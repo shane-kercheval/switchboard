@@ -6,11 +6,13 @@
 
 ## 1. What Switchboard is
 
-Switchboard is a **manual orchestrator for AI coding agents**. It lets a developer spawn multiple Claude Code and Codex sessions within a project, route messages between them, and define reusable patterns for common multi-agent workflows like dueling code review, plan-and-implement, and fan-out aggregation.
+Switchboard is a **human-directed orchestrator for AI coding agents** — an interactive tool you run alongside your existing Claude Code and Codex setup. It lets a developer spawn multiple agent sessions within a project, route messages between them, and define reusable patterns for common multi-agent workflows like second-opinion code review, plan-and-implement, and parallel-solution adjudication.
 
-Switchboard is a **workflow engine for primitives, not for processes**. It codifies the *shape* of common multi-agent operations (fan-out, fan-in with template wrapping, sequential handoff) so they can be invoked with one command instead of manually copy-pasted. It does not impose any larger structure on top of those primitives — there is no built-in concept of "plan phase" or "review phase," no SDLC walkthrough, no opinionated process. The user composes patterns ad hoc and saves the ones they reuse.
+More precisely, it is a **workflow engine for primitives, not for processes**. It codifies the *shape* of common multi-agent operations (fan-out, fan-in with template wrapping, sequential handoff) so they can be invoked with one command instead of manually copy-pasted. It does not impose any larger structure on top of those primitives — there is no built-in concept of "plan phase" or "review phase," no SDLC walkthrough, no opinionated process. The user composes patterns ad hoc and saves the ones they reuse.
 
-The human stays in the loop where judgment matters (deciding what to route, when to revise, when to proceed) and is removed from the loop where mechanics waste time (copy-paste, template application, waiting for parallel agents to finish).
+The human stays in the loop where judgment matters (deciding what to route, when to revise, when to proceed) and is removed from the loop where mechanics waste time (copy-paste, template application, babysitting parallel agents).
+
+A second consequence of this design: because Switchboard resolves prompts itself and sends agents plain text, prompt-provider configuration lives in *one place* (Switchboard) and works across every agent backend. A user's prompt library — whether in Tiddly, another MCP server, or Switchboard's local store — works identically with both Claude Code and Codex agents, without configuring the prompt source in either. This is especially useful for Codex, where MCP prompt support is limited or absent depending on version. The same does **not** hold for MCP tools or for Claude Code skills, which are invoked by the model mid-turn and must still be configured in the underlying agent (see section 6).
 
 ## 2. Goals and non-goals
 
@@ -19,6 +21,7 @@ The human stays in the loop where judgment matters (deciding what to route, when
 - Spawn and manage multiple Claude Code and Codex agent instances in a single project with named roles.
 - Route messages between agents with explicit fan-out (one human → many agents), fan-in (many agents → one agent), and sequential handoff, with optional prompt-template wrapping.
 - Apply prompt templates from one or more configured **prompt providers** during routing, with parameterized substitution. Providers include a built-in local file store (prompts authored as files inside the project or the user's Switchboard config directory) and any MCP server that exposes prompts (for example [Tiddly](https://tiddly.me)).
+- Centralize prompt-provider configuration in Switchboard so a user's prompt library works identically across all supported agent backends (Claude Code, Codex, future additions) without per-agent MCP setup. Does not extend to MCP *tools* or to model-discovered *skills*, which remain per-agent concerns.
 - Ship example prompts and example patterns in the local store so a new user is productive immediately, with no MCP setup required.
 - Define reusable patterns as files that compose primitives — invoked by name, parameterized at invocation time.
 - Run patterns autonomously after launch so the user can walk away and return to completed work.
@@ -129,6 +132,8 @@ Switchboard interacts with Claude Code and Codex through their non-interactive m
 
 Per-message process spawn for v1: each turn invokes `claude -p --resume <session-id>` or `codex exec --resume <session-id>`, captures the structured output stream, and exits. State persists in the harness's session files between invocations. Long-lived agent processes can be considered later if latency matters.
 
+Switchboard runs `claude -p` in its **default** mode (no `--bare`) so the agent inherits the user's full environment: skills, hooks, plugins, MCP servers, CLAUDE.md, and auto-memory all load exactly as they would in an interactive session. This is deliberate — Switchboard's value is to orchestrate normal Claude Code / Codex sessions, not to amputate them. Anthropic has stated that `--bare` will become the `-p` default in a future release; when that happens, Switchboard will need to pass equivalent context-loading flags (`--mcp-config`, `--agents`, `--plugin-dir`, `--settings`, `--append-system-prompt`) to preserve current behavior. To make that change a one-place edit, harness command-line construction is centralized in a single "harness invoker" helper from day one. Tracked under open question 10.9; full background in [docs/research/claude-code-headless.md](research/claude-code-headless.md).
+
 ### Permissions and sandboxing
 
 For MVP, Switchboard exposes a single user-facing toggle: **skip permissions (default: on)**. When on, agents run with maximum autonomy:
@@ -158,9 +163,11 @@ Switchboard must be able to:
 
 ### Passthrough mechanism
 
-For harness commands Switchboard does not need to coordinate, a passthrough exists: the user can type any harness slash command (e.g., `/model`, `/clear`, `/cost`) when interacting with an agent, and Switchboard forwards it to the harness verbatim. This avoids reimplementing every harness feature.
+For harness commands Switchboard does not need to coordinate, the design *intent* is a passthrough: the user types a harness slash command (e.g., `/model`, `/clear`, `/cost`) when interacting with an agent, and Switchboard forwards it to the harness verbatim. This avoids reimplementing every harness feature.
 
-**Open question 5.2:** Exact mechanism for passthrough — does it require a prefix to disambiguate from Switchboard's own slash commands, or do Switchboard's commands live in a separate namespace?
+**Important caveat — `claude -p` limitation today:** Headless mode does not currently accept slash commands as input — that includes built-in commands (`/cost`, `/model`, `/clear`) and user-invoked skills (`/skill-name`). This is a known upstream gap ([anthropics/claude-code#837](https://github.com/anthropics/claude-code/issues/837), [#38505](https://github.com/anthropics/claude-code/issues/38505)). Until it is resolved, Switchboard's passthrough is constrained to commands we can implement out-of-band: `/cost` derived from `--output-format json` metadata, `/model` implemented by re-spawning with a different `--model` flag, and so on. A blanket "type any slash command and forward it" is not achievable in pure headless mode today. Tracked under open question 10.10; see [docs/research/claude-code-headless.md](research/claude-code-headless.md) for sources. (The auto-invoked side of skills is unaffected — see §6.)
+
+**Open question 5.2:** Exact mechanism for passthrough — does it require a prefix to disambiguate from Switchboard's own slash commands, or do Switchboard's commands live in a separate namespace? Partially blocked on the upstream limitation above.
 
 ### What we lose by going non-interactive
 
@@ -199,6 +206,18 @@ The prefix is the user-chosen registration name for an MCP-server provider, so a
 - Local-store lookup checks the project scope first, then the user-global scope. A project-scoped prompt with the same name shadows the user-global one — intentional, so a project can override a personal prompt.
 
 This separation between provider and workflow is intentional: a prompt store is a prompt store, not a workflow engine. Encoding control flow ("run agent A, then fan out to B and C, then aggregate via template D") in a stored prompt would stretch the store out of shape. Patterns are programs; prompts are data.
+
+#### Cross-agent normalization
+
+Switchboard resolves prompt IDs itself and sends agents the rendered text as a plain message — the agent never sees the MCP call, the provider, or the arguments. The useful side effect: prompt-provider configuration lives in *one place* (Switchboard) and works the same across every agent backend. A user's prompts (Tiddly, another MCP server, or the local store) work identically with both Claude Code and Codex agents, without configuring the prompt source in either harness. This is especially useful for Codex, whose MCP prompt support is limited or absent depending on version — Switchboard gives Codex users a Claude-Code-style prompt library experience without requiring Codex to support it.
+
+What this does **not** cover:
+
+- **MCP tools.** Tools are invoked by the model mid-turn, not by the user pre-turn. Switchboard cannot proxy them; tools (e.g. an Atlassian MCP server, Google Drive integration) must still be configured in the underlying agent.
+- **Claude Code skills.** Configured in Claude Code itself (`~/.claude/skills/`, project `.claude/skills/`); Switchboard does not mediate them. **Auto-invoked skills do work normally in Switchboard-spawned sessions** because default `claude -p` loads the user's full environment — the model can discover and invoke skills mid-turn just as it would interactively. The *user-invoked* side of skills (`/skill-name` as an explicit command) is currently unavailable due to a `claude -p` limitation; see §5 passthrough and [docs/research/claude-code-headless.md](research/claude-code-headless.md).
+- **Per-agent setup in general.** Authentication, permission flags, hooks, and MCP tool registration remain the underlying harness's concern.
+
+Switchboard normalizes the *user-invoked prompt* surface across agents. Model-invoked capabilities (tools, skills) and harness-level configuration are still per-agent.
 
 #### Authoring a local prompt
 
@@ -351,6 +370,8 @@ Aggregated from inline flags above, plus a few additional:
 - **10.6** Multi-machine workflows (running Switchboard on a remote dev machine over SSH). Out of scope for v1, but the architecture should not fight it.
 - **10.7** Local prompt file format. Markdown body with YAML frontmatter is the working assumption; alternatives (pure YAML, plain `.txt` with separate manifest) should be evaluated against authoring ergonomics and round-tripping with editors.
 - **10.8** Whether the local store and the MCP-server provider need to expose the same template-arguments contract (variable names, types, defaults) so a prompt can move between them without breaking pattern files. Working assumption: yes; the local file's frontmatter mirrors what an MCP `prompts/get` response would carry.
+- **10.9 (monitoring)** `--bare` will become the `claude -p` default in a future Anthropic release ([source](https://code.claude.com/docs/en/headless)). When it lands, default `-p` no longer auto-loads skills, hooks, plugins, MCP servers, or CLAUDE.md, and Switchboard must explicitly pass `--mcp-config`, `--agents`, `--plugin-dir`, `--settings`, `--append-system-prompt`, etc. to preserve current behavior. Mitigation: harness command-line construction is centralized from day one (§5 "Process model"). Action: monitor Anthropic release notes; flip the helper when announced. Background in [docs/research/claude-code-headless.md](research/claude-code-headless.md).
+- **10.10 (monitoring)** Headless slash-command support. `claude -p` does not accept slash commands today, blocking §5's full passthrough vision. Tracked upstream at [anthropics/claude-code#837](https://github.com/anthropics/claude-code/issues/837) and [#38505](https://github.com/anthropics/claude-code/issues/38505). Workarounds described in §5; full passthrough lights up automatically when upstream lands.
 
 ## 11. Phasing
 

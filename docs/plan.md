@@ -428,33 +428,35 @@ The user reads the implementer's response and decides what's next. Common follow
 
 Switchboard interacts with Claude Code and Codex through their non-interactive modes (`claude -p` and `codex exec`). The underlying sessions are real Claude Code / Codex sessions backed by the harnesses' own session files — they survive Switchboard, can be resumed later, and could in principle be opened in the harness's interactive TUI by the user if they wanted. Switchboard does not lock the user out of the harness; it just drives it.
 
+The architectural backbone of this section is the **per-harness adapter** pattern: one adapter per harness translates that harness's native event stream into a normalized internal stream the rest of Switchboard consumes. This keeps the pattern engine, UI, and persistence layer harness-agnostic, while letting each adapter handle its own quirks (event vocabularies, exit-code semantics, session-file richness, etc.). See "Per-harness adapter and normalized event stream" below for the shape; see [docs/research/harness-comparison.md](research/harness-comparison.md) for the cross-harness comparison that drove the design.
+
 ### Process model
 
 Per-message process spawn for v1: each turn invokes `claude -p --resume <session-id>` or `codex exec resume <session-id>`, captures the structured output stream, and exits. State persists in the harness's session files between invocations. Long-lived agent processes can be considered later if latency matters.
+
+Switchboard runs `claude -p` in its **default** mode (no `--bare`) so the agent inherits the user's full environment: skills, hooks, plugins, MCP servers, CLAUDE.md, and auto-memory all load exactly as they would in an interactive session. The Codex equivalent (we do not pass `--ignore-user-config` or `--ephemeral`) gives the same outcome: the user's `~/.codex/config.toml` and session persistence are honored. This is deliberate — Switchboard's value is to orchestrate normal Claude Code / Codex sessions, not to amputate them. Anthropic has stated that `--bare` will become the `-p` default in a future release; when that happens, Switchboard will need to pass equivalent context-loading flags (`--mcp-config`, `--agents`, `--plugin-dir`, `--settings`, `--append-system-prompt`) to preserve current behavior. To make that change a one-place edit, harness command-line construction is centralized in a single "harness invoker" helper from day one. Tracked under open question 10.9; full background in [docs/research/claude-code-headless.md](research/claude-code-headless.md).
 
 Switchboard consumes the harness stream by spawning the process, reading stdout line-by-line as JSONL, and dispatching each event into the normalized event stream described below. Standard pipe-and-readline; no file-watching for the basic case. Full streaming details in [docs/research/harness-comparison.md](research/harness-comparison.md).
 
 **Process group**: the harness is spawned in its own process group (Rust: `Command::process_group(0)`) so cancellation can `killpg` the entire group with one signal. This handles both Claude Code (single process) and Codex (Node parent + Rust child) uniformly — verified empirically; see the cancellation sections of the per-harness research notes. **Note**: Codex's parent process catches `SIGTERM` and exits with code `0`, so Switchboard cannot detect cancellation from the exit code alone — it relies on the absence of a terminal event in the stream (`turn.completed` or `turn.failed`).
 
-Switchboard runs `claude -p` in its **default** mode (no `--bare`) so the agent inherits the user's full environment: skills, hooks, plugins, MCP servers, CLAUDE.md, and auto-memory all load exactly as they would in an interactive session. The Codex equivalent (we do not pass `--ignore-user-config` or `--ephemeral`) gives the same outcome: the user's `~/.codex/config.toml` and session persistence are honored. This is deliberate — Switchboard's value is to orchestrate normal Claude Code / Codex sessions, not to amputate them. Anthropic has stated that `--bare` will become the `-p` default in a future release; when that happens, Switchboard will need to pass equivalent context-loading flags (`--mcp-config`, `--agents`, `--plugin-dir`, `--settings`, `--append-system-prompt`) to preserve current behavior. To make that change a one-place edit, harness command-line construction is centralized in a single "harness invoker" helper from day one. Tracked under open question 10.9; full background in [docs/research/claude-code-headless.md](research/claude-code-headless.md).
-
 ### Permissions and sandboxing
 
-For MVP, Switchboard exposes a single user-facing toggle: **skip permissions (default: on)**. When on, agents run with maximum autonomy:
+For v1, Switchboard runs both harnesses with maximum autonomy — skip-permissions is effectively required, not optional:
 
 - Claude Code: `--dangerously-skip-permissions`
 - Codex: `--dangerously-bypass-approvals-and-sandbox` (also accepts `--yolo` as an undocumented alias in 0.128.0; relying on the long form is safer)
 
-Internally, the configuration layer maps this single toggle to the actual flags per harness, so granular control (separate sandbox modes, per-tool allowlists) can be added later without breaking the user-facing model.
+This is a deliberate v1 simplification. Headless mode has no native interactive permission prompt UX, and building one inside Switchboard (intercept denials at runtime, modal-prompt the user, re-issue the turn) is non-trivial work that we don't want to gate v1 on. Granular permission control is a deferred design decision — see §11.
 
 **Known issues to track:**
 
 - Codex has open bugs around `--dangerously-bypass-approvals-and-sandbox` not fully bypassing in all sub-modes (e.g., a recent regression where the directory-trust prompt fires anyway). Switchboard should pin tested Codex versions and surface any unexpected prompts as errors.
 - Codex separates approval policy from sandbox mode. The MVP collapses these; v2 may expose them separately.
 
-### Required harness commands for MVP
+### Harness capabilities Switchboard depends on
 
-What Switchboard needs from each harness, with notes on what is exposed natively, derived, or unavailable. Hands-on probe results are documented in [docs/research/claude-code-cli-observed.md](research/claude-code-cli-observed.md), [docs/research/codex-cli-observed.md](research/codex-cli-observed.md), and [docs/research/harness-comparison.md](research/harness-comparison.md).
+The capabilities and behaviors Switchboard needs from each harness, with notes on what is exposed natively, derived, or unavailable. Hands-on probe results are documented in [docs/research/claude-code-cli-observed.md](research/claude-code-cli-observed.md), [docs/research/codex-cli-observed.md](research/codex-cli-observed.md), and [docs/research/harness-comparison.md](research/harness-comparison.md).
 
 - **Spawn** a session with explicit flags. *(native, both)*
 - **Send** a message and capture the structured stream. *(native, both — `claude -p --output-format stream-json` and `codex exec --json`)*
@@ -468,7 +470,7 @@ What Switchboard needs from each harness, with notes on what is exposed natively
 - **Surface compaction state.** *(No programmatic `/compact` in either harness; both do auto-compact at high utilization.)* Switchboard's role is to monitor utilization and surface warnings as the threshold approaches, not to drive compaction itself. Reimplementing summarization in Switchboard would underperform the harnesses' tuned compaction and is not planned (see open question 10.11).
 - **Read tool calls and tool results** from the stream. *(Asymmetric.)* Claude Code emits typed `tool_use` and `tool_result` content blocks (with named tools, including MCP tools). Codex routes everything through `command_execution` items (raw shell commands with `aggregated_output` and `exit_code`). Switchboard renders them differently per harness — there is no single unified rendering.
 - **Capture permission denials.** *(Confirmed for Claude Code via `result.permission_denials`.)* Denials do **not** error the turn — the model receives them as feedback and adapts. Switchboard treats denials as a distinct UX category (informational, not failure). Codex behavior presumed similar; verification deferred.
-- **Run agents concurrently.** *(Confirmed for Claude Code: three parallel `claude -p` from the same cwd produced three independent session files with no contention.)* This is what makes fan-out feasible. Codex concurrent runs not directly probed; presumed similar.
+- **Run agents concurrently.** *(Confirmed for Claude Code: three parallel `claude -p` from the same cwd produced three independent session files with no contention.)* This is what makes fan-out feasible. Codex's process model (parent + child) and per-session-file isolation suggest the same property holds; explicit verification deferred to implementation.
 
 ### Per-harness adapter and normalized event stream
 
@@ -481,7 +483,7 @@ ToolResult      { agent, tool_use_id, output, is_error }
 TurnEnd         { agent, status: success | error,
                   stop_reason, usage: { input, output, cached, reasoning, context_window? },
                   cost_usd?, permission_denials, raw_event }
-RateLimitEvent  { agent, info }
+RateLimitEvent  { agent, info }    // info: harness-specific shape, surfaced for UI display, not interpreted by the pattern engine
 ```
 
 Each adapter (Claude Code, Codex) is responsible for: building the harness command line, spawning the process, parsing its native stream, normalizing into the events above, and surfacing harness-specific metadata in `raw_event` so callers that need to dig in can. The pattern engine, UI, and persistence layer consume only the normalized stream.
@@ -505,9 +507,15 @@ What is **preserved** because the harness still runs in default mode: hooks fire
 What is **lost** in headless mode:
 
 - **Plan mode** (Claude Code's interactive plan/approve cycle) — REPL-only; no headless equivalent.
-- **User-invoked slash commands** — `/cost`, `/model`, `/clear`, `/compact`, and `/skill-name` are not accepted as input in `claude -p`. See §9 passthrough and open question 10.10.
+- **User-invoked slash commands** — `/cost`, `/model`, `/clear`, `/compact`, and `/skill-name` are not accepted as input in `claude -p`. See the passthrough section above and open question 10.10.
 - **Programmatic compaction** — both harnesses do auto-compact; neither exposes a triggerable `/compact` from headless. See open question 10.11.
 - **The harness's own TUI rendering** — Switchboard renders everything itself from the stream.
+
+### Integration testing
+
+Switchboard's per-harness adapters are exercised by an integration test suite that runs against the **real, installed Claude Code and Codex CLIs** — not mocks. This is critical: adapter correctness depends on harness behavior we don't control (event vocabularies, exit codes, stream timing, session-file format), and mocked tests would silently lock in our current understanding while upstream releases drift. Real-harness tests catch those regressions on the next CI run. Switchboard's own logic (pattern parser, prompt resolver, MCP client, normalized event dispatcher) is covered separately by ordinary unit tests with the harness mocked at the adapter boundary.
+
+To keep the integration suite affordable in time and API cost, every test prompt is constrained to a small response (e.g., "reply with the single word 'ack'", not "write me a poem"). Modern Claude / Codex usage limits are generous enough that even a thorough suite runs in minutes-to-tens-of-minutes for a small dollar amount per CI run. The constraint isn't test count — it's per-test response size.
 
 
 ## 10. Form factor and distribution
@@ -569,7 +577,7 @@ Decisions explicitly **not made** in this document, to be addressed in later doc
 
 - **Long-lived agent processes.** Per-message spawn for v1; may revisit if latency dominates.
 - **Visual pattern editor.** v1 is file-based, with agent-consumable authoring docs as the supported authoring path.
-- **Granular permission/sandbox config.** v1 collapses to a single toggle.
+- **Granular permission / sandbox config.** v1 runs both harnesses with maximum autonomy (skip-permissions on); the off / restricted-mode user experience is deferred. Plausible future directions: **config-driven tool allowlists** (YAML per project / per agent, passed through as `--allowedTools` / `--permission-mode`), **interactive permission prompts** (Switchboard intercepts denials at runtime and pops a modal asking the user to allow / deny / always-allow, then re-issues the turn — pending a probe of harness resume-after-denial mechanics), and **per-pattern permission scoping** (a pattern step declares its required tools, Switchboard restricts the harness for the duration). Codex's separate approval-policy vs sandbox-mode distinction (currently collapsed into the single max-autonomy posture) is part of this same design space.
 - **Cross-session persistent agent memory.** Architecture should not preclude; not implemented in v1.
 - **Global / cross-project agent templates.** Agents in v1 are project-scoped. A future direction lets users define reusable agent templates (personas) that can be invoked from any project — for example, a personal "writing editor" persona that knows your voice and applies across blog posts, docs, and emails, or a "domain expert" persona carrying institutional knowledge (a regulatory framework, your team's architecture conventions, a research methodology) reusable in any project that touches the area. Optionally surfaced via semantic search over the project context to suggest which template fits. Distinct from "Cross-session persistent agent memory" above (memory is what an agent remembers across sessions; global templates are which agents are available to spawn).
 - **Multi-project workflows.** Each project is independent in v1.

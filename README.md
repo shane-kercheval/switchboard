@@ -1,10 +1,10 @@
 # Switchboard
 
-Manual orchestrator for AI coding agents.
+Human-directed orchestrator for AI coding agents.
 
-Switchboard lets you spawn multiple Claude Code and Codex sessions in a single project, route messages between them, and define reusable patterns for common multi-agent workflows like dueling code review, plan-and-implement, and fan-out aggregation.
+Switchboard lets you spawn multiple Claude Code and Codex sessions in a single project, route messages between them, and define reusable patterns for common multi-agent workflows like second-opinion code review, plan-and-implement, and parallel-solution adjudication.
 
-It's built for developers who want explicit, human-in-the-loop control over multi-agent workflows — not an opinionated SDLC engine, not a full agent replacement, just the coordination layer between agents you're already using.
+It's built for anyone who wants explicit, human-in-the-loop control over multi-agent workflows — not an opinionated SDLC engine, not a full agent replacement, just the coordination layer between agents you're already using.
 
 ## Status
 
@@ -18,10 +18,12 @@ Running multiple AI coding agents in parallel — one to plan, others to review,
 
 Switchboard removes the coordination overhead while keeping the human in the loop where judgment matters: deciding what to route, when to revise, when to proceed.
 
+There is also a quieter benefit: because Switchboard resolves prompts itself and sends agents plain text, your prompt library lives in one place and works identically with both Claude Code and Codex agents — without configuring the prompt source in either harness. Especially useful for Codex, where MCP prompt support is limited.
+
 ## Core ideas
 
 - **Project**: a workspace containing related agents working toward a shared goal (a feature, a refactor, a document).
-- **Agent**: a Claude Code or Codex session, named and assigned a role within a project.
+- **Agent**: a Claude Code or Codex session, named within a project.
 - **Pattern**: a reusable, parameterized routing template — for example "fan-out review and aggregate" — defined as a YAML file and invoked by name.
 - **Routing**: message passing between agents, optionally wrapped in a prompt template, with support for fan-out (one to many) and fan-in (many to one).
 
@@ -31,6 +33,7 @@ Switchboard removes the coordination overhead while keeping the human in the loo
 - Prescribing a software development lifecycle. Patterns are user-defined; Switchboard ships defaults but doesn't impose process.
 - Managing git, CI, or PR workflows. Out of scope.
 - Cross-session persistent agent memory. Possibly a future addition; not in scope for v1.
+- A hosted / SaaS service. Switchboard runs locally on your machine. A future hosted service may exist for cross-machine sync of patterns and prompts; that is not v1.
 
 ## Design and discussion
 

@@ -10,7 +10,7 @@ It's built for anyone who wants explicit, human-in-the-loop control over multi-a
 
 ## Status
 
-Early development. Design is being captured in [`/docs`](./docs) before implementation begins. The high-level design is in [`docs/blueprint.md`](./docs/blueprint.md).
+Early development. Design is being captured in [`/docs`](./docs) before implementation begins. The high-level design is in [`docs/system-design.md`](./docs/system-design.md).
 
 Switchboard will ship as a single-binary desktop app (built with Tauri) — installable via Homebrew on macOS, `.deb`/`.rpm` on Linux, and a signed `.msi` installer on Windows once available.
 

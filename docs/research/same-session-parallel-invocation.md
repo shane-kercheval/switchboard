@@ -2,7 +2,7 @@
 
 **Captured:** 2026-05-10
 **Versions:** Claude Code 2.1.138, Codex CLI 0.130.0
-**Affects blueprint sections:** §7 (Walking away / pattern execution), §9 (Process model), §12 open question 10.2 (concurrent agent use across patterns).
+**Affects system-design sections:** §7 (Walking away / pattern execution), §9 (Process model), §12 open question 10.2 (concurrent agent use across patterns).
 
 ## Question
 
@@ -49,7 +49,7 @@ For each harness:
 4. **No reservation needed across pattern steps.** Whether a future pattern step "owns" an agent is irrelevant — the rule is purely "is this agent currently mid-turn?" If yes, refuse or queue. This composes cleanly with both autonomous pattern execution and ad-hoc manual sends, and avoids surprising "agent locked" UX.
 5. **UI gating is the natural enforcement point.** A user in the UI can't manually dispatch to an agent that's currently busy because the input affordance is disabled (or the dispatch shows a clear "agent busy" error). Pattern-step dispatch goes through the same dispatcher and gets the same gate. The collision scenario simply can't occur if the dispatcher is the single chokepoint.
 
-## Resolution to blueprint open question 10.2
+## Resolution to system-design open question 10.2
 
 **Working assumption** (now grounded in the probe):
 

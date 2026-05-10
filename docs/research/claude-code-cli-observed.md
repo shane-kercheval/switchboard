@@ -86,7 +86,7 @@ The `stream-json` output emits one JSON object per line. Observed event types in
 
 `stop_reason` on intermediate `assistant` events is `null` while the cycle continues. The single, definitive end-of-turn signal is the `result` event. Switchboard should treat `result` as "this turn is done" and not try to parse stop signals from individual `assistant` events.
 
-This also resolves part of blueprint open question 10.1 (what about tool-call-only responses): there is no such thing as a "tool-call-only response" at the harness level — the harness keeps cycling (model → tool_use → tool_result → model → ...) until the model emits a final text and the `result` event fires. Switchboard always sees a complete turn.
+This also resolves part of system-design open question 10.1 (what about tool-call-only responses): there is no such thing as a "tool-call-only response" at the harness level — the harness keeps cycling (model → tool_use → tool_result → model → ...) until the model emits a final text and the `result` event fires. Switchboard always sees a complete turn.
 
 ### `contextWindow` IS exposed in the `result` event
 
@@ -239,7 +239,7 @@ Probed by spawning `claude -p "Write a 100-line poem..."`, waiting 20 seconds (l
 
 These can be picked up later; they are not blocking for §5 design.
 
-## Resolutions / updates for the blueprint
+## Resolutions / updates for the system-design
 
 1. **Open question 10.12 (model→max-context map)** — partially resolved for Claude Code: `contextWindow` is in `result.modelUsage.<model>`. Switchboard does not need to maintain a Claude Code map. (Codex still TBD.)
 2. **Open question 10.1 (tool-call response handling)** — effectively resolved: the harness handles the loop internally; Switchboard sees one `result` event per user-initiated turn regardless of how many tool cycles happened inside.

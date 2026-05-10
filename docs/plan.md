@@ -180,6 +180,8 @@ Please review the current uncommitted changes in this repository.
 For each issue, identify the file, the concern, and a suggested fix.
 ```
 
+Local prompts are authored file-first, the same as patterns: edit them in whichever editor you prefer (Vim, VS Code, etc.), optionally have your existing Claude Code or Codex agent generate a starter from `docs/agent-instructions/prompts.md`. Switchboard reads the files and surfaces them via slash-command autocomplete; in v1 it does not provide an in-app editor for prompts (see "Future direction: prompt library view" below for what changes in v2+).
+
 **Frontmatter spec for v1:**
 
 | Field | Required | Notes |

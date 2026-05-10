@@ -536,15 +536,29 @@ Switchboard ships as a **single-binary desktop application** rather than a TUI o
 - **Single small binary** (~3 MB Hello World, vs Electron's ~150 MB). Sub-half-second startup, low memory footprint.
 - **OS-native WebView** for rendering — WebKit on macOS, WebView2 on Windows, WebKitGTK on Linux. ~99% of modern web tech works identically across platforms.
 - **Rust core** handles backend logic: filesystem, harness adapters, MCP client, IPC handlers. Single-process app — no Python subprocess, no separate server.
-- **Web frontend** (HTML/CSS/JS) renders the UI in the WebView and talks to the Rust core via Tauri's typed command system. Standard web tech, any framework.
+- **Web frontend** (HTML/CSS/JS) renders the UI in the WebView and talks to the Rust core via Tauri's typed command system: the WebView calls Rust functions via `invoke()` (typed inputs and return values), and the Rust core streams events back via Tauri's event API (the harness streams Switchboard receives are republished as events the frontend subscribes to). Standard web tech, any framework.
 - **Native OS integration** via Tauri plugins (notifications, file dialogs, system tray, auto-updater).
 - **Tauri 2.x** (released 2024) is mature with cross-platform desktop support and a growing plugin ecosystem.
 
 Other options were considered (Electron, local web UI, TUI). Comparison and reasoning captured in [docs/research/desktop-framework-evaluation.md](research/desktop-framework-evaluation.md).
 
+**Architecturally: one process.** Rust core + WebView are bundled together inside the Tauri app. Harness subprocesses (Claude Code, Codex) are spawned by the Rust core but live within Switchboard's process tree. There is no separate backend server, no sidecar process, no Python or Node runtime to install.
+
 ### Backend language: Rust
 
-Follows from Tauri. The MCP client uses the [official Rust MCP SDK (`rmcp`)](https://github.com/modelcontextprotocol/rust-sdk), currently **Tier 2** in the [MCP SDK Tiering System](https://modelcontextprotocol.io/community/sdk-tiers) — production-ready with a smaller community than the Tier 1 Python/TypeScript/Go/C# SDKs and slower SLAs (issue triage within a month vs 2 days; critical bug fixes within 2 weeks vs 7 days; new protocol features within 6 months vs same-release). Functionally adequate for Switchboard's use case (`prompts/list` and `prompts/get` are supported and stable). Tier 2 risks discussed in the research note.
+Follows from Tauri. The Rust core handles filesystem access, harness adapters (spawning and stream-parsing `claude -p` / `codex exec`), the MCP client (for prompts), and the Tauri command handlers the frontend invokes. Single-process app: no separate backend server, no language-runtime prereq for the user.
+
+### MCP client
+
+The MCP client uses the [official Rust MCP SDK (`rmcp`)](https://github.com/modelcontextprotocol/rust-sdk), currently **Tier 2** in the [MCP SDK Tiering System](https://modelcontextprotocol.io/community/sdk-tiers).
+
+What Tier 2 means concretely vs Tier 1 (Python, TypeScript, Go, C#):
+
+- Slower SLAs: issue triage within a month vs 2 days; critical bug fixes within 2 weeks vs 7 days; new protocol features within 6 months vs same-release.
+- Smaller community for examples and prior art.
+- Up to 20% of conformance tests may fail (vs 100% pass for Tier 1).
+
+Functionally adequate for Switchboard: `prompts/list` and `prompts/get` are supported and stable, which is what we need. The Tier 2 risks (slow upstream evolution, slower bug response) are acceptable given the architectural wins of staying in Rust. Full discussion in the research note.
 
 ### Frontend stack: Svelte + Tailwind CSS
 

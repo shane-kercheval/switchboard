@@ -8,7 +8,7 @@ More precisely, it is a **workflow engine for primitives, not for processes**. I
 
 The human stays in the loop where judgment matters (deciding what to route, when to revise, when to proceed) and is removed from the loop where mechanics waste time (copy-paste, template application, babysitting parallel agents).
 
-A second consequence of this design: **because Switchboard resolves prompts itself and sends agents plain text, prompt-provider configuration lives in *one place* (Switchboard) and works across every agent backend**. A user's prompt library — whether in Tiddly, another MCP server, or Switchboard's local store — works identically with both Claude Code and Codex agents, without configuring the prompt source in either. This is especially useful for Codex, where MCP prompt support is limited or absent depending on version. The same does **not** hold for MCP tools or for Claude Code skills, which are invoked by the model mid-turn and must still be configured in the underlying agent (see section 6).
+This orchestration model has a useful side effect for prompt management. Because Switchboard resolves prompts itself and sends agents plain text, **prompt-provider configuration lives in *one place* (Switchboard) and works across every agent backend**. A user's prompt library — whether in Tiddly, another MCP server, or Switchboard's local store — works identically with both Claude Code and Codex agents, without configuring the prompt source in either. This is especially useful for Codex, where MCP prompt support is limited or absent depending on version. (The same does **not** hold for MCP tools or Claude Code skills, which are invoked by the model mid-turn and must still be configured in the underlying agent; see section 6.)
 
 ## 2. Goals and non-goals
 
@@ -33,6 +33,7 @@ A second consequence of this design: **because Switchboard resolves prompts itse
 - **Visual / GUI pattern editor.** Authoring is file-based, supported by agent-consumable instruction docs (see goals — "Agent-friendly authoring"). A visual or form-based pattern editor is not planned.
 - **Multi-user collaboration.** Single-developer tool. Sharing patterns and configurations via git is supported as a side effect of file-based config, but there is no real-time collaboration model.
 - **Hosted / SaaS service.** Switchboard runs locally on the developer's machine. There is no managed cloud version, no shared backend, no remote agent execution. A future hosted service may eventually provide cross-machine sync of patterns, prompts, and project configuration; that is out of scope for v1.
+- **Arbitrary harness slash-command passthrough.** v1 does not support invoking arbitrary harness slash commands as input (`/cost`, `/model`, `/skill-name`, etc.). This is an upstream `claude -p` limitation; specific commands are worked around individually (see §9). Tracked in §12 (10.10).
 
 ## 3. Core concepts
 
@@ -64,6 +65,8 @@ Each project's Switchboard-managed state lives in a `.switchboard/` directory at
 
 `config.yaml`, `patterns/`, and `prompts/` are intended to be checked into git and shared. `state/` is local-machine runtime data and should be `.gitignore`d.
 
+State is kept project-local rather than in a user-global registry so that opening the project from a different machine surfaces "no state yet" explicitly rather than silently dereferencing stale registry entries.
+
 ## 4. Functional primitives
 
 These five primitives cover everything Switchboard needs to do at the functional level. Patterns compose them.
@@ -76,6 +79,8 @@ Create a new agent within a project. User specifies:
 - Name (free-form label).
 - Optional initial prompt (sent as the first message after spawn to prime the agent with role context, project background, or any other instructions the user wants in place before the first real turn). Authored like any other prompt — free-form text or a fully-qualified prompt ID resolved through the prompt-provider system (§6).
 - Optional working directory override (defaults to project working directory).
+
+Agent names are restricted to `[A-Za-z0-9_-]+` at creation; this avoids ambiguity when names appear as template variable identifiers (Primitive 4) or in file paths.
 
 The harness session ID is captured and persisted. The agent is now part of the project and can receive messages and participate in patterns.
 
@@ -147,9 +152,13 @@ Authoring is intentionally file-based. The user edits patterns in whichever edit
 
 v1 ships with a small library of built-in patterns (review-and-aggregate, sequential handoff with template) as starting points; users can copy or fork these to author their own.
 
+Users without an existing Claude Code or Codex installation outside Switchboard can use a Switchboard-spawned agent itself to author a pattern from the instruction docs — agents Switchboard manages are full Claude Code / Codex sessions and can read project files normally. Hand-authoring against the DSL spec also works for power users.
+
 Pattern files are project-scoped only — there is no user-global pattern directory parallel to user-global prompts. Reuse across projects happens via copy or symlink. (Asymmetric with prompts on purpose: patterns tend to be project-shaped — they reference specific agent names and workflows — whereas prompts are more reusable as personal templates.)
 
 ## 6. Prompts and prompt providers
+
+> *Scope note: this section covers prompts only. Model-invoked MCP tools and Claude Code skills remain configured per-agent, not per-Switchboard. See "Cross-agent normalization" below for the boundary.*
 
 A **prompt** is a reusable, optionally parameterized text template — for example, "Review the diff focusing on `{{ focus }}`." Pattern files and slash commands reference prompts by ID. The *prompt text* lives in a **prompt provider**; the *workflow* lives in the pattern file. Switchboard reads pattern files, resolves prompt IDs to prompt content via the configured providers, and applies templates with substitution.
 
@@ -188,7 +197,7 @@ Local prompts are authored file-first, the same as patterns: edit them in whiche
 |---|---|---|
 | `id` | yes | Slug; matches MCP's `name` field. Used as the suffix in `local:<id>` references. |
 | `description` | yes | Short human description. Matches MCP standard. |
-| `arguments` | optional | Array of `{name, description, required}`. Matches MCP standard. All arguments are treated as strings in template substitution; typed arguments may be added later if needed. |
+| `arguments` | optional | Array of `{name, description, required}`. Matches MCP standard. All arguments are treated as strings in template substitution; typed arguments may be added later if needed. No `default` field in v1 — local frontmatter intentionally mirrors MCP's surface so prompts move cleanly between providers (open question 10.8). |
 | `tags` | optional | Array of strings. Matches Tiddly's tag extension. Reserved for future library/browse views (see "Future direction" below); v1 does not use them in the slash-command UI. |
 
 This minimal set mirrors the MCP `prompts/list` standard, plus Tiddly's tag extension as a superset, so prompts move cleanly between local and MCP storage. Other metadata fields (title, owner, etc.) are explicitly out of scope for v1.
@@ -355,6 +364,14 @@ A pattern is invoked by name. Switchboard prompts for the pattern's inputs (whic
 
 All participating agents stay simultaneously visible in their panes throughout pattern execution; status indicators show which are still running, waiting, or completed. The user can collapse background agents to focus on a specific one, or expand them all to watch the work in parallel. Pattern execution is independent of which pane has focus — agents continue running in the background regardless. When the pattern completes (the final step has dispatched its output), the user is notified via OS-native notification (per §10 Form factor).
 
+### Agent contention
+
+Switchboard enforces **one in-flight turn per agent** at the application layer. A dispatch (whether from a pattern step or a manual user send) against an agent that is already mid-turn is refused with a clear error ("agent X is busy"); the user can switch focus to inspect the busy agent. Queueing is not implemented in v1.
+
+This rule lives in Switchboard, not the harnesses, because **neither harness rejects same-session parallel invocation** — both accept it, both succeed, and the on-disk effects diverge unhelpfully (Claude Code grows an orphan branch in its session tree; Codex silently interleaves both turns into one flat transcript and a future resume cannot tell them apart). See [docs/research/same-session-parallel-invocation.md](research/same-session-parallel-invocation.md) for the probe and the empirical findings. Since the harnesses don't protect us, the dispatcher must.
+
+Two patterns invoked simultaneously that target *disjoint* agents both run normally. The constraint is per-agent, not per-pattern.
+
 ### Failure handling
 
 If a step in a pattern fails (an agent errors, a harness call fails, a template substitution fails), the pattern halts. Partial results are retained. The user sees the error, can inspect the state of each agent involved, and decides whether to retry the pattern, retry from a specific step, or abandon.
@@ -368,7 +385,7 @@ Patterns run inside the Switchboard backend (the Rust core; see §10 Form factor
 - **Minimize / hide the window**: backend keeps running normally; pattern continues.
 - **Close the window** (X button): hides the app to the system tray (or dock on macOS). The backend stays up; the pattern continues. The user can reopen the window from the tray icon to check on progress.
 - **Quit the app explicitly** (cmd-Q, tray-menu Quit): stops the backend. If any patterns are in progress, Switchboard prompts the user to confirm and then cancels them cleanly (see "Cancelling a pattern or turn" below).
-- **Machine sleep**: pauses the backend; pattern execution pauses with it. Resumes on wake.
+- **Machine sleep**: backend is suspended with the OS. In-flight harness calls may time out across long sleeps; on wake Switchboard surfaces any failed turns and lets the user retry. Patterns themselves don't auto-resume mid-turn.
 
 When the user returns, Switchboard shows the state of any patterns that completed, are in progress, or were cancelled.
 
@@ -379,7 +396,7 @@ The user can cancel at two granularities:
 - **Cancel a pattern.** Stops the pattern's orchestration. Switchboard sends `SIGTERM` to the in-flight harness subprocess (using the process group it spawned in, so both single-process Claude Code and Codex's parent+child tree are cleaned up uniformly — see §9 and the harness-cancellation research note). Partial results stay: the agent's harness session file persists on disk and can be inspected or sent further messages. The pattern is marked **cancelled** and cannot be auto-resumed — re-invoking starts from the beginning.
 - **Cancel an agent's turn.** Kills the spawned harness subprocess for a single agent's in-flight turn (useful if the agent is going off the rails). Same `SIGTERM`-to-process-group mechanism. The agent stays around and can be re-prompted; the harness session is in a usable state for the next message, with the cancelled turn simply absent.
 
-If Switchboard buffered streaming output from the cancelled turn (whatever the agent had produced before the kill), the user can review that partial content in-app — it's available from the buffered stream, not from the harness session file (see the harness-cancellation research note for why).
+If Switchboard buffered streaming output from the cancelled turn (whatever the agent had produced before the kill), the user can review that partial content in-app — it's available from the buffered stream, not from the harness session file (see the harness-cancellation research note for why). The buffered partial content is in-memory only; restarting Switchboard discards it. The harness session file remains the durable record (which by design omits incomplete turns).
 
 ## 8. Worked example: review-and-aggregate
 
@@ -454,9 +471,37 @@ This is a deliberate v1 simplification. Headless mode has no native interactive 
 - Codex has open bugs around `--dangerously-bypass-approvals-and-sandbox` not fully bypassing in all sub-modes (e.g., a recent regression where the directory-trust prompt fires anyway). Switchboard should pin tested Codex versions and surface any unexpected prompts as errors.
 - Codex separates approval policy from sandbox mode. The MVP collapses these; v2 may expose them separately.
 
+### Safety guidance
+
+Switchboard's v1 posture (autonomous agents with full filesystem and shell access, patterns that can run unattended) makes git-based projects strongly recommended: uncommitted local damage is recoverable; surprise rewrites of untracked files are not. Concrete guidance:
+
+- Run patterns inside a project that's checked into git.
+- Commit work in progress before invoking long-running patterns.
+- Treat unattended runs as risky-by-default.
+
+A one-time first-launch acknowledgement dialog (with a checkbox the user must tick to proceed) surfaces this posture explicitly so users opt in knowingly rather than discovering the autonomy posture after damage. This is a v1 acceptance item.
+
 ### Harness capabilities Switchboard depends on
 
 The capabilities and behaviors Switchboard needs from each harness, with notes on what is exposed natively, derived, or unavailable. Hands-on probe results are documented in [docs/research/claude-code-cli-observed.md](research/claude-code-cli-observed.md), [docs/research/codex-cli-observed.md](research/codex-cli-observed.md), and [docs/research/harness-comparison.md](research/harness-comparison.md).
+
+**Summary table** (details in the prose below):
+
+| Capability | Claude Code | Codex |
+|---|---|---|
+| Spawn with explicit flags | native | native |
+| Send + capture structured stream | native | native |
+| Detect turn completion | native | native |
+| Detect errors | native | native (asymmetric payload) |
+| Resume by UUID | native | native |
+| Assign session ID at spawn | native | unavailable (captured from stream) |
+| Fork from checkpoint | native | unavailable (workarounds — see 10.14) |
+| Read session metadata (cost, tokens, context window) | native | partial (cost derived; context-window in session file) |
+| Derive context utilization | native | derived (session file or pricing map) |
+| Programmatic compaction | unavailable (auto only) | unavailable (auto only) |
+| Tool calls + results in stream | native (typed blocks) | native (`command_execution` only) |
+| Capture permission denials | native | presumed (verification deferred) |
+| Run agents concurrently | confirmed | presumed |
 
 - **Spawn** a session with explicit flags. *(native, both)*
 - **Send** a message and capture the structured stream. *(native, both — `claude -p --output-format stream-json` and `codex exec --json`)*
@@ -534,10 +579,10 @@ Switchboard ships as a **single-binary desktop application** rather than a TUI o
 [Tauri](https://tauri.app/) is the chosen framework. Reasons:
 
 - **Single small binary** (~3 MB Hello World, vs Electron's ~150 MB). Sub-half-second startup, low memory footprint.
-- **OS-native WebView** for rendering — WebKit on macOS, WebView2 on Windows, WebKitGTK on Linux. ~99% of modern web tech works identically across platforms.
+- **OS-native WebView** for rendering — WebKit on macOS, WebView2 on Windows, WebKitGTK on Linux. ~99% of modern web tech works identically across platforms. (Linux's WebKitGTK lags WebKit-on-macOS in version and bug surface; sticking to widely-supported CSS/JS features avoids cross-platform rendering surprises.)
 - **Rust core** handles backend logic: filesystem, harness adapters, MCP client, IPC handlers. Single-process app — no Python subprocess, no separate server.
 - **Web frontend** (HTML/CSS/JS) renders the UI in the WebView and talks to the Rust core via Tauri's typed command system: the WebView calls Rust functions via `invoke()` (typed inputs and return values), and the Rust core streams events back via Tauri's event API (the harness streams Switchboard receives are republished as events the frontend subscribes to). Standard web tech, any framework.
-- **Native OS integration** via Tauri plugins (notifications, file dialogs, system tray, auto-updater).
+- **Native OS integration** via Tauri plugins (notifications, file dialogs, system tray, auto-updater). On Linux, system tray availability depends on the desktop environment (GNOME requires the AppIndicator extension); Switchboard falls back to a windowed-only mode where tray is unavailable.
 - **Tauri 2.x** (released 2024) is mature with cross-platform desktop support and a growing plugin ecosystem.
 
 Other options were considered (Electron, local web UI, TUI). Comparison and reasoning captured in [docs/research/desktop-framework-evaluation.md](research/desktop-framework-evaluation.md).
@@ -559,6 +604,8 @@ What Tier 2 means concretely vs Tier 1 (Python, TypeScript, Go, C#):
 - Up to 20% of conformance tests may fail (vs 100% pass for Tier 1).
 
 Functionally adequate for Switchboard: `prompts/list` and `prompts/get` are supported and stable, which is what we need. The Tier 2 risks (slow upstream evolution, slower bug response) are acceptable given the architectural wins of staying in Rust. Full discussion in the research note.
+
+If MCP evolves faster than `rmcp` can track, fallback paths include (a) wrapping a Tier 1 SDK via FFI / sidecar, or (b) moving the MCP layer to a TypeScript companion process invoked over IPC. Both preserve the Rust core's other architectural wins; both are larger changes than we'd want to make casually but are not architectural rewrites.
 
 ### Frontend stack: Svelte + Tailwind CSS
 
@@ -594,7 +641,7 @@ Decisions explicitly **not made** in this document, to be addressed in later doc
 - **Granular permission / sandbox config.** v1 runs both harnesses with maximum autonomy (skip-permissions on); the off / restricted-mode user experience is deferred. Plausible future directions: **config-driven tool allowlists** (YAML per project / per agent, passed through as `--allowedTools` / `--permission-mode`), **interactive permission prompts** (Switchboard intercepts denials at runtime and pops a modal asking the user to allow / deny / always-allow, then re-issues the turn — pending a probe of harness resume-after-denial mechanics), and **per-pattern permission scoping** (a pattern step declares its required tools, Switchboard restricts the harness for the duration). Codex's separate approval-policy vs sandbox-mode distinction (currently collapsed into the single max-autonomy posture) is part of this same design space.
 - **Cross-session persistent agent memory.** Architecture should not preclude; not implemented in v1.
 - **Global / cross-project agent templates.** Agents in v1 are project-scoped. A future direction lets users define reusable agent templates (personas) that can be invoked from any project — for example, a personal "writing editor" persona that knows your voice and applies across blog posts, docs, and emails, or a "domain expert" persona carrying institutional knowledge (a regulatory framework, your team's architecture conventions, a research methodology) reusable in any project that touches the area. Optionally surfaced via semantic search over the project context to suggest which template fits. Distinct from "Cross-session persistent agent memory" above (memory is what an agent remembers across sessions; global templates are which agents are available to spawn).
-- **Multi-project workflows.** Each project is independent in v1.
+- **Multi-project workflows.** Each project is independent in v1. (Related to "Global / cross-project agent templates" above — both concern workflows that span more than one project.)
 - **Pattern conditionals and branching.** v1 patterns are linear.
 
 ## 12. Open questions
@@ -602,10 +649,10 @@ Decisions explicitly **not made** in this document, to be addressed in later doc
 Aggregated from inline flags above, plus a few additional:
 
 - **5.1** Exact pattern DSL keywords and structure. Needs a separate spec.
-- **5.2** Passthrough mechanism for harness commands — namespacing.
+- **5.2** Passthrough mechanism for harness commands — namespacing. Partially blocked on 10.10; namespacing only matters once upstream allows arbitrary slash-command passthrough.
 - **6.1** MiniJinja subset (full MiniJinja vs a restricted subset) and template-available variables beyond `responses`.
 - ~~**10.1** What does Switchboard do when an agent's "next assistant response" is a tool call rather than text?~~ **Resolved by hands-on probe:** both harnesses run the model → tool_use → tool_result → model loop internally and emit a single terminal event per user-initiated turn (Claude Code: `result`; Codex: `turn.completed` / `turn.failed`). Switchboard always sees a complete turn — there is no "tool-call-only response" to handle. See [docs/research/harness-comparison.md](research/harness-comparison.md).
-- **10.2** When two patterns reference the same agent, what happens? Disallow concurrent use? Queue? Refuse?
+- ~~**10.2** When two patterns reference the same agent, what happens? Disallow concurrent use? Queue? Refuse?~~ **Resolved by hands-on probe:** Switchboard enforces one in-flight turn per agent at the application layer; collisions are refused with a clear error. Queueing is deferred. See §7 "Agent contention" and [docs/research/same-session-parallel-invocation.md](research/same-session-parallel-invocation.md). The harnesses themselves do not error on same-session parallel invocation — they silently corrupt (Claude Code: orphan branch in session tree) or conflate (Codex: interleaved transcript) — so this enforcement must live in Switchboard.
 - **10.3** How are agents preserved across Switchboard restarts? Harness session IDs persist on disk; Switchboard's project/agent registry needs its own persistence model.
 - **10.4** Pattern versioning. If a pattern file changes mid-execution (unlikely but possible), what happens to the in-flight pattern?
 - ~~**10.5** Notifications when a pattern completes — terminal bell? OS notification? Just visible state in the UI?~~ **Resolved by §10 form factor commitment:** OS-native notifications via Tauri's notification plugin. See §7 "Watching a pattern run" for when notifications fire. Remaining UX details (which events notify, user opt-out controls) are implementation choices, not plan-level questions.
@@ -621,4 +668,3 @@ Aggregated from inline flags above, plus a few additional:
 - **10.15** Should the Codex adapter read the session file (`~/.codex/sessions/...jsonl`) in addition to the `--json` stream? The session file carries information the stream doesn't (rate limits, `model_context_window`, full reasoning blocks). Tradeoff: more complete information vs more file-watching plumbing and the question of whether to tail-read live or read on completion. Working assumption: read on turn completion (after `turn.completed`/`turn.failed`) to enrich the normalized event stream with the missing fields.
 - **10.16** Disk usage of harness session files. Both harnesses persist transcripts indefinitely (Claude Code at `~/.claude/projects/<encoded-cwd>/*.jsonl`, Codex at `~/.codex/sessions/YYYY/MM/DD/...`). A long-lived project with many agents and many turns will accumulate. Should Switchboard offer pruning, surface totals, or otherwise manage this? Out of scope for v1, but the architecture should not preclude it.
 - **10.17** Network failure and retry policy. What does Switchboard do when a turn fails mid-pattern because of a transient API error or network blip? Working assumption: a single configurable retry on transient errors (rate-limit, 5xx) before marking the step as failed. Permanent errors (auth, invalid model, denied content) fail immediately. To be detailed in §7 once we have an implementation footprint.
-- **10.18** Cost budgeting at the pattern and project level. Both harnesses support `--max-budget-usd` (Claude Code) per invocation. A pattern that fans out × N multiplies cost per step; a long-running project running unattended could rack up real money. Should Switchboard offer per-pattern and per-project budget caps in addition to per-invocation? Working assumption: yes for both, with clear pre-launch cost estimates for fan-out patterns. Detailed design deferred.

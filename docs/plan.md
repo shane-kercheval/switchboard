@@ -316,25 +316,44 @@ The user opens Switchboard and sees a list of their projects. They open one, or 
 
 ### Inside a project
 
-The user sees the project's agents. One is currently selected; the others are accessible. The selected agent's conversation is the main view; switching to a different agent is a single action.
+The user sees the project's agents in a multi-pane layout — every agent's most recent output is visible at a glance, with one designated as the primary view (active focus for typing input, larger pane). Background agents (those not in the primary view) can be collapsed to a status row to reclaim space, or expanded to see their full output. Panes can be rearranged and resized within the main window. A persistent overview panel lists all agents with their real-time status (idle, processing, waiting on tool, errored) for quick triage.
 
-### Sending a message
+Agents in v1 are **project-scoped** — they're created within a project and stay there. Cross-project / global agent templates are a planned future direction (tracked in §11) — for example, a personal "writing editor" persona that knows your voice and applies across blog posts, docs, and emails, or a "domain expert" persona carrying institutional knowledge (a regulatory framework, your team's architecture conventions, a research methodology) reusable in any project that touches the area. Optionally these could be surfaced via semantic search over the project context, suggesting which template fits.
 
-The user composes a message via:
+### Per-agent status and actions
 
-- A slash command (resolves to a prompt by ID; the UI may accept a bare name if it matches exactly one configured provider — see §6 resolution rules).
-- Free-form text.
-- Optionally both: slash command for the structured part, free-form for context.
+Each agent in the project surfaces real-time state alongside its conversation:
 
-The user picks recipient(s): the currently selected agent by default, or any combination of agents in the project. Send.
+- **Status**: idle, processing, waiting on tool, errored.
+- **Context utilization**: % of model context used, derived from the harness JSON (see §9 "Required harness commands"). Surfaced as a progress bar so the operator can see when an agent approaches the auto-compact threshold.
+- **Cost / token usage**: per turn and cumulative. Native for Claude Code (`total_cost_usd` from the harness); derived for Codex via a per-model pricing table (see §9).
+
+Each agent also exposes a context menu of operator actions:
+
+- **Fork session** — create a new agent branched from the current state (per §9 "Fork a session from a checkpoint"; native in Claude Code, workaround for Codex per open question 10.14).
+- **Open session file** — open the underlying harness JSONL session file in the user's default editor for inspection or external tooling.
+- **Reset / remove** — clean up the agent (CRUD-y; not enumerated in §4 primitives, just a UI affordance).
+- **Switch to interactive mode** — open the underlying session in the harness's own TUI for actions Switchboard's headless surface can't reach (manual `/compact`, plan mode, etc.).
+
+### Composing and dispatching messages
+
+The **operator's** (i.e. user's) core action — whether typing a fresh message, forwarding an agent's output, or invoking a saved pattern — is one primitive: **compose a message and dispatch it to one or more agents.** The composition has three components:
+
+- **Source.** What is being sent — any combination of: free-form text the operator types, and/or the output from one or more agents (latest turn by default; the operator can pick a specific earlier turn). When multiple sources are combined, the optional wrapping prompt is the natural way to control how they're stitched together via template variables.
+- **Optional wrapping.** A prompt template from any provider (e.g. `local:code-review`, `tiddly:ai-review-feedback`) that the source(s) are rendered into. May be invoked via slash command in the message bar; the UI may accept a bare name if it matches exactly one configured provider (see §6 resolution rules).
+- **Recipients.** One or more agents to receive the (possibly wrapped) message. Currently focused agent is the default; multi-select picks any combination of agents in the project.
+
+These three components compose freely. Typing a fresh message is just user text + no wrapping + one recipient. A fan-out is user text + optional wrapping + many recipients. Forwarding an agent's output is the agent's turn + optional wrapping + other agents. A **pattern** is the saved (and possibly sequenced) version of one or more of these compositions — see "Invoking a pattern" below.
 
 ### Invoking a pattern
 
-A pattern is invoked by name. Switchboard prompts for the pattern's inputs (which agents to use, which prompts, any free-form context). The user confirms; the pattern launches and runs autonomously.
+A pattern is the **saved, named, optionally sequenced and autonomous version of compose-and-dispatch.** A single-step pattern is functionally identical to a manual send — just persisted under a name for reuse. A multi-step pattern (e.g. fan-out → wait → fan-in → dispatch) adds sequencing and autonomous execution: the operator invokes once, the pattern runs through multiple compose-and-dispatch steps automatically.
+
+A pattern is invoked by name. Switchboard prompts for the pattern's inputs (which agents to use, which prompts, any free-form context). The operator confirms; the pattern launches and runs autonomously.
 
 ### Watching a pattern run
 
-The user can switch focus among agents to watch any of their outputs. The pattern continues running in the background regardless of which agent the user is currently viewing. When the pattern completes (the final step has dispatched its output), the user is notified.
+All participating agents stay simultaneously visible in their panes throughout pattern execution; status indicators show which are still running, waiting, or completed. The operator can collapse background agents to focus on a specific one, or expand them all to watch the work in parallel. Pattern execution is independent of which pane has focus — agents continue running in the background regardless. When the pattern completes (the final step has dispatched its output), the operator is notified via OS-native notification (per §10 Form factor).
 
 ### Failure handling
 
@@ -344,7 +363,23 @@ A turn that ends with a tool **permission denial** is *not* a failure. The harne
 
 ### Walking away
 
-A pattern continues to run as long as the Switchboard host process is alive. Closing the UI window does not stop a pattern. Putting the machine to sleep stops a pattern (because the host process is paused). When the user returns, Switchboard shows the state of any in-progress or completed patterns.
+Patterns run inside the Switchboard backend (the Rust core; see §10 Form factor). They keep running as long as the backend process is alive — independent of whether the UI window is visible. Specifically:
+
+- **Minimize / hide the window**: backend keeps running normally; pattern continues.
+- **Close the window** (X button): hides the app to the system tray (or dock on macOS). The backend stays up; the pattern continues. The operator can reopen the window from the tray icon to check on progress.
+- **Quit the app explicitly** (cmd-Q, tray-menu Quit): stops the backend. If any patterns are in progress, Switchboard prompts the operator to confirm and then cancels them cleanly (see "Cancelling a pattern or turn" below).
+- **Machine sleep**: pauses the backend; pattern execution pauses with it. Resumes on wake.
+
+When the operator returns, Switchboard shows the state of any patterns that completed, are in progress, or were cancelled.
+
+### Cancelling a pattern or turn
+
+The operator can cancel at two granularities:
+
+- **Cancel a pattern.** Stops the pattern's orchestration. Switchboard sends `SIGTERM` to the in-flight harness subprocess (using the process group it spawned in, so both single-process Claude Code and Codex's parent+child tree are cleaned up uniformly — see §9 and the harness-cancellation research note). Partial results stay: the agent's harness session file persists on disk and can be inspected or sent further messages. The pattern is marked **cancelled** and cannot be auto-resumed — re-invoking starts from the beginning.
+- **Cancel an agent's turn.** Kills the spawned harness subprocess for a single agent's in-flight turn (useful if the agent is going off the rails). Same `SIGTERM`-to-process-group mechanism. The agent stays around and can be re-prompted; the harness session is in a usable state for the next message, with the cancelled turn simply absent.
+
+If Switchboard buffered streaming output from the cancelled turn (whatever the agent had produced before the kill), the operator can review that partial content in-app — it's available from the buffered stream, not from the harness session file (see the harness-cancellation research note for why).
 
 ## 8. Worked example: review-and-aggregate
 
@@ -398,6 +433,8 @@ Switchboard interacts with Claude Code and Codex through their non-interactive m
 Per-message process spawn for v1: each turn invokes `claude -p --resume <session-id>` or `codex exec resume <session-id>`, captures the structured output stream, and exits. State persists in the harness's session files between invocations. Long-lived agent processes can be considered later if latency matters.
 
 Switchboard consumes the harness stream by spawning the process, reading stdout line-by-line as JSONL, and dispatching each event into the normalized event stream described below. Standard pipe-and-readline; no file-watching for the basic case. Full streaming details in [docs/research/harness-comparison.md](research/harness-comparison.md).
+
+**Process group**: the harness is spawned in its own process group (Rust: `Command::process_group(0)`) so cancellation can `killpg` the entire group with one signal. This handles both Claude Code (single process) and Codex (Node parent + Rust child) uniformly — verified empirically; see the cancellation sections of the per-harness research notes. **Note**: Codex's parent process catches `SIGTERM` and exits with code `0`, so Switchboard cannot detect cancellation from the exit code alone — it relies on the absence of a terminal event in the stream (`turn.completed` or `turn.failed`).
 
 Switchboard runs `claude -p` in its **default** mode (no `--bare`) so the agent inherits the user's full environment: skills, hooks, plugins, MCP servers, CLAUDE.md, and auto-memory all load exactly as they would in an interactive session. The Codex equivalent (we do not pass `--ignore-user-config` or `--ephemeral`) gives the same outcome: the user's `~/.codex/config.toml` and session persistence are honored. This is deliberate — Switchboard's value is to orchestrate normal Claude Code / Codex sessions, not to amputate them. Anthropic has stated that `--bare` will become the `-p` default in a future release; when that happens, Switchboard will need to pass equivalent context-loading flags (`--mcp-config`, `--agents`, `--plugin-dir`, `--settings`, `--append-system-prompt`) to preserve current behavior. To make that change a one-place edit, harness command-line construction is centralized in a single "harness invoker" helper from day one. Tracked under open question 10.9; full background in [docs/research/claude-code-headless.md](research/claude-code-headless.md).
 
@@ -534,6 +571,7 @@ Decisions explicitly **not made** in this document, to be addressed in later doc
 - **Visual pattern editor.** v1 is file-based, with agent-consumable authoring docs as the supported authoring path.
 - **Granular permission/sandbox config.** v1 collapses to a single toggle.
 - **Cross-session persistent agent memory.** Architecture should not preclude; not implemented in v1.
+- **Global / cross-project agent templates.** Agents in v1 are project-scoped. A future direction lets users define reusable agent templates (personas) that can be invoked from any project — for example, a personal "writing editor" persona that knows your voice and applies across blog posts, docs, and emails, or a "domain expert" persona carrying institutional knowledge (a regulatory framework, your team's architecture conventions, a research methodology) reusable in any project that touches the area. Optionally surfaced via semantic search over the project context to suggest which template fits. Distinct from "Cross-session persistent agent memory" above (memory is what an agent remembers across sessions; global templates are which agents are available to spawn).
 - **Multi-project workflows.** Each project is independent in v1.
 - **Pattern conditionals and branching.** v1 patterns are linear.
 

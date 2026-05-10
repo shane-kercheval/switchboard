@@ -172,6 +172,30 @@ Two events emitted: `error` (early signal) and `turn.failed` (terminal). Process
 
 **Switchboard implication:** Codex's normalized end-of-turn signal is **`turn.completed` OR `turn.failed`** — not just `turn.completed`. The harness adapter's "wait for end of turn" loop must listen for both. The `error` event before `turn.failed` carries the same information; Switchboard can ignore it and rely solely on `turn.failed` to keep the adapter simpler.
 
+## Cancellation (SIGTERM mid-stream)
+
+Probed by spawning `codex exec --json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox "Write a 100-line poem..."`, waiting until the model was reasoning, then sending SIGTERM to the parent process.
+
+**Process model:** Codex is a **two-process tree**:
+- Parent: a Node.js wrapper (`node .../bin/codex`)
+- Child: the actual codex binary (Rust, `vendor/aarch64-apple-darwin/codex/codex`)
+
+`pgrep -P <parent_pid>` shows the child. Killing the parent with SIGTERM **does kill the child** — no orphan processes left behind. Verified: after the parent died, `ps -p <child_pid>` shows nothing.
+
+**Best practice for Switchboard**: spawn the harness in its own process group (`Command::process_group(0)` in Rust, `os.setsid()` in Python), then on cancel send the signal to the entire group (`killpg`). This handles both Claude Code's single-process case and Codex's two-process case uniformly without special-casing.
+
+**Exit code:** `0` — the parent catches SIGTERM and exits gracefully. **Switchboard cannot use exit code alone to distinguish "killed mid-stream" from "completed normally"** for Codex. The reliable signal is the absence of a `turn.completed` or `turn.failed` event in the stream before exit.
+
+**Stream output**: captured `thread.started` and `turn.started`, but no `item.completed` or `turn.completed`. The model was in its reasoning phase when killed; no `agent_message` had streamed yet. Switchboard's adapter sees: terminal event missing + process exited = cancelled.
+
+**Session file (`~/.codex/sessions/.../rollout-*.jsonl`)**: notably **richer than the stream** — captured `session_meta`, `turn_context`, `user_message`, `task_started`, a `token_count` event with rate-limit info, and a `reasoning` event (encrypted). But no `agent_message` (model never produced final output). Same conclusion as Claude Code: the partial response content can't be recovered from the session file; only what was streamed is the operator's "here's what we have so far."
+
+**Resume after cancel**: works cleanly. `codex exec resume <thread_id> "Just say 'resumed ok'..."` returned successfully with the expected agent message. The session is in a usable state.
+
+**Switchboard implication**: same shape as Claude Code, with two extras worth handling:
+1. Use **process groups** so the kill signal reaches the codex child, not just the Node parent. (Lazy approach — kill just the parent — works on macOS/Linux because the child dies anyway in our tests, but explicit process groups are safer for cross-platform behavior.)
+2. **Don't rely on exit code** to detect cancellation — Codex parent exits 0 even after SIGTERM. Detect via "stream ended without `turn.completed`/`turn.failed`."
+
 ## Things still worth probing
 
 - **Forking sessions in non-interactive mode.** No native `codex exec fork`. Possibly we copy the session file to a new ID? Worth a future probe.

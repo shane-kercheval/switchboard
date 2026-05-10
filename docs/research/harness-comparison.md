@@ -119,6 +119,28 @@ In both cases, intermediate events do not signal stop reliably. **Switchboard sh
 
 This also means the plan's open question 10.1 (what if the next assistant response is a tool call?) is not a real concern at the harness level. Both harnesses run the model → tool_use → tool_result → model loop internally and only emit the end event when the cycle finally produces a final answer. From Switchboard's POV, every user-initiated turn produces exactly one terminal event regardless of internal tool cycles.
 
+## Cancellation (SIGTERM mid-stream)
+
+Probed both harnesses by spawning a long-prompt invocation, waiting until the model was producing output (or reasoning, in Codex's case), then sending SIGTERM.
+
+| Concern | Claude Code | Codex |
+|---|---|---|
+| Process model | Single process | Two-process tree (Node wrapper + codex binary) |
+| SIGTERM propagation | Just kill the PID; nothing else to clean up | Killing the parent kills the child too (verified); but **process groups are safer cross-platform** — spawn in a new group, kill the group |
+| Exit code on SIGTERM | `143` (128 + 15) — distinguishable from completion | **`0`** (parent catches signal, exits gracefully) — **not distinguishable from completion via exit code alone** |
+| Detecting cancellation | Exit code 143 OR absent `result` event | Absent `turn.completed` AND absent `turn.failed` (must rely on the stream, not the exit code) |
+| Session file behavior | Stops at last completed turn; partial assistant response **not** persisted | Captures more than the stream did (reasoning, token_count, rate limits) but no `agent_message` for the in-flight turn |
+| Recovering partial content | From the streamed events Switchboard buffered itself | Same — session file doesn't carry partial responses either |
+| Resume after cancel | Works cleanly; session is in a usable state | Works cleanly; session is in a usable state |
+
+**Switchboard cancellation design (per-harness adapter):**
+
+1. **Track the spawned PID** — every subprocess API returns it. Trivial.
+2. **Spawn in a new process group** so a single signal to the group cleans up both single-process (Claude Code) and tree (Codex) harnesses uniformly. Rust: `Command::process_group(0)`, then `nix::sys::signal::killpg`. Python: `os.setsid()`, then `os.killpg`.
+3. **Buffer the stream** if Switchboard wants to surface "here's what the agent had said before you cancelled." The session files do not carry partial assistant responses for either harness — only the stream does.
+4. **Detect cancellation from the absence of a terminal event** in the stream rather than the exit code. Codex's exit-0-on-SIGTERM behavior makes the exit code unreliable for this purpose, even though Claude Code's exit 143 would have worked alone.
+5. **Resume is fine** — after cancellation the session is usable. The cancelled turn is just absent from the transcript; the next message proceeds normally.
+
 ## Permission denials
 
 Tested only on Claude Code (`--permission-mode dontAsk` + a Write attempt). Findings: denials do not error the turn (`is_error: false`); the model receives the denial as feedback and adapts. The full attempted call is captured in `result.permission_denials`. Codex denial behavior is presumed similar but not directly probed — verification deferred to implementation.

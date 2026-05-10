@@ -210,6 +210,26 @@ Three parallel `claude -p` invocations from the same cwd completed cleanly:
 
 Wall-clock for the slowest invocation matched its individual duration, confirming actual parallelism (not queueing). **Implication: fan-out via concurrent process spawn is safe at this scale.** No file locking or session-state contention observed.
 
+## Cancellation (SIGTERM mid-stream)
+
+Probed by spawning `claude -p "Write a 100-line poem..."`, waiting 20 seconds (long enough to be mid-stream-output), then sending SIGTERM to the process.
+
+**Process model:** Claude Code is a **single process** — no child processes spawned. `pgrep -P <pid>` shows nothing. Killing the parent kills the whole thing; no process-tree concerns.
+
+**Exit code:** `143` (= 128 + 15, the standard "killed by SIGTERM"). Switchboard can use this to distinguish "killed externally" from "completed normally" (exit 0 on success, exit 1 on internal error).
+
+**Stream output**: captured everything up to the moment of kill — including a partial `text_delta` event mid-token-stream like `"text":"**The Ocean's Hymn**\n\nBeneath the bruise of d"`. So Switchboard's adapter, if it wants to show the operator "here's what the agent had said before you cancelled," should buffer the streamed events itself and not rely on the session file for partial recovery.
+
+**Session file (`~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`)**: stops at the last completed assistant turn. The partial assistant response that streamed to stdout was **not persisted** to the session file. Event types we saw in the file: `queue-operation`, `attachment` (tool/MCP/skill listings), `user`, `last-prompt`, `ai-title`. No `assistant` entry for the in-flight turn.
+
+**Resume after cancel**: works cleanly. Sending a follow-up via `claude -p --resume <uuid> "Just say 'resumed ok'"` returned `is_error: false`, `result: 'resumed ok'`, `stop_reason: end_turn`. The harness session is in a usable state; the cancelled turn is just absent.
+
+**Switchboard implication**: cancellation works as expected. The adapter:
+1. Tracks the spawned PID (returned by the language's subprocess API).
+2. On user-initiated cancel, sends `SIGTERM` to the PID.
+3. Buffers the stream output independently if it wants to surface partial content (the session file won't have it).
+4. After cancel, the agent's harness session is preserved and can be re-sent messages immediately.
+
 ## Things still worth probing
 
 - **`--input-format stream-json`** — for sending follow-up messages mid-stream without restarting the process. Could matter for the "long-lived agent process" deferred decision.

@@ -1,8 +1,10 @@
 # Research: TUI framework evaluation
 
+> **Status: SUPERSEDED.** This evaluation drove an initial decision to ship Switchboard as a Textual-based TUI. We later re-evaluated after articulating the UX vision more concretely (multi-pane agent dashboards, real-time per-agent status, expand/collapse outputs, slick aesthetics) and pivoted to a desktop application built with Tauri. The current decision is captured in [desktop-framework-evaluation.md](desktop-framework-evaluation.md). This note is preserved for historical context.
+
 **Captured:** 2026-05-09
-**Decision:** Textual (Python)
-**Affects plan sections:** §10 (Form factor and distribution).
+**Decision (later superseded):** Textual (Python)
+**Affects plan sections:** §10 (Form factor and distribution) — historical only; current decision is documented elsewhere.
 
 ## Summary
 

@@ -2,7 +2,7 @@
 
 ## 1. What Switchboard is
 
-Switchboard is a **human-directed orchestrator for AI coding agents** — an interactive terminal application (TUI) you run alongside your existing Claude Code and Codex setup. It lets you spawn multiple agent sessions within a project, route messages between them, and define reusable patterns for common multi-agent workflows like second-opinion code review, plan-and-implement, and parallel-solution adjudication.
+Switchboard is a **human-directed orchestrator for AI coding agents** — a desktop application you run alongside your existing Claude Code and Codex setup. It lets you spawn multiple agent sessions within a project, route messages between them, and define reusable patterns for common multi-agent workflows like second-opinion code review, plan-and-implement, and parallel-solution adjudication.
 
 More precisely, it is a **workflow engine for primitives, not for processes**. It codifies the *shape* of common multi-agent operations (fan-out, fan-in with template wrapping, sequential handoff) so they can be invoked with one command instead of manually copy-pasted. It does not impose any larger structure on top of those primitives — there is no built-in concept of "plan phase" or "review phase," no SDLC walkthrough, no opinionated process. The user composes patterns ad hoc and saves the ones they reuse.
 
@@ -143,7 +143,7 @@ When invoked, Switchboard prompts the user for each input and then executes the 
 
 Patterns are authored as YAML files at `<project>/.switchboard/patterns/`. Because they live inside the project directory, they are naturally version-controlled along with the project itself — diffed, reviewed, and shared via the user's normal git workflow. There is no directory-picker step in Switchboard's UI; the location is conventional.
 
-Authoring is intentionally file-based. The user edits patterns in whichever editor they prefer (Vim, VS Code, etc.); Switchboard's TUI reads the files but does not include an editor of its own. The supported authoring path for new users is to point an existing Claude Code or Codex agent at `docs/agent-instructions/patterns.md` and have it generate a starter pattern from a description (per §2 "Agent-friendly authoring"). Hand-authoring against the DSL spec works too for power users.
+Authoring is intentionally file-based. The user edits patterns in whichever editor they prefer (Vim, VS Code, etc.); Switchboard's UI reads the files but does not include an editor of its own. The supported authoring path for new users is to point an existing Claude Code or Codex agent at `docs/agent-instructions/patterns.md` and have it generate a starter pattern from a description (per §2 "Agent-friendly authoring"). Hand-authoring against the DSL spec works too for power users.
 
 v1 ships with a small library of built-in patterns (review-and-aggregate, sequential handoff with template) as starting points; users can copy or fork these to author their own.
 
@@ -157,7 +157,7 @@ Pattern files and slash commands reference prompts by ID. The *prompt text* live
 
 Two providers ship in v1:
 
-- **Local file store.** Prompts authored as files (markdown body with YAML frontmatter for metadata: id, description, arguments). Lives at two scopes: a project-scoped directory at `<project>/.switchboard/prompts/` (versioned with the project) and a user-global directory resolved per OS conventions via Python's `platformdirs` (e.g. `~/.config/switchboard/prompts/` on Linux, `~/Library/Application Support/switchboard/prompts/` on macOS, `%APPDATA%\switchboard\prompts\` on Windows). The local store is the lowest-friction way to author a prompt and the mechanism Switchboard uses to ship example prompts.
+- **Local file store.** Prompts authored as files (markdown body with YAML frontmatter for metadata: id, description, arguments). Lives at two scopes: a project-scoped directory at `<project>/.switchboard/prompts/` (versioned with the project) and a user-global directory resolved per OS conventions via the Rust [`directories`](https://crates.io/crates/directories) crate (e.g. `~/.config/switchboard/prompts/` on Linux, `~/Library/Application Support/switchboard/prompts/` on macOS, `%APPDATA%\switchboard\prompts\` on Windows). The local store is the lowest-friction way to author a prompt and the mechanism Switchboard uses to ship example prompts.
 - **MCP-server provider.** Resolves IDs against any MCP server the user has configured that exposes prompts. [Tiddly](https://tiddly.me) is the canonical example and the development reference, but the integration is generic: pointing Switchboard at a different MCP prompt server is a configuration change, not a code change.
 
 ### Authoring a local prompt
@@ -234,7 +234,7 @@ disagreement.
 
 ## 7. User-facing model
 
-This section describes the conceptual user experience. The TUI form factor is documented in §10 (Form factor and distribution).
+This section describes the conceptual user experience. The desktop form factor and frontend stack are documented in §10 (Form factor and distribution).
 
 ### Project list
 
@@ -401,43 +401,56 @@ What is **lost** in headless mode:
 
 ## 10. Form factor and distribution
 
-### Form factor: TUI
+### Form factor: single-binary desktop app
 
-Switchboard ships as a **terminal user interface (TUI)** rather than a desktop or web application. Reasoning:
+Switchboard ships as a **single-binary desktop application** rather than a TUI or browser-based tool. Reasoning:
 
-- The orchestration target — Claude Code and Codex — are themselves CLI/TUI tools. Users are already in the terminal; Switchboard fits alongside without forcing a context switch.
-- Modern TUI frameworks handle every UX requirement we have: multi-pane layouts (multiple agent outputs side by side), expand/collapse trees, modal pickers (for prompts and patterns), tabbed project switching, mouse interaction, real-time streaming.
-- Faster to ship for v1 and aligned with the early audience already running CLI agents.
-- The data layer (file-based config, JSONL session files, normalized event stream, per-harness adapters described in §9) is UI-agnostic. If a desktop pivot becomes necessary later, only the rendering layer changes.
+- The UX vision (multi-pane agent dashboards, real-time per-agent status, expand/collapse outputs, native context menus, slick aesthetics) is desktop-shaped — TUIs can approximate it but always feel cramped at the high end.
+- Single-binary distribution: download an installer or run a package-manager command, double-click. No language runtime prereq, no browser tab to manage, no separate server to start.
+- Native OS integration: dock icon, system notifications, native file dialogs, proper window management, system tray.
+- The "anyone who wants" audience benefits more from a polished desktop app than from either a TUI or a browser-tab UX.
 
-### Framework: Textual (Python)
+### Framework: Tauri (Rust core + WebView frontend)
 
-[Textual](https://textual.textualize.io/) is the chosen framework. Reasons:
+[Tauri](https://tauri.app/) is the chosen framework. Reasons:
 
-- Strongest rendering polish among current TUI frameworks (real markdown, syntax highlighting, animations, modal dialogs, mouse-clickable buttons)
-- Async-native, which fits the streaming-from-stdin event model directly
-- Best-in-class mouse support
-- Mature, well-documented, growing ecosystem (Posting, Toolong, Frogmouth, Memray are precedents of "feels like a desktop app, runs in the terminal")
+- **Single small binary** (~3 MB Hello World, vs Electron's ~150 MB). Sub-half-second startup, low memory footprint.
+- **OS-native WebView** for rendering — WebKit on macOS, WebView2 on Windows, WebKitGTK on Linux. ~99% of modern web tech works identically across platforms.
+- **Rust core** handles backend logic: filesystem, harness adapters, MCP client, IPC handlers. Single-process app — no Python subprocess, no separate server.
+- **Web frontend** (HTML/CSS/JS) renders the UI in the WebView and talks to the Rust core via Tauri's typed command system. Standard web tech, any framework.
+- **Native OS integration** via Tauri plugins (notifications, file dialogs, system tray, auto-updater).
+- **Tauri 2.x** (released 2024) is mature with cross-platform desktop support and a growing plugin ecosystem.
 
-Other strong options were considered (Bubbletea/Go, Ratatui/Rust). Comparison and reasoning captured in [docs/research/tui-framework-evaluation.md](research/tui-framework-evaluation.md).
+Other options were considered (Electron, local web UI, TUI). Comparison and reasoning captured in [docs/research/desktop-framework-evaluation.md](research/desktop-framework-evaluation.md).
 
-### Language: Python
+### Backend language: Rust
 
-Follows from Textual.
+Follows from Tauri. The MCP client uses the [official Rust MCP SDK (`rmcp`)](https://github.com/modelcontextprotocol/rust-sdk), currently **Tier 2** in the [MCP SDK Tiering System](https://modelcontextprotocol.io/community/sdk-tiers) — production-ready with a smaller community than the Tier 1 Python/TypeScript/Go/C# SDKs and slower SLAs (issue triage within a month vs 2 days; critical bug fixes within 2 weeks vs 7 days; new protocol features within 6 months vs same-release). Functionally adequate for Switchboard's use case (`prompts/list` and `prompts/get` are supported and stable). Tier 2 risks discussed in the research note.
 
-### Distribution: PyPI
+### Frontend stack: Svelte + Tailwind CSS
 
-Primary install path:
+The UI is built with **Svelte 5** and **Tailwind CSS**, with components from **shadcn-svelte** as needed. Reasons:
 
-```
-uv tool install switchboard
-# or
-pipx install switchboard
-```
+- Svelte produces smaller bundles than React with less boilerplate.
+- Reactive model and minimal ceremony are well-suited to AI-agent-written code.
+- Tailwind for styling; no separate component framework required.
+- shadcn-svelte for design-system primitives (modal, tabs, accordion) when we want them.
 
-Both are isolated-environment installs that put `switchboard` on `PATH`. **`uv`** is the recommended tool — faster than pipx and has a `uvx switchboard` one-shot run option for trying the tool without installing.
+React + Tailwind + shadcn/ui is a viable alternative if a future contributor or rewrite prefers the bigger ecosystem. The architectural decisions (Tauri shell, Rust core) don't depend on the frontend framework.
 
-For users who don't have Python or prefer a single binary, a PyInstaller-bundled binary distribution is a planned later-release improvement; not required for v1.
+### Distribution: signed native binaries
+
+Primary install paths per platform:
+
+- **macOS**: `brew install switchboard` (via a Homebrew tap) or direct `.dmg` download.
+- **Linux**: `.deb` / `.rpm` packages, or direct binary download for other distros.
+- **Windows**: `.msi` installer or direct `.exe` download.
+
+Cross-platform builds via Tauri's bundling pipeline. Code signing (Apple Developer ID for macOS, Authenticode for Windows) is required for friction-free installs and is part of the v1 release infrastructure work.
+
+Tauri's built-in updater is wired in from day one so users get version updates inside the app.
+
+For developers running from source: standard `cargo tauri dev` workflow.
 
 ## 11. Deferred decisions
 

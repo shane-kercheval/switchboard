@@ -622,7 +622,3 @@ Aggregated from inline flags above, plus a few additional:
 - **10.16** Disk usage of harness session files. Both harnesses persist transcripts indefinitely (Claude Code at `~/.claude/projects/<encoded-cwd>/*.jsonl`, Codex at `~/.codex/sessions/YYYY/MM/DD/...`). A long-lived project with many agents and many turns will accumulate. Should Switchboard offer pruning, surface totals, or otherwise manage this? Out of scope for v1, but the architecture should not preclude it.
 - **10.17** Network failure and retry policy. What does Switchboard do when a turn fails mid-pattern because of a transient API error or network blip? Working assumption: a single configurable retry on transient errors (rate-limit, 5xx) before marking the step as failed. Permanent errors (auth, invalid model, denied content) fail immediately. To be detailed in §7 once we have an implementation footprint.
 - **10.18** Cost budgeting at the pattern and project level. Both harnesses support `--max-budget-usd` (Claude Code) per invocation. A pattern that fans out × N multiplies cost per step; a long-running project running unattended could rack up real money. Should Switchboard offer per-pattern and per-project budget caps in addition to per-invocation? Working assumption: yes for both, with clear pre-launch cost estimates for fan-out patterns. Detailed design deferred.
-
----
-
-*Last updated: drafted from design conversation. Subject to revision as implementation reveals gaps. Phasing and per-release plans live separately in `docs/implementation-plans/`.*

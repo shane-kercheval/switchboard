@@ -42,16 +42,31 @@ A second consequence of this design: **because Switchboard resolves prompts itse
 
 | Concept | Definition |
 |---|---|
-| **Project** | A workspace containing a group of agents working toward a shared goal. Projects are persistent, named, and have a working directory (typically a git repo). |
-| **Agent** | A Claude Code or Codex session within a project, with a user-assigned name and optional initial-prompt configuration. Each agent has a persistent harness session ID under the hood. |
-| **Primary agent** | The agent the user is currently focused on (foregrounded in the UI). Background agents exist but are not the focus. |
-| **Pattern** | A named, parameterized composition of primitives — for example "fan-out review and aggregate." Defined as a YAML file in the project directory. Invoked by name with arguments. |
-| **Prompt template** | A named prompt definition resolved by ID at routing time. Used as message content (sent to an agent) or as a wrapper (applied around aggregated outputs before forwarding). |
-| **Prompt provider** | A source of prompts that Switchboard can resolve IDs against. Two implementations ship in v1: a local file store (markdown/YAML files on disk) and an MCP-server provider (any MCP server that exposes prompts; Tiddly is the canonical example). Providers are addressed by a short prefix (e.g. `local:code-review`, `tiddly:code-review`). |
+| **Project** | A workspace containing a group of agents working toward a shared goal. Persistent, named, and bound to a working directory (typically a git repo). Project-specific config, patterns, and local prompts live under `<project>/.switchboard/` (see directory layout below). |
+| **Agent** | A Claude Code or Codex session within a project, with a user-assigned name. Each agent has a persistent harness session ID under the hood. |
+| **Primitive** | An atomic operation Switchboard provides for a pattern to compose: spawn agent, send message, auto-forward output, fan-in with template, save/invoke pattern. Five exist in v1; see §4. |
+| **Pattern** | A named, parameterized composition of primitives — for example "fan-out review and aggregate." Defined as a YAML file under `<project>/.switchboard/patterns/`. Invoked by name with arguments. |
+| **Prompt template** | A named prompt definition resolved by ID at routing time. Used as message content (sent to an agent) or as a wrapper applied around aggregated outputs before forwarding (used in fan-in; see §4 Primitive 4). |
+| **Prompt provider** | A source of prompts Switchboard resolves IDs against. Two implementations ship in v1: `local` (file store) and any registered MCP-server provider. Addressed by prefix (e.g. `local:code-review`, `tiddly:code-review`). See §6. |
 | **Routing** | Message passing between agents. Includes fan-out (one source, many recipients), fan-in (many sources, one recipient, with template wrapping), and sequential handoff. |
 | **Harness session** | The underlying Claude Code or Codex session that backs an agent. Persisted on disk by the harness; resumed via `--resume`. |
 
 A note on terminology: "session" in the agent ecosystem is overloaded. Switchboard uses **project** for its top-level workspace concept and reserves **session** to mean the underlying harness session backing a single agent.
+
+### Project directory layout
+
+Each project's Switchboard-managed state lives in a `.switchboard/` directory at the project root. The shape (illustrative; exact contents TBD):
+
+```
+<project>/
+└── .switchboard/
+    ├── config.yaml         # project config (registered MCP providers, harness flags, etc.)
+    ├── patterns/           # pattern definitions (YAML)
+    ├── prompts/            # local prompts (markdown body + YAML frontmatter)
+    └── state/              # runtime state (agent registry, harness session IDs)
+```
+
+`config.yaml`, `patterns/`, and `prompts/` are intended to be checked into git and shared. `state/` is local-machine runtime data and should be `.gitignore`d.
 
 ## 4. Functional primitives
 
@@ -199,13 +214,12 @@ Providers are addressed by a short prefix in prompt IDs:
 
 The prefix is the user-chosen registration name for an MCP-server provider, so a user with two MCP prompt servers configured can address both unambiguously. The `local` prefix is reserved for the built-in local store.
 
-**Default provider.** Each project has a configured default provider (set in project config; defaults to `local` for new projects). An unprefixed prompt ID resolves against the default. This keeps simple cases terse: a project that uses only Tiddly can set the default to `tiddly` and write `code-review` everywhere.
-
 **Resolution rules.**
 
-- A prefixed ID resolves only against the named provider; if not found there, it errors. No cross-provider fallback.
-- An unprefixed ID resolves against the project's default provider only. Same rule.
-- Local-store lookup checks the project scope first, then the user-global scope. A project-scoped prompt with the same name shadows the user-global one — intentional, so a project can override a personal prompt.
+- **Pattern files require explicit prefix.** Every prompt reference in a pattern is fully qualified (e.g. `local:code-review`, `tiddly:code-review`). This keeps pattern files portable: a pattern shared between projects always resolves to the same prompt source, regardless of how the receiving user has their providers configured. There is no concept of a "default provider" for unprefixed lookup in pattern files.
+- **Prefixed lookup is strict.** A prefixed ID resolves only against the named provider; if not found, it errors. No cross-provider fallback.
+- **Local-store scopes.** Local-store lookup checks the project scope (`<project>/.switchboard/prompts/`) first, then the user-global scope (`~/.config/switchboard/prompts/`). A project-scoped prompt with the same name shadows the user-global one — intentional, so a project can override a personal prompt.
+- **Interactive UI ergonomics.** When the user types a slash command in the message bar, the UI may provide autocomplete across all configured providers and may accept a bare name if it matches exactly one provider's prompt. This is a UI-layer affordance only — it does not affect how patterns or other persisted artifacts reference prompts.
 
 This separation between provider and workflow is intentional: a prompt store is a prompt store, not a workflow engine. Encoding control flow ("run agent A, then fan out to B and C, then aggregate via template D") in a stored prompt would stretch the store out of shape. Patterns are programs; prompts are data.
 
@@ -273,17 +287,17 @@ The user opens Switchboard and sees a list of their projects. They open one, or 
 
 ### Inside a project
 
-The user sees the project's agents. One is foregrounded as primary; others are accessible (background). The primary agent's conversation is the main view; switching primary is a single action.
+The user sees the project's agents. One is currently selected; the others are accessible. The selected agent's conversation is the main view; switching to a different agent is a single action.
 
 ### Sending a message
 
 The user composes a message via:
 
-- A slash command (resolves to a prompt by ID, against the project's default provider unless prefixed).
+- A slash command (resolves to a prompt by ID; the UI may accept a bare name if it matches exactly one configured provider — see §6 resolution rules).
 - Free-form text.
 - Optionally both: slash command for the structured part, free-form for context.
 
-The user picks recipient(s): the primary agent by default, or any combination of agents in the project. Send.
+The user picks recipient(s): the currently selected agent by default, or any combination of agents in the project. Send.
 
 ### Invoking a pattern
 
@@ -291,7 +305,7 @@ A pattern is invoked by name. Switchboard prompts for the pattern's inputs (whic
 
 ### Watching a pattern run
 
-The user can switch focus among agents to watch any of their outputs. The pattern continues running in the background regardless of which agent is foregrounded. When the pattern completes (the final step has dispatched its output), the user is notified.
+The user can switch focus among agents to watch any of their outputs. The pattern continues running in the background regardless of which agent the user is currently viewing. When the pattern completes (the final step has dispatched its output), the user is notified.
 
 ### Failure handling
 
@@ -309,21 +323,21 @@ To anchor the abstractions above, here is what a code-review workflow looks like
 
 The user has a project `feature-event-logs` open in Switchboard. They have three agents:
 
-- `planner` (Claude Code, primary)
-- `reviewer-claude` (Claude Code, background)
-- `reviewer-codex` (Codex, background)
+- `planner` (Claude Code, currently selected)
+- `reviewer-claude` (Claude Code)
+- `reviewer-codex` (Codex)
 
 The user has previously authored a pattern in `.switchboard/patterns/review-and-aggregate.yaml`. The review prompt ships as a built-in local prompt (`local:code-review`); the aggregation wrapper is one the user keeps in Tiddly (`tiddly:ai-review-feedback`). Both work because Switchboard resolves each ID against the named provider.
 
 **Invocation:**
 
 1. The user invokes the pattern: "Run review-and-aggregate."
-2. Switchboard prompts:
-   - Primary: `planner` (default)
-   - Reviewers: `reviewer-claude`, `reviewer-codex` (multi-select)
-   - Review prompt: `local:code-review` (bundled with Switchboard)
-   - Aggregation prompt: `tiddly:ai-review-feedback` (the user's own, stored in Tiddly)
-   - User context: "Review milestone 1, focus on the event-emission API."
+2. Switchboard prompts for each pattern input:
+   - `primary_agent`: `planner` (autofilled with the currently selected agent; user can change)
+   - `reviewer_agents`: `reviewer-claude`, `reviewer-codex` (multi-select)
+   - `review_prompt`: `local:code-review` (bundled with Switchboard)
+   - `aggregation_prompt`: `tiddly:ai-review-feedback` (the user's own, stored in Tiddly)
+   - `user_context`: "Review milestone 1, focus on the event-emission API."
 3. The user confirms. The pattern launches.
 
 **Execution:**
@@ -332,7 +346,7 @@ The user has previously authored a pattern in `.switchboard/patterns/review-and-
 2. Switchboard waits for both reviewers to complete their turns.
 3. Switchboard collects both reviewers' final assistant messages.
 4. Switchboard renders the aggregation-prompt template, substituting in the two reviews under their respective variable names.
-5. Switchboard sends the rendered message to the primary agent (`planner`).
+5. Switchboard sends the rendered message to `planner` (the agent supplied as the pattern's `primary_agent` input).
 6. The planner runs and produces its response.
 7. Pattern complete. The user is notified.
 
@@ -378,54 +392,6 @@ Aggregated from inline flags above, plus a few additional:
 - **10.12** Model→max-context map maintenance. Neither harness exposes `tokens_max` in headless output, so Switchboard ships and maintains its own table mapping model identifiers to context window sizes (covering both Anthropic and OpenAI models). Working assumption: bundled in the Switchboard repo, updated when new models ship; user-overridable via config for new or custom models that haven't been added yet. Open: where is the canonical source we sync from?
 - **10.13 (monitoring)** Programmatic `/compact` exposure in either harness. Multiple Anthropic feature requests open ([anthropics/claude-code#5643](https://github.com/anthropics/claude-code/issues/5643), [#39275](https://github.com/anthropics/claude-code/issues/39275), [#39574](https://github.com/anthropics/claude-code/issues/39574), [#26488](https://github.com/anthropics/claude-code/issues/26488)); Codex equivalent not documented. When upstream lands, Switchboard can offer first-class compaction control inside patterns.
 
-## 11. Phasing
-
-Sketch only. Each phase will get its own implementation plan in `docs/implementation-plans/`.
-
-### v0.1 — Walking skeleton
-
-The minimum thing that demonstrates the model end to end:
-
-- Project create / open.
-- Spawn one agent (Claude Code only).
-- Send a message; render the streamed response.
-- Persist project + agent registry across restarts.
-- Local prompt provider (file-based), with a small bundled set of example prompts so the slash-command path is exercised end to end.
-
-Not yet: patterns, fan-out, fan-in, Codex, multi-agent, MCP-server provider.
-
-### v0.2 — Multi-agent and basic fan-out
-
-- Spawn multiple agents in a project.
-- Send a message to multiple agents (primitive 2 with N>1 recipients).
-- Watch any agent's output, switch focus.
-- Codex agents alongside Claude Code agents.
-- MCP-server prompt provider (Tiddly used as the development reference), with the prefix-based addressing scheme from section 6.
-
-### v0.3 — Patterns
-
-- Pattern file format and parser.
-- Pattern invocation UI (collect inputs, confirm).
-- Auto-forward (primitive 3).
-- Fan-in with template wrapping (primitive 4).
-- Built-in pattern: review-and-aggregate.
-- Agent-authoring guide at `docs/agent-instructions/patterns.md` ships alongside the parser, so users can ask their existing Claude Code or Codex agent to scaffold new patterns.
-
-### v0.4 — Polish and second-order features
-
-- Failure handling and retry UI.
-- Notifications.
-- Built-in pattern library expanded.
-- Documentation for authoring custom patterns.
-
-### Beyond v0.4
-
-- In-UI pattern authoring.
-- Granular permission config.
-- Long-lived agent processes (if latency demands).
-- Cross-session memory primitives.
-- Multi-machine workflows.
-
 ---
 
-*Last updated: drafted from design conversation. Subject to revision as implementation reveals gaps.*
+*Last updated: drafted from design conversation. Subject to revision as implementation reveals gaps. Phasing and per-release plans live separately in `docs/implementation-plans/`.*

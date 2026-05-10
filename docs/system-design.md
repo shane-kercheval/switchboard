@@ -96,7 +96,7 @@ User specifies:
 
 The composed message is sent to each recipient. If recipients are multiple, this is a fan-out: each agent receives the same message and runs independently.
 
-Fan-out is designed for read-or-advise work (multiple reviewers, multiple second opinions, parallel solution exploration). Fanning out *implementer* agents that all write to the same files in parallel will produce last-write-wins corruption — multi-agent parallel implementation requires per-agent git worktrees, which is out of scope for v1.
+Typical uses include multiple reviewers on the same diff, second opinions on a plan, and parallel solution exploration.
 
 This primitive is **synchronous from the human's perspective** — the human sends the message, the agents start working. The human can then watch any agent's output, switch between them, or walk away.
 
@@ -110,7 +110,7 @@ Used for sequential handoff (planner → implementer with the plan as input) and
 
 Configure: when all of agents A, B, ..., N finish their current turns, combine their outputs into a single message using a wrapping prompt template, then send to agent X.
 
-The wrapping template has access to each agent's response by name (or by position): `{{ responses.reviewer_claude }}`, `{{ responses.reviewer_codex }}`, etc. Agent names containing hyphens are normalized to underscores in template contexts (so an agent named `reviewer-claude` is accessed as `responses.reviewer_claude`). Templates may use Jinja-style for-loops to handle variable numbers of sources.
+The wrapping template has access to each agent's response by name (or by position): `{{ responses.reviewer_claude }}`, `{{ responses.reviewer_codex }}`, etc. Agent names containing hyphens are normalized to underscores in template contexts (so an agent named `reviewer-claude` is accessed as `responses.reviewer_claude`). Templates may use Jinja-style for-loops to handle variable numbers of sources — important for workflows whose participating agents are supplied as an invocation-time list (e.g., the user picks the reviewer set when invoking) rather than hardcoded by name. (See open question 5.1 for the precise template-function surface.)
 
 This is the most behaviorally-rich primitive. It implies waiting on multiple agents, accumulating their final responses, applying a template, and dispatching. Failure handling (one agent crashes mid-workflow) is covered in section 7.
 
@@ -210,7 +210,7 @@ A **prompt** is a reusable, optionally parameterized text template — for examp
 
 Two providers ship in v1:
 
-- **Local file store.** Prompts authored as files (markdown body with YAML frontmatter for metadata: id, description, arguments). Resolved across one or more directories: a fixed project scope at `<project>/.switchboard/prompts/`, plus an ordered list of user-configured directories (`local_prompt_dirs` in config — see "Configuring local prompt directories" below). This lets a power user keep their personal prompt library in their own git repo (e.g. `~/repos/my-prompts/`) instead of being limited to the OS-conventional app data directory. The local store is the lowest-friction way to author a prompt and the mechanism Switchboard uses to ship example prompts.
+- **Local file store.** Prompts authored as files (markdown body with YAML frontmatter for metadata: name, description, arguments). Resolved across one or more directories: a fixed project scope at `<project>/.switchboard/prompts/`, plus an ordered list of user-configured directories (`local_prompt_dirs` in config — see "Configuring local prompt directories" below). This lets a power user keep their personal prompt library in their own git repo (e.g. `~/repos/my-prompts/`) instead of being limited to the OS-conventional app data directory. The local store is the lowest-friction way to author a prompt and the mechanism Switchboard uses to ship example prompts.
 - **MCP-server provider.** Resolves IDs against any MCP server the user has configured that exposes prompts. [Tiddly](https://tiddly.me) is the canonical example and the development reference, but the integration is generic: pointing Switchboard at a different MCP prompt server is a configuration change, not a code change.
 
 ### Authoring a local prompt
@@ -219,7 +219,7 @@ A local prompt is a single file. Example (`<project>/.switchboard/prompts/code-r
 
 ```markdown
 ---
-id: code-review
+name: code-review
 description: Ask an agent to review the current diff against a checklist.
 arguments:
   - name: focus
@@ -239,12 +239,14 @@ Local prompts are authored file-first, the same as workflows: edit them in which
 
 | Field | Required | Notes |
 |---|---|---|
-| `id` | yes | Slug; matches MCP's `name` field. Used as the suffix in `local:<id>` references. |
+| `name` | yes | Slug. Matches MCP's `prompts/list` `name` field and Claude Code's skill `name` field. Used as the suffix in `local:<name>` references. |
 | `description` | yes | Short human description. Matches MCP standard. |
 | `arguments` | optional | Array of `{name, description, required}`. Matches MCP standard. All arguments are treated as strings in template substitution; typed arguments may be added later if needed. No `default` field in v1 — local frontmatter intentionally mirrors MCP's surface so prompts move cleanly between providers (open question 10.8). |
 | `tags` | optional | Array of strings. Matches Tiddly's tag extension. Reserved for future library/browse views (see "Future direction" below); v1 does not use them in the slash-command UI. |
 
 This minimal set mirrors the MCP `prompts/list` standard, plus Tiddly's tag extension as a superset, so prompts move cleanly between local and MCP storage. Other metadata fields (title, owner, etc.) are explicitly out of scope for v1.
+
+**Skill-file compatibility.** Because the frontmatter shape (`name` + `description` + body) is identical to a Claude Code skill's frontmatter, a skill `.md` file can be dropped into a Switchboard prompts directory and used as a local prompt as-is. The semantics differ — a skill is invoked by the model mid-turn within a Claude Code session, whereas a Switchboard prompt is dispatched by the user via slash command — but the file format is the same, and skill bodies typically read as instructions that work fine when sent as a user message. (The reverse — a Switchboard prompt with `arguments` working as a Claude Code skill — does not hold; skills aren't parameterized.)
 
 ### Configuring local prompt directories and MCP-server providers
 
@@ -398,6 +400,8 @@ The user's core action — whether typing a fresh message, forwarding an agent's
 
 These three components compose freely. Typing a fresh message is just user text + no wrapping + one recipient. A fan-out is user text + optional wrapping + many recipients. Forwarding an agent's output is the agent's turn + optional wrapping + other agents. A **workflow** is the saved (and possibly sequenced) version of one or more of these compositions — see "Invoking a workflow" below.
 
+This compose-and-dispatch surface is also where truly ad-hoc aggregation happens. "Aggregate whatever agents are running right now" is not a workflow — workflows declare their participants up front, even when those participants are supplied dynamically as an invocation-time list. For one-off cases (the user manually kicked off three agents, wants to gather their outputs once they finish), the compose bar is the right surface: pick the source agents, pick a wrapping prompt, dispatch to the recipient.
+
 ### Invoking a workflow
 
 A workflow is the **saved, named, optionally sequenced and autonomous version of compose-and-dispatch.** A single-step workflow is functionally identical to a manual send — just persisted under a name for reuse. A multi-step workflow (e.g. fan-out → wait → fan-in → dispatch) adds sequencing and autonomous execution: the user invokes once, the workflow runs through multiple compose-and-dispatch steps automatically.
@@ -491,17 +495,19 @@ The user has previously authored a workflow in `.switchboard/workflows/review-an
 
 **During execution:**
 
-All three agents stay simultaneously visible in their panes throughout. While both reviewers are running, the user can watch both streams in parallel — or collapse the reviewer panes down to just their status indicators (running / completed) and let them work in the background. When the implementer kicks in, its pane comes alive with the aggregation. The user doesn't have to switch around to know what's happening.
+All three agents stay simultaneously visible in their panes throughout. While both reviewers are running, the user can watch both streams in parallel — or collapse the reviewer panes down to just their status indicators (running / completed) and let them work in the background. When the implementer kicks in, its pane comes alive with the aggregation. The user doesn't have to switch around to know what's happening. The workflow-progress surface (per §7) shows where the workflow is overall — e.g., "review-and-aggregate: step 2 of 4 (waiting on reviewers)" — so the user can see the workflow-level view alongside the per-agent panes.
 
 **Afterwards:**
 
 The user reads the implementer's response and decides what's next. Common follow-ups: compose-and-dispatch the response onward (e.g., forward to a follow-up agent with a wrapping prompt — see §7 "Composing and dispatching messages"), invoke another workflow, or just stop. The workflow is done; the next move is the user's.
 
+**Variation worth noting:** the same workflow could insert a Primitive 5 (Pause for user input) step between the aggregation and the implementer dispatch — letting the user read the aggregated reviews and weigh in (approve, redirect, add context) before the implementer runs. The workflow then dispatches the user's input together with the aggregation to the implementer. This is the natural shape when you want the autonomous fan-out-and-aggregate work to happen without you, but reserve the judgment moment for yourself.
+
 ## 9. Harness integration
 
 Switchboard interacts with Claude Code and Codex through their non-interactive modes (`claude -p` and `codex exec`). The underlying sessions are real Claude Code / Codex sessions backed by the harnesses' own session files — they survive Switchboard, can be resumed later, and could in principle be opened in the harness's interactive TUI by the user if they wanted. Switchboard does not lock the user out of the harness; it just drives it.
 
-The architectural backbone of this section is the **per-harness adapter** workflow: one adapter per harness translates that harness's native event stream into a normalized internal stream the rest of Switchboard consumes. This keeps the workflow engine, UI, and persistence layer harness-agnostic, while letting each adapter handle its own quirks (event vocabularies, exit-code semantics, session-file richness, etc.). See "Per-harness adapter and normalized event stream" below for the shape; see [docs/research/harness-comparison.md](research/harness-comparison.md) for the cross-harness comparison that drove the design.
+The architectural backbone of this section is the **per-harness adapter** pattern (design-pattern sense): one adapter per harness translates that harness's native event stream into a normalized internal stream the rest of Switchboard consumes. This keeps the workflow engine, UI, and persistence layer harness-agnostic, while letting each adapter handle its own quirks (event vocabularies, exit-code semantics, session-file richness, etc.). See "Per-harness adapter and normalized event stream" below for the shape; see [docs/research/harness-comparison.md](research/harness-comparison.md) for the cross-harness comparison that drove the design.
 
 ### Process model
 
@@ -727,7 +733,7 @@ Decisions explicitly **not made** in this document, to be addressed in later doc
 
 Aggregated from inline flags above, plus a few additional:
 
-- **5.1** Exact workflow DSL keywords and structure. Needs a separate spec.
+- **5.1** Exact workflow DSL keywords and structure. Needs a separate spec. Specific surfaces the spec must pin down: the template-function surface for dynamic agent sets (e.g., what `responses_from(...)` looks like; ordered/named iteration over `responses`; position-vs-name access); how invocation-time list inputs (`reviewer_agents: [agent]`) flow into template variables; the iteration variable scoping rules from Primitive 6.
 - **5.2** Passthrough mechanism for harness commands — namespacing. Partially blocked on 10.10; namespacing only matters once upstream allows arbitrary slash-command passthrough.
 - **6.1** MiniJinja subset (full MiniJinja vs a restricted subset) and template-available variables beyond `responses`.
 - ~~**10.1** What does Switchboard do when an agent's "next assistant response" is a tool call rather than text?~~ **Resolved by hands-on probe:** both harnesses run the model → tool_use → tool_result → model loop internally and emit a single terminal event per user-initiated turn (Claude Code: `result`; Codex: `turn.completed` / `turn.failed`). Switchboard always sees a complete turn — there is no "tool-call-only response" to handle. See [docs/research/harness-comparison.md](research/harness-comparison.md).

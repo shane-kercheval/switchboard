@@ -10,6 +10,8 @@ It's built for anyone who wants explicit, human-in-the-loop control over multi-a
 
 Early development. Design is being captured in [`/docs`](./docs) before implementation begins. The high-level plan is in [`docs/plan.md`](./docs/plan.md).
 
+Switchboard will ship as a terminal app — installable via `uv tool install switchboard` or `pipx install switchboard` once available.
+
 This is not yet usable software. Star or watch the repo if you want to follow along.
 
 ## Why

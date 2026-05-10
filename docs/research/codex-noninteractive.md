@@ -1,7 +1,7 @@
 # Research: Codex non-interactive mode (`codex exec`)
 
 **Captured:** 2026-05-09
-**Affects plan sections:** §5 (harness integration), open questions 10.11, 10.12, 10.13.
+**Affects blueprint sections:** §5 (harness integration), open questions 10.11, 10.12, 10.13.
 
 ## Summary
 

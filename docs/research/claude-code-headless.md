@@ -1,7 +1,7 @@
 # Research: Claude Code headless mode (`claude -p`)
 
 **Captured:** 2026-05-09
-**Affects plan sections:** §5 (harness integration), §6 (prompt providers / cross-agent normalization), open questions 10.9, 10.10, 10.11, 10.12, 10.13.
+**Affects blueprint sections:** §5 (harness integration), §6 (prompt providers / cross-agent normalization), open questions 10.9, 10.10, 10.11, 10.12, 10.13.
 
 ## Summary
 

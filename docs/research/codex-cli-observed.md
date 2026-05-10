@@ -204,7 +204,7 @@ Probed by spawning `codex exec --json --skip-git-repo-check --dangerously-bypass
 - **Auto-compaction in `codex exec`.** Mentioned in docs but not observed (our turn was tiny).
 - **`codex exec review` subcommand.** What does it do that `exec` doesn't? Plausibly a structured review mode.
 
-## Resolutions / updates for the plan
+## Resolutions / updates for the blueprint
 
 1. **Open question 10.12 (model→max-context map)** — for Codex, `model_context_window` is in session-file events but not the stream. Switchboard can read it from the session file or maintain a map. Either way, Codex needs more work than Claude Code. The plan's open question stays open for Codex but is partially resolved overall.
 2. **§5 fork primitive** — Claude Code has native `--fork-session`; Codex does not have a non-interactive equivalent. Should be flagged as harness-asymmetric in the comparison doc.

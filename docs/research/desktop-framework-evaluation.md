@@ -2,7 +2,7 @@
 
 **Captured:** 2026-05-09
 **Decision:** Tauri (Rust core + WebView frontend) with Svelte + Tailwind CSS for the UI
-**Affects plan sections:** §10 (Form factor and distribution).
+**Affects blueprint sections:** §10 (Form factor and distribution).
 **Supersedes:** [tui-framework-evaluation.md](tui-framework-evaluation.md) — initial decision was a Textual TUI; pivoted after re-evaluating the UX vision.
 
 ## Why we pivoted from TUI

@@ -4,7 +4,7 @@
 
 **Captured:** 2026-05-09
 **Decision (later superseded):** Textual (Python)
-**Affects plan sections:** §10 (Form factor and distribution) — historical only; current decision is documented elsewhere.
+**Affects blueprint sections:** §10 (Form factor and distribution) — historical only; current decision is documented elsewhere.
 
 ## Summary
 

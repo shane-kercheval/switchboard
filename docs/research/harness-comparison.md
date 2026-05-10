@@ -104,7 +104,7 @@ If Switchboard's Codex adapter wants those fields, it can **read the session fil
 - This is a **read-after-completion** pattern, not a **tail-follow** pattern. Much simpler — no file-watcher infrastructure, just an `fs.readFile` after the terminal event.
 - Claude Code does not need this — its stream and session file carry roughly the same information.
 
-Tracked under open question 10.15 in the plan.
+Tracked under open question 10.15 in the blueprint.
 
 ## Stop detection
 
@@ -117,7 +117,7 @@ Process exit code is `1` on error in both harnesses, useful as an out-of-band cr
 
 In both cases, intermediate events do not signal stop reliably. **Switchboard should always wait for the explicit end event** — never try to derive stop from individual content events.
 
-This also means the plan's open question 10.1 (what if the next assistant response is a tool call?) is not a real concern at the harness level. Both harnesses run the model → tool_use → tool_result → model loop internally and only emit the end event when the cycle finally produces a final answer. From Switchboard's POV, every user-initiated turn produces exactly one terminal event regardless of internal tool cycles.
+This also means the blueprint's open question 10.1 (what if the next assistant response is a tool call?) is not a real concern at the harness level. Both harnesses run the model → tool_use → tool_result → model loop internally and only emit the end event when the cycle finally produces a final answer. From Switchboard's POV, every user-initiated turn produces exactly one terminal event regardless of internal tool cycles.
 
 ## Cancellation (SIGTERM mid-stream)
 
@@ -200,7 +200,7 @@ These are not symmetric features but serve similar purposes. For Switchboard's "
 6. **Session file richness vs stream**: in Claude Code the stream is roughly equivalent to the session file. In Codex the stream is a deliberately minimal subset; the session file is the full story. **Switchboard may want to read Codex session files for some operations** (rate limits, context window, full reasoning) that aren't in the stream.
 7. **Tool-call semantics**: typed tools (Claude Code) vs shell commands (Codex). UI rendering differs.
 
-## Updates the plan needs
+## Updates the blueprint needs
 
 After this round of research, the changes for §5 and the open questions are:
 

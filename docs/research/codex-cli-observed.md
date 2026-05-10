@@ -148,6 +148,8 @@ This is a meaningfully different model: Codex skills are always-loaded context; 
 
 Codex separates **sandbox mode** (filesystem write boundaries) from **approval policy** (whether to ask before commands). The yolo flag `--dangerously-bypass-approvals-and-sandbox` collapses both to "off." The directory-trust prompt was not encountered in our probe (cwd was `/private/tmp/switchboard-probe`, with `--skip-git-repo-check` — clean test).
 
+**Stall hazard from incomplete bypass (mitigation guidance):** there is a known regression where `--dangerously-bypass-approvals-and-sandbox` doesn't fully bypass in all sub-modes — the directory-trust prompt or similar interactive prompts can fire anyway. From Switchboard's POV the harness then blocks on stdin with no JSON events, manifesting as silence the stall detector (10.18) only catches at threshold. **Mitigation**: the Codex adapter should close stdin after dispatching the prompt; an interactive read returns EOF and the harness errors instead of hanging silently. As a backup signal, watch stderr for known prompt strings.
+
 `turn_context` event in the session file confirms: `"approval_policy": "never"`, `"sandbox_policy": {"type": "danger-full-access"}`, `"permission_profile": {"type": "disabled"}`.
 
 ## Quirks and surprises

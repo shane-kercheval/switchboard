@@ -1,5 +1,7 @@
 # Switchboard
 
+![Switchboard](docs/images/banner.png)
+
 Human-directed orchestrator for AI coding agents.
 
 Switchboard lets you spawn multiple Claude Code and Codex sessions in a single project, route messages between them, and define reusable patterns for common multi-agent workflows like second-opinion code review, plan-and-implement, and parallel-solution adjudication.

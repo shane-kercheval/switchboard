@@ -325,10 +325,10 @@ Agents in v1 are **project-scoped** — they're created within a project and sta
 Each agent in the project surfaces real-time state alongside its conversation:
 
 - **Status**: idle, processing, waiting on tool, errored.
-- **Context utilization**: % of model context used, derived from the harness JSON (see §9 "Required harness commands"). Surfaced as a progress bar so the operator can see when an agent approaches the auto-compact threshold.
+- **Context utilization**: % of model context used, derived from the harness JSON (see §9 "Required harness commands"). Surfaced as a progress bar so the user can see when an agent approaches the auto-compact threshold.
 - **Cost / token usage**: per turn and cumulative. Native for Claude Code (`total_cost_usd` from the harness); derived for Codex via a per-model pricing table (see §9).
 
-Each agent also exposes a context menu of operator actions:
+Each agent also exposes a context menu of user actions:
 
 - **Fork session** — create a new agent branched from the current state (per §9 "Fork a session from a checkpoint"; native in Claude Code, workaround for Codex per open question 10.14).
 - **Open session file** — open the underlying harness JSONL session file in the user's default editor for inspection or external tooling.
@@ -337,9 +337,9 @@ Each agent also exposes a context menu of operator actions:
 
 ### Composing and dispatching messages
 
-The **operator's** (i.e. user's) core action — whether typing a fresh message, forwarding an agent's output, or invoking a saved pattern — is one primitive: **compose a message and dispatch it to one or more agents.** The composition has three components:
+The user's core action — whether typing a fresh message, forwarding an agent's output, or invoking a saved pattern — is one primitive: **compose a message and dispatch it to one or more agents.** The composition has three components:
 
-- **Source.** What is being sent — any combination of: free-form text the operator types, and/or the output from one or more agents (latest turn by default; the operator can pick a specific earlier turn). When multiple sources are combined, the optional wrapping prompt is the natural way to control how they're stitched together via template variables.
+- **Source.** What is being sent — any combination of: free-form text the user types, and/or the output from one or more agents (latest turn by default; the user can pick a specific earlier turn). When multiple sources are combined, the optional wrapping prompt is the natural way to control how they're stitched together via template variables.
 - **Optional wrapping.** A prompt template from any provider (e.g. `local:code-review`, `tiddly:ai-review-feedback`) that the source(s) are rendered into. May be invoked via slash command in the message bar; the UI may accept a bare name if it matches exactly one configured provider (see §6 resolution rules).
 - **Recipients.** One or more agents to receive the (possibly wrapped) message. Currently focused agent is the default; multi-select picks any combination of agents in the project.
 
@@ -347,13 +347,13 @@ These three components compose freely. Typing a fresh message is just user text 
 
 ### Invoking a pattern
 
-A pattern is the **saved, named, optionally sequenced and autonomous version of compose-and-dispatch.** A single-step pattern is functionally identical to a manual send — just persisted under a name for reuse. A multi-step pattern (e.g. fan-out → wait → fan-in → dispatch) adds sequencing and autonomous execution: the operator invokes once, the pattern runs through multiple compose-and-dispatch steps automatically.
+A pattern is the **saved, named, optionally sequenced and autonomous version of compose-and-dispatch.** A single-step pattern is functionally identical to a manual send — just persisted under a name for reuse. A multi-step pattern (e.g. fan-out → wait → fan-in → dispatch) adds sequencing and autonomous execution: the user invokes once, the pattern runs through multiple compose-and-dispatch steps automatically.
 
-A pattern is invoked by name. Switchboard prompts for the pattern's inputs (which agents to use, which prompts, any free-form context). The operator confirms; the pattern launches and runs autonomously.
+A pattern is invoked by name. Switchboard prompts for the pattern's inputs (which agents to use, which prompts, any free-form context). The user confirms; the pattern launches and runs autonomously.
 
 ### Watching a pattern run
 
-All participating agents stay simultaneously visible in their panes throughout pattern execution; status indicators show which are still running, waiting, or completed. The operator can collapse background agents to focus on a specific one, or expand them all to watch the work in parallel. Pattern execution is independent of which pane has focus — agents continue running in the background regardless. When the pattern completes (the final step has dispatched its output), the operator is notified via OS-native notification (per §10 Form factor).
+All participating agents stay simultaneously visible in their panes throughout pattern execution; status indicators show which are still running, waiting, or completed. The user can collapse background agents to focus on a specific one, or expand them all to watch the work in parallel. Pattern execution is independent of which pane has focus — agents continue running in the background regardless. When the pattern completes (the final step has dispatched its output), the user is notified via OS-native notification (per §10 Form factor).
 
 ### Failure handling
 
@@ -366,20 +366,20 @@ A turn that ends with a tool **permission denial** is *not* a failure. The harne
 Patterns run inside the Switchboard backend (the Rust core; see §10 Form factor). They keep running as long as the backend process is alive — independent of whether the UI window is visible. Specifically:
 
 - **Minimize / hide the window**: backend keeps running normally; pattern continues.
-- **Close the window** (X button): hides the app to the system tray (or dock on macOS). The backend stays up; the pattern continues. The operator can reopen the window from the tray icon to check on progress.
-- **Quit the app explicitly** (cmd-Q, tray-menu Quit): stops the backend. If any patterns are in progress, Switchboard prompts the operator to confirm and then cancels them cleanly (see "Cancelling a pattern or turn" below).
+- **Close the window** (X button): hides the app to the system tray (or dock on macOS). The backend stays up; the pattern continues. The user can reopen the window from the tray icon to check on progress.
+- **Quit the app explicitly** (cmd-Q, tray-menu Quit): stops the backend. If any patterns are in progress, Switchboard prompts the user to confirm and then cancels them cleanly (see "Cancelling a pattern or turn" below).
 - **Machine sleep**: pauses the backend; pattern execution pauses with it. Resumes on wake.
 
-When the operator returns, Switchboard shows the state of any patterns that completed, are in progress, or were cancelled.
+When the user returns, Switchboard shows the state of any patterns that completed, are in progress, or were cancelled.
 
 ### Cancelling a pattern or turn
 
-The operator can cancel at two granularities:
+The user can cancel at two granularities:
 
 - **Cancel a pattern.** Stops the pattern's orchestration. Switchboard sends `SIGTERM` to the in-flight harness subprocess (using the process group it spawned in, so both single-process Claude Code and Codex's parent+child tree are cleaned up uniformly — see §9 and the harness-cancellation research note). Partial results stay: the agent's harness session file persists on disk and can be inspected or sent further messages. The pattern is marked **cancelled** and cannot be auto-resumed — re-invoking starts from the beginning.
 - **Cancel an agent's turn.** Kills the spawned harness subprocess for a single agent's in-flight turn (useful if the agent is going off the rails). Same `SIGTERM`-to-process-group mechanism. The agent stays around and can be re-prompted; the harness session is in a usable state for the next message, with the cancelled turn simply absent.
 
-If Switchboard buffered streaming output from the cancelled turn (whatever the agent had produced before the kill), the operator can review that partial content in-app — it's available from the buffered stream, not from the harness session file (see the harness-cancellation research note for why).
+If Switchboard buffered streaming output from the cancelled turn (whatever the agent had produced before the kill), the user can review that partial content in-app — it's available from the buffered stream, not from the harness session file (see the harness-cancellation research note for why).
 
 ## 8. Worked example: review-and-aggregate
 
@@ -389,7 +389,7 @@ To anchor the abstractions above, here is what a code-review workflow looks like
 
 The user has a project `feature-event-logs` open in Switchboard. They have three agents:
 
-- `planner` (Claude Code, currently selected)
+- `implementer` (Claude Code, currently selected)
 - `reviewer-claude` (Claude Code)
 - `reviewer-codex` (Codex)
 
@@ -398,31 +398,31 @@ The user has previously authored a pattern in `.switchboard/patterns/review-and-
 **Invocation:**
 
 1. The user invokes the pattern: "Run review-and-aggregate."
-2. Switchboard prompts for each pattern input:
-   - `primary_agent`: `planner` (autofilled with the currently selected agent; user can change)
-   - `reviewer_agents`: `reviewer-claude`, `reviewer-codex` (multi-select)
-   - `review_prompt`: `local:code-review` (bundled with Switchboard)
-   - `aggregation_prompt`: `tiddly:ai-review-feedback` (the user's own, stored in Tiddly)
-   - `user_context`: "Review milestone 1, focus on the event-emission API."
+2. Switchboard pops up an invocation form with one field per input the pattern declared in its YAML (`primary_agent`, `reviewer_agents`, `review_prompt`, etc. — see §4 for the schema). The user fills in:
+   - **`primary_agent`** → `implementer` (autofilled with the currently selected agent; user can change)
+   - **`reviewer_agents`** → `reviewer-claude` and `reviewer-codex` (multi-select)
+   - **`review_prompt`** → `local:code-review` (bundled with Switchboard)
+   - **`aggregation_prompt`** → `tiddly:ai-review-feedback` (the user's own, stored in Tiddly)
+   - **`user_context`** → "Review milestone 1, focus on the event-emission API."
 3. The user confirms. The pattern launches.
 
 **Execution:**
 
 1. Switchboard sends the review-prompt message (with user context appended) to both reviewers in parallel. Each reviewer runs.
 2. Switchboard waits for both reviewers to complete their turns.
-3. Switchboard collects both reviewers' final assistant messages.
+3. Switchboard collects both reviewers' final responses.
 4. Switchboard renders the aggregation-prompt template, substituting in the two reviews under their respective variable names.
-5. Switchboard sends the rendered message to `planner` (the agent supplied as the pattern's `primary_agent` input).
-6. The planner runs and produces its response.
+5. Switchboard sends the rendered message to `implementer` (the agent supplied as the pattern's `primary_agent` input).
+6. The implementer runs and produces its response.
 7. Pattern complete. The user is notified.
 
 **During execution:**
 
-The user can watch any agent's output. When both reviews are in flight, the user might split attention between the two. When the planner is processing, the user watches the planner. None of this affects pattern execution.
+All three agents stay simultaneously visible in their panes throughout. While both reviewers are running, the user can watch both streams in parallel — or collapse the reviewer panes down to just their status indicators (running / completed) and let them work in the background. When the implementer kicks in, its pane comes alive with the aggregation. The user doesn't have to switch around to know what's happening.
 
 **Afterwards:**
 
-The user reads the planner's response, decides whether to revise, route to the implementer, or do something else. The pattern is done; the next action is the user's.
+The user reads the implementer's response and decides what's next. Common follow-ups: compose-and-dispatch the response onward (e.g., forward to a follow-up agent with a wrapping prompt — see §7 "Composing and dispatching messages"), invoke another pattern, or just stop. The pattern is done; the next move is the user's.
 
 ## 9. Harness integration
 

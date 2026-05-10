@@ -43,7 +43,7 @@ This orchestration model has a useful side effect for prompt management. Because
 |---|---|
 | **Project** | A workspace containing a group of agents working toward a shared goal. Persistent, named, and bound to a working directory (typically a git repo). Project-specific config, workflows, and local prompts live under `<project>/.switchboard/` (see directory layout below). |
 | **Agent** | A Claude Code or Codex session within a project, with a user-assigned name. Each agent has a persistent harness session ID under the hood. |
-| **Primitive** | An atomic operation Switchboard provides for a workflow to compose: spawn agent, send message, auto-forward output, fan-in with template, pause for user input, iterate over a list, save/invoke workflow. Seven exist in v1; see §4. |
+| **Primitive** | An atomic operation Switchboard provides for a workflow to compose: spawn agent, send message, auto-forward output, fan-in with template, pause for user input, iterate over a list. Six exist in v1; see §4. (Saving and invoking a reusable workflow is the composition layer over these primitives, not itself a primitive — see §5.) |
 | **Workflow** | A named, parameterized composition of primitives — for example "fan-out review and aggregate." Defined as a YAML file under `<project>/.switchboard/workflows/`. Invoked by name with arguments. |
 | **Prompt template** | A named prompt definition resolved by ID at routing time. Used as message content (sent to an agent) or as a wrapper applied around aggregated outputs before forwarding (used in fan-in; see §4 Primitive 4). |
 | **Prompt provider** | A source of prompts Switchboard resolves IDs against. Two implementations ship in v1: `local` (file store) and any registered MCP-server provider. Addressed by prefix (e.g. `local:code-review`, `tiddly:code-review`). See §6. |
@@ -62,7 +62,7 @@ Each project's Switchboard-managed state lives in a `.switchboard/` directory at
     ├── config.yaml         # project config (registered MCP providers, harness flags, etc.)
     ├── workflows/           # workflow definitions (YAML)
     ├── prompts/            # local prompts (markdown body + YAML frontmatter)
-    └── state/              # runtime state (agent registry, harness session IDs)
+    └── state/              # runtime state (agent registry, harness session IDs, workflow-run checkpoints)
 ```
 
 `config.yaml`, `workflows/`, and `prompts/` are intended to be checked into git and shared. `state/` is local-machine runtime data and should be `.gitignore`d.
@@ -71,7 +71,7 @@ State is kept project-local rather than in a user-global registry so that openin
 
 ## 4. Functional primitives
 
-These seven primitives cover everything Switchboard needs to do at the functional level. Workflows compose them.
+These six primitives cover everything Switchboard needs to do at the functional level. Workflows compose them. (Saving and invoking a reusable workflow is the composition layer over these primitives, covered in §5.)
 
 ### Primitive 1 — Spawn an agent
 
@@ -146,9 +146,17 @@ Used for milestone-based work, per-target processing, or any "do this whole sub-
 - **No nested loops in v1.** Outer-only iteration. Nested iteration is a v2+ consideration.
 - **Lists are static, supplied at invocation time.** The list isn't computed from a prior step's agent output — that opens dynamic-allocation questions out of scope for v1.
 
-### Primitive 7 — Save and invoke a reusable workflow
+### Execution model: implicit DAGs
 
-A workflow is a named, parameterized composition of the other primitives, defined as a YAML file in the project directory. Invoking a workflow fills in its parameters and runs it.
+The primitives compose into DAGs (directed acyclic graphs): fan-out runs nodes in parallel, fan-in synchronizes them, sequential steps sequence in order, and iteration replays a sub-DAG bounded by a static list. The runtime must therefore handle parallel dispatch within fan-out and proper synchronization within fan-in — not just walk the YAML top-to-bottom and serialize all dispatches.
+
+The DAG is conceptual, not declared. The runtime never sees explicit edges like "task A depends on task B" the way an Airflow DSL would express them. Instead, the graph emerges implicitly from which agents each step references — recipients of a `send` step, agents listed in a `wait_for_all`, agents whose outputs are template variables in a fan-in. The runtime can read off the parallelism and synchronization it needs from those references; it doesn't need a separate dependency declaration.
+
+A general-purpose DAG scheduler (topological sort over arbitrary node dependencies, dynamic scheduling) is **not** required for v1. A step-based interpreter that supports parallel dispatch within fan-out and proper synchronization within fan-in is sufficient for the six primitives above. A general DAG model is a possible v2+ direction if workflows ever grow arbitrary inter-step dependencies.
+
+## 5. Workflows
+
+A **workflow** is a named, parameterized composition of the primitives in §4, defined as a YAML file in the project directory. Invoking a workflow fills in its parameters and runs it.
 
 Workflow definition format (illustrative; exact schema TBD):
 
@@ -176,17 +184,7 @@ steps:
 
 When invoked, Switchboard prompts the user for each input and then executes the steps.
 
-**Note on the example above:** the YAML is illustrative — it shows intent (composable steps with templated inputs, fan-out and fan-in expressed as data, named template variables for fan-in responses) without committing to the exact syntax. The schema, keywords, escape hatches, error handling, and template-function surface (e.g., what `responses_from(...)` actually looks like) need careful design at implementation time. See open question 5.1. The `wait_for_all` step is the wait phase of Primitive 4 (fan-in with template wrapping) made explicit in YAML; it is not a separate primitive.
-
-### Execution model: implicit DAGs
-
-The primitives compose into DAGs (directed acyclic graphs): fan-out runs nodes in parallel, fan-in synchronizes them, sequential steps sequence in order, and iteration replays a sub-DAG bounded by a static list. The runtime must therefore handle parallel dispatch within fan-out and proper synchronization within fan-in — not just walk the YAML top-to-bottom and serialize all dispatches.
-
-The DAG is conceptual, not declared. The runtime never sees explicit edges like "task A depends on task B" the way an Airflow DSL would express them. Instead, the graph emerges implicitly from which agents each step references — recipients of a `send` step, agents listed in a `wait_for_all`, agents whose outputs are template variables in a fan-in. The runtime can read off the parallelism and synchronization it needs from those references; it doesn't need a separate dependency declaration.
-
-A general-purpose DAG scheduler (topological sort over arbitrary node dependencies, dynamic scheduling) is **not** required for v1. A step-based interpreter that supports parallel dispatch within fan-out and proper synchronization within fan-in is sufficient for the seven primitives above. A general DAG model is a possible v2+ direction if workflows ever grow arbitrary inter-step dependencies.
-
-## 5. Workflows
+**Note on the example above:** the YAML is illustrative — it shows intent (composable steps with templated inputs, fan-out and fan-in expressed as data, named template variables for fan-in responses) without committing to the exact syntax. The schema, keywords, escape hatches, error handling, and template-function surface (e.g., what `responses_from(...)` actually looks like) need careful design at implementation time. See open question 5.1. Where the YAML shows fan-in as `wait_for_all` + a `send` step using `responses_from(...)`, that's the desugared form of Primitive 4 (fan-in with template wrapping); the DSL exposes the wait and dispatch phases as separate steps for readability and flexibility, not because fan-in is itself a composition of other primitives.
 
 ### Authoring
 
@@ -198,7 +196,7 @@ v1 ships with a small library of built-in workflows (review-and-aggregate, seque
 
 Users without an existing Claude Code or Codex installation outside Switchboard can use a Switchboard-spawned agent itself to author a workflow from the instruction docs — agents Switchboard manages are full Claude Code / Codex sessions and can read project files normally. Hand-authoring against the DSL spec also works for power users.
 
-Workflow files are project-scoped only — there is no user-global workflow directory parallel to user-global prompts. Reuse across projects happens via copy or symlink. (Asymmetric with prompts on purpose: workflows tend to be project-shaped — they reference specific agent names and workflows — whereas prompts are more reusable as personal templates.)
+Workflow files are project-scoped only — there is no user-global workflow directory parallel to user-global prompts. Reuse across projects happens via copy or symlink. (Asymmetric with prompts on purpose: workflows tend to be project-shaped — they reference specific agent names and project-specific structure — whereas prompts are more reusable as personal templates.)
 
 ## 6. Prompts and prompt providers
 
@@ -388,7 +386,6 @@ Each agent also exposes a context menu of user actions:
 - **Fork session** — create a new agent branched from the current state (per §9 "Fork a session from a checkpoint"; native in Claude Code, workaround for Codex per open question 10.14).
 - **Open session file** — open the underlying harness JSONL session file in the user's default editor for inspection or external tooling.
 - **Reset / remove** — clean up the agent (CRUD-y; not enumerated in §4 primitives, just a UI affordance).
-- **Switch to interactive mode** — open the underlying session in the harness's own TUI for actions Switchboard's headless surface can't reach (manual `/compact`, plan mode, etc.). Disabled while the agent has an in-flight turn. Opening interactive mode transitions the agent to a `Detached` state that holds the contention lock — Switchboard dispatch is refused until the user closes the interactive session.
 
 ### Composing and dispatching messages
 
@@ -410,17 +407,24 @@ A workflow is invoked by name. Switchboard prompts for the workflow's inputs (wh
 
 ### Watching a workflow run
 
-All participating agents stay simultaneously visible in their panes throughout workflow execution; status indicators show which are still running, waiting, or completed. The user can collapse background agents to focus on a specific one, or expand them all to watch the work in parallel. Workflow execution is independent of which pane has focus — agents continue running in the background regardless. When the workflow completes (all turns it initiated have reached a terminal state), the user is notified via OS-native notification (per §10 Form factor).
+All participating agents stay simultaneously visible in their panes throughout workflow execution; status indicators show which are still running, waiting, or completed. The user can collapse background agents to focus on a specific one, or expand them all to watch the work in parallel. Workflow execution is independent of which pane has focus — agents continue running in the background regardless. When a workflow completes (all turns it initiated have reached a terminal state) or pauses on Primitive 5 (waiting for user input), the user is notified via OS-native notification (per §10 Form factor).
 
-A **workflow-progress surface** (shape TBD — status row in the project header, side panel, or modal) shows the active workflow's name, current step, total steps, and per-step status. When a workflow is paused on Primitive 5 (waiting for user input), the surface shows "step N of M — waiting for your input." For workflows using Primitive 6 (iterate over a list), the surface shows the iteration dimension as well, in the user's own vocabulary — e.g., "iteration 2 of 3 (milestone = "implement-handlers"), step 3 of 8" — using the loop variable name and value the workflow declared. On return after walk-away, this is the first thing the user sees: any workflow that was interrupted is surfaced with the same step (and iteration) detail and options to retry or abandon (see "Walking away" below).
+A **workflow-progress surface** (shape TBD — status row in the project header, side panel, or modal) shows each active workflow's name, current step, total steps, and per-step status. Multiple workflows can be in flight simultaneously (when they target disjoint agents — see "Agent contention" below); the surface lists each. When a workflow is paused on Primitive 5 (waiting for user input), the surface shows "step N of M — waiting for your input." For workflows using Primitive 6 (iterate over a list), the surface shows the iteration dimension as well, in the user's own vocabulary — e.g., "iteration 2 of 3 (milestone = "implement-handlers"), step 3 of 8" — using the loop variable name and value the workflow declared. On return after walk-away, this is the first thing the user sees: any workflow that was interrupted is surfaced with the same step (and iteration) detail and options to retry or abandon (see "Walking away" below).
 
 ### Agent contention
 
-Switchboard enforces **one in-flight turn per agent** at the application layer. A dispatch (whether from a workflow step or a manual user send) against an agent that is already mid-turn is refused with a clear error ("agent X is busy"); the user can switch focus to inspect the busy agent. Queueing is not implemented in v1.
+Switchboard enforces **one in-flight turn per agent** at the application layer. The contention check is a single rule applied at the dispatcher, but it surfaces differently depending on the source:
+
+- **UI compose-bar dispatch:** the Send affordance is gated visually before the user can click — the user sees "agent X is busy" inline and can draft but not send (per "Composing and dispatching messages" above).
+- **Workflow-step dispatch:** there's no compose-bar UX to gate; the dispatcher refuses the step with a clear error ("agent X is busy, currently running step N of workflow P") and the workflow halts on it as a step failure.
+
+Queueing is not implemented in v1.
 
 This rule lives in Switchboard, not the harnesses, because **neither harness rejects same-session parallel invocation** — both accept it, both succeed, and the on-disk effects diverge unhelpfully (Claude Code grows an orphan branch in its session tree; Codex silently interleaves both turns into one flat transcript and a future resume cannot tell them apart). See [docs/research/same-session-parallel-invocation.md](research/same-session-parallel-invocation.md) for the probe and the empirical findings. Since the harnesses don't protect us, the dispatcher must.
 
 Two workflows invoked simultaneously that target *disjoint* agents both run normally. The constraint is per-agent, not per-workflow.
+
+**Out-of-band harness use is outside the enforcement layer.** If the user manually invokes `claude --resume <session-id>` or `codex exec resume <thread-id>` in a separate terminal against a session Switchboard is also tracking, the same-session-parallel-invocation hazards apply — Switchboard can't see the external process and won't gate against it. This is the trade-off for not locking users out of their own harness sessions; users who do this are taking on the risk knowingly.
 
 ### Failure handling
 
@@ -432,10 +436,10 @@ A step is considered failed in any of these cases:
 - A pre-dispatch resolution fails: prompt ID not found in its provider, MCP server unreachable, agent referenced by name has been deleted.
 - A template substitution fails (missing variable, render error).
 - An agent contention refusal: the step's target is mid-turn (per §7 "Agent contention"). This counts as a step failure rather than a transient retry condition — it indicates a genuine collision with other in-flight work.
-- A user manually cancels an agent's turn while the agent is participating in a workflow step. Symmetric with other failure modes; the step fails and the workflow halts.
+- A user manually cancels an agent's turn while the agent is participating in a workflow step. The workflow is marked **cancelled** (not failed) — the user's cancellation is intent-bearing, identical to clicking cancel-workflow directly.
 - Within a fan-in step (Primitive 4), any participating agent failing fails the whole step.
 
-A turn that ends with a tool **permission denial** is *not* a failure. The harness reports the denial (Claude Code's `result.permission_denials`, similar in Codex), the model receives the denial as feedback and adapts its response, and the turn completes normally. Switchboard surfaces denials as informational ("the model attempted X, was blocked") rather than as workflow-halting errors. Failures are reserved for harness-level errors (`is_error: true` / `turn.failed` / non-zero exit), template substitution errors, and workflow-orchestration errors.
+A turn that ends with a tool **permission denial** is *not* a failure. The harness reports the denial (Claude Code's `result.permission_denials`; presumed similar in Codex but not yet verified — see §9), the model receives the denial as feedback and adapts its response, and the turn completes normally. Switchboard surfaces denials as informational ("the model attempted X, was blocked") rather than as workflow-halting errors. Failures are reserved for harness-level errors (`is_error: true` / `turn.failed` / non-zero exit), template substitution errors, and workflow-orchestration errors.
 
 ### Walking away
 
@@ -728,6 +732,7 @@ Decisions explicitly **not made** in this document, to be addressed in later doc
 - **Per-workflow MCP tool selection / allowlists.** The v1 prompt/tool boundary (prompts normalized at Switchboard, tools per-agent) is a v1 simplification, not a permanent commitment. A future direction: workflow steps could declare their required MCP tools, and Switchboard could constrain the harness for that step's duration.
 - **Compaction event normalization.** Whether either harness emits a structured event when auto-compaction fires is unprobed. If they do, `Compacted { agent, before_tokens, after_tokens? }` joins the normalized vocabulary; if not, the §9 vocabulary accepts that gap and the UI works from the context-utilization signal alone.
 - **DAG visualization of in-flight workflows.** v1's workflow-progress surface (§7) shows current step, total steps, status — a linear view. Workflows are conceptually DAG-shaped (per §4 "Execution model"); a graph view that shows the actual execution shape with current/complete/pending nodes highlighted is a natural v2+ extension, especially as workflows grow with iteration and pause-for-user-input nodes.
+- **In-app launch of the harness's interactive TUI** ("Switch to interactive mode" on an agent for actions Switchboard's headless surface can't reach — manual `/compact`, plan mode, etc.). Spawning the harness's terminal TUI from a desktop app requires OS-specific terminal-launching and lock-tracking complexity that doesn't earn its keep against the niche use cases. Users who need this today can quit Switchboard and run `claude --resume <session-id>` (or `codex exec resume`) themselves — sessions are real Claude/Codex sessions and survive Switchboard. Deferred to v2 if user demand surfaces.
 
 ## 12. Open questions
 
@@ -738,7 +743,7 @@ Aggregated from inline flags above, plus a few additional:
 - **6.1** MiniJinja subset (full MiniJinja vs a restricted subset) and template-available variables beyond `responses`.
 - ~~**10.1** What does Switchboard do when an agent's "next assistant response" is a tool call rather than text?~~ **Resolved by hands-on probe:** both harnesses run the model → tool_use → tool_result → model loop internally and emit a single terminal event per user-initiated turn (Claude Code: `result`; Codex: `turn.completed` / `turn.failed`). Switchboard always sees a complete turn — there is no "tool-call-only response" to handle. See [docs/research/harness-comparison.md](research/harness-comparison.md).
 - ~~**10.2** When two workflows reference the same agent, what happens? Disallow concurrent use? Queue? Refuse?~~ **Resolved by hands-on probe:** Switchboard enforces one in-flight turn per agent at the application layer; collisions are refused with a clear error. Queueing is deferred. See §7 "Agent contention" and [docs/research/same-session-parallel-invocation.md](research/same-session-parallel-invocation.md). The harnesses themselves do not error on same-session parallel invocation — they silently corrupt (Claude Code: orphan branch in session tree) or conflate (Codex: interleaved transcript) — so this enforcement must live in Switchboard.
-- **10.3** How are agents preserved across Switchboard restarts? Harness session IDs persist on disk; Switchboard's project/agent registry needs its own persistence model. Restart-time UX (showing "workflow interrupted at step N" so the user can retry or abandon) needs a working answer for §7's walk-away promise to hold; mid-step recovery (resuming an interrupted in-flight turn) is out of scope.
+- **10.3** Persistence schema for project/agent registry and workflow-run checkpoints (kept in `<project>/.switchboard/state/`, per §3). The user-visible restart UX (interrupted-at-step-N + retry/abandon, including iteration index/value for Primitive 6) is committed in §7 "Walking away"; what remains open is the on-disk format (JSONL append-only, SQLite, or otherwise), atomicity guarantees on concurrent agent-spawn-during-write, and the eventual pruning story. Mid-step recovery (resuming an interrupted in-flight turn) remains out of scope.
 - **10.4** Workflow versioning. If a workflow file changes mid-execution (unlikely but possible), what happens to the in-flight workflow?
 - ~~**10.5** Notifications when a workflow completes — terminal bell? OS notification? Just visible state in the UI?~~ **Resolved by §10 form factor commitment:** OS-native notifications via Tauri's notification plugin. See §7 "Watching a workflow run" for when notifications fire. Remaining UX details (which events notify, user opt-out controls) are implementation choices, not plan-level questions.
 - **10.6** Multi-machine workflows (running Switchboard on a remote dev machine over SSH). Out of scope for v1, but the architecture should not fight it.
@@ -750,7 +755,7 @@ Aggregated from inline flags above, plus a few additional:
 - **10.12** Model→max-context map maintenance. **Partially resolved by hands-on probe:** Claude Code v2.1.138 *does* expose `contextWindow` per turn in `result.modelUsage.<model>` — Switchboard reads it directly, no map needed for Claude Code. Codex's stream omits it; the value lives in the session file's `task_started` event. Working assumption for Codex: ship a bundled model→max-context map, but also let the Codex adapter read the session file and prefer that as authoritative when present. Still open: do we ship the map, read the session file, or both? Open: where is the canonical map source for new models we sync from?
 - **10.13 (monitoring)** Programmatic `/compact` exposure in either harness. Multiple Anthropic feature requests open ([anthropics/claude-code#5643](https://github.com/anthropics/claude-code/issues/5643), [#39275](https://github.com/anthropics/claude-code/issues/39275), [#39574](https://github.com/anthropics/claude-code/issues/39574), [#26488](https://github.com/anthropics/claude-code/issues/26488)); Codex equivalent not documented. When upstream lands, Switchboard can offer first-class compaction control inside workflows.
 - **10.14** Codex non-interactive fork. Claude Code has native `--fork-session`; Codex has no `codex exec fork`. Three options: (a) drop fork from v1's Codex agent capability and document the asymmetry; (b) implement fork by copying the session JSONL to a new file and passing the new ID to `codex exec resume` (untested — file format may not support this cleanly); (c) implement fork by spawning a fresh Codex session and re-feeding a summarized version of the prior context as the initial prompt. Decision deferred to implementation; (a) is the safe v1 default.
-- **10.15** Should the Codex adapter read the session file (`~/.codex/sessions/...jsonl`) in addition to the `--json` stream? The session file carries information the stream doesn't (rate limits, `model_context_window`, full reasoning blocks). Tradeoff: more complete information vs more file-watching plumbing and the question of whether to tail-read live or read on completion. Working assumption: read on turn completion (after `turn.completed`/`turn.failed`) to enrich the normalized event stream with the missing fields.
+- ~~**10.15** Should the Codex adapter read the session file (`~/.codex/sessions/...jsonl`) in addition to the `--json` stream?~~ **Resolved (commitment).** The Codex adapter reads the session file on turn completion to enrich the normalized event stream with fields the `--json` stream omits (rate limits, `model_context_window`, full reasoning blocks, `session_meta` for the SessionMeta event). Multiple §7 and §9 commitments now depend on this (per-turn context-utilization for Codex, RateLimitEvent timing, SessionMeta). What remains as implementation detail: tail-vs-completion timing for any future live-stream enrichment, and the lookup-strategy mechanics for the date-partitioned session path (see codex-cli-observed.md research note).
 - **10.16** Disk usage of harness session files. Both harnesses persist transcripts indefinitely (Claude Code at `~/.claude/projects/<encoded-cwd>/*.jsonl`, Codex at `~/.codex/sessions/YYYY/MM/DD/...`). A long-lived project with many agents and many turns will accumulate. Should Switchboard offer pruning, surface totals, or otherwise manage this? Out of scope for v1, but the architecture should not preclude it.
 - **10.17** Network failure and retry policy. What does Switchboard do when a turn fails mid-workflow because of a transient API error or network blip? Working assumption: a single configurable retry on transient errors (rate-limit, 5xx) before marking the step as failed. Permanent errors (auth, invalid model, denied content) fail immediately. To be detailed in §7 once we have an implementation footprint.
 - **10.18** Stall detection. A turn with no stream events for T seconds is ambiguous (genuinely hung vs slow tool). UX (passive surface, prompt-to-cancel after threshold, or some other affordance) deferred to implementation, including a probe of whether either harness emits reliable heartbeats during long operations.

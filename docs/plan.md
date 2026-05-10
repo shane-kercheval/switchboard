@@ -78,7 +78,7 @@ Create a new agent within a project. User specifies:
 
 - Agent type (Claude Code or Codex).
 - Name (free-form label).
-- Optional initial prompt (sent as the first message after spawn; substitutes for a system prompt where harness-level system prompts aren't accessible).
+- Optional initial prompt (sent as the first message after spawn to prime the agent with role context, project background, or any other instructions the user wants in place before the first real turn). Authored like any other prompt — free-form text or a fully-qualified prompt ID resolved through the prompt-provider system (§6).
 - Optional working directory override (defaults to project working directory).
 
 The harness session ID is captured and persisted. The agent is now part of the project and can receive messages and participate in patterns.
@@ -88,7 +88,7 @@ The harness session ID is captured and persisted. The agent is now part of the p
 User specifies:
 
 - Recipients (one or more agents).
-- Prompt template (an MCP prompt ID — e.g. from Tiddly) and/or free-form text.
+- Prompt template (a fully-qualified prompt ID, e.g. `local:code-review` or `tiddly:code-review`) and/or free-form text.
 - Optional parameters for the prompt template.
 
 The composed message is sent to each recipient. If recipients are multiple, this is a fan-out: each agent receives the same message and runs independently.
@@ -97,7 +97,7 @@ This primitive is **synchronous from the human's perspective** — the human sen
 
 ### Primitive 3 — Auto-forward an agent's output
 
-Configure: when agent A finishes its current turn (next assistant text response), forward that output to one or more recipient agents, optionally wrapped in a prompt template.
+Configure: when agent A finishes its current turn (next assistant text response — handling of tool-call responses is open question 10.1), forward that output to one or more recipient agents, optionally wrapped in a prompt template.
 
 Used for sequential handoff (planner → implementer with the plan as input) and for agent-driven fan-out (planner → multiple implementers in parallel, one reviewer → multiple follow-up reviewers, etc.). Configured before agent A is launched on its turn; fires automatically when A completes.
 
@@ -105,7 +105,7 @@ Used for sequential handoff (planner → implementer with the plan as input) and
 
 Configure: when all of agents A, B, ..., N finish their current turns, combine their outputs into a single message using a wrapping prompt template, then send to agent X.
 
-The wrapping template has access to each agent's response by name (or by position): `{{ responses.reviewer_a }}`, `{{ responses.reviewer_b }}`, etc. Templates may use Jinja-style for-loops to handle variable numbers of sources.
+The wrapping template has access to each agent's response by name (or by position): `{{ responses.reviewer_claude }}`, `{{ responses.reviewer_codex }}`, etc. Agent names containing hyphens are normalized to underscores in template contexts (so an agent named `reviewer-claude` is accessed as `responses.reviewer_claude`). Templates may use Jinja-style for-loops to handle variable numbers of sources.
 
 This is the most behaviorally-rich primitive. It implies waiting on multiple agents, accumulating their final responses, applying a template, and dispatching. Failure handling (one agent crashes mid-pattern) is covered in section 7.
 
@@ -121,9 +121,9 @@ description: Send a message to multiple reviewers, aggregate, send to primary.
 inputs:
   primary_agent: agent
   reviewer_agents: [agent]
-  review_prompt: prompt_id
-  aggregation_prompt: prompt_id
-  user_context: text  # optional
+  review_prompt: prompt_id           # invocation supplies e.g. local:code-review
+  aggregation_prompt: prompt_id      # invocation supplies e.g. tiddly:ai-review-feedback
+  user_context: text                 # optional
 steps:
   - send:
       to: "{{ reviewer_agents }}"

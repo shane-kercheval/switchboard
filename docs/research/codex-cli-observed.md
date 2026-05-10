@@ -20,7 +20,7 @@ Switchboard uses `codex exec`. Relevant flags:
 | `-o, --output-last-message <FILE>` | Also write the final assistant message to a file. |
 | `-c, --config <key=value>` | Override any config value (TOML-typed); the primary configuration mechanism — Codex doesn't have one flag per knob the way Claude Code does. |
 | `-s, --sandbox <mode>` | `read-only`, `workspace-write`, `danger-full-access`. |
-| `--dangerously-bypass-approvals-and-sandbox` | The "yolo" flag. |
+| `--dangerously-bypass-approvals-and-sandbox` | The "yolo" flag. **Undocumented alias `--yolo` is accepted** in 0.128.0 (verified by direct test: `codex exec --yolo --json "..."` runs identically to the long form). The alias does not appear in `--help`; preferring the long form is safer for forward compatibility. |
 | `-C, --cd <DIR>` | Working directory. |
 | `--add-dir <DIR>` | Additional writable directories. |
 | `--skip-git-repo-check` | Allow running outside a git repo (Codex defaults to requiring one). |

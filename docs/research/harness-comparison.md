@@ -61,6 +61,51 @@ RateLimitEvent { agent, info }
 
 Each harness adapter translates its native events into this shape. Switchboard's pattern engine, UI, and persistence layer consume the normalized form.
 
+## Streaming mechanism
+
+Both harnesses stream over stdout in real time. The implementation pattern is the same:
+
+1. Switchboard spawns the harness process (`child_process.spawn` in Node, `subprocess.Popen` in Python, etc.) with the structured-output flag (`claude -p --output-format stream-json --verbose` or `codex exec --json`).
+2. The harness writes one JSON object per line to stdout as events occur.
+3. Switchboard reads stdout line-by-line, parses each line as one event, dispatches to the normalized event stream.
+4. The process exits or emits its terminal event and the stream ends.
+
+Standard Unix pipe-and-readline. **No file-watching required for the basic case.**
+
+### Granularity: per-event, not per-token
+
+Both harnesses emit events at **content-block granularity**, not character-by-character. When Claude Code generates a `thinking` block, you get one event for the whole block; when it generates a `tool_use`, one event; when it generates the final text, one event. Codex is the same — one `item.completed` per `agent_message` or `command_execution`.
+
+The events do arrive in real time, not buffered to the end — during the file-read probe, we observed the thinking → tool_use → tool_result → final text events stream in over a few seconds. So the user gets visible feedback throughout, even though each chunk is a whole content block rather than a stream of tokens.
+
+### Token-by-token streaming (Claude Code only, untested)
+
+Claude Code's `--include-partial-messages` flag (only works with `-p` and `--output-format=stream-json`) emits partial message chunks as they arrive — true token-level streaming. We did not probe this; the v1 design assumes content-block granularity is sufficient.
+
+Codex has no equivalent flag observed. For Codex, content-block streaming is the ceiling.
+
+For v1, content-block streaming is almost certainly enough — text appears as the model generates it; the user sees progress. Token-by-token is a polish item if the typing animation feels too chunky.
+
+### Terminal event is the stop signal
+
+Do not try to detect end-of-turn by absence of events. Wait for the explicit terminal event:
+
+- Claude Code: `result` (always — check `is_error` for success vs failure).
+- Codex: `turn.completed` (success) or `turn.failed` (error).
+
+Process exit also signals terminal-or-crash; useful as an out-of-band cross-check.
+
+### When file-watching enters the picture (Codex only)
+
+The Codex `--json` stream is a deliberately minimal subset of what gets recorded in the session file (`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`). The session file carries extras the stream doesn't: rate limits, `model_context_window`, full reasoning blocks (encrypted), Codex's internal developer messages.
+
+If Switchboard's Codex adapter wants those fields, it can **read the session file on `turn.completed`** to enrich the normalized event with the missing data. Two notes:
+
+- This is a **read-after-completion** pattern, not a **tail-follow** pattern. Much simpler — no file-watcher infrastructure, just an `fs.readFile` after the terminal event.
+- Claude Code does not need this — its stream and session file carry roughly the same information.
+
+Tracked under open question 10.15 in the plan.
+
 ## Stop detection
 
 Both harnesses provide a single, definitive end-of-turn event, but Codex has a separate failure terminus:

@@ -41,7 +41,7 @@ This orchestration model has a useful side effect for prompt management. Because
 |---|---|
 | **Project** | A workspace containing a group of agents working toward a shared goal. Persistent, named, and bound to a working directory (typically a git repo). Project-specific config, patterns, and local prompts live under `<project>/.switchboard/` (see directory layout below). |
 | **Agent** | A Claude Code or Codex session within a project, with a user-assigned name. Each agent has a persistent harness session ID under the hood. |
-| **Primitive** | An atomic operation Switchboard provides for a pattern to compose: spawn agent, send message, auto-forward output, fan-in with template, pause for user input, save/invoke pattern. Six exist in v1; see §4. |
+| **Primitive** | An atomic operation Switchboard provides for a pattern to compose: spawn agent, send message, auto-forward output, fan-in with template, pause for user input, iterate over a list, save/invoke pattern. Seven exist in v1; see §4. |
 | **Pattern** | A named, parameterized composition of primitives — for example "fan-out review and aggregate." Defined as a YAML file under `<project>/.switchboard/patterns/`. Invoked by name with arguments. |
 | **Prompt template** | A named prompt definition resolved by ID at routing time. Used as message content (sent to an agent) or as a wrapper applied around aggregated outputs before forwarding (used in fan-in; see §4 Primitive 4). |
 | **Prompt provider** | A source of prompts Switchboard resolves IDs against. Two implementations ship in v1: `local` (file store) and any registered MCP-server provider. Addressed by prefix (e.g. `local:code-review`, `tiddly:code-review`). See §6. |
@@ -69,7 +69,7 @@ State is kept project-local rather than in a user-global registry so that openin
 
 ## 4. Functional primitives
 
-These six primitives cover everything Switchboard needs to do at the functional level. Patterns compose them.
+These seven primitives cover everything Switchboard needs to do at the functional level. Patterns compose them.
 
 ### Primitive 1 — Spawn an agent
 
@@ -124,7 +124,27 @@ When the pattern reaches this step, Switchboard fires the OS-native notification
 
 This makes the human-in-the-loop framing explicit at the pattern level, not just implicit at the pattern's end: a pattern author can encode "do these autonomous steps, then pause for me to weigh in, then continue" without forcing the user to remember to manually trigger the next phase.
 
-### Primitive 6 — Save and invoke a reusable pattern
+### Primitive 6 — Iterate over a list
+
+Repeat a sub-sequence of pattern steps once for each item in a list supplied at invocation time. The pattern step specifies:
+
+- The iteration variable name (e.g., `milestone`, `task`, `target`).
+- The input list to iterate over (a pattern input, e.g., `{{ milestones }}`, supplied by the user at invocation).
+- The sub-sequence of steps to run per iteration. Steps inside the loop body use the existing primitives (send, auto-forward, fan-in, pause for user input).
+
+The iteration variable is bound for each iteration's body and available in template substitution (e.g., `prompt: "{{ execute_plan_prompt }}", context: "milestone {{ milestone }}"`).
+
+Used for milestone-based work, per-target processing, or any "do this whole sub-workflow once per item in a list" shape — for example, a plan-then-implement-and-review workflow that should run once per milestone in an implementation plan.
+
+**Deliberate v1 scope:**
+
+- **Bounded over a list only.** No "iterate until condition X" — that requires conditionals (deferred to v2; see §11).
+- **Failure halts the whole pattern.** A step failure inside iteration N halts the pattern; the user resolves it (retry, abandon) just like any other step failure. No "skip to next iteration on failure."
+- **No cross-iteration state.** Each iteration is independent. `{{ user_input }}` from a pause-for-user-input step in iteration 2 doesn't see iteration 1's input. This keeps scoping rules simple.
+- **No nested loops in v1.** Outer-only iteration. Nested iteration is a v2+ consideration.
+- **Lists are static, supplied at invocation time.** The list isn't computed from a prior step's agent output — that opens dynamic-allocation questions out of scope for v1.
+
+### Primitive 7 — Save and invoke a reusable pattern
 
 A pattern is a named, parameterized composition of the other primitives, defined as a YAML file in the project directory. Invoking a pattern fills in its parameters and runs it.
 
@@ -154,7 +174,7 @@ steps:
 
 When invoked, Switchboard prompts the user for each input and then executes the steps.
 
-**Note on the example above:** the YAML is illustrative — it shows intent (composable steps with templated inputs, fan-out and fan-in expressed as data, named template variables for fan-in responses) without committing to the exact syntax. The schema, keywords, escape hatches, error handling, and template-function surface (e.g., what `responses_from(...)` actually looks like) need careful design at implementation time. See open question 5.1. The `wait_for_all` step is the wait phase of Primitive 4 (fan-in with template wrapping) made explicit in YAML; it is not a seventh primitive.
+**Note on the example above:** the YAML is illustrative — it shows intent (composable steps with templated inputs, fan-out and fan-in expressed as data, named template variables for fan-in responses) without committing to the exact syntax. The schema, keywords, escape hatches, error handling, and template-function surface (e.g., what `responses_from(...)` actually looks like) need careful design at implementation time. See open question 5.1. The `wait_for_all` step is the wait phase of Primitive 4 (fan-in with template wrapping) made explicit in YAML; it is not a separate primitive.
 
 ## 5. Patterns
 
@@ -378,7 +398,7 @@ A pattern is invoked by name. Switchboard prompts for the pattern's inputs (whic
 
 All participating agents stay simultaneously visible in their panes throughout pattern execution; status indicators show which are still running, waiting, or completed. The user can collapse background agents to focus on a specific one, or expand them all to watch the work in parallel. Pattern execution is independent of which pane has focus — agents continue running in the background regardless. When the pattern completes (all turns it initiated have reached a terminal state), the user is notified via OS-native notification (per §10 Form factor).
 
-A **pattern-progress surface** (shape TBD — status row in the project header, side panel, or modal) shows the active pattern's name, current step, total steps, and per-step status. When a pattern is paused on Primitive 5 (waiting for user input), the surface shows "step N of M — waiting for your input." On return after walk-away, this is the first thing the user sees: any pattern that was interrupted is surfaced as "interrupted at step N" with options to retry or abandon (see "Walking away" below).
+A **pattern-progress surface** (shape TBD — status row in the project header, side panel, or modal) shows the active pattern's name, current step, total steps, and per-step status. When a pattern is paused on Primitive 5 (waiting for user input), the surface shows "step N of M — waiting for your input." For patterns using Primitive 6 (iterate over a list), the surface shows the iteration dimension as well, in the user's own vocabulary — e.g., "iteration 2 of 3 (milestone = "implement-handlers"), step 3 of 8" — using the loop variable name and value the pattern declared. On return after walk-away, this is the first thing the user sees: any pattern that was interrupted is surfaced with the same step (and iteration) detail and options to retry or abandon (see "Walking away" below).
 
 ### Agent contention
 
@@ -411,7 +431,7 @@ Patterns run inside the Switchboard backend (the Rust core; see §10 Form factor
 - **Close the window** (X button): hides the app to the system tray (or dock on macOS). The backend stays up; the pattern continues. The user can reopen the window from the tray icon to check on progress. On Linux desktops without tray support (per §10), Close-the-window quits the app instead of hiding to tray; user is prompted to confirm cancellation of any in-flight patterns first.
 - **Quit the app explicitly** (cmd-Q, tray-menu Quit): stops the backend. If any patterns are in progress, Switchboard prompts the user to confirm and then cancels them cleanly (see "Cancelling a pattern or turn" below).
 - **Machine sleep**: backend is suspended with the OS. In-flight harness calls may time out across long sleeps; on wake Switchboard surfaces any failed turns and lets the user retry. Patterns themselves don't auto-resume mid-turn.
-- **Switchboard crash or OS reboot**: harness subprocesses die with Switchboard's process tree. On next start, any pattern that was in flight is surfaced (via the pattern-progress surface) as "interrupted at step N" — the last step boundary that was successfully checkpointed. The user chooses retry-from-step-N or abandon. Mid-step recovery (resuming an interrupted in-flight turn) is out of scope; see 10.3.
+- **Switchboard crash or OS reboot**: harness subprocesses die with Switchboard's process tree. On next start, any pattern that was in flight is surfaced (via the pattern-progress surface) as "interrupted at step N" — the last step boundary that was successfully checkpointed. For iterated patterns (Primitive 6), the checkpoint also captures the iteration index and value (e.g., "interrupted at iteration 2, step 3"). The user chooses retry-from-step-N or abandon. Mid-step recovery (resuming an interrupted in-flight turn) is out of scope; see 10.3.
 
 When the user returns, Switchboard shows the state of any patterns that completed, are in progress, paused for user input, were cancelled, or were interrupted by a crash.
 
@@ -688,7 +708,7 @@ Decisions explicitly **not made** in this document, to be addressed in later doc
 - **Cross-session persistent agent memory.** Architecture should not preclude; not implemented in v1.
 - **Global / cross-project agent templates.** Agents in v1 are project-scoped. A future direction lets users define reusable agent templates (personas) that can be invoked from any project — for example, a personal "writing editor" persona that knows your voice and applies across blog posts, docs, and emails, or a "domain expert" persona carrying institutional knowledge (a regulatory framework, your team's architecture conventions, a research methodology) reusable in any project that touches the area. Optionally surfaced via semantic search over the project context to suggest which template fits. Distinct from "Cross-session persistent agent memory" above (memory is what an agent remembers across sessions; global templates are which agents are available to spawn).
 - **Multi-project workflows.** Each project is independent in v1. (Related to "Global / cross-project agent templates" above — both concern workflows that span more than one project.)
-- **Pattern conditionals and branching.** v1 patterns are linear. Race semantics (`wait_for_first` / first-of-N completion) and iterative-until-condition workflows are deferred along with conditionals.
+- **Pattern conditionals and branching.** v1 patterns are linear except for bounded iteration over a static list (Primitive 6). Conditional steps (`if reviewer flagged a bug, halt`), iterative-until-condition workflows (`iterate until tests pass`), race semantics (`wait_for_first` / first-of-N completion), nested loops, and dynamic iteration lists (computed from a prior step's output) are all deferred to v2+.
 - **Per-pattern MCP tool selection / allowlists.** The v1 prompt/tool boundary (prompts normalized at Switchboard, tools per-agent) is a v1 simplification, not a permanent commitment. A future direction: pattern steps could declare their required MCP tools, and Switchboard could constrain the harness for that step's duration.
 - **Compaction event normalization.** Whether either harness emits a structured event when auto-compaction fires is unprobed. If they do, `Compacted { agent, before_tokens, after_tokens? }` joins the normalized vocabulary; if not, the §9 vocabulary accepts that gap and the UI works from the context-utilization signal alone.
 

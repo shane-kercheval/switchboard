@@ -59,7 +59,7 @@ TurnEnd { agent, stop_reason, usage: { input, output, cached, reasoning, context
 RateLimitEvent { agent, info }
 ```
 
-Each harness adapter translates its native events into this shape. Switchboard's pattern engine, UI, and persistence layer consume the normalized form.
+Each harness adapter translates its native events into this shape. Switchboard's workflow engine, UI, and persistence layer consume the normalized form.
 
 ## Streaming mechanism
 

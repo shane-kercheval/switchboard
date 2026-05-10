@@ -2,9 +2,9 @@
 
 ![Switchboard](docs/images/banner.png)
 
-Human-directed orchestrator for AI coding agents.
+Switchboard is a human-directed orchestrator for AI coding agents — a desktop application you run alongside your existing Claude Code and Codex setup. 
 
-Switchboard lets you spawn multiple Claude Code and Codex sessions in a single project, route messages between them, and define reusable patterns for common multi-agent workflows like second-opinion code review, plan-and-implement, and parallel-solution adjudication.
+Switchboard lets you spawn multiple Claude Code and Codex sessions in a single project, route messages between them, and define reusable workflows for common multi-agent operations like second-opinion code review, plan-and-implement, and parallel-solution adjudication.
 
 It's built for anyone who wants explicit, human-in-the-loop control over multi-agent workflows — not an opinionated SDLC engine, not a full agent replacement, just the coordination layer between agents you're already using.
 
@@ -28,16 +28,16 @@ There is also a quieter benefit: because Switchboard resolves prompts itself and
 
 - **Project**: a workspace containing related agents working toward a shared goal (a feature, a refactor, a document).
 - **Agent**: a Claude Code or Codex session, named within a project.
-- **Pattern**: a reusable, parameterized routing template — for example "fan-out review and aggregate" — defined as a YAML file and invoked by name.
+- **Workflow**: a reusable, parameterized routing template — for example "fan-out review and aggregate" — defined as a YAML file and invoked by name.
 - **Routing**: message passing between agents, optionally wrapped in a prompt template, with support for fan-out (one to many) and fan-in (many to one).
 
 ## Non-goals
 
 - Replacing the Claude Code or Codex harness. Switchboard drives them; it doesn't reimplement them.
-- Prescribing a software development lifecycle. Patterns are user-defined; Switchboard ships defaults but doesn't impose process.
+- Prescribing a software development lifecycle. Workflows are user-defined; Switchboard ships defaults but doesn't impose process.
 - Managing git, CI, or PR workflows. Out of scope.
 - Cross-session persistent agent memory. Possibly a future addition; not in scope for v1.
-- A hosted / SaaS service. Switchboard runs locally on your machine. A future hosted service may exist for cross-machine sync of patterns and prompts; that is not v1.
+- A hosted / SaaS service. Switchboard runs locally on your machine. A future hosted service may exist for cross-machine sync of workflows and prompts; that is not v1.
 
 ## Design and discussion
 

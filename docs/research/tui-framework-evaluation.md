@@ -40,7 +40,7 @@ Performance differences between the frameworks are immaterial for Switchboard �
 - **Streaming-from-stdin** maps naturally onto Textual's async event loop. Every `await` we'd write fits the harness-stream consumption model (read line, parse, dispatch normalized event).
 - **Mouse support and modal-dialog polish** are most refined; matters for the "feels like an app" experience that broadens our audience beyond hardcore terminal users.
 - **Best precedents** for our shape of app: Posting (HTTP client) and Toolong (log viewer) demonstrate "this could be a desktop app but happens to be in the terminal."
-- **Python ecosystem alignment** — same language for harness adapters, MCP client, pattern parser, and UI. One language, one toolchain, one debugger, one packaging story.
+- **Python ecosystem alignment** — same language for harness adapters, MCP client, workflow parser, and UI. One language, one toolchain, one debugger, one packaging story.
 
 ## Why distribution friction is acceptable
 

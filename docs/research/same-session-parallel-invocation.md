@@ -2,11 +2,11 @@
 
 **Captured:** 2026-05-10
 **Versions:** Claude Code 2.1.138, Codex CLI 0.130.0
-**Affects system-design sections:** §7 (Walking away / pattern execution), §9 (Process model), §12 open question 10.2 (concurrent agent use across patterns).
+**Affects system-design sections:** §7 (Walking away / workflow execution), §9 (Process model), §12 open question 10.2 (concurrent agent use across workflows).
 
 ## Question
 
-When Switchboard invokes a harness twice in parallel against the **same session ID** — e.g., a pattern step targeting agent X is in flight when a second pattern step (or manual user action) also targets X — what happens? Does the harness error? Block? Corrupt the session file?
+When Switchboard invokes a harness twice in parallel against the **same session ID** — e.g., a workflow step targeting agent X is in flight when a second workflow step (or manual user action) also targets X — what happens? Does the harness error? Block? Corrupt the session file?
 
 (Distinct from the §9 concurrency probe, which tested parallel `claude -p` against *different* session IDs and confirmed no contention.)
 
@@ -46,28 +46,28 @@ For each harness:
    - Claude Code: tree-with-orphan-branch. Recoverable in principle; invisible by default.
    - Codex: flat interleaved transcript. Two threads merged into one; the conflation is permanent and invisible.
 3. **Switchboard MUST enforce single-in-flight-turn-per-agent at the application layer.** The harnesses will not protect us. A dispatcher that tracks each agent's "in-flight turn" status and refuses or queues subsequent dispatches against the same agent is the correct place for this rule.
-4. **No reservation needed across pattern steps.** Whether a future pattern step "owns" an agent is irrelevant — the rule is purely "is this agent currently mid-turn?" If yes, refuse or queue. This composes cleanly with both autonomous pattern execution and ad-hoc manual sends, and avoids surprising "agent locked" UX.
-5. **UI gating is the natural enforcement point.** A user in the UI can't manually dispatch to an agent that's currently busy because the input affordance is disabled (or the dispatch shows a clear "agent busy" error). Pattern-step dispatch goes through the same dispatcher and gets the same gate. The collision scenario simply can't occur if the dispatcher is the single chokepoint.
+4. **No reservation needed across workflow steps.** Whether a future workflow step "owns" an agent is irrelevant — the rule is purely "is this agent currently mid-turn?" If yes, refuse or queue. This composes cleanly with both autonomous workflow execution and ad-hoc manual sends, and avoids surprising "agent locked" UX.
+5. **UI gating is the natural enforcement point.** A user in the UI can't manually dispatch to an agent that's currently busy because the input affordance is disabled (or the dispatch shows a clear "agent busy" error). Workflow-step dispatch goes through the same dispatcher and gets the same gate. The collision scenario simply can't occur if the dispatcher is the single chokepoint.
 
 ## Resolution to system-design open question 10.2
 
 **Working assumption** (now grounded in the probe):
 
-> Switchboard enforces one in-flight turn per agent at the application layer. A dispatch (whether from a pattern step or a manual user send) against an agent that's already mid-turn refuses with a clear error ("agent X is busy, currently running step N of pattern P"). The user can switch focus to inspect the busy agent. Queueing is not implemented in v1; refuse-on-collision is the v1 default.
+> Switchboard enforces one in-flight turn per agent at the application layer. A dispatch (whether from a workflow step or a manual user send) against an agent that's already mid-turn refuses with a clear error ("agent X is busy, currently running step N of workflow P"). The user can switch focus to inspect the busy agent. Queueing is not implemented in v1; refuse-on-collision is the v1 default.
 
 This works because:
-- Patterns within a single session are serialized by the orchestrator; pattern-internal collisions don't occur by construction.
-- Cross-pattern collisions (two patterns invoked concurrently both targeting agent X) are caught by the dispatcher.
-- Manual-during-pattern collisions (user typing to X while pattern uses X) are caught by the dispatcher.
+- Workflows within a single session are serialized by the orchestrator; workflow-internal collisions don't occur by construction.
+- Cross-workflow collisions (two workflows invoked concurrently both targeting agent X) are caught by the dispatcher.
+- Manual-during-workflow collisions (user typing to X while workflow uses X) are caught by the dispatcher.
 
-Two patterns invoked simultaneously that target *disjoint* agents both run normally. The constraint is per-agent, not per-pattern.
+Two workflows invoked simultaneously that target *disjoint* agents both run normally. The constraint is per-agent, not per-workflow.
 
 ## Enforcement design
 
 The probe established that the harnesses won't reject parallel same-session invocation, so Switchboard's enforcement lives in the application layer. The design:
 
-1. **Single dispatcher chokepoint.** All turn dispatches — pattern steps, manual user sends from the UI, anything that talks to a harness — go through one function in the Rust core. No code path bypasses it. The dispatcher is the only place that knows how to spawn `claude -p` / `codex exec`, so any new send surface has to call into it.
-2. **Per-agent in-memory state.** A `HashMap<AgentId, AgentState>` behind a Tokio `Mutex` (or `RwLock`) holds each agent's status: `Idle` or `InFlight { pattern_id, step_idx, started_at }`. Pre-flight check on dispatch: if non-idle, refuse with a structured error the UI renders as "agent X is busy, currently running step N of pattern P." Flip back to `Idle` on the terminal event (`result` / `turn.completed` / `turn.failed`) or when the cancellation path runs.
+1. **Single dispatcher chokepoint.** All turn dispatches — workflow steps, manual user sends from the UI, anything that talks to a harness — go through one function in the Rust core. No code path bypasses it. The dispatcher is the only place that knows how to spawn `claude -p` / `codex exec`, so any new send surface has to call into it.
+2. **Per-agent in-memory state.** A `HashMap<AgentId, AgentState>` behind a Tokio `Mutex` (or `RwLock`) holds each agent's status: `Idle` or `InFlight { workflow_id, step_idx, started_at }`. Pre-flight check on dispatch: if non-idle, refuse with a structured error the UI renders as "agent X is busy, currently running step N of workflow P." Flip back to `Idle` on the terminal event (`result` / `turn.completed` / `turn.failed`) or when the cancellation path runs.
 3. **Project-level instance lock.** Take an exclusive `flock` on `<project>/.switchboard/state/instance.lock` at project open. A second Switchboard window trying to open the same project sees "this project is open in another Switchboard window" and refuses. ~10 lines of Rust; closes the multi-window-same-project hole that in-memory state alone can't cover.
 4. **Crash recovery: none needed.** Harness subprocesses are spawned in Switchboard's process tree (per §9 Process model — own process group, but parented to Switchboard). When Switchboard exits — clean or crash — those subprocesses die. On next start, every agent is legitimately `Idle`; there is no in-flight state to reconcile.
 
@@ -75,7 +75,7 @@ The probe established that the harnesses won't reject parallel same-session invo
 
 - **On-disk per-agent lock files.** Stale-after-crash failure mode; OS-specific edge cases; redundant with the in-memory dispatcher gate.
 - **Harness-level locks (lsof, fcntl on the session JSONL).** Fragile, OS-dependent, and the dispatcher gate makes them unnecessary.
-- **Cross-pattern reservations** (e.g., "pattern A reserves agent X for steps 1-5"). The per-agent in-flight check is sufficient: if pattern A holds X mid-turn-of-step-3 and pattern B's step-1 wants X, B's step-1 is refused at dispatch time. Reservations would add lifecycle complexity (release-on-error, release-on-cancel, partial-reservation-on-skip) for no behavioral gain.
+- **Cross-workflow reservations** (e.g., "workflow A reserves agent X for steps 1-5"). The per-agent in-flight check is sufficient: if workflow A holds X mid-turn-of-step-3 and workflow B's step-1 wants X, B's step-1 is refused at dispatch time. Reservations would add lifecycle complexity (release-on-error, release-on-cancel, partial-reservation-on-skip) for no behavioral gain.
 
 ## What this does **not** answer
 

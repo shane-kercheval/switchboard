@@ -2,9 +2,11 @@
 
 ## 1. What Switchboard is
 
-Switchboard is a **human-directed orchestrator for AI coding agents** — a desktop application you run alongside your existing Claude Code and Codex setup. It lets you spawn multiple agent sessions within a project, route messages between them, and define reusable patterns for common multi-agent workflows like second-opinion code review, plan-and-implement, and parallel-solution adjudication.
+Switchboard is a **human-directed orchestrator for AI coding agents** — a desktop application you run alongside your existing Claude Code and Codex setup. It lets you spawn multiple agent sessions within a project, route messages between them, and define reusable workflows for common multi-agent operations like second-opinion code review, plan-and-implement, and parallel-solution adjudication.
 
-More precisely, it is a **workflow engine for primitives, not for processes**. It codifies the *shape* of common multi-agent operations (fan-out, fan-in with template wrapping, sequential handoff) so they can be invoked with one command instead of manually copy-pasted. It does not impose any larger structure on top of those primitives — there is no built-in concept of "plan phase" or "review phase," no SDLC walkthrough, no opinionated process. The user composes patterns ad hoc and saves the ones they reuse.
+More precisely, it is a **workflow engine for primitives, not for processes**. It codifies the *shape* of common multi-agent operations (fan-out, fan-in with template wrapping, sequential handoff, pause-for-user-input, iteration) so they can be invoked with one command instead of manually copy-pasted. It does not impose any larger structure on top of those primitives — there is no built-in concept of "plan phase" or "review phase," no SDLC walkthrough, no opinionated process. The user composes workflows ad hoc and saves the ones they reuse.
+
+Workflows are DAG-shaped (fan-out runs nodes in parallel; fan-in synchronizes them; iteration replays a sub-DAG bounded by a static list). Switchboard is **not** a workflow engine in the Airflow / Temporal / Step-Functions sense: no scheduler, no operator dashboards, no retry-policy framework, no DAG visualization in v1, no arbitrary inter-step dependency declarations. Workflow files are authored as a YAML step sequence; the runtime is a step-based interpreter that knows how to dispatch in parallel and synchronize, not a general DAG executor. (A graph view of in-flight workflow execution is a plausible v2+ direction; see §11.)
 
 The human stays in the loop where judgment matters (deciding what to route, when to revise, when to proceed) and is removed from the loop where mechanics waste time (copy-paste, template application, babysitting parallel agents).
 
@@ -16,33 +18,33 @@ This orchestration model has a useful side effect for prompt management. Because
 
 - **Multi-agent spawn and management.** Multiple Claude Code and Codex agent instances run in a single project with user-assigned names.
 - **Routing primitives.** Explicit fan-out (one source → many agents, where the source is either a human-composed message or another agent's output), fan-in (many agents → one recipient), and sequential handoff, with optional prompt-template wrapping.
-- **Reusable, parameterized patterns.** Patterns are files that compose primitives — invoked by name, parameterized at invocation time.
-- **Agent-friendly authoring.** Pattern files and other authorable artifacts (local prompts, project setup) are documented in instruction docs under `docs/agent-instructions/` designed for AI coding agents to consume. The intended authoring path is to point your existing Claude Code or Codex agent at the relevant instruction file and ask it to generate the artifact from a description, rather than learning the DSL by hand.
-- **Autonomous pattern execution.** A pattern continues to run after launch so the user can switch focus to other work without babysitting it (within the lifetime of the Switchboard host process; see §7).
+- **Reusable, parameterized workflows.** Workflows are files that compose primitives — invoked by name, parameterized at invocation time.
+- **Agent-friendly authoring.** Workflow files and other authorable artifacts (local prompts, project setup) are documented in instruction docs under `docs/agent-instructions/` designed for AI coding agents to consume. The intended authoring path is to point your existing Claude Code or Codex agent at the relevant instruction file and ask it to generate the artifact from a description, rather than learning the DSL by hand.
+- **Autonomous workflow execution.** A workflow continues to run after launch so the user can switch focus to other work without babysitting it (within the lifetime of the Switchboard host process; see §7).
 - **Configurable prompt providers.** Apply prompt templates from one or more configured prompt providers during routing, with parameterized substitution. Providers include a built-in local file store (prompts authored as files inside the project or the user's Switchboard config directory) and any MCP server that exposes prompts (for example [Tiddly](https://tiddly.me)). Provider configuration is centralized in Switchboard, so a user's prompt library works identically across Claude Code, Codex, and future agent backends without per-agent MCP setup. Does not extend to MCP *tools* or to model-discovered *skills*, which remain per-agent concerns.
-- **Zero-setup onboarding.** Switchboard ships with example prompts and example patterns in the local store so a new user can invoke a useful pattern within minutes of installation, without configuring an MCP server.
+- **Zero-setup onboarding.** Switchboard ships with example prompts and example workflows in the local store so a new user can invoke a useful workflow within minutes of installation, without configuring an MCP server.
 - **Full access to the underlying harness.** Switchboard drives Claude Code and Codex; it doesn't replace them.
-- **Shareable, versioned configuration.** Patterns, local prompts, and project configuration are file-based and live inside the project's `.switchboard/` directory, so they version, diff, review, and share via the user's normal git workflow.
+- **Shareable, versioned configuration.** Workflows, local prompts, and project configuration are file-based and live inside the project's `.switchboard/` directory, so they version, diff, review, and share via the user's normal git workflow.
 
 ### Non-goals
 
 - **Replacing the Claude Code or Codex harness.** Compaction, tool rendering, permission policy, plan mode, hooks, and skills all live in the harnesses. Switchboard drives them via their non-interactive modes (`claude -p`, `codex exec`).
 - **Prescribing a software development lifecycle.** Switchboard does not know about "planner" or "reviewer" as roles with semantics. Roles are labels the user assigns; the tool is agnostic.
-- **Managing git, CI, or PR workflows.** Out of scope. Patterns can read agent outputs and route them; they don't run `git commit`, open PRs, or integrate with CI.
+- **Managing git, CI, or PR workflows.** Out of scope. Workflows can read agent outputs and route them; they don't run `git commit`, open PRs, or integrate with CI.
 - **Cross-session persistent agent memory** (vector DBs, RAG over prior sessions). Considered as a future feature; the v1 architecture should not preclude it but does not implement it.
-- **Visual / GUI pattern editor.** Authoring is file-based, supported by agent-consumable instruction docs (see goals — "Agent-friendly authoring"). A visual or form-based pattern editor is not planned.
-- **Multi-user collaboration.** Single-developer tool. Sharing patterns and configurations via git is supported as a side effect of file-based config, but there is no real-time collaboration model.
-- **Hosted / SaaS service.** Switchboard runs locally on the developer's machine. There is no managed cloud version, no shared backend, no remote agent execution. A future hosted service may eventually provide cross-machine sync of patterns, prompts, and project configuration; that is out of scope for v1.
+- **Visual / GUI workflow editor.** Authoring is file-based for V1, supported by agent-consumable instruction docs (see goals — "Agent-friendly authoring"). A visual or form-based workflow editor is not planned until later versions.
+- **Multi-user collaboration.** Single-developer tool. Sharing workflows and configurations via git is supported as a side effect of file-based config, but there is no real-time collaboration model.
+- **Hosted / SaaS service.** Switchboard runs locally on the developer's machine. There is no managed cloud version, no shared backend, no remote agent execution. A future hosted service may eventually provide cross-machine sync of workflows, prompts, and project configuration; that is out of scope for v1.
 - **Arbitrary harness slash-command passthrough.** v1 does not support invoking arbitrary harness slash commands as input (`/cost`, `/model`, `/skill-name`, etc.). This is an upstream `claude -p` limitation; specific commands are worked around individually (see §9). Tracked in §12 (10.10).
 
 ## 3. Core concepts
 
 | Concept | Definition |
 |---|---|
-| **Project** | A workspace containing a group of agents working toward a shared goal. Persistent, named, and bound to a working directory (typically a git repo). Project-specific config, patterns, and local prompts live under `<project>/.switchboard/` (see directory layout below). |
+| **Project** | A workspace containing a group of agents working toward a shared goal. Persistent, named, and bound to a working directory (typically a git repo). Project-specific config, workflows, and local prompts live under `<project>/.switchboard/` (see directory layout below). |
 | **Agent** | A Claude Code or Codex session within a project, with a user-assigned name. Each agent has a persistent harness session ID under the hood. |
-| **Primitive** | An atomic operation Switchboard provides for a pattern to compose: spawn agent, send message, auto-forward output, fan-in with template, pause for user input, iterate over a list, save/invoke pattern. Seven exist in v1; see §4. |
-| **Pattern** | A named, parameterized composition of primitives — for example "fan-out review and aggregate." Defined as a YAML file under `<project>/.switchboard/patterns/`. Invoked by name with arguments. |
+| **Primitive** | An atomic operation Switchboard provides for a workflow to compose: spawn agent, send message, auto-forward output, fan-in with template, pause for user input, iterate over a list, save/invoke workflow. Seven exist in v1; see §4. |
+| **Workflow** | A named, parameterized composition of primitives — for example "fan-out review and aggregate." Defined as a YAML file under `<project>/.switchboard/workflows/`. Invoked by name with arguments. |
 | **Prompt template** | A named prompt definition resolved by ID at routing time. Used as message content (sent to an agent) or as a wrapper applied around aggregated outputs before forwarding (used in fan-in; see §4 Primitive 4). |
 | **Prompt provider** | A source of prompts Switchboard resolves IDs against. Two implementations ship in v1: `local` (file store) and any registered MCP-server provider. Addressed by prefix (e.g. `local:code-review`, `tiddly:code-review`). See §6. |
 | **Routing** | Message passing between agents. Includes fan-out (one source, many recipients), fan-in (many sources, one recipient, with template wrapping), and sequential handoff. |
@@ -58,18 +60,18 @@ Each project's Switchboard-managed state lives in a `.switchboard/` directory at
 <project>/
 └── .switchboard/
     ├── config.yaml         # project config (registered MCP providers, harness flags, etc.)
-    ├── patterns/           # pattern definitions (YAML)
+    ├── workflows/           # workflow definitions (YAML)
     ├── prompts/            # local prompts (markdown body + YAML frontmatter)
     └── state/              # runtime state (agent registry, harness session IDs)
 ```
 
-`config.yaml`, `patterns/`, and `prompts/` are intended to be checked into git and shared. `state/` is local-machine runtime data and should be `.gitignore`d.
+`config.yaml`, `workflows/`, and `prompts/` are intended to be checked into git and shared. `state/` is local-machine runtime data and should be `.gitignore`d.
 
 State is kept project-local rather than in a user-global registry so that opening the project from a different machine surfaces "no state yet" explicitly rather than silently dereferencing stale registry entries.
 
 ## 4. Functional primitives
 
-These seven primitives cover everything Switchboard needs to do at the functional level. Patterns compose them.
+These seven primitives cover everything Switchboard needs to do at the functional level. Workflows compose them.
 
 ### Primitive 1 — Spawn an agent
 
@@ -82,7 +84,7 @@ Create a new agent within a project. User specifies:
 
 Agent names are restricted to `[A-Za-z0-9_-]+` at creation; this avoids ambiguity when names appear as template variable identifiers (Primitive 4) or in file paths.
 
-The harness session ID is captured and persisted. The agent is now part of the project and can receive messages and participate in patterns.
+The harness session ID is captured and persisted. The agent is now part of the project and can receive messages and participate in workflows.
 
 ### Primitive 2 — Send a message to one or more agents
 
@@ -110,26 +112,26 @@ Configure: when all of agents A, B, ..., N finish their current turns, combine t
 
 The wrapping template has access to each agent's response by name (or by position): `{{ responses.reviewer_claude }}`, `{{ responses.reviewer_codex }}`, etc. Agent names containing hyphens are normalized to underscores in template contexts (so an agent named `reviewer-claude` is accessed as `responses.reviewer_claude`). Templates may use Jinja-style for-loops to handle variable numbers of sources.
 
-This is the most behaviorally-rich primitive. It implies waiting on multiple agents, accumulating their final responses, applying a template, and dispatching. Failure handling (one agent crashes mid-pattern) is covered in section 7.
+This is the most behaviorally-rich primitive. It implies waiting on multiple agents, accumulating their final responses, applying a template, and dispatching. Failure handling (one agent crashes mid-workflow) is covered in section 7.
 
 ### Primitive 5 — Pause for user input
 
-Pause pattern execution and wait for the user to respond. The pattern step specifies:
+Pause workflow execution and wait for the user to respond. The workflow step specifies:
 
 - Optional context message shown to the user (often a wrapping prompt referencing prior agent outputs — "here's what the reviewers said; what direction do you want to take?").
 - Optional pre-configured recipient — an agent that the user's response will be dispatched to in the next step. The user just types; they don't have to remember which agent the message goes to.
-- Whether the input is required (default: yes; the user choosing "abandon" cancels the pattern).
+- Whether the input is required (default: yes; the user choosing "abandon" cancels the workflow).
 
-When the pattern reaches this step, Switchboard fires the OS-native notification (per §10), suspends pattern execution, and surfaces the compose bar pre-targeted at the configured recipient. The user composes their response using the same compose-and-dispatch semantics as §7 (free-form text, optionally combining a prior agent's output, optionally wrapped in a prompt). Their input becomes available to subsequent steps as a template variable (`{{ user_input }}`) and is dispatched per the pattern's next step.
+When the workflow reaches this step, Switchboard fires the OS-native notification (per §10), suspends workflow execution, and surfaces the compose bar pre-targeted at the configured recipient. The user composes their response using the same compose-and-dispatch semantics as §7 (free-form text, optionally combining a prior agent's output, optionally wrapped in a prompt). Their input becomes available to subsequent steps as a template variable (`{{ user_input }}`) and is dispatched per the workflow's next step.
 
-This makes the human-in-the-loop framing explicit at the pattern level, not just implicit at the pattern's end: a pattern author can encode "do these autonomous steps, then pause for me to weigh in, then continue" without forcing the user to remember to manually trigger the next phase.
+This makes the human-in-the-loop framing explicit at the workflow level, not just implicit at the workflow's end: a workflow author can encode "do these autonomous steps, then pause for me to weigh in, then continue" without forcing the user to remember to manually trigger the next phase.
 
 ### Primitive 6 — Iterate over a list
 
-Repeat a sub-sequence of pattern steps once for each item in a list supplied at invocation time. The pattern step specifies:
+Repeat a sub-sequence of workflow steps once for each item in a list supplied at invocation time. The workflow step specifies:
 
 - The iteration variable name (e.g., `milestone`, `task`, `target`).
-- The input list to iterate over (a pattern input, e.g., `{{ milestones }}`, supplied by the user at invocation).
+- The input list to iterate over (a workflow input, e.g., `{{ milestones }}`, supplied by the user at invocation).
 - The sub-sequence of steps to run per iteration. Steps inside the loop body use the existing primitives (send, auto-forward, fan-in, pause for user input).
 
 The iteration variable is bound for each iteration's body and available in template substitution (e.g., `prompt: "{{ execute_plan_prompt }}", context: "milestone {{ milestone }}"`).
@@ -139,16 +141,16 @@ Used for milestone-based work, per-target processing, or any "do this whole sub-
 **Deliberate v1 scope:**
 
 - **Bounded over a list only.** No "iterate until condition X" — that requires conditionals (deferred to v2; see §11).
-- **Failure halts the whole pattern.** A step failure inside iteration N halts the pattern; the user resolves it (retry, abandon) just like any other step failure. No "skip to next iteration on failure."
+- **Failure halts the whole workflow.** A step failure inside iteration N halts the workflow; the user resolves it (retry, abandon) just like any other step failure. No "skip to next iteration on failure."
 - **No cross-iteration state.** Each iteration is independent. `{{ user_input }}` from a pause-for-user-input step in iteration 2 doesn't see iteration 1's input. This keeps scoping rules simple.
 - **No nested loops in v1.** Outer-only iteration. Nested iteration is a v2+ consideration.
 - **Lists are static, supplied at invocation time.** The list isn't computed from a prior step's agent output — that opens dynamic-allocation questions out of scope for v1.
 
-### Primitive 7 — Save and invoke a reusable pattern
+### Primitive 7 — Save and invoke a reusable workflow
 
-A pattern is a named, parameterized composition of the other primitives, defined as a YAML file in the project directory. Invoking a pattern fills in its parameters and runs it.
+A workflow is a named, parameterized composition of the other primitives, defined as a YAML file in the project directory. Invoking a workflow fills in its parameters and runs it.
 
-Pattern definition format (illustrative; exact schema TBD):
+Workflow definition format (illustrative; exact schema TBD):
 
 ```yaml
 name: review-and-aggregate
@@ -176,25 +178,33 @@ When invoked, Switchboard prompts the user for each input and then executes the 
 
 **Note on the example above:** the YAML is illustrative — it shows intent (composable steps with templated inputs, fan-out and fan-in expressed as data, named template variables for fan-in responses) without committing to the exact syntax. The schema, keywords, escape hatches, error handling, and template-function surface (e.g., what `responses_from(...)` actually looks like) need careful design at implementation time. See open question 5.1. The `wait_for_all` step is the wait phase of Primitive 4 (fan-in with template wrapping) made explicit in YAML; it is not a separate primitive.
 
-## 5. Patterns
+### Execution model: implicit DAGs
+
+The primitives compose into DAGs (directed acyclic graphs): fan-out runs nodes in parallel, fan-in synchronizes them, sequential steps sequence in order, and iteration replays a sub-DAG bounded by a static list. The runtime must therefore handle parallel dispatch within fan-out and proper synchronization within fan-in — not just walk the YAML top-to-bottom and serialize all dispatches.
+
+The DAG is conceptual, not declared. The runtime never sees explicit edges like "task A depends on task B" the way an Airflow DSL would express them. Instead, the graph emerges implicitly from which agents each step references — recipients of a `send` step, agents listed in a `wait_for_all`, agents whose outputs are template variables in a fan-in. The runtime can read off the parallelism and synchronization it needs from those references; it doesn't need a separate dependency declaration.
+
+A general-purpose DAG scheduler (topological sort over arbitrary node dependencies, dynamic scheduling) is **not** required for v1. A step-based interpreter that supports parallel dispatch within fan-out and proper synchronization within fan-in is sufficient for the seven primitives above. A general DAG model is a possible v2+ direction if workflows ever grow arbitrary inter-step dependencies.
+
+## 5. Workflows
 
 ### Authoring
 
-Patterns are authored as YAML files at `<project>/.switchboard/patterns/`. Because they live inside the project directory, they are naturally version-controlled along with the project itself — diffed, reviewed, and shared via the user's normal git workflow. There is no directory-picker step in Switchboard's UI; the location is conventional.
+Workflows are authored as YAML files at `<project>/.switchboard/workflows/`. Because they live inside the project directory, they are naturally version-controlled along with the project itself — diffed, reviewed, and shared via the user's normal git workflow. There is no directory-picker step in Switchboard's UI; the location is conventional.
 
-Authoring is intentionally file-based. The user edits patterns in whichever editor they prefer (Vim, VS Code, etc.); Switchboard's UI reads the files but does not include an editor of its own. The supported authoring path for new users is to point an existing Claude Code or Codex agent at `docs/agent-instructions/patterns.md` and have it generate a starter pattern from a description (per §2 "Agent-friendly authoring"). Hand-authoring against the DSL spec works too for power users.
+Authoring is intentionally file-based. The user edits workflows in whichever editor they prefer (Vim, VS Code, etc.); Switchboard's UI reads the files but does not include an editor of its own. The supported authoring path for new users is to point an existing Claude Code or Codex agent at `docs/agent-instructions/workflows.md` and have it generate a starter workflow from a description (per §2 "Agent-friendly authoring"). Hand-authoring against the DSL spec works too for power users.
 
-v1 ships with a small library of built-in patterns (review-and-aggregate, sequential handoff with template) as starting points; users can copy or fork these to author their own.
+v1 ships with a small library of built-in workflows (review-and-aggregate, sequential handoff with template) as starting points; users can copy or fork these to author their own.
 
-Users without an existing Claude Code or Codex installation outside Switchboard can use a Switchboard-spawned agent itself to author a pattern from the instruction docs — agents Switchboard manages are full Claude Code / Codex sessions and can read project files normally. Hand-authoring against the DSL spec also works for power users.
+Users without an existing Claude Code or Codex installation outside Switchboard can use a Switchboard-spawned agent itself to author a workflow from the instruction docs — agents Switchboard manages are full Claude Code / Codex sessions and can read project files normally. Hand-authoring against the DSL spec also works for power users.
 
-Pattern files are project-scoped only — there is no user-global pattern directory parallel to user-global prompts. Reuse across projects happens via copy or symlink. (Asymmetric with prompts on purpose: patterns tend to be project-shaped — they reference specific agent names and workflows — whereas prompts are more reusable as personal templates.)
+Workflow files are project-scoped only — there is no user-global workflow directory parallel to user-global prompts. Reuse across projects happens via copy or symlink. (Asymmetric with prompts on purpose: workflows tend to be project-shaped — they reference specific agent names and workflows — whereas prompts are more reusable as personal templates.)
 
 ## 6. Prompts and prompt providers
 
 > *Scope note: this section covers prompts only. Model-invoked MCP tools and Claude Code skills remain configured per-agent, not per-Switchboard. See "Cross-agent normalization" below for the boundary.*
 
-A **prompt** is a reusable, optionally parameterized text template — for example, "Review the diff focusing on `{{ focus }}`." Pattern files and slash commands reference prompts by ID. The *prompt text* lives in a **prompt provider**; the *workflow* lives in the pattern file. Switchboard reads pattern files, resolves prompt IDs to prompt content via the configured providers, and applies templates with substitution.
+A **prompt** is a reusable, optionally parameterized text template — for example, "Review the diff focusing on `{{ focus }}`." Workflow files and slash commands reference prompts by ID. The *prompt text* lives in a **prompt provider**; the *workflow* lives in the workflow file. Switchboard reads workflow files, resolves prompt IDs to prompt content via the configured providers, and applies templates with substitution.
 
 ### Providers
 
@@ -223,7 +233,7 @@ Please review the current uncommitted changes in this repository.
 For each issue, identify the file, the concern, and a suggested fix.
 ```
 
-Local prompts are authored file-first, the same as patterns: edit them in whichever editor you prefer (Vim, VS Code, etc.), optionally have your existing Claude Code or Codex agent generate a starter from `docs/agent-instructions/prompts.md`. Switchboard reads the files and surfaces them via slash-command autocomplete; in v1 it does not provide an in-app editor for prompts (see "Future direction: prompt library view" below for what changes in v2+).
+Local prompts are authored file-first, the same as workflows: edit them in whichever editor you prefer (Vim, VS Code, etc.), optionally have your existing Claude Code or Codex agent generate a starter from `docs/agent-instructions/prompts.md`. Switchboard reads the files and surfaces them via slash-command autocomplete; in v1 it does not provide an in-app editor for prompts (see "Future direction: prompt library view" below for what changes in v2+).
 
 **Frontmatter spec for v1:**
 
@@ -241,7 +251,7 @@ This minimal set mirrors the MCP `prompts/list` standard, plus Tiddly's tag exte
 Both local prompt directories (`local_prompt_dirs`) and MCP-server providers (`mcp_providers`) are declared in YAML config at one of two scopes:
 
 - **User-global**: `~/.config/switchboard/config.yaml` (path resolved per OS via the Rust `directories` crate). For personal preferences — your prompt library location, your Tiddly account, etc.
-- **Project-scoped**: `<project>/.switchboard/config.yaml`. Adds or replaces user-global config. Useful when a team pattern needs a specific MCP provider (e.g., a team Tiddly URL distinct from the user's personal one) or when a project ships its own curated set of prompt directories.
+- **Project-scoped**: `<project>/.switchboard/config.yaml`. Adds or replaces user-global config. Useful when a team workflow needs a specific MCP provider (e.g., a team Tiddly URL distinct from the user's personal one) or when a project ships its own curated set of prompt directories.
 
 Resolution rules differ slightly between the two keys:
 
@@ -277,7 +287,7 @@ mcp_providers:
       command: ["npx", "-y", "@example/mcp-server"]
 ```
 
-**Tiddly is a first-class preset.** The Switchboard UI offers a one-click "Connect Tiddly" action: the user pastes a Personal Access Token, and the app writes the corresponding `preset: tiddly` config entry automatically. Tiddly's URL and auth pattern are baked in. Other MCP servers require manual config (or a generic "Add MCP server" form in the UI). The presets list is open — additional first-class integrations (e.g., a future popular prompt-store MCP) can be added the same way.
+**Tiddly is a first-class preset.** The Switchboard UI offers a one-click "Connect Tiddly" action: the user pastes a Personal Access Token, and the app writes the corresponding `preset: tiddly` config entry automatically. Tiddly's URL and auth workflow are baked in. Other MCP servers require manual config (or a generic "Add MCP server" form in the UI). The presets list is open — additional first-class integrations (e.g., a future popular prompt-store MCP) can be added the same way.
 
 ### Addressing prompts
 
@@ -290,24 +300,24 @@ The prefix is the user-chosen registration name for an MCP-server provider, so a
 
 ### Resolution rules
 
-- **Pattern files require explicit prefix.** Every prompt reference in a pattern is fully qualified (e.g. `local:code-review`, `tiddly:code-review`). This keeps pattern files portable: a pattern shared between projects always resolves to the same prompt source, regardless of how the receiving user has their providers configured. There is no concept of a "default provider" for unprefixed lookup in pattern files.
+- **Workflow files require explicit prefix.** Every prompt reference in a workflow is fully qualified (e.g. `local:code-review`, `tiddly:code-review`). This keeps workflow files portable: a workflow shared between projects always resolves to the same prompt source, regardless of how the receiving user has their providers configured. There is no concept of a "default provider" for unprefixed lookup in workflow files.
 - **Prefixed lookup is strict.** A prefixed ID resolves only against the named provider; if not found, it errors. No cross-provider fallback.
 - **Local-store resolution.** Project scope (`<project>/.switchboard/prompts/`) is checked first, then each directory in `local_prompt_dirs` (from project config if present, otherwise from user config) in declared order. Default value if not configured: `[<OS-conventional path>]` (e.g. `~/.config/switchboard/prompts/` on Linux, resolved via the Rust [`directories`](https://crates.io/crates/directories) crate). A prompt with the same name in an earlier-checked directory shadows later ones — intentional, lets a project override a personal library, lets a personal library override a team library, etc. Project config's `local_prompt_dirs` (if set) replaces the user-config list rather than merging, so the project's intent is explicit.
-- **Interactive UI ergonomics.** When the user types a slash command in the message bar, the UI may provide autocomplete across all configured providers and may accept a bare name if it matches exactly one provider's prompt. This is a UI-layer affordance only — it does not affect how patterns or other persisted artifacts reference prompts.
-- **Prompt versioning is out of scope for v1.** Pattern references resolve to whatever the provider returns at invocation time; if a Tiddly prompt is edited, every pattern referencing it picks up the new version on the next invocation. Recovery and history are deferred to the upstream tool — Tiddly's own version history for hosted prompts, git for local prompts.
+- **Interactive UI ergonomics.** When the user types a slash command in the message bar, the UI may provide autocomplete across all configured providers and may accept a bare name if it matches exactly one provider's prompt. This is a UI-layer affordance only — it does not affect how workflows or other persisted artifacts reference prompts.
+- **Prompt versioning is out of scope for v1.** Workflow references resolve to whatever the provider returns at invocation time; if a Tiddly prompt is edited, every workflow referencing it picks up the new version on the next invocation. Recovery and history are deferred to the upstream tool — Tiddly's own version history for hosted prompts, git for local prompts.
 
 ### Prompt arguments
 
 Prompts can declare arguments (per the frontmatter spec for local prompts, or per the MCP `prompts/list` response for MCP-served prompts). At routing time:
 
 1. Switchboard discovers a prompt's arguments from its provider (frontmatter for local; `prompts/list` for MCP).
-2. The user (or the invoking pattern) supplies values for each argument.
+2. The user (or the invoking workflow) supplies values for each argument.
 3. **For MCP-served prompts**, Switchboard calls `prompts/get` with the supplied values; the MCP server renders the template and returns the rendered text.
 4. **For local prompts**, Switchboard renders the template itself with MiniJinja (see "Wrapping templates" below for the Rust templating choice) and produces the rendered text.
 
 The agent only ever sees the final rendered text — neither the template nor the arguments. This is what makes the "prompt-provider configuration lives in one place" property work across harnesses (see "Cross-agent normalization" below).
 
-This separation between provider and workflow is intentional: a prompt store is a prompt store, not a workflow engine. Encoding control flow ("run agent A, then fan out to B and C, then aggregate via template D") in a stored prompt would stretch the store out of shape. Patterns are programs; prompts are data.
+This separation between provider and workflow is intentional: a prompt store is a prompt store, not a workflow engine. Encoding control flow ("run agent A, then fan out to B and C, then aggregate via template D") in a stored prompt would stretch the store out of shape. Workflows are programs; prompts are data.
 
 ### Cross-agent normalization
 
@@ -323,7 +333,7 @@ Switchboard normalizes the *user-invoked prompt* surface across agents. Model-in
 
 ### Wrapping templates
 
-Wrapping templates (used for fan-in) are prompts — from any provider — that take agent responses as variables. The pattern definition declares which agent maps to which template variable. The template uses **Jinja2-compatible syntax**, rendered via [MiniJinja](https://github.com/mitsuhiko/minijinja) (a native Rust templating engine by the author of Jinja2, designed for Jinja2 compatibility — chosen so prompts move cleanly between Tiddly's Jinja2 and Switchboard's local rendering without surprises). Open question 6.1 captures whether v1 commits to MiniJinja's full surface or a restricted subset:
+Wrapping templates (used for fan-in) are prompts — from any provider — that take agent responses as variables. The workflow definition declares which agent maps to which template variable. The template uses **Jinja2-compatible syntax**, rendered via [MiniJinja](https://github.com/mitsuhiko/minijinja) (a native Rust templating engine by the author of Jinja2, designed for Jinja2 compatibility — chosen so prompts move cleanly between Tiddly's Jinja2 and Switchboard's local rendering without surprises). Open question 6.1 captures whether v1 commits to MiniJinja's full surface or a restricted subset:
 
 ```jinja
 The following are reviews from multiple agents:
@@ -380,37 +390,37 @@ Each agent also exposes a context menu of user actions:
 
 ### Composing and dispatching messages
 
-The user's core action — whether typing a fresh message, forwarding an agent's output, or invoking a saved pattern — is one primitive: **compose a message and dispatch it to one or more agents.** The composition has three components:
+The user's core action — whether typing a fresh message, forwarding an agent's output, or invoking a saved workflow — is one primitive: **compose a message and dispatch it to one or more agents.** The composition has three components:
 
 - **Source.** What is being sent — any combination of: free-form text the user types, and/or the output from one or more agents (latest turn by default; the user can pick a specific earlier turn). When multiple sources are combined, the optional wrapping prompt is the natural way to control how they're stitched together via template variables.
 - **Optional wrapping.** A prompt template from any provider (e.g. `local:code-review`, `tiddly:ai-review-feedback`) that the source(s) are rendered into. May be invoked via slash command in the message bar; the UI may accept a bare name if it matches exactly one configured provider (see §6 resolution rules).
-- **Recipients.** One or more agents to receive the (possibly wrapped) message. Currently focused agent is the default; multi-select picks any combination of agents in the project. If a recipient is busy with an in-flight turn, the compose bar accepts input (the user can draft) but Send is gated until the agent is idle; the gating reason ("busy in pattern X step N") is visible inline.
+- **Recipients.** One or more agents to receive the (possibly wrapped) message. Currently focused agent is the default; multi-select picks any combination of agents in the project. If a recipient is busy with an in-flight turn, the compose bar accepts input (the user can draft) but Send is gated until the agent is idle; the gating reason ("busy in workflow X step N") is visible inline.
 
-These three components compose freely. Typing a fresh message is just user text + no wrapping + one recipient. A fan-out is user text + optional wrapping + many recipients. Forwarding an agent's output is the agent's turn + optional wrapping + other agents. A **pattern** is the saved (and possibly sequenced) version of one or more of these compositions — see "Invoking a pattern" below.
+These three components compose freely. Typing a fresh message is just user text + no wrapping + one recipient. A fan-out is user text + optional wrapping + many recipients. Forwarding an agent's output is the agent's turn + optional wrapping + other agents. A **workflow** is the saved (and possibly sequenced) version of one or more of these compositions — see "Invoking a workflow" below.
 
-### Invoking a pattern
+### Invoking a workflow
 
-A pattern is the **saved, named, optionally sequenced and autonomous version of compose-and-dispatch.** A single-step pattern is functionally identical to a manual send — just persisted under a name for reuse. A multi-step pattern (e.g. fan-out → wait → fan-in → dispatch) adds sequencing and autonomous execution: the user invokes once, the pattern runs through multiple compose-and-dispatch steps automatically.
+A workflow is the **saved, named, optionally sequenced and autonomous version of compose-and-dispatch.** A single-step workflow is functionally identical to a manual send — just persisted under a name for reuse. A multi-step workflow (e.g. fan-out → wait → fan-in → dispatch) adds sequencing and autonomous execution: the user invokes once, the workflow runs through multiple compose-and-dispatch steps automatically.
 
-A pattern is invoked by name. Switchboard prompts for the pattern's inputs (which agents to use, which prompts, any free-form context). The user confirms; the pattern launches and runs autonomously.
+A workflow is invoked by name. Switchboard prompts for the workflow's inputs (which agents to use, which prompts, any free-form context). The user confirms; the workflow launches and runs autonomously.
 
-### Watching a pattern run
+### Watching a workflow run
 
-All participating agents stay simultaneously visible in their panes throughout pattern execution; status indicators show which are still running, waiting, or completed. The user can collapse background agents to focus on a specific one, or expand them all to watch the work in parallel. Pattern execution is independent of which pane has focus — agents continue running in the background regardless. When the pattern completes (all turns it initiated have reached a terminal state), the user is notified via OS-native notification (per §10 Form factor).
+All participating agents stay simultaneously visible in their panes throughout workflow execution; status indicators show which are still running, waiting, or completed. The user can collapse background agents to focus on a specific one, or expand them all to watch the work in parallel. Workflow execution is independent of which pane has focus — agents continue running in the background regardless. When the workflow completes (all turns it initiated have reached a terminal state), the user is notified via OS-native notification (per §10 Form factor).
 
-A **pattern-progress surface** (shape TBD — status row in the project header, side panel, or modal) shows the active pattern's name, current step, total steps, and per-step status. When a pattern is paused on Primitive 5 (waiting for user input), the surface shows "step N of M — waiting for your input." For patterns using Primitive 6 (iterate over a list), the surface shows the iteration dimension as well, in the user's own vocabulary — e.g., "iteration 2 of 3 (milestone = "implement-handlers"), step 3 of 8" — using the loop variable name and value the pattern declared. On return after walk-away, this is the first thing the user sees: any pattern that was interrupted is surfaced with the same step (and iteration) detail and options to retry or abandon (see "Walking away" below).
+A **workflow-progress surface** (shape TBD — status row in the project header, side panel, or modal) shows the active workflow's name, current step, total steps, and per-step status. When a workflow is paused on Primitive 5 (waiting for user input), the surface shows "step N of M — waiting for your input." For workflows using Primitive 6 (iterate over a list), the surface shows the iteration dimension as well, in the user's own vocabulary — e.g., "iteration 2 of 3 (milestone = "implement-handlers"), step 3 of 8" — using the loop variable name and value the workflow declared. On return after walk-away, this is the first thing the user sees: any workflow that was interrupted is surfaced with the same step (and iteration) detail and options to retry or abandon (see "Walking away" below).
 
 ### Agent contention
 
-Switchboard enforces **one in-flight turn per agent** at the application layer. A dispatch (whether from a pattern step or a manual user send) against an agent that is already mid-turn is refused with a clear error ("agent X is busy"); the user can switch focus to inspect the busy agent. Queueing is not implemented in v1.
+Switchboard enforces **one in-flight turn per agent** at the application layer. A dispatch (whether from a workflow step or a manual user send) against an agent that is already mid-turn is refused with a clear error ("agent X is busy"); the user can switch focus to inspect the busy agent. Queueing is not implemented in v1.
 
 This rule lives in Switchboard, not the harnesses, because **neither harness rejects same-session parallel invocation** — both accept it, both succeed, and the on-disk effects diverge unhelpfully (Claude Code grows an orphan branch in its session tree; Codex silently interleaves both turns into one flat transcript and a future resume cannot tell them apart). See [docs/research/same-session-parallel-invocation.md](research/same-session-parallel-invocation.md) for the probe and the empirical findings. Since the harnesses don't protect us, the dispatcher must.
 
-Two patterns invoked simultaneously that target *disjoint* agents both run normally. The constraint is per-agent, not per-pattern.
+Two workflows invoked simultaneously that target *disjoint* agents both run normally. The constraint is per-agent, not per-workflow.
 
 ### Failure handling
 
-If a step in a pattern fails, the pattern halts. Partial results are retained. The user sees the error, can inspect the state of each agent involved, and decides whether to retry the pattern, retry from a specific step, or abandon.
+If a step in a workflow fails, the workflow halts. Partial results are retained. The user sees the error, can inspect the state of each agent involved, and decides whether to retry the workflow, retry from a specific step, or abandon.
 
 A step is considered failed in any of these cases:
 
@@ -418,28 +428,28 @@ A step is considered failed in any of these cases:
 - A pre-dispatch resolution fails: prompt ID not found in its provider, MCP server unreachable, agent referenced by name has been deleted.
 - A template substitution fails (missing variable, render error).
 - An agent contention refusal: the step's target is mid-turn (per §7 "Agent contention"). This counts as a step failure rather than a transient retry condition — it indicates a genuine collision with other in-flight work.
-- A user manually cancels an agent's turn while the agent is participating in a pattern step. Symmetric with other failure modes; the step fails and the pattern halts.
+- A user manually cancels an agent's turn while the agent is participating in a workflow step. Symmetric with other failure modes; the step fails and the workflow halts.
 - Within a fan-in step (Primitive 4), any participating agent failing fails the whole step.
 
-A turn that ends with a tool **permission denial** is *not* a failure. The harness reports the denial (Claude Code's `result.permission_denials`, similar in Codex), the model receives the denial as feedback and adapts its response, and the turn completes normally. Switchboard surfaces denials as informational ("the model attempted X, was blocked") rather than as pattern-halting errors. Failures are reserved for harness-level errors (`is_error: true` / `turn.failed` / non-zero exit), template substitution errors, and pattern-orchestration errors.
+A turn that ends with a tool **permission denial** is *not* a failure. The harness reports the denial (Claude Code's `result.permission_denials`, similar in Codex), the model receives the denial as feedback and adapts its response, and the turn completes normally. Switchboard surfaces denials as informational ("the model attempted X, was blocked") rather than as workflow-halting errors. Failures are reserved for harness-level errors (`is_error: true` / `turn.failed` / non-zero exit), template substitution errors, and workflow-orchestration errors.
 
 ### Walking away
 
-Patterns run inside the Switchboard backend (the Rust core; see §10 Form factor). They keep running as long as the backend process is alive — independent of whether the UI window is visible. Specifically:
+Workflows run inside the Switchboard backend (the Rust core; see §10 Form factor). They keep running as long as the backend process is alive — independent of whether the UI window is visible. Specifically:
 
-- **Minimize / hide the window**: backend keeps running normally; pattern continues.
-- **Close the window** (X button): hides the app to the system tray (or dock on macOS). The backend stays up; the pattern continues. The user can reopen the window from the tray icon to check on progress. On Linux desktops without tray support (per §10), Close-the-window quits the app instead of hiding to tray; user is prompted to confirm cancellation of any in-flight patterns first.
-- **Quit the app explicitly** (cmd-Q, tray-menu Quit): stops the backend. If any patterns are in progress, Switchboard prompts the user to confirm and then cancels them cleanly (see "Cancelling a pattern or turn" below).
-- **Machine sleep**: backend is suspended with the OS. In-flight harness calls may time out across long sleeps; on wake Switchboard surfaces any failed turns and lets the user retry. Patterns themselves don't auto-resume mid-turn.
-- **Switchboard crash or OS reboot**: harness subprocesses die with Switchboard's process tree. On next start, any pattern that was in flight is surfaced (via the pattern-progress surface) as "interrupted at step N" — the last step boundary that was successfully checkpointed. For iterated patterns (Primitive 6), the checkpoint also captures the iteration index and value (e.g., "interrupted at iteration 2, step 3"). The user chooses retry-from-step-N or abandon. Mid-step recovery (resuming an interrupted in-flight turn) is out of scope; see 10.3.
+- **Minimize / hide the window**: backend keeps running normally; workflow continues.
+- **Close the window** (X button): hides the app to the system tray (or dock on macOS). The backend stays up; the workflow continues. The user can reopen the window from the tray icon to check on progress. On Linux desktops without tray support (per §10), Close-the-window quits the app instead of hiding to tray; user is prompted to confirm cancellation of any in-flight workflows first.
+- **Quit the app explicitly** (cmd-Q, tray-menu Quit): stops the backend. If any workflows are in progress, Switchboard prompts the user to confirm and then cancels them cleanly (see "Cancelling a workflow or turn" below).
+- **Machine sleep**: backend is suspended with the OS. In-flight harness calls may time out across long sleeps; on wake Switchboard surfaces any failed turns and lets the user retry. Workflows themselves don't auto-resume mid-turn.
+- **Switchboard crash or OS reboot**: harness subprocesses die with Switchboard's process tree. On next start, any workflow that was in flight is surfaced (via the workflow-progress surface) as "interrupted at step N" — the last step boundary that was successfully checkpointed. For iterated workflows (Primitive 6), the checkpoint also captures the iteration index and value (e.g., "interrupted at iteration 2, step 3"). The user chooses retry-from-step-N or abandon. Mid-step recovery (resuming an interrupted in-flight turn) is out of scope; see 10.3.
 
-When the user returns, Switchboard shows the state of any patterns that completed, are in progress, paused for user input, were cancelled, or were interrupted by a crash.
+When the user returns, Switchboard shows the state of any workflows that completed, are in progress, paused for user input, were cancelled, or were interrupted by a crash.
 
-### Cancelling a pattern or turn
+### Cancelling a workflow or turn
 
 The user can cancel at two granularities:
 
-- **Cancel a pattern.** Stops the pattern's orchestration. Switchboard sends `SIGTERM` to the in-flight harness subprocess (using the process group it spawned in, so both single-process Claude Code and Codex's parent+child tree are cleaned up uniformly — see §9 and the harness-cancellation research note). Partial results stay: the agent's harness session file persists on disk and can be inspected or sent further messages. The pattern is marked **cancelled** and cannot be auto-resumed — re-invoking starts from the beginning.
+- **Cancel a workflow.** Stops the workflow's orchestration. Switchboard sends `SIGTERM` to the in-flight harness subprocess (using the process group it spawned in, so both single-process Claude Code and Codex's parent+child tree are cleaned up uniformly — see §9 and the harness-cancellation research note). Partial results stay: the agent's harness session file persists on disk and can be inspected or sent further messages. The workflow is marked **cancelled** and cannot be auto-resumed — re-invoking starts from the beginning.
 - **Cancel an agent's turn.** Kills the spawned harness subprocess for a single agent's in-flight turn (useful if the agent is going off the rails). Same `SIGTERM`-to-process-group mechanism. The agent stays around and can be re-prompted; the harness session is in a usable state for the next message, with the cancelled turn simply absent.
 
 If Switchboard buffered streaming output from the cancelled turn (whatever the agent had produced before the kill), the user can review that partial content in-app — it's available from the buffered stream, not from the harness session file (see the harness-cancellation research note for why). The buffered partial content is in-memory only; restarting Switchboard discards it. The harness session file remains the durable record (which by design omits incomplete turns).
@@ -456,18 +466,18 @@ The user has a project `feature-event-logs` open in Switchboard. They have three
 - `reviewer-claude` (Claude Code)
 - `reviewer-codex` (Codex)
 
-The user has previously authored a pattern in `.switchboard/patterns/review-and-aggregate.yaml`. The review prompt ships as a built-in local prompt (`local:code-review`); the aggregation wrapper is one the user keeps in Tiddly (`tiddly:ai-review-feedback`). Both work because Switchboard resolves each ID against the named provider.
+The user has previously authored a workflow in `.switchboard/workflows/review-and-aggregate.yaml`. The review prompt ships as a built-in local prompt (`local:code-review`); the aggregation wrapper is one the user keeps in Tiddly (`tiddly:ai-review-feedback`). Both work because Switchboard resolves each ID against the named provider.
 
 **Invocation:**
 
-1. The user invokes the pattern: "Run review-and-aggregate."
-2. Switchboard pops up an invocation form with one field per input the pattern declared in its YAML (`primary_agent`, `reviewer_agents`, `review_prompt`, etc. — see §4 for the schema). The user fills in:
+1. The user invokes the workflow: "Run review-and-aggregate."
+2. Switchboard pops up an invocation form with one field per input the workflow declared in its YAML (`primary_agent`, `reviewer_agents`, `review_prompt`, etc. — see §4 for the schema). The user fills in:
    - **`primary_agent`** → `implementer`
    - **`reviewer_agents`** → `reviewer-claude` and `reviewer-codex` (multi-select)
    - **`review_prompt`** → `local:code-review` (bundled with Switchboard)
    - **`aggregation_prompt`** → `tiddly:ai-review-feedback` (the user's own, stored in Tiddly)
    - **`user_context`** → "Review milestone 1, focus on the event-emission API."
-3. The user confirms. The pattern launches.
+3. The user confirms. The workflow launches.
 
 **Execution:**
 
@@ -475,9 +485,9 @@ The user has previously authored a pattern in `.switchboard/patterns/review-and-
 2. Switchboard waits for both reviewers to complete their turns.
 3. Switchboard collects both reviewers' final responses.
 4. Switchboard renders the aggregation-prompt template, substituting in the two reviews under their respective variable names.
-5. Switchboard sends the rendered message to `implementer` (the agent supplied as the pattern's `primary_agent` input).
+5. Switchboard sends the rendered message to `implementer` (the agent supplied as the workflow's `primary_agent` input).
 6. The implementer runs and produces its response.
-7. Pattern complete. The user is notified.
+7. Workflow complete. The user is notified.
 
 **During execution:**
 
@@ -485,13 +495,13 @@ All three agents stay simultaneously visible in their panes throughout. While bo
 
 **Afterwards:**
 
-The user reads the implementer's response and decides what's next. Common follow-ups: compose-and-dispatch the response onward (e.g., forward to a follow-up agent with a wrapping prompt — see §7 "Composing and dispatching messages"), invoke another pattern, or just stop. The pattern is done; the next move is the user's.
+The user reads the implementer's response and decides what's next. Common follow-ups: compose-and-dispatch the response onward (e.g., forward to a follow-up agent with a wrapping prompt — see §7 "Composing and dispatching messages"), invoke another workflow, or just stop. The workflow is done; the next move is the user's.
 
 ## 9. Harness integration
 
 Switchboard interacts with Claude Code and Codex through their non-interactive modes (`claude -p` and `codex exec`). The underlying sessions are real Claude Code / Codex sessions backed by the harnesses' own session files — they survive Switchboard, can be resumed later, and could in principle be opened in the harness's interactive TUI by the user if they wanted. Switchboard does not lock the user out of the harness; it just drives it.
 
-The architectural backbone of this section is the **per-harness adapter** pattern: one adapter per harness translates that harness's native event stream into a normalized internal stream the rest of Switchboard consumes. This keeps the pattern engine, UI, and persistence layer harness-agnostic, while letting each adapter handle its own quirks (event vocabularies, exit-code semantics, session-file richness, etc.). See "Per-harness adapter and normalized event stream" below for the shape; see [docs/research/harness-comparison.md](research/harness-comparison.md) for the cross-harness comparison that drove the design.
+The architectural backbone of this section is the **per-harness adapter** workflow: one adapter per harness translates that harness's native event stream into a normalized internal stream the rest of Switchboard consumes. This keeps the workflow engine, UI, and persistence layer harness-agnostic, while letting each adapter handle its own quirks (event vocabularies, exit-code semantics, session-file richness, etc.). See "Per-harness adapter and normalized event stream" below for the shape; see [docs/research/harness-comparison.md](research/harness-comparison.md) for the cross-harness comparison that drove the design.
 
 ### Process model
 
@@ -521,15 +531,15 @@ This is a deliberate v1 simplification. Headless mode has no native interactive 
 
 ### Safety guidance
 
-Switchboard's v1 posture (autonomous agents with full filesystem and shell access, patterns that can run unattended) makes git-based projects strongly recommended: uncommitted local damage is recoverable; surprise rewrites of untracked files are not. Concrete guidance:
+Switchboard's v1 posture (autonomous agents with full filesystem and shell access, workflows that can run unattended) makes git-based projects strongly recommended: uncommitted local damage is recoverable; surprise rewrites of untracked files are not. Concrete guidance:
 
-- Run patterns inside a project that's checked into git.
-- Commit work in progress before invoking long-running patterns.
+- Run workflows inside a project that's checked into git.
+- Commit work in progress before invoking long-running workflows.
 - Treat unattended runs as risky-by-default.
 
 A one-time first-launch acknowledgement dialog (with a checkbox the user must tick to proceed) surfaces this posture explicitly so users opt in knowingly rather than discovering the autonomy posture after damage. This is a v1 acceptance item.
 
-**Why not a more constrained default?** We considered shipping with `--sandbox workspace-write` (Codex) and an equivalent constrained `--permission-mode` for Claude Code. Both block network access and out-of-cwd shell writes, which would silently break the agent capabilities Switchboard exists to coordinate: a reviewer using `gh pr view`, an implementer running `cargo build` against a new dependency, any agent calling an external API or running a tool that fetches data. The choice would make the safe default the *broken* default, training users to bypass the safety guard reflexively — worst of both worlds. Full autonomy is the default that makes the headline workflows actually run. Granular permission control (allowlists, per-agent constraints, per-pattern scoping) is tracked in §11 for users who want a more restrictive posture later.
+**Why not a more constrained default?** We considered shipping with `--sandbox workspace-write` (Codex) and an equivalent constrained `--permission-mode` for Claude Code. Both block network access and out-of-cwd shell writes, which would silently break the agent capabilities Switchboard exists to coordinate: a reviewer using `gh pr view`, an implementer running `cargo build` against a new dependency, any agent calling an external API or running a tool that fetches data. The choice would make the safe default the *broken* default, training users to bypass the safety guard reflexively — worst of both worlds. Full autonomy is the default that makes the headline workflows actually run. Granular permission control (allowlists, per-agent constraints, per-workflow scoping) is tracked in §11 for users who want a more restrictive posture later.
 
 ### Harness capabilities Switchboard depends on
 
@@ -592,12 +602,12 @@ TurnAborted     { agent, reason: spawn_failed | stream_truncated | timeout | can
                 // TurnEnd { status: error } which represents a harness-reported error.
 RateLimitEvent  { agent, info }
                 // info: harness-specific shape, surfaced for UI display, not
-                // interpreted by the pattern engine. Timing differs by harness:
+                // interpreted by the workflow engine. Timing differs by harness:
                 // Claude Code can emit mid-turn; Codex's source (session file)
                 // means the event arrives after the terminal event.
 ```
 
-Each adapter (Claude Code, Codex) is responsible for: building the harness command line, spawning the process, parsing its native stream, normalizing into the events above, and surfacing harness-specific metadata in `raw_event` so callers that need to dig in can. The pattern engine, UI, and persistence layer consume only the normalized stream.
+Each adapter (Claude Code, Codex) is responsible for: building the harness command line, spawning the process, parsing its native stream, normalizing into the events above, and surfacing harness-specific metadata in `raw_event` so callers that need to dig in can. The workflow engine, UI, and persistence layer consume only the normalized stream.
 
 Reading Codex session files (in addition to the stream) is an implementation choice the Codex adapter may make to fill in gaps the stream doesn't expose (rate limits, context window, full reasoning). Tracked under open question 10.15.
 
@@ -624,7 +634,7 @@ What is **lost** in headless mode:
 
 ### Integration testing
 
-Switchboard's per-harness adapters are exercised by an integration test suite that runs against the **real, installed Claude Code and Codex CLIs** — not mocks. This is critical: adapter correctness depends on harness behavior we don't control (event vocabularies, exit codes, stream timing, session-file format), and mocked tests would silently lock in our current understanding while upstream releases drift. Real-harness tests catch those regressions on the next CI run. Switchboard's own logic (pattern parser, prompt resolver, MCP client, normalized event dispatcher) is covered separately by ordinary unit tests with the harness mocked at the adapter boundary.
+Switchboard's per-harness adapters are exercised by an integration test suite that runs against the **real, installed Claude Code and Codex CLIs** — not mocks. This is critical: adapter correctness depends on harness behavior we don't control (event vocabularies, exit codes, stream timing, session-file format), and mocked tests would silently lock in our current understanding while upstream releases drift. Real-harness tests catch those regressions on the next CI run. Switchboard's own logic (workflow parser, prompt resolver, MCP client, normalized event dispatcher) is covered separately by ordinary unit tests with the harness mocked at the adapter boundary.
 
 To keep the integration suite affordable in time and API cost, every test prompt is constrained to a small response (e.g., "reply with the single word 'ack'", not "write me a poem"). Modern Claude / Codex usage limits are generous enough that even a thorough suite runs in minutes-to-tens-of-minutes for a small dollar amount per CI run. The constraint isn't test count — it's per-test response size.
 
@@ -647,7 +657,7 @@ Switchboard ships as a **single-binary desktop application** rather than a TUI o
 - **Single small binary** (~3 MB Hello World, vs Electron's ~150 MB). Sub-half-second startup, low memory footprint.
 - **OS-native WebView** for rendering — WebKit on macOS, WebView2 on Windows, WebKitGTK on Linux. ~99% of modern web tech works identically across platforms. (Linux's WebKitGTK lags WebKit-on-macOS in version and bug surface; sticking to widely-supported CSS/JS features avoids cross-platform rendering surprises.)
 - **Rust core** handles backend logic: filesystem, harness adapters, MCP client, IPC handlers. Single-process app — no Python subprocess, no separate server.
-- **Web frontend** (HTML/CSS/JS) renders the UI in the WebView and talks to the Rust core via Tauri's typed command system: the WebView calls Rust functions via `invoke()` (typed inputs and return values), and the Rust core streams events back via Tauri's event API (the harness streams Switchboard receives are republished as events the frontend subscribes to). Standard web tech, any framework. Event emission from the Rust core to the WebView is fire-and-forget; the core owns a bounded per-agent ring buffer that the frontend renders the latest state from. UI lag or a collapsed pane never blocks the harness adapter or the pattern engine — buffer sizing and per-event coalescing rules are implementation choices.
+- **Web frontend** (HTML/CSS/JS) renders the UI in the WebView and talks to the Rust core via Tauri's typed command system: the WebView calls Rust functions via `invoke()` (typed inputs and return values), and the Rust core streams events back via Tauri's event API (the harness streams Switchboard receives are republished as events the frontend subscribes to). Standard web tech, any framework. Event emission from the Rust core to the WebView is fire-and-forget; the core owns a bounded per-agent ring buffer that the frontend renders the latest state from. UI lag or a collapsed pane never blocks the harness adapter or the workflow engine — buffer sizing and per-event coalescing rules are implementation choices.
 - **Native OS integration** via Tauri plugins (notifications, file dialogs, system tray, auto-updater). On Linux, system tray availability depends on the desktop environment (GNOME requires the AppIndicator extension); Switchboard falls back to a windowed-only mode where tray is unavailable.
 - **Tauri 2.x** (released 2024) is mature with cross-platform desktop support and a growing plugin ecosystem.
 
@@ -703,37 +713,38 @@ For developers running from source: standard `cargo tauri dev` workflow.
 Decisions explicitly **not made** in this document, to be addressed in later docs or after early implementation:
 
 - **Long-lived agent processes.** Per-message spawn for v1; may revisit if latency dominates. Cold-start latency should be benchmarked once early in implementation (default-mode `claude -p` loads skills, hooks, MCP servers, plugins, CLAUDE.md, and auto-memory each turn); revisit if consistently >2s.
-- **Visual pattern editor.** v1 is file-based, with agent-consumable authoring docs as the supported authoring path.
-- **Granular permission / sandbox config.** v1 runs both harnesses with maximum autonomy (skip-permissions on); the off / restricted-mode user experience is deferred. Plausible future directions: **config-driven tool allowlists** (YAML per project / per agent, passed through as `--allowedTools` / `--permission-mode`), **interactive permission prompts** (Switchboard intercepts denials at runtime and pops a modal asking the user to allow / deny / always-allow, then re-issues the turn — pending a probe of harness resume-after-denial mechanics), and **per-pattern permission scoping** (a pattern step declares its required tools, Switchboard restricts the harness for the duration). Codex's separate approval-policy vs sandbox-mode distinction (currently collapsed into the single max-autonomy posture) is part of this same design space.
+- **Visual workflow editor.** v1 is file-based, with agent-consumable authoring docs as the supported authoring path.
+- **Granular permission / sandbox config.** v1 runs both harnesses with maximum autonomy (skip-permissions on); the off / restricted-mode user experience is deferred. Plausible future directions: **config-driven tool allowlists** (YAML per project / per agent, passed through as `--allowedTools` / `--permission-mode`), **interactive permission prompts** (Switchboard intercepts denials at runtime and pops a modal asking the user to allow / deny / always-allow, then re-issues the turn — pending a probe of harness resume-after-denial mechanics), and **per-workflow permission scoping** (a workflow step declares its required tools, Switchboard restricts the harness for the duration). Codex's separate approval-policy vs sandbox-mode distinction (currently collapsed into the single max-autonomy posture) is part of this same design space.
 - **Cross-session persistent agent memory.** Architecture should not preclude; not implemented in v1.
 - **Global / cross-project agent templates.** Agents in v1 are project-scoped. A future direction lets users define reusable agent templates (personas) that can be invoked from any project — for example, a personal "writing editor" persona that knows your voice and applies across blog posts, docs, and emails, or a "domain expert" persona carrying institutional knowledge (a regulatory framework, your team's architecture conventions, a research methodology) reusable in any project that touches the area. Optionally surfaced via semantic search over the project context to suggest which template fits. Distinct from "Cross-session persistent agent memory" above (memory is what an agent remembers across sessions; global templates are which agents are available to spawn).
 - **Multi-project workflows.** Each project is independent in v1. (Related to "Global / cross-project agent templates" above — both concern workflows that span more than one project.)
-- **Pattern conditionals and branching.** v1 patterns are linear except for bounded iteration over a static list (Primitive 6). Conditional steps (`if reviewer flagged a bug, halt`), iterative-until-condition workflows (`iterate until tests pass`), race semantics (`wait_for_first` / first-of-N completion), nested loops, and dynamic iteration lists (computed from a prior step's output) are all deferred to v2+.
-- **Per-pattern MCP tool selection / allowlists.** The v1 prompt/tool boundary (prompts normalized at Switchboard, tools per-agent) is a v1 simplification, not a permanent commitment. A future direction: pattern steps could declare their required MCP tools, and Switchboard could constrain the harness for that step's duration.
+- **Workflow conditionals and branching.** v1 workflows are linear except for bounded iteration over a static list (Primitive 6). Conditional steps (`if reviewer flagged a bug, halt`), iterative-until-condition workflows (`iterate until tests pass`), race semantics (`wait_for_first` / first-of-N completion), nested loops, and dynamic iteration lists (computed from a prior step's output) are all deferred to v2+.
+- **Per-workflow MCP tool selection / allowlists.** The v1 prompt/tool boundary (prompts normalized at Switchboard, tools per-agent) is a v1 simplification, not a permanent commitment. A future direction: workflow steps could declare their required MCP tools, and Switchboard could constrain the harness for that step's duration.
 - **Compaction event normalization.** Whether either harness emits a structured event when auto-compaction fires is unprobed. If they do, `Compacted { agent, before_tokens, after_tokens? }` joins the normalized vocabulary; if not, the §9 vocabulary accepts that gap and the UI works from the context-utilization signal alone.
+- **DAG visualization of in-flight workflows.** v1's workflow-progress surface (§7) shows current step, total steps, status — a linear view. Workflows are conceptually DAG-shaped (per §4 "Execution model"); a graph view that shows the actual execution shape with current/complete/pending nodes highlighted is a natural v2+ extension, especially as workflows grow with iteration and pause-for-user-input nodes.
 
 ## 12. Open questions
 
 Aggregated from inline flags above, plus a few additional:
 
-- **5.1** Exact pattern DSL keywords and structure. Needs a separate spec.
+- **5.1** Exact workflow DSL keywords and structure. Needs a separate spec.
 - **5.2** Passthrough mechanism for harness commands — namespacing. Partially blocked on 10.10; namespacing only matters once upstream allows arbitrary slash-command passthrough.
 - **6.1** MiniJinja subset (full MiniJinja vs a restricted subset) and template-available variables beyond `responses`.
 - ~~**10.1** What does Switchboard do when an agent's "next assistant response" is a tool call rather than text?~~ **Resolved by hands-on probe:** both harnesses run the model → tool_use → tool_result → model loop internally and emit a single terminal event per user-initiated turn (Claude Code: `result`; Codex: `turn.completed` / `turn.failed`). Switchboard always sees a complete turn — there is no "tool-call-only response" to handle. See [docs/research/harness-comparison.md](research/harness-comparison.md).
-- ~~**10.2** When two patterns reference the same agent, what happens? Disallow concurrent use? Queue? Refuse?~~ **Resolved by hands-on probe:** Switchboard enforces one in-flight turn per agent at the application layer; collisions are refused with a clear error. Queueing is deferred. See §7 "Agent contention" and [docs/research/same-session-parallel-invocation.md](research/same-session-parallel-invocation.md). The harnesses themselves do not error on same-session parallel invocation — they silently corrupt (Claude Code: orphan branch in session tree) or conflate (Codex: interleaved transcript) — so this enforcement must live in Switchboard.
-- **10.3** How are agents preserved across Switchboard restarts? Harness session IDs persist on disk; Switchboard's project/agent registry needs its own persistence model. Restart-time UX (showing "pattern interrupted at step N" so the user can retry or abandon) needs a working answer for §7's walk-away promise to hold; mid-step recovery (resuming an interrupted in-flight turn) is out of scope.
-- **10.4** Pattern versioning. If a pattern file changes mid-execution (unlikely but possible), what happens to the in-flight pattern?
-- ~~**10.5** Notifications when a pattern completes — terminal bell? OS notification? Just visible state in the UI?~~ **Resolved by §10 form factor commitment:** OS-native notifications via Tauri's notification plugin. See §7 "Watching a pattern run" for when notifications fire. Remaining UX details (which events notify, user opt-out controls) are implementation choices, not plan-level questions.
+- ~~**10.2** When two workflows reference the same agent, what happens? Disallow concurrent use? Queue? Refuse?~~ **Resolved by hands-on probe:** Switchboard enforces one in-flight turn per agent at the application layer; collisions are refused with a clear error. Queueing is deferred. See §7 "Agent contention" and [docs/research/same-session-parallel-invocation.md](research/same-session-parallel-invocation.md). The harnesses themselves do not error on same-session parallel invocation — they silently corrupt (Claude Code: orphan branch in session tree) or conflate (Codex: interleaved transcript) — so this enforcement must live in Switchboard.
+- **10.3** How are agents preserved across Switchboard restarts? Harness session IDs persist on disk; Switchboard's project/agent registry needs its own persistence model. Restart-time UX (showing "workflow interrupted at step N" so the user can retry or abandon) needs a working answer for §7's walk-away promise to hold; mid-step recovery (resuming an interrupted in-flight turn) is out of scope.
+- **10.4** Workflow versioning. If a workflow file changes mid-execution (unlikely but possible), what happens to the in-flight workflow?
+- ~~**10.5** Notifications when a workflow completes — terminal bell? OS notification? Just visible state in the UI?~~ **Resolved by §10 form factor commitment:** OS-native notifications via Tauri's notification plugin. See §7 "Watching a workflow run" for when notifications fire. Remaining UX details (which events notify, user opt-out controls) are implementation choices, not plan-level questions.
 - **10.6** Multi-machine workflows (running Switchboard on a remote dev machine over SSH). Out of scope for v1, but the architecture should not fight it.
 - ~~**10.7** Local prompt file format. Markdown body with YAML frontmatter is the working assumption; alternatives (pure YAML, plain `.txt` with separate manifest) should be evaluated against authoring ergonomics and round-tripping with editors.~~ **Resolved:** committed to markdown body with YAML frontmatter for v1. Schema documented in §6 "Authoring a local prompt".
-- **10.8** Whether the local store and the MCP-server provider need to expose the same template-arguments contract (variable names, types, defaults) so a prompt can move between them without breaking pattern files. Working assumption: yes; the local file's frontmatter mirrors what an MCP `prompts/get` response would carry.
+- **10.8** Whether the local store and the MCP-server provider need to expose the same template-arguments contract (variable names, types, defaults) so a prompt can move between them without breaking workflow files. Working assumption: yes; the local file's frontmatter mirrors what an MCP `prompts/get` response would carry.
 - **10.9 (monitoring)** `--bare` will become the `claude -p` default in a future Anthropic release ([source](https://code.claude.com/docs/en/headless)). When it lands, default `-p` no longer auto-loads skills, hooks, plugins, MCP servers, or CLAUDE.md, and Switchboard must explicitly pass `--mcp-config`, `--agents`, `--plugin-dir`, `--settings`, `--append-system-prompt`, etc. to preserve current behavior. Mitigation: harness command-line construction is centralized from day one (§9 "Process model"). Action: monitor Anthropic release notes; flip the helper when announced. Background in [docs/research/claude-code-headless.md](research/claude-code-headless.md).
 - **10.10 (monitoring)** Headless slash-command support. `claude -p` (CLI path) does not accept slash commands today, blocking §9's full passthrough vision. Tracked upstream at [anthropics/claude-code#837](https://github.com/anthropics/claude-code/issues/837) and [#38505](https://github.com/anthropics/claude-code/issues/38505). The Claude Agent SDK does support this, so a future SDK-based adapter is an alternative path; v1 stays on CLI for Claude/Codex consistency (see §9 passthrough).
 - **10.11** Compaction strategy. Programmatic `/compact` is unavailable in both harnesses today; both do auto-compact at high utilization. Working assumption: Switchboard monitors token usage, warns the user as the auto-compact threshold approaches, and defers actual compaction to the harness. We do not implement Switchboard-side summarization (would underperform the harnesses' tuned compaction). Alternative to consider: surface a "fork from checkpoint with summary" action that uses the existing fork primitive plus an explicit summarize-and-restart prompt, as a coarse user-driven alternative when the user wants to reclaim context outside auto-compact. Background in [docs/research/claude-code-headless.md](research/claude-code-headless.md) and [docs/research/codex-noninteractive.md](research/codex-noninteractive.md).
 - **10.12** Model→max-context map maintenance. **Partially resolved by hands-on probe:** Claude Code v2.1.138 *does* expose `contextWindow` per turn in `result.modelUsage.<model>` — Switchboard reads it directly, no map needed for Claude Code. Codex's stream omits it; the value lives in the session file's `task_started` event. Working assumption for Codex: ship a bundled model→max-context map, but also let the Codex adapter read the session file and prefer that as authoritative when present. Still open: do we ship the map, read the session file, or both? Open: where is the canonical map source for new models we sync from?
-- **10.13 (monitoring)** Programmatic `/compact` exposure in either harness. Multiple Anthropic feature requests open ([anthropics/claude-code#5643](https://github.com/anthropics/claude-code/issues/5643), [#39275](https://github.com/anthropics/claude-code/issues/39275), [#39574](https://github.com/anthropics/claude-code/issues/39574), [#26488](https://github.com/anthropics/claude-code/issues/26488)); Codex equivalent not documented. When upstream lands, Switchboard can offer first-class compaction control inside patterns.
+- **10.13 (monitoring)** Programmatic `/compact` exposure in either harness. Multiple Anthropic feature requests open ([anthropics/claude-code#5643](https://github.com/anthropics/claude-code/issues/5643), [#39275](https://github.com/anthropics/claude-code/issues/39275), [#39574](https://github.com/anthropics/claude-code/issues/39574), [#26488](https://github.com/anthropics/claude-code/issues/26488)); Codex equivalent not documented. When upstream lands, Switchboard can offer first-class compaction control inside workflows.
 - **10.14** Codex non-interactive fork. Claude Code has native `--fork-session`; Codex has no `codex exec fork`. Three options: (a) drop fork from v1's Codex agent capability and document the asymmetry; (b) implement fork by copying the session JSONL to a new file and passing the new ID to `codex exec resume` (untested — file format may not support this cleanly); (c) implement fork by spawning a fresh Codex session and re-feeding a summarized version of the prior context as the initial prompt. Decision deferred to implementation; (a) is the safe v1 default.
 - **10.15** Should the Codex adapter read the session file (`~/.codex/sessions/...jsonl`) in addition to the `--json` stream? The session file carries information the stream doesn't (rate limits, `model_context_window`, full reasoning blocks). Tradeoff: more complete information vs more file-watching plumbing and the question of whether to tail-read live or read on completion. Working assumption: read on turn completion (after `turn.completed`/`turn.failed`) to enrich the normalized event stream with the missing fields.
 - **10.16** Disk usage of harness session files. Both harnesses persist transcripts indefinitely (Claude Code at `~/.claude/projects/<encoded-cwd>/*.jsonl`, Codex at `~/.codex/sessions/YYYY/MM/DD/...`). A long-lived project with many agents and many turns will accumulate. Should Switchboard offer pruning, surface totals, or otherwise manage this? Out of scope for v1, but the architecture should not preclude it.
-- **10.17** Network failure and retry policy. What does Switchboard do when a turn fails mid-pattern because of a transient API error or network blip? Working assumption: a single configurable retry on transient errors (rate-limit, 5xx) before marking the step as failed. Permanent errors (auth, invalid model, denied content) fail immediately. To be detailed in §7 once we have an implementation footprint.
+- **10.17** Network failure and retry policy. What does Switchboard do when a turn fails mid-workflow because of a transient API error or network blip? Working assumption: a single configurable retry on transient errors (rate-limit, 5xx) before marking the step as failed. Permanent errors (auth, invalid model, denied content) fail immediately. To be detailed in §7 once we have an implementation footprint.
 - **10.18** Stall detection. A turn with no stream events for T seconds is ambiguous (genuinely hung vs slow tool). UX (passive surface, prompt-to-cancel after threshold, or some other affordance) deferred to implementation, including a probe of whether either harness emits reliable heartbeats during long operations.

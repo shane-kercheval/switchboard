@@ -12,20 +12,21 @@ More precisely, it is a **workflow engine for primitives, not for processes**. I
 
 The human stays in the loop where judgment matters (deciding what to route, when to revise, when to proceed) and is removed from the loop where mechanics waste time (copy-paste, template application, babysitting parallel agents).
 
-A second consequence of this design: because Switchboard resolves prompts itself and sends agents plain text, prompt-provider configuration lives in *one place* (Switchboard) and works across every agent backend. A user's prompt library — whether in Tiddly, another MCP server, or Switchboard's local store — works identically with both Claude Code and Codex agents, without configuring the prompt source in either. This is especially useful for Codex, where MCP prompt support is limited or absent depending on version. The same does **not** hold for MCP tools or for Claude Code skills, which are invoked by the model mid-turn and must still be configured in the underlying agent (see section 6).
+A second consequence of this design: **because Switchboard resolves prompts itself and sends agents plain text, prompt-provider configuration lives in *one place* (Switchboard) and works across every agent backend**. A user's prompt library — whether in Tiddly, another MCP server, or Switchboard's local store — works identically with both Claude Code and Codex agents, without configuring the prompt source in either. This is especially useful for Codex, where MCP prompt support is limited or absent depending on version. The same does **not** hold for MCP tools or for Claude Code skills, which are invoked by the model mid-turn and must still be configured in the underlying agent (see section 6).
 
 ## 2. Goals and non-goals
 
 ### Goals
 
-- Spawn and manage multiple Claude Code and Codex agent instances in a single project with named roles.
-- Route messages between agents with explicit fan-out (one human → many agents), fan-in (many agents → one agent), and sequential handoff, with optional prompt-template wrapping.
-- Apply prompt templates from one or more configured **prompt providers** during routing, with parameterized substitution. Providers include a built-in local file store (prompts authored as files inside the project or the user's Switchboard config directory) and any MCP server that exposes prompts (for example [Tiddly](https://tiddly.me)).
-- Centralize prompt-provider configuration in Switchboard so a user's prompt library works identically across all supported agent backends (Claude Code, Codex, future additions) without per-agent MCP setup. Does not extend to MCP *tools* or to model-discovered *skills*, which remain per-agent concerns.
-- Ship example prompts and example patterns in the local store so a new user is productive immediately, with no MCP setup required.
-- Define reusable patterns as files that compose primitives — invoked by name, parameterized at invocation time.
-- Run patterns autonomously after launch so the user can walk away and return to completed work.
-- Preserve full access to the underlying Claude Code and Codex experience — Switchboard drives the harnesses, doesn't replace them.
+- **Multi-agent spawn and management.** Multiple Claude Code and Codex agent instances run in a single project with user-assigned names.
+- **Routing primitives.** Explicit fan-out (one source → many agents, where the source is either a human-composed message or another agent's output), fan-in (many agents → one recipient), and sequential handoff, with optional prompt-template wrapping.
+- **Reusable, parameterized patterns.** Patterns are files that compose primitives — invoked by name, parameterized at invocation time.
+- **Agent-friendly authoring.** Pattern files and other authorable artifacts (local prompts, project setup) are documented in instruction docs under `docs/agent-instructions/` designed for AI coding agents to consume. The intended authoring path is to point your existing Claude Code or Codex agent at the relevant instruction file and ask it to generate the artifact from a description, rather than learning the DSL by hand.
+- **Autonomous pattern execution.** A pattern continues to run after launch so the user can switch focus to other work without babysitting it (within the lifetime of the Switchboard host process; see §7).
+- **Configurable prompt providers.** Apply prompt templates from one or more configured prompt providers during routing, with parameterized substitution. Providers include a built-in local file store (prompts authored as files inside the project or the user's Switchboard config directory) and any MCP server that exposes prompts (for example [Tiddly](https://tiddly.me)). Provider configuration is centralized in Switchboard, so a user's prompt library works identically across Claude Code, Codex, and future agent backends without per-agent MCP setup. Does not extend to MCP *tools* or to model-discovered *skills*, which remain per-agent concerns.
+- **Zero-setup onboarding.** Switchboard ships with example prompts and example patterns in the local store so a new user can invoke a useful pattern within minutes of installation, without configuring an MCP server.
+- **Full access to the underlying harness.** Switchboard drives Claude Code and Codex; it doesn't replace them.
+- **Shareable, versioned configuration.** Patterns, local prompts, and project configuration are file-based and live inside the project's `.switchboard/` directory, so they version, diff, review, and share via the user's normal git workflow.
 
 ### Non-goals
 
@@ -33,8 +34,9 @@ A second consequence of this design: because Switchboard resolves prompts itself
 - **Prescribing a software development lifecycle.** Switchboard does not know about "planner" or "reviewer" as roles with semantics. Roles are labels the user assigns; the tool is agnostic.
 - **Managing git, CI, or PR workflows.** Out of scope. Patterns can read agent outputs and route them; they don't run `git commit`, open PRs, or integrate with CI.
 - **Cross-session persistent agent memory** (vector DBs, RAG over prior sessions). Considered as a future feature; the v1 architecture should not preclude it but does not implement it.
-- **In-UI pattern authoring** in v1. Patterns are authored as files; UI authoring may come later.
+- **Visual / GUI pattern editor.** Authoring is file-based, supported by agent-consumable instruction docs (see goals — "Agent-friendly authoring"). A visual or form-based pattern editor is not planned.
 - **Multi-user collaboration.** Single-developer tool. Sharing patterns and configurations via git is supported as a side effect of file-based config, but there is no real-time collaboration model.
+- **Hosted / SaaS service.** Switchboard runs locally on the developer's machine. There is no managed cloud version, no shared backend, no remote agent execution. A future hosted service may eventually provide cross-machine sync of patterns, prompts, and project configuration; that is out of scope for v1.
 
 ## 3. Core concepts
 
@@ -80,9 +82,9 @@ This primitive is **synchronous from the human's perspective** — the human sen
 
 ### Primitive 3 — Auto-forward an agent's output
 
-Configure: when agent A finishes its current turn (next assistant text response), forward that output to agent B, optionally wrapped in a prompt template.
+Configure: when agent A finishes its current turn (next assistant text response), forward that output to one or more recipient agents, optionally wrapped in a prompt template.
 
-Used for sequential handoff (planner → implementer with the plan as input, for example). Configured before agent A is launched on its turn; fires automatically when A completes.
+Used for sequential handoff (planner → implementer with the plan as input) and for agent-driven fan-out (planner → multiple implementers in parallel, one reviewer → multiple follow-up reviewers, etc.). Configured before agent A is launched on its turn; fires automatically when A completes.
 
 ### Primitive 4 — Fan-in with template wrapping
 
@@ -349,7 +351,7 @@ Decisions explicitly **not made** in this document, to be addressed in later doc
 - **UI form factor.** TUI vs desktop app. Will be decided once functional requirements above are validated by an early prototype.
 - **Language and stack.** Depends on UI form factor.
 - **Long-lived agent processes.** Per-message spawn for v1; may revisit if latency dominates.
-- **In-UI pattern authoring.** v1 is file-based.
+- **Visual pattern editor.** v1 is file-based, with agent-consumable authoring docs as the supported authoring path.
 - **Granular permission/sandbox config.** v1 collapses to a single toggle.
 - **Cross-session persistent agent memory.** Architecture should not preclude; not implemented in v1.
 - **Multi-project workflows.** Each project is independent in v1.
@@ -404,6 +406,7 @@ Not yet: patterns, fan-out, fan-in, Codex, multi-agent, MCP-server provider.
 - Auto-forward (primitive 3).
 - Fan-in with template wrapping (primitive 4).
 - Built-in pattern: review-and-aggregate.
+- Agent-authoring guide at `docs/agent-instructions/patterns.md` ships alongside the parser, so users can ask their existing Claude Code or Codex agent to scaffold new patterns.
 
 ### v0.4 — Polish and second-order features
 

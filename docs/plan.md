@@ -97,7 +97,7 @@ This primitive is **synchronous from the human's perspective** — the human sen
 
 ### Primitive 3 — Auto-forward an agent's output
 
-Configure: when agent A finishes its current turn (next assistant text response — handling of tool-call responses is open question 10.1), forward that output to one or more recipient agents, optionally wrapped in a prompt template.
+Configure: when agent A finishes its current turn, forward that output to one or more recipient agents, optionally wrapped in a prompt template.
 
 Used for sequential handoff (planner → implementer with the plan as input) and for agent-driven fan-out (planner → multiple implementers in parallel, one reviewer → multiple follow-up reviewers, etc.). Configured before agent A is launched on its turn; fires automatically when A completes.
 
@@ -167,16 +167,39 @@ Internally, the configuration layer maps this single toggle to the actual flags 
 
 ### Required harness commands for MVP
 
-What Switchboard needs from each harness, with notes on what is exposed natively vs. derived vs. unavailable today:
+What Switchboard needs from each harness, with notes on what is exposed natively, derived, or unavailable. Hands-on probe results are documented in [docs/research/claude-code-cli-observed.md](research/claude-code-cli-observed.md), [docs/research/codex-cli-observed.md](research/codex-cli-observed.md), and [docs/research/harness-comparison.md](research/harness-comparison.md).
 
 - **Spawn** a session with explicit flags. *(native, both)*
-- **Send** a message and capture the structured stream. *(native, both)*
-- **Detect turn completion** via a stop / `turn.completed` event. *(native, both)*
-- **Resume** a session by ID. *(native, both)*
-- **Fork** a session from a checkpoint. *(needs verification per harness; track in implementation)*
-- **Read session metadata** (model, session ID, cost/tokens) from the JSON output stream. *(mostly native: Claude Code exposes `total_cost_usd` directly; Codex exposes raw token usage and Switchboard derives cost from a per-model pricing table.)*
-- **Derive context utilization.** Neither harness exposes a `tokens_max` field in headless mode — Claude Code's request to add one was closed as not planned ([anthropics/claude-code#8011](https://github.com/anthropics/claude-code/issues/8011)). Switchboard combines raw token counts from the JSON output with its own model→max-context map (see open question 10.12) to compute and display utilization.
-- **Surface compaction state.** Programmatic `/compact` is not available in either harness. Both harnesses do auto-compact on their own (Claude Code at ~95% of context; Codex via a configurable threshold). Switchboard's role is to monitor utilization and surface warnings as the threshold approaches, not to drive compaction itself; if a user wants explicit control they switch to interactive mode for a manual `/compact`. Reimplementing summarization in Switchboard would underperform the harnesses' tuned compaction and is not planned (see open question 10.11). Background in [docs/research/claude-code-headless.md](research/claude-code-headless.md) and [docs/research/codex-noninteractive.md](research/codex-noninteractive.md).
+- **Send** a message and capture the structured stream. *(native, both — `claude -p --output-format stream-json` and `codex exec --json`)*
+- **Detect turn completion.** *(native, both — single terminal event per turn.)* Claude Code emits `result`; Codex emits `turn.completed` on success and `turn.failed` on error. Switchboard's adapter waits for either.
+- **Detect errors.** *(native, both, but asymmetric.)* Claude Code: `result.is_error` and/or `result.api_error_status` (do not rely on `subtype` — it stays `"success"` even on error). Codex: a `turn.failed` event terminates the turn, payload carries the API error. Both harnesses also exit non-zero on error.
+- **Resume** a session by UUID. *(native, both — Claude Code: `--resume <uuid>`; Codex: `codex exec resume <uuid>`.)*
+- **Assign a session ID at spawn.** *(Claude Code only — `--session-id <uuid>`. Codex assigns its own; Switchboard captures it from the first stream event.)*
+- **Fork** a session from a checkpoint. *(Native in Claude Code via `--fork-session` with `--resume`. **Gap in Codex** — no non-interactive `codex exec fork`. Workarounds: copy the session JSONL to a new file, or start a fresh session and re-feed summarized prior context. Tracked under open question 10.14.)*
+- **Read session metadata** (model, session ID, cost, tokens) from the stream. *(Asymmetric.)* Claude Code: `result.total_cost_usd`, `result.modelUsage.<model>.{contextWindow, maxOutputTokens, costUSD}`. Codex: only token counts in `turn.completed.usage`; cost must be derived via a Switchboard-maintained per-model pricing table; `model_context_window` is in the **session file** (not the stream).
+- **Derive context utilization.** *(Native for Claude Code, asymmetric for Codex.)* Claude Code exposes `contextWindow` per turn in the result event — Switchboard reads it directly. Codex's stream omits it; Switchboard either reads the session file or maintains a model→max-context map. Open question 10.12 captures the choice.
+- **Surface compaction state.** *(No programmatic `/compact` in either harness; both do auto-compact at high utilization.)* Switchboard's role is to monitor utilization and surface warnings as the threshold approaches, not to drive compaction itself. Reimplementing summarization in Switchboard would underperform the harnesses' tuned compaction and is not planned (see open question 10.11).
+- **Read tool calls and tool results** from the stream. *(Asymmetric.)* Claude Code emits typed `tool_use` and `tool_result` content blocks (with named tools, including MCP tools). Codex routes everything through `command_execution` items (raw shell commands with `aggregated_output` and `exit_code`). Switchboard renders them differently per harness — there is no single unified rendering.
+- **Capture permission denials.** *(Confirmed for Claude Code via `result.permission_denials`.)* Denials do **not** error the turn — the model receives them as feedback and adapts. Switchboard treats denials as a distinct UX category (informational, not failure). Codex behavior presumed similar; verification deferred.
+- **Run agents concurrently.** *(Confirmed for Claude Code: three parallel `claude -p` from the same cwd produced three independent session files with no contention.)* This is what makes fan-out feasible. Codex concurrent runs not directly probed; presumed similar.
+
+### Per-harness adapter and normalized event stream
+
+The two harness streams are structurally different (event-name vocabularies, content shapes, where cost / context-window / rate-limit info appears). To keep the rest of Switchboard harness-agnostic, the harness layer is organized around **per-harness adapters** that translate native events into a normalized internal event stream the rest of the system consumes:
+
+```
+TurnStart       { agent, session_id }
+ContentChunk    { agent, kind: thinking | text | tool_use, data }
+ToolResult      { agent, tool_use_id, output, is_error }
+TurnEnd         { agent, status: success | error,
+                  stop_reason, usage: { input, output, cached, reasoning, context_window? },
+                  cost_usd?, permission_denials, raw_event }
+RateLimitEvent  { agent, info }
+```
+
+Each adapter (Claude Code, Codex) is responsible for: building the harness command line, spawning the process, parsing its native stream, normalizing into the events above, and surfacing harness-specific metadata in `raw_event` so callers that need to dig in can. The pattern engine, UI, and persistence layer consume only the normalized stream.
+
+Reading Codex session files (in addition to the stream) is an implementation choice the Codex adapter may make to fill in gaps the stream doesn't expose (rate limits, context window, full reasoning). Tracked under open question 10.15.
 
 ### Passthrough mechanism
 
@@ -311,6 +334,8 @@ The user can switch focus among agents to watch any of their outputs. The patter
 
 If a step in a pattern fails (an agent errors, a harness call fails, a template substitution fails), the pattern halts. Partial results are retained. The user sees the error, can inspect the state of each agent involved, and decides whether to retry the pattern, retry from a specific step, or abandon.
 
+A turn that ends with a tool **permission denial** is *not* a failure. The harness reports the denial (Claude Code's `result.permission_denials`, similar in Codex), the model receives the denial as feedback and adapts its response, and the turn completes normally. Switchboard surfaces denials as informational ("the model attempted X, was blocked") rather than as pattern-halting errors. Failures are reserved for harness-level errors (`is_error: true` / `turn.failed` / non-zero exit), template substitution errors, and pattern-orchestration errors.
+
 ### Walking away
 
 A pattern continues to run as long as the Switchboard host process is alive. Closing the UI window does not stop a pattern. Putting the machine to sleep stops a pattern (because the host process is paused). When the user returns, Switchboard shows the state of any in-progress or completed patterns.
@@ -378,7 +403,7 @@ Aggregated from inline flags above, plus a few additional:
 - **5.1** Exact pattern DSL keywords and structure. Needs a separate spec.
 - **5.2** Passthrough mechanism for harness commands — namespacing.
 - **6.1** Templating syntax (Jinja2 vs simpler) and template-available variables beyond `responses`.
-- **10.1** What does Switchboard do when an agent's "next assistant response" is a tool call rather than text? Default proposed: wait for the next text response. Override?
+- ~~**10.1** What does Switchboard do when an agent's "next assistant response" is a tool call rather than text?~~ **Resolved by hands-on probe:** both harnesses run the model → tool_use → tool_result → model loop internally and emit a single terminal event per user-initiated turn (Claude Code: `result`; Codex: `turn.completed` / `turn.failed`). Switchboard always sees a complete turn — there is no "tool-call-only response" to handle. See [docs/research/harness-comparison.md](research/harness-comparison.md).
 - **10.2** When two patterns reference the same agent, what happens? Disallow concurrent use? Queue? Refuse?
 - **10.3** How are agents preserved across Switchboard restarts? Harness session IDs persist on disk; Switchboard's project/agent registry needs its own persistence model.
 - **10.4** Pattern versioning. If a pattern file changes mid-execution (unlikely but possible), what happens to the in-flight pattern?
@@ -389,8 +414,14 @@ Aggregated from inline flags above, plus a few additional:
 - **10.9 (monitoring)** `--bare` will become the `claude -p` default in a future Anthropic release ([source](https://code.claude.com/docs/en/headless)). When it lands, default `-p` no longer auto-loads skills, hooks, plugins, MCP servers, or CLAUDE.md, and Switchboard must explicitly pass `--mcp-config`, `--agents`, `--plugin-dir`, `--settings`, `--append-system-prompt`, etc. to preserve current behavior. Mitigation: harness command-line construction is centralized from day one (§5 "Process model"). Action: monitor Anthropic release notes; flip the helper when announced. Background in [docs/research/claude-code-headless.md](research/claude-code-headless.md).
 - **10.10 (monitoring)** Headless slash-command support. `claude -p` does not accept slash commands today, blocking §5's full passthrough vision. Tracked upstream at [anthropics/claude-code#837](https://github.com/anthropics/claude-code/issues/837) and [#38505](https://github.com/anthropics/claude-code/issues/38505). Workarounds described in §5; full passthrough lights up automatically when upstream lands.
 - **10.11** Compaction strategy. Programmatic `/compact` is unavailable in both harnesses today; both do auto-compact at high utilization. Working assumption: Switchboard monitors token usage, warns the user as the auto-compact threshold approaches, and defers actual compaction to the harness. We do not implement Switchboard-side summarization (would underperform the harnesses' tuned compaction). Alternative to consider: surface a "fork from checkpoint with summary" action that uses the existing fork primitive plus an explicit summarize-and-restart prompt, as a coarse user-driven alternative when the user wants to reclaim context outside auto-compact. Background in [docs/research/claude-code-headless.md](research/claude-code-headless.md) and [docs/research/codex-noninteractive.md](research/codex-noninteractive.md).
-- **10.12** Model→max-context map maintenance. Neither harness exposes `tokens_max` in headless output, so Switchboard ships and maintains its own table mapping model identifiers to context window sizes (covering both Anthropic and OpenAI models). Working assumption: bundled in the Switchboard repo, updated when new models ship; user-overridable via config for new or custom models that haven't been added yet. Open: where is the canonical source we sync from?
+- **10.12** Model→max-context map maintenance. **Partially resolved by hands-on probe:** Claude Code v2.1.138 *does* expose `contextWindow` per turn in `result.modelUsage.<model>` — Switchboard reads it directly, no map needed for Claude Code. Codex's stream omits it; the value lives in the session file's `task_started` event. Working assumption for Codex: ship a bundled model→max-context map, but also let the Codex adapter read the session file and prefer that as authoritative when present. Still open: do we ship the map, read the session file, or both? Open: where is the canonical map source for new models we sync from?
 - **10.13 (monitoring)** Programmatic `/compact` exposure in either harness. Multiple Anthropic feature requests open ([anthropics/claude-code#5643](https://github.com/anthropics/claude-code/issues/5643), [#39275](https://github.com/anthropics/claude-code/issues/39275), [#39574](https://github.com/anthropics/claude-code/issues/39574), [#26488](https://github.com/anthropics/claude-code/issues/26488)); Codex equivalent not documented. When upstream lands, Switchboard can offer first-class compaction control inside patterns.
+- **10.14** Codex non-interactive fork. Claude Code has native `--fork-session`; Codex has no `codex exec fork`. Three options: (a) drop fork from v1's Codex agent capability and document the asymmetry; (b) implement fork by copying the session JSONL to a new file and passing the new ID to `codex exec resume` (untested — file format may not support this cleanly); (c) implement fork by spawning a fresh Codex session and re-feeding a summarized version of the prior context as the initial prompt. Decision deferred to implementation; (a) is the safe v1 default.
+- **10.15** Should the Codex adapter read the session file (`~/.codex/sessions/...jsonl`) in addition to the `--json` stream? The session file carries information the stream doesn't (rate limits, `model_context_window`, full reasoning blocks). Tradeoff: more complete information vs more file-watching plumbing and the question of whether to tail-read live or read on completion. Working assumption: read on turn completion (after `turn.completed`/`turn.failed`) to enrich the normalized event stream with the missing fields.
+- **10.16** Disk usage of harness session files. Both harnesses persist transcripts indefinitely (Claude Code at `~/.claude/projects/<encoded-cwd>/*.jsonl`, Codex at `~/.codex/sessions/YYYY/MM/DD/...`). A long-lived project with many agents and many turns will accumulate. Should Switchboard offer pruning, surface totals, or otherwise manage this? Out of scope for v1, but the architecture should not preclude it.
+- **10.17** Network failure and retry policy. What does Switchboard do when a turn fails mid-pattern because of a transient API error or network blip? Working assumption: a single configurable retry on transient errors (rate-limit, 5xx) before marking the step as failed. Permanent errors (auth, invalid model, denied content) fail immediately. To be detailed in §7 once we have an implementation footprint.
+- **10.18** Cost budgeting at the pattern and project level. Both harnesses support `--max-budget-usd` (Claude Code) per invocation. A pattern that fans out × N multiplies cost per step; a long-running project running unattended could rack up real money. Should Switchboard offer per-pattern and per-project budget caps in addition to per-invocation? Working assumption: yes for both, with clear pre-launch cost estimates for fan-out patterns. Detailed design deferred.
+- **10.19** Switchboard as MCP client. The plan says "Switchboard resolves prompt IDs via the configured MCP server" — meaning Switchboard itself runs an MCP client to fetch prompts (independent of the harnesses' own MCP clients). This is an implementation responsibility worth noting explicitly: Switchboard ships an MCP client implementation for the prompt-provider feature, not just the harness wrappers.
 
 ---
 

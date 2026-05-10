@@ -71,7 +71,7 @@ Open Anthropic issues tracking this gap:
 
 Source: [Run Claude Code programmatically — Claude Code Docs](https://code.claude.com/docs/en/headless), [\[FEATURE\] Better context window handling in SDK headless mode (anthropics/claude-code#8011)](https://github.com/anthropics/claude-code/issues/8011)
 
-**Context-window maximum (`tokens_max`) is *not* exposed.** Issue [#8011](https://github.com/anthropics/claude-code/issues/8011) requested this and was **closed as not planned**. To compute a utilization percentage, Switchboard must combine the raw token counts above with its own model→max-context map (keyed on the model identifier in the `system/init` event).
+**Context-window maximum.** Issue [#8011](https://github.com/anthropics/claude-code/issues/8011) requested a `tokens_max` field in `usage` and was **closed as not planned** — but **a `contextWindow` field IS exposed elsewhere**, under `result.modelUsage.<model>.contextWindow`, as of v2.1.138. This was confirmed by hands-on probe (see [claude-code-cli-observed.md](claude-code-cli-observed.md)). The "not planned" was specifically about adding it to `usage`; it ended up surfaced via a different path. Switchboard can read it directly per turn — no model→max-context map needed for Claude Code.
 
 **`/compact` cannot be triggered programmatically.** It is REPL-only. Multiple open feature requests exist:
 

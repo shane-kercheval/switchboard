@@ -9,6 +9,8 @@ Switchboard drives Codex through `codex exec`, the non-interactive subcommand. T
 
 ## Key findings
 
+**Note (added after hands-on probe):** Codex's `--json` stream is a deliberately minimal subset of what's actually recorded. The session file (`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`) carries much more — including `model_context_window`, rate-limit info, the full system prompt (`base_instructions`), and encrypted reasoning blocks. See [codex-cli-observed.md](codex-cli-observed.md) for the complete picture. Switchboard's Codex adapter may need to read both the stream and the session file to surface everything we want.
+
 ### Token usage is exposed in `codex exec --json`
 
 Per-turn usage is reported in `turn.completed` events:

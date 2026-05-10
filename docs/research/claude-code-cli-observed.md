@@ -190,7 +190,15 @@ Forced by `--permission-mode dontAsk` plus a prompt asking the model to use `Wri
 }
 ```
 
-**Switchboard implication:** denials do not error the turn (`is_error: false`) — the model receives the denial as feedback and adapts its response. `permission_denials` contains the full attempted call with arguments. Switchboard can use this to surface "the model tried X but was blocked" affordances without treating the turn as failed. Note that with disallowed *tools* (e.g. `--disallowedTools Read`), the model often routes around (we saw it use `cat` via `Bash` after `Read` was disallowed) — disallowance prevents the tool from appearing, denial happens after attempt.
+**Switchboard implication:** denials do not error the turn (`is_error: false`) — the model receives the denial as feedback and adapts its response. `permission_denials` contains the full attempted call with arguments. Switchboard can use this to surface "the model tried X but was blocked" affordances without treating the turn as failed.
+
+Three behaviors to keep distinct:
+
+- **Disallowed tools** (e.g. `--disallowedTools Read`): the tool doesn't appear in the model's palette at all; the model often routes around (we saw it use `cat` via `Bash` after `Read` was disallowed). No `permission_denials` fires because no attempt was made.
+- **Model self-restraint**: in `--permission-mode dontAsk`, the model frequently *refuses to attempt* destructive operations on its own ("rm is destructive — want me to proceed?") rather than trying. No `permission_denials` fires here either. To force a denial in our probe, we had to explicitly tell the model "just attempt it."
+- **Permission denial**: the model attempted, the harness blocked it. This is the case `permission_denials` captures.
+
+Switchboard's "the model tried X but was blocked" UI surface only fires for the third case. Self-restraint shows up as ordinary text output ("I won't do that"); disallowed-tool routing shows up as the model using a different tool.
 
 ## Concurrent invocations
 

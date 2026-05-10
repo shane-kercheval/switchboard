@@ -152,16 +152,16 @@ Internally, the configuration layer maps this single toggle to the actual flags 
 
 ### Required harness commands for MVP
 
-Switchboard must be able to:
+What Switchboard needs from each harness, with notes on what is exposed natively vs. derived vs. unavailable today:
 
-- **Spawn** a session with explicit flags.
-- **Send** a message and capture the structured stream.
-- **Detect turn completion** (the harness emits a stop event).
-- **Trigger compaction** (`/compact` equivalent invoked programmatically).
-- **Read context utilization** (percent of context consumed).
-- **Read session metadata** (model, session ID, cost/tokens).
-- **Resume** a session by ID.
-- **Fork** a session from a checkpoint.
+- **Spawn** a session with explicit flags. *(native, both)*
+- **Send** a message and capture the structured stream. *(native, both)*
+- **Detect turn completion** via a stop / `turn.completed` event. *(native, both)*
+- **Resume** a session by ID. *(native, both)*
+- **Fork** a session from a checkpoint. *(needs verification per harness; track in implementation)*
+- **Read session metadata** (model, session ID, cost/tokens) from the JSON output stream. *(mostly native: Claude Code exposes `total_cost_usd` directly; Codex exposes raw token usage and Switchboard derives cost from a per-model pricing table.)*
+- **Derive context utilization.** Neither harness exposes a `tokens_max` field in headless mode — Claude Code's request to add one was closed as not planned ([anthropics/claude-code#8011](https://github.com/anthropics/claude-code/issues/8011)). Switchboard combines raw token counts from the JSON output with its own model→max-context map (see open question 10.12) to compute and display utilization.
+- **Surface compaction state.** Programmatic `/compact` is not available in either harness. Both harnesses do auto-compact on their own (Claude Code at ~95% of context; Codex via a configurable threshold). Switchboard's role is to monitor utilization and surface warnings as the threshold approaches, not to drive compaction itself; if a user wants explicit control they switch to interactive mode for a manual `/compact`. Reimplementing summarization in Switchboard would underperform the harnesses' tuned compaction and is not planned (see open question 10.11). Background in [docs/research/claude-code-headless.md](research/claude-code-headless.md) and [docs/research/codex-noninteractive.md](research/codex-noninteractive.md).
 
 ### Passthrough mechanism
 
@@ -374,6 +374,9 @@ Aggregated from inline flags above, plus a few additional:
 - **10.8** Whether the local store and the MCP-server provider need to expose the same template-arguments contract (variable names, types, defaults) so a prompt can move between them without breaking pattern files. Working assumption: yes; the local file's frontmatter mirrors what an MCP `prompts/get` response would carry.
 - **10.9 (monitoring)** `--bare` will become the `claude -p` default in a future Anthropic release ([source](https://code.claude.com/docs/en/headless)). When it lands, default `-p` no longer auto-loads skills, hooks, plugins, MCP servers, or CLAUDE.md, and Switchboard must explicitly pass `--mcp-config`, `--agents`, `--plugin-dir`, `--settings`, `--append-system-prompt`, etc. to preserve current behavior. Mitigation: harness command-line construction is centralized from day one (§5 "Process model"). Action: monitor Anthropic release notes; flip the helper when announced. Background in [docs/research/claude-code-headless.md](research/claude-code-headless.md).
 - **10.10 (monitoring)** Headless slash-command support. `claude -p` does not accept slash commands today, blocking §5's full passthrough vision. Tracked upstream at [anthropics/claude-code#837](https://github.com/anthropics/claude-code/issues/837) and [#38505](https://github.com/anthropics/claude-code/issues/38505). Workarounds described in §5; full passthrough lights up automatically when upstream lands.
+- **10.11** Compaction strategy. Programmatic `/compact` is unavailable in both harnesses today; both do auto-compact at high utilization. Working assumption: Switchboard monitors token usage, warns the user as the auto-compact threshold approaches, and defers actual compaction to the harness. We do not implement Switchboard-side summarization (would underperform the harnesses' tuned compaction). Alternative to consider: surface a "fork from checkpoint with summary" action that uses the existing fork primitive plus an explicit summarize-and-restart prompt, as a coarse user-driven alternative when the user wants to reclaim context outside auto-compact. Background in [docs/research/claude-code-headless.md](research/claude-code-headless.md) and [docs/research/codex-noninteractive.md](research/codex-noninteractive.md).
+- **10.12** Model→max-context map maintenance. Neither harness exposes `tokens_max` in headless output, so Switchboard ships and maintains its own table mapping model identifiers to context window sizes (covering both Anthropic and OpenAI models). Working assumption: bundled in the Switchboard repo, updated when new models ship; user-overridable via config for new or custom models that haven't been added yet. Open: where is the canonical source we sync from?
+- **10.13 (monitoring)** Programmatic `/compact` exposure in either harness. Multiple Anthropic feature requests open ([anthropics/claude-code#5643](https://github.com/anthropics/claude-code/issues/5643), [#39275](https://github.com/anthropics/claude-code/issues/39275), [#39574](https://github.com/anthropics/claude-code/issues/39574), [#26488](https://github.com/anthropics/claude-code/issues/26488)); Codex equivalent not documented. When upstream lands, Switchboard can offer first-class compaction control inside patterns.
 
 ## 11. Phasing
 

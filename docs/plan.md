@@ -151,13 +151,13 @@ Pattern files are project-scoped only — there is no user-global pattern direct
 
 ## 6. Prompts and prompt providers
 
-Pattern files and slash commands reference prompts by ID. The *prompt text* lives in a **prompt provider**; the *workflow* lives in the pattern file. Switchboard reads pattern files, resolves prompt IDs to prompt content via the configured providers, and applies templates with substitution.
+A **prompt** is a reusable, optionally parameterized text template — for example, "Review the diff focusing on `{{ focus }}`." Pattern files and slash commands reference prompts by ID. The *prompt text* lives in a **prompt provider**; the *workflow* lives in the pattern file. Switchboard reads pattern files, resolves prompt IDs to prompt content via the configured providers, and applies templates with substitution.
 
 ### Providers
 
 Two providers ship in v1:
 
-- **Local file store.** Prompts authored as files (markdown body with YAML frontmatter for metadata: id, description, arguments). Lives at two scopes: a project-scoped directory at `<project>/.switchboard/prompts/` (versioned with the project) and a user-global directory resolved per OS conventions via the Rust [`directories`](https://crates.io/crates/directories) crate (e.g. `~/.config/switchboard/prompts/` on Linux, `~/Library/Application Support/switchboard/prompts/` on macOS, `%APPDATA%\switchboard\prompts\` on Windows). The local store is the lowest-friction way to author a prompt and the mechanism Switchboard uses to ship example prompts.
+- **Local file store.** Prompts authored as files (markdown body with YAML frontmatter for metadata: id, description, arguments). Resolved across one or more directories: a fixed project scope at `<project>/.switchboard/prompts/`, plus an ordered list of user-configured directories (`local_prompt_dirs` in config — see "Configuring local prompt directories" below). This lets a power user keep their personal prompt library in their own git repo (e.g. `~/repos/my-prompts/`) instead of being limited to the OS-conventional app data directory. The local store is the lowest-friction way to author a prompt and the mechanism Switchboard uses to ship example prompts.
 - **MCP-server provider.** Resolves IDs against any MCP server the user has configured that exposes prompts. [Tiddly](https://tiddly.me) is the canonical example and the development reference, but the integration is generic: pointing Switchboard at a different MCP prompt server is a configuration change, not a code change.
 
 ### Authoring a local prompt
@@ -180,7 +180,59 @@ Please review the current uncommitted changes in this repository.
 For each issue, identify the file, the concern, and a suggested fix.
 ```
 
-A user can promote a local prompt to an MCP server later (paste it into Tiddly, change the prefix in pattern files), but is never required to.
+**Frontmatter spec for v1:**
+
+| Field | Required | Notes |
+|---|---|---|
+| `id` | yes | Slug; matches MCP's `name` field. Used as the suffix in `local:<id>` references. |
+| `description` | yes | Short human description. Matches MCP standard. |
+| `arguments` | optional | Array of `{name, description, required}`. Matches MCP standard. All arguments are treated as strings in template substitution; typed arguments may be added later if needed. |
+| `tags` | optional | Array of strings. Matches Tiddly's tag extension. Reserved for future library/browse views (see "Future direction" below); v1 does not use them in the slash-command UI. |
+
+This minimal set mirrors the MCP `prompts/list` standard, plus Tiddly's tag extension as a superset, so prompts move cleanly between local and MCP storage. Other metadata fields (title, owner, etc.) are explicitly out of scope for v1.
+
+### Configuring local prompt directories and MCP-server providers
+
+Both local prompt directories (`local_prompt_dirs`) and MCP-server providers (`mcp_providers`) are declared in YAML config at one of two scopes:
+
+- **User-global**: `~/.config/switchboard/config.yaml` (path resolved per OS via the Rust `directories` crate). For personal preferences — your prompt library location, your Tiddly account, etc.
+- **Project-scoped**: `<project>/.switchboard/config.yaml`. Adds or replaces user-global config. Useful when a team pattern needs a specific MCP provider (e.g., a team Tiddly URL distinct from the user's personal one) or when a project ships its own curated set of prompt directories.
+
+Resolution rules differ slightly between the two keys:
+
+- **`local_prompt_dirs`**: project's list, if set, *replaces* the user-global list (project intent is explicit).
+- **`mcp_providers`**: project providers shadow user-global providers with the same `name` (entry-level merge); the user's other providers stay available.
+
+**Example config:**
+
+```yaml
+# A list of directories Switchboard scans for local prompts, in declared
+# order. If unset, defaults to [<OS-conventional path>]. Power users can
+# point at a personal git-managed prompt library here.
+local_prompt_dirs:
+  - ~/repos/my-prompts-library      # personal git-managed library
+  - ~/.config/switchboard/prompts   # OS-conventional default; explicitly include if you want it
+
+mcp_providers:
+  - name: tiddly                    # used as the prefix (tiddly:my-prompt)
+    preset: tiddly                  # first-class preset; only requires a token
+    token: ${TIDDLY_PAT}            # env var reference
+
+  - name: my-team-mcp               # generic HTTP MCP server
+    transport:
+      type: http
+      url: https://mcp.example.com
+    auth:
+      type: bearer
+      token: ${TEAM_MCP_TOKEN}
+
+  - name: my-local-stdio            # generic stdio MCP server (e.g. an npm-packaged server)
+    transport:
+      type: stdio
+      command: ["npx", "-y", "@example/mcp-server"]
+```
+
+**Tiddly is a first-class preset.** The Switchboard UI offers a one-click "Connect Tiddly" action: the user pastes a Personal Access Token, and the app writes the corresponding `preset: tiddly` config entry automatically. Tiddly's URL and auth pattern are baked in. Other MCP servers require manual config (or a generic "Add MCP server" form in the UI). The presets list is open — additional first-class integrations (e.g., a future popular prompt-store MCP) can be added the same way.
 
 ### Addressing prompts
 
@@ -195,8 +247,20 @@ The prefix is the user-chosen registration name for an MCP-server provider, so a
 
 - **Pattern files require explicit prefix.** Every prompt reference in a pattern is fully qualified (e.g. `local:code-review`, `tiddly:code-review`). This keeps pattern files portable: a pattern shared between projects always resolves to the same prompt source, regardless of how the receiving user has their providers configured. There is no concept of a "default provider" for unprefixed lookup in pattern files.
 - **Prefixed lookup is strict.** A prefixed ID resolves only against the named provider; if not found, it errors. No cross-provider fallback.
-- **Local-store scopes.** Local-store lookup checks the project scope first, then the user-global scope. A project-scoped prompt with the same name shadows the user-global one — intentional, so a project can override a personal prompt.
+- **Local-store resolution.** Project scope (`<project>/.switchboard/prompts/`) is checked first, then each directory in `local_prompt_dirs` (from project config if present, otherwise from user config) in declared order. Default value if not configured: `[<OS-conventional path>]` (e.g. `~/.config/switchboard/prompts/` on Linux, resolved via the Rust [`directories`](https://crates.io/crates/directories) crate). A prompt with the same name in an earlier-checked directory shadows later ones — intentional, lets a project override a personal library, lets a personal library override a team library, etc. Project config's `local_prompt_dirs` (if set) replaces the user-config list rather than merging, so the project's intent is explicit.
 - **Interactive UI ergonomics.** When the user types a slash command in the message bar, the UI may provide autocomplete across all configured providers and may accept a bare name if it matches exactly one provider's prompt. This is a UI-layer affordance only — it does not affect how patterns or other persisted artifacts reference prompts.
+- **Prompt versioning is out of scope for v1.** Pattern references resolve to whatever the provider returns at invocation time; if a Tiddly prompt is edited, every pattern referencing it picks up the new version on the next invocation. Recovery and history are deferred to the upstream tool — Tiddly's own version history for hosted prompts, git for local prompts.
+
+### Prompt arguments
+
+Prompts can declare arguments (per the frontmatter spec for local prompts, or per the MCP `prompts/list` response for MCP-served prompts). At routing time:
+
+1. Switchboard discovers a prompt's arguments from its provider (frontmatter for local; `prompts/list` for MCP).
+2. The user (or the invoking pattern) supplies values for each argument.
+3. **For MCP-served prompts**, Switchboard calls `prompts/get` with the supplied values; the MCP server renders the template and returns the rendered text.
+4. **For local prompts**, Switchboard renders the template itself with MiniJinja (see "Wrapping templates" below for the Rust templating choice) and produces the rendered text.
+
+The agent only ever sees the final rendered text — neither the template nor the arguments. This is what makes the "prompt-provider configuration lives in one place" property work across harnesses (see "Cross-agent normalization" below).
 
 This separation between provider and workflow is intentional: a prompt store is a prompt store, not a workflow engine. Encoding control flow ("run agent A, then fan out to B and C, then aggregate via template D") in a stored prompt would stretch the store out of shape. Patterns are programs; prompts are data.
 
@@ -214,7 +278,7 @@ Switchboard normalizes the *user-invoked prompt* surface across agents. Model-in
 
 ### Wrapping templates
 
-Wrapping templates (used for fan-in) are prompts — from any provider — that take agent responses as variables. The pattern definition declares which agent maps to which template variable. The template uses **Jinja2** syntax (open question 6.1 captures whether v1 commits to full Jinja2 or a smaller subset):
+Wrapping templates (used for fan-in) are prompts — from any provider — that take agent responses as variables. The pattern definition declares which agent maps to which template variable. The template uses **Jinja2-compatible syntax**, rendered via [MiniJinja](https://github.com/mitsuhiko/minijinja) (a native Rust templating engine by the author of Jinja2, designed for Jinja2 compatibility — chosen so prompts move cleanly between Tiddly's Jinja2 and Switchboard's local rendering without surprises). Open question 6.1 captures whether v1 commits to MiniJinja's full surface or a restricted subset:
 
 ```jinja
 The following are reviews from multiple agents:
@@ -230,7 +294,15 @@ Summarize the recommendations and identify points of agreement and
 disagreement.
 ```
 
-**Open question 6.1:** Exact templating subset (full Jinja2 vs a smaller restricted subset) and what variables are available in templates beyond `responses` (e.g., `user_context`, `agent_metadata`, `project_info`).
+**Open question 6.1:** Exact templating subset (full MiniJinja vs a smaller restricted subset) and what variables are available in templates beyond `responses` (e.g., `user_context`, `agent_metadata`, `project_info`).
+
+### Future direction: prompt library view
+
+v1's prompt UX is slash-command-driven — the user types a slash command in the message bar, autocomplete suggests prompts across configured providers, and the prompt is sent to the agent. This is the minimum surface to make prompts useful.
+
+A richer **prompt library view** is plausible for v2+: a "Prompts" panel that lists all prompts from all configured providers, lets the user filter by provider or tag, search by name/description/content, and edit local prompts in their editor (or open Tiddly-hosted prompts in Tiddly via deep link). This is what makes the optional `tags` field in the local prompt frontmatter useful — v1's slash command picker doesn't need them, but a library view does.
+
+The schema and provider model already accommodate this; v1 just doesn't ship the UI. Keeping the data shape compatible (mirroring MCP's prompt schema + Tiddly's tag extension) is what makes it cheap to add later.
 
 ## 7. User-facing model
 

@@ -11,7 +11,7 @@ It is **not** a user tutorial. Tutorial-style authoring guidance lives in `docs/
 ## Scope
 
 - File structure: top-level keys, inputs declaration, steps array
-- Step types: one per primitive (system-design §4 Primitives 1–6) plus the `wait_for_all` helper
+- Step types: one per workflow-runtime primitive (system-design §4 Primitives 2–6 — `send`, auto-forward [as `forward_from` on `send`], fan-in, pause for user input, iterate). Spawn (Primitive 1) is not a workflow step — agents are spawned through the UI before the workflow runs and supplied as workflow inputs. Plus the `wait_for` and `wait_for_all` synchronization helpers
 - Templating: MiniJinja subset, available variables, built-in template functions
 - Variable scoping rules
 - Error and validation conventions
@@ -132,6 +132,8 @@ Dispatch a message to one or more agents. Returns immediately; does not wait for
 
 If `prompt` is set, the prompt's template is rendered with workflow-scope variables plus any `template_vars` and dispatched. If `text` is set, the literal text is dispatched (after templating). At least one of `prompt`, `text`, or `forward_from` is required.
 
+When `to` is a list of agents, dispatches are issued in declared order; agents run in parallel. The step returns once all dispatches have been issued (not when any has completed) — to synchronize, use `wait_for_all` in the next step.
+
 #### Canonical composition with `forward_from`
 
 When `forward_from` is set, the dispatched message body is composed deterministically so that workflow files remain portable and reviewable:
@@ -179,17 +181,29 @@ Block until all named agents' in-flight turns complete. Failure of any one is a 
 
 ### `pause_for_user` (Primitive 5)
 
-Suspend workflow execution and wait for the user to dispatch a response from the compose bar. Fires an OS-native notification when entered.
+Suspend workflow execution and wait for the user to respond via the compose bar. Fires an OS-native notification when entered.
 
 | Field | Required | Type | Notes |
 |---|---|---|---|
 | `context` | optional | text | Templated message shown to the user (e.g., "Reviews are in. What direction do you want to take?"). |
-| `recipient` | optional | agent | If set, the compose bar is pre-targeted at this agent — the user just types their response, and the input is dispatched to this recipient as part of the same step. Templated. |
-| `required` | optional | bool | Default `true`. If `false`, the user may "skip" without supplying input (the workflow proceeds with `user_input` set to empty string). If `true`, "skip" cancels the workflow. |
+| `recipient` | optional | agent | If set, the user's response is dispatched to this agent as part of the same step (see "Mode 2" below). Templated. |
+| `required` | optional | bool | Default `true`. If `true`, the user choosing "skip" cancels the workflow. If `false`, the user may skip without supplying input. |
 
-After the user dispatches, the variable `user_input` (built-in, scoped per "Variable scoping" below) holds the user's typed text. If the user combined a prior agent's output or applied a wrapping prompt in the compose bar, those affect what is dispatched to `recipient` — they do not change `user_input`. This keeps `user_input` predictable for subsequent template references.
+The user's typed text is captured into the built-in variable `user_input` (scoped per "Variable scoping" below). If the user combined a prior agent's output or applied a wrapping prompt in the compose bar, those affect what is dispatched to `recipient` — they do not change `user_input`. This keeps `user_input` predictable for subsequent template references.
 
-**Implicit wait when `recipient` is set:** `pause_for_user` with `recipient` resolves only when the recipient's turn (dispatched from the user's input) reaches terminal state. The pause + dispatch + wait are bundled into one step. This is the only step in the spec that bundles wait with dispatch — the rationale is ergonomic: the user has just answered a question and the natural expectation is to see what the agent says before the workflow proceeds, and pause-with-recipient targets exactly one agent (no fan-out parallelism to preserve). Authors who want true fire-and-forget after a pause should omit `recipient` and write a separate `send` step using `user_input`.
+The step has two modes depending on whether `recipient` is set:
+
+**Mode 1: without `recipient` — capture only.**
+
+The step suspends, captures the user's typed text into `user_input`, and completes. No dispatch happens; no agent turn is initiated by the step. The next step in the workflow runs immediately after the user submits. If `required: false` and the user skips, `user_input` is bound to the empty string and the step still completes normally.
+
+**Mode 2: with `recipient` — capture, dispatch, and implicitly wait.**
+
+The step suspends, captures the user's typed text into `user_input`, dispatches `user_input` (along with any compose-bar combining/wrapping the user applied) to `recipient`, and **implicitly waits** for the recipient's turn to reach terminal state before the next workflow step runs. The pause + dispatch + wait are bundled into one step. This is the only step type in the spec that bundles wait with dispatch — the rationale is ergonomic: the user has just answered a question and the natural expectation is to see the agent's response before the workflow proceeds, and pause-with-recipient targets exactly one agent (no fan-out parallelism to preserve). Authors wanting true fire-and-forget after a pause should drop `recipient` (use Mode 1) and write a separate `send` step using `user_input`.
+
+If `required: false` and the user skips in Mode 2, no dispatch occurs and no wait is applied; `user_input` is bound to the empty string and the step completes immediately.
+
+If `required: true` and the user skips in either mode, the workflow is marked `cancelled` (per "Failure handling" below).
 
 ### `for_each` (Primitive 6)
 
@@ -202,6 +216,8 @@ Repeat a sub-sequence of steps once for each item in a list.
 | `steps` | yes | sequence | Sub-steps to execute per iteration. Same structure as the top-level `steps`. |
 
 The iteration variable is bound for each iteration's body and accessible in template substitution (e.g., `{{ milestone }}`). Iterations are sequential, not parallel. Iterating over an empty list is a no-op (the body executes zero times); not an error. A failure inside iteration N halts the whole workflow per system-design §4 (no per-iteration error handling in v1). Nested `for_each` is an error in v1.
+
+The iteration variable name (`item:`) must not collide with any workflow input name; the collision is a parse-time validation error (consistent with the agent-name uniqueness rule — silent shadowing is a footgun and is rejected at the boundary).
 
 ## Templating
 
@@ -244,12 +260,24 @@ A variable name that resolves in two scopes uses the innermost. A variable name 
 
 | Function | Returns | Notes |
 |---|---|---|
-| `responses_from(agents)` | mapping name → text | Maps each agent's name (with hyphens normalized to underscores) to that agent's latest completed turn output. Errors if any agent has no completed output yet. Agent-name uniqueness after hyphen→underscore normalization is enforced at agent-creation time (per system-design §3 Primitive 1), so collisions cannot occur here. Use this when authoring a Switchboard-aware aggregation prompt that wants to iterate over responses with custom formatting. |
-| `aggregated_responses(agents)` | text | Returns the same data as `responses_from(agents)` pre-formatted into a single string in the canonical aggregation shape (defined below). Use this when the receiving prompt takes a single text-blob argument — typical of cross-platform prompts (Tiddly, MCP servers, hand-authored prompts not aware of Switchboard's data shape). Errors if any agent has no completed output yet. |
-| `last_output(agent)` | text | Single agent's latest completed output. Errors if the agent has no completed output yet. |
+| `responses_from(agents)` | mapping name → text | Maps each agent's name (with hyphens normalized to underscores) to that agent's latest completed turn output **for the current workflow run** (see "Output scope" below). The mapping preserves the input agent list order during iteration. Errors if any agent has no completed output yet from this workflow run. Agent-name uniqueness after hyphen→underscore normalization is enforced at agent-creation time (per system-design §3 Primitive 1), so collisions cannot occur here. Use this when authoring a Switchboard-aware aggregation prompt that wants to iterate over responses with custom formatting. |
+| `aggregated_responses(agents)` | text | Returns the same data as `responses_from(agents)` pre-formatted into a single string in the canonical aggregation shape (defined below). Use this when the receiving prompt takes a single text-blob argument — typical of cross-platform prompts (Tiddly, MCP servers, hand-authored prompts not aware of Switchboard's data shape). Same workflow-scope and ordering rules as `responses_from`. Errors if any agent has no completed output yet from this workflow run. |
+| `last_output(agent)` | text | Single agent's latest completed output **for the current workflow run** (see "Output scope" below). Errors if the agent has no completed output yet from this workflow run. |
 | `agent_names(agents)` | [text] | Maps a list of agent references to their string names. Useful when iterating in a template. |
 
 These functions are callable inside `{{ ... }}` expressions and `{% ... %}` control structures.
+
+Functions accepting `agents` arguments accept either a single agent reference or a list of agents; a single agent is treated as a one-element list.
+
+#### Output scope
+
+`forward_from`, `responses_from`, `aggregated_responses`, and `last_output` see only turns dispatched by the current workflow run and observed reaching terminal state via a `wait_for` / `wait_for_all` (or via a `pause_for_user` with `recipient`'s implicit wait). Out-of-band turns are invisible to these helpers — specifically:
+
+- Manual compose-bar dispatches the user makes to a participating agent between workflow steps.
+- Turns from prior workflow runs against the same agent.
+- Turns from concurrent workflow runs targeting the same agent.
+
+Rationale: deterministic, predictable behavior. The author writes the workflow as a sequence of dispatches with declared dependencies; the helpers should reflect what the workflow itself orchestrated, not silently couple to whatever the user (or another workflow) did out-of-band. Implementation: the workflow runtime maintains a per-run map of agent → most-recent-completed-turn-this-workflow-saw, updated on `wait_for` / `wait_for_all` success; the helpers read from this map.
 
 #### Canonical aggregation shape (`aggregated_responses`)
 
@@ -301,11 +329,13 @@ Visible only inside the prompt template being rendered for that one `send` step.
 
 ## Failure handling and workflow status
 
+A workflow does not transition to `complete` until every turn it dispatched has reached terminal state, including turns still in flight after the last step is issued. Authors do not need a trailing `wait_for` on the final dispatch — the runtime holds the workflow open until all turns it initiated settle.
+
 A workflow run terminates in one of these statuses:
 
 | Status | Meaning |
 |---|---|
-| `complete` | All steps executed; all turns reached terminal state |
+| `complete` | All steps executed; all turns dispatched by the workflow reached terminal state |
 | `cancelled` | User cancelled (via cancel-workflow OR by cancelling an agent's turn while the agent was in a workflow step) |
 | `failed` | A step failed (harness error, template render error, pre-dispatch resolution error, contention refusal, fan-in per-agent failure) |
 | `interrupted` | Switchboard exited uncontrollably (crash / OS reboot / force-kill) mid-workflow with an in-flight step. Explicit quit cleanly cancels in-flight workflows → `cancelled`, not `interrupted` (per system-design §7 "Walking away"). |
@@ -319,6 +349,12 @@ Per system-design §7:
 - Switchboard process death mid-step → `interrupted` (recovery: surface "interrupted at step N" with retry/abandon options)
 
 A `failed` or `interrupted` workflow can be retried from the failed step or abandoned. A `cancelled` workflow cannot be auto-resumed (user must re-invoke from the start).
+
+### Retry from inside a `for_each` iteration
+
+When a step inside a `for_each` body fails or is interrupted, the workflow checkpoint captures both the iteration index and the iteration variable's value (per system-design §7 "Walking away"). On retry, the runtime rebinds the iteration variable from the checkpoint and resumes execution at the failed step's index *within that iteration*. Earlier steps in the same iteration are not re-executed.
+
+Authors should keep this in mind when writing iteration bodies that have side-effecting steps (e.g., a `send` that creates a file or commits): on retry of step N within iteration K, steps 1..N-1 of iteration K do not run again. Where retry-correctness matters, design the workflow so the failing step is the side-effecting one (so its effects are not double-applied) or so earlier-step effects are idempotent.
 
 ## Validation
 
@@ -335,6 +371,7 @@ A workflow file is validated at two times:
 - All template strings parse as valid templates (referenced variable names need not be declared yet — that's an invocation-time check)
 - No nested `for_each`
 - No reserved built-in names used as input names
+- No `for_each` `item:` name that collides with a workflow input name (per §`for_each` — silent shadowing is rejected at the boundary)
 
 Hardcoded `prompt_id` literals (e.g., `prompt: "local:code-review"` with no template substitution) are **not** resolved against providers at parse time; provider resolution happens at invocation time. This is intentional — configured prompt providers may change between save and run.
 
@@ -345,6 +382,7 @@ Hardcoded `prompt_id` literals (e.g., `prompt: "local:code-review"` with no temp
 - All `prompt_id`-typed input values resolve through configured providers
 - All template variable references resolve in the available scope (per "Available template variables") at the time the template is about to render
 - Built-in functions (`responses_from`, etc.) get arguments of the right shape
+- Any `[agent]` list resolved for use as a step target (`to`), synchronization argument (`agents`), forwarding source (`forward_from`), or helper-function argument (`responses_from`, `aggregated_responses`, `agent_names`) contains unique agents — after hyphen→underscore normalization (per system-design §3 Primitive 1). Duplicate references fail invocation pre-flight; rationale: double-dispatch to a busy agent, ambiguous waits, and mapping-key collisions in fan-in helpers all silently produce wrong results.
 
 Pre-dispatch failures fail the relevant step per "Failure handling" above.
 
@@ -453,8 +491,7 @@ steps:
         - pause_for_user:
             context: "Plan for {{ milestone }} ready. Approve, redirect, or add context."
             recipient: "{{ coder }}"
-        - wait_for:
-            agent: "{{ coder }}"
+        # No wait_for here — pause_for_user with `recipient` implicitly waits.
         - send:
             to: "{{ reviewer }}"
             forward_from: "{{ coder }}"

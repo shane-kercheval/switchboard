@@ -102,15 +102,15 @@ This primitive is **synchronous from the human's perspective** — the human sen
 
 ### Primitive 3 — Auto-forward an agent's output
 
-Configure: when agent A finishes its current turn, forward that output to one or more recipient agents, optionally wrapped in a prompt template.
+A subsequent `send` step references the latest completed output of one or more upstream agents and composes them into the new message body. The composition follows a canonical text shape (see `docs/workflow-spec.md` §`send` `forward_from`) so the receiving agent sees clearly delimited source content.
 
-Used for sequential handoff (planner → implementer with the plan as input) and for agent-driven fan-out (planner → multiple implementers in parallel, one reviewer → multiple follow-up reviewers, etc.). Configured before agent A is launched on its turn; fires automatically when A completes.
+Used for sequential handoff (planner → implementer with the plan as input) and for agent-driven fan-out (planner → multiple implementers in parallel, one reviewer → multiple follow-up reviewers, etc.). The forwarding is resolved at the moment the `send` step runs — there is no event-time subscription. (Implementation note: this is a step-time composition by the workflow interpreter, not an event-driven hook configured on the upstream agent.)
 
 ### Primitive 4 — Fan-in with template wrapping
 
 Configure: when all of agents A, B, ..., N finish their current turns, combine their outputs into a single message using a wrapping prompt template, then send to agent X.
 
-The wrapping template has access to each agent's response by name (or by position): `{{ responses.reviewer_claude }}`, `{{ responses.reviewer_codex }}`, etc. Agent names containing hyphens are normalized to underscores in template contexts (so an agent named `reviewer-claude` is accessed as `responses.reviewer_claude`). Templates may use Jinja-style for-loops to handle variable numbers of sources — important for workflows whose participating agents are supplied as an invocation-time list (e.g., the user picks the reviewer set when invoking) rather than hardcoded by name. (See open question 5.1 for the precise template-function surface.)
+Wrapping templates receive agent responses through two helper functions exposed by the workflow DSL — `aggregated_responses(agents)` returning the canonical text shape (the default for cross-platform prompts that take a single text-blob argument), and `responses_from(agents)` returning a name → text mapping for Switchboard-aware prompts that want to iterate with custom formatting. The author binds whichever helper they need into a step-local `template_vars` slot at workflow-authoring time. Agent names containing hyphens are normalized to underscores in mapping keys. See `docs/workflow-spec.md` for the exact surface, including the canonical text shape and the name-collision rules.
 
 This is the most behaviorally-rich primitive. It implies waiting on multiple agents, accumulating their final responses, applying a template, and dispatching. Failure handling (one agent crashes mid-workflow) is covered in section 7.
 
@@ -119,10 +119,12 @@ This is the most behaviorally-rich primitive. It implies waiting on multiple age
 Pause workflow execution and wait for the user to respond. The workflow step specifies:
 
 - Optional context message shown to the user (often a wrapping prompt referencing prior agent outputs — "here's what the reviewers said; what direction do you want to take?").
-- Optional pre-configured recipient — an agent that the user's response will be dispatched to in the next step. The user just types; they don't have to remember which agent the message goes to.
-- Whether the input is required (default: yes; the user choosing "abandon" cancels the workflow).
+- Optional pre-configured recipient — an agent that the user's response will be dispatched to. The user just types; they don't have to remember which agent the message goes to.
+- Whether the input is required (default: yes — skipping cancels the workflow; if `false`, skipping proceeds with empty input bound to `{{ user_input }}`).
 
-When the workflow reaches this step, Switchboard fires the OS-native notification (per §10), suspends workflow execution, and surfaces the compose bar pre-targeted at the configured recipient. The user composes their response using the same compose-and-dispatch semantics as §7 (free-form text, optionally combining a prior agent's output, optionally wrapped in a prompt). Their input becomes available to subsequent steps as a template variable (`{{ user_input }}`) and is dispatched per the workflow's next step.
+When the workflow reaches this step, Switchboard fires the OS-native notification (per §10), suspends workflow execution, and surfaces the compose bar pre-targeted at the configured recipient. The user composes their response using the same compose-and-dispatch semantics as §7 (free-form text, optionally combining a prior agent's output, optionally wrapped in a prompt). Their typed text becomes available to subsequent steps as `{{ user_input }}`.
+
+When `recipient` is set, the pause step also implicitly waits for the recipient's turn (dispatched from the user's input) to reach terminal state before the workflow proceeds. Rationale: pause-with-recipient targets exactly one agent, so there is no fan-out parallelism to preserve, and the natural user expectation is to see the agent's response before continuing. Authors wanting fire-and-forget after a pause should drop `recipient` and write a separate `send` step that uses `{{ user_input }}`. See `docs/workflow-spec.md` §`pause_for_user` for the full lifecycle including the no-recipient and skip cases.
 
 This makes the human-in-the-loop framing explicit at the workflow level, not just implicit at the workflow's end: a workflow author can encode "do these autonomous steps, then pause for me to weigh in, then continue" without forcing the user to remember to manually trigger the next phase.
 
@@ -158,7 +160,7 @@ A general-purpose DAG scheduler (topological sort over arbitrary node dependenci
 
 A **workflow** is a named, parameterized composition of the primitives in §4, defined as a YAML file in the project directory. Invoking a workflow fills in its parameters and runs it.
 
-Workflow definition format (illustrative; exact schema TBD):
+Workflow definition format (illustrative; the authoritative schema is `docs/workflow-spec.md`):
 
 ```yaml
 name: review-and-aggregate
@@ -168,13 +170,15 @@ inputs:
   reviewer_agents: [agent]
   review_prompt: prompt_id           # invocation supplies e.g. local:code-review
   aggregation_prompt: prompt_id      # invocation supplies e.g. tiddly:ai-review-feedback
-  user_context: text                 # optional
+  user_context: text?
 steps:
   - send:
       to: "{{ reviewer_agents }}"
       prompt: "{{ review_prompt }}"
-      context: "{{ user_context }}"
-  - wait_for_all: "{{ reviewer_agents }}"
+      template_vars:
+        context: "{{ user_context }}"
+  - wait_for_all:
+      agents: "{{ reviewer_agents }}"
   - send:
       to: "{{ primary_agent }}"
       prompt: "{{ aggregation_prompt }}"
@@ -185,6 +189,8 @@ steps:
 When invoked, Switchboard prompts the user for each input and then executes the steps.
 
 The example above uses `aggregated_responses(...)` — the helper that returns the reviewers' outputs pre-formatted in a canonical text shape — because typical aggregation prompts (especially cross-platform ones like `tiddly:ai-review-feedback`) take a single text-blob argument. A sibling helper `responses_from(...)` returns the same data as a name → text mapping for Switchboard-aware prompts that want to iterate with custom formatting. See `docs/workflow-spec.md` for both.
+
+The DSL exposes both `wait_for` (single agent) and `wait_for_all` (multiple agents) as synchronization steps. See `docs/workflow-spec.md` for their exact semantics, including behavior when no in-flight turn exists at the synchronization point.
 
 The DSL exposes fan-in as `wait_for_all` + a `send` step (using either helper above) — the wait and dispatch phases are separate steps for readability and flexibility, not because fan-in is itself a composition of other primitives.
 
@@ -335,23 +341,33 @@ Switchboard normalizes the *user-invoked prompt* surface across agents. Model-in
 
 ### Wrapping templates
 
-Wrapping templates (used for fan-in) are prompts — from any provider — that take agent responses as variables. The workflow definition declares which agent maps to which template variable. The template uses **Jinja2-compatible syntax**, rendered via [MiniJinja](https://github.com/mitsuhiko/minijinja) (a native Rust templating engine by the author of Jinja2, designed for Jinja2 compatibility — chosen so prompts move cleanly between Tiddly's Jinja2 and Switchboard's local rendering without surprises). Open question 6.1 captures whether v1 commits to MiniJinja's full surface or a restricted subset:
+Wrapping templates (used for fan-in) are prompts — from any provider — that take agent responses as a template argument. The workflow author binds the responses into a template variable using one of the DSL helpers (`aggregated_responses(agents)` for a canonical text blob, or `responses_from(agents)` for a name → text mapping). The template uses **Jinja2-compatible syntax**, rendered via [MiniJinja](https://github.com/mitsuhiko/minijinja) (a native Rust templating engine by the author of Jinja2, designed for Jinja2 compatibility — chosen so prompts move cleanly between Tiddly's Jinja2 and Switchboard's local rendering without surprises).
+
+The most common shape uses `aggregated_responses` and a single text argument — works with any cross-platform prompt that takes a string:
 
 ```jinja
 The following are reviews from multiple agents:
 
+{{ feedback }}
+
+Summarize the recommendations and identify points of agreement and
+disagreement.
+```
+
+For Switchboard-aware prompts that want full formatting control, `responses_from` returns a mapping the template iterates explicitly:
+
+```jinja
 {% for name, response in responses.items() %}
 ## {{ name }}
 
 {{ response }}
 
 {% endfor %}
-
-Summarize the recommendations and identify points of agreement and
-disagreement.
 ```
 
-**Open question 6.1:** Exact templating subset (full MiniJinja vs a smaller restricted subset) and what variables are available in templates beyond `responses` (e.g., `user_context`, `agent_metadata`, `project_info`).
+In both cases the variable name (`feedback`, `responses`) is whatever the workflow author bound into `template_vars`. Neither is an implicit ambient variable — the workflow's `template_vars` declaration carries the binding.
+
+**Resolved in `docs/workflow-spec.md` §Templating** (MiniJinja subset, available variable scopes, built-in template functions).
 
 ### Future direction: prompt library view
 
@@ -385,7 +401,7 @@ Each agent in the project surfaces real-time state alongside its conversation:
 
 Each agent also exposes a context menu of user actions:
 
-- **Fork session** — create a new agent branched from the current state (per §9 "Fork a session from a checkpoint"; native in Claude Code, workaround for Codex per open question 10.14).
+- **Fork session** — create a new agent branched from the current state. Native in Claude Code via `--fork-session`. Unavailable for Codex agents in v1 (per resolved 10.14) — the menu item is shown only on Claude Code agents; Codex agents see an explanatory tooltip.
 - **Open session file** — open the underlying harness JSONL session file in the user's default editor for inspection or external tooling.
 - **Reset / remove** — clean up the agent (CRUD-y; not enumerated in §4 primitives, just a UI affordance).
 
@@ -501,7 +517,7 @@ The user has previously authored a workflow in `.switchboard/workflows/review-an
 
 **During execution:**
 
-All three agents stay simultaneously visible in their panes throughout. While both reviewers are running, the user can watch both streams in parallel — or collapse the reviewer panes down to just their status indicators (running / completed) and let them work in the background. When the implementer kicks in, its pane comes alive with the aggregation. The user doesn't have to switch around to know what's happening. The workflow-progress surface (per §7) shows where the workflow is overall — e.g., "review-and-aggregate: step 2 of 4 (waiting on reviewers)" — so the user can see the workflow-level view alongside the per-agent panes.
+All three agents stay simultaneously visible in their panes throughout. While both reviewers are running, the user can watch both streams in parallel — or collapse the reviewer panes down to just their status indicators (running / completed) and let them work in the background. When the implementer kicks in, its pane comes alive with the aggregation. The user doesn't have to switch around to know what's happening. The workflow-progress surface (per §7) shows where the workflow is overall — e.g., "review-and-aggregate: step 2 of 3 (waiting on reviewers)" — so the user can see the workflow-level view alongside the per-agent panes.
 
 **Afterwards:**
 
@@ -567,7 +583,7 @@ The capabilities and behaviors Switchboard needs from each harness, with notes o
 | Detect errors | native | native (asymmetric payload) |
 | Resume by UUID | native | native |
 | Assign session ID at spawn | native | unavailable (captured from stream) |
-| Fork from checkpoint | native | unavailable (workarounds — see 10.14) |
+| Fork from checkpoint | native | unavailable in v1 (per resolved 10.14) |
 | Read session metadata (tokens, context window) | native | partial (context-window in session file) |
 | Derive context utilization | native | derived (session file) |
 | Programmatic compaction | unavailable (auto only) | unavailable (auto only) |
@@ -581,7 +597,7 @@ The capabilities and behaviors Switchboard needs from each harness, with notes o
 - **Detect errors.** *(native, both, but asymmetric.)* Claude Code: `result.is_error` and/or `result.api_error_status` (do not rely on `subtype` — it stays `"success"` even on error). Codex: a `turn.failed` event terminates the turn, payload carries the API error. Both harnesses also exit non-zero on error.
 - **Resume** a session by UUID. *(native, both — Claude Code: `--resume <uuid>`; Codex: `codex exec resume <uuid>`.)*
 - **Assign a session ID at spawn.** *(Claude Code only — `--session-id <uuid>`. Codex assigns its own; Switchboard captures it from the first stream event.)*
-- **Fork** a session from a checkpoint. *(Native in Claude Code via `--fork-session` with `--resume`. **Gap in Codex** — no non-interactive `codex exec fork`. Workarounds: copy the session JSONL to a new file, or start a fresh session and re-feed summarized prior context. Tracked under open question 10.14.)*
+- **Fork** a session from a checkpoint. *(Native in Claude Code via `--fork-session` with `--resume`. **Unavailable for Codex in v1** per resolved 10.14 — no non-interactive `codex exec fork` exists; Switchboard does not implement the workarounds (copy session JSONL; re-feed summarized prior context) for v1. Switchboard surfaces Fork only on Claude Code agents; Codex agents show a tooltip explaining the gap.)*
 - **Read session metadata** (model, session ID, tokens) from the stream. *(Asymmetric.)* Claude Code: `result.modelUsage.<model>.{contextWindow, maxOutputTokens}`. Codex: only token counts in `turn.completed.usage`; `model_context_window` is in the **session file** (not the stream). Switchboard does not surface dollar cost — see §3 "Non-goals."
 - **Derive context utilization.** *(Native for Claude Code, asymmetric for Codex.)* Claude Code exposes `contextWindow` per turn in the result event — Switchboard reads it directly. Codex's stream omits it; Switchboard reads the session file (per resolved 10.15). Open question 10.12 captures any further refinements.
 - **Surface compaction state.** *(No programmatic `/compact` in either harness; both do auto-compact at high utilization.)* Switchboard's role is to monitor utilization and surface warnings as the threshold approaches, not to drive compaction itself. Reimplementing summarization in Switchboard would underperform the harnesses' tuned compaction and is not planned (see open question 10.11).
@@ -621,7 +637,7 @@ RateLimitEvent  { agent, info }
 
 Each adapter (Claude Code, Codex) is responsible for: building the harness command line, spawning the process, parsing its native stream, normalizing into the events above, and surfacing harness-specific metadata in `raw_event` so callers that need to dig in can. The workflow engine, UI, and persistence layer consume only the normalized stream.
 
-Reading Codex session files (in addition to the stream) is an implementation choice the Codex adapter may make to fill in gaps the stream doesn't expose (rate limits, context window, full reasoning). Tracked under open question 10.15.
+Reading Codex session files (in addition to the `--json` stream) is a committed v1 dependency for the Codex adapter (per resolved 10.15) — needed to fill in gaps the stream doesn't expose (rate limits, `model_context_window`, full reasoning blocks, `session_meta`). Multiple §7 and §9 commitments depend on this enrichment.
 
 ### Passthrough mechanism
 
@@ -742,7 +758,7 @@ Aggregated from inline flags above, plus a few additional:
 
 - **5.1** Exact workflow DSL keywords and structure. Resolved in `docs/workflow-spec.md`. The spec pins down the template-function surface for dynamic agent sets (`responses_from(...)` returning a name → text mapping for Switchboard-aware prompts; `aggregated_responses(...)` returning the same data pre-formatted as a single text blob for cross-platform prompts; `last_output(agent)` and `agent_names(agents)` helpers); how invocation-time list inputs (`reviewer_agents: [agent]`) flow into template variables; the iteration variable scoping rules from Primitive 6.
 - **5.2** Passthrough mechanism for harness commands — namespacing. Partially blocked on 10.10; namespacing only matters once upstream allows arbitrary slash-command passthrough.
-- **6.1** MiniJinja subset (full MiniJinja vs a restricted subset) and template-available variables beyond `responses`.
+- ~~**6.1** MiniJinja subset and template-available variables.~~ **Resolved in `docs/workflow-spec.md` §Templating** (supported / unsupported MiniJinja features, available variable scopes, built-in template functions).
 - ~~**10.1** What does Switchboard do when an agent's "next assistant response" is a tool call rather than text?~~ **Resolved by hands-on probe:** both harnesses run the model → tool_use → tool_result → model loop internally and emit a single terminal event per user-initiated turn (Claude Code: `result`; Codex: `turn.completed` / `turn.failed`). Switchboard always sees a complete turn — there is no "tool-call-only response" to handle. See [docs/research/harness-comparison.md](research/harness-comparison.md).
 - ~~**10.2** When two workflows reference the same agent, what happens? Disallow concurrent use? Queue? Refuse?~~ **Resolved by hands-on probe:** Switchboard enforces one in-flight turn per agent at the application layer; collisions are refused with a clear error. Queueing is deferred. See §7 "Agent contention" and [docs/research/same-session-parallel-invocation.md](research/same-session-parallel-invocation.md). The harnesses themselves do not error on same-session parallel invocation — they silently corrupt (Claude Code: orphan branch in session tree) or conflate (Codex: interleaved transcript) — so this enforcement must live in Switchboard.
 - **10.3** Persistence schema for project/agent registry and workflow-run checkpoints (kept in `<project>/.switchboard/state/`, per §3). The user-visible restart UX (interrupted-at-step-N + retry/abandon, including iteration index/value for Primitive 6) is committed in §7 "Walking away"; what remains open is the on-disk format (JSONL append-only, SQLite, or otherwise), atomicity guarantees on concurrent agent-spawn-during-write, and the eventual pruning story. Mid-step recovery (resuming an interrupted in-flight turn) remains out of scope.

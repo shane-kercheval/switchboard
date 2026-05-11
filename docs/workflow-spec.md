@@ -125,14 +125,16 @@ Dispatch a message to one or more agents. Returns immediately; does not wait for
 | Field | Required | Type | Notes |
 |---|---|---|---|
 | `to` | yes | agent or [agent] | Recipient(s). Single agent or a list. Templated. |
-| `prompt` | yes (or `text`) | prompt_id | Prompt to resolve and render. Templated. |
-| `text` | yes (or `prompt`) | text | Literal text to send (no prompt resolution). Templated. Mutually exclusive with `prompt`. |
+| `prompt` | yes (or `text` or `forward_from`) | prompt_id | Prompt to resolve and render. Templated. |
+| `text` | yes (or `prompt` or `forward_from`) | text | Literal text to send (no prompt resolution). Templated. Mutually exclusive with `prompt`. |
 | `template_vars` | optional | mapping | Variables passed to the prompt template at render time. Mapping of name → templated value. |
-| `forward_from` | optional | agent or [agent] | Auto-forward source(s). When set, the latest output(s) of the named agent(s) are composed into the message body per the canonical shape below. Equivalent to Primitive 3 (auto-forward). |
+| `forward_from` | optional | agent or [agent] | Auto-forward source(s). When set, the latest output(s) of the named agent(s) are composed into the message body per the canonical shape below. Equivalent to Primitive 3 (auto-forward). If any referenced agent has no completed output from the current workflow run (per §"Output scope"), the step fails with a clear error ("no in-workflow completed output for agent X"). |
 
 If `prompt` is set, the prompt's template is rendered with workflow-scope variables plus any `template_vars` and dispatched. If `text` is set, the literal text is dispatched (after templating). At least one of `prompt`, `text`, or `forward_from` is required.
 
 When `to` is a list of agents, dispatches are issued in declared order; agents run in parallel. The step returns once all dispatches have been issued (not when any has completed) — to synchronize, use `wait_for_all` in the next step.
+
+**Partial-dispatch failure:** If any dispatch in the list fails pre-flight (contention refusal, agent deleted, render error), remaining dispatches in the list are not attempted, and Switchboard sends `SIGTERM` to the process groups of any dispatches in the same step that have already been issued. The step is marked `failed`. Rationale: this preserves a clean state for retry-from-step (which re-issues all dispatches in the list) at the cost of discarding partial work from the failing step. The alternative — letting partial dispatches settle and presenting retry with a mixed completed/never-dispatched state — forces the retry runtime to invent partial-state semantics with no clear user benefit (retry of a parallel-send step re-executes the whole step either way).
 
 #### Canonical composition with `forward_from`
 
@@ -191,6 +193,8 @@ Suspend workflow execution and wait for the user to respond via the compose bar.
 
 The user's typed text is captured into the built-in variable `user_input` (scoped per "Variable scoping" below). If the user combined a prior agent's output or applied a wrapping prompt in the compose bar, those affect what is dispatched to `recipient` — they do not change `user_input`. This keeps `user_input` predictable for subsequent template references.
 
+If the user typed nothing but combined a prior agent's output and dispatched, `user_input` is the empty string; in Mode 2, the dispatch still happens with the combined content as the message body.
+
 The step has two modes depending on whether `recipient` is set:
 
 **Mode 1: without `recipient` — capture only.**
@@ -205,6 +209,8 @@ If `required: false` and the user skips in Mode 2, no dispatch occurs and no wai
 
 If `required: true` and the user skips in either mode, the workflow is marked `cancelled` (per "Failure handling" below).
 
+**Mode 2 dispatch failure (contention refusal, agent deleted, render error, etc.):** If the dispatch to `recipient` fails at dispatch time for any reason — most commonly because `recipient` is mid-turn from another workflow or a manual send — the workflow is marked `failed` (per the contention rule in system-design §7). On retry-from-step, the runtime re-enters the pause: the compose bar is shown again, **pre-filled with the text captured in `user_input` before the failed dispatch**. The user must re-submit explicitly — the pre-fill is a convenience, not an automatic re-dispatch. This lets the user re-send unchanged or revise given whatever context shifted, and avoids both the silent-input-loss UX cliff and the "stale intent silently re-dispatched" surprise.
+
 ### `for_each` (Primitive 6)
 
 Repeat a sub-sequence of steps once for each item in a list.
@@ -217,7 +223,7 @@ Repeat a sub-sequence of steps once for each item in a list.
 
 The iteration variable is bound for each iteration's body and accessible in template substitution (e.g., `{{ milestone }}`). Iterations are sequential, not parallel. Iterating over an empty list is a no-op (the body executes zero times); not an error. A failure inside iteration N halts the whole workflow per system-design §4 (no per-iteration error handling in v1). Nested `for_each` is an error in v1.
 
-The iteration variable name (`item:`) must not collide with any workflow input name; the collision is a parse-time validation error (consistent with the agent-name uniqueness rule — silent shadowing is a footgun and is rejected at the boundary).
+The iteration variable name (`item:`) must not collide with any workflow input name or with the reserved built-in name `user_input`; the collision is a parse-time validation error (consistent with the agent-name uniqueness rule — silent shadowing is a footgun and is rejected at the boundary).
 
 ## Templating
 
@@ -277,7 +283,9 @@ Functions accepting `agents` arguments accept either a single agent reference or
 - Turns from prior workflow runs against the same agent.
 - Turns from concurrent workflow runs targeting the same agent.
 
-Rationale: deterministic, predictable behavior. The author writes the workflow as a sequence of dispatches with declared dependencies; the helpers should reflect what the workflow itself orchestrated, not silently couple to whatever the user (or another workflow) did out-of-band. Implementation: the workflow runtime maintains a per-run map of agent → most-recent-completed-turn-this-workflow-saw, updated on `wait_for` / `wait_for_all` success; the helpers read from this map.
+Rationale: deterministic, predictable behavior. The author writes the workflow as a sequence of dispatches with declared dependencies; the helpers should reflect what the workflow itself orchestrated, not silently couple to whatever the user (or another workflow) did out-of-band. Implementation: the workflow runtime maintains a per-run map of agent → most-recent-completed-turn-this-workflow-saw, updated on `wait_for` / `wait_for_all` success **and on `pause_for_user` Mode-2 implicit-wait completion**; the helpers read from this map. The map stores agent → turn-id references, not turn bodies — bodies are read from the harness session file when a helper resolves.
+
+**Cross-iteration visibility within `for_each`:** Turns from earlier iterations of the same `for_each` body are workflow-run turns and remain visible to helpers in later iterations — only `user_input` is scoped per-iteration. Authors who don't want stale cross-iteration values should explicitly `wait_for` after a fresh `send` at the start of each iteration so the helper sees the new turn rather than the prior iteration's.
 
 #### Canonical aggregation shape (`aggregated_responses`)
 
@@ -294,6 +302,8 @@ Rationale: deterministic, predictable behavior. The author writes the workflow a
 ```
 
 A receiving prompt that simply wraps the aggregation as `{{ feedback }}` (e.g., `tiddly:ai-review-feedback`) gets this canonical shape with no Switchboard-specific authoring required.
+
+**Sentinel collision policy:** there is no escaping of `=== START` / `=== END` in agent output. If an agent's output literally contains a sentinel-shaped line, the receiving agent sees it as part of the forwarded content. This is judged acceptable: collisions are rare in practice (the sentinel pattern is distinctive), agents are good at recovering from minor delimitation noise, and escaping would obscure the structure for the common case. Authors who need strict delimitation can use `responses_from` and a custom template that wraps content explicitly (e.g., XML-style tags).
 
 #### Choosing between `responses_from` and `aggregated_responses`
 
@@ -331,6 +341,8 @@ Visible only inside the prompt template being rendered for that one `send` step.
 
 A workflow does not transition to `complete` until every turn it dispatched has reached terminal state, including turns still in flight after the last step is issued. Authors do not need a trailing `wait_for` on the final dispatch — the runtime holds the workflow open until all turns it initiated settle.
 
+A turn that fails during this trailing settle period marks the workflow `failed`, even if no step explicitly awaited it. Authors relying on fire-and-forget should accept that any participating turn's failure marks the workflow `failed` — silently swallowing trailing errors would be worse.
+
 A workflow run terminates in one of these statuses:
 
 | Status | Meaning |
@@ -350,9 +362,18 @@ Per system-design §7:
 
 A `failed` or `interrupted` workflow can be retried from the failed step or abandoned. A `cancelled` workflow cannot be auto-resumed (user must re-invoke from the start).
 
+**Workflow file snapshot at invocation:** Workflow runs execute against an immutable snapshot of the workflow file and its bound inputs, captured at invocation time. Prompt resolution still happens at each step's dispatch (per system-design §6 prompt resolution rules) — edits to a referenced prompt take effect on the next workflow invocation, not the in-flight run. Edits to the workflow file on disk after invocation do not affect the in-flight run or retries; the snapshot is what executes. Rationale: deterministic execution and deterministic retry; reload-on-retry would create incoherent "same run, different program" behavior given step-index checkpointing.
+
 ### Retry from inside a `for_each` iteration
 
-When a step inside a `for_each` body fails or is interrupted, the workflow checkpoint captures both the iteration index and the iteration variable's value (per system-design §7 "Walking away"). On retry, the runtime rebinds the iteration variable from the checkpoint and resumes execution at the failed step's index *within that iteration*. Earlier steps in the same iteration are not re-executed.
+When a step inside a `for_each` body fails or is interrupted, the workflow checkpoint captures the iteration index, the iteration variable's value, the per-run **output-scope map** (agent → most-recent-completed-turn-id; see §"Output scope"), and the most recently captured `user_input` in the current scope. On retry, the runtime rebinds the iteration variable from the checkpoint, restores the output-scope map and `user_input`, and resumes execution at the failed step's index *within that iteration*. Earlier steps in the same iteration are not re-executed.
+
+The output-scope-map restoration is what lets `forward_from` / `last_output` / `aggregated_responses` / `responses_from` correctly resolve in steps that come *after* the failed step but *before* a re-completed dispatch — without it, retries would fail with "no in-workflow completed output for agent X" even though earlier iteration steps already completed those dispatches.
+
+The `user_input` restoration rule has two cases:
+
+- **Retry of a non-pause step that comes after a completed `pause_for_user`**: the prior scoped `user_input` is restored from the checkpoint so subsequent steps that template-reference it render correctly.
+- **Retry of the same Mode-2 `pause_for_user` step that failed at dispatch**: the runtime re-enters the pause UI per the Mode-2 dispatch-failure rule. The compose bar is pre-filled with the captured `user_input` and the user must re-submit explicitly. The captured `user_input` is *not* automatically replayed — re-submission is a conscious act.
 
 Authors should keep this in mind when writing iteration bodies that have side-effecting steps (e.g., a `send` that creates a file or commits): on retry of step N within iteration K, steps 1..N-1 of iteration K do not run again. Where retry-correctness matters, design the workflow so the failing step is the side-effecting one (so its effects are not double-applied) or so earlier-step effects are idempotent.
 
@@ -371,7 +392,8 @@ A workflow file is validated at two times:
 - All template strings parse as valid templates (referenced variable names need not be declared yet — that's an invocation-time check)
 - No nested `for_each`
 - No reserved built-in names used as input names
-- No `for_each` `item:` name that collides with a workflow input name (per §`for_each` — silent shadowing is rejected at the boundary)
+- No `for_each` `item:` name that collides with a workflow input name *or* with the reserved built-in name `user_input` (per §`for_each` — silent shadowing is rejected at the boundary)
+- Hardcoded `[agent]` literals in step bodies (YAML literals, not template substitution) are checked at parse time: empty literals (e.g., `to: []`) and literals containing duplicate references (after hyphen→underscore normalization) are rejected.
 
 Hardcoded `prompt_id` literals (e.g., `prompt: "local:code-review"` with no template substitution) are **not** resolved against providers at parse time; provider resolution happens at invocation time. This is intentional — configured prompt providers may change between save and run.
 
@@ -383,6 +405,7 @@ Hardcoded `prompt_id` literals (e.g., `prompt: "local:code-review"` with no temp
 - All template variable references resolve in the available scope (per "Available template variables") at the time the template is about to render
 - Built-in functions (`responses_from`, etc.) get arguments of the right shape
 - Any `[agent]` list resolved for use as a step target (`to`), synchronization argument (`agents`), forwarding source (`forward_from`), or helper-function argument (`responses_from`, `aggregated_responses`, `agent_names`) contains unique agents — after hyphen→underscore normalization (per system-design §3 Primitive 1). Duplicate references fail invocation pre-flight; rationale: double-dispatch to a busy agent, ambiguous waits, and mapping-key collisions in fan-in helpers all silently produce wrong results.
+- Any `[agent]` list resolved for use as above is non-empty. `[agent]`-typed inputs that resolve to an empty list (e.g., the user supplied no agents in the invocation form's multi-select) fail invocation pre-flight. Rationale: an empty fan-in list silently produces a vacuous "success" with no actual fan-in, which is almost certainly an authoring or invocation error rather than intent. (Empty `[text]` lists used by `for_each` remain valid — see §`for_each`.)
 
 Pre-dispatch failures fail the relevant step per "Failure handling" above.
 

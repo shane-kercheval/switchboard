@@ -102,7 +102,9 @@ If you want richer templating, the user can keep the prompt in Tiddly (an MCP pr
 
 ## Skill-file compatibility
 
-Switchboard's local-prompt format is intentionally compatible with Claude Code skill files. A `.md` file authored as a Claude Code skill (frontmatter with `name`, `description`, body) can be dropped into a Switchboard prompts directory and used as a local prompt. The reverse is also true — a Switchboard local prompt with a `name` and `description` works as a Claude Code skill file. This means the user's skill library is implicitly a Switchboard prompt library.
+Switchboard's local-prompt format is intentionally compatible with Claude Code skill files in the forward direction: a `.md` file authored as a Claude Code skill (frontmatter with `name`, `description`, body) can be dropped into a Switchboard prompts directory and used as a local prompt as-is. The user's skill library is implicitly a Switchboard prompt library.
+
+The reverse direction holds **only for argument-less prompts**: a Switchboard local prompt that declares no `arguments` works as a Claude Code skill file. A Switchboard prompt with `arguments` does *not* round-trip — Claude Code skills aren't parameterized, so the `arguments` declaration would be ignored and any `{{ var }}` references in the body would render literally. If you need to share a parameterized prompt across both surfaces, keep it in Switchboard's prompts directory and don't expect skill-side parameter handling.
 
 ## Worked examples
 
@@ -173,4 +175,4 @@ You can pass a list as a string and parse it, but more commonly the iteration ha
 
 ## When to point at the formal spec
 
-This doc covers the common authoring path. For edge cases, validation rules, or the full template-engine reference, see `docs/system-design.md` §6 ("Prompts and prompt providers"). For the workflow DSL that consumes these prompts, see `docs/workflow-spec.md`.
+This doc covers the common authoring path. For provider behavior (local file store + MCP server resolution), see `docs/system-design.md` §6 ("Prompts and prompt providers"). For the authoritative supported/unsupported MiniJinja subset and the template-variable scoping rules used when these prompts are rendered inside a workflow, see `docs/workflow-spec.md` §Templating. For the workflow DSL that consumes these prompts, see `docs/workflow-spec.md`.

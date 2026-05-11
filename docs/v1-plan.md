@@ -124,7 +124,7 @@ M1 → M2 → M3 → M4 → M5 → M6
 - Per-agent in-memory state (`HashMap<AgentId, AgentState>` behind a Tokio Mutex)
 - Project-level `flock` on `<project>/.switchboard/state/instance.lock` (multi-window-same-project guard)
 - Compose-and-dispatch UI: source (free-form text + optional latest-output-of-agent) + recipients (multi-select); Send gated when recipient busy
-- Agent context menu: fork session (Claude Code only — `--fork-session`; Codex agents show explanatory tooltip per resolved 10.14), open session file, reset/remove
+- Agent context menu: fork session (Claude Code only — `--fork-session`; Codex agents show explanatory tooltip: "Fork is not available for Codex sessions in v1; see the docs for workarounds." per resolved 10.14), open session file, reset/remove
 - **Per-turn cancellation:** SIGTERM to the in-flight harness subprocess's process group; partial output buffered in-memory and stays accessible in the agent's pane until the next turn or restart (per system-design §7 Cancelling). Detection accounts for Codex's SIGTERM-exits-0 quirk (absence of terminal event).
 - Integration test suite extended for contention enforcement and cancellation paths.
 
@@ -170,7 +170,7 @@ M1 → M2 → M3 → M4 → M5 → M6
 
 - Workflow YAML parser per `docs/workflow-spec.md`
 - Step-based execution interpreter (parallel dispatch within fan-out, synchronization within fan-in — per system-design §4 Execution model)
-- Primitives 1–4: spawn, send, auto-forward, fan-in with template wrapping
+- Workflow primitives 2–4 (send, auto-forward via `forward_from`, fan-in with template wrapping) plus the `wait_for` / `wait_for_all` synchronization helpers. Spawn (Primitive 1) is not a workflow step — agents are spawned through the UI before the workflow runs and supplied as workflow inputs.
 - Workflow-progress surface (per §7) — each active workflow's name, current step, total steps, per-step status; supports multiple concurrent workflows
 - Step-boundary checkpointing to `<project>/.switchboard/state/runs/<run-id>.jsonl`
 - Failure handling per system-design §7 (pre-dispatch failures, contention refusals, fan-in per-agent failures)
@@ -193,7 +193,10 @@ M1 → M2 → M3 → M4 → M5 → M6
 
 **Scope:**
 
-- Primitive 5 (Pause for user input) — workflow suspends; OS-native notification fires; compose bar pre-targeted at the configured recipient; user's response is dispatched to that recipient and the step blocks until the recipient's turn reaches terminal state (per workflow-spec §`pause_for_user` — implicit wait when `recipient` is set); user's typed text also becomes available as `user_input` for subsequent steps
+- Primitive 5 (Pause for user input) in **both modes** per workflow-spec §`pause_for_user`:
+  - **Mode 1 (no `recipient`)** — capture only: workflow suspends; OS-native notification fires; user submits or skips; `user_input` is bound; next step runs. No dispatch, no implicit wait.
+  - **Mode 2 (with `recipient`)** — capture + dispatch + implicit wait: compose bar pre-targeted at the configured recipient; user's response is dispatched to that recipient and the step blocks until the recipient's turn reaches terminal state. On Mode-2 dispatch failure (recipient busy, deleted, etc.), workflow → `failed`; retry re-enters the pause UI with prior `user_input` pre-filled and requires explicit re-submit.
+  - Both modes honor `required: true` (skip → `cancelled`) and `required: false` (skip → empty `user_input`, step proceeds with no dispatch in either mode).
 - Primitive 6 (Iterate over a list) — bounded iteration over a static invocation-time list; iteration variable available in template substitution; loop body uses existing primitives
 - Iteration-aware checkpointing — checkpoint captures iteration index and value
 - Workflow-progress surface gains the iteration dimension ("iteration 2 of 3 (milestone = 'X'), step 3 of 8")
@@ -204,7 +207,7 @@ M1 → M2 → M3 → M4 → M5 → M6
 
 **Dependencies:** M5 (workflow engine, progress surface, checkpointing).
 
-**Acceptance:** invoke a workflow with a pause-for-user-input step — workflow suspends, notification fires, user types a response, workflow continues with the response dispatched to the configured recipient. Invoke a workflow that iterates over a 3-item list — pattern runs three times, progress surface shows iteration index, restart mid-iteration recovers correctly.
+**Acceptance:** invoke a workflow with a Mode-2 `pause_for_user` step — workflow suspends, notification fires, user types a response, workflow continues with the response dispatched to the configured recipient and the step blocking until that turn completes. Separately, invoke a workflow with a Mode-1 `pause_for_user` step (no `recipient`) — workflow suspends, user submits, `user_input` is bound, next step runs immediately with no dispatch. Invoke a workflow that iterates over a 3-item list — pattern runs three times, progress surface shows iteration index. On retry of a workflow interrupted at iteration K step N: iteration variable is restored to its iteration-K value, output-scope map and `user_input` are restored from the checkpoint, execution resumes at step N within iteration K, and steps 1..N-1 of iteration K are not re-executed (per workflow-spec §"Retry from inside a `for_each` iteration").
 
 ---
 

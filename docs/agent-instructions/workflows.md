@@ -90,6 +90,9 @@ Long-form keys: `type` (required), `description` (optional), `default` (optional
 - Input names: lowercase with underscores, e.g., `reviewer_agents`.
 - Reserved built-in name: `user_input` cannot be used as an input name.
 - Required inputs (no `?` suffix and no `default`) must be supplied at invocation; missing values fail invocation pre-flight.
+- `[agent]` lists used as step targets, sync arguments, forwarding sources, or helper-function arguments must contain unique agents — after hyphen→underscore normalization. Duplicates fail invocation pre-flight (e.g., `[reviewer-a, reviewer_a]` collides; `[reviewer-a, reviewer-a]` is a literal duplicate).
+- `[agent]` lists used as above must also be non-empty; empty lists fail invocation pre-flight (an empty fan-in is almost certainly an authoring error rather than intent).
+- A `for_each` `item:` name that collides with a workflow input name or with `user_input` is a parse-time error.
 
 ## Steps
 
@@ -119,6 +122,8 @@ Long-form keys: `type` (required), `description` (optional), `default` (optional
 
 `send` is **fire-and-forget**: it dispatches and returns immediately. To wait for the recipient(s) to finish, follow with `wait_for` or `wait_for_all`. (The exception is `pause_for_user` with `recipient` set, which bundles dispatch and wait — see below.)
 
+**When `to` is a list of agents**: dispatches are issued in declared order; agents run in parallel; the step returns once all dispatches have been issued (not when any has completed). Always follow with `wait_for_all` to synchronize before consuming their outputs. If any dispatch in the list fails (e.g., one agent is busy), Switchboard cancels any already-issued dispatches in the same step before marking the step `failed` — retry re-issues the whole list cleanly.
+
 ### `wait_for` and `wait_for_all` — synchronization
 
 ```yaml
@@ -139,13 +144,20 @@ Long-form keys: `type` (required), `description` (optional), `default` (optional
     recipient: "{{ primary_agent }}"
 ```
 
-Suspends the workflow, fires an OS notification, and surfaces the compose bar to the user. After the user dispatches, their typed text becomes available as `user_input` in subsequent steps.
+Suspends the workflow, fires an OS notification, and surfaces the compose bar to the user. The user's typed text becomes available as `user_input` in subsequent steps.
 
 | Field | Required | Notes |
 |---|---|---|
 | `context` | optional | Templated message shown to the user explaining what they're being asked. |
-| `recipient` | optional | If set, the user's input is dispatched to this agent. The step **blocks until the recipient's turn completes** (implicit wait — bundled into the step). |
-| `required` | optional | Default `true`. If `false`, the user can "skip" without input (workflow proceeds with `user_input` set to empty string). |
+| `recipient` | optional | If set, the user's input is also dispatched to this agent and the step blocks until the agent's turn completes (Mode 2 — see below). |
+| `required` | optional | Default `true`. If `true` and the user skips, the workflow is `cancelled`. If `false` and the user skips, `user_input` is bound to the empty string and the step proceeds — in Mode 2, no dispatch happens on skip. |
+
+**Two modes**, picked by whether `recipient` is set:
+
+- **Mode 1 (no `recipient`) — capture only.** Workflow suspends, user submits or skips, `user_input` is bound, next step runs immediately. No dispatch happens. Use this when you want the user's input as data for subsequent steps but don't want to send it to an agent yet.
+- **Mode 2 (with `recipient`) — capture, dispatch, and implicitly wait.** Workflow suspends, user submits, the input is dispatched to `recipient`, and the step blocks until the recipient's turn reaches terminal state. Use this when you want the user to drive an agent directly. This is the only step type that bundles dispatch with an implicit wait — the rationale is ergonomic (the user just answered a question; the natural expectation is to see the agent's response before the workflow moves on).
+
+If you want fire-and-forget after a pause, drop `recipient` (use Mode 1) and write a separate `send` step that uses `{{ user_input }}`.
 
 ### `for_each` — iterate over a list
 
@@ -166,7 +178,7 @@ Suspends the workflow, fires an OS notification, and surfaces the compose bar to
 
 The iteration variable is bound for each iteration's body and accessible as `{{ milestone }}` (or whatever `item` is named). Iterations are **sequential** — they do not run in parallel. Iterating over an empty list is a no-op.
 
-**Constraints in v1**: nested `for_each` is not allowed; iterations cannot share state with each other (`user_input` from iteration N is not visible in iteration N+1); the list is supplied at invocation time, not computed from a prior step's output.
+**Constraints in v1**: nested `for_each` is not allowed; iterations cannot share state with each other (`user_input` from iteration N is not visible in iteration N+1); the list is supplied at invocation time, not computed from a prior step's output. The `item:` name must not collide with any workflow input name or with the reserved built-in name `user_input` — collisions are a parse-time error.
 
 ## Templating
 
@@ -194,6 +206,8 @@ Variables are resolved innermost first:
 
 - If the user already has an aggregation prompt (e.g., a Tiddly prompt that wraps `{{ feedback }}` in some framing): use `aggregated_responses` and bind it to the prompt's argument name.
 - If you (or the user) is authoring a fresh aggregation prompt that wants per-agent formatting: use `responses_from` and iterate in the prompt's template.
+
+**Output scope (important).** These helpers — and `forward_from` on `send` steps — see only turns that the **current workflow run** dispatched and observed reach terminal state via `wait_for`, `wait_for_all`, or a Mode-2 `pause_for_user` implicit wait. They do *not* see manual compose-bar dispatches the user made between workflow steps, turns from prior workflow runs, or turns from concurrent workflow runs against the same agent. If you call `last_output(agent)` and the workflow itself never dispatched to that agent, you get a runtime error — even if the agent has perfectly good output from elsewhere. Always pair a `send` with a `wait_for` (or use Mode-2 pause) before calling helpers on that agent. (Cross-iteration note: turns from earlier iterations of the same `for_each` *are* visible to helpers in later iterations — only `user_input` is per-iteration.)
 
 ## Forwarding
 
@@ -290,6 +304,7 @@ steps:
         - pause_for_user:
             context: "Plan for {{ milestone }} ready. Approve, redirect, or add context."
             recipient: "{{ coder }}"
+        # No wait_for here — pause_for_user with `recipient` (Mode 2) implicitly waits.
         - send:
             to: "{{ reviewer }}"
             forward_from: "{{ coder }}"
@@ -320,6 +335,8 @@ steps:
 - A step failure (harness error, template render error, contention refusal, missing prompt) halts the workflow with status `failed`.
 - The user cancelling the workflow (or any participating agent's turn during a workflow) marks the workflow `cancelled`.
 - A crash, OS reboot, or force-kill mid-workflow marks it `interrupted` — the user can retry from the failed step or abandon.
+
+**Retry semantics inside `for_each`**: when a workflow is retried after a failure inside an iteration, the runtime restores the iteration variable and the per-run output state from the checkpoint and resumes at the *failed step within that iteration*. Earlier steps in the same iteration are **not** re-executed. If you write iteration bodies with side-effecting steps (commits, file writes), keep this in mind: on retry of step N within iteration K, steps 1..N-1 of iteration K do not run again — design so the failing step is the side-effecting one (so its effects are not double-applied) or so earlier-step effects are idempotent.
 
 You don't need to write failure-handling logic in the workflow file; the runtime handles it. Just write the happy path.
 

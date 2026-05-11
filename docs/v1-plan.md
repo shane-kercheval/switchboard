@@ -10,10 +10,11 @@ The canonical "what is Switchboard and why" lives in [`docs/system-design.md`](s
 
 ## Prerequisites
 
-Two artifacts are needed before per-milestone implementation specs can be expanded:
+Three artifacts are needed before per-milestone implementation specs can be expanded:
 
-- **`docs/workflow-spec.md`** — the formal workflow DSL spec (open question 5.1 in system-design). Keywords, schema, escape hatches, error handling, template-function surface (`responses_from(...)` mapping form for Switchboard-aware prompts; `aggregated_responses(...)` text-blob form for cross-platform prompts), iteration variable scoping (Primitive 6), step-checkpoint semantics. Blocks M3+ specs from being concretely expandable.
-- **A pricing table for Codex cost derivation** — small data file listing per-model token prices. Needed in M2 for normalized cost reporting; can be drafted any time before then.
+- **`docs/workflow-spec.md`** ✅ — the formal workflow DSL spec (open question 5.1 in system-design). Keywords, schema, escape hatches, error handling, template-function surface (`responses_from(...)` mapping form for Switchboard-aware prompts; `aggregated_responses(...)` text-blob form for cross-platform prompts), iteration variable scoping (Primitive 6), step-checkpoint semantics. Blocks M3+ specs from being concretely expandable. **Done.**
+- **`docs/agent-instructions/prompts.md`** — tutorial-style authoring doc for prompts, written for an AI coding agent to consume (per system-design §6 / §2 "Agent-friendly authoring"). The user points an existing Claude Code or Codex agent at this file to generate a starter local prompt. Stub acceptable initially; full draft before M4.
+- **`docs/agent-instructions/workflows.md`** — tutorial-style authoring doc for workflows, written for an AI coding agent to consume (per system-design §5 / §2). Same authoring path: point an agent at this file plus `docs/workflow-spec.md` to generate a starter workflow from a description. Stub acceptable initially; full draft before M5.
 
 ## v1 scope (consolidated from system-design §11 / §12)
 
@@ -76,12 +77,13 @@ M1 → M2 → M3 → M4 → M5 → M6
 - Normalized event stream wired up minimally (TurnStart, ContentChunk(text), TurnEnd) — enough to render streaming text
 - Single-pane agent UI with compose bar and streaming output
 - Agent registry persistence (project ↔ agent ↔ harness session ID)
+- **Hygiene CI** — GitHub Actions workflow running `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test` (unit), and frontend lint/test on every push and PR. No API keys or secrets required at this stage. (Integration suite CI begins in M2 once the suite first exists; release/signing CI is M7.)
 
-**Deliverables:** runnable `cargo tauri dev` workflow; macOS-only build; one project, one agent, one streaming send-and-receive.
+**Deliverables:** runnable `cargo tauri dev` workflow; macOS-only build; one project, one agent, one streaming send-and-receive; hygiene CI passing on `main`.
 
 **Dependencies:** none (foundational).
 
-**Acceptance:** maintainer can `cargo tauri dev`, create a project, spawn an agent named `assistant`, send "What's 2+2?", see "4" stream into the pane.
+**Acceptance:** maintainer can `cargo tauri dev`, create a project, spawn an agent named `assistant`, send "What's 2+2?", see "4" stream into the pane. Hygiene CI passes on the M1 branch / merge to main.
 
 ---
 
@@ -94,18 +96,19 @@ M1 → M2 → M3 → M4 → M5 → M6
 - Codex adapter: `codex exec --json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox`
 - Codex session-file enrichment (per resolved 10.15) — read `~/.codex/sessions/...jsonl` on `turn.completed`/`turn.failed` for rate limits, `model_context_window`, `session_meta`
 - Normalized event vocabulary fully populated for both harnesses (TurnStart, ContentChunk, ToolStarted, ToolCompleted, TurnEnd, TurnAborted, RateLimitEvent, SessionMeta)
-- Codex pricing table for cost derivation (since Codex stream omits cost)
 - Process-group spawn for both harnesses (`Command::process_group(0)`)
 - Stall-mitigation: close stdin after dispatch (per codex-cli-observed.md research note)
 - **Probe and document Codex `turn.failed` payload shape and permission-denial behavior.** Update `docs/research/codex-cli-observed.md` with findings; reflect any adjustments in the normalized error taxonomy / `permission_denials` field.
+- **Agent-name-collision validation** — per system-design §3 Primitive 1, two agents in the same project whose names differ only in hyphen vs. underscore are rejected at creation. Unit test on the agent registry covers this.
 - **Minimal agent selector UI** — single-pane view at a time, with a selector to switch between agents in the project. Multi-pane layout deferred to M3.
 - **Integration test suite scaffolding** — small-prompt tests against real `claude -p` and `codex exec`. Initial coverage: terminal-event detection (TurnEnd vs TurnAborted), error reporting, basic vocabulary normalization. Suite extends with each subsequent milestone.
+- **Integration CI workflow** — GitHub Actions workflow that runs the integration suite against the installed harnesses on every push and PR (from collaborators with secrets; forks fall back to unit-only). API key secrets configured in GitHub Actions at this point. Suite grows in M3–M6; gating policy stays the same throughout.
 
-**Deliverables:** Codex adapter; pricing table; per-harness adapter abstraction validated end-to-end; minimal agent selector; integration test scaffolding.
+**Deliverables:** Codex adapter; per-harness adapter abstraction validated end-to-end; minimal agent selector; integration test scaffolding; integration CI workflow live.
 
-**Dependencies:** M1 (Tauri shell, normalized stream skeleton, registry).
+**Dependencies:** M1 (Tauri shell, normalized stream skeleton, registry, hygiene CI).
 
-**Acceptance:** spawn one Claude Code agent and one Codex agent in the same project; switch between them via the agent selector; each streams correctly through the normalized event pipeline; per-agent metadata (cost, tokens, context utilization) populates correctly for both. Integration test suite runs locally against installed harnesses with at least one test per normalized event type.
+**Acceptance:** spawn one Claude Code agent and one Codex agent in the same project; switch between them via the agent selector; each streams correctly through the normalized event pipeline; per-agent metadata (tokens, context utilization) populates correctly for both. Spawning a second agent with a name that collides with the first after hyphen→underscore normalization (e.g., `agent-a` then `agent_a`) is rejected with a clear error. Integration test suite runs locally and in CI against installed harnesses with at least one test per normalized event type.
 
 ---
 
@@ -121,9 +124,11 @@ M1 → M2 → M3 → M4 → M5 → M6
 - Per-agent in-memory state (`HashMap<AgentId, AgentState>` behind a Tokio Mutex)
 - Project-level `flock` on `<project>/.switchboard/state/instance.lock` (multi-window-same-project guard)
 - Compose-and-dispatch UI: source (free-form text + optional latest-output-of-agent) + recipients (multi-select); Send gated when recipient busy
-- Agent context menu: fork session (Claude Code only — `--fork-session`), open session file, reset/remove
+- Agent context menu: fork session (Claude Code only — `--fork-session`; Codex agents show explanatory tooltip per resolved 10.14), open session file, reset/remove
 - **Per-turn cancellation:** SIGTERM to the in-flight harness subprocess's process group; partial output buffered in-memory and stays accessible in the agent's pane until the next turn or restart (per system-design §7 Cancelling). Detection accounts for Codex's SIGTERM-exits-0 quirk (absence of terminal event).
 - Integration test suite extended for contention enforcement and cancellation paths.
+
+> **Note for M3 expansion:** scope is heavy. The implementation-grade expansion will likely break this into sub-milestones (e.g., M3a multi-pane + per-agent state machine; M3b dispatcher + contention enforcement; M3c per-turn cancel). Kept consolidated here at outline grade since these pieces are tightly coupled.
 
 **Deliverables:** multi-agent UI; dispatcher; contention enforcement (UI gating + dispatch error per §7); per-turn cancel.
 
@@ -188,7 +193,7 @@ M1 → M2 → M3 → M4 → M5 → M6
 
 **Scope:**
 
-- Primitive 5 (Pause for user input) — workflow suspends; OS-native notification fires; compose bar pre-targeted at the configured recipient; user's response becomes a template variable for subsequent steps
+- Primitive 5 (Pause for user input) — workflow suspends; OS-native notification fires; compose bar pre-targeted at the configured recipient; user's response is dispatched to that recipient and the step blocks until the recipient's turn reaches terminal state (per workflow-spec §`pause_for_user` — implicit wait when `recipient` is set); user's typed text also becomes available as `user_input` for subsequent steps
 - Primitive 6 (Iterate over a list) — bounded iteration over a static invocation-time list; iteration variable available in template substitution; loop body uses existing primitives
 - Iteration-aware checkpointing — checkpoint captures iteration index and value
 - Workflow-progress surface gains the iteration dimension ("iteration 2 of 3 (milestone = 'X'), step 3 of 8")
@@ -205,7 +210,7 @@ M1 → M2 → M3 → M4 → M5 → M6
 
 ### M7 — Polish, safety, distribution
 
-**Goal:** Switchboard ships as signed binaries on all three platforms, with auto-updater, safety dialog, polished walk-away semantics, and the integration test suite gated in CI.
+**Goal:** Switchboard ships as signed binaries on all three platforms, with auto-updater, safety dialog, and polished walk-away semantics. (CI for hygiene and integration suites is already in place from M1/M2 respectively; M7 adds the release/signing pipeline on top.)
 
 **Scope:**
 
@@ -218,14 +223,14 @@ M1 → M2 → M3 → M4 → M5 → M6
 - Tauri event-emission ring buffer (bounded per-agent, per §10) — UI lag never blocks core
 - Cross-platform builds: macOS via Homebrew tap + signed `.dmg`; Linux `.deb`/`.rpm`; Windows signed `.msi`
 - Code signing (Apple Developer ID, Authenticode) — release infrastructure
-- Tauri auto-updater wired
-- **CI plumbing for the integration test suite** — wire the suite (built up incrementally across M2–M6) into push-to-main and PR-from-collaborators triggers; forks get the unit suite. API key management for CI.
+- Tauri auto-updater wired (signed update artifacts, manifest endpoint, embedded public key)
+- **Release CI workflow** — signing keys in CI secrets; per-tag release pipeline that builds, signs, and publishes installers + auto-update manifest. Distinct from the hygiene CI (M1) and integration CI (M2) workflows already running on push.
 
-**Deliverables:** signed cross-platform binaries; auto-updater; safety dialog; polished walk-away UX; partial-output review UI; CI integration suite gated on push.
+**Deliverables:** signed cross-platform binaries; auto-updater; safety dialog; polished walk-away UX; partial-output review UI; release CI workflow.
 
 **Dependencies:** M6 (engine + primitives complete) for the polished walk-away path to be meaningful; distribution infrastructure can begin in parallel toward the end of M5/M6.
 
-**Acceptance:** maintainer can install Switchboard via `brew install switchboard` on macOS; first launch presents acknowledgement dialog; closing the window hides to tray (or windowed-only on Linux without AppIndicator); quitting prompts for confirmation if workflows are in flight and walk-away path resumes correctly on next launch; cancelling a fan-out workflow surfaces partial-output review; auto-updater detects and installs a new release end-to-end; CI integration suite runs on every PR from a collaborator and on push to main.
+**Acceptance:** maintainer can install Switchboard via `brew install switchboard` on macOS; first launch presents acknowledgement dialog; closing the window hides to tray (or windowed-only on Linux without AppIndicator); quitting prompts for confirmation if workflows are in flight and walk-away path resumes correctly on next launch; cancelling a fan-out workflow surfaces partial-output review; auto-updater detects and installs a new release end-to-end; release CI tag-triggered pipeline produces signed installers and updates the manifest end-to-end.
 
 ## What this plan does not commit to
 

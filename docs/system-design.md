@@ -33,7 +33,9 @@ This orchestration model has a useful side effect for prompt management. Because
 - **Visual / GUI workflow editor.** Authoring is file-based for V1, supported by agent-consumable instruction docs (see goals — "Agent-friendly authoring"). A visual or form-based workflow editor is not planned until later versions.
 - **Multi-user collaboration.** Single-developer tool. Sharing workflows and configurations via git is supported as a side effect of file-based config, but there is no real-time collaboration model.
 - **Hosted / SaaS service.** Switchboard runs locally on the developer's machine. There is no managed cloud version, no shared backend, no remote agent execution. A future hosted service may eventually provide cross-machine sync of workflows, prompts, and project configuration; that is out of scope for v1.
-- **Arbitrary harness slash-command passthrough.** v1 does not support invoking arbitrary harness slash commands as input (`/cost`, `/model`, `/skill-name`, etc.). This is an upstream `claude -p` limitation; specific commands are worked around individually (see §9). Tracked in §12 (10.10).
+- **Arbitrary harness slash-command passthrough.** v1 does not support invoking arbitrary harness slash commands as input (`/model`, `/skill-name`, etc.). This is an upstream `claude -p` limitation; specific commands are worked around individually (see §9). Tracked in §12 (10.10).
+- **Per-turn dollar cost reporting.** Switchboard does not surface a dollar cost per turn or cumulative dollar spend. Both harnesses are used predominantly through subscription tiers (Claude Max, ChatGPT Plus/Pro/Team) where there is no per-turn dollar amount that maps to what the user is actually being charged; API-key users hit their own provider caps inside the harness. Surfacing a price-per-token-derived "cost" would be misleading for most users and would force Switchboard to maintain a per-model pricing table for Codex that doesn't reflect what users pay. Token usage and context utilization (real signals the user can act on — "I'm at 80% context, time to compact") are surfaced normally.
+- **Multi-agent parallel writes to project files.** A general property of any multi-agent setup; out of Switchboard's ownership. Users running multiple agents that write to the same files at the same time accept the conflict risk; resolving such conflicts is the user's responsibility (typically via git, file scoping, or workflow design that serializes writes).
 
 ## 3. Core concepts
 
@@ -379,7 +381,7 @@ Each agent in the project surfaces real-time state alongside its conversation:
 
 - **Status**: idle, processing, waiting on tool, errored.
 - **Context utilization**: % of model context used, derived from the harness JSON (see §9 "Required harness commands"). Surfaced as a progress bar updated per turn (live for Claude Code; per-turn for Codex via session-file enrichment per 10.15) so the user can see when an agent approaches the auto-compact threshold.
-- **Cost / token usage**: per turn and cumulative. Native for Claude Code (`total_cost_usd` from the harness); derived for Codex via a per-model pricing table (see §9).
+- **Token usage**: per turn and cumulative. Surfaced from the harness's reported usage counts. Switchboard does not surface dollar cost — see §3 "Non-goals" for the rationale.
 
 Each agent also exposes a context menu of user actions:
 
@@ -566,8 +568,8 @@ The capabilities and behaviors Switchboard needs from each harness, with notes o
 | Resume by UUID | native | native |
 | Assign session ID at spawn | native | unavailable (captured from stream) |
 | Fork from checkpoint | native | unavailable (workarounds — see 10.14) |
-| Read session metadata (cost, tokens, context window) | native | partial (cost derived; context-window in session file) |
-| Derive context utilization | native | derived (session file or pricing map) |
+| Read session metadata (tokens, context window) | native | partial (context-window in session file) |
+| Derive context utilization | native | derived (session file) |
 | Programmatic compaction | unavailable (auto only) | unavailable (auto only) |
 | Tool calls + results in stream | native (typed blocks) | native (`command_execution` only) |
 | Capture permission denials | native | presumed (verification deferred) |
@@ -580,8 +582,8 @@ The capabilities and behaviors Switchboard needs from each harness, with notes o
 - **Resume** a session by UUID. *(native, both — Claude Code: `--resume <uuid>`; Codex: `codex exec resume <uuid>`.)*
 - **Assign a session ID at spawn.** *(Claude Code only — `--session-id <uuid>`. Codex assigns its own; Switchboard captures it from the first stream event.)*
 - **Fork** a session from a checkpoint. *(Native in Claude Code via `--fork-session` with `--resume`. **Gap in Codex** — no non-interactive `codex exec fork`. Workarounds: copy the session JSONL to a new file, or start a fresh session and re-feed summarized prior context. Tracked under open question 10.14.)*
-- **Read session metadata** (model, session ID, cost, tokens) from the stream. *(Asymmetric.)* Claude Code: `result.total_cost_usd`, `result.modelUsage.<model>.{contextWindow, maxOutputTokens, costUSD}`. Codex: only token counts in `turn.completed.usage`; cost must be derived via a Switchboard-maintained per-model pricing table; `model_context_window` is in the **session file** (not the stream).
-- **Derive context utilization.** *(Native for Claude Code, asymmetric for Codex.)* Claude Code exposes `contextWindow` per turn in the result event — Switchboard reads it directly. Codex's stream omits it; Switchboard either reads the session file or maintains a model→max-context map. Open question 10.12 captures the choice.
+- **Read session metadata** (model, session ID, tokens) from the stream. *(Asymmetric.)* Claude Code: `result.modelUsage.<model>.{contextWindow, maxOutputTokens}`. Codex: only token counts in `turn.completed.usage`; `model_context_window` is in the **session file** (not the stream). Switchboard does not surface dollar cost — see §3 "Non-goals."
+- **Derive context utilization.** *(Native for Claude Code, asymmetric for Codex.)* Claude Code exposes `contextWindow` per turn in the result event — Switchboard reads it directly. Codex's stream omits it; Switchboard reads the session file (per resolved 10.15). Open question 10.12 captures any further refinements.
 - **Surface compaction state.** *(No programmatic `/compact` in either harness; both do auto-compact at high utilization.)* Switchboard's role is to monitor utilization and surface warnings as the threshold approaches, not to drive compaction itself. Reimplementing summarization in Switchboard would underperform the harnesses' tuned compaction and is not planned (see open question 10.11).
 - **Read tool calls and tool results** from the stream. *(Asymmetric.)* Claude Code emits typed `tool_use` and `tool_result` content blocks (with named tools, including MCP tools). Codex routes everything through `command_execution` items (raw shell commands with `aggregated_output` and `exit_code`). Switchboard renders them differently per harness — there is no single unified rendering.
 - **Capture permission denials.** *(Confirmed for Claude Code via `result.permission_denials`.)* Denials do **not** error the turn — the model receives them as feedback and adapts. Switchboard treats denials as a distinct UX category (informational, not failure). Codex behavior is presumed similar but not yet verified — §7 wording about Codex denials is hedged accordingly.
@@ -589,7 +591,7 @@ The capabilities and behaviors Switchboard needs from each harness, with notes o
 
 ### Per-harness adapter and normalized event stream
 
-The two harness streams are structurally different (event-name vocabularies, content shapes, where cost / context-window / rate-limit info appears). To keep the rest of Switchboard harness-agnostic, the harness layer is organized around **per-harness adapters** that translate native events into a normalized internal event stream the rest of the system consumes:
+The two harness streams are structurally different (event-name vocabularies, content shapes, where context-window / rate-limit info appears). To keep the rest of Switchboard harness-agnostic, the harness layer is organized around **per-harness adapters** that translate native events into a normalized internal event stream the rest of the system consumes:
 
 ```
 SessionMeta     { agent, model, harness_version, tools, mcp_servers, skills, raw }
@@ -604,7 +606,7 @@ ToolStarted     { agent, tool_use_id, kind, input }
 ToolCompleted   { agent, tool_use_id, output, is_error }
 TurnEnd         { agent, status: success | error,
                   stop_reason, usage: { input, output, cached, reasoning, context_window? },
-                  cost_usd?, permission_denials, raw_event }
+                  permission_denials, raw_event }
 TurnAborted     { agent, reason: spawn_failed | stream_truncated | timeout | cancelled, detail }
                 // for adapter-layer failures the harness itself didn't report
                 // (process spawn fails, stream ends without a terminal event,
@@ -623,9 +625,9 @@ Reading Codex session files (in addition to the stream) is an implementation cho
 
 ### Passthrough mechanism
 
-For harness commands Switchboard does not need to coordinate, the design *intent* is a passthrough: the user types a harness slash command (e.g., `/model`, `/clear`, `/cost`) when interacting with an agent, and Switchboard forwards it to the harness verbatim. This avoids reimplementing every harness feature.
+For harness commands Switchboard does not need to coordinate, the design *intent* is a passthrough: the user types a harness slash command (e.g., `/model`, `/clear`) when interacting with an agent, and Switchboard forwards it to the harness verbatim. This avoids reimplementing every harness feature.
 
-**Important caveat — CLI-path limitation:** The `claude -p` CLI does not accept slash commands as input — that includes built-in commands (`/cost`, `/model`, `/clear`) and user-invoked skills (`/skill-name`). The CLI gap is tracked upstream at [anthropics/claude-code#837](https://github.com/anthropics/claude-code/issues/837) and [#38505](https://github.com/anthropics/claude-code/issues/38505). Note this is a CLI-path limitation specifically: the Claude Agent SDK does support headless slash-command dispatch, so a future SDK-based adapter could close this gap. v1 stays on the CLI path because Codex's integration is also CLI-only and an SDK-vs-CLI split between the two harness adapters would create avoidable asymmetry. Until then, Switchboard's passthrough is constrained to commands we can implement out-of-band: `/cost` derived from `--output-format json` metadata, `/model` implemented by re-spawning with a different `--model` flag, and so on. Tracked under open question 10.10; see [docs/research/claude-code-headless.md](research/claude-code-headless.md) for sources. (The auto-invoked side of skills is unaffected — see §6.)
+**Important caveat — CLI-path limitation:** The `claude -p` CLI does not accept slash commands as input — that includes built-in commands (`/model`, `/clear`) and user-invoked skills (`/skill-name`). The CLI gap is tracked upstream at [anthropics/claude-code#837](https://github.com/anthropics/claude-code/issues/837) and [#38505](https://github.com/anthropics/claude-code/issues/38505). Note this is a CLI-path limitation specifically: the Claude Agent SDK does support headless slash-command dispatch, so a future SDK-based adapter could close this gap. v1 stays on the CLI path because Codex's integration is also CLI-only and an SDK-vs-CLI split between the two harness adapters would create avoidable asymmetry. Until then, Switchboard's passthrough is constrained to commands we can implement out-of-band: `/model` implemented by re-spawning with a different `--model` flag, and so on. Tracked under open question 10.10; see [docs/research/claude-code-headless.md](research/claude-code-headless.md) for sources. (The auto-invoked side of skills is unaffected — see §6.)
 
 **Open question 5.2:** Exact mechanism for passthrough — does it require a prefix to disambiguate from Switchboard's own slash commands, or do Switchboard's commands live in a separate namespace? Partially blocked on the upstream limitation above.
 
@@ -638,7 +640,7 @@ What is **preserved** because the harness still runs in default mode: hooks fire
 What is **lost** in headless mode:
 
 - **Plan mode** (Claude Code's interactive plan/approve cycle) — REPL-only; no headless equivalent.
-- **User-invoked slash commands** — `/cost`, `/model`, `/clear`, `/compact`, and `/skill-name` are not accepted as input in `claude -p`. See the passthrough section above and open question 10.10.
+- **User-invoked slash commands** — `/model`, `/clear`, `/compact`, and `/skill-name` are not accepted as input in `claude -p`. See the passthrough section above and open question 10.10.
 - **Programmatic compaction** — both harnesses do auto-compact; neither exposes a triggerable `/compact` from headless. See open question 10.11.
 - **The harness's own TUI rendering** — Switchboard renders everything itself from the stream.
 
@@ -754,7 +756,7 @@ Aggregated from inline flags above, plus a few additional:
 - **10.11** Compaction strategy. Programmatic `/compact` is unavailable in both harnesses today; both do auto-compact at high utilization. Working assumption: Switchboard monitors token usage, warns the user as the auto-compact threshold approaches, and defers actual compaction to the harness. We do not implement Switchboard-side summarization (would underperform the harnesses' tuned compaction). Alternative to consider: surface a "fork from checkpoint with summary" action that uses the existing fork primitive plus an explicit summarize-and-restart prompt, as a coarse user-driven alternative when the user wants to reclaim context outside auto-compact. Background in [docs/research/claude-code-headless.md](research/claude-code-headless.md) and [docs/research/codex-noninteractive.md](research/codex-noninteractive.md).
 - **10.12** Model→max-context map maintenance. **Partially resolved by hands-on probe:** Claude Code v2.1.138 *does* expose `contextWindow` per turn in `result.modelUsage.<model>` — Switchboard reads it directly, no map needed for Claude Code. Codex's stream omits it; the value lives in the session file's `task_started` event. Working assumption for Codex: ship a bundled model→max-context map, but also let the Codex adapter read the session file and prefer that as authoritative when present. Still open: do we ship the map, read the session file, or both? Open: where is the canonical map source for new models we sync from?
 - **10.13 (monitoring)** Programmatic `/compact` exposure in either harness. Multiple Anthropic feature requests open ([anthropics/claude-code#5643](https://github.com/anthropics/claude-code/issues/5643), [#39275](https://github.com/anthropics/claude-code/issues/39275), [#39574](https://github.com/anthropics/claude-code/issues/39574), [#26488](https://github.com/anthropics/claude-code/issues/26488)); Codex equivalent not documented. When upstream lands, Switchboard can offer first-class compaction control inside workflows.
-- **10.14** Codex non-interactive fork. Claude Code has native `--fork-session`; Codex has no `codex exec fork`. Three options: (a) drop fork from v1's Codex agent capability and document the asymmetry; (b) implement fork by copying the session JSONL to a new file and passing the new ID to `codex exec resume` (untested — file format may not support this cleanly); (c) implement fork by spawning a fresh Codex session and re-feeding a summarized version of the prior context as the initial prompt. Decision deferred to implementation; (a) is the safe v1 default.
+- ~~**10.14** Codex non-interactive fork.~~ **Resolved for v1: option (a).** Fork is unavailable for Codex agents in v1 — the agent context-menu Fork action is shown only on Claude Code agents; Codex agents show an explanatory tooltip ("Fork is not available for Codex sessions in v1; see the docs for workarounds"). Workarounds (b) copy session JSONL and (c) re-feed summarized prior context are deferred to v2+ if user demand surfaces. The asymmetry is documented in §9 and the M3 deliverables.
 - ~~**10.15** Should the Codex adapter read the session file (`~/.codex/sessions/...jsonl`) in addition to the `--json` stream?~~ **Resolved (commitment).** The Codex adapter reads the session file on turn completion to enrich the normalized event stream with fields the `--json` stream omits (rate limits, `model_context_window`, full reasoning blocks, `session_meta` for the SessionMeta event). Multiple §7 and §9 commitments now depend on this (per-turn context-utilization for Codex, RateLimitEvent timing, SessionMeta). What remains as implementation detail: tail-vs-completion timing for any future live-stream enrichment, and the lookup-strategy mechanics for the date-partitioned session path (see codex-cli-observed.md research note).
 - **10.16** Disk usage of harness session files. Both harnesses persist transcripts indefinitely (Claude Code at `~/.claude/projects/<encoded-cwd>/*.jsonl`, Codex at `~/.codex/sessions/YYYY/MM/DD/...`). A long-lived project with many agents and many turns will accumulate. Should Switchboard offer pruning, surface totals, or otherwise manage this? Out of scope for v1, but the architecture should not preclude it.
 - **10.17** Network failure and retry policy. What does Switchboard do when a turn fails mid-workflow because of a transient API error or network blip? Working assumption: a single configurable retry on transient errors (rate-limit, 5xx) before marking the step as failed. Permanent errors (auth, invalid model, denied content) fail immediately. To be detailed in §7 once we have an implementation footprint.

@@ -93,7 +93,7 @@ Long-form `type` is required when long form is used; mixing shorthand and long f
 ### Validation rules
 
 - Input names must match `[a-z][a-z0-9_]*`
-- An input named with a reserved built-in name (`user_input`, `responses`) is an error
+- An input named with a reserved built-in name (`user_input`) is an error
 - Required inputs (no `?` suffix, no `default`) must be supplied at invocation; missing values fail invocation pre-flight
 - Agent-typed inputs are validated at invocation time — referenced agents must exist in the project
 - `prompt_id`-typed inputs are validated at invocation time — the prompt must resolve through configured providers

@@ -142,15 +142,15 @@ When `forward_from` is set, the dispatched message body is composed deterministi
 ```
 <rendered text or prompt body, if any>
 
------8<----- forwarded from <agent_name> -----8<-----
+=== START forwarded from <agent_name> ===
 <agent's latest completed output verbatim>
------8<----- end <agent_name> -----8<-----
+=== END forwarded from <agent_name> ===
 
------8<----- forwarded from <next_agent_name> -----8<-----
+=== START forwarded from <next_agent_name> ===
 ...
 ```
 
-The `-----8<-----` sentinel was chosen to minimize collision with markdown headers, code fences, or other content agents commonly produce. If only `forward_from` is set (no `text` or `prompt`), the body is the forwarded composition alone with no leading content.
+The `=== START / END ===` sentinel is plain-English-readable to the receiving agent and unlikely to collide with markdown headers, code fences, or other content agents commonly produce. If only `forward_from` is set (no `text` or `prompt`), the body is the forwarded composition alone with no leading content.
 
 ### `wait_for` (synchronization, single agent)
 
@@ -253,16 +253,16 @@ These functions are callable inside `{{ ... }}` expressions and `{% ... %}` cont
 
 #### Canonical aggregation shape (`aggregated_responses`)
 
-`aggregated_responses(agents)` composes the agents' outputs in declared order, each delimited by a sentinel line on its own line. The sentinel matches `forward_from`'s shape (per §`send`) so users see one canonical aggregation format throughout Switchboard:
+`aggregated_responses(agents)` composes the agents' outputs in declared order, each delimited by a `=== START / END ===` sentinel line. The pattern matches `forward_from`'s shape (per §`send`) so users see one canonical aggregation format throughout Switchboard:
 
 ```
------8<----- response from <agent_a_name> -----8<-----
+=== START response from <agent_a_name> ===
 <agent_a's latest completed output verbatim>
------8<----- end <agent_a_name> -----8<-----
+=== END response from <agent_a_name> ===
 
------8<----- response from <agent_b_name> -----8<-----
+=== START response from <agent_b_name> ===
 <agent_b's latest completed output verbatim>
------8<----- end <agent_b_name> -----8<-----
+=== END response from <agent_b_name> ===
 ```
 
 A receiving prompt that simply wraps the aggregation as `{{ feedback }}` (e.g., `tiddly:ai-review-feedback`) gets this canonical shape with no Switchboard-specific authoring required.

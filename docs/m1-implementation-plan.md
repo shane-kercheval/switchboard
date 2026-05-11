@@ -5,7 +5,7 @@
 ## How to use this plan
 
 1. Read these files first (in order):
-   - `docs/system-design.md` — the canonical "what is Switchboard and why." Sections 2 (primitives overview), 3 (the six primitives, especially Primitive 1 / agent name normalization), 5 (per-harness adapter abstraction), 7 (agent contention; only the M1-relevant parts), 10 (platform / tray notes; M1-irrelevant parts can be skimmed).
+   - `docs/system-design.md` — the canonical "what is Switchboard and why." Sections 3 (core concepts — agent name normalization), 4 (functional primitives — what we're orchestrating), 7 (user-facing model — agent contention; only the M1-relevant parts), 9 (harness integration — per-harness adapter trait, normalized event stream, Claude Code specifics), 10 (form factor — platform / tray notes; M1-irrelevant parts can be skimmed).
    - `docs/v1-plan.md` — the M1 section in particular, plus the "Critical path" preamble.
    - `docs/research/claude-code-headless.md` and `docs/research/claude-code-cli-observed.md` — these are the ground-truth references for the Claude Code CLI surface. The CLI's observed behavior (event types, `--session-id`, `--include-partial-messages`, exit codes, single-process model) is more authoritative than anything reconstructed from memory.
 2. Resolve the **Open questions** below with the user before starting.
@@ -23,7 +23,7 @@ These are decisions the plan currently leaves to the user. Confirm them before t
 4. **shadcn-svelte version pinning.** shadcn-svelte tracks Svelte 5 (uses runes). **Pin exact versions** of `shadcn-svelte` CLI, `bits-ui`, and any peer deps in `package.json` and the lockfile at the version current when M1.1 starts. Do not use `latest` — for an AI-agent-consumed plan, floating versions are a reproducibility hazard, and `bits-ui` peer-dep churn against Svelte 5 runes makes this concrete. Stack composition itself (Tauri 2.x + Svelte 5 + Tailwind + shadcn-svelte) is settled per `v1-plan.md` M1 scope.
 5. **Streaming granularity.** Pass `--include-partial-messages` so the UI receives token-by-token deltas (matches the "see streaming text" UX in the M1 acceptance). Confirm.
 6. **Project creation UX.** For M1, picking a project = a native folder-picker dialog. No project name field, no "recent projects" list (defer to M2). Confirm.
-7. **CI scope.** Hygiene CI = GitHub Actions, single workflow file, runs `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, frontend `pnpm lint` and `pnpm test`. **Vitest + `@testing-library/svelte` are set up in M1.1 with one trivial smoke test** so `pnpm test` has something to run from day 1, and M1.5's component tests are pure additive work. macOS runner only for M1 (cross-platform builds are M7). Confirm.
+7. **CI scope.** Hygiene CI = GitHub Actions, single workflow file, runs `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test`, frontend `pnpm lint` and `pnpm test`. **Vitest + `@testing-library/svelte` are set up in M1.1 with one trivial smoke test** so `pnpm test` has something to run from day 1, and M1.5's component tests are pure additive work. macOS runner only for M1 (cross-platform builds are M7). Confirm.
 
 If the user accepts the recommendations as-stated, proceed. If they push back on any, revise the plan section that depends on the answer **before** starting that sub-milestone.
 
@@ -72,6 +72,7 @@ After this sub-milestone:
    - Frontend: Svelte 5 with TypeScript + Vite + Tailwind. shadcn-svelte: <https://shadcn-svelte.com/>.
    - Pick a package manager (recommend `pnpm`). Pin it in `package.json`'s `packageManager` field.
    - **Pin exact versions** for `shadcn-svelte`, `bits-ui`, and peers per OQ4 — no `^` or `~` ranges and no `"latest"` for these deps.
+   - **Install and initialize `tauri-plugin-dialog`** (Rust: `tauri-plugin-dialog` crate; frontend: `@tauri-apps/plugin-dialog`). First used in M1.5's folder picker, but adding plugins mid-stream involves Cargo.toml + capabilities config + npm install — wire it now to avoid that yak-shave later.
    - The Tauri app's bundle identifier should be something like `com.switchboard.app`.
 2. **Set up the Cargo workspace.** The Tauri Rust crate (e.g., `crates/app`) is one workspace member. Future M1.2/M1.3/M1.4 work will likely add `crates/core` (project model, registry, harness adapter) and may further split. For M1.1, just establish a workspace `Cargo.toml` so adding crates later is trivial.
 3. **Add a trivial round-trip command.** A `ping(name: String) -> String` Tauri command and a Svelte component that calls it on mount and renders the response. This proves IPC end-to-end.
@@ -140,7 +141,7 @@ Pure-Rust persistence layer for a Switchboard project — no UI, no harness yet.
    ```rust
    #[derive(Serialize, Deserialize)]
    pub struct AgentRecord {
-       pub id: AgentId,            // ULID or UUID v7 — generated on create
+       pub id: AgentId,            // UUID v7 (time-ordered; via the uuid crate's v7 feature) — generated on create
        pub name: String,           // user-supplied, validated for uniqueness
        pub harness: HarnessKind,   // enum, M1 only ClaudeCode
        pub session_id: Uuid,       // Claude Code session UUID
@@ -163,7 +164,7 @@ Use `tempfile::TempDir` for isolation. All tests are unit tests in the `core` cr
 - **Duplicate name (verbatim).** Registering `assistant` twice fails with the duplicate-name error.
 - **Duplicate name (hyphen↔underscore).** `agent-a` then `agent_a` fails. `Agent_A` then `agent-a` fails. (Case-insensitive too if we go that route — confirm in the open-questions answers.)
 - **Empty / whitespace-only name.** Rejected.
-- **Reserved characters in name.** Decide and document a policy (recommend: `^[a-zA-Z][a-zA-Z0-9_-]*$`); test rejection.
+- **Reserved characters in name.** Per `system-design.md` §3, the spec is `^[A-Za-z0-9_-]+$` (no leading-character constraint). Test rejection of empty, whitespace, and characters outside the class. Test acceptance of digit-first, hyphen-first, and underscore-first names so the spec rule is enforced rather than accidentally tightened. If during implementation a stricter rule seems warranted (e.g., digit-first names create awkward template-variable identifiers in fan-in contexts), surface the proposal — don't silently tighten.
 - **`Project::create` on a path that already has `.switchboard/`** fails cleanly.
 - **`Project::open` on a path with no `.switchboard/`** fails cleanly.
 - **Corrupted registry line** — append a malformed line to the JSONL by hand, then `list_agents` returns a typed error pointing at the bad line. (Don't silently skip — corruption should surface.)
@@ -194,8 +195,22 @@ No Tauri integration in this sub-milestone — that's M1.4. Keep this work in `c
 
 ### Implementation outline
 
-1. **Normalized event types.**
+1. **Normalized event types.** Two enums: `AdapterEvent` (what adapters emit) and `NormalizedEvent` (what crosses IPC). The split makes "TurnStart is dispatcher-owned, never adapter-emitted" a type-level invariant rather than a doc convention.
+
    ```rust
+   // Adapter-emitted: parser produces these. TurnStart is NOT here — it is
+   // dispatcher-owned. Excluding it from this enum makes the invariant
+   // type-enforced; a future adapter author cannot accidentally emit TurnStart.
+   #[derive(Debug, Clone, Serialize, Deserialize)]
+   #[serde(tag = "type", rename_all = "snake_case")]
+   #[non_exhaustive]
+   pub enum AdapterEvent {
+       ContentChunk { turn_id: TurnId, text: String },
+       TurnEnd { turn_id: TurnId, outcome: TurnOutcome, ended_at: DateTime<Utc> },
+   }
+
+   // Wire format: what crosses IPC to the frontend. The dispatcher constructs
+   // TurnStart at dispatch time; AdapterEvent is lifted into the rest via From.
    #[derive(Debug, Clone, Serialize, Deserialize)]
    #[serde(tag = "type", rename_all = "snake_case")]
    #[non_exhaustive]
@@ -205,14 +220,51 @@ No Tauri integration in this sub-milestone — that's M1.4. Keep this work in `c
        TurnEnd { turn_id: TurnId, outcome: TurnOutcome, ended_at: DateTime<Utc> },
    }
 
+   impl From<AdapterEvent> for NormalizedEvent {
+       fn from(e: AdapterEvent) -> Self {
+           match e {
+               AdapterEvent::ContentChunk { turn_id, text } =>
+                   NormalizedEvent::ContentChunk { turn_id, text },
+               AdapterEvent::TurnEnd { turn_id, outcome, ended_at } =>
+                   NormalizedEvent::TurnEnd { turn_id, outcome, ended_at },
+           }
+       }
+   }
+
    #[derive(Debug, Clone, Serialize, Deserialize)]
    #[serde(tag = "status", rename_all = "snake_case")]
+   #[non_exhaustive]
    pub enum TurnOutcome {
        Completed,
-       Failed { message: String },
+       Failed { kind: FailureKind, message: String },
+       // Future: Cancelled { source: CancelSource } — added in M3 when per-turn
+       // cancel lands. Cancellation is intentional, not a failure — its own
+       // top-level variant.
+   }
+
+   #[derive(Debug, Clone, Serialize, Deserialize)]
+   #[serde(rename_all = "snake_case")]
+   #[non_exhaustive]
+   pub enum FailureKind {
+       /// Harness reported `is_error` in its terminal `result` event. Caused by
+       /// model/API issues — bad model name, rate limit, transient API error,
+       /// invalid prompt content. Retry semantics: depends on cause; the
+       /// caller should look at the message before retrying.
+       HarnessError,
+       /// Synthesized by the adapter when the subprocess died, the parser hit
+       /// malformed JSON, or stdout EOF arrived without a terminal `result`
+       /// event. Caused by infrastructure — process crash, OOM, network drop
+       /// mid-stream, etc. Retry semantics: typically transient.
+       AdapterFailure,
+       // Future: Timeout — added when (and if) we land an active per-turn
+       // hard timeout (separate from passive stall detection — see
+       // system-design.md §12 open question 10.19).
    }
    ```
-   The `#[serde(tag = "type", rename_all = "snake_case")]` pins the IPC wire format for the frontend (M1.5 writes a matching TypeScript discriminated union). `DateTime<Utc>` serializes to an ISO-8601 string by default — the TS type uses `string`, not `Date`. Future milestones add ToolStarted, ToolCompleted, TurnAborted, RateLimitEvent, SessionMeta — `#[non_exhaustive]` keeps adding variants in M2 non-breaking. **Any future variant must keep the same `tag` attribute** to maintain the wire contract.
+
+   The `#[serde(tag = "type", rename_all = "snake_case")]` on `NormalizedEvent` pins the IPC wire format for the frontend (M1.5 writes a matching TypeScript discriminated union). `DateTime<Utc>` serializes to an ISO-8601 string by default — the TS type uses `string`, not `Date`. Future milestones add ToolStarted, ToolCompleted, RateLimitEvent, SessionMeta — `#[non_exhaustive]` keeps adding variants in M2 non-breaking, and the matching tag attribute on both enums must be preserved to maintain the wire contract. New adapter-emitted variants get added to *both* enums; new dispatcher-emitted variants (rare — TurnStart is the only one for now) go in `NormalizedEvent` only.
+
+   **Why `kind` on `Failed` (not just `message`):** the discriminator is load-bearing for M5's partial-failure rule (the human-in-the-loop pause we filed in `v1-plan.md` M5). When one agent in a fan-in fails, the workflow needs to distinguish "harness reported a model error" (`HarnessError` — bad prompt, retry won't help) from "subprocess crashed" (`AdapterFailure` — transient, retry might help). The UI can use the same discriminator to surface different affordances ("retry" vs "this is a Switchboard problem, restart the agent"). Internal Rust code at the adapter layer can carry richer cause detail in logs without surfacing it on the wire.
 
 2. **`HarnessAdapter` trait.** The minimum surface for M1:
    ```rust
@@ -226,9 +278,22 @@ No Tauri integration in this sub-milestone — that's M1.4. Keep this work in `c
        ) -> Result<EventStream, DispatchError>;
    }
 
-   pub type EventStream = Pin<Box<dyn Stream<Item = NormalizedEvent> + Send>>;
+   pub type EventStream = Pin<Box<dyn Stream<Item = AdapterEvent> + Send>>;
+
+   #[derive(Debug, thiserror::Error)]
+   pub enum DispatchError {
+       #[error("claude binary not found on PATH")]
+       BinaryNotFound,
+       #[error("failed to spawn claude subprocess: {0}")]
+       SpawnFailed(#[from] std::io::Error),
+   }
    ```
-   Implementation note: the stream completes when the harness subprocess emits its terminal `result` event (which becomes `TurnEnd`). Subprocess exit afterwards is fire-and-forget.
+
+   **Error routing** — two paths, never confused:
+   - `DispatchError` covers failures *before* the stream is established (binary missing, spawn syscall failed). The dispatcher (M1.4) handles these by leaving the agent in `Idle` and surfacing the error to the caller.
+   - Failures *after* the stream starts (subprocess died, parser hit malformed JSON, EOF without terminal `result` event) surface as a synthesized `AdapterEvent::TurnEnd { outcome: Failed }` on the stream — never as a `DispatchError`. The turn completes cleanly from the dispatcher's perspective.
+   
+   The stream completes when the parser observes the harness's terminal `result` event (becomes `AdapterEvent::TurnEnd`). Subprocess lifecycle continues until reaped per step 8.
 
 3. **`ClaudeCodeAdapter`.** Constructs the command line:
    ```
@@ -245,7 +310,7 @@ No Tauri integration in this sub-milestone — that's M1.4. Keep this work in `c
    - **If idempotent** → always pass `--session-id <uuid>`, no branching needed at all. Eliminates a code path entirely.
    - **If not idempotent** → pass `--session-id <uuid>` on the first turn and `--resume <uuid>` thereafter. Choose based on the existence of `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl` (ground truth from Claude's own data). **Do not add a mutable `initialized: bool` field to `AgentRecord`** — that violates the registry's append-only invariant and drifts from ground truth (user deletes session file → registry stays stale).
    
-   Per `claude-code-cli-observed.md`, `--include-partial-messages` requires `stream-json` output and the `--verbose` flag may be required — verify by running `claude --help`. The `--input-format stream-json` flag is **not** used in M1 (positional prompt input only — see step 5).
+   Per `claude-code-cli-observed.md`, `--include-partial-messages` requires `stream-json` output. Per the research notes, `--verbose` is required alongside `--include-partial-messages` — confirm by running `claude --help`, but plan for it being mandatory. The `--input-format stream-json` flag is **not** used in M1 (positional prompt input only — see step 5).
 
 4. **Stream-json parser.** Use `tokio::process::Command` with piped stdout. Read line-by-line via `BufReader::lines()`. Parse each line as JSON; map to `NormalizedEvent` per the table below.
 
@@ -268,9 +333,11 @@ No Tauri integration in this sub-milestone — that's M1.4. Keep this work in `c
 
 7. **Error handling.** Distinguish two cases:
    - **`claude` binary not found on PATH** — at adapter construction (or first dispatch), use `which::which("claude")` to detect. Return a typed `BinaryNotFound` error from the adapter constructor — *not* via `TurnEnd(Failed)`. This surfaces as an app-level banner (M1.5), not a per-turn failure. Minimum-version assertion is deferred to M7.
-   - **Subprocess failure mid-turn** (non-zero exit, JSON parse error, malformed line, EOF without terminal `result`) → adapter synthesizes a terminal `TurnEnd(Failed { message })` and ends the stream. Don't panic.
+   - **Subprocess failure mid-turn** → adapter synthesizes a terminal `TurnEnd(Failed { kind, message })` and ends the stream. Don't panic. Map the cause to `FailureKind`:
+     - **Harness's terminal `result` event reports `is_error: true`** (or `api_error_status != null`) → `Failed { kind: HarnessError, message: <result.result text> }`.
+     - **Subprocess died, parser hit malformed JSON, stdout EOF arrived without terminal event, non-zero exit before terminal event** → `Failed { kind: AdapterFailure, message: <description of the cause> }`.
    
-   **Stream contract** — consumers always receive exactly one terminal `TurnEnd` per turn. The adapter owns this guarantee: if the subprocess dies without emitting `result`, the adapter must synthesize `TurnEnd(Failed)`. Frontend state machines must not have to handle "stream ended without TurnEnd" as a distinct case.
+   **Stream contract** — consumers always receive exactly one terminal `TurnEnd` per turn. The adapter owns this guarantee: if the subprocess dies without emitting `result`, the adapter must synthesize `TurnEnd(Failed { kind: AdapterFailure, ... })`. Frontend state machines must not have to handle "stream ended without TurnEnd" as a distinct case.
 
 8. **Subprocess lifecycle ownership.** The dispatch task owns the `Child` handle from `Command::spawn()`. Concurrently:
    1. Read stdout line-by-line via `BufReader::lines()` — drives the parser → normalized events.
@@ -310,7 +377,7 @@ while let Some(line) = lines.next_line().await? {
   - Empty / whitespace-only prompt — confirms what Claude Code does and we handle it
   
   Capture these by running `claude -p ... --output-format stream-json > fixture.jsonl` once and committing them to the repo.
-- **Wire-format roundtrip test.** A `serde_json::to_value` + `from_value` roundtrip on each `NormalizedEvent` variant confirms the on-the-wire shape — `{"type": "turn_start", ...}`, `{"type": "content_chunk", ...}`, `{"type": "turn_end", "turn_id": "...", "outcome": {"status": "completed"}, "ended_at": "..."}`. Asserts the snake_case discriminator strings match what M1.5's TS type expects.
+- **Wire-format roundtrip test.** A `serde_json::to_value` + `from_value` roundtrip on each `NormalizedEvent` variant confirms the on-the-wire shape — `{"type": "turn_start", ...}`, `{"type": "content_chunk", ...}`, `{"type": "turn_end", "turn_id": "...", "outcome": {"status": "completed"}, "ended_at": "..."}`. Asserts the snake_case discriminator strings match what M1.5's TS type expects. Also test the `From<AdapterEvent> for NormalizedEvent` lift — every `AdapterEvent` variant maps to its `NormalizedEvent` counterpart with no field loss.
 - **Parser unit tests.** Feed each fixture through the parser; assert the expected `NormalizedEvent` sequence.
 - **Process-spawn unit test.** Spawn the fake harness, drain the stream, assert events. This validates the subprocess plumbing without hitting real `claude`.
 - **Live integration test.** Gated behind `#[ignore]` plus an env-var check (`SWITCHBOARD_LIVE_HARNESS=1`). Runs `claude -p` for real, asserts that "What's 2+2?" produces some `ContentChunk` containing `"4"` and a `TurnEnd(Completed)`. Run this manually before merging M1.3 — do not enable in CI for M1 (M2 stands up the integration CI workflow).
@@ -364,6 +431,11 @@ This sub-milestone establishes the chokepoint pattern that M3 will harden into t
    async fn check_claude_binary() -> Result<(), String>;  // surfaces BinaryNotFound for the M1.5 banner
 
    #[tauri::command]
+   async fn check_project_status(root: String) -> Result<ProjectStatus, String>;
+   // ProjectStatus = NotAProject | AlreadyAProject — the M1.5 folder picker calls
+   // this before deciding whether to offer create or open. Avoids errors-as-control-flow.
+
+   #[tauri::command]
    async fn create_project(state: State<'_, AppState>, root: String) -> Result<ProjectInfo, String>;
 
    #[tauri::command]
@@ -381,8 +453,9 @@ This sub-milestone establishes the chokepoint pattern that M3 will harden into t
    Returning `String` for the error type is a Tauri convention; map `thiserror`-typed errors to `to_string()` at the boundary. **`send_message` returns the `TurnId` synchronously** — the dispatcher generates it before spawning the harness, lets the UI scope its event subscription to that turn (see step 5), and emits `TurnStart` immediately so the user sees "processing" the moment they hit Send.
 5. **Turn lifecycle and event forwarding.**
    - On `send_message`: dispatcher generates a fresh `TurnId`, locks the agent state, checks `Idle`, transitions to `InFlight` (acquiring an `AgentIdleGuard` — see step 6), releases the lock, returns the `TurnId` to the caller, and spawns the dispatch task.
-   - The dispatch task **immediately emits `TurnStart`** via the `EventEmitter` (before the harness subprocess even boots). Then it spawns the harness adapter via the `HarnessAdapter` trait, drains the resulting `EventStream`, and forwards each event via the emitter.
-   - **Event name pattern: `agent:<agent_id>:turn:<turn_id>`** (turn-scoped, not just agent-scoped). This prevents stale events from a prior turn from leaking into the next render in the M1.5 reducer.
+   - The dispatch task **immediately emits `TurnStart`** via the `EventEmitter` (before the harness subprocess even boots). Then it spawns the harness adapter via the `HarnessAdapter` trait, drains the resulting `EventStream` (typed as `AdapterEvent`), lifts each event into a `NormalizedEvent` via `From<AdapterEvent>`, and forwards via the emitter.
+   - **Event name pattern: `agent:<agent_id>`** (per-agent — one channel for the lifetime of the agent, not per-turn). Each event payload carries its own `turn_id`. The M1.5 reducer subscribes once when the AgentPane mounts (not per turn) and filters events by the current `turn_id` to discriminate between turns.
+   - **Why per-agent, not per-turn:** a per-turn channel name (`agent:<id>:turn:<turn_id>`) would require the frontend to subscribe AFTER receiving the `turn_id` from the IPC reply — but the dispatch task emits `TurnStart` concurrently, and the IPC reply and the event cross the WebView bridge in undefined order. If `TurnStart` arrives first, the listener doesn't exist yet and the event is silently dropped (the worst kind of bug — intermittent, environment-dependent). The per-agent channel eliminates the race because the listener exists before any event can fire. The reducer's `turn_id` filter is the load-bearing defense against cross-turn event leakage (see the M1.5 reducer test "late event from prior turn ignored").
    - **Backpressure: M1 emits each event naively, one Tauri event per `NormalizedEvent`.** This will not scale to M3's multi-pane fan-out (one fan-out turn × N agents × hundreds of token deltas). M3 expansion must address this — design space includes the §10 ring buffer, coalescing windows, rate limiting, or size caps. See the deferred-from-M1 callout in `v1-plan.md` M3.
 6. **Two invariants the dispatcher must guarantee** (keep these mentally separate — they're independent guarantees with different owners):
    - **Dispatcher invariant — agent always returns to Idle.** Implementation: hold an `AgentIdleGuard` for the lifetime of the dispatch task. Its `Drop` impl flips state back to `Idle`. This holds even on panic, channel drop, or any other early termination path. (RAII pattern, like `tokio::sync::MutexGuard`.) **Owner: dispatcher.** Ensures backend state coherence.
@@ -393,13 +466,13 @@ This sub-milestone establishes the chokepoint pattern that M3 will harden into t
 
 - **Dispatcher unit tests** (no Tauri — use `RecordingEmitter` for assertions).
   - `send_message` to an idle agent transitions to InFlight, runs the turn, transitions back to Idle.
-  - `send_message` returns a `TurnId` synchronously; the dispatch task emits `TurnStart` (with that `TurnId`) on `agent:<id>:turn:<turn_id>` before any parser events arrive (assert via `RecordingEmitter`'s recorded sequence).
+  - `send_message` returns a `TurnId` synchronously; the dispatch task emits `TurnStart` (with that `TurnId`) on `agent:<id>` before any parser events arrive (assert via `RecordingEmitter`'s recorded sequence).
   - Concurrent `send_message` calls to the same agent: the second returns the busy error.
-  - Concurrent `send_message` calls to *different* agents both run; their event streams don't cross-contaminate (assert by event name — `agent:<id>:turn:<turn_id>` is unique per turn).
+  - Concurrent `send_message` calls to *different* agents both run; their event streams don't cross-contaminate (assert by event name — each agent has its own `agent:<id>` channel).
   - A failed turn (fake harness emits an error fixture) leaves the agent back in Idle, not stuck in InFlight.
   - **Panic test:** a panicking dispatch task does not leave the agent stuck `InFlight` — `AgentIdleGuard`'s `Drop` impl restores state. Use a force-panic adapter to validate.
-  - **Stream-contract test:** an adapter that ends its stream without a terminal event — the dispatcher's drain loop must observe exactly one `TurnEnd` per turn (the adapter, per M1.3 step 7, synthesizes `TurnEnd(Failed)` if the upstream subprocess dies silent). Catches regression if the adapter ever fails to do so.
-- **`EventEmitter` testing.** Use `RecordingEmitter` to assert exact event sequences emitted per turn. Happy path: `turn_start` → `content_chunk`×N → `turn_end(completed)`. Failed path: `turn_start` → `turn_end(failed)`. All events on the turn-scoped name `agent:<id>:turn:<turn_id>`.
+  - **Stream-contract test:** an adapter that ends its `AdapterEvent` stream without a terminal `AdapterEvent::TurnEnd` — the dispatcher's drain loop must observe exactly one `TurnEnd` per turn (the adapter, per M1.3 step 7, synthesizes `TurnEnd(Failed)` if the upstream subprocess dies silent). Catches regression if the adapter ever fails to do so.
+- **`EventEmitter` testing.** Use `RecordingEmitter` to assert exact event sequences emitted per turn. Happy path: `turn_start` → `content_chunk`×N → `turn_end(completed)`. Failed path: `turn_start` → `turn_end(failed)`. All events on the per-agent name `agent:<id>`; payloads carry the `turn_id`.
 - **Tauri command tests.** Tauri's testing story is limited. Each command is a thin shim around a free function that takes state explicitly; unit-test the free function. Don't try to test the `#[tauri::command]` wrapper itself.
 - **End-to-end Tauri smoke** is deferred to M1.5 (manual verification: open devtools, listen, send a message, see events stream).
 
@@ -427,7 +500,11 @@ The actual user-facing walking skeleton. After this sub-milestone, the M1 accept
 
 1. **Startup binary check.** On app startup, dispatch the `check_claude_binary` Tauri command (defined in M1.4). If it returns `BinaryNotFound`, render a top-of-app banner: "Claude Code not found on PATH. Install from <https://claude.com/code>." Banner persists across navigation. Project creation and agent creation are still allowed (so the user can configure things even without `claude` installed); `send_message` will fail until `claude` is installed and the user re-runs the check (or re-launches Switchboard).
 2. **App routing.** Three states: no-project (welcome screen), project-open-no-agents (create agent prompt), project-open-with-agent (single-pane view). Use a Svelte `$state` rune.
-3. **Folder picker.** Tauri's `@tauri-apps/plugin-dialog` (`open({ directory: true })`).
+3. **Folder picker + create/open flow.** Use Tauri's `@tauri-apps/plugin-dialog` (`open({ directory: true })`) to let the user pick a folder. Once a folder is selected, **call `check_project_status(root)`** (M1.4 command) to determine whether the folder is already a Switchboard project. Render distinct CTAs based on the result:
+   - `NotAProject` → "Create Switchboard project here?" CTA → calls `create_project(root)` on confirm.
+   - `AlreadyAProject` → "Open this Switchboard project?" CTA → calls `open_project(root)` on confirm.
+   
+   This avoids using errors as control flow (the alternative — call `open_project` first and handle a `NotAProject` error — conflates "this isn't a project" with actual error states and produces confusing UX).
 4. **Welcome screen.** Single CTA: "Open or create project."
 5. **Create-agent prompt.** Single text field with default `"assistant"`, validates against the same regex used in M1.2, shows the duplicate-name error inline if rejected.
 6. **Single-pane view.**
@@ -449,10 +526,16 @@ type NormalizedEvent =
 
 type TurnOutcome =
   | { status: "completed" }
-  | { status: "failed"; message: string };
+  | { status: "failed"; kind: FailureKind; message: string };
+  // Future: | { status: "cancelled"; source: CancelSource } — added in M3 when per-turn cancel lands.
+
+type FailureKind = "harness_error" | "adapter_failure";
+  // Future: "timeout" — added if/when an active per-turn timeout lands.
 ```
 
 `started_at` / `ended_at` are ISO-8601 strings (serde's default for `DateTime<Utc>`), not JS `Date` objects. Convert at the boundary if you need `Date`.
+
+**The reducer's default branches are load-bearing for forward-compat in two places:** (a) for unknown `outcome.status` values (M3 will add `"cancelled"`) — fall through to a generic "turn ended in an unknown way" rendering and `console.warn`; (b) for unknown `kind` values within `Failed` (future variants like `"timeout"`) — fall through to displaying the `message` as-is, which is always present. The frontend should never crash on a future-vintage backend; it should degrade.
 
 #### Reducer shape
 
@@ -476,7 +559,7 @@ type AgentTranscript = { agentId: string; turns: Turn[] };
 
 User turns are appended to `turns` synchronously at submit time. Agent turns are appended on `turn_start` and updated as `content_chunk` and `turn_end` events arrive.
 
-7. **Event subscription.** When `send_message` returns its `TurnId`, the component subscribes specifically to **`agent:<id>:turn:<turn_id>`** (turn-scoped, not agent-scoped). This prevents events from a prior turn — including any late-arriving stragglers — from leaking into the current turn's render. Unsubscribe when `turn_end` fires. The reducer applies each event per the table:
+7. **Event subscription.** Subscribe to **`agent:<id>`** (per-agent, not per-turn) when the AgentPane mounts. Subscription persists for the lifetime of the AgentPane — unsubscribe on unmount, not per turn. Each incoming event carries its own `turn_id`; the reducer applies the event to the matching turn in `transcript.turns` and silently ignores events whose `turn_id` doesn't match any known turn. (See M1.4 step 5 for why per-agent, not per-turn — the per-turn channel design has a TurnStart subscription race.) The reducer applies each event per the table:
 
    | Event | Reducer effect |
    |---|---|
@@ -485,7 +568,7 @@ User turns are appended to `turns` synchronously at submit time. Agent turns are
    | `turn_end` (completed) | Set `status: "complete"`, set `endedAt` |
    | `turn_end` (failed) | Set `status: "failed"`, populate `error`, set `endedAt` |
 
-8. **Send flow.** On Send: append the user's prompt as a `user`-role Turn synchronously, call `send_message` to get the `TurnId`, subscribe to that turn's event channel, set status to "processing." Lock the Send button until `turn_end` fires.
+8. **Send flow.** On Send: append the user's prompt as a `user`-role Turn synchronously, call `send_message` to get the `TurnId`, store it as the current in-flight turn id, set status to "processing." (No subscription action — the per-agent subscription was already established at mount time.) Lock the Send button until `turn_end` fires for this `turn_id`.
 9. **Component structure (suggested).**
    - `AppShell.svelte` — root, manages app state, hosts the binary-not-found banner.
    - `WelcomeScreen.svelte` — no-project state.
@@ -502,7 +585,7 @@ Vitest + `@testing-library/svelte` are already set up from M1.1.
   - Empty transcript + (`turn_start`, `content_chunk`×N, `turn_end(completed)`) → one complete agent Turn whose `text` equals the concatenated chunk text.
   - Empty transcript + (`turn_start`, `content_chunk`×N, `turn_end(failed)` with message) → one failed Turn with `status: "failed"`, populated `error`, partial accumulated text preserved.
   - Multiple sequential turns concatenate correctly into the `turns` array; turn order matches arrival order.
-  - **Late event from a prior turn** (different `turn_id`) is ignored — proves turn-scoped subscription is necessary, not just nice-to-have.
+  - **Late event from a prior turn** (different `turn_id`) is ignored — this is the load-bearing defense against cross-turn event leakage now that the subscription is per-agent rather than per-turn (see M1.4 step 5). Don't skip this test.
 - **Component-level tests** for `ComposeBar`:
   - Cmd+Enter triggers submit
   - Empty / whitespace-only input doesn't submit

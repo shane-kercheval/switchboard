@@ -22,7 +22,7 @@ Three artifacts are needed before per-milestone implementation specs can be expa
 
 - Multi-agent project workspace, file-based config under `<project>/.switchboard/`
 - Per-harness adapters for Claude Code (`claude -p`) and Codex (`codex exec`)
-- Normalized event stream (full vocabulary by M2: TurnStart, ContentChunk, ToolStarted, ToolCompleted, TurnEnd, TurnAborted, RateLimitEvent, SessionMeta — M1 lands the minimal subset for streaming text)
+- Normalized event stream (full vocabulary by M2: TurnStart, ContentChunk, ToolStarted, ToolCompleted, TurnEnd, RateLimitEvent, SessionMeta — M1 lands the minimal subset for streaming text. Adapter-layer failures fold into TurnEnd's structured `outcome` field — there is no separate TurnAborted wire event, per system-design §9.)
 - Six functional primitives composable into workflows (spawn, send, auto-forward, fan-in with template wrapping, pause for user input, iterate over a list)
 - Workflow YAML execution engine with step-boundary checkpointing
 - Prompt providers: local file store + MCP-served (via `rmcp`); Tiddly preset
@@ -95,13 +95,13 @@ M1 → M2 → M3 → M4 → M5 → M6
 
 - Codex adapter: `codex exec --json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox`
 - Codex session-file enrichment (per resolved 10.15) — read `~/.codex/sessions/...jsonl` on `turn.completed`/`turn.failed` for rate limits, `model_context_window`, `session_meta`
-- Normalized event vocabulary fully populated for both harnesses (TurnStart, ContentChunk, ToolStarted, ToolCompleted, TurnEnd, TurnAborted, RateLimitEvent, SessionMeta)
+- Normalized event vocabulary fully populated for both harnesses (TurnStart, ContentChunk, ToolStarted, ToolCompleted, TurnEnd, RateLimitEvent, SessionMeta — adapter-layer failures fold into TurnEnd's structured `outcome` field per system-design §9)
 - Process-group spawn for both harnesses (`Command::process_group(0)`)
 - Stall-mitigation: close stdin after dispatch (per codex-cli-observed.md research note)
 - **Probe and document Codex `turn.failed` payload shape and permission-denial behavior.** Update `docs/research/codex-cli-observed.md` with findings; reflect any adjustments in the normalized error taxonomy / `permission_denials` field.
 - **Agent-name-collision validation** — per system-design §3 Primitive 1, two agents in the same project whose names differ only in hyphen vs. underscore are rejected at creation. Unit test on the agent registry covers this.
 - **Minimal agent selector UI** — single-pane view at a time, with a selector to switch between agents in the project. Multi-pane layout deferred to M3.
-- **Integration test suite scaffolding** — small-prompt tests against real `claude -p` and `codex exec`. Initial coverage: terminal-event detection (TurnEnd vs TurnAborted), error reporting, basic vocabulary normalization. Suite extends with each subsequent milestone.
+- **Integration test suite scaffolding** — small-prompt tests against real `claude -p` and `codex exec`. Initial coverage: terminal-event detection (TurnEnd with each `outcome` shape — `Completed`, `Failed { kind: HarnessError }`, `Failed { kind: AdapterFailure }`), error reporting, basic vocabulary normalization. Suite extends with each subsequent milestone.
 - **Integration CI workflow** — GitHub Actions workflow that runs the integration suite against the installed harnesses on every push and PR (from collaborators with secrets; forks fall back to unit-only). API key secrets configured in GitHub Actions at this point. Suite grows in M3–M6; gating policy stays the same throughout.
 
 **Deliverables:** Codex adapter; per-harness adapter abstraction validated end-to-end; minimal agent selector; integration test scaffolding; integration CI workflow live.

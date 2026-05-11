@@ -622,14 +622,27 @@ ToolStarted     { agent, tool_use_id, kind, input }
                 // fires when the tool call is dispatched (lets the UI show
                 // "running tool... (3.2s elapsed)" before the result lands).
 ToolCompleted   { agent, tool_use_id, output, is_error }
-TurnEnd         { agent, status: success | error,
-                  stop_reason, usage: { input, output, cached, reasoning, context_window? },
+TurnEnd         { agent, outcome, stop_reason?,
+                  usage: { input, output, cached, reasoning, context_window? },
                   permission_denials, raw_event }
-TurnAborted     { agent, reason: spawn_failed | stream_truncated | timeout | cancelled, detail }
-                // for adapter-layer failures the harness itself didn't report
-                // (process spawn fails, stream ends without a terminal event,
-                // Codex parent silently exits 0 on SIGTERM, etc.). Distinct from
-                // TurnEnd { status: error } which represents a harness-reported error.
+                // outcome = Completed
+                //         | Failed { kind: HarnessError | AdapterFailure, message }
+                //         | Cancelled { source: User | Workflow }   // added in M3 when per-turn cancel lands
+                //
+                // HarnessError: harness's terminal event reported is_error
+                //   (bad model name, rate limit, transient API error,
+                //   invalid prompt content). The harness gave us a clean signal.
+                // AdapterFailure: synthesized by the adapter when the subprocess
+                //   died, the parser hit malformed JSON, or stdout EOF arrived
+                //   without a terminal event (e.g., Codex parent silently exits
+                //   0 on SIGTERM). Infrastructure-level; not the user's fault.
+                //
+                // Terminal event type is always TurnEnd. Terminal status lives
+                // in outcome — there is no separate TurnAborted / TurnTimeout /
+                // TurnCancelled wire event. The kind field on Failed lets
+                // consumers (UI, M5 partial-failure rule) distinguish causes
+                // without proliferating event variants. Exactly one TurnEnd
+                // per turn.
 RateLimitEvent  { agent, info }
                 // info: harness-specific shape, surfaced for UI display, not
                 // interpreted by the workflow engine. Timing differs by harness:
@@ -638,6 +651,8 @@ RateLimitEvent  { agent, info }
 ```
 
 Each adapter (Claude Code, Codex) is responsible for: building the harness command line, spawning the process, parsing its native stream, normalizing into the events above, and surfacing harness-specific metadata in `raw_event` so callers that need to dig in can. The workflow engine, UI, and persistence layer consume only the normalized stream.
+
+**Forward-compat note — §7 workflow status taxonomy.** §7 describes workflow-level status as "complete, cancelled, failed, interrupted." After M3 lands `Cancelled` as a top-level `TurnOutcome` variant, the per-turn vocabulary will be `Completed | Failed | Cancelled` — three statuses, not four. Where does "interrupted" map? Two reasonable resolutions for when M3 expansion picks this up: (a) fold into `Cancelled { source: User | Workflow | Signal }`, with `Signal` covering SIGINT/SIGTERM (cleanest — one variant, source field discriminates); (b) keep `Interrupted` as its own top-level `TurnOutcome` variant for OS-signal-driven shutdowns specifically. Decision deferred to M3, but flagged here so §7 and §9 don't silently drift in the meantime.
 
 Reading Codex session files (in addition to the `--json` stream) is a committed v1 dependency for the Codex adapter (per resolved 10.15) — needed to fill in gaps the stream doesn't expose (rate limits, `model_context_window`, full reasoning blocks, `session_meta`). Multiple §7 and §9 commitments depend on this enrichment.
 
@@ -779,3 +794,4 @@ Aggregated from inline flags above, plus a few additional:
 - **10.16** Disk usage of harness session files. Both harnesses persist transcripts indefinitely (Claude Code at `~/.claude/projects/<encoded-cwd>/*.jsonl`, Codex at `~/.codex/sessions/YYYY/MM/DD/...`). A long-lived project with many agents and many turns will accumulate. Should Switchboard offer pruning, surface totals, or otherwise manage this? Out of scope for v1, but the architecture should not preclude it.
 - **10.17** Network failure and retry policy. What does Switchboard do when a turn fails mid-workflow because of a transient API error or network blip? Working assumption: a single configurable retry on transient errors (rate-limit, 5xx) before marking the step as failed. Permanent errors (auth, invalid model, denied content) fail immediately. To be detailed in §7 once we have an implementation footprint.
 - **10.18** Stall detection. A turn with no stream events for T seconds is ambiguous (genuinely hung vs slow tool). UX (passive surface, prompt-to-cancel after threshold, or some other affordance) deferred to implementation, including a probe of whether either harness emits reliable heartbeats during long operations.
+- **10.19** Hard per-turn timeout. Distinct from 10.18 (passive stall detection — observation-only). Should Switchboard impose its own active per-turn timeout that hard-kills the subprocess after T seconds regardless of activity? Open sub-questions: default value (none / 5min / configurable?), per-workflow override, user-configurability, surfacing as `TurnEnd { outcome: Failed { kind: Timeout, ... } }` (the `FailureKind` enum already accommodates this — see system-design §9 / m1-implementation-plan.md M1.3). Defer until there's concrete demand; runaway costs in long workflows could surface this as a real need.

@@ -80,7 +80,7 @@ Create a new agent within a project. User specifies:
 - Optional initial prompt (sent as the first message after spawn to prime the agent with role context, project background, or any other instructions the user wants in place before the first real turn). Authored like any other prompt — free-form text or a fully-qualified prompt ID resolved through the prompt-provider system (§6).
 - Optional working directory override (defaults to project working directory).
 
-Agent names are restricted to `[A-Za-z0-9_-]+` at creation; this avoids ambiguity when names appear as template variable identifiers (Primitive 4) or in file paths.
+Agent names are restricted to `[A-Za-z0-9_-]+` at creation; this avoids ambiguity when names appear as template variable identifiers (Primitive 4) or in file paths. Two agents in the same project whose names differ only in hyphen vs. underscore (e.g., `reviewer-a` vs `reviewer_a`) are not allowed — agent names must be unique after normalizing hyphens to underscores, since both forms collapse to the same template-variable identifier in fan-in contexts (Primitive 4).
 
 The harness session ID is captured and persisted. The agent is now part of the project and can receive messages and participate in workflows.
 
@@ -177,12 +177,14 @@ steps:
       to: "{{ primary_agent }}"
       prompt: "{{ aggregation_prompt }}"
       template_vars:
-        responses: "{{ responses_from(reviewer_agents) }}"
+        feedback: "{{ aggregated_responses(reviewer_agents) }}"
 ```
 
 When invoked, Switchboard prompts the user for each input and then executes the steps.
 
-**Note on the example above:** the YAML is illustrative — it shows intent (composable steps with templated inputs, fan-out and fan-in expressed as data, named template variables for fan-in responses) without committing to the exact syntax. The schema, keywords, escape hatches, error handling, and template-function surface (e.g., what `responses_from(...)` actually looks like) need careful design at implementation time. See open question 5.1. Where the YAML shows fan-in as `wait_for_all` + a `send` step using `responses_from(...)`, that's the desugared form of Primitive 4 (fan-in with template wrapping); the DSL exposes the wait and dispatch phases as separate steps for readability and flexibility, not because fan-in is itself a composition of other primitives.
+The example above uses `aggregated_responses(...)` — the helper that returns the reviewers' outputs pre-formatted in a canonical text shape — because typical aggregation prompts (especially cross-platform ones like `tiddly:ai-review-feedback`) take a single text-blob argument. A sibling helper `responses_from(...)` returns the same data as a name → text mapping for Switchboard-aware prompts that want to iterate with custom formatting. See `docs/workflow-spec.md` for both.
+
+The DSL exposes fan-in as `wait_for_all` + a `send` step (using either helper above) — the wait and dispatch phases are separate steps for readability and flexibility, not because fan-in is itself a composition of other primitives.
 
 ### Authoring
 
@@ -434,7 +436,7 @@ A step is considered failed in any of these cases:
 - A pre-dispatch resolution fails: prompt ID not found in its provider, MCP server unreachable, agent referenced by name has been deleted.
 - A template substitution fails (missing variable, render error).
 - An agent contention refusal: the step's target is mid-turn (per §7 "Agent contention"). This counts as a step failure rather than a transient retry condition — it indicates a genuine collision with other in-flight work.
-- A user manually cancels an agent's turn while the agent is participating in a workflow step. The workflow is marked **cancelled** (not failed) — the user's cancellation is intent-bearing, identical to clicking cancel-workflow directly.
+- A user manually cancels an agent's turn while the agent is participating in a workflow step. The workflow is marked **cancelled** (not failed) — the user's cancellation is intent-bearing, identical to clicking cancel-workflow directly. This rule applies uniformly: cancelling any participating agent's turn during a workflow (including just one of N agents in a fan-in step) marks the whole workflow `cancelled`.
 - Within a fan-in step (Primitive 4), any participating agent failing fails the whole step.
 
 A turn that ends with a tool **permission denial** is *not* a failure. The harness reports the denial (Claude Code's `result.permission_denials`; presumed similar in Codex but not yet verified — see §9), the model receives the denial as feedback and adapts its response, and the turn completes normally. Switchboard surfaces denials as informational ("the model attempted X, was blocked") rather than as workflow-halting errors. Failures are reserved for harness-level errors (`is_error: true` / `turn.failed` / non-zero exit), template substitution errors, and workflow-orchestration errors.
@@ -490,7 +492,7 @@ The user has previously authored a workflow in `.switchboard/workflows/review-an
 1. Switchboard sends the review-prompt message (with user context appended) to both reviewers in parallel. Each reviewer runs.
 2. Switchboard waits for both reviewers to complete their turns.
 3. Switchboard collects both reviewers' final responses.
-4. Switchboard renders the aggregation-prompt template, substituting in the two reviews under their respective variable names.
+4. Switchboard composes the two reviews into a single aggregated text blob (canonical shape per `docs/workflow-spec.md`), then renders the aggregation-prompt template with that blob bound to the prompt's text argument. Because the aggregation prompt is a generic Tiddly prompt that takes a single `{{ feedback }}` argument, no Switchboard-specific authoring is needed — the helper does the formatting.
 5. Switchboard sends the rendered message to `implementer` (the agent supplied as the workflow's `primary_agent` input).
 6. The implementer runs and produces its response.
 7. Workflow complete. The user is notified.
@@ -736,7 +738,7 @@ Decisions explicitly **not made** in this document, to be addressed in later doc
 
 Aggregated from inline flags above, plus a few additional:
 
-- **5.1** Exact workflow DSL keywords and structure. Needs a separate spec. Specific surfaces the spec must pin down: the template-function surface for dynamic agent sets (e.g., what `responses_from(...)` looks like; ordered/named iteration over `responses`; position-vs-name access); how invocation-time list inputs (`reviewer_agents: [agent]`) flow into template variables; the iteration variable scoping rules from Primitive 6.
+- **5.1** Exact workflow DSL keywords and structure. Resolved in `docs/workflow-spec.md`. The spec pins down the template-function surface for dynamic agent sets (`responses_from(...)` returning a name → text mapping for Switchboard-aware prompts; `aggregated_responses(...)` returning the same data pre-formatted as a single text blob for cross-platform prompts; `last_output(agent)` and `agent_names(agents)` helpers); how invocation-time list inputs (`reviewer_agents: [agent]`) flow into template variables; the iteration variable scoping rules from Primitive 6.
 - **5.2** Passthrough mechanism for harness commands — namespacing. Partially blocked on 10.10; namespacing only matters once upstream allows arbitrary slash-command passthrough.
 - **6.1** MiniJinja subset (full MiniJinja vs a restricted subset) and template-available variables beyond `responses`.
 - ~~**10.1** What does Switchboard do when an agent's "next assistant response" is a tool call rather than text?~~ **Resolved by hands-on probe:** both harnesses run the model → tool_use → tool_result → model loop internally and emit a single terminal event per user-initiated turn (Claude Code: `result`; Codex: `turn.completed` / `turn.failed`). Switchboard always sees a complete turn — there is no "tool-call-only response" to handle. See [docs/research/harness-comparison.md](research/harness-comparison.md).

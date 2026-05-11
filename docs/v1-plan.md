@@ -129,6 +129,8 @@ M1 → M2 → M3 → M4 → M5 → M6
 - Integration test suite extended for contention enforcement and cancellation paths.
 
 > **Note for M3 expansion:** scope is heavy. The implementation-grade expansion will likely break this into sub-milestones (e.g., M3a multi-pane + per-agent state machine; M3b dispatcher + contention enforcement; M3c per-turn cancel). Kept consolidated here at outline grade since these pieces are tightly coupled.
+>
+> **Deferred from M1.4 — dispatcher event-emission backpressure.** M1 emits each `NormalizedEvent` as a separate Tauri event with no rate limiting or coalescing. This will not scale to M3's multi-pane fan-out (one fan-out turn × N agents × hundreds of token deltas per turn). M3 expansion must address — the design space includes the §10 ring buffer, coalescing windows, rate limiting, or size caps. Pick one in the M3 expansion.
 
 **Deliverables:** multi-agent UI; dispatcher; contention enforcement (UI gating + dispatch error per §7); per-turn cancel.
 
@@ -202,6 +204,8 @@ M1 → M2 → M3 → M4 → M5 → M6
 - Workflow-progress surface gains the iteration dimension ("iteration 2 of 3 (milestone = 'X'), step 3 of 8")
 - Crash recovery surfaces interrupted iterations with full context
 - Integration test suite extended for pause-resume cycles and iteration (including mid-iteration interrupt + recovery).
+
+**Design decision to resolve during M6 expansion (may be deferred to v2):** *automated handoff guard.* For any workflow handoff where the next consumer is a non-human (auto-forward, fan-in, sequential), should Switchboard run a lightweight classifier on the producer's response — workflow goal + response → "valid handoff" vs. "needs human review" — and auto-trigger a pause if it flags? Two failure modes are in scope: (a) the agent returned a clarifying question instead of doing the task; (b) the response carries a soft error (API rate limit, "I can't help with that," etc.) that didn't surface as a hard error. Implementation sketch: invoke `claude -p --bare` (or Codex equivalent) with a fast model (haiku-class), no history, prompt = workflow goal + producer response, classify and act. Open sub-questions: per-workflow opt-out vs. per-step opt-in vs. default-on; cost/latency budget per handoff (one extra LLM call); pause-if-uncertain default; whether to share a mechanism with explicit author-supplied post-conditions (an `assert:` field on steps). M6 expansion must produce a yes/no decision; if "yes but heavy," defer implementation to v2 with the design captured.
 
 **Deliverables:** Primitives 5 and 6; iteration-aware progress surface and checkpoints.
 

@@ -91,6 +91,28 @@ There is a whole genre of blog posts and GitHub repos that approximate Switchboa
 
 ---
 
+## Not in this category
+
+### [Sauna.ai](https://www.sauna.ai/)
+
+General-purpose AI coworker built by [Wordware](https://www.wordware.ai/). Connects to everyday work tools (Slack, Gmail, Google Calendar, Linear, GitHub, Notion, Granola) and learns how a person works — drafting messages, filing tickets, delivering briefings, tracking tasks. Available via web, iOS, iMessage, Slack, and email.
+
+**What "multiplayer" means here:** Sauna's multiplayer feature is about two humans sharing one person's AI assistant. "Brain Access" lets a colleague read or operate your whole Sauna (files, memory, connections, tools). "Shared Folders" gives access to a specific slice of your knowledge base. This is human-to-human context sharing, not AI-to-AI communication.
+
+**Why it's not a competitor:** Sauna is a general knowledge-work assistant — it has no coding-agent orchestration capability and no concept of dispatching prompts to agent instances, fan-out/fan-in, workflow files, or harness adapters. The target user is anyone doing general office work; the target user for Switchboard is a developer running multiple AI coding agents. Different problem, different user, different primitives. Not in the same category.
+
+### [Hermes Agent](https://hermes-agent.nousresearch.com/) (Nous Research)
+
+Open-source (MIT), server-side personal AI agent. Currently at v0.13.0 with 128k GitHub stars and 6,900+ commits — one of the most mature open-source agent projects in existence. Python codebase. Model-agnostic (OpenRouter, NVIDIA NIM, OpenAI, Anthropic, self-hosted, and more). Runs on local, Docker, SSH, Singularity, or Modal backends. Reachable via Telegram, Discord, Slack, WhatsApp, Signal, email, and CLI.
+
+Key capabilities: persistent memory with a closed learning loop (auto-generates skills from experience, skills self-improve during use, FTS5 session search with LLM summarization for cross-session recall), a built-in cron scheduler for unattended automations, isolated subagent delegation for parallel workstreams with Python RPC scripts for zero-context-cost pipelines, MCP integration, web/browser control, and an RL training integration (Atropos) for producing tool-calling training trajectories.
+
+**The subagent delegation feature:** Hermes can spawn isolated subagents with their own conversations and terminals, which superficially overlaps with Switchboard's fan-out primitive. The key difference is that in Hermes, the agent itself decides when to delegate and to what — the orchestration is AI-directed. There is no user-authored workflow that says "send to these three agents, wait for all, aggregate, then pause and ask me what to do next." The human sends a goal to Hermes and Hermes handles the rest.
+
+**Why it's not a competitor:** Hermes is a general-purpose autonomous personal assistant that runs on a server and happens to support subagent delegation. It is not a harness layer over Claude Code and Codex, has no concept of human-directed fan-out/fan-in workflows, no pause-for-user primitive, no YAML DSL, and no cross-harness prompt library. The user's role is to give Hermes a task and let it run — not to orchestrate a set of named, persistent coding agents through a structured workflow. Worth monitoring for the skills/memory model specifically, which is more sophisticated than anything in the passive-session-manager tier.
+
+---
+
 ## Where Switchboard's gap is real
 
 Mapping the features of the tools above against Switchboard's core capabilities:
@@ -145,3 +167,5 @@ Mapping the features of the tools above against Switchboard's core capabilities:
 - [claude-code-by-agents](https://github.com/baryhuang/claude-code-by-agents)
 - [Best Multi-Agent Desktop Apps for Claude Code, Codex (Nimbalyst blog)](https://nimbalyst.com/blog/best-multi-agent-desktop-apps-claude-code-codex-2026/)
 - [Best Multi-Agent Coding Tools in 2026 (Nimbalyst blog)](https://nimbalyst.com/blog/best-multi-agent-coding-tools-2026/)
+- [Sauna.ai](https://www.sauna.ai/) / [Multiplayer](https://www.sauna.ai/learn/multiplayer)
+- [Hermes Agent](https://hermes-agent.nousresearch.com/) / [GitHub](https://github.com/NousResearch/hermes-agent)

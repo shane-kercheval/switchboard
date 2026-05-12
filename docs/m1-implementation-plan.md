@@ -141,10 +141,10 @@ Pure-Rust persistence layer for a Switchboard project — no UI, no harness yet.
    ```rust
    #[derive(Serialize, Deserialize)]
    pub struct AgentRecord {
-       pub id: AgentId,            // UUID v7 (time-ordered; via the uuid crate's v7 feature) — generated on create
-       pub name: String,           // user-supplied, validated for uniqueness
-       pub harness: HarnessKind,   // enum, M1 only ClaudeCode
-       pub session_id: Uuid,       // Claude Code session UUID
+       pub id: AgentId,                  // UUID v7 (time-ordered; via the uuid crate's v7 feature) — generated on create
+       pub name: String,                 // user-supplied, validated for uniqueness
+       pub harness: HarnessKind,         // enum, M1 only ClaudeCode
+       pub session_id: Option<Uuid>,     // Claude session UUID. Set at create-time for Claude Code agents (per OQ1's pre-generated UUID resolution). For Codex agents (M2+), this stays None — Codex assigns its own session ID from the stream and stores it in a per-agent sidecar (see m2-implementation-plan.md OQ2). Optional from the start so M2's Codex adapter doesn't force a schema migration.
        pub created_at: DateTime<Utc>,
    }
    ```

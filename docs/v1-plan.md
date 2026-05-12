@@ -65,9 +65,9 @@ M1 → M2 → M3 → M4 → M5 → M6
 
 ## Milestones
 
-### M1 — Walking skeleton (Claude Code only)
+### M1 — End-to-end minimum (Claude Code only)
 
-**Goal:** Open Switchboard, create a project bound to a working directory, spawn one Claude Code agent, send a message, see streaming text in a single pane. macOS only.
+**Goal:** the smallest end-to-end implementation that exercises every architectural layer (Tauri shell, persistence, harness adapter, dispatcher, UI), with Claude Code as the only harness — proves the architecture works as a whole before M2 adds Codex through the same trait. Concretely: open Switchboard, create a project bound to a working directory, spawn one Claude Code agent, send a message, see streaming text in a single pane. macOS only.
 
 **Scope:**
 

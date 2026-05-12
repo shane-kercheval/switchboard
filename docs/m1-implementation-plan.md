@@ -1,6 +1,21 @@
-# M1 implementation plan: Walking skeleton (Claude Code only)
+# M1 implementation plan (Claude Code only)
 
 > **Audience:** the AI coding agent implementing M1. Read this entire doc, plus the prerequisites listed below, **before writing any code**. Stop after each sub-milestone for human review.
+
+## What M1 is
+
+M1 builds the **smallest possible end-to-end implementation** of Switchboard — every architectural layer wired together (Tauri app shell, project filesystem, harness adapter trait + one concrete adapter, dispatcher, single-pane UI), with **Claude Code as the only harness**.
+
+The goal isn't to ship a feature-complete app — it's to prove the architecture works as a coherent whole before adding more on top of it. M1 is the foundation everything else builds on:
+
+- **M2** validates the per-harness adapter abstraction by adding Codex through the same trait, expands the normalized event vocabulary, and adds integration test infrastructure.
+- **M3** adds multi-pane UI, dispatcher contention enforcement, and per-turn cancel.
+- **M4** adds prompt providers (slash commands).
+- **M5+** add workflows, pause-for-user, iteration, and the rest of v1.
+
+If any architectural layer is missing or broken in M1, M2 can't validate the adapter abstraction by plugging in a second harness, and every subsequent milestone is pushing on rotten foundations.
+
+**Concretely**, after M1 a user can: open Switchboard, create a project bound to a working directory, spawn one Claude Code agent named `assistant`, send "What's 2+2?", see "4" stream into the pane. macOS only. That's the entire user-visible surface — small, but every layer underneath it is real.
 
 ## How to use this plan
 
@@ -8,24 +23,9 @@
    - `docs/system-design.md` — the canonical "what is Switchboard and why." Sections 3 (core concepts — agent name normalization), 4 (functional primitives — what we're orchestrating), 7 (user-facing model — agent contention; only the M1-relevant parts), 9 (harness integration — per-harness adapter trait, normalized event stream, Claude Code specifics), 10 (form factor — platform / tray notes; M1-irrelevant parts can be skimmed).
    - `docs/v1-plan.md` — the M1 section in particular, plus the "Critical path" preamble.
    - `docs/research/claude-code-headless.md` and `docs/research/claude-code-cli-observed.md` — these are the ground-truth references for the Claude Code CLI surface. The CLI's observed behavior (event types, `--session-id`, `--include-partial-messages`, exit codes, single-process model) is more authoritative than anything reconstructed from memory.
-2. Resolve the **Open questions** below with the user before starting.
-3. Implement sub-milestones M1.1 → M1.5 in order. Each sub-milestone is self-contained: code + tests + doc updates. Stop after each one, summarize what landed, and wait for human review before continuing.
-4. Ask clarifying questions when uncertain. Do not invent behavior the spec is silent on — surface the gap.
-5. Per `~/.claude/CLAUDE.md`: never remove or skip tests/functionality to get tests to pass; never commit on the user's behalf; never add Claude as author/co-author.
-
-## Open questions to resolve before starting
-
-These are decisions the plan currently leaves to the user. Confirm them before touching M1.1.
-
-1. **Session ID strategy.** Recommend pre-generating a UUID v4 in Switchboard. **First, probe whether `claude -p --session-id <new-uuid> '...'` succeeds when the session does not yet exist** (i.e., is `--session-id` create-or-resume idempotent?). If yes — always pass `--session-id <uuid>`, no first-turn-vs-subsequent branch needed (best M1 simplification). If no — pass `--session-id <uuid>` on the first turn and `--resume <uuid>` thereafter, choosing based on the existence of `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl` (ground truth from Claude's own data, **not** a registry field — that would violate the registry's append-only invariant). Confirm this is OK.
-2. **Single-agent vs N-agent registry in M1.** The M1 acceptance only requires one agent (`assistant`). Recommend the registry persists *N* agents from day one (forward-compatible with M2's multi-agent UI), but the M1 UI exposes only one — no agent selector. Confirm.
-3. **Working directory binding.** A project is a 1:1 binding to a working directory on disk. The `.switchboard/` folder lives directly inside that directory. Confirm: (a) `.switchboard/` should be created in the project root (not in `~/.switchboard/projects/<name>/`); (b) Switchboard does **not** add `.switchboard/` to `.gitignore` automatically — the user controls that.
-4. **shadcn-svelte version pinning.** shadcn-svelte tracks Svelte 5 (uses runes). **Pin exact versions** of `shadcn-svelte` CLI, `bits-ui`, and any peer deps in `package.json` and the lockfile at the version current when M1.1 starts. Do not use `latest` — for an AI-agent-consumed plan, floating versions are a reproducibility hazard, and `bits-ui` peer-dep churn against Svelte 5 runes makes this concrete. Stack composition itself (Tauri 2.x + Svelte 5 + Tailwind + shadcn-svelte) is settled per `v1-plan.md` M1 scope.
-5. **Streaming granularity.** Pass `--include-partial-messages` so the UI receives token-by-token deltas (matches the "see streaming text" UX in the M1 acceptance). Confirm.
-6. **Project creation UX.** For M1, picking a project = a native folder-picker dialog. No project name field, no "recent projects" list (defer to M2). Confirm.
-7. **CI scope.** Hygiene CI = GitHub Actions, single workflow file, runs `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test`, frontend `pnpm lint` and `pnpm test`. **Vitest + `@testing-library/svelte` are set up in M1.1 with one trivial smoke test** so `pnpm test` has something to run from day 1, and M1.5's component tests are pure additive work. macOS runner only for M1 (cross-platform builds are M7). Confirm.
-
-If the user accepts the recommendations as-stated, proceed. If they push back on any, revise the plan section that depends on the answer **before** starting that sub-milestone.
+2. Implement sub-milestones M1.1 → M1.5 in order. Each sub-milestone is self-contained: code + tests + doc updates. Stop after each one, summarize what landed, and wait for human review before continuing.
+3. **Ask clarifying questions if you hit something the plan is silent on.** Otherwise the plan is committed — implement as written. Do not invent behavior the spec doesn't cover; surface the gap.
+4. Per `~/.claude/CLAUDE.md`: never remove or skip tests/functionality to get tests to pass; never commit on the user's behalf; never add Claude as author/co-author.
 
 ## Definition of done for M1 (as a whole)
 
@@ -49,7 +49,7 @@ These belong to later milestones — do not implement them, even if "easy":
 - First-launch acknowledgement dialog (M7)
 - Tray, walk-away, signing, auto-updater (M7)
 
-If the implementing agent finds a "clearly minor" expansion of M1 scope tempting, **stop and ask**. The M1 walking skeleton's value is its smallness.
+If the implementing agent finds a "clearly minor" expansion of M1 scope tempting, **stop and ask**. M1's value is its smallness — the smaller the end-to-end slice, the faster M2 can validate the architecture by adding the second harness on top of it.
 
 ---
 
@@ -71,14 +71,35 @@ After this sub-milestone:
 1. **Initialize Tauri 2.x app** using the official template. Reference: <https://tauri.app/start/create-project/>.
    - Frontend: Svelte 5 with TypeScript + Vite + Tailwind. shadcn-svelte: <https://shadcn-svelte.com/>.
    - Pick a package manager (recommend `pnpm`). Pin it in `package.json`'s `packageManager` field.
-   - **Pin exact versions** for `shadcn-svelte`, `bits-ui`, and peers per OQ4 — no `^` or `~` ranges and no `"latest"` for these deps.
+   - **Pin exact versions** for `shadcn-svelte`, `bits-ui`, and peers — no `^` or `~` ranges and no `"latest"`. For an AI-agent-consumed plan, floating versions are a reproducibility hazard, and `bits-ui` peer-dep churn against Svelte 5 runes makes this concrete.
    - **Install and initialize `tauri-plugin-dialog`** (Rust: `tauri-plugin-dialog` crate; frontend: `@tauri-apps/plugin-dialog`). First used in M1.5's folder picker, but adding plugins mid-stream involves Cargo.toml + capabilities config + npm install — wire it now to avoid that yak-shave later.
    - The Tauri app's bundle identifier should be something like `com.switchboard.app`.
-2. **Set up the Cargo workspace.** The Tauri Rust crate (e.g., `crates/app`) is one workspace member. Future M1.2/M1.3/M1.4 work will likely add `crates/core` (project model, registry, harness adapter) and may further split. For M1.1, just establish a workspace `Cargo.toml` so adding crates later is trivial.
-3. **Add a trivial round-trip command.** A `ping(name: String) -> String` Tauri command and a Svelte component that calls it on mount and renders the response. This proves IPC end-to-end.
-4. **Frontend test infra.** Set up Vitest + `@testing-library/svelte`. Write one trivial smoke test (e.g., the App component mounts without throwing). Wire `pnpm test` into CI from day 1. This makes M1.5's component tests pure additive work — no setup-plus-tests combo PR.
-5. **Hygiene CI.** Create `.github/workflows/hygiene.yml`. macOS runner. Steps: checkout → setup Node + pnpm → setup Rust toolchain (stable) → `pnpm install` → `pnpm lint` → `pnpm test` → `cargo fmt --check` → `cargo clippy --all-targets --all-features -- -D warnings` → `cargo test --all-features`.
-6. **README.md update.** Add a "Local development" section with the `cargo tauri dev` command and prerequisites (Node, pnpm, Rust toolchain, Xcode CLT for macOS).
+2. **Set up the Cargo workspace.** The Tauri template generates a single-crate layout; restructure into a workspace so M1.2/M1.3/M1.4 can add `crates/core` (project model, registry) and `crates/harness` (adapter trait + Claude Code adapter) cleanly. Concretely:
+   - Root `Cargo.toml` with a `[workspace]` block listing members. Tauri's generated crate (default `src-tauri/`) becomes `crates/app/` (or stays as `src-tauri/` — pick the convention you prefer; the rest of the plan assumes `crates/app/`). Future crates land alongside as `crates/core/`, `crates/harness/`, etc.
+   - `[workspace.package]` block defining shared `edition = "2021"` (or `"2024"` if pinned Rust supports it), `version`, `authors`, `license`, `repository` — member crates inherit via `package.edition.workspace = true` etc.
+   - `[workspace.dependencies]` block pinning shared deps **once** (each member crate uses `serde = { workspace = true }`). At minimum: `tokio` (with `["full"]` features for now; can narrow later), `serde` (with `derive`), `serde_json`, `serde_yaml`, `thiserror`, `uuid` (with `["v7", "serde"]`), `chrono` (with `["serde"]`), `tracing`, `tracing-subscriber`, `which`, `async-trait`, `futures`, `tempfile` (dev-dep for tests). M1.3 will add to this list.
+   - `[workspace.lints]` block (Cargo 1.74+, supported in 2026) defining shared rustc + clippy lints. Set `clippy.pedantic = "warn"` is overkill; start with `clippy.all = "warn"` plus a few targeted pedantic lints. Member crates pull in via `[lints] workspace = true`.
+   - **Commit `Cargo.lock`** — Switchboard ships as a binary, not a library; reproducible builds require committed lockfile.
+   - `rustfmt.toml` — keep minimal. Just `edition = "2021"` (or 2024) and `max_width = 100`. Default rustfmt is fine; don't over-customize.
+3. **Project hygiene + agent context.** Files that aren't code but make the repo navigable for humans and AI agents alike:
+   - **`Makefile`** — single source of truth for dev commands so neither the README nor agents have to remember invocations. Targets: `dev` (`cargo tauri dev`), `test` (`cargo test --all-features` + `pnpm test`), `lint` (`cargo clippy --all-targets --all-features -- -D warnings` + `pnpm lint`), `fmt` (`cargo fmt` + `pnpm format` if applicable), `check` (everything CI runs locally — `fmt --check`, `lint`, `test`), `clean`. Keep it small; one-liners per target.
+   - **`AGENTS.md`** — playbook for AI agents (and humans) working on the codebase. Living doc, extended each sub-milestone. Initial sections:
+     - **What this project is** (1 paragraph + pointer to `docs/system-design.md`)
+     - **Architecture overview** (Rust workspace layout, Svelte frontend, Tauri shell — pointer to `docs/v1-plan.md` for milestone roadmap)
+     - **Where things live** (`crates/`, `docs/`, `.github/`, `Makefile`, etc.)
+     - **How to run / test / lint** (point at Makefile)
+     - **Coding conventions** (no comments unless WHY is non-obvious; type hints everywhere; thiserror for typed errors; `Stdio::null()` for subprocess stdin; per-agent event channel `agent:<id>` with reducer-side `turn_id` filter; etc. — extend per sub-milestone as patterns emerge)
+     - **Key invariants** (registry is append-only; exactly one terminal `TurnEnd` per turn; dispatcher is the single chokepoint for harness calls; etc. — extend per sub-milestone)
+     - **Authoritative docs** (system-design.md, v1-plan.md, m{N}-implementation-plan.md, research notes)
+   - **`CLAUDE.md`** — one line: `@AGENTS.md`. The `@` prefix tells Claude Code to inline AGENTS.md when loading project context. Keeps Claude-specific entrypoint trivial; AGENTS.md is the harness-neutral source of truth.
+   - **`rust-toolchain.toml`** — pin Rust stable channel current at M1.1 start (e.g., `[toolchain] channel = "1.83.0", components = ["rustfmt", "clippy"], profile = "minimal"`). Reproducible builds; clear "what Rust version this builds against."
+   - **`.nvmrc`** — pin the Node version (`pnpm`'s `packageManager` field pins pnpm itself; `.nvmrc` pins the Node runtime under it).
+   - **`.editorconfig`** — basic formatting consistency (tabs vs spaces by file type, trim trailing whitespace, final newline). Cross-IDE; respected by VS Code, JetBrains, Vim, etc. Keeps formatting drift out of diffs.
+   - **`.gitignore`** — verify Tauri's generated `.gitignore` covers `/target/`, `/node_modules/`, `/dist/`, build artifacts, OS files (`.DS_Store`), and Tauri-specific paths (`/crates/app/target/`). Add anything missing.
+4. **Add a trivial round-trip command.** A `ping(name: String) -> String` Tauri command and a Svelte component that calls it on mount and renders the response. This proves IPC end-to-end.
+5. **Frontend test infra.** Set up Vitest + `@testing-library/svelte`. Write one trivial smoke test (e.g., the App component mounts without throwing). Wire `pnpm test` into CI from day 1. This makes M1.5's component tests pure additive work — no setup-plus-tests combo PR.
+6. **Hygiene CI.** Create `.github/workflows/hygiene.yml`. macOS runner. Steps: checkout → setup Node + pnpm → setup Rust toolchain (stable) → `pnpm install` → run via `make check` (which runs `pnpm lint`, `pnpm test`, `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features`). Using `make check` keeps CI and local in sync — same command, same set of checks.
+7. **README.md update.** Add a "Local development" section. Don't duplicate Makefile commands; reference them. Roughly: "Prerequisites: Node + pnpm (see `.nvmrc`), Rust (see `rust-toolchain.toml`), Xcode CLT (macOS). Common commands: `make dev`, `make test`, `make check`. See `AGENTS.md` for project context, `docs/v1-plan.md` for the milestone roadmap."
 
 ### Code snippets
 
@@ -101,15 +122,27 @@ const reply = await invoke<string>("ping", { name: "world" });
 ### Testing strategy
 
 - **Rust unit test for `ping`** — calls the function directly, asserts the reply.
-- **Frontend smoke test** — Vitest + `@testing-library/svelte` is set up in this milestone (per implementation outline step 4). The smoke test confirms the App component mounts.
+- **Frontend smoke test** — Vitest + `@testing-library/svelte` is set up in this milestone (per implementation outline step 5). The smoke test confirms the App component mounts.
+- **`make check` runs clean locally** — proves the Makefile + workspace + lint + test wiring all hang together. CI then runs `make check` and matches.
 - **CI itself is the test of CI** — confirm the hygiene workflow runs green on the M1.1 PR before merging.
 
 ### Docs to update
 
-- `README.md` — local dev section.
+- `README.md` — local dev section per implementation outline step 7.
+- `AGENTS.md` — initial scaffold per implementation outline step 3.
 - No spec changes expected.
 
-### Stop for review after M1.1
+### Manual smoke test
+
+After CI passes and you've reviewed the diff, verify by hand. **If anything below fails, the PR isn't ready regardless of unit-test results.**
+
+1. **Fresh clone smoke** — `git clone` to a scratch directory; install prerequisites per the new README; run `make dev` → an empty Tauri window opens within ~30s.
+2. **`make test`** → exits 0; output shows Rust + Vitest tests both ran.
+3. **`make lint`** → exits 0 (no clippy warnings, no frontend lint errors).
+4. **`make fmt`** — running it should be a no-op on a freshly-checked-out tree (already formatted).
+5. **`make check`** → exits 0. Same set of checks CI runs.
+6. **Ping round-trip** — in the running app, open WebView devtools, look for the rendered ping response in the UI (or call `await window.__TAURI__.core.invoke('ping', { name: 'world' })` in the console and confirm it returns `'pong, world'`).
+7. **README sanity** — re-read the README "Local development" section and confirm the commands listed actually work as described. The fresh-clone smoke above is the ground-truth check for this.
 
 Open a PR titled `M1.1: Tauri shell + hygiene CI`. Wait for human review.
 
@@ -124,6 +157,11 @@ Pure-Rust persistence layer for a Switchboard project — no UI, no harness yet.
 - An existing project can be loaded by its path.
 - `Agent` records can be appended to and listed from the registry.
 - Agent name uniqueness (including hyphen↔underscore normalization per `system-design.md` §3 Primitive 1) is enforced at the registry layer.
+
+**Scope notes:**
+- A project is a 1:1 binding to a working directory on disk (typically a git repo). The `.switchboard/` folder lives **directly inside that directory** (not in `~/.switchboard/projects/<name>/`). Per `system-design.md` §3.
+- The registry holds **N agents from day one** (forward-compatible with M2's multi-agent UI). M1.5's UI exposes only one — agent selector lands in M2.
+- Switchboard does **not** modify the user's `.gitignore`. If the user wants `.switchboard/` ignored (or committed), that's their call. Switchboard touching `.gitignore` would be invasive for a tool that touches user repos.
 
 ### Implementation outline
 
@@ -144,7 +182,7 @@ Pure-Rust persistence layer for a Switchboard project — no UI, no harness yet.
        pub id: AgentId,                  // UUID v7 (time-ordered; via the uuid crate's v7 feature) — generated on create
        pub name: String,                 // user-supplied, validated for uniqueness
        pub harness: HarnessKind,         // enum, M1 only ClaudeCode
-       pub session_id: Option<Uuid>,     // Claude session UUID. Set at create-time for Claude Code agents (per OQ1's pre-generated UUID resolution). For Codex agents (M2+), this stays None — Codex assigns its own session ID from the stream and stores it in a per-agent sidecar (see m2-implementation-plan.md OQ2). Optional from the start so M2's Codex adapter doesn't force a schema migration.
+       pub session_id: Option<Uuid>,     // Claude session UUID (v7, same convention as AgentId). Set at create-time for Claude Code agents — pre-generated by Switchboard and passed to Claude via `--session-id <uuid>` (see M1.3 step 3). For Codex agents (M2+), this stays None — Codex assigns its own session ID from the stream and stores it in a per-agent sidecar (see m2-implementation-plan.md OQ2). Optional from the start so M2's Codex adapter doesn't force a schema migration.
        pub created_at: DateTime<Utc>,
    }
    ```
@@ -173,8 +211,16 @@ Use `tempfile::TempDir` for isolation. All tests are unit tests in the `core` cr
 
 - New section in `system-design.md` is **not** needed; the persistence schema is already described at intent level there. If concrete schema details are useful for future readers, append them under the existing §10 or §3 sections; don't create a new top-level section.
 - `docs/v1-plan.md`'s deferred-detail callout (line 243, "Persistence schema details (10.3)") — note that M1 lands the registry shape; the runs/checkpoint shape is still M5.
+- **`AGENTS.md`** — add the registry-is-append-only invariant, the hyphen↔underscore name normalization rule, and the `<project>/.switchboard/` directory layout to the relevant AGENTS.md sections.
 
-### Stop for review after M1.2
+### Manual smoke test
+
+M1.2 is backend-only — no UI, no Tauri integration yet. Verification is short. **If anything below fails, the PR isn't ready regardless of unit-test results.**
+
+1. **`make test`** → exits 0; output includes the new `crates/core` tests.
+2. **`cargo test -p switchboard-core` (or whatever the core crate ends up named)** → roundtrip, name-uniqueness (verbatim + hyphen↔underscore), corruption, regex acceptance/rejection tests all pass.
+3. **Ad-hoc tempdir smoke** — write a quick scratch test or `cargo run --example` if one exists; otherwise drop into a `#[test]` and verify: create a `Project` at a tempdir, register two agents, reopen the project, list agents — see your two records in order. Optional sanity check beyond what the unit tests already cover.
+4. **`make check`** → exits 0.
 
 Open a PR titled `M1.2: project filesystem + agent registry`. Wait for human review.
 
@@ -308,7 +354,9 @@ No Tauri integration in this sub-milestone — that's M1.4. Keep this work in `c
    **Before implementing, probe `--session-id` idempotency:** run `claude -p --session-id <fresh-uuid> 'hi'` against a UUID that has no on-disk session yet. Does it create the session and run the turn (idempotent — best case), or does it fail demanding `--resume`?
    
    - **If idempotent** → always pass `--session-id <uuid>`, no branching needed at all. Eliminates a code path entirely.
-   - **If not idempotent** → pass `--session-id <uuid>` on the first turn and `--resume <uuid>` thereafter. Choose based on the existence of `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl` (ground truth from Claude's own data). **Do not add a mutable `initialized: bool` field to `AgentRecord`** — that violates the registry's append-only invariant and drifts from ground truth (user deletes session file → registry stays stale).
+   - **If not idempotent** → pass `--session-id <uuid>` on the first turn and `--resume <uuid>` thereafter. Choose based on the existence of `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl` (ground truth from Claude's own data). **Do not add a mutable `initialized: bool` field to `AgentRecord`.** Two reasons: (a) it violates the registry's append-only invariant; (b) ground truth is more robust — if the user manually deletes a session file, the FS check sees "no file" and the adapter creates a fresh session via `--session-id`, but a registry flag would still say `initialized: true` and the adapter would call `--resume`, which Claude rejects (file's gone), leaving the agent stuck.
+
+   The session UUID itself is pre-generated as a UUID v7 at agent creation time (same convention as `AgentId` — keeps one UUID version across the codebase; Claude treats the UUID as opaque so v4 vs v7 is functionally identical) and stored on `AgentRecord.session_id` (see M1.2).
    
    Per `claude-code-cli-observed.md`, `--include-partial-messages` requires `stream-json` output. Per the research notes, `--verbose` is required alongside `--include-partial-messages` — confirm by running `claude --help`, but plan for it being mandatory. The `--input-format stream-json` flag is **not** used in M1 (positional prompt input only — see step 5).
 
@@ -393,9 +441,19 @@ while let Some(line) = lines.next_line().await? {
 ### Docs to update
 
 - `docs/research/claude-code-cli-observed.md` — if any of the capture/probe work in M1.3 reveals new behavior (especially around `--include-partial-messages` and `--input-format stream-json`), append a "Findings during M1.3" subsection.
-- No spec changes expected unless something contradicts `system-design.md` §5 — surface that to the user immediately.
+- No spec changes expected unless something contradicts `system-design.md` §9 — surface that to the user immediately.
+- **`AGENTS.md`** — add the exactly-one-terminal-event stream contract, the AdapterEvent vs NormalizedEvent split rationale (TurnStart is dispatcher-owned, never adapter-emitted), the parser-precedence rule (deltas authoritative when `--include-partial-messages` enabled), the subprocess-lifecycle pattern (`Stdio::null()` at spawn, drain stderr concurrently, `child.wait()` after terminal event), and the FailureKind discriminator on TurnEnd.
 
-### Stop for review after M1.3
+### Manual smoke test
+
+M1.3 is backend-only — adapter + parser, no Tauri integration. Live verification requires `claude` installed and authenticated. **If anything below fails, the PR isn't ready regardless of unit-test results.**
+
+1. **`make test`** → exits 0; output includes the harness crate's fake-fixture parser tests.
+2. **Probe `--session-id` idempotency by hand** (per the M1.3 step 3 instruction). Run `claude -p --session-id <fresh-uuid> 'reply with ack'` against a UUID Claude has never seen. Did the implementing agent's reported probe result match? Confirm the implementation took the right branch (always-pass `--session-id` if idempotent; first-vs-subsequent if not).
+3. **Live integration test** — `SWITCHBOARD_LIVE_HARNESS=1 cargo test -- --ignored` runs the real-`claude` smoke test. Should complete in ~5–10s. Expect at least one `ContentChunk` containing `"4"` (or the model's answer to "What's 2+2?") and a clean `TurnEnd(Completed)`.
+4. **Negative path manual check** — temporarily rename or remove `claude` from your PATH, then run the live integration test. Should see the typed `BinaryNotFound` error, NOT a generic `TurnEnd(Failed)`. Restore PATH afterwards.
+5. **Stderr drain check** — run the live integration test once with `RUST_LOG=debug` (or whatever the project's log config ends up as) and confirm stderr from `claude` is being read and logged, not silently dropped.
+6. **`make check`** → exits 0.
 
 Open a PR titled `M1.3: normalized events + Claude Code adapter`. Wait for human review.
 
@@ -479,8 +537,34 @@ This sub-milestone establishes the chokepoint pattern that M3 will harden into t
 ### Docs to update
 
 - No new doc files. If the `Dispatcher` shape diverges meaningfully from `system-design.md` §7, surface that as a discussion before changing the spec.
+- **`AGENTS.md`** — add the dispatcher-is-the-single-chokepoint rule, the `EventEmitter` trait + `RecordingEmitter` testing pattern, the `AgentIdleGuard` RAII pattern (with `std::sync::Mutex` rather than `tokio::sync::Mutex`), the dispatch ordering (call `adapter.dispatch()` before transitioning state to `InFlight`), and the per-agent event channel `agent:<id>` convention.
 
-### Stop for review after M1.4
+### Manual smoke test
+
+M1.4 wires the dispatcher into Tauri commands but ships no UI — verification is via devtools console. Requires `claude` installed and authenticated. **If anything below fails, the PR isn't ready regardless of unit-test results.**
+
+1. **`make test`** → exits 0; output includes dispatcher unit tests using `RecordingEmitter`.
+2. **`make dev`** → app window opens (still empty UI from M1.1).
+3. **Open WebView devtools** and exercise the command surface manually. Suggested sequence:
+   ```javascript
+   // Confirm the binary check works
+   await window.__TAURI__.core.invoke('check_claude_binary');  // returns null/ok
+   await window.__TAURI__.core.invoke('check_project_status', { root: '/tmp/sw-smoke' });  // returns 'NotAProject' or error variant
+
+   // Create a project + agent
+   await window.__TAURI__.core.invoke('create_project', { root: '/tmp/sw-smoke' });
+   await window.__TAURI__.core.invoke('create_agent', { name: 'assistant' });
+
+   // Subscribe to events for that agent (use the agent_id from create_agent's response)
+   const unlisten = await window.__TAURI__.event.listen('agent:<agent_id_from_above>', e => console.log(e));
+
+   // Send a message
+   const turnId = await window.__TAURI__.core.invoke('send_message', { agentId: '<id>', prompt: "What's 2+2?" });
+   ```
+   Expect to see in the console: `turn_start` event → multiple `content_chunk` events with text → `turn_end` with `outcome: { status: 'completed' }` and a populated `usage` field. Each event payload's `turn_id` matches the one returned synchronously.
+4. **Concurrent dispatch refusal** — call `send_message` twice fast for the same agent; the second returns the "agent is busy" error.
+5. **Missing-binary path** — temporarily remove `claude` from PATH, restart the app, run `check_claude_binary` → `BinaryNotFound`. Restore PATH.
+6. **`make check`** → exits 0.
 
 Open a PR titled `M1.4: dispatcher + Tauri command surface`. Wait for human review.
 
@@ -490,11 +574,13 @@ Open a PR titled `M1.4: dispatcher + Tauri command surface`. Wait for human revi
 
 ### Goal & outcome
 
-The actual user-facing walking skeleton. After this sub-milestone, the M1 acceptance flow works end-to-end:
+The first sub-milestone with a user-facing surface — M1.1–M1.4 are all backend / infrastructure with no UI. After this sub-milestone lands, the M1 acceptance flow works end-to-end:
 - Launch app → no project → "Open project" button → native folder picker → if folder has no `.switchboard/`, prompt to create; if it does, open.
 - Project open → if no agents, "Create agent" button → name input (defaults to `assistant`) → creates the agent.
 - Agent exists → single-pane view with output area on top, compose bar on bottom.
 - Type "What's 2+2?" → press Send (or Cmd+Enter) → output streams in real time → "4" appears.
+
+**UX scope (M1 only, on purpose):** picking a project = native folder-picker dialog only. No project-name field (the folder name IS the project's identity). No "recent projects" list. These land in later milestones when the multi-project / multi-agent UX justifies them.
 
 ### Implementation outline
 
@@ -575,7 +661,7 @@ User turns are appended to `turns` synchronously at submit time. Agent turns are
    - `ProjectView.svelte` — project-open state, hosts agent UI.
    - `AgentPane.svelte` — output area + compose bar; owns the per-agent transcript.
    - `ComposeBar.svelte` — extracted for testability.
-10. **Styling.** Tailwind utility classes; shadcn-svelte components for the button, dialog, textarea (using the versions pinned in M1.1 per OQ4).
+10. **Styling.** Tailwind utility classes; shadcn-svelte components for the button, dialog, textarea (using the versions pinned in M1.1).
 
 ### Testing strategy
 
@@ -597,8 +683,38 @@ Vitest + `@testing-library/svelte` are already set up from M1.1.
 
 - `README.md` — "Try it out" section with the M1 acceptance steps.
 - A short user-facing note (could be in README or a separate `docs/getting-started.md`) — but only if the user asks for it. Don't create new docs unprompted per the global instructions.
+- **`AGENTS.md`** — add the per-agent transcript reducer shape (TS types pinned in M1.5), the per-agent subscription model (subscribe on AgentPane mount, reducer filters by `turn_id`), the binary-not-found banner pattern (once-per-app-launch via `check_claude_binary` startup probe), and the wire-format ↔ TS-type mapping convention (`#[serde(tag = "type", rename_all = "snake_case")]` on Rust enums → discriminated union in TS).
 
-### Stop for review after M1.5
+### Manual smoke test
+
+This is the closing manual test for the entire M1 acceptance flow — the moment of truth. Requires `claude` installed and authenticated. **If anything below fails, the PR isn't ready regardless of unit-test results.**
+
+1. **`make test`** → exits 0; output includes new reducer + ComposeBar component tests.
+2. **`make dev`** → app window opens within ~30s. No banner if `claude` is on PATH; if missing, see the binary-not-found banner with install link copy.
+3. **Welcome screen** → "Open project" button visible.
+4. **Folder picker** → click "Open project," native folder picker opens, pick a fresh empty directory (e.g., `/tmp/sw-smoke-1`).
+5. **Create-project CTA** → since the folder has no `.switchboard/`, you see "Create Switchboard project here?" — confirm.
+6. **No-agents state** → app enters project view, prompts "Create agent."
+7. **Create agent** → name field defaults to `"assistant"`. Submit.
+8. **Single-pane view appears** → output area on top (empty), compose bar on bottom, status indicator shows "idle."
+9. **Send "What's 2+2?"** → press Cmd+Enter (and separately try the Send button).
+   - User turn appears in transcript immediately (optimistic).
+   - Status flips to "processing"; Send button disables.
+   - Agent reply streams into the pane character-by-character ("4" or similar correct answer).
+   - On TurnEnd, status returns to "idle"; Send button re-enables.
+10. **Send a follow-up** → e.g., "What about times two?" → confirm the model recalls prior context (proves session resume works), reply streams.
+11. **Reload the app** (close and `make dev` again) → re-open the same project → agent is still there → send another message → still works (proves persistence end-to-end).
+12. **Empty/whitespace prompt rejection** → try sending with empty input or only spaces → Send button stays disabled or backend rejects (depending on which gate fires first).
+13. **Existing-project flow** — close app, restart, click "Open project," pick the same `/tmp/sw-smoke-1` directory → see "Open this Switchboard project?" CTA (not "create"), confirm, project loads with the existing agent.
+14. **Late-event filter** — open devtools console, watch the events on `agent:<id>` channel as you send a message. After TurnEnd fires, no further events should arrive on the channel (until you send the next message). The reducer's `turn_id` filter catches any stragglers; nothing should leak into the next turn's display.
+15. **`make check`** → exits 0.
+
+### M1 close-out
+
+After M1.5 merges, M1 is done. Final check on a fresh clone:
+- `git clone` to a brand-new directory.
+- Follow the README "Local development" + "Try it out" steps from scratch.
+- Hit every step 1–13 above. Anything that requires "see prior README" or "ask in chat" is a README bug — fix it.
 
 Open a PR titled `M1.5: single-pane agent UI`. Wait for human review.
 

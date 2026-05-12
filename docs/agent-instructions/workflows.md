@@ -1,6 +1,6 @@
 # Authoring a workflow for Switchboard
 
-> **Audience:** an AI coding agent (Claude Code or Codex) being asked to generate a starter workflow file for a Switchboard project. If you are a human author, this doc works for you too — you are just not the primary audience.
+> **Audience:** an AI coding agent (Claude Code or Codex) being asked to generate a starter workflow file for a Switchboard working directory. If you are a human author, this doc works for you too — you are just not the primary audience.
 >
 > **Companion docs:** the formal DSL spec is at `docs/workflow-spec.md`. Read this doc first for the authoring path; consult the spec for edge cases, validation rules, and the full reserved-keys list.
 
@@ -8,15 +8,15 @@
 
 A **workflow** is a YAML file that defines a reusable, parameterized sequence of agent operations — for example "fan out to three reviewers, aggregate their feedback, send to the implementer." Workflows are how the user automates multi-agent coordination they would otherwise do by hand.
 
-Workflows are file-based. There is no in-app editor. You are generating a file the user will save into the project's workflow directory.
+Workflows are file-based. There is no in-app editor. You are generating a file the user will save into the working directory's workflows directory (`<directory>/.switchboard/workflows/` — shared across all projects in that working directory; see `docs/system-design.md` §3).
 
 ## Where workflows live
 
-Workflows are project-scoped:
+Workflows are directory-scoped (shared across all projects in the same working directory):
 
-- `<project>/.switchboard/workflows/<workflow-name>.yaml`
+- `<directory>/.switchboard/workflows/<workflow-name>.yaml`
 
-There is no user-global workflow directory. To share a workflow across projects, the user copies or symlinks the file. (Asymmetric with prompts on purpose: workflows reference project-specific agent names; prompts are more portable.)
+There is no user-global workflow directory. To share a workflow across working directories (different repos), the user copies or symlinks the file. Within a working directory, all projects can invoke the same workflow definitions — workflows describe *how to do work*; projects scope *the work in progress*. See `docs/system-design.md` §3 for the directory/project model.
 
 ## Top-level structure
 
@@ -342,7 +342,7 @@ You don't need to write failure-handling logic in the workflow file; the runtime
 
 ## After authoring
 
-1. Save the file as `<project>/.switchboard/workflows/<name>.yaml` (filename matches `name`).
+1. Save the file as `<directory>/.switchboard/workflows/<name>.yaml` (filename matches `name`). Workflows are directory-scoped — shared across all projects in that working directory.
 2. The user invokes it from Switchboard's workflow picker. The invocation form auto-generates from the `inputs` declaration.
 3. The workflow runs autonomously; the user watches via the workflow-progress surface and per-agent panes.
 

@@ -237,8 +237,8 @@ This sub-milestone does NOT add session-file enrichment — that's M2.4. M2.3 em
    
    **Process-group spawn** + **stdin close after dispatch** per the M2.2 pattern.
 
-3. **Session-id handling** (Codex only — Claude Code continues to use `AgentRecord.session_id` per M1.3). Codex assigns its own session_id from the first stream event (`thread.started` event carries `thread_id`); we react to it with a per-agent session-link sidecar at `<project>/.switchboard/state/sessions/<agent_id>.jsonl`. The asymmetry mirrors the underlying harness asymmetry (Claude Code can pre-assign session_id; Codex can't).
-   - Before dispatch: look up the most-recent record from `<project>/.switchboard/state/sessions/<agent_id>.jsonl` (latest line wins, file is append-only).
+3. **Session-id handling** (Codex only — Claude Code continues to use `AgentRecord.session_id` per M1.3). Codex assigns its own session_id from the first stream event (`thread.started` event carries `thread_id`); we react to it with a per-agent session-link sidecar at `<directory>/.switchboard/projects/<project-id>/sessions/<agent_id>.jsonl`. The asymmetry mirrors the underlying harness asymmetry (Claude Code can pre-assign session_id; Codex can't). Project-scoped path because each project is its own task — its agents and their session links are isolated.
+   - Before dispatch: look up the most-recent record from `<directory>/.switchboard/projects/<project-id>/sessions/<agent_id>.jsonl` (latest line wins, file is append-only).
    - If no record → first turn → spawn with `codex exec` (no resume).
    - If a record exists → spawn with `codex exec resume <session_id>`.
    - **On first stream event (`thread.started` with `thread_id`), append a new record to the session-link file *immediately*, before any other parsing or dispatch work that could fail.** This ensures we have a durable link to a Codex session that already exists, even if the process panics or EOFs immediately after. Record shape:
@@ -293,7 +293,7 @@ This sub-milestone does NOT add session-file enrichment — that's M2.4. M2.3 em
 
 - `docs/research/codex-cli-observed.md` — if M2.3 implementation surfaces anything new (especially around the resume flow or session-id capture timing), append to the M2.1 findings section.
 - No spec changes expected; system-design §9 already specifies the per-harness adapter shape and Codex's session-id-from-stream model.
-- **`AGENTS.md`** — add the Codex session-link sidecar pattern (`<project>/.switchboard/state/sessions/<agent_id>.jsonl`, append-only, latest line wins, write-on-`thread.started`-immediately, original_start_date_utc copied on resume). Add the AppState named-fields convention (`claude_adapter` / `codex_adapter`) and the harness-asymmetry note (Claude pre-assigns session_id; Codex captures from stream).
+- **`AGENTS.md`** — add the Codex session-link sidecar pattern (`<directory>/.switchboard/projects/<project-id>/sessions/<agent_id>.jsonl`, append-only, latest line wins, write-on-`thread.started`-immediately, original_start_date_utc copied on resume). Add the AppState named-fields convention (`claude_adapter` / `codex_adapter`) and the harness-asymmetry note (Claude pre-assigns session_id; Codex captures from stream).
 
 ### Manual smoke test
 
@@ -308,7 +308,7 @@ M2.3 introduces the second harness end-to-end. Requires both `claude` and `codex
    const turnId = await window.__TAURI__.core.invoke('send_message', { agentId: '<id>', prompt: 'reply with ack' });
    ```
    Console should show: `turn_start` → `content_chunk` (single, not stream of deltas — Codex emits whole `agent_message` items) → `turn_end(completed)`. Compare against your existing Claude Code agent — same event shape, different streaming granularity.
-4. **Session-link sidecar exists** — `cat <project>/.switchboard/state/sessions/<codex-agent-id>.jsonl`. Should have a single line with `session_id`, `original_start_date_utc`, `started_at`. Send a second message to the same agent → second line appended; both lines have the same `session_id` and `original_start_date_utc`.
+4. **Session-link sidecar exists** — `cat <directory>/.switchboard/projects/<project-id>/sessions/<codex-agent-id>.jsonl`. Should have a single line with `session_id`, `original_start_date_utc`, `started_at`. Send a second message to the same agent → second line appended; both lines have the same `session_id` and `original_start_date_utc`.
 5. **Resume works** — close app, restart, send another message to the same Codex agent → it should `codex exec resume <session-id>` (not start fresh) and the model should recall prior context.
 6. **Two agents, no cross-talk** — with both Claude Code and Codex agents in the same project, dispatch to each via devtools. Confirm events arrive on the right per-agent channel; no events from one show up in the other.
 7. **`make check`** → exits 0.
@@ -388,16 +388,18 @@ Open a PR titled `M2.4: Codex session-file enrichment`. Wait for human review.
 
 ### Goal & outcome
 
-Minimal UI for switching between agents in a project. After this sub-milestone:
-- The single-pane view shows a selector listing all agents in the current project (with their harness type — Claude Code / Codex — visibly indicated).
+Minimal UI for switching between agents within the **active project**. After this sub-milestone:
+- The single-pane view shows a selector listing all agents in the *active* project (with their harness type — Claude Code / Codex — visibly indicated). Agents from other loaded projects do NOT appear; they're scoped to their own project.
 - Selecting a different agent switches the pane to display that agent's transcript.
 - Each agent's transcript is preserved across switches (you don't lose history when you switch away).
 - Per-agent runtime metadata (model, tokens, context utilization, rate limits) is captured into project-level state and available for future UI surfacing (M2 doesn't yet render it; M3+ does).
 - The `create_agent` flow accepts a harness type (currently hardcoded in M1).
 
-This is **not multi-pane** — one pane visible at a time. Multi-pane is M3.
+This is **not multi-pane** — one pane visible at a time. Multi-pane is M3. **Project switcher is also M3.** M2's selector switches agents within the active project; switching the active project itself comes in M3.
 
 **This sub-milestone reshuffles M1.5's frontend ownership model** — moving transcripts and subscriptions from per-pane to project-level. This reshuffle is *required*, not avoidable: per-pane subscriptions would recreate M1.4's TurnStart race when switching agents (the same race we eliminated by going per-agent in the M1 round-2 review). Backend M1 abstractions (`HarnessAdapter`, dispatcher, registry, `EventEmitter` trait) are unchanged.
+
+**Multi-project note:** state shape for transcripts and runtimes is keyed by `agent_id` (globally unique UUID v7), so the M2 frontend already correctly handles agents from non-active projects emitting events in the background — those events update their per-agent state silently, and when the user switches active project (M3), the new project's agents already have their full transcripts ready to render.
 
 ### Implementation outline
 

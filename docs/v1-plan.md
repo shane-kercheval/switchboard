@@ -20,7 +20,7 @@ Three artifacts are needed before per-milestone implementation specs can be expa
 
 ### In v1
 
-- Multi-agent project workspace, file-based config under `<project>/.switchboard/`
+- Multi-agent project workspaces with file-based config under `<directory>/.switchboard/`. Multiple projects can coexist in the same working directory (see system-design §3 "Why multiple projects per working directory") — each is a task-scoped grouping of agents + workflow runs + runtime state. Workflow *definitions* and prompts are directory-scoped (shared across all projects in the repo).
 - Per-harness adapters for Claude Code (`claude -p`) and Codex (`codex exec`)
 - Normalized event stream (full vocabulary by M2: TurnStart, ContentChunk, ToolStarted, ToolCompleted, TurnEnd, RateLimitEvent, SessionMeta — M1 lands the minimal subset for streaming text. Adapter-layer failures fold into TurnEnd's structured `outcome` field — there is no separate TurnAborted wire event, per system-design §9.)
 - Six functional primitives composable into workflows (spawn, send, auto-forward, fan-in with template wrapping, pause for user input, iterate over a list)
@@ -72,7 +72,7 @@ M1 → M2 → M3 → M4 → M5 → M6
 **Scope:**
 
 - Tauri 2.x app shell (Rust core + Svelte 5 frontend, shadcn-svelte components, Tailwind)
-- Single project on disk: `<project>/.switchboard/{config.yaml,state/registry.jsonl}`
+- On-disk layout supports N projects per working directory from day 1 (UI exposes one in M1; project switcher lands in M3): `<directory>/.switchboard/{config.yaml, projects.jsonl, projects/<project-id>/{config.yaml, registry.jsonl}}` per system-design §3.
 - Single per-message process spawn for `claude -p --resume <session-id>` with `--dangerously-skip-permissions`
 - Normalized event stream wired up minimally (TurnStart, ContentChunk(text), TurnEnd) — enough to render streaming text
 - Single-pane agent UI with compose bar and streaming output
@@ -121,8 +121,9 @@ M1 → M2 → M3 → M4 → M5 → M6
 - Multi-pane layout: every agent's most recent output visible; one focused agent (active for compose-bar input); collapse/expand background agents
 - Persistent overview panel: all agents with real-time status (idle, processing, waiting on tool, errored)
 - **Single-dispatcher chokepoint** (per system-design §7 Agent contention) — only entry point that talks to harness adapters
-- Per-agent in-memory state (`HashMap<AgentId, AgentState>` behind a Tokio Mutex)
-- Project-level `flock` on `<project>/.switchboard/state/instance.lock` (multi-window-same-project guard)
+- Per-agent in-memory state (`HashMap<AgentId, AgentState>` behind a `std::sync::Mutex` — sync mutex; state ops are O(1) field flips, never held across `.await`; required for the `AgentIdleGuard::Drop` RAII pattern per M1.4 step 6)
+- Project-level `flock` on `<directory>/.switchboard/projects/<project-id>/instance.lock` (one Switchboard process per project guard — different projects in the same working directory can be open in the same window concurrently; same project in two Switchboard processes is refused). **Intra-process re-open** (e.g., the user clicks an already-loaded project in the project switcher) is a no-op that returns the existing in-memory `Project` handle from `AppState.projects` — `flock` is the inter-process guard only; in-process re-entry is handled by the dispatcher's project map.
+- **Project switcher UI** — sidebar/dropdown that lists all projects in the active working directory and lets the user switch which project the single pane displays. Background activity (workflows in flight, agents streaming) for non-active projects keeps running while the user views another project. Single window only; multi-window is not in scope.
 - Compose-and-dispatch UI: source (free-form text + optional latest-output-of-agent) + recipients (multi-select); Send gated when recipient busy
 - Agent context menu: fork session (Claude Code only — `--fork-session`; Codex agents show explanatory tooltip: "Fork is not available for Codex sessions in v1; see the docs for workarounds." per resolved 10.14), open session file, reset/remove
 - **Per-turn cancellation:** SIGTERM to the in-flight harness subprocess's process group; partial output buffered in-memory and stays accessible in the agent's pane until the next turn or restart (per system-design §7 Cancelling). Detection accounts for Codex's SIGTERM-exits-0 quirk (absence of terminal event).
@@ -146,7 +147,7 @@ M1 → M2 → M3 → M4 → M5 → M6
 
 **Scope:**
 
-- Local file store: `<project>/.switchboard/prompts/` plus configurable `local_prompt_dirs` (per system-design §6)
+- Local file store: `<directory>/.switchboard/prompts/` (directory-scoped — shared across all projects in that working directory) plus configurable `local_prompt_dirs` (per system-design §6)
 - Frontmatter parsing: `name`, `description`, `arguments`, `tags`
 - MiniJinja rendering for local prompts
 - MCP client via `rmcp` — `prompts/list` and `prompts/get` only
@@ -160,7 +161,7 @@ M1 → M2 → M3 → M4 → M5 → M6
 
 **Dependencies:** M3 (compose bar exists).
 
-**Acceptance:** drop a local prompt file with arguments into `<project>/.switchboard/prompts/`, invoke via `/promptname`, fill arguments, see rendered text dispatched. Configure Tiddly preset, invoke a Tiddly prompt the same way. Drop a Claude Code skill `.md` file into the prompts directory, confirm it works as a local prompt.
+**Acceptance:** drop a local prompt file with arguments into `<directory>/.switchboard/prompts/`, invoke via `/promptname`, fill arguments, see rendered text dispatched. Configure Tiddly preset, invoke a Tiddly prompt the same way. Drop a Claude Code skill `.md` file into the prompts directory, confirm it works as a local prompt.
 
 ---
 
@@ -173,8 +174,9 @@ M1 → M2 → M3 → M4 → M5 → M6
 - Workflow YAML parser per `docs/workflow-spec.md`
 - Step-based execution interpreter (parallel dispatch within fan-out, synchronization within fan-in — per system-design §4 Execution model)
 - Workflow primitives 2–4 (send, auto-forward via `forward_from`, fan-in with template wrapping) plus the `wait_for` / `wait_for_all` synchronization helpers. Spawn (Primitive 1) is not a workflow step — agents are spawned through the UI before the workflow runs and supplied as workflow inputs.
+- **Workflow runs are project-scoped and run concurrently across projects.** A workflow invoked against project A and another invoked against project B in the same working directory run independently — separate dispatchers (per project), separate checkpoints (per project), separate progress surfaces. The user can switch the active project in the UI to monitor either; non-active projects keep running. No special cross-project coordination is needed (workflows touch only their own project's agents and state).
 - Workflow-progress surface (per §7) — each active workflow's name, current step, total steps, per-step status; supports multiple concurrent workflows
-- Step-boundary checkpointing to `<project>/.switchboard/state/runs/<run-id>.jsonl`
+- Step-boundary checkpointing to `<directory>/.switchboard/projects/<project-id>/runs/<run-id>.jsonl` (workflow runs are project-scoped — concurrent runs across projects in the same directory are independent)
 - Failure handling per system-design §7 (pre-dispatch failures, contention refusals, fan-in per-agent failures)
 - **Workflow-level cancellation:** "Cancel workflow" action stops orchestration; SIGTERM-to-process-group on whichever harness subprocesses are in-flight; workflow marked `cancelled`. User cancelling an agent's turn while it's part of a workflow step → workflow also marked `cancelled` (per system-design §7 — user intent-bearing).
 - Built-in workflows shipped: `review-and-aggregate`, `sequential handoff with template`
@@ -246,5 +248,5 @@ M1 → M2 → M3 → M4 → M5 → M6
 - **Per-milestone time estimates.** Speculative pre-implementation; will be added inline when each milestone is expanded if useful.
 - **Implementation-grade detail per milestone.** This is the outline; expansion happens in dedicated passes.
 - **The exact workflow DSL.** Lives in `docs/workflow-spec.md` (prerequisite).
-- **Persistence schema details (10.3).** On-disk format choices for `state/registry.jsonl` and `state/runs/<run-id>.jsonl` are deferred until M3 / M5 expansion.
+- **Persistence schema details (10.3).** On-disk format choices for `<directory>/.switchboard/projects/<project-id>/registry.jsonl` and `<directory>/.switchboard/projects/<project-id>/runs/<run-id>.jsonl` are deferred until M3 / M5 expansion.
 - **Stall detection threshold and UX (10.18).** Deferred to M2/M3 expansion when the live-stream behavior of both harnesses is being implemented.

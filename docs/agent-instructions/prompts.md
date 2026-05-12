@@ -1,21 +1,21 @@
 # Authoring a local prompt for Switchboard
 
-> **Audience:** an AI coding agent (Claude Code or Codex) being asked to generate a starter local prompt for a Switchboard project. If you are a human author, this doc works for you too — you are just not the primary audience.
+> **Audience:** an AI coding agent (Claude Code or Codex) being asked to generate a starter local prompt for a Switchboard working directory. If you are a human author, this doc works for you too — you are just not the primary audience.
 
 ## What a local prompt is
 
 A **local prompt** is a single markdown file with YAML frontmatter that Switchboard resolves by name when the user invokes a slash command in the compose bar (e.g., `/code-review`) or when a workflow references a prompt ID (e.g., `local:code-review`). Switchboard renders the template (MiniJinja subset, see below) and dispatches the rendered text to one or more agents.
 
-Local prompts are file-based. There is no in-app editor. You are generating a file the user (or you) will save into the project's prompt directory.
+Local prompts are file-based. There is no in-app editor. You are generating a file the user (or you) will save into the working directory's prompt store (`<directory>/.switchboard/prompts/` — shared across all projects in that directory; see `docs/system-design.md` §3).
 
 ## Where local prompts live
 
 Switchboard resolves local prompts from:
 
-1. The **project prompt directory**: `<project>/.switchboard/prompts/`
-2. Any **user-configured directories** listed in `local_prompt_dirs` in the user's config (used for sharing prompts across projects via a personal git repo).
+1. The **directory prompt store**: `<directory>/.switchboard/prompts/` — directory-scoped, shared across all projects in that working directory (see `docs/system-design.md` §3 for the directory/project model).
+2. Any **user-configured directories** listed in `local_prompt_dirs` in the user's config (used for sharing prompts across working directories via a personal git repo).
 
-Default to writing the prompt into `<project>/.switchboard/prompts/`. If the user has indicated they keep prompts elsewhere, follow their instruction.
+Default to writing the prompt into `<directory>/.switchboard/prompts/`. If the user has indicated they keep prompts elsewhere, follow their instruction.
 
 ## File format
 
@@ -169,7 +169,7 @@ You can pass a list as a string and parse it, but more commonly the iteration ha
 
 ## After authoring
 
-1. Save the file as `<project>/.switchboard/prompts/<name>.md` (filename matches the `name` field).
+1. Save the file as `<directory>/.switchboard/prompts/<name>.md` (filename matches the `name` field). Prompts are directory-scoped — available to all projects in that working directory.
 2. The user can immediately invoke it by typing `/<name>` in the compose bar.
 3. If the user has Switchboard open, the prompt appears in slash-command autocomplete without a restart.
 

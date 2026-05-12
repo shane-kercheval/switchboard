@@ -41,33 +41,53 @@ This orchestration model has a useful side effect for prompt management. Because
 
 | Concept | Definition |
 |---|---|
-| **Project** | A workspace containing a group of agents working toward a shared goal. Persistent, named, and bound to a working directory (typically a git repo). Project-specific config, workflows, and local prompts live under `<project>/.switchboard/` (see directory layout below). |
-| **Agent** | A Claude Code or Codex session within a project, with a user-assigned name. Each agent has a persistent harness session ID under the hood. |
+| **Working directory** | An on-disk directory (typically a git repo) where Switchboard does its work. Identified by canonicalized path. One Switchboard-managed `.switchboard/` lives at the directory root and contains zero or more **projects**. |
+| **Project** | A named, task-scoped grouping of agents + workflow runs + runtime state, hosted within a working directory. (Workflow *definitions* are directory-scoped — shared across projects; projects own workflow *runs* — the in-flight invocations against their agents.) Each project has a UUID (`ProjectId`) and a user-supplied name (unique within its directory; can collide across directories). Multiple projects can coexist in the same working directory, allowing the user to run separate workstreams (backend / frontend / planning / etc.) on the same repo simultaneously. Project-specific state lives at `<directory>/.switchboard/projects/<project-id>/` (see directory layout below). |
+| **Agent** | A Claude Code or Codex session within a project, with a user-assigned name. Each agent has a persistent harness session ID under the hood. Agents are bound to their project, not directly to the directory. |
 | **Primitive** | An atomic operation Switchboard provides for a workflow to compose: spawn agent, send message, auto-forward output, fan-in with template, pause for user input, iterate over a list. Six exist in v1; see §4. (Saving and invoking a reusable workflow is the composition layer over these primitives, not itself a primitive — see §5.) |
-| **Workflow** | A named, parameterized composition of primitives — for example "fan-out review and aggregate." Defined as a YAML file under `<project>/.switchboard/workflows/`. Invoked by name with arguments. |
+| **Workflow** | A named, parameterized composition of primitives — for example "fan-out review and aggregate." Defined as a YAML file under `<directory>/.switchboard/workflows/` (workflows are directory-scoped, shared across projects in that directory; rationale below). Invoked by name with arguments against a specific project. |
 | **Prompt template** | A named prompt definition resolved by ID at routing time. Used as message content (sent to an agent) or as a wrapper applied around aggregated outputs before forwarding (used in fan-in; see §4 Primitive 4). |
 | **Prompt provider** | A source of prompts Switchboard resolves IDs against. Two implementations ship in v1: `local` (file store) and any registered MCP-server provider. Addressed by prefix (e.g. `local:code-review`, `tiddly:code-review`). See §6. |
 | **Routing** | Message passing between agents. Includes fan-out (one source, many recipients), fan-in (many sources, one recipient, with template wrapping), and sequential handoff. |
 | **Harness session** | The underlying Claude Code or Codex session that backs an agent. Persisted on disk by the harness; resumed via `--resume`. |
 
-A note on terminology: "session" in the agent ecosystem is overloaded. Switchboard uses **project** for its top-level workspace concept and reserves **session** to mean the underlying harness session backing a single agent.
+A note on terminology: "session" in the agent ecosystem is overloaded. Switchboard uses **project** for its task-scoped workspace concept (multiple projects per working directory) and reserves **session** to mean the underlying harness session backing a single agent.
 
-### Project directory layout
+### Why multiple projects per working directory
 
-Each project's Switchboard-managed state lives in a `.switchboard/` directory at the project root. The shape (illustrative; exact contents TBD):
+A single working directory (a git repo) often hosts multiple in-flight workstreams: planning a feature while implementing another, backend changes alongside frontend changes, several `plan-*.md` documents being drafted in parallel. Switchboard accommodates this by letting the user create multiple **projects** under the same working directory — each with its own agents, workflows-in-flight, and state. Switching the active project in the UI is a display change only; non-active projects keep running in the background (workflows don't pause, agents don't unsubscribe). v1 is single-window; multi-window is not in scope.
+
+### Directory layout
+
+Switchboard-managed state lives in a `.switchboard/` directory at the working directory's root. The shape (illustrative):
 
 ```
-<project>/
+<directory>/
 └── .switchboard/
-    ├── config.yaml         # project config (registered MCP providers, harness flags, etc.)
-    ├── workflows/           # workflow definitions (YAML)
-    ├── prompts/            # local prompts (markdown body + YAML frontmatter)
-    └── state/              # runtime state (agent registry, harness session IDs, workflow-run checkpoints)
+    ├── config.yaml             # directory-level config (placeholder in v1; mostly empty)
+    ├── workflows/              # workflow definitions (YAML), shared across projects in this directory
+    ├── prompts/                # local prompts (markdown body + YAML frontmatter), shared across projects
+    ├── projects.jsonl          # append-only index of projects: { id, name, created_at }
+    └── projects/
+        └── <project-id>/       # per-project state (one subdirectory per project)
+            ├── config.yaml     # per-project config
+            ├── instance.lock   # M3+ flock — one Switchboard process per project at a time
+            ├── registry.jsonl  # agent registry for this project (append-only)
+            ├── sessions/       # M2+ — Codex session-link sidecar files (per agent)
+            └── runs/           # M5+ — workflow-run checkpoints
 ```
 
-`config.yaml`, `workflows/`, and `prompts/` are intended to be checked into git and shared. `state/` is local-machine runtime data and should be `.gitignore`d.
+**What's directory-scoped vs project-scoped:** workflows and local prompts are directory-scoped — defined once per repo, reusable across projects. Agents, runtime state, workflow runs, and harness session links are project-scoped — each project has its own. Rationale: workflow definitions and prompt libraries are about *how to do the work*; they belong to the repo. Agents and runtime state are about *the work in progress*; they belong to the project (the task).
 
-State is kept project-local rather than in a user-global registry so that opening the project from a different machine surfaces "no state yet" explicitly rather than silently dereferencing stale registry entries.
+The directory-level `config.yaml`, `workflows/`, and `prompts/` are intended to be checked into git and shared. Everything else — `projects.jsonl`, the entire `projects/` tree (including per-project `config.yaml`, `registry.jsonl`, `sessions/`, `runs/`), and lock files — is local-machine runtime data and should be `.gitignore`d.
+
+State is kept directory-local (not user-global) so that opening the directory from a different machine surfaces "no projects yet" explicitly rather than silently dereferencing stale registry entries.
+
+**Default project on first init.** When a working directory is initialized for the first time, Switchboard auto-suggests creating one project named after the directory's basename (e.g., directory `switchboard` → suggested project name `switchboard`). The user can override the name or skip and pick later. Rationale: removes friction on first use; the implicit assumption is that users who don't multi-project still get a usable default.
+
+**Project name uniqueness within a directory** uses the same canonicalization as agent names (per §4 Primitive 1): hyphens normalized to underscores, lowercased, for the uniqueness check only — `feature-a` and `feature_a` collide; `feature-A` and `feature-a` collide. Stored verbatim as the user typed.
+
+**Deletion in v1.** Project and agent deletion are deliberately out of scope for v1. No UI affordance, no command-level deletion API, no canonical deletion semantics are defined. Users may manually edit `.switchboard/` state at their own risk (the file formats are documented), but this is not a supported workflow — first-class deletion semantics (cascade behavior, in-flight flock handling, append-only-vs-tombstone, history retention) will be specified when the feature is added. Tracked: M3 may add project deletion via the project switcher; agent deletion is unscheduled.
 
 ## 4. Functional primitives
 
@@ -198,7 +218,7 @@ The DSL exposes fan-in as `wait_for_all` + a `send` step (using either helper ab
 
 ### Authoring
 
-Workflows are authored as YAML files at `<project>/.switchboard/workflows/`. Because they live inside the project directory, they are naturally version-controlled along with the project itself — diffed, reviewed, and shared via the user's normal git workflow. There is no directory-picker step in Switchboard's UI; the location is conventional.
+Workflows are authored as YAML files at `<directory>/.switchboard/workflows/` (directory-scoped — shared across all projects in that working directory; see §3 for the rationale). Because they live inside the working directory, they are naturally version-controlled along with the repo — diffed, reviewed, and shared via the user's normal git workflow. There is no directory-picker step in Switchboard's UI; the location is conventional.
 
 Authoring is intentionally file-based. The user edits workflows in whichever editor they prefer (Vim, VS Code, etc.); Switchboard's UI reads the files but does not include an editor of its own. The supported authoring path for new users is to point an existing Claude Code or Codex agent at `docs/agent-instructions/workflows.md` and have it generate a starter workflow from a description (per §2 "Agent-friendly authoring"). Hand-authoring against the DSL spec works too for power users.
 
@@ -206,7 +226,7 @@ v1 ships with a small library of built-in workflows (review-and-aggregate, seque
 
 Users without an existing Claude Code or Codex installation outside Switchboard can use a Switchboard-spawned agent itself to author a workflow from the instruction docs — agents Switchboard manages are full Claude Code / Codex sessions and can read project files normally. Hand-authoring against the DSL spec also works for power users.
 
-Workflow files are project-scoped only — there is no user-global workflow directory parallel to user-global prompts. Reuse across projects happens via copy or symlink. (Asymmetric with prompts on purpose: workflows tend to be project-shaped — they reference specific agent names and project-specific structure — whereas prompts are more reusable as personal templates.)
+Workflow files are **directory-scoped** — there is no user-global workflow directory parallel to user-global prompts. Workflows live under `<directory>/.switchboard/workflows/` and are shared across all projects in that working directory (per §3 directory layout). Reuse across *different* working directories (different repos) happens via copy or symlink. (Asymmetric with prompts on purpose: prompts are user-portable templates while workflows are repo-shaped — they reference the conventions of a specific codebase. But within a single repo, workflows are shared infrastructure, not per-task — multiple projects in the same directory invoke the same workflow definitions against their own agents.)
 
 ## 6. Prompts and prompt providers
 
@@ -218,12 +238,12 @@ A **prompt** is a reusable, optionally parameterized text template — for examp
 
 Two providers ship in v1:
 
-- **Local file store.** Prompts authored as files (markdown body with YAML frontmatter for metadata: name, description, arguments). Resolved across one or more directories: a fixed project scope at `<project>/.switchboard/prompts/`, plus an ordered list of user-configured directories (`local_prompt_dirs` in config — see "Configuring local prompt directories" below). This lets a power user keep their personal prompt library in their own git repo (e.g. `~/repos/my-prompts/`) instead of being limited to the OS-conventional app data directory. The local store is the lowest-friction way to author a prompt and the mechanism Switchboard uses to ship example prompts.
+- **Local file store.** Prompts authored as files (markdown body with YAML frontmatter for metadata: name, description, arguments). Resolved across one or more directories: a fixed directory scope at `<directory>/.switchboard/prompts/` (shared across all projects in that working directory; see §3), plus an ordered list of user-configured directories (`local_prompt_dirs` in config — see "Configuring local prompt directories" below). This lets a power user keep their personal prompt library in their own git repo (e.g. `~/repos/my-prompts/`) instead of being limited to the OS-conventional app data directory. The local store is the lowest-friction way to author a prompt and the mechanism Switchboard uses to ship example prompts.
 - **MCP-server provider.** Resolves IDs against any MCP server the user has configured that exposes prompts. [Tiddly](https://tiddly.me) is the canonical example and the development reference, but the integration is generic: pointing Switchboard at a different MCP prompt server is a configuration change, not a code change.
 
 ### Authoring a local prompt
 
-A local prompt is a single file. Example (`<project>/.switchboard/prompts/code-review.md`):
+A local prompt is a single file. Example (`<directory>/.switchboard/prompts/code-review.md`):
 
 ```markdown
 ---
@@ -261,12 +281,12 @@ This minimal set mirrors the MCP `prompts/list` standard, plus Tiddly's tag exte
 Both local prompt directories (`local_prompt_dirs`) and MCP-server providers (`mcp_providers`) are declared in YAML config at one of two scopes:
 
 - **User-global**: `~/.config/switchboard/config.yaml` (path resolved per OS via the Rust `directories` crate). For personal preferences — your prompt library location, your Tiddly account, etc.
-- **Project-scoped**: `<project>/.switchboard/config.yaml`. Adds or replaces user-global config. Useful when a team workflow needs a specific MCP provider (e.g., a team Tiddly URL distinct from the user's personal one) or when a project ships its own curated set of prompt directories.
+- **Directory-scoped**: `<directory>/.switchboard/config.yaml`. Adds or replaces user-global config. Useful when a team workflow needs a specific MCP provider (e.g., a team Tiddly URL distinct from the user's personal one) or when a repo ships its own curated set of prompt directories. Shared across all projects in that working directory.
 
 Resolution rules differ slightly between the two keys:
 
-- **`local_prompt_dirs`**: project's list, if set, *replaces* the user-global list (project intent is explicit).
-- **`mcp_providers`**: project providers shadow user-global providers with the same `name` (entry-level merge); the user's other providers stay available.
+- **`local_prompt_dirs`**: directory's list, if set, *replaces* the user-global list (directory intent is explicit).
+- **`mcp_providers`**: directory providers shadow user-global providers with the same `name` (entry-level merge); the user's other providers stay available.
 
 **Example config:**
 
@@ -312,7 +332,7 @@ The prefix is the user-chosen registration name for an MCP-server provider, so a
 
 - **Workflow files require explicit prefix.** Every prompt reference in a workflow is fully qualified (e.g. `local:code-review`, `tiddly:code-review`). This keeps workflow files portable: a workflow shared between projects always resolves to the same prompt source, regardless of how the receiving user has their providers configured. There is no concept of a "default provider" for unprefixed lookup in workflow files.
 - **Prefixed lookup is strict.** A prefixed ID resolves only against the named provider; if not found, it errors. No cross-provider fallback.
-- **Local-store resolution.** Project scope (`<project>/.switchboard/prompts/`) is checked first, then each directory in `local_prompt_dirs` (from project config if present, otherwise from user config) in declared order. Default value if not configured: `[<OS-conventional path>]` (e.g. `~/.config/switchboard/prompts/` on Linux, resolved via the Rust [`directories`](https://crates.io/crates/directories) crate). A prompt with the same name in an earlier-checked directory shadows later ones — intentional, lets a project override a personal library, lets a personal library override a team library, etc. Project config's `local_prompt_dirs` (if set) replaces the user-config list rather than merging, so the project's intent is explicit.
+- **Local-store resolution.** Directory scope (`<directory>/.switchboard/prompts/`) is checked first, then each directory in `local_prompt_dirs` (from directory config if present, otherwise from user config) in declared order. Default value if not configured: `[<OS-conventional path>]` (e.g. `~/.config/switchboard/prompts/` on Linux, resolved via the Rust [`directories`](https://crates.io/crates/directories) crate). A prompt with the same name in an earlier-checked directory shadows later ones — intentional, lets a working directory override a personal library, lets a personal library override a team library, etc. Directory config's `local_prompt_dirs` (if set) replaces the user-config list rather than merging, so the directory's intent is explicit.
 - **Interactive UI ergonomics.** When the user types a slash command in the message bar, the UI may provide autocomplete across all configured providers and may accept a bare name if it matches exactly one provider's prompt. This is a UI-layer affordance only — it does not affect how workflows or other persisted artifacts reference prompts.
 - **Prompt versioning is out of scope for v1.** Workflow references resolve to whatever the provider returns at invocation time; if a Tiddly prompt is edited, every workflow referencing it picks up the new version on the next invocation. Recovery and history are deferred to the upstream tool — Tiddly's own version history for hosted prompts, git for local prompts.
 
@@ -778,7 +798,7 @@ Aggregated from inline flags above, plus a few additional:
 - ~~**6.1** MiniJinja subset and template-available variables.~~ **Resolved in `docs/workflow-spec.md` §Templating** (supported / unsupported MiniJinja features, available variable scopes, built-in template functions).
 - ~~**10.1** What does Switchboard do when an agent's "next assistant response" is a tool call rather than text?~~ **Resolved by hands-on probe:** both harnesses run the model → tool_use → tool_result → model loop internally and emit a single terminal event per user-initiated turn (Claude Code: `result`; Codex: `turn.completed` / `turn.failed`). Switchboard always sees a complete turn — there is no "tool-call-only response" to handle. See [docs/research/harness-comparison.md](research/harness-comparison.md).
 - ~~**10.2** When two workflows reference the same agent, what happens? Disallow concurrent use? Queue? Refuse?~~ **Resolved by hands-on probe:** Switchboard enforces one in-flight turn per agent at the application layer; collisions are refused with a clear error. Queueing is deferred. See §7 "Agent contention" and [docs/research/same-session-parallel-invocation.md](research/same-session-parallel-invocation.md). The harnesses themselves do not error on same-session parallel invocation — they silently corrupt (Claude Code: orphan branch in session tree) or conflate (Codex: interleaved transcript) — so this enforcement must live in Switchboard.
-- **10.3** Persistence schema for project/agent registry and workflow-run checkpoints (kept in `<project>/.switchboard/state/`, per §3). The user-visible restart UX (interrupted-at-step-N + retry/abandon, including iteration index/value for Primitive 6) is committed in §7 "Walking away"; what remains open is the on-disk format (JSONL append-only, SQLite, or otherwise), atomicity guarantees on concurrent agent-spawn-during-write, and the eventual pruning story. Mid-step recovery (resuming an interrupted in-flight turn) remains out of scope.
+- **10.3** Persistence schema for project/agent registry and workflow-run checkpoints (kept under `<directory>/.switchboard/projects/<project-id>/`, per §3). The user-visible restart UX (interrupted-at-step-N + retry/abandon, including iteration index/value for Primitive 6) is committed in §7 "Walking away"; what remains open is the on-disk format (JSONL append-only, SQLite, or otherwise), atomicity guarantees on concurrent agent-spawn-during-write, and the eventual pruning story. Mid-step recovery (resuming an interrupted in-flight turn) remains out of scope.
 - ~~**10.4** Workflow versioning.~~ **Resolved (commitment).** Workflow runs execute against an immutable snapshot of the workflow file and its bound inputs, captured at invocation. Prompt resolution still happens at each step's dispatch (per §6 prompt resolution rules) — edits to a referenced prompt take effect on the next workflow invocation, not the in-flight run. Edits to the workflow file on disk after invocation do not affect the in-flight run or retries; the snapshot is what executes. Rationale: deterministic execution and deterministic retry; reload-on-retry would create incoherent "same run, different program" behavior given step-index checkpointing.
 - ~~**10.5** Notifications when a workflow completes — terminal bell? OS notification? Just visible state in the UI?~~ **Resolved by §10 form factor commitment:** OS-native notifications via Tauri's notification plugin. See §7 "Watching a workflow run" for when notifications fire. Remaining UX details (which events notify, user opt-out controls) are implementation choices, not plan-level questions.
 - **10.6** Multi-machine workflows (running Switchboard on a remote dev machine over SSH). Out of scope for v1, but the architecture should not fight it.

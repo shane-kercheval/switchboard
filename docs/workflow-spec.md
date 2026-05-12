@@ -21,12 +21,12 @@ It is **not** a user tutorial. Tutorial-style authoring guidance lives in `docs/
 What is **out of scope** for this doc:
 
 - Parser internals (recursive descent vs YAML library choice — M5 implementation)
-- Persistence-layer encoding of workflow runs (`state/runs/<run-id>.jsonl` schema — M5 expansion)
+- Persistence-layer encoding of workflow runs (`<directory>/.switchboard/projects/<project-id>/runs/<run-id>.jsonl` schema — M5 expansion)
 - UI rendering of workflow progress (system-design §7)
 
 ## File location and naming
 
-- Workflow files live under `<project>/.switchboard/workflows/`
+- Workflow files live under `<directory>/.switchboard/workflows/` (directory-scoped — shared across all projects in that working directory; see system-design §3)
 - One workflow per file; filename matches the workflow's declared `name` (e.g., `review-and-aggregate.yaml`)
 - File extension: `.yaml` (preferred) or `.yml`
 
@@ -554,7 +554,7 @@ Using any reserved key in a v1 workflow file is a parse-time validation error.
 
 The following are *implementation* details, not language-spec details, and live in M5's per-milestone expansion (see `docs/v1-plan.md`):
 
-- On-disk encoding of workflow runs (`<project>/.switchboard/state/runs/<run-id>.jsonl` schema)
+- On-disk encoding of workflow runs (`<directory>/.switchboard/projects/<project-id>/runs/<run-id>.jsonl` schema)
 - Concurrency model for parallel `send` dispatches within a `wait_for_all`
 - Tauri command shapes for invoking workflows from the Svelte frontend
 - Workflow-progress event payload format for the frontend ring buffer

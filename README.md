@@ -8,19 +8,13 @@ Switchboard lets you spawn multiple Claude Code and Codex sessions in a single p
 
 It's built for anyone who wants explicit, human-in-the-loop control over multi-agent workflows — not an opinionated SDLC engine, not a full agent replacement, just the coordination layer between agents you're already using.
 
-## Status
-
-Early development. Design is being captured in [`docs/system-design.md`](./docs/system-design.md).
-
-Switchboard will ship as a single-binary desktop app (built with Tauri) — installable via Homebrew on macOS, `.deb`/`.rpm` on Linux, and a signed `.msi` installer on Windows once available.
-
-This is not yet usable software. Star or watch the repo if you want to follow along.
-
 ## Why
 
 Running multiple AI coding agents in parallel — one to plan, others to review, one to implement — produces meaningfully better results than running a single agent, but the manual coordination overhead (copy-paste between terminals, tracking which agent has which context, applying prompt templates by hand) is busywork that should be automated so you can spend that time on the parts that need judgment.
 
 Switchboard removes the coordination overhead while keeping the human in the loop where judgment matters: deciding what to route, when to revise, when to proceed.
+
+The goal isn't to give the AI a task and review what it produced. It's to stay in the decisions that matter — is this plan good enough to implement? which review feedback is worth acting on? — while automating the mechanical routing in between. Switchboard is the coordination layer; you're still the one making the calls.
 
 There is also a quieter benefit: because Switchboard resolves prompts itself and sends agents plain text, your prompt library lives in one place and works identically with both Claude Code and Codex agents — without configuring the prompt source in either harness. Especially useful for Codex, where MCP prompt support is limited.
 
@@ -38,6 +32,14 @@ There is also a quieter benefit: because Switchboard resolves prompts itself and
 - Managing git, CI, or PR workflows. Out of scope.
 - Cross-session persistent agent memory. Possibly a future addition; not in scope for v1.
 - A hosted / SaaS service. Switchboard runs locally on your machine. A future hosted service may exist for cross-machine sync of workflows and prompts; that is not v1.
+
+## Status
+
+Early development. Design is being captured in [`docs/system-design.md`](./docs/system-design.md).
+
+Switchboard will ship as a single-binary desktop app (built with Tauri) — installable via Homebrew on macOS, `.deb`/`.rpm` on Linux, and a signed `.msi` installer on Windows once available.
+
+This is not yet usable software. Star or watch the repo if you want to follow along.
 
 ## Design and discussion
 

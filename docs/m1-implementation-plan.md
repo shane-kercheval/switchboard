@@ -165,6 +165,7 @@ Pure-Rust persistence layer for working directories, projects (multiple per dire
 - The directory's `.switchboard/` folder lives **directly inside the working directory** (not in `~/.switchboard/...`). Per system-design §3.
 - Both the **agent registry** and the **project index** hold **N entries from day one** (forward-compatible with the project switcher UI in M3 and the agent selector UI in M2). M1.5's UI exposes one active project displaying one agent — switchers come in later milestones.
 - Switchboard does **not** modify the user's `.gitignore`. The directory-level `config.yaml`, `workflows/`, and `prompts/` are intended to be git-tracked; everything else under `.switchboard/` is runtime data the user should `.gitignore` themselves. Switchboard touching `.gitignore` would be invasive for a tool that touches user repos.
+- **User-global config (OS-conventional path via the `directories` crate; for `local_prompt_dirs` and MCP provider configs per `system-design.md` §6) is M4+ scope — M1 does not read or write it.** M1 has no prompts (M4) and no MCP (M4), so nothing in M1's scope materializes the user-global layer. The `directories` crate dependency, the schema, the override-vs-fallback resolution logic, and the tests all land alongside prompt providers in M4. Implementing agent: do not add user-global config handling to M1; the silence is intentional.
 
 ### Implementation outline
 

@@ -230,6 +230,43 @@ Probed by spawning `claude -p "Write a 100-line poem..."`, waiting 20 seconds (l
 3. Buffers the stream output independently if it wants to surface partial content (the session file won't have it).
 4. After cancel, the agent's harness session is preserved and can be re-sent messages immediately.
 
+## M1.3 implementation findings (2026-05-13)
+
+These observations came from building `ClaudeCodeAdapter` and running the live integration tests (`tests/live.rs`).
+
+### `--verbose` is mandatory with `--include-partial-messages --output-format stream-json`
+
+Without `--verbose`, the `stream_event` delta lines are absent from the output even when `--include-partial-messages` is passed. The required flag combination for streaming text deltas is:
+
+```
+claude -p <prompt> \
+  --output-format stream-json \
+  --include-partial-messages \
+  --verbose \
+  --dangerously-skip-permissions \
+  [--session-id <uuid>]
+```
+
+`--verbose` is not optional here — omitting it silently produces a stream without `content_block_delta` events.
+
+### `--session-id` idempotency confirmed
+
+Passing a fresh UUID v7 via `--session-id` creates a new session without requiring `--resume`. Confirmed: two sequential turns using the same `session_id` both complete successfully (first creates the session, second resumes it). Switchboard uses the always-pass pattern: `--session-id` is included on every dispatch regardless of whether the session has been used before.
+
+### Exact `stream_event` shape with `--include-partial-messages`
+
+```json
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}}
+```
+
+Tool input streaming emits `input_json_delta` instead of `text_delta` — these must be skipped (tool input is not displayed as content):
+
+```json
+{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}}
+```
+
+The terminal `assistant` message carries the complete assembled text in its `content` blocks. With `--include-partial-messages`, this arrives *after* the delta stream and must be explicitly skipped to avoid double-emitting the text as `ContentChunk`s. The parser skips top-level `type: "assistant"` events for this reason.
+
 ## Things still worth probing
 
 - **`--input-format stream-json`** — for sending follow-up messages mid-stream without restarting the process. Could matter for the "long-lived agent process" deferred decision.

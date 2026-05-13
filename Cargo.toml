@@ -27,6 +27,7 @@ which = "8"
 async-trait = "0.1"
 futures = "0.3"
 tempfile = "3"
+tokio-stream = "0.1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

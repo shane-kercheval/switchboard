@@ -11,9 +11,9 @@ The current milestone is **M1** — the smallest end-to-end vertical slice with 
 ## Architecture overview
 
 - **Rust workspace** (`crates/`) built on Tauri 2.x.
-  - `crates/app/` — Tauri host. Owns Tauri commands, app state, window. Wired to `crates/core` in M1.4; `crates/harness` is added in M1.3.
+  - `crates/app/` — Tauri host. Owns Tauri commands, app state, window. Wired to `crates/core` and `crates/harness` in M1.4.
   - `crates/core/` — pure-Rust persistence layer: `Directory`, `Project`, `AgentRecord`, name validation, JSONL/YAML I/O. No Tauri dependency. Future home of the `Dispatcher` (M1.4).
-  - Future: `crates/harness/` (per-harness adapters, M1.3).
+  - `crates/harness/` — per-harness adapters (M1.3). `ClaudeCodeAdapter`, `MockHarnessAdapter`, event types, stream parser. No Tauri dependency.
 - **Frontend** — plain Svelte 5 + Vite + TypeScript + Tailwind v4. Lives at repo root (`src/`, `index.html`, `vite.config.ts`). shadcn-svelte will be initialized in M1.5 when the first UI components land — peer deps (`bits-ui`, `tw-animate-css`) are already installed so `shadcn-svelte init` will be a no-op on the install side.
 - **Tauri shell** glues frontend to Rust via `#[tauri::command]` handlers and per-agent event channels.
 
@@ -102,6 +102,14 @@ Prerequisites: see `README.md`. The Rust toolchain is pinned in `rust-toolchain.
 **ID convention (M1.2).** All IDs (`AgentId`, `ProjectId`, future `TurnId`, Claude `session_id`) are UUID v7. Time-ordered, serde-friendly, opaque to consumers.
 
 **Pre-generated Claude session IDs (M1.2).** For `HarnessKind::ClaudeCode` agents, `AgentRecord.session_id` is generated at registration time and stored on the record. The M1.3 adapter passes it to `claude` via `--session-id <uuid>`. For future Codex agents (M2+), `session_id` stays `None` — Codex assigns its own ID and stores it in a per-agent sidecar.
+
+**Stream contract (M1.3).** Every turn produces exactly one `TurnEnd` event — the final event on the stream. Adapters must synthesize `TurnEnd(Failed { kind: AdapterFailure })` if stdout closes without a `result` event (truncated stream). `TurnStart` is *not* emitted by adapters — it is dispatcher-owned (M1.4) and synthesized before the stream is handed to consumers. This invariant is type-enforced: `AdapterEvent` has no `TurnStart` variant.
+
+**Adapter/dispatcher boundary (M1.3).** `AdapterEvent` carries only `ContentChunk` and `TurnEnd`. `NormalizedEvent` adds `TurnStart` (constructed by the M1.4 dispatcher). `From<AdapterEvent> for NormalizedEvent` lifts adapter events to the wire format. Consumers on the frontend always see `NormalizedEvent`.
+
+**`MockHarnessAdapter` (M1.3).** `MockScenario::Streaming` emits 3 `ContentChunk`s then `TurnEnd(Completed)`. `MockScenario::Panic` intentionally violates the stream contract (panics before `TurnEnd`) — its only legitimate use is testing the M1.4 dispatcher's `AgentIdleGuard` Drop path. Do not use `MockScenario::Panic` for any other purpose.
+
+**Exit-code reconciliation (M1.3).** If `TurnEnd(Completed)` is emitted and the subprocess then exits non-zero, the adapter logs `tracing::warn!` only — it does not emit a second `TurnEnd`. Consumers always see exactly one terminal event.
 
 ## Authoritative docs
 

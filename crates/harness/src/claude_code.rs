@@ -54,7 +54,7 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         turn_id: TurnId,
     ) -> Result<EventStream, DispatchError> {
         let binary = resolve_binary(&self.claude_binary_path)?;
-        let args = build_args(agent, prompt);
+        let args = build_args(agent, prompt, project_root);
 
         let mut child = tokio::process::Command::new(&binary)
             .args(&args)
@@ -94,7 +94,7 @@ fn resolve_binary(path: &Path) -> Result<PathBuf, DispatchError> {
     which::which(path).map_err(|_| DispatchError::BinaryNotFound)
 }
 
-fn build_args(agent: &AgentRecord, prompt: &str) -> Vec<String> {
+fn build_args(agent: &AgentRecord, prompt: &str, project_root: &Path) -> Vec<String> {
     let mut args = vec![
         "-p".to_owned(),
         prompt.to_owned(),
@@ -105,10 +105,37 @@ fn build_args(agent: &AgentRecord, prompt: &str) -> Vec<String> {
         "--dangerously-skip-permissions".to_owned(),
     ];
     if let Some(session_id) = agent.session_id {
-        args.push("--session-id".to_owned());
+        // --session-id creates a new session with the given UUID (first turn).
+        // --resume continues an existing session (all subsequent turns).
+        // Claude Code stores sessions at ~/.claude/projects/<encoded-cwd>/<uuid>.jsonl;
+        // we check that path to pick the right flag.
+        if session_file_exists(project_root, &session_id) {
+            args.push("--resume".to_owned());
+        } else {
+            args.push("--session-id".to_owned());
+        }
         args.push(session_id.to_string());
     }
     args
+}
+
+/// Returns true if Claude Code has already persisted a session file for the
+/// given session UUID in the given working directory.
+fn session_file_exists(project_root: &Path, session_id: &uuid::Uuid) -> bool {
+    let Ok(canonical) = project_root.canonicalize() else {
+        return false;
+    };
+    // Claude Code encodes the cwd as the absolute path with every '/' replaced by '-'.
+    let encoded = canonical.to_string_lossy().replace('/', "-");
+    let Ok(home) = std::env::var("HOME") else {
+        return false;
+    };
+    PathBuf::from(home)
+        .join(".claude")
+        .join("projects")
+        .join(&encoded)
+        .join(format!("{session_id}.jsonl"))
+        .exists()
 }
 
 async fn run_producer(

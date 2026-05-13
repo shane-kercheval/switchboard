@@ -101,9 +101,9 @@ Prerequisites: see `README.md`. The Rust toolchain is pinned in `rust-toolchain.
 
 **ID convention (M1.2).** All IDs (`AgentId`, `ProjectId`, future `TurnId`, Claude `session_id`) are UUID v7. Time-ordered, serde-friendly, opaque to consumers.
 
-**Pre-generated Claude session IDs (M1.2).** For `HarnessKind::ClaudeCode` agents, `AgentRecord.session_id` is generated at registration time and stored on the record. The M1.3 adapter passes it to `claude` via `--session-id <uuid>`. For future Codex agents (M2+), `session_id` stays `None` — Codex assigns its own ID and stores it in a per-agent sidecar.
+**Pre-generated Claude session IDs (M1.2).** For `HarnessKind::ClaudeCode` agents, `AgentRecord.session_id` is generated at registration time and stored on the record. The M1.3 adapter uses `--session-id <uuid>` for the first turn (creates the session) and `--resume <uuid>` for subsequent turns (resumes it), distinguished by checking whether `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl` exists. For future Codex agents (M2+), `session_id` stays `None` — Codex assigns its own ID and stores it in a per-agent sidecar.
 
-**Stream contract (M1.3).** Every turn produces exactly one `TurnEnd` event — the final event on the stream. Adapters must synthesize `TurnEnd(Failed { kind: AdapterFailure })` if stdout closes without a `result` event (truncated stream). `TurnStart` is *not* emitted by adapters — it is dispatcher-owned (M1.4) and synthesized before the stream is handed to consumers. This invariant is type-enforced: `AdapterEvent` has no `TurnStart` variant.
+**Stream contract (M1.3).** Every turn produces exactly one `TurnEnd` event — the final event on the stream. Adapters must synthesize `TurnEnd(Failed { kind: AdapterFailure })` if stdout closes without a `result` event (truncated stream). `TurnStart` is _not_ emitted by adapters — it is dispatcher-owned (M1.4) and synthesized before the stream is handed to consumers. This invariant is type-enforced: `AdapterEvent` has no `TurnStart` variant.
 
 **Adapter/dispatcher boundary (M1.3).** `AdapterEvent` carries only `ContentChunk` and `TurnEnd`. `NormalizedEvent` adds `TurnStart` (constructed by the M1.4 dispatcher). `From<AdapterEvent> for NormalizedEvent` lifts adapter events to the wire format. Consumers on the frontend always see `NormalizedEvent`.
 

@@ -249,9 +249,17 @@ claude -p <prompt> \
 
 `--verbose` is not optional here — omitting it silently produces a stream without `content_block_delta` events.
 
-### `--session-id` idempotency confirmed
+### `--session-id` vs `--resume` for session continuity
 
-Passing a fresh UUID v7 via `--session-id` creates a new session without requiring `--resume`. Confirmed: two sequential turns using the same `session_id` both complete successfully (first creates the session, second resumes it). Switchboard uses the always-pass pattern: `--session-id` is included on every dispatch regardless of whether the session has been used before.
+`--session-id <uuid>` **creates** a new session with the given UUID. It does NOT resume an existing session — passing `--session-id` with a UUID that already has a persisted session file fails the second turn.
+
+`--resume <uuid>` **resumes** an existing session by UUID.
+
+The correct adapter pattern:
+- **First turn** (no session file exists): `--session-id <uuid>`
+- **Subsequent turns** (session file exists at `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`): `--resume <uuid>`
+
+`ClaudeCodeAdapter` checks `~/.claude/projects/<canonicalized-cwd-with-/-replaced-by-->/<uuid>.jsonl` at dispatch time to pick the right flag. This was confirmed by the `live_session_id_idempotency_confirmed` test: two sequential turns sharing the same `session_id` both complete when the first uses `--session-id` and the second uses `--resume`.
 
 ### Exact `stream_event` shape with `--include-partial-messages`
 

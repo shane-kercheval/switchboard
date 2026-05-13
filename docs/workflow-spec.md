@@ -552,7 +552,7 @@ Using any reserved key in a v1 workflow file is a parse-time validation error.
 
 ## Out-of-scope decisions deferred to M5 expansion
 
-The following are *implementation* details, not language-spec details, and live in M5's per-milestone expansion (see `docs/v1-plan.md`):
+The following are *implementation* details, not language-spec details, and live in M5's per-milestone expansion (see `docs/implementation_plans/2026-05-12-v1.md`):
 
 - On-disk encoding of workflow runs (`<directory>/.switchboard/projects/<project-id>/runs/<run-id>.jsonl` schema)
 - Concurrency model for parallel `send` dispatches within a `wait_for_all`

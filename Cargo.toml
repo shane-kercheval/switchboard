@@ -40,8 +40,6 @@ module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 must_use_candidate = "allow"
-# Singular vs plural pairs (`agent_a` vs `agents_a`) are intentional and read clearly.
-similar_names = "allow"
 
 [profile.release]
 codegen-units = 1

@@ -1,5 +1,4 @@
-use std::fs::{File, OpenOptions, create_dir_all};
-use std::io::{BufRead, BufReader, Write};
+use std::fs::{File, create_dir_all};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -9,6 +8,7 @@ use uuid::Uuid;
 use crate::agent::AgentRecord;
 use crate::error::{CoreError, Result};
 use crate::harness::HarnessKind;
+use crate::io::{append_jsonl, read_jsonl, read_yaml, write_yaml};
 use crate::name::{canonicalize_for_uniqueness, validate_name};
 
 pub type ProjectId = Uuid;
@@ -24,7 +24,9 @@ pub struct ProjectSummary {
     pub created_at: DateTime<Utc>,
 }
 
-/// On-disk shape of `<directory>/.switchboard/projects/<id>/config.yaml`.
+/// On-disk shape of `<directory>/.switchboard/projects/<id>/config.yaml`. This
+/// is the canonical source of truth for a project's identity; the matching
+/// entry in `projects.jsonl` is denormalized for fast listing.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectConfig {
     pub version: u32,
@@ -36,7 +38,6 @@ pub struct ProjectConfig {
 #[derive(Debug, Clone)]
 pub struct Project {
     pub id: ProjectId,
-    pub name: String,
     pub directory: PathBuf,
     pub config: ProjectConfig,
     pub root: PathBuf,
@@ -44,10 +45,25 @@ pub struct Project {
 }
 
 impl Project {
+    /// User-facing project name, sourced from `config.yaml` (the canonical
+    /// record; the `projects.jsonl` summary's `name` is a denormalized copy).
+    pub fn name(&self) -> &str {
+        &self.config.name
+    }
+
     /// Append a new agent to this project's registry. Validates the name (regex +
     /// per-project uniqueness with hyphen↔underscore + case normalization), generates
     /// a UUID v7 `AgentId`, and (for Claude Code) pre-generates a UUID v7 `session_id`
     /// the M1.3 adapter will pass via `--session-id <uuid>`.
+    ///
+    /// # Concurrency
+    ///
+    /// Not safe to call concurrently against the *same `Project` instance* — the
+    /// read-check-then-append sequence has a TOCTOU window. Callers must
+    /// serialize access (the M1.4 dispatcher / `AppState` mutex does this).
+    /// Concurrent calls against *different* `Project` instances (in the same
+    /// or different directories) are fine; M3's `instance.lock` provides
+    /// cross-process serialization.
     pub fn register_agent(&self, name: &str, harness: HarnessKind) -> Result<AgentRecord> {
         validate_name(name)?;
         let canonical = canonicalize_for_uniqueness(name);
@@ -97,7 +113,6 @@ pub(crate) fn load(directory: &Path, id: ProjectId, root: PathBuf) -> Result<Pro
     let registry_path = root.join("registry.jsonl");
     Ok(Project {
         id,
-        name: config.name.clone(),
         directory: directory.to_owned(),
         config,
         root,
@@ -107,7 +122,7 @@ pub(crate) fn load(directory: &Path, id: ProjectId, root: PathBuf) -> Result<Pro
 
 /// Create a new project's on-disk artifacts (config.yaml + empty registry.jsonl).
 /// The caller (`Directory`) is responsible for appending the `ProjectSummary` to
-/// projects.jsonl.
+/// projects.jsonl — and for rolling back the directory if that append fails.
 pub(crate) fn create_on_disk(
     directory: &Path,
     projects_dir: &Path,
@@ -136,7 +151,6 @@ pub(crate) fn create_on_disk(
     };
     let project = Project {
         id,
-        name: name.to_owned(),
         directory: directory.to_owned(),
         config,
         root,
@@ -145,65 +159,10 @@ pub(crate) fn create_on_disk(
     Ok((summary, project))
 }
 
-pub(crate) fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let line = serde_json::to_string(value).map_err(|e| CoreError::CorruptJsonl {
-        path: path.to_owned(),
-        line_number: 0,
-        line: String::new(),
-        source: e,
-    })?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|e| CoreError::io(path, e))?;
-    writeln!(file, "{line}").map_err(|e| CoreError::io(path, e))?;
-    file.flush().map_err(|e| CoreError::io(path, e))?;
-    Ok(())
-}
-
-pub(crate) fn read_jsonl<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
-    let file = match File::open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(CoreError::io(path, e)),
-    };
-    let reader = BufReader::new(file);
-    let mut out = Vec::new();
-    for (idx, line) in reader.lines().enumerate() {
-        let line = line.map_err(|e| CoreError::io(path, e))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let parsed: T = serde_json::from_str(&line).map_err(|e| CoreError::CorruptJsonl {
-            path: path.to_owned(),
-            line_number: idx + 1,
-            line: line.clone(),
-            source: e,
-        })?;
-        out.push(parsed);
-    }
-    Ok(out)
-}
-
-pub(crate) fn read_yaml<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
-    let bytes = std::fs::read(path).map_err(|e| CoreError::io(path, e))?;
-    serde_norway::from_slice(&bytes).map_err(|e| CoreError::CorruptYaml {
-        path: path.to_owned(),
-        source: e,
-    })
-}
-
-pub(crate) fn write_yaml<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let yaml = serde_norway::to_string(value).map_err(|e| CoreError::CorruptYaml {
-        path: path.to_owned(),
-        source: e,
-    })?;
-    std::fs::write(path, yaml).map_err(|e| CoreError::io(path, e))
-}
-
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use super::*;
     use tempfile::TempDir;
 
@@ -228,6 +187,13 @@ mod tests {
 
         let listed = project.list_agents().unwrap();
         assert_eq!(listed, vec![record]);
+    }
+
+    #[test]
+    fn project_name_delegates_to_config() {
+        let (_tmp, project) = fresh_project();
+        assert_eq!(project.name(), "test-project");
+        assert_eq!(project.name(), project.config.name);
     }
 
     #[test]
@@ -295,7 +261,7 @@ mod tests {
         project
             .register_agent("assistant", HarnessKind::ClaudeCode)
             .unwrap();
-        let mut f = OpenOptions::new()
+        let mut f = std::fs::OpenOptions::new()
             .append(true)
             .open(&project.registry_path)
             .unwrap();

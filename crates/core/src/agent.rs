@@ -49,9 +49,11 @@ mod tests {
     }
 
     #[test]
-    fn session_id_is_omitted_when_none_via_typed_field() {
+    fn session_id_serializes_as_null_when_none() {
         // Codex (M2+) will land with session_id: None — make sure the wire shape
-        // preserves null rather than failing.
+        // emits null rather than omitting the field (which would happen with
+        // #[serde(skip_serializing_if = "Option::is_none")]). This test guards
+        // against accidentally adding that attribute.
         let record = AgentRecord {
             id: Uuid::now_v7(),
             project_id: Uuid::now_v7(),

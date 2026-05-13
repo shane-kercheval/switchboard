@@ -4,10 +4,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, Result};
+use crate::io::{append_jsonl, read_jsonl, read_yaml, write_yaml};
 use crate::name::{canonicalize_for_uniqueness, validate_name};
-use crate::project::{
-    self, Project, ProjectId, ProjectSummary, append_jsonl, read_jsonl, read_yaml, write_yaml,
-};
+use crate::project::{self, Project, ProjectId, ProjectSummary};
 
 const DIRECTORY_CONFIG_VERSION: u32 = 1;
 const SWITCHBOARD_DIR: &str = ".switchboard";
@@ -76,13 +75,37 @@ impl Directory {
     }
 
     /// Lists all projects in this directory's index. Returns empty if `init` has
-    /// not been called yet.
+    /// not been called yet. If `.switchboard/` exists but `projects.jsonl` is
+    /// missing, that's corruption — surfaces as `MissingAppendOnlyFile` rather
+    /// than being silently reinterpreted as "no projects."
     pub fn list_projects(&self) -> Result<Vec<ProjectSummary>> {
-        read_jsonl(&self.projects_index_path())
+        let index = self.projects_index_path();
+        if self.has_switchboard() && !index.exists() {
+            return Err(CoreError::MissingAppendOnlyFile { path: index });
+        }
+        read_jsonl(&index)
     }
 
     /// Creates a new project under this directory. Validates the name (regex +
     /// per-directory uniqueness with hyphen↔underscore + case normalization).
+    ///
+    /// # Atomicity
+    ///
+    /// The project directory is created first, then the summary is appended to
+    /// `projects.jsonl`. If the append fails, the freshly-created project
+    /// directory is removed so `list_projects` and `open_project` remain
+    /// consistent with the index. The original append error stays primary; a
+    /// rollback failure (rare) is logged but does not replace the primary
+    /// error.
+    ///
+    /// # Concurrency
+    ///
+    /// Not safe to call concurrently against the *same `Directory` instance* —
+    /// the read-check-then-append sequence has a TOCTOU window. Callers must
+    /// serialize access (the M1.4 dispatcher / `AppState` mutex does this).
+    /// Concurrent calls against *different* `Directory` instances (different
+    /// directories) are fine; M3's `instance.lock` provides cross-process
+    /// serialization within one directory.
     pub fn create_project(&self, name: &str) -> Result<Project> {
         self.assert_initialized()?;
         validate_name(name)?;
@@ -98,12 +121,22 @@ impl Directory {
 
         let projects_dir = self.projects_dir();
         let (summary, project) = project::create_on_disk(&self.path, &projects_dir, name)?;
-        append_jsonl(&self.projects_index_path(), &summary)?;
+        if let Err(append_err) = append_jsonl(&self.projects_index_path(), &summary) {
+            if let Err(rollback_err) = std::fs::remove_dir_all(&project.root) {
+                tracing_log_rollback_failure(&project.root, &rollback_err);
+            }
+            return Err(append_err);
+        }
         Ok(project)
     }
 
     /// Loads a project by id. Errors if the project is not in this directory's
     /// index.
+    ///
+    /// # Concurrency
+    ///
+    /// Same instance-level serialization requirement as `create_project` — see
+    /// that method's `# Concurrency` note.
     pub fn open_project(&self, id: ProjectId) -> Result<Project> {
         let summary = self
             .list_projects()?
@@ -146,7 +179,6 @@ impl Directory {
         if self.has_switchboard() {
             Ok(())
         } else {
-            // Standard NotFound surfaces correctly via the typed Io variant.
             Err(CoreError::io(
                 self.switchboard_dir(),
                 std::io::Error::new(
@@ -156,6 +188,17 @@ impl Directory {
             ))
         }
     }
+}
+
+// `tracing` is not yet a dep of this crate (deferred until M1.4 when the
+// dispatcher introduces real logging). Until then, rollback failures go to
+// stderr so they aren't completely silent. Replace with `tracing::warn!` when
+// the dep lands.
+fn tracing_log_rollback_failure(path: &Path, err: &std::io::Error) {
+    eprintln!(
+        "switchboard-core: failed to roll back project directory {} after index append failure: {err}",
+        path.display(),
+    );
 }
 
 #[cfg(test)]
@@ -217,6 +260,17 @@ mod tests {
     }
 
     #[test]
+    fn list_projects_after_init_with_missing_index_is_typed_error() {
+        let tmp = TempDir::new().unwrap();
+        let directory = Directory::at(tmp.path()).unwrap();
+        directory.init().unwrap();
+        // Simulate the index being manually removed after init.
+        std::fs::remove_file(directory.projects_index_path()).unwrap();
+        let err = directory.list_projects().unwrap_err();
+        assert!(matches!(err, CoreError::MissingAppendOnlyFile { .. }));
+    }
+
+    #[test]
     fn create_project_without_init_fails() {
         let tmp = TempDir::new().unwrap();
         let directory = Directory::at(tmp.path()).unwrap();
@@ -270,5 +324,32 @@ mod tests {
             }
             other => panic!("expected CorruptJsonl, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn create_project_rolls_back_directory_when_index_append_fails() {
+        let tmp = TempDir::new().unwrap();
+        let directory = Directory::at(tmp.path()).unwrap();
+        directory.init().unwrap();
+        // Make projects.jsonl unwritable by replacing it with a read-only directory
+        // of the same name — the append call's open() will fail.
+        let index = directory.projects_index_path();
+        std::fs::remove_file(&index).unwrap();
+        std::fs::create_dir(&index).unwrap();
+
+        let projects_dir_before = std::fs::read_dir(directory.projects_dir()).unwrap().count();
+
+        let err = directory.create_project("alpha").unwrap_err();
+        assert!(
+            matches!(err, CoreError::Io { .. }),
+            "expected Io error, got {err:?}"
+        );
+
+        // Rollback must have removed the freshly-created project root.
+        let projects_dir_after = std::fs::read_dir(directory.projects_dir()).unwrap().count();
+        assert_eq!(
+            projects_dir_before, projects_dir_after,
+            "project directory not rolled back after index append failure"
+        );
     }
 }

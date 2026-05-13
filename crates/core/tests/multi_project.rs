@@ -12,6 +12,10 @@ use std::path::Path;
 use switchboard_core::{Directory, HarnessKind, Project};
 use tempfile::TempDir;
 
+// `agent_a` (the created record) vs `agents_a` (the listed slice) read clearly
+// in test code — suppress the workspace-wide `similar_names` lint here so we
+// don't have to allow it for production code where it might catch real issues.
+#[allow(clippy::similar_names)]
 #[test]
 fn multi_project_directory_end_to_end_with_layout_assertion() {
     let tmp = TempDir::new().unwrap();
@@ -32,6 +36,10 @@ fn multi_project_directory_end_to_end_with_layout_assertion() {
         .register_agent("assistant", HarnessKind::ClaudeCode)
         .unwrap();
     assert_ne!(agent_a.id, agent_b.id);
+    // Both must be Some (Claude Code pre-generates) AND distinct. A bare
+    // assert_ne! would silently pass if both were None.
+    assert!(agent_a.session_id.is_some());
+    assert!(agent_b.session_id.is_some());
     assert_ne!(agent_a.session_id, agent_b.session_id);
 
     // Adding a second agent in project_a so we can confirm registries don't cross-pollinate.

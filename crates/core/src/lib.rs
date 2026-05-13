@@ -8,6 +8,7 @@ pub mod agent;
 pub mod directory;
 pub mod error;
 pub mod harness;
+mod io;
 pub mod name;
 pub mod project;
 

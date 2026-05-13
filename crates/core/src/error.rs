@@ -49,6 +49,16 @@ pub enum CoreError {
         #[source]
         source: serde_norway::Error,
     },
+
+    #[error("failed to serialize value for {path}: {source}")]
+    Serialize {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+
+    #[error("expected append-only file is missing after init: {path}")]
+    MissingAppendOnlyFile { path: PathBuf },
 }
 
 impl CoreError {

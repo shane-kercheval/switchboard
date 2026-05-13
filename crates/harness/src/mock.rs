@@ -70,7 +70,6 @@ impl HarnessAdapter for MockHarnessAdapter {
                             turn_id,
                             text: chunk,
                         });
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     }
                     let _ = tx.send(AdapterEvent::TurnEnd {
                         turn_id,
@@ -85,7 +84,6 @@ impl HarnessAdapter for MockHarnessAdapter {
                         turn_id,
                         text: "partial".to_owned(),
                     });
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     panic!("MockScenario::Panic — intentional, for AgentIdleGuard drop test");
                 });
             }

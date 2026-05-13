@@ -1,4 +1,4 @@
-.PHONY: dev test lint fmt check clean install
+.PHONY: dev test lint fmt check clean install test-live
 
 install:
 	pnpm install --frozen-lockfile
@@ -30,6 +30,9 @@ check:
 	pnpm check
 	pnpm format:check
 	pnpm test
+
+test-live:
+	cargo test --locked -p switchboard-harness -- --ignored
 
 clean:
 	cargo clean

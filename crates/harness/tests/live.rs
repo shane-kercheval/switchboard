@@ -1,6 +1,6 @@
 /// Live integration tests gated behind `#[ignore]`.
 ///
-/// Run with: `SWITCHBOARD_LIVE_HARNESS=1 cargo test -- --ignored`
+/// Run with: `make test-live`
 ///
 /// Requires `claude` installed and authenticated. Not part of CI for M1 — M2
 /// sets up the integration CI workflow.
@@ -22,17 +22,9 @@ fn live_agent() -> AgentRecord {
     }
 }
 
-fn should_run() -> bool {
-    std::env::var("SWITCHBOARD_LIVE_HARNESS").is_ok_and(|v| v == "1")
-}
-
 #[tokio::test]
-#[ignore = "requires claude installed and SWITCHBOARD_LIVE_HARNESS=1"]
+#[ignore = "requires claude installed — run with: make test-live"]
 async fn live_basic_turn_completes() {
-    if !should_run() {
-        return;
-    }
-
     let adapter = ClaudeCodeAdapter::new();
     let agent = live_agent();
     let turn_id = Uuid::now_v7();
@@ -83,15 +75,11 @@ async fn live_basic_turn_completes() {
 }
 
 #[tokio::test]
-#[ignore = "requires claude installed and SWITCHBOARD_LIVE_HARNESS=1"]
-async fn live_session_id_idempotency_confirmed() {
-    // Verifies that passing a fresh UUID v7 via --session-id creates a new session
-    // without requiring --resume. The session_id in the system/init event must match.
-    if !should_run() {
-        return;
-    }
-
-    // Two separate turns with the SAME session_id — both should succeed.
+#[ignore = "requires claude installed — run with: make test-live"]
+async fn live_session_continuity_across_turns() {
+    // Verifies that session state persists across turns: the first turn uses
+    // --session-id to create the session; the second reuses the same session_id
+    // and the adapter automatically switches to --resume.
     let adapter = ClaudeCodeAdapter::new();
     let session_id = Uuid::now_v7();
 
@@ -121,7 +109,8 @@ async fn live_session_id_idempotency_confirmed() {
     });
     assert!(completed1, "first turn should complete");
 
-    // Second turn reuses the same session_id (resume semantics).
+    // Second turn reuses the same session_id — adapter detects the session file
+    // and switches to --resume automatically.
     let agent2 = AgentRecord {
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
@@ -149,5 +138,47 @@ async fn live_session_id_idempotency_confirmed() {
     assert!(
         completed2,
         "second turn with same session_id should complete"
+    );
+}
+
+#[tokio::test]
+#[ignore = "pre-M2 probe — requires claude installed — run with: make test-live"]
+async fn live_resume_on_fresh_session_id_accepted() {
+    // Probes whether `--resume <uuid>` succeeds when no session file exists yet.
+    // If this test passes, --resume is safe to use unconditionally (first turn
+    // included) and the session_file_exists FS check in ClaudeCodeAdapter can be
+    // eliminated entirely. Run once before M2 to resolve the edge case documented
+    // in the M1.3 section of the milestone plan.
+    //
+    // We bypass ClaudeCodeAdapter here and call claude directly so we can force
+    // --resume regardless of what the filesystem check would decide.
+    let session_id = Uuid::now_v7();
+
+    let output = tokio::process::Command::new("claude")
+        .args([
+            "-p",
+            "Reply with only the word PROBE",
+            "--resume",
+            &session_id.to_string(),
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--include-partial-messages",
+            "--dangerously-skip-permissions",
+        ])
+        .current_dir("/tmp")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .expect("claude should be runnable");
+
+    assert!(
+        output.status.success(),
+        "--resume on a fresh session_id failed (exit {}): {}\nIf this consistently fails, \
+         the session_file_exists FS check is necessary and cannot be removed.",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
     );
 }

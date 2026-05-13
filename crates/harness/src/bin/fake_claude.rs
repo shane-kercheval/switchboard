@@ -8,7 +8,7 @@
 //! non-empty, non-comment line is written to stdout verbatim.
 //!
 //! Special comment lines in the fixture (processed, never forwarded to stdout):
-//!   `// exit:<N>` — exit with code N instead of 0 (must be the last line).
+//!   `// exit:<N>` — exit with code N instead of 0; stops line processing.
 //!   `// stderr:<message>` — write message to stderr before streaming begins.
 //!
 //! A fixed "`fake_claude`: done" line is always written to stderr so tests can
@@ -47,7 +47,7 @@ fn main() {
 
         if let Some(rest) = line.strip_prefix("// exit:") {
             exit_code = rest.trim().parse().unwrap_or(1);
-            continue;
+            break;
         }
 
         if let Some(msg) = line.strip_prefix("// stderr:") {

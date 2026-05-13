@@ -54,7 +54,7 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         turn_id: TurnId,
     ) -> Result<EventStream, DispatchError> {
         let binary = resolve_binary(&self.claude_binary_path)?;
-        let args = build_args(agent, prompt, project_root);
+        let args = build_args(agent, prompt, project_root, None);
 
         let mut child = tokio::process::Command::new(&binary)
             .args(&args)
@@ -94,7 +94,13 @@ fn resolve_binary(path: &Path) -> Result<PathBuf, DispatchError> {
     which::which(path).map_err(|_| DispatchError::BinaryNotFound)
 }
 
-fn build_args(agent: &AgentRecord, prompt: &str, project_root: &Path) -> Vec<String> {
+/// `home_override` is `None` in production (reads `$HOME`) and `Some(path)` in tests.
+fn build_args(
+    agent: &AgentRecord,
+    prompt: &str,
+    project_root: &Path,
+    home_override: Option<&Path>,
+) -> Vec<String> {
     let mut args = vec![
         "-p".to_owned(),
         prompt.to_owned(),
@@ -109,7 +115,11 @@ fn build_args(agent: &AgentRecord, prompt: &str, project_root: &Path) -> Vec<Str
         // --resume continues an existing session (all subsequent turns).
         // Claude Code stores sessions at ~/.claude/projects/<encoded-cwd>/<uuid>.jsonl;
         // we check that path to pick the right flag.
-        if session_file_exists(project_root, &session_id) {
+        let exists = match home_override {
+            Some(home) => session_exists_in(home, project_root, &session_id),
+            None => session_file_exists(project_root, &session_id),
+        };
+        if exists {
             args.push("--resume".to_owned());
         } else {
             args.push("--session-id".to_owned());
@@ -119,19 +129,23 @@ fn build_args(agent: &AgentRecord, prompt: &str, project_root: &Path) -> Vec<Str
     args
 }
 
-/// Returns true if Claude Code has already persisted a session file for the
-/// given session UUID in the given working directory.
+/// Production wrapper: reads `$HOME` and delegates to `session_exists_in`.
 fn session_file_exists(project_root: &Path, session_id: &uuid::Uuid) -> bool {
-    let Ok(canonical) = project_root.canonicalize() else {
-        return false;
-    };
-    // Claude Code encodes the cwd as the absolute path with every '/' replaced by '-'.
-    let encoded = canonical.to_string_lossy().replace('/', "-");
     let Ok(home) = std::env::var("HOME") else {
         return false;
     };
-    PathBuf::from(home)
-        .join(".claude")
+    session_exists_in(Path::new(&home), project_root, session_id)
+}
+
+/// Pure check — testable without touching the real `$HOME`.
+/// Claude Code stores sessions at `<home>/.claude/projects/<encoded-cwd>/<uuid>.jsonl`
+/// where the encoded cwd is the canonicalized path with every `/` replaced by `-`.
+fn session_exists_in(home: &Path, project_root: &Path, session_id: &uuid::Uuid) -> bool {
+    let Ok(canonical) = project_root.canonicalize() else {
+        return false;
+    };
+    let encoded = canonical.to_string_lossy().replace('/', "-");
+    home.join(".claude")
         .join("projects")
         .join(&encoded)
         .join(format!("{session_id}.jsonl"))
@@ -172,6 +186,9 @@ async fn run_producer(
                         }
                         _ => {}
                     }
+                    // Receiver drop is intentional: if the consumer disconnects
+                    // mid-stream, we let the producer drain and exit cleanly.
+                    // Per-turn cancel (M3) will handle the shutdown case properly.
                     let _ = tx.send(event);
                     if terminal_seen {
                         break;
@@ -247,11 +264,88 @@ async fn run_producer(
 
 async fn drain_stderr(stderr: tokio::process::ChildStderr, agent_id: AgentId, turn_id: TurnId) {
     let mut lines = tokio::io::BufReader::new(stderr).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        tracing::debug!(
-            agent_id = %agent_id,
-            %turn_id,
-            "harness stderr: {line}"
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => {
+                tracing::debug!(agent_id = %agent_id, %turn_id, "harness stderr: {line}");
+            }
+            Ok(None) => break,
+            Err(e) => {
+                tracing::warn!(agent_id = %agent_id, %turn_id, error = %e, "stderr read error");
+                break;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use switchboard_core::HarnessKind;
+    use uuid::Uuid;
+
+    fn agent_with_session(session_id: Uuid) -> AgentRecord {
+        AgentRecord {
+            id: Uuid::now_v7(),
+            project_id: Uuid::now_v7(),
+            name: "test".to_owned(),
+            harness: HarnessKind::ClaudeCode,
+            session_id: Some(session_id),
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn session_exists_in_encodes_path_and_detects_file() {
+        let home = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let session_id = Uuid::now_v7();
+
+        assert!(
+            !session_exists_in(home.path(), project.path(), &session_id),
+            "no file yet"
         );
+
+        let canonical = project.path().canonicalize().unwrap();
+        let encoded = canonical.to_string_lossy().replace('/', "-");
+        let session_dir = home.path().join(".claude").join("projects").join(&encoded);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(session_dir.join(format!("{session_id}.jsonl")), "").unwrap();
+
+        assert!(
+            session_exists_in(home.path(), project.path(), &session_id),
+            "file exists now"
+        );
+    }
+
+    #[test]
+    fn build_args_uses_session_id_when_no_file() {
+        let home = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let agent = agent_with_session(Uuid::now_v7());
+
+        let args = build_args(&agent, "hi", project.path(), Some(home.path()));
+
+        assert!(args.contains(&"--session-id".to_owned()));
+        assert!(!args.contains(&"--resume".to_owned()));
+    }
+
+    #[test]
+    fn build_args_uses_resume_when_session_file_exists() {
+        let home = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let session_id = Uuid::now_v7();
+        let agent = agent_with_session(session_id);
+
+        let canonical = project.path().canonicalize().unwrap();
+        let encoded = canonical.to_string_lossy().replace('/', "-");
+        let session_dir = home.path().join(".claude").join("projects").join(&encoded);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(session_dir.join(format!("{session_id}.jsonl")), "").unwrap();
+
+        let args = build_args(&agent, "hi", project.path(), Some(home.path()));
+
+        assert!(args.contains(&"--resume".to_owned()));
+        assert!(!args.contains(&"--session-id".to_owned()));
     }
 }

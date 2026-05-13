@@ -59,6 +59,10 @@ fn parse_stream_event(obj: &Value, turn_id: TurnId) -> ParseOutcome {
         .unwrap_or("")
         .to_owned();
 
+    if text.is_empty() {
+        return ParseOutcome::Skip;
+    }
+
     ParseOutcome::Event(AdapterEvent::ContentChunk { turn_id, text })
 }
 
@@ -225,6 +229,12 @@ mod tests {
     fn input_json_delta_tool_input_is_skipped() {
         // Tool input stream deltas must not be emitted as ContentChunks.
         let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{"}}}"#;
+        assert!(matches!(parse_line(line, tid()), ParseOutcome::Skip));
+    }
+
+    #[test]
+    fn empty_text_delta_is_skipped() {
+        let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}}}"#;
         assert!(matches!(parse_line(line, tid()), ParseOutcome::Skip));
     }
 

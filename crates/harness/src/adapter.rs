@@ -16,7 +16,7 @@ pub type EventStream = Pin<Box<dyn Stream<Item = AdapterEvent> + Send>>;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum DispatchError {
-    #[error("claude binary not found on PATH")]
+    #[error("harness binary not found")]
     BinaryNotFound,
     #[error("failed to spawn claude subprocess: {0}")]
     SpawnFailed(#[from] std::io::Error),

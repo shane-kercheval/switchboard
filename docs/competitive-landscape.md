@@ -1,0 +1,171 @@
+# Switchboard — Competitive Landscape
+
+*Researched May 2026. Covers the multi-agent coding orchestration space as it exists now.*
+
+## Summary
+
+The multi-agent coding tool space is crowded at both ends of a spectrum, with a genuine gap in the middle where Switchboard sits:
+
+- **Fully autonomous** — give a goal, the system decomposes and runs with it. Human-in-the-loop is minimal or post-hoc.
+- **Passive session managers** — dashboards and TUIs that help you watch and manually control multiple agent terminals. No workflow automation.
+
+Switchboard occupies the middle: **human-directed, workflow-file-driven, with explicit pause-and-interjection primitives**. Nothing currently in the landscape clearly occupies that space.
+
+---
+
+## Passive session managers
+
+These tools help you run and watch multiple agent sessions. They do not pass messages between agents or automate any routing. The user is still the message bus.
+
+### [Claude Squad](https://github.com/smtg-ai/claude-squad)
+
+Terminal-native TUI (Go). Uses tmux for session isolation and git worktrees for branch separation. Supports Claude Code, Codex, Aider, OpenCode, Amp, Gemini via configurable launch commands. Single window with keyboard navigation across sessions, status display, attach/detach, and optional auto-yes (yolo) mode for unattended runs.
+
+**What it does not do:** No workflow automation, no fan-out/fan-in, no prompt library, no YAML DSL, no inter-agent message routing of any kind.
+
+### [Nimbalyst](https://nimbalyst.com/)
+
+Desktop app (macOS/Windows/Linux, MIT-licensed, open source). Visual workspace for Claude Code and Codex (OpenCode and GitHub Copilot in alpha). Features: session kanban board, 7+ visual editors (WYSIWYG markdown, Excalidraw, Mermaid, ERD, CSV, mockups, Monaco code), inline red/green diff review, git worktree support, MCP server integration, iOS companion app, SOC 2 certified.
+
+**On inter-agent communication specifically:** Nimbalyst does not pass messages between agent instances programmatically. The "Agent Orchestration" feature is a kanban board for organizing sessions. One of their own comparison articles describes the problem as "the user becomes the message bus between agents, copy-pasting context and re-explaining decisions" — Nimbalyst makes that manual process less painful (visual diff review, easy session switching) but does not eliminate it. Routing one agent's output to another as a workflow primitive does not exist.
+
+### [Conductor](https://amux.io/blog/best-multi-agent-orchestrators-2026/) (Melty Labs)
+
+Free macOS desktop app. Visual dashboard, diff-first review UI, Claude and Codex side-by-side. Light and fast. Comparable to Nimbalyst in tier (visual management of isolated worktrees), lighter on editors, stronger on diff review UX.
+
+**What it does not do:** No workflow files, no inter-agent routing.
+
+### [Agent Deck](https://github.com/asheshgoplani/agent-deck)
+
+TUI session manager for Claude, Gemini, OpenCode, Codex. Similar tier to Claude Squad, less mature.
+
+### [amux](https://github.com/mixpeek/amux)
+
+tmux-based agent multiplexer for running dozens of parallel Claude Code sessions unattended. Web dashboard and kanban, self-healing (auto-compact, restart on corruption). Agents can discover peers and delegate work via a REST API + shared global memory — the closest thing in this tier to inter-agent communication, but it is infrastructure for headless unattended runs, not a human-in-the-loop workflow tool.
+
+---
+
+## Fully autonomous / AI-directed systems
+
+These tools take a goal and run with it. Human checkpoints are minimal or post-hoc. They solve a different problem from Switchboard.
+
+### [Augment Code Intent](https://docs.augmentcode.com/intent/overview)
+
+macOS desktop app (public beta; Windows coming). The most sophisticated product in this category. Three-agent architecture: Coordinator breaks down a spec into tasks → Specialist agents (6 personas: Implementation, Architecture, Testing, etc.) execute in parallel → Verifier validates against spec before human review. The "living spec" — a self-updating document all agents share — is the core innovation.
+
+**Key differences from Switchboard:**
+- Fully AI-directed: you write a spec and the system runs. Human checkpoints are post-hoc (review after, not mid-workflow).
+- No explicit pause-for-user-input primitive that encodes a mid-workflow human decision point.
+- Augment-model-only (their Context Engine); not a harness-agnostic layer over Claude Code + Codex.
+- No user-authored workflow files; no YAML DSL.
+
+### [oh-my-claudecode](https://ohmyclaudecode.com/)
+
+32 specialized agents (Planner, Architect, Critic, Explorer, Executor, etc.), 40+ skills. Pipeline: team-plan → team-prd → team-exec → team-verify → team-fix, loops until verify passes. Smart model routing (Haiku for simple, Opus for complex). Runs up to 5 Claude instances in parallel. Zero-config.
+
+**Key difference:** Fully autonomous swarm; you describe intent and it runs. Not designed for workflows where the human interjects at defined points with their own judgment.
+
+### [Claude Code Agent Teams](https://code.claude.com/docs/en/agent-teams) (Anthropic, experimental)
+
+One Claude Code session acts as team lead, coordinates teammates via a shared task list; teammates run in their own context windows. Still experimental and disabled by default. AI-directed (the lead agent decides what to delegate), not human-directed.
+
+### [ComposioHQ/agent-orchestrator](https://github.com/ComposioHQ/agent-orchestrator)
+
+Plans tasks, spawns agents, handles CI fixes, merge conflicts, and code reviews. Autonomous pipeline for unattended parallel feature work.
+
+---
+
+## Scripting / framework tier
+
+### [wshobson/agents](https://github.com/wshobson/agents)
+
+Intelligent automation and multi-agent orchestration scripts for Claude Code. Script/hook-level rather than a DSL + desktop app.
+
+### [claude-code-by-agents](https://github.com/baryhuang/claude-code-by-agents)
+
+Desktop app and API for multi-agent Claude Code orchestration via @mentions. Coordinates local and remote agents. More developer-API-focused than user-workflow-focused.
+
+### DIY shell scripts
+
+There is a whole genre of blog posts and GitHub repos that approximate Switchboard's fan-out/fan-in by scripting multiple `claude -p` invocations, collecting outputs, and routing them manually. This works but is brittle, not portable across projects, and requires rewriting per workflow shape.
+
+---
+
+## Not in this category
+
+### [Sauna.ai](https://www.sauna.ai/)
+
+General-purpose AI coworker built by [Wordware](https://www.wordware.ai/). Connects to everyday work tools (Slack, Gmail, Google Calendar, Linear, GitHub, Notion, Granola) and learns how a person works — drafting messages, filing tickets, delivering briefings, tracking tasks. Available via web, iOS, iMessage, Slack, and email.
+
+**What "multiplayer" means here:** Sauna's multiplayer feature is about two humans sharing one person's AI assistant. "Brain Access" lets a colleague read or operate your whole Sauna (files, memory, connections, tools). "Shared Folders" gives access to a specific slice of your knowledge base. This is human-to-human context sharing, not AI-to-AI communication.
+
+**Why it's not a competitor:** Sauna is a general knowledge-work assistant — it has no coding-agent orchestration capability and no concept of dispatching prompts to agent instances, fan-out/fan-in, workflow files, or harness adapters. The target user is anyone doing general office work; the target user for Switchboard is a developer running multiple AI coding agents. Different problem, different user, different primitives. Not in the same category.
+
+### [Hermes Agent](https://hermes-agent.nousresearch.com/) (Nous Research)
+
+Open-source (MIT), server-side personal AI agent. Currently at v0.13.0 with 128k GitHub stars and 6,900+ commits — one of the most mature open-source agent projects in existence. Python codebase. Model-agnostic (OpenRouter, NVIDIA NIM, OpenAI, Anthropic, self-hosted, and more). Runs on local, Docker, SSH, Singularity, or Modal backends. Reachable via Telegram, Discord, Slack, WhatsApp, Signal, email, and CLI.
+
+Key capabilities: persistent memory with a closed learning loop (auto-generates skills from experience, skills self-improve during use, FTS5 session search with LLM summarization for cross-session recall), a built-in cron scheduler for unattended automations, isolated subagent delegation for parallel workstreams with Python RPC scripts for zero-context-cost pipelines, MCP integration, web/browser control, and an RL training integration (Atropos) for producing tool-calling training trajectories.
+
+**The subagent delegation feature:** Hermes can spawn isolated subagents with their own conversations and terminals, which superficially overlaps with Switchboard's fan-out primitive. The key difference is that in Hermes, the agent itself decides when to delegate and to what — the orchestration is AI-directed. There is no user-authored workflow that says "send to these three agents, wait for all, aggregate, then pause and ask me what to do next." The human sends a goal to Hermes and Hermes handles the rest.
+
+**Why it's not a competitor:** Hermes is a general-purpose autonomous personal assistant that runs on a server and happens to support subagent delegation. It is not a harness layer over Claude Code and Codex, has no concept of human-directed fan-out/fan-in workflows, no pause-for-user primitive, no YAML DSL, and no cross-harness prompt library. The user's role is to give Hermes a task and let it run — not to orchestrate a set of named, persistent coding agents through a structured workflow. Worth monitoring for the skills/memory model specifically, which is more sophisticated than anything in the passive-session-manager tier.
+
+---
+
+## Where Switchboard's gap is real
+
+Mapping the features of the tools above against Switchboard's core capabilities:
+
+| Capability | Claude Squad | Nimbalyst | Conductor | amux | Intent | oh-my-claude |
+|---|---|---|---|---|---|---|
+| Multi-agent session management | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Fan-out (dispatch same message to N agents) | manual | manual | manual | manual | AI-directed | AI-directed |
+| Fan-in (aggregate N outputs → one agent) | manual | manual | manual | partial | AI-directed | AI-directed |
+| Reusable YAML workflow files | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| Named, parameterized, version-controlled workflows | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| Explicit mid-workflow human pause primitive | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| Prompt library (local + MCP) across harnesses | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| Works across Claude Code + Codex uniformly | ✓ | ✓ | ✓ | partial | ✗ | ✗ |
+| Human-directed (not AI-directed) orchestration | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ |
+
+**The specific features no existing tool has:**
+
+1. **Reusable YAML workflow DSL** that encodes a multi-step, multi-agent operation (fan-out → wait → fan-in → pause → dispatch) as a named, parameterized, version-controlled file you invoke by name.
+
+2. **Explicit `pause_for_user` as a workflow primitive** — encoding "run these autonomous steps, then stop and get my input, then continue" is the shape of real human-in-the-loop workflows (e.g.: run review agents autonomously, aggregate their output, pause and show me the summary before I decide what to tell the implementer). No tool formalizes this.
+
+3. **Cross-harness prompt library management** — resolving `tiddly:ai-review-feedback` and `local:code-review` as a unified prompt provider surface that works identically across Claude Code and Codex sessions. Prompt-provider configuration in one place, not per-agent.
+
+4. **Fan-in with template wrapping** — taking N agents' outputs, composing them with a wrapping prompt (e.g., the Tiddly `ai-review-feedback` prompt), and dispatching the result to another agent as a spec-level primitive, not a copy-paste operation.
+
+---
+
+## Closest competitors by dimension
+
+| What you care about | Closest existing option | Gap |
+|---|---|---|
+| Desktop app for managing multiple Claude Code / Codex sessions | Nimbalyst | No inter-agent routing; no workflow files |
+| Terminal-based multi-agent session manager | Claude Squad | TUI only; no automation |
+| Autonomous multi-agent coding loop | Intent (Augment) | AI-directed, not human-directed |
+| Scripted fan-out/fan-in | DIY shell scripts | Not reusable, not portable, no UI |
+| Prompt library across agents | — | Nothing |
+| Workflow files + human pause points | — | Nothing |
+
+---
+
+## References
+
+- [Claude Squad](https://github.com/smtg-ai/claude-squad)
+- [Nimbalyst](https://nimbalyst.com/) / [Features](https://nimbalyst.com/features/)
+- [amux](https://github.com/mixpeek/amux)
+- [Conductor — Best Multi-Agent Orchestrators 2026 (amux blog)](https://amux.io/blog/best-multi-agent-orchestrators-2026/)
+- [Augment Code Intent](https://docs.augmentcode.com/intent/overview)
+- [oh-my-claudecode](https://github.com/yeachan-heo/oh-my-claudecode)
+- [Claude Code Agent Teams](https://code.claude.com/docs/en/agent-teams)
+- [ComposioHQ/agent-orchestrator](https://github.com/ComposioHQ/agent-orchestrator)
+- [claude-code-by-agents](https://github.com/baryhuang/claude-code-by-agents)
+- [Best Multi-Agent Desktop Apps for Claude Code, Codex (Nimbalyst blog)](https://nimbalyst.com/blog/best-multi-agent-desktop-apps-claude-code-codex-2026/)
+- [Best Multi-Agent Coding Tools in 2026 (Nimbalyst blog)](https://nimbalyst.com/blog/best-multi-agent-coding-tools-2026/)
+- [Sauna.ai](https://www.sauna.ai/) / [Multiplayer](https://www.sauna.ai/learn/multiplayer)
+- [Hermes Agent](https://hermes-agent.nousresearch.com/) / [GitHub](https://github.com/NousResearch/hermes-agent)

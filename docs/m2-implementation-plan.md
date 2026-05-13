@@ -247,6 +247,7 @@ This sub-milestone does NOT add session-file enrichment — that's M2.4. M2.3 em
      ```
      `original_start_date_utc` is set to the **current UTC date ONLY on the first dispatch** (when there was no prior record). On subsequent resumes, **copy `original_start_date_utc` from the prior record** — never use `Utc::today()`. This is load-bearing for M2.4's date-partitioned session-file lookup: Codex sessions resumed days later still live in the original spawn date's directory.
    - **Duplicate records on resume** are explicitly allowed and intended: each new dispatch appends a new record (same `session_id`, same `original_start_date_utc`, fresh `started_at`). The file is append-only; latest line wins for resume lookups; the history is debugging-useful.
+   - **Attach-existing-session case** (per M2.5's `attach_agent` flow): when the agent is created via `attach_agent` with a user-supplied `existing_session_id`, write the **first** session-link record at agent-creation time (not on first stream event — the session already exists). `original_start_date_utc` is parsed from the existing session file's path: `~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-*-<session_id>.jsonl` → use `<YYYY>-<MM>-<DD>`. Subsequent dispatches append normally and use `codex exec resume <session_id>` from the start (no first-turn-vs-resume branch — the session always exists).
 
 4. **Stream parsing.** Read stdout line-by-line; parse each JSON line; map per the table:
 
@@ -439,9 +440,31 @@ This is **not multi-pane** — one pane visible at a time. Multi-pane is M3. **P
 
 4. **Agent selector component.** Use shadcn-svelte's Select / Dropdown (or simple list — pick the lighter option). Lists all agents from `list_agents()`. Each entry shows `name` + a small badge for harness type (`Claude Code` / `Codex`). Selecting an entry sets the "active agent id" in app state; the AgentPane component re-mounts (or just rerenders) with the new `agent_id`.
 
-5. **Create-agent prompt** (extending M1.5) gets a harness-type chooser — radio buttons or a dropdown with "Claude Code" / "Codex". Pre-fills with whichever the user picked last (or Claude Code if first time). Validates that the binary for the chosen harness is available before creating the agent (call `check_claude_binary` or new `check_codex_binary` Tauri command); rejects creation with a clear inline error if the chosen harness's binary isn't installed.
+5. **Create-agent prompt** (extending M1.5) gets a harness-type chooser — radio buttons or a dropdown with "Claude Code" / "Codex". Pre-fills with whichever the user picked last (or Claude Code if first time). Two creation modes side-by-side: **"Create new agent"** (the M1 flow — pre-generates a session UUID) and **"Attach existing session"** (per step 6 below). Validates that the binary for the chosen harness is available before creating the agent (call `check_claude_binary` or new `check_codex_binary` Tauri command); rejects creation with a clear inline error if the chosen harness's binary isn't installed.
 
-6. **`check_codex_binary` Tauri command** — mirrors `check_claude_binary` from M1.4. Backend returns `BinaryNotFound` if `which::which("codex")` fails. The startup banner from M1.5 step 1 now checks both binaries independently — show **per-harness banners** ("Claude Code not found on PATH; Claude Code agents will be unavailable until you install it" / "Codex not found on PATH; Codex agents will be unavailable until you install it"). Allow agent creation for any installed harness; the create-agent dialog disables the harness chooser entry that's not installed and shows a small inline note.
+6. **Attach existing session.** New `attach_agent` Tauri command and UI affordance:
+   ```rust
+   #[tauri::command]
+   async fn attach_agent(
+       state: State<'_, AppState>,
+       name: String,
+       harness: HarnessKind,
+       existing_session_id: String,
+   ) -> Result<AgentRecord, String>;
+   ```
+   Validation (under both harnesses, fail before registering):
+   - Name passes the same uniqueness + regex rules as `create_agent` (per M1.2).
+   - **Claude Code**: `existing_session_id` must be a valid UUID and `~/.claude/projects/<encoded-cwd>/<existing_session_id>.jsonl` must exist (`<encoded-cwd>` is the active project's working directory per the cwd-encoding rule from `claude-code-cli-observed.md`). If the file doesn't exist, return `SessionFileNotFound { harness, expected_path }`.
+   - **Codex**: `existing_session_id` must be a valid UUID and a session file must exist somewhere under `~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-*-<existing_session_id>.jsonl`. Glob across all date directories (or limit to "last 90 days" if performance matters — flag if so). If not found, return `SessionFileNotFound`. **Parse `<YYYY>-<MM>-<DD>` from the discovered file's path** and stash it for the session-link sidecar.
+   
+   On success:
+   - Register an `AgentRecord` with `session_id = existing_session_id` (Claude) or `None` (Codex — actual session link goes to sidecar; see below). The agent record's `created_at` is "now" (the attach time, not the original session start time).
+   - **Claude Code**: dispatch from then on uses `--resume <session_id>` from the start (no first-turn-vs-resume branch — the session always exists by definition).
+   - **Codex**: write the **first** session-link sidecar record at attach time (not on first stream event), with `session_id = existing_session_id`, `original_start_date_utc = <parsed-from-path>`, `started_at = <now>`. Subsequent dispatches use `codex exec resume <session_id>` from the start.
+   
+   UI: the create-agent dialog has a "+ Attach existing session" toggle that swaps the dialog into attach mode — name field stays, harness chooser stays, and a new field for "Existing session UUID" appears. Submit calls `attach_agent` instead of `create_agent`. On `SessionFileNotFound`, show the error inline including the expected path so the user can verify why it didn't match (typo in UUID, wrong directory, etc.).
+
+7. **`check_codex_binary` Tauri command** — mirrors `check_claude_binary` from M1.4. Backend returns `BinaryNotFound` if `which::which("codex")` fails. The startup banner from M1.5 step 1 now checks both binaries independently — show **per-harness banners** ("Claude Code not found on PATH; Claude Code agents will be unavailable until you install it" / "Codex not found on PATH; Codex agents will be unavailable until you install it"). Allow agent creation for any installed harness; the create-agent dialog disables the harness chooser entry that's not installed and shows a small inline note.
 
 ### Testing strategy
 
@@ -452,13 +475,17 @@ This is **not multi-pane** — one pane visible at a time. Multi-pane is M3. **P
 - **Dynamic agent add test:** open a project with one agent; create a second agent via `create_agent`; immediately dispatch to the new agent; assert events arrive correctly (no missed first event).
 - **Project swap test:** open project A (with agents); switch to project B (with different agents); assert no listeners remain registered for project A's agent ids; assert project B's agent ids are subscribed; events emitted on project A's channels do not leak into project B's state.
 - **Banner UX test:** mount the app with `claude` installed but not `codex`; assert per-harness banner shows for Codex only; the create-agent dialog disables the Codex harness chooser entry.
+- **`attach_agent` validation tests** (`crates/core` unit tests):
+  - Claude Code: attach with a valid existing UUID + session file present → `AgentRecord` registered with `session_id = <provided>`. Attach with a UUID whose session file doesn't exist → `SessionFileNotFound` error including expected path. Attach with a non-UUID string → validation error.
+  - Codex: attach with a session_id that has a session file under `~/.codex/sessions/<date>/...` → `AgentRecord` registered, sidecar file written immediately with `original_start_date_utc` parsed from the discovered file's path. Attach with a session_id with no matching file anywhere → `SessionFileNotFound`. Attach with a session file in a date directory more than ~90 days old (if a search bound is set) → behaves per the bound (found or not — pin in implementation, document in tests).
+  - Both harnesses: attach-then-attach-with-same-name → name-collision error (same rules as `create_agent`).
 - **End-to-end manual test:** create one Claude Code agent and one Codex agent in the same project, send messages to each (via devtools first, then via the UI once the selector is wired), switch between them, confirm transcripts persist and update correctly. Send several turns to one agent and verify `runtime.lastUsage` updates after each turn.
 
 ### Docs to update
 
 - `README.md` "Try it out" — extend M1.5's flow to include creating a Codex agent + switching between agents.
 - M1.5 binary-not-found banner copy may need updating to handle two binaries gracefully.
-- **`AGENTS.md`** — add the project-level state model (transcripts AND runtime metadata maps, both keyed by agent_id, with separate reducers but a shared per-agent listener), the subscription lifecycle (creation on project-active, dynamic-add on `create_agent` success, atomic teardown on project swap, teardown on close), and the per-harness banner UX convention. Document why the frontend ownership reshuffled vs M1.5 (per-pane subscriptions would recreate the M1.4 TurnStart race when switching agents).
+- **`AGENTS.md`** — add the project-level state model (transcripts AND runtime metadata maps, both keyed by agent_id, with separate reducers but a shared per-agent listener), the subscription lifecycle (creation on project-active, dynamic-add on `create_agent` success, atomic teardown on project swap, teardown on close), and the per-harness banner UX convention. Document why the frontend ownership reshuffled vs M1.5 (per-pane subscriptions would recreate the M1.4 TurnStart race when switching agents). Document the **`attach_agent` flow** as a peer of `create_agent` (validates the harness's session file exists; for Codex, parses `original_start_date_utc` from the discovered file's path and writes the first sidecar record at attach time).
 
 ### Manual smoke test
 
@@ -473,7 +500,10 @@ M2.5 is the major UI sub-milestone — full multi-agent end-to-end flow via the 
 7. **Project swap teardown** — close the project (or open a different project root); send a message to an agent in the new project; in devtools, confirm no events from the old project's agents are firing into the new project's state.
 8. **Dynamic agent add** — with the project open, create a third agent; immediately send a message to it (no app restart) → events arrive cleanly, no missed first event.
 9. **Per-agent runtime metadata** — devtools: `console.log(/* however the runtime state is exposed */)` after a few turns; should see `lastUsage` populated for each agent based on its most-recent TurnEnd.
-10. **`make check`** → exits 0.
+10. **Attach existing Claude session.** In a separate terminal: `claude -p --session-id $(uuidgen | tr A-Z a-z) --dangerously-skip-permissions 'remember the word PURPLE'` from inside the same working directory. Note the UUID. Back in Switchboard, click "Attach existing session" in the create-agent dialog, paste the UUID, name `attached-claude`, submit. The new agent should appear in the selector. Send "what word did I tell you to remember?" → reply should reference PURPLE (proves the session attached and the model has prior context).
+11. **Attach existing Codex session.** Similar flow: `codex exec --json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox 'remember the word ORANGE'` externally; capture the `thread_id` from the stream output (or look up the most recent file in `~/.codex/sessions/<today>/`). In Switchboard, attach that session_id with name `attached-codex`. Send a follow-up referencing ORANGE → reply should recall it. The Codex sidecar file at `<directory>/.switchboard/projects/<project-id>/sessions/<attached-codex-id>.jsonl` should have one line with `original_start_date_utc = <today>`.
+12. **Attach with bad UUID** — try attaching with a UUID that has no session file. Inline error appears showing the expected path; no agent gets registered.
+13. **`make check`** → exits 0.
 
 ### Stop for review after M2.5
 

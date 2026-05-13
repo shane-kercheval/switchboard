@@ -45,6 +45,27 @@ This is not yet usable software. Star or watch the repo if you want to follow al
 
 The architectural decisions, functional requirements, and open questions are being worked through in [`docs/`](./docs). Comments and pushback welcome via issues.
 
+## Local development
+
+macOS only for v1. Prerequisites:
+
+- **Rust** — pinned via [`rust-toolchain.toml`](./rust-toolchain.toml). Install [rustup](https://rustup.rs); the toolchain will be auto-installed on first build.
+- **Node** — version pinned in [`.nvmrc`](./.nvmrc). Install via [nvm](https://github.com/nvm-sh/nvm) (`nvm use`) or any Node version manager.
+- **pnpm** — pinned via the `packageManager` field in `package.json`. Enable via `corepack enable` (Corepack ships with Node).
+- **Xcode Command Line Tools** — `xcode-select --install` (required for native macOS builds).
+
+Common commands (run from the repo root):
+
+```sh
+make install   # one-time: pnpm install --frozen-lockfile
+make dev       # run the Tauri dev shell
+make test      # run all Rust + frontend tests
+make lint      # clippy, eslint, svelte-check
+make check     # everything CI runs — run before opening a PR
+```
+
+See [`AGENTS.md`](./AGENTS.md) for project orientation and conventions, and [`docs/implementation_plans/2026-05-12-v1.md`](./docs/implementation_plans/2026-05-12-v1.md) for the milestone roadmap.
+
 ## License
 
 Apache 2.0. See [LICENSE](./LICENSE).

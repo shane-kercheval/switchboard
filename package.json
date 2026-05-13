@@ -13,8 +13,8 @@
     "tauri": "tauri",
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "lint": "eslint .",
-    "format": "prettier --write \"src/**/*.{ts,svelte,css,html,json}\"",
-    "format:check": "prettier --check \"src/**/*.{ts,svelte,css,html,json}\"",
+    "format": "prettier --write \"**/*.{ts,js,svelte,css,html,json,md}\"",
+    "format:check": "prettier --check \"**/*.{ts,js,svelte,css,html,json,md}\"",
     "test": "vitest run",
     "test:watch": "vitest"
   },

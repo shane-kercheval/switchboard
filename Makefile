@@ -11,9 +11,11 @@ test:
 	pnpm test
 
 lint:
+	cargo fmt --all -- --check
 	cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 	pnpm lint
 	pnpm check
+	pnpm format:check
 
 fmt:
 	cargo fmt --all

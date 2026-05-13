@@ -12,11 +12,25 @@ export default ts.config(
   ...ts.configs.recommended,
   ...svelte.configs["flat/recommended"],
   {
+    // Browser-only: src/ ships to the WebView. Node globals (process, Buffer, etc.)
+    // do not exist there — leaking them past lint would mask real bugs since
+    // OS-level access belongs on the Rust side via Tauri commands.
+    files: ["src/**/*.{ts,svelte,svelte.ts}"],
     languageOptions: {
-      globals: {
-        ...globals.browser,
-        ...globals.node,
-      },
+      globals: { ...globals.browser },
+    },
+  },
+  {
+    // Node-only: config files + test runner setup execute under Node.
+    files: [
+      "*.config.{ts,js,mjs,cjs}",
+      "tests/**/*.{ts,js}",
+      "vite.config.ts",
+      "svelte.config.js",
+      "eslint.config.js",
+    ],
+    languageOptions: {
+      globals: { ...globals.node },
     },
   },
   {

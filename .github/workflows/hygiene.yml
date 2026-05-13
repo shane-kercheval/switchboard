@@ -20,7 +20,8 @@ jobs:
 
       - uses: pnpm/action-setup@v4
         with:
-          version: 11
+          # Keep in sync with `packageManager` in package.json.
+          version: 11.1.1
 
       - uses: actions/setup-node@v4
         with:

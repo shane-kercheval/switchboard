@@ -7,6 +7,4 @@ if (!target) {
   throw new Error("missing #app mount node");
 }
 
-const app = mount(App, { target });
-
-export default app;
+mount(App, { target });

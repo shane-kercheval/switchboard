@@ -132,17 +132,24 @@ const reply = await invoke<string>("ping", { name: "world" });
 - `AGENTS.md` — initial scaffold per implementation outline step 3.
 - No spec changes expected.
 
-### Manual smoke test
+### Verification
 
-After CI passes and you've reviewed the diff, verify by hand. **If anything below fails, the PR isn't ready regardless of unit-test results.**
+The implementing agent runs the Agent-runnable checks and reports results in the PR description. The human runs the Human-required checks before approving. **If anything below fails, the PR isn't ready regardless of unit-test results.**
 
-1. **Fresh clone smoke** — `git clone` to a scratch directory; install prerequisites per the new README; run `make dev` → an empty Tauri window opens within ~30s.
-2. **`make test`** → exits 0; output shows Rust + Vitest tests both ran.
-3. **`make lint`** → exits 0 (no clippy warnings, no frontend lint errors).
-4. **`make fmt`** — running it should be a no-op on a freshly-checked-out tree (already formatted).
-5. **`make check`** → exits 0. Same set of checks CI runs.
-6. **Ping round-trip** — in the running app, open WebView devtools, look for the rendered ping response in the UI (or call `await window.__TAURI__.core.invoke('ping', { name: 'world' })` in the console and confirm it returns `'pong, world'`).
-7. **README sanity** — re-read the README "Local development" section and confirm the commands listed actually work as described. The fresh-clone smoke above is the ground-truth check for this.
+#### Agent-runnable
+
+1. **`make test`** → exits 0; output shows Rust + Vitest tests both ran.
+2. **`make lint`** → exits 0 (no clippy warnings, no frontend lint errors).
+3. **`make fmt`** — no-op on a freshly-checked-out tree (already formatted).
+4. **`make check`** → exits 0. Same set of checks CI runs.
+5. **Ping round-trip** — written as a Rust unit test calling `ping("world")` directly and asserting `"pong, world"` (already in the testing strategy).
+6. **README sanity** — re-read the README "Local development" section and confirm the commands listed match the Makefile targets and prerequisites the agent set up. Spot-check that nothing is stale.
+
+#### Human-required
+
+1. **`make dev`** opens an empty Tauri window within ~30s. Visual confirmation that the app shell renders (background color, title bar, WebView).
+2. **Ping round-trip in WebView** — open the running app's WebView devtools, look for the rendered ping response in the UI, OR call `await window.__TAURI__.core.invoke('ping', { name: 'world' })` in the console and confirm it returns `'pong, world'`. Confirms IPC is actually working through the WebView, not just at the Rust unit-test level.
+3. **Fresh clone smoke** — `git clone` to a scratch directory, install prerequisites per the README, run `make dev`. Confirms the README is followable from scratch.
 
 Open a PR titled `M1.1: Tauri shell + hygiene CI`. Wait for human review.
 
@@ -258,15 +265,21 @@ Use `tempfile::TempDir` for isolation. All tests are unit tests in the `core` cr
 - `docs/v1-plan.md`'s deferred-detail callout ("Persistence schema details (10.3)") — note that M1 lands the registry + project-index shapes; the runs/checkpoint shape is still M5.
 - **`AGENTS.md`** — add the registry-is-append-only invariant, the hyphen↔underscore name normalization rule (applies to both agent names within a project AND project names within a directory), the directory layout (`<directory>/.switchboard/{config.yaml, workflows/, prompts/, projects.jsonl, projects/<project-id>/...}`), and the multi-project-per-directory model. Note explicitly that "project" is a task-scoped grouping (not 1:1 with a directory) — easy concept to get wrong on first encounter.
 
-### Manual smoke test
+### Verification
 
-M1.2 is backend-only — no UI, no Tauri integration yet. Verification is short. **If anything below fails, the PR isn't ready regardless of unit-test results.**
+M1.2 is backend-only — no UI, no Tauri integration yet. Everything is agent-runnable. **If anything below fails, the PR isn't ready regardless of unit-test results.**
+
+#### Agent-runnable
 
 1. **`make test`** → exits 0; output includes the new `crates/core` tests for `Directory`, `Project`, agent registry, and project index.
 2. **`cargo test -p switchboard-core`** → directory + multi-project + agent registry tests all pass (roundtrip, multi-project-per-directory, project-scoped name uniqueness, corruption, regex acceptance/rejection).
-3. **Ad-hoc multi-project tempdir smoke** — drop into a `#[test]` and verify the multi-project case end-to-end: `Directory::at(tmp).init()`; create two projects with different names; register two agents in each (use `assistant` as a name in BOTH projects to confirm same-name-different-projects works); reopen the directory; list projects (see both); list agents in each (see correct two per project, no cross-talk). Optional sanity check beyond unit tests.
-4. **Inspect the on-disk layout** after the smoke above — `find <tmp>/.switchboard -type f` should show: `config.yaml`, `projects.jsonl`, `projects/<id-1>/{config.yaml, registry.jsonl}`, `projects/<id-2>/{config.yaml, registry.jsonl}`. Layout matches system-design §3.
+3. **Multi-project tempdir test** — write an integration-style `#[test]` (in `crates/core/tests/`) that exercises the multi-project case end-to-end: `Directory::at(tmp).init()`; create two projects with different names; register two agents in each (use `assistant` as a name in BOTH projects to confirm same-name-different-projects works); reopen the directory; list projects (see both); list agents in each (see correct two per project, no cross-talk). This becomes a regression test, not just a one-time check.
+4. **On-disk layout assertion** — extend the test above with a `find`-equivalent walk (or `std::fs::read_dir` traversal) asserting the layout matches system-design §3: `config.yaml`, `projects.jsonl`, `projects/<id-1>/{config.yaml, registry.jsonl}`, `projects/<id-2>/{config.yaml, registry.jsonl}`. Codifies the layout commitment.
 5. **`make check`** → exits 0.
+
+#### Human-required
+
+None — M1.2 ships no UI, no devtools surface, no visual artifact. The agent-runnable checks above are the verification.
 
 Open a PR titled `M1.2: project filesystem + agent registry`. Wait for human review.
 
@@ -534,16 +547,22 @@ while let Some(line) = lines.next_line().await? {
 - No spec changes expected unless something contradicts `system-design.md` §9 — surface that to the user immediately.
 - **`AGENTS.md`** — add the exactly-one-terminal-event stream contract, the AdapterEvent vs NormalizedEvent split rationale (TurnStart is dispatcher-owned, never adapter-emitted), the parser-precedence rule (deltas authoritative when `--include-partial-messages` enabled), the subprocess-lifecycle pattern (`Stdio::null()` at spawn, drain stderr concurrently, `child.wait()` after terminal event), the FailureKind discriminator on TurnEnd, and the **`MockHarnessAdapter` for dev-time UI iteration without real `claude`** (selected via `SWITCHBOARD_HARNESS=mock` env var).
 
-### Manual smoke test
+### Verification
 
-M1.3 is backend-only — adapter + parser, no Tauri integration. Live verification requires `claude` installed and authenticated. **If anything below fails, the PR isn't ready regardless of unit-test results.**
+M1.3 is backend-only — adapter + parser, no Tauri integration. Live verification requires `claude` installed and authenticated. Everything is agent-runnable. **If anything below fails, the PR isn't ready regardless of unit-test results.**
 
-1. **`make test`** → exits 0; output includes the harness crate's fake-fixture parser tests.
-2. **Probe `--session-id` idempotency by hand** (per the M1.3 step 3 instruction). Run `claude -p --session-id <fresh-uuid> 'reply with ack'` against a UUID Claude has never seen. Did the implementing agent's reported probe result match? Confirm the implementation took the right branch (always-pass `--session-id` if idempotent; first-vs-subsequent if not).
+#### Agent-runnable
+
+1. **`make test`** → exits 0; output includes the harness crate's fake-fixture parser tests + the `MockHarnessAdapter` test.
+2. **Probe `--session-id` idempotency** (per M1.3 step 3 instruction). Run `claude -p --session-id <fresh-uuid> 'reply with ack'` against a UUID Claude has never seen. Document the result in the PR description and confirm the implementation took the right branch (always-pass `--session-id` if idempotent; FS-check first-vs-subsequent if not).
 3. **Live integration test** — `SWITCHBOARD_LIVE_HARNESS=1 cargo test -- --ignored` runs the real-`claude` smoke test. Should complete in ~5–10s. Expect at least one `ContentChunk` containing `"4"` (or the model's answer to "What's 2+2?") and a clean `TurnEnd(Completed)`.
-4. **Negative path manual check** — temporarily rename or remove `claude` from your PATH, then run the live integration test. Should see the typed `BinaryNotFound` error, NOT a generic `TurnEnd(Failed)`. Restore PATH afterwards.
-5. **Stderr drain check** — run the live integration test once with `RUST_LOG=debug` (or whatever the project's log config ends up as) and confirm stderr from `claude` is being read and logged, not silently dropped.
+4. **Negative path: missing binary** — write a test (or run a one-off command) that constructs `ClaudeCodeAdapter` against a `claude_binary_path` set to a nonexistent path. Should return the typed `BinaryNotFound` error from the adapter constructor, NOT a generic `TurnEnd(Failed)`.
+5. **Stderr drain check** — run the live integration test once with `RUST_LOG=debug` (or whatever the project's log config ends up as) and confirm stderr from `claude` appears in the captured logs (not silently dropped). Easiest path: assert the test captures something on stderr in a unit test using the fake-harness fixture that writes to stderr.
 6. **`make check`** → exits 0.
+
+#### Human-required
+
+None — M1.3 ships no UI surface. The agent's report of probe results + live integration test passing is the verification.
 
 Open a PR titled `M1.3: normalized events + Claude Code adapter`. Wait for human review.
 
@@ -673,19 +692,29 @@ This sub-milestone establishes the chokepoint pattern that M3 will harden into t
 - No new doc files. If the `Dispatcher` shape diverges meaningfully from `system-design.md` §7, surface that as a discussion before changing the spec.
 - **`AGENTS.md`** — add the dispatcher-is-the-single-chokepoint rule, the `EventEmitter` trait + `RecordingEmitter` testing pattern, the `AgentIdleGuard` RAII pattern (with `std::sync::Mutex` rather than `tokio::sync::Mutex`), the dispatch ordering (acquire `AgentIdleGuard` first → state transitions `Idle → InFlight` under lock; release lock; call `adapter.dispatch()` with lock released; `DispatchError` causes guard to drop on early return → state restored to `Idle` automatically; `TurnStart` fires *only after* `dispatch()` returns `Ok` so no orphan `TurnStart` ever lands on the wire), the per-agent event channel `agent:<id>` convention, and the multi-project AppState shape (one bound directory at a time, N projects loaded, one active project for UI display, dispatcher is global because agent IDs are globally unique).
 
-### Manual smoke test
+### Verification
 
-M1.4 wires the dispatcher into Tauri commands but ships no UI — verification is via devtools console. Requires `claude` installed and authenticated for the real-harness path. **If `claude` isn't available, you can do most of the verification with `SWITCHBOARD_HARNESS=mock make dev` instead** — the mock harness (M1.3 step 9) returns canned responses end-to-end, exercising the full dispatcher + Tauri command + event-emission path without a real subprocess. Real-harness verification still happens before merge for the live integration test, but local dev iteration doesn't need it. **If anything below fails, the PR isn't ready regardless of unit-test results.**
+M1.4 wires the dispatcher into Tauri commands but ships no UI yet — most verification happens via devtools console (a human does that). Agent verification is via tests + free-function unit tests of the command shims. Tip for the implementing agent: develop with `SWITCHBOARD_HARNESS=mock make dev` if `claude` isn't installed locally. **If anything below fails, the PR isn't ready regardless of unit-test results.**
 
-1. **`make test`** → exits 0; output includes dispatcher unit tests using `RecordingEmitter` plus the cross-project-concurrency test.
-2. **`make dev`** → app window opens (still empty UI from M1.1).
-3. **Open WebView devtools** and exercise the command surface manually. Suggested sequence:
+#### Agent-runnable
+
+1. **`make test`** → exits 0; output includes dispatcher unit tests using `RecordingEmitter` plus the cross-project-concurrency test plus the panic and stream-contract tests.
+2. **Tauri command free-function tests** — assert the free functions backing each Tauri command (`init_directory`, `create_project`, `open_project`, `set_active_project`, `create_agent`, `list_agents`, `send_message`, `check_claude_binary`, `check_project_status`) behave correctly when invoked directly with a constructed `AppState`. Don't try to test the `#[tauri::command]` wrapper itself.
+3. **Missing-binary path** — write a test that constructs `AppState` with an adapter pointing at a nonexistent `claude` binary and calls `check_claude_binary` → returns `BinaryNotFound`. Don't rely on actually editing `$PATH`.
+4. **`make check`** → exits 0.
+
+#### Human-required
+
+The full Tauri-IPC + event-streaming + multi-project concurrency path can only be exercised via the running app's WebView devtools. Use the real harness (`make dev`) for these unless you specifically want to test the mock path; both should behave identically at the dispatcher boundary.
+
+1. **`make dev`** → app window opens (still empty UI from M1.1).
+2. **Open WebView devtools** and exercise the command surface. Suggested sequence:
    ```javascript
    // Confirm the binary check works
    await window.__TAURI__.core.invoke('check_claude_binary');  // returns null/ok
 
    // Bind a working directory + create a project
-   const dirInfo = await window.__TAURI__.core.invoke('init_directory', { path: '/tmp/sw-smoke' });
+   await window.__TAURI__.core.invoke('init_directory', { path: '/tmp/sw-smoke' });
    const projA = await window.__TAURI__.core.invoke('create_project', { name: 'project-a' });
    await window.__TAURI__.core.invoke('set_active_project', { projectId: projA.id });
 
@@ -699,7 +728,7 @@ M1.4 wires the dispatcher into Tauri commands but ships no UI — verification i
    const turnId = await window.__TAURI__.core.invoke('send_message', { agentId: agent.id, prompt: "What's 2+2?" });
    ```
    Expect to see in the console: `turn_start` event → multiple `content_chunk` events with text → `turn_end` with `outcome: { status: 'completed' }` and a populated `usage` field. Each event payload's `turn_id` matches the one returned synchronously.
-4. **Multi-project concurrency** — create a second project in the same directory:
+3. **Multi-project concurrency** — create a second project in the same directory:
    ```javascript
    const projB = await window.__TAURI__.core.invoke('create_project', { name: 'project-b' });
    await window.__TAURI__.core.invoke('set_active_project', { projectId: projB.id });
@@ -711,9 +740,7 @@ M1.4 wires the dispatcher into Tauri commands but ships no UI — verification i
    const turnB = await window.__TAURI__.core.invoke('send_message', { agentId: agentB.id, prompt: 'count to 3' });
    ```
    Both should stream concurrently; events arrive on the right per-agent channel; no cross-talk. Confirms the architecture supports multi-project even before the UI does.
-5. **Concurrent dispatch refusal (same agent)** — call `send_message` twice fast for the same agent; the second returns the "agent is busy" error.
-6. **Missing-binary path** — temporarily remove `claude` from PATH, restart the app, run `check_claude_binary` → `BinaryNotFound`. Restore PATH.
-7. **`make check`** → exits 0.
+4. **Concurrent dispatch refusal (same agent)** — call `send_message` twice fast for the same agent; the second returns the "agent is busy" error.
 
 Open a PR titled `M1.4: dispatcher + Tauri command surface`. Wait for human review.
 
@@ -842,37 +869,45 @@ Vitest + `@testing-library/svelte` are already set up from M1.1.
 - A short user-facing note (could be in README or a separate `docs/getting-started.md`) — but only if the user asks for it. Don't create new docs unprompted per the global instructions.
 - **`AGENTS.md`** — add the per-agent transcript reducer shape (TS types pinned in M1.5), the per-agent subscription model (subscribe on AgentPane mount, reducer filters by `turn_id`), the binary-not-found banner pattern (once-per-app-launch via `check_claude_binary` startup probe), and the wire-format ↔ TS-type mapping convention (`#[serde(tag = "type", rename_all = "snake_case")]` on Rust enums → discriminated union in TS).
 
-### Manual smoke test
+### Verification
 
-This is the closing manual test for the entire M1 acceptance flow — the moment of truth. Requires `claude` installed and authenticated for the real-harness path (steps below assume `SWITCHBOARD_HARNESS` unset / default). **For UI iteration during M1.5 development, use `SWITCHBOARD_HARNESS=mock make dev`** — the mock harness from M1.3 step 9 returns canned streaming text without needing real `claude`, lets you iterate on the UI without burning quota or requiring auth setup. Run the smoke test below against the real harness before merging. **If anything below fails, the PR isn't ready regardless of unit-test results.**
+The closing test for the entire M1 acceptance flow. Tip for the implementing agent: develop with `SWITCHBOARD_HARNESS=mock make dev` for UI iteration without burning real-claude quota; the human path below assumes the real harness for the final smoke. **If anything below fails, the PR isn't ready regardless of unit-test results.**
 
-1. **`make test`** → exits 0; output includes new reducer + ComposeBar component tests.
-2. **`make dev`** → app window opens within ~30s. No banner if `claude` is on PATH; if missing, see the binary-not-found banner with install link copy.
-3. **Welcome screen** → "Open working directory" button visible.
-4. **Folder picker** → click "Open working directory," native folder picker opens, pick a fresh empty directory (e.g., `/tmp/sw-smoke-1`).
-5. **First-time-init CTA** → since the folder has no `.switchboard/`, you see "Initialize Switchboard in this directory and create a project named `sw-smoke-1`?" — confirm.
-6. **Title bar** → reads something like `sw-smoke-1 — sw-smoke-1` (project name + directory basename; default project name was the directory's name).
-7. **No-agents state** → app prompts "Create agent."
-8. **Create agent** → name field defaults to `"assistant"`. Submit.
-9. **Single-pane view appears** → output area on top (empty), compose bar on bottom, status indicator shows "idle."
-10. **Send "What's 2+2?"** → press Cmd+Enter (and separately try the Send button).
-    - User turn appears in transcript immediately (optimistic).
-    - Status flips to "processing"; Send button disables.
-    - Agent reply streams into the pane character-by-character ("4" or similar correct answer).
-    - On TurnEnd, status returns to "idle"; Send button re-enables.
-11. **Send a follow-up** → e.g., "What about times two?" → confirm the model recalls prior context (proves session resume works), reply streams.
-12. **Reload the app** (close and `make dev` again) → re-open the same directory → see "Open this project?" CTA listing the existing project — confirm, agent is still there → send another message → still works (proves persistence end-to-end).
-13. **Existing-directory flow with multiple projects** — close app, restart, pick the same `/tmp/sw-smoke-1` directory → see the existing project listed; alongside it, "Create another project" → enter a new name (e.g., `task-2`) → new project becomes active. Confirm: title bar updates; no agents in this new project; create one and send a message — runs independently of the first project's agent. Both projects' state coexist on disk under `<directory>/.switchboard/projects/`.
-14. **Empty/whitespace prompt rejection** → try sending with empty input or only spaces → Send button stays disabled or backend rejects (depending on which gate fires first).
-15. **Late-event filter** — open devtools console, watch the events on `agent:<id>` channel as you send a message. After TurnEnd fires, no further events should arrive on the channel (until you send the next message). The reducer's `turn_id` filter catches any stragglers; nothing should leak into the next turn's display.
-16. **`make check`** → exits 0.
+#### Agent-runnable
+
+1. **`make test`** → exits 0; output includes new reducer + ComposeBar component tests + the late-event-from-prior-turn reducer test.
+2. **Reducer unit tests cover the full event sequence** — assert: empty transcript + (`turn_start`, `content_chunk`×N, `turn_end(completed)`) → one complete agent Turn whose text equals the concatenated chunk text; failed-turn variant similarly; late event with mismatched `turn_id` ignored.
+3. **`make check`** → exits 0.
+
+#### Human-required
+
+The M1 acceptance flow is fundamentally a UI walkthrough — these can only be done by a human in front of the running app. Run against the real harness (`make dev` with `claude` installed and authenticated). The implementing agent may use `SWITCHBOARD_HARNESS=mock make dev` to iterate but the human verification uses real `claude`.
+
+1. **`make dev`** → app window opens within ~30s. No banner if `claude` is on PATH; if missing, see the binary-not-found banner with install link copy.
+2. **Welcome screen** → "Open working directory" button visible.
+3. **Folder picker** → click "Open working directory," native folder picker opens, pick a fresh empty directory (e.g., `/tmp/sw-smoke-1`).
+4. **First-time-init CTA** → since the folder has no `.switchboard/`, you see "Initialize Switchboard in this directory and create a project named `sw-smoke-1`?" — confirm.
+5. **Title bar** → reads something like `sw-smoke-1 — sw-smoke-1` (project name + directory basename; default project name was the directory's name).
+6. **No-agents state** → app prompts "Create agent."
+7. **Create agent** → name field defaults to `"assistant"`. Submit.
+8. **Single-pane view appears** → output area on top (empty), compose bar on bottom, status indicator shows "idle."
+9. **Send "What's 2+2?"** → press Cmd+Enter (and separately try the Send button).
+   - User turn appears in transcript immediately (optimistic).
+   - Status flips to "processing"; Send button disables.
+   - Agent reply streams into the pane character-by-character ("4" or similar correct answer).
+   - On TurnEnd, status returns to "idle"; Send button re-enables.
+10. **Send a follow-up** → e.g., "What about times two?" → confirm the model recalls prior context (proves session resume works), reply streams.
+11. **Reload the app** (close and `make dev` again) → re-open the same directory → see "Open this project?" CTA listing the existing project — confirm, agent is still there → send another message → still works (proves persistence end-to-end).
+12. **Existing-directory flow with multiple projects** — close app, restart, pick the same `/tmp/sw-smoke-1` directory → see the existing project listed; alongside it, "Create another project" → enter a new name (e.g., `task-2`) → new project becomes active. Confirm: title bar updates; no agents in this new project; create one and send a message — runs independently of the first project's agent. Both projects' state coexist on disk under `<directory>/.switchboard/projects/`.
+13. **Empty/whitespace prompt rejection** → try sending with empty input or only spaces → Send button stays disabled or backend rejects (depending on which gate fires first).
+14. **Late-event filter** — open devtools console, watch the events on `agent:<id>` channel as you send a message. After TurnEnd fires, no further events should arrive on the channel (until you send the next message). The reducer's `turn_id` filter catches any stragglers; nothing should leak into the next turn's display.
 
 ### M1 close-out
 
 After M1.5 merges, M1 is done. Final check on a fresh clone:
 - `git clone` to a brand-new directory.
 - Follow the README "Local development" + "Try it out" steps from scratch.
-- Hit every step 1–13 above. Anything that requires "see prior README" or "ask in chat" is a README bug — fix it.
+- Hit every step 1–14 of the Human-required section above. Anything that requires "see prior README" or "ask in chat" is a README bug — fix it.
 
 Open a PR titled `M1.5: single-pane agent UI`. Wait for human review.
 

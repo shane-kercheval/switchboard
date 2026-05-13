@@ -85,16 +85,22 @@ This sub-milestone is research, not implementation — no Rust tests yet. The va
 - No spec changes expected. If the probe surfaces something that contradicts `system-design.md` §9 (e.g., Codex emits a previously-undocumented terminal event), flag it for discussion before changing the spec.
 - **`AGENTS.md`** — add a "Codex CLI ground truth" pointer noting that `docs/research/codex-cli-observed.md` is the authoritative reference for Codex behavior, and that `crates/<harness>/tests/fixtures/codex/` holds captured fixtures the parser tests run against. Note the resume + date-partitioning gotcha (sessions resumed days later live in the original spawn-day's directory).
 
-### Manual smoke test
+### Verification
 
-M2.1 is research/probes — the deliverable is captured fixtures + research doc updates, not code. **If anything below fails, the PR isn't ready regardless of what the agent reported.**
+M2.1 is research/probes — the deliverable is captured fixtures + research doc updates, not code. Everything is agent-runnable. **If anything below fails, the PR isn't ready regardless of what the agent reported.**
 
-1. **Inspect captured fixtures** — `ls crates/<harness>/tests/fixtures/codex/`. Each scenario from step 1 of the implementation outline should have its own `.jsonl` file. Open one — it should be real captured stream-json (look for `thread.started`, `turn.completed`/`turn.failed`, etc.), not paraphrased.
-2. **Read the new "Findings during M2.1" subsection** in `docs/research/codex-cli-observed.md` — it should include real JSON line excerpts, not just prose.
-3. **Spot-check one probe command** — pick one of the four scenarios and run the command yourself; output should match the captured fixture (modulo per-run UUIDs/timestamps).
-4. **Verify the install path** — try the documented Codex install command on a clean shell session (or in a container/VM if you have one handy). `codex --version` should print after install.
-5. **Verify non-interactive auth** — run `OPENAI_API_KEY=<key> codex exec --json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox 'reply with ack'` (or whatever the M2.1 finding says is the right env-var path). Should run without prompting.
-6. **Verify resume + date-partition behavior** — the M2.1 probe should have answered: does `codex exec resume` append to the original session file, or write to the resume-day's directory? Confirm the answer is documented and matches what M2.4's date-partitioning logic will assume.
+#### Agent-runnable
+
+1. **Inspect captured fixtures** — `ls crates/<harness>/tests/fixtures/codex/`. Each scenario from step 1 of the implementation outline should have its own `.jsonl` file; open one and confirm it's real captured stream-json (look for `thread.started`, `turn.completed`/`turn.failed`, etc.), not paraphrased.
+2. **Read the new "Findings during M2.1" subsection** in `docs/research/codex-cli-observed.md` — should include real JSON line excerpts, not just prose.
+3. **Spot-check one probe command** — pick one of the four scenarios and run the command directly; output should match the captured fixture (modulo per-run UUIDs/timestamps).
+4. **Verify the install path** — run the documented Codex install command on a clean shell session (or in a container/VM); `codex --version` should print after install.
+5. **Verify non-interactive auth** — run `OPENAI_API_KEY=<key> codex exec --json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox 'reply with ack'` (or whatever M2.1 finding says is the right env-var path). Should run without prompting.
+6. **Verify resume + date-partition behavior** — confirm the probe answered: does `codex exec resume` append to the original session file, or write to the resume-day's directory? The answer is in the research doc and matches what M2.4's date-partitioning logic will assume.
+
+#### Human-required
+
+None — M2.1 has no UI surface. The agent's report of fixtures captured + research doc updated is the verification.
 
 ### Stop for review after M2.1
 
@@ -192,16 +198,21 @@ After this sub-milestone:
 - No `system-design.md` changes expected — §9's vocabulary already specifies the full set.
 - **`AGENTS.md`** — extend the event-vocabulary section with the four new variants (ToolStarted, ToolCompleted, RateLimitEvent, SessionMeta) and the two field additions (ContentChunk.kind, TurnEnd.usage). Document the "M2.2 paid the wire-breaks once" rationale so future-us doesn't re-litigate. Add the process-group spawn pattern (`Command::process_group(0)`) and the `Stdio::null()` stdin convention for subprocess spawn.
 
-### Manual smoke test
+### Verification
 
 M2.2 expands the Claude Code adapter to emit the full event vocabulary, refactors to process-group spawn + `Stdio::null()`, and adds wire-format-breaking field changes. Requires `claude` installed and authenticated. **If anything below fails, the PR isn't ready regardless of unit-test results.**
 
+#### Agent-runnable
+
 1. **`make test`** → exits 0; output includes new ToolStarted/ToolCompleted/RateLimitEvent/SessionMeta wire-format roundtrip tests + the no-thinking-emitted parser test.
 2. **`SWITCHBOARD_LIVE_HARNESS=1 cargo test -- --ignored`** — live Claude Code integration still passes; new tool-using fixture emits ToolStarted/ToolCompleted; first turn emits SessionMeta.
-3. **`make dev`** → app opens. Send "list the files in this directory using ls" via the M1.5 UI to your existing `assistant` agent. Open WebView devtools console; you should see (in addition to ContentChunks) new event types arriving — depending on M2's UI scope, either rendered or `console.warn`'d by the reducer's default branch.
-4. **TurnEnd usage populated** — devtools console: confirm the `turn_end` event payload includes a populated `usage: { input_tokens, output_tokens, ... context_window }` field. If `context_window` is missing or zero for Claude, that's a real bug — the result event should carry it via `modelUsage.<model>.contextWindow`.
-5. **Process-group sanity check** — while a turn is mid-stream, in another shell run `pgrep -P <switchboard-pid>` to confirm the `claude` subprocess is in its own process group. (`ps -p <claude-pid> -o pgid` should show a different pgid than Switchboard's own.) Foundational for M3's `killpg`-based cancel.
-6. **`make check`** → exits 0.
+3. **TurnEnd.usage populated assertion** — extend the live integration test to assert the `TurnEnd.usage` field is `Some(...)` with non-zero `input_tokens`, `output_tokens`, and a populated `context_window`. Catches the missing-field regression as a real test, not a manual-eyeball check.
+4. **Process-group sanity check via test** — write a unit/integration test (using the fake harness or a one-off long-running fake process) that asserts `getpgid(child)` differs from `getpgid(parent)`. Codifies the `Command::process_group(0)` requirement as a regression test rather than a manual `pgrep` check.
+5. **`make check`** → exits 0.
+
+#### Human-required
+
+1. **`make dev`** → app opens. Send "list the files in this directory using ls" via the M1.5 UI to your existing `assistant` agent. Open WebView devtools console; you should see (in addition to ContentChunks) new event types arriving — `console.warn`'d by the M1.5 reducer's default branch (UI rendering of new event types is M3+). Confirms the new variants actually cross the IPC boundary, not just the Rust side.
 
 ### Stop for review after M2.2
 
@@ -296,23 +307,28 @@ This sub-milestone does NOT add session-file enrichment — that's M2.4. M2.3 em
 - No spec changes expected; system-design §9 already specifies the per-harness adapter shape and Codex's session-id-from-stream model.
 - **`AGENTS.md`** — add the Codex session-link sidecar pattern (`<directory>/.switchboard/projects/<project-id>/sessions/<agent_id>.jsonl`, append-only, latest line wins, write-on-`thread.started`-immediately, original_start_date_utc copied on resume). Add the AppState named-fields convention (`claude_adapter` / `codex_adapter`) and the harness-asymmetry note (Claude pre-assigns session_id; Codex captures from stream).
 
-### Manual smoke test
+### Verification
 
 M2.3 introduces the second harness end-to-end. Requires both `claude` and `codex` installed and authenticated. **If anything below fails, the PR isn't ready regardless of unit-test results.**
 
+#### Agent-runnable
+
 1. **`make test`** → exits 0; output includes new Codex fixture-driven parser tests + dispatcher two-adapter test + error-buffer-on-EOF test.
 2. **`SWITCHBOARD_LIVE_HARNESS=1 cargo test -- --ignored`** → live Codex smoke test passes; assertions about ContentChunk + ToolStarted + ToolCompleted + TurnEnd fire correctly.
-3. **`make dev`** → app opens. Open WebView devtools and exercise:
+3. **Session-link sidecar test** — extend the live integration test to assert the sidecar file gets a record on `thread.started`, with valid `session_id`, `original_start_date_utc` (today), `started_at`. Then run a second dispatch in the same test and assert the file now has two lines, both with the same `session_id` and `original_start_date_utc`.
+4. **Resume works (test, not manual)** — extend the live integration test to dispatch twice to the same Codex agent and assert the second invocation uses `codex exec resume <session-id>` (inspectable via the spawn arguments — the test can wrap the adapter or assert via a logged command line).
+5. **Two-adapter dispatcher test** — already in the testing strategy: create one Claude Code agent and one Codex agent in the same registry, dispatch to each, assert events flow through both correctly without cross-talk.
+6. **`make check`** → exits 0.
+
+#### Human-required
+
+1. **`make dev`** → app opens. Open WebView devtools and exercise the Codex-via-IPC path:
    ```javascript
    await window.__TAURI__.core.invoke('check_codex_binary');                    // ok if codex installed
    await window.__TAURI__.core.invoke('create_agent', { name: 'codex-helper', harness: 'codex' });
    const turnId = await window.__TAURI__.core.invoke('send_message', { agentId: '<id>', prompt: 'reply with ack' });
    ```
-   Console should show: `turn_start` → `content_chunk` (single, not stream of deltas — Codex emits whole `agent_message` items) → `turn_end(completed)`. Compare against your existing Claude Code agent — same event shape, different streaming granularity.
-4. **Session-link sidecar exists** — `cat <directory>/.switchboard/projects/<project-id>/sessions/<codex-agent-id>.jsonl`. Should have a single line with `session_id`, `original_start_date_utc`, `started_at`. Send a second message to the same agent → second line appended; both lines have the same `session_id` and `original_start_date_utc`.
-5. **Resume works** — close app, restart, send another message to the same Codex agent → it should `codex exec resume <session-id>` (not start fresh) and the model should recall prior context.
-6. **Two agents, no cross-talk** — with both Claude Code and Codex agents in the same project, dispatch to each via devtools. Confirm events arrive on the right per-agent channel; no events from one show up in the other.
-7. **`make check`** → exits 0.
+   Console should show: `turn_start` → `content_chunk` (single, not stream of deltas — Codex emits whole `agent_message` items) → `turn_end(completed)`. Compare against your existing Claude Code agent — same event shape, different streaming granularity. Confirms the IPC path actually carries Codex events (the agent-runnable tests cover the Rust side; this confirms the wire format crosses the WebView bridge correctly).
 
 ### Stop for review after M2.3
 
@@ -367,17 +383,22 @@ After this sub-milestone:
 - `docs/research/codex-cli-observed.md` — confirm or revise the session-file-vs-stream timing assumption based on what you see in implementation. The current research note says "the session file is updated synchronously" — verify.
 - **`AGENTS.md`** — add the Codex session-file enrichment pattern (read on `turn.completed` / `turn.failed` to fill in RateLimitEvent + SessionMeta from the session file; agent-scoped events arrive after TurnEnd because Codex's metadata source is the session file). Add the "TurnEnd is terminal for a turn, not for the per-agent channel" rule.
 
-### Manual smoke test
+### Verification
 
-M2.4 adds Codex session-file enrichment so RateLimitEvent and SessionMeta fire for Codex agents. Requires `codex` installed and authenticated. **If anything below fails, the PR isn't ready regardless of unit-test results.**
+M2.4 adds Codex session-file enrichment so RateLimitEvent and SessionMeta fire for Codex agents. Requires `codex` installed and authenticated. Mostly agent-runnable. **If anything below fails, the PR isn't ready regardless of unit-test results.**
+
+#### Agent-runnable
 
 1. **`make test`** → exits 0; output includes session-file parser tests + date-boundary test + session-file-not-yet-written test.
 2. **`SWITCHBOARD_LIVE_HARNESS=1 cargo test -- --ignored`** → live Codex test now also asserts RateLimitEvent and SessionMeta arrive after TurnEnd.
-3. **`make dev`** → app opens. Send a message to a Codex agent via devtools. Console should show, **after** the `turn_end` event: a `session_meta` event (first turn only — populated with `model_context_window` from the session file) and a `rate_limit_event` (every turn — populated with the rate-limit info Codex puts in `token_count`).
-4. **Session file actually read** — find the corresponding session file at `~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-*-<session-uuid>.jsonl` (use the `session_id` from the M2.3 sidecar). Confirm the file exists and its `task_started` event contains `model_context_window` matching what M2.4 emitted in SessionMeta.
-5. **Cross-day session** (optional, harder to test naturally) — manually edit the sidecar's `original_start_date_utc` to yesterday's date, restart, dispatch → adapter should look in yesterday's directory, find the session file, enrich correctly. Restore the sidecar afterwards.
-6. **Missing session file edge case** — temporarily move a session file aside, dispatch → adapter should retry briefly then degrade gracefully (logged warning, no SessionMeta/RateLimitEvent for this turn, but TurnEnd still fires cleanly). Restore the file.
-7. **`make check`** → exits 0.
+3. **Session file actually read (test)** — extend the live integration test: after a Codex turn completes, locate the session file at `~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-*-<session-uuid>.jsonl` (using the `session_id` from the M2.3 sidecar), parse its `task_started` event, and assert the `model_context_window` matches what the SessionMeta event carried. Catches "we said we read the file but actually we hardcoded the value" regressions.
+4. **Cross-day session test** — write a unit/integration test that mocks the sidecar's `original_start_date_utc` to yesterday, then dispatches → adapter looks in yesterday's directory; assert it finds a fixture session file there. Codifies the date-partition gotcha as a real test.
+5. **Missing session file test** — write a test that runs the enrichment with the session file moved aside → adapter retries briefly then logs a warning and skips SessionMeta/RateLimitEvent for that turn (but TurnEnd still fires cleanly).
+6. **`make check`** → exits 0.
+
+#### Human-required
+
+1. **`make dev`** → app opens. Send a message to a Codex agent via devtools. Console should show, **after** the `turn_end` event: a `session_meta` event (first turn only — populated with `model_context_window` from the session file) and a `rate_limit_event` (every turn — populated with the rate-limit info Codex puts in `token_count`). Confirms the agent-scoped events actually cross the WebView bridge after TurnEnd, not just the Rust side.
 
 ### Stop for review after M2.4
 
@@ -487,23 +508,30 @@ This is **not multi-pane** — one pane visible at a time. Multi-pane is M3. **P
 - M1.5 binary-not-found banner copy may need updating to handle two binaries gracefully.
 - **`AGENTS.md`** — add the project-level state model (transcripts AND runtime metadata maps, both keyed by agent_id, with separate reducers but a shared per-agent listener), the subscription lifecycle (creation on project-active, dynamic-add on `create_agent` success, atomic teardown on project swap, teardown on close), and the per-harness banner UX convention. Document why the frontend ownership reshuffled vs M1.5 (per-pane subscriptions would recreate the M1.4 TurnStart race when switching agents). Document the **`attach_agent` flow** as a peer of `create_agent` (validates the harness's session file exists; for Codex, parses `original_start_date_utc` from the discovered file's path and writes the first sidecar record at attach time).
 
-### Manual smoke test
+### Verification
 
-M2.5 is the major UI sub-milestone — full multi-agent end-to-end flow via the new selector. Requires both `claude` and `codex` installed and authenticated. **If anything below fails, the PR isn't ready regardless of unit-test results.**
+M2.5 is the major UI sub-milestone — full multi-agent end-to-end flow via the new selector. Requires both `claude` and `codex` installed and authenticated. UI-heavy. **If anything below fails, the PR isn't ready regardless of unit-test results.**
 
-1. **`make test`** → exits 0; output includes new selector + runtime-reducer + project-swap teardown + dynamic-agent-add tests.
-2. **`make dev`** → app opens. If only one harness is installed, you should see a banner specifically for the missing one ("Codex not found on PATH; Codex agents will be unavailable until you install it") and the create-agent dialog should disable the corresponding harness chooser entry.
-3. **Create both agents** — open or create a project, then create one Claude Code agent and one Codex agent. Selector lists both with harness-type badges visible.
-4. **Switch between them** — pick the Claude agent, send "What's 2+2?", watch it stream. Switch to Codex agent (Claude turn finishes), send "reply with ack", watch it stream (different streaming granularity — Codex emits whole `agent_message` items, not deltas; this is expected and visibly different).
-5. **Switch back to Claude agent** — its prior transcript is still there (didn't get dropped).
-6. **Send to both, then switch** — start a turn on the Claude agent, immediately switch to Codex and send a turn there. Switch back to Claude → its turn either completed or is mid-stream; transcript is intact either way. No cross-talk.
-7. **Project swap teardown** — close the project (or open a different project root); send a message to an agent in the new project; in devtools, confirm no events from the old project's agents are firing into the new project's state.
-8. **Dynamic agent add** — with the project open, create a third agent; immediately send a message to it (no app restart) → events arrive cleanly, no missed first event.
-9. **Per-agent runtime metadata** — devtools: `console.log(/* however the runtime state is exposed */)` after a few turns; should see `lastUsage` populated for each agent based on its most-recent TurnEnd.
-10. **Attach existing Claude session.** In a separate terminal: `claude -p --session-id $(uuidgen | tr A-Z a-z) --dangerously-skip-permissions 'remember the word PURPLE'` from inside the same working directory. Note the UUID. Back in Switchboard, click "Attach existing session" in the create-agent dialog, paste the UUID, name `attached-claude`, submit. The new agent should appear in the selector. Send "what word did I tell you to remember?" → reply should reference PURPLE (proves the session attached and the model has prior context).
-11. **Attach existing Codex session.** Similar flow: `codex exec --json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox 'remember the word ORANGE'` externally; capture the `thread_id` from the stream output (or look up the most recent file in `~/.codex/sessions/<today>/`). In Switchboard, attach that session_id with name `attached-codex`. Send a follow-up referencing ORANGE → reply should recall it. The Codex sidecar file at `<directory>/.switchboard/projects/<project-id>/sessions/<attached-codex-id>.jsonl` should have one line with `original_start_date_utc = <today>`.
-12. **Attach with bad UUID** — try attaching with a UUID that has no session file. Inline error appears showing the expected path; no agent gets registered.
-13. **`make check`** → exits 0.
+#### Agent-runnable
+
+1. **`make test`** → exits 0; output includes new selector + runtime-reducer + project-swap teardown + dynamic-agent-add tests + `attach_agent` validation tests.
+2. **`make check`** → exits 0.
+
+#### Human-required
+
+The full multi-agent flow can only be verified by a human in the running app.
+
+1. **`make dev`** → app opens. If only one harness is installed, you should see a banner specifically for the missing one ("Codex not found on PATH; Codex agents will be unavailable until you install it") and the create-agent dialog should disable the corresponding harness chooser entry.
+2. **Create both agents** — open or create a project, then create one Claude Code agent and one Codex agent. Selector lists both with harness-type badges visible.
+3. **Switch between them** — pick the Claude agent, send "What's 2+2?", watch it stream. Switch to Codex agent (Claude turn finishes), send "reply with ack", watch it stream (different streaming granularity — Codex emits whole `agent_message` items, not deltas; this is expected and visibly different).
+4. **Switch back to Claude agent** — its prior transcript is still there (didn't get dropped).
+5. **Send to both, then switch** — start a turn on the Claude agent, immediately switch to Codex and send a turn there. Switch back to Claude → its turn either completed or is mid-stream; transcript is intact either way. No cross-talk.
+6. **Project swap teardown** — close the project (or open a different project root); send a message to an agent in the new project; in devtools, confirm no events from the old project's agents are firing into the new project's state.
+7. **Dynamic agent add** — with the project open, create a third agent; immediately send a message to it (no app restart) → events arrive cleanly, no missed first event.
+8. **Per-agent runtime metadata** — devtools: `console.log(/* however the runtime state is exposed */)` after a few turns; should see `lastUsage` populated for each agent based on its most-recent TurnEnd.
+9. **Attach existing Claude session.** In a separate terminal: `claude -p --session-id $(uuidgen | tr A-Z a-z) --dangerously-skip-permissions 'remember the word PURPLE'` from inside the same working directory. Note the UUID. Back in Switchboard, click "Attach existing session" in the create-agent dialog, paste the UUID, name `attached-claude`, submit. The new agent should appear in the selector. Send "what word did I tell you to remember?" → reply should reference PURPLE (proves the session attached and the model has prior context).
+10. **Attach existing Codex session.** Similar flow: `codex exec --json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox 'remember the word ORANGE'` externally; capture the `thread_id` from the stream output (or look up the most recent file in `~/.codex/sessions/<today>/`). In Switchboard, attach that session_id with name `attached-codex`. Send a follow-up referencing ORANGE → reply should recall it. The Codex sidecar file at `<directory>/.switchboard/projects/<project-id>/sessions/<attached-codex-id>.jsonl` should have one line with `original_start_date_utc = <today>`.
+11. **Attach with bad UUID** — try attaching with a UUID that has no session file. Inline error appears showing the expected path; no agent gets registered.
 
 ### Stop for review after M2.5
 
@@ -578,16 +606,22 @@ This sub-milestone IS the testing strategy for the adapters. The "tests of the t
 - Top-level `README.md` "Local development" section — add a brief note pointing at the integration test README.
 - **`AGENTS.md`** — add the integration testing convention (env-var-gated, `crates/<harness>/tests/integration/` layout, cheapest-model + small-response discipline per system-design §9, adapter-level tests for adapter-emitted events vs dispatcher-level smoke for TurnStart). Add a `Makefile` target reference (`make integration`) if introduced.
 
-### Manual smoke test
+### Verification
 
-M2.6 lands the integration test suite (no CI yet — that's M2.7). Requires both harnesses installed and authenticated; will consume subscription rate-limit quota for the duration of the run. **If anything below fails, the PR isn't ready regardless of unit-test results.**
+M2.6 lands the integration test suite (no CI yet — that's M2.7). Requires both harnesses installed and authenticated; will consume subscription rate-limit quota for the duration of the run. Everything is agent-runnable. **If anything below fails, the PR isn't ready regardless of unit-test results.**
+
+#### Agent-runnable
 
 1. **`make test`** (or `cargo test` with no env var) → all unit tests pass; integration tests are reported as "ignored." No real harness invocations on this run.
 2. **`SWITCHBOARD_LIVE_HARNESS=1 cargo test -- --ignored`** (or `make integration` if added as a Makefile target) → all integration tests pass. Should complete in 1–3 minutes.
-3. **Validate one regression catches a real break** — pick one test, intentionally break the corresponding adapter behavior in a temporary local change (e.g., comment out the SessionMeta emission in the Claude Code adapter), re-run integration → that specific test fails. Restore the change. This proves the test catches what it claims to catch.
-4. **Read the new `tests/README.md`** — follow the "how to run integration tests locally" instructions step-by-step on your own machine. Anything that requires "see the implementer in chat" is a README bug — fix it.
-5. **Test layout** — `ls crates/<harness>/tests/integration/`. Should see one file per adapter-emitted event type per harness, plus a single `dispatcher_smoke.rs` for TurnStart (per the adapter-vs-dispatcher boundary established in finding #7 of the M2 review).
+3. **Validate one regression catches a real break** — pick one test, intentionally break the corresponding adapter behavior in a temporary local change (e.g., comment out the SessionMeta emission in the Claude Code adapter), re-run integration → that specific test fails. Restore the change. Proves the test catches what it claims to catch.
+4. **`tests/README.md` followability** — read the new doc and follow the "how to run integration tests locally" instructions on a clean shell session. Anything that requires "see the implementer in chat" is a README bug — fix it.
+5. **Test layout** — `ls crates/<harness>/tests/integration/`. Should see one file per adapter-emitted event type per harness, plus a single `dispatcher_smoke.rs` for TurnStart (per the adapter-vs-dispatcher boundary).
 6. **`make check`** → exits 0 (no env var; integration suite not run during `make check`).
+
+#### Human-required
+
+None — the integration suite is fully agent-runnable. The agent's report of "all integration tests passed" + the regression-catches-break check is the verification.
 
 ### Stop for review after M2.6
 
@@ -653,16 +687,21 @@ This is operational config — primary validation is "does it run end-to-end in 
 - The `tests/README.md` from M2.6 — add a line pointing at the CI workflow file.
 - **`AGENTS.md`** — add the CI workflow shape (hygiene CI from M1.1 + integration CI from M2.7; fork-PR fallback skips integration; env-var-based auth in CI). Add the secret-availability gate pattern as a convention for any future CI workflow that needs API keys. Note that no cost reporting is surfaced anywhere — subscription-tier model per system-design §3 non-goals.
 
-### Manual smoke test
+### Verification
 
-M2.7 is operational config — the deliverable is a working CI workflow, not code. **If anything below fails, the PR isn't ready regardless of unit-test results.**
+M2.7 is operational config — the deliverable is a working CI workflow, not code. Mostly agent-runnable (push branches, observe logs); one human gate. **If anything below fails, the PR isn't ready regardless of unit-test results.**
+
+#### Agent-runnable
 
 1. **Inspect `.github/workflows/integration.yml`** — clean, readable; secret-availability gate is the first real step; install steps run only when secrets are available.
-2. **Push the M2.7 PR** → workflow fires on the push. Open the GitHub Actions run; verify the "secrets available" step prints `available=true` (your branch has access to org secrets).
+2. **Push the M2.7 PR** → workflow fires on the push. Open the GitHub Actions run; verify the "secrets available" step prints `available=true` (the branch has access to org secrets).
 3. **Workflow completes green** — install steps succeed; integration suite runs; run summary appears at the end with `# tests run`, `# passed`, `# failed`, `wall-clock duration`.
-4. **Fork PR fallback** — push a throwaway commit from a personal fork (or simulate by stripping secrets temporarily). Confirm the workflow runs but skips integration cleanly with the `::notice::Skipping integration tests — secrets unavailable` line. Hygiene CI (M1.1) still runs and gates merge.
-5. **Failure path** — in a throwaway branch, intentionally break a test (e.g., assert the wrong text) → push → CI catches it and the workflow fails with a useful diff in the logs.
-6. **Local parity** — confirm `make integration` (or whatever the local-equivalent target is) runs the same commands locally that CI runs in the workflow. Local and CI should match.
+4. **Failure path** — in a throwaway branch, intentionally break a test (e.g., assert the wrong text) → push → CI catches it and the workflow fails with a useful diff in the logs. Roll back.
+5. **Local parity** — confirm `make integration` (or the local-equivalent target) runs the same commands locally that CI runs in the workflow. Local and CI should match.
+
+#### Human-required
+
+1. **Fork PR fallback** — only the maintainer can verify this end-to-end (the agent doesn't have the ability to push from a fork without the maintainer's GitHub credentials). Push a throwaway commit from a personal fork (or simulate by temporarily stripping the secrets). Confirm the workflow runs but skips integration cleanly with the `::notice::Skipping integration tests — secrets unavailable` line. Hygiene CI (M1.1) still runs and gates merge.
 
 ### Stop for review after M2.7
 

@@ -71,10 +71,10 @@ Switchboard-managed state lives in a `.switchboard/` directory at the working di
     └── projects/
         └── <project-id>/       # per-project state (one subdirectory per project)
             ├── config.yaml     # per-project config
-            ├── instance.lock   # M3+ flock — one Switchboard process per project at a time
+            ├── instance.lock   # M4+ flock — one Switchboard process per project at a time
             ├── registry.jsonl  # agent registry for this project (append-only)
             ├── sessions/       # M2+ — Codex session-link sidecar files (per agent)
-            └── runs/           # M5+ — workflow-run checkpoints
+            └── runs/           # M6+ — workflow-run checkpoints
 ```
 
 **What's directory-scoped vs project-scoped:** workflows and local prompts are directory-scoped — defined once per repo, reusable across projects. Agents, runtime state, workflow runs, and harness session links are project-scoped — each project has its own. Rationale: workflow definitions and prompt libraries are about *how to do the work*; they belong to the repo. Agents and runtime state are about *the work in progress*; they belong to the project (the task).
@@ -87,7 +87,7 @@ State is kept directory-local (not user-global) so that opening the directory fr
 
 **Project name uniqueness within a directory** uses the same canonicalization as agent names (per §4 Primitive 1): hyphens normalized to underscores, lowercased, for the uniqueness check only — `feature-a` and `feature_a` collide; `feature-A` and `feature-a` collide. Stored verbatim as the user typed.
 
-**Deletion in v1.** Project and agent deletion are deliberately out of scope for v1. No UI affordance, no command-level deletion API, no canonical deletion semantics are defined. Users may manually edit `.switchboard/` state at their own risk (the file formats are documented), but this is not a supported workflow — first-class deletion semantics (cascade behavior, in-flight flock handling, append-only-vs-tombstone, history retention) will be specified when the feature is added. Tracked: M3 may add project deletion via the project switcher; agent deletion is unscheduled.
+**Deletion in v1.** Project and agent deletion are deliberately out of scope for v1. No UI affordance, no command-level deletion API, no canonical deletion semantics are defined. Users may manually edit `.switchboard/` state at their own risk (the file formats are documented), but this is not a supported workflow — first-class deletion semantics (cascade behavior, in-flight flock handling, append-only-vs-tombstone, history retention) will be specified when the feature is added. Tracked: M4 may add project deletion via the project switcher; agent deletion is unscheduled.
 
 ## 4. Functional primitives
 
@@ -647,7 +647,7 @@ TurnEnd         { agent, outcome, stop_reason?,
                   permission_denials, raw_event }
                 // outcome = Completed
                 //         | Failed { kind: HarnessError | AdapterFailure, message }
-                //         | Cancelled { source: User | Workflow }   // added in M3 when per-turn cancel lands
+                //         | Cancelled { source: User | Workflow }   // added in M4 when per-turn cancel lands
                 //
                 // HarnessError: harness's terminal event reported is_error
                 //   (bad model name, rate limit, transient API error,
@@ -660,7 +660,7 @@ TurnEnd         { agent, outcome, stop_reason?,
                 // Terminal event type is always TurnEnd. Terminal status lives
                 // in outcome — there is no separate TurnAborted / TurnTimeout /
                 // TurnCancelled wire event. The kind field on Failed lets
-                // consumers (UI, M5 partial-failure rule) distinguish causes
+                // consumers (UI, M6 partial-failure rule) distinguish causes
                 // without proliferating event variants. Exactly one TurnEnd
                 // per turn.
 RateLimitEvent  { agent, info }
@@ -672,7 +672,7 @@ RateLimitEvent  { agent, info }
 
 Each adapter (Claude Code, Codex) is responsible for: building the harness command line, spawning the process, parsing its native stream, normalizing into the events above, and surfacing harness-specific metadata in `raw_event` so callers that need to dig in can. The workflow engine, UI, and persistence layer consume only the normalized stream.
 
-**Forward-compat note — §7 workflow status taxonomy.** §7 describes workflow-level status as "complete, cancelled, failed, interrupted." After M3 lands `Cancelled` as a top-level `TurnOutcome` variant, the per-turn vocabulary will be `Completed | Failed | Cancelled` — three statuses, not four. Where does "interrupted" map? Two reasonable resolutions for when M3 expansion picks this up: (a) fold into `Cancelled { source: User | Workflow | Signal }`, with `Signal` covering SIGINT/SIGTERM (cleanest — one variant, source field discriminates); (b) keep `Interrupted` as its own top-level `TurnOutcome` variant for OS-signal-driven shutdowns specifically. Decision deferred to M3, but flagged here so §7 and §9 don't silently drift in the meantime.
+**Forward-compat note — §7 workflow status taxonomy.** §7 describes workflow-level status as "complete, cancelled, failed, interrupted." After M4 lands `Cancelled` as a top-level `TurnOutcome` variant, the per-turn vocabulary will be `Completed | Failed | Cancelled` — three statuses, not four. Where does "interrupted" map? Two reasonable resolutions for when M4 expansion picks this up: (a) fold into `Cancelled { source: User | Workflow | Signal }`, with `Signal` covering SIGINT/SIGTERM (cleanest — one variant, source field discriminates); (b) keep `Interrupted` as its own top-level `TurnOutcome` variant for OS-signal-driven shutdowns specifically. Decision deferred to M4, but flagged here so §7 and §9 don't silently drift in the meantime.
 
 Reading Codex session files (in addition to the `--json` stream) is a committed v1 dependency for the Codex adapter (per resolved 10.15) — needed to fill in gaps the stream doesn't expose (rate limits, `model_context_window`, full reasoning blocks, `session_meta`). Multiple §7 and §9 commitments depend on this enrichment.
 
@@ -809,7 +809,7 @@ Aggregated from inline flags above, plus a few additional:
 - **10.11** Compaction strategy. Programmatic `/compact` is unavailable in both harnesses today; both do auto-compact at high utilization. Working assumption: Switchboard monitors token usage, warns the user as the auto-compact threshold approaches, and defers actual compaction to the harness. We do not implement Switchboard-side summarization (would underperform the harnesses' tuned compaction). Alternative to consider: surface a "fork from checkpoint with summary" action that uses the existing fork primitive plus an explicit summarize-and-restart prompt, as a coarse user-driven alternative when the user wants to reclaim context outside auto-compact. Background in [docs/research/claude-code-headless.md](research/claude-code-headless.md) and [docs/research/codex-noninteractive.md](research/codex-noninteractive.md).
 - **10.12** Model→max-context map maintenance. **Partially resolved by hands-on probe:** Claude Code v2.1.138 *does* expose `contextWindow` per turn in `result.modelUsage.<model>` — Switchboard reads it directly, no map needed for Claude Code. Codex's stream omits it; the value lives in the session file's `task_started` event. Working assumption for Codex: ship a bundled model→max-context map, but also let the Codex adapter read the session file and prefer that as authoritative when present. Still open: do we ship the map, read the session file, or both? Open: where is the canonical map source for new models we sync from?
 - **10.13 (monitoring)** Programmatic `/compact` exposure in either harness. Multiple Anthropic feature requests open ([anthropics/claude-code#5643](https://github.com/anthropics/claude-code/issues/5643), [#39275](https://github.com/anthropics/claude-code/issues/39275), [#39574](https://github.com/anthropics/claude-code/issues/39574), [#26488](https://github.com/anthropics/claude-code/issues/26488)); Codex equivalent not documented. When upstream lands, Switchboard can offer first-class compaction control inside workflows.
-- ~~**10.14** Codex non-interactive fork.~~ **Resolved for v1: option (a).** Fork is unavailable for Codex agents in v1 — the agent context-menu Fork action is shown only on Claude Code agents; Codex agents show an explanatory tooltip ("Fork is not available for Codex sessions in v1; see the docs for workarounds"). Workarounds (b) copy session JSONL and (c) re-feed summarized prior context are deferred to v2+ if user demand surfaces. The asymmetry is documented in §9 and the M3 deliverables.
+- ~~**10.14** Codex non-interactive fork.~~ **Resolved for v1: option (a).** Fork is unavailable for Codex agents in v1 — the agent context-menu Fork action is shown only on Claude Code agents; Codex agents show an explanatory tooltip ("Fork is not available for Codex sessions in v1; see the docs for workarounds"). Workarounds (b) copy session JSONL and (c) re-feed summarized prior context are deferred to v2+ if user demand surfaces. The asymmetry is documented in §9 and the M4 deliverables.
 - ~~**10.15** Should the Codex adapter read the session file (`~/.codex/sessions/...jsonl`) in addition to the `--json` stream?~~ **Resolved (commitment).** The Codex adapter reads the session file on turn completion to enrich the normalized event stream with fields the `--json` stream omits (rate limits, `model_context_window`, full reasoning blocks, `session_meta` for the SessionMeta event). Multiple §7 and §9 commitments now depend on this (per-turn context-utilization for Codex, RateLimitEvent timing, SessionMeta). What remains as implementation detail: tail-vs-completion timing for any future live-stream enrichment, and the lookup-strategy mechanics for the date-partitioned session path (see codex-cli-observed.md research note).
 - **10.16** Disk usage of harness session files. Both harnesses persist transcripts indefinitely (Claude Code at `~/.claude/projects/<encoded-cwd>/*.jsonl`, Codex at `~/.codex/sessions/YYYY/MM/DD/...`). A long-lived project with many agents and many turns will accumulate. Should Switchboard offer pruning, surface totals, or otherwise manage this? Out of scope for v1, but the architecture should not preclude it.
 - **10.17** Network failure and retry policy. What does Switchboard do when a turn fails mid-workflow because of a transient API error or network blip? Working assumption: a single configurable retry on transient errors (rate-limit, 5xx) before marking the step as failed. Permanent errors (auth, invalid model, denied content) fail immediately. To be detailed in §7 once we have an implementation footprint.

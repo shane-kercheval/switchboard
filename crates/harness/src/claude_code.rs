@@ -188,7 +188,7 @@ async fn run_producer(
                     }
                     // Receiver drop is intentional: if the consumer disconnects
                     // mid-stream, we let the producer drain and exit cleanly.
-                    // Per-turn cancel (M3) will handle the shutdown case properly.
+                    // Per-turn cancel (M4) will handle the shutdown case properly.
                     let _ = tx.send(event);
                     if terminal_seen {
                         break;

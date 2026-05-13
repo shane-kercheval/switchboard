@@ -65,7 +65,7 @@ impl From<AdapterEvent> for NormalizedEvent {
 }
 
 /// Outcome of a completed turn. The `kind` field on `Failed` is load-bearing for
-/// M5's partial-failure policy: `HarnessError` (model/API issue) vs `AdapterFailure`
+/// M6's partial-failure policy: `HarnessError` (model/API issue) vs `AdapterFailure`
 /// (subprocess crash, parse error, infrastructure) have different retry semantics.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "status", rename_all = "snake_case")]

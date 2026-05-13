@@ -20,8 +20,8 @@ It is **not** a user tutorial. Tutorial-style authoring guidance lives in `docs/
 
 What is **out of scope** for this doc:
 
-- Parser internals (recursive descent vs YAML library choice — M5 implementation)
-- Persistence-layer encoding of workflow runs (`<directory>/.switchboard/projects/<project-id>/runs/<run-id>.jsonl` schema — M5 expansion)
+- Parser internals (recursive descent vs YAML library choice — M6 implementation)
+- Persistence-layer encoding of workflow runs (`<directory>/.switchboard/projects/<project-id>/runs/<run-id>.jsonl` schema — M6 expansion)
 - UI rendering of workflow progress (system-design §7)
 
 ## File location and naming
@@ -550,9 +550,9 @@ The following top-level workflow-file keys and step-type keys are **reserved** i
 
 Using any reserved key in a v1 workflow file is a parse-time validation error.
 
-## Out-of-scope decisions deferred to M5 expansion
+## Out-of-scope decisions deferred to M6 expansion
 
-The following are *implementation* details, not language-spec details, and live in M5's per-milestone expansion (see `docs/implementation_plans/2026-05-12-v1.md`):
+The following are *implementation* details, not language-spec details, and live in M6's per-milestone expansion (see `docs/implementation_plans/2026-05-12-v1.md`):
 
 - On-disk encoding of workflow runs (`<directory>/.switchboard/projects/<project-id>/runs/<run-id>.jsonl` schema)
 - Concurrency model for parallel `send` dispatches within a `wait_for_all`

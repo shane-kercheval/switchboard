@@ -100,8 +100,8 @@ fn assert_layout(directory: &Path, project_ids: &[uuid::Uuid]) {
     assert!(sb.join("prompts").is_dir());
     assert!(sb.join("projects").is_dir());
 
-    // M1 must NOT create the M2+/M3+/M5+ artifacts.
-    assert!(!sb.join("instance.lock").exists(), "instance.lock is M3+");
+    // M1 must NOT create the M2+/M4+/M6+ artifacts.
+    assert!(!sb.join("instance.lock").exists(), "instance.lock is M4+");
 
     for project_id in project_ids {
         let project_root = sb.join("projects").join(project_id.to_string());
@@ -111,9 +111,9 @@ fn assert_layout(directory: &Path, project_ids: &[uuid::Uuid]) {
         );
         assert!(project_root.join("config.yaml").exists());
         assert!(project_root.join("registry.jsonl").exists());
-        // M2+/M5+ artifacts must not be created in M1.
+        // M2+/M6+ artifacts must not be created in M1.
         assert!(!project_root.join("sessions").exists(), "sessions/ is M2+");
-        assert!(!project_root.join("runs").exists(), "runs/ is M5+");
+        assert!(!project_root.join("runs").exists(), "runs/ is M6+");
     }
 
     // projects.jsonl is append-only with one ProjectSummary per line.

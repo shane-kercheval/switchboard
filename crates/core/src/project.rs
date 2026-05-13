@@ -62,7 +62,7 @@ impl Project {
     /// read-check-then-append sequence has a TOCTOU window. Callers must
     /// serialize access (the M1.4 dispatcher / `AppState` mutex does this).
     /// Concurrent calls against *different* `Project` instances (in the same
-    /// or different directories) are fine; M3's `instance.lock` provides
+    /// or different directories) are fine; M4's `instance.lock` provides
     /// cross-process serialization.
     pub fn register_agent(&self, name: &str, harness: HarnessKind) -> Result<AgentRecord> {
         validate_name(name)?;

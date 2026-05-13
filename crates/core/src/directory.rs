@@ -104,7 +104,7 @@ impl Directory {
     /// the read-check-then-append sequence has a TOCTOU window. Callers must
     /// serialize access (the M1.4 dispatcher / `AppState` mutex does this).
     /// Concurrent calls against *different* `Directory` instances (different
-    /// directories) are fine; M3's `instance.lock` provides cross-process
+    /// directories) are fine; M4's `instance.lock` provides cross-process
     /// serialization within one directory.
     pub fn create_project(&self, name: &str) -> Result<Project> {
         self.assert_initialized()?;

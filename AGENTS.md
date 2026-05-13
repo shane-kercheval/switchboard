@@ -77,18 +77,18 @@ Prerequisites: see `README.md`. The Rust toolchain is pinned in `rust-toolchain.
 ```
 <directory>/.switchboard/
   config.yaml                          # directory-level config; version: 1
-  workflows/                           # YAML workflow files (M5+, empty in M1)
-  prompts/                             # local prompt providers (M4+, empty in M1)
+  workflows/                           # YAML workflow files (M6+, empty in M1)
+  prompts/                             # local prompt providers (M5+, empty in M1)
   projects.jsonl                       # append-only index: {id, name, created_at}
   projects/<project-id>/
     config.yaml                        # per-project config; version: 1, name, created_at
     registry.jsonl                     # append-only AgentRecord stream
-    # NOT created in M1: instance.lock (M3), sessions/ (M2), runs/ (M5)
+    # NOT created in M1: instance.lock (M4), sessions/ (M2), runs/ (M6)
 ```
 
 `config.yaml`, `workflows/`, and `prompts/` are intended to be git-tracked. Everything else is runtime data the user should `.gitignore` themselves — Switchboard does NOT modify the user's `.gitignore`.
 
-**Multi-project model (M1.2).** A working directory hosts N projects. A "project" is a task-scoped grouping of agents (e.g., `backend-feature`, `task-2`) — not a 1:1 mapping with the directory. The M1.5 UI displays one active project at a time; the project switcher itself is M3. Project unload is not a v1 concept; once opened, projects stay in memory for the app session.
+**Multi-project model (M1.2).** A working directory hosts N projects. A "project" is a task-scoped grouping of agents (e.g., `backend-feature`, `task-2`) — not a 1:1 mapping with the directory. The M1.5 UI displays one active project at a time; the project switcher itself is M4. Project unload is not a v1 concept; once opened, projects stay in memory for the app session.
 
 **Append-only persistence (M1.2).** `projects.jsonl` and per-project `registry.jsonl` are write-once-per-record. No deletion in v1. Corrupted JSONL lines surface as a typed `CoreError::CorruptJsonl { path, line_number, line, source }` — never silently skipped.
 

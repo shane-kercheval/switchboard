@@ -46,6 +46,16 @@ impl Default for ClaudeCodeAdapter {
 
 #[async_trait]
 impl HarnessAdapter for ClaudeCodeAdapter {
+    fn probe(&self) -> Result<(), DispatchError> {
+        // `which::which` handles both absolute paths (checks existence +
+        // executable bit) and relative names (PATH lookup), so it's a
+        // stricter check than `resolve_binary` for symmetry with the error
+        // we'd otherwise only learn about at spawn time.
+        which::which(&self.claude_binary_path)
+            .map(|_| ())
+            .map_err(|_| DispatchError::BinaryNotFound)
+    }
+
     async fn dispatch(
         &self,
         agent: &AgentRecord,
@@ -347,5 +357,24 @@ mod tests {
 
         assert!(args.contains(&"--resume".to_owned()));
         assert!(!args.contains(&"--session-id".to_owned()));
+    }
+
+    #[test]
+    fn probe_reports_missing_binary_for_absolute_path() {
+        let adapter = ClaudeCodeAdapter::with_binary_path("/nonexistent/path/to/claude");
+        assert!(matches!(
+            adapter.probe(),
+            Err(DispatchError::BinaryNotFound)
+        ));
+    }
+
+    #[test]
+    fn probe_reports_missing_binary_for_relative_name() {
+        let adapter =
+            ClaudeCodeAdapter::with_binary_path("this-binary-does-not-exist-on-PATH-xyz123");
+        assert!(matches!(
+            adapter.probe(),
+            Err(DispatchError::BinaryNotFound)
+        ));
     }
 }

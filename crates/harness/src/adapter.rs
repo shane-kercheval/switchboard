@@ -37,4 +37,10 @@ pub trait HarnessAdapter: Send + Sync {
         prompt: &str,
         turn_id: TurnId,
     ) -> Result<EventStream, DispatchError>;
+
+    /// Pre-flight check that the harness can be invoked. Returns
+    /// `BinaryNotFound` if the binary is missing; `Ok(())` if the adapter
+    /// is ready to dispatch. In-process adapters (e.g., the mock) return
+    /// `Ok(())` unconditionally.
+    fn probe(&self) -> Result<(), DispatchError>;
 }

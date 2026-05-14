@@ -8,8 +8,12 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use crate::adapter::{DispatchError, EventStream, HarnessAdapter};
 use crate::events::{AdapterEvent, TurnId, TurnOutcome};
 
-/// Controls the behaviour of `MockHarnessAdapter`. Two scenarios cover M1.3's
-/// needs; add more as the test suite requires them.
+/// Controls the behaviour of `MockHarnessAdapter`.
+///
+/// Fault-injection scenarios (`Panic`, `TruncatedStream`) intentionally
+/// violate the stream contract — in production, a missing terminal event
+/// is an adapter bug, not an acceptable outcome. They exist solely to
+/// exercise the dispatcher's state-recovery path.
 pub enum MockScenario {
     /// Emits three `ContentChunk`s followed by `TurnEnd(Completed)`. Used for
     /// dev-time UI iteration (no real `claude` needed) and as the standard
@@ -18,9 +22,17 @@ pub enum MockScenario {
 
     /// Intentionally violates the stream contract — panics mid-stream before
     /// `TurnEnd`. The **only** legitimate use is testing the M1.4 dispatcher's
-    /// `AgentIdleGuard` Drop path (verifies the agent returns to `Idle` even
-    /// when the stream task panics). Never use in production code paths.
+    /// `AgentIdleGuard` Drop path under producer-task panic. Never use in
+    /// production code paths.
     Panic,
+
+    /// Intentionally violates the stream contract — emits two `ContentChunk`s
+    /// and then drops the sender without a terminal event. Distinct from
+    /// `Panic` in that the producer exits cleanly; only the contract is
+    /// violated. Used to validate the dispatcher's drain loop on truncated
+    /// streams *without* relying on a panic side-effect. Never use in
+    /// production code paths.
+    TruncatedStream,
 }
 
 /// A `HarnessAdapter` that produces canned events without spawning any subprocess.
@@ -47,6 +59,10 @@ impl Default for MockHarnessAdapter {
 
 #[async_trait]
 impl HarnessAdapter for MockHarnessAdapter {
+    fn probe(&self) -> Result<(), DispatchError> {
+        Ok(())
+    }
+
     async fn dispatch(
         &self,
         _agent: &AgentRecord,
@@ -85,6 +101,19 @@ impl HarnessAdapter for MockHarnessAdapter {
                         text: "partial".to_owned(),
                     });
                     panic!("MockScenario::Panic — intentional, for AgentIdleGuard drop test");
+                });
+            }
+            MockScenario::TruncatedStream => {
+                tokio::spawn(async move {
+                    let _ = tx.send(AdapterEvent::ContentChunk {
+                        turn_id,
+                        text: "partial-one".to_owned(),
+                    });
+                    let _ = tx.send(AdapterEvent::ContentChunk {
+                        turn_id,
+                        text: "partial-two".to_owned(),
+                    });
+                    // Drop tx without emitting TurnEnd — stream closes silently.
                 });
             }
         }

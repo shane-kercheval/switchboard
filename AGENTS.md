@@ -11,9 +11,10 @@ The current milestone is **M1** — the smallest end-to-end vertical slice with 
 ## Architecture overview
 
 - **Rust workspace** (`crates/`) built on Tauri 2.x.
-  - `crates/app/` — Tauri host. Owns Tauri commands, app state, window. Wired to `crates/core` and `crates/harness` in M1.4.
-  - `crates/core/` — pure-Rust persistence layer: `Directory`, `Project`, `AgentRecord`, name validation, JSONL/YAML I/O. No Tauri dependency. Future home of the `Dispatcher` (M1.4).
-  - `crates/harness/` — per-harness adapters (M1.3). `ClaudeCodeAdapter`, `MockHarnessAdapter`, event types, stream parser. No Tauri dependency.
+  - `crates/app/` — Tauri host. Owns Tauri commands, `AppState`, window, `AppHandleEmitter`. Thin shims over free functions (`*_impl`) defined in `commands.rs`; the free functions are what tests target.
+  - `crates/core/` — pure-Rust persistence layer: `Directory`, `Project`, `AgentRecord`, name validation, JSONL/YAML I/O. No Tauri dependency, no async.
+  - `crates/harness/` — per-harness adapters: `HarnessAdapter` trait, `ClaudeCodeAdapter`, `MockHarnessAdapter`, event types, stream parser. No Tauri dependency.
+  - `crates/dispatcher/` (M1.4) — `Dispatcher`, `EventEmitter` trait + `RecordingEmitter` test double, `AgentIdleGuard`. Drives adapters; owns per-agent in-memory state and `TurnId` generation. No Tauri dependency — bridged to Tauri via `AppHandleEmitter` in `crates/app`.
 - **Frontend** — plain Svelte 5 + Vite + TypeScript + Tailwind v4. Lives at repo root (`src/`, `index.html`, `vite.config.ts`). shadcn-svelte will be initialized in M1.5 when the first UI components land — peer deps (`bits-ui`, `tw-animate-css`) are already installed so `shadcn-svelte init` will be a no-op on the install side.
 - **Tauri shell** glues frontend to Rust via `#[tauri::command]` handlers and per-agent event channels.
 
@@ -107,9 +108,38 @@ Prerequisites: see `README.md`. The Rust toolchain is pinned in `rust-toolchain.
 
 **Adapter/dispatcher boundary (M1.3).** `AdapterEvent` carries only `ContentChunk` and `TurnEnd`. `NormalizedEvent` adds `TurnStart` (constructed by the M1.4 dispatcher). `From<AdapterEvent> for NormalizedEvent` lifts adapter events to the wire format. Consumers on the frontend always see `NormalizedEvent`.
 
-**`MockHarnessAdapter` (M1.3).** `MockScenario::Streaming` emits 3 `ContentChunk`s then `TurnEnd(Completed)`. `MockScenario::Panic` intentionally violates the stream contract (panics before `TurnEnd`) — its only legitimate use is testing the M1.4 dispatcher's `AgentIdleGuard` Drop path. Do not use `MockScenario::Panic` for any other purpose.
+**`MockHarnessAdapter` (M1.3, extended M1.4).** `MockScenario::Streaming` emits 3 `ContentChunk`s then `TurnEnd(Completed)`. Two fault-injection scenarios exist solely to exercise the dispatcher's state-recovery path — both intentionally violate the stream contract and **must never appear in production code paths**: `MockScenario::Panic` (producer task panics mid-stream) and `MockScenario::TruncatedStream` (sender dropped without `TurnEnd`). Use `Panic` only for the `AgentIdleGuard` Drop-under-panic test; use `TruncatedStream` for testing the drain loop's behaviour on a clean truncation. A missing terminal event in production is an adapter bug, not an acceptable outcome — see the dispatcher trust rule below.
 
 **Exit-code reconciliation (M1.3).** If `TurnEnd(Completed)` is emitted and the subprocess then exits non-zero, the adapter logs `tracing::warn!` only — it does not emit a second `TurnEnd`. Consumers always see exactly one terminal event.
+
+**Dispatcher chokepoint (M1.4).** `Dispatcher::send_message` is the single entry point for sending a turn to an agent. Two invariants are independent and have different owners:
+
+- _Agent always returns to Idle_ — **dispatcher-owned.** Held via `AgentIdleGuard` for the lifetime of the dispatch task. RAII `Drop` flips state back to `Idle` on any termination path (success, error, panic). Uses `std::sync::Mutex` (not `tokio::sync::Mutex`) because `Drop` runs synchronously; the lock is never held across `.await`.
+- _Exactly one terminal event per turn_ — **adapter-owned** (per M1.3). The dispatcher's drain loop trusts the contract and does not synthesize `TurnEnd` on its own. Single ownership is the design — fallback synthesis at the dispatcher layer would split ownership and mask adapter bugs. If the drain loop observes stream-end without a terminal event, that's an adapter contract violation: the dispatcher logs `tracing::warn!` (so the regression is visible), restores agent state via the guard, and lets the failure surface to the M1.5 reducer (which is responsible for handling "no terminal event observed within N seconds" as an error state).
+
+**Dispatch ordering (M1.4).** `send_message` is load-bearing:
+
+1. Acquire `AgentIdleGuard` under the state lock (`Idle` → `InFlight`). Concurrent sends to the same agent → `Err(Busy)`.
+2. Generate fresh `TurnId` (UUID v7) **before** calling `adapter.dispatch()`. The dispatcher owns `TurnId` generation; adapters never generate them.
+3. Call `adapter.dispatch(.., turn_id)` — the `TurnId` is passed in so the adapter can embed it in every emitted `AdapterEvent`. On `Err`, the guard drops on early return → state restored to `Idle`. **No `TurnStart` was emitted** — the wire stays clean.
+4. Emit `TurnStart` (with the same `turn_id`) only after `dispatch()` returns `Ok`.
+5. Spawn the drain task with ownership of the stream, guard, and emitter. Return `DispatchHandle { turn_id, join }` to the caller.
+
+**`EventEmitter` trait (M1.4).** Production: `AppHandleEmitter` (wraps `tauri::AppHandle::emit`). Tests: `RecordingEmitter` (collects `(name, payload)` tuples). The dispatcher takes `Arc<dyn EventEmitter>`, so it's unit-testable without spinning up Tauri.
+
+**Per-agent event channel (M1.4).** The channel name is `agent:<agent_id>` — one channel for the lifetime of the agent, **not** per-turn. Each event payload carries its own `turn_id`; the M1.5 reducer filters by `turn_id` to discriminate between turns. Per-turn channel names would race with the dispatch IPC reply (listener wouldn't exist when `TurnStart` fires); per-agent eliminates that race by definition.
+
+**`AppState` shape (M1.4, multi-project from day 1).** `{ directory: Mutex<Option<Directory>>, projects: Mutex<HashMap<ProjectId, Project>>, active_project_id: Mutex<Option<ProjectId>>, dispatcher: Arc<Dispatcher>, adapter: Arc<dyn HarnessAdapter>, emitter: Arc<dyn EventEmitter> }`. One bound directory at a time (multi-directory is not in scope for v1). N projects loaded; one active project drives UI display. The dispatcher is global because agent IDs are globally unique; switching the active project does not stop background activity on agents in other projects.
+
+**`AgentRecord` lookup for `send_message` (M1.4).** Scans `AppState.projects` for the project whose registry contains the requested `agent_id`. No implicit "active project" routing — the agent ID is globally unique (UUID v7). M1 reads disk on each lookup (registries are small, one project loaded); an in-memory cache is an M4+ optimization, deliberately deferred.
+
+**Harness selection at startup (M1.4).** Read `SWITCHBOARD_HARNESS` env var:
+
+- Unset or `"claude"` → `ClaudeCodeAdapter` (production default).
+- `"mock"` → `MockHarnessAdapter` (useful for UI iteration without `claude` installed; identical behaviour at the dispatcher boundary).
+- Any other value → panic at startup with a clear error.
+
+**Tauri command pattern (M1.4).** Each `#[tauri::command]` is a thin shim over a free function named `<command>_impl(state: &AppState, ...) -> Result<T, AppError>`. The shim parses UUIDs from strings (Tauri IPC types) and maps `AppError` to `String` (Tauri convention). Unit tests target the free functions; the `#[tauri::command]` wrapper itself is not tested.
 
 ## Authoritative docs
 

@@ -1,6 +1,6 @@
 [package]
-name = "switchboard-app"
-description = "Switchboard desktop application (Tauri shell)"
+name = "switchboard-dispatcher"
+description = "Switchboard dispatcher: per-agent state, EventEmitter, AgentIdleGuard (drives harness adapters)"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -8,22 +8,12 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
-[lib]
-name = "switchboard_app"
-crate-type = ["staticlib", "cdylib", "rlib"]
-
 [lints]
 workspace = true
-
-[build-dependencies]
-tauri-build = { workspace = true }
 
 [dependencies]
 switchboard-core = { path = "../core" }
 switchboard-harness = { path = "../harness" }
-switchboard-dispatcher = { path = "../dispatcher" }
-tauri = { workspace = true }
-tauri-plugin-dialog = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -31,8 +21,7 @@ thiserror = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
+futures = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
 tempfile = { workspace = true }

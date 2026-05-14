@@ -17,6 +17,14 @@ Switchboard occupies the middle: **human-directed, workflow-file-driven, with ex
 
 These tools help you run and watch multiple agent sessions. They do not pass messages between agents or automate any routing. The user is still the message bus.
 
+### [Claude Code Agent View](https://claude.com/blog/agent-view-in-claude-code) (Anthropic, Research Preview — May 2026)
+
+Native multi-session management built directly into Claude Code. Run `claude agents` or press the left arrow from any session to open a TUI dashboard showing all active sessions — each row shows status, whether the session is waiting on input, and the last response. From the list you can peek at the last turn and reply inline without attaching, or press enter to drop into the full transcript. Sessions can be sent to the background with `/bg` or launched directly in the background with `claude --bg [task]`. Available on Pro, Max, Team, Enterprise, and API plans.
+
+**What it does not do:** No fan-out, no fan-in, no inter-agent message routing, no YAML workflow files, no prompt library, no pause-for-user primitive, no cross-harness support (Claude Code only). The user is still the message bus — Agent View makes it easier to see all the sessions and respond to them, but routing output from one agent to another as an automated operation does not exist.
+
+**Strategic note for Switchboard:** Anthropic shipping this validates the multi-session management problem while staying firmly in the passive tier. It also means Switchboard can assume Claude Code users will have reasonable session visibility built in — Switchboard's differentiation sits clearly in the workflow automation layer above it: fan-out/fan-in, reusable YAML workflows, and the `pause_for_user` primitive. Agent View + Switchboard are complementary rather than competing. The continued absence of Codex support in Agent View also keeps Switchboard's cross-harness value prop intact.
+
 ### [Claude Squad](https://github.com/smtg-ai/claude-squad)
 
 Terminal-native TUI (Go). Uses tmux for session isolation and git worktrees for branch separation. Supports Claude Code, Codex, Aider, OpenCode, Amp, Gemini via configurable launch commands. Single window with keyboard navigation across sessions, status display, attach/detach, and optional auto-yes (yolo) mode for unattended runs.
@@ -167,5 +175,6 @@ Mapping the features of the tools above against Switchboard's core capabilities:
 - [claude-code-by-agents](https://github.com/baryhuang/claude-code-by-agents)
 - [Best Multi-Agent Desktop Apps for Claude Code, Codex (Nimbalyst blog)](https://nimbalyst.com/blog/best-multi-agent-desktop-apps-claude-code-codex-2026/)
 - [Best Multi-Agent Coding Tools in 2026 (Nimbalyst blog)](https://nimbalyst.com/blog/best-multi-agent-coding-tools-2026/)
+- [Claude Code Agent View (Anthropic blog)](https://claude.com/blog/agent-view-in-claude-code)
 - [Sauna.ai](https://www.sauna.ai/) / [Multiplayer](https://www.sauna.ai/learn/multiplayer)
 - [Hermes Agent](https://hermes-agent.nousresearch.com/) / [GitHub](https://github.com/NousResearch/hermes-agent)

@@ -1,0 +1,17 @@
+dist/
+target/
+node_modules/
+crates/
+.github/
+# Prose markdown — prettier's opinions on long-form docs differ from existing style.
+docs/
+# Generated / lockfiles.
+pnpm-lock.yaml
+Cargo.lock
+# Rust source — formatted by rustfmt, not prettier.
+*.rs
+# TOML — prettier has no native TOML support. Cargo.toml et al. are touched rarely;
+# adding prettier-plugin-toml or taplo for ~5 files isn't worth the extra dep/CI time.
+# Listed here defensively so a future "let's add the toml plugin" change doesn't
+# silently reformat all our manifests on first run.
+*.toml

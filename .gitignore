@@ -18,10 +18,17 @@ Thumbs.db
 *.log
 logs/
 
-# Build / dist (placeholder; will expand once language is chosen)
+# Rust
+target/
+
+# JS / Vite
+node_modules/
 dist/
 build/
 out/
+
+# Tauri generated
+crates/app/gen/
 
 # Local switchboard state
 .switchboard/

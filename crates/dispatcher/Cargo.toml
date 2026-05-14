@@ -1,0 +1,27 @@
+[package]
+name = "switchboard-dispatcher"
+description = "Switchboard dispatcher: per-agent state, EventEmitter, AgentIdleGuard (drives harness adapters)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+switchboard-core = { path = "../core" }
+switchboard-harness = { path = "../harness" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

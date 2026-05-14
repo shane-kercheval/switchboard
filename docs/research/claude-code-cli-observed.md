@@ -44,7 +44,17 @@ Subcommands of note: `mcp` (configure MCP servers), `agents` (manage agents), `p
 
 **Storage location:** `~/.claude/projects/<encoded-cwd>/<session-uuid>.jsonl`
 
-Where `<encoded-cwd>` is the absolute working directory with `/` replaced by `-`. For example, `/private/tmp/switchboard-probe` becomes `-private-tmp-switchboard-probe`.
+Where `<encoded-cwd>` is the absolute working directory with **both `/` and `.` replaced by `-`**. The rule applies uniformly regardless of dot position within the path. Empirically verified by running `claude -p` in several cwd shapes and inspecting `~/.claude/projects/`:
+
+| Cwd | Encoded |
+|---|---|
+| `/private/tmp/sw-probe/foo.bar/sub` | `-private-tmp-sw-probe-foo-bar-sub` (mid-component dot) |
+| `/private/tmp/sw-probe/.hidden/sub` | `-private-tmp-sw-probe--hidden-sub` (leading dot) |
+| `/private/tmp/sw-probe/foo/.bar.baz` | `-private-tmp-sw-probe-foo--bar-baz` (multiple dots, mixed) |
+| `/private/tmp/sw-probe/foo/version.1.2.3` | `-private-tmp-sw-probe-foo-version-1-2-3` (version-style) |
+| `/Users/x/repo/.switchboard/projects/abc` | `-Users-x-repo--switchboard-projects-abc` (Switchboard's actual layout) |
+
+(Original M1.3 research listed only `/` → `-`; the dot-stripping rule was missed because probe paths happened to contain no dots. Re-verified in M1.5 with the probe shapes above after manual testing surfaced the bug against `.switchboard/`. The rule's behaviour under the `/Users/` path-root is constituted by the original M1.5 bug reproduction itself: claude wrote the session file at `~/.claude/projects/-Users-shanekercheval-repos-temp--switchboard-projects-<uuid>/` for a real cwd at `/Users/shanekercheval/repos/temp/.switchboard/projects/<uuid>` — same `.` → `-` rule applied under `/Users/`. No separate `/Users/`-rooted probe was run; the live bug acted as the verification.)
 
 **Format:** newline-delimited JSON. Each line is one event with a `uuid` and a `parentUuid` chain forming a tree (which is what `--fork-session` branches from).
 
@@ -229,6 +239,51 @@ Probed by spawning `claude -p "Write a 100-line poem..."`, waiting 20 seconds (l
 2. On user-initiated cancel, sends `SIGTERM` to the PID.
 3. Buffers the stream output independently if it wants to surface partial content (the session file won't have it).
 4. After cancel, the agent's harness session is preserved and can be re-sent messages immediately.
+
+## M1.3 implementation findings (2026-05-13)
+
+These observations came from building `ClaudeCodeAdapter` and running the live integration tests (`tests/live.rs`).
+
+### `--verbose` is mandatory with `--include-partial-messages --output-format stream-json`
+
+Without `--verbose`, the `stream_event` delta lines are absent from the output even when `--include-partial-messages` is passed. The required flag combination for streaming text deltas is:
+
+```
+claude -p <prompt> \
+  --output-format stream-json \
+  --include-partial-messages \
+  --verbose \
+  --dangerously-skip-permissions \
+  [--session-id <uuid>]
+```
+
+`--verbose` is not optional here — omitting it silently produces a stream without `content_block_delta` events.
+
+### `--session-id` vs `--resume` for session continuity
+
+`--session-id <uuid>` **creates** a new session with the given UUID. It does NOT resume an existing session — passing `--session-id` with a UUID that already has a persisted session file fails the second turn.
+
+`--resume <uuid>` **resumes** an existing session by UUID.
+
+The correct adapter pattern:
+- **First turn** (no session file exists): `--session-id <uuid>`
+- **Subsequent turns** (session file exists at `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`): `--resume <uuid>`
+
+`ClaudeCodeAdapter` checks `~/.claude/projects/<canonicalized-cwd-with-/-replaced-by-->/<uuid>.jsonl` at dispatch time to pick the right flag. This was confirmed by the `live_session_id_idempotency_confirmed` test: two sequential turns sharing the same `session_id` both complete when the first uses `--session-id` and the second uses `--resume`.
+
+### Exact `stream_event` shape with `--include-partial-messages`
+
+```json
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}}
+```
+
+Tool input streaming emits `input_json_delta` instead of `text_delta` — these must be skipped (tool input is not displayed as content):
+
+```json
+{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}}
+```
+
+The terminal `assistant` message carries the complete assembled text in its `content` blocks. With `--include-partial-messages`, this arrives *after* the delta stream and must be explicitly skipped to avoid double-emitting the text as `ContentChunk`s. The parser skips top-level `type: "assistant"` events for this reason.
 
 ## Things still worth probing
 

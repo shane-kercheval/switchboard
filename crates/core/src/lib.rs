@@ -10,6 +10,7 @@ pub mod error;
 pub mod harness;
 mod io;
 pub mod name;
+mod paths;
 pub mod project;
 
 pub use agent::{AgentId, AgentRecord};

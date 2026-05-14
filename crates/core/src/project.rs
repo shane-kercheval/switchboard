@@ -10,6 +10,7 @@ use crate::error::{CoreError, Result};
 use crate::harness::HarnessKind;
 use crate::io::{append_jsonl, read_jsonl, read_yaml, write_yaml};
 use crate::name::{canonicalize_for_uniqueness, validate_name};
+use crate::paths::{CONFIG_FILE, REGISTRY_FILE};
 
 pub type ProjectId = Uuid;
 
@@ -101,7 +102,7 @@ impl Project {
 /// Load a `Project` from disk. Reads the per-project config.yaml; the caller has
 /// already located the project root (e.g., via `Directory::open_project`).
 pub(crate) fn load(directory: &Path, id: ProjectId, root: PathBuf) -> Result<Project> {
-    let config_path = root.join("config.yaml");
+    let config_path = root.join(CONFIG_FILE);
     let config = read_yaml::<ProjectConfig>(&config_path)?;
     if config.version != PROJECT_CONFIG_VERSION {
         return Err(CoreError::UnsupportedConfigVersion {
@@ -110,7 +111,7 @@ pub(crate) fn load(directory: &Path, id: ProjectId, root: PathBuf) -> Result<Pro
             expected: PROJECT_CONFIG_VERSION,
         });
     }
-    let registry_path = root.join("registry.jsonl");
+    let registry_path = root.join(REGISTRY_FILE);
     Ok(Project {
         id,
         directory: directory.to_owned(),
@@ -138,7 +139,7 @@ pub(crate) fn create_on_disk(
         name: name.to_owned(),
         created_at,
     };
-    write_yaml(&root.join("config.yaml"), &config)?;
+    write_yaml(&root.join(CONFIG_FILE), &config)?;
 
     // Touch registry.jsonl so the file exists even before any agents are
     // registered. `create_new` (not `create`) so we fail fast if a stale
@@ -146,7 +147,7 @@ pub(crate) fn create_on_disk(
     // prior `create_project` partially succeeded and rollback failed to
     // remove the project dir; under that condition we want a hard error,
     // not silent truncation of a registry that might still have data.
-    let registry_path = root.join("registry.jsonl");
+    let registry_path = root.join(REGISTRY_FILE);
     std::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -248,7 +249,7 @@ mod tests {
         let (_tmp, project) = fresh_project();
         // Write a bad version to the project's config.yaml.
         std::fs::write(
-            project.root.join("config.yaml"),
+            project.root.join(CONFIG_FILE),
             "version: 99\nname: x\ncreated_at: 2026-05-12T00:00:00Z\n",
         )
         .unwrap();

@@ -8,13 +8,11 @@ use crate::io::{append_jsonl, read_jsonl, read_yaml, write_yaml};
 use crate::name::{canonicalize_for_uniqueness, validate_name};
 use crate::project::{self, Project, ProjectId, ProjectSummary};
 
+use crate::paths::{
+    CONFIG_FILE, PROJECTS_DIR, PROJECTS_INDEX, PROMPTS_DIR, SWITCHBOARD_DIR, WORKFLOWS_DIR,
+};
+
 const DIRECTORY_CONFIG_VERSION: u32 = 1;
-const SWITCHBOARD_DIR: &str = ".switchboard";
-const CONFIG_FILE: &str = "config.yaml";
-const PROJECTS_INDEX: &str = "projects.jsonl";
-const PROJECTS_DIR: &str = "projects";
-const WORKFLOWS_DIR: &str = "workflows";
-const PROMPTS_DIR: &str = "prompts";
 
 /// On-disk shape of `<directory>/.switchboard/config.yaml`. Mostly empty in v1;
 /// placeholder for future MCP/harness config per system-design §6.
@@ -123,7 +121,7 @@ impl Directory {
         let (summary, project) = project::create_on_disk(&self.path, &projects_dir, name)?;
         if let Err(append_err) = append_jsonl(&self.projects_index_path(), &summary) {
             if let Err(rollback_err) = std::fs::remove_dir_all(&project.root) {
-                tracing_log_rollback_failure(&project.root, &rollback_err);
+                log_rollback_failure_to_stderr(&project.root, &rollback_err);
             }
             return Err(append_err);
         }
@@ -190,11 +188,12 @@ impl Directory {
     }
 }
 
-// `tracing` is not yet a dep of this crate (deferred until M1.4 when the
-// dispatcher introduces real logging). Until then, rollback failures go to
-// stderr so they aren't completely silent. Replace with `tracing::warn!` when
-// the dep lands.
-fn tracing_log_rollback_failure(path: &Path, err: &std::io::Error) {
+// `crates/core` deliberately stays free of a `tracing` dep — it's the
+// persistence layer, kept lean and Tauri-free. Rollback failures go to
+// stderr so they aren't completely silent in dev. A future v1.md M4 entry
+// tracks surfacing this as a structured `CoreError` variant so the app
+// layer can `tracing::warn!` it with full context.
+fn log_rollback_failure_to_stderr(path: &Path, err: &std::io::Error) {
     eprintln!(
         "switchboard-core: failed to roll back project directory {} after index append failure: {err}",
         path.display(),

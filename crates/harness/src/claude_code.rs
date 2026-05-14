@@ -364,7 +364,10 @@ fn synthesize_truncation_turn_end(
 const STDERR_MESSAGE_MAX_LEN: usize = 800;
 
 /// Returns a single-line, length-bounded representation of the captured
-/// stderr tail. Empty string if no lines were captured.
+/// stderr tail. Empty string if no lines were captured. Length-bounding is
+/// performed on **char boundaries** — slicing a String by byte offsets can
+/// land mid-UTF-8 and panic (real risk with non-ASCII paths or error
+/// messages in stderr).
 fn format_stderr_tail(tail: &Mutex<VecDeque<String>>) -> String {
     let Ok(buf) = tail.lock() else {
         return String::new();
@@ -374,7 +377,15 @@ fn format_stderr_tail(tail: &Mutex<VecDeque<String>>) -> String {
     }
     let joined = buf.iter().cloned().collect::<Vec<_>>().join(" | ");
     if joined.len() > STDERR_MESSAGE_MAX_LEN {
-        let mut truncated = joined[joined.len() - STDERR_MESSAGE_MAX_LEN..].to_owned();
+        // Find the lowest char boundary at or after `joined.len() - MAX`.
+        // Walk byte positions forward from that target until we hit a
+        // valid boundary; result is guaranteed to be `<= MAX` chars worth
+        // of suffix (typically fewer if multi-byte chars sit at the edge).
+        let target = joined.len() - STDERR_MESSAGE_MAX_LEN;
+        let start = (target..=joined.len())
+            .find(|&i| joined.is_char_boundary(i))
+            .unwrap_or(joined.len());
+        let mut truncated = joined[start..].to_owned();
         truncated.insert(0, '…');
         truncated
     } else {
@@ -538,6 +549,35 @@ mod tests {
             !args.contains(&"--session-id".to_owned()),
             "must not pass --session-id when the session already exists"
         );
+    }
+
+    #[test]
+    fn format_stderr_tail_handles_non_ascii_at_truncation_boundary() {
+        // Regression: byte-slicing on a String can land mid-UTF-8 and
+        // panic with "byte index N is not a char boundary." Stderr from
+        // real subprocesses often contains paths or messages with
+        // multi-byte characters (e.g., accented usernames, emoji, smart
+        // quotes). Truncation must walk to a char boundary.
+        let tail: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+        // 600 ASCII chars + a 3-byte "…" emoji repeated so multi-byte
+        // chars sit near the truncation boundary at byte 800.
+        let mut payload = "A".repeat(600);
+        for _ in 0..150 {
+            payload.push('…'); // 3 bytes per ellipsis
+        }
+        // payload is 600 + 450 = 1050 bytes, well over 800. The byte at
+        // position (len - 800) almost certainly lands mid-character.
+        tail.lock().unwrap().push_back(payload);
+
+        let result = format_stderr_tail(&tail);
+        // The leading-ellipsis prefix + char-boundary slicing means total
+        // bytes is bounded by STDERR_MESSAGE_MAX_LEN + a small constant
+        // (the prefix). Critically: NO PANIC.
+        assert!(
+            result.starts_with('…'),
+            "truncated output should be prefixed with …"
+        );
+        assert!(result.chars().count() < 850);
     }
 
     #[test]

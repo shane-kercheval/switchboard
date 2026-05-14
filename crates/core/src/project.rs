@@ -1,4 +1,4 @@
-use std::fs::{File, create_dir_all};
+use std::fs::create_dir_all;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -140,9 +140,18 @@ pub(crate) fn create_on_disk(
     };
     write_yaml(&root.join("config.yaml"), &config)?;
 
-    // Touch registry.jsonl so the file exists even before any agents are registered.
+    // Touch registry.jsonl so the file exists even before any agents are
+    // registered. `create_new` (not `create`) so we fail fast if a stale
+    // registry already sits at this path — that would only happen if a
+    // prior `create_project` partially succeeded and rollback failed to
+    // remove the project dir; under that condition we want a hard error,
+    // not silent truncation of a registry that might still have data.
     let registry_path = root.join("registry.jsonl");
-    File::create(&registry_path).map_err(|e| CoreError::io(&registry_path, e))?;
+    std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&registry_path)
+        .map_err(|e| CoreError::io(&registry_path, e))?;
 
     let summary = ProjectSummary {
         id,

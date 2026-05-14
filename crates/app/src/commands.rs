@@ -34,6 +34,10 @@ pub async fn pick_directory_impl(path: &str) -> Result<DirectoryInfo, AppError> 
     let directory = Directory::at(Path::new(path))?;
     let has_switchboard = directory.has_switchboard();
     let projects = if has_switchboard {
+        // Reject incompatible directory config versions before listing
+        // projects. The version field exists explicitly so a future v2
+        // schema can't be silently accepted by a v1 build.
+        directory.config()?;
         directory.list_projects()?
     } else {
         Vec::new()
@@ -55,8 +59,17 @@ pub async fn pick_directory_impl(path: &str) -> Result<DirectoryInfo, AppError> 
 /// (their `AgentIdleGuard` and event channels are dispatcher-owned and
 /// agent-scoped) — graceful cleanup of those is M4 work.
 pub async fn init_directory_impl(state: &AppState, path: &str) -> Result<DirectoryInfo, AppError> {
+    // Serialize against concurrent registry writes (create_project,
+    // register_agent). init_directory creates `.switchboard/` structure
+    // and writes the directory's config.yaml — both modify the registry's
+    // on-disk shape.
+    let _write = lock(&state.registry_write);
     let directory = Directory::at(Path::new(path))?;
     directory.init()?;
+    // Validate the directory's config version after init (init creates a
+    // fresh v1 config if missing; this catches the case where the user
+    // points at a directory with an incompatible existing config).
+    directory.config()?;
     let projects = directory.list_projects()?;
     let info = DirectoryInfo {
         path: directory.path.to_string_lossy().into_owned(),
@@ -86,6 +99,12 @@ pub fn list_projects_impl(state: &AppState) -> Result<Vec<ProjectSummary>, AppEr
 }
 
 pub fn create_project_impl(state: &AppState, name: &str) -> Result<ProjectSummary, AppError> {
+    // Serialize the uniqueness check + JSONL append against concurrent
+    // `create_project` / `register_agent` / `init_directory` calls. Without
+    // this, two concurrent IPC calls could both pass the canonical-name
+    // uniqueness check (which reads disk) and then both append colliding
+    // records (which write disk).
+    let _write = lock(&state.registry_write);
     let directory = bound_directory(state)?;
     let project = directory.create_project(name)?;
     let summary = ProjectSummary {
@@ -128,6 +147,10 @@ pub fn set_active_project_impl(state: &AppState, project_id: ProjectId) -> Resul
 }
 
 pub fn create_agent_impl(state: &AppState, name: &str) -> Result<AgentRecord, AppError> {
+    // Same TOCTOU protection as create_project_impl — register_agent has
+    // an internal read-check-then-append window that two concurrent IPC
+    // calls could race through.
+    let _write = lock(&state.registry_write);
     let active = lock(&state.active_project_id).ok_or(AppError::NoActiveProject)?;
     let project = lock(&state.projects)
         .get(&active)
@@ -221,6 +244,7 @@ mod tests {
 
     use std::sync::Arc;
 
+    use switchboard_core::CoreError;
     use switchboard_dispatcher::RecordingEmitter;
     use switchboard_harness::{ClaudeCodeAdapter, HarnessAdapter, MockHarnessAdapter};
     use tempfile::TempDir;
@@ -366,6 +390,71 @@ mod tests {
         assert_eq!(
             state.dispatcher.agent_status(agent.id),
             Some(switchboard_dispatcher::AgentStatus::Idle)
+        );
+    }
+
+    #[tokio::test]
+    async fn pick_directory_rejects_incompatible_config_version() {
+        // Set up a directory with a v99 config — `Directory::config()`
+        // returns UnsupportedConfigVersion which we want propagated up
+        // through pick_directory so the user can't proceed against a
+        // future-schema directory with an older Switchboard build.
+        let tmp = TempDir::new().unwrap();
+        let directory = Directory::at(tmp.path()).unwrap();
+        directory.init().unwrap();
+        std::fs::write(tmp.path().join(".switchboard/config.yaml"), "version: 99\n").unwrap();
+
+        let err = pick_directory_impl(tmp.path().to_str().unwrap())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AppError::Core(CoreError::UnsupportedConfigVersion { found: 99, .. })
+            ),
+            "expected UnsupportedConfigVersion(99), got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_create_project_same_name_serializes_via_registry_write_lock() {
+        // TOCTOU regression: two concurrent IPC calls for create_project
+        // with the same name must not both succeed. Without the
+        // registry_write mutex, both could pass the uniqueness check
+        // before either writes the index. With the mutex, exactly one
+        // succeeds and one returns DuplicateProjectName.
+        let tmp = TempDir::new().unwrap();
+        let adapter: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let emitter = Arc::new(RecordingEmitter::new());
+        let state = Arc::new(AppState::new(adapter, emitter as Arc<dyn EventEmitter>));
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        let state_a = Arc::clone(&state);
+        let state_b = Arc::clone(&state);
+        // Run on real threads so the mutex contention is real (not
+        // single-threaded cooperative scheduling). The work inside
+        // create_project_impl is synchronous once it enters the locked
+        // section.
+        let a = tokio::task::spawn_blocking(move || create_project_impl(&state_a, "shared-name"));
+        let b = tokio::task::spawn_blocking(move || create_project_impl(&state_b, "shared-name"));
+        let results = [a.await.unwrap(), b.await.unwrap()];
+
+        let successes = results.iter().filter(|r| r.is_ok()).count();
+        let dup_errors = results
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r,
+                    Err(AppError::Core(CoreError::DuplicateProjectName { .. }))
+                )
+            })
+            .count();
+        assert_eq!(successes, 1, "exactly one create must succeed: {results:?}");
+        assert_eq!(
+            dup_errors, 1,
+            "the other must return DuplicateProjectName: {results:?}"
         );
     }
 

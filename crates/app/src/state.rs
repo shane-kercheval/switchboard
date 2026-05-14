@@ -13,16 +13,29 @@ use switchboard_harness::HarnessAdapter;
 /// supports M4's project switcher without restructuring.
 ///
 /// **Lock-order convention** (when more than one of these mutexes is held
-/// at the same time): `directory` → `projects` → `active_project_id`. Always
-/// acquire in this order. Violating the order can deadlock under concurrent
-/// access. Currently only `init_directory_impl` holds multiple of these
-/// together; future code paths that nest these locks must keep this order.
-/// Single-lock acquisitions (which most callers do) are unaffected — the
-/// convention only matters when nesting.
+/// at the same time): `registry_write` → `directory` → `projects` →
+/// `active_project_id`. Always acquire in this order. Violating the order
+/// can deadlock under concurrent access. Single-lock acquisitions (which
+/// most callers do) are unaffected — the convention only matters when
+/// nesting.
+///
+/// `registry_write` serializes append-only-log mutations
+/// (`create_project`, `register_agent`, `init_directory`).
+/// `Directory::create_project` and `Project::register_agent` have a TOCTOU
+/// window between their internal "is this name unique?" read and the
+/// subsequent append; two concurrent IPC calls could otherwise both pass
+/// the uniqueness check and append colliding records. The mutex closes
+/// that window inside one process; cross-process serialization is M4's
+/// `instance.lock`.
 pub struct AppState {
     pub directory: Mutex<Option<Directory>>,
     pub projects: Mutex<HashMap<ProjectId, Project>>,
     pub active_project_id: Mutex<Option<ProjectId>>,
+    /// Acquired around any operation that appends to a JSONL on disk
+    /// (`projects.jsonl` or a project's `registry.jsonl`). `std::sync::Mutex`
+    /// because the protected work is fully synchronous — no `.await` while
+    /// the guard is held.
+    pub registry_write: Mutex<()>,
     pub dispatcher: Arc<Dispatcher>,
     pub adapter: Arc<dyn HarnessAdapter>,
     pub emitter: Arc<dyn EventEmitter>,
@@ -34,6 +47,7 @@ impl AppState {
             directory: Mutex::new(None),
             projects: Mutex::new(HashMap::new()),
             active_project_id: Mutex::new(None),
+            registry_write: Mutex::new(()),
             dispatcher: Arc::new(Dispatcher::new()),
             adapter,
             emitter,

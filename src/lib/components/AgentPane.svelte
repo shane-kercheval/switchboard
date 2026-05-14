@@ -64,9 +64,18 @@
   }
 
   let unlisten: UnlistenFn | null = null;
+  // True once `listen()` has registered the callback with Tauri. Send is
+  // gated on this so a fast click can't fire `send_message` before the
+  // listener exists — without the gate, `turn_start` + early chunks could
+  // arrive on a channel with no subscriber and be dropped.
+  let listenerReady = $state<boolean>(false);
+  // Set true if the component unmounts before `await listen()` resolves;
+  // the closure then immediately invokes the freshly-returned unlisten so
+  // the registration doesn't leak past component lifetime.
+  let cancelled = false;
 
   onMount(async () => {
-    unlisten = await listen<NormalizedEvent>(`agent:${agent.id}`, (event) => {
+    const fn = await listen<NormalizedEvent>(`agent:${agent.id}`, (event) => {
       const ev = event.payload;
       transcript = reduce(transcript, ev);
       if (ev.type === "turn_start") {
@@ -81,9 +90,18 @@
         if (inFlightTurnId === ev.turn_id) inFlightTurnId = null;
       }
     });
+    if (cancelled) {
+      // Component already unmounted while listen() was in flight — clean
+      // up immediately so the registration doesn't outlive the component.
+      fn();
+      return;
+    }
+    unlisten = fn;
+    listenerReady = true;
   });
 
   onDestroy(() => {
+    cancelled = true;
     if (unlisten) unlisten();
     clearHeartbeat();
   });
@@ -120,11 +138,27 @@
     }
   }
 
-  // Send is locked while we're awaiting the IPC reply (synchronous "sending"
-  // flag) AND while a turn is in flight from a prior send (inFlightTurnId).
-  const sendDisabled = $derived(sending || inFlightTurnId !== null);
+  // Send is locked while we're awaiting the IPC reply (synchronous
+  // "sending" flag), while a turn is in flight from a prior send
+  // (`inFlightTurnId`), AND before the per-agent listener has been
+  // registered (`!listenerReady`). The listener-readiness gate prevents a
+  // fast click from firing `send_message` before `listen()` has resolved,
+  // which would lose `turn_start` and early chunks (they'd hit a channel
+  // with no subscriber).
+  const sendDisabled = $derived(!listenerReady || sending || inFlightTurnId !== null);
 
-  const status = $derived(sendDisabled ? "processing" : sendError !== null ? "error" : "idle");
+  // While the listener is being set up, present idle (the textarea still
+  // accepts input; only Send is gated). After listenerReady, status
+  // follows the actual dispatch state.
+  const status = $derived(
+    !listenerReady
+      ? "idle"
+      : sending || inFlightTurnId !== null
+        ? "processing"
+        : sendError !== null
+          ? "error"
+          : "idle",
+  );
 </script>
 
 <div class="flex h-full flex-col">

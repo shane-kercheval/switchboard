@@ -42,6 +42,11 @@ export type Turn =
       text: string;
       status: "streaming" | "complete" | "failed";
       error?: string;
+      // Cause of the failure when status is "failed". Preserved so M2's
+      // retry-policy UI can distinguish recoverable from non-recoverable
+      // failures (e.g., HarnessError → suggest retry; AdapterFailure →
+      // suggest "report bug"). Undefined for streaming/complete turns.
+      errorKind?: FailureKind;
       startedAt: string;
       endedAt?: string;
     };

@@ -2,6 +2,7 @@
   import Button from "$lib/components/ui/Button.svelte";
   import Input from "$lib/components/ui/Input.svelte";
   import type { DirectoryInfo, ProjectSummary } from "$lib/types";
+  import { basename } from "$lib/utils";
 
   type Props = {
     info: DirectoryInfo;
@@ -22,12 +23,6 @@
     onSelectProject,
     onCancel,
   }: Props = $props();
-
-  function basename(path: string): string {
-    const trimmed = path.endsWith("/") ? path.slice(0, -1) : path;
-    const i = trimmed.lastIndexOf("/");
-    return i >= 0 ? trimmed.slice(i + 1) : trimmed;
-  }
 
   // svelte-ignore state_referenced_locally
   // Initial value only — App.svelte remounts this component on a new pick.

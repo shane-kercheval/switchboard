@@ -11,6 +11,14 @@ use switchboard_harness::HarnessAdapter;
 /// The single piece of state managed by Tauri. Multi-project from day 1 (per
 /// system-design §3); M1 only loads one project at a time, but the shape
 /// supports M4's project switcher without restructuring.
+///
+/// **Lock-order convention** (when more than one of these mutexes is held
+/// at the same time): `directory` → `projects` → `active_project_id`. Always
+/// acquire in this order. Violating the order can deadlock under concurrent
+/// access. Currently only `init_directory_impl` holds multiple of these
+/// together; future code paths that nest these locks must keep this order.
+/// Single-lock acquisitions (which most callers do) are unaffected — the
+/// convention only matters when nesting.
 pub struct AppState {
     pub directory: Mutex<Option<Directory>>,
     pub projects: Mutex<HashMap<ProjectId, Project>>,

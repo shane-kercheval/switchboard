@@ -116,10 +116,17 @@ describe("AgentPane", () => {
     expect(screen.getByText("Hi there!")).toBeInTheDocument();
   });
 
-  it("fast-events race: events arrive before sendMessage resolves; Send re-enables", async () => {
+  it("fast-events race: events arrive before sendMessage resolves; no zombie heartbeat fires", async () => {
     // The mock harness can emit every event before the IPC reply lands. The
-    // component must handle this without leaving inFlightTurnId set to a
-    // turn that has already completed.
+    // component must (a) end in idle state with Send re-enabled (i.e. not
+    // leak `inFlightTurnId` set to a completed turn), and (b) cancel the
+    // heartbeat timer cleanly even though `inFlightTurnId` was still null at
+    // turn_end time. Pre-fix, clearHeartbeat was gated on
+    // `inFlightTurnId === turn_id` and the timer leaked, eventually firing
+    // a `heartbeat_timeout` against a turn the reducer had already marked
+    // complete — caught by the late-event guard but visibly wrong.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+
     let resolveSend!: (value: string) => void;
     invokeMock.mockReturnValueOnce(
       new Promise<string>((resolve) => {
@@ -143,19 +150,85 @@ describe("AgentPane", () => {
       ended_at: "2026-05-13T00:00:02Z",
     });
 
-    // Now resolve the IPC. The post-await check should see the turn already
-    // complete and NOT set inFlightTurnId.
     resolveSend(TURN_ID);
-
     await waitFor(() => {
       expect(screen.getByText("pong")).toBeInTheDocument();
       expect(screen.getByTestId("agent-status")).toHaveTextContent("idle");
     });
-    // Once the textarea has content again, Send is enabled — proves
-    // inFlightTurnId was correctly left null.
+
+    // Advance past the heartbeat window. If the timer was leaked (pre-fix),
+    // it would fire here and either flip the turn's status to "failed" or
+    // surface a turn-error element. Three assertions together prove the
+    // timer was cancelled — any one alone could pass for the wrong reason.
+    vi.advanceTimersByTime(HEARTBEAT_TIMEOUT_MS + 1_000);
+    await Promise.resolve();
+    expect(
+      screen.queryByTestId("turn-error"),
+      "no turn-error element must appear after the heartbeat window",
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByTestId("agent-status"),
+      "agent status must remain idle (a zombie heartbeat would flip it)",
+    ).toHaveTextContent("idle");
+    // The completed turn must still read as complete in the rendered text —
+    // not get retroactively replaced by a failure body.
+    expect(screen.getByText("pong")).toBeInTheDocument();
+
+    // Send is enabled once the textarea has content again.
     const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
     await fireEvent.input(textarea, { target: { value: "again" } });
     expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("early-chunk re-arm: chunks before IPC resolves keep extending the heartbeat", async () => {
+    // The companion to the fast-events test: the heartbeat-vs-inFlight split
+    // exists so that a `content_chunk` arriving *before* `sendMessage`
+    // resolves still re-arms the timer (gated on `heartbeatTurnId`, set on
+    // `turn_start`, rather than on `inFlightTurnId`, which is null until
+    // after the IPC await). A regression that reverts the re-arm gate to
+    // `inFlightTurnId` would let a long real-claude stream with slow IPC
+    // false-positive timeout despite active streaming — that's the bug this
+    // test prevents.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+
+    // Hold the IPC indefinitely — `inFlightTurnId` will remain null for the
+    // entire test, mirroring "events arrive before the IPC reply".
+    invokeMock.mockReturnValueOnce(new Promise<string>(() => {}));
+
+    const AgentPane = (await import("./AgentPane.svelte")).default;
+    render(AgentPane, { props: { agent: AGENT } });
+    await waitForListener();
+
+    await typeAndSend("hello");
+
+    fireEv({ type: "turn_start", turn_id: TURN_ID, started_at: "2026-05-13T00:00:01Z" });
+
+    // Advance to just before the timeout: timer is still armed for the
+    // original turn_start moment.
+    vi.advanceTimersByTime(HEARTBEAT_TIMEOUT_MS - 5_000);
+
+    // Chunk arrives while IPC is still pending. The re-arm must NOT be
+    // gated on inFlightTurnId (still null here) — gating it on
+    // heartbeatTurnId (set on turn_start) is what makes this work.
+    fireEv({ type: "content_chunk", turn_id: TURN_ID, text: "still streaming" });
+
+    // Advance past the original timer's would-be fire point. If re-arm
+    // failed, the heartbeat would fire here and mark the turn failed.
+    vi.advanceTimersByTime(HEARTBEAT_TIMEOUT_MS - 5_000);
+    await Promise.resolve();
+
+    expect(
+      screen.queryByTestId("turn-error"),
+      "no turn-error must appear — the chunk should have reset the heartbeat",
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByTestId("agent-status"),
+      "agent status must remain processing while the stream is alive",
+    ).toHaveTextContent("processing");
+    expect(
+      screen.getByText("still streaming"),
+      "streamed text must be visible (turn must NOT have been retroactively flipped to failed)",
+    ).toBeInTheDocument();
   });
 
   it("failed turn: error message displayed, status returns to idle, Send re-enables", async () => {

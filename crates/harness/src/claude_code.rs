@@ -445,17 +445,41 @@ mod tests {
 
     #[test]
     fn encode_cwd_replaces_dots_and_slashes_with_dashes() {
-        // Regression: paths containing dot-prefixed components (like the
-        // `.switchboard/` directory Switchboard itself uses) must match
-        // claude's actual encoding. A `/` → `-` only rule would produce
-        // `temp-.switchboard-`; the correct rule produces `temp--switchboard-`.
+        // All cases below are empirically verified against `claude` itself
+        // by running it in each cwd shape and inspecting where it created
+        // its session-storage directory under `~/.claude/projects/`. See
+        // `docs/research/claude-code-cli-observed.md` for the probe.
+
+        // Switchboard's actual on-disk layout: `.switchboard/` dot-prefixed
+        // component must produce `--switchboard` (double dash).
         assert_eq!(
             encode_cwd(Path::new("/Users/x/repo/.switchboard/projects/abc")),
             "-Users-x-repo--switchboard-projects-abc"
         );
+        // No-dots baseline.
         assert_eq!(
             encode_cwd(Path::new("/Users/shanekercheval/repos/temp")),
             "-Users-shanekercheval-repos-temp"
+        );
+        // Mid-component dot (e.g., a username with a dot, or a package-style name).
+        assert_eq!(
+            encode_cwd(Path::new("/private/tmp/sw-probe/foo.bar/sub")),
+            "-private-tmp-sw-probe-foo-bar-sub"
+        );
+        // Leading dot of a path component (hidden directory).
+        assert_eq!(
+            encode_cwd(Path::new("/private/tmp/sw-probe/.hidden/sub")),
+            "-private-tmp-sw-probe--hidden-sub"
+        );
+        // Multiple dots in one component (mixed leading + mid).
+        assert_eq!(
+            encode_cwd(Path::new("/private/tmp/sw-probe/foo/.bar.baz")),
+            "-private-tmp-sw-probe-foo--bar-baz"
+        );
+        // Version-style component with several mid-dots.
+        assert_eq!(
+            encode_cwd(Path::new("/private/tmp/sw-probe/foo/version.1.2.3")),
+            "-private-tmp-sw-probe-foo-version-1-2-3"
         );
     }
 

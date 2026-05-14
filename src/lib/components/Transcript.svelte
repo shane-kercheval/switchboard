@@ -16,9 +16,9 @@
 
   // Whenever the transcript changes and we're pinned, scroll to bottom.
   $effect(() => {
-    // Re-run on transcript changes by reading a derived value.
-    const _ = transcript.turns.length;
-    void _;
+    // Register a reactive read on transcript so this effect re-runs whenever
+    // turns are added or modified.
+    void transcript.turns.length;
     if (pinned && container) {
       container.scrollTop = container.scrollHeight;
     }

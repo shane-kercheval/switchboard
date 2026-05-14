@@ -21,10 +21,6 @@ pub enum ParseOutcome {
 /// `"...what can I help with today?Saved your name to memory..."`.
 #[derive(Debug, Default)]
 pub struct ParserState {
-    /// Whether the current `content_block` (between `_start` and `_stop`)
-    /// is a text block. Used so `_stop` knows whether a text block just
-    /// ended — `content_block_stop` itself does not carry the block type.
-    in_text_block: bool,
     /// Whether at least one `ContentChunk` has been emitted in this turn.
     /// A leading separator is only sensible *between* text blocks, never
     /// before the first one.
@@ -74,17 +70,11 @@ fn parse_stream_event(obj: &Value, turn_id: TurnId, state: &mut ParserState) -> 
                 .and_then(|cb| cb.get("type"))
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            state.in_text_block = block_type == "text";
-            if state.in_text_block && state.chunks_emitted_in_turn {
+            if block_type == "text" && state.chunks_emitted_in_turn {
                 // A new text block is opening after prior text — separator
                 // will be prepended onto its first emitted chunk.
                 state.pending_separator = true;
             }
-            ParseOutcome::Skip
-        }
-        Some("content_block_stop") => {
-            // Block-type info isn't carried on _stop; we tracked it from _start.
-            state.in_text_block = false;
             ParseOutcome::Skip
         }
         Some("content_block_delta") => parse_content_block_delta(event, turn_id, state),
@@ -111,6 +101,12 @@ fn parse_content_block_delta(
         return ParseOutcome::Skip;
     }
 
+    // M2 design debt: the `\n\n` separator is synthesized inline into the
+    // chunk text here, which conflates parsing with presentation. A cleaner
+    // shape is a structured `TextBlockBoundary` event (alongside the
+    // content-kind work tracked in M2 / M2.2 for tool calls and thinking)
+    // that lets the reducer / UI choose how to render block boundaries.
+    // Inline `\n\n` is interim until that lands.
     let chunk_text = if state.pending_separator {
         state.pending_separator = false;
         format!("\n\n{text}")

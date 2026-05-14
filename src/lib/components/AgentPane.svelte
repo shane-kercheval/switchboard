@@ -27,25 +27,37 @@
   let sending = $state<boolean>(false);
   let sendError = $state<string | null>(null);
 
-  // Heartbeat timer: when a turn is in flight and no content_chunk has been
+  // Heartbeat timer: when a turn is streaming and no content_chunk has been
   // observed for HEARTBEAT_TIMEOUT_MS, dispatch a heartbeat_timeout into the
   // reducer. The reducer transitions the turn to "failed" with a retry
   // message. Stream-contract ownership stays with the adapter (M1.3); this is
   // the frontend's resilience against any adapter bug that silently truncates
   // a stream (M1.4 §7).
+  //
+  // The heartbeat tracks its own target turn (`heartbeatTurnId`) independent
+  // of `inFlightTurnId` (which only governs Send-disabled UI state). They are
+  // separate concerns: in a fast-events race the entire event stream can
+  // fire before `inFlightTurnId` is set, and gating the timer-clear on
+  // `inFlightTurnId === ev.turn_id` would leak a zombie 60s timer per turn.
+  // Similarly, early `content_chunk`s (before IPC resolves) must still extend
+  // the timer — keying re-arm on `heartbeatTurnId` ensures they do.
   let heartbeat: ReturnType<typeof setTimeout> | null = null;
+  let heartbeatTurnId: TurnId | null = null;
 
   function clearHeartbeat(): void {
     if (heartbeat !== null) {
       clearTimeout(heartbeat);
       heartbeat = null;
     }
+    heartbeatTurnId = null;
   }
 
   function armHeartbeat(turnId: TurnId): void {
     clearHeartbeat();
+    heartbeatTurnId = turnId;
     heartbeat = setTimeout(() => {
       heartbeat = null;
+      heartbeatTurnId = null;
       transcript = reduce(transcript, { type: "heartbeat_timeout", turn_id: turnId });
       if (inFlightTurnId === turnId) inFlightTurnId = null;
     }, HEARTBEAT_TIMEOUT_MS);
@@ -60,14 +72,13 @@
       if (ev.type === "turn_start") {
         armHeartbeat(ev.turn_id);
       } else if (ev.type === "content_chunk") {
-        // Only re-arm if the chunk is for the turn we're tracking. Stale
-        // chunks for unrelated turns would otherwise extend the timer wrongly.
-        if (inFlightTurnId === ev.turn_id) armHeartbeat(ev.turn_id);
+        // Re-arm on chunks for the turn the heartbeat is tracking. Stale
+        // chunks for unrelated turns are ignored so the timer doesn't get
+        // dragged to the wrong turn's lifetime.
+        if (heartbeatTurnId === ev.turn_id) armHeartbeat(ev.turn_id);
       } else if (ev.type === "turn_end") {
-        if (inFlightTurnId === ev.turn_id) {
-          inFlightTurnId = null;
-          clearHeartbeat();
-        }
+        if (heartbeatTurnId === ev.turn_id) clearHeartbeat();
+        if (inFlightTurnId === ev.turn_id) inFlightTurnId = null;
       }
     });
   });
@@ -84,6 +95,11 @@
     // is distinct from the backend-assigned turn_id (which is the agent
     // turn's id). Sharing the same id would create duplicate keys in the
     // `{#each ... (turn.id)}` block and break Svelte's keyed rendering.
+    //
+    // v4 here is fine — this id is frontend-only and never crosses the IPC
+    // boundary, so the project-wide UUID v7 convention (time-ordered,
+    // backend-friendly) serves no purpose for it. Backend ids (AgentId,
+    // ProjectId, TurnId) remain v7 per AGENTS.md.
     const userTurnId = crypto.randomUUID();
     transcript = appendUserTurn(transcript, userTurnId, prompt);
     try {

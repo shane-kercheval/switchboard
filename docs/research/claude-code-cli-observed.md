@@ -44,7 +44,17 @@ Subcommands of note: `mcp` (configure MCP servers), `agents` (manage agents), `p
 
 **Storage location:** `~/.claude/projects/<encoded-cwd>/<session-uuid>.jsonl`
 
-Where `<encoded-cwd>` is the absolute working directory with **both `/` and `.` replaced by `-`**. For example, `/private/tmp/switchboard-probe` becomes `-private-tmp-switchboard-probe`, and `/Users/x/repo/.switchboard/projects/abc` becomes `-Users-x-repo--switchboard-projects-abc` — note the double-dash where the dot-prefixed `.switchboard` was. (Original M1.3 research listed only `/` → `-`; the dot-stripping rule was missed because probe paths happened to contain no dots and surfaced in M1.5 manual testing against a directory layout containing `.switchboard/`.)
+Where `<encoded-cwd>` is the absolute working directory with **both `/` and `.` replaced by `-`**. The rule applies uniformly regardless of dot position within the path. Empirically verified by running `claude -p` in several cwd shapes and inspecting `~/.claude/projects/`:
+
+| Cwd | Encoded |
+|---|---|
+| `/private/tmp/sw-probe/foo.bar/sub` | `-private-tmp-sw-probe-foo-bar-sub` (mid-component dot) |
+| `/private/tmp/sw-probe/.hidden/sub` | `-private-tmp-sw-probe--hidden-sub` (leading dot) |
+| `/private/tmp/sw-probe/foo/.bar.baz` | `-private-tmp-sw-probe-foo--bar-baz` (multiple dots, mixed) |
+| `/private/tmp/sw-probe/foo/version.1.2.3` | `-private-tmp-sw-probe-foo-version-1-2-3` (version-style) |
+| `/Users/x/repo/.switchboard/projects/abc` | `-Users-x-repo--switchboard-projects-abc` (Switchboard's actual layout) |
+
+(Original M1.3 research listed only `/` → `-`; the dot-stripping rule was missed because probe paths happened to contain no dots. Re-verified in M1.5 with the probe shapes above after manual testing surfaced the bug against `.switchboard/`. The rule's behaviour under the `/Users/` path-root is constituted by the original M1.5 bug reproduction itself: claude wrote the session file at `~/.claude/projects/-Users-shanekercheval-repos-temp--switchboard-projects-<uuid>/` for a real cwd at `/Users/shanekercheval/repos/temp/.switchboard/projects/<uuid>` — same `.` → `-` rule applied under `/Users/`. No separate `/Users/`-rooted probe was run; the live bug acted as the verification.)
 
 **Format:** newline-delimited JSON. Each line is one event with a `uuid` and a `parentUuid` chain forming a tree (which is what `--fork-session` branches from).
 

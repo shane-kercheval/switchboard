@@ -67,6 +67,7 @@ Prerequisites: see `README.md`. The Rust toolchain is pinned in `rust-toolchain.
   - Svelte 5 runes (`$state`, `$derived`, `$effect`).
   - Wire-format types match Rust `#[serde(tag = "type", rename_all = "snake_case")]` — TS uses discriminated unions.
   - **Test the orchestration glue, not just the pure helpers.** Reducer / form components have unit tests for state-transition tables and isolated keyboard/click behaviour. _Components that wrap IPC + event subscriptions + reactive state_ must additionally have integration tests that mock `invoke` and `listen`, capture the event-listener callback, and verify state transitions across realistic event sequences — including ordering races (events arriving before the IPC reply resolves), terminal-state handling (heartbeat timeouts, failed turns), and error paths (IPC throws). Reducer tests alone are not sufficient — every M1.5 frontend bug lived in the wrapping component, not the reducer.
+  - **Async-flush in component tests.** Use `await tick()` (from `svelte`) or `await waitFor(...)` for assertions on rendered state changes — both wait for Svelte's reactive scheduler to quiesce. `await Promise.resolve()` flushes only one microtask, which is sufficient for absence assertions (asserting something _did not_ happen, like the heartbeat zombie test) but fragile for presence assertions where Svelte may need multiple microtask cycles to settle.
 - **Both**
   - No comments unless the _why_ is non-obvious. Identifiers explain _what_.
   - Type hints on every function signature.

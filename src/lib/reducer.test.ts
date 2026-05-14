@@ -62,6 +62,7 @@ describe("reducer", () => {
     const t = expectAgentTurn(final, 0);
     expect(t.status).toBe("failed");
     expect(t.error).toBe("rate limit");
+    expect(t.errorKind).toBe("harness_error");
     expect(t.text).toBe("partial answer");
   });
 
@@ -137,7 +138,7 @@ describe("reducer", () => {
     expect(after2).toEqual(original);
   });
 
-  it("heartbeat_timeout transitions a streaming turn to failed", () => {
+  it("heartbeat_timeout transitions a streaming turn to failed with adapter_failure kind", () => {
     let t = emptyTranscript(AGENT_ID);
     t = reduce(t, { type: "turn_start", turn_id: TURN_A, started_at: ts(1) });
     t = reduce(t, { type: "content_chunk", turn_id: TURN_A, text: "stuck halfway" });
@@ -146,12 +147,17 @@ describe("reducer", () => {
     const turn = expectAgentTurn(t, 0);
     expect(turn.status).toBe("failed");
     expect(turn.error).toBe("no response from harness — retry?");
+    expect(turn.errorKind).toBe("adapter_failure");
     expect(turn.text).toBe("stuck halfway");
   });
 
   it("user turns interleave with agent turns in submit order", () => {
+    // Production gives user turns a local crypto.randomUUID() distinct from
+    // the backend-assigned agent turn_id — see AgentPane::handleSubmit. Test
+    // mirrors that: user and agent ids are different.
+    const USER_TURN = "33333333-3333-7000-8000-333333333333";
     let t: AgentTranscript = emptyTranscript(AGENT_ID);
-    t = appendUserTurn(t, TURN_A, "what is 2+2?");
+    t = appendUserTurn(t, USER_TURN, "what is 2+2?");
     t = reduce(t, { type: "turn_start", turn_id: TURN_A, started_at: ts(1) });
     t = reduce(t, { type: "content_chunk", turn_id: TURN_A, text: "4" });
     t = reduce(t, {
@@ -170,5 +176,20 @@ describe("reducer", () => {
     const t = emptyTranscript(AGENT_ID);
     const after = reduce(t, { type: "heartbeat_timeout", turn_id: TURN_A });
     expect(after).toEqual(t);
+  });
+
+  it("duplicate turn_start for the same turn_id appends only one agent turn", () => {
+    // Defense-in-depth: a duplicate turn_start (dispatcher bug, late retry
+    // delivery) must not produce two agent turns with the same id. Svelte's
+    // keyed `{#each}` would silently collapse them and the reducer state
+    // would diverge from what's rendered.
+    let t = emptyTranscript(AGENT_ID);
+    t = reduce(t, { type: "turn_start", turn_id: TURN_A, started_at: ts(1) });
+    t = reduce(t, { type: "turn_start", turn_id: TURN_A, started_at: ts(2) });
+    expect(t.turns).toHaveLength(1);
+    // The original turn — including its startedAt — is preserved; the second
+    // turn_start is dropped, not overwritten.
+    const turn = expectAgentTurn(t, 0);
+    expect(turn.startedAt).toBe(ts(1));
   });
 });

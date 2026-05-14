@@ -8,6 +8,7 @@
   import DirectorySelector from "$lib/components/DirectorySelector.svelte";
   import WelcomeScreen from "$lib/components/WelcomeScreen.svelte";
   import type { AgentRecord, DirectoryInfo, ProjectSummary } from "$lib/types";
+  import { basename, pickNewestAgent } from "$lib/utils";
 
   // App phase: drives which screen renders.
   type Phase =
@@ -37,12 +38,6 @@
     }
   });
 
-  function basename(path: string): string {
-    const trimmed = path.endsWith("/") ? path.slice(0, -1) : path;
-    const i = trimmed.lastIndexOf("/");
-    return i >= 0 ? trimmed.slice(i + 1) : trimmed;
-  }
-
   async function handlePickDirectory(): Promise<void> {
     inlineError = null;
     const result = await openDialog({ directory: true, multiple: false });
@@ -69,7 +64,7 @@
       if (agents.length === 0) {
         phase = { kind: "no-agent", directory: dir, project };
       } else {
-        phase = { kind: "active", directory: dir, project, agent: pickNewest(agents) };
+        phase = { kind: "active", directory: dir, project, agent: pickNewestAgent(agents) };
       }
     } catch (err) {
       inlineError = err instanceof Error ? err.message : String(err);
@@ -104,7 +99,7 @@
       if (agents.length === 0) {
         phase = { kind: "no-agent", directory: dir, project };
       } else {
-        phase = { kind: "active", directory: dir, project, agent: pickNewest(agents) };
+        phase = { kind: "active", directory: dir, project, agent: pickNewestAgent(agents) };
       }
     } catch (err) {
       inlineError = err instanceof Error ? err.message : String(err);
@@ -143,21 +138,11 @@
     return undefined;
   }
 
-  // Most-recently-created agent wins (created_at desc, then id desc as a
-  // deterministic tiebreak). Callers must check `agents.length > 0` before
-  // invoking this. M4 introduces an agent switcher; until then, only one
-  // agent is displayed at a time. In-flight turns on agents that are no
-  // longer displayed continue running on their per-agent channel but are
-  // effectively orphaned in the UI for M1.5 — known limitation.
-  function pickNewest(agents: AgentRecord[]): AgentRecord {
-    const sorted = [...agents].sort((a, b) => {
-      if (a.created_at !== b.created_at) return b.created_at.localeCompare(a.created_at);
-      return b.id.localeCompare(a.id);
-    });
-    const first = sorted[0];
-    if (!first) throw new Error("pickNewest called with empty agents array");
-    return first;
-  }
+  // M4 introduces an agent switcher; until then, only one agent is
+  // displayed at a time (the most recently created). In-flight turns on
+  // agents that are no longer displayed continue running on their per-agent
+  // channel but are effectively orphaned in the UI for M1.5 — known
+  // limitation. The pick logic itself lives in `$lib/utils.pickNewestAgent`.
 
   const breadcrumb = $derived.by(() => {
     if (phase.kind === "active" || phase.kind === "no-agent") {
@@ -201,7 +186,18 @@
     {:else if phase.kind === "no-agent"}
       <CreateAgentForm {busy} error={inlineError} onSubmit={handleCreateAgent} />
     {:else if phase.kind === "active"}
-      <AgentPane agent={phase.agent} />
+      <!--
+        Load-bearing: `{#key phase.agent.id}` forces AgentPane to unmount and
+        remount when the active agent changes (e.g., the user creates a new
+        agent in M4's agent-switcher). AgentPane's transcript, event-channel
+        subscription, and heartbeat timer are all initialised in onMount on
+        the assumption that `agent` does not change in-place. Don't remove
+        this `{#key}` without restructuring AgentPane to react to `agent`
+        prop changes (resetting state, re-subscribing).
+      -->
+      {#key phase.agent.id}
+        <AgentPane agent={phase.agent} />
+      {/key}
     {/if}
   </div>
 </main>

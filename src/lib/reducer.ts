@@ -11,7 +11,18 @@ import type { AgentTranscript, ReducerInput, Turn, TurnId } from "./types";
 // turn would resurrect with late content.
 export function reduce(transcript: AgentTranscript, input: ReducerInput): AgentTranscript {
   switch (input.type) {
-    case "turn_start":
+    case "turn_start": {
+      // Defense-in-depth: a duplicate turn_start (dispatcher bug, late retry
+      // delivery, etc.) must not append a second agent turn with the same
+      // id. Svelte's `{#each ... (turn.id)}` keyed rendering would silently
+      // collapse them and the reducer state would diverge from the UI.
+      //
+      // Check only for an existing *agent* turn — user turns get a separate
+      // local UUID in production, but the type doesn't enforce that, and a
+      // coincidental id collision shouldn't block the agent turn from being
+      // appended.
+      const existing = findTurn(transcript, input.turn_id);
+      if (existing !== undefined && existing.role === "agent") return transcript;
       return appendAgentTurn(transcript, {
         id: input.turn_id,
         role: "agent",
@@ -19,6 +30,7 @@ export function reduce(transcript: AgentTranscript, input: ReducerInput): AgentT
         status: "streaming",
         startedAt: input.started_at,
       });
+    }
 
     case "content_chunk": {
       const existing = findTurn(transcript, input.turn_id);
@@ -47,6 +59,7 @@ export function reduce(transcript: AgentTranscript, input: ReducerInput): AgentT
         ...existing,
         status: "failed",
         error: input.outcome.message,
+        errorKind: input.outcome.kind,
         endedAt: input.ended_at,
       });
     }
@@ -60,6 +73,9 @@ export function reduce(transcript: AgentTranscript, input: ReducerInput): AgentT
         ...existing,
         status: "failed",
         error: "no response from harness — retry?",
+        // Heartbeat timeouts are frontend-synthesized adapter failures —
+        // same retry semantics as a real AdapterFailure from the parser.
+        errorKind: "adapter_failure",
         endedAt: new Date().toISOString(),
       });
     }

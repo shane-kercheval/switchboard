@@ -24,8 +24,10 @@ export type NormalizedEvent =
 // turn is in flight. The reducer treats it as a transition to "failed."
 //
 // Lives on the reducer-input union (not the wire-format `NormalizedEvent`)
-// because it's frontend-synthesized, not emitted by the dispatcher.
-export type HeartbeatTimeout = { type: "heartbeat_timeout"; turn_id: TurnId };
+// because it's frontend-synthesized, not emitted by the dispatcher. The
+// `at` timestamp is supplied by the caller (AgentPane) at fire time —
+// keeping the reducer pure (no `new Date()` inside `reduce()`).
+export type HeartbeatTimeout = { type: "heartbeat_timeout"; turn_id: TurnId; at: string };
 
 export type ReducerInput = NormalizedEvent | HeartbeatTimeout;
 

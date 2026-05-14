@@ -58,4 +58,15 @@ describe("pickNewestAgent", () => {
   it("throws on empty input", () => {
     expect(() => pickNewestAgent([])).toThrow();
   });
+
+  it("orders correctly across timezone-suffix variations (Z vs +00:00 vs offsets)", () => {
+    // Regression: lexical comparison of ISO 8601 strings only works when
+    // every record carries the same timezone suffix. Real wall-clock-ordered
+    // records here, with the same instants but different surface formats.
+    const earlier = agent("a", "earlier", "2026-05-13T00:00:00Z"); // T=0
+    const middle = agent("b", "middle", "2026-05-13T01:00:00+00:00"); // T=+1h (same instant as below)
+    const later = agent("c", "later", "2026-05-13T03:00:00.000+02:00"); // T=+1h (same as middle)
+    const latest = agent("d", "latest", "2026-05-13T02:00:00Z"); // T=+2h, the newest
+    expect(pickNewestAgent([earlier, middle, later, latest]).id).toBe("d");
+  });
 });

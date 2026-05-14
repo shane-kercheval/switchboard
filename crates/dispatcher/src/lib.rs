@@ -137,10 +137,21 @@ impl Dispatcher {
             turn_id,
             started_at: Utc::now(),
         };
-        emitter.emit(
-            &channel,
-            serde_json::to_value(&start).expect("NormalizedEvent serialization is infallible"),
-        );
+        // Serialization of a well-formed NormalizedEvent is infallible
+        // (pure data, no IO, no custom serializers that can fail), but
+        // panicking inside the drain task on the cosmic edge case would
+        // leave the agent stuck in `InFlight` until the guard drops.
+        // Log-and-skip is safer.
+        match serde_json::to_value(&start) {
+            Ok(payload) => emitter.emit(&channel, payload),
+            Err(e) => {
+                tracing::error!(
+                    %turn_id,
+                    error = %e,
+                    "failed to serialize TurnStart — skipping emit (should be unreachable)"
+                );
+            }
+        }
 
         let join = tokio::spawn(drain_stream(stream, channel, emitter, guard));
         Ok(DispatchHandle { turn_id, join })
@@ -227,9 +238,18 @@ async fn drain_stream(
             terminal_seen = true;
         }
         let normalized: NormalizedEvent = event.into();
-        let payload =
-            serde_json::to_value(&normalized).expect("NormalizedEvent serialization is infallible");
-        emitter.emit(&channel, payload);
+        // Log-and-skip on cosmic serialization failures rather than panic
+        // the drain task — see `send_message` for rationale.
+        match serde_json::to_value(&normalized) {
+            Ok(payload) => emitter.emit(&channel, payload),
+            Err(e) => {
+                tracing::error!(
+                    agent_id = %agent_id,
+                    error = %e,
+                    "failed to serialize NormalizedEvent — skipping emit (should be unreachable)"
+                );
+            }
+        }
     }
     if !terminal_seen {
         tracing::warn!(

@@ -117,7 +117,7 @@ describe("reducer", () => {
     // resurrect with late content.
     let t = emptyTranscript(AGENT_ID);
     t = reduce(t, { type: "turn_start", turn_id: TURN_A, started_at: ts(1) });
-    t = reduce(t, { type: "heartbeat_timeout", turn_id: TURN_A });
+    t = reduce(t, { type: "heartbeat_timeout", turn_id: TURN_A, at: ts(50) });
 
     const original = t;
     expect(expectAgentTurn(original, 0).status).toBe("failed");
@@ -142,13 +142,32 @@ describe("reducer", () => {
     let t = emptyTranscript(AGENT_ID);
     t = reduce(t, { type: "turn_start", turn_id: TURN_A, started_at: ts(1) });
     t = reduce(t, { type: "content_chunk", turn_id: TURN_A, text: "stuck halfway" });
-    t = reduce(t, { type: "heartbeat_timeout", turn_id: TURN_A });
+    t = reduce(t, { type: "heartbeat_timeout", turn_id: TURN_A, at: ts(50) });
 
     const turn = expectAgentTurn(t, 0);
     expect(turn.status).toBe("failed");
     expect(turn.error).toBe("no response from harness — retry?");
     expect(turn.errorKind).toBe("adapter_failure");
     expect(turn.text).toBe("stuck halfway");
+    // Caller-supplied `at` propagates to endedAt — reducer no longer reads
+    // system time, so this assertion is deterministic.
+    expect(turn.endedAt).toBe(ts(50));
+  });
+
+  it("ignores events with unknown wire-format type (forward-compat default branch)", () => {
+    // Defense-in-depth: a future backend release could ship a new
+    // NormalizedEvent variant ahead of a frontend rebuild. The reducer
+    // must return the transcript unchanged rather than crashing or
+    // returning `undefined` (which would break reactive state).
+    const t = emptyTranscript(AGENT_ID);
+    // Cast through `unknown` because TS otherwise refuses the literal —
+    // that's exactly the case we're guarding against (runtime types
+    // diverging from compile-time types).
+    const unknownEvent = {
+      type: "some_future_event",
+      payload: "anything",
+    } as unknown as Parameters<typeof reduce>[1];
+    expect(reduce(t, unknownEvent)).toEqual(t);
   });
 
   it("user turns interleave with agent turns in submit order", () => {
@@ -174,7 +193,7 @@ describe("reducer", () => {
 
   it("heartbeat_timeout for unknown turn is a no-op", () => {
     const t = emptyTranscript(AGENT_ID);
-    const after = reduce(t, { type: "heartbeat_timeout", turn_id: TURN_A });
+    const after = reduce(t, { type: "heartbeat_timeout", turn_id: TURN_A, at: ts(50) });
     expect(after).toEqual(t);
   });
 

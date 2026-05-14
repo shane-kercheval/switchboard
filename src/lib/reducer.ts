@@ -76,9 +76,17 @@ export function reduce(transcript: AgentTranscript, input: ReducerInput): AgentT
         // Heartbeat timeouts are frontend-synthesized adapter failures —
         // same retry semantics as a real AdapterFailure from the parser.
         errorKind: "adapter_failure",
-        endedAt: new Date().toISOString(),
+        endedAt: input.at,
       });
     }
+    // Defense-in-depth: an unknown wire-format variant from a future
+    // backend release must not crash the reducer (which would leave the
+    // returned value `undefined` → reactive state breakage). The frontend
+    // degrades to "ignore" until a rebuild adds explicit handling. The
+    // wire-format types are `#[non_exhaustive]` on the Rust side
+    // specifically so this kind of graceful degradation is possible.
+    default:
+      return transcript;
   }
 }
 

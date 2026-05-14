@@ -19,13 +19,17 @@ export function basename(path: string): string {
 
 // Picks the most-recently-created agent. M4 introduces an agent switcher; in
 // M1 the active agent is just "whichever the user created most recently."
-// Tiebreak by id desc keeps the choice deterministic when timestamps tie:
-// since AgentId is UUID v7 (time-ordered), descending-by-id means
-// newer-by-id wins, which is consistent with the `created_at` primary sort.
+// Primary sort: `created_at` descending, compared by parsed timestamp so
+// the result is correct regardless of timezone suffix variation (chrono
+// emits `Z` today, but `+00:00` and offset-bearing forms are valid ISO
+// 8601 too — lexical comparison would silently misorder those).
+// Tiebreak by id desc: since AgentId is UUID v7 (time-ordered), the
+// higher id is the newer one, consistent with the primary sort.
 // Throws on empty input — callers must check `agents.length > 0` first.
 export function pickNewestAgent(agents: AgentRecord[]): AgentRecord {
   const sorted = [...agents].sort((a, b) => {
-    if (a.created_at !== b.created_at) return b.created_at.localeCompare(a.created_at);
+    const dt = Date.parse(b.created_at) - Date.parse(a.created_at);
+    if (dt !== 0) return dt;
     return b.id.localeCompare(a.id);
   });
   const first = sorted[0];

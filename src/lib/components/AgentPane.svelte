@@ -58,7 +58,14 @@
     heartbeat = setTimeout(() => {
       heartbeat = null;
       heartbeatTurnId = null;
-      transcript = reduce(transcript, { type: "heartbeat_timeout", turn_id: turnId });
+      // `at` is supplied here (not inside the reducer) so the reducer
+      // stays pure — reducer tests can assert on transcripts without
+      // tolerating wall-clock variation in `endedAt`.
+      transcript = reduce(transcript, {
+        type: "heartbeat_timeout",
+        turn_id: turnId,
+        at: new Date().toISOString(),
+      });
       if (inFlightTurnId === turnId) inFlightTurnId = null;
     }, HEARTBEAT_TIMEOUT_MS);
   }

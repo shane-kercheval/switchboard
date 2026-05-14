@@ -66,6 +66,7 @@ Prerequisites: see `README.md`. The Rust toolchain is pinned in `rust-toolchain.
   - `strict: true` in tsconfig; no `any`.
   - Svelte 5 runes (`$state`, `$derived`, `$effect`).
   - Wire-format types match Rust `#[serde(tag = "type", rename_all = "snake_case")]` — TS uses discriminated unions.
+  - **Test the orchestration glue, not just the pure helpers.** Reducer / form components have unit tests for state-transition tables and isolated keyboard/click behaviour. _Components that wrap IPC + event subscriptions + reactive state_ must additionally have integration tests that mock `invoke` and `listen`, capture the event-listener callback, and verify state transitions across realistic event sequences — including ordering races (events arriving before the IPC reply resolves), terminal-state handling (heartbeat timeouts, failed turns), and error paths (IPC throws). Reducer tests alone are not sufficient — every M1.5 frontend bug lived in the wrapping component, not the reducer.
 - **Both**
   - No comments unless the _why_ is non-obvious. Identifiers explain _what_.
   - Type hints on every function signature.
@@ -140,6 +141,18 @@ Prerequisites: see `README.md`. The Rust toolchain is pinned in `rust-toolchain.
 - Any other value → panic at startup with a clear error.
 
 **Tauri command pattern (M1.4).** Each `#[tauri::command]` is a thin shim over a free function named `<command>_impl(state: &AppState, ...) -> Result<T, AppError>`. The shim parses UUIDs from strings (Tauri IPC types) and maps `AppError` to `String` (Tauri convention). Unit tests target the free functions; the `#[tauri::command]` wrapper itself is not tested.
+
+**Wire-format ↔ TS type mapping (M1.5).** Rust enums use `#[serde(tag = "type", rename_all = "snake_case")]`; TS types are hand-written discriminated unions in `src/lib/types.ts` that match the Rust shape literally. `DateTime<Utc>` serializes as an ISO-8601 string; consumers convert at the boundary if they need `Date` objects. New variants land additively (`#[non_exhaustive]` on the Rust side, reducer default branches on the TS side that degrade gracefully on unknown discriminants).
+
+**Per-agent transcript reducer (M1.5).** The reducer is a pure function `(transcript, ReducerInput) → transcript` in `src/lib/reducer.ts`. `ReducerInput` is the wire-format `NormalizedEvent` union plus a frontend-synthesized `{ type: "heartbeat_timeout", turn_id }` variant. The reducer is the **single source of truth** for transcript state — component effects (heartbeat timer, IPC subscription) push events into the reducer rather than mutating transcripts directly. Cross-turn isolation is enforced two ways: events for unknown `turn_id`s are dropped, and events for turns already in a terminal state (`complete` or `failed`) are also dropped (the dispatcher's drain task may continue emitting after the UI has heartbeat-timed-out the turn).
+
+**Per-agent event subscription (M1.5).** `AgentPane.svelte` subscribes to `agent:<id>` on mount via `@tauri-apps/api/event::listen` and unsubscribes on unmount. One subscription per AgentPane lifetime, **not** per turn — see M1.4's per-agent channel rationale (per-turn channels race with the IPC reply).
+
+**Binary-not-found banner (M1.5).** `App.svelte` calls `check_claude_binary` once at mount. On failure, renders a non-blocking red banner at the top with the install link. Banner persists across all phases (welcome / directory-selector / no-agent / active). Send attempts will fail until the user installs `claude` and reloads the app; UI flow still works for project/agent creation without `claude` present.
+
+**Heartbeat timeout (M1.5).** Frontend defense against adapter contract violations (M1.4 §7). `HEARTBEAT_TIMEOUT_MS = 60_000` in `src/lib/types.ts`. The AgentPane component owns the timer; it resets on each `content_chunk` for the in-flight turn and fires a `heartbeat_timeout` reducer input when no chunk arrives within the window. The reducer transitions the turn to `failed` with a "no response from harness — retry?" message. **M2 caveat**: when tool calls land, this rule becomes unsafe (a long tool execution can legitimately emit zero `content_chunk`s for minutes). Revisit then.
+
+**M1.5 known limitations.** One bound directory at a time (multi-directory deferred to never-in-v1). One displayed agent per project at a time — most-recently-created wins, deterministic tiebreak `created_at desc, id desc`. M4 adds the agent switcher; until then, in-flight turns on agents that are no longer displayed continue to run on their per-agent channel but are effectively orphaned in the UI. Transcripts are in-memory only (no persistence across app reloads); projects + agents persist on disk under `<directory>/.switchboard/`.
 
 ## Authoritative docs
 

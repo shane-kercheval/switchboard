@@ -66,6 +66,37 @@ make check     # everything CI runs — run before opening a PR
 
 See [`AGENTS.md`](./AGENTS.md) for project orientation and conventions, and [`docs/implementation_plans/2026-05-12-v1.md`](./docs/implementation_plans/2026-05-12-v1.md) for the milestone roadmap.
 
+## Try it out (M1)
+
+After `make install`, you can run the M1 end-to-end flow:
+
+```sh
+make dev
+```
+
+Sequence:
+
+1. App window opens to a welcome screen with **Open working directory**.
+2. Click it → native folder picker → choose a fresh directory (e.g., `/tmp/sw-smoke`).
+3. The directory has no `.switchboard/` yet, so the app offers to **Initialize Switchboard** with a default project name matching the folder. Confirm.
+4. The breadcrumb at the top now reads `<project-name> — <folder-basename>`.
+5. The app prompts you to **Create an agent** (default name `assistant`). Confirm.
+6. Single-pane view appears: scrollback on top, compose bar on bottom, status indicator showing **idle**.
+7. Type `What's 2+2?` and press ⌘+Enter (or click **Send**). The agent's response streams into the pane character-by-character; status flips to **processing** while the turn runs, back to **idle** when it completes.
+8. Send a follow-up. The agent recalls prior context — session resume works.
+9. Close the app and run `make dev` again. Re-open the same directory; you'll see the existing project listed. Open it → the agent is still there → send another message.
+10. To create a second project in the same directory, re-open the directory and use **Create another project** in the project list.
+
+### Developing without `claude` installed
+
+If `claude` isn't on your `PATH` (or you don't want to burn quota during UI iteration), launch with the mock harness:
+
+```sh
+SWITCHBOARD_HARNESS=mock make dev
+```
+
+The mock emits canned streaming responses (`Mock response to: <prompt> — replied by mock harness.`) — identical event-stream shape to the real harness, so the UI exercises every code path. The startup binary-not-found banner stays hidden under the mock since `MockHarnessAdapter::probe()` always returns OK.
+
 ## License
 
 Apache 2.0. See [LICENSE](./LICENSE).

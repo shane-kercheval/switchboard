@@ -44,7 +44,7 @@ Subcommands of note: `mcp` (configure MCP servers), `agents` (manage agents), `p
 
 **Storage location:** `~/.claude/projects/<encoded-cwd>/<session-uuid>.jsonl`
 
-Where `<encoded-cwd>` is the absolute working directory with `/` replaced by `-`. For example, `/private/tmp/switchboard-probe` becomes `-private-tmp-switchboard-probe`.
+Where `<encoded-cwd>` is the absolute working directory with **both `/` and `.` replaced by `-`**. For example, `/private/tmp/switchboard-probe` becomes `-private-tmp-switchboard-probe`, and `/Users/x/repo/.switchboard/projects/abc` becomes `-Users-x-repo--switchboard-projects-abc` — note the double-dash where the dot-prefixed `.switchboard` was. (Original M1.3 research listed only `/` → `-`; the dot-stripping rule was missed because probe paths happened to contain no dots and surfaced in M1.5 manual testing against a directory layout containing `.switchboard/`.)
 
 **Format:** newline-delimited JSON. Each line is one event with a `uuid` and a `parentUuid` chain forming a tree (which is what `--fork-session` branches from).
 

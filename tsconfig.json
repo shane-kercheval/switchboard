@@ -22,7 +22,11 @@
     "checkJs": false,
     "sourceMap": true,
     "declaration": false,
-    "useDefineForClassFields": true
+    "useDefineForClassFields": true,
+    "paths": {
+      "$lib": ["./src/lib"],
+      "$lib/*": ["./src/lib/*"]
+    }
   },
   "include": ["src/**/*.ts", "src/**/*.svelte", "tests/**/*.ts", "*.config.ts", "*.config.js"],
   "exclude": ["node_modules", "dist", "target"]

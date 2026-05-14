@@ -1,5 +1,7 @@
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -9,7 +11,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::adapter::{DispatchError, EventStream, HarnessAdapter};
 use crate::events::{AdapterEvent, FailureKind, TurnId, TurnOutcome};
-use crate::parser::{self, ParseOutcome};
+use crate::parser::{self, ParseOutcome, ParserState};
 
 /// Adapter for Claude Code (`claude -p`). Spawns a `claude` subprocess,
 /// feeds the prompt as a positional argument, and maps the stream-json output
@@ -149,18 +151,38 @@ fn session_file_exists(project_root: &Path, session_id: &uuid::Uuid) -> bool {
 
 /// Pure check — testable without touching the real `$HOME`.
 /// Claude Code stores sessions at `<home>/.claude/projects/<encoded-cwd>/<uuid>.jsonl`
-/// where the encoded cwd is the canonicalized path with every `/` replaced by `-`.
+/// where the encoded cwd replaces both `/` and `.` with `-`. For example,
+/// `/Users/x/repo/.switchboard/projects/<id>` is encoded as
+/// `-Users-x-repo--switchboard-projects-<id>` — the leading dot of
+/// `.switchboard` becomes a dash, producing the double-dash `--switchboard`.
+/// The empirically-observed rule, confirmed against `~/.claude/projects/`
+/// listings for cwds containing dot-prefixed components.
 fn session_exists_in(home: &Path, project_root: &Path, session_id: &uuid::Uuid) -> bool {
     let Ok(canonical) = project_root.canonicalize() else {
         return false;
     };
-    let encoded = canonical.to_string_lossy().replace('/', "-");
+    let encoded = encode_cwd(&canonical);
     home.join(".claude")
         .join("projects")
         .join(&encoded)
         .join(format!("{session_id}.jsonl"))
         .exists()
 }
+
+/// Encodes a canonical absolute path the way Claude Code does for its
+/// session-storage directory naming: every `/` and `.` becomes `-`. Switchboard's
+/// own working paths reliably contain `.switchboard`, so getting this rule
+/// exactly right is load-bearing — any mismatch causes the adapter to think a
+/// session file is missing and pass `--session-id`, which claude rejects with
+/// "Session ID … is already in use" on subsequent turns.
+fn encode_cwd(canonical: &Path) -> String {
+    canonical.to_string_lossy().replace(['/', '.'], "-")
+}
+
+/// Most recent stderr lines we keep around so we can include them in the
+/// synthesized failure message when the subprocess exits without a terminal
+/// event. Bounded to avoid unbounded growth on a chatty subprocess.
+const STDERR_TAIL_CAPACITY: usize = 16;
 
 async fn run_producer(
     mut child: tokio::process::Child,
@@ -171,17 +193,26 @@ async fn run_producer(
     agent_id: AgentId,
 ) {
     // Drain stderr concurrently; prevents pipe-full deadlock if the subprocess
-    // writes to stderr while we block reading stdout.
-    let stderr_task = tokio::spawn(drain_stderr(stderr, agent_id, turn_id));
+    // writes to stderr while we block reading stdout. The shared `stderr_tail`
+    // buffer captures the last few lines for inclusion in failure messages.
+    let stderr_tail: Arc<Mutex<VecDeque<String>>> =
+        Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_CAPACITY)));
+    let stderr_task = tokio::spawn(drain_stderr(
+        stderr,
+        agent_id,
+        turn_id,
+        Arc::clone(&stderr_tail),
+    ));
 
     let mut terminal_seen = false;
     let mut terminal_was_completed = false;
+    let mut parser_state = ParserState::default();
 
     let mut lines = tokio::io::BufReader::new(stdout).lines();
 
     loop {
         match lines.next_line().await {
-            Ok(Some(line)) => match parser::parse_line(&line, turn_id) {
+            Ok(Some(line)) => match parser::parse_line(&line, turn_id, &mut parser_state) {
                 ParseOutcome::Event(event) => {
                     match &event {
                         AdapterEvent::TurnEnd {
@@ -234,19 +265,16 @@ async fn run_producer(
         }
     }
 
-    // Stream contract: ensure exactly one terminal event was emitted.
-    if !terminal_seen {
-        let _ = tx.send(AdapterEvent::TurnEnd {
-            turn_id,
-            outcome: TurnOutcome::Failed {
-                kind: FailureKind::AdapterFailure,
-                message: "harness exited without terminal result event".to_owned(),
-            },
-            ended_at: Utc::now(),
-        });
-    }
-
+    // Wait for the stderr drain to finish before reading the tail — gives the
+    // drain task a chance to capture any final lines after stdout EOF.
     let _ = stderr_task.await;
+
+    // Stream contract: ensure exactly one terminal event was emitted. The
+    // failure message includes the tail of stderr so the consumer can see
+    // why the subprocess exited silently (auth error, flag rejection, etc.).
+    if !terminal_seen {
+        let _ = tx.send(synthesize_truncation_turn_end(turn_id, &stderr_tail));
+    }
 
     // Reap subprocess. If the parser observed Completed but the exit code is
     // non-zero, log the discrepancy — per M1 policy, we do not re-emit. M2
@@ -272,12 +300,23 @@ async fn run_producer(
     }
 }
 
-async fn drain_stderr(stderr: tokio::process::ChildStderr, agent_id: AgentId, turn_id: TurnId) {
+async fn drain_stderr(
+    stderr: tokio::process::ChildStderr,
+    agent_id: AgentId,
+    turn_id: TurnId,
+    tail: Arc<Mutex<VecDeque<String>>>,
+) {
     let mut lines = tokio::io::BufReader::new(stderr).lines();
     loop {
         match lines.next_line().await {
             Ok(Some(line)) => {
                 tracing::debug!(agent_id = %agent_id, %turn_id, "harness stderr: {line}");
+                if let Ok(mut buf) = tail.lock() {
+                    if buf.len() >= STDERR_TAIL_CAPACITY {
+                        buf.pop_front();
+                    }
+                    buf.push_back(line);
+                }
             }
             Ok(None) => break,
             Err(e) => {
@@ -285,6 +324,51 @@ async fn drain_stderr(stderr: tokio::process::ChildStderr, agent_id: AgentId, tu
                 break;
             }
         }
+    }
+}
+
+/// Build the synthesized `TurnEnd(Failed)` event emitted when stdout EOFs
+/// without a terminal `result` event. Includes the captured stderr tail so
+/// the consumer can see the underlying cause (auth error, flag rejection).
+fn synthesize_truncation_turn_end(
+    turn_id: TurnId,
+    stderr_tail: &Mutex<VecDeque<String>>,
+) -> AdapterEvent {
+    let stderr_msg = format_stderr_tail(stderr_tail);
+    let message = if stderr_msg.is_empty() {
+        "harness exited without terminal result event (no stderr captured)".to_owned()
+    } else {
+        format!("harness exited without terminal result event; stderr: {stderr_msg}")
+    };
+    AdapterEvent::TurnEnd {
+        turn_id,
+        outcome: TurnOutcome::Failed {
+            kind: FailureKind::AdapterFailure,
+            message,
+        },
+        ended_at: Utc::now(),
+    }
+}
+
+/// Bound the failure-message length so it stays readable in the UI.
+const STDERR_MESSAGE_MAX_LEN: usize = 800;
+
+/// Returns a single-line, length-bounded representation of the captured
+/// stderr tail. Empty string if no lines were captured.
+fn format_stderr_tail(tail: &Mutex<VecDeque<String>>) -> String {
+    let Ok(buf) = tail.lock() else {
+        return String::new();
+    };
+    if buf.is_empty() {
+        return String::new();
+    }
+    let joined = buf.iter().cloned().collect::<Vec<_>>().join(" | ");
+    if joined.len() > STDERR_MESSAGE_MAX_LEN {
+        let mut truncated = joined[joined.len() - STDERR_MESSAGE_MAX_LEN..].to_owned();
+        truncated.insert(0, '…');
+        truncated
+    } else {
+        joined
     }
 }
 
@@ -317,7 +401,7 @@ mod tests {
         );
 
         let canonical = project.path().canonicalize().unwrap();
-        let encoded = canonical.to_string_lossy().replace('/', "-");
+        let encoded = encode_cwd(&canonical);
         let session_dir = home.path().join(".claude").join("projects").join(&encoded);
         std::fs::create_dir_all(&session_dir).unwrap();
         std::fs::write(session_dir.join(format!("{session_id}.jsonl")), "").unwrap();
@@ -348,7 +432,7 @@ mod tests {
         let agent = agent_with_session(session_id);
 
         let canonical = project.path().canonicalize().unwrap();
-        let encoded = canonical.to_string_lossy().replace('/', "-");
+        let encoded = encode_cwd(&canonical);
         let session_dir = home.path().join(".claude").join("projects").join(&encoded);
         std::fs::create_dir_all(&session_dir).unwrap();
         std::fs::write(session_dir.join(format!("{session_id}.jsonl")), "").unwrap();
@@ -357,6 +441,69 @@ mod tests {
 
         assert!(args.contains(&"--resume".to_owned()));
         assert!(!args.contains(&"--session-id".to_owned()));
+    }
+
+    #[test]
+    fn encode_cwd_replaces_dots_and_slashes_with_dashes() {
+        // Regression: paths containing dot-prefixed components (like the
+        // `.switchboard/` directory Switchboard itself uses) must match
+        // claude's actual encoding. A `/` → `-` only rule would produce
+        // `temp-.switchboard-`; the correct rule produces `temp--switchboard-`.
+        assert_eq!(
+            encode_cwd(Path::new("/Users/x/repo/.switchboard/projects/abc")),
+            "-Users-x-repo--switchboard-projects-abc"
+        );
+        assert_eq!(
+            encode_cwd(Path::new("/Users/shanekercheval/repos/temp")),
+            "-Users-shanekercheval-repos-temp"
+        );
+    }
+
+    #[test]
+    fn session_exists_in_handles_dot_components_in_project_root() {
+        // Real-world reproduction: a project_root containing `.switchboard`
+        // must resolve to the same encoded directory claude uses, otherwise
+        // `--session-id` is passed on the second turn and claude rejects with
+        // "Session ID already in use".
+        let home = tempfile::TempDir::new().unwrap();
+        let parent = tempfile::TempDir::new().unwrap();
+        // Build a project root that mirrors Switchboard's actual layout —
+        // a `.switchboard` directory with a dot-prefixed component.
+        let project_root = parent
+            .path()
+            .join(".switchboard")
+            .join("projects")
+            .join("p1");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let session_id = Uuid::now_v7();
+
+        // Pre-create the session file at the path claude would write it to.
+        let canonical = project_root.canonicalize().unwrap();
+        let encoded = encode_cwd(&canonical);
+        // Sanity: the encoded path must contain `--switchboard`, not `-.switchboard`.
+        assert!(
+            encoded.contains("--switchboard"),
+            "encoded path should have `--switchboard` (got: {encoded})"
+        );
+        let session_dir = home.path().join(".claude").join("projects").join(&encoded);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(session_dir.join(format!("{session_id}.jsonl")), "").unwrap();
+
+        // Detection works through the dot-stripping encoding.
+        assert!(session_exists_in(home.path(), &project_root, &session_id));
+
+        // build_args therefore picks --resume on the second turn — not
+        // --session-id, which would cause the "already in use" rejection.
+        let agent = agent_with_session(session_id);
+        let args = build_args(&agent, "hi", &project_root, Some(home.path()));
+        assert!(
+            args.contains(&"--resume".to_owned()),
+            "expected --resume when session file exists, got: {args:?}"
+        );
+        assert!(
+            !args.contains(&"--session-id".to_owned()),
+            "must not pass --session-id when the session already exists"
+        );
     }
 
     #[test]

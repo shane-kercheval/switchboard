@@ -25,6 +25,26 @@ pub struct DirectoryInfo {
     pub projects: Vec<ProjectSummary>,
 }
 
+/// Read-only inspection. Canonicalizes the path, checks whether
+/// `.switchboard/` already exists, and lists projects if it does. **Does
+/// not** create directories, write files, or modify `AppState` — the
+/// frontend uses this to show the appropriate post-folder-picker CTA
+/// (init / create-project / select-project) before committing.
+pub async fn pick_directory_impl(path: &str) -> Result<DirectoryInfo, AppError> {
+    let directory = Directory::at(Path::new(path))?;
+    let has_switchboard = directory.has_switchboard();
+    let projects = if has_switchboard {
+        directory.list_projects()?
+    } else {
+        Vec::new()
+    };
+    Ok(DirectoryInfo {
+        path: directory.path.to_string_lossy().into_owned(),
+        has_switchboard,
+        projects,
+    })
+}
+
 /// Idempotent for the same path: creates `.switchboard/` if missing and
 /// binds the directory in `AppState`. Re-binding to a *different* canonical
 /// path clears the loaded-project cache and the active project, so the
@@ -427,6 +447,48 @@ mod tests {
         let b_count = events.iter().filter(|(n, _)| n == &ch_b).count();
         assert_eq!(a_count, 5, "agent A's channel got the wrong event count");
         assert_eq!(b_count, 5, "agent B's channel got the wrong event count");
+    }
+
+    #[tokio::test]
+    async fn pick_directory_does_not_create_switchboard_dir() {
+        let tmp = TempDir::new().unwrap();
+        let info = pick_directory_impl(tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        assert!(!info.has_switchboard);
+        assert!(info.projects.is_empty());
+        assert!(
+            !tmp.path().join(".switchboard").exists(),
+            "pick_directory must not write to disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn pick_directory_lists_projects_when_switchboard_exists() {
+        let (tmp, state, _) = fresh_state_with_mock();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        create_project_impl(&state, "alpha").unwrap();
+
+        // Use a fresh state with no directory bound — pick_directory is
+        // stateless, it just inspects the path.
+        let info = pick_directory_impl(tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        assert!(info.has_switchboard);
+        assert_eq!(info.projects.len(), 1);
+        assert_eq!(info.projects[0].name, "alpha");
+    }
+
+    #[tokio::test]
+    async fn pick_directory_rejects_missing_path() {
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        let err = pick_directory_impl(missing.to_str().unwrap())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Core(_)));
     }
 
     #[test]

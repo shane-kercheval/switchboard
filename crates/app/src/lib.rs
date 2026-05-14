@@ -16,7 +16,7 @@ use tauri::{Emitter, Manager, State};
 use crate::commands::{
     DirectoryInfo, check_claude_binary_impl, create_agent_impl, create_project_impl,
     init_directory_impl, list_agents_impl, list_projects_impl, open_project_impl, parse_uuid,
-    send_message_impl, set_active_project_impl,
+    pick_directory_impl, send_message_impl, set_active_project_impl,
 };
 use crate::state::AppState;
 
@@ -25,6 +25,11 @@ use switchboard_core::{AgentRecord, ProjectSummary};
 #[tauri::command]
 async fn check_claude_binary(state: State<'_, AppState>) -> Result<(), String> {
     check_claude_binary_impl(state.inner()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pick_directory(path: String) -> Result<DirectoryInfo, String> {
+    pick_directory_impl(&path).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -150,6 +155,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             check_claude_binary,
+            pick_directory,
             init_directory,
             list_projects,
             create_project,

@@ -3,18 +3,21 @@
 //! Exercises the **full backend vertical slice** that an M1 user actually
 //! triggers: `Directory::init` → `create_project` → `register_agent` →
 //! `Dispatcher::send_message` → real `claude` subprocess → events streamed
-//! back through the `EventEmitter`. Uses realistic on-disk paths
-//! (`<tmp>/.switchboard/projects/<uuid>/`) so any path-encoding rule applied
-//! by the harness adapter is exercised against the *actual* layout — not the
-//! flatter `/tmp` paths the harness-crate live tests use.
+//! back through the `EventEmitter`. Uses realistic on-disk paths so any
+//! path-encoding rule or cwd-semantic decision is exercised against the
+//! actual layout.
 //!
 //! Why this layer matters: pure unit tests and adapter-only live tests can
-//! pass while the integration path still has a bug. The M1.5 session-id
-//! encoding bug (path containing `.switchboard` was not detected on the
-//! second turn because the encoding rule was `/ → -` only, missing `. → -`)
-//! is the load-bearing example. A test at this layer fails on the second
-//! send, immediately, with the same `"Session ID is already in use"` claude
-//! returns — months before any UI manual testing surfaces it.
+//! pass while the integration path still has a bug. Two M1.5-era bugs were
+//! caught by this layer (or would have been, had it existed):
+//!
+//! - The session-id encoding bug (`/` → `-` only, missing `. → -`) —
+//!   detected by `live_full_stack_two_consecutive_turns_succeed`, which
+//!   exercises session resume across two turns.
+//! - The cwd bug (claude was spawned in `.switchboard/projects/<uuid>/`
+//!   instead of the user's bound working directory, so it couldn't see the
+//!   user's repo files) — detected by `live_full_stack_claude_sees_files_in_cwd`,
+//!   which writes a file into the working dir and asserts claude can read it.
 //!
 //! Run with: `make test-live`. Gated behind `#[ignore]` because each test
 //! costs real claude credits (~$0.08–$0.16 per run) and requires
@@ -36,6 +39,16 @@ fn turn_end_statuses(emitter: &Arc<RecordingEmitter>, channel: &str) -> Vec<Stri
         .into_iter()
         .filter(|(name, payload)| name == channel && payload["type"] == "turn_end")
         .filter_map(|(_, payload)| payload["outcome"]["status"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// Concatenates every `content_chunk.text` for a channel in arrival order.
+fn agent_text(emitter: &Arc<RecordingEmitter>, channel: &str) -> String {
+    emitter
+        .snapshot()
+        .into_iter()
+        .filter(|(name, payload)| name == channel && payload["type"] == "content_chunk")
+        .filter_map(|(_, payload)| payload["text"].as_str().map(str::to_owned))
         .collect()
 }
 
@@ -72,15 +85,13 @@ async fn live_full_stack_two_consecutive_turns_succeed() {
     let handle1 = dispatcher
         .send_message(
             &agent,
-            &project.root,
+            &project.directory,
             "Reply with exactly the word: ack",
             adapter.as_ref(),
             Arc::clone(&emitter) as Arc<dyn EventEmitter>,
         )
         .await
         .expect("first send_message");
-    // Awaiting the drain handle guarantees every event for this turn is
-    // already in the emitter by the time the await resolves.
     handle1.join.await.expect("drain joined");
 
     // Turn 2: the regression catch. Adapter must detect the session file
@@ -90,7 +101,7 @@ async fn live_full_stack_two_consecutive_turns_succeed() {
     let handle2 = dispatcher
         .send_message(
             &agent,
-            &project.root,
+            &project.directory,
             "And again, exactly: ack",
             adapter.as_ref(),
             Arc::clone(&emitter) as Arc<dyn EventEmitter>,
@@ -134,7 +145,7 @@ async fn live_full_stack_emits_turn_start_then_content_then_turn_end() {
     let handle = dispatcher
         .send_message(
             &agent,
-            &project.root,
+            &project.directory,
             "Reply with exactly: hi",
             adapter.as_ref(),
             Arc::clone(&emitter) as Arc<dyn EventEmitter>,
@@ -174,27 +185,19 @@ async fn live_full_stack_emits_turn_start_then_content_then_turn_end() {
 #[tokio::test]
 #[ignore = "requires claude installed and authenticated — run with: make test-live"]
 async fn live_full_stack_paths_with_dot_components_resolve_correctly() {
-    // Direct regression test for the path-encoding bug. Asserts that the
-    // session file claude actually wrote (in ~/.claude/projects/...) is
-    // detectable by the adapter when the project_root contains a
-    // dot-prefixed directory (`.switchboard/`). If the encoding rule
-    // diverges from claude's behaviour, this test fails on the second send
-    // attempt with "Session ID is already in use".
+    // Direct regression test for the path-encoding bug. The user's bound
+    // working directory can contain dots (hidden directories, dotted
+    // usernames, etc.). The path-encoding rule must apply the same way at
+    // any path position, otherwise the second-turn `--resume` lookup fails.
     let tmp = TempDir::new().expect("tempdir");
-    let directory = Directory::at(tmp.path()).expect("Directory::at");
+    // Build a working directory with a dot-prefixed component to exercise
+    // the encoding rule. The actual user-bound dir is typed by the user
+    // and can take any shape; we simulate one of the trickier cases here.
+    let working_dir = tmp.path().join(".config").join("my.app");
+    std::fs::create_dir_all(&working_dir).expect("create working dir");
+    let directory = Directory::at(&working_dir).expect("Directory::at");
     directory.init().expect("init");
     let project = directory.create_project("dot-path-test").expect("project");
-
-    // Sanity: project.root must contain `.switchboard` — if Switchboard ever
-    // changes its on-disk layout, this assertion catches the test going stale.
-    assert!(
-        project
-            .root
-            .components()
-            .any(|c| c.as_os_str().to_string_lossy() == ".switchboard"),
-        "expected project.root to contain `.switchboard`, got: {:?}",
-        project.root
-    );
 
     let agent = project
         .register_agent("assistant", HarnessKind::ClaudeCode)
@@ -210,7 +213,7 @@ async fn live_full_stack_paths_with_dot_components_resolve_correctly() {
         let handle = dispatcher
             .send_message(
                 &agent,
-                &project.root,
+                &project.directory,
                 prompt,
                 adapter.as_ref(),
                 Arc::clone(&emitter) as Arc<dyn EventEmitter>,
@@ -231,5 +234,57 @@ async fn live_full_stack_paths_with_dot_components_resolve_correctly() {
         "second turn must complete (proves session resume works through dot-path encoding); \
          got statuses: {statuses:?} from events: {:?}",
         emitter.snapshot()
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires claude installed and authenticated — run with: make test-live"]
+async fn live_full_stack_claude_sees_files_in_cwd() {
+    // Regression test for the M1.5 cwd bug: claude was being spawned in
+    // `<dir>/.switchboard/projects/<uuid>/` (a Switchboard-internal metadata
+    // directory) instead of the user's bound working directory. The
+    // observable symptom was that claude couldn't see the user's repo
+    // files via its Read/Glob/Bash tools — the M1 use case (orchestrate
+    // claude on the user's code) was broken.
+    //
+    // This test: write a known-content file into the working directory,
+    // dispatch a turn asking claude to read it, assert the streamed
+    // response references the content. Pre-fix, claude's Read tool would
+    // fail or return nothing (the file isn't in `.switchboard/projects/<uuid>/`).
+    let tmp = TempDir::new().expect("tempdir");
+    // A token unlikely to appear in any other context, so its presence in
+    // the response is strong evidence claude read the file.
+    let token = "SWITCHBOARD_LIVE_TEST_TOKEN_F8A23E";
+    std::fs::write(tmp.path().join("MARKER.txt"), token).expect("write marker");
+
+    let directory = Directory::at(tmp.path()).expect("Directory::at");
+    directory.init().expect("init");
+    let project = directory.create_project("cwd-test").expect("project");
+    let agent = project
+        .register_agent("assistant", HarnessKind::ClaudeCode)
+        .expect("agent");
+
+    let dispatcher = Arc::new(Dispatcher::new());
+    let adapter: Arc<dyn HarnessAdapter> = Arc::new(ClaudeCodeAdapter::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let channel = format!("agent:{}", agent.id);
+
+    let handle = dispatcher
+        .send_message(
+            &agent,
+            &project.directory,
+            "Read the file MARKER.txt in the current directory and tell me what string it contains. Reply with just the string, nothing else.",
+            adapter.as_ref(),
+            Arc::clone(&emitter) as Arc<dyn EventEmitter>,
+        )
+        .await
+        .expect("send_message");
+    handle.join.await.expect("drain joined");
+
+    let text = agent_text(&emitter, &channel);
+    assert!(
+        text.contains(token),
+        "claude's response must contain the marker token (proves it read the file from the cwd); \
+         got text: {text:?}"
     );
 }

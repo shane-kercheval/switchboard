@@ -30,10 +30,15 @@ pub enum DispatchError {
 /// the adapter must synthesize `TurnEnd(Failed { kind: AdapterFailure })`.
 #[async_trait]
 pub trait HarnessAdapter: Send + Sync {
+    /// Dispatch a single turn. `cwd` is the working directory the
+    /// subprocess is spawned in — for `ClaudeCodeAdapter` this is the
+    /// user's bound working directory (so claude can see the user's repo
+    /// files via its Read/Glob/Bash tools), **not** the per-project
+    /// metadata directory inside `.switchboard/projects/<uuid>/`.
     async fn dispatch(
         &self,
         agent: &AgentRecord,
-        project_root: &Path,
+        cwd: &Path,
         prompt: &str,
         turn_id: TurnId,
     ) -> Result<EventStream, DispatchError>;

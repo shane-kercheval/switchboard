@@ -123,16 +123,14 @@ impl Dispatcher {
     pub async fn send_message(
         self: &Arc<Self>,
         agent: &AgentRecord,
-        project_root: &Path,
+        cwd: &Path,
         prompt: &str,
         adapter: &dyn HarnessAdapter,
         emitter: Arc<dyn EventEmitter>,
     ) -> Result<DispatchHandle, DispatcherError> {
         let guard = AgentIdleGuard::acquire(Arc::clone(self), agent.id)?;
         let turn_id: TurnId = Uuid::now_v7();
-        let stream = adapter
-            .dispatch(agent, project_root, prompt, turn_id)
-            .await?;
+        let stream = adapter.dispatch(agent, cwd, prompt, turn_id).await?;
 
         let channel = channel_name(agent.id);
         let start = NormalizedEvent::TurnStart {

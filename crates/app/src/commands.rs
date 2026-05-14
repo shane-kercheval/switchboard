@@ -49,7 +49,7 @@ pub async fn pick_directory_impl(path: &str) -> Result<DirectoryInfo, AppError> 
 /// binds the directory in `AppState`. Re-binding to a *different* canonical
 /// path clears the loaded-project cache and the active project, so the
 /// frontend can't subsequently dispatch to an agent from the previous
-/// directory (which would resolve to a now-stale `project.root`).
+/// directory (which would resolve to a now-stale `project.directory`).
 ///
 /// In-flight dispatches on agents from the prior directory keep running
 /// (their `AgentIdleGuard` and event channels are dispatcher-owned and
@@ -166,11 +166,19 @@ pub async fn send_message_impl(
     prompt: &str,
 ) -> Result<DispatchHandle, AppError> {
     let (project, agent) = lookup_agent(state, agent_id)?;
+    // Claude is spawned with cwd = the user's bound working directory (the
+    // folder they opened), NOT the per-project metadata directory inside
+    // `.switchboard/projects/<uuid>/`. The working directory is what
+    // contains the user's actual code that claude needs to see via its
+    // Read/Glob/Bash tools — the metadata directory is just where
+    // Switchboard stores its own state. Multiple projects in the same
+    // working directory share the same cwd; their per-agent sessions are
+    // distinguished by session UUID, which is unique per agent.
     let handle = state
         .dispatcher
         .send_message(
             &agent,
-            &project.root,
+            &project.directory,
             prompt,
             state.adapter.as_ref(),
             Arc::clone(&state.emitter) as Arc<dyn EventEmitter>,
@@ -265,7 +273,7 @@ mod tests {
 
         // The actual user-visible bug guard: sending to the old agent ID
         // now returns AgentNotFound (not a silent dispatch against the old
-        // project.root).
+        // project's cwd).
         let err = send_message_impl(&state, agent.id, "should fail")
             .await
             .unwrap_err();

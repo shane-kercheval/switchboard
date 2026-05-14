@@ -61,19 +61,25 @@ impl HarnessAdapter for ClaudeCodeAdapter {
     async fn dispatch(
         &self,
         agent: &AgentRecord,
-        project_root: &Path,
+        cwd: &Path,
         prompt: &str,
         turn_id: TurnId,
     ) -> Result<EventStream, DispatchError> {
         let binary = resolve_binary(&self.claude_binary_path)?;
-        let args = build_args(agent, prompt, project_root, None);
+        let args = build_args(agent, prompt, cwd, None);
 
         let mut child = tokio::process::Command::new(&binary)
             .args(&args)
-            .current_dir(project_root)
+            .current_dir(cwd)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .stdin(Stdio::null())
+            // `kill_on_drop(true)` only fires when `child` is dropped — and
+            // `child` is owned by `run_producer` (spawned task). Consumers
+            // dropping the event stream does NOT propagate; the subprocess
+            // continues until natural exit. M4 cancellation will need a
+            // `CancellationToken` plumbed through so mid-turn cancel kills
+            // the subprocess properly.
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| {
@@ -110,7 +116,7 @@ fn resolve_binary(path: &Path) -> Result<PathBuf, DispatchError> {
 fn build_args(
     agent: &AgentRecord,
     prompt: &str,
-    project_root: &Path,
+    cwd: &Path,
     home_override: Option<&Path>,
 ) -> Vec<String> {
     let mut args = vec![
@@ -126,10 +132,14 @@ fn build_args(
         // --session-id creates a new session with the given UUID (first turn).
         // --resume continues an existing session (all subsequent turns).
         // Claude Code stores sessions at ~/.claude/projects/<encoded-cwd>/<uuid>.jsonl;
-        // we check that path to pick the right flag.
+        // we check that path to pick the right flag. The `cwd` used for the
+        // session-path lookup must be the SAME cwd we pass to the
+        // subprocess — claude computes its own session-storage path from
+        // its actual cwd, so any divergence here means we look in the
+        // wrong place and pass `--session-id` when we should `--resume`.
         let exists = match home_override {
-            Some(home) => session_exists_in(home, project_root, &session_id),
-            None => session_file_exists(project_root, &session_id),
+            Some(home) => session_exists_in(home, cwd, &session_id),
+            None => session_file_exists(cwd, &session_id),
         };
         if exists {
             args.push("--resume".to_owned());
@@ -142,11 +152,11 @@ fn build_args(
 }
 
 /// Production wrapper: reads `$HOME` and delegates to `session_exists_in`.
-fn session_file_exists(project_root: &Path, session_id: &uuid::Uuid) -> bool {
+fn session_file_exists(cwd: &Path, session_id: &uuid::Uuid) -> bool {
     let Ok(home) = std::env::var("HOME") else {
         return false;
     };
-    session_exists_in(Path::new(&home), project_root, session_id)
+    session_exists_in(Path::new(&home), cwd, session_id)
 }
 
 /// Pure check — testable without touching the real `$HOME`.
@@ -157,8 +167,8 @@ fn session_file_exists(project_root: &Path, session_id: &uuid::Uuid) -> bool {
 /// `.switchboard` becomes a dash, producing the double-dash `--switchboard`.
 /// The empirically-observed rule, confirmed against `~/.claude/projects/`
 /// listings for cwds containing dot-prefixed components.
-fn session_exists_in(home: &Path, project_root: &Path, session_id: &uuid::Uuid) -> bool {
-    let Ok(canonical) = project_root.canonicalize() else {
+fn session_exists_in(home: &Path, cwd: &Path, session_id: &uuid::Uuid) -> bool {
+    let Ok(canonical) = cwd.canonicalize() else {
         return false;
     };
     let encoded = encode_cwd(&canonical);
@@ -484,42 +494,42 @@ mod tests {
     }
 
     #[test]
-    fn session_exists_in_handles_dot_components_in_project_root() {
-        // Real-world reproduction: a project_root containing `.switchboard`
-        // must resolve to the same encoded directory claude uses, otherwise
-        // `--session-id` is passed on the second turn and claude rejects with
-        // "Session ID already in use".
+    fn session_exists_in_handles_dot_components_in_cwd() {
+        // The cwd we spawn claude in is the user's bound working directory,
+        // which can contain dots (hidden directories, dotted usernames like
+        // `/Users/john.doe/...`, dotted middle components like
+        // `my.app/src/`). The encoding rule `/` + `.` → `-` has to match
+        // claude's actual rule, otherwise we look for the session file in
+        // the wrong place, pass `--session-id` on the second turn, and
+        // claude rejects with "Session ID already in use".
         let home = tempfile::TempDir::new().unwrap();
         let parent = tempfile::TempDir::new().unwrap();
-        // Build a project root that mirrors Switchboard's actual layout —
-        // a `.switchboard` directory with a dot-prefixed component.
-        let project_root = parent
-            .path()
-            .join(".switchboard")
-            .join("projects")
-            .join("p1");
-        std::fs::create_dir_all(&project_root).unwrap();
+        // A user-realistic working directory containing a dot-prefixed
+        // component (hidden dir) plus a mid-component dot — both shapes
+        // the encoding must handle.
+        let cwd = parent.path().join(".config").join("my.app");
+        std::fs::create_dir_all(&cwd).unwrap();
         let session_id = Uuid::now_v7();
 
         // Pre-create the session file at the path claude would write it to.
-        let canonical = project_root.canonicalize().unwrap();
+        let canonical = cwd.canonicalize().unwrap();
         let encoded = encode_cwd(&canonical);
-        // Sanity: the encoded path must contain `--switchboard`, not `-.switchboard`.
+        // Sanity: dot-prefixed and mid-dot components are both stripped.
         assert!(
-            encoded.contains("--switchboard"),
-            "encoded path should have `--switchboard` (got: {encoded})"
+            encoded.contains("--config-my-app"),
+            "encoded path should strip both dots (got: {encoded})"
         );
         let session_dir = home.path().join(".claude").join("projects").join(&encoded);
         std::fs::create_dir_all(&session_dir).unwrap();
         std::fs::write(session_dir.join(format!("{session_id}.jsonl")), "").unwrap();
 
         // Detection works through the dot-stripping encoding.
-        assert!(session_exists_in(home.path(), &project_root, &session_id));
+        assert!(session_exists_in(home.path(), &cwd, &session_id));
 
         // build_args therefore picks --resume on the second turn — not
         // --session-id, which would cause the "already in use" rejection.
         let agent = agent_with_session(session_id);
-        let args = build_args(&agent, "hi", &project_root, Some(home.path()));
+        let args = build_args(&agent, "hi", &cwd, Some(home.path()));
         assert!(
             args.contains(&"--resume".to_owned()),
             "expected --resume when session file exists, got: {args:?}"

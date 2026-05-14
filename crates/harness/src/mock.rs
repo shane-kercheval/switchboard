@@ -66,7 +66,7 @@ impl HarnessAdapter for MockHarnessAdapter {
     async fn dispatch(
         &self,
         _agent: &AgentRecord,
-        _project_root: &Path,
+        _cwd: &Path,
         prompt: &str,
         turn_id: TurnId,
     ) -> Result<EventStream, DispatchError> {

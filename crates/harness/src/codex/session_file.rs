@@ -50,17 +50,13 @@ use serde_json::Value;
 
 use crate::events::McpServerStatus;
 
-/// Initial wait before the first session-file read attempt. Codex writes the
+/// Per-attempt backoff between session-file read tries. Codex writes the
 /// session file synchronously per `docs/research/codex-cli-observed.md`; by
-/// the time the terminal stream event arrives, the file should already be on
-/// disk. The retry exists only as defense against filesystem-flush latency
-/// on slow disks. Tune downward only with empirical evidence.
-pub const ENRICHMENT_TIMEOUT_MS: u64 = 200;
-
-/// Backoff between the first and second read attempts. With both at 200ms,
-/// worst-case enrichment adds 400ms to a turn's perceived latency. Single
-/// retry — Codex either writes the file synchronously (succeeds first try)
-/// or there's a bug, and waiting longer doesn't help.
+/// the time the terminal stream event arrives, the file should already be
+/// on disk. The first attempt fires **immediately** — the backoff applies
+/// only between failed attempts, so a typical turn pays zero latency. Two
+/// backoffs across three total attempts cap worst-case enrichment latency at
+/// 400ms before giving up. Tune downward only with empirical evidence.
 pub const ENRICHMENT_RETRY_DELAY_MS: u64 = 200;
 
 /// What enrichment extracted from the session file. All fields optional —
@@ -109,6 +105,12 @@ pub fn session_directory(home_dir: &Path, original_start_date_utc: NaiveDate) ->
 /// timestamp, so we match by suffix. Returns `None` if the directory or file
 /// is absent.
 ///
+/// On multi-match (very rare — would require a backup/rename or Codex bug,
+/// since session UUIDs are unique by construction), picks the file with the
+/// **latest mtime**, falling back to lexicographic order if mtime is
+/// unavailable. The "newest wins" rule matches the M2.4 plan and avoids
+/// silently enriching from a stale duplicate.
+///
 /// A `glob` crate dep is unnecessary for one suffix-match pattern — a single
 /// `read_dir` + suffix filter is simpler, has no allocations beyond the
 /// filename strings, and avoids pulling in a transitive dep tree.
@@ -121,16 +123,39 @@ pub fn locate_session_file(
     let dir = session_directory(home_dir, original_start_date_utc);
     let entries = std::fs::read_dir(&dir).ok()?;
     let suffix = format!("-{session_id}.jsonl");
+    let mut matches: Vec<PathBuf> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if let Some(name) = path.file_name().and_then(|n| n.to_str())
             && name.starts_with("rollout-")
             && name.ends_with(&suffix)
         {
-            return Some(path);
+            matches.push(path);
         }
     }
-    None
+    pick_newest(matches)
+}
+
+/// Choose the most-recent path by mtime. Falls back to the lexicographically
+/// largest filename if mtime can't be read (filesystems without timestamp
+/// support, permission edge cases) — Codex's `rollout-<timestamp>-` filename
+/// prefix happens to make lex-largest correlate with newest in practice.
+fn pick_newest(mut matches: Vec<PathBuf>) -> Option<PathBuf> {
+    match matches.len() {
+        0 => None,
+        1 => matches.pop(),
+        _ => {
+            matches.sort_by(|a, b| {
+                let mtime_a = a.metadata().and_then(|m| m.modified()).ok();
+                let mtime_b = b.metadata().and_then(|m| m.modified()).ok();
+                match (mtime_a, mtime_b) {
+                    (Some(ma), Some(mb)) => ma.cmp(&mb),
+                    _ => a.file_name().cmp(&b.file_name()),
+                }
+            });
+            matches.pop() // largest after ascending sort
+        }
+    }
 }
 
 /// Read and parse the session file. Returns `Enrichment::default()` (all
@@ -265,31 +290,31 @@ impl Sleeper for TokioSleeper {
     }
 }
 
-/// Wait for a session file to appear, then parse it. Initial wait
-/// `ENRICHMENT_TIMEOUT_MS`; on miss, sleep `ENRICHMENT_RETRY_DELAY_MS` and
-/// retry once. If both misses, returns `Enrichment::default()` and logs a
-/// warning — the adapter then emits `TurnEnd` with `context_window: None`
-/// and no enrichment-derived events.
+/// Locate and parse the session file with bounded retries. Attempts the
+/// read immediately; on miss, sleeps `ENRICHMENT_RETRY_DELAY_MS` and retries,
+/// up to a total of three attempts (two backoffs). On all-miss returns
+/// `Enrichment::default()` and logs a warning — the adapter then emits
+/// `TurnEnd` with `context_window: None` and no enrichment-derived events.
 ///
-/// Per the plan, sleeps run before the read attempts (not between attempts)
-/// so a brand-new session has a chance to flush before the first try.
+/// **Typical-case latency: 0ms.** Codex writes the session file
+/// synchronously and the file is usually on disk by terminal-event time;
+/// only flush-latency edge cases trigger the retries.
 pub async fn load_with_retry(
     home_dir: &Path,
     original_start_date_utc: NaiveDate,
     session_id: &str,
     sleeper: &dyn Sleeper,
 ) -> Enrichment {
-    sleeper
-        .sleep(Duration::from_millis(ENRICHMENT_TIMEOUT_MS))
-        .await;
-    if let Some(path) = locate_session_file(home_dir, original_start_date_utc, session_id) {
-        return parse_session_file(&path);
-    }
-    sleeper
-        .sleep(Duration::from_millis(ENRICHMENT_RETRY_DELAY_MS))
-        .await;
-    if let Some(path) = locate_session_file(home_dir, original_start_date_utc, session_id) {
-        return parse_session_file(&path);
+    const ATTEMPTS: usize = 3;
+    for attempt in 0..ATTEMPTS {
+        if attempt > 0 {
+            sleeper
+                .sleep(Duration::from_millis(ENRICHMENT_RETRY_DELAY_MS))
+                .await;
+        }
+        if let Some(path) = locate_session_file(home_dir, original_start_date_utc, session_id) {
+            return parse_session_file(&path);
+        }
     }
     tracing::warn!(
         session_id = %session_id,
@@ -509,6 +534,35 @@ not valid json
     }
 
     #[test]
+    fn locate_session_file_picks_newest_mtime_on_multi_match() {
+        // Real Codex would never produce two rollouts with the same session
+        // UUID, but a backup/rename script could. The plan says "if
+        // multiple matches, pick most recent" — pin that against the
+        // `read_dir`-order ambiguity.
+        let tmp = TempDir::new().unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 5, 15).unwrap();
+        let session_id = "019e2c5f-aaaa-7000-8000-0000000000aa";
+        let dir = session_directory(tmp.path(), date);
+        std::fs::create_dir_all(&dir).unwrap();
+        let older = dir.join(format!("rollout-1000-{session_id}.jsonl"));
+        let newer = dir.join(format!("rollout-9999-{session_id}.jsonl"));
+        std::fs::write(&older, "older").unwrap();
+        // Sleep just enough to give the newer file a distinct mtime on
+        // filesystems with second-resolution timestamps. macOS HFS+ is
+        // second-resolution; APFS / ext4 are nanosecond. 1100ms is the
+        // tightest cross-platform guarantee.
+        std::thread::sleep(Duration::from_millis(1100));
+        std::fs::write(&newer, "newer").unwrap();
+
+        let found = locate_session_file(tmp.path(), date, session_id);
+        assert_eq!(
+            found.as_deref(),
+            Some(newer.as_path()),
+            "newest mtime wins on multi-match"
+        );
+    }
+
+    #[test]
     fn locate_session_file_ignores_non_rollout_files() {
         let tmp = TempDir::new().unwrap();
         let date = NaiveDate::from_ymd_opt(2026, 5, 15).unwrap();
@@ -566,8 +620,9 @@ not valid json
     }
 
     #[tokio::test]
-    async fn load_with_retry_returns_default_after_two_failed_attempts() {
-        // File never appears — both attempts miss, enrichment is default.
+    async fn load_with_retry_returns_default_after_all_attempts_miss() {
+        // File never appears — three attempts, two inter-attempt sleeps,
+        // total 400ms worst case before default.
         let tmp = TempDir::new().unwrap();
         let date = NaiveDate::from_ymd_opt(2026, 5, 15).unwrap();
         let sleeper = RecordingSleeper::new();
@@ -576,13 +631,22 @@ not valid json
         assert_eq!(result, Enrichment::default());
 
         let sleeps = sleeper.recorded();
-        assert_eq!(sleeps.len(), 2, "two sleeps before two attempts");
-        assert_eq!(sleeps[0], Duration::from_millis(ENRICHMENT_TIMEOUT_MS));
-        assert_eq!(sleeps[1], Duration::from_millis(ENRICHMENT_RETRY_DELAY_MS));
+        assert_eq!(
+            sleeps.len(),
+            2,
+            "two backoffs between three attempts on all-miss"
+        );
+        for sleep in &sleeps {
+            assert_eq!(*sleep, Duration::from_millis(ENRICHMENT_RETRY_DELAY_MS));
+        }
     }
 
     #[tokio::test]
-    async fn load_with_retry_succeeds_on_first_attempt() {
+    async fn load_with_retry_succeeds_on_first_attempt_with_zero_sleeps() {
+        // Codex writes synchronously, so the file is normally already on
+        // disk. This pins the "typical case pays zero latency" contract —
+        // a regression that re-introduced a pre-attempt sleep would
+        // surface here as a non-empty recorded list.
         let tmp = TempDir::new().unwrap();
         let date = NaiveDate::from_ymd_opt(2026, 5, 15).unwrap();
         let session_id = "019e2c5f-aaaa-7000-8000-000000000001";
@@ -597,13 +661,54 @@ not valid json
 
         let result = load_with_retry(tmp.path(), date, session_id, &sleeper).await;
         assert_eq!(result.cli_version.as_deref(), Some("0.130.0"));
+        assert!(
+            sleeper.recorded().is_empty(),
+            "first-attempt success pays zero latency"
+        );
+    }
 
-        // One sleep before the successful first attempt; second sleep + retry not exercised.
-        let sleeps = sleeper.recorded();
+    /// Sleeper that materializes a target file on its first `sleep` call —
+    /// simulates "writer was mid-flush during attempt 1, flushed by
+    /// attempt 2." Records each requested duration like
+    /// [`RecordingSleeper`] for assertion.
+    struct StagingSleeper {
+        target: PathBuf,
+        content: String,
+        recorded: Mutex<Vec<Duration>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Sleeper for StagingSleeper {
+        async fn sleep(&self, duration: Duration) {
+            self.recorded.lock().unwrap().push(duration);
+            if !self.target.exists() {
+                std::fs::write(&self.target, &self.content).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn load_with_retry_succeeds_on_second_attempt_with_one_sleep() {
+        // The retry exists to defend against filesystem-flush latency on
+        // slow disks — file absent on the first try, present by the
+        // second. One backoff before success.
+        let tmp = TempDir::new().unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 5, 15).unwrap();
+        let session_id = "019e2c5f-aaaa-7000-8000-000000000002";
+        let dir = session_directory(tmp.path(), date);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sleeper = StagingSleeper {
+            target: dir.join(format!("rollout-2-{session_id}.jsonl")),
+            content: r#"{"type":"session_meta","payload":{"cli_version":"0.130.1"}}"#.to_owned(),
+            recorded: Mutex::new(Vec::new()),
+        };
+
+        let result = load_with_retry(tmp.path(), date, session_id, &sleeper).await;
+        assert_eq!(result.cli_version.as_deref(), Some("0.130.1"));
         assert_eq!(
-            sleeps.len(),
+            sleeper.recorded.lock().unwrap().len(),
             1,
-            "one sleep before the first successful read"
+            "one backoff before second-attempt success"
         );
     }
 

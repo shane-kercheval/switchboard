@@ -522,6 +522,10 @@ async fn emit_terminal_with_enrichment(
     // registries fresh on every emission per the plan's "no caching layer"
     // policy.
     if is_first_turn {
+        // Loads both ~/.codex/config.toml and <cwd>/.codex/config.toml
+        // unconditionally — Codex's trust-list gate is deliberately
+        // skipped; see `config.rs` module doc for rationale (display-only
+        // surface, not a security boundary).
         let mcp_servers = config::load_mcp_servers(home_dir, cwd);
         let skills_list = skills::load_skills(home_dir, cwd);
         if let Some(fields) =
@@ -541,6 +545,14 @@ async fn emit_terminal_with_enrichment(
 }
 
 /// Overlay the enriched `context_window` onto an existing `TurnUsage`.
+///
+/// **Precedence: stream wins.** If the stream-parsed usage already carries
+/// `Some(window)`, enrichment is ignored — the stream is the canonical
+/// source for the field. Today Codex's stream never emits a `context_window`
+/// (M2.4 enrichment exists precisely to fill that gap), so the overlay
+/// always fires; a future Codex CLI variant that does populate the field
+/// would render this overlay a no-op rather than silently overwrite.
+///
 /// Returns `None` if `usage` was `None` and the enrichment carried no
 /// `context_window` — fabricating a `Some` with all-zero tokens just to
 /// carry the window would corrupt the "None means unparseable" contract
@@ -792,6 +804,49 @@ mod tests {
             Err(other) => panic!("expected PreStreamRead, got {other:?}"),
             Ok(_) => panic!("dispatch must fail on corrupt sidecar"),
         }
+    }
+
+    fn usage_with_window(window: Option<u32>) -> TurnUsage {
+        TurnUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: None,
+            reasoning_output_tokens: None,
+            context_window: window,
+            total_cost_usd: None,
+        }
+    }
+
+    #[test]
+    fn apply_context_window_overlays_when_stream_field_is_none() {
+        let usage = usage_with_window(None);
+        let result = apply_context_window(Some(usage), Some(258_400));
+        assert_eq!(
+            result.and_then(|u| u.context_window),
+            Some(258_400),
+            "enrichment fills the gap when stream omits the field"
+        );
+    }
+
+    #[test]
+    fn apply_context_window_preserves_stream_value_over_enrichment() {
+        // Stream wins. A future Codex CLI variant that emits context_window
+        // directly must not be silently overwritten by the enrichment path.
+        let usage = usage_with_window(Some(123_456));
+        let result = apply_context_window(Some(usage), Some(999_999));
+        assert_eq!(
+            result.and_then(|u| u.context_window),
+            Some(123_456),
+            "stream-emitted context_window wins over enrichment"
+        );
+    }
+
+    #[test]
+    fn apply_context_window_returns_none_when_usage_is_none() {
+        // Strict "None means unparseable usage" — never fabricate a Some
+        // just to carry an enrichment-derived window.
+        let result = apply_context_window(None, Some(258_400));
+        assert!(result.is_none());
     }
 
     #[test]

@@ -189,6 +189,24 @@ mod tests {
     }
 
     #[test]
+    fn skills_path_that_is_a_file_returns_empty_no_propagation() {
+        // Pathologic case: user (or some script) placed a regular file at
+        // ~/.agents/skills instead of a directory. `read_dir` fails with
+        // NotADirectory. Adapter must not propagate — registries are
+        // display-only. Mirrors config.rs's `user_only_unreadable_file_...`
+        // test for symmetric partial-parse coverage.
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let agents_dir = home.path().join(".agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(agents_dir.join("skills"), "i am a file, not a directory").unwrap();
+
+        // Must not panic, must not return an error — just an empty list.
+        let result = load_skills(home.path(), cwd.path());
+        assert!(result.is_empty());
+    }
+
+    #[test]
     fn empty_skills_directory_yields_empty_vec() {
         let home = TempDir::new().unwrap();
         let cwd = TempDir::new().unwrap();

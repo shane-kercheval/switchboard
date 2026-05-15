@@ -738,11 +738,17 @@ async fn resume_turn_omits_session_meta_but_still_emits_rate_limit_and_enriches(
 
     let events = dispatch_with_home(&agent, cwd.path(), home.path(), &fixture("text-only")).await;
 
+    let terminal_idx = events
+        .iter()
+        .position(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+        .expect("TurnEnd present");
+    let rate_limit_idx = events
+        .iter()
+        .position(|e| matches!(e, AdapterEvent::RateLimitEvent { .. }))
+        .expect("RateLimitEvent emitted every turn");
     assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, AdapterEvent::RateLimitEvent { .. })),
-        "RateLimitEvent emitted every turn"
+        terminal_idx < rate_limit_idx,
+        "RateLimitEvent must follow TurnEnd on resume turns too; got indices {terminal_idx}, {rate_limit_idx}"
     );
     assert!(
         !events

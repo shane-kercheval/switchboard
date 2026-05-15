@@ -81,10 +81,17 @@ async fn mock_turn_ids_match_dispatch_argument() {
     let events: Vec<AdapterEvent> = stream.collect().await;
 
     for event in &events {
+        // `MockScenario::Streaming` is documented to emit only ContentChunk
+        // and TurnEnd. If a future mock scenario starts emitting other
+        // variants, this test needs an explicit update — the wildcard
+        // panic is intentional, not stale.
         let event_turn_id = match event {
             AdapterEvent::ContentChunk { turn_id: tid, .. }
             | AdapterEvent::TurnEnd { turn_id: tid, .. } => *tid,
-            _ => unreachable!("M1 AdapterEvent has only ContentChunk and TurnEnd variants"),
+            other => panic!(
+                "MockScenario::Streaming should only emit ContentChunk / TurnEnd; \
+                 got {other:?}. Update this test if the mock's scenarios are extended."
+            ),
         };
         assert_eq!(
             event_turn_id, turn_id,

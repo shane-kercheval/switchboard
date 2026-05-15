@@ -231,6 +231,76 @@ describe("AgentPane", () => {
     ).toBeInTheDocument();
   });
 
+  it("tool events extend the heartbeat: a long tool call past the original timeout does NOT false-fail", async () => {
+    // A long shell command (build, large grep, test run) emits a tool_started,
+    // then minutes of silence, then tool_completed — zero content_chunks in
+    // between. Pre-fix, the heartbeat would fire mid-tool and flip the turn
+    // to "failed" while the agent was still actively working. The fix re-arms
+    // on tool_started and tool_completed for the tracked turn.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    invokeMock.mockResolvedValueOnce(TURN_ID);
+
+    const AgentPane = (await import("./AgentPane.svelte")).default;
+    render(AgentPane, { props: { agent: AGENT } });
+    await waitForListener();
+
+    await typeAndSend("run a long command");
+
+    fireEv({ type: "turn_start", turn_id: TURN_ID, started_at: "2026-05-13T00:00:01Z" });
+
+    // Just before the original timeout, a tool starts. The re-arm must
+    // extend the timer past the original deadline.
+    vi.advanceTimersByTime(HEARTBEAT_TIMEOUT_MS - 5_000);
+    fireEv({
+      type: "tool_started",
+      turn_id: TURN_ID,
+      tool_use_id: "toolu_x",
+      kind: "builtin",
+      name: "Bash",
+      input: { command: "make test" },
+    });
+
+    // Push to just before the new (post-tool_started) deadline. If
+    // tool_started didn't re-arm, the original timer would have fired
+    // halfway through this window.
+    vi.advanceTimersByTime(HEARTBEAT_TIMEOUT_MS - 5_000);
+    await Promise.resolve();
+    expect(
+      screen.queryByTestId("turn-error"),
+      "tool_started must re-arm the heartbeat — no turn-error should appear yet",
+    ).not.toBeInTheDocument();
+
+    // tool_completed must also re-arm. Emit it before pushing past the
+    // current deadline, then verify silence past the original would-be
+    // re-fire point.
+    fireEv({
+      type: "tool_completed",
+      turn_id: TURN_ID,
+      tool_use_id: "toolu_x",
+      output: "ok",
+      is_error: false,
+    });
+    vi.advanceTimersByTime(HEARTBEAT_TIMEOUT_MS - 5_000);
+    await Promise.resolve();
+    expect(
+      screen.queryByTestId("turn-error"),
+      "tool_completed must re-arm the heartbeat — still no turn-error",
+    ).not.toBeInTheDocument();
+
+    // Then the agent emits text and ends — normal completion.
+    fireEv({ type: "content_chunk", turn_id: TURN_ID, kind: "text", text: "done" });
+    fireEv({
+      type: "turn_end",
+      turn_id: TURN_ID,
+      outcome: { status: "completed" },
+      ended_at: "2026-05-13T00:05:00Z",
+    });
+    await waitFor(() => {
+      expect(screen.getByText("done")).toBeInTheDocument();
+      expect(screen.getByTestId("agent-status")).toHaveTextContent("idle");
+    });
+  });
+
   it("failed turn: error message displayed, status returns to idle, Send re-enables", async () => {
     invokeMock.mockResolvedValueOnce(TURN_ID);
 

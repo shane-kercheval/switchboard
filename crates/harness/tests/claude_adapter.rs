@@ -8,6 +8,9 @@ use switchboard_harness::{
 };
 use uuid::Uuid;
 
+#[cfg(unix)]
+use nix::unistd::{Pid, getpgid};
+
 const FAKE_CLAUDE: &str = env!("CARGO_BIN_EXE_fake_claude");
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/claude");
 
@@ -112,11 +115,15 @@ async fn text_only_no_double_emit_from_assistant_message() {
 }
 
 #[tokio::test]
-async fn tool_use_fixture_skips_tool_events_and_yields_text() {
+async fn tool_use_fixture_yields_text_chunk_and_completed() {
+    // The tool-use fixture's only text content comes from a single
+    // `text_delta` ("Done."); tool input_json_delta events at the parser
+    // layer are skipped (M1 behavior preserved). M2.2 additionally emits
+    // ToolStarted/ToolCompleted from the assistant/user envelopes — those
+    // are asserted in a dedicated test below.
     let agent = fake_agent();
     let events = collect_events(&adapter(), &agent, &fixture("tool-use")).await;
 
-    // Only text ContentChunks — tool input_json_delta events must be skipped.
     let chunks: Vec<&str> = events
         .iter()
         .filter_map(|e| {
@@ -398,33 +405,40 @@ async fn text_only_content_chunks_carry_text_kind() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn spawned_child_lives_in_its_own_process_group() {
-    // Process-group spawn invariant for M4's killpg target. Compares the
-    // spawned child's pgid to ours; the values must differ. Uses `nix` as a
-    // safe wrapper around `getpgid` (workspace forbids `unsafe`).
-    use nix::unistd::{Pid, getpgid};
-    use std::process::Stdio;
-
+async fn adapter_spawns_child_in_its_own_process_group() {
+    // Process-group spawn invariant for M4's killpg target. This test routes
+    // through `ClaudeCodeAdapter::dispatch` (NOT a direct Command spawn) so
+    // it actually guards `claude_code.rs:command.process_group(0)`. fake_claude
+    // honors a `// pgid_to:<path>` directive, writing its own pgid; the test
+    // reads the file and asserts it differs from the parent's pgid.
     let parent_pgid = getpgid(None).expect("getpgid(self) should succeed");
 
-    let mut command = tokio::process::Command::new(FAKE_CLAUDE);
-    command
-        .args(["-p", &fixture("text-only")])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .stdin(Stdio::null())
-        .process_group(0);
-    let mut child = command.spawn().expect("spawn fake_claude");
-    let raw_child_pid = i32::try_from(child.id().expect("child pid"))
-        .expect("child pid fits in i32 on macOS / Linux");
-    let child_pgid = getpgid(Some(Pid::from_raw(raw_child_pid))).expect("getpgid(child)");
+    let tempdir = tempfile::TempDir::new().expect("tempdir");
+    let pgid_path = tempdir.path().join("child.pgid");
+    let fixture_path = tempdir.path().join("pgid-fixture.jsonl");
 
-    // Reap before assertions so a failure doesn't leak a zombie.
-    let _ = child.wait().await;
+    let base = std::fs::read_to_string(fixture("text-only")).expect("read text-only fixture");
+    let fixture_with_directive = format!("// pgid_to:{}\n{base}", pgid_path.display());
+    std::fs::write(&fixture_path, fixture_with_directive).expect("write pgid fixture");
+
+    let agent = fake_agent();
+    let _events = collect_events(
+        &adapter(),
+        &agent,
+        fixture_path.to_str().expect("utf-8 path"),
+    )
+    .await;
+
+    let child_pgid_raw = std::fs::read_to_string(&pgid_path)
+        .expect("fake_claude should have written its pgid")
+        .trim()
+        .parse::<i32>()
+        .expect("pgid file should contain a single decimal integer");
+    let child_pgid = Pid::from_raw(child_pgid_raw);
 
     assert_ne!(
         child_pgid, parent_pgid,
-        "child should be in its own process group; got equal pgids ({child_pgid})"
+        "child should be in its own process group (parent_pgid={parent_pgid}, child_pgid={child_pgid})"
     );
 }
 

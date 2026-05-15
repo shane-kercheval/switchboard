@@ -141,11 +141,11 @@ export type DirectoryInfo = {
 };
 
 export const HEARTBEAT_TIMEOUT_MS = 60_000;
-// M1 heuristic: 60s with no `content_chunk` is a "stream is silent" signal.
-// This is appropriate for text-only turns where chunks arrive continuously.
-//
-// M2 NOTE: when tool calls land (`ToolStarted` / `ToolCompleted` events),
-// this rule becomes unsafe — a long tool execution can legitimately produce
-// zero `content_chunk`s for minutes while emitting other (parser-skipped)
-// stream events. Revisit then: heartbeat on any event, or expose tool-call
-// lifecycle markers to the reducer so the timer resets appropriately.
+// Heartbeat re-arms on any per-turn activity event for the heartbeat's
+// tracked turn: `content_chunk`, `tool_started`, `tool_completed`. 60s of
+// total silence across all three is the "stream is silent" threshold. Tool
+// events are load-bearing here — a long shell command (build, test run,
+// large grep) emits no `content_chunk`s for minutes and would otherwise
+// trigger a false-positive failure. Agent-scoped events (`session_meta`,
+// `rate_limit_event`) intentionally do NOT re-arm — they're not turn-anchored
+// and can flow at any time without indicating turn progress.

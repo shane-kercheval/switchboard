@@ -13,6 +13,9 @@
 //!   `// read_stdin` — read stdin to EOF before streaming. The adapter must
 //!     spawn the child with `Stdio::null()` for stdin so this returns
 //!     immediately; without it, the test would deadlock waiting for input.
+//!   `// pgid_to:<path>` — write the child's own process-group id (decimal
+//!     ASCII, single line) to the given path before streaming. Tests use
+//!     this to assert the adapter put us in our own process group.
 //!
 //! A fixed "`fake_claude`: done" line is always written to stderr so tests can
 //! verify the stderr drain path handles output without deadlocking.
@@ -64,6 +67,21 @@ fn main() {
             // blocks forever — exactly the deadlock the stdin-EOF test guards.
             let mut sink = String::new();
             io::stdin().lock().read_to_string(&mut sink).ok();
+            continue;
+        }
+
+        if let Some(path) = line.strip_prefix("// pgid_to:") {
+            #[cfg(unix)]
+            {
+                let pgid = nix::unistd::getpgrp();
+                if let Ok(mut f) = std::fs::File::create(path.trim()) {
+                    let _ = writeln!(f, "{pgid}");
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = path;
+            }
             continue;
         }
 

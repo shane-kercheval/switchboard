@@ -100,7 +100,7 @@ After either command, commit both the manifest change and the lockfile diff in o
 
 ### Live testing against real harnesses
 
-Adapter correctness depends on behavior we don't control: harness event vocabularies, exit-code semantics, stream timing, session-file layout. CLI vendors (Anthropic, OpenAI) ship updates that shift these contracts — sometimes silently. Mocked-only tests would lock in our *current understanding* of the harnesses and keep passing forever even after upstream drift breaks production. Live tests are how we notice.
+Adapter correctness depends on behavior we don't control: harness event vocabularies, exit-code semantics, stream timing, session-file layout. CLI vendors (Anthropic, OpenAI) ship updates that shift these contracts — sometimes silently. Mocked-only tests would lock in our _current understanding_ of the harnesses and keep passing forever even after upstream drift breaks production. Live tests are how we notice.
 
 **Live tests are developer-local, not CI.** Subscription auth tokens (the only supported auth in v1) tend to rotate on use and can be device-bound, which makes them brittle as GitHub Actions secrets and creates a non-trivial blast radius if leaked. We accept the trade-off: upstream CLI changes are detected reactively (when a developer runs `make test-live`) rather than proactively via scheduled CI. Revisit if a clean auth model emerges.
 

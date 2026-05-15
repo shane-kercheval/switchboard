@@ -48,6 +48,12 @@ pub struct McpServerStatus {
 /// number for Codex). `context_window` for Claude comes from
 /// `result.modelUsage.<model>.contextWindow`; for Codex it's populated by
 /// M2.4's session-file enrichment. All other fields are tokens.
+///
+/// Populated for both `Completed` and `Failed` turns — the harness charges
+/// for partial work, so token counts on failure are meaningful telemetry,
+/// not noise. `usage: None` means "telemetry was unparseable / absent,"
+/// distinct from a real `Some` carrying zero values (which Claude's
+/// synthetic auth-failure responses legitimately emit).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TurnUsage {
     pub input_tokens: u64,
@@ -260,22 +266,22 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn fixed_turn_id() -> TurnId {
+    fn fresh_turn_id() -> TurnId {
         Uuid::now_v7()
     }
 
-    fn fixed_agent_id() -> AgentId {
+    fn fresh_agent_id() -> AgentId {
         Uuid::now_v7()
     }
 
-    fn fixed_time() -> DateTime<Utc> {
+    fn fresh_time() -> DateTime<Utc> {
         Utc::now()
     }
 
     #[test]
     fn turn_start_wire_shape() {
-        let turn_id = fixed_turn_id();
-        let started_at = fixed_time();
+        let turn_id = fresh_turn_id();
+        let started_at = fresh_time();
         let event = NormalizedEvent::TurnStart {
             turn_id,
             started_at,
@@ -289,7 +295,7 @@ mod tests {
 
     #[test]
     fn content_chunk_wire_shape_with_kind_text() {
-        let turn_id = fixed_turn_id();
+        let turn_id = fresh_turn_id();
         let event = NormalizedEvent::ContentChunk {
             turn_id,
             kind: ContentKind::Text,
@@ -306,7 +312,7 @@ mod tests {
     #[test]
     fn content_chunk_wire_shape_preserves_thinking_kind() {
         let event = NormalizedEvent::ContentChunk {
-            turn_id: fixed_turn_id(),
+            turn_id: fresh_turn_id(),
             kind: ContentKind::Thinking,
             text: "deliberating".to_owned(),
         };
@@ -318,11 +324,11 @@ mod tests {
 
     #[test]
     fn turn_end_completed_wire_shape_with_no_usage() {
-        let turn_id = fixed_turn_id();
+        let turn_id = fresh_turn_id();
         let event = NormalizedEvent::TurnEnd {
             turn_id,
             outcome: TurnOutcome::Completed,
-            ended_at: fixed_time(),
+            ended_at: fresh_time(),
             usage: None,
         };
         let value = serde_json::to_value(&event).unwrap();
@@ -336,9 +342,9 @@ mod tests {
     #[test]
     fn turn_end_wire_shape_with_full_usage() {
         let event = NormalizedEvent::TurnEnd {
-            turn_id: fixed_turn_id(),
+            turn_id: fresh_turn_id(),
             outcome: TurnOutcome::Completed,
-            ended_at: fixed_time(),
+            ended_at: fresh_time(),
             usage: Some(TurnUsage {
                 input_tokens: 100,
                 output_tokens: 25,
@@ -362,12 +368,12 @@ mod tests {
     #[test]
     fn turn_end_failed_wire_shape() {
         let event = NormalizedEvent::TurnEnd {
-            turn_id: fixed_turn_id(),
+            turn_id: fresh_turn_id(),
             outcome: TurnOutcome::Failed {
                 kind: FailureKind::HarnessError,
                 message: "bad model".to_owned(),
             },
-            ended_at: fixed_time(),
+            ended_at: fresh_time(),
             usage: None,
         };
         let value = serde_json::to_value(&event).unwrap();
@@ -381,12 +387,12 @@ mod tests {
     #[test]
     fn adapter_failure_kind_wire_shape() {
         let event = NormalizedEvent::TurnEnd {
-            turn_id: fixed_turn_id(),
+            turn_id: fresh_turn_id(),
             outcome: TurnOutcome::Failed {
                 kind: FailureKind::AdapterFailure,
                 message: "crash".to_owned(),
             },
-            ended_at: fixed_time(),
+            ended_at: fresh_time(),
             usage: None,
         };
         let value = serde_json::to_value(&event).unwrap();
@@ -396,7 +402,7 @@ mod tests {
     #[test]
     fn tool_started_wire_shape() {
         let event = NormalizedEvent::ToolStarted {
-            turn_id: fixed_turn_id(),
+            turn_id: fresh_turn_id(),
             tool_use_id: "toolu_abc".to_owned(),
             kind: ToolKind::Builtin,
             name: "Bash".to_owned(),
@@ -415,7 +421,7 @@ mod tests {
     #[test]
     fn tool_started_mcp_kind_wire_shape() {
         let event = NormalizedEvent::ToolStarted {
-            turn_id: fixed_turn_id(),
+            turn_id: fresh_turn_id(),
             tool_use_id: "toolu_xyz".to_owned(),
             kind: ToolKind::Mcp,
             name: "mcp__server__action".to_owned(),
@@ -430,7 +436,7 @@ mod tests {
     #[test]
     fn tool_completed_wire_shape() {
         let event = NormalizedEvent::ToolCompleted {
-            turn_id: fixed_turn_id(),
+            turn_id: fresh_turn_id(),
             tool_use_id: "toolu_abc".to_owned(),
             output: "hello\n".to_owned(),
             is_error: false,
@@ -447,7 +453,7 @@ mod tests {
     #[test]
     fn rate_limit_event_wire_shape() {
         let event = NormalizedEvent::RateLimitEvent {
-            agent_id: fixed_agent_id(),
+            agent_id: fresh_agent_id(),
             info: json!({"status": "allowed", "resetsAt": 1_778_701_800u64}),
         };
         let value = serde_json::to_value(&event).unwrap();
@@ -460,7 +466,7 @@ mod tests {
     #[test]
     fn session_meta_wire_shape() {
         let event = NormalizedEvent::SessionMeta {
-            agent_id: fixed_agent_id(),
+            agent_id: fresh_agent_id(),
             model: "claude-sonnet-4-6".to_owned(),
             harness_version: "2.1.140".to_owned(),
             tools: vec!["Bash".to_owned(), "Read".to_owned()],
@@ -487,7 +493,7 @@ mod tests {
     #[test]
     fn adapter_event_lifts_to_normalized_content_chunk() {
         let adapter = AdapterEvent::ContentChunk {
-            turn_id: fixed_turn_id(),
+            turn_id: fresh_turn_id(),
             kind: ContentKind::Text,
             text: "hi".to_owned(),
         };
@@ -505,9 +511,9 @@ mod tests {
     #[test]
     fn adapter_event_lifts_to_normalized_turn_end_completed() {
         let adapter = AdapterEvent::TurnEnd {
-            turn_id: fixed_turn_id(),
+            turn_id: fresh_turn_id(),
             outcome: TurnOutcome::Completed,
-            ended_at: fixed_time(),
+            ended_at: fresh_time(),
             usage: None,
         };
         let normalized = NormalizedEvent::from(adapter);
@@ -524,12 +530,12 @@ mod tests {
     #[test]
     fn adapter_event_lifts_to_normalized_turn_end_failed() {
         let adapter = AdapterEvent::TurnEnd {
-            turn_id: fixed_turn_id(),
+            turn_id: fresh_turn_id(),
             outcome: TurnOutcome::Failed {
                 kind: FailureKind::AdapterFailure,
                 message: "oops".to_owned(),
             },
-            ended_at: fixed_time(),
+            ended_at: fresh_time(),
             usage: None,
         };
         let normalized = NormalizedEvent::from(adapter);
@@ -548,7 +554,7 @@ mod tests {
     #[test]
     fn adapter_event_lifts_to_normalized_tool_started() {
         let adapter = AdapterEvent::ToolStarted {
-            turn_id: fixed_turn_id(),
+            turn_id: fresh_turn_id(),
             tool_use_id: "t".to_owned(),
             kind: ToolKind::Builtin,
             name: "Bash".to_owned(),
@@ -564,7 +570,7 @@ mod tests {
     #[test]
     fn adapter_event_lifts_to_normalized_tool_completed() {
         let adapter = AdapterEvent::ToolCompleted {
-            turn_id: fixed_turn_id(),
+            turn_id: fresh_turn_id(),
             tool_use_id: "t".to_owned(),
             output: "ok".to_owned(),
             is_error: false,
@@ -578,7 +584,7 @@ mod tests {
 
     #[test]
     fn adapter_event_lifts_to_normalized_rate_limit_event() {
-        let agent_id = fixed_agent_id();
+        let agent_id = fresh_agent_id();
         let adapter = AdapterEvent::RateLimitEvent {
             agent_id,
             info: json!({"x": 1}),
@@ -593,7 +599,7 @@ mod tests {
     #[test]
     fn adapter_event_lifts_to_normalized_session_meta() {
         let adapter = AdapterEvent::SessionMeta {
-            agent_id: fixed_agent_id(),
+            agent_id: fresh_agent_id(),
             model: "claude-sonnet-4-6".to_owned(),
             harness_version: "2.1.140".to_owned(),
             tools: vec![],

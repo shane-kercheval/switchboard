@@ -87,10 +87,17 @@
       transcript = reduce(transcript, ev);
       if (ev.type === "turn_start") {
         armHeartbeat(ev.turn_id);
-      } else if (ev.type === "content_chunk") {
-        // Re-arm on chunks for the turn the heartbeat is tracking. Stale
-        // chunks for unrelated turns are ignored so the timer doesn't get
-        // dragged to the wrong turn's lifetime.
+      } else if (
+        ev.type === "content_chunk" ||
+        ev.type === "tool_started" ||
+        ev.type === "tool_completed"
+      ) {
+        // Re-arm on any per-turn activity event for the turn the heartbeat
+        // is tracking. A long shell tool call legitimately produces zero
+        // content_chunks for minutes (e.g., test runs, large greps); without
+        // tool-event re-arming, the heartbeat would falsely fail those turns.
+        // Stale events for unrelated turns are ignored so the timer doesn't
+        // get dragged to the wrong turn's lifetime.
         if (heartbeatTurnId === ev.turn_id) armHeartbeat(ev.turn_id);
       } else if (ev.type === "turn_end") {
         if (heartbeatTurnId === ev.turn_id) clearHeartbeat();

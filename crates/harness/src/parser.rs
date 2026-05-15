@@ -32,10 +32,11 @@ pub enum ParseOutcome {
 /// `"...what can I help with today?Saved your name to memory..."`.
 #[derive(Debug, Default)]
 pub struct ParserState {
-    /// Whether at least one `ContentChunk` has been emitted in this turn.
-    /// A leading separator is only sensible *between* text blocks, never
-    /// before the first one.
-    chunks_emitted_in_turn: bool,
+    /// Whether at least one text-kind `ContentChunk` has been emitted in
+    /// this turn. (Tool events don't drive separator logic; only text-block
+    /// boundaries do.) A leading separator is only sensible *between* text
+    /// blocks, never before the first one.
+    text_chunk_emitted_in_turn: bool,
     /// Set true when a new text block opens *after* prior text has already
     /// been emitted. Cleared when the next `ContentChunk` is emitted (the
     /// separator is prepended onto that chunk's text).
@@ -84,7 +85,7 @@ fn parse_stream_event(obj: &Value, turn_id: TurnId, state: &mut ParserState) -> 
                 .and_then(|cb| cb.get("type"))
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            if block_type == "text" && state.chunks_emitted_in_turn {
+            if block_type == "text" && state.text_chunk_emitted_in_turn {
                 // A new text block is opening after prior text — separator
                 // will be prepended onto its first emitted chunk.
                 state.pending_separator = true;
@@ -126,7 +127,7 @@ fn parse_content_block_delta(
     } else {
         text.to_owned()
     };
-    state.chunks_emitted_in_turn = true;
+    state.text_chunk_emitted_in_turn = true;
 
     ParseOutcome::Event(AdapterEvent::ContentChunk {
         turn_id,
@@ -167,21 +168,23 @@ fn parse_result(obj: &Value, turn_id: TurnId) -> ParseOutcome {
     })
 }
 
-/// Pull `TurnUsage` from a `result` event. Returns `None` if no usable usage
-/// data is present. Malformed individual fields default sensibly rather than
-/// failing the whole extraction — the turn already completed; failing to
-/// parse usage shouldn't mask that.
+/// Pull `TurnUsage` from a `result` event.
+///
+/// `input_tokens` and `output_tokens` are **required** numeric fields: if
+/// either is missing or non-numeric, returns `None`. Per the M2.2 plan:
+/// malformed or missing usage → `None`, never a fabricated zero-Some. Zero
+/// values from a real harness (auth-failure synthetic responses, certain
+/// edge cases) DO produce a valid `Some` — what matters is whether the
+/// schema is present, not whether the values are non-zero.
+///
+/// Populated for both Completed and Failed turns. The harness charges for
+/// partial work, so token counts on failure are meaningful telemetry.
 fn extract_usage_from_result(obj: &Value) -> Option<TurnUsage> {
     let usage_obj = obj.get("usage")?;
 
-    let input_tokens = usage_obj
-        .get("input_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let output_tokens = usage_obj
-        .get("output_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
+    let input_tokens = usage_obj.get("input_tokens").and_then(Value::as_u64)?;
+    let output_tokens = usage_obj.get("output_tokens").and_then(Value::as_u64)?;
+
     let cached_input_tokens = usage_obj
         .get("cache_read_input_tokens")
         .and_then(Value::as_u64)
@@ -302,10 +305,8 @@ fn parse_mcp_server_status(v: &Value) -> Option<McpServerStatus> {
 /// pattern-matching for `authentication_failed` is a one-line drop-in,
 /// not a refactor.
 fn parse_assistant_envelope(obj: &Value, turn_id: TurnId) -> ParseOutcome {
-    // M2.3 hook: top-level `error` field is reserved here for auth-failure
-    // detection. Currently no-op so future code can layer in without
-    // restructuring this dispatch.
-    let _reserved_error = obj.get("error");
+    // M2.3 hook: check `obj.get("error")` here for auth-failure detection
+    // (`"authentication_failed"`) before the content-array dispatch below.
 
     let Some(content) = obj
         .get("message")
@@ -394,8 +395,14 @@ fn parse_user_envelope(obj: &Value, turn_id: TurnId) -> ParseOutcome {
 /// Claude's `tool_result.content` is either a scalar string or an array of
 /// content blocks (`{type: "text", text: "..."}`, plus future image / other
 /// types). We concatenate the text blocks; if every block is non-text we
-/// emit a placeholder so the operator sees that something was there rather
-/// than an empty tool result.
+/// emit a `[non-text tool result omitted]` placeholder so the operator sees
+/// that something was there rather than an empty tool result.
+///
+/// **Mixed-content arrays** (e.g., `[image, text, image]`) emit only the
+/// joined text — non-text blocks are dropped silently with no per-block
+/// placeholder. The placeholder is only emitted when *every* block is
+/// non-text. M2.5 UI work may revisit per-block placeholders if rich tool
+/// output rendering surfaces a need.
 fn stringify_tool_result_content(content: Option<&Value>) -> String {
     let Some(content) = content else {
         return String::new();
@@ -541,6 +548,46 @@ mod tests {
                 assert_eq!(usage.input_tokens, 10);
             }
             _ => panic!("expected TurnEnd with Some(usage)"),
+        }
+    }
+
+    #[test]
+    fn result_with_missing_required_usage_fields_yields_none() {
+        // Per the M2.2 plan: malformed or missing usage → None, never a
+        // fabricated zero-Some. The Claude auth-failure synthetic response
+        // has `"usage":{}` (no input_tokens / output_tokens fields); that
+        // must surface as `usage: None` so consumers can distinguish
+        // "telemetry unparseable" from "real zero-usage turn."
+        let line = r#"{"type":"result","is_error":true,"api_error_status":null,"result":"err","usage":{}}"#;
+        match parse_one(line, tid()) {
+            ParseOutcome::Event(AdapterEvent::TurnEnd { usage: None, .. }) => {}
+            _ => panic!("expected TurnEnd with None usage when required fields are absent"),
+        }
+    }
+
+    #[test]
+    fn result_with_zero_token_counts_still_yields_some() {
+        // Schema present with numeric zeros IS valid telemetry — Claude's
+        // synthetic responses do this. We return Some so the absence of
+        // the schema is the only thing that produces None.
+        let line = r#"{"type":"result","is_error":true,"api_error_status":null,"result":"err","usage":{"input_tokens":0,"output_tokens":0}}"#;
+        match parse_one(line, tid()) {
+            ParseOutcome::Event(AdapterEvent::TurnEnd {
+                usage: Some(usage), ..
+            }) => {
+                assert_eq!(usage.input_tokens, 0);
+                assert_eq!(usage.output_tokens, 0);
+            }
+            _ => panic!("expected TurnEnd with Some(usage) when zero-token schema is present"),
+        }
+    }
+
+    #[test]
+    fn result_with_missing_usage_object_yields_none() {
+        let line = r#"{"type":"result","is_error":false,"api_error_status":null,"result":"ok"}"#;
+        match parse_one(line, tid()) {
+            ParseOutcome::Event(AdapterEvent::TurnEnd { usage: None, .. }) => {}
+            _ => panic!("expected TurnEnd with None usage when usage field is absent"),
         }
     }
 

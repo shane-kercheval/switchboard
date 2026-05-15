@@ -25,9 +25,15 @@ async-trait = { workspace = true }
 futures = { workspace = true }
 which = { workspace = true }
 
+# `nix` is unix-only and used by:
+# - the `fake_claude` test binary (`src/bin/fake_claude.rs`) to write its own
+#   pgid to a file so the integration test can verify process-group spawn
+#   actually flows through ClaudeCodeAdapter::dispatch.
+# - the process-group integration test itself (`tests/claude_adapter.rs`).
+# Listed as a regular dep (not dev-dep) so the bin target can link it.
+[target."cfg(unix)".dependencies]
+nix = { version = "0.31.3", default-features = false, features = ["process"] }
+
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = { workspace = true }
-
-[target."cfg(unix)".dev-dependencies]
-nix = { version = "0.31.3", default-features = false, features = ["process"] }

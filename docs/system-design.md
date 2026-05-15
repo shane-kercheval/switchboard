@@ -641,9 +641,32 @@ The two harness streams are structurally different (event-name vocabularies, con
 
 ```
 SessionMeta     { agent, model, harness_version, tools, mcp_servers, skills, raw }
-                // emitted once at first turn; populated from Claude Code's system/init
-                // event or Codex's session_meta record. Useful for UI diagnostics
-                // ("MCP server X failed to connect for this agent").
+                // emitted once at first turn. Sources vary by field and by harness:
+                //   model         — Claude system/init stream event; Codex session-file
+                //                   first turn_context record.
+                //   harness_version — Claude system/init; Codex session-file session_meta.
+                //   mcp_servers   — Claude system/init (already-merged across user/local/
+                //                   project scopes by Claude itself); Codex from reading
+                //                   ~/.codex/config.toml + <cwd>/.codex/config.toml
+                //                   (Switchboard merges, since Codex doesn't emit a
+                //                   registry event in non-interactive mode).
+                //   skills        — Claude directory scan of ~/.claude/skills/ and
+                //                   <cwd>/.claude/skills/; Codex directory scan of
+                //                   ~/.agents/skills/ and <cwd>/.agents/skills/.
+                //   tools         — Claude live: populated from system/init.tools
+                //                   (the merged builtin + MCP + dynamic list claude reports).
+                //                   Claude rehydration from disk: empty (session file
+                //                   lacks the equivalent record).
+                //                   Codex live and rehydration: empty (no equivalent
+                //                   source — command_execution + mcp_tool_call cover
+                //                   the dispatched-tool surface stream-side, but there's
+                //                   no available-tools registry separate from mcp_servers).
+                //                   Field is preserved across the wire for the populated
+                //                   Claude-live path; reserved for a future symmetric
+                //                   registry surface across harnesses.
+                // Display-only — the registry data informs the per-agent sidebar; it does
+                // not gate dispatch. Failures to read config/directories emit empty lists
+                // with a warning, never an error.
 TurnStart       { agent, session_id }
 ContentChunk    { agent, kind: thinking | text, data }
 ToolStarted     { agent, tool_use_id, kind, input }

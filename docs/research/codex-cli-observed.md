@@ -357,3 +357,166 @@ codex exec resume --json --skip-git-repo-check --dangerously-bypass-approvals-an
 
 Resume emits `thread.started` with the SAME thread_id (not a new id) and the input_tokens count nearly doubles, confirming prior-turn context preservation. Stream shape on resume is byte-equivalent to first-turn shape: `thread.started` → `turn.started` → `item.completed` (agent_message) → `turn.completed`.
 
+## Findings during M2.4-prep (2026-05-15)
+
+Pre-M2.4 sanity probe of a real Codex session file (`~/.codex/sessions/2026/05/15/rollout-...-019e2c5f-...jsonl`, captured during M2.3 live probing) revealed three structural surprises beyond what M2.1's sanitized `rate-limits.session.jsonl` fixture conveyed. The M2.1 fixture is field-accurate for what it captured (`session_meta` line 1 + `task_started` + two `token_count` variants + `task_complete`) but omits record types that turn out to matter for the M2.4 enrichment contract.
+
+### Real session-file record types (codex-cli 0.130.0)
+
+```
+session_meta              ← once at line 1, never on resume (M2.1 confirmed)
+event_msg/task_started    ← per turn, carries model_context_window
+turn_context              ← per turn, carries `model` + cwd + sandbox + approval policies
+response_item/message     ← per turn body (multiple per turn)
+event_msg/user_message    ← per turn
+event_msg/token_count     ← per turn, TWO sub-shapes (see below)
+event_msg/agent_message   ← per turn
+event_msg/task_complete   ← per turn (terminal of the turn within the session file)
+```
+
+Two-turn resumed session: ~22 lines, one `session_meta`, two each of `task_started` / `turn_context` / `task_complete`, four `token_count`s, interleaved `response_item`s. Resume genuinely appends to the original file — confirmed.
+
+### NEW: `session_meta` does NOT carry model / tools / mcp_servers
+
+The M2.4 plan body (step 3) says: "`session_meta` (line 1) → enrich SessionMeta event on first turn." With an implicit expectation that `session_meta` carries `model`, `tools`, and `mcp_servers` (the SessionMeta event's required fields).
+
+Real `session_meta.payload` shape:
+
+```json
+{
+  "id": "<session uuid>",
+  "timestamp": "<RFC3339>",
+  "cwd": "/abs/path",
+  "originator": "codex_exec",
+  "cli_version": "0.130.0",
+  "source": "exec",
+  "model_provider": "openai",
+  "base_instructions": { "text": "<system prompt — multi-KB>" }
+}
+```
+
+No `model`. No `tools`. No `mcp_servers`. None of those fields exist on `session_meta` at all.
+
+### NEW: `model` lives in per-turn `turn_context`
+
+Each turn writes a `turn_context` record between `task_started` and the first `response_item`. Payload shape (relevant fields):
+
+```json
+{
+  "turn_id": "<turn uuid>",
+  "cwd": "/abs/path",
+  "current_date": "2026-05-15",
+  "timezone": "America/Los_Angeles",
+  "approval_policy": "never",
+  "sandbox_policy": { "type": "danger-full-access" },
+  "model": "gpt-5.5",
+  "personality": "pragmatic",
+  "effort": "medium",
+  "summary": "none",
+  ...
+}
+```
+
+→ **M2.4 implication:** for `SessionMeta.model`, parse the first `turn_context` in the session file. (`session_meta.cli_version` covers `harness_version`.) Codex supports per-turn model overrides; M2's `SessionMeta` is once-per-agent-session, so first-turn model is the right snapshot.
+
+### NEW: `tools` and `mcp_servers` are not present in the session file — even with MCP actively in use
+
+**Initial probe (no MCP)** — the M2.3-era `/tmp/sw-codex-probe` session ran with `--dangerously-bypass-approvals-and-sandbox` and no MCP. Neither `tools` nor `mcp_servers` appeared.
+
+**Follow-up probe (MCP actively configured + invoked)** — inspected an older Codex session (`~/.codex/sessions/2026/05/14/rollout-...-019e29a7-...jsonl`, codex-cli 0.130.0) that successfully invoked `tiddly_notes_bookmarks.get_context` twice. Result: still **zero** matches for `"tools": [` or `"mcp_servers": [` anywhere in the file. The available-MCP-servers registry (visible to the user via `codex /mcp`) is **not snapshotted to the session file** in any Codex version observed so far. The registry lives only in `~/.codex/config.toml`.
+
+**MCP tool invocations DO leave session-file records — three of them per call:**
+
+1. `response_item / function_call` with the MCP tool's flat name and a distinguishing `namespace` field:
+   ```json
+   {"type":"function_call","name":"get_context","namespace":"mcp__tiddly_notes_bookmarks__","arguments":"{...}","call_id":"call_..."}
+   ```
+   Non-MCP tools (e.g., `exec_command`) have no `namespace` field.
+
+2. `response_item / function_call_output` — paired with the call_id, carries the result body.
+
+3. `event_msg / mcp_tool_call_end` — a new event_msg subtype emitted only for MCP calls:
+   ```json
+   {"type":"mcp_tool_call_end","call_id":"call_...","invocation":{"server":"tiddly_notes_bookmarks","tool":"get_context","arguments":{...}},"duration":{"secs":0,"nanos":631405208},"result":{"Ok":{"content":[...],"isError":false}}}
+   ```
+   Carries explicit `server` and `tool` fields and the duration; complementary to the function_call (which carries the namespace prefix).
+
+→ **Implication for the session-file source alone:** session-file records do not carry the available-MCP-servers registry. Switchboard's `SessionMeta.mcp_servers` is populated from a **different source** — the Codex config files (`~/.codex/config.toml` + project-level `.codex/config.toml`) — loaded by a dedicated config-loader. See §"MCP and skills registry sourcing" below for the file shapes and merge order. Both live dispatch (initial framing) and disk rehydration call the same config-loader. `tools` stays `vec![]` for Codex (no equivalent registry source exists yet; reserved for future symmetric surface).
+
+→ **M2.6 implication (foreshadow):** the `function_call namespace` + `mcp_tool_call_end` records are the session-file-side surface that disk rehydration must read to reconstruct MCP **tool calls** (the per-turn invocations, distinct from the available-servers registry above) in loaded transcripts. The stream-side `mcp_tool_call` item (M2.1 / M2.3) and these session-file records are **different vocabularies**; M2.6's session-file parser normalizes both into the same `ToolStarted`/`ToolCompleted` shape.
+
+### Cross-harness: Claude Code session files have the same registry gap
+
+Independently verified against `~/.claude/projects/.../<session-uuid>.jsonl` (the most recent active Claude session, M2.3-era work). Record types: `agent-name`, `ai-title`, `assistant`, `attachment`, `file-history-snapshot`, `last-prompt`, `permission-mode`, `queue-operation`, `system`, `user`. `system` subtypes: `local_command`, `api_error`, `away_summary`, `compact_boundary`, `turn_duration` — **no `system/init`-equivalent in the session file**. `grep -cE '"tools":\s*\[|"mcp_servers":\s*\[' "$CL_SESSION"` returns `0`.
+
+Claude Code's `tools` and `mcp_servers` registry is **stream-only** (the `system/init` event captured by the M1.1 parser). The on-disk session file does not snapshot it.
+
+→ **Cross-harness gap:** neither harness writes the available-MCP-servers registry to its session file. Live dispatch sources it from different places per harness: Claude reads the merged registry from its `system/init` stream event (Claude itself merges the three scopes before emitting); Codex reads its config files directly via the Switchboard config-loader (Codex's non-interactive mode doesn't emit a `system/init`-equivalent). For **disk rehydration** (M2.6), both harnesses also call config-loaders: Claude's loads three scopes (`~/.claude.json` user + local, `<cwd>/.mcp.json` project); Codex's loads two (`~/.codex/config.toml` + `<cwd>/.codex/config.toml`). See §"MCP and skills registry sourcing" below for the full source documentation for both harnesses.
+
+### NEW: `event_msg/token_count` has TWO payload shapes
+
+The M2.1 fixture captured only the rate-limits-bearing variant:
+
+```json
+{ "type": "token_count", "info": null, "rate_limits": { ... } }
+```
+
+Real session files also emit a token-usage-bearing variant after each model response:
+
+```json
+{
+  "type": "token_count",
+  "info": {
+    "total_token_usage": { "input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens", "total_tokens" },
+    "last_token_usage": { ... },
+    ...
+  }
+}
+```
+
+The two variants are emitted in different points of the turn lifecycle and **don't both carry rate_limits**.
+
+→ **M2.4 implication:** the `token_count` parser must filter on the presence and non-null-ness of `rate_limits` before emitting `RateLimitEvent`; the info-only variant is ignored (the stream's `turn.completed.usage` is the canonical token-usage source for M2, already wired in M2.3).
+
+### Path layout confirmed
+
+`~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-<ISO-with-dashes>-<thread_id>.jsonl` — verified verbatim. M2.4's date-partition lookup uses sidecar's `original_start_date_utc` for `<YYYY>/<MM>/<DD>` and `session_id` for the trailing `-<thread_id>.jsonl` glob.
+
+### Net plan corrections for M2.4 step 3
+
+- `session_meta.payload` → source for `harness_version` only (`cli_version`); does NOT source `model` / `tools` / `mcp_servers`.
+- `turn_context.payload.model` (first one in file) → source for `SessionMeta.model`.
+- `tools` → emit `vec![]` for Codex (no equivalent registry source).
+- `mcp_servers` → load from `~/.codex/config.toml` + `<cwd>/.codex/config.toml` via the Codex config-loader (see §"MCP and skills registry sourcing" below for shapes).
+- `event_msg/token_count` → filter on `rate_limits` presence; ignore the info-only variant.
+- Other record types (`turn_context` other than the model field, `response_item`, `event_msg/user_message`, `event_msg/agent_message`, `event_msg/task_complete`) → ignored in M2.4 (covered by the existing "other event types → ignored in M2" catch-all in the plan body, but worth pinning explicitly so the implementer doesn't write defensive branches for them).
+
+
+
+## MCP and skills registry sourcing
+
+For the user-facing sidebar listing of MCP servers and skills, Switchboard reads Codex's config files directly (the session file and stream don't carry the registry — see prior findings). The scope tables below are the authoritative in-repo summary; see [OpenAI's Codex Config Reference](https://developers.openai.com/codex/config-reference) and [Codex MCP docs](https://developers.openai.com/codex/mcp) for upstream documentation.
+
+### MCP scopes (two levels)
+
+| Scope        | File                                       | When loaded                                      |
+| ------------ | ------------------------------------------ | ------------------------------------------------ |
+| User-level   | `~/.codex/config.toml`                     | Always                                           |
+| Project      | `<cwd>/.codex/config.toml`                 | Codex itself: only if directory is trusted. Switchboard: always (we skip the trust gate — fidelity gap is small and self-corrects on first interactive Codex use in that directory) |
+
+Format: TOML, `[mcp_servers.<name>]` tables. Merge by name; project-level entries win.
+
+### Skills (directory-based, not config file)
+
+Two locations scanned:
+
+- `~/.agents/skills/<name>/SKILL.md` — user-scope skills.
+- `<cwd>/.agents/skills/<name>/SKILL.md` — project-scope skills.
+
+Each immediate subdirectory containing a `SKILL.md` counts as one skill; the directory name is the skill name. (Codex also reads `$REPO_ROOT/.agents/skills/` for repo-rooted scope, but Switchboard's notion of "project cwd" already encompasses the repo root in practice — same path.) Merge by name; project-scope wins.
+
+Codex used to scan `~/.codex/skills/` for user-scope skills; that path is marked deprecated in Codex's source. Switchboard uses the canonical `~/.agents/skills/` only.
+
+### Why this matters
+
+Codex's non-interactive `exec` mode doesn't emit a `system/init`-style registry event the way Claude does. Without reading these files, Switchboard cannot tell the user what MCP servers / skills a Codex agent has available — the sidebar would always show empty. This is display-only information; dispatch is unaffected.

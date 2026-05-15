@@ -285,6 +285,43 @@ Tool input streaming emits `input_json_delta` instead of `text_delta` — these 
 
 The terminal `assistant` message carries the complete assembled text in its `content` blocks. With `--include-partial-messages`, this arrives *after* the delta stream and must be explicitly skipped to avoid double-emitting the text as `ContentChunk`s. The parser skips top-level `type: "assistant"` events for this reason.
 
+## Findings during M2.4-prep (2026-05-15)
+
+While probing Codex session-file shapes for M2.4 (see `codex-cli-observed.md` §"Findings during M2.4-prep"), the same question was asked of Claude Code's on-disk session file. Result: a **cross-harness symmetry** worth documenting on the Claude side too — the gap is structural, not Codex-specific.
+
+### Claude session-file record types (claude-code 2.1.x era)
+
+Inspected `~/.claude/projects/-Users-shanekercheval-repos-switchboard/<uuid>.jsonl` from active M2.3-era work. Record types observed:
+
+```
+agent-name              (84)
+ai-title                (241)
+assistant               (1472)
+attachment              (180)
+file-history-snapshot   (180)
+last-prompt             (242)
+permission-mode         (232)
+queue-operation         (18)
+system                  (123)
+user                    (1051)
+```
+
+`system` subtypes: `local_command`, `api_error`, `away_summary`, `compact_boundary`, `turn_duration`. **No `system/init`-equivalent**, no `tools` field, no `mcp_servers` field anywhere in the file (`grep -cE '"tools":\s*\[|"mcp_servers":\s*\['` returns `0`).
+
+### The registry is stream-only
+
+The `system/init` event — which the M1 parser reads to populate `SessionMeta.tools` / `SessionMeta.mcp_servers` — is emitted **only on the live stream-json output**, never written to the session file. The session file records the conversation tree (assistant/user messages, tool calls, file snapshots) but not the available-tools / MCP-servers registry that was in effect when the session started.
+
+→ **No impact on live dispatch.** M1's Claude adapter consumes `system/init` from the stream directly; `SessionMeta` events fire correctly on every dispatch. The wire-format contract is unchanged.
+
+→ **M2.6 (disk rehydration) implication.** When loading a Claude transcript from disk, the parser cannot reconstruct `SessionMeta.tools` / `SessionMeta.mcp_servers` from the session file itself — that data is genuinely lost on disk. M2.6 reconstructs `SessionMeta` from a **combination of sources**: `model` from the first `assistant.message.model` in the session file; `harness_version` as `String::new()` (the empty-string-means-absent convention `parse_system_event` already uses); `mcp_servers` from the Claude config-loader that reads the three MCP scopes (`~/.claude.json` user-level + nested local under cwd path, `<cwd>/.mcp.json` project-level) and merges them; `skills` from a directory scan of `~/.claude/skills/` + `<cwd>/.claude/skills/`; `tools: vec![]` (the stream-side `system/init.tools` listing is the only populator, and that's not on disk). See §"MCP and skills registry sourcing" below for full file shapes.
+
+→ **Cross-harness symmetry.** Codex has the identical session-file gap (its on-disk `session_meta.payload` carries `cli_version` and `model_provider` but no model/tools/mcp_servers; `model` lives in per-turn `turn_context`; the available-MCP-servers registry isn't snapshotted at all). Codex's rehydration follows the same pattern: source per-turn records for `model` + `harness_version`, call the Codex config-loader (`~/.codex/config.toml` + `<cwd>/.codex/config.toml`) for `mcp_servers`, scan `~/.agents/skills/` + `<cwd>/.agents/skills/` for `skills`. Both harnesses thus end up with a populated `mcp_servers` / `skills` from rehydration — sourced from config files, not the session file.
+
+### What IS recoverable from disk (preview for M2.6)
+
+For both harnesses, the conversation **content** rehydrates fine — `assistant`/`user` records (Claude) and `response_item/message` records (Codex) carry the turn text + tool calls. The on-disk gap is specifically the **registry of available capabilities**, which the harnesses treat as a runtime/configuration concern rather than a per-session artifact. This is M2.6's design problem, not a regression in shipped code.
+
 ## Things still worth probing
 
 - **`--input-format stream-json`** — for sending follow-up messages mid-stream without restarting the process. Could matter for the "long-lived agent process" deferred decision.
@@ -306,3 +343,34 @@ These can be picked up later; they are not blocking for §5 design.
 - Hands-on probes captured in `/tmp/switchboard-probe/` (`hello-json.out`, `hello-stream.out`, `tool-call.out`).
 - Session files at `~/.claude/projects/-private-tmp-switchboard-probe/*.jsonl`.
 - `claude --help` (v2.1.138).
+
+## MCP and skills registry sourcing
+
+For the user-facing sidebar listing of MCP servers and skills, Switchboard reads Claude Code's config files directly when stream-side `system/init` data is unavailable (disk rehydration after restart). The scope tables below are the authoritative in-repo summary; see [Claude Code MCP docs](https://code.claude.com/docs/en/mcp) and [Claude Code Settings docs](https://code.claude.com/docs/en/settings) for upstream documentation.
+
+### MCP scopes (three levels)
+
+| Scope     | Storage location                                              | Description                                |
+| --------- | ------------------------------------------------------------- | ------------------------------------------ |
+| `user`    | `~/.claude.json` top-level `mcpServers` table                 | All projects, current user                 |
+| `local`   | `~/.claude.json` nested under the project's path entry        | Current project only, private to user (default for `claude mcp add`) |
+| `project` | `<cwd>/.mcp.json` (separate file at the project root)         | Shared with the team via version control   |
+
+Format: JSON. Switchboard's loader reads all three locations and merges by entry name; the resolution order matches Claude's own runtime behavior (project > local > user, with project winning when the same name is defined at multiple scopes).
+
+For live dispatch, Switchboard does **not** read the files — Claude itself has already merged them and emits the result in the stream's `system/init` event. The config-loader is only used for disk rehydration (M2.6), where the session file lacks any `system/init`-equivalent record.
+
+### Skills (directory-based, not config file)
+
+Two locations scanned:
+
+- `~/.claude/skills/<name>/SKILL.md` — user-scope skills, all projects.
+- `<cwd>/.claude/skills/<name>/SKILL.md` — project-scope skills.
+
+Each immediate subdirectory containing a `SKILL.md` counts as one skill; the directory name is the skill name. Merge by name; project-scope wins.
+
+### Why this matters
+
+Live Claude dispatch already provides the registry via `system/init`. The config-loader exists only to fill the gap for **rehydrated** transcripts (sessions loaded from disk after a Switchboard restart) — without it, the per-agent sidebar would show empty MCP / skills lists until the user dispatches a new turn and a fresh `system/init` arrives.
+
+This is display-only information; dispatch is unaffected.

@@ -17,8 +17,11 @@
 //! `-C`. cwd is set instead via `tokio::process::Command::current_dir(cwd)`
 //! for both paths — Codex inherits cwd from the parent process automatically.
 
+pub mod config;
 pub mod parser;
+pub mod session_file;
 pub mod sidecar;
+pub mod skills;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -32,9 +35,10 @@ use tokio::io::AsyncBufReadExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::adapter::{DispatchError, EventStream, HarnessAdapter};
-use crate::events::{AdapterEvent, FailureKind, TurnId, TurnOutcome};
+use crate::events::{AdapterEvent, FailureKind, TurnId, TurnOutcome, TurnUsage};
 
 use parser::{CodexParserState, parse_line};
+use session_file::{Enrichment, TokioSleeper};
 use sidecar::{SessionLinkRecord, SidecarError, append_record, read_latest, sidecar_path};
 
 /// Adapter for Codex (`codex exec --json`). Spawns a `codex` subprocess and
@@ -47,14 +51,22 @@ use sidecar::{SessionLinkRecord, SidecarError, append_record, read_latest, sidec
 /// only the binary changes.
 pub struct CodexAdapter {
     codex_binary_path: PathBuf,
+    /// Optional override for the user's home directory. Used by tests to
+    /// stage temp directories without mutating process-wide `$HOME`. In
+    /// production this is `None` and the adapter resolves `$HOME` at
+    /// dispatch time (mirrors `claude_code::session_file_exists`'s
+    /// pattern).
+    home_dir_override: Option<PathBuf>,
 }
 
 impl CodexAdapter {
-    /// Production constructor. Uses `codex` from PATH.
+    /// Production constructor. Uses `codex` from PATH; reads `$HOME` at
+    /// dispatch time for session-file + config lookups.
     #[must_use]
     pub fn new() -> Self {
         Self {
             codex_binary_path: PathBuf::from("codex"),
+            home_dir_override: None,
         }
     }
 
@@ -62,6 +74,21 @@ impl CodexAdapter {
     pub fn with_binary_path(path: impl Into<PathBuf>) -> Self {
         Self {
             codex_binary_path: path.into(),
+            home_dir_override: None,
+        }
+    }
+
+    /// Override both the binary path and the home directory — used by
+    /// fixture-driven adapter tests that stage a `TempDir` as `home_dir`
+    /// so they can write into `<home>/.codex/sessions/...` without touching
+    /// the developer's real `~/.codex/`.
+    pub fn with_binary_and_home(
+        binary_path: impl Into<PathBuf>,
+        home_dir: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            codex_binary_path: binary_path.into(),
+            home_dir_override: Some(home_dir.into()),
         }
     }
 }
@@ -127,13 +154,37 @@ impl HarnessAdapter for CodexAdapter {
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let agent_id = agent.id;
+        let home_dir = resolve_home_dir(self.home_dir_override.as_deref());
 
         tokio::spawn(run_producer(
-            child, stdout, stderr, tx, turn_id, agent_id, sidecar, prior,
+            child,
+            stdout,
+            stderr,
+            tx,
+            turn_id,
+            agent_id,
+            sidecar,
+            prior,
+            home_dir,
+            cwd.to_owned(),
         ));
 
         Ok(Box::pin(UnboundedReceiverStream::new(rx)))
     }
+}
+
+/// Resolve the home directory for session-file / config lookups. If the
+/// adapter was constructed with an override (test path), use that
+/// unconditionally; otherwise read `$HOME`. Returns an empty `PathBuf` if
+/// `$HOME` is unset — `locate_session_file` and the config loaders both
+/// degrade to empty/None on missing/unreadable inputs.
+fn resolve_home_dir(override_path: Option<&Path>) -> PathBuf {
+    if let Some(path) = override_path {
+        return path.to_owned();
+    }
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default()
 }
 
 fn resolve_binary(path: &Path) -> Result<PathBuf, DispatchError> {
@@ -183,10 +234,10 @@ const STDERR_TAIL_CAPACITY: usize = 16;
 const STDERR_MESSAGE_MAX_LEN: usize = 800;
 
 // Parallel to `ClaudeCodeAdapter::run_producer` (which sits just under the
-// `too_many_lines` threshold). The Codex variant adds sidecar persistence
-// + EOF synthesis that consumes the buffered stdout error; both pushed it
-// over. Splitting further would fragment the per-line control flow without
-// improving readability.
+// `too_many_lines` threshold). The Codex variant adds sidecar persistence,
+// EOF synthesis that consumes the buffered stdout error, and M2.4
+// post-terminal session-file enrichment. Splitting further would fragment
+// the per-line control flow without improving readability.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_producer(
     mut child: tokio::process::Child,
@@ -197,6 +248,8 @@ async fn run_producer(
     agent_id: AgentId,
     sidecar_file: PathBuf,
     prior: Option<SessionLinkRecord>,
+    home_dir: PathBuf,
+    cwd: PathBuf,
 ) {
     let stderr_tail: Arc<Mutex<VecDeque<String>>> =
         Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_CAPACITY)));
@@ -280,20 +333,35 @@ async fn run_producer(
                     }
                 };
                 for event in events {
-                    match &event {
+                    match event {
                         AdapterEvent::TurnEnd {
-                            outcome: TurnOutcome::Completed,
-                            ..
+                            turn_id: ev_turn_id,
+                            outcome,
+                            ended_at,
+                            usage,
                         } => {
-                            terminal_was_completed = true;
+                            if matches!(outcome, TurnOutcome::Completed) {
+                                terminal_was_completed = true;
+                            }
                             terminal_seen = true;
+                            emit_terminal_with_enrichment(
+                                &tx,
+                                &sidecar_file,
+                                &home_dir,
+                                &cwd,
+                                agent_id,
+                                ev_turn_id,
+                                outcome,
+                                ended_at,
+                                usage,
+                                prior.is_none(),
+                            )
+                            .await;
                         }
-                        AdapterEvent::TurnEnd { .. } => {
-                            terminal_seen = true;
+                        other => {
+                            let _ = tx.send(other);
                         }
-                        _ => {}
                     }
-                    let _ = tx.send(event);
                 }
                 if terminal_seen {
                     break 'lines;
@@ -359,6 +427,136 @@ async fn run_producer(
             );
         }
         _ => {}
+    }
+}
+
+/// Run the M2.4 enrichment cycle for a parser-emitted `TurnEnd`:
+///
+/// 1. Re-read the sidecar (single source of truth for `session_id` +
+///    `original_start_date_utc` — never recompute the date from
+///    `Utc::today()` at enrichment time; see [`session_file`] module docs).
+/// 2. Read the Codex session file with the 200ms + 200ms retry policy.
+/// 3. Emit the (now-enriched) `TurnEnd`. The enriched `context_window`
+///    overlays `usage.context_window` if `usage` was `Some`; if `usage` was
+///    `None` we don't fabricate a `TurnUsage` just to carry a context-window
+///    (preserves the strict "None means unparseable" contract).
+/// 4. Emit `RateLimitEvent` if rate-limit info was extracted.
+/// 5. Emit `SessionMeta` if this is the first turn (`prior.is_none()` at
+///    dispatch time) AND the enrichment yielded a model or `cli_version`.
+///
+/// All steps degrade gracefully — sidecar read failure or session-file
+/// absence emits a non-enriched `TurnEnd` only, and the post-terminal
+/// derived events are simply skipped.
+///
+/// `is_first_turn` is computed by the caller from `prior.is_none()` at
+/// dispatch time.
+///
+// TODO(M2.5): the attach-existing-session flow pre-writes a sidecar record
+// at attach time. For that agent's first Switchboard-driven dispatch,
+// `prior` will be `Some(...)` but the UI still needs `SessionMeta` to
+// populate the sidebar. Override `is_first_turn` for the post-attach
+// first dispatch via a `force_session_meta` parameter (or equivalent) added
+// to the dispatch contract in M2.5.
+#[allow(clippy::too_many_arguments)]
+async fn emit_terminal_with_enrichment(
+    tx: &tokio::sync::mpsc::UnboundedSender<AdapterEvent>,
+    sidecar_file: &Path,
+    home_dir: &Path,
+    cwd: &Path,
+    agent_id: AgentId,
+    turn_id: TurnId,
+    outcome: TurnOutcome,
+    ended_at: chrono::DateTime<Utc>,
+    usage: Option<TurnUsage>,
+    is_first_turn: bool,
+) {
+    // Step 1: re-read sidecar to get the canonical date/session_id pair.
+    // If unreadable, skip enrichment entirely and emit a plain TurnEnd.
+    let enrichment = match read_latest(sidecar_file) {
+        Ok(Some(record)) => {
+            session_file::load_with_retry(
+                home_dir,
+                record.original_start_date_utc,
+                &record.session_id,
+                &TokioSleeper,
+            )
+            .await
+        }
+        Ok(None) => {
+            tracing::warn!(
+                agent_id = %agent_id,
+                %turn_id,
+                "Codex enrichment: sidecar absent at terminal-event time; emitting TurnEnd without enrichment"
+            );
+            Enrichment::default()
+        }
+        Err(e) => {
+            tracing::warn!(
+                agent_id = %agent_id,
+                %turn_id,
+                error = %e,
+                "Codex enrichment: sidecar re-read failed; emitting TurnEnd without enrichment"
+            );
+            Enrichment::default()
+        }
+    };
+
+    // Step 3: emit the enriched TurnEnd.
+    let enriched_usage = apply_context_window(usage, enrichment.context_window);
+    let _ = tx.send(AdapterEvent::TurnEnd {
+        turn_id,
+        outcome,
+        ended_at,
+        usage: enriched_usage,
+    });
+
+    // Step 4: emit RateLimitEvent if rate-limit info was found.
+    if let Some(rate_limits) = enrichment.rate_limits.clone() {
+        let _ = tx.send(AdapterEvent::RateLimitEvent {
+            agent_id,
+            info: rate_limits,
+        });
+    }
+
+    // Step 5: emit SessionMeta (first turn only). Loads MCP + skills
+    // registries fresh on every emission per the plan's "no caching layer"
+    // policy.
+    if is_first_turn {
+        let mcp_servers = config::load_mcp_servers(home_dir, cwd);
+        let skills_list = skills::load_skills(home_dir, cwd);
+        if let Some(fields) =
+            session_file::build_session_meta_fields(&enrichment, mcp_servers, skills_list)
+        {
+            let _ = tx.send(AdapterEvent::SessionMeta {
+                agent_id,
+                model: fields.model,
+                harness_version: fields.harness_version,
+                tools: Vec::new(),
+                mcp_servers: fields.mcp_servers,
+                skills: fields.skills,
+                raw: fields.raw,
+            });
+        }
+    }
+}
+
+/// Overlay the enriched `context_window` onto an existing `TurnUsage`.
+/// Returns `None` if `usage` was `None` and the enrichment carried no
+/// `context_window` — fabricating a `Some` with all-zero tokens just to
+/// carry the window would corrupt the "None means unparseable" contract
+/// elsewhere in the stack.
+fn apply_context_window(
+    usage: Option<TurnUsage>,
+    enriched_window: Option<u32>,
+) -> Option<TurnUsage> {
+    match (usage, enriched_window) {
+        (Some(mut u), window) => {
+            if u.context_window.is_none() {
+                u.context_window = window;
+            }
+            Some(u)
+        }
+        (None, _) => None,
     }
 }
 

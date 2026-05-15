@@ -195,10 +195,11 @@ async fn live_codex_basic_turn_completes() {
         "expected 'ack' in response text, got: {text:?}"
     );
 
-    let terminal = events
+    let terminal_idx = events
         .iter()
-        .find(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+        .position(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
         .expect("should have a terminal TurnEnd");
+    let terminal = &events[terminal_idx];
     assert!(
         matches!(
             terminal,
@@ -209,6 +210,55 @@ async fn live_codex_basic_turn_completes() {
         ),
         "expected TurnEnd(Completed), got: {terminal:?}"
     );
+
+    // M2.4 post-terminal enrichment must fire for Codex turns:
+    // - TurnEnd.usage.context_window is enriched from the session file's
+    //   task_started.model_context_window (Codex's stream doesn't carry it).
+    // - RateLimitEvent fires every turn from token_count.rate_limits.
+    // - SessionMeta fires on the first turn carrying model + cli_version +
+    //   the merged MCP servers / skills registries.
+    match terminal {
+        AdapterEvent::TurnEnd { usage: Some(u), .. } => {
+            assert!(
+                u.context_window.is_some(),
+                "M2.4: TurnEnd.usage.context_window must be enriched from session file (got None)"
+            );
+        }
+        _ => panic!("expected TurnEnd with Some(usage), got: {terminal:?}"),
+    }
+    let rate_limit_idx = events
+        .iter()
+        .position(|e| matches!(e, AdapterEvent::RateLimitEvent { .. }))
+        .expect("M2.4: RateLimitEvent must fire post-terminal for Codex");
+    let session_meta_idx = events
+        .iter()
+        .position(|e| matches!(e, AdapterEvent::SessionMeta { .. }))
+        .expect("M2.4: SessionMeta must fire on first turn for Codex");
+    assert!(
+        terminal_idx < rate_limit_idx && rate_limit_idx < session_meta_idx,
+        "enrichment events must arrive after TurnEnd in order: TurnEnd → RateLimitEvent → SessionMeta"
+    );
+
+    // SessionMeta shape: structural-only checks. mcp_servers / skills lists
+    // are developer-environment-dependent (we don't pin a particular ~/.codex
+    // setup), so just assert the model + harness_version are non-empty and
+    // tools is the documented vec![].
+    match &events[session_meta_idx] {
+        AdapterEvent::SessionMeta {
+            model,
+            harness_version,
+            tools,
+            ..
+        } => {
+            assert!(!model.is_empty(), "model must be set from turn_context");
+            assert!(
+                !harness_version.is_empty(),
+                "harness_version must be set from session_meta.cli_version"
+            );
+            assert!(tools.is_empty(), "tools is vec![] for Codex");
+        }
+        _ => unreachable!(),
+    }
 
     // Sidecar must exist after the first turn with the captured thread_id.
     let sidecar = tmp

@@ -31,24 +31,27 @@ fn codex_agent() -> AgentRecord {
     }
 }
 
-fn adapter() -> CodexAdapter {
-    CodexAdapter::with_binary_path(FAKE_CODEX)
-}
-
 /// Dispatch the agent at the `fake_codex` binary with the named fixture as
-/// the prompt (which `fake_codex` interprets as the fixture path). Drains the
-/// stream to a `Vec<AdapterEvent>` for assertion.
+/// the prompt (which `fake_codex` interprets as the fixture path). Drains
+/// the stream to a `Vec<AdapterEvent>` for assertion. Always injects a
+/// fresh empty `home_dir` so M2.4 enrichment runs against an empty
+/// ~/.codex/sessions (no developer-environment leakage) — and degrades
+/// gracefully to default-Enrichment (no derived events).
 async fn dispatch_fixture(
     agent: &AgentRecord,
     cwd: &Path,
     fixture_path: &str,
 ) -> Vec<AdapterEvent> {
+    let home = tempfile::TempDir::new().unwrap();
     let turn_id = Uuid::now_v7();
-    let stream = adapter()
+    let adapter = CodexAdapter::with_binary_and_home(FAKE_CODEX, home.path());
+    let stream = adapter
         .dispatch(agent, cwd, fixture_path, turn_id)
         .await
         .expect("dispatch should succeed");
     stream.collect().await
+    // `home` drops after the stream is fully collected; the producer task
+    // is done by then so no use-after-drop risk.
 }
 
 #[tokio::test]
@@ -321,8 +324,9 @@ async fn truncated_stream_synthesizes_adapter_failure_with_buffered_error() {
 
     let agent = codex_agent();
     let cwd = tempfile::TempDir::new().unwrap();
+    let home = tempfile::TempDir::new().unwrap();
     let turn_id = Uuid::now_v7();
-    let stream = adapter()
+    let stream = CodexAdapter::with_binary_and_home(FAKE_CODEX, home.path())
         .dispatch(&agent, cwd.path(), fixture_path.to_str().unwrap(), turn_id)
         .await
         .expect("dispatch should succeed");
@@ -504,7 +508,8 @@ async fn dispatch_with_corrupt_sidecar_returns_pre_stream_read_error() {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, "{not valid json\n").unwrap();
 
-    let result = adapter()
+    let home = tempfile::TempDir::new().unwrap();
+    let result = CodexAdapter::with_binary_and_home(FAKE_CODEX, home.path())
         .dispatch(&agent, tmp.path(), &fixture("text-only"), Uuid::now_v7())
         .await;
     assert!(
@@ -513,5 +518,390 @@ async fn dispatch_with_corrupt_sidecar_returns_pre_stream_read_error() {
             Err(switchboard_harness::DispatchError::PreStreamRead(_))
         ),
         "expected PreStreamRead error on corrupt sidecar"
+    );
+}
+
+// --- M2.4 post-terminal enrichment ---
+//
+// These tests stage a temp `home_dir` (via `CodexAdapter::with_binary_and_home`)
+// and pre-write a Codex session file at the path the adapter will look up
+// via the sidecar's `session_id` + `original_start_date_utc`. The fixture's
+// hardcoded thread_id (`00000000-0000-7000-8000-000000000001`) is what
+// `fake_codex` echoes back via the `thread.started` stream event, so the
+// sidecar's session_id is predictable for staging.
+
+const FIXTURE_THREAD_ID: &str = "00000000-0000-7000-8000-000000000001";
+
+/// The session-file content used by the enrichment tests below. Pinned
+/// inline rather than reading the M2.1 `rate-limits.session.jsonl` fixture
+/// directly because the tests assert specific numeric values; coupling the
+/// test to the fixture would make a future fixture refresh silently break
+/// the assertions.
+const ENRICHMENT_SESSION_CONTENT: &str = r#"{"timestamp":"2026-01-01T00:00:00.000Z","type":"session_meta","payload":{"cli_version":"0.130.0","base_instructions":{"text":"long system prompt"}}}
+{"timestamp":"2026-01-01T00:00:00.500Z","type":"turn_context","payload":{"model":"gpt-5.5","cwd":"/example/cwd"}}
+{"timestamp":"2026-01-01T00:00:01.000Z","type":"event_msg","payload":{"type":"task_started","model_context_window":258400}}
+{"timestamp":"2026-01-01T00:00:01.500Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"primary":{"used_percent":42.0,"window_minutes":300}}}}
+"#;
+
+fn session_file_path(home: &Path, date: chrono::NaiveDate, session_id: &str) -> std::path::PathBuf {
+    // Mirrors the layout `session_file::session_directory` computes in
+    // production: `<home>/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-*-<uuid>.jsonl`.
+    home.join(".codex")
+        .join("sessions")
+        .join(date.format("%Y").to_string())
+        .join(date.format("%m").to_string())
+        .join(date.format("%d").to_string())
+        .join(format!("rollout-1747000000000-{session_id}.jsonl"))
+}
+
+fn stage_session_file(
+    home: &Path,
+    date: chrono::NaiveDate,
+    session_id: &str,
+    content: &str,
+) -> std::path::PathBuf {
+    let path = session_file_path(home, date, session_id);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, content).unwrap();
+    path
+}
+
+fn write_sidecar(
+    cwd: &Path,
+    agent: &AgentRecord,
+    session_id: &str,
+    original_start_date_utc: chrono::NaiveDate,
+) {
+    let sidecar = cwd
+        .join(".switchboard")
+        .join("projects")
+        .join(agent.project_id.to_string())
+        .join("sessions")
+        .join(format!("{}.jsonl", agent.id));
+    std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+    let record = serde_json::json!({
+        "session_id": session_id,
+        "original_start_date_utc": original_start_date_utc.format("%Y-%m-%d").to_string(),
+        "started_at": "2026-05-15T00:00:00Z",
+    });
+    std::fs::write(&sidecar, format!("{record}\n")).unwrap();
+}
+
+async fn dispatch_with_home(
+    agent: &AgentRecord,
+    cwd: &Path,
+    home: &Path,
+    fixture_path: &str,
+) -> Vec<AdapterEvent> {
+    let turn_id = Uuid::now_v7();
+    let adapter = CodexAdapter::with_binary_and_home(FAKE_CODEX, home);
+    let stream = adapter
+        .dispatch(agent, cwd, fixture_path, turn_id)
+        .await
+        .expect("dispatch should succeed");
+    stream.collect().await
+}
+
+#[tokio::test]
+async fn first_turn_emits_enriched_turn_end_rate_limit_and_session_meta() {
+    // First-turn dispatch with a real session file staged at today's date
+    // partition + MCP config + a skill. Asserts the full enriched event
+    // sequence: TurnEnd(enriched) → RateLimitEvent → SessionMeta.
+    let cwd = tempfile::TempDir::new().unwrap();
+    let home = tempfile::TempDir::new().unwrap();
+    let agent = codex_agent();
+
+    // Stage session file at today's date (first-turn case — the adapter's
+    // try_persist_sidecar uses Utc::now().date_naive() for original_start_date_utc).
+    let today = chrono::Utc::now().date_naive();
+    stage_session_file(
+        home.path(),
+        today,
+        FIXTURE_THREAD_ID,
+        ENRICHMENT_SESSION_CONTENT,
+    );
+
+    // Stage an MCP config at user scope.
+    let config_dir = home.path().join(".codex");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.toml"),
+        r#"
+[mcp_servers.user_alpha]
+command = "x"
+"#,
+    )
+    .unwrap();
+
+    // Stage a skill at user scope.
+    let skill_dir = home
+        .path()
+        .join(".agents")
+        .join("skills")
+        .join("user_skill");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(skill_dir.join("SKILL.md"), "# skill").unwrap();
+
+    let events = dispatch_with_home(&agent, cwd.path(), home.path(), &fixture("text-only")).await;
+
+    // Locate the TurnEnd, RateLimitEvent, SessionMeta — and verify ordering.
+    let terminal_idx = events
+        .iter()
+        .position(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+        .expect("TurnEnd present");
+    let rate_limit_idx = events
+        .iter()
+        .position(|e| matches!(e, AdapterEvent::RateLimitEvent { .. }))
+        .expect("RateLimitEvent emitted post-terminal");
+    let session_meta_idx = events
+        .iter()
+        .position(|e| matches!(e, AdapterEvent::SessionMeta { .. }))
+        .expect("SessionMeta emitted on first turn");
+    assert!(
+        terminal_idx < rate_limit_idx && rate_limit_idx < session_meta_idx,
+        "order must be TurnEnd → RateLimitEvent → SessionMeta; got indices {terminal_idx}, {rate_limit_idx}, {session_meta_idx}"
+    );
+
+    // Enriched context_window from task_started.model_context_window.
+    match &events[terminal_idx] {
+        AdapterEvent::TurnEnd { usage: Some(u), .. } => {
+            assert_eq!(
+                u.context_window,
+                Some(258_400),
+                "context_window enriched from session file"
+            );
+        }
+        other => panic!("expected TurnEnd with Some(usage), got {other:?}"),
+    }
+
+    // RateLimitEvent.info carries the rate_limits object verbatim.
+    match &events[rate_limit_idx] {
+        AdapterEvent::RateLimitEvent { info, .. } => {
+            assert_eq!(
+                info.pointer("/primary/used_percent"),
+                Some(&serde_json::Value::from(42.0))
+            );
+        }
+        _ => unreachable!(),
+    }
+
+    // SessionMeta carries model, harness_version, MCP server, skill, and
+    // base_instructions.text is stripped from raw.
+    match &events[session_meta_idx] {
+        AdapterEvent::SessionMeta {
+            model,
+            harness_version,
+            mcp_servers,
+            skills,
+            tools,
+            raw,
+            ..
+        } => {
+            assert_eq!(model, "gpt-5.5");
+            assert_eq!(harness_version, "0.130.0");
+            assert!(tools.is_empty(), "tools is vec![] for Codex");
+            assert!(
+                mcp_servers.iter().any(|s| s.name == "user_alpha"),
+                "merged MCP servers must include user_alpha"
+            );
+            assert_eq!(skills, &vec!["user_skill".to_owned()]);
+            // base_instructions.text must be stripped to keep IPC payloads small.
+            let stripped = raw.pointer("/payload/base_instructions/text");
+            assert_eq!(
+                stripped,
+                Some(&serde_json::Value::String(
+                    "<stripped — see codex-cli-observed.md>".to_owned()
+                )),
+                "base_instructions.text must be stripped in raw"
+            );
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[tokio::test]
+async fn resume_turn_omits_session_meta_but_still_emits_rate_limit_and_enriches() {
+    // Pre-write a sidecar to mark this as a resume from the adapter's
+    // point of view. SessionMeta is first-turn-only (prior.is_none() → true
+    // only when sidecar is absent at dispatch start).
+    let cwd = tempfile::TempDir::new().unwrap();
+    let home = tempfile::TempDir::new().unwrap();
+    let agent = codex_agent();
+    let today = chrono::Utc::now().date_naive();
+    write_sidecar(cwd.path(), &agent, FIXTURE_THREAD_ID, today);
+    stage_session_file(
+        home.path(),
+        today,
+        FIXTURE_THREAD_ID,
+        ENRICHMENT_SESSION_CONTENT,
+    );
+
+    let events = dispatch_with_home(&agent, cwd.path(), home.path(), &fixture("text-only")).await;
+
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::RateLimitEvent { .. })),
+        "RateLimitEvent emitted every turn"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::SessionMeta { .. })),
+        "SessionMeta MUST NOT fire on resume turns — got {events:#?}"
+    );
+    // TurnEnd is still enriched.
+    let enriched_window = events.iter().find_map(|e| match e {
+        AdapterEvent::TurnEnd { usage: Some(u), .. } => Some(u.context_window),
+        _ => None,
+    });
+    assert_eq!(
+        enriched_window,
+        Some(Some(258_400)),
+        "context_window enriched on resume turns too"
+    );
+}
+
+#[tokio::test]
+async fn cross_midnight_uses_sidecar_date_not_today() {
+    // Sidecar's original_start_date_utc says yesterday; host clock says
+    // today. Lookup must use the sidecar's date.
+    //
+    // We can't move the host clock backwards in this test, so we stage the
+    // file at "yesterday" relative to Utc::now(). The adapter, on this
+    // resume dispatch, must read the sidecar (yesterday) and find the file
+    // — not call Utc::today() and look in today's empty directory.
+    let cwd = tempfile::TempDir::new().unwrap();
+    let home = tempfile::TempDir::new().unwrap();
+    let agent = codex_agent();
+    let yesterday = chrono::Utc::now().date_naive() - chrono::Duration::days(1);
+    write_sidecar(cwd.path(), &agent, FIXTURE_THREAD_ID, yesterday);
+    stage_session_file(
+        home.path(),
+        yesterday,
+        FIXTURE_THREAD_ID,
+        ENRICHMENT_SESSION_CONTENT,
+    );
+
+    let events = dispatch_with_home(&agent, cwd.path(), home.path(), &fixture("text-only")).await;
+
+    let enriched_window = events.iter().find_map(|e| match e {
+        AdapterEvent::TurnEnd { usage: Some(u), .. } => Some(u.context_window),
+        _ => None,
+    });
+    assert_eq!(
+        enriched_window,
+        Some(Some(258_400)),
+        "lookup must use sidecar's original_start_date_utc (yesterday), not today"
+    );
+    // Also confirms the RateLimitEvent path traverses the cross-day file.
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::RateLimitEvent { .. })),
+        "RateLimitEvent found in yesterday's session file"
+    );
+}
+
+#[tokio::test]
+async fn missing_session_file_emits_unenriched_turn_end_and_no_derived_events() {
+    // No staged session file at all → load_with_retry returns
+    // Enrichment::default() → TurnEnd has usage with context_window: None,
+    // no RateLimitEvent, no SessionMeta (cli_version + model both absent →
+    // build_session_meta_fields returns None).
+    let cwd = tempfile::TempDir::new().unwrap();
+    let home = tempfile::TempDir::new().unwrap();
+    let agent = codex_agent();
+
+    let events = dispatch_with_home(&agent, cwd.path(), home.path(), &fixture("text-only")).await;
+
+    let terminals: Vec<&AdapterEvent> = events
+        .iter()
+        .filter(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+        .collect();
+    assert_eq!(terminals.len(), 1, "exactly one TurnEnd");
+    match terminals[0] {
+        AdapterEvent::TurnEnd {
+            usage: Some(u),
+            outcome: TurnOutcome::Completed,
+            ..
+        } => {
+            // Stream-derived usage is present; context_window is None
+            // because enrichment found nothing.
+            assert!(
+                u.context_window.is_none(),
+                "no session file → context_window stays None"
+            );
+        }
+        other => panic!("expected TurnEnd(Completed) with Some(usage), got {other:?}"),
+    }
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::RateLimitEvent { .. })),
+        "no rate_limits found → no RateLimitEvent"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::SessionMeta { .. })),
+        "no model/cli_version found → no SessionMeta"
+    );
+}
+
+#[tokio::test]
+async fn project_scope_mcp_config_overlays_user_scope() {
+    // Project-scope <cwd>/.codex/config.toml entries appear alongside
+    // user-scope entries in the SessionMeta.mcp_servers list.
+    let cwd = tempfile::TempDir::new().unwrap();
+    let home = tempfile::TempDir::new().unwrap();
+    let agent = codex_agent();
+    let today = chrono::Utc::now().date_naive();
+    stage_session_file(
+        home.path(),
+        today,
+        FIXTURE_THREAD_ID,
+        ENRICHMENT_SESSION_CONTENT,
+    );
+
+    let user_config_dir = home.path().join(".codex");
+    std::fs::create_dir_all(&user_config_dir).unwrap();
+    std::fs::write(
+        user_config_dir.join("config.toml"),
+        r#"
+[mcp_servers.from_user]
+command = "u"
+"#,
+    )
+    .unwrap();
+
+    let project_config_dir = cwd.path().join(".codex");
+    std::fs::create_dir_all(&project_config_dir).unwrap();
+    std::fs::write(
+        project_config_dir.join("config.toml"),
+        r#"
+[mcp_servers.from_project]
+command = "p"
+"#,
+    )
+    .unwrap();
+
+    let events = dispatch_with_home(&agent, cwd.path(), home.path(), &fixture("text-only")).await;
+
+    let session_meta = events
+        .iter()
+        .find_map(|e| match e {
+            AdapterEvent::SessionMeta { mcp_servers, .. } => Some(mcp_servers.clone()),
+            _ => None,
+        })
+        .expect("SessionMeta emitted on first turn");
+    let names: Vec<&str> = session_meta.iter().map(|s| s.name.as_str()).collect();
+    assert!(
+        names.contains(&"from_user") && names.contains(&"from_project"),
+        "merged registry must include both scopes; got {names:?}"
+    );
+    assert!(
+        session_meta.iter().all(|s| s.status == "configured"),
+        "all entries report status='configured'"
     );
 }

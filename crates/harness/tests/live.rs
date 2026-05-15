@@ -230,38 +230,53 @@ async fn live_codex_basic_turn_completes() {
 #[tokio::test]
 #[ignore = "requires codex installed — run with: make test-live"]
 async fn live_codex_resume_reuses_session() {
-    // Two sequential dispatches with the same agent — the second must use
-    // `codex exec resume` and Codex should report a higher input_tokens
-    // (context carried over). We don't observe the command line directly
-    // here; we observe the *effect* via the sidecar (two records, same
-    // session_id) and the usage (second turn > first turn).
+    // Memorize-then-recall: definitive proof that resume restores prior
+    // turn's context. Token-count growth would also signal "system prompts
+    // and tool registry are being resent" — a weaker test. The recall
+    // pattern fails iff Codex genuinely loses the conversation state.
     let tmp = tempfile::TempDir::new().unwrap();
     let adapter = CodexAdapter::new();
     let agent = live_codex_agent();
 
+    // Turn 1: ask Codex to remember a specific word.
     let turn1 = Uuid::now_v7();
     let stream1 = adapter
-        .dispatch(&agent, tmp.path(), "Reply with the word 'ack'", turn1)
+        .dispatch(
+            &agent,
+            tmp.path(),
+            "Remember the word 'mango'. Reply with only 'ok'.",
+            turn1,
+        )
         .await
         .expect("first dispatch should succeed");
-    let events1: Vec<AdapterEvent> = stream1.collect().await;
-    let usage1 = events1.iter().find_map(|e| match e {
-        AdapterEvent::TurnEnd { usage: Some(u), .. } => Some(u.clone()),
-        _ => None,
-    });
+    let _events1: Vec<AdapterEvent> = stream1.collect().await;
 
+    // Turn 2 (resume): ask Codex to recall the word.
     let turn2 = Uuid::now_v7();
     let stream2 = adapter
-        .dispatch(&agent, tmp.path(), "Reply with the word 'ack' again", turn2)
+        .dispatch(
+            &agent,
+            tmp.path(),
+            "What word did I ask you to remember? Reply with only that word.",
+            turn2,
+        )
         .await
         .expect("resume dispatch should succeed");
     let events2: Vec<AdapterEvent> = stream2.collect().await;
-    let usage2 = events2.iter().find_map(|e| match e {
-        AdapterEvent::TurnEnd { usage: Some(u), .. } => Some(u.clone()),
-        _ => None,
-    });
+    let recall_text: String = events2
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::ContentChunk { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        recall_text.to_lowercase().contains("mango"),
+        "resume must restore the prior turn's context: turn2 reply was {recall_text:?}"
+    );
 
     // Sidecar should have two records (one per dispatch), same session_id.
+    // Codex echoes the same thread_id on resume.
     let sidecar = tmp
         .path()
         .join(".switchboard")
@@ -280,20 +295,10 @@ async fn live_codex_resume_reuses_session() {
     let r2: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
     assert_eq!(
         r1["session_id"], r2["session_id"],
-        "resume reuses the original thread_id"
+        "real Codex echoes the same thread_id on resume"
     );
     assert_eq!(
         r1["original_start_date_utc"], r2["original_start_date_utc"],
         "resume preserves original_start_date_utc"
     );
-
-    // Second turn's input_tokens should be ≥ first turn's (context carried).
-    if let (Some(u1), Some(u2)) = (usage1, usage2) {
-        assert!(
-            u2.input_tokens >= u1.input_tokens,
-            "resume must preserve prior context: turn1={} turn2={}",
-            u1.input_tokens,
-            u2.input_tokens
-        );
-    }
 }

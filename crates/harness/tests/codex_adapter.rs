@@ -241,13 +241,38 @@ async fn first_dispatch_writes_sidecar_with_captured_thread_id() {
 
 #[tokio::test]
 async fn resume_dispatch_appends_second_record_preserving_original_date() {
-    // First dispatch creates the sidecar; second dispatch should treat the
-    // agent as a resume and append a second record. Both records share
-    // session_id and original_start_date_utc; started_at differs.
+    // Pin two contract properties together:
+    //
+    //   (a) session_id on a record is whatever the dispatch's thread.started
+    //       carried (in real Codex, the resumed thread_id echoes back the
+    //       same id; in tests, it's whatever the fixture says — and we use
+    //       two distinguishable fixtures here to prove the producer records
+    //       *each dispatch's* captured id, not just the first).
+    //   (b) original_start_date_utc is copied verbatim from the prior record
+    //       on resume — never re-derived from Utc::today().
+    //
+    // The earlier first-fixture-twice shape couldn't catch a regression
+    // that read the prior record but failed to copy original_start_date_utc,
+    // because both records carried identical content from the same fixture.
+    // Using a second fixture with a distinct thread_id exercises the
+    // copy-vs-recompute distinction directly.
     let tmp = tempfile::TempDir::new().unwrap();
+    let fixture_alt_path = tmp.path().join("text-only-alt.jsonl");
+    std::fs::write(
+        &fixture_alt_path,
+        r#"{"type":"thread.started","thread_id":"019aaaaa-bbbb-7777-8888-000000000042"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"ack-alt"}}
+{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}
+"#,
+    )
+    .unwrap();
+
     let agent = codex_agent();
+    // First dispatch: canonical fixture (thread_id ends in 001).
     let _ = dispatch_fixture(&agent, tmp.path(), &fixture("text-only")).await;
-    let _ = dispatch_fixture(&agent, tmp.path(), &fixture("text-only")).await;
+    // Second dispatch: alt fixture with a DIFFERENT thread_id.
+    let _ = dispatch_fixture(&agent, tmp.path(), fixture_alt_path.to_str().unwrap()).await;
 
     let sidecar = tmp
         .path()
@@ -259,19 +284,23 @@ async fn resume_dispatch_appends_second_record_preserving_original_date() {
     let content = std::fs::read_to_string(&sidecar).unwrap();
     let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
     assert_eq!(lines.len(), 2, "second dispatch appends a record");
-    // Both records carry the same thread_id (text-only fixture emits the
-    // same thread.started thread_id on every read).
-    for line in &lines {
-        assert!(line.contains("00000000-0000-7000-8000-000000000001"));
-    }
-    // original_start_date_utc must match across records (latest-line-wins
-    // copies the prior date — never re-derives from Utc::today()).
-    let first_record: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-    let second_record: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    let r1: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    let r2: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    // session_id reflects each dispatch's captured thread.started (the
+    // two fixtures emit different ids, so the recorded ids must differ).
+    assert_eq!(r1["session_id"], "00000000-0000-7000-8000-000000000001");
+    assert_eq!(r2["session_id"], "019aaaaa-bbbb-7777-8888-000000000042");
+    // original_start_date_utc preserved verbatim across records — even
+    // though session_id changed, the date must NOT be recomputed.
     assert_eq!(
-        first_record["original_start_date_utc"], second_record["original_start_date_utc"],
-        "resume must copy original_start_date_utc verbatim"
+        r1["original_start_date_utc"], r2["original_start_date_utc"],
+        "resume must copy original_start_date_utc verbatim regardless of thread_id change"
     );
+    // started_at differs per record (each dispatch gets a fresh wall-clock
+    // stamp). Loose check — exact equality only on the date components is
+    // not enforced; we just confirm both records carry the field.
+    assert!(r1["started_at"].is_string());
+    assert!(r2["started_at"].is_string());
 }
 
 #[tokio::test]
@@ -326,6 +355,77 @@ async fn truncated_stream_synthesizes_adapter_failure_with_buffered_error() {
     }
 }
 
+#[tokio::test]
+async fn corrupt_thread_started_emits_adapter_failure() {
+    // thread.started without a thread_id field — the sidecar can't be
+    // written, so the adapter must fail-loud rather than silently produce
+    // an unresumable agent.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let fixture_path = tmp.path().join("corrupt-thread.jsonl");
+    std::fs::write(
+        &fixture_path,
+        r#"{"type":"thread.started"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"ack"}}
+{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}
+"#,
+    )
+    .unwrap();
+
+    let agent = codex_agent();
+    // Bounded: the stream must close promptly after the producer force-kills
+    // the child. A regression that omitted the kill would leave the producer
+    // task awaiting child.wait() forever (fake_codex sleeps via stderr
+    // drain) and the test would hang past this timeout. 5s is generous;
+    // healthy path closes in well under 100ms.
+    let events = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        dispatch_fixture(&agent, tmp.path(), fixture_path.to_str().unwrap()),
+    )
+    .await
+    .expect("stream must close promptly after corrupt thread.started");
+
+    let terminals: Vec<&AdapterEvent> = events
+        .iter()
+        .filter(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+        .collect();
+    assert_eq!(
+        terminals.len(),
+        1,
+        "exactly one terminal event from the corrupt-thread.started path"
+    );
+    match terminals[0] {
+        AdapterEvent::TurnEnd {
+            outcome:
+                TurnOutcome::Failed {
+                    kind: FailureKind::AdapterFailure,
+                    message,
+                },
+            ..
+        } => {
+            assert!(
+                message.contains("thread.started") && message.contains("thread_id"),
+                "expected corrupt-thread-id explanation, got: {message}"
+            );
+        }
+        other => panic!("expected TurnEnd(AdapterFailure), got {other:?}"),
+    }
+
+    // Sidecar must NOT exist — we refused to write a record without a
+    // valid thread_id, so the next dispatch correctly sees no prior session.
+    let sidecar = tmp
+        .path()
+        .join(".switchboard")
+        .join("projects")
+        .join(agent.project_id.to_string())
+        .join("sessions")
+        .join(format!("{}.jsonl", agent.id));
+    assert!(
+        !sidecar.exists(),
+        "sidecar must not be written when thread_id is invalid"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn sidecar_write_failure_terminates_stream_with_adapter_failure() {
@@ -353,7 +453,17 @@ async fn sidecar_write_failure_terminates_stream_with_adapter_failure() {
     perms.set_mode(0o444); // read-only
     std::fs::set_permissions(&sidecar, perms).unwrap();
 
-    let events = dispatch_fixture(&agent, tmp.path(), &fixture("text-only")).await;
+    // Bounded: the producer must force-kill the child after emitting the
+    // AdapterFailure event so the stream closes promptly. A regression that
+    // emitted the event but failed to kill would let the producer task
+    // hang awaiting child.wait() while the consumer's stream stayed open;
+    // this timeout catches that.
+    let events = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        dispatch_fixture(&agent, tmp.path(), &fixture("text-only")),
+    )
+    .await
+    .expect("stream must close promptly after sidecar write failure");
     let terminals: Vec<&AdapterEvent> = events
         .iter()
         .filter(|e| matches!(e, AdapterEvent::TurnEnd { .. }))

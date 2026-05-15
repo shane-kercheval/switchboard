@@ -214,6 +214,12 @@ async fn run_producer(
     // subsequent thread.started events (defensive — Codex emits one per
     // dispatch in M2.1's fixtures).
     let mut sidecar_written = false;
+    // Set on any error path that ends the producer loop with the subprocess
+    // still potentially running. The child is then killed before awaiting
+    // `stderr_task` / `child.wait()` so the stream closes promptly and the
+    // dispatcher's `AgentIdleGuard` releases at terminal time, not whenever
+    // codex eventually decides to exit on its own.
+    let mut force_kill_child = false;
 
     let mut lines = tokio::io::BufReader::new(stdout).lines();
 
@@ -222,12 +228,33 @@ async fn run_producer(
             Ok(Some(line)) => {
                 let outcome = parse_line(&line, turn_id, &mut state);
 
+                // Corrupt thread.started — fail-loud rather than silently
+                // creating an unresumable agent. The sidecar invariant
+                // requires a valid thread_id; missing/non-string is an
+                // upstream contract violation.
+                if state.corrupt_thread_started {
+                    let _ = tx.send(AdapterEvent::TurnEnd {
+                        turn_id,
+                        outcome: TurnOutcome::Failed {
+                            kind: FailureKind::AdapterFailure,
+                            message: "Codex thread.started event missing or non-string thread_id — sidecar unwritable; resume would fail"
+                                .to_owned(),
+                        },
+                        ended_at: Utc::now(),
+                        usage: None,
+                    });
+                    terminal_seen = true;
+                    force_kill_child = true;
+                    break 'lines;
+                }
+
                 if !sidecar_written && let Some(thread_id) = state.pending_thread_id.take() {
                     if let Some(failure) =
                         try_persist_sidecar(&sidecar_file, prior.as_ref(), thread_id, turn_id)
                     {
                         let _ = tx.send(failure);
                         terminal_seen = true;
+                        force_kill_child = true;
                         break 'lines;
                     }
                     sidecar_written = true;
@@ -248,6 +275,7 @@ async fn run_producer(
                             usage: None,
                         });
                         terminal_seen = true;
+                        force_kill_child = true;
                         break 'lines;
                     }
                 };
@@ -271,7 +299,7 @@ async fn run_producer(
                     break 'lines;
                 }
             }
-            Ok(None) => break, // stdout EOF
+            Ok(None) => break, // stdout EOF — child has closed stdout; natural shutdown.
             Err(e) => {
                 let _ = tx.send(AdapterEvent::TurnEnd {
                     turn_id,
@@ -283,9 +311,19 @@ async fn run_producer(
                     usage: None,
                 });
                 terminal_seen = true;
+                force_kill_child = true;
                 break;
             }
         }
+    }
+
+    if force_kill_child {
+        // SAFETY: `child.kill()` only fails if the process has already
+        // exited; either way the subsequent `wait()` will resolve
+        // promptly. The kill propagates through the process group (set at
+        // spawn via `process_group(0)`) so Codex's two-process tree (Node
+        // parent + Rust child) gets cleaned up together.
+        let _ = child.kill().await;
     }
 
     let _ = stderr_task.await;

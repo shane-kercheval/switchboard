@@ -45,6 +45,13 @@ use crate::parser::ParseOutcome;
 pub struct CodexParserState {
     pub pending_thread_id: Option<String>,
     pub last_error: Option<String>,
+    /// Set when `thread.started` arrives without a valid `thread_id` field
+    /// (missing or non-string). The sidecar cannot be written without a
+    /// `thread_id`, so the producer must fail-loud — silently letting the
+    /// turn complete would create a silently-unresumable agent (the next
+    /// dispatch's `read_latest` returns `Ok(None)`, Codex spawns a fresh
+    /// session, prior context is lost without a user-visible signal).
+    pub corrupt_thread_started: bool,
 }
 
 /// Parse one Codex stream-json line. Returns `ParseOutcome::Skip` for events
@@ -66,7 +73,7 @@ pub fn parse_line(line: &str, turn_id: TurnId, state: &mut CodexParserState) -> 
         Some("item.started") => parse_item_started(&value, turn_id),
         Some("item.completed") => parse_item_completed(&value, turn_id),
         Some("turn.completed") => parse_turn_completed(&value, turn_id),
-        Some("turn.failed") => parse_turn_failed(&value, turn_id),
+        Some("turn.failed") => parse_turn_failed(&value, turn_id, state),
         Some("error") => parse_error_event(&value, state),
         _ => ParseOutcome::Skip,
     }
@@ -75,6 +82,11 @@ pub fn parse_line(line: &str, turn_id: TurnId, state: &mut CodexParserState) -> 
 fn parse_thread_started(obj: &Value, state: &mut CodexParserState) -> ParseOutcome {
     if let Some(id) = obj.get("thread_id").and_then(Value::as_str) {
         state.pending_thread_id = Some(id.to_owned());
+    } else {
+        tracing::warn!(
+            "Codex thread.started event missing or non-string thread_id — sidecar cannot be written; resume will fail"
+        );
+        state.corrupt_thread_started = true;
     }
     ParseOutcome::Skip
 }
@@ -282,13 +294,25 @@ fn extract_usage_from_turn_completed(obj: &Value) -> Option<TurnUsage> {
     })
 }
 
-fn parse_turn_failed(obj: &Value, turn_id: TurnId) -> ParseOutcome {
+fn parse_turn_failed(obj: &Value, turn_id: TurnId, state: &mut CodexParserState) -> ParseOutcome {
+    // Canonical source for the failure message is `turn.failed.error.message`
+    // from this event itself. If it's missing or empty, fall back to the
+    // most recent buffered `error` event payload — Codex emits multiple
+    // `Reconnecting... N/5` retry messages before a degraded `turn.failed`
+    // can lose the 401 signal, so the fallback preserves AuthFailure
+    // classification on sparse terminal events. The buffer is consumed
+    // (taken) so EOF synthesis later doesn't double-surface it.
     let raw_message = obj
         .get("error")
         .and_then(|e| e.get("message"))
         .and_then(Value::as_str)
         .unwrap_or("");
-    let message = unwrap_error_message(raw_message);
+    let message_source = if raw_message.is_empty() {
+        state.last_error.take().unwrap_or_default()
+    } else {
+        raw_message.to_owned()
+    };
+    let message = unwrap_error_message(&message_source);
     let kind = if is_codex_auth_failure(&message) {
         FailureKind::AuthFailure
     } else {
@@ -682,6 +706,94 @@ mod tests {
             state.pending_thread_id.as_deref(),
             Some("019e2c5f-aaaa-7000-8000-000000000001")
         );
+        assert!(!state.corrupt_thread_started);
+    }
+
+    #[test]
+    fn thread_started_with_missing_thread_id_sets_corrupt_flag() {
+        // Forward-compat / defensive: thread.started without thread_id can't
+        // populate the sidecar, so the producer must fail-loud rather than
+        // silently produce an unresumable agent.
+        let line = r#"{"type":"thread.started"}"#;
+        let mut state = CodexParserState::default();
+        assert!(matches!(
+            parse_line(line, tid(), &mut state),
+            ParseOutcome::Skip
+        ));
+        assert!(state.pending_thread_id.is_none());
+        assert!(state.corrupt_thread_started);
+    }
+
+    #[test]
+    fn thread_started_with_non_string_thread_id_sets_corrupt_flag() {
+        let line = r#"{"type":"thread.started","thread_id":42}"#;
+        let mut state = CodexParserState::default();
+        assert!(matches!(
+            parse_line(line, tid(), &mut state),
+            ParseOutcome::Skip
+        ));
+        assert!(state.pending_thread_id.is_none());
+        assert!(state.corrupt_thread_started);
+    }
+
+    #[test]
+    fn turn_failed_with_empty_message_falls_back_to_buffered_last_error() {
+        // Codex emits retry messages via `error` events before a degraded
+        // `turn.failed` (e.g., final `turn.failed` carries no message). The
+        // buffered last_error must surface so AuthFailure classification on
+        // sparse terminals still fires.
+        let mut state = CodexParserState::default();
+        let _ = parse_line(
+            r#"{"type":"error","message":"Reconnecting... 5/5 (unexpected status 401 Unauthorized)"}"#,
+            tid(),
+            &mut state,
+        );
+        let line = r#"{"type":"turn.failed","error":{"message":""}}"#;
+        match parse_line(line, tid(), &mut state) {
+            ParseOutcome::Event(AdapterEvent::TurnEnd {
+                outcome:
+                    TurnOutcome::Failed {
+                        kind: FailureKind::AuthFailure,
+                        message,
+                    },
+                ..
+            }) => {
+                assert!(
+                    message.contains("401 Unauthorized"),
+                    "fallback must surface buffered 401: {message}"
+                );
+            }
+            other => panic!("expected TurnEnd(AuthFailure), got {other:?}"),
+        }
+        // The fallback consumed the buffer; subsequent reads would be None.
+        assert!(state.last_error.is_none());
+    }
+
+    #[test]
+    fn turn_failed_with_message_ignores_buffered_last_error() {
+        // Canonical priority: when turn.failed.error.message is non-empty,
+        // it wins over the buffer. Pins precedence against accidental
+        // inversion.
+        let mut state = CodexParserState::default();
+        let _ = parse_line(
+            r#"{"type":"error","message":"stale retry chatter"}"#,
+            tid(),
+            &mut state,
+        );
+        let line = r#"{"type":"turn.failed","error":{"message":"canonical failure"}}"#;
+        match parse_line(line, tid(), &mut state) {
+            ParseOutcome::Event(AdapterEvent::TurnEnd {
+                outcome:
+                    TurnOutcome::Failed {
+                        kind: FailureKind::HarnessError,
+                        message,
+                    },
+                ..
+            }) => {
+                assert_eq!(message, "canonical failure");
+            }
+            other => panic!("expected TurnEnd(HarnessError) with canonical message, got {other:?}"),
+        }
     }
 
     #[test]

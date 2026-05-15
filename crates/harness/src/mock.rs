@@ -33,6 +33,14 @@ pub enum MockScenario {
     /// streams *without* relying on a panic side-effect. Never use in
     /// production code paths.
     TruncatedStream,
+
+    /// Returns `Err(DispatchError::BinaryNotFound)` from `dispatch()` before
+    /// any stream is established. Used to exercise the dispatcher's
+    /// pre-stream failure path: the `AgentIdleGuard` must drop on early
+    /// return so agent state restores to `Idle`, and no `TurnStart` is
+    /// emitted (the wire stays clean — consumers see the `DispatcherError`
+    /// from `send_message`, never a half-stream).
+    DispatchFails,
 }
 
 /// A `HarnessAdapter` that produces canned events without spawning any subprocess.
@@ -70,6 +78,10 @@ impl HarnessAdapter for MockHarnessAdapter {
         prompt: &str,
         turn_id: TurnId,
     ) -> Result<EventStream, DispatchError> {
+        if matches!(self.scenario, MockScenario::DispatchFails) {
+            return Err(DispatchError::BinaryNotFound);
+        }
+
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
         match self.scenario {
@@ -120,6 +132,10 @@ impl HarnessAdapter for MockHarnessAdapter {
                     });
                     // Drop tx without emitting TurnEnd — stream closes silently.
                 });
+            }
+            MockScenario::DispatchFails => {
+                // Handled by the early return above.
+                unreachable!()
             }
         }
 

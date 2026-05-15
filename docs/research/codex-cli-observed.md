@@ -218,3 +218,110 @@ Probed by spawning `codex exec --json --skip-git-repo-check --dangerously-bypass
 - Hands-on probes captured in `/tmp/switchboard-probe/` (`codex-hello.out`, `codex-tool-call.out`).
 - Session files at `~/.codex/sessions/2026/05/09/rollout-*.jsonl`.
 - `codex --help`, `codex exec --help`, `codex exec resume --help`, `codex fork --help`, `codex mcp --help`, `codex mcp list` (v0.128.0).
+
+---
+
+## Findings during M2.1 (2026-05-14)
+
+Captured live against `codex-cli 0.130.0` (npm `@openai/codex@0.130.0`). All fixtures live under `crates/harness/tests/fixtures/codex/` (sanitized UUIDs `00000000-0000-7000-8000-NNNNNNNNNNNN`, payload shapes preserved verbatim).
+
+### Confirmed: `token_count.rate_limits` is session-file-only
+
+Stream (`text-only.jsonl`):
+```
+{"type":"thread.started","thread_id":"..."}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"ack"}}
+{"type":"turn.completed","usage":{"input_tokens":15568,"cached_input_tokens":7552,"output_tokens":5,"reasoning_output_tokens":0}}
+```
+
+Session file (`rate-limits.session.jsonl`) for the same turn carries the rate-limit payload in two `event_msg/token_count` events (values below are sanitized placeholders, structure preserved verbatim):
+```
+{"type":"token_count","info":null,"rate_limits":{"limit_id":"codex","limit_name":null,"primary":{"used_percent":42.0,"window_minutes":300,"resets_at":1800000000},"secondary":{"used_percent":7.0,"window_minutes":10080,"resets_at":1800600000},"credits":null,"plan_type":"plus_or_pro","rate_limit_reached_type":null}}
+```
+
+`session_meta` is written **once per session file at line 1** and is **not repeated on resume** (confirmed: `grep -c '"type":"session_meta"'` on a resumed session file returns `1`, even after the appended resumed turn). M2.4's "parse line 1 for session_meta on enrichment" assumption is correct for both first turns and resumes.
+
+The `turn.completed.usage` stream payload carries token counts but **no `total_cost_usd`** (subscription-only — no dollars at the harness boundary). `context_window` is **not present in the stream** either; only in the session file's `task_started.model_context_window` and `token_count.info.model_context_window`. M2.4 enrichment is load-bearing for context-window display.
+
+→ **M2.4 owns `RateLimitEvent` for Codex AND `context_window` for Codex.** M2.3 emits `TurnEnd.usage` with `context_window: None`, populated later by enrichment.
+
+The companion `rate-limits.stream.jsonl` fixture is byte-equivalent to `text-only.jsonl` by design — they're the same turn captured from two angles. Keeping the pair self-contained makes the "stream lacks `rate_limits`, session has it" finding readable without cross-referencing.
+
+### Confirmed: resume appends to original session file
+
+Same-day resume:
+```
+codex exec resume 00000000-0000-7000-8000-000000000001 ...
+```
+appends to `~/.codex/sessions/<original-spawn-YYYY>/<MM>/<DD>/rollout-<original-spawn-ISO-with-dashes>-00000000-0000-7000-8000-000000000001.jsonl` (filename and directory both keyed to the **original spawn date**, not resume date). File size grew (32417 → 35619 bytes in our probe); mtime updated; no new file created.
+
+→ `original_start_date_utc` in the session-link sidecar is genuinely load-bearing for M2.4's date-partitioned session-file lookup. Cross-day verification: not run (would require waiting 24h); the on-disk layout (date subdirs + the appended-to-original behavior) makes the cross-day path mechanical to test from a synthetic sidecar.
+
+### NEW: MCP tool calls flow as a distinct item type — `mcp_tool_call`, not `command_execution`
+
+Captured live against an `example_mcp_server` (`mcp-tool-call.jsonl` — any MCP server with at least one callable tool reproduces the same shape):
+```
+{"type":"item.started","item":{"id":"item_0","type":"mcp_tool_call","server":"...","tool":"list_tags","arguments":{},"result":null,"error":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_0","type":"mcp_tool_call","server":"...","tool":"list_tags","arguments":{},"result":{"content":[{"type":"text","text":"Invalid or expired token"}],"structured_content":null},"error":null,"status":"failed"}}
+```
+
+Field shape differs from `command_execution`: `{server, tool, arguments, result, error, status}` instead of `{command, aggregated_output, exit_code, status}`. M2.3's parser table must cover BOTH item types — the M2.1 plan's "default to `command_execution` shape and refine later" guess is contradicted by direct evidence.
+
+**Coverage gap:** the captured fixture covers the **failure path only** (`status: "failed"`, server returned an auth error on our probe). The `status: "completed"` / `is_error: false` branch — where `result.content[*].text` is joined for `ToolCompleted.output` — has no fixture coverage. M2.3 should cover the success path with **inline-constructed JSON in the test body**, not by chasing a working MCP server for a second live capture.
+
+**M2.3 mapping (corrected):**
+| Codex item.type | `ToolStarted.name` | `ToolCompleted.output` | `ToolCompleted.is_error` |
+|---|---|---|---|
+| `command_execution` | `"command_execution"` | `item.aggregated_output` | `item.exit_code != 0` |
+| `mcp_tool_call` | `format!("{}.{}", server, tool)` | stringified `result.content[*].text` join, or `error` if non-null | `item.status == "failed"` OR `item.error != null` |
+
+### NEW: auth-failure flows through the stream for BOTH harnesses (not stderr-only)
+
+The plan's M2.3 step 5 assumed "`codex` exits non-zero with no stream output and stderr matches…". Direct probe shows the **opposite** for both harnesses.
+
+**Codex** (`auth-failure.jsonl` + `auth-failure.stderr.txt`):
+- exit=1
+- stdout (stream-json): `thread.started`, `turn.started`, several `error` events with retry messages (`Reconnecting... N/5 (unexpected status 401 Unauthorized: Missing bearer or basic authentication in header, url: ...openai.com/v1/responses…)`), terminal `turn.failed` with the final 401 error.
+- stderr (timestamped Rust tracing lines): `ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 401 Unauthorized, url: wss://api.openai.com/v1/responses`.
+
+→ **Codex auth-failure detection (M2.3):** pattern-match on `turn.failed.error.message` containing `"401 Unauthorized"` (the simpler `starts_with("unexpected status 401")` is also valid). Do **not** scope the match to the OpenAI URL — `openai.com/v1/responses` is an OpenAI implementation detail that could change across Codex versions and the 401 prefix alone is a sufficient discriminant (a successful API call cannot return 401). Stderr is a secondary signal, not the primary path.
+
+**Claude Code** (`auth-failure.jsonl` + empty `auth-failure.stderr.txt`):
+- exit=1; stderr **empty**.
+- stdout (stream-json): `system/init`, `assistant` with `model: "<synthetic>"`, top-level `"error": "authentication_failed"`, content text `"Not logged in · Please run /login"`; terminal `result` with `is_error: true`, `terminal_reason: "completed"`, zero usage, empty `modelUsage`.
+
+→ **Claude Code auth-failure detection (M2.3):** pattern-match on the `assistant` event's top-level `"error": "authentication_failed"` field. This is the only recommended detector — it's a stable machine-readable discriminant. **Do not** key off `result.is_error` combined with the user-facing string `"Not logged in · Please run /login"` (the string is a UI surface that can change across Claude Code versions and false-positives on any zero-token turn). **Do not** key off `terminal_reason` — Claude's vocabulary is loose: `terminal_reason: "completed"` means "the turn reached a terminal event," not "the turn succeeded," and is set even on auth-failure. **Do not** rely on stderr — Claude Code emits nothing to stderr in this case.
+
+→ **Plan revision needed**: M2.3 step 5's "exits non-zero with no stream output and stderr matches" rule must be replaced with the per-harness stream-pattern matchers above. The `FailureKind::AuthFailure` variant still lands as planned; only the detection logic changes.
+
+### NEW: `turn.failed.error.message` has variable shape — sometimes plain string, sometimes JSON-encoded JSON
+
+Two shapes observed:
+
+1. **Plain human-readable string** (auth-failure case): `"unexpected status 401 Unauthorized: Missing bearer or basic authentication in header, ..."`. Safe to surface directly into `TurnOutcome::Failed.message` for UI display.
+2. **JSON-encoded string containing a nested error object** (invalid-model case): `"{\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The 'invalid-model-name' model is not supported when using Codex with a ChatGPT account.\"}}"`. Surfacing this raw renders an escaped JSON blob to the user.
+
+→ **M2.3 strategy:** before assigning to `TurnOutcome::Failed.message`, `serde_json::from_str::<Value>(&error_message_string).ok()` — if it parses and the resulting object has a nested `error.message` string, surface that; otherwise pass through the raw string. One-pass best-effort unwrap, no error on parse failure (the plain-string case must work). Cover both shapes with unit tests against `auth-failure.jsonl` (plain) and `errored.jsonl` (JSON-encoded).
+
+### Permission-denial probe: did not fire under our flags
+
+Ran without `--dangerously-bypass-approvals-and-sandbox` against a trusted project (`/private/tmp/m2-codex-probe` was already in `~/.codex/config.toml`'s `projects`); the model read `/etc/passwd` without any approval / sandbox-denial event in the stream. With our spawn flags (`--skip-git-repo-check --dangerously-bypass-approvals-and-sandbox`) plus the trusted-projects allowlist Codex maintains, denials simply don't surface in `exec --json`. Captured as "negative result" rather than a fixture file — M2.5+ permission-denial UX is deferred until a reproducible trigger exists.
+
+### Auxiliary observations
+
+- `Reading additional input from stdin...` appears on stderr for every `codex exec` invocation that doesn't have stdin redirected. M2.2/M2.3 spawn the child with `Stdio::null()` to silence this and avoid the pipe-deadlock risk; the adapter does not (and must not) write to Codex's stdin. **Production stderr will not contain this preamble line** — the M2.1 fixture preserved it as captured (uncredited stdin) for ground-truth documentation, but any M2.3 stderr-pattern matcher must not require it.
+- The Codex two-process model (Node parent + Rust child) was **not directly probed in M2.1** (no `ps -ef` capture, no signal-handling probe). M2.3's `process_group(0)` work assumes the tree exists per `harness-comparison.md`'s prior observation. Process-group sanity is verified experimentally in M2.2 (Claude Code) and M2.3 (Codex) — neither M2.1 nor this doc certifies it independently.
+- `command_execution.command` is the literal shell command string (e.g., `/bin/zsh -lc ls`), not a structured argv. Don't try to parse it.
+- `agent_message` `item.completed` arrives once per "message" (not per token); for typical short replies that's a single event. Long replies still arrive as one event with the full text. M2.3 emits one `ContentChunk` per `agent_message`.
+- Stream events that we ignore in M2 (per the M2.3 plan table): `turn.started`, `thread.started` (used internally to capture `thread_id` only). Both observed in every fixture.
+
+### Install path (candidate)
+
+For fresh macOS GHA runners (M2.8 verifies):
+```bash
+npm install -g @openai/codex@0.130.0
+which codex      # expect ~/.npm-global/bin/codex or $NVM/bin/codex
+codex --version  # expect: codex-cli 0.130.0
+```
+Pinned version avoids drift; M2.8 confirms the install + version probe end-to-end in CI.

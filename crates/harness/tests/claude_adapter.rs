@@ -8,7 +8,7 @@ use switchboard_harness::{
 use uuid::Uuid;
 
 const FAKE_CLAUDE: &str = env!("CARGO_BIN_EXE_fake_claude");
-const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/claude");
 
 fn fixture(name: &str) -> String {
     format!("{FIXTURES}/{name}.jsonl")

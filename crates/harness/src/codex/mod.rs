@@ -386,12 +386,7 @@ async fn run_producer(
     }
 
     if force_kill_child {
-        // SAFETY: `child.kill()` only fails if the process has already
-        // exited; either way the subsequent `wait()` will resolve
-        // promptly. The kill propagates through the process group (set at
-        // spawn via `process_group(0)`) so Codex's two-process tree (Node
-        // parent + Rust child) gets cleaned up together.
-        let _ = child.kill().await;
+        kill_codex_process_group(&mut child).await;
     }
 
     let _ = stderr_task.await;
@@ -569,6 +564,44 @@ fn apply_context_window(
             Some(u)
         }
         (None, _) => None,
+    }
+}
+
+/// Force-kill the Codex subprocess and any descendants it spawned.
+///
+/// **Why not just `child.kill()`.** `tokio::process::Child::kill` is
+/// `libc::kill(pid, SIGKILL)` — it signals only the spawned PID. Codex's
+/// CLI is a two-process tree: a Node parent that spawns a Rust child for
+/// the actual model work. Killing only the Node parent leaves the Rust
+/// child holding the write end of stdout/stderr pipes, so the producer
+/// task's `stderr_task.await` blocks forever waiting on an EOF that never
+/// arrives. The fix is to signal the whole process group with `killpg`.
+///
+/// `process_group(0)` at spawn (see `dispatch`) makes the spawned child its
+/// own process-group leader, so `pgid == pid`. We pass the child's PID to
+/// `killpg`; the kernel then signals every process in that group, including
+/// any descendants Codex spawned.
+///
+/// `child.wait()` later in the producer reaps the (now-dead) parent, so no
+/// zombie. Cleanly cross-platform: non-unix falls back to plain
+/// `child.kill()` (no process-group concept).
+// `clippy::unused_async` fires on unix because that branch has no `.await`;
+// the non-unix branch does (`child.kill().await`). Keep the function async
+// so the signature is uniform across platforms.
+#[cfg_attr(unix, allow(clippy::unused_async))]
+async fn kill_codex_process_group(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    {
+        if let Some(pid) = child.id() {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pid.cast_signed()),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill().await;
     }
 }
 

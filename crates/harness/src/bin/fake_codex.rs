@@ -25,6 +25,13 @@
 //!   `// pgid_to:<path>` — write the child's own process-group id (decimal
 //!     ASCII, single line) to the given path before streaming. Tests use
 //!     this to assert the adapter put us in our own process group.
+//!   `// spawn_child_holding_stderr` (unix only) — fork a child process
+//!     that inherits the parent's stderr FD and sleeps indefinitely.
+//!     Simulates Codex's two-process tree (Node parent + Rust child) so
+//!     tests can verify the adapter uses `killpg` to clean up the whole
+//!     group; with plain `kill` on the parent PID, the forked child would
+//!     keep the stderr pipe open and the adapter's stderr-drain task would
+//!     hang on EOF that never arrives.
 //!
 //! A fixed "`fake_codex`: done" line is always written to stderr so tests can
 //! verify the stderr drain path handles output without deadlocking.
@@ -73,6 +80,34 @@ fn main() {
         if line.trim() == "// read_stdin" {
             let mut sink = String::new();
             io::stdin().lock().read_to_string(&mut sink).ok();
+            continue;
+        }
+
+        if line.trim() == "// spawn_child_holding_stderr" {
+            #[cfg(unix)]
+            {
+                // Spawn `sleep` as a long-running child. By default
+                // std::process::Command inherits the parent's stdio, so
+                // the sleep child holds an FD to fake_codex's stderr
+                // pipe — exactly the "Rust child keeps the pipe alive
+                // after the Node parent dies" pattern in real Codex.
+                // The child inherits fake_codex's process group (set by
+                // the adapter's `process_group(0)` at spawn), so
+                // killpg(fake_codex_pid) reaches both. Plain
+                // kill(fake_codex_pid) would only reach the parent and
+                // leave the sleep child holding the pipe — exactly the
+                // hang we're testing against.
+                //
+                // We don't track the child handle: if the adapter's
+                // killpg works, the kernel reaps it; if it doesn't, the
+                // test fails loudly with a timeout. No reason to clean
+                // up explicitly.
+                let _ = std::process::Command::new("sleep").arg("3600").spawn();
+            }
+            #[cfg(not(unix))]
+            {
+                // No-op on non-unix; process groups aren't a thing.
+            }
             continue;
         }
 

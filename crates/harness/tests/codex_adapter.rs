@@ -432,6 +432,65 @@ async fn corrupt_thread_started_emits_adapter_failure() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn force_kill_signals_whole_process_group_not_just_parent() {
+    // Codex's CLI is a two-process tree: a Node parent that spawns a Rust
+    // child holding the actual model work. The Rust child inherits stdout
+    // / stderr pipes from the parent. If the producer's force_kill_child
+    // path used plain `child.kill()` (which signals only the parent PID),
+    // the Rust child would keep stderr open and the producer's
+    // stderr_task.await would hang on EOF that never arrives.
+    //
+    // This fixture uses fake_codex's `// spawn_child_holding_stderr`
+    // directive to fork a child that inherits stderr and sleeps forever.
+    // Then emits a corrupt thread.started to trigger force_kill_child.
+    // With killpg (the correct fix), both processes die and the stream
+    // closes in milliseconds. With plain kill, this hangs past the 5s
+    // timeout.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let fixture_path = tmp.path().join("two-process-corrupt.jsonl");
+    std::fs::write(
+        &fixture_path,
+        r#"// spawn_child_holding_stderr
+{"type":"thread.started"}
+"#,
+    )
+    .unwrap();
+
+    let agent = codex_agent();
+    let events = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        dispatch_fixture(&agent, tmp.path(), fixture_path.to_str().unwrap()),
+    )
+    .await
+    .expect("stream must close promptly — killpg must signal the forked child too");
+
+    let terminals: Vec<&AdapterEvent> = events
+        .iter()
+        .filter(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+        .collect();
+    assert_eq!(
+        terminals.len(),
+        1,
+        "exactly one terminal event from the corrupt-thread.started path"
+    );
+    assert!(
+        matches!(
+            terminals[0],
+            AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Failed {
+                    kind: FailureKind::AdapterFailure,
+                    ..
+                },
+                ..
+            }
+        ),
+        "expected TurnEnd(AdapterFailure), got: {:?}",
+        terminals[0]
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn sidecar_write_failure_terminates_stream_with_adapter_failure() {
     // Goal: prove that an in-stream sidecar-write failure (post-dispatch,
     // during the producer task's first thread.started capture) synthesizes

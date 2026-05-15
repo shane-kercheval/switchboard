@@ -33,7 +33,7 @@ toml = { workspace = true }
 # - the process-group integration test itself (`tests/claude_adapter.rs`).
 # Listed as a regular dep (not dev-dep) so the bin target can link it.
 [target."cfg(unix)".dependencies]
-nix = { version = "0.31.3", default-features = false, features = ["process"] }
+nix = { version = "0.31.3", default-features = false, features = ["process", "signal"] }
 
 [dev-dependencies]
 tokio = { workspace = true }

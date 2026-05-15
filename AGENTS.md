@@ -98,6 +98,17 @@ After either command, commit both the manifest change and the lockfile diff in o
 - **For Svelte components that wrap IPC + event subscriptions + reactive state:** pure-reducer tests are insufficient. Also write component-level tests that mock `invoke` and `listen`, capture the event-listener callback, and exercise realistic event sequences — including ordering races (events arriving before the IPC reply resolves), terminal-state handling, and error paths. Frontend bugs tend to live in the wrapping component, not the reducer.
 - **Async flush in component tests:** use `await tick()` (from `svelte`) or `await waitFor(...)` for presence assertions on rendered state — both wait for Svelte's reactive scheduler. `await Promise.resolve()` flushes one microtask, which is OK for absence assertions but fragile for presence.
 
+#### Test-type vocabulary
+
+Use these terms consistently in code, comments, commits, and plan docs. The Rust types are Cargo-defined; the "fixture-driven" / "live" distinction is project-specific.
+
+- **Unit test** — `#[cfg(test)] mod tests { ... }` inside a `src/<module>.rs` file. Compiled into the parent crate, so it can call **private items**. Best for internal helpers, state machines, edge cases. Runs in `cargo test` / `make test`.
+- **Integration test** (Cargo term) — any `.rs` file under a crate's `tests/` directory. Each file compiles into its own test binary that links against the crate as an external consumer; can only call **`pub` items**. Best for end-to-end behavior through the public API. Also runs in `cargo test` / `make test`.
+- **Fixture-driven integration test** — subset of integration tests that exercise the public API using recorded `*.jsonl` fixtures, the `fake_claude` test binary, `MockHarnessAdapter`, or other stubs. Hermetic, fast, no external dependencies. Counted in default `make test` / `make check`.
+- **Live test** — subset of integration tests that spawn the real `claude` / `codex` CLI. Marked `#[ignore = "requires <harness> installed — run with: make test-live"]`. Costs subscription quota. Run via `make test-live`, not default `make test`. See "Live testing against real harnesses" above for the full policy.
+
+In short: **live ⊂ integration ⊂ all tests**, and fixture-driven is the other (non-live) half of the integration set.
+
 ### Live testing against real harnesses
 
 Adapter correctness depends on behavior we don't control: harness event vocabularies, exit-code semantics, stream timing, session-file layout. CLI vendors (Anthropic, OpenAI) ship updates that shift these contracts — sometimes silently. Mocked-only tests would lock in our _current understanding_ of the harnesses and keep passing forever even after upstream drift breaks production. Live tests are how we notice.

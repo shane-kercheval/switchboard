@@ -68,7 +68,8 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         let binary = resolve_binary(&self.claude_binary_path)?;
         let args = build_args(agent, prompt, cwd, None);
 
-        let mut child = tokio::process::Command::new(&binary)
+        let mut command = tokio::process::Command::new(&binary);
+        command
             .args(&args)
             .current_dir(cwd)
             .stdout(Stdio::piped())
@@ -80,15 +81,19 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             // continues until natural exit. M4 cancellation will need a
             // `CancellationToken` plumbed through so mid-turn cancel kills
             // the subprocess properly.
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    DispatchError::BinaryNotFound
-                } else {
-                    DispatchError::SpawnFailed(e)
-                }
-            })?;
+            .kill_on_drop(true);
+        // Put the child in its own process group so M4's cancel can `killpg`
+        // the entire subprocess tree. M2 doesn't add `killpg`; M2.2 just
+        // establishes the group.
+        #[cfg(unix)]
+        command.process_group(0);
+        let mut child = command.spawn().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                DispatchError::BinaryNotFound
+            } else {
+                DispatchError::SpawnFailed(e)
+            }
+        })?;
 
         let stdout = child.stdout.take().expect("stdout piped");
         let stderr = child.stderr.take().expect("stderr piped");
@@ -222,8 +227,27 @@ async fn run_producer(
 
     loop {
         match lines.next_line().await {
-            Ok(Some(line)) => match parser::parse_line(&line, turn_id, &mut parser_state) {
-                ParseOutcome::Event(event) => {
+            Ok(Some(line)) => {
+                let outcome = parser::parse_line(&line, turn_id, agent_id, &mut parser_state);
+                let events = match outcome {
+                    ParseOutcome::Event(event) => vec![event],
+                    ParseOutcome::Events(events) => events,
+                    ParseOutcome::Skip => continue,
+                    ParseOutcome::Error(msg) => {
+                        let _ = tx.send(AdapterEvent::TurnEnd {
+                            turn_id,
+                            outcome: TurnOutcome::Failed {
+                                kind: FailureKind::AdapterFailure,
+                                message: format!("malformed JSON from harness: {msg}"),
+                            },
+                            ended_at: Utc::now(),
+                            usage: None,
+                        });
+                        terminal_seen = true;
+                        break;
+                    }
+                };
+                for event in events {
                     match &event {
                         AdapterEvent::TurnEnd {
                             outcome: TurnOutcome::Completed,
@@ -241,24 +265,11 @@ async fn run_producer(
                     // mid-stream, we let the producer drain and exit cleanly.
                     // Per-turn cancel (M4) will handle the shutdown case properly.
                     let _ = tx.send(event);
-                    if terminal_seen {
-                        break;
-                    }
                 }
-                ParseOutcome::Skip => {}
-                ParseOutcome::Error(msg) => {
-                    let _ = tx.send(AdapterEvent::TurnEnd {
-                        turn_id,
-                        outcome: TurnOutcome::Failed {
-                            kind: FailureKind::AdapterFailure,
-                            message: format!("malformed JSON from harness: {msg}"),
-                        },
-                        ended_at: Utc::now(),
-                    });
-                    terminal_seen = true;
+                if terminal_seen {
                     break;
                 }
-            },
+            }
             Ok(None) => break, // stdout EOF
             Err(e) => {
                 let _ = tx.send(AdapterEvent::TurnEnd {
@@ -268,6 +279,7 @@ async fn run_producer(
                         message: format!("stdout read error: {e}"),
                     },
                     ended_at: Utc::now(),
+                    usage: None,
                 });
                 terminal_seen = true;
                 break;
@@ -357,6 +369,7 @@ fn synthesize_truncation_turn_end(
             message,
         },
         ended_at: Utc::now(),
+        usage: None,
     }
 }
 

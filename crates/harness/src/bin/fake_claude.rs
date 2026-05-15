@@ -10,11 +10,14 @@
 //! Special comment lines in the fixture (processed, never forwarded to stdout):
 //!   `// exit:<N>` — exit with code N instead of 0; stops line processing.
 //!   `// stderr:<message>` — write message to stderr before streaming begins.
+//!   `// read_stdin` — read stdin to EOF before streaming. The adapter must
+//!     spawn the child with `Stdio::null()` for stdin so this returns
+//!     immediately; without it, the test would deadlock waiting for input.
 //!
 //! A fixed "`fake_claude`: done" line is always written to stderr so tests can
 //! verify the stderr drain path handles output without deadlocking.
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::process;
 
 fn main() {
@@ -52,6 +55,15 @@ fn main() {
 
         if let Some(msg) = line.strip_prefix("// stderr:") {
             writeln!(err, "fake_claude: {}", msg.trim()).ok();
+            continue;
+        }
+
+        if line.trim() == "// read_stdin" {
+            // Drain stdin to EOF before continuing. If the adapter forgot to
+            // close the child's stdin (i.e., didn't set Stdio::null()), this
+            // blocks forever — exactly the deadlock the stdin-EOF test guards.
+            let mut sink = String::new();
+            io::stdin().lock().read_to_string(&mut sink).ok();
             continue;
         }
 

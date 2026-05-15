@@ -3,6 +3,8 @@ target/
 node_modules/
 crates/
 .github/
+# Untracked local Claude Code settings (gitignored globally).
+.claude/settings.local.json
 # Prose markdown — prettier's opinions on long-form docs differ from existing style.
 docs/
 # Generated / lockfiles.

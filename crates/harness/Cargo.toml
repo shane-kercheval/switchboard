@@ -28,3 +28,6 @@ which = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = { workspace = true }
+
+[target."cfg(unix)".dev-dependencies]
+nix = { version = "0.31.3", default-features = false, features = ["process"] }

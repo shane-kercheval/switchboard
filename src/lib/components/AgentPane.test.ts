@@ -90,8 +90,8 @@ describe("AgentPane", () => {
 
     // Stream the agent turn.
     fireEv({ type: "turn_start", turn_id: TURN_ID, started_at: "2026-05-13T00:00:01Z" });
-    fireEv({ type: "content_chunk", turn_id: TURN_ID, text: "Hi " });
-    fireEv({ type: "content_chunk", turn_id: TURN_ID, text: "there!" });
+    fireEv({ type: "content_chunk", turn_id: TURN_ID, kind: "text", text: "Hi " });
+    fireEv({ type: "content_chunk", turn_id: TURN_ID, kind: "text", text: "there!" });
     fireEv({
       type: "turn_end",
       turn_id: TURN_ID,
@@ -142,7 +142,7 @@ describe("AgentPane", () => {
 
     // Stream the entire agent turn BEFORE the IPC reply lands.
     fireEv({ type: "turn_start", turn_id: TURN_ID, started_at: "2026-05-13T00:00:01Z" });
-    fireEv({ type: "content_chunk", turn_id: TURN_ID, text: "pong" });
+    fireEv({ type: "content_chunk", turn_id: TURN_ID, kind: "text", text: "pong" });
     fireEv({
       type: "turn_end",
       turn_id: TURN_ID,
@@ -210,7 +210,7 @@ describe("AgentPane", () => {
     // Chunk arrives while IPC is still pending. The re-arm must NOT be
     // gated on inFlightTurnId (still null here) — gating it on
     // heartbeatTurnId (set on turn_start) is what makes this work.
-    fireEv({ type: "content_chunk", turn_id: TURN_ID, text: "still streaming" });
+    fireEv({ type: "content_chunk", turn_id: TURN_ID, kind: "text", text: "still streaming" });
 
     // Advance past the original timer's would-be fire point. If re-arm
     // failed, the heartbeat would fire here and mark the turn failed.
@@ -241,7 +241,7 @@ describe("AgentPane", () => {
     await typeAndSend("trigger failure");
 
     fireEv({ type: "turn_start", turn_id: TURN_ID, started_at: "2026-05-13T00:00:01Z" });
-    fireEv({ type: "content_chunk", turn_id: TURN_ID, text: "partial " });
+    fireEv({ type: "content_chunk", turn_id: TURN_ID, kind: "text", text: "partial " });
     fireEv({
       type: "turn_end",
       turn_id: TURN_ID,

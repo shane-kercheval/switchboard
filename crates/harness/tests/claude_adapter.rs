@@ -3,7 +3,8 @@ use std::path::Path;
 use futures::StreamExt;
 use switchboard_core::{AgentRecord, HarnessKind};
 use switchboard_harness::{
-    AdapterEvent, ClaudeCodeAdapter, DispatchError, FailureKind, HarnessAdapter, TurnOutcome,
+    AdapterEvent, ClaudeCodeAdapter, ContentKind, DispatchError, FailureKind, HarnessAdapter,
+    ToolKind, TurnOutcome,
 };
 use uuid::Uuid;
 
@@ -264,6 +265,189 @@ async fn binary_not_found_returns_dispatch_error() {
         Err(other) => panic!("expected BinaryNotFound, got: {other}"),
         Ok(_) => panic!("expected Err(BinaryNotFound), got Ok"),
     }
+}
+
+#[tokio::test]
+async fn text_only_fixture_emits_session_meta_and_rate_limit_event() {
+    // The text-only fixture starts with `system/init` (→ SessionMeta) and
+    // includes one `rate_limit_event` line (→ RateLimitEvent). M2.2 promotes
+    // both events from "skipped" to first-class emissions.
+    let agent = fake_agent();
+    let events = collect_events(&adapter(), &agent, &fixture("text-only")).await;
+
+    let session_meta = events
+        .iter()
+        .find(|e| matches!(e, AdapterEvent::SessionMeta { .. }));
+    assert!(
+        session_meta.is_some(),
+        "expected SessionMeta from system/init line"
+    );
+    if let Some(AdapterEvent::SessionMeta {
+        model,
+        harness_version,
+        ..
+    }) = session_meta
+    {
+        assert!(!model.is_empty(), "model should be populated");
+        assert!(
+            !harness_version.is_empty(),
+            "harness_version should be populated"
+        );
+    }
+
+    let rate_limit = events
+        .iter()
+        .find(|e| matches!(e, AdapterEvent::RateLimitEvent { .. }));
+    assert!(
+        rate_limit.is_some(),
+        "expected RateLimitEvent from in-stream rate_limit_event line"
+    );
+}
+
+#[tokio::test]
+async fn tool_use_fixture_emits_tool_started_and_tool_completed() {
+    // The tool-use fixture has an `assistant` envelope carrying a `tool_use`
+    // block (→ ToolStarted) and a `user` envelope carrying a `tool_result`
+    // (→ ToolCompleted). Both must surface alongside the existing
+    // ContentChunk ("Done.") and TurnEnd events.
+    let agent = fake_agent();
+    let events = collect_events(&adapter(), &agent, &fixture("tool-use")).await;
+
+    let tool_started = events.iter().find_map(|e| {
+        if let AdapterEvent::ToolStarted {
+            tool_use_id,
+            name,
+            kind,
+            ..
+        } = e
+        {
+            Some((tool_use_id.clone(), name.clone(), *kind))
+        } else {
+            None
+        }
+    });
+    let (started_id, name, kind) = tool_started.expect("expected ToolStarted from tool_use block");
+    assert_eq!(name, "Bash");
+    assert_eq!(kind, ToolKind::Builtin);
+
+    let tool_completed = events.iter().find_map(|e| {
+        if let AdapterEvent::ToolCompleted {
+            tool_use_id,
+            output,
+            is_error,
+            ..
+        } = e
+        {
+            Some((tool_use_id.clone(), output.clone(), *is_error))
+        } else {
+            None
+        }
+    });
+    let (completed_id, output, is_error) =
+        tool_completed.expect("expected ToolCompleted from tool_result block");
+    assert_eq!(
+        completed_id, started_id,
+        "tool_use_id should pair across started/completed"
+    );
+    assert!(output.contains("hello"), "got output: {output:?}");
+    assert!(!is_error);
+}
+
+#[tokio::test]
+async fn with_usage_fixture_populates_turn_end_usage() {
+    let agent = fake_agent();
+    let events = collect_events(&adapter(), &agent, &fixture("with-usage")).await;
+
+    let turn_end = events
+        .iter()
+        .find(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+        .expect("expected a TurnEnd");
+    let AdapterEvent::TurnEnd {
+        outcome,
+        usage: Some(usage),
+        ..
+    } = turn_end
+    else {
+        panic!("expected TurnEnd with Some(usage), got: {turn_end:?}");
+    };
+    assert!(matches!(outcome, TurnOutcome::Completed));
+    assert!(usage.input_tokens > 0);
+    assert!(usage.output_tokens > 0);
+    assert!(usage.context_window.is_some_and(|c| c > 0));
+    assert!(usage.total_cost_usd.is_some_and(|c| c > 0.0));
+}
+
+#[tokio::test]
+async fn text_only_content_chunks_carry_text_kind() {
+    // Invariant: no ContentChunk emitted in M2 carries kind: Thinking — all
+    // real-fixture chunks are ContentKind::Text.
+    let agent = fake_agent();
+    let events = collect_events(&adapter(), &agent, &fixture("text-only")).await;
+
+    let any_non_text = events.iter().any(|e| {
+        matches!(
+            e,
+            AdapterEvent::ContentChunk {
+                kind: ContentKind::Thinking,
+                ..
+            }
+        )
+    });
+    assert!(!any_non_text, "no ContentChunk should carry kind=Thinking");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn spawned_child_lives_in_its_own_process_group() {
+    // Process-group spawn invariant for M4's killpg target. Compares the
+    // spawned child's pgid to ours; the values must differ. Uses `nix` as a
+    // safe wrapper around `getpgid` (workspace forbids `unsafe`).
+    use nix::unistd::{Pid, getpgid};
+    use std::process::Stdio;
+
+    let parent_pgid = getpgid(None).expect("getpgid(self) should succeed");
+
+    let mut command = tokio::process::Command::new(FAKE_CLAUDE);
+    command
+        .args(["-p", &fixture("text-only")])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .process_group(0);
+    let mut child = command.spawn().expect("spawn fake_claude");
+    let raw_child_pid = i32::try_from(child.id().expect("child pid"))
+        .expect("child pid fits in i32 on macOS / Linux");
+    let child_pgid = getpgid(Some(Pid::from_raw(raw_child_pid))).expect("getpgid(child)");
+
+    // Reap before assertions so a failure doesn't leak a zombie.
+    let _ = child.wait().await;
+
+    assert_ne!(
+        child_pgid, parent_pgid,
+        "child should be in its own process group; got equal pgids ({child_pgid})"
+    );
+}
+
+#[tokio::test]
+async fn child_with_blocking_stdin_read_still_terminates() {
+    // Property test for the existing Stdio::null() convention. The fixture
+    // starts with `// read_stdin`, which makes fake_claude block on stdin to
+    // EOF before streaming. The adapter MUST set Stdio::null() so the read
+    // returns immediately; otherwise this test hangs.
+    let agent = fake_agent();
+    let events = collect_events(&adapter(), &agent, &fixture("stdin-reader")).await;
+
+    let terminal = events
+        .iter()
+        .find(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+        .expect("subprocess should have terminated cleanly with a TurnEnd");
+    assert!(matches!(
+        terminal,
+        AdapterEvent::TurnEnd {
+            outcome: TurnOutcome::Completed,
+            ..
+        }
+    ));
 }
 
 #[tokio::test]

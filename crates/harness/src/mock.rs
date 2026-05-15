@@ -6,7 +6,7 @@ use switchboard_core::AgentRecord;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::adapter::{DispatchError, EventStream, HarnessAdapter};
-use crate::events::{AdapterEvent, TurnId, TurnOutcome};
+use crate::events::{AdapterEvent, ContentKind, TurnId, TurnOutcome};
 
 /// Controls the behaviour of `MockHarnessAdapter`.
 ///
@@ -84,6 +84,7 @@ impl HarnessAdapter for MockHarnessAdapter {
                     for chunk in chunks {
                         let _ = tx.send(AdapterEvent::ContentChunk {
                             turn_id,
+                            kind: ContentKind::Text,
                             text: chunk,
                         });
                     }
@@ -91,6 +92,7 @@ impl HarnessAdapter for MockHarnessAdapter {
                         turn_id,
                         outcome: TurnOutcome::Completed,
                         ended_at: Utc::now(),
+                        usage: None,
                     });
                 });
             }
@@ -98,6 +100,7 @@ impl HarnessAdapter for MockHarnessAdapter {
                 tokio::spawn(async move {
                     let _ = tx.send(AdapterEvent::ContentChunk {
                         turn_id,
+                        kind: ContentKind::Text,
                         text: "partial".to_owned(),
                     });
                     panic!("MockScenario::Panic — intentional, for AgentIdleGuard drop test");
@@ -107,10 +110,12 @@ impl HarnessAdapter for MockHarnessAdapter {
                 tokio::spawn(async move {
                     let _ = tx.send(AdapterEvent::ContentChunk {
                         turn_id,
+                        kind: ContentKind::Text,
                         text: "partial-one".to_owned(),
                     });
                     let _ = tx.send(AdapterEvent::ContentChunk {
                         turn_id,
+                        kind: ContentKind::Text,
                         text: "partial-two".to_owned(),
                     });
                     // Drop tx without emitting TurnEnd — stream closes silently.

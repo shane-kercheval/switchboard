@@ -4,9 +4,7 @@ Playbook for AI agents (and humans) working on Switchboard. High-level orientati
 
 ## What this project is
 
-Switchboard is a macOS desktop app for orchestrating multiple AI coding agents (Claude Code, Codex, etc.) inside one project context. The canonical "what is Switchboard and why" lives in `docs/system-design.md`.
-
-The current milestone is **M2** — both harnesses through the same abstraction, unified project transcript with per-agent attribution, transcript rehydration from harness session files. See `docs/implementation_plans/2026-05-12-v1-m2.md` for the active plan and `docs/implementation_plans/2026-05-12-v1.md` for the full v1 roadmap.
+Switchboard is a macOS desktop app for orchestrating multiple AI coding agents (Claude Code, Codex, etc.) inside one project context. The canonical "what is Switchboard and why" lives in `docs/system-design.md`. Active and past implementation plans live under `docs/implementation_plans/`.
 
 ## Architecture overview
 
@@ -52,6 +50,20 @@ Prerequisites: see `README.md`. Rust toolchain pinned in `rust-toolchain.toml`; 
 - CI uses `pnpm install --frozen-lockfile` and `cargo build --locked` for byte-identical reproducibility.
 - Manifest ranges document the supported semver range; the lockfile pins the exact tested version.
 
+### Adding or updating dependencies
+
+**Always use the CLI tools — never hand-edit `Cargo.toml` / `package.json` version strings.** Hand-editing is how stale training-data versions land in the repo: a typed `"0.30"` looks fine but silently pins the `0.30.x` line even when `0.31.x` is the current latest, because Cargo's caret semantics on `0.x` versions don't bridge minor bumps.
+
+- **Rust (Cargo)**: `cargo add <crate>` queries crates.io live and writes the current latest. Flags as needed:
+  - `--dev` for `[dev-dependencies]`.
+  - `--package <crate>` to target a specific workspace member.
+  - `--no-default-features --features <feat>` to opt out of defaults.
+  - `--target 'cfg(unix)'` for platform-conditional deps.
+  - To bump an existing dep to the latest within its range: `cargo update -p <crate>`. To bump across a major boundary: re-run `cargo add <crate>` (rewrites the manifest line to the current latest).
+- **Frontend (pnpm)**: `pnpm add <pkg>` (or `pnpm add -D <pkg>` for `devDependencies`) — same principle. `pnpm update --latest <pkg>` to bump across majors.
+
+After either command, commit both the manifest change and the lockfile diff in one commit.
+
 ## Coding conventions
 
 ### Rust
@@ -63,6 +75,7 @@ Prerequisites: see `README.md`. Rust toolchain pinned in `rust-toolchain.toml`; 
 - Subprocess gotchas (load-bearing for adapter code):
   - Use `tokio::io::BufReader`, not `std::io::BufReader`, for async pipes. `tokio::process::ChildStdout` doesn't implement `std::io::Read`.
   - Use `Stdio::null()` for stdin we never write to. Prevents pipe-full deadlocks and stalls on harnesses that try to read interactively (see `docs/research/codex-cli-observed.md`).
+  - Spawn the harness in its own process group on Unix (`Command::process_group(0)`). Lets cancellation reach the whole subprocess tree with one `killpg`, and makes the convention uniform across Claude Code (single process) and Codex (Node parent + Rust child).
 
 ### TypeScript / Svelte
 
@@ -74,7 +87,7 @@ Prerequisites: see `README.md`. Rust toolchain pinned in `rust-toolchain.toml`; 
 ### Both languages
 
 - Type hints on every function signature.
-- No comments unless the *why* is non-obvious. Identifiers explain *what*.
+- No comments unless the _why_ is non-obvious. Identifiers explain _what_.
 - No imports inside functions unless absolutely necessary.
 
 ### Testing
@@ -84,6 +97,19 @@ Prerequisites: see `README.md`. Rust toolchain pinned in `rust-toolchain.toml`; 
 - Deterministic — no time-of-day or wall-clock dependencies in unit tests.
 - **For Svelte components that wrap IPC + event subscriptions + reactive state:** pure-reducer tests are insufficient. Also write component-level tests that mock `invoke` and `listen`, capture the event-listener callback, and exercise realistic event sequences — including ordering races (events arriving before the IPC reply resolves), terminal-state handling, and error paths. Frontend bugs tend to live in the wrapping component, not the reducer.
 - **Async flush in component tests:** use `await tick()` (from `svelte`) or `await waitFor(...)` for presence assertions on rendered state — both wait for Svelte's reactive scheduler. `await Promise.resolve()` flushes one microtask, which is OK for absence assertions but fragile for presence.
+
+### Live testing against real harnesses
+
+Adapter correctness depends on behavior we don't control: harness event vocabularies, exit-code semantics, stream timing, session-file layout. CLI vendors (Anthropic, OpenAI) ship updates that shift these contracts — sometimes silently. Mocked-only tests would lock in our *current understanding* of the harnesses and keep passing forever even after upstream drift breaks production. Live tests are how we notice.
+
+**Live tests are developer-local, not CI.** Subscription auth tokens (the only supported auth in v1) tend to rotate on use and can be device-bound, which makes them brittle as GitHub Actions secrets and creates a non-trivial blast radius if leaked. We accept the trade-off: upstream CLI changes are detected reactively (when a developer runs `make test-live`) rather than proactively via scheduled CI. Revisit if a clean auth model emerges.
+
+- **Convention.** Live tests are normal `cargo test` tests marked `#[ignore = "requires <harness> installed — run with: make test-live"]`. They live alongside the fixture-driven tests (e.g., `crates/harness/tests/live.rs`).
+- **Runner.** `make test-live` runs `cargo test -- --ignored` against the harness + dispatcher crates. The default `make test` / `make check` paths **do not** run live tests — they stay fast and offline.
+- **Authentication.** Live tests rely on the developer's logged-in `claude` / `codex` session (subscription auth, no API keys). If a test fails with an auth-flavored error, run `claude login` / `codex login` and retry.
+- **Cost discipline.** Every live prompt is constrained to a tiny response (e.g., `"Reply with the single word 'ack'"`) so the whole suite costs cents and finishes in minutes. The constraint is per-test response size, not test count — add as many small live tests as the surface needs.
+- **What to cover.** Any change that affects how an adapter talks to the real CLI — new subprocess flags, new event types we parse, new session-file fields we read, new spawn behavior (process groups, stdio handles) — should land with a live test that exercises the change end-to-end. The fixture-based tests prove the parser handles a recorded shape; the live tests prove that shape still arrives from the current CLI version.
+- **When to run.** Before merging any adapter-touching PR. After a new release of Claude Code or Codex, to catch upstream regressions before they hit users. Periodically as a sanity check even when nothing has changed locally (CLI vendors can ship server-side changes that affect stream content without a client version bump).
 
 ## Cross-cutting invariants
 
@@ -96,18 +122,16 @@ Project-wide rules that apply across all milestones. Milestone-specific mechanic
 - **IDs are UUID v7.** `AgentId`, `ProjectId`, `TurnId`, Claude `session_id`. Time-ordered, serde-friendly, opaque to consumers. Globally unique — the keying basis for per-agent state and per-agent event channels.
 - **Name normalization.** Agent and project names match `[A-Za-z0-9_-]+`; uniqueness check is `lowercase + hyphen→underscore` canonicalization (`Reviewer-A` and `reviewer_a` collide). Stored verbatim; canonicalization is only for the uniqueness check. See system-design §3.
 - **Append-only persistence.** `projects.jsonl`, per-project `registry.jsonl`, and Codex `sessions/<agent_id>.jsonl` sidecars are write-once-per-record. No deletion in v1. Corruption in Switchboard-owned JSONL fails loud (typed `CoreError::CorruptJsonl`); corruption in harness-owned session files skip-with-warning (the harness wrote the bad line; refusing to render history is hostile UX).
-- **Stream contract.** Every turn produces exactly one `TurnEnd` event. Adapters synthesize one on stream truncation. `TurnStart` is dispatcher-emitted, never adapter-emitted (type-enforced — `AdapterEvent` has no `TurnStart` variant). `TurnEnd` is terminal for a *turn*, not for the per-agent channel — agent-scoped events (`SessionMeta`, `RateLimitEvent`) can flow at any time.
+- **Stream contract.** Every turn produces exactly one `TurnEnd` event. Adapters synthesize one on stream truncation. `TurnStart` is dispatcher-emitted, never adapter-emitted (type-enforced — `AdapterEvent` has no `TurnStart` variant). `TurnEnd` is terminal for a _turn_, not for the per-agent channel — agent-scoped events (`SessionMeta`, `RateLimitEvent`) can flow at any time.
 - **Session-id uniqueness across all loaded projects.** No two Switchboard agents may target the same underlying harness `session_id` — concurrent dispatch to the same harness session corrupts (per `docs/research/same-session-parallel-invocation.md`). Enforced at agent creation / attach time, scanning all projects in the bound directory.
 - **Filesystem layout.** All Switchboard state lives at `<directory>/.switchboard/` — directly under the user's working directory, not in `~/.switchboard/`. `config.yaml`, `workflows/`, and `prompts/` are intended to be git-tracked; everything else is runtime data the user should `.gitignore` themselves. See system-design §3 for the full layout.
 
 ## Authoritative docs
 
 - `docs/system-design.md` — canonical design (the "what and why").
-- `docs/implementation_plans/2026-05-12-v1.md` — v1 milestone roadmap.
-- `docs/implementation_plans/2026-05-12-v1-m1.md` — M1 plan (shipped baseline).
-- `docs/implementation_plans/2026-05-12-v1-m2.md` — M2 plan (active).
+- `docs/implementation_plans/` — per-milestone plans and the v1 roadmap. Read the active milestone plan before changing scope; it's the ground truth for what to build.
 - `docs/research/` — harness ground-truth notes:
   - `claude-code-cli-observed.md`, `claude-code-headless.md` — Claude Code CLI behavior.
-  - `codex-cli-observed.md`, `codex-noninteractive.md` — Codex CLI behavior. **Most M2-load-bearing reference.**
+  - `codex-cli-observed.md`, `codex-noninteractive.md` — Codex CLI behavior.
   - `harness-comparison.md` — cross-harness comparison driving the per-harness adapter design.
   - `same-session-parallel-invocation.md` — why we enforce session-id uniqueness at the app layer.

@@ -164,6 +164,7 @@ async fn failed_turn_outcome_wire_shape_roundtrips() {
             message: "bad model".to_owned(),
         },
         ended_at: chrono::Utc::now(),
+        usage: None,
     };
 
     let normalized = NormalizedEvent::from(event);

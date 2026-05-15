@@ -13,5 +13,8 @@ mod parser;
 
 pub use adapter::{DispatchError, EventStream, HarnessAdapter};
 pub use claude_code::ClaudeCodeAdapter;
-pub use events::{AdapterEvent, FailureKind, NormalizedEvent, TurnId, TurnOutcome};
+pub use events::{
+    AdapterEvent, ContentKind, FailureKind, McpServerStatus, NormalizedEvent, ToolKind, TurnId,
+    TurnOutcome, TurnUsage,
+};
 pub use mock::{MockHarnessAdapter, MockScenario};

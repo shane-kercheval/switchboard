@@ -26,9 +26,9 @@ describe("reducer", () => {
   it("turn_start + N content_chunks + turn_end(completed) → one complete agent turn", () => {
     const events: NormalizedEvent[] = [
       { type: "turn_start", turn_id: TURN_A, started_at: ts(1) },
-      { type: "content_chunk", turn_id: TURN_A, text: "Hello, " },
-      { type: "content_chunk", turn_id: TURN_A, text: "world" },
-      { type: "content_chunk", turn_id: TURN_A, text: "!" },
+      { type: "content_chunk", turn_id: TURN_A, kind: "text", text: "Hello, " },
+      { type: "content_chunk", turn_id: TURN_A, kind: "text", text: "world" },
+      { type: "content_chunk", turn_id: TURN_A, kind: "text", text: "!" },
       {
         type: "turn_end",
         turn_id: TURN_A,
@@ -48,8 +48,8 @@ describe("reducer", () => {
   it("turn_end(failed) populates error and preserves partial text", () => {
     const events: NormalizedEvent[] = [
       { type: "turn_start", turn_id: TURN_A, started_at: ts(1) },
-      { type: "content_chunk", turn_id: TURN_A, text: "partial " },
-      { type: "content_chunk", turn_id: TURN_A, text: "answer" },
+      { type: "content_chunk", turn_id: TURN_A, kind: "text", text: "partial " },
+      { type: "content_chunk", turn_id: TURN_A, kind: "text", text: "answer" },
       {
         type: "turn_end",
         turn_id: TURN_A,
@@ -69,7 +69,7 @@ describe("reducer", () => {
   it("multiple sequential turns concatenate in arrival order", () => {
     const events: NormalizedEvent[] = [
       { type: "turn_start", turn_id: TURN_A, started_at: ts(1) },
-      { type: "content_chunk", turn_id: TURN_A, text: "first" },
+      { type: "content_chunk", turn_id: TURN_A, kind: "text", text: "first" },
       {
         type: "turn_end",
         turn_id: TURN_A,
@@ -77,7 +77,7 @@ describe("reducer", () => {
         ended_at: ts(2),
       },
       { type: "turn_start", turn_id: TURN_B, started_at: ts(3) },
-      { type: "content_chunk", turn_id: TURN_B, text: "second" },
+      { type: "content_chunk", turn_id: TURN_B, kind: "text", text: "second" },
       {
         type: "turn_end",
         turn_id: TURN_B,
@@ -106,6 +106,7 @@ describe("reducer", () => {
     const after = reduce(before, {
       type: "content_chunk",
       turn_id: TURN_B,
+      kind: "text",
       text: "should not appear",
     });
     expect(after).toEqual(before);
@@ -125,6 +126,7 @@ describe("reducer", () => {
     const after1 = reduce(original, {
       type: "content_chunk",
       turn_id: TURN_A,
+      kind: "text",
       text: "late content",
     });
     expect(after1).toEqual(original);
@@ -141,7 +143,7 @@ describe("reducer", () => {
   it("heartbeat_timeout transitions a streaming turn to failed with adapter_failure kind", () => {
     let t = emptyTranscript(AGENT_ID);
     t = reduce(t, { type: "turn_start", turn_id: TURN_A, started_at: ts(1) });
-    t = reduce(t, { type: "content_chunk", turn_id: TURN_A, text: "stuck halfway" });
+    t = reduce(t, { type: "content_chunk", turn_id: TURN_A, kind: "text", text: "stuck halfway" });
     t = reduce(t, { type: "heartbeat_timeout", turn_id: TURN_A, at: ts(50) });
 
     const turn = expectAgentTurn(t, 0);
@@ -178,7 +180,7 @@ describe("reducer", () => {
     let t: AgentTranscript = emptyTranscript(AGENT_ID);
     t = appendUserTurn(t, USER_TURN, "what is 2+2?");
     t = reduce(t, { type: "turn_start", turn_id: TURN_A, started_at: ts(1) });
-    t = reduce(t, { type: "content_chunk", turn_id: TURN_A, text: "4" });
+    t = reduce(t, { type: "content_chunk", turn_id: TURN_A, kind: "text", text: "4" });
     t = reduce(t, {
       type: "turn_end",
       turn_id: TURN_A,
@@ -210,5 +212,63 @@ describe("reducer", () => {
     // turn_start is dropped, not overwritten.
     const turn = expectAgentTurn(t, 0);
     expect(turn.startedAt).toBe(ts(1));
+  });
+
+  // M2.2 adds four new variants to NormalizedEvent (tool_started,
+  // tool_completed, rate_limit_event, session_meta). The reducer's default
+  // arm must pass these through without crashing or mutating the transcript —
+  // per-variant handling lands in M2.5 / M2.6.
+  it("tool_started passes through default arm unchanged", () => {
+    let t = emptyTranscript(AGENT_ID);
+    t = reduce(t, { type: "turn_start", turn_id: TURN_A, started_at: ts(1) });
+    const before = t;
+    const after = reduce(before, {
+      type: "tool_started",
+      turn_id: TURN_A,
+      tool_use_id: "toolu_x",
+      kind: "builtin",
+      name: "Bash",
+      input: { command: "ls" },
+    });
+    expect(after).toEqual(before);
+  });
+
+  it("tool_completed passes through default arm unchanged", () => {
+    let t = emptyTranscript(AGENT_ID);
+    t = reduce(t, { type: "turn_start", turn_id: TURN_A, started_at: ts(1) });
+    const before = t;
+    const after = reduce(before, {
+      type: "tool_completed",
+      turn_id: TURN_A,
+      tool_use_id: "toolu_x",
+      output: "hello\n",
+      is_error: false,
+    });
+    expect(after).toEqual(before);
+  });
+
+  it("session_meta passes through default arm unchanged", () => {
+    const before = emptyTranscript(AGENT_ID);
+    const after = reduce(before, {
+      type: "session_meta",
+      agent_id: AGENT_ID,
+      model: "claude-sonnet-4-6",
+      harness_version: "2.1.140",
+      tools: ["Bash"],
+      mcp_servers: [],
+      skills: [],
+      raw: {},
+    });
+    expect(after).toEqual(before);
+  });
+
+  it("rate_limit_event passes through default arm unchanged", () => {
+    const before = emptyTranscript(AGENT_ID);
+    const after = reduce(before, {
+      type: "rate_limit_event",
+      agent_id: AGENT_ID,
+      info: { status: "allowed" },
+    });
+    expect(after).toEqual(before);
   });
 });

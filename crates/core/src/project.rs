@@ -77,8 +77,12 @@ impl Project {
             }
         }
 
+        // Harness-asymmetry rule (M2.3): Claude Code pre-generates session_id
+        // at registration time; Codex leaves it None and relies on the per-agent
+        // session-link sidecar populated from `thread.started` on first dispatch.
         let session_id = match harness {
             HarnessKind::ClaudeCode => Some(Uuid::now_v7()),
+            HarnessKind::Codex => None,
         };
 
         let record = AgentRecord {

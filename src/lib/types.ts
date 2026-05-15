@@ -6,8 +6,12 @@ export type TurnId = string;
 export type AgentId = string;
 export type ProjectId = string;
 
-export type FailureKind = "harness_error" | "adapter_failure";
+export type FailureKind = "harness_error" | "adapter_failure" | "auth_failure";
 // Future: "timeout" — added if/when an active per-turn timeout lands.
+// `auth_failure` lands in M2.3 — stream-based detection for both Claude
+// (assistant.error == "authentication_failed") and Codex (turn.failed.error
+// contains "401 Unauthorized"). M2.5 renders a dedicated banner; the M2.3
+// reducer falls back to the default failed-turn UI for now.
 
 export type TurnOutcome =
   | { status: "completed" }
@@ -117,13 +121,17 @@ export type AgentTranscript = {
 };
 
 // Mirror of `crates/core::AgentRecord`. `session_id` is `null` for harnesses
-// that assign their own session ID (Codex, M2+); for Claude Code it's
-// pre-generated at registration time.
+// that assign their own session ID (Codex — set to `null` for life; the
+// per-agent session-link sidecar is the system-of-record for Codex's
+// captured thread_id); for Claude Code it's pre-generated at registration
+// time.
+export type HarnessKind = "claude_code" | "codex";
+
 export type AgentRecord = {
   id: AgentId;
   project_id: ProjectId;
   name: string;
-  harness: "claude_code";
+  harness: HarnessKind;
   session_id: string | null;
   created_at: string;
 };

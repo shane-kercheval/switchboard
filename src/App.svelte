@@ -113,7 +113,10 @@
     inlineError = null;
     busy = true;
     try {
-      const agent = await api.createAgent(name);
+      // M2.3: the harness param became required (no default). The frontend
+      // M1 flow always created Claude agents; the UI selector for Claude vs
+      // Codex lands in M2.5 alongside the unified-stream view.
+      const agent = await api.createAgent(name, "claude_code");
       phase = {
         kind: "active",
         directory: phase.directory,

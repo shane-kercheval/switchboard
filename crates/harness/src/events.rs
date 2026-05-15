@@ -259,6 +259,12 @@ pub enum FailureKind {
     /// Adapter synthesized this: subprocess died, parser hit malformed JSON, or
     /// stdout EOF arrived without a terminal `result` event. Typically transient.
     AdapterFailure,
+    /// Subscription / tier auth is missing or expired. Detected via stream-event
+    /// patterns: Claude's `assistant.error == "authentication_failed"` (state-flag
+    /// pattern consumed in `parse_result`) or Codex's `turn.failed.error.message`
+    /// containing `"401 Unauthorized"`. Frontend renders a "subscription auth
+    /// required" banner rather than a generic error.
+    AuthFailure,
 }
 
 #[cfg(test)]
@@ -380,6 +386,28 @@ mod tests {
         assert_eq!(value["outcome"]["status"], "failed");
         assert_eq!(value["outcome"]["kind"], "harness_error");
         assert_eq!(value["outcome"]["message"], "bad model");
+        let parsed: NormalizedEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, event);
+    }
+
+    #[test]
+    fn auth_failure_kind_wire_shape() {
+        let event = NormalizedEvent::TurnEnd {
+            turn_id: fresh_turn_id(),
+            outcome: TurnOutcome::Failed {
+                kind: FailureKind::AuthFailure,
+                message: "Not logged in · Please run /login".to_owned(),
+            },
+            ended_at: fresh_time(),
+            usage: None,
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["outcome"]["status"], "failed");
+        assert_eq!(value["outcome"]["kind"], "auth_failure");
+        assert_eq!(
+            value["outcome"]["message"],
+            "Not logged in · Please run /login"
+        );
         let parsed: NormalizedEvent = serde_json::from_value(value).unwrap();
         assert_eq!(parsed, event);
     }

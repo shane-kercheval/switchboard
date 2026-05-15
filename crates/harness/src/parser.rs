@@ -7,6 +7,7 @@ use crate::events::{
     TurnUsage,
 };
 
+#[derive(Debug)]
 pub enum ParseOutcome {
     /// One adapter event was produced. The common case.
     Event(AdapterEvent),
@@ -41,6 +42,17 @@ pub struct ParserState {
     /// been emitted. Cleared when the next `ContentChunk` is emitted (the
     /// separator is prepended onto that chunk's text).
     pending_separator: bool,
+    /// Auth-failure stash: `Some(message)` means an `assistant` envelope with
+    /// `"error": "authentication_failed"` was observed earlier in this turn;
+    /// the message is the displayable text extracted from the assistant
+    /// event. `parse_result` consumes via `.take()` and refines the terminal
+    /// `TurnEnd` from `HarnessError` to `AuthFailure`. This is the
+    /// state-flag pattern that keeps the M1.3 "exactly one terminal event
+    /// per turn" contract intact — `parse_result` remains the sole emitter.
+    /// `None` discriminates "not seen" from "seen with no displayable text"
+    /// (which sets `Some(String::new())` and lets the M2.5 render layer
+    /// supply default copy).
+    pending_auth_failure: Option<String>,
 }
 
 /// Parse one stream-json line. Stateful: `state` accumulates text-block
@@ -64,9 +76,9 @@ pub fn parse_line(
 
     match value.get("type").and_then(Value::as_str) {
         Some("stream_event") => parse_stream_event(&value, turn_id, state),
-        Some("result") => parse_result(&value, turn_id),
+        Some("result") => parse_result(&value, turn_id, state),
         Some("system") => parse_system_event(&value, agent_id),
-        Some("assistant") => parse_assistant_envelope(&value, turn_id),
+        Some("assistant") => parse_assistant_envelope(&value, turn_id, state),
         Some("user") => parse_user_envelope(&value, turn_id),
         Some("rate_limit_event") => parse_rate_limit_event(&value, agent_id),
         _ => ParseOutcome::Skip,
@@ -136,7 +148,7 @@ fn parse_content_block_delta(
     })
 }
 
-fn parse_result(obj: &Value, turn_id: TurnId) -> ParseOutcome {
+fn parse_result(obj: &Value, turn_id: TurnId, state: &mut ParserState) -> ParseOutcome {
     let is_error = obj
         .get("is_error")
         .and_then(Value::as_bool)
@@ -144,7 +156,19 @@ fn parse_result(obj: &Value, turn_id: TurnId) -> ParseOutcome {
 
     let has_api_error = obj.get("api_error_status").is_some_and(|v| !v.is_null());
 
-    let outcome = if is_error || has_api_error {
+    // Consume the auth-failure stash (state-flag pattern, M2.3). When the
+    // prior `assistant` envelope flagged auth failure, refine the terminal
+    // outcome from `HarnessError` to `AuthFailure` — `parse_result` remains
+    // the sole `TurnEnd` emitter, preserving the M1.3 single-terminal-event
+    // contract. Usage extraction below still runs (auth-failure results
+    // carry zero-valued telemetry, which is legitimate, not noise).
+    let auth_failure = state.pending_auth_failure.take();
+    let outcome = if let Some(auth_message) = auth_failure {
+        TurnOutcome::Failed {
+            kind: FailureKind::AuthFailure,
+            message: auth_message,
+        }
+    } else if is_error || has_api_error {
         let message = obj
             .get("result")
             .and_then(Value::as_str)
@@ -301,12 +325,45 @@ fn parse_mcp_server_status(v: &Value) -> Option<McpServerStatus> {
 /// `parse_stream_event` (the envelope arrives after all the deltas), so we
 /// don't emit `ContentChunk`s from here — that would double-emit.
 ///
-/// Structured so that an M2.3 addition of `if obj.get("error").is_some()`
-/// pattern-matching for `authentication_failed` is a one-line drop-in,
-/// not a refactor.
-fn parse_assistant_envelope(obj: &Value, turn_id: TurnId) -> ParseOutcome {
-    // M2.3 hook: check `obj.get("error")` here for auth-failure detection
-    // (`"authentication_failed"`) before the content-array dispatch below.
+/// **Auth-failure detection (M2.3, state-flag pattern).** If the envelope
+/// carries top-level `"error": "authentication_failed"`, stash the
+/// displayable message on `state.pending_auth_failure` for `parse_result` to
+/// consume; do **not** emit a terminal event here. The result envelope
+/// remains the sole `TurnEnd` emitter; the stash just refines its
+/// `FailureKind` from `HarnessError` to `AuthFailure`.
+fn parse_assistant_envelope(obj: &Value, turn_id: TurnId, state: &mut ParserState) -> ParseOutcome {
+    if obj.get("error").and_then(Value::as_str) == Some("authentication_failed") {
+        // Extract displayable text: first text content block in `message.content`,
+        // fall back to the raw error-field value. Empty extraction is preserved
+        // as `Some(String::new())` — the `Some` discriminates "seen" from "not
+        // seen"; the empty string is the parser's signal that no displayable
+        // message was available, and the M2.5 render layer supplies default
+        // copy. No hardcoded UI strings in the parser.
+        let message = obj
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_array)
+            .and_then(|content| {
+                content.iter().find_map(|block| {
+                    if block.get("type").and_then(Value::as_str) == Some("text") {
+                        block.get("text").and_then(Value::as_str).map(str::to_owned)
+                    } else {
+                        None
+                    }
+                })
+            })
+            .unwrap_or_else(|| {
+                obj.get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned()
+            });
+        state.pending_auth_failure = Some(message);
+        // Fall through to tool_use extraction — an auth-failed assistant
+        // envelope from claude is unlikely to carry tool_use blocks (the
+        // synthesized response is plain text), but bypassing extraction
+        // here would silently drop them if a future shape change adds any.
+    }
 
     let Some(content) = obj
         .get("message")
@@ -956,5 +1013,91 @@ mod tests {
             r#"{"type":"stream_event","event":{"type":"content_block_stop","index":1}}"#,
         ]);
         assert_eq!(out, "answer");
+    }
+
+    // --- Auth-failure state-flag pattern (M2.3) ---
+
+    /// Replays the captured Claude auth-failure fixture through `parse_line`
+    /// with a shared `ParserState` across the three lines. Asserts:
+    /// - The `assistant` envelope (line 2) emits no terminal event — just
+    ///   stashes `pending_auth_failure` on state. The M1.3 one-terminal-event
+    ///   contract must hold; the assistant envelope cannot double-emit.
+    /// - The `result` envelope (line 3) emits exactly one `TurnEnd` with
+    ///   `kind: AuthFailure` (refined from `HarnessError`) and the message
+    ///   extracted from `message.content[0].text` ("Not logged in · Please
+    ///   run /login"). Usage extraction still runs (zero-valued telemetry
+    ///   from auth-failure result events is legitimate).
+    #[test]
+    fn claude_auth_failure_fixture_yields_one_turn_end_with_auth_failure_kind() {
+        let fixture = include_str!("../tests/fixtures/claude/auth-failure.jsonl");
+        let mut state = ParserState::default();
+        let turn_id = tid();
+        let agent_id = aid();
+        let mut events: Vec<AdapterEvent> = Vec::new();
+        for line in fixture.lines().filter(|l| !l.trim().is_empty()) {
+            match parse_line(line, turn_id, agent_id, &mut state) {
+                ParseOutcome::Event(ev) => events.push(ev),
+                ParseOutcome::Events(evs) => events.extend(evs),
+                ParseOutcome::Skip => {}
+                ParseOutcome::Error(e) => panic!("unexpected parse error: {e}"),
+            }
+        }
+        let turn_ends: Vec<&AdapterEvent> = events
+            .iter()
+            .filter(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+            .collect();
+        assert_eq!(
+            turn_ends.len(),
+            1,
+            "exactly one TurnEnd must be emitted (M1.3 contract); got {turn_ends:#?}"
+        );
+        match turn_ends[0] {
+            AdapterEvent::TurnEnd {
+                outcome:
+                    TurnOutcome::Failed {
+                        kind: FailureKind::AuthFailure,
+                        message,
+                    },
+                ..
+            } => {
+                assert_eq!(message, "Not logged in · Please run /login");
+            }
+            other => panic!("expected TurnEnd(Failed{{AuthFailure}}), got {other:?}"),
+        }
+    }
+
+    /// Guards the per-dispatch `ParserState`-freshness invariant: a fresh
+    /// `ParserState` between dispatches means a prior turn's auth failure
+    /// cannot poison the next turn. (Structurally enforced by `run_producer`
+    /// constructing a new state per turn, but the test pins the behaviour
+    /// against regression.)
+    #[test]
+    fn fresh_parser_state_after_auth_failure_yields_completed_next_turn() {
+        // Dispatch 1: full auth-failure sequence with one ParserState.
+        let mut state1 = ParserState::default();
+        let turn_id_1 = tid();
+        let agent_id = aid();
+        let fixture = include_str!("../tests/fixtures/claude/auth-failure.jsonl");
+        for line in fixture.lines().filter(|l| !l.trim().is_empty()) {
+            let _ = parse_line(line, turn_id_1, agent_id, &mut state1);
+        }
+        assert!(
+            state1.pending_auth_failure.is_none(),
+            "parse_result must `.take()` the stash — leaving it set would corrupt later results"
+        );
+
+        // Dispatch 2: a fresh ParserState (mirrors `run_producer`'s per-turn
+        // reset). The next turn's `result` event must NOT see any auth-failure
+        // state, regardless of what happened earlier on a different state.
+        let mut state2 = ParserState::default();
+        let turn_id_2 = tid();
+        let success_line = r#"{"type":"result","subtype":"success","is_error":false,"api_error_status":null,"result":"ack"}"#;
+        match parse_line(success_line, turn_id_2, agent_id, &mut state2) {
+            ParseOutcome::Event(AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                ..
+            }) => {}
+            other => panic!("expected TurnEnd(Completed) on the second dispatch, got {other:?}"),
+        }
     }
 }

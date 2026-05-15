@@ -20,6 +20,13 @@ pub enum DispatchError {
     BinaryNotFound,
     #[error("failed to spawn harness subprocess: {0}")]
     SpawnFailed(#[from] std::io::Error),
+    /// Sidecar-or-equivalent pre-stream persistence read failed. Used by the
+    /// Codex adapter when it can't read the session-link sidecar before
+    /// deciding first-turn vs resume — a corrupt or unreadable sidecar
+    /// is fail-loud (per the AGENTS.md cross-cutting invariant on Switchboard-owned
+    /// JSONL corruption), not silently treated as "no prior session."
+    #[error("adapter pre-stream read failed: {0}")]
+    PreStreamRead(String),
 }
 
 /// Implemented by each harness (`ClaudeCode`, Codex, ...). Returns a stream of

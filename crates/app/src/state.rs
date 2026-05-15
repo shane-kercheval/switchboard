@@ -37,19 +37,29 @@ pub struct AppState {
     /// the guard is held.
     pub registry_write: Mutex<()>,
     pub dispatcher: Arc<Dispatcher>,
-    pub adapter: Arc<dyn HarnessAdapter>,
+    /// Adapter for `HarnessKind::ClaudeCode` agents. M2.3+: named fields per
+    /// harness replace M1/M2's single `adapter` field so the routing rule
+    /// (`send_message_impl` matches on `agent.harness`) is type-supported.
+    pub claude_adapter: Arc<dyn HarnessAdapter>,
+    /// Adapter for `HarnessKind::Codex` agents.
+    pub codex_adapter: Arc<dyn HarnessAdapter>,
     pub emitter: Arc<dyn EventEmitter>,
 }
 
 impl AppState {
-    pub fn new(adapter: Arc<dyn HarnessAdapter>, emitter: Arc<dyn EventEmitter>) -> Self {
+    pub fn new(
+        claude_adapter: Arc<dyn HarnessAdapter>,
+        codex_adapter: Arc<dyn HarnessAdapter>,
+        emitter: Arc<dyn EventEmitter>,
+    ) -> Self {
         Self {
             directory: Mutex::new(None),
             projects: Mutex::new(HashMap::new()),
             active_project_id: Mutex::new(None),
             registry_write: Mutex::new(()),
             dispatcher: Arc::new(Dispatcher::new()),
-            adapter,
+            claude_adapter,
+            codex_adapter,
             emitter,
         }
     }

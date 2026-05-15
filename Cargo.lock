@@ -3025,6 +3025,7 @@ dependencies = [
 name = "switchboard-app"
 version = "0.0.1"
 dependencies = [
+ "async-trait",
  "chrono",
  "serde",
  "serde_json",
@@ -3037,6 +3038,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
  "tracing",
  "tracing-subscriber",
  "uuid",

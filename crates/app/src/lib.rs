@@ -10,21 +10,26 @@ mod state;
 use std::sync::Arc;
 
 use switchboard_dispatcher::EventEmitter;
-use switchboard_harness::{ClaudeCodeAdapter, HarnessAdapter, MockHarnessAdapter};
+use switchboard_harness::{ClaudeCodeAdapter, CodexAdapter, HarnessAdapter, MockHarnessAdapter};
 use tauri::{Emitter, Manager, State};
 
 use crate::commands::{
-    DirectoryInfo, check_claude_binary_impl, create_agent_impl, create_project_impl,
-    init_directory_impl, list_agents_impl, list_projects_impl, open_project_impl, parse_uuid,
-    pick_directory_impl, send_message_impl, set_active_project_impl,
+    DirectoryInfo, check_claude_binary_impl, check_codex_binary_impl, create_agent_impl,
+    create_project_impl, init_directory_impl, list_agents_impl, list_projects_impl,
+    open_project_impl, parse_uuid, pick_directory_impl, send_message_impl, set_active_project_impl,
 };
 use crate::state::AppState;
 
-use switchboard_core::{AgentRecord, ProjectSummary};
+use switchboard_core::{AgentRecord, HarnessKind, ProjectSummary};
 
 #[tauri::command]
 async fn check_claude_binary(state: State<'_, AppState>) -> Result<(), String> {
     check_claude_binary_impl(state.inner()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn check_codex_binary(state: State<'_, AppState>) -> Result<(), String> {
+    check_codex_binary_impl(state.inner()).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -68,8 +73,12 @@ async fn set_active_project(state: State<'_, AppState>, project_id: String) -> R
 }
 
 #[tauri::command]
-async fn create_agent(state: State<'_, AppState>, name: String) -> Result<AgentRecord, String> {
-    create_agent_impl(state.inner(), &name).map_err(|e| e.to_string())
+async fn create_agent(
+    state: State<'_, AppState>,
+    name: String,
+    harness: HarnessKind,
+) -> Result<AgentRecord, String> {
+    create_agent_impl(state.inner(), &name, harness).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -117,16 +126,29 @@ impl EventEmitter for AppHandleEmitter {
     }
 }
 
-/// Reads `SWITCHBOARD_HARNESS` to decide which adapter to construct.
-/// Unset or `"claude"` → `ClaudeCodeAdapter`. `"mock"` → `MockHarnessAdapter`.
-/// Any other value → panic (silent fall-through to default would be a footgun).
-fn build_adapter() -> Arc<dyn HarnessAdapter> {
+/// Reads `SWITCHBOARD_HARNESS` to decide which adapter pair to construct.
+/// - Unset or `"claude"` → `claude_adapter = ClaudeCodeAdapter`, `codex_adapter = CodexAdapter`.
+/// - `"mock"` → both adapters = `MockHarnessAdapter`.
+/// - Any other value → panic (silent fall-through to default would be a footgun).
+///
+/// Returns `(claude_adapter, codex_adapter)`. Both are constructed under
+/// "claude"/unset because the `match agent.harness` routing in
+/// `send_message_impl` may dispatch to either at runtime; neither adapter's
+/// constructor performs a binary check, so missing CLIs only surface at
+/// `check_*_binary` time, not at app startup.
+fn build_adapters() -> (Arc<dyn HarnessAdapter>, Arc<dyn HarnessAdapter>) {
     match std::env::var("SWITCHBOARD_HARNESS").as_deref() {
         Ok("mock") => {
-            tracing::info!("SWITCHBOARD_HARNESS=mock — using MockHarnessAdapter");
-            Arc::new(MockHarnessAdapter::new())
+            tracing::info!(
+                "SWITCHBOARD_HARNESS=mock — using MockHarnessAdapter for both harnesses"
+            );
+            let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+            (Arc::clone(&mock), mock)
         }
-        Ok("claude") | Err(_) => Arc::new(ClaudeCodeAdapter::new()),
+        Ok("claude") | Err(_) => (
+            Arc::new(ClaudeCodeAdapter::new()),
+            Arc::new(CodexAdapter::new()),
+        ),
         Ok(other) => panic!(
             "invalid SWITCHBOARD_HARNESS={other:?}; expected one of: claude, mock (or unset for default)"
         ),
@@ -142,7 +164,7 @@ pub fn run() {
         )
         .try_init();
 
-    let adapter = build_adapter();
+    let (claude_adapter, codex_adapter) = build_adapters();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -150,11 +172,16 @@ pub fn run() {
             let emitter: Arc<dyn EventEmitter> = Arc::new(AppHandleEmitter {
                 app: app.handle().clone(),
             });
-            app.manage(AppState::new(Arc::clone(&adapter), emitter));
+            app.manage(AppState::new(
+                Arc::clone(&claude_adapter),
+                Arc::clone(&codex_adapter),
+                emitter,
+            ));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             check_claude_binary,
+            check_codex_binary,
             pick_directory,
             init_directory,
             list_projects,

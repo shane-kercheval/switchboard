@@ -189,7 +189,7 @@ describe("App", () => {
     });
     const createAgentCalls = invokeMock.mock.calls.filter(([cmd]) => cmd === "create_agent");
     expect(createAgentCalls).toHaveLength(1);
-    expect(createAgentCalls[0]?.[1]).toEqual({ name: "assistant" });
+    expect(createAgentCalls[0]?.[1]).toEqual({ name: "assistant", harness: "claude_code" });
   });
 
   it("directory-selector → welcome: clicking Cancel returns to the welcome screen", async () => {

@@ -2,10 +2,21 @@
 // 1:1 onto a `#[tauri::command]` in `crates/app/src/lib.rs`.
 
 import { invoke } from "@tauri-apps/api/core";
-import type { AgentRecord, DirectoryInfo, ProjectId, ProjectSummary, TurnId } from "./types";
+import type {
+  AgentRecord,
+  DirectoryInfo,
+  HarnessKind,
+  ProjectId,
+  ProjectSummary,
+  TurnId,
+} from "./types";
 
 export async function checkClaudeBinary(): Promise<void> {
   await invoke<null>("check_claude_binary");
+}
+
+export async function checkCodexBinary(): Promise<void> {
+  await invoke<null>("check_codex_binary");
 }
 
 export async function pickDirectory(path: string): Promise<DirectoryInfo> {
@@ -32,8 +43,8 @@ export async function setActiveProject(projectId: ProjectId): Promise<void> {
   await invoke<null>("set_active_project", { projectId });
 }
 
-export async function createAgent(name: string): Promise<AgentRecord> {
-  return await invoke<AgentRecord>("create_agent", { name });
+export async function createAgent(name: string, harness: HarnessKind): Promise<AgentRecord> {
+  return await invoke<AgentRecord>("create_agent", { name, harness });
 }
 
 export async function listAgents(projectId?: ProjectId): Promise<AgentRecord[]> {

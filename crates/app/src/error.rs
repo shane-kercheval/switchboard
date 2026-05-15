@@ -40,6 +40,14 @@ pub enum AppError {
         #[source]
         source: uuid::Error,
     },
+
+    /// `HarnessKind` is `#[non_exhaustive]`. If a future variant lands but
+    /// `AppState` hasn't been extended with an adapter for it, `send_message`
+    /// surfaces this rather than silently dispatching to the wrong adapter
+    /// or panicking. Should be unreachable in well-maintained code; tracks
+    /// "did we forget to wire a new harness?" as a typed error.
+    #[error("unsupported harness kind: app has no adapter wired for this variant")]
+    UnsupportedHarness,
 }
 
 impl AppError {

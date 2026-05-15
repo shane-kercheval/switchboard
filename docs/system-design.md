@@ -654,7 +654,7 @@ TurnEnd         { agent, outcome, stop_reason?,
                   usage: { input, output, cached, reasoning, context_window? },
                   permission_denials, raw_event }
                 // outcome = Completed
-                //         | Failed { kind: HarnessError | AdapterFailure, message }
+                //         | Failed { kind: HarnessError | AdapterFailure | AuthFailure, message }
                 //         | Cancelled { source: User | Workflow }   // added in M4 when per-turn cancel lands
                 //
                 // HarnessError: harness's terminal event reported is_error
@@ -664,6 +664,12 @@ TurnEnd         { agent, outcome, stop_reason?,
                 //   died, the parser hit malformed JSON, or stdout EOF arrived
                 //   without a terminal event (e.g., Codex parent silently exits
                 //   0 on SIGTERM). Infrastructure-level; not the user's fault.
+                // AuthFailure: subscription / tier auth is missing or expired.
+                //   Detected via stream events (Claude: `assistant.error ==
+                //   "authentication_failed"`; Codex: `turn.failed.error.message`
+                //   contains `"401 Unauthorized"`). Distinct from HarnessError
+                //   so the UI can render an auth-specific banner rather than
+                //   a generic error.
                 //
                 // Terminal event type is always TurnEnd. Terminal status lives
                 // in outcome — there is no separate TurnAborted / TurnTimeout /

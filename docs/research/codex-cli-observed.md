@@ -325,3 +325,35 @@ which codex      # expect ~/.npm-global/bin/codex or $NVM/bin/codex
 codex --version  # expect: codex-cli 0.130.0
 ```
 Pinned version avoids drift; M2.8 confirms the install + version probe end-to-end in CI.
+
+## Findings during M2.3 (2026-05-15)
+
+Pre-implementation flag-verification probe surfaced one direct contradiction to the M2.3 plan's initial resume command line:
+
+### `-C` / `--cd` is rejected by the `codex exec resume` subcommand
+
+`codex exec resume --help` (codex-cli 0.130.0) lists these flags as accepted: `-c, --config`, `--last`, `--all`, `--enable`, `--disable`, `-i, --image`, `-m, --model`, `--dangerously-bypass-approvals-and-sandbox`, `--skip-git-repo-check`, `--ephemeral`, `--ignore-user-config`, `--ignore-rules`, `--json`, `-o, --output-last-message`, `-h, --help`. **No `-C` / `--cd`.** Confirmed by live probe: passing `-C /tmp/sw-codex-probe` produces:
+
+```
+error: unexpected argument '-C' found
+  tip: to pass '-C' as a value, use '-- -C'
+Usage: codex exec resume [OPTIONS] [SESSION_ID] [PROMPT]
+```
+
+The `codex exec` subcommand (first-turn) DOES accept `-C, --cd <DIR>`. The asymmetry is real and undocumented elsewhere.
+
+→ **M2.3 resume command line** must omit `-C`. cwd is set via `tokio::process::Command::current_dir(cwd)` on the spawn builder — Codex inherits cwd from the parent process automatically, so `-C` is only needed to *override* that. Dropping it on resume changes no behavior.
+
+### Live round-trip verified resume context preservation
+
+Same-session fresh-then-resume round trip (codex-cli 0.130.0):
+
+```
+codex exec --json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -C /tmp/sw-codex-probe "ack"
+# → thread.started 019e2c5f-...; input_tokens=15570
+codex exec resume --json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox 019e2c5f-... "ack"
+# → thread.started 019e2c5f-...; input_tokens=31225 (doubled — prior turn's context loaded)
+```
+
+Resume emits `thread.started` with the SAME thread_id (not a new id) and the input_tokens count nearly doubles, confirming prior-turn context preservation. Stream shape on resume is byte-equivalent to first-turn shape: `thread.started` → `turn.started` → `item.completed` (agent_message) → `turn.completed`.
+

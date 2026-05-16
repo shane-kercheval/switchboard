@@ -31,6 +31,16 @@ Terminal-native TUI (Go). Uses tmux for session isolation and git worktrees for 
 
 **What it does not do:** No workflow automation, no fan-out/fan-in, no prompt library, no YAML DSL, no inter-agent message routing of any kind.
 
+### [Cursor 3](https://cursor.com/blog/cursor-3) (April 2026)
+
+IDE-native multi-agent workspace, shipped as part of the Cursor 3 release. Built on top of their VS Code fork; the Agents Window is a new standalone interface alongside the traditional editor. Shows all running agents — local, cloud VM, cross-repo — in a unified sidebar. Key features: **Agent Tabs** (multiple agent conversations side-by-side or in a grid); **`/best-of-n`** (runs the same prompt against N models simultaneously, each in an isolated git worktree, for side-by-side output comparison); **cloud agents** (seamless handoff between local and cloud VM so long-running tasks survive closing your laptop); **Automations** (always-on agents triggered by Slack, GitHub, Linear, or a schedule); **Design Mode** (click on live UI elements in an integrated browser to target agent edits visually). Cursor 3 is the most polished passive session manager in the space.
+
+**What `/best-of-n` is and isn't:** This is the feature that looks most like Switchboard's fan-out. It dispatches the *same prompt* to *N models* in parallel for *comparison purposes* — you pick the winner. It is not routing different messages to specialized agents, and there is no fan-in step where the N outputs are aggregated and forwarded to another agent. The user is still manually deciding what to do with the results.
+
+**What it does not do:** No cross-agent message routing, no fan-in aggregation, no YAML workflow files, no `pause_for_user` primitive, no sequential handoff automation, no cross-harness prompt library. Each agent operates independently; the user is still the message bus for any coordinated multi-agent operation.
+
+**Form factor difference:** Cursor is an IDE for developers writing code in Cursor. Switchboard is a harness-agnostic orchestration layer over CLI tools (`claude -p`, `codex exec`, `gemini -p`) that works regardless of editor. A Cursor user running agents inside their IDE and a Switchboard user running multiple CLI agents in parallel are in overlapping but distinct workflows.
+
 ### [Nimbalyst](https://nimbalyst.com/)
 
 Desktop app (macOS/Windows/Linux, MIT-licensed, open source). Visual workspace for Claude Code and Codex (OpenCode and GitHub Copilot in alpha). Features: session kanban board, 7+ visual editors (WYSIWYG markdown, Excalidraw, Mermaid, ERD, CSV, mockups, Monaco code), inline red/green diff review, git worktree support, MCP server integration, iOS companion app, SOC 2 certified.
@@ -176,5 +186,6 @@ Mapping the features of the tools above against Switchboard's core capabilities:
 - [Best Multi-Agent Desktop Apps for Claude Code, Codex (Nimbalyst blog)](https://nimbalyst.com/blog/best-multi-agent-desktop-apps-claude-code-codex-2026/)
 - [Best Multi-Agent Coding Tools in 2026 (Nimbalyst blog)](https://nimbalyst.com/blog/best-multi-agent-coding-tools-2026/)
 - [Claude Code Agent View (Anthropic blog)](https://claude.com/blog/agent-view-in-claude-code)
+- [Cursor 3 announcement](https://cursor.com/blog/cursor-3) / [Cursor 3 deep dive (DataCamp)](https://www.datacamp.com/blog/cursor-3)
 - [Sauna.ai](https://www.sauna.ai/) / [Multiplayer](https://www.sauna.ai/learn/multiplayer)
 - [Hermes Agent](https://hermes-agent.nousresearch.com/) / [GitHub](https://github.com/NousResearch/hermes-agent)

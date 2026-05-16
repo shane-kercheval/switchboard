@@ -1,11 +1,9 @@
 // Internal frontend state types for the M2.5 unified-stream model.
 //
-// These intentionally live alongside (not inside) `$lib/types.ts` during
-// Pass A so the existing M1.5 `Turn` / `AgentTranscript` types keep
-// compiling while the legacy AgentPane is still in service. Pass B
-// deletes the legacy types and the legacy AgentPane in one atomic
-// migration; at that point this module's types become the canonical
-// in-memory shape and `$lib/types.ts` shrinks to wire-format-only.
+// Companion to `$lib/types.ts` (wire-format types only). Component state
+// shape lives here; events on the IPC boundary live there. Reducers in
+// this module's `reducers.ts` consume wire-format events and produce the
+// shapes defined below.
 //
 // **Naming convention.** snake_case throughout, matching the wire-format
 // (`turn_id`, `agent_id`, `started_at`, `ended_at`). Aligning state shape

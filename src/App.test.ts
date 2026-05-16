@@ -1,17 +1,17 @@
-import { vi, describe, it, expect, beforeEach } from "vitest";
+import { vi, describe, it, expect, beforeEach, afterEach } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/svelte";
 import type { AgentRecord, DirectoryInfo, ProjectSummary } from "$lib/types";
 
 // App.svelte tests focus narrowly on the primary phase-transition routing
-// of the M1 acceptance flow:
+// of the M2.5 acceptance flow:
 //
-//   welcome → directory-selector → no-agent → active
+//   welcome → directory-selector → no-agent → loaded
 //
 // Plus the cancel-back-to-welcome path. Per-screen UI is already covered by
-// AgentPane / DirectorySelector / ComposeBar / reducer tests; these tests
-// verify the App-level orchestration that glues them together (which IPC
-// commands fire, in what order, and which phase renders next).
+// Sidebar / UnifiedTranscript / ComposeBar / DirectorySelector tests; these
+// tests verify the App-level orchestration that glues them together (which
+// IPC commands fire, in what order, and which phase renders next).
 //
 // Edge cases (cancel error states, multi-project switcher, rebind UI
 // state-reset across phases) are deliberately deferred to M4 when the
@@ -79,6 +79,14 @@ describe("App", () => {
     invokeMock.mockReset();
     listenMock.mockReset();
     openDialogMock.mockReset();
+  });
+
+  // The state-rune module is a singleton; tests that register agents
+  // would otherwise leak state across runs. Drain via the test-only
+  // reset helper.
+  afterEach(async () => {
+    const { _testing } = await import("$lib/state/index.svelte");
+    _testing.reset();
   });
 
   it("mounts and renders the welcome screen when the binary check succeeds", async () => {
@@ -159,7 +167,7 @@ describe("App", () => {
     expect(cmds).toContain("list_agents");
   });
 
-  it("no-agent → active: submitting Create agent invokes create_agent and renders AgentPane", async () => {
+  it("no-agent → loaded: submitting Create agent invokes create_agent and renders the 3-pane layout", async () => {
     setInvokeResponses({
       check_claude_binary: null,
       pick_directory: INFO_NO_SWITCHBOARD,
@@ -181,12 +189,16 @@ describe("App", () => {
 
     await fireEvent.click(screen.getByTestId("confirm-create-agent"));
 
+    // The "loaded" phase renders Sidebar + UnifiedTranscript + ComposeBar.
     await waitFor(() => {
-      // AgentPane renders the agent's name in its header.
-      expect(screen.getByText("assistant")).toBeInTheDocument();
-      // ComposeBar renders inside AgentPane — proves the active phase is mounted.
+      expect(screen.getByTestId("loaded-layout")).toBeInTheDocument();
+      expect(screen.getByTestId("sidebar")).toBeInTheDocument();
+      expect(screen.getByTestId("unified-transcript")).toBeInTheDocument();
       expect(screen.getByTestId("compose-textarea")).toBeInTheDocument();
     });
+    // Sidebar surfaces the agent's name.
+    expect(screen.getByTestId("agent-name")).toHaveTextContent("assistant");
+
     const createAgentCalls = invokeMock.mock.calls.filter(([cmd]) => cmd === "create_agent");
     expect(createAgentCalls).toHaveLength(1);
     expect(createAgentCalls[0]?.[1]).toEqual({ name: "assistant", harness: "claude_code" });

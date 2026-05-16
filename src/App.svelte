@@ -2,24 +2,33 @@
   import { onMount } from "svelte";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import * as api from "$lib/api";
-  import AgentPane from "$lib/components/AgentPane.svelte";
   import Banner from "$lib/components/Banner.svelte";
+  import ComposeBar from "$lib/components/ComposeBar.svelte";
   import CreateAgentForm from "$lib/components/CreateAgentForm.svelte";
   import DirectorySelector from "$lib/components/DirectorySelector.svelte";
+  import Sidebar from "$lib/components/Sidebar.svelte";
+  import UnifiedTranscript from "$lib/components/UnifiedTranscript.svelte";
   import WelcomeScreen from "$lib/components/WelcomeScreen.svelte";
+  import { registerAgent } from "$lib/state/index.svelte";
   import type { AgentRecord, DirectoryInfo, ProjectSummary } from "$lib/types";
-  import { basename, pickNewestAgent } from "$lib/utils";
+  import { basename } from "$lib/utils";
 
   // App phase: drives which screen renders.
+  //
+  // The "loaded" phase replaces M1.5's singleton-active-agent "active"
+  // phase per the M2.5 plan — no implicit focused agent. `agents` is the
+  // list registered with the state module on project load; the new
+  // Sidebar / UnifiedTranscript / ComposeBar components read transcripts
+  // and runtimes for these agents from the state module directly.
   type Phase =
     | { kind: "welcome" }
     | { kind: "directory-selector"; info: DirectoryInfo }
     | { kind: "no-agent"; directory: DirectoryInfo; project: ProjectSummary }
     | {
-        kind: "active";
+        kind: "loaded";
         directory: DirectoryInfo;
         project: ProjectSummary;
-        agent: AgentRecord;
+        agents: AgentRecord[];
       };
 
   let phase = $state<Phase>({ kind: "welcome" });
@@ -30,6 +39,9 @@
   // Startup binary probe. If it fails, show a non-blocking banner with the
   // install link copy. UI flow proceeds either way — sending will fail until
   // the user installs `claude` and reloads.
+  //
+  // (Pass D will extend this to per-harness banners — Claude + Codex
+  // independently, plus subscription-auth detection.)
   onMount(async () => {
     try {
       await api.checkClaudeBinary();
@@ -37,6 +49,15 @@
       banner = "Claude Code not found on PATH. Install from https://claude.com/code";
     }
   });
+
+  /// Register every agent in the loaded list with the state module before
+  /// the UI renders the 3-pane layout. registerAgent is idempotent under
+  /// concurrent calls (per the pendingRegistrations guard), so
+  /// Promise.all is safe — overlapping calls for the same agent_id share
+  /// one in-flight registration.
+  async function registerAll(agents: AgentRecord[]): Promise<void> {
+    await Promise.all(agents.map((a) => registerAgent(a)));
+  }
 
   async function handlePickDirectory(): Promise<void> {
     inlineError = null;
@@ -64,7 +85,8 @@
       if (agents.length === 0) {
         phase = { kind: "no-agent", directory: dir, project };
       } else {
-        phase = { kind: "active", directory: dir, project, agent: pickNewestAgent(agents) };
+        await registerAll(agents);
+        phase = { kind: "loaded", directory: dir, project, agents };
       }
     } catch (err) {
       inlineError = err instanceof Error ? err.message : String(err);
@@ -99,7 +121,8 @@
       if (agents.length === 0) {
         phase = { kind: "no-agent", directory: dir, project };
       } else {
-        phase = { kind: "active", directory: dir, project, agent: pickNewestAgent(agents) };
+        await registerAll(agents);
+        phase = { kind: "loaded", directory: dir, project, agents };
       }
     } catch (err) {
       inlineError = err instanceof Error ? err.message : String(err);
@@ -113,15 +136,16 @@
     inlineError = null;
     busy = true;
     try {
-      // M2.3: the harness param became required (no default). The frontend
-      // M1 flow always created Claude agents; the UI selector for Claude vs
-      // Codex lands in M2.5 alongside the unified-stream view.
+      // M2.3: the harness param became required. The "choose Claude vs
+      // Codex" UI lands in Pass C; until then new-agent creation defaults
+      // to Claude Code, matching the M1 flow.
       const agent = await api.createAgent(name, "claude_code");
+      await registerAgent(agent);
       phase = {
-        kind: "active",
+        kind: "loaded",
         directory: phase.directory,
         project: phase.project,
-        agent,
+        agents: [agent],
       };
     } catch (err) {
       inlineError = err instanceof Error ? err.message : String(err);
@@ -137,18 +161,12 @@
 
   function currentDirectoryPath(): string | undefined {
     if (phase.kind === "directory-selector") return phase.info.path;
-    if (phase.kind === "no-agent" || phase.kind === "active") return phase.directory.path;
+    if (phase.kind === "no-agent" || phase.kind === "loaded") return phase.directory.path;
     return undefined;
   }
 
-  // M4 introduces an agent switcher; until then, only one agent is
-  // displayed at a time (the most recently created). In-flight turns on
-  // agents that are no longer displayed continue running on their per-agent
-  // channel but are effectively orphaned in the UI for M1.5 — known
-  // limitation. The pick logic itself lives in `$lib/utils.pickNewestAgent`.
-
   const breadcrumb = $derived.by(() => {
-    if (phase.kind === "active" || phase.kind === "no-agent") {
+    if (phase.kind === "loaded" || phase.kind === "no-agent") {
       return `${phase.project.name} — ${basename(phase.directory.path)}`;
     }
     return null;
@@ -188,19 +206,14 @@
       />
     {:else if phase.kind === "no-agent"}
       <CreateAgentForm {busy} error={inlineError} onSubmit={handleCreateAgent} />
-    {:else if phase.kind === "active"}
-      <!--
-        Load-bearing: `{#key phase.agent.id}` forces AgentPane to unmount and
-        remount when the active agent changes (e.g., the user creates a new
-        agent in M4's agent-switcher). AgentPane's transcript, event-channel
-        subscription, and heartbeat timer are all initialised in onMount on
-        the assumption that `agent` does not change in-place. Don't remove
-        this `{#key}` without restructuring AgentPane to react to `agent`
-        prop changes (resetting state, re-subscribing).
-      -->
-      {#key phase.agent.id}
-        <AgentPane agent={phase.agent} />
-      {/key}
+    {:else if phase.kind === "loaded"}
+      <div class="flex flex-1 overflow-hidden" data-testid="loaded-layout">
+        <Sidebar agents={phase.agents} />
+        <div class="flex flex-1 flex-col overflow-hidden">
+          <UnifiedTranscript agents={phase.agents} />
+          <ComposeBar agents={phase.agents} />
+        </div>
+      </div>
     {/if}
   </div>
 </main>

@@ -28,10 +28,11 @@
 // listener boundary and threads it through. Tests can drive the reducers
 // with fixed timestamps for deterministic assertions.
 //
-// **Pass A scope:** this module is not yet wired into the UI. The
-// existing M1.5 AgentPane keeps using its private state until Pass B
-// performs the atomic UI migration. The module compiles, has its own
-// tests, and is ready for consumers — but no component imports it yet.
+// **UI integration** (Pass B): App.svelte calls `registerAgent` at
+// project-open time and on dynamic agent add. Sidebar / UnifiedTranscript
+// / ComposeBar components read `transcripts` / `runtimes` / `ui`
+// directly. ComposeBar drives `dispatchUserTurn` + Tauri `send_message`
+// + `failSendStart` on IPC error.
 
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { AgentId, AgentRecord, FailureKind, NormalizedEvent, TurnId } from "$lib/types";

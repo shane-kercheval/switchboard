@@ -90,44 +90,22 @@ export type NormalizedEvent =
   // the reducer's default arm absorbs it without rendering changes).
   | { type: "agent_idle"; agent_id: AgentId };
 
-// Synthetic reducer input — fired by the AgentPane's heartbeat timer when no
-// `content_chunk` activity has been observed for HEARTBEAT_TIMEOUT_MS while a
-// turn is in flight. The reducer treats it as a transition to "failed."
+// Synthetic reducer input — fired by the state module's heartbeat timer
+// when no per-turn activity has been observed for HEARTBEAT_TIMEOUT_MS
+// while a turn is in flight. The reducer treats it as a transition to
+// "failed."
 //
 // Lives on the reducer-input union (not the wire-format `NormalizedEvent`)
 // because it's frontend-synthesized, not emitted by the dispatcher. The
-// `at` timestamp is supplied by the caller (AgentPane) at fire time —
-// keeping the reducer pure (no `new Date()` inside `reduce()`).
+// `at` timestamp is supplied by the caller (the state module's timer
+// callback) at fire time — keeping the reducer pure (no `new Date()`
+// inside `reduce()`).
 export type HeartbeatTimeout = { type: "heartbeat_timeout"; turn_id: TurnId; at: string };
 
 export type ReducerInput = NormalizedEvent | HeartbeatTimeout;
 
-export type Turn =
-  | {
-      id: TurnId;
-      role: "user";
-      text: string;
-      submittedAt: string;
-    }
-  | {
-      id: TurnId;
-      role: "agent";
-      text: string;
-      status: "streaming" | "complete" | "failed";
-      error?: string;
-      // Cause of the failure when status is "failed". Preserved so M2's
-      // retry-policy UI can distinguish recoverable from non-recoverable
-      // failures (e.g., HarnessError → suggest retry; AdapterFailure →
-      // suggest "report bug"). Undefined for streaming/complete turns.
-      errorKind?: FailureKind;
-      startedAt: string;
-      endedAt?: string;
-    };
-
-export type AgentTranscript = {
-  agentId: AgentId;
-  turns: Turn[];
-};
+// Internal state types (Turn, AgentRuntime, etc.) live in
+// `src/lib/state/types.ts`. This file is wire-format-only.
 
 // Mirror of `crates/core::AgentRecord`. `session_id` is `null` for harnesses
 // that assign their own session ID (Codex — set to `null` for life; the

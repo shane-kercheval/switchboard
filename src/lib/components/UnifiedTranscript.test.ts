@@ -116,6 +116,44 @@ describe("UnifiedTranscript", () => {
     expect(turns[3]).toHaveTextContent("hey!");
   });
 
+  it("preserves insertion order on same-timestamp ties (no v4-random tie-breaker)", async () => {
+    // Same-agent same-timestamp: user turn + agent turn share started_at.
+    // User-turn ids are crypto.randomUUID (v4); agent ids are UUID v7.
+    // A lexicographic turn_id tie-breaker would order them randomly.
+    // Stable sort + transcripts[agent.id] insertion order keeps user
+    // first (it was appended first by dispatchUserTurn).
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "ffffffff-ffff-4fff-8fff-ffffffffffff", // v4-random shape; sorts AFTER v7 lex
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:00.000Z",
+        text: "prompt",
+      },
+      {
+        role: "agent",
+        turn_id: "00000000-0000-7000-8000-000000000001", // v7-time-ordered; sorts BEFORE the v4 above
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:00.000Z", // identical to user's
+        status: "complete",
+        items: [{ item_kind: "text", kind: "text", text: "response" }],
+      },
+    ];
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+
+    const turns = screen.getAllByTestId("turn");
+    // User must render before agent — preserved via stable sort over
+    // the insertion order in transcripts[CLAUDE_AGENT.id], NOT by
+    // turn_id comparison (which would put agent first because v7 < v4
+    // lexicographically).
+    expect(turns[0]).toHaveAttribute("data-role", "user");
+    expect(turns[1]).toHaveAttribute("data-role", "agent");
+  });
+
   it("attributes user turns to their recipient agent (You → agentname)", async () => {
     const state = await loadState();
     await state.registerAgent(CODEX_AGENT);

@@ -51,27 +51,35 @@
 
   async function handleSubmit(): Promise<void> {
     if (sendDisabled || recipientId === null) return;
-    const text = prompt.trim();
-    prompt = "";
+    const submittedText = prompt.trim();
     sendError = null;
 
     // Local UUID for the user-turn id — frontend-only, never crosses the
     // IPC boundary. Distinct from the backend-assigned turn_id (which is
     // the agent's response turn).
     const userTurnId = crypto.randomUUID();
-    dispatchUserTurn(recipientId, userTurnId, text);
+    dispatchUserTurn(recipientId, userTurnId, submittedText);
 
     try {
-      await api.sendMessage(recipientId, text);
-      // Success: TurnStart will arrive on the channel and flip
-      // run_status → "processing". Nothing to do here.
+      await api.sendMessage(recipientId, submittedText);
+      // Clear-only-if-unchanged: if the user typed new text during the
+      // in-flight window, preserve it. If the prompt still matches what
+      // we submitted, clear it for the next message. M4+ may disable
+      // the textarea during in-flight to remove this case entirely.
+      if (prompt.trim() === submittedText) {
+        prompt = "";
+      }
+      // TurnStart will arrive on the channel and flip run_status →
+      // "processing". Nothing further to do here.
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       sendError = message;
       // Restore sendability (starting → idle) so the user can retry.
       // Guarded inside the state module — no-op if TurnStart raced
       // ahead and the agent is already processing (in which case the
-      // IPC failure was spurious).
+      // IPC failure was spurious). Prompt text is preserved
+      // unconditionally on failure so the user can retry without
+      // retyping.
       failSendStart(recipientId, { message, kind: "adapter_failure" });
     }
   }

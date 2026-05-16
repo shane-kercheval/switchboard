@@ -66,6 +66,26 @@ export function transcriptReducer(
       const existing = findTurn(turns, input.turn_id);
       if (existing === undefined || existing.role !== "agent") return turns;
       if (existing.status !== "streaming") return turns;
+      // Coalesce adjacent text chunks of the same `kind` into a single
+      // TextChunk item. Real Claude streaming produces ~10-char chunks
+      // per content_chunk event; without coalescing the renderer turns a
+      // normal paragraph into N separately-rendered <div>s. A tool call
+      // between two text runs is NOT coalesced (it sits at its own
+      // index in `items`, preserving the text/tool/text ordering
+      // contract). Different ContentKind (text vs. thinking) stays
+      // separate so M3+ reasoning rendering doesn't accidentally fold
+      // into plain text.
+      const lastIndex = existing.items.length - 1;
+      const lastItem = lastIndex >= 0 ? existing.items[lastIndex] : undefined;
+      if (lastItem?.item_kind === "text" && lastItem.kind === input.kind) {
+        const updatedItems = [...existing.items];
+        updatedItems[lastIndex] = {
+          item_kind: "text",
+          kind: lastItem.kind,
+          text: lastItem.text + input.text,
+        };
+        return updateTurn(turns, input.turn_id, { ...existing, items: updatedItems });
+      }
       return updateTurn(turns, input.turn_id, {
         ...existing,
         items: [...existing.items, { item_kind: "text", kind: input.kind, text: input.text }],
@@ -179,11 +199,18 @@ export function transcriptReducer(
 export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): AgentRuntime {
   switch (input.type) {
     case "turn_start":
-      // run_status flips to "processing" on TurnStart, NOT on the
-      // user-clicked Send. Two reasons: (1) keeps the reducer pure (no
-      // distinction between "intent to send" and "send accepted"); (2) the
-      // dispatcher's `Busy` guard means a Send before `turn_start` is
-      // observationally indistinguishable from idle anyway.
+      // Backend-confirmed dispatch: `starting → processing`. The
+      // user-clicked Send transition (`idle → starting`) is driven by
+      // the `dispatchUserTurn` state-module action — caller-driven,
+      // outside the reducer. The reducer handles only the backend
+      // event side of the state machine. See `AgentRuntime.run_status`
+      // docstring in `./types.ts` for the full diagram.
+      //
+      // Sets unconditionally (not guarded on prior state): a regression
+      // that emitted `TurnStart` while the runtime was `idle` should
+      // still land on `processing` rather than silently dropping the
+      // event. `last_error` is cleared so a successful new dispatch
+      // doesn't surface stale failure state.
       return {
         ...runtime,
         run_status: "processing",

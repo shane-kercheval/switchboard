@@ -124,6 +124,84 @@ describe("ComposeBar", () => {
     expect(state.runtimes[AGENT_A.id]?.last_error?.message).toBe("backend exploded");
   });
 
+  it("preserves textarea text on send failure so the user can retry without retyping", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    invokeMock.mockRejectedValueOnce(new Error("network down"));
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { agents: [AGENT_A] } });
+
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "important prompt" } });
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("compose-send-error")).toBeInTheDocument();
+    });
+    // Textarea still has the original text — retry doesn't require retyping.
+    expect(textarea.value).toBe("important prompt");
+    // Send is enabled again (idle + non-empty prompt).
+    expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("clears textarea on send success when prompt is unchanged", async () => {
+    // Happy-path: user submits, IPC succeeds without the user typing
+    // anything new during the await, textarea clears for the next
+    // message.
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    invokeMock.mockResolvedValueOnce("turn-1");
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { agents: [AGENT_A] } });
+
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "hello" } });
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    // Wait for the post-await success branch to clear the prompt.
+    await waitFor(() => {
+      expect(textarea.value).toBe("");
+    });
+    // User turn is in the transcript; runtime is "starting" (TurnStart
+    // hasn't arrived yet — the listener events are separate).
+    expect((state.transcripts[AGENT_A.id] ?? []).length).toBe(1);
+  });
+
+  it("preserves new typing on send success when prompt has changed mid-await", async () => {
+    // Capture-and-compare pattern: if `prompt.trim() === submittedText`
+    // after the await, clear; otherwise preserve the user's new typing.
+    // This protects against the rare race where the user types new text
+    // during the IPC window and the send succeeds.
+    await loadState().then((s) => s.registerAgent(AGENT_A));
+    let resolveInvoke: (v: string) => void = () => {};
+    invokeMock.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveInvoke = resolve as (v: string) => void;
+        }),
+    );
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { agents: [AGENT_A] } });
+
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "first message" } });
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    // While the send is in flight, user types something new.
+    await fireEvent.input(textarea, { target: { value: "second draft" } });
+
+    // Send succeeds. Wait for the post-IPC microtask flush; the
+    // capture-and-compare branch sees `prompt !== submittedText` and
+    // leaves the new typing intact.
+    resolveInvoke("turn-1");
+    await waitFor(() => {
+      expect(textarea.value).toBe("second draft");
+    });
+  });
+
   it("optimistic user turn appears immediately on click, before IPC reply", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);

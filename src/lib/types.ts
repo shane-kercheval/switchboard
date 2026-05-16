@@ -86,8 +86,11 @@ export type NormalizedEvent =
   //   1. Channel-ordering: no further events arrive for this dispatch.
   //   2. Sendability: when this event is processed, a fresh send to the
   //      same agent will not return `Busy`.
-  // M2.5 will wire the compose-bar Send enablement off this event (today
-  // the reducer's default arm absorbs it without rendering changes).
+  // The frontend's compose-bar gates Send enablement on
+  // `runtimes[recipient].run_status === "idle"`; `agent_idle` is the
+  // sole event that flips `run_status` from `processing` back to `idle`
+  // (the only path out of `processing` — see `AgentRuntime.run_status`
+  // docstring in `src/lib/state/types.ts` for the full state machine).
   | { type: "agent_idle"; agent_id: AgentId };
 
 // Synthetic reducer input — fired by the state module's heartbeat timer

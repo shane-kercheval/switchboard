@@ -66,25 +66,58 @@ describe("transcriptReducer", () => {
   });
 
   describe("content_chunk → items", () => {
-    it("pushes a TextChunk to items on the matching streaming turn", () => {
+    it("coalesces adjacent same-kind text chunks into one TextChunk item", () => {
+      // Real Claude streaming arrives in many small chunks per content_chunk
+      // event. Coalescing means the renderer produces one paragraph <div>,
+      // not N separately-rendered single-line <div>s.
       let turns = reduce([], turnStart(TURN_1));
       turns = reduce(turns, contentChunk(TURN_1, "hello "));
       turns = reduce(turns, contentChunk(TURN_1, "world"));
       const turn = turns[0];
       if (turn?.role !== "agent") throw new Error("unreachable");
-      expect(turn.items).toEqual([
-        { item_kind: "text", kind: "text", text: "hello " },
-        { item_kind: "text", kind: "text", text: "world" },
-      ]);
+      expect(turn.items).toEqual([{ item_kind: "text", kind: "text", text: "hello world" }]);
     });
 
-    it("preserves chunk boundaries (does not concatenate)", () => {
+    it("does NOT coalesce across a tool item — preserves text/tool/text ordering", () => {
+      // The interleaving contract: a tool between two text runs sits at
+      // its own index. The two text runs stay as separate items even
+      // though they're the same kind, because they're not adjacent.
       let turns = reduce([], turnStart(TURN_1));
-      turns = reduce(turns, contentChunk(TURN_1, "alpha"));
-      turns = reduce(turns, contentChunk(TURN_1, "beta"));
+      turns = reduce(turns, contentChunk(TURN_1, "before "));
+      turns = reduce(turns, {
+        type: "tool_started",
+        turn_id: TURN_1,
+        tool_use_id: "tool-1",
+        kind: "builtin",
+        name: "Bash",
+        input: {},
+      });
+      turns = reduce(turns, contentChunk(TURN_1, "after"));
+      const turn = turns[0];
+      if (turn?.role !== "agent") throw new Error("unreachable");
+      expect(turn.items).toHaveLength(3);
+      expect(turn.items[0]).toMatchObject({ item_kind: "text", text: "before " });
+      expect(turn.items[1]).toMatchObject({ item_kind: "tool", tool_use_id: "tool-1" });
+      expect(turn.items[2]).toMatchObject({ item_kind: "text", text: "after" });
+    });
+
+    it("does NOT coalesce across different ContentKind (text vs thinking)", () => {
+      // M3+ reasoning rendering uses kind: "thinking". Coalescing
+      // would silently fold a thinking block into a preceding text
+      // chunk, breaking reasoning-aware UI.
+      let turns = reduce([], turnStart(TURN_1));
+      turns = reduce(turns, { type: "content_chunk", turn_id: TURN_1, kind: "text", text: "hi" });
+      turns = reduce(turns, {
+        type: "content_chunk",
+        turn_id: TURN_1,
+        kind: "thinking",
+        text: "ponder",
+      });
       const turn = turns[0];
       if (turn?.role !== "agent") throw new Error("unreachable");
       expect(turn.items).toHaveLength(2);
+      expect(turn.items[0]).toMatchObject({ kind: "text" });
+      expect(turn.items[1]).toMatchObject({ kind: "thinking" });
     });
 
     it("drops chunks for unknown turn_id", () => {

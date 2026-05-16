@@ -4,6 +4,7 @@
   import * as api from "$lib/api";
   import Banner from "$lib/components/Banner.svelte";
   import ComposeBar from "$lib/components/ComposeBar.svelte";
+  import AddAgentModal from "$lib/components/AddAgentModal.svelte";
   import CreateAgentForm from "$lib/components/CreateAgentForm.svelte";
   import type { AgentFormSubmit } from "$lib/components/CreateAgentForm.types";
   import DirectorySelector from "$lib/components/DirectorySelector.svelte";
@@ -132,20 +133,24 @@
     }
   }
 
-  async function handleCreateAgent(submission: AgentFormSubmit): Promise<void> {
+  /// Shared core: invoke the right Tauri command for the submission shape,
+  /// then call `registerAgent` to wire listeners. Throws on either failure
+  /// so the caller can surface the error in its phase-specific UI.
+  async function createOrAttachAndRegister(submission: AgentFormSubmit): Promise<AgentRecord> {
+    const agent =
+      submission.mode === "create"
+        ? await api.createAgent(submission.name, submission.harness)
+        : await api.attachAgent(submission.name, submission.harness, submission.existingSessionId);
+    await registerAgent(agent);
+    return agent;
+  }
+
+  async function handleCreateFirstAgent(submission: AgentFormSubmit): Promise<void> {
     if (phase.kind !== "no-agent") return;
     inlineError = null;
     busy = true;
     try {
-      const agent =
-        submission.mode === "create"
-          ? await api.createAgent(submission.name, submission.harness)
-          : await api.attachAgent(
-              submission.name,
-              submission.harness,
-              submission.existingSessionId,
-            );
-      await registerAgent(agent);
+      const agent = await createOrAttachAndRegister(submission);
       phase = {
         kind: "loaded",
         directory: phase.directory,
@@ -157,6 +162,42 @@
     } finally {
       busy = false;
     }
+  }
+
+  /// Loaded-phase add-agent handler. Appends to `phase.agents` immutably
+  /// (matches the rest of App.svelte's reassignment pattern and sidesteps
+  /// the question of whether `$state` deep-tracks array mutations through
+  /// a discriminated-union narrowing — it does, but reassign is clearer).
+  let addAgentOpen = $state<boolean>(false);
+  let addAgentError = $state<string | null>(null);
+  let addAgentBusy = $state<boolean>(false);
+
+  async function handleAddAgentFromLoaded(submission: AgentFormSubmit): Promise<void> {
+    if (phase.kind !== "loaded") return;
+    addAgentError = null;
+    addAgentBusy = true;
+    try {
+      const agent = await createOrAttachAndRegister(submission);
+      phase = {
+        ...phase,
+        agents: [...phase.agents, agent],
+      };
+      addAgentOpen = false;
+    } catch (err) {
+      addAgentError = err instanceof Error ? err.message : String(err);
+    } finally {
+      addAgentBusy = false;
+    }
+  }
+
+  function handleAddAgentCancel(): void {
+    addAgentOpen = false;
+    addAgentError = null;
+  }
+
+  function openAddAgent(): void {
+    addAgentError = null;
+    addAgentOpen = true;
   }
 
   function handleCancel(): void {
@@ -210,15 +251,22 @@
         onCancel={handleCancel}
       />
     {:else if phase.kind === "no-agent"}
-      <CreateAgentForm {busy} error={inlineError} onSubmit={handleCreateAgent} />
+      <CreateAgentForm {busy} error={inlineError} onSubmit={handleCreateFirstAgent} />
     {:else if phase.kind === "loaded"}
       <div class="flex flex-1 overflow-hidden" data-testid="loaded-layout">
-        <Sidebar agents={phase.agents} />
+        <Sidebar agents={phase.agents} onAddAgent={openAddAgent} />
         <div class="flex flex-1 flex-col overflow-hidden">
           <UnifiedTranscript agents={phase.agents} />
           <ComposeBar agents={phase.agents} />
         </div>
       </div>
+      <AddAgentModal
+        bind:open={addAgentOpen}
+        busy={addAgentBusy}
+        error={addAgentError}
+        onSubmit={handleAddAgentFromLoaded}
+        onCancel={handleAddAgentCancel}
+      />
     {/if}
   </div>
 </main>

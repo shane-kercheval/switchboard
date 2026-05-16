@@ -3,7 +3,10 @@
   import { runtimes, transcripts } from "$lib/state/index.svelte";
   import { cn } from "$lib/utils";
 
-  let { agents }: { agents: AgentRecord[] } = $props();
+  /// `onAddAgent` is the "+ Add agent" entry point in the sidebar header
+  /// (Pass C.1). Optional so existing callers + tests that don't pass it
+  /// continue rendering; when absent, the button isn't shown.
+  let { agents, onAddAgent }: { agents: AgentRecord[]; onAddAgent?: () => void } = $props();
 
   function statusLabel(status: "idle" | "starting" | "processing" | undefined): string {
     if (status === "starting" || status === "processing") return "processing";
@@ -61,9 +64,21 @@
 
 <aside class="flex w-64 flex-col border-r border-neutral-200 bg-neutral-50" data-testid="sidebar">
   <div
-    class="border-b border-neutral-200 px-4 py-3 text-xs font-semibold tracking-wide text-neutral-500 uppercase"
+    class="flex items-center justify-between border-b border-neutral-200 px-4 py-3 text-xs font-semibold tracking-wide text-neutral-500 uppercase"
   >
-    Agents
+    <span>Agents</span>
+    {#if onAddAgent}
+      <button
+        type="button"
+        class="rounded px-1.5 py-0.5 text-sm font-bold text-neutral-700 hover:bg-neutral-200"
+        title="Add agent"
+        aria-label="Add agent"
+        data-testid="sidebar-add-agent"
+        onclick={onAddAgent}
+      >
+        +
+      </button>
+    {/if}
   </div>
   <div class="flex-1 overflow-y-auto">
     {#if agents.length === 0}

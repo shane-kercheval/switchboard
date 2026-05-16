@@ -1,6 +1,6 @@
 import { vi, describe, it, expect, beforeEach, afterEach } from "vitest";
 import "@testing-library/jest-dom/vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/svelte";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import type { AgentRecord, DirectoryInfo, ProjectSummary } from "$lib/types";
 
 // App.svelte tests focus narrowly on the primary phase-transition routing
@@ -226,5 +226,102 @@ describe("App", () => {
       expect(screen.getByText("Open working directory")).toBeInTheDocument();
       expect(screen.queryByText("Working directory")).not.toBeInTheDocument();
     });
+  });
+
+  // M2.5 plan's "dynamic agent add" acceptance test. The first agent's
+  // session is already loaded; the user opens the sidebar "+" entry point,
+  // submits, and the new agent appears in the sidebar (and is registered
+  // in the state module so its events would flow on dispatch). The
+  // load-bearing property: the new agent's listener is wired before the
+  // phase transition completes, so an immediate dispatch wouldn't lose
+  // the first event.
+  it("loaded → add agent via sidebar modal: appends to phase.agents and registers a listener", async () => {
+    const SECOND_AGENT: AgentRecord = {
+      id: "44444444-4444-7000-8000-444444444444",
+      project_id: PROJECT.id,
+      name: "second",
+      harness: "codex",
+      session_id: null,
+      created_at: "2026-05-13T00:00:02Z",
+    };
+    setInvokeResponses({
+      check_claude_binary: null,
+      pick_directory: INFO_NO_SWITCHBOARD,
+      init_directory: { ...INFO_NO_SWITCHBOARD, has_switchboard: true },
+      create_project: PROJECT,
+      set_active_project: null,
+      list_agents: [],
+      create_agent: AGENT,
+    });
+    openDialogMock.mockResolvedValueOnce(PATH);
+
+    // Walk through to the loaded phase with one agent already present.
+    const App = (await import("./App.svelte")).default;
+    render(App);
+    await waitFor(() => expect(screen.getByText("Open working directory")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("Open working directory"));
+    await waitFor(() => expect(screen.getByTestId("confirm-init")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("confirm-init"));
+    await waitFor(() => expect(screen.getByTestId("confirm-create-agent")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("confirm-create-agent"));
+    await waitFor(() => expect(screen.getByTestId("loaded-layout")).toBeInTheDocument());
+
+    // listen() count at the loaded boundary — registerAgent wires one
+    // listener per agent. Captures the baseline so we can assert the
+    // second-agent registration adds exactly one more.
+    const listenCallsBeforeAdd = listenMock.mock.calls.length;
+
+    // Now swap create_agent to return the second agent for the next call.
+    // (setInvokeResponses replaces the dispatch table; preserve everything
+    // else.)
+    setInvokeResponses({
+      check_claude_binary: null,
+      pick_directory: INFO_NO_SWITCHBOARD,
+      init_directory: { ...INFO_NO_SWITCHBOARD, has_switchboard: true },
+      create_project: PROJECT,
+      set_active_project: null,
+      list_agents: [],
+      create_agent: SECOND_AGENT,
+    });
+
+    // Sidebar's "+" opens the modal. The modal renders a CreateAgentForm
+    // (embedded variant — same data-testid="confirm-create-agent").
+    await fireEvent.click(screen.getByTestId("sidebar-add-agent"));
+    await waitFor(() => expect(screen.getByTestId("dialog-content")).toBeInTheDocument());
+    // Scope queries to the modal — Sidebar also uses `data-testid="agent-name"`
+    // for each agent row, so a global getByTestId("agent-name") would match
+    // multiple after the modal opens.
+    const modal = screen.getByTestId("dialog-content");
+
+    // Default form values (mode=create, harness=claude_code, name=assistant)
+    // would collide with the existing agent's name. Change the name to
+    // something unique before submitting.
+    const nameInput = within(modal).getByTestId("agent-name") as HTMLInputElement;
+    await fireEvent.input(nameInput, { target: { value: "second" } });
+    await fireEvent.click(within(modal).getByTestId("harness-codex"));
+    await fireEvent.click(within(modal).getByTestId("confirm-create-agent"));
+
+    // The new agent should land in the sidebar (immutable phase update).
+    // Both agents render side-by-side; assert the second is now present.
+    await waitFor(() => {
+      const names = screen.getAllByTestId("agent-name");
+      expect(names.some((n) => n.textContent === "second")).toBe(true);
+    });
+
+    // Modal closes after successful submission.
+    expect(screen.queryByTestId("dialog-content")).not.toBeInTheDocument();
+
+    // create_agent IPC fired with the form's values (proves the modal's
+    // submission was correctly threaded through createOrAttachAndRegister).
+    const createAgentCalls = invokeMock.mock.calls.filter(([cmd]) => cmd === "create_agent");
+    expect(createAgentCalls).toHaveLength(2); // first agent + this one
+    expect(createAgentCalls[1]?.[1]).toEqual({ name: "second", harness: "codex" });
+
+    // Exactly one additional listener was registered — the load-bearing
+    // property for "immediately dispatch and no events miss." A regression
+    // that updated phase.agents without calling registerAgent would still
+    // render the sidebar but silently drop events.
+    expect(listenMock.mock.calls.length).toBe(listenCallsBeforeAdd + 1);
+    expect(listenMock.mock.calls.at(-1)?.[0]).toBe(`agent:${SECOND_AGENT.id}`);
   });
 });

@@ -8,9 +8,16 @@
     busy?: boolean;
     error?: string | null;
     onSubmit: (submission: AgentFormSubmit) => void;
+    /// Optional cancel callback. When provided, renders a Cancel button
+    /// alongside Submit AND switches to "embedded" layout (no page-fill
+    /// outer wrapper, no standalone heading) — the modal supplies its own
+    /// title and centering via `Dialog`. Absence of this prop means
+    /// "standalone phase" (the no-agent first-time flow), which keeps the
+    /// existing page-fill card layout.
+    onCancel?: () => void;
   };
 
-  let { busy = false, error = null, onSubmit }: Props = $props();
+  let { busy = false, error = null, onSubmit, onCancel }: Props = $props();
   let name = $state<string>("assistant");
   let harness = $state<HarnessKind>("claude_code");
   let mode = $state<"create" | "attach">("create");
@@ -54,107 +61,138 @@
   }
 </script>
 
-<div class="flex h-full flex-col items-center justify-center gap-6 p-8">
-  <div class="w-full max-w-md space-y-4 rounded-md border border-neutral-200 bg-neutral-50 p-6">
-    <div class="space-y-1">
-      <h2 class="text-lg font-semibold text-neutral-900">Create an agent</h2>
-      <p class="text-sm text-neutral-600">Agents live inside the active project.</p>
-    </div>
+<!--
+  Layout shape switches on whether `onCancel` was provided:
+  - **Standalone** (no `onCancel`): page-fill centered card + heading.
+    Used by the no-agent first-time flow.
+  - **Embedded** (`onCancel` provided): bare form fields. The modal
+    wrapper supplies its own title and centering via `Dialog`.
 
-    <div
-      class="flex gap-2 rounded-md border border-neutral-200 bg-white p-1"
-      role="tablist"
-      data-testid="mode-toggle"
+  The form-field block (mode toggle → harness → name → optional UUID →
+  error → action row) is identical across both layouts.
+-->
+{#snippet formBody()}
+  <div
+    class="flex gap-2 rounded-md border border-neutral-200 bg-white p-1"
+    role="tablist"
+    data-testid="mode-toggle"
+  >
+    <button
+      type="button"
+      class="flex-1 rounded px-2 py-1 text-xs font-medium {mode === 'create'
+        ? 'bg-neutral-900 text-white'
+        : 'text-neutral-700 hover:bg-neutral-100'}"
+      role="tab"
+      aria-selected={mode === "create"}
+      data-testid="mode-create"
+      onclick={() => selectMode("create")}
+      disabled={busy}
     >
-      <button
-        type="button"
-        class="flex-1 rounded px-2 py-1 text-xs font-medium {mode === 'create'
-          ? 'bg-neutral-900 text-white'
-          : 'text-neutral-700 hover:bg-neutral-100'}"
-        role="tab"
-        aria-selected={mode === "create"}
-        data-testid="mode-create"
-        onclick={() => selectMode("create")}
-        disabled={busy}
-      >
-        Create new
-      </button>
-      <button
-        type="button"
-        class="flex-1 rounded px-2 py-1 text-xs font-medium {mode === 'attach'
-          ? 'bg-neutral-900 text-white'
-          : 'text-neutral-700 hover:bg-neutral-100'}"
-        role="tab"
-        aria-selected={mode === "attach"}
-        data-testid="mode-attach"
-        onclick={() => selectMode("attach")}
-        disabled={busy}
-      >
-        Attach existing
-      </button>
-    </div>
+      Create new
+    </button>
+    <button
+      type="button"
+      class="flex-1 rounded px-2 py-1 text-xs font-medium {mode === 'attach'
+        ? 'bg-neutral-900 text-white'
+        : 'text-neutral-700 hover:bg-neutral-100'}"
+      role="tab"
+      aria-selected={mode === "attach"}
+      data-testid="mode-attach"
+      onclick={() => selectMode("attach")}
+      disabled={busy}
+    >
+      Attach existing
+    </button>
+  </div>
 
-    <fieldset class="space-y-1" disabled={busy}>
-      <legend class="text-xs text-neutral-600">Harness</legend>
-      <div class="flex gap-3 text-sm" data-testid="harness-picker">
-        <label class="flex items-center gap-1.5">
-          <input
-            type="radio"
-            name="harness"
-            value="claude_code"
-            checked={harness === "claude_code"}
-            onchange={() => (harness = "claude_code")}
-            data-testid="harness-claude"
-          />
-          Claude Code
-        </label>
-        <label class="flex items-center gap-1.5">
-          <input
-            type="radio"
-            name="harness"
-            value="codex"
-            checked={harness === "codex"}
-            onchange={() => (harness = "codex")}
-            data-testid="harness-codex"
-          />
-          Codex
-        </label>
-      </div>
-    </fieldset>
-
-    <label class="block space-y-1">
-      <span class="text-xs text-neutral-600">Agent name</span>
-      <Input bind:value={name} disabled={busy} data-testid="agent-name" />
-    </label>
-
-    {#if mode === "attach"}
-      <label class="block space-y-1">
-        <span class="text-xs text-neutral-600"> Existing session UUID </span>
-        <Input
-          bind:value={existingSessionId}
-          disabled={busy}
-          placeholder="00000000-0000-0000-0000-000000000000"
-          data-testid="attach-session-id"
+  <fieldset class="space-y-1" disabled={busy}>
+    <legend class="text-xs text-neutral-600">Harness</legend>
+    <div class="flex gap-3 text-sm" data-testid="harness-picker">
+      <label class="flex items-center gap-1.5">
+        <input
+          type="radio"
+          name="harness"
+          value="claude_code"
+          checked={harness === "claude_code"}
+          onchange={() => (harness = "claude_code")}
+          data-testid="harness-claude"
         />
-        {#if existingSessionId.trim() !== "" && !sessionIdValid}
-          <span class="block text-xs text-red-700" data-testid="attach-session-id-error">
-            Must be a UUID (8-4-4-4-12 hex characters).
-          </span>
-        {/if}
+        Claude Code
       </label>
-    {/if}
+      <label class="flex items-center gap-1.5">
+        <input
+          type="radio"
+          name="harness"
+          value="codex"
+          checked={harness === "codex"}
+          onchange={() => (harness = "codex")}
+          data-testid="harness-codex"
+        />
+        Codex
+      </label>
+    </div>
+  </fieldset>
 
-    {#if error}
-      <p class="text-xs text-red-700" data-testid="error">{error}</p>
-    {/if}
-    <div class="flex justify-end">
-      <Button data-testid="confirm-create-agent" disabled={!canSubmit} onclick={handleSubmit}>
-        {#if busy}
-          {mode === "create" ? "Creating…" : "Attaching…"}
-        {:else}
-          {mode === "create" ? "Create agent" : "Attach agent"}
-        {/if}
+  <label class="block space-y-1">
+    <span class="text-xs text-neutral-600">Agent name</span>
+    <Input bind:value={name} disabled={busy} data-testid="agent-name" />
+  </label>
+
+  {#if mode === "attach"}
+    <label class="block space-y-1">
+      <span class="text-xs text-neutral-600"> Existing session UUID </span>
+      <Input
+        bind:value={existingSessionId}
+        disabled={busy}
+        placeholder="00000000-0000-0000-0000-000000000000"
+        data-testid="attach-session-id"
+      />
+      {#if existingSessionId.trim() !== "" && !sessionIdValid}
+        <span class="block text-xs text-red-700" data-testid="attach-session-id-error">
+          Must be a UUID (8-4-4-4-12 hex characters).
+        </span>
+      {/if}
+    </label>
+  {/if}
+
+  {#if error}
+    <p class="text-xs text-red-700" data-testid="error">{error}</p>
+  {/if}
+  <div class="flex justify-end gap-2">
+    {#if onCancel}
+      <Button
+        variant="secondary"
+        data-testid="cancel-create-agent"
+        disabled={busy}
+        onclick={onCancel}
+      >
+        Cancel
       </Button>
+    {/if}
+    <Button data-testid="confirm-create-agent" disabled={!canSubmit} onclick={handleSubmit}>
+      {#if busy}
+        {mode === "create" ? "Creating…" : "Attaching…"}
+      {:else}
+        {mode === "create" ? "Create agent" : "Attach agent"}
+      {/if}
+    </Button>
+  </div>
+{/snippet}
+
+{#if onCancel}
+  <!-- Embedded: bare form, modal supplies its own title/centering. -->
+  <div class="space-y-4" data-testid="create-agent-form-embedded">
+    {@render formBody()}
+  </div>
+{:else}
+  <!-- Standalone: page-fill centered card + heading. -->
+  <div class="flex h-full flex-col items-center justify-center gap-6 p-8">
+    <div class="w-full max-w-md space-y-4 rounded-md border border-neutral-200 bg-neutral-50 p-6">
+      <div class="space-y-1">
+        <h2 class="text-lg font-semibold text-neutral-900">Create an agent</h2>
+        <p class="text-sm text-neutral-600">Agents live inside the active project.</p>
+      </div>
+      {@render formBody()}
     </div>
   </div>
-</div>
+{/if}

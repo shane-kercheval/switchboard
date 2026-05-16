@@ -242,7 +242,6 @@ function handleEvent(agentId: AgentId, event: NormalizedEvent): void {
   // boundary — the only legitimate `new Date()` call for tool-event
   // timestamps. Threaded to the reducer as `receivedAt`; reducers
   // themselves stay pure and deterministic.
-  // eslint-disable-next-line svelte/prefer-svelte-reactivity
   const receivedAt = new Date().toISOString();
 
   const priorTurns = transcripts[agentId] ?? [];

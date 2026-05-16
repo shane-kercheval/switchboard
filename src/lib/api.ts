@@ -47,6 +47,18 @@ export async function createAgent(name: string, harness: HarnessKind): Promise<A
   return await invoke<AgentRecord>("create_agent", { name, harness });
 }
 
+export async function attachAgent(
+  name: string,
+  harness: HarnessKind,
+  existingSessionId: string,
+): Promise<AgentRecord> {
+  return await invoke<AgentRecord>("attach_agent", {
+    name,
+    harness,
+    existingSessionId,
+  });
+}
+
 export async function listAgents(projectId?: ProjectId): Promise<AgentRecord[]> {
   return await invoke<AgentRecord[]>("list_agents", { projectId });
 }

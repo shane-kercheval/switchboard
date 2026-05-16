@@ -5,6 +5,7 @@
   import Banner from "$lib/components/Banner.svelte";
   import ComposeBar from "$lib/components/ComposeBar.svelte";
   import CreateAgentForm from "$lib/components/CreateAgentForm.svelte";
+  import type { AgentFormSubmit } from "$lib/components/CreateAgentForm.types";
   import DirectorySelector from "$lib/components/DirectorySelector.svelte";
   import Sidebar from "$lib/components/Sidebar.svelte";
   import UnifiedTranscript from "$lib/components/UnifiedTranscript.svelte";
@@ -131,15 +132,19 @@
     }
   }
 
-  async function handleCreateAgent(name: string): Promise<void> {
+  async function handleCreateAgent(submission: AgentFormSubmit): Promise<void> {
     if (phase.kind !== "no-agent") return;
     inlineError = null;
     busy = true;
     try {
-      // M2.3: the harness param became required. The "choose Claude vs
-      // Codex" UI lands in Pass C; until then new-agent creation defaults
-      // to Claude Code, matching the M1 flow.
-      const agent = await api.createAgent(name, "claude_code");
+      const agent =
+        submission.mode === "create"
+          ? await api.createAgent(submission.name, submission.harness)
+          : await api.attachAgent(
+              submission.name,
+              submission.harness,
+              submission.existingSessionId,
+            );
       await registerAgent(agent);
       phase = {
         kind: "loaded",

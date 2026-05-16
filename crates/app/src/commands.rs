@@ -88,6 +88,10 @@ pub async fn init_directory_impl(state: &AppState, path: &str) -> Result<Directo
         if rebinding {
             lock(&state.projects).clear();
             *lock(&state.active_project_id) = None;
+            // A pending one-shot from a prior directory's attach must not
+            // leak into the newly-bound directory's first dispatch — the
+            // agent_id wouldn't even resolve.
+            lock(&state.pending_first_dispatch).clear();
         }
         *current = Some(directory);
     }
@@ -164,6 +168,227 @@ pub fn create_agent_impl(
     Ok(project.register_agent(name, harness)?)
 }
 
+/// Attach an existing harness session (Claude Code or Codex) as a new
+/// Switchboard agent in the active project.
+///
+/// Validation order (all under the directory-level `registry_write` mutex
+/// so the cross-project session-id check + register form one atomic step):
+/// 1. Active project resolved.
+/// 2. `existing_session_id` parses as UUID.
+/// 3. Per-harness session-file existence under `home_dir`. For Codex,
+///    discovery also returns the parsed `YYYY-MM-DD` (the sidecar's
+///    `original_start_date_utc`).
+/// 4. Session-id collision scan across **all loaded projects** in the bound
+///    directory — Claude scans `AgentRecord.session_id`, Codex scans every
+///    project's `sessions/<agent_id>.jsonl` sidecar. Two `AgentRecord`s
+///    pointing at the same harness session is the same-session-parallel-
+///    invocation hazard (`docs/research/same-session-parallel-invocation.md`).
+/// 5. Register via the harness-specific `register_attached_*` method.
+/// 6. (Codex only) Append the first sidecar record with the discovered
+///    `original_start_date_utc`.
+/// 7. Insert the new `agent_id` into `pending_first_dispatch` so the next
+///    `send_message` runs with `is_first_dispatch_after_attach: true` —
+///    forces `SessionMeta` emission for the Codex sidebar.
+///
+/// `home_dir` is passed in (not resolved here) so tests can stage a temp
+/// directory without mutating process-wide `$HOME`. The Tauri command shim
+/// reads `$HOME` and forwards.
+pub fn attach_agent_impl(
+    state: &AppState,
+    name: &str,
+    harness: HarnessKind,
+    existing_session_id: &str,
+    home_dir: &Path,
+) -> Result<AgentRecord, AppError> {
+    let _write = lock(&state.registry_write);
+    let active = lock(&state.active_project_id).ok_or(AppError::NoActiveProject)?;
+    let project = lock(&state.projects)
+        .get(&active)
+        .cloned()
+        .ok_or(AppError::ProjectNotLoaded(active))?;
+    let directory = bound_directory(state)?;
+
+    let session_uuid = parse_uuid(existing_session_id)?;
+
+    let record = match harness {
+        HarnessKind::ClaudeCode => {
+            let expected = switchboard_harness::claude_session_file_path(
+                home_dir,
+                &directory.path,
+                &session_uuid,
+            );
+            if !expected.exists() {
+                return Err(AppError::SessionFileNotFound {
+                    harness,
+                    expected_path: expected.to_string_lossy().into_owned(),
+                });
+            }
+            check_claude_session_id_unique(state, &session_uuid)?;
+            project.register_attached_claude_agent(name, session_uuid)?
+        }
+        HarnessKind::Codex => {
+            let (_path, original_start_date_utc) =
+                switchboard_harness::find_codex_session_file_for_attach(
+                    home_dir,
+                    existing_session_id,
+                )
+                .map_err(map_codex_attach_lookup_error(harness, home_dir))?;
+            check_codex_session_id_unique(state, existing_session_id, &directory.path)?;
+            // Pre-mint the AgentId so we can write the sidecar **before**
+            // committing the registry record. If the sidecar write fails,
+            // the registry stays untouched — at worst an orphan sidecar
+            // file lands on disk, invisible to dispatch and the collision
+            // scan (which walks AgentRecords → looks up *their* sidecars,
+            // not the inverse). Inverted commit order, inverted blast
+            // radius vs. registry-first.
+            let new_agent_id = Uuid::now_v7();
+            let sidecar_path = switchboard_harness::codex::sidecar::sidecar_path(
+                &directory.path,
+                project.id,
+                new_agent_id,
+            );
+            let sidecar_record = switchboard_harness::codex::sidecar::SessionLinkRecord {
+                session_id: existing_session_id.to_owned(),
+                original_start_date_utc,
+                started_at: chrono::Utc::now(),
+            };
+            switchboard_harness::codex::sidecar::append_record(&sidecar_path, &sidecar_record)?;
+            project.register_attached_codex_agent_with_id(name, new_agent_id)?
+        }
+        _ => return Err(AppError::UnsupportedHarness),
+    };
+
+    lock(&state.pending_first_dispatch).insert(record.id);
+    Ok(record)
+}
+
+fn map_codex_attach_lookup_error(
+    harness: HarnessKind,
+    home_dir: &Path,
+) -> impl FnOnce(switchboard_harness::AttachLookupError) -> AppError + '_ {
+    move |err| match err {
+        switchboard_harness::AttachLookupError::NotFound { session_id } => {
+            let expected = home_dir
+                .join(".codex")
+                .join("sessions")
+                .join("*/*/*")
+                .join(format!("rollout-*-{session_id}.jsonl"));
+            AppError::SessionFileNotFound {
+                harness,
+                expected_path: expected.to_string_lossy().into_owned(),
+            }
+        }
+        switchboard_harness::AttachLookupError::Ambiguous { session_id, paths } => {
+            AppError::AmbiguousSessionFile { session_id, paths }
+        }
+        // `AttachLookupError` is `#[non_exhaustive]` across crate boundaries.
+        // A future variant we don't recognize lands here with a non-misleading
+        // message — not `SessionFileNotFound` (would mislead the user into
+        // looking for a missing file) and not `UnsupportedHarness` (would
+        // mis-route the cause). Logged so we notice the addition.
+        other => {
+            tracing::error!(error = ?other, "unhandled AttachLookupError variant — surfacing as AttachLookupFailed");
+            AppError::AttachLookupFailed {
+                message: other.to_string(),
+            }
+        }
+    }
+}
+
+/// Enumerate every project on disk under the bound directory, preferring
+/// the in-memory `state.projects` entry for already-loaded projects (avoids
+/// a redundant disk read of the same `config.yaml`). Unloaded projects are
+/// constructed via `directory.open_project(id)`, which is a pure read —
+/// it does **not** mutate `state.projects` or register any listeners.
+///
+/// Used by the attach-flow collision scans. A v1 directory typically holds
+/// a handful of projects so the disk cost is small; if a directory ever
+/// grows to dozens of projects, attach latency may become visible — flag
+/// as a future optimization (cache `Project` handles + invalidate on
+/// rebind), not a current concern.
+fn enumerate_all_projects(state: &AppState) -> Result<Vec<Project>, AppError> {
+    let directory = bound_directory(state)?;
+    let loaded = lock(&state.projects);
+    let mut all: Vec<Project> = Vec::new();
+    for summary in directory.list_projects()? {
+        if let Some(p) = loaded.get(&summary.id) {
+            all.push(p.clone());
+        } else {
+            all.push(directory.open_project(summary.id)?);
+        }
+    }
+    Ok(all)
+}
+
+/// Cross-project Claude session-id collision check. Walks every project on
+/// disk in the bound directory — not just `state.projects` — because an
+/// unloaded project's `AgentRecord` could still be opened later and
+/// dispatched concurrently, which is the same-session-parallel-invocation
+/// hazard the invariant is defending against. Held under `registry_write`
+/// so it's atomic with the subsequent register.
+fn check_claude_session_id_unique(state: &AppState, candidate: &Uuid) -> Result<(), AppError> {
+    for project in enumerate_all_projects(state)? {
+        for agent in project.list_agents()? {
+            if agent.session_id == Some(*candidate) {
+                return Err(AppError::SessionAlreadyAttached {
+                    existing_agent_id: agent.id,
+                    existing_agent_name: agent.name,
+                    existing_project_id: project.id,
+                    existing_project_name: project.config.name.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Cross-project Codex session-id collision check. Codex agents leave
+/// `AgentRecord.session_id = None`; the session-link sidecar at
+/// `<directory>/.switchboard/projects/<project-id>/sessions/<agent-id>.jsonl`
+/// is the system-of-record. Walks every project on disk in the bound
+/// directory.
+///
+/// **Loud-fail on corrupt sidecar.** Sidecars are Switchboard-owned JSONL;
+/// AGENTS.md's append-only-persistence invariant says Switchboard-owned
+/// corruption surfaces (typed error), not skip-with-warning. Skipping
+/// could let a duplicate attach through and violate same-session-uniqueness.
+/// The error is wrapped in `AttachBlockedByCorruption` so the user sees
+/// "the failure is about an *unrelated* agent's state, not your attach
+/// target."
+fn check_codex_session_id_unique(
+    state: &AppState,
+    candidate: &str,
+    directory: &Path,
+) -> Result<(), AppError> {
+    for project in enumerate_all_projects(state)? {
+        for agent in project.list_agents()? {
+            if agent.harness != HarnessKind::Codex {
+                continue;
+            }
+            let sidecar =
+                switchboard_harness::codex::sidecar::sidecar_path(directory, project.id, agent.id);
+            let latest =
+                switchboard_harness::codex::sidecar::read_latest(&sidecar).map_err(|source| {
+                    AppError::AttachBlockedByCorruption {
+                        path: sidecar.clone(),
+                        source,
+                    }
+                })?;
+            if let Some(record) = latest
+                && record.session_id == candidate
+            {
+                return Err(AppError::SessionAlreadyAttached {
+                    existing_agent_id: agent.id,
+                    existing_agent_name: agent.name,
+                    existing_project_id: project.id,
+                    existing_project_name: project.config.name.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn list_agents_impl(
     state: &AppState,
     project_id: Option<ProjectId>,
@@ -212,7 +437,15 @@ pub async fn send_message_impl(
         HarnessKind::Codex => state.codex_adapter.as_ref(),
         _ => return Err(AppError::UnsupportedHarness),
     };
-    let handle = state
+    // Drain the attach-flow one-shot **before** the awaited dispatch so the
+    // mutex never crosses an `.await`. Restore on pre-stream `Err` (binary
+    // missing, spawn failure) so a retry still forces `SessionMeta`. The
+    // mid-stream gap is documented on `AppState.pending_first_dispatch`.
+    let is_first_dispatch_after_attach = lock(&state.pending_first_dispatch).remove(&agent_id);
+    let options = switchboard_harness::DispatchOptions {
+        is_first_dispatch_after_attach,
+    };
+    let result = state
         .dispatcher
         .send_message(
             &agent,
@@ -220,14 +453,13 @@ pub async fn send_message_impl(
             prompt,
             adapter,
             Arc::clone(&state.emitter) as Arc<dyn EventEmitter>,
-            // Normal sends use defaults. The attach-existing-session flow
-            // (M2.5) will set DispatchOptions::is_first_dispatch_after_attach
-            // on the first post-attach dispatch so Codex agents emit
-            // SessionMeta and the sidebar populates.
-            switchboard_harness::DispatchOptions::default(),
+            options,
         )
-        .await?;
-    Ok(handle)
+        .await;
+    if is_first_dispatch_after_attach && result.is_err() {
+        lock(&state.pending_first_dispatch).insert(agent_id);
+    }
+    Ok(result?)
 }
 
 pub fn check_claude_binary_impl(state: &AppState) -> Result<(), AppError> {
@@ -318,15 +550,21 @@ mod tests {
         set_active_project_impl(&state, proj.id).unwrap();
         let agent = create_agent_impl(&state, "assistant", HarnessKind::ClaudeCode).unwrap();
 
+        // Simulate a stale attach-flow one-shot from the old directory.
+        lock(&state.pending_first_dispatch).insert(agent.id);
+
         // Rebind to a different directory.
         let info_b = init_directory_impl(&state, tmp_b.path().to_str().unwrap())
             .await
             .unwrap();
 
-        // Loaded-project state was cleared, active project unset.
+        // Loaded-project state was cleared, active project unset, and the
+        // pending one-shot drained — a stale agent_id from a previous
+        // directory's attach must not leak into the new binding.
         assert_eq!(info_b.projects.len(), 0);
         assert!(lock(&state.projects).is_empty());
         assert!(lock(&state.active_project_id).is_none());
+        assert!(lock(&state.pending_first_dispatch).is_empty());
 
         // The actual user-visible bug guard: sending to the old agent ID
         // now returns AgentNotFound (not a silent dispatch against the old
@@ -694,6 +932,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_first_dispatch_is_drained_on_successful_send() {
+        let (tmp, state, _) = fresh_state_with_mock();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let proj = create_project_impl(&state, "alpha").unwrap();
+        set_active_project_impl(&state, proj.id).unwrap();
+        let agent = create_agent_impl(&state, "a", HarnessKind::ClaudeCode).unwrap();
+        lock(&state.pending_first_dispatch).insert(agent.id);
+
+        let handle = send_message_impl(&state, agent.id, "hi").await.unwrap();
+        handle.join.await.unwrap();
+
+        assert!(
+            !lock(&state.pending_first_dispatch).contains(&agent.id),
+            "one-shot must be drained after a successful first post-attach dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_first_dispatch_is_restored_on_pre_stream_error() {
+        use switchboard_harness::MockScenario;
+        let failing: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::with_scenario(
+            MockScenario::DispatchFails,
+        ));
+        let emitter = Arc::new(RecordingEmitter::new());
+        let state = AppState::new(
+            Arc::clone(&failing),
+            Arc::clone(&failing),
+            emitter as Arc<dyn EventEmitter>,
+        );
+        let tmp = TempDir::new().unwrap();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let proj = create_project_impl(&state, "alpha").unwrap();
+        set_active_project_impl(&state, proj.id).unwrap();
+        let agent = create_agent_impl(&state, "a", HarnessKind::ClaudeCode).unwrap();
+        lock(&state.pending_first_dispatch).insert(agent.id);
+
+        let err = send_message_impl(&state, agent.id, "hi").await.unwrap_err();
+        assert!(matches!(err, AppError::Dispatcher(_)));
+        assert!(
+            lock(&state.pending_first_dispatch).contains(&agent.id),
+            "one-shot must be restored on pre-stream Err so a retry still forces SessionMeta"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_first_dispatch_unset_means_default_flag() {
+        // Sanity: agents that never went through attach get
+        // is_first_dispatch_after_attach=false (the default). Captured via a
+        // recording adapter so we can inspect the DispatchOptions.
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct RecordingAdapter {
+            saw_flag: Arc<AtomicBool>,
+        }
+
+        #[async_trait]
+        impl HarnessAdapter for RecordingAdapter {
+            fn probe(&self) -> Result<(), switchboard_harness::DispatchError> {
+                Ok(())
+            }
+            async fn dispatch(
+                &self,
+                _agent: &AgentRecord,
+                _cwd: &Path,
+                _prompt: &str,
+                turn_id: switchboard_harness::TurnId,
+                options: switchboard_harness::DispatchOptions,
+            ) -> Result<switchboard_harness::EventStream, switchboard_harness::DispatchError>
+            {
+                self.saw_flag
+                    .store(options.is_first_dispatch_after_attach, Ordering::SeqCst);
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                tokio::spawn(async move {
+                    let _ = tx.send(switchboard_harness::AdapterEvent::TurnEnd {
+                        turn_id,
+                        outcome: switchboard_harness::TurnOutcome::Completed,
+                        ended_at: chrono::Utc::now(),
+                        usage: None,
+                    });
+                });
+                Ok(Box::pin(
+                    tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
+                ))
+            }
+        }
+
+        let saw_flag = Arc::new(AtomicBool::new(false));
+        let adapter: Arc<dyn HarnessAdapter> = Arc::new(RecordingAdapter {
+            saw_flag: saw_flag.clone(),
+        });
+        let emitter = Arc::new(RecordingEmitter::new());
+        let state = AppState::new(
+            Arc::clone(&adapter),
+            Arc::clone(&adapter),
+            emitter as Arc<dyn EventEmitter>,
+        );
+        let tmp = TempDir::new().unwrap();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let proj = create_project_impl(&state, "alpha").unwrap();
+        set_active_project_impl(&state, proj.id).unwrap();
+        let agent_default = create_agent_impl(&state, "a", HarnessKind::ClaudeCode).unwrap();
+        let handle = send_message_impl(&state, agent_default.id, "hi")
+            .await
+            .unwrap();
+        handle.join.await.unwrap();
+        assert!(
+            !saw_flag.load(Ordering::SeqCst),
+            "default send must pass is_first_dispatch_after_attach=false"
+        );
+
+        // Now stash the flag and re-send for the same agent — adapter must see true.
+        lock(&state.pending_first_dispatch).insert(agent_default.id);
+        let handle = send_message_impl(&state, agent_default.id, "again")
+            .await
+            .unwrap();
+        handle.join.await.unwrap();
+        assert!(
+            saw_flag.load(Ordering::SeqCst),
+            "post-attach send must pass is_first_dispatch_after_attach=true"
+        );
+    }
+
+    #[tokio::test]
     async fn cross_project_concurrent_send_no_cross_talk() {
         let (tmp, state, emitter) = fresh_state_with_mock();
         init_directory_impl(&state, tmp.path().to_str().unwrap())
@@ -783,5 +1150,674 @@ mod tests {
     fn parse_uuid_rejects_garbage() {
         let err = parse_uuid("not-a-uuid").unwrap_err();
         assert!(matches!(err, AppError::InvalidUuid { .. }));
+    }
+
+    /// Stage a Claude session file under `home_dir` so it matches what the
+    /// adapter would expect for the given cwd + `session_id` pair. Returns the
+    /// staged path.
+    fn stage_claude_session_file(
+        home_dir: &Path,
+        cwd: &Path,
+        session_id: &Uuid,
+    ) -> std::path::PathBuf {
+        let canonical_cwd = cwd.canonicalize().unwrap();
+        let target =
+            switchboard_harness::claude_session_file_path(home_dir, &canonical_cwd, session_id);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "{}\n").unwrap();
+        target
+    }
+
+    /// Stage a Codex rollout file under `home_dir` for the given `session_id`
+    /// + date. Returns the staged path.
+    fn stage_codex_session_file(
+        home_dir: &Path,
+        date: chrono::NaiveDate,
+        session_id: &str,
+    ) -> std::path::PathBuf {
+        let dir = home_dir
+            .join(".codex")
+            .join("sessions")
+            .join(date.format("%Y").to_string())
+            .join(date.format("%m").to_string())
+            .join(date.format("%d").to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("rollout-1700000000000-{session_id}.jsonl"));
+        std::fs::write(&path, "{}\n").unwrap();
+        path
+    }
+
+    async fn fresh_state_with_active_project(
+        name: &str,
+    ) -> (TempDir, TempDir, AppState, switchboard_core::ProjectSummary) {
+        let tmp_workdir = TempDir::new().unwrap();
+        let tmp_home = TempDir::new().unwrap();
+        let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let emitter = Arc::new(RecordingEmitter::new());
+        let state = AppState::new(
+            Arc::clone(&mock),
+            Arc::clone(&mock),
+            emitter as Arc<dyn EventEmitter>,
+        );
+        init_directory_impl(&state, tmp_workdir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let proj = create_project_impl(&state, name).unwrap();
+        set_active_project_impl(&state, proj.id).unwrap();
+        (tmp_workdir, tmp_home, state, proj)
+    }
+
+    #[tokio::test]
+    async fn attach_claude_succeeds_when_session_file_exists() {
+        let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let session_id = Uuid::now_v7();
+        stage_claude_session_file(tmp_home.path(), tmp_workdir.path(), &session_id);
+
+        let record = attach_agent_impl(
+            &state,
+            "attached",
+            HarnessKind::ClaudeCode,
+            &session_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap();
+        assert_eq!(record.session_id, Some(session_id));
+        assert_eq!(record.harness, HarnessKind::ClaudeCode);
+        // pending_first_dispatch is populated so the first send forces SessionMeta.
+        assert!(lock(&state.pending_first_dispatch).contains(&record.id));
+    }
+
+    #[tokio::test]
+    async fn attach_claude_rejects_missing_session_file_with_expected_path() {
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let session_id = Uuid::now_v7();
+        let err = attach_agent_impl(
+            &state,
+            "attached",
+            HarnessKind::ClaudeCode,
+            &session_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap_err();
+        match err {
+            AppError::SessionFileNotFound {
+                harness,
+                expected_path,
+            } => {
+                assert_eq!(harness, HarnessKind::ClaudeCode);
+                assert!(expected_path.contains(&session_id.to_string()));
+                assert!(expected_path.contains(".claude"));
+            }
+            other => panic!("expected SessionFileNotFound, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_rejects_invalid_uuid() {
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let err = attach_agent_impl(
+            &state,
+            "attached",
+            HarnessKind::ClaudeCode,
+            "not-a-uuid",
+            tmp_home.path(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AppError::InvalidUuid { .. }));
+    }
+
+    #[tokio::test]
+    async fn attach_codex_succeeds_and_writes_sidecar() {
+        let (tmp_workdir, tmp_home, state, proj) = fresh_state_with_active_project("alpha").await;
+        let session_id = Uuid::now_v7();
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 5, 10).unwrap();
+        stage_codex_session_file(tmp_home.path(), date, &session_id.to_string());
+
+        let record = attach_agent_impl(
+            &state,
+            "attached-codex",
+            HarnessKind::Codex,
+            &session_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            record.session_id, None,
+            "Codex AgentRecord.session_id stays None"
+        );
+        assert!(lock(&state.pending_first_dispatch).contains(&record.id));
+
+        // Sidecar record exists with the discovered date.
+        let sidecar = switchboard_harness::codex::sidecar::sidecar_path(
+            tmp_workdir.path(),
+            proj.id,
+            record.id,
+        );
+        let latest = switchboard_harness::codex::sidecar::read_latest(&sidecar)
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.session_id, session_id.to_string());
+        assert_eq!(latest.original_start_date_utc, date);
+    }
+
+    #[tokio::test]
+    async fn attach_codex_rejects_missing_session_file() {
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let session_id = Uuid::now_v7();
+        let err = attach_agent_impl(
+            &state,
+            "attached-codex",
+            HarnessKind::Codex,
+            &session_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap_err();
+        match err {
+            AppError::SessionFileNotFound {
+                harness,
+                expected_path,
+            } => {
+                assert_eq!(harness, HarnessKind::Codex);
+                assert!(expected_path.contains(".codex"));
+                assert!(expected_path.contains("rollout-*"));
+            }
+            other => panic!("expected SessionFileNotFound, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_claude_rejects_cross_project_session_id_collision() {
+        // Two projects in the same directory. Attach session_id S in alpha;
+        // attempt to attach the same S in beta → SessionAlreadyAttached.
+        let (tmp_workdir, tmp_home, state, alpha) = fresh_state_with_active_project("alpha").await;
+        let beta = create_project_impl(&state, "beta").unwrap();
+        let session_id = Uuid::now_v7();
+        stage_claude_session_file(tmp_home.path(), tmp_workdir.path(), &session_id);
+
+        attach_agent_impl(
+            &state,
+            "attached",
+            HarnessKind::ClaudeCode,
+            &session_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap();
+
+        set_active_project_impl(&state, beta.id).unwrap();
+        let err = attach_agent_impl(
+            &state,
+            "attached",
+            HarnessKind::ClaudeCode,
+            &session_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap_err();
+        match err {
+            AppError::SessionAlreadyAttached {
+                existing_project_name,
+                existing_project_id,
+                ..
+            } => {
+                assert_eq!(existing_project_name, "alpha");
+                assert_eq!(existing_project_id, alpha.id);
+            }
+            other => panic!("expected SessionAlreadyAttached, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_claude_rejects_same_project_session_id_collision() {
+        let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let session_id = Uuid::now_v7();
+        stage_claude_session_file(tmp_home.path(), tmp_workdir.path(), &session_id);
+
+        attach_agent_impl(
+            &state,
+            "first",
+            HarnessKind::ClaudeCode,
+            &session_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap();
+        let err = attach_agent_impl(
+            &state,
+            "second",
+            HarnessKind::ClaudeCode,
+            &session_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AppError::SessionAlreadyAttached { .. }));
+    }
+
+    #[tokio::test]
+    async fn attach_codex_rejects_cross_project_session_id_collision() {
+        let (tmp_workdir, tmp_home, state, _alpha) = fresh_state_with_active_project("alpha").await;
+        let beta = create_project_impl(&state, "beta").unwrap();
+        let session_id = Uuid::now_v7();
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 5, 10).unwrap();
+        stage_codex_session_file(tmp_home.path(), date, &session_id.to_string());
+
+        attach_agent_impl(
+            &state,
+            "a",
+            HarnessKind::Codex,
+            &session_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap();
+
+        set_active_project_impl(&state, beta.id).unwrap();
+        let err = attach_agent_impl(
+            &state,
+            "b",
+            HarnessKind::Codex,
+            &session_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap_err();
+        // Discovery (existence check) runs before the sidecar collision scan
+        // — but here the collision IS the only failure surface (session file
+        // still exists). Confirm we surface the collision, not "not found."
+        match err {
+            AppError::SessionAlreadyAttached {
+                existing_project_name,
+                ..
+            } => {
+                assert_eq!(existing_project_name, "alpha");
+            }
+            other => panic!("expected SessionAlreadyAttached, got {other:?}"),
+        }
+
+        let _ = tmp_workdir;
+    }
+
+    #[tokio::test]
+    async fn attach_rejects_duplicate_name_in_active_project() {
+        let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        create_agent_impl(&state, "taken", HarnessKind::ClaudeCode).unwrap();
+        let session_id = Uuid::now_v7();
+        stage_claude_session_file(tmp_home.path(), tmp_workdir.path(), &session_id);
+
+        let err = attach_agent_impl(
+            &state,
+            "taken",
+            HarnessKind::ClaudeCode,
+            &session_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AppError::Core(switchboard_core::CoreError::DuplicateAgentName { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn attach_codex_surfaces_ambiguous_session_file() {
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let session_id = Uuid::now_v7();
+        let id_str = session_id.to_string();
+        stage_codex_session_file(
+            tmp_home.path(),
+            chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            &id_str,
+        );
+        stage_codex_session_file(
+            tmp_home.path(),
+            chrono::NaiveDate::from_ymd_opt(2026, 2, 2).unwrap(),
+            &id_str,
+        );
+
+        let err = attach_agent_impl(
+            &state,
+            "attached-codex",
+            HarnessKind::Codex,
+            &id_str,
+            tmp_home.path(),
+        )
+        .unwrap_err();
+        match err {
+            AppError::AmbiguousSessionFile {
+                session_id: id,
+                paths,
+            } => {
+                assert_eq!(id, id_str);
+                assert_eq!(paths.len(), 2);
+            }
+            other => panic!("expected AmbiguousSessionFile, got {other:?}"),
+        }
+    }
+
+    /// The sidecar-first commit ordering's load-bearing invariant:
+    /// when the registry append fails after the sidecar write succeeds,
+    /// the result is an *orphan sidecar with no `AgentRecord`* — invisible
+    /// to dispatch and to the collision scan — not an orphan `AgentRecord`
+    /// pointing at the wrong session (the failure mode the ordering
+    /// inverts). Without this test, a future regression that re-ordered
+    /// the ops would only surface via the docstring contradicting the
+    /// code.
+    ///
+    /// Trigger: name collision. The second attach uses a *different*
+    /// `session_id` so the collision scan passes; the sidecar write
+    /// (against a freshly-minted `AgentId`) succeeds; then
+    /// `register_attached_codex_agent_with_id` fails on the duplicate
+    /// name. Asserts: registry unchanged + an orphan sidecar exists on
+    /// disk referencing the second `session_id`.
+    #[tokio::test]
+    async fn attach_codex_register_failure_after_sidecar_write_leaves_orphan_not_partial() {
+        let (tmp_workdir, tmp_home, state, proj) = fresh_state_with_active_project("alpha").await;
+        let canonical_workdir = tmp_workdir.path().canonicalize().unwrap();
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 5, 10).unwrap();
+
+        let first_session = Uuid::now_v7();
+        stage_codex_session_file(tmp_home.path(), date, &first_session.to_string());
+        attach_agent_impl(
+            &state,
+            "taken",
+            HarnessKind::Codex,
+            &first_session.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap();
+
+        // Second attach: distinct session_id (collision scan passes) +
+        // colliding name (register fails after sidecar write).
+        let second_session = Uuid::now_v7();
+        stage_codex_session_file(tmp_home.path(), date, &second_session.to_string());
+        let err = attach_agent_impl(
+            &state,
+            "taken",
+            HarnessKind::Codex,
+            &second_session.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AppError::Core(switchboard_core::CoreError::DuplicateAgentName { .. })
+        ));
+
+        // Registry has exactly one "taken" — name uniqueness held.
+        let agents = list_agents_impl(&state, None).unwrap();
+        assert_eq!(
+            agents.iter().filter(|a| a.name == "taken").count(),
+            1,
+            "registry must not double-add on name collision"
+        );
+
+        // Sidecar dir has TWO files: the legitimate first attach's sidecar
+        // (pointing at first_session) and the orphan from the failed second
+        // attach (pointing at second_session). The orphan is invisible to
+        // dispatch (no AgentRecord with that id) and invisible to the
+        // collision scan (which walks AgentRecords → looks up *their*
+        // sidecars). Asserting both files exist pins the invariant.
+        let sessions_dir = canonical_workdir
+            .join(".switchboard")
+            .join("projects")
+            .join(proj.id.to_string())
+            .join("sessions");
+        let mut found_first = false;
+        let mut found_orphan_for_second = false;
+        for entry in std::fs::read_dir(&sessions_dir).unwrap().flatten() {
+            let content = std::fs::read_to_string(entry.path()).unwrap();
+            if content.contains(&first_session.to_string()) {
+                found_first = true;
+            }
+            if content.contains(&second_session.to_string()) {
+                found_orphan_for_second = true;
+            }
+        }
+        assert!(found_first, "first attach's sidecar must remain on disk");
+        assert!(
+            found_orphan_for_second,
+            "second attach's sidecar must remain as orphan after register failed (sidecar-first invariant)"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_codex_rejects_same_project_session_id_collision() {
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let session_id = Uuid::now_v7();
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 5, 10).unwrap();
+        stage_codex_session_file(tmp_home.path(), date, &session_id.to_string());
+
+        attach_agent_impl(
+            &state,
+            "first",
+            HarnessKind::Codex,
+            &session_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap();
+        let err = attach_agent_impl(
+            &state,
+            "second",
+            HarnessKind::Codex,
+            &session_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AppError::SessionAlreadyAttached { .. }));
+    }
+
+    /// Collision detection must scan **all on-disk projects**, not just
+    /// loaded ones. The hazard the invariant defends against: an unloaded
+    /// project's Claude `AgentRecord` can be opened later and dispatched
+    /// concurrently with a Switchboard agent in the currently-open project
+    /// that targets the same `session_id` — corrupting the harness session
+    /// per `docs/research/same-session-parallel-invocation.md`.
+    #[tokio::test]
+    async fn attach_claude_detects_collision_against_unloaded_project() {
+        // Phase 1: create project A in a fresh AppState, attach session-id S.
+        let tmp_workdir = TempDir::new().unwrap();
+        let tmp_home = TempDir::new().unwrap();
+        let session_id = Uuid::now_v7();
+        stage_claude_session_file(tmp_home.path(), tmp_workdir.path(), &session_id);
+
+        {
+            let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+            let emitter = Arc::new(RecordingEmitter::new());
+            let state_a = AppState::new(
+                Arc::clone(&mock),
+                Arc::clone(&mock),
+                emitter as Arc<dyn EventEmitter>,
+            );
+            init_directory_impl(&state_a, tmp_workdir.path().to_str().unwrap())
+                .await
+                .unwrap();
+            let proj_a = create_project_impl(&state_a, "alpha").unwrap();
+            set_active_project_impl(&state_a, proj_a.id).unwrap();
+            attach_agent_impl(
+                &state_a,
+                "attached",
+                HarnessKind::ClaudeCode,
+                &session_id.to_string(),
+                tmp_home.path(),
+            )
+            .unwrap();
+        } // state_a dropped — project A's registry is persisted but no longer loaded in any AppState.
+
+        // Phase 2: fresh AppState bound to the same directory. Only open
+        // project B; A is on disk but unloaded. Attempt to attach the same
+        // session-id in B → must detect the collision against A.
+        let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let emitter = Arc::new(RecordingEmitter::new());
+        let state_b = AppState::new(
+            Arc::clone(&mock),
+            Arc::clone(&mock),
+            emitter as Arc<dyn EventEmitter>,
+        );
+        init_directory_impl(&state_b, tmp_workdir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let proj_b = create_project_impl(&state_b, "beta").unwrap();
+        set_active_project_impl(&state_b, proj_b.id).unwrap();
+
+        let err = attach_agent_impl(
+            &state_b,
+            "attached",
+            HarnessKind::ClaudeCode,
+            &session_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap_err();
+        match err {
+            AppError::SessionAlreadyAttached {
+                existing_project_name,
+                ..
+            } => assert_eq!(existing_project_name, "alpha"),
+            other => {
+                panic!("expected SessionAlreadyAttached against unloaded project, got {other:?}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_codex_detects_collision_against_unloaded_project() {
+        let tmp_workdir = TempDir::new().unwrap();
+        let tmp_home = TempDir::new().unwrap();
+        let session_id = Uuid::now_v7();
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 5, 10).unwrap();
+        stage_codex_session_file(tmp_home.path(), date, &session_id.to_string());
+
+        {
+            let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+            let emitter = Arc::new(RecordingEmitter::new());
+            let state_a = AppState::new(
+                Arc::clone(&mock),
+                Arc::clone(&mock),
+                emitter as Arc<dyn EventEmitter>,
+            );
+            init_directory_impl(&state_a, tmp_workdir.path().to_str().unwrap())
+                .await
+                .unwrap();
+            let proj_a = create_project_impl(&state_a, "alpha").unwrap();
+            set_active_project_impl(&state_a, proj_a.id).unwrap();
+            attach_agent_impl(
+                &state_a,
+                "attached",
+                HarnessKind::Codex,
+                &session_id.to_string(),
+                tmp_home.path(),
+            )
+            .unwrap();
+        }
+
+        let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let emitter = Arc::new(RecordingEmitter::new());
+        let state_b = AppState::new(
+            Arc::clone(&mock),
+            Arc::clone(&mock),
+            emitter as Arc<dyn EventEmitter>,
+        );
+        init_directory_impl(&state_b, tmp_workdir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let proj_b = create_project_impl(&state_b, "beta").unwrap();
+        set_active_project_impl(&state_b, proj_b.id).unwrap();
+
+        let err = attach_agent_impl(
+            &state_b,
+            "attached",
+            HarnessKind::Codex,
+            &session_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap_err();
+        match err {
+            AppError::SessionAlreadyAttached {
+                existing_project_name,
+                ..
+            } => assert_eq!(existing_project_name, "alpha"),
+            other => {
+                panic!("expected SessionAlreadyAttached against unloaded project, got {other:?}")
+            }
+        }
+    }
+
+    /// Corruption in a Switchboard-owned sidecar must surface as
+    /// `AttachBlockedByCorruption`, not be silently skipped — otherwise the
+    /// collision scan could miss a real binding and let a duplicate attach
+    /// through. The error wrapping is intentional so the user sees that the
+    /// failure is about an unrelated agent's state, not the session they
+    /// were trying to attach.
+    #[tokio::test]
+    async fn attach_codex_fails_loud_on_corrupt_sidecar_in_other_project() {
+        let (tmp_workdir, tmp_home, state, proj) = fresh_state_with_active_project("alpha").await;
+
+        // Plant a Codex agent in alpha with a corrupt sidecar. Use the
+        // canonical bound-directory path (`Directory::at` canonicalizes;
+        // macOS resolves `/var` → `/private/var`, so the sidecar collision
+        // scan inside attach_agent_impl reads from the canonical path —
+        // we must too, for the path equality assertion below.
+        let canonical_workdir = tmp_workdir.path().canonicalize().unwrap();
+        let other_agent = proj_handle(&state, proj.id)
+            .register_attached_codex_agent_with_id("ghost", Uuid::now_v7())
+            .unwrap();
+        let bad_sidecar = switchboard_harness::codex::sidecar::sidecar_path(
+            &canonical_workdir,
+            proj.id,
+            other_agent.id,
+        );
+        std::fs::create_dir_all(bad_sidecar.parent().unwrap()).unwrap();
+        std::fs::write(&bad_sidecar, b"this is not json\n").unwrap();
+
+        // Attempt an unrelated attach. Stage a real Codex session file so
+        // the discovery phase passes — the failure must come from the
+        // collision-scan corruption check, not the discovery miss.
+        let new_session = Uuid::now_v7();
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 5, 10).unwrap();
+        stage_codex_session_file(tmp_home.path(), date, &new_session.to_string());
+
+        let err = attach_agent_impl(
+            &state,
+            "newcomer",
+            HarnessKind::Codex,
+            &new_session.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap_err();
+        match err {
+            AppError::AttachBlockedByCorruption { path, .. } => {
+                assert_eq!(path, bad_sidecar);
+            }
+            other => panic!("expected AttachBlockedByCorruption, got {other:?}"),
+        }
+    }
+
+    /// Look up a loaded `Project` handle by id from `state.projects`.
+    /// Test-only convenience for staging cross-project corruption without
+    /// re-opening the project via the public command surface.
+    fn proj_handle(state: &AppState, id: ProjectId) -> Project {
+        lock(&state.projects).get(&id).cloned().unwrap()
+    }
+
+    #[tokio::test]
+    async fn attach_without_active_project_errors() {
+        let (_tmp_workdir, tmp_home, state) = {
+            let tmp_workdir = TempDir::new().unwrap();
+            let tmp_home = TempDir::new().unwrap();
+            let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+            let emitter = Arc::new(RecordingEmitter::new());
+            let state = AppState::new(
+                Arc::clone(&mock),
+                Arc::clone(&mock),
+                emitter as Arc<dyn EventEmitter>,
+            );
+            init_directory_impl(&state, tmp_workdir.path().to_str().unwrap())
+                .await
+                .unwrap();
+            (tmp_workdir, tmp_home, state)
+        };
+        let err = attach_agent_impl(
+            &state,
+            "x",
+            HarnessKind::ClaudeCode,
+            &Uuid::now_v7().to_string(),
+            tmp_home.path(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AppError::NoActiveProject));
     }
 }

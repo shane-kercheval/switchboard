@@ -160,23 +160,34 @@ fn session_file_exists(cwd: &Path, session_id: &uuid::Uuid) -> bool {
 }
 
 /// Pure check — testable without touching the real `$HOME`.
-/// Claude Code stores sessions at `<home>/.claude/projects/<encoded-cwd>/<uuid>.jsonl`
-/// where the encoded cwd replaces both `/` and `.` with `-`. For example,
+fn session_exists_in(home: &Path, cwd: &Path, session_id: &uuid::Uuid) -> bool {
+    let Ok(canonical) = cwd.canonicalize() else {
+        return false;
+    };
+    claude_session_file_path(home, &canonical, session_id).exists()
+}
+
+/// Compute the canonical Claude Code session-file path. Claude Code stores
+/// sessions at `<home>/.claude/projects/<encoded-cwd>/<uuid>.jsonl` where the
+/// encoded cwd replaces both `/` and `.` with `-`. For example,
 /// `/Users/x/repo/.switchboard/projects/<id>` is encoded as
 /// `-Users-x-repo--switchboard-projects-<id>` — the leading dot of
 /// `.switchboard` becomes a dash, producing the double-dash `--switchboard`.
 /// The empirically-observed rule, confirmed against `~/.claude/projects/`
 /// listings for cwds containing dot-prefixed components.
-fn session_exists_in(home: &Path, cwd: &Path, session_id: &uuid::Uuid) -> bool {
-    let Ok(canonical) = cwd.canonicalize() else {
-        return false;
-    };
-    let encoded = encode_cwd(&canonical);
+///
+/// **Caller contract.** `cwd` must be a *canonical* absolute path (no
+/// symlinks, no `..`). The attach-flow caller resolves cwd via
+/// `Directory::at(...)` which canonicalizes; pass `directory.path` directly.
+/// Passing a non-canonical cwd produces a wrong encoding and the lookup will
+/// miss the real session file.
+#[must_use]
+pub fn claude_session_file_path(home: &Path, cwd: &Path, session_id: &uuid::Uuid) -> PathBuf {
+    let encoded = encode_cwd(cwd);
     home.join(".claude")
         .join("projects")
         .join(&encoded)
         .join(format!("{session_id}.jsonl"))
-        .exists()
 }
 
 /// Encodes a canonical absolute path the way Claude Code does for its

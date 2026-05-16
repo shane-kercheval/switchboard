@@ -158,6 +158,129 @@ fn pick_newest(mut matches: Vec<PathBuf>) -> Option<PathBuf> {
     }
 }
 
+/// Error from `find_codex_session_file_for_attach`. Distinct from
+/// `locate_session_file`'s "newest-mtime-wins" silent contract because the
+/// attach flow commits a Switchboard agent to one specific session file for
+/// its lifetime — picking arbitrarily on a multi-match (or silently failing
+/// on a miss) would bind to the wrong harness session and violate the
+/// session-id-uniqueness invariant.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum AttachLookupError {
+    /// No `rollout-*-<session_id>.jsonl` file exists under
+    /// `~/.codex/sessions/*/*/*/`.
+    #[error("no Codex session file found for session_id {session_id}")]
+    NotFound { session_id: String },
+    /// More than one `rollout-*-<session_id>.jsonl` file exists across the
+    /// date partitions. Impossible by Codex's design (UUIDs are unique by
+    /// construction); a real occurrence implies external anomaly (manual copy,
+    /// FS corruption). Surface to the user rather than picking arbitrarily.
+    #[error("ambiguous Codex session file for session_id {session_id}: {} candidates", paths.len())]
+    Ambiguous {
+        session_id: String,
+        paths: Vec<PathBuf>,
+    },
+}
+
+/// Locate the Codex session file for an *existing* `session_id`, scanning
+/// **all** date partitions under `~/.codex/sessions/`. Returns the file path
+/// and the parsed `YYYY-MM-DD` from the directory tree (load-bearing for the
+/// attach-flow sidecar's `original_start_date_utc`).
+///
+/// **Distinct from `locate_session_file`.** `locate_session_file` is used by
+/// post-turn enrichment, where the agent has already committed to a
+/// `session_id` + date pair (the sidecar carries both); silently picking
+/// newest-mtime on a duplicate is acceptable. This attach helper is used
+/// **before** registration commits, and the user is choosing which file to
+/// bind to — silent dup resolution would bind to the wrong file. Fail loud.
+///
+/// Scan strategy: `read_dir × 3` over `<home>/.codex/sessions/YYYY/MM/DD/`.
+/// Non-numeric directory names are silently skipped (defensive against
+/// `.DS_Store` and similar). The whole scan errors only if the root
+/// `~/.codex/sessions/` directory is unreadable; per-leaf read failures are
+/// skipped so a single permission-denied date dir doesn't blanket-fail the
+/// lookup.
+pub fn find_codex_session_file_for_attach(
+    home_dir: &Path,
+    session_id: &str,
+) -> Result<(PathBuf, NaiveDate), AttachLookupError> {
+    let root = home_dir.join(".codex").join("sessions");
+    let suffix = format!("-{session_id}.jsonl");
+    let mut matches: Vec<(PathBuf, NaiveDate)> = Vec::new();
+
+    let Ok(year_entries) = std::fs::read_dir(&root) else {
+        return Err(AttachLookupError::NotFound {
+            session_id: session_id.to_owned(),
+        });
+    };
+    for year_entry in year_entries.flatten() {
+        let Some(year) = parse_numeric_dir(&year_entry, 4) else {
+            continue;
+        };
+        let Ok(month_entries) = std::fs::read_dir(year_entry.path()) else {
+            continue;
+        };
+        for month_entry in month_entries.flatten() {
+            let Some(month) = parse_numeric_dir(&month_entry, 2) else {
+                continue;
+            };
+            let Ok(day_entries) = std::fs::read_dir(month_entry.path()) else {
+                continue;
+            };
+            for day_entry in day_entries.flatten() {
+                let Some(day) = parse_numeric_dir(&day_entry, 2) else {
+                    continue;
+                };
+                let Some(date) =
+                    NaiveDate::from_ymd_opt(i32::from(year), u32::from(month), u32::from(day))
+                else {
+                    continue;
+                };
+                let Ok(file_entries) = std::fs::read_dir(day_entry.path()) else {
+                    continue;
+                };
+                for file_entry in file_entries.flatten() {
+                    let path = file_entry.path();
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                        && name.starts_with("rollout-")
+                        && name.ends_with(&suffix)
+                    {
+                        matches.push((path, date));
+                    }
+                }
+            }
+        }
+    }
+
+    match matches.len() {
+        0 => Err(AttachLookupError::NotFound {
+            session_id: session_id.to_owned(),
+        }),
+        1 => Ok(matches.into_iter().next().expect("len==1 guaranteed")),
+        _ => {
+            // Sort for stable error output.
+            matches.sort_by(|a, b| a.0.cmp(&b.0));
+            Err(AttachLookupError::Ambiguous {
+                session_id: session_id.to_owned(),
+                paths: matches.into_iter().map(|(p, _)| p).collect(),
+            })
+        }
+    }
+}
+
+/// Parse a directory-entry name as a fixed-width zero-padded numeric (year=4,
+/// month/day=2). Returns None for non-numeric names (`.DS_Store`, `Thumbs.db`,
+/// stray files, etc.) and for unexpected widths. `u16` accommodates 4-digit
+/// years through 9999 — well past any realistic session date.
+fn parse_numeric_dir(entry: &std::fs::DirEntry, expected_width: usize) -> Option<u16> {
+    let name = entry.file_name();
+    let name_str = name.to_str()?;
+    if name_str.len() != expected_width || !name_str.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    name_str.parse().ok()
+}
+
 /// Read and parse the session file. Returns `Enrichment::default()` (all
 /// `None`) on any IO error or top-level corruption — per the harness-owned
 /// file skip-with-warning invariant in `AGENTS.md`. Individual malformed
@@ -596,6 +719,109 @@ not valid json
         // Pointed at today → not found (file is in yesterday's dir).
         let today = NaiveDate::from_ymd_opt(2026, 5, 16).unwrap();
         assert!(locate_session_file(tmp.path(), today, session_id).is_none());
+    }
+
+    fn write_rollout(tmp: &Path, date: NaiveDate, session_id: &str) -> PathBuf {
+        let dir = session_directory(tmp, date);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("rollout-1747000000000-{session_id}.jsonl"));
+        std::fs::write(&path, "{}\n").unwrap();
+        path
+    }
+
+    #[test]
+    fn find_for_attach_returns_path_and_parsed_date_on_single_match() {
+        let tmp = TempDir::new().unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 5, 15).unwrap();
+        let session_id = "019e2c5f-aaaa-7000-8000-000000000001";
+        let target = write_rollout(tmp.path(), date, session_id);
+
+        let (path, parsed_date) =
+            find_codex_session_file_for_attach(tmp.path(), session_id).unwrap();
+        assert_eq!(path, target);
+        assert_eq!(parsed_date, date);
+    }
+
+    #[test]
+    fn find_for_attach_scans_all_date_partitions() {
+        // The caller doesn't know the original spawn date; we walk the
+        // YYYY/MM/DD tree to find any match.
+        let tmp = TempDir::new().unwrap();
+        let session_id = "019e2c5f-bbbb-7000-8000-000000000002";
+        let date_old = NaiveDate::from_ymd_opt(2025, 12, 1).unwrap();
+        let _decoy = write_rollout(tmp.path(), date_old, "different-session-id");
+        let date_target = NaiveDate::from_ymd_opt(2026, 4, 20).unwrap();
+        let target = write_rollout(tmp.path(), date_target, session_id);
+
+        let (path, parsed_date) =
+            find_codex_session_file_for_attach(tmp.path(), session_id).unwrap();
+        assert_eq!(path, target);
+        assert_eq!(parsed_date, date_target);
+    }
+
+    #[test]
+    fn find_for_attach_returns_not_found_when_no_match() {
+        let tmp = TempDir::new().unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 5, 15).unwrap();
+        let _other = write_rollout(tmp.path(), date, "different-session-id");
+
+        let err = find_codex_session_file_for_attach(tmp.path(), "nope-session-id").unwrap_err();
+        assert!(
+            matches!(err, AttachLookupError::NotFound { ref session_id } if session_id == "nope-session-id")
+        );
+    }
+
+    #[test]
+    fn find_for_attach_returns_not_found_when_sessions_root_missing() {
+        // Empty tmp dir, no ~/.codex/sessions/ at all.
+        let tmp = TempDir::new().unwrap();
+        let err = find_codex_session_file_for_attach(tmp.path(), "any-id").unwrap_err();
+        assert!(matches!(err, AttachLookupError::NotFound { .. }));
+    }
+
+    #[test]
+    fn find_for_attach_fails_loud_on_ambiguous_match() {
+        // Same session_id under two date partitions — impossible by Codex's
+        // design (UUIDs are unique), but if it happens (manual copy, FS
+        // weirdness), attach must surface it rather than binding arbitrarily.
+        let tmp = TempDir::new().unwrap();
+        let session_id = "019e2c5f-cccc-7000-8000-000000000003";
+        let date_a = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let date_b = NaiveDate::from_ymd_opt(2026, 2, 2).unwrap();
+        let path_a = write_rollout(tmp.path(), date_a, session_id);
+        let path_b = write_rollout(tmp.path(), date_b, session_id);
+
+        let err = find_codex_session_file_for_attach(tmp.path(), session_id).unwrap_err();
+        match err {
+            AttachLookupError::Ambiguous {
+                session_id: id,
+                paths,
+            } => {
+                assert_eq!(id, session_id);
+                assert!(paths.contains(&path_a));
+                assert!(paths.contains(&path_b));
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn find_for_attach_skips_non_numeric_directory_entries() {
+        // Defensive: macOS .DS_Store at year/month/day levels must not break
+        // the scan. The valid rollout under a real numeric tree still resolves.
+        let tmp = TempDir::new().unwrap();
+        let sessions = tmp.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join(".DS_Store"), b"junk").unwrap();
+        std::fs::create_dir_all(sessions.join("not-a-year")).unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 5, 15).unwrap();
+        let session_id = "019e2c5f-dddd-7000-8000-000000000004";
+        let target = write_rollout(tmp.path(), date, session_id);
+
+        let (path, parsed_date) =
+            find_codex_session_file_for_attach(tmp.path(), session_id).unwrap();
+        assert_eq!(path, target);
+        assert_eq!(parsed_date, date);
     }
 
     /// Test sleeper that records each requested sleep duration without

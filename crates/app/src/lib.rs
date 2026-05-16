@@ -14,9 +14,10 @@ use switchboard_harness::{ClaudeCodeAdapter, CodexAdapter, HarnessAdapter, MockH
 use tauri::{Emitter, Manager, State};
 
 use crate::commands::{
-    DirectoryInfo, check_claude_binary_impl, check_codex_binary_impl, create_agent_impl,
-    create_project_impl, init_directory_impl, list_agents_impl, list_projects_impl,
-    open_project_impl, parse_uuid, pick_directory_impl, send_message_impl, set_active_project_impl,
+    DirectoryInfo, attach_agent_impl, check_claude_binary_impl, check_codex_binary_impl,
+    create_agent_impl, create_project_impl, init_directory_impl, list_agents_impl,
+    list_projects_impl, open_project_impl, parse_uuid, pick_directory_impl, send_message_impl,
+    set_active_project_impl,
 };
 use crate::state::AppState;
 
@@ -79,6 +80,20 @@ async fn create_agent(
     harness: HarnessKind,
 ) -> Result<AgentRecord, String> {
     create_agent_impl(state.inner(), &name, harness).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn attach_agent(
+    state: State<'_, AppState>,
+    name: String,
+    harness: HarnessKind,
+    existing_session_id: String,
+) -> Result<AgentRecord, String> {
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    attach_agent_impl(state.inner(), &name, harness, &existing_session_id, &home)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -189,6 +204,7 @@ pub fn run() {
             open_project,
             set_active_project,
             create_agent,
+            attach_agent,
             list_agents,
             send_message,
         ])

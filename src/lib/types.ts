@@ -79,7 +79,16 @@ export type NormalizedEvent =
       mcp_servers: McpServerStatus[];
       skills: string[];
       raw: unknown;
-    };
+    }
+  // Emitted by the dispatcher as the last event on the per-agent channel
+  // for a dispatch — immediately before the dispatcher's internal idle
+  // guard drops. Two contracts the frontend may rely on:
+  //   1. Channel-ordering: no further events arrive for this dispatch.
+  //   2. Sendability: when this event is processed, a fresh send to the
+  //      same agent will not return `Busy`.
+  // M2.5 will wire the compose-bar Send enablement off this event (today
+  // the reducer's default arm absorbs it without rendering changes).
+  | { type: "agent_idle"; agent_id: AgentId };
 
 // Synthetic reducer input — fired by the AgentPane's heartbeat timer when no
 // `content_chunk` activity has been observed for HEARTBEAT_TIMEOUT_MS while a

@@ -101,23 +101,30 @@ async fn send_message_emits_turn_start_before_content_chunks() {
     handle.join.await.unwrap();
 
     let events = emitter.snapshot();
-    // MockScenario::Streaming → 3 chunks + TurnEnd, plus dispatcher's TurnStart = 5.
-    assert_eq!(events.len(), 5);
+    // MockScenario::Streaming → 3 chunks + TurnEnd, plus dispatcher's
+    // TurnStart and dispatcher's AgentIdle = 6.
+    assert_eq!(events.len(), 6);
     assert_eq!(event_type(&events[0].1), "turn_start");
     assert_eq!(event_type(&events[1].1), "content_chunk");
     assert_eq!(event_type(&events[2].1), "content_chunk");
     assert_eq!(event_type(&events[3].1), "content_chunk");
     assert_eq!(event_type(&events[4].1), "turn_end");
+    assert_eq!(event_type(&events[5].1), "agent_idle");
 
     let expected_channel = format!("agent:{}", agent.id);
     for (name, _) in &events {
         assert_eq!(name, &expected_channel);
     }
 
-    // turn_id is consistent across the whole sequence.
+    // turn_id is consistent across the whole sequence — across turn-scoped
+    // variants only. AgentIdle is agent-scoped and carries `agent_id`
+    // instead of `turn_id`, so it's excluded from this check.
     let turn_id = extract_turn_id(&events[0].1);
     assert_eq!(turn_id, handle.turn_id);
     for (_, payload) in &events {
+        if event_type(payload) == "agent_idle" {
+            continue;
+        }
         assert_eq!(extract_turn_id(payload), turn_id);
     }
 
@@ -213,12 +220,13 @@ async fn concurrent_send_to_different_agents_both_succeed() {
     let events = emitter.snapshot();
     let a_count = events.iter().filter(|(n, _)| n == &channel_a).count();
     let b_count = events.iter().filter(|(n, _)| n == &channel_b).count();
-    assert_eq!(a_count, 5);
-    assert_eq!(b_count, 5);
+    // Per channel: TurnStart + 3 ContentChunks + TurnEnd + AgentIdle = 6.
+    assert_eq!(a_count, 6);
+    assert_eq!(b_count, 6);
     // Total = sum of per-channel counts — proves no events leaked to a
     // phantom third channel (which would be silently allowed by the
     // per-channel asserts alone).
-    assert_eq!(events.len(), 10);
+    assert_eq!(events.len(), 12);
 }
 
 #[tokio::test]
@@ -363,4 +371,75 @@ async fn dispatch_failure_emits_no_turn_start_and_leaves_agent_idle() {
         .unwrap();
     handle.join.await.unwrap();
     assert_eq!(dispatcher.agent_status(agent.id), Some(AgentStatus::Idle));
+}
+
+#[tokio::test]
+async fn agent_idle_is_last_event_and_unblocks_next_send() {
+    // Pins two load-bearing contracts of NormalizedEvent::AgentIdle (see
+    // `crates/harness/src/events.rs`):
+    //
+    //   (1) Channel-ordering: AgentIdle is the LAST event on the per-agent
+    //       channel for a dispatch — nothing follows it.
+    //   (2) Sendability: when the frontend processes AgentIdle, a fresh
+    //       send to the same agent succeeds without returning Busy. (The
+    //       dispatcher's guard drop happens after emit, but
+    //       fire-and-forget IPC means by the time the consumer reacts,
+    //       the drop has executed.)
+    //
+    // A regression that emitted AgentIdle out of order — or omitted it —
+    // would surface here as either (1) the last-event check failing or
+    // (2) the second send returning Busy.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let adapter = MockHarnessAdapter::new();
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+
+    let handle = dispatcher
+        .send_message(
+            &agent,
+            Path::new("/tmp/project"),
+            "first",
+            &adapter,
+            as_emitter(&emitter),
+        )
+        .await
+        .unwrap();
+    handle.join.await.unwrap();
+
+    let events = emitter.snapshot();
+    // Contract (1): last event on the channel is agent_idle.
+    let last = events.last().expect("at least one event emitted");
+    assert_eq!(
+        event_type(&last.1),
+        "agent_idle",
+        "AgentIdle must be the last event on the per-agent channel; got {:?}",
+        events
+            .iter()
+            .map(|(_, v)| event_type(v))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        last.1["agent_id"].as_str().unwrap(),
+        agent.id.to_string(),
+        "AgentIdle agent_id matches the dispatched agent"
+    );
+    // AgentIdle is also the ONLY agent_idle in the sequence.
+    let agent_idle_count = events
+        .iter()
+        .filter(|(_, v)| event_type(v) == "agent_idle")
+        .count();
+    assert_eq!(agent_idle_count, 1, "exactly one AgentIdle per dispatch");
+
+    // Contract (2): a fresh send to the same agent succeeds — no Busy.
+    let handle2 = dispatcher
+        .send_message(
+            &agent,
+            Path::new("/tmp/project"),
+            "second",
+            &adapter,
+            as_emitter(&emitter),
+        )
+        .await
+        .expect("second send must not return Busy after AgentIdle");
+    handle2.join.await.unwrap();
 }

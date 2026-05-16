@@ -258,7 +258,31 @@ async fn drain_stream(
             "drain_stream observed stream end without a terminal TurnEnd event — adapter contract violation; agent state restored to Idle"
         );
     }
-    // `guard` drops here regardless → agent returns to Idle via RAII.
+
+    // Emit `AgentIdle` as the last event on the per-agent channel for this
+    // dispatch, BEFORE the guard drops. Two invariants this ordering
+    // upholds for the frontend (see `NormalizedEvent::AgentIdle` doc):
+    // (1) channel-ordering — no further events arrive on this channel for
+    //     this dispatch (we're past the stream-drain loop);
+    // (2) sendability — by the time the frontend's IPC handler runs this
+    //     event, the guard drop below has executed (the emit is
+    //     fire-and-forget; the drop is synchronous), so a fresh send
+    //     observes `Idle`.
+    // Emitted unconditionally — even on the no-terminal-event path, the
+    // agent is genuinely idle once the stream drains, and the frontend
+    // needs the signal to re-enable Send for retry.
+    let idle = NormalizedEvent::AgentIdle { agent_id };
+    match serde_json::to_value(&idle) {
+        Ok(payload) => emitter.emit(&channel, payload),
+        Err(e) => {
+            tracing::error!(
+                agent_id = %agent_id,
+                error = %e,
+                "failed to serialize AgentIdle — skipping emit (should be unreachable)"
+            );
+        }
+    }
+    // `guard` drops here → agent returns to Idle via RAII.
     drop(guard);
 }
 

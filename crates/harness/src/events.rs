@@ -117,9 +117,14 @@ pub enum AdapterEvent {
     },
 }
 
-/// Wire format across the IPC boundary to the frontend. The dispatcher constructs
-/// `TurnStart` at dispatch time; adapter events lift into the remaining variants
-/// via `From<AdapterEvent>`.
+/// Wire format across the IPC boundary to the frontend.
+///
+/// **Variant sources.** `TurnStart` and `AgentIdle` are dispatcher-owned —
+/// neither exists on [`AdapterEvent`]. The dispatcher synthesizes them at
+/// well-defined lifecycle points: `TurnStart` before the adapter stream is
+/// established, `AgentIdle` after the stream drains and immediately before
+/// the dispatcher's `AgentIdleGuard` drops. Adapter events lift into the
+/// remaining variants via `From<AdapterEvent>`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[non_exhaustive]
@@ -165,6 +170,24 @@ pub enum NormalizedEvent {
         skills: Vec<String>,
         raw: serde_json::Value,
     },
+    /// Emitted by the dispatcher as the **last event on the per-agent
+    /// channel** for a dispatch — immediately before `AgentIdleGuard`
+    /// drops.
+    ///
+    /// Frontend consumers may rely on two contracts:
+    ///
+    /// 1. **Channel-ordering**: no further events arrive on this channel
+    ///    for this dispatch.
+    /// 2. **Sendability**: by the time the frontend processes `AgentIdle`,
+    ///    the dispatcher accepts a new send to this agent without
+    ///    returning `Busy`.
+    ///
+    /// Distinct from `TurnEnd`: `TurnEnd` is terminal for a turn,
+    /// `AgentIdle` is terminal for the per-agent channel for this dispatch.
+    /// For Codex agents, post-`TurnEnd` enrichment events
+    /// (`RateLimitEvent`, `SessionMeta`) flow between `TurnEnd` and
+    /// `AgentIdle`.
+    AgentIdle { agent_id: AgentId },
 }
 
 impl From<AdapterEvent> for NormalizedEvent {
@@ -488,6 +511,17 @@ mod tests {
         let value = serde_json::to_value(&event).unwrap();
         assert_eq!(value["type"], "rate_limit_event");
         assert_eq!(value["info"]["status"], "allowed");
+        let parsed: NormalizedEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, event);
+    }
+
+    #[test]
+    fn agent_idle_wire_shape() {
+        let agent_id = fresh_agent_id();
+        let event = NormalizedEvent::AgentIdle { agent_id };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["type"], "agent_idle");
+        assert_eq!(value["agent_id"], agent_id.to_string());
         let parsed: NormalizedEvent = serde_json::from_value(value).unwrap();
         assert_eq!(parsed, event);
     }

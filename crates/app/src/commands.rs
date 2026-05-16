@@ -726,8 +726,9 @@ mod tests {
         let ch_b = format!("agent:{}", agent_b.id);
         let a_count = events.iter().filter(|(n, _)| n == &ch_a).count();
         let b_count = events.iter().filter(|(n, _)| n == &ch_b).count();
-        assert_eq!(a_count, 5, "agent A's channel got the wrong event count");
-        assert_eq!(b_count, 5, "agent B's channel got the wrong event count");
+        // Per channel: TurnStart + 3 ContentChunks + TurnEnd + AgentIdle = 6.
+        assert_eq!(a_count, 6, "agent A's channel got the wrong event count");
+        assert_eq!(b_count, 6, "agent B's channel got the wrong event count");
     }
 
     #[tokio::test]

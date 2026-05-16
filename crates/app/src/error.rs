@@ -125,6 +125,17 @@ pub enum AppError {
     /// `SessionFileNotFound` / `AmbiguousSessionFile` shapes.
     #[error("attach session lookup failed: {message}")]
     AttachLookupFailed { message: String },
+
+    /// Subscription auth not detected for the harness. Best-effort
+    /// file-presence signal — see `check_codex_auth_impl` docstring for
+    /// the known false-positive case (stale `auth.json` with API-key-only
+    /// runtime config). Banner copy is actionable ("run `codex login`")
+    /// rather than diagnostic.
+    #[error("{harness:?} subscription auth not detected; expected at {expected_path}")]
+    AuthNotConfigured {
+        harness: HarnessKind,
+        expected_path: String,
+    },
 }
 
 impl AppError {

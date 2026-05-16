@@ -117,6 +117,28 @@ export type ReducerInput = NormalizedEvent | HeartbeatTimeout;
 // time.
 export type HarnessKind = "claude_code" | "codex";
 
+/// Result of the startup-time per-harness probes. `binary` is the
+/// `which`-on-PATH check; `auth` is the best-effort subscription-auth
+/// detection (Codex only — Claude's auth lives in the macOS keychain with
+/// no reliable file signal, deferred to v2 per the M2.5 plan).
+///
+/// `auth: "unsupported"` means "Switchboard does not attempt detection for
+/// this harness" — distinct from `"missing"` (we tried, file wasn't there).
+/// The frontend never shows an auth banner for an `"unsupported"` result.
+export type HarnessAvailability = {
+  harness: HarnessKind;
+  binary: "available" | "missing";
+  auth: "available" | "missing" | "unsupported";
+};
+
+/// Structured banner shape. The App.svelte banner-stack ordering rule:
+/// binary-missing banners first; for any harness whose binary is missing,
+/// the auth banner is suppressed (auth is irrelevant if the CLI isn't
+/// installed).
+export type HarnessBanner =
+  | { kind: "binary_missing"; harness: HarnessKind }
+  | { kind: "auth_missing"; harness: HarnessKind };
+
 export type AgentRecord = {
   id: AgentId;
   project_id: ProjectId;

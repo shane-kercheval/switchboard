@@ -470,6 +470,36 @@ pub fn check_codex_binary_impl(state: &AppState) -> Result<(), AppError> {
     state.codex_adapter.probe().map_err(AppError::Probe)
 }
 
+/// Best-effort Codex subscription-auth detection. Returns `Ok(())` if the
+/// auth file is present at the default location (`<home>/.codex/auth.json`),
+/// `Err(AppError::AuthNotConfigured)` otherwise.
+///
+/// **Known limitations** (per the M2.5 plan's "Acceptance language" — best
+/// effort, not robust):
+/// - **False positive on API-key-only setups.** A user with only
+///   `OPENAI_API_KEY` env var and no `codex login` may still have a stale
+///   `auth.json` from a prior login; we report "authenticated" but a real
+///   dispatch may surface an `AuthFailure`. The banner's actionable copy
+///   ("run `codex login`") is still correct guidance under that case.
+/// - **No Claude equivalent.** Claude Code on macOS stores OAuth tokens in
+///   the keychain; there's no on-disk file we can reliably probe. The plan
+///   explicitly defers robust Claude auth detection to v2.
+///
+/// `home_dir` is a parameter (not derived from `$HOME` inside) for the
+/// same testability reason as `attach_agent_impl` — the Tauri shim reads
+/// `$HOME` and forwards.
+pub fn check_codex_auth_impl(home_dir: &Path) -> Result<(), AppError> {
+    let auth_path = home_dir.join(".codex").join("auth.json");
+    if auth_path.exists() {
+        Ok(())
+    } else {
+        Err(AppError::AuthNotConfigured {
+            harness: HarnessKind::Codex,
+            expected_path: auth_path.to_string_lossy().into_owned(),
+        })
+    }
+}
+
 fn bound_directory(state: &AppState) -> Result<Directory, AppError> {
     lock(&state.directory)
         .as_ref()
@@ -779,6 +809,31 @@ mod tests {
     fn check_codex_binary_with_mock_adapter_returns_ok() {
         let (_tmp, state, _) = fresh_state_with_mock();
         assert!(check_codex_binary_impl(&state).is_ok());
+    }
+
+    #[test]
+    fn check_codex_auth_returns_ok_when_auth_json_exists() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".codex")).unwrap();
+        std::fs::write(tmp.path().join(".codex/auth.json"), "{}").unwrap();
+        assert!(check_codex_auth_impl(tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn check_codex_auth_returns_error_when_auth_json_missing() {
+        let tmp = TempDir::new().unwrap();
+        let err = check_codex_auth_impl(tmp.path()).unwrap_err();
+        match err {
+            AppError::AuthNotConfigured {
+                harness,
+                expected_path,
+            } => {
+                assert_eq!(harness, HarnessKind::Codex);
+                assert!(expected_path.contains(".codex"));
+                assert!(expected_path.ends_with("auth.json"));
+            }
+            other => panic!("expected AuthNotConfigured, got {other:?}"),
+        }
     }
 
     #[test]

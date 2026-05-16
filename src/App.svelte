@@ -12,7 +12,13 @@
   import UnifiedTranscript from "$lib/components/UnifiedTranscript.svelte";
   import WelcomeScreen from "$lib/components/WelcomeScreen.svelte";
   import { registerAgent } from "$lib/state/index.svelte";
-  import type { AgentRecord, DirectoryInfo, ProjectSummary } from "$lib/types";
+  import type {
+    AgentRecord,
+    DirectoryInfo,
+    HarnessAvailability,
+    HarnessBanner,
+    ProjectSummary,
+  } from "$lib/types";
   import { basename } from "$lib/utils";
 
   // App phase: drives which screen renders.
@@ -36,20 +42,74 @@
   let phase = $state<Phase>({ kind: "welcome" });
   let busy = $state<boolean>(false);
   let inlineError = $state<string | null>(null);
-  let banner = $state<string | null>(null);
 
-  // Startup binary probe. If it fails, show a non-blocking banner with the
-  // install link copy. UI flow proceeds either way — sending will fail until
-  // the user installs `claude` and reloads.
-  //
-  // (Pass D will extend this to per-harness banners — Claude + Codex
-  // independently, plus subscription-auth detection.)
-  onMount(async () => {
-    try {
-      await api.checkClaudeBinary();
-    } catch {
-      banner = "Claude Code not found on PATH. Install from https://claude.com/code";
+  /// Per-harness availability, populated by the startup probes. Drives
+  /// both the banner stack and the create-agent form's radio gating.
+  /// Initial state: optimistic ("available") until probes return — the
+  /// brief flicker is preferred over flashing all banners on first paint.
+  /// Claude auth is `"unsupported"` always (keychain-based on macOS; no
+  /// reliable file signal — deferred to v2 per the M2.5 plan).
+  let claudeAvailability = $state<HarnessAvailability>({
+    harness: "claude_code",
+    binary: "available",
+    auth: "unsupported",
+  });
+  let codexAvailability = $state<HarnessAvailability>({
+    harness: "codex",
+    binary: "available",
+    auth: "available",
+  });
+
+  /// Banner stack ordering: binary-missing first, then auth-missing.
+  /// Suppression rule: if a harness's binary is missing, its auth banner
+  /// is hidden (auth is irrelevant if the CLI isn't installed). Max two
+  /// banners visible (one per harness).
+  const banners = $derived.by((): HarnessBanner[] => {
+    const result: HarnessBanner[] = [];
+    for (const a of [claudeAvailability, codexAvailability]) {
+      if (a.binary === "missing") {
+        result.push({ kind: "binary_missing", harness: a.harness });
+      } else if (a.auth === "missing") {
+        result.push({ kind: "auth_missing", harness: a.harness });
+      }
     }
+    return result;
+  });
+
+  function bannerCopy(b: HarnessBanner): string {
+    if (b.kind === "binary_missing") {
+      return b.harness === "claude_code"
+        ? "Claude Code not found on PATH. Install from https://claude.com/code"
+        : "Codex not found on PATH. Install from https://github.com/openai/codex";
+    }
+    // auth_missing — Codex only (Claude auth detection unsupported).
+    return "Codex not authenticated — run `codex login` and reload Switchboard. (API-key-only auth is not supported.)";
+  }
+
+  function bannerTestid(b: HarnessBanner): string {
+    return `banner-${b.kind}-${b.harness}`;
+  }
+
+  // Startup probes. Each harness's binary + auth (where applicable) runs
+  // independently; failures populate the availability state and the
+  // `banners` $derived recomputes. UI flow proceeds regardless — sending
+  // to a missing-binary agent fails at dispatch with a typed error.
+  onMount(async () => {
+    const claudeBinary = api.checkClaudeBinary().then(
+      () => "available" as const,
+      () => "missing" as const,
+    );
+    const codexBinary = api.checkCodexBinary().then(
+      () => "available" as const,
+      () => "missing" as const,
+    );
+    const codexAuth = api.checkCodexAuth().then(
+      () => "available" as const,
+      () => "missing" as const,
+    );
+    const [cb, xb, xa] = await Promise.all([claudeBinary, codexBinary, codexAuth]);
+    claudeAvailability = { harness: "claude_code", binary: cb, auth: "unsupported" };
+    codexAvailability = { harness: "codex", binary: xb, auth: xa };
   });
 
   /// Register every agent in the loaded list with the state module before
@@ -220,9 +280,9 @@
 </script>
 
 <main class="flex h-full flex-col bg-white text-neutral-900">
-  {#if banner}
-    <Banner message={banner} />
-  {/if}
+  {#each banners as banner (bannerTestid(banner))}
+    <Banner message={bannerCopy(banner)} testid={bannerTestid(banner)} />
+  {/each}
   {#if breadcrumb}
     <div
       class="border-b border-neutral-200 px-4 py-2 text-xs text-neutral-600"
@@ -251,7 +311,13 @@
         onCancel={handleCancel}
       />
     {:else if phase.kind === "no-agent"}
-      <CreateAgentForm {busy} error={inlineError} onSubmit={handleCreateFirstAgent} />
+      <CreateAgentForm
+        {busy}
+        error={inlineError}
+        onSubmit={handleCreateFirstAgent}
+        {claudeAvailability}
+        {codexAvailability}
+      />
     {:else if phase.kind === "loaded"}
       <div class="flex flex-1 overflow-hidden" data-testid="loaded-layout">
         <Sidebar agents={phase.agents} onAddAgent={openAddAgent} />
@@ -264,6 +330,8 @@
         bind:open={addAgentOpen}
         busy={addAgentBusy}
         error={addAgentError}
+        {claudeAvailability}
+        {codexAvailability}
         onSubmit={handleAddAgentFromLoaded}
         onCancel={handleAddAgentCancel}
       />

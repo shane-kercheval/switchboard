@@ -89,24 +89,65 @@ describe("App", () => {
     _testing.reset();
   });
 
-  it("mounts and renders the welcome screen when the binary check succeeds", async () => {
-    setInvokeResponses({ check_claude_binary: null });
+  it("mounts and renders the welcome screen when all harness probes succeed", async () => {
+    setInvokeResponses({
+      check_claude_binary: null,
+      check_codex_binary: null,
+      check_codex_auth: null,
+    });
     const App = (await import("./App.svelte")).default;
     render(App);
     expect(screen.getByText("Switchboard")).toBeInTheDocument();
     expect(screen.getByText("Open working directory")).toBeInTheDocument();
     await waitFor(() => {
-      expect(screen.queryByTestId("binary-not-found-banner")).not.toBeInTheDocument();
+      expect(screen.queryByTestId(/^banner-/)).not.toBeInTheDocument();
     });
   });
 
-  it("renders the binary-not-found banner when the startup probe fails", async () => {
-    invokeMock.mockRejectedValueOnce(new Error("harness probe failed: harness binary not found"));
+  it("renders a Claude binary-missing banner when only the Claude probe fails", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "check_claude_binary")
+        throw new Error("harness probe failed: harness binary not found");
+      if (cmd === "check_codex_binary" || cmd === "check_codex_auth") return null;
+      throw new Error(`unexpected invoke call: ${cmd}`);
+    });
     const App = (await import("./App.svelte")).default;
     render(App);
     await waitFor(() => {
-      expect(screen.getByTestId("binary-not-found-banner")).toBeInTheDocument();
+      expect(screen.getByTestId("banner-binary_missing-claude_code")).toBeInTheDocument();
     });
+    // The other harness's banners must NOT show — independent per-harness state.
+    expect(screen.queryByTestId("banner-binary_missing-codex")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("banner-auth_missing-codex")).not.toBeInTheDocument();
+  });
+
+  it("renders a Codex auth-missing banner when only the Codex auth probe fails", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "check_codex_auth") throw new Error("auth not configured");
+      if (cmd === "check_claude_binary" || cmd === "check_codex_binary") return null;
+      throw new Error(`unexpected invoke call: ${cmd}`);
+    });
+    const App = (await import("./App.svelte")).default;
+    render(App);
+    await waitFor(() => {
+      expect(screen.getByTestId("banner-auth_missing-codex")).toBeInTheDocument();
+    });
+  });
+
+  it("suppresses Codex auth banner when Codex binary is also missing (auth is irrelevant)", async () => {
+    // Both Codex probes fail. Only the binary banner should show — the
+    // user can't act on the auth gap until they install the CLI.
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "check_codex_binary" || cmd === "check_codex_auth") throw new Error("missing");
+      if (cmd === "check_claude_binary") return null;
+      throw new Error(`unexpected invoke call: ${cmd}`);
+    });
+    const App = (await import("./App.svelte")).default;
+    render(App);
+    await waitFor(() => {
+      expect(screen.getByTestId("banner-binary_missing-codex")).toBeInTheDocument();
+    });
+    expect(screen.queryByTestId("banner-auth_missing-codex")).not.toBeInTheDocument();
   });
 
   it("welcome → directory-selector: clicking Open working directory invokes pick_directory and renders the selector", async () => {

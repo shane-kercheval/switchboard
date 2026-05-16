@@ -11,6 +11,7 @@
   /// dismiss path (ESC, overlay click, Cancel button, the form's own
   /// onCancel) collapses to the same handler.
   import type { AgentFormSubmit } from "./CreateAgentForm.types";
+  import type { HarnessAvailability } from "$lib/types";
   import CreateAgentForm from "./CreateAgentForm.svelte";
   import Dialog from "./ui/Dialog.svelte";
 
@@ -21,11 +22,21 @@
     error?: string | null;
     onSubmit: (submission: AgentFormSubmit) => void;
     onCancel: () => void;
+    claudeAvailability?: HarnessAvailability;
+    codexAvailability?: HarnessAvailability;
   };
 
-  let { open = $bindable(), busy = false, error = null, onSubmit, onCancel }: Props = $props();
+  let {
+    open = $bindable(),
+    busy = false,
+    error = null,
+    onSubmit,
+    onCancel,
+    claudeAvailability,
+    codexAvailability,
+  }: Props = $props();
 </script>
 
 <Dialog bind:open title="Add an agent" onClose={onCancel}>
-  <CreateAgentForm {busy} {error} {onSubmit} {onCancel} />
+  <CreateAgentForm {busy} {error} {onSubmit} {onCancel} {claudeAvailability} {codexAvailability} />
 </Dialog>

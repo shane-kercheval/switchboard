@@ -3,6 +3,33 @@ import "@testing-library/jest-dom/vitest";
 import { fireEvent, render, screen } from "@testing-library/svelte";
 import CreateAgentForm from "./CreateAgentForm.svelte";
 import type { AgentFormSubmit } from "./CreateAgentForm.types";
+import type { HarnessAvailability } from "$lib/types";
+
+const CLAUDE_AVAILABLE: HarnessAvailability = {
+  harness: "claude_code",
+  binary: "available",
+  auth: "unsupported",
+};
+const CLAUDE_BINARY_MISSING: HarnessAvailability = {
+  harness: "claude_code",
+  binary: "missing",
+  auth: "unsupported",
+};
+const CODEX_AVAILABLE: HarnessAvailability = {
+  harness: "codex",
+  binary: "available",
+  auth: "available",
+};
+const CODEX_BINARY_MISSING: HarnessAvailability = {
+  harness: "codex",
+  binary: "missing",
+  auth: "missing",
+};
+const CODEX_AUTH_MISSING: HarnessAvailability = {
+  harness: "codex",
+  binary: "available",
+  auth: "missing",
+};
 
 const VALID_UUID = "019e2c5f-aaaa-7000-8000-000000000001";
 
@@ -117,6 +144,93 @@ describe("CreateAgentForm", () => {
     await fireEvent.input(nameInput, { target: { value: "   " } });
     const submit = screen.getByTestId("confirm-create-agent") as HTMLButtonElement;
     expect(submit.disabled).toBe(true);
+  });
+
+  it("Codex binary missing: Codex radio disabled with tooltip; submit blocked", async () => {
+    const onSubmit = vi.fn();
+    render(CreateAgentForm, {
+      props: {
+        onSubmit,
+        claudeAvailability: CLAUDE_AVAILABLE,
+        codexAvailability: CODEX_BINARY_MISSING,
+      },
+    });
+    const codexRadio = screen.getByTestId("harness-codex") as HTMLInputElement;
+    expect(codexRadio.disabled).toBe(true);
+    // Tooltip lives on the wrapping label.
+    const codexLabel = codexRadio.closest("label");
+    expect(codexLabel?.getAttribute("title")).toContain("Codex not found on PATH");
+
+    // Claude radio still selectable + submit succeeds with Claude.
+    const claudeRadio = screen.getByTestId("harness-claude") as HTMLInputElement;
+    expect(claudeRadio.disabled).toBe(false);
+    await fireEvent.click(screen.getByTestId("confirm-create-agent"));
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
+      mode: "create",
+      name: "assistant",
+      harness: "claude_code",
+    } satisfies AgentFormSubmit);
+  });
+
+  it("Codex auth missing (binary available): Codex radio disabled; tooltip mentions codex login", async () => {
+    const onSubmit = vi.fn();
+    render(CreateAgentForm, {
+      props: {
+        onSubmit,
+        claudeAvailability: CLAUDE_AVAILABLE,
+        codexAvailability: CODEX_AUTH_MISSING,
+      },
+    });
+    const codexRadio = screen.getByTestId("harness-codex") as HTMLInputElement;
+    expect(codexRadio.disabled).toBe(true);
+    const codexLabel = codexRadio.closest("label");
+    expect(codexLabel?.getAttribute("title")).toContain("codex login");
+  });
+
+  it("Claude binary missing: Claude radio disabled, Codex remains selectable", async () => {
+    const onSubmit = vi.fn();
+    render(CreateAgentForm, {
+      props: {
+        onSubmit,
+        claudeAvailability: CLAUDE_BINARY_MISSING,
+        codexAvailability: CODEX_AVAILABLE,
+      },
+    });
+    const claudeRadio = screen.getByTestId("harness-claude") as HTMLInputElement;
+    expect(claudeRadio.disabled).toBe(true);
+    const codexRadio = screen.getByTestId("harness-codex") as HTMLInputElement;
+    expect(codexRadio.disabled).toBe(false);
+  });
+
+  it("selecting an unavailable harness shows inline gating message and disables submit", async () => {
+    const onSubmit = vi.fn();
+    render(CreateAgentForm, {
+      props: {
+        onSubmit,
+        claudeAvailability: CLAUDE_BINARY_MISSING,
+        codexAvailability: CODEX_AVAILABLE,
+      },
+    });
+    // Default selection is Claude (which is unavailable in this setup).
+    expect(screen.getByTestId("harness-unavailable")).toHaveTextContent(
+      "Claude Code not found on PATH",
+    );
+    const submit = screen.getByTestId("confirm-create-agent") as HTMLButtonElement;
+    expect(submit.disabled).toBe(true);
+  });
+
+  it("both harnesses available: no gating message, no radio disabled", () => {
+    const onSubmit = vi.fn();
+    render(CreateAgentForm, {
+      props: {
+        onSubmit,
+        claudeAvailability: CLAUDE_AVAILABLE,
+        codexAvailability: CODEX_AVAILABLE,
+      },
+    });
+    expect(screen.queryByTestId("harness-unavailable")).not.toBeInTheDocument();
+    expect((screen.getByTestId("harness-claude") as HTMLInputElement).disabled).toBe(false);
+    expect((screen.getByTestId("harness-codex") as HTMLInputElement).disabled).toBe(false);
   });
 
   it("mode toggle attach → create → attach clears the stale session-id and error", async () => {

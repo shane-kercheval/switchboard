@@ -3,8 +3,8 @@ use std::path::Path;
 use futures::StreamExt;
 use switchboard_core::{AgentRecord, HarnessKind};
 use switchboard_harness::{
-    AdapterEvent, ClaudeCodeAdapter, ContentKind, DispatchError, FailureKind, HarnessAdapter,
-    ToolKind, TurnOutcome,
+    AdapterEvent, ClaudeCodeAdapter, ContentKind, DispatchError, DispatchOptions, FailureKind,
+    HarnessAdapter, ToolKind, TurnOutcome,
 };
 use uuid::Uuid;
 
@@ -40,7 +40,13 @@ async fn collect_events(
 ) -> Vec<AdapterEvent> {
     let turn_id = Uuid::now_v7();
     let stream = adapter
-        .dispatch(agent, Path::new("/tmp"), fixture_path, turn_id)
+        .dispatch(
+            agent,
+            Path::new("/tmp"),
+            fixture_path,
+            turn_id,
+            DispatchOptions::default(),
+        )
         .await
         .expect("dispatch should succeed");
     stream.collect().await
@@ -265,7 +271,13 @@ async fn binary_not_found_returns_dispatch_error() {
     let agent = fake_agent();
     let turn_id = Uuid::now_v7();
     let result = bad_adapter
-        .dispatch(&agent, Path::new("/tmp"), "hi", turn_id)
+        .dispatch(
+            &agent,
+            Path::new("/tmp"),
+            "hi",
+            turn_id,
+            DispatchOptions::default(),
+        )
         .await;
     match result {
         Err(DispatchError::BinaryNotFound) => {}

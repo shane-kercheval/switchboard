@@ -16,7 +16,7 @@ use switchboard_core::{AgentRecord, HarnessKind};
 use switchboard_dispatcher::{
     AgentStatus, Dispatcher, DispatcherError, EventEmitter, RecordingEmitter,
 };
-use switchboard_harness::{MockHarnessAdapter, MockScenario, TurnId};
+use switchboard_harness::{DispatchOptions, MockHarnessAdapter, MockScenario, TurnId};
 use uuid::Uuid;
 
 fn agent_record() -> AgentRecord {
@@ -62,6 +62,7 @@ async fn send_message_idle_then_inflight_then_idle() {
             "hello",
             &adapter,
             as_emitter(&emitter),
+            DispatchOptions::default(),
         )
         .await
         .unwrap();
@@ -95,6 +96,7 @@ async fn send_message_emits_turn_start_before_content_chunks() {
             "hello",
             &adapter,
             as_emitter(&emitter),
+            DispatchOptions::default(),
         )
         .await
         .unwrap();
@@ -147,6 +149,7 @@ async fn concurrent_send_to_same_agent_returns_busy() {
             "first",
             &adapter,
             as_emitter(&emitter),
+            DispatchOptions::default(),
         )
         .await
         .unwrap();
@@ -159,6 +162,7 @@ async fn concurrent_send_to_same_agent_returns_busy() {
             "second",
             &adapter,
             as_emitter(&emitter),
+            DispatchOptions::default(),
         )
         .await;
     assert!(matches!(result, Err(DispatcherError::Busy)));
@@ -173,6 +177,7 @@ async fn concurrent_send_to_same_agent_returns_busy() {
             "third",
             &adapter,
             as_emitter(&emitter),
+            DispatchOptions::default(),
         )
         .await
         .unwrap();
@@ -194,6 +199,7 @@ async fn concurrent_send_to_different_agents_both_succeed() {
             "A's prompt",
             &adapter,
             as_emitter(&emitter),
+            DispatchOptions::default(),
         )
         .await
         .unwrap();
@@ -204,6 +210,7 @@ async fn concurrent_send_to_different_agents_both_succeed() {
             "B's prompt",
             &adapter,
             as_emitter(&emitter),
+            DispatchOptions::default(),
         )
         .await
         .unwrap();
@@ -243,6 +250,7 @@ async fn panic_in_producer_still_restores_agent_to_idle() {
             "will panic",
             &adapter,
             as_emitter(&emitter),
+            DispatchOptions::default(),
         )
         .await
         .unwrap();
@@ -295,6 +303,7 @@ async fn truncated_stream_without_turn_end_returns_to_idle() {
             "prompt",
             &adapter,
             as_emitter(&emitter),
+            DispatchOptions::default(),
         )
         .await
         .unwrap();
@@ -331,6 +340,7 @@ async fn dispatch_failure_emits_no_turn_start_and_leaves_agent_idle() {
             "won't dispatch",
             &adapter,
             as_emitter(&emitter),
+            DispatchOptions::default(),
         )
         .await;
 
@@ -366,6 +376,7 @@ async fn dispatch_failure_emits_no_turn_start_and_leaves_agent_idle() {
             "now works",
             &healthy_adapter,
             as_emitter(&emitter),
+            DispatchOptions::default(),
         )
         .await
         .unwrap();
@@ -401,6 +412,7 @@ async fn agent_idle_is_last_event_and_unblocks_next_send() {
             "first",
             &adapter,
             as_emitter(&emitter),
+            DispatchOptions::default(),
         )
         .await
         .unwrap();
@@ -438,6 +450,7 @@ async fn agent_idle_is_last_event_and_unblocks_next_send() {
             "second",
             &adapter,
             as_emitter(&emitter),
+            DispatchOptions::default(),
         )
         .await
         .expect("second send must not return Busy after AgentIdle");

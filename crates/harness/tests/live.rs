@@ -9,7 +9,7 @@ use std::path::Path;
 use futures::StreamExt;
 use switchboard_core::{AgentRecord, HarnessKind};
 use switchboard_harness::{
-    AdapterEvent, ClaudeCodeAdapter, CodexAdapter, HarnessAdapter, TurnOutcome,
+    AdapterEvent, ClaudeCodeAdapter, CodexAdapter, DispatchOptions, HarnessAdapter, TurnOutcome,
 };
 use uuid::Uuid;
 
@@ -37,6 +37,7 @@ async fn live_basic_turn_completes() {
             Path::new("/tmp"),
             "Reply with only the number 4 and nothing else.",
             turn_id,
+            DispatchOptions::default(),
         )
         .await
         .expect("dispatch should succeed with real claude");
@@ -96,7 +97,13 @@ async fn live_session_continuity_across_turns() {
 
     let turn1 = Uuid::now_v7();
     let stream1 = adapter
-        .dispatch(&agent1, Path::new("/tmp"), "Say ACK", turn1)
+        .dispatch(
+            &agent1,
+            Path::new("/tmp"),
+            "Say ACK",
+            turn1,
+            DispatchOptions::default(),
+        )
         .await
         .expect("first dispatch with fresh session_id should succeed");
     let events1: Vec<AdapterEvent> = stream1.collect().await;
@@ -124,7 +131,13 @@ async fn live_session_continuity_across_turns() {
 
     let turn2 = Uuid::now_v7();
     let stream2 = adapter
-        .dispatch(&agent2, Path::new("/tmp"), "Say ACK again", turn2)
+        .dispatch(
+            &agent2,
+            Path::new("/tmp"),
+            "Say ACK again",
+            turn2,
+            DispatchOptions::default(),
+        )
         .await
         .expect("second dispatch reusing session_id should succeed");
     let events2: Vec<AdapterEvent> = stream2.collect().await;
@@ -174,6 +187,7 @@ async fn live_codex_basic_turn_completes() {
             tmp.path(),
             "Reply with the single word 'ack' and nothing else.",
             turn_id,
+            DispatchOptions::default(),
         )
         .await
         .expect("dispatch should succeed with real codex");
@@ -296,6 +310,7 @@ async fn live_codex_resume_reuses_session() {
             tmp.path(),
             "Remember the word 'mango'. Reply with only 'ok'.",
             turn1,
+            DispatchOptions::default(),
         )
         .await
         .expect("first dispatch should succeed");
@@ -309,6 +324,7 @@ async fn live_codex_resume_reuses_session() {
             tmp.path(),
             "What word did I ask you to remember? Reply with only that word.",
             turn2,
+            DispatchOptions::default(),
         )
         .await
         .expect("resume dispatch should succeed");

@@ -3,8 +3,8 @@ use std::path::Path;
 use futures::StreamExt;
 use switchboard_core::{AgentRecord, HarnessKind};
 use switchboard_harness::{
-    AdapterEvent, FailureKind, HarnessAdapter, MockHarnessAdapter, MockScenario, TurnId,
-    TurnOutcome,
+    AdapterEvent, DispatchOptions, FailureKind, HarnessAdapter, MockHarnessAdapter, MockScenario,
+    TurnId, TurnOutcome,
 };
 use uuid::Uuid;
 
@@ -22,7 +22,13 @@ fn fake_agent() -> AgentRecord {
 async fn drain(adapter: &MockHarnessAdapter, prompt: &str) -> Vec<AdapterEvent> {
     let turn_id: TurnId = Uuid::now_v7();
     let stream = adapter
-        .dispatch(&fake_agent(), Path::new("/tmp"), prompt, turn_id)
+        .dispatch(
+            &fake_agent(),
+            Path::new("/tmp"),
+            prompt,
+            turn_id,
+            DispatchOptions::default(),
+        )
         .await
         .expect("mock dispatch should not fail");
     stream.collect().await
@@ -75,7 +81,13 @@ async fn mock_turn_ids_match_dispatch_argument() {
     let adapter = MockHarnessAdapter::new();
     let turn_id: TurnId = Uuid::now_v7();
     let stream = adapter
-        .dispatch(&fake_agent(), Path::new("/tmp"), "test", turn_id)
+        .dispatch(
+            &fake_agent(),
+            Path::new("/tmp"),
+            "test",
+            turn_id,
+            DispatchOptions::default(),
+        )
         .await
         .unwrap();
     let events: Vec<AdapterEvent> = stream.collect().await;
@@ -131,7 +143,13 @@ async fn streaming_scenario_does_not_return_dispatch_error() {
     let adapter = MockHarnessAdapter::new();
     let turn_id: TurnId = Uuid::now_v7();
     let result = adapter
-        .dispatch(&fake_agent(), Path::new("/tmp"), "test", turn_id)
+        .dispatch(
+            &fake_agent(),
+            Path::new("/tmp"),
+            "test",
+            turn_id,
+            DispatchOptions::default(),
+        )
         .await;
     assert!(result.is_ok(), "mock should never return a DispatchError");
 }

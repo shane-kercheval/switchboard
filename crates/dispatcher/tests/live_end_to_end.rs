@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use switchboard_core::{Directory, HarnessKind};
 use switchboard_dispatcher::{Dispatcher, EventEmitter, RecordingEmitter};
-use switchboard_harness::{ClaudeCodeAdapter, HarnessAdapter};
+use switchboard_harness::{ClaudeCodeAdapter, DispatchOptions, HarnessAdapter};
 use tempfile::TempDir;
 
 /// Extracts the `outcome.status` strings from every `turn_end` event the
@@ -89,6 +89,7 @@ async fn live_full_stack_two_consecutive_turns_succeed() {
             "Reply with exactly the word: ack",
             adapter.as_ref(),
             Arc::clone(&emitter) as Arc<dyn EventEmitter>,
+            DispatchOptions::default(),
         )
         .await
         .expect("first send_message");
@@ -105,6 +106,7 @@ async fn live_full_stack_two_consecutive_turns_succeed() {
             "And again, exactly: ack",
             adapter.as_ref(),
             Arc::clone(&emitter) as Arc<dyn EventEmitter>,
+            DispatchOptions::default(),
         )
         .await
         .expect("second send_message");
@@ -149,6 +151,7 @@ async fn live_full_stack_emits_turn_start_then_content_then_turn_end() {
             "Reply with exactly: hi",
             adapter.as_ref(),
             Arc::clone(&emitter) as Arc<dyn EventEmitter>,
+            DispatchOptions::default(),
         )
         .await
         .expect("send_message");
@@ -217,6 +220,7 @@ async fn live_full_stack_paths_with_dot_components_resolve_correctly() {
                 prompt,
                 adapter.as_ref(),
                 Arc::clone(&emitter) as Arc<dyn EventEmitter>,
+                DispatchOptions::default(),
             )
             .await
             .unwrap_or_else(|e| panic!("send_message #{} failed: {e:?}", i + 1));
@@ -276,6 +280,7 @@ async fn live_full_stack_claude_sees_files_in_cwd() {
             "Read the file MARKER.txt in the current directory and tell me what string it contains. Reply with just the string, nothing else.",
             adapter.as_ref(),
             Arc::clone(&emitter) as Arc<dyn EventEmitter>,
+            DispatchOptions::default(),
         )
         .await
         .expect("send_message");

@@ -64,7 +64,12 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         cwd: &Path,
         prompt: &str,
         turn_id: TurnId,
+        _options: crate::DispatchOptions,
     ) -> Result<EventStream, DispatchError> {
+        // Claude Code emits `SessionMeta` from its `system/init` stream
+        // event on every dispatch — no first-turn gating — so the
+        // attach-flow override has nothing to do here. `_options` is
+        // accepted for trait conformance and intentionally unused.
         let binary = crate::subprocess::resolve_binary(&self.claude_binary_path)?;
         let args = build_args(agent, prompt, cwd, None);
 

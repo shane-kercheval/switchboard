@@ -77,6 +77,7 @@ impl HarnessAdapter for MockHarnessAdapter {
         _cwd: &Path,
         prompt: &str,
         turn_id: TurnId,
+        _options: crate::DispatchOptions,
     ) -> Result<EventStream, DispatchError> {
         if matches!(self.scenario, MockScenario::DispatchFails) {
             return Err(DispatchError::BinaryNotFound);

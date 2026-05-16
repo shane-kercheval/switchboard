@@ -127,10 +127,13 @@ impl Dispatcher {
         prompt: &str,
         adapter: &dyn HarnessAdapter,
         emitter: Arc<dyn EventEmitter>,
+        options: switchboard_harness::DispatchOptions,
     ) -> Result<DispatchHandle, DispatcherError> {
         let guard = AgentIdleGuard::acquire(Arc::clone(self), agent.id)?;
         let turn_id: TurnId = Uuid::now_v7();
-        let stream = adapter.dispatch(agent, cwd, prompt, turn_id).await?;
+        let stream = adapter
+            .dispatch(agent, cwd, prompt, turn_id, options)
+            .await?;
 
         let channel = channel_name(agent.id);
         let start = NormalizedEvent::TurnStart {

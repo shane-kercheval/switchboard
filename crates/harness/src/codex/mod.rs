@@ -113,6 +113,7 @@ impl HarnessAdapter for CodexAdapter {
         cwd: &Path,
         prompt: &str,
         turn_id: TurnId,
+        options: crate::DispatchOptions,
     ) -> Result<EventStream, DispatchError> {
         let binary = crate::subprocess::resolve_binary(&self.codex_binary_path)?;
         // Sidecar path: <cwd>/.switchboard/projects/<project-id>/sessions/<agent-id>.jsonl.
@@ -152,6 +153,14 @@ impl HarnessAdapter for CodexAdapter {
         let agent_id = agent.id;
         let home_dir = resolve_home_dir(self.home_dir_override.as_deref());
 
+        // SessionMeta-emission gate: normally first-dispatch-of-an-agent
+        // (no prior sidecar). The attach flow pre-writes a sidecar at
+        // attach time, so without this override the first post-attach
+        // dispatch would be misclassified as a resume and SessionMeta
+        // would never fire for the attached agent's sidebar. Caller signals
+        // "treat this as first turn" via DispatchOptions.
+        let force_session_meta = options.is_first_dispatch_after_attach;
+
         tokio::spawn(run_producer(
             child,
             stdout,
@@ -163,6 +172,7 @@ impl HarnessAdapter for CodexAdapter {
             prior,
             home_dir,
             cwd.to_owned(),
+            force_session_meta,
         ));
 
         Ok(Box::pin(UnboundedReceiverStream::new(rx)))
@@ -236,6 +246,7 @@ async fn run_producer(
     prior: Option<SessionLinkRecord>,
     home_dir: PathBuf,
     cwd: PathBuf,
+    force_session_meta: bool,
 ) {
     let stderr_tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::with_capacity(
         crate::subprocess::STDERR_TAIL_CAPACITY,
@@ -332,6 +343,13 @@ async fn run_producer(
                                 terminal_was_completed = true;
                             }
                             terminal_seen = true;
+                            // First-turn gate. Normal case: no prior sidecar
+                            // record. Attach-flow case: prior is Some but the
+                            // caller explicitly signals "treat as first turn"
+                            // via DispatchOptions, so the sidebar's
+                            // MCP/skills/model registry populates on the
+                            // first post-attach dispatch.
+                            let is_first_turn = prior.is_none() || force_session_meta;
                             emit_terminal_with_enrichment(
                                 &tx,
                                 &sidecar_file,
@@ -342,7 +360,7 @@ async fn run_producer(
                                 outcome,
                                 ended_at,
                                 usage,
-                                prior.is_none(),
+                                is_first_turn,
                             )
                             .await;
                         }
@@ -424,22 +442,18 @@ async fn run_producer(
 ///    `None` we don't fabricate a `TurnUsage` just to carry a context-window
 ///    (preserves the strict "None means unparseable" contract).
 /// 4. Emit `RateLimitEvent` if rate-limit info was extracted.
-/// 5. Emit `SessionMeta` if this is the first turn (`prior.is_none()` at
-///    dispatch time) AND the enrichment yielded a model or `cli_version`.
+/// 5. Emit `SessionMeta` if this is the first turn AND the enrichment
+///    yielded a model or `cli_version`.
 ///
 /// All steps degrade gracefully — sidecar read failure or session-file
 /// absence emits a non-enriched `TurnEnd` only, and the post-terminal
 /// derived events are simply skipped.
 ///
-/// `is_first_turn` is computed by the caller from `prior.is_none()` at
-/// dispatch time.
-///
-// TODO(M2.5): the attach-existing-session flow pre-writes a sidecar record
-// at attach time. For that agent's first Switchboard-driven dispatch,
-// `prior` will be `Some(...)` but the UI still needs `SessionMeta` to
-// populate the sidebar. Override `is_first_turn` for the post-attach
-// first dispatch via a `force_session_meta` parameter (or equivalent) added
-// to the dispatch contract in M2.5.
+/// `is_first_turn` is computed by the caller as `prior.is_none() ||
+/// options.is_first_dispatch_after_attach` — the attach flow pre-writes
+/// a sidecar at attach time, so the `prior.is_none()` heuristic alone
+/// would misclassify a post-attach dispatch as a resume and skip the
+/// load-bearing `SessionMeta` emission that populates the sidebar.
 #[allow(clippy::too_many_arguments)]
 async fn emit_terminal_with_enrichment(
     tx: &tokio::sync::mpsc::UnboundedSender<AdapterEvent>,
@@ -732,7 +746,13 @@ mod tests {
         // Use any binary path — dispatch fails on sidecar read before spawn.
         let adapter = CodexAdapter::with_binary_path("/nonexistent");
         match adapter
-            .dispatch(&agent, tmp.path(), "hi", Uuid::now_v7())
+            .dispatch(
+                &agent,
+                tmp.path(),
+                "hi",
+                Uuid::now_v7(),
+                crate::DispatchOptions::default(),
+            )
             .await
         {
             Err(DispatchError::PreStreamRead(_)) => {}

@@ -220,6 +220,11 @@ pub async fn send_message_impl(
             prompt,
             adapter,
             Arc::clone(&state.emitter) as Arc<dyn EventEmitter>,
+            // Normal sends use defaults. The attach-existing-session flow
+            // (M2.5) will set DispatchOptions::is_first_dispatch_after_attach
+            // on the first post-attach dispatch so Codex agents emit
+            // SessionMeta and the sidebar populates.
+            switchboard_harness::DispatchOptions::default(),
         )
         .await?;
     Ok(handle)
@@ -595,6 +600,7 @@ mod tests {
             _cwd: &Path,
             _prompt: &str,
             turn_id: switchboard_harness::TurnId,
+            _options: switchboard_harness::DispatchOptions,
         ) -> Result<switchboard_harness::EventStream, switchboard_harness::DispatchError> {
             self.dispatch_count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);

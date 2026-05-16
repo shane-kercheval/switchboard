@@ -8,7 +8,7 @@ use std::path::Path;
 use futures::StreamExt;
 use switchboard_core::{AgentRecord, HarnessKind};
 use switchboard_harness::{
-    AdapterEvent, CodexAdapter, FailureKind, HarnessAdapter, ToolKind, TurnOutcome,
+    AdapterEvent, CodexAdapter, DispatchOptions, FailureKind, HarnessAdapter, ToolKind, TurnOutcome,
 };
 use uuid::Uuid;
 
@@ -46,7 +46,13 @@ async fn dispatch_fixture(
     let turn_id = Uuid::now_v7();
     let adapter = CodexAdapter::with_binary_and_home(FAKE_CODEX, home.path());
     let stream = adapter
-        .dispatch(agent, cwd, fixture_path, turn_id)
+        .dispatch(
+            agent,
+            cwd,
+            fixture_path,
+            turn_id,
+            DispatchOptions::default(),
+        )
         .await
         .expect("dispatch should succeed");
     stream.collect().await
@@ -327,7 +333,13 @@ async fn truncated_stream_synthesizes_adapter_failure_with_buffered_error() {
     let home = tempfile::TempDir::new().unwrap();
     let turn_id = Uuid::now_v7();
     let stream = CodexAdapter::with_binary_and_home(FAKE_CODEX, home.path())
-        .dispatch(&agent, cwd.path(), fixture_path.to_str().unwrap(), turn_id)
+        .dispatch(
+            &agent,
+            cwd.path(),
+            fixture_path.to_str().unwrap(),
+            turn_id,
+            DispatchOptions::default(),
+        )
         .await
         .expect("dispatch should succeed");
     let events: Vec<AdapterEvent> = stream.collect().await;
@@ -625,7 +637,13 @@ async fn dispatch_with_corrupt_sidecar_returns_pre_stream_read_error() {
 
     let home = tempfile::TempDir::new().unwrap();
     let result = CodexAdapter::with_binary_and_home(FAKE_CODEX, home.path())
-        .dispatch(&agent, tmp.path(), &fixture("text-only"), Uuid::now_v7())
+        .dispatch(
+            &agent,
+            tmp.path(),
+            &fixture("text-only"),
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
         .await;
     assert!(
         matches!(
@@ -708,10 +726,20 @@ async fn dispatch_with_home(
     home: &Path,
     fixture_path: &str,
 ) -> Vec<AdapterEvent> {
+    dispatch_with_home_and_options(agent, cwd, home, fixture_path, DispatchOptions::default()).await
+}
+
+async fn dispatch_with_home_and_options(
+    agent: &AgentRecord,
+    cwd: &Path,
+    home: &Path,
+    fixture_path: &str,
+    options: DispatchOptions,
+) -> Vec<AdapterEvent> {
     let turn_id = Uuid::now_v7();
     let adapter = CodexAdapter::with_binary_and_home(FAKE_CODEX, home);
     let stream = adapter
-        .dispatch(agent, cwd, fixture_path, turn_id)
+        .dispatch(agent, cwd, fixture_path, turn_id, options)
         .await
         .expect("dispatch should succeed");
     stream.collect().await
@@ -880,6 +908,50 @@ async fn resume_turn_omits_session_meta_but_still_emits_rate_limit_and_enriches(
         enriched_window,
         Some(Some(258_400)),
         "context_window enriched on resume turns too"
+    );
+}
+
+#[tokio::test]
+async fn attach_flow_first_dispatch_forces_session_meta_despite_sidecar_present() {
+    // Pre-write sidecar (mimicking the attach-existing-session flow). The
+    // adapter's prior.is_none() heuristic would normally classify this as
+    // a resume and skip SessionMeta — leaving the sidebar's MCP/skills/model
+    // listing empty for attached Codex agents until some other path fires.
+    //
+    // With DispatchOptions::is_first_dispatch_after_attach = true, the
+    // adapter must treat the dispatch as a first turn and emit SessionMeta.
+    let cwd = tempfile::TempDir::new().unwrap();
+    let home = tempfile::TempDir::new().unwrap();
+    let agent = codex_agent();
+    let today = chrono::Utc::now().date_naive();
+    // Sidecar exists at dispatch start — without the override this would
+    // suppress SessionMeta.
+    write_sidecar(cwd.path(), &agent, FIXTURE_THREAD_ID, today);
+    stage_session_file(
+        home.path(),
+        today,
+        FIXTURE_THREAD_ID,
+        ENRICHMENT_SESSION_CONTENT,
+    );
+
+    let options = DispatchOptions {
+        is_first_dispatch_after_attach: true,
+    };
+    let events = dispatch_with_home_and_options(
+        &agent,
+        cwd.path(),
+        home.path(),
+        &fixture("text-only"),
+        options,
+    )
+    .await;
+
+    let session_meta = events
+        .iter()
+        .find(|e| matches!(e, AdapterEvent::SessionMeta { .. }));
+    assert!(
+        session_meta.is_some(),
+        "is_first_dispatch_after_attach must force SessionMeta on a resume dispatch; got events: {events:#?}"
     );
 }
 

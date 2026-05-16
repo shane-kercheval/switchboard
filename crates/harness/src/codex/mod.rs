@@ -114,7 +114,7 @@ impl HarnessAdapter for CodexAdapter {
         prompt: &str,
         turn_id: TurnId,
     ) -> Result<EventStream, DispatchError> {
-        let binary = resolve_binary(&self.codex_binary_path)?;
+        let binary = crate::subprocess::resolve_binary(&self.codex_binary_path)?;
         // Sidecar path: <cwd>/.switchboard/projects/<project-id>/sessions/<agent-id>.jsonl.
         // cwd here is the user's bound working directory (per send_message_impl
         // in crates/app/src/commands.rs), not the per-project metadata directory.
@@ -183,13 +183,6 @@ fn resolve_home_dir(override_path: Option<&Path>) -> PathBuf {
         .unwrap_or_default()
 }
 
-fn resolve_binary(path: &Path) -> Result<PathBuf, DispatchError> {
-    if path.is_absolute() {
-        return Ok(path.to_owned());
-    }
-    which::which(path).map_err(|_| DispatchError::BinaryNotFound)
-}
-
 /// Build the args for `codex exec [resume <id>]`. Flag set verified against
 /// codex-cli 0.130.0; see the module-level docstring and
 /// `docs/research/codex-cli-observed.md` §"Findings during M2.3" for the
@@ -226,9 +219,6 @@ fn build_args(prompt: &str, prior: Option<&SessionLinkRecord>) -> Vec<String> {
     }
 }
 
-const STDERR_TAIL_CAPACITY: usize = 16;
-const STDERR_MESSAGE_MAX_LEN: usize = 800;
-
 // Parallel to `ClaudeCodeAdapter::run_producer` (which sits just under the
 // `too_many_lines` threshold). The Codex variant adds sidecar persistence,
 // EOF synthesis that consumes the buffered stdout error, and M2.4
@@ -247,13 +237,15 @@ async fn run_producer(
     home_dir: PathBuf,
     cwd: PathBuf,
 ) {
-    let stderr_tail: Arc<Mutex<VecDeque<String>>> =
-        Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_CAPACITY)));
-    let stderr_task = tokio::spawn(drain_stderr(
+    let stderr_tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::with_capacity(
+        crate::subprocess::STDERR_TAIL_CAPACITY,
+    )));
+    let stderr_task = tokio::spawn(crate::subprocess::drain_stderr(
         stderr,
         agent_id,
         turn_id,
         Arc::clone(&stderr_tail),
+        "codex",
     ));
 
     let mut terminal_seen = false;
@@ -382,7 +374,7 @@ async fn run_producer(
     }
 
     if force_kill_child {
-        kill_codex_process_group(&mut child).await;
+        crate::subprocess::kill_subprocess_group(&mut child).await;
     }
 
     let _ = stderr_task.await;
@@ -563,44 +555,6 @@ fn apply_context_window(
     }
 }
 
-/// Force-kill the Codex subprocess and any descendants it spawned.
-///
-/// **Why not just `child.kill()`.** `tokio::process::Child::kill` is
-/// `libc::kill(pid, SIGKILL)` — it signals only the spawned PID. Codex's
-/// CLI is a two-process tree: a Node parent that spawns a Rust child for
-/// the actual model work. Killing only the Node parent leaves the Rust
-/// child holding the write end of stdout/stderr pipes, so the producer
-/// task's `stderr_task.await` blocks forever waiting on an EOF that never
-/// arrives. The fix is to signal the whole process group with `killpg`.
-///
-/// `process_group(0)` at spawn (see `dispatch`) makes the spawned child its
-/// own process-group leader, so `pgid == pid`. We pass the child's PID to
-/// `killpg`; the kernel then signals every process in that group, including
-/// any descendants Codex spawned.
-///
-/// `child.wait()` later in the producer reaps the (now-dead) parent, so no
-/// zombie. Cleanly cross-platform: non-unix falls back to plain
-/// `child.kill()` (no process-group concept).
-// `clippy::unused_async` fires on unix because that branch has no `.await`;
-// the non-unix branch does (`child.kill().await`). Keep the function async
-// so the signature is uniform across platforms.
-#[cfg_attr(unix, allow(clippy::unused_async))]
-async fn kill_codex_process_group(child: &mut tokio::process::Child) {
-    #[cfg(unix)]
-    {
-        if let Some(pid) = child.id() {
-            let _ = nix::sys::signal::killpg(
-                nix::unistd::Pid::from_raw(pid.cast_signed()),
-                nix::sys::signal::Signal::SIGKILL,
-            );
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = child.kill().await;
-    }
-}
-
 /// Write a session-link record on the first `thread.started` of the
 /// dispatch. Returns `None` on success, or `Some(TurnEnd{AdapterFailure})`
 /// to emit and terminate the stream on failure. Sidecar persistence is
@@ -632,33 +586,6 @@ fn try_persist_sidecar(
     }
 }
 
-async fn drain_stderr(
-    stderr: tokio::process::ChildStderr,
-    agent_id: AgentId,
-    turn_id: TurnId,
-    tail: Arc<Mutex<VecDeque<String>>>,
-) {
-    let mut lines = tokio::io::BufReader::new(stderr).lines();
-    loop {
-        match lines.next_line().await {
-            Ok(Some(line)) => {
-                tracing::debug!(agent_id = %agent_id, %turn_id, "codex stderr: {line}");
-                if let Ok(mut buf) = tail.lock() {
-                    if buf.len() >= STDERR_TAIL_CAPACITY {
-                        buf.pop_front();
-                    }
-                    buf.push_back(line);
-                }
-            }
-            Ok(None) => break,
-            Err(e) => {
-                tracing::warn!(agent_id = %agent_id, %turn_id, error = %e, "stderr read error");
-                break;
-            }
-        }
-    }
-}
-
 /// Build the synthesized `TurnEnd(Failed)` event emitted when stdout EOFs
 /// without a terminal event. `buffered_error` is the most-recent `{type:
 /// "error"}` stdout payload (after JSON unwrap), used as the primary
@@ -668,7 +595,7 @@ fn synthesize_truncation_turn_end(
     stderr_tail: &Mutex<VecDeque<String>>,
     buffered_error: Option<String>,
 ) -> AdapterEvent {
-    let stderr_msg = format_stderr_tail(stderr_tail);
+    let stderr_msg = crate::subprocess::format_stderr_tail(stderr_tail);
     let message = match (buffered_error, stderr_msg.is_empty()) {
         (Some(err), true) => {
             let unwrapped = parser::unwrap_error_message(&err);
@@ -693,27 +620,6 @@ fn synthesize_truncation_turn_end(
         },
         ended_at: Utc::now(),
         usage: None,
-    }
-}
-
-fn format_stderr_tail(tail: &Mutex<VecDeque<String>>) -> String {
-    let Ok(buf) = tail.lock() else {
-        return String::new();
-    };
-    if buf.is_empty() {
-        return String::new();
-    }
-    let joined = buf.iter().cloned().collect::<Vec<_>>().join(" | ");
-    if joined.len() > STDERR_MESSAGE_MAX_LEN {
-        let target = joined.len() - STDERR_MESSAGE_MAX_LEN;
-        let start = (target..=joined.len())
-            .find(|&i| joined.is_char_boundary(i))
-            .unwrap_or(joined.len());
-        let mut truncated = joined[start..].to_owned();
-        truncated.insert(0, '…');
-        truncated
-    } else {
-        joined
     }
 }
 
@@ -876,19 +782,5 @@ mod tests {
         // just to carry an enrichment-derived window.
         let result = apply_context_window(None, Some(258_400));
         assert!(result.is_none());
-    }
-
-    #[test]
-    fn format_stderr_tail_handles_non_ascii_at_truncation_boundary() {
-        let tail: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
-        let mut payload = "A".repeat(600);
-        for _ in 0..150 {
-            payload.push('…');
-        }
-        tail.lock().unwrap().push_back(payload);
-
-        let result = format_stderr_tail(&tail);
-        assert!(result.starts_with('…'));
-        assert!(result.chars().count() < 850);
     }
 }

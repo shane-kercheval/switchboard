@@ -15,6 +15,7 @@ pub mod codex;
 pub mod events;
 pub mod mock;
 mod parser;
+pub mod subprocess;
 
 pub use adapter::{DispatchError, EventStream, HarnessAdapter};
 pub use claude_code::ClaudeCodeAdapter;

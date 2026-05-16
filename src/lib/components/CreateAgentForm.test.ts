@@ -30,6 +30,16 @@ const CODEX_AUTH_MISSING: HarnessAvailability = {
   binary: "available",
   auth: "missing",
 };
+const CLAUDE_CHECKING: HarnessAvailability = {
+  harness: "claude_code",
+  binary: "checking",
+  auth: "unsupported",
+};
+const CODEX_CHECKING: HarnessAvailability = {
+  harness: "codex",
+  binary: "checking",
+  auth: "checking",
+};
 
 const VALID_UUID = "019e2c5f-aaaa-7000-8000-000000000001";
 
@@ -217,6 +227,26 @@ describe("CreateAgentForm", () => {
     );
     const submit = screen.getByTestId("confirm-create-agent") as HTMLButtonElement;
     expect(submit.disabled).toBe(true);
+  });
+
+  it("checking state: both radios disabled, submit disabled, no inline message (silent disable)", () => {
+    const onSubmit = vi.fn();
+    render(CreateAgentForm, {
+      props: {
+        onSubmit,
+        claudeAvailability: CLAUDE_CHECKING,
+        codexAvailability: CODEX_CHECKING,
+      },
+    });
+    // Both radios are disabled — closes the pre-probe fail-open window.
+    expect((screen.getByTestId("harness-claude") as HTMLInputElement).disabled).toBe(true);
+    expect((screen.getByTestId("harness-codex") as HTMLInputElement).disabled).toBe(true);
+    // Submit is gated alongside.
+    const submit = screen.getByTestId("confirm-create-agent") as HTMLButtonElement;
+    expect(submit.disabled).toBe(true);
+    // No scary "Checking…" inline copy — checking returns null from the
+    // reason helper so the silent-disable UX is intentional.
+    expect(screen.queryByTestId("harness-unavailable")).not.toBeInTheDocument();
   });
 
   it("both harnesses available: no gating message, no radio disabled", () => {

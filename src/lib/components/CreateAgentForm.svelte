@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { HarnessAvailability, HarnessKind } from "$lib/types";
   import type { AgentFormSubmit } from "./CreateAgentForm.types";
+  import { harnessUnavailableReason, isHarnessSelectable } from "$lib/harnessAvailability";
   import Button from "$lib/components/ui/Button.svelte";
   import Input from "$lib/components/ui/Input.svelte";
 
@@ -38,26 +39,23 @@
   let mode = $state<"create" | "attach">("create");
   let existingSessionId = $state<string>("");
 
-  /// A harness is unavailable if its binary is missing OR (Codex-only)
-  /// its auth is missing. Returns null when available, otherwise the
-  /// tooltip / inline-error copy.
-  function unavailabilityReason(a: HarnessAvailability): string | null {
-    if (a.binary === "missing") {
-      return a.harness === "claude_code"
-        ? "Claude Code not found on PATH. Install from https://claude.com/code"
-        : "Codex not found on PATH. Install from https://github.com/openai/codex";
-    }
-    if (a.auth === "missing") {
-      return "Codex not authenticated — run `codex login` and reload Switchboard. (API-key-only auth is not supported.)";
-    }
-    return null;
-  }
-
-  const claudeUnavailable = $derived(unavailabilityReason(claudeAvailability));
-  const codexUnavailable = $derived(unavailabilityReason(codexAvailability));
-  const selectedUnavailable = $derived(
-    harness === "claude_code" ? claudeUnavailable : codexUnavailable,
+  /// Gate state per harness. Two predicates from `harnessAvailability`:
+  /// - `isHarnessSelectable` — false for `"checking"` / `"missing"`;
+  ///   gates radio `disabled` and the parent's submit button.
+  /// - `harnessUnavailableReason` — message text for *real* missing
+  ///   states; returns null for `"checking"` so the inline gating
+  ///   message doesn't show during the brief probe window.
+  ///
+  /// The two predicates intentionally disagree on `"checking"`: the
+  /// user is blocked, but no scary "Checking…" copy renders.
+  const claudeSelectable = $derived(isHarnessSelectable(claudeAvailability));
+  const codexSelectable = $derived(isHarnessSelectable(codexAvailability));
+  const claudeReason = $derived(harnessUnavailableReason(claudeAvailability));
+  const codexReason = $derived(harnessUnavailableReason(codexAvailability));
+  const selectedSelectable = $derived(
+    harness === "claude_code" ? claudeSelectable : codexSelectable,
   );
+  const selectedReason = $derived(harness === "claude_code" ? claudeReason : codexReason);
 
   /// UUID shape check (any version — Codex and Claude use v4 / v7
   /// respectively; the backend re-validates). This is a UX gate so the user
@@ -67,9 +65,7 @@
 
   const sessionIdValid = $derived(mode !== "attach" || UUID_PATTERN.test(existingSessionId.trim()));
 
-  const canSubmit = $derived(
-    !busy && name.trim() !== "" && sessionIdValid && selectedUnavailable === null,
-  );
+  const canSubmit = $derived(!busy && name.trim() !== "" && sessionIdValid && selectedSelectable);
 
   function handleSubmit(): void {
     const trimmedName = name.trim();
@@ -147,43 +143,43 @@
     <legend class="text-xs text-neutral-600">Harness</legend>
     <div class="flex gap-3 text-sm" data-testid="harness-picker">
       <label
-        class="flex items-center gap-1.5 {claudeUnavailable
-          ? 'cursor-not-allowed text-neutral-400'
-          : ''}"
-        title={claudeUnavailable ?? ""}
+        class="flex items-center gap-1.5 {claudeSelectable
+          ? ''
+          : 'cursor-not-allowed text-neutral-400'}"
+        title={claudeReason ?? ""}
       >
         <input
           type="radio"
           name="harness"
           value="claude_code"
           checked={harness === "claude_code"}
-          disabled={claudeUnavailable !== null}
+          disabled={!claudeSelectable}
           onchange={() => (harness = "claude_code")}
           data-testid="harness-claude"
         />
         Claude Code
       </label>
       <label
-        class="flex items-center gap-1.5 {codexUnavailable
-          ? 'cursor-not-allowed text-neutral-400'
-          : ''}"
-        title={codexUnavailable ?? ""}
+        class="flex items-center gap-1.5 {codexSelectable
+          ? ''
+          : 'cursor-not-allowed text-neutral-400'}"
+        title={codexReason ?? ""}
       >
         <input
           type="radio"
           name="harness"
           value="codex"
           checked={harness === "codex"}
-          disabled={codexUnavailable !== null}
+          disabled={!codexSelectable}
           onchange={() => (harness = "codex")}
           data-testid="harness-codex"
         />
         Codex
       </label>
     </div>
-    {#if selectedUnavailable}
+    {#if selectedReason}
       <p class="text-xs text-red-700" data-testid="harness-unavailable">
-        {selectedUnavailable}
+        {selectedReason}
       </p>
     {/if}
   </fieldset>

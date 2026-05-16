@@ -56,7 +56,7 @@ pub enum AppError {
     /// directory. Surfaces the expected path so the user can verify the
     /// session-id and the encoded-cwd against what the harness actually
     /// created.
-    #[error("{harness:?} session file for session_id not found; expected at {expected_path}")]
+    #[error("{harness} session file for session_id not found; expected at {expected_path}")]
     SessionFileNotFound {
         harness: HarnessKind,
         expected_path: String,
@@ -131,7 +131,7 @@ pub enum AppError {
     /// the known false-positive case (stale `auth.json` with API-key-only
     /// runtime config). Banner copy is actionable ("run `codex login`")
     /// rather than diagnostic.
-    #[error("{harness:?} subscription auth not detected; expected at {expected_path}")]
+    #[error("{harness} subscription auth not detected; expected at {expected_path}")]
     AuthNotConfigured {
         harness: HarnessKind,
         expected_path: String,

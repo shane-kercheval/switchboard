@@ -1,3 +1,5 @@
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 /// Identifies which AI coding harness an agent is bound to. M1 had only Claude Code;
@@ -14,6 +16,27 @@ use serde::{Deserialize, Serialize};
 pub enum HarnessKind {
     ClaudeCode,
     Codex,
+}
+
+/// User-facing names. Used in `thiserror` `#[error]` format strings that
+/// surface to the frontend via Tauri (where `AppError::to_string()` is the
+/// IPC error payload). The `Debug` impl prints `ClaudeCode` without a
+/// space; this `Display` impl prints `Claude Code` which is what users see
+/// on Anthropic's product surface.
+///
+/// Tracing logs continue to use `{:?}` (Debug) since logs are dev-facing
+/// and the Debug-precise variant name is more useful for grep.
+impl fmt::Display for HarnessKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Exhaustive match within the defining crate (the `#[non_exhaustive]`
+        // attribute applies across crate boundaries only). Adding a future
+        // variant forces this impl to be updated — exactly the right
+        // pressure for "new harness → new user-facing name."
+        match self {
+            Self::ClaudeCode => f.write_str("Claude Code"),
+            Self::Codex => f.write_str("Codex"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -42,5 +65,11 @@ mod tests {
     fn codex_deserializes_from_snake_case() {
         let parsed: HarnessKind = serde_json::from_str("\"codex\"").unwrap();
         assert_eq!(parsed, HarnessKind::Codex);
+    }
+
+    #[test]
+    fn display_uses_user_facing_names_with_space_for_claude() {
+        assert_eq!(format!("{}", HarnessKind::ClaudeCode), "Claude Code");
+        assert_eq!(format!("{}", HarnessKind::Codex), "Codex");
     }
 }

@@ -122,22 +122,62 @@ export type HarnessKind = "claude_code" | "codex";
 /// detection (Codex only — Claude's auth lives in the macOS keychain with
 /// no reliable file signal, deferred to v2 per the M2.5 plan).
 ///
-/// `auth: "unsupported"` means "Switchboard does not attempt detection for
-/// this harness" — distinct from `"missing"` (we tried, file wasn't there).
-/// The frontend never shows an auth banner for an `"unsupported"` result.
-export type HarnessAvailability = {
-  harness: HarnessKind;
-  binary: "available" | "missing";
-  auth: "available" | "missing" | "unsupported";
-};
+/// **Discriminated union, not a flat record.** The v1 invariant "auth
+/// detection is Codex-only; Claude's auth is always `unsupported`" is
+/// encoded structurally in the type: the Claude variant's `auth` is
+/// the literal `"unsupported"`, the Codex variant's covers the real
+/// probe states. Consumers narrow on `harness` before accessing `auth`,
+/// and `a.auth === "missing"` is only type-checkable for the Codex
+/// variant. This eliminates the runtime-guard-with-defensive-arm
+/// pattern that a flat record forces on every consumer.
+///
+/// A future harness with file-detectable auth adds a new variant
+/// rather than widening Claude's auth field — the compiler then forces
+/// every consumer (banner copy, form gating) to acknowledge the new
+/// case explicitly.
+///
+/// **State semantics** (per the Codex variant; Claude has only
+/// `unsupported`):
+/// - `"checking"`: probe in flight; the initial value at mount. Form
+///   gating treats this as not-selectable (silent disable — no scary
+///   "Checking…" copy) so a user racing the probe can't submit before
+///   we know.
+/// - `"available"`: probe completed positively.
+/// - `"missing"`: probe completed negatively. Banner copy is actionable
+///   (install link / `codex login`).
+/// - `"unsupported"`: only on the Claude variant.
+///
+/// Replacing the original optimistic-"available" default with `"checking"`
+/// makes the pre-probe semantics structural rather than convention-based:
+/// fail-closed by type, not by polite hope.
+export type BinaryState = "available" | "missing" | "checking";
+
+export type HarnessAvailability =
+  | {
+      harness: "claude_code";
+      binary: BinaryState;
+      auth: "unsupported";
+    }
+  | {
+      harness: "codex";
+      binary: BinaryState;
+      auth: "available" | "missing" | "checking";
+    };
 
 /// Structured banner shape. The App.svelte banner-stack ordering rule:
 /// binary-missing banners first; for any harness whose binary is missing,
 /// the auth banner is suppressed (auth is irrelevant if the CLI isn't
 /// installed).
+///
+/// **v1 invariant encoded in the type**: `auth_missing` is Codex-only.
+/// Claude's auth is `"unsupported"` (keychain-based on macOS — see
+/// `HarnessAvailability` docstring). A future Claude auth probe must add
+/// a new banner variant or extend this one explicitly; the literal
+/// `harness: "codex"` arm prevents accidental "Codex not authenticated"
+/// copy from leaking onto Claude banners.
 export type HarnessBanner =
   | { kind: "binary_missing"; harness: HarnessKind }
-  | { kind: "auth_missing"; harness: HarnessKind };
+  | { kind: "auth_missing"; harness: "codex" };
 
 export type AgentRecord = {
   id: AgentId;

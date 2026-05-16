@@ -14,11 +14,13 @@
   import { registerAgent } from "$lib/state/index.svelte";
   import type {
     AgentRecord,
+    BinaryState,
     DirectoryInfo,
     HarnessAvailability,
     HarnessBanner,
     ProjectSummary,
   } from "$lib/types";
+  import { bannerCopy, bannerTestid } from "$lib/harnessAvailability";
   import { basename } from "$lib/utils";
 
   // App phase: drives which screen renders.
@@ -43,73 +45,81 @@
   let busy = $state<boolean>(false);
   let inlineError = $state<string | null>(null);
 
-  /// Per-harness availability, populated by the startup probes. Drives
-  /// both the banner stack and the create-agent form's radio gating.
-  /// Initial state: optimistic ("available") until probes return — the
-  /// brief flicker is preferred over flashing all banners on first paint.
+  /// Per-harness availability state. **Stored as flat per-probe fields**
+  /// rather than as the `HarnessAvailability` discriminated union directly:
+  /// the union is the consumer-facing boundary type (banners + form
+  /// gating), but probe handlers write a single field at a time. Holding
+  /// the runtime state as union values would force every per-probe write
+  /// to re-construct the whole variant and read-then-spread the unchanged
+  /// fields, which is friction without benefit. Instead: flat fields here
+  /// → derived unions for consumers.
+  ///
+  /// Initial state uses `"checking"` to encode the pre-probe state in
+  /// the type system rather than fail-open-by-convention. Form gating
+  /// treats `"checking"` as not-selectable (silent disable) so a user
+  /// fast enough to reach the create form before probes complete can't
+  /// submit before we know. Banners stay hidden during checking because
+  /// the suppression rule only pushes on `"missing"`.
+  ///
   /// Claude auth is `"unsupported"` always (keychain-based on macOS; no
   /// reliable file signal — deferred to v2 per the M2.5 plan).
-  let claudeAvailability = $state<HarnessAvailability>({
+  let claudeBinary = $state<BinaryState>("checking");
+  let codexBinary = $state<BinaryState>("checking");
+  let codexAuth = $state<"available" | "missing" | "checking">("checking");
+
+  const claudeAvailability = $derived<HarnessAvailability>({
     harness: "claude_code",
-    binary: "available",
+    binary: claudeBinary,
     auth: "unsupported",
   });
-  let codexAvailability = $state<HarnessAvailability>({
+  const codexAvailability = $derived<HarnessAvailability>({
     harness: "codex",
-    binary: "available",
-    auth: "available",
+    binary: codexBinary,
+    auth: codexAuth,
   });
 
   /// Banner stack ordering: binary-missing first, then auth-missing.
   /// Suppression rule: if a harness's binary is missing, its auth banner
   /// is hidden (auth is irrelevant if the CLI isn't installed). Max two
   /// banners visible (one per harness).
+  ///
+  /// The `auth_missing` push gates on `a.harness === "codex"` because
+  /// `HarnessBanner.auth_missing` is type-narrowed to Codex (v1 invariant).
   const banners = $derived.by((): HarnessBanner[] => {
     const result: HarnessBanner[] = [];
     for (const a of [claudeAvailability, codexAvailability]) {
       if (a.binary === "missing") {
         result.push({ kind: "binary_missing", harness: a.harness });
-      } else if (a.auth === "missing") {
-        result.push({ kind: "auth_missing", harness: a.harness });
+      } else if (a.auth === "missing" && a.harness === "codex") {
+        result.push({ kind: "auth_missing", harness: "codex" });
       }
     }
     return result;
   });
 
-  function bannerCopy(b: HarnessBanner): string {
-    if (b.kind === "binary_missing") {
-      return b.harness === "claude_code"
-        ? "Claude Code not found on PATH. Install from https://claude.com/code"
-        : "Codex not found on PATH. Install from https://github.com/openai/codex";
-    }
-    // auth_missing — Codex only (Claude auth detection unsupported).
-    return "Codex not authenticated — run `codex login` and reload Switchboard. (API-key-only auth is not supported.)";
-  }
-
-  function bannerTestid(b: HarnessBanner): string {
-    return `banner-${b.kind}-${b.harness}`;
-  }
-
-  // Startup probes. Each harness's binary + auth (where applicable) runs
-  // independently; failures populate the availability state and the
-  // `banners` $derived recomputes. UI flow proceeds regardless — sending
-  // to a missing-binary agent fails at dispatch with a typed error.
-  onMount(async () => {
-    const claudeBinary = api.checkClaudeBinary().then(
-      () => "available" as const,
-      () => "missing" as const,
+  // Startup probes. Each probe writes its own slice as soon as it
+  // resolves — no `Promise.all` barrier. A slow `check_codex_auth`
+  // doesn't block the Claude binary state from leaving `"checking"`;
+  // a slow `check_codex_binary` doesn't block its own auth check
+  // from updating. The data model stays honest about *what we know
+  // now* vs *what we're still waiting on*, same principle as the
+  // `"checking"` state itself.
+  //
+  // UI flow proceeds regardless — sending to a missing-binary agent
+  // fails at dispatch with a typed error.
+  onMount(() => {
+    api.checkClaudeBinary().then(
+      () => (claudeBinary = "available"),
+      () => (claudeBinary = "missing"),
     );
-    const codexBinary = api.checkCodexBinary().then(
-      () => "available" as const,
-      () => "missing" as const,
+    api.checkCodexBinary().then(
+      () => (codexBinary = "available"),
+      () => (codexBinary = "missing"),
     );
-    const codexAuth = api.checkCodexAuth().then(
-      () => "available" as const,
-      () => "missing" as const,
+    api.checkCodexAuth().then(
+      () => (codexAuth = "available"),
+      () => (codexAuth = "missing"),
     );
-    const [cb, xb, xa] = await Promise.all([claudeBinary, codexBinary, codexAuth]);
-    claudeAvailability = { harness: "claude_code", binary: cb, auth: "unsupported" };
-    codexAvailability = { harness: "codex", binary: xb, auth: xa };
   });
 
   /// Register every agent in the loaded list with the state module before

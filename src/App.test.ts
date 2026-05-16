@@ -64,13 +64,25 @@ const INFO_NO_SWITCHBOARD: DirectoryInfo = {
  * about which commands succeed (and with what return value) without
  * assuming any specific call order — App.svelte may legitimately reorder
  * sub-steps within a phase transition.
+ *
+ * The three startup probes (`check_claude_binary`, `check_codex_binary`,
+ * `check_codex_auth`) default to success so non-banner tests don't need to
+ * spell them out, but `unexpected invoke call` still throws for any IPC
+ * the test didn't anticipate. Banner-failure tests use
+ * `invokeMock.mockImplementation` directly to override individual probes.
  */
 function setInvokeResponses(map: Record<string, unknown>): void {
+  const withDefaults: Record<string, unknown> = {
+    check_claude_binary: null,
+    check_codex_binary: null,
+    check_codex_auth: null,
+    ...map,
+  };
   invokeMock.mockImplementation(async (cmd: string) => {
-    if (!(cmd in map)) {
+    if (!(cmd in withDefaults)) {
       throw new Error(`unexpected invoke call: ${cmd}`);
     }
-    return map[cmd];
+    return withDefaults[cmd];
   });
 }
 
@@ -90,11 +102,7 @@ describe("App", () => {
   });
 
   it("mounts and renders the welcome screen when all harness probes succeed", async () => {
-    setInvokeResponses({
-      check_claude_binary: null,
-      check_codex_binary: null,
-      check_codex_auth: null,
-    });
+    setInvokeResponses({});
     const App = (await import("./App.svelte")).default;
     render(App);
     expect(screen.getByText("Switchboard")).toBeInTheDocument();
@@ -132,6 +140,52 @@ describe("App", () => {
     await waitFor(() => {
       expect(screen.getByTestId("banner-auth_missing-codex")).toBeInTheDocument();
     });
+  });
+
+  it("both binaries missing: two binary banners render simultaneously, no auth banner", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "check_claude_binary" || cmd === "check_codex_binary") throw new Error("missing");
+      if (cmd === "check_codex_auth") return null;
+      throw new Error(`unexpected invoke call: ${cmd}`);
+    });
+    const App = (await import("./App.svelte")).default;
+    render(App);
+    await waitFor(() => {
+      expect(screen.getByTestId("banner-binary_missing-claude_code")).toBeInTheDocument();
+      expect(screen.getByTestId("banner-binary_missing-codex")).toBeInTheDocument();
+    });
+    // Suppression rule applies per-harness independently — Codex auth banner
+    // hidden because Codex binary is missing.
+    expect(screen.queryByTestId("banner-auth_missing-codex")).not.toBeInTheDocument();
+  });
+
+  it("slow probe doesn't block fast probes — each updates its slice independently", async () => {
+    // `check_codex_auth` never resolves; `check_claude_binary` and
+    // `check_codex_binary` both fail fast. The Claude + Codex binary
+    // banners must surface even while the auth probe is still in flight.
+    // Pins the per-probe-resolution invariant (no Promise.all barrier).
+    const authPromise = new Promise<null>(() => {
+      // Intentionally never resolves. Each test runs in its own
+      // singleton-state context (the `afterEach` reset drains
+      // listeners); the hung promise is GC'd when the test scope
+      // tears down.
+    });
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "check_claude_binary" || cmd === "check_codex_binary") throw new Error("missing");
+      if (cmd === "check_codex_auth") return authPromise;
+      throw new Error(`unexpected invoke call: ${cmd}`);
+    });
+    const App = (await import("./App.svelte")).default;
+    render(App);
+    // Both binary banners surface without waiting on the hung auth probe.
+    await waitFor(() => {
+      expect(screen.getByTestId("banner-binary_missing-claude_code")).toBeInTheDocument();
+      expect(screen.getByTestId("banner-binary_missing-codex")).toBeInTheDocument();
+    });
+    // Auth banner is correctly suppressed (Codex binary missing), but
+    // also wouldn't surface independently since the probe hasn't
+    // resolved yet.
+    expect(screen.queryByTestId("banner-auth_missing-codex")).not.toBeInTheDocument();
   });
 
   it("suppresses Codex auth banner when Codex binary is also missing (auth is irrelevant)", async () => {

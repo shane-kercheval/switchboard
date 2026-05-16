@@ -47,13 +47,14 @@ pub struct McpServerStatus {
 /// `total_cost_usd` is Claude Code only (subscription auth has no dollar
 /// number for Codex). `context_window` for Claude comes from
 /// `result.modelUsage.<model>.contextWindow`; for Codex it's populated by
-/// M2.4's session-file enrichment. All other fields are tokens.
+/// post-terminal session-file enrichment. All other fields are tokens.
 ///
-/// Populated for both `Completed` and `Failed` turns — the harness charges
-/// for partial work, so token counts on failure are meaningful telemetry,
-/// not noise. `usage: None` means "telemetry was unparseable / absent,"
-/// distinct from a real `Some` carrying zero values (which Claude's
-/// synthetic auth-failure responses legitimately emit).
+/// Populated when the harness reports usage on its terminal event. Claude
+/// carries it on both `Completed` and `Failed` turns; Codex carries it on
+/// `Completed` only (Codex's `turn.failed` doesn't include `usage` in
+/// observed fixtures). `usage: None` means "telemetry was unparseable /
+/// absent," distinct from a real `Some` carrying zero values (which
+/// Claude's synthetic auth-failure responses legitimately emit).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TurnUsage {
     pub input_tokens: u64,

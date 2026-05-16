@@ -642,25 +642,39 @@ The two harness streams are structurally different (event-name vocabularies, con
 ```
 SessionMeta     { agent, model, harness_version, tools, mcp_servers, skills, raw }
                 // emitted once at first turn. Sources vary by field and by harness:
-                //   model         — Claude system/init stream event; Codex session-file
-                //                   first turn_context record.
-                //   harness_version — Claude system/init; Codex session-file session_meta.
-                //   mcp_servers   — Claude system/init (already-merged across user/local/
-                //                   project scopes by Claude itself); Codex from reading
-                //                   ~/.codex/config.toml + <cwd>/.codex/config.toml
-                //                   (Switchboard merges, since Codex doesn't emit a
-                //                   registry event in non-interactive mode).
-                //   skills        — Claude directory scan of ~/.claude/skills/ and
-                //                   <cwd>/.claude/skills/; Codex directory scan of
-                //                   ~/.agents/skills/ and <cwd>/.agents/skills/.
-                //   tools         — Claude live: populated from system/init.tools
-                //                   (the merged builtin + MCP + dynamic list claude reports).
-                //                   Claude rehydration from disk: empty (session file
-                //                   lacks the equivalent record).
-                //                   Codex live and rehydration: empty (no equivalent
-                //                   source — command_execution + mcp_tool_call cover
-                //                   the dispatched-tool surface stream-side, but there's
-                //                   no available-tools registry separate from mcp_servers).
+                //   model         — Claude live: system/init stream event.
+                //                   Claude rehydration: session-file system/init record (M2.6).
+                //                   Codex live + rehydration: session-file first
+                //                   turn_context record.
+                //   harness_version — Claude live: system/init.claude_code_version.
+                //                   Claude rehydration: session-file system/init.
+                //                   Codex live + rehydration: session-file session_meta.cli_version.
+                //   mcp_servers   — Claude live: system/init.mcp_servers (already
+                //                   merged across user/local/project scopes by Claude
+                //                   itself).
+                //                   Claude rehydration: Switchboard reads ~/.claude.json
+                //                   (user + local scopes) and <cwd>/.mcp.json (project
+                //                   scope) — Claude session files don't carry the registry
+                //                   (M2.6).
+                //                   Codex live + rehydration: Switchboard reads
+                //                   ~/.codex/config.toml + <cwd>/.codex/config.toml —
+                //                   Codex's non-interactive mode doesn't emit a registry
+                //                   event AND session files don't carry the registry.
+                //   skills        — Claude live: system/init.skills (already merged by
+                //                   Claude across ~/.claude/skills/ + <cwd>/.claude/skills/).
+                //                   Claude rehydration: Switchboard directory scan of the
+                //                   same two paths (M2.6, since session files don't carry
+                //                   the registry).
+                //                   Codex live + rehydration: Switchboard directory scan
+                //                   of ~/.agents/skills/ + <cwd>/.agents/skills/.
+                //   tools         — Claude live: system/init.tools (the merged builtin +
+                //                   MCP + dynamic list Claude reports).
+                //                   Claude rehydration: empty (session file lacks the
+                //                   equivalent record).
+                //                   Codex live + rehydration: empty (no equivalent source
+                //                   — command_execution + mcp_tool_call cover the
+                //                   dispatched-tool surface stream-side, but there's no
+                //                   available-tools registry separate from mcp_servers).
                 //                   Field is preserved across the wire for the populated
                 //                   Claude-live path; reserved for a future symmetric
                 //                   registry surface across harnesses.
@@ -673,9 +687,8 @@ ToolStarted     { agent, tool_use_id, kind, input }
                 // fires when the tool call is dispatched (lets the UI show
                 // "running tool... (3.2s elapsed)" before the result lands).
 ToolCompleted   { agent, tool_use_id, output, is_error }
-TurnEnd         { agent, outcome, stop_reason?,
-                  usage: { input, output, cached, reasoning, context_window? },
-                  permission_denials, raw_event }
+TurnEnd         { agent, outcome, ended_at,
+                  usage?: { input, output, cached, reasoning, context_window?, total_cost_usd? } }
                 // outcome = Completed
                 //         | Failed { kind: HarnessError | AdapterFailure | AuthFailure, message }
                 //         | Cancelled { source: User | Workflow }   // added in M4 when per-turn cancel lands

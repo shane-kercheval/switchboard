@@ -432,6 +432,62 @@ async fn corrupt_thread_started_emits_adapter_failure() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn malformed_json_mid_stream_force_kills_and_emits_adapter_failure() {
+    // The ParseOutcome::Error branch in run_producer's main loop sets
+    // force_kill_child and breaks. This test exercises that path with a
+    // two-process tree (via the spawn_child_holding_stderr directive),
+    // proving both that (a) malformed mid-stream JSON terminates the
+    // stream promptly and (b) the kill reaches the descendant — without
+    // killpg, the forked child would keep stderr open and the producer
+    // would hang past the 5s budget.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let fixture_path = tmp.path().join("malformed-mid-stream.jsonl");
+    std::fs::write(
+        &fixture_path,
+        r#"// spawn_child_holding_stderr
+{"type":"thread.started","thread_id":"00000000-0000-7000-8000-0000000000bb"}
+this is not valid json mid-stream
+"#,
+    )
+    .unwrap();
+
+    let agent = codex_agent();
+    let events = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        dispatch_fixture(&agent, tmp.path(), fixture_path.to_str().unwrap()),
+    )
+    .await
+    .expect("stream must close promptly after malformed JSON triggers force-kill");
+
+    let terminals: Vec<&AdapterEvent> = events
+        .iter()
+        .filter(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+        .collect();
+    assert_eq!(
+        terminals.len(),
+        1,
+        "exactly one terminal event from the malformed-JSON path"
+    );
+    match terminals[0] {
+        AdapterEvent::TurnEnd {
+            outcome:
+                TurnOutcome::Failed {
+                    kind: FailureKind::AdapterFailure,
+                    message,
+                },
+            ..
+        } => {
+            assert!(
+                message.contains("malformed JSON"),
+                "expected 'malformed JSON' in error message, got: {message}"
+            );
+        }
+        other => panic!("expected TurnEnd(AdapterFailure), got: {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn force_kill_signals_whole_process_group_not_just_parent() {
     // Codex's CLI is a two-process tree: a Node parent that spawns a Rust
     // child holding the actual model work. The Rust child inherits stdout

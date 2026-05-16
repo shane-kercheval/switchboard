@@ -39,7 +39,7 @@ use crate::events::{AdapterEvent, FailureKind, TurnId, TurnOutcome, TurnUsage};
 
 use parser::{CodexParserState, parse_line};
 use session_file::{Enrichment, TokioSleeper};
-use sidecar::{SessionLinkRecord, SidecarError, append_record, read_latest, sidecar_path};
+use sidecar::{SessionLinkRecord, append_record, read_latest, sidecar_path};
 
 /// Adapter for Codex (`codex exec --json`). Spawns a `codex` subprocess and
 /// maps the stream-event output to `AdapterEvent`s. Session continuity is
@@ -119,16 +119,12 @@ impl HarnessAdapter for CodexAdapter {
         // cwd here is the user's bound working directory (per send_message_impl
         // in crates/app/src/commands.rs), not the per-project metadata directory.
         let sidecar = sidecar_path(cwd, agent.project_id, agent.id);
-        let prior = read_latest(&sidecar).map_err(|e| match e {
-            SidecarError::Io { .. }
-                if matches!(&e, SidecarError::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound) =>
-            {
-                // Unreachable in practice — read_latest maps NotFound to
-                // Ok(None) before returning. Guard anyway for forward-compat.
-                DispatchError::PreStreamRead(e.to_string())
-            }
-            other => DispatchError::PreStreamRead(other.to_string()),
-        })?;
+        // SidecarError::Corrupt is the load-bearing case (fail-loud per
+        // AGENTS.md). IO errors (including NotFound, though `read_latest`
+        // already maps that to Ok(None)) also surface here as
+        // PreStreamRead — uniform pre-stream failure on any read problem.
+        let prior =
+            read_latest(&sidecar).map_err(|e| DispatchError::PreStreamRead(e.to_string()))?;
         let args = build_args(prompt, prior.as_ref());
 
         let mut command = tokio::process::Command::new(&binary);

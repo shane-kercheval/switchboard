@@ -352,6 +352,55 @@ describe("AgentPane", () => {
     expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(false);
   });
 
+  it("agent-scoped events (rate_limit_event, session_meta) don't crash the component or disturb in-flight state", async () => {
+    // Codex agents emit RateLimitEvent (every turn) and SessionMeta (first
+    // turn) on the per-agent channel AFTER TurnEnd. They aren't rendered
+    // in the M2.4 UI, but the component still receives them via the
+    // captured listener — must tolerate them without errors and without
+    // disturbing the turn's in-flight state. Guards against the "unknown
+    // discriminant crashes the reducer" regression class.
+    invokeMock.mockResolvedValueOnce(TURN_ID);
+
+    const AgentPane = (await import("./AgentPane.svelte")).default;
+    render(AgentPane, { props: { agent: AGENT } });
+    await waitForListener();
+
+    await typeAndSend("hi");
+    fireEv({ type: "turn_start", turn_id: TURN_ID, started_at: "2026-05-13T00:00:01Z" });
+    fireEv({ type: "content_chunk", turn_id: TURN_ID, kind: "text", text: "ack" });
+    fireEv({
+      type: "turn_end",
+      turn_id: TURN_ID,
+      outcome: { status: "completed" },
+      ended_at: "2026-05-13T00:00:02Z",
+    });
+
+    // Post-terminal Codex-style enrichment events. Today these are wire
+    // shapes the reducer doesn't render — but firing them must not throw.
+    fireEv({
+      type: "rate_limit_event",
+      agent_id: AGENT.id,
+      info: { primary: { used_percent: 42.0, window_minutes: 300 } },
+    });
+    fireEv({
+      type: "session_meta",
+      agent_id: AGENT.id,
+      model: "gpt-5.5",
+      harness_version: "0.130.0",
+      tools: [],
+      mcp_servers: [],
+      skills: [],
+      raw: {},
+    });
+
+    // Turn completed cleanly + send is re-enabled — no state disturbance
+    // from the two agent-scoped events.
+    await waitFor(() => {
+      expect(screen.getByTestId("agent-status")).toHaveTextContent("idle");
+    });
+    expect(screen.getByText("ack")).toBeInTheDocument();
+  });
+
   it("heartbeat timeout: silent stream marks turn failed and clears in-flight state", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     invokeMock.mockResolvedValueOnce(TURN_ID);

@@ -14,10 +14,10 @@ use switchboard_harness::HarnessAdapter;
 ///
 /// **Lock-order convention** (when more than one of these mutexes is held
 /// at the same time): `registry_write` → `directory` → `projects` →
-/// `active_project_id` → `pending_first_dispatch`. Always acquire in this
+/// `active_project_id` → `needs_session_meta`. Always acquire in this
 /// order. Violating the order can deadlock under concurrent access.
 /// Single-lock acquisitions (which most callers do) are unaffected — the
-/// convention only matters when nesting. `pending_first_dispatch` is the
+/// convention only matters when nesting. `needs_session_meta` is the
 /// tail because both `attach_agent_impl` (under `registry_write`) and
 /// `send_message_impl` (no other locks held) acquire it briefly with no
 /// `.await` crossing the guard.
@@ -47,10 +47,11 @@ pub struct AppState {
     /// Adapter for `HarnessKind::Codex` agents.
     pub codex_adapter: Arc<dyn HarnessAdapter>,
     pub emitter: Arc<dyn EventEmitter>,
-    /// One-shot set of `agent_id`s whose next dispatch must run with
+    /// Set of `agent_id`s whose next dispatch must run with
     /// `DispatchOptions::is_first_dispatch_after_attach = true`. Populated by
-    /// `attach_agent_impl`; drained-and-passed-through by `send_message_impl`
-    /// on the next dispatch for the same agent.
+    /// `attach_agent_impl` (Codex-only — see below); read (not drained) by
+    /// `send_message_impl`; cleared by the per-dispatch emitter decorator
+    /// when a `session_meta` event for the matching agent is observed.
     ///
     /// **Purpose.** The Codex attach-existing-session flow pre-writes a
     /// sidecar record at attach time. Without this flag, the Codex adapter
@@ -60,20 +61,29 @@ pub struct AppState {
     /// flag tells the adapter "force `SessionMeta` even though the sidecar
     /// is non-empty."
     ///
-    /// **Restore-on-Err.** `send_message_impl` drains the flag *before*
-    /// awaiting `dispatcher.send_message`. On pre-stream `Err` (binary
-    /// missing, spawn failure), the flag is re-inserted so a retry still
-    /// forces `SessionMeta`. Mid-stream failures (adapter spawned Ok,
-    /// stream aborted before `emit_terminal_with_enrichment`) are **not**
-    /// covered — the flag is gone, `SessionMeta` was never emitted, and
-    /// the agent's sidebar stays empty for its lifetime. Workaround:
-    /// re-attach (pure metadata op, no harness invocation). Revisit if
-    /// real users hit this.
+    /// **Codex-only.** Claude Code emits `SessionMeta` from its `system/init`
+    /// stream event on every dispatch (see `crates/harness/src/claude_code.rs`),
+    /// so the override has nothing to do for Claude attaches. The insert in
+    /// `attach_agent_impl` is gated on `HarnessKind::Codex`.
+    ///
+    /// **Read-don't-drain.** `send_message_impl` reads with `contains`, not
+    /// `remove`. The clear happens in a per-dispatch emitter decorator
+    /// (`crate::emitter::SessionMetaObservingEmitter`) that intercepts
+    /// `session_meta` events on the per-agent channel and removes the
+    /// `agent_id` only when emission is genuinely observed. This means:
+    /// - Successive dispatches that fail mid-stream pre-`SessionMeta` each
+    ///   continue to see `is_first_dispatch_after_attach: true` — the flag
+    ///   persists until the override actually does its job.
+    /// - Once `SessionMeta` flows through, the decorator drops the flag and
+    ///   subsequent dispatches use the default `false`.
+    ///
+    /// **Wrapped in `Arc<Mutex<…>>`** so the emitter decorator can hold a
+    /// clone for the lifetime of the dispatcher's `'static` drain task.
     ///
     /// **Rebind clearing.** Cleared by `init_directory_impl` alongside
     /// `projects` and `active_project_id` — a stale `agent_id` from a
     /// previous directory's attach must not leak across rebinds.
-    pub pending_first_dispatch: Mutex<HashSet<AgentId>>,
+    pub needs_session_meta: Arc<Mutex<HashSet<AgentId>>>,
 }
 
 impl AppState {
@@ -91,7 +101,7 @@ impl AppState {
             claude_adapter,
             codex_adapter,
             emitter,
-            pending_first_dispatch: Mutex::new(HashSet::new()),
+            needs_session_meta: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 }

@@ -4,6 +4,7 @@
 //! is the Tauri wiring layer.
 
 mod commands;
+mod emitter;
 mod error;
 mod state;
 

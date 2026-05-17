@@ -1,7 +1,7 @@
 import { vi, describe, it, expect, beforeEach, afterEach } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
-import type { AgentRecord, DirectoryInfo, ProjectSummary } from "$lib/types";
+import type { AgentRecord, DirectoryInfo, NormalizedEvent, ProjectSummary } from "$lib/types";
 
 // App.svelte tests focus narrowly on the primary phase-transition routing
 // of the M2.5 acceptance flow:
@@ -20,11 +20,20 @@ import type { AgentRecord, DirectoryInfo, ProjectSummary } from "$lib/types";
 const invokeMock = vi.fn(
   async (_cmd: string, _args?: Record<string, unknown>): Promise<unknown> => null,
 );
-const listenMock = vi.fn(
-  async (_event: string, _handler: unknown): Promise<() => void> =>
-    () => {},
-);
+// `agent:<id>` event-channel callbacks captured here so E2E tests can fire
+// a recorded sequence into the state module and assert the round trip.
+const listenCallbacks = new Map<string, (e: { payload: NormalizedEvent }) => void>();
+const listenMock = vi.fn(async (event: string, handler: unknown): Promise<() => void> => {
+  listenCallbacks.set(event, handler as (e: { payload: NormalizedEvent }) => void);
+  return () => {};
+});
 const openDialogMock = vi.fn(async (_options: unknown): Promise<string | null> => null);
+
+function fireTo(channel: string, event: NormalizedEvent): void {
+  const cb = listenCallbacks.get(channel);
+  if (cb === undefined) throw new Error(`no listener registered for ${channel}`);
+  cb({ payload: event });
+}
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: (cmd: string, args?: Record<string, unknown>) => invokeMock(cmd, args),
@@ -90,6 +99,12 @@ describe("App", () => {
   beforeEach(() => {
     invokeMock.mockReset();
     listenMock.mockReset();
+    listenCallbacks.clear();
+    // Restore the capture-callback default after `.mockReset()` clears it.
+    listenMock.mockImplementation(async (event: string, handler: unknown) => {
+      listenCallbacks.set(event, handler as (e: { payload: NormalizedEvent }) => void);
+      return () => {};
+    });
     openDialogMock.mockReset();
   });
 
@@ -418,5 +433,281 @@ describe("App", () => {
     // render the sidebar but silently drop events.
     expect(listenMock.mock.calls.length).toBe(listenCallsBeforeAdd + 1);
     expect(listenMock.mock.calls.at(-1)?.[0]).toBe(`agent:${SECOND_AGENT.id}`);
+  });
+
+  // Companion to the "dynamic agent add" test above, exercising the
+  // **attach existing session** code path through the same modal. The
+  // load-bearing assertion is the IPC shape: a regression that mis-wired
+  // the form's `attach` mode to call `create_agent` (or to ship
+  // existing_session_id under the wrong field) would still render the
+  // sidebar agent but silently never reuse the existing harness session.
+  it("loaded → attach agent via sidebar modal: invokes attach_agent with existing_session_id and registers a listener", async () => {
+    const EXISTING_SESSION_ID = "55555555-5555-7000-8000-555555555555";
+    const ATTACHED_AGENT: AgentRecord = {
+      id: "66666666-6666-7000-8000-666666666666",
+      project_id: PROJECT.id,
+      name: "attached-claude",
+      harness: "claude_code",
+      session_id: EXISTING_SESSION_ID,
+      created_at: "2026-05-13T00:00:03Z",
+    };
+    setInvokeResponses({
+      pick_directory: INFO_NO_SWITCHBOARD,
+      init_directory: { ...INFO_NO_SWITCHBOARD, has_switchboard: true },
+      create_project: PROJECT,
+      set_active_project: null,
+      list_agents: [],
+      create_agent: AGENT,
+    });
+    openDialogMock.mockResolvedValueOnce(PATH);
+
+    const App = (await import("./App.svelte")).default;
+    render(App);
+    await waitFor(() => expect(screen.getByText("Open working directory")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("Open working directory"));
+    await waitFor(() => expect(screen.getByTestId("confirm-init")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("confirm-init"));
+    await waitFor(() => expect(screen.getByTestId("confirm-create-agent")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("confirm-create-agent"));
+    await waitFor(() => expect(screen.getByTestId("loaded-layout")).toBeInTheDocument());
+
+    const listenCallsBeforeAttach = listenMock.mock.calls.length;
+
+    setInvokeResponses({
+      pick_directory: INFO_NO_SWITCHBOARD,
+      init_directory: { ...INFO_NO_SWITCHBOARD, has_switchboard: true },
+      create_project: PROJECT,
+      set_active_project: null,
+      list_agents: [],
+      attach_agent: ATTACHED_AGENT,
+    });
+
+    await fireEvent.click(screen.getByTestId("sidebar-add-agent"));
+    await waitFor(() => expect(screen.getByTestId("dialog-content")).toBeInTheDocument());
+    const modal = screen.getByTestId("dialog-content");
+
+    // Switch the modal from "create" mode (default) to "attach".
+    await fireEvent.click(within(modal).getByTestId("mode-attach"));
+
+    const nameInput = within(modal).getByTestId("agent-name") as HTMLInputElement;
+    await fireEvent.input(nameInput, { target: { value: "attached-claude" } });
+    const sessionInput = within(modal).getByTestId("attach-session-id") as HTMLInputElement;
+    await fireEvent.input(sessionInput, { target: { value: EXISTING_SESSION_ID } });
+    await fireEvent.click(within(modal).getByTestId("confirm-create-agent"));
+
+    // Sidebar shows the attached agent.
+    await waitFor(() => {
+      const names = screen.getAllByTestId("agent-name");
+      expect(names.some((n) => n.textContent === "attached-claude")).toBe(true);
+    });
+    // Modal closes after successful submission.
+    expect(screen.queryByTestId("dialog-content")).not.toBeInTheDocument();
+
+    // attach_agent IPC fired with the attach-shaped payload. A regression
+    // that fell back to create_agent (wrong command) or dropped the
+    // existing_session_id field would fail this check.
+    const attachCalls = invokeMock.mock.calls.filter(([cmd]) => cmd === "attach_agent");
+    expect(attachCalls).toHaveLength(1);
+    expect(attachCalls[0]?.[1]).toEqual({
+      name: "attached-claude",
+      harness: "claude_code",
+      // camelCase at the IPC boundary — Tauri converts to Rust snake_case
+      // on the way in. See `src/lib/api.ts::attachAgent`.
+      existingSessionId: EXISTING_SESSION_ID,
+    });
+    // No create_agent call leaked from the attach path.
+    const createAgentCallsForAttach = invokeMock.mock.calls.filter(
+      ([cmd, args]) =>
+        cmd === "create_agent" && (args as Record<string, unknown>)?.["name"] === "attached-claude",
+    );
+    expect(createAgentCallsForAttach).toHaveLength(0);
+
+    // Listener for the new agent registered. Same load-bearing property
+    // as the dynamic-add test: a regression that updated phase.agents
+    // without wiring the channel would still render the sidebar but
+    // silently drop dispatch events.
+    expect(listenMock.mock.calls.length).toBe(listenCallsBeforeAttach + 1);
+    expect(listenMock.mock.calls.at(-1)?.[0]).toBe(`agent:${ATTACHED_AGENT.id}`);
+  });
+
+  // The pair of E2E tests below exercise the full round trip:
+  //   compose-bar Send → invoke("send_message") → captured listen callback
+  //   → reducer → UI render → run_status returns to idle.
+  // Per-layer unit tests cover each piece in isolation; these pin the
+  // wiring through App.svelte against IPC-field renames or listener-
+  // registration regressions. One test per harness because the
+  // post-terminal event ordering differs (Codex emits RateLimitEvent +
+  // SessionMeta between TurnEnd and AgentIdle).
+  it("E2E (Claude): send → turn_start → content_chunk → turn_end → agent_idle renders the response and unblocks Send", async () => {
+    setInvokeResponses({
+      pick_directory: INFO_NO_SWITCHBOARD,
+      init_directory: { ...INFO_NO_SWITCHBOARD, has_switchboard: true },
+      create_project: PROJECT,
+      set_active_project: null,
+      list_agents: [],
+      create_agent: AGENT,
+      send_message: "77777777-7777-7000-8000-777777777777", // turn_id
+    });
+    openDialogMock.mockResolvedValueOnce(PATH);
+
+    const App = (await import("./App.svelte")).default;
+    render(App);
+    await waitFor(() => expect(screen.getByText("Open working directory")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("Open working directory"));
+    await waitFor(() => expect(screen.getByTestId("confirm-init")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("confirm-init"));
+    await waitFor(() => expect(screen.getByTestId("confirm-create-agent")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("confirm-create-agent"));
+    await waitFor(() => expect(screen.getByTestId("loaded-layout")).toBeInTheDocument());
+
+    // Type the prompt and Send.
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "hi" } });
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    // IPC for send_message fired with the right args.
+    await waitFor(() => {
+      const sendCalls = invokeMock.mock.calls.filter(([cmd]) => cmd === "send_message");
+      expect(sendCalls).toHaveLength(1);
+      expect(sendCalls[0]?.[1]).toEqual({ agentId: AGENT.id, prompt: "hi" });
+    });
+
+    // Fire the recorded Claude event sequence through the captured listener.
+    const turnId = "88888888-8888-7000-8000-888888888888";
+    const channel = `agent:${AGENT.id}`;
+    fireTo(channel, {
+      type: "turn_start",
+      turn_id: turnId,
+      started_at: "2026-05-16T00:00:00Z",
+    });
+    fireTo(channel, {
+      type: "content_chunk",
+      turn_id: turnId,
+      kind: "text",
+      text: "hello back",
+    });
+    fireTo(channel, {
+      type: "turn_end",
+      turn_id: turnId,
+      outcome: { status: "completed" },
+      ended_at: "2026-05-16T00:00:01Z",
+      usage: null,
+    });
+    fireTo(channel, { type: "agent_idle", agent_id: AGENT.id });
+
+    // Transcript shows the streamed text.
+    await waitFor(() => {
+      expect(screen.getByTestId("unified-transcript")).toHaveTextContent("hello back");
+    });
+    // Send is re-enabled (run_status flipped back to idle on agent_idle).
+    // Send-disabled state also depends on the textarea having content; the
+    // compose bar clears the textarea on submit, so a fresh prompt must
+    // be typed to observe the re-enabled state.
+    await fireEvent.input(textarea, { target: { value: "again" } });
+    await waitFor(() => {
+      expect(screen.getByTestId("compose-send")).not.toBeDisabled();
+    });
+  });
+
+  it("E2E (Codex): post-terminal sequence (turn_end → rate_limit_event → session_meta → agent_idle) lands metadata and unblocks Send", async () => {
+    const CODEX_AGENT: AgentRecord = {
+      id: "99999999-9999-7000-8000-999999999999",
+      project_id: PROJECT.id,
+      name: "codex-bot",
+      harness: "codex",
+      session_id: null,
+      created_at: "2026-05-13T00:00:04Z",
+    };
+    setInvokeResponses({
+      pick_directory: INFO_NO_SWITCHBOARD,
+      init_directory: { ...INFO_NO_SWITCHBOARD, has_switchboard: true },
+      create_project: PROJECT,
+      set_active_project: null,
+      list_agents: [],
+      create_agent: CODEX_AGENT,
+      send_message: "aaaaaaaa-aaaa-7000-8000-aaaaaaaaaaaa", // turn_id
+    });
+    openDialogMock.mockResolvedValueOnce(PATH);
+
+    const App = (await import("./App.svelte")).default;
+    render(App);
+    await waitFor(() => expect(screen.getByText("Open working directory")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("Open working directory"));
+    await waitFor(() => expect(screen.getByTestId("confirm-init")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("confirm-init"));
+    await waitFor(() => expect(screen.getByTestId("confirm-create-agent")).toBeInTheDocument());
+    // The create-agent form defaults to Claude; switch to Codex.
+    await fireEvent.click(screen.getByTestId("harness-codex"));
+    await fireEvent.click(screen.getByTestId("confirm-create-agent"));
+    await waitFor(() => expect(screen.getByTestId("loaded-layout")).toBeInTheDocument());
+
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "ack?" } });
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    await waitFor(() => {
+      const sendCalls = invokeMock.mock.calls.filter(([cmd]) => cmd === "send_message");
+      expect(sendCalls).toHaveLength(1);
+      expect(sendCalls[0]?.[1]).toEqual({ agentId: CODEX_AGENT.id, prompt: "ack?" });
+    });
+
+    const turnId = "bbbbbbbb-bbbb-7000-8000-bbbbbbbbbbbb";
+    const channel = `agent:${CODEX_AGENT.id}`;
+    fireTo(channel, {
+      type: "turn_start",
+      turn_id: turnId,
+      started_at: "2026-05-16T00:00:00Z",
+    });
+    fireTo(channel, {
+      type: "content_chunk",
+      turn_id: turnId,
+      kind: "text",
+      text: "ack",
+    });
+    fireTo(channel, {
+      type: "turn_end",
+      turn_id: turnId,
+      outcome: { status: "completed" },
+      ended_at: "2026-05-16T00:00:01Z",
+      usage: {
+        input_tokens: 100,
+        output_tokens: 5,
+        context_window: 200000,
+      },
+    });
+    // Codex post-terminal enrichment: rate_limit_event and session_meta
+    // arrive AFTER turn_end and BEFORE agent_idle. The frontend must
+    // accept them on the same per-agent channel without flipping
+    // run_status to idle until agent_idle.
+    fireTo(channel, {
+      type: "rate_limit_event",
+      agent_id: CODEX_AGENT.id,
+      info: { primary: { used_percent: 12.5 } },
+    });
+    fireTo(channel, {
+      type: "session_meta",
+      agent_id: CODEX_AGENT.id,
+      model: "gpt-test",
+      harness_version: "0.130.0",
+      tools: [],
+      mcp_servers: [{ name: "fs", status: "connected" }],
+      skills: [],
+      raw: null,
+    });
+    fireTo(channel, { type: "agent_idle", agent_id: CODEX_AGENT.id });
+
+    // Transcript shows the response text from the Codex-shape stream.
+    await waitFor(() => {
+      expect(screen.getByTestId("unified-transcript")).toHaveTextContent("ack");
+    });
+    // Send re-enabled only after agent_idle — not at turn_end, not at
+    // session_meta. Pin the load-bearing assertion: if a regression
+    // flipped run_status on turn_end (or anywhere before agent_idle),
+    // post-terminal events would race the user's next Send. (Textarea
+    // must be re-populated; compose-bar clears it on submit.)
+    await fireEvent.input(textarea, { target: { value: "again" } });
+    await waitFor(() => {
+      expect(screen.getByTestId("compose-send")).not.toBeDisabled();
+    });
   });
 });

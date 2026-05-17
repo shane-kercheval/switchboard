@@ -456,3 +456,78 @@ async fn agent_idle_is_last_event_and_unblocks_next_send() {
         .expect("second send must not return Busy after AgentIdle");
     handle2.join.await.unwrap();
 }
+
+#[tokio::test]
+async fn agent_idle_is_last_after_codex_post_terminal_enrichment_sequence() {
+    // Pins the load-bearing ordering invariant for Codex's post-terminal
+    // enrichment: the dispatcher's drain task must preserve the adapter's
+    // event order `TurnEnd → RateLimitEvent → SessionMeta` and emit
+    // `AgentIdle` strictly after all of them.
+    //
+    // Why this matters: AgentIdle is the sole sendability signal on the
+    // frontend (`AGENTS.md` stream contract; `AgentRuntime.run_status`
+    // state machine). If the dispatcher accidentally emitted AgentIdle
+    // mid-sequence — e.g., promptly on `TurnEnd` rather than on
+    // `AgentIdleGuard` drop after the drain loop drains the channel —
+    // the compose-bar would re-enable while RateLimitEvent / SessionMeta
+    // were still racing through IPC. A user sending immediately would
+    // either get a `Busy` from the dispatcher (worst case) or, more
+    // subtly, see sidebar metadata update *after* the next turn's
+    // user message appeared — a confusing inversion the user would read
+    // as a bug.
+    //
+    // The existing `agent_idle_is_last_event_and_unblocks_next_send` test
+    // exercises only the `ContentChunk → TurnEnd` path. This one extends
+    // coverage to the Codex shape, which is the path with the most
+    // events between TurnEnd and AgentIdle and thus the most chances for
+    // a re-ordering regression to land undetected.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let adapter = MockHarnessAdapter::with_scenario(MockScenario::CodexPostTerminalEnrichment);
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+
+    let handle = dispatcher
+        .send_message(
+            &agent,
+            Path::new("/tmp/project"),
+            "hello",
+            &adapter,
+            as_emitter(&emitter),
+            DispatchOptions::default(),
+        )
+        .await
+        .unwrap();
+    handle.join.await.unwrap();
+
+    let events = emitter.snapshot();
+    let type_sequence: Vec<&str> = events.iter().map(|(_, v)| event_type(v)).collect();
+
+    // The dispatcher synthesizes TurnStart at the front and AgentIdle at
+    // the back; everything in between is the adapter's stream in arrival
+    // order. The exact expected sequence:
+    assert_eq!(
+        type_sequence,
+        vec![
+            "turn_start",
+            "content_chunk",
+            "turn_end",
+            "rate_limit_event",
+            "session_meta",
+            "agent_idle",
+        ],
+        "post-terminal events must preserve adapter order, and AgentIdle must come after all of them"
+    );
+
+    // Tighten the contract: the index of agent_idle is the LAST index. A
+    // regression that appended a stray event after AgentIdle would pass
+    // the sequence check above but fail this.
+    let last_idx = type_sequence
+        .iter()
+        .rposition(|t| *t == "agent_idle")
+        .unwrap();
+    assert_eq!(
+        last_idx,
+        type_sequence.len() - 1,
+        "AgentIdle must be strictly the final event — no trailing events allowed"
+    );
+}

@@ -75,6 +75,47 @@ async fn live_basic_turn_completes() {
         ),
         "expected TurnEnd(Completed), got: {terminal:?}"
     );
+
+    // Drift detection for promoted M2 events — symmetric with the Codex
+    // live test's enrichment assertions. Claude emits `SessionMeta` from
+    // its `system/init` stream event on every dispatch; the wire-format
+    // contract says `model`, `harness_version`, and `tools` are populated.
+    // `TurnEnd.usage.context_window` comes from `result.modelUsage.<model>.contextWindow`.
+    // If Anthropic's CLI ever silently drops or renames these fields, this
+    // test catches it before it ships to users (fixture-based tests would
+    // keep passing against the old recorded shape).
+    let session_meta = events
+        .iter()
+        .find(|e| matches!(e, AdapterEvent::SessionMeta { .. }))
+        .expect("Claude must emit SessionMeta from system/init on every dispatch");
+    match session_meta {
+        AdapterEvent::SessionMeta {
+            model,
+            harness_version,
+            tools,
+            ..
+        } => {
+            assert!(!model.is_empty(), "SessionMeta.model must be non-empty");
+            assert!(
+                !harness_version.is_empty(),
+                "SessionMeta.harness_version must be non-empty"
+            );
+            assert!(
+                !tools.is_empty(),
+                "SessionMeta.tools must list at least Claude's builtin tools"
+            );
+        }
+        _ => unreachable!(),
+    }
+    match terminal {
+        AdapterEvent::TurnEnd { usage: Some(u), .. } => {
+            assert!(
+                u.context_window.is_some(),
+                "TurnEnd.usage.context_window must be populated from result.modelUsage (got None)"
+            );
+        }
+        _ => panic!("expected TurnEnd with Some(usage), got: {terminal:?}"),
+    }
 }
 
 #[tokio::test]

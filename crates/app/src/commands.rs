@@ -91,7 +91,7 @@ pub async fn init_directory_impl(state: &AppState, path: &str) -> Result<Directo
             // A pending one-shot from a prior directory's attach must not
             // leak into the newly-bound directory's first dispatch — the
             // agent_id wouldn't even resolve.
-            lock(&state.pending_first_dispatch).clear();
+            lock(&state.needs_session_meta).clear();
         }
         *current = Some(directory);
     }
@@ -186,9 +186,14 @@ pub fn create_agent_impl(
 /// 5. Register via the harness-specific `register_attached_*` method.
 /// 6. (Codex only) Append the first sidecar record with the discovered
 ///    `original_start_date_utc`.
-/// 7. Insert the new `agent_id` into `pending_first_dispatch` so the next
-///    `send_message` runs with `is_first_dispatch_after_attach: true` —
-///    forces `SessionMeta` emission for the Codex sidebar.
+/// 7. (Codex only) Insert the new `agent_id` into `needs_session_meta` so
+///    every dispatch up to and including the one that observes `SessionMeta`
+///    runs with `is_first_dispatch_after_attach: true` — forces `SessionMeta`
+///    emission for the Codex sidebar. The per-dispatch emitter decorator
+///    clears the flag once `session_meta` is genuinely observed on the wire.
+///    Claude attaches do **not** populate this set: Claude emits `SessionMeta`
+///    from its `system/init` stream event on every dispatch (see
+///    `crates/harness/src/claude_code.rs`), so the override has nothing to do.
 ///
 /// `home_dir` is passed in (not resolved here) so tests can stage a temp
 /// directory without mutating process-wide `$HOME`. The Tauri command shim
@@ -253,12 +258,16 @@ pub fn attach_agent_impl(
                 started_at: chrono::Utc::now(),
             };
             switchboard_harness::codex::sidecar::append_record(&sidecar_path, &sidecar_record)?;
-            project.register_attached_codex_agent_with_id(name, new_agent_id)?
+            let record = project.register_attached_codex_agent_with_id(name, new_agent_id)?;
+            // Codex-only: force SessionMeta on subsequent dispatches until
+            // one is genuinely observed. Claude attaches don't need this —
+            // see step 7 docstring.
+            lock(&state.needs_session_meta).insert(record.id);
+            record
         }
         _ => return Err(AppError::UnsupportedHarness),
     };
 
-    lock(&state.pending_first_dispatch).insert(record.id);
     Ok(record)
 }
 
@@ -437,29 +446,33 @@ pub async fn send_message_impl(
         HarnessKind::Codex => state.codex_adapter.as_ref(),
         _ => return Err(AppError::UnsupportedHarness),
     };
-    // Drain the attach-flow one-shot **before** the awaited dispatch so the
-    // mutex never crosses an `.await`. Restore on pre-stream `Err` (binary
-    // missing, spawn failure) so a retry still forces `SessionMeta`. The
-    // mid-stream gap is documented on `AppState.pending_first_dispatch`.
-    let is_first_dispatch_after_attach = lock(&state.pending_first_dispatch).remove(&agent_id);
+    // Read (don't drain) the attach-flow flag. The per-dispatch emitter
+    // decorator clears the flag if-and-only-if a `session_meta` event is
+    // observed on the wire. Pre-stream errors and mid-stream failures both
+    // leave the flag intact, so the next retry still forces SessionMeta.
+    // See `AppState::needs_session_meta` and `crate::emitter` for the full
+    // contract; the four-dispatch test below pins the invariant.
+    let is_first_dispatch_after_attach = lock(&state.needs_session_meta).contains(&agent_id);
     let options = switchboard_harness::DispatchOptions {
         is_first_dispatch_after_attach,
     };
-    let result = state
+    let observing_emitter: Arc<dyn EventEmitter> =
+        Arc::new(crate::emitter::SessionMetaObservingEmitter::new(
+            Arc::clone(&state.emitter),
+            Arc::clone(&state.needs_session_meta),
+            agent_id,
+        ));
+    Ok(state
         .dispatcher
         .send_message(
             &agent,
             &project.directory,
             prompt,
             adapter,
-            Arc::clone(&state.emitter) as Arc<dyn EventEmitter>,
+            observing_emitter,
             options,
         )
-        .await;
-    if is_first_dispatch_after_attach && result.is_err() {
-        lock(&state.pending_first_dispatch).insert(agent_id);
-    }
-    Ok(result?)
+        .await?)
 }
 
 pub fn check_claude_binary_impl(state: &AppState) -> Result<(), AppError> {
@@ -528,7 +541,7 @@ pub(crate) fn parse_uuid(value: &str) -> Result<Uuid, AppError> {
 mod tests {
     use super::*;
 
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
     use switchboard_core::CoreError;
@@ -581,7 +594,7 @@ mod tests {
         let agent = create_agent_impl(&state, "assistant", HarnessKind::ClaudeCode).unwrap();
 
         // Simulate a stale attach-flow one-shot from the old directory.
-        lock(&state.pending_first_dispatch).insert(agent.id);
+        lock(&state.needs_session_meta).insert(agent.id);
 
         // Rebind to a different directory.
         let info_b = init_directory_impl(&state, tmp_b.path().to_str().unwrap())
@@ -589,12 +602,12 @@ mod tests {
             .unwrap();
 
         // Loaded-project state was cleared, active project unset, and the
-        // pending one-shot drained — a stale agent_id from a previous
+        // attach-flow flag drained — a stale agent_id from a previous
         // directory's attach must not leak into the new binding.
         assert_eq!(info_b.projects.len(), 0);
         assert!(lock(&state.projects).is_empty());
         assert!(lock(&state.active_project_id).is_none());
-        assert!(lock(&state.pending_first_dispatch).is_empty());
+        assert!(lock(&state.needs_session_meta).is_empty());
 
         // The actual user-visible bug guard: sending to the old agent ID
         // now returns AgentNotFound (not a silent dispatch against the old
@@ -987,7 +1000,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_first_dispatch_is_drained_on_successful_send() {
+    async fn needs_session_meta_persists_when_no_session_meta_observed() {
+        // Read-don't-drain: a successful dispatch that does NOT carry a
+        // session_meta event must leave the flag intact, so a follow-up
+        // dispatch still forces SessionMeta.
         let (tmp, state, _) = fresh_state_with_mock();
         init_directory_impl(&state, tmp.path().to_str().unwrap())
             .await
@@ -995,19 +1011,25 @@ mod tests {
         let proj = create_project_impl(&state, "alpha").unwrap();
         set_active_project_impl(&state, proj.id).unwrap();
         let agent = create_agent_impl(&state, "a", HarnessKind::ClaudeCode).unwrap();
-        lock(&state.pending_first_dispatch).insert(agent.id);
+        lock(&state.needs_session_meta).insert(agent.id);
 
         let handle = send_message_impl(&state, agent.id, "hi").await.unwrap();
         handle.join.await.unwrap();
 
+        // MockHarnessAdapter's Streaming scenario emits TurnStart + chunks +
+        // TurnEnd + AgentIdle — no SessionMeta — so the decorator never fires
+        // and the flag must survive.
         assert!(
-            !lock(&state.pending_first_dispatch).contains(&agent.id),
-            "one-shot must be drained after a successful first post-attach dispatch"
+            lock(&state.needs_session_meta).contains(&agent.id),
+            "flag must persist when no session_meta was observed on the wire"
         );
     }
 
     #[tokio::test]
-    async fn pending_first_dispatch_is_restored_on_pre_stream_error() {
+    async fn needs_session_meta_persists_through_pre_stream_error() {
+        // Pre-stream Err paths (binary missing, spawn failure) also leave
+        // the flag set: read-don't-drain means there's nothing to "restore"
+        // — the flag was never moved.
         use switchboard_harness::MockScenario;
         let failing: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::with_scenario(
             MockScenario::DispatchFails,
@@ -1025,18 +1047,18 @@ mod tests {
         let proj = create_project_impl(&state, "alpha").unwrap();
         set_active_project_impl(&state, proj.id).unwrap();
         let agent = create_agent_impl(&state, "a", HarnessKind::ClaudeCode).unwrap();
-        lock(&state.pending_first_dispatch).insert(agent.id);
+        lock(&state.needs_session_meta).insert(agent.id);
 
         let err = send_message_impl(&state, agent.id, "hi").await.unwrap_err();
         assert!(matches!(err, AppError::Dispatcher(_)));
         assert!(
-            lock(&state.pending_first_dispatch).contains(&agent.id),
-            "one-shot must be restored on pre-stream Err so a retry still forces SessionMeta"
+            lock(&state.needs_session_meta).contains(&agent.id),
+            "flag must persist through pre-stream Err so a retry still forces SessionMeta"
         );
     }
 
     #[tokio::test]
-    async fn pending_first_dispatch_unset_means_default_flag() {
+    async fn needs_session_meta_unset_means_default_flag() {
         // Sanity: agents that never went through attach get
         // is_first_dispatch_after_attach=false (the default). Captured via a
         // recording adapter so we can inspect the DispatchOptions.
@@ -1104,7 +1126,7 @@ mod tests {
         );
 
         // Now stash the flag and re-send for the same agent — adapter must see true.
-        lock(&state.pending_first_dispatch).insert(agent_default.id);
+        lock(&state.needs_session_meta).insert(agent_default.id);
         let handle = send_message_impl(&state, agent_default.id, "again")
             .await
             .unwrap();
@@ -1112,6 +1134,114 @@ mod tests {
         assert!(
             saw_flag.load(Ordering::SeqCst),
             "post-attach send must pass is_first_dispatch_after_attach=true"
+        );
+    }
+
+    #[tokio::test]
+    async fn needs_session_meta_clears_only_after_session_meta_is_observed() {
+        // The load-bearing invariant of the read-don't-drain design:
+        // - Dispatches #1 and #2 stream + complete WITHOUT emitting
+        //   session_meta → flag survives both → adapter sees
+        //   `is_first_dispatch_after_attach: true` each time.
+        // - Dispatch #3 emits a session_meta event → the decorator clears
+        //   the flag mid-stream → flag is gone.
+        // - Dispatch #4 sees `is_first_dispatch_after_attach: false`.
+        // Captures both directions of the invariant in one sequence so a
+        // regression on either side ("drain at start" or "clear without
+        // observation") fails this test.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct ProgrammableAdapter {
+            dispatch_count: AtomicUsize,
+            seen_flags: Arc<Mutex<Vec<bool>>>,
+            // Dispatch index (0-based) at which SessionMeta+TurnEnd should be emitted.
+            emit_session_meta_at: usize,
+        }
+
+        #[async_trait]
+        impl HarnessAdapter for ProgrammableAdapter {
+            fn probe(&self) -> Result<(), switchboard_harness::DispatchError> {
+                Ok(())
+            }
+            async fn dispatch(
+                &self,
+                agent: &AgentRecord,
+                _cwd: &Path,
+                _prompt: &str,
+                turn_id: switchboard_harness::TurnId,
+                options: switchboard_harness::DispatchOptions,
+            ) -> Result<switchboard_harness::EventStream, switchboard_harness::DispatchError>
+            {
+                let index = self.dispatch_count.fetch_add(1, Ordering::SeqCst);
+                lock(&self.seen_flags).push(options.is_first_dispatch_after_attach);
+                let emit_meta = index == self.emit_session_meta_at;
+                let agent_id = agent.id;
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                tokio::spawn(async move {
+                    if emit_meta {
+                        let _ = tx.send(switchboard_harness::AdapterEvent::SessionMeta {
+                            agent_id,
+                            model: "test-model".to_owned(),
+                            harness_version: "0.0.0".to_owned(),
+                            tools: vec![],
+                            mcp_servers: vec![],
+                            skills: vec![],
+                            raw: serde_json::Value::Null,
+                        });
+                    }
+                    let _ = tx.send(switchboard_harness::AdapterEvent::TurnEnd {
+                        turn_id,
+                        outcome: switchboard_harness::TurnOutcome::Completed,
+                        ended_at: chrono::Utc::now(),
+                        usage: None,
+                    });
+                });
+                Ok(Box::pin(
+                    tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
+                ))
+            }
+        }
+
+        let seen_flags = Arc::new(Mutex::new(Vec::new()));
+        let adapter: Arc<dyn HarnessAdapter> = Arc::new(ProgrammableAdapter {
+            dispatch_count: AtomicUsize::new(0),
+            seen_flags: Arc::clone(&seen_flags),
+            emit_session_meta_at: 2, // 0-based: third dispatch emits SessionMeta
+        });
+        let emitter = Arc::new(RecordingEmitter::new());
+        let state = AppState::new(
+            Arc::clone(&adapter),
+            Arc::clone(&adapter),
+            emitter as Arc<dyn EventEmitter>,
+        );
+        let tmp = TempDir::new().unwrap();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let proj = create_project_impl(&state, "alpha").unwrap();
+        set_active_project_impl(&state, proj.id).unwrap();
+        let agent = create_agent_impl(&state, "a", HarnessKind::Codex).unwrap();
+        // Simulate the Codex-attach state: the flag is set on a real attach,
+        // but `create_agent_impl` doesn't trigger that path, so set it
+        // directly to isolate the read-don't-drain behavior under test.
+        lock(&state.needs_session_meta).insert(agent.id);
+
+        // Run four dispatches sequentially. Each completes before the next.
+        for _ in 0..4 {
+            let handle = send_message_impl(&state, agent.id, "hi").await.unwrap();
+            handle.join.await.unwrap();
+        }
+
+        let flags = lock(&seen_flags).clone();
+        assert_eq!(
+            flags,
+            vec![true, true, true, false],
+            "flag must persist across dispatches 1+2 (no session_meta) and on dispatch 3 \
+             (which emits session_meta); only dispatch 4 — after observation — sees false"
+        );
+        assert!(
+            !lock(&state.needs_session_meta).contains(&agent.id),
+            "set must be empty after session_meta is observed"
         );
     }
 
@@ -1278,8 +1408,16 @@ mod tests {
         .unwrap();
         assert_eq!(record.session_id, Some(session_id));
         assert_eq!(record.harness, HarnessKind::ClaudeCode);
-        // pending_first_dispatch is populated so the first send forces SessionMeta.
-        assert!(lock(&state.pending_first_dispatch).contains(&record.id));
+        // Codex-only invariant: Claude attaches must NOT populate
+        // `needs_session_meta`. Claude emits SessionMeta from its
+        // `system/init` stream event on every dispatch (see
+        // `crates/harness/src/claude_code.rs`), so the override has nothing
+        // to do. Pins the asymmetry against "let me just delete the
+        // if-match to simplify" refactors.
+        assert!(
+            !lock(&state.needs_session_meta).contains(&record.id),
+            "Claude attach must NOT populate needs_session_meta"
+        );
     }
 
     #[tokio::test]
@@ -1340,7 +1478,10 @@ mod tests {
             record.session_id, None,
             "Codex AgentRecord.session_id stays None"
         );
-        assert!(lock(&state.pending_first_dispatch).contains(&record.id));
+        assert!(
+            lock(&state.needs_session_meta).contains(&record.id),
+            "Codex attach must populate needs_session_meta so first dispatch forces SessionMeta"
+        );
 
         // Sidecar record exists with the discovered date.
         let sidecar = switchboard_harness::codex::sidecar::sidecar_path(

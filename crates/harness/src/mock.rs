@@ -41,6 +41,16 @@ pub enum MockScenario {
     /// emitted (the wire stays clean — consumers see the `DispatcherError`
     /// from `send_message`, never a half-stream).
     DispatchFails,
+
+    /// Emits a Codex-shaped post-terminal enrichment sequence:
+    /// `ContentChunk → TurnEnd(Completed) → RateLimitEvent → SessionMeta`.
+    /// Used in the dispatcher's `agent_idle_is_last_after_codex_post_terminal_enrichment_sequence`
+    /// test to pin that the dispatcher preserves adapter event order and
+    /// emits `AgentIdle` strictly after all post-terminal events. Real
+    /// Codex emits this shape via `emit_terminal_with_enrichment` in
+    /// `crates/harness/src/codex/mod.rs`; this scenario stands in without
+    /// requiring a subprocess.
+    CodexPostTerminalEnrichment,
 }
 
 /// A `HarnessAdapter` that produces canned events without spawning any subprocess.
@@ -73,7 +83,7 @@ impl HarnessAdapter for MockHarnessAdapter {
 
     async fn dispatch(
         &self,
-        _agent: &AgentRecord,
+        agent: &AgentRecord,
         _cwd: &Path,
         prompt: &str,
         turn_id: TurnId,
@@ -84,6 +94,7 @@ impl HarnessAdapter for MockHarnessAdapter {
         }
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let agent_id = agent.id;
 
         match self.scenario {
             MockScenario::Streaming => {
@@ -132,6 +143,37 @@ impl HarnessAdapter for MockHarnessAdapter {
                         text: "partial-two".to_owned(),
                     });
                     // Drop tx without emitting TurnEnd — stream closes silently.
+                });
+            }
+            MockScenario::CodexPostTerminalEnrichment => {
+                tokio::spawn(async move {
+                    let _ = tx.send(AdapterEvent::ContentChunk {
+                        turn_id,
+                        kind: ContentKind::Text,
+                        text: "ack".to_owned(),
+                    });
+                    let _ = tx.send(AdapterEvent::TurnEnd {
+                        turn_id,
+                        outcome: TurnOutcome::Completed,
+                        ended_at: Utc::now(),
+                        usage: None,
+                    });
+                    let _ = tx.send(AdapterEvent::RateLimitEvent {
+                        agent_id,
+                        info: serde_json::json!({"primary": {"used_percent": 12.5}}),
+                    });
+                    let _ = tx.send(AdapterEvent::SessionMeta {
+                        agent_id,
+                        model: "gpt-test".to_owned(),
+                        harness_version: "0.130.0".to_owned(),
+                        tools: vec![],
+                        mcp_servers: vec![crate::events::McpServerStatus {
+                            name: "fs".to_owned(),
+                            status: "connected".to_owned(),
+                        }],
+                        skills: vec![],
+                        raw: serde_json::Value::Null,
+                    });
                 });
             }
             MockScenario::DispatchFails => {

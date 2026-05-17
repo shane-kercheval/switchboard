@@ -42,13 +42,15 @@ export function harnessUnavailableReason(a: HarnessAvailability): string | null 
       ? "Claude Code not found on PATH. Install from https://claude.com/code"
       : "Codex not found on PATH. Install from https://github.com/openai/codex";
   }
-  if (a.auth === "missing") {
-    // Codex-only by current invariant. Generic phrasing in case a future
-    // harness with file-detectable auth lands here — the v1 hardcoded
-    // copy is correct for Codex specifically since auth-detection is
-    // Codex-only in v1.
+  if (a.auth === "missing" && a.harness === "codex") {
     return "Codex not authenticated — run `codex login` and reload Switchboard. (API-key-only auth is not supported.)";
   }
+  // `auth === "missing"` for a non-Codex harness is structurally
+  // unreachable today (the discriminated-union variant for Claude has
+  // `auth: "unsupported"`). The explicit harness guard above is
+  // belt-and-suspenders symmetric with `bannerCopy`, so a future Claude
+  // auth probe widening Claude's auth field cannot silently render
+  // Codex copy on a Claude row.
   return null;
 }
 

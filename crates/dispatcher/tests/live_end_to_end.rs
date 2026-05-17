@@ -169,15 +169,32 @@ async fn live_full_stack_emits_turn_start_then_content_then_turn_end() {
         Some("turn_start"),
         "first event on the channel must be turn_start; got: {kinds:?}"
     );
+    // AGENTS.md stream contract: `AgentIdle` is the last event on the
+    // per-agent channel for a dispatch, AFTER `TurnEnd` and any
+    // post-terminal agent-scoped events. This was originally a
+    // `turn_end`-is-last assertion (pre-AgentIdle); updated to track the
+    // current contract.
     assert_eq!(
         kinds.last().map(String::as_str),
-        Some("turn_end"),
-        "last event must be turn_end; got: {kinds:?}"
+        Some("agent_idle"),
+        "last event must be agent_idle; got: {kinds:?}"
     );
     assert_eq!(
         kinds.iter().filter(|k| *k == "turn_end").count(),
         1,
         "must be exactly one terminal event per turn; got: {kinds:?}"
+    );
+    assert_eq!(
+        kinds.iter().filter(|k| *k == "agent_idle").count(),
+        1,
+        "exactly one agent_idle per dispatch; got: {kinds:?}"
+    );
+    // turn_end must precede agent_idle.
+    let turn_end_idx = kinds.iter().position(|k| k == "turn_end").unwrap();
+    let agent_idle_idx = kinds.iter().position(|k| k == "agent_idle").unwrap();
+    assert!(
+        turn_end_idx < agent_idle_idx,
+        "turn_end must precede agent_idle; got: {kinds:?}"
     );
     assert!(
         kinds.iter().any(|k| k == "content_chunk"),

@@ -282,8 +282,8 @@ async fn truncated_stream_without_turn_end_returns_to_idle() {
     // Fault-injection: MockScenario::TruncatedStream emits chunks and
     // drops the sender without TurnEnd — a deliberate contract
     // violation, NOT acceptable real-world behaviour. Real adapters
-    // (e.g., ClaudeCodeAdapter, M1.3 step 7) synthesize TurnEnd(Failed)
-    // on truncation; the dispatcher trusts that and does not repair.
+    // (e.g., ClaudeCodeAdapter) synthesize TurnEnd(Failed) on truncation;
+    // the dispatcher trusts that and does not repair.
     //
     // This test asserts only the dispatcher's state-recovery half of
     // the picture: agent returns to Idle even when the adapter
@@ -321,13 +321,13 @@ async fn truncated_stream_without_turn_end_returns_to_idle() {
 
 #[tokio::test]
 async fn dispatch_failure_emits_no_turn_start_and_leaves_agent_idle() {
-    // Per the M1.4 invariant: when `adapter.dispatch()` returns Err,
-    // `send_message` lifts it to `DispatcherError::Dispatch`, the
+    // Pre-stream-failure invariant: when `adapter.dispatch()` returns
+    // Err, `send_message` lifts it to `DispatcherError::Dispatch`, the
     // `AgentIdleGuard` drops on early return, and NO `TurnStart` is
     // emitted (the wire stays clean — consumers see the error from
-    // `send_message`, never a half-stream). This is the "pre-stream
-    // failure" path, distinct from the "stream established then broke"
-    // paths covered by Panic / TruncatedStream above.
+    // `send_message`, never a half-stream). Distinct from the
+    // "stream established then broke" paths covered by Panic /
+    // TruncatedStream above.
     let dispatcher = Arc::new(Dispatcher::new());
     let adapter = MockHarnessAdapter::with_scenario(MockScenario::DispatchFails);
     let emitter = Arc::new(RecordingEmitter::new());

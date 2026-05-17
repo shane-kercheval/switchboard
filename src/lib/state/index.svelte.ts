@@ -1,14 +1,12 @@
-// App-level state for the M2.5 unified-stream model.
+// App-level state for the unified-stream model.
 //
-// **Why this module exists.** The M1.5 model had AgentPane.svelte own its
-// own listener, transcript, heartbeat — one component, one agent. M2.5
-// makes per-agent state outlive any particular UI component:
-// subscriptions persist for the lifetime of the app session, regardless of
-// which agent the user is "looking at" (per AGENTS.md: no singleton
-// "active" or "focused" agent). The state therefore lives one layer above
-// any component, in this module.
+// **Why this module exists.** Per-agent state outlives any particular UI
+// component: subscriptions persist for the lifetime of the app session,
+// regardless of which agent the user is "looking at" (per AGENTS.md: no
+// singleton "active" or "focused" agent). The state therefore lives one
+// layer above any component, in this module.
 //
-// **Lifetime contract** (per system-design §3 and M2 invariants):
+// **Lifetime contract** (per system-design §3):
 // - Subscriptions register at agent creation/load time (`registerAgent`).
 // - They are NEVER torn down. `set_active_project` is display-only and
 //   does not unregister listeners (background events for other projects
@@ -28,11 +26,11 @@
 // listener boundary and threads it through. Tests can drive the reducers
 // with fixed timestamps for deterministic assertions.
 //
-// **UI integration** (Pass B): App.svelte calls `registerAgent` at
-// project-open time and on dynamic agent add. Sidebar / UnifiedTranscript
-// / ComposeBar components read `transcripts` / `runtimes` / `ui`
-// directly. ComposeBar drives `dispatchUserTurn` + Tauri `send_message`
-// + `failSendStart` on IPC error.
+// **UI integration**: App.svelte calls `registerAgent` at project-open
+// time and on dynamic agent add. Sidebar / UnifiedTranscript / ComposeBar
+// components read `transcripts` / `runtimes` / `ui` directly. ComposeBar
+// drives `dispatchUserTurn` + Tauri `send_message` + `failSendStart` on
+// IPC error.
 
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { loadTranscript } from "$lib/api";
@@ -59,9 +57,8 @@ export const transcripts = $state<TranscriptMap>({});
 export const runtimes = $state<RuntimeMap>({});
 
 /// Session-local ergonomic — the recipient picker preselects whichever
-/// agent the user last sent to. Not persisted across app reloads (per
-/// design decision: ergonomic, not a semantic privilege; M4+ revisits if
-/// real asks surface).
+/// agent the user last sent to. Not persisted across app reloads
+/// (ergonomic, not a semantic privilege).
 export const ui = $state<{ lastRecipientId: AgentId | null }>({ lastRecipientId: null });
 
 /// Per-agent unlisten functions for the Tauri event channel. Keyed by
@@ -105,12 +102,12 @@ const heartbeats = new Map<AgentId, Heartbeat>();
 /// the duplication — the same conversation lands twice. Even on the failure
 /// branch, the safer default is "don't retry implicitly" rather than risk
 /// the duplicate-content case. An explicit retry UX (per-agent retry button)
-/// is M2.7+ work; it would mutate this set out-of-band.
+/// is future work; it would mutate this set out-of-band.
 ///
-/// **TODO(M-future)**: clear this set when the bound directory rebinds —
-/// the agents in a different directory are a different population. Out of
-/// scope for M2.6 (no directory-rebind path exists yet in the post-M2.5
-/// flow that wouldn't already reset the whole app state).
+/// **TODO**: clear this set when the bound directory rebinds — the agents
+/// in a different directory are a different population. Out of scope here
+/// (no directory-rebind path exists yet that wouldn't already reset the
+/// whole app state).
 // eslint-disable-next-line svelte/prefer-svelte-reactivity
 const hydrationAttempted = new Set<AgentId>();
 
@@ -129,10 +126,9 @@ const hydrationAttempted = new Set<AgentId>();
 /// mint fresh `turn_id`s at parse time. The set is authoritative; the
 /// status field is presentational.
 ///
-/// **Failure scope** (matches the M2.6 plan's `hydration_status: "failed"`
-/// definition): only lookup-mechanism failures (IPC reject) land here. Per-
-/// line parse warnings flow through as `LoadedTranscript.warnings` inside
-/// an otherwise-`complete` result.
+/// **Failure scope**: only lookup-mechanism failures (IPC reject) land
+/// in `hydration_status: "failed"`. Per-line parse warnings flow through
+/// as `LoadedTranscript.warnings` inside an otherwise-`complete` result.
 export async function hydrateAgent(agentId: AgentId): Promise<void> {
   const current = runtimes[agentId];
   if (current === undefined) {
@@ -218,10 +214,11 @@ export async function registerAgent(agent: AgentRecord): Promise<void> {
 /// `run_status` to `"starting"`. Called by the compose-bar's Send handler
 /// at submit time, before the IPC reply arrives. The user's message is
 /// part of the conversation, not transient UI state — appending here
-/// means it survives reload (once M2.6 hydrates) and renders immediately
-/// without waiting for the backend round-trip. The `"starting"` state
-/// closes the pre-`TurnStart` sendability race (see `AgentRuntime`
-/// docstring for the full state machine).
+/// means it survives reload (via session-file hydration on next project
+/// open) and renders immediately without waiting for the backend
+/// round-trip. The `"starting"` state closes the pre-`TurnStart`
+/// sendability race (see `AgentRuntime` docstring for the full state
+/// machine).
 ///
 /// **Defensive invariants** (compose-bar should gate first; these are
 /// fail-loud defense-in-depth):

@@ -2,9 +2,9 @@
 //!
 //! Codex emits a flat top-level event stream (no envelope wrapper). Each line
 //! is a JSON object discriminated by `type`. The parser maps these to
-//! `AdapterEvent`s per the M2.3 mapping table; events the parser cannot
-//! handle deterministically (rate limits, session metadata) are deferred to
-//! M2.4's session-file enrichment.
+//! `AdapterEvent`s; events the parser cannot handle deterministically
+//! (rate limits, session metadata) are deferred to the post-terminal
+//! session-file enrichment (see [`super::session_file`]).
 //!
 //! **State threading.** `CodexParserState` is constructed fresh per dispatch
 //! by the producer task (parallels Claude's `ParserState` pattern in
@@ -57,7 +57,7 @@ pub struct CodexParserState {
 /// Parse one Codex stream-json line. Returns `ParseOutcome::Skip` for events
 /// the parser observed but produced no normalized output (e.g.,
 /// `thread.started` captures the `thread_id` into state; `token_count` is
-/// session-file-only per M2.1 findings; `turn.started` is dispatcher-owned).
+/// session-file-only; `turn.started` is dispatcher-owned).
 pub fn parse_line(line: &str, turn_id: TurnId, state: &mut CodexParserState) -> ParseOutcome {
     let value: Value = match serde_json::from_str(line) {
         Ok(v) => v,
@@ -66,8 +66,9 @@ pub fn parse_line(line: &str, turn_id: TurnId, state: &mut CodexParserState) -> 
 
     // `turn.started`, `event_msg`, and unknown types all skip; collapsed
     // via the wildcard arm. `event_msg` carries Codex's session-file-bound
-    // `token_count` payload, which M2.4 owns (M2.1 confirmed `rate_limits`
-    // is session-file-only).
+    // `token_count` payload, which the post-terminal enrichment owns
+    // (rate_limits is session-file-only — see
+    // `docs/research/codex-cli-observed.md`).
     match value.get("type").and_then(Value::as_str) {
         Some("thread.started") => parse_thread_started(&value, state),
         Some("item.started") => parse_item_started(&value, turn_id),
@@ -97,13 +98,13 @@ fn parse_item_started(obj: &Value, turn_id: TurnId) -> ParseOutcome {
     };
     let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
 
-    // Forward-compat defensive policy (M2.3): if a future Codex version emits
+    // Forward-compat defensive policy: if a future Codex version emits
     // `item.started` for `agent_message`, do NOT synthesize a phantom
     // `ToolStarted` — text messages are not tool calls. Warn and skip; the
     // subsequent `item.completed` still produces the `ContentChunk`.
     if item_type == "agent_message" {
         tracing::warn!(
-            "Codex emitted item.started for agent_message; M2 expected only item.completed — CLI version may have changed"
+            "Codex emitted item.started for agent_message; only item.completed was expected — CLI version may have changed"
         );
         return ParseOutcome::Skip;
     }
@@ -199,7 +200,7 @@ fn parse_item_completed(obj: &Value, turn_id: TurnId) -> ParseOutcome {
     }
 }
 
-/// MCP output extraction policy (M2.3 step 4, mirrors Claude's
+/// MCP output extraction policy (mirrors Claude's
 /// `stringify_tool_result_content`):
 /// - Join `text`-typed content blocks via `as_str().unwrap_or("")`; skip
 ///   non-text blocks silently when any text block is present.
@@ -273,9 +274,10 @@ fn parse_turn_completed(obj: &Value, turn_id: TurnId) -> ParseOutcome {
 
 /// Codex's `turn.completed.usage` carries token counts but no cost dollars
 /// (subscription auth at the harness boundary) and no `context_window`
-/// (session-file-only per M2.1; M2.4 enriches). Required fields:
-/// `input_tokens`, `output_tokens`. Missing/non-numeric required fields →
-/// `None` (no fabricated zero-Some); zero-valued real telemetry → `Some`.
+/// (session-file-only; the post-terminal enrichment fills it in). Required
+/// fields: `input_tokens`, `output_tokens`. Missing/non-numeric required
+/// fields → `None` (no fabricated zero-Some); zero-valued real telemetry
+/// → `Some`.
 fn extract_usage_from_turn_completed(obj: &Value) -> Option<TurnUsage> {
     let usage_obj = obj.get("usage")?;
     let input_tokens = usage_obj.get("input_tokens").and_then(Value::as_u64)?;
@@ -361,7 +363,7 @@ pub fn unwrap_error_message(raw: &str) -> String {
 /// Codex auth-failure detection — pattern-matches the unwrapped error
 /// message against the documented 401 signature. A successful API call
 /// cannot return 401, so the substring is a sufficient discriminant (per
-/// `docs/research/codex-cli-observed.md` M2.1 findings).
+/// `docs/research/codex-cli-observed.md`).
 pub fn is_codex_auth_failure(message: &str) -> bool {
     message.contains("401 Unauthorized")
 }
@@ -420,7 +422,10 @@ mod tests {
                 assert_eq!(u.input_tokens, 15568);
                 assert_eq!(u.output_tokens, 5);
                 assert_eq!(u.cached_input_tokens, Some(7552));
-                assert_eq!(u.context_window, None, "M2.4 enriches context_window");
+                assert_eq!(
+                    u.context_window, None,
+                    "context_window is enriched post-terminal from the session file"
+                );
                 assert_eq!(
                     u.total_cost_usd, None,
                     "Codex has no $ at the harness boundary"
@@ -526,7 +531,7 @@ mod tests {
                     },
                 ..
             } => {
-                // M2.1 captured: JSON-encoded error wrapping
+                // The captured fixture has a JSON-encoded error wrapping
                 // `error.message = "The 'invalid-model-name' model …"`.
                 // Unwrapping must surface the inner message, NOT the raw
                 // escaped JSON.
@@ -568,7 +573,7 @@ mod tests {
             })
             .expect("ToolCompleted expected");
         assert!(tool_completed.1, "status=failed must propagate to is_error");
-        // The M2.1 fixture's result.content[0].text is "Invalid or expired token".
+        // The captured fixture's result.content[0].text is "Invalid or expired token".
         // Extraction joins text blocks, so output reflects the server's message.
         assert!(
             tool_completed.0.contains("Invalid or expired token"),
@@ -577,7 +582,7 @@ mod tests {
         );
     }
 
-    // --- Inline-constructed coverage for paths the M2.1 fixtures don't cover ---
+    // --- Inline-constructed coverage for paths the captured fixtures don't cover ---
 
     #[test]
     fn mcp_success_path_joins_text_content() {

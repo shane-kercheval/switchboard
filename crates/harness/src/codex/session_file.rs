@@ -2,8 +2,8 @@
 //!
 //! After each turn's terminal stream event (`turn.completed` / `turn.failed`),
 //! the Codex adapter reads the session file to fill in metadata the stream
-//! omits. Per `docs/research/codex-cli-observed.md` M2.4-prep findings, the
-//! session file is the **only** source for:
+//! omits. Per `docs/research/codex-cli-observed.md`, the session file is
+//! the **only** source for:
 //! - `event_msg/task_started.payload.model_context_window` →
 //!   `TurnEnd.usage.context_window` (per-turn).
 //! - `event_msg/token_count.rate_limits` (non-null variant only) →
@@ -122,8 +122,8 @@ pub fn session_directory(home_dir: &Path, session_partition_date: NaiveDate) -> 
 /// On multi-match (very rare — would require a backup/rename or Codex bug,
 /// since session UUIDs are unique by construction), picks the file with the
 /// **latest mtime**, falling back to lexicographic order if mtime is
-/// unavailable. The "newest wins" rule matches the M2.4 plan and avoids
-/// silently enriching from a stale duplicate.
+/// unavailable. The "newest wins" rule avoids silently enriching from a
+/// stale duplicate.
 ///
 /// A `glob` crate dep is unnecessary for one suffix-match pattern — a single
 /// `read_dir` + suffix filter is simpler, has no allocations beyond the
@@ -374,8 +374,8 @@ pub fn parse_session_content(content: &str) -> Enrichment {
                     }
                     "token_count" => {
                         // Two variants share this type — only the one with
-                        // non-null `rate_limits` is what M2.4 wants. The
-                        // info-only variant is ignored (the stream's
+                        // non-null `rate_limits` is what enrichment surfaces.
+                        // The info-only variant is ignored (the stream's
                         // turn.completed.usage carries token totals).
                         // Last-rate-limit-bearing-record-wins.
                         if let Some(rate_limits) = p.get("rate_limits")
@@ -395,9 +395,9 @@ pub fn parse_session_content(content: &str) -> Enrichment {
 }
 
 /// Strip `payload.base_instructions.text` from a `session_meta` record. The
-/// surrounding envelope is preserved verbatim so M2.6+ can still introspect
-/// the field's existence and the `base_instructions` table's other keys.
-/// Returns a clone — the caller owns the result.
+/// surrounding envelope is preserved verbatim so future consumers can still
+/// introspect the field's existence and the `base_instructions` table's
+/// other keys. Returns a clone — the caller owns the result.
 fn strip_base_instructions(mut value: Value) -> Value {
     if let Some(payload) = value.get_mut("payload")
         && let Some(base) = payload.get_mut("base_instructions")
@@ -484,9 +484,8 @@ pub fn build_session_meta_fields(
 }
 
 /// Fields ready to plug into [`crate::events::AdapterEvent::SessionMeta`].
-/// `tools` is always `vec![]` for Codex — no equivalent registry source per
-/// M2.4-prep findings; kept implicit on the adapter side rather than carried
-/// here.
+/// `tools` is always `vec![]` for Codex — no equivalent registry source on
+/// disk; kept implicit on the adapter side rather than carried here.
 pub struct SessionMetaFields {
     pub model: String,
     pub harness_version: String,
@@ -496,8 +495,8 @@ pub struct SessionMetaFields {
 }
 
 /// Load a Codex session file and project it into a
-/// [`crate::transcript::LoadedTranscript`]. Used by M2.6 transcript hydration
-/// on project open and on attach.
+/// [`crate::transcript::LoadedTranscript`]. Used by transcript hydration on
+/// project open and on attach.
 ///
 /// `session_partition_date` MUST come from the per-agent session-link sidecar
 /// (`crate::codex::sidecar::SessionLinkRecord.session_partition_date`). Codex
@@ -506,7 +505,7 @@ pub struct SessionMetaFields {
 /// stored date is authoritative — never recompute from `Local::today()`.
 ///
 /// `cwd` is the user's bound working directory, used for project-scoped
-/// MCP config and skill loaders (same loaders M2.4 uses for live dispatch).
+/// MCP config and skill loaders (the same loaders live dispatch uses).
 ///
 /// **Stale-sidecar case**: if `session_partition_date` is present but no
 /// session file lives at the recorded path (user deleted it, external
@@ -964,7 +963,7 @@ fn decode_mcp_result(result: Option<&Value>) -> (String, bool) {
 
 /// Discriminate built-in vs MCP function-call name. MCP calls carry a
 /// `namespace: "mcp__<server>__"` field; the surfaced name is
-/// `<server>.<tool>` (matching M2.3's stream-side emission).
+/// `<server>.<tool>` (matching the stream-side emission).
 fn classify_codex_function_call(name: &str, namespace: Option<&str>) -> (ToolKind, String) {
     if let Some(ns) = namespace
         && ns.starts_with("mcp__")
@@ -1120,7 +1119,7 @@ mod tests {
             )),
             "base_instructions.text must be stripped"
         );
-        // The surrounding shape is preserved so M2.6+ can introspect.
+        // The surrounding shape is preserved so future consumers can introspect.
         assert_eq!(
             raw.pointer("/payload/cli_version"),
             Some(&Value::String("0.130.0".to_owned())),

@@ -116,8 +116,9 @@ async fn mock_turn_ids_match_dispatch_argument() {
 async fn panic_scenario_ends_stream_without_turn_end() {
     // MockScenario::Panic intentionally violates the stream contract.
     // The stream ends after the first ContentChunk (task panics before TurnEnd).
-    // This test validates the panic scenario works as designed — the M1.4
-    // dispatcher test uses this to verify AgentIdleGuard restores Idle on panic.
+    // This test validates the panic scenario works as designed — the
+    // dispatcher tests use this to verify AgentIdleGuard restores Idle
+    // on panic.
     let adapter = MockHarnessAdapter::with_scenario(MockScenario::Panic);
     let events = drain(&adapter, "test").await;
 
@@ -157,7 +158,8 @@ async fn streaming_scenario_does_not_return_dispatch_error() {
 #[tokio::test]
 async fn completed_turn_outcome_wire_shape_roundtrips() {
     // Checks that TurnEnd(Completed) from the Streaming scenario serializes and
-    // deserializes correctly via the NormalizedEvent lifting path (used by M1.4 dispatcher).
+    // deserializes correctly via the NormalizedEvent lifting path (used by the
+    // dispatcher).
     use switchboard_harness::NormalizedEvent;
 
     let adapter = MockHarnessAdapter::new();

@@ -124,9 +124,8 @@ async fn text_only_no_double_emit_from_assistant_message() {
 async fn tool_use_fixture_yields_text_chunk_and_completed() {
     // The tool-use fixture's only text content comes from a single
     // `text_delta` ("Done."); tool input_json_delta events at the parser
-    // layer are skipped (M1 behavior preserved). M2.2 additionally emits
-    // ToolStarted/ToolCompleted from the assistant/user envelopes — those
-    // are asserted in a dedicated test below.
+    // layer are skipped. ToolStarted/ToolCompleted come from the
+    // assistant/user envelopes — asserted in a dedicated test below.
     let agent = fake_agent();
     let events = collect_events(&adapter(), &agent, &fixture("tool-use")).await;
 
@@ -289,8 +288,8 @@ async fn binary_not_found_returns_dispatch_error() {
 #[tokio::test]
 async fn text_only_fixture_emits_session_meta_and_rate_limit_event() {
     // The text-only fixture starts with `system/init` (→ SessionMeta) and
-    // includes one `rate_limit_event` line (→ RateLimitEvent). M2.2 promotes
-    // both events from "skipped" to first-class emissions.
+    // includes one `rate_limit_event` line (→ RateLimitEvent). Both events
+    // are first-class emissions.
     let agent = fake_agent();
     let events = collect_events(&adapter(), &agent, &fixture("text-only")).await;
 
@@ -398,7 +397,7 @@ async fn with_usage_fixture_populates_turn_end_usage() {
 
 #[tokio::test]
 async fn text_only_content_chunks_carry_text_kind() {
-    // Invariant: no ContentChunk emitted in M2 carries kind: Thinking — all
+    // Invariant: no ContentChunk emitted carries kind: Thinking — all
     // real-fixture chunks are ContentKind::Text.
     let agent = fake_agent();
     let events = collect_events(&adapter(), &agent, &fixture("text-only")).await;
@@ -418,11 +417,13 @@ async fn text_only_content_chunks_carry_text_kind() {
 #[cfg(unix)]
 #[tokio::test]
 async fn adapter_spawns_child_in_its_own_process_group() {
-    // Process-group spawn invariant for M4's killpg target. This test routes
-    // through `ClaudeCodeAdapter::dispatch` (NOT a direct Command spawn) so
-    // it actually guards `claude_code.rs:command.process_group(0)`. fake_claude
-    // honors a `// pgid_to:<path>` directive, writing its own pgid; the test
-    // reads the file and asserts it differs from the parent's pgid.
+    // Process-group spawn invariant — future cancellation work needs the
+    // child in its own process group for a `killpg`-style teardown. This
+    // test routes through `ClaudeCodeAdapter::dispatch` (NOT a direct
+    // Command spawn) so it actually guards
+    // `claude_code.rs:command.process_group(0)`. fake_claude honors a
+    // `// pgid_to:<path>` directive, writing its own pgid; the test reads
+    // the file and asserts it differs from the parent's pgid.
     let parent_pgid = getpgid(None).expect("getpgid(self) should succeed");
 
     let tempdir = tempfile::TempDir::new().expect("tempdir");

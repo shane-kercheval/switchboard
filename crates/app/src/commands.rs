@@ -58,7 +58,7 @@ pub async fn pick_directory_impl(path: &str) -> Result<DirectoryInfo, AppError> 
 ///
 /// In-flight dispatches on agents from the prior directory keep running
 /// (their `AgentIdleGuard` and event channels are dispatcher-owned and
-/// agent-scoped) — graceful cleanup of those is M4 work.
+/// agent-scoped) — graceful cleanup of those is future work.
 pub async fn init_directory_impl(state: &AppState, path: &str) -> Result<DirectoryInfo, AppError> {
     // Serialize against concurrent registry writes (create_project,
     // register_agent). init_directory creates `.switchboard/` structure
@@ -440,11 +440,12 @@ pub async fn send_message_impl(
     // Switchboard stores its own state. Multiple projects in the same
     // working directory share the same cwd; their per-agent sessions are
     // distinguished by session UUID, which is unique per agent.
-    // M2.3 routing: select the adapter by agent.harness. The dispatcher is
-    // harness-agnostic (keyed by AgentId); the match here is the substantive
-    // failure surface — a regression that routes Codex through the Claude
-    // adapter would silently spawn the wrong binary. App routing test in
-    // the test module below pins this against regression.
+    // Per-harness routing: select the adapter by agent.harness. The
+    // dispatcher is harness-agnostic (keyed by AgentId); the match here is
+    // the substantive failure surface — a regression that routes Codex
+    // through the Claude adapter would silently spawn the wrong binary.
+    // App routing test in the test module below pins this against
+    // regression.
     let adapter: &dyn HarnessAdapter = match agent.harness {
         HarnessKind::ClaudeCode => state.claude_adapter.as_ref(),
         HarnessKind::Codex => state.codex_adapter.as_ref(),
@@ -557,8 +558,7 @@ pub fn check_codex_binary_impl(state: &AppState) -> Result<(), AppError> {
 /// auth file is present at the default location (`<home>/.codex/auth.json`),
 /// `Err(AppError::AuthNotConfigured)` otherwise.
 ///
-/// **Known limitations** (per the M2.5 plan's "Acceptance language" — best
-/// effort, not robust):
+/// **Known limitations** (best effort, not robust):
 /// - **False positive on API-key-only setups.** A user with only
 ///   `OPENAI_API_KEY` env var and no `codex login` may still have a stale
 ///   `auth.json` from a prior login; we report "authenticated" but a real
@@ -1001,8 +1001,8 @@ mod tests {
         }
     }
 
-    /// App routing test (M2.3). The dispatcher is harness-agnostic (keyed
-    /// by `AgentId` alone), so adapter cross-talk is structurally impossible
+    /// App routing test. The dispatcher is harness-agnostic (keyed by
+    /// `AgentId` alone), so adapter cross-talk is structurally impossible
     /// there. The substantive failure mode is at the App layer:
     /// `send_message_impl` selects an adapter via `match agent.harness`,
     /// and a regression that hard-codes one adapter would silently spawn

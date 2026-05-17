@@ -7,9 +7,9 @@
 //! - **Project**: `<cwd>/.mcp.json` top-level `"mcpServers"` object.
 //!
 //! Merge rule: **project > local > user** on name collision. The merged
-//! surface is just the name list (the registry is display-only, per the
-//! M2.4 rationale in `codex/config.rs`), so the "win" is observationally
-//! a deduplication. Order: project entries first, then local-only, then
+//! surface is just the name list (the registry is display-only — see the
+//! rationale in `codex/config.rs`), so the "win" is observationally a
+//! deduplication. Order: project entries first, then local-only, then
 //! user-only — by-scope is a clearer story for the sidebar than a single
 //! alphabetic merge.
 //!

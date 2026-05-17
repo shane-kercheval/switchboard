@@ -8,32 +8,32 @@ export type ProjectId = string;
 
 export type FailureKind = "harness_error" | "adapter_failure" | "auth_failure";
 // Future: "timeout" — added if/when an active per-turn timeout lands.
-// `auth_failure` lands in M2.3 — stream-based detection for both Claude
-// (assistant.error == "authentication_failed") and Codex (turn.failed.error
-// contains "401 Unauthorized"). M2.5 renders a dedicated banner; the M2.3
-// reducer falls back to the default failed-turn UI for now.
+// `auth_failure` is detected via stream events: Claude's
+// `assistant.error == "authentication_failed"` and Codex's
+// `turn.failed.error` containing `"401 Unauthorized"`.
 
 export type TurnOutcome =
   | { status: "completed" }
   | { status: "failed"; kind: FailureKind; message: string };
-// Future: | { status: "cancelled"; source: CancelSource } — added in M4 when per-turn cancel lands.
+// Future: | { status: "cancelled"; source: CancelSource } — added when per-turn cancel lands.
 
 // ContentChunk.kind discriminates rendering. `thinking` is reserved in the
-// wire format but not emitted in M2 — M3+ reasoning UI can land without a
-// wire-format break.
+// wire format but not currently emitted — future reasoning UI can land
+// without a wire-format break.
 export type ContentKind = "text" | "thinking";
 
 // ToolStarted.kind discriminates tool origin so the UI can label calls
-// without scraping the name. `plugin` and `other` are reserved-but-not-emitted
-// in M2.2 (same pattern as ContentKind.thinking).
+// without scraping the name. `plugin` and `other` are
+// reserved-but-not-currently-emitted (same pattern as ContentKind.thinking).
 export type ToolKind = "builtin" | "mcp" | "plugin" | "other";
 
 export type McpServerStatus = { name: string; status: string };
 
 // Per-turn usage carried on `turn_end.usage`. `total_cost_usd` is Claude
 // Code only (subscription auth has no dollar number for Codex). Tokens are
-// not displayed by the M2 UI per the cost-surface contract; the wire format
-// carries them so v2 / v3 can surface without a wire-break.
+// not displayed by the current UI per the cost-surface contract; the wire
+// format carries them so future versions can surface without a
+// wire-break.
 export type TurnUsage = {
   input_tokens: number;
   output_tokens: number;
@@ -106,7 +106,7 @@ export type NormalizedEvent =
 export type HeartbeatTimeout = { type: "heartbeat_timeout"; turn_id: TurnId; at: string };
 
 // Mirror of Rust `LoadedTranscript` from `crates/harness/src/transcript.rs`.
-// Used by the M2.6 transcript-hydration flow: `load_transcript` Tauri command
+// Used by the transcript-hydration flow: `load_transcript` Tauri command
 // returns this shape; the reducer's `hydrate` input consumes it.
 export type LoadedTranscript = {
   turns: LoadedTurn[];
@@ -188,7 +188,7 @@ export type HarnessKind = "claude_code" | "codex";
 /// Result of the startup-time per-harness probes. `binary` is the
 /// `which`-on-PATH check; `auth` is the best-effort subscription-auth
 /// detection (Codex only — Claude's auth lives in the macOS keychain with
-/// no reliable file signal, deferred to v2 per the M2.5 plan).
+/// no reliable file signal, deferred to a future release).
 ///
 /// **Discriminated union, not a flat record.** The v1 invariant "auth
 /// detection is Codex-only; Claude's auth is always `unsupported`" is

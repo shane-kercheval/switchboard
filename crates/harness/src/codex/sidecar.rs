@@ -3,15 +3,15 @@
 //! Codex assigns its own session id (the `thread_id` from `thread.started`)
 //! on first dispatch. Switchboard records the mapping in an append-only
 //! JSONL file at `<directory>/.switchboard/projects/<project-id>/sessions/
-//! <agent_id>.jsonl`. This is the **M2.3→M2.4 contract**:
-//! - `session_id` drives M2.4's session-file filename glob.
-//! - `session_partition_date` drives M2.4's date-partition path lookup; it
+//! <agent_id>.jsonl`. Schema contract:
+//! - `session_id` drives the Codex session-file filename glob.
+//! - `session_partition_date` drives the date-partition path lookup; it
 //!   is set on the very first dispatch (from the **local** date — Codex
 //!   partitions its session files by local date, not UTC) and copied
 //!   verbatim on every resume (NEVER recomputed — Codex appends to the
-//!   original spawn-date's session file even on cross-day resumes per M2.1
-//!   findings). This field is a filesystem-lookup key, not a conversation
-//!   timestamp; UI transcript ordering uses event/turn timestamps in UTC.
+//!   original spawn-date's session file even on cross-day resumes). This
+//!   field is a filesystem-lookup key, not a conversation timestamp; UI
+//!   transcript ordering uses event/turn timestamps in UTC.
 //!
 //! Each dispatch appends a new record. Latest-line-wins on resume lookups;
 //! the full history is retained for debugging. Duplicate records are
@@ -19,20 +19,21 @@
 //!
 //! **Failure semantics.** Sidecar persistence is load-bearing for resume
 //! (without it, the second turn would create a new session and lose
-//! context) and for M2.4 enrichment (without `session_partition_date`, the
-//! adapter doesn't know which date-partitioned directory to look in).
-//! Silently swallowing a write error would create an unresumable agent, so
-//! callers (the producer task in [`crate::codex::mod`]) **immediately
-//! terminate the stream** with `TurnEnd(Failed{AdapterFailure})` on append
-//! failure — no continued parsing past a missing sidecar record.
+//! context) and for post-terminal enrichment (without
+//! `session_partition_date`, the adapter doesn't know which
+//! date-partitioned directory to look in). Silently swallowing a write
+//! error would create an unresumable agent, so callers (the producer task
+//! in [`crate::codex::mod`]) **immediately terminate the stream** with
+//! `TurnEnd(Failed{AdapterFailure})` on append failure — no continued
+//! parsing past a missing sidecar record.
 //!
 //! **Crash-safety note.** Writes use `writeln!` + `flush()`, mirroring
 //! `switchboard_core::io::append_jsonl` (`crates/core/src/io.rs`). Neither
 //! call site issues `file.sync_data()` or fsyncs the parent directory — a
-//! power loss between write and writeback can leave a torn line. M1.5
-//! review flagged this gap workspace-wide; M4 owns the fix. **Whoever
-//! hardens core's `append_jsonl` must also harden this helper** so the two
-//! call sites don't drift apart.
+//! power loss between write and writeback can leave a torn line. This is
+//! a known gap workspace-wide; the fix is future work. **Whoever hardens
+//! core's `append_jsonl` must also harden this helper** so the two call
+//! sites don't drift apart.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -44,10 +45,11 @@ use switchboard_core::{AgentId, ProjectId};
 
 /// One row of the per-agent session-link sidecar JSONL.
 ///
-/// **Schema is the M2.3→M2.4 contract.** Renaming or restructuring these
-/// fields requires coordinated M2.4 changes — M2.4 reads `session_id` (for
-/// the filename glob) and `session_partition_date` (for the date-partition
-/// directory) directly.
+/// **Schema is load-bearing for both resume and post-terminal enrichment.**
+/// Renaming or restructuring these fields requires coordinated changes
+/// in the enrichment path — it reads `session_id` (for the filename glob)
+/// and `session_partition_date` (for the date-partition directory)
+/// directly.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionLinkRecord {
     /// Codex `thread_id` captured from the first stream event of the very
@@ -61,7 +63,7 @@ pub struct SessionLinkRecord {
     /// resume it is copied verbatim from the prior record; for the
     /// attach-existing-session flow it is parsed from the path of the
     /// matched rollout file. Codex appends to the original spawn-date's
-    /// session file regardless of resume date (per M2.1 findings).
+    /// session file regardless of resume date.
     ///
     /// **Filesystem-lookup key, not a conversation timestamp.** UI
     /// transcript ordering uses event/turn timestamps in UTC; this field
@@ -300,8 +302,9 @@ mod tests {
 
     #[test]
     fn session_link_record_wire_shape_is_stable() {
-        // The schema is the M2.3→M2.4 contract. Pin the field names so a
-        // future rename surfaces here, not as a silent M2.4 lookup failure.
+        // The schema is load-bearing for resume and post-terminal enrichment.
+        // Pin the field names so a future rename surfaces here, not as a
+        // silent enrichment lookup failure.
         let record = SessionLinkRecord {
             session_id: "019e2c5f-aaaa-7000-8000-000000000001".to_owned(),
             session_partition_date: NaiveDate::from_ymd_opt(2026, 5, 15).unwrap(),

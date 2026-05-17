@@ -102,9 +102,9 @@ describe("transcriptReducer", () => {
     });
 
     it("does NOT coalesce across different ContentKind (text vs thinking)", () => {
-      // M3+ reasoning rendering uses kind: "thinking". Coalescing
-      // would silently fold a thinking block into a preceding text
-      // chunk, breaking reasoning-aware UI.
+      // Future reasoning rendering will use kind: "thinking".
+      // Coalescing would silently fold a thinking block into a
+      // preceding text chunk, breaking reasoning-aware UI.
       let turns = reduce([], turnStart(TURN_1));
       turns = reduce(turns, { type: "content_chunk", turn_id: TURN_1, kind: "text", text: "hi" });
       turns = reduce(turns, {
@@ -517,7 +517,8 @@ describe("runtimeReducer", () => {
   it("freshRuntime initializes with run_status=idle, hydration_status=complete", () => {
     const r = fresh();
     expect(r.run_status).toBe("idle");
-    // M2.5 default: nothing to hydrate. M2.6 introduces "loading" at project open.
+    // Default for newly-created agents: nothing to hydrate. The hydration
+    // flow flips this to "loading" on project open / attach.
     expect(r.hydration_status).toBe("complete");
     expect(r.in_flight_turn_id).toBeUndefined();
     expect(r.last_error).toBeUndefined();

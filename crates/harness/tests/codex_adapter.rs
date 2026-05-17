@@ -25,7 +25,7 @@ fn codex_agent() -> AgentRecord {
         project_id: Uuid::now_v7(),
         name: "test-codex".to_owned(),
         harness: HarnessKind::Codex,
-        // Codex agents always have session_id = None (M2.3 invariant).
+        // Codex agents always have session_id = None.
         session_id: None,
         created_at: chrono::Utc::now(),
     }
@@ -34,9 +34,9 @@ fn codex_agent() -> AgentRecord {
 /// Dispatch the agent at the `fake_codex` binary with the named fixture as
 /// the prompt (which `fake_codex` interprets as the fixture path). Drains
 /// the stream to a `Vec<AdapterEvent>` for assertion. Always injects a
-/// fresh empty `home_dir` so M2.4 enrichment runs against an empty
-/// ~/.codex/sessions (no developer-environment leakage) — and degrades
-/// gracefully to default-Enrichment (no derived events).
+/// fresh empty `home_dir` so post-terminal enrichment runs against an
+/// empty ~/.codex/sessions (no developer-environment leakage) — and
+/// degrades gracefully to default-Enrichment (no derived events).
 async fn dispatch_fixture(
     agent: &AgentRecord,
     cwd: &Path,
@@ -94,7 +94,7 @@ async fn tool_use_fixture_yields_command_execution_sequence() {
     let tmp = tempfile::TempDir::new().unwrap();
     let agent = codex_agent();
     let events = dispatch_fixture(&agent, tmp.path(), &fixture("tool-use")).await;
-    // Expected sequence (from M2.1 fixture):
+    // Expected sequence (from the captured fixture):
     //   ToolStarted(command_execution) → ToolCompleted → ContentChunk → TurnEnd(Completed)
     let tool_started = events
         .iter()
@@ -242,7 +242,7 @@ async fn first_dispatch_writes_sidecar_with_captured_thread_id() {
         "captured thread_id should land in the record, got: {}",
         lines[0]
     );
-    // Sanity: shape includes the M2.4 contract fields.
+    // Sanity: shape includes the sidecar schema fields.
     assert!(lines[0].contains("session_id"));
     assert!(lines[0].contains("session_partition_date"));
     assert!(lines[0].contains("started_at"));
@@ -702,7 +702,7 @@ async fn dispatch_with_corrupt_sidecar_returns_pre_stream_read_error() {
     );
 }
 
-// --- M2.4 post-terminal enrichment ---
+// --- Post-terminal enrichment ---
 //
 // These tests stage a temp `home_dir` (via `CodexAdapter::with_binary_and_home`)
 // and pre-write a Codex session file at the path the adapter will look up
@@ -714,7 +714,7 @@ async fn dispatch_with_corrupt_sidecar_returns_pre_stream_read_error() {
 const FIXTURE_THREAD_ID: &str = "00000000-0000-7000-8000-000000000001";
 
 /// The session-file content used by the enrichment tests below. Pinned
-/// inline rather than reading the M2.1 `rate-limits.session.jsonl` fixture
+/// inline rather than reading the `rate-limits.session.jsonl` fixture
 /// directly because the tests assert specific numeric values; coupling the
 /// test to the fixture would make a future fixture refresh silently break
 /// the assertions.

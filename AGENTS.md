@@ -89,6 +89,7 @@ After either command, commit both the manifest change and the lockfile diff in o
 - Type hints on every function signature.
 - No comments unless the _why_ is non-obvious. Identifiers explain _what_.
 - No imports inside functions unless absolutely necessary.
+- **No milestone or pass references in code** (`// M2.3 contract`, `// Per the M1.5 plan`, `// Added in M2.6`). Describe the rule directly; chronology lives in `git blame` and PR descriptions.
 
 ### Testing
 

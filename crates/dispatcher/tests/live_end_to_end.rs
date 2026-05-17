@@ -1,6 +1,6 @@
 //! Live end-to-end integration tests against real `claude`.
 //!
-//! Exercises the **full backend vertical slice** that an M1 user actually
+//! Exercises the **full backend vertical slice** that a user actually
 //! triggers: `Directory::init` → `create_project` → `register_agent` →
 //! `Dispatcher::send_message` → real `claude` subprocess → events streamed
 //! back through the `EventEmitter`. Uses realistic on-disk paths so any
@@ -8,8 +8,8 @@
 //! actual layout.
 //!
 //! Why this layer matters: pure unit tests and adapter-only live tests can
-//! pass while the integration path still has a bug. Two M1.5-era bugs were
-//! caught by this layer (or would have been, had it existed):
+//! pass while the integration path still has a bug. Two real regressions
+//! that this layer guards against:
 //!
 //! - The session-id encoding bug (`/` → `-` only, missing `. → -`) —
 //!   detected by `live_full_stack_two_consecutive_turns_succeed`, which
@@ -55,13 +55,14 @@ fn agent_text(emitter: &Arc<RecordingEmitter>, channel: &str) -> String {
 #[tokio::test]
 #[ignore = "requires claude installed and authenticated — run with: make test-live"]
 async fn live_full_stack_two_consecutive_turns_succeed() {
-    // Reproduces the full M1 vertical slice. Creates a working directory,
-    // initializes the .switchboard/ layout, registers a project + agent
-    // exactly like the app does, then dispatches two turns. The second turn
-    // is the load-bearing assertion — the first turn creates the session
-    // file, and the second turn must find it and switch from `--session-id`
-    // to `--resume`. The M1.5 encoding bug would surface here as the second
-    // turn failing with "Session ID … is already in use".
+    // Reproduces the full backend vertical slice. Creates a working
+    // directory, initializes the .switchboard/ layout, registers a project +
+    // agent exactly like the app does, then dispatches two turns. The
+    // second turn is the load-bearing assertion — the first turn creates
+    // the session file, and the second turn must find it and switch from
+    // `--session-id` to `--resume`. A path-encoding bug in the session-file
+    // lookup would surface here as the second turn failing with "Session
+    // ID … is already in use".
     let tmp = TempDir::new().expect("tempdir");
     let directory = Directory::at(tmp.path()).expect("Directory::at");
     directory.init().expect("init .switchboard/");
@@ -261,12 +262,13 @@ async fn live_full_stack_paths_with_dot_components_resolve_correctly() {
 #[tokio::test]
 #[ignore = "requires claude installed and authenticated — run with: make test-live"]
 async fn live_full_stack_claude_sees_files_in_cwd() {
-    // Regression test for the M1.5 cwd bug: claude was being spawned in
-    // `<dir>/.switchboard/projects/<uuid>/` (a Switchboard-internal metadata
-    // directory) instead of the user's bound working directory. The
-    // observable symptom was that claude couldn't see the user's repo
-    // files via its Read/Glob/Bash tools — the M1 use case (orchestrate
-    // claude on the user's code) was broken.
+    // Regression test for the cwd-routing rule: claude must be spawned in
+    // the user's bound working directory, NOT in
+    // `<dir>/.switchboard/projects/<uuid>/` (the Switchboard-internal
+    // metadata directory). The observable symptom of a regression here is
+    // that claude can't see the user's repo files via its Read/Glob/Bash
+    // tools — the core use case (orchestrate claude on the user's code)
+    // would be broken.
     //
     // This test: write a known-content file into the working directory,
     // dispatch a turn asking claude to read it, assert the streamed

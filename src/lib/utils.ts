@@ -17,8 +17,9 @@ export function basename(path: string): string {
   return i >= 0 ? trimmed.slice(i + 1) : trimmed;
 }
 
-// Picks the most-recently-created agent. M4 introduces an agent switcher; in
-// M1 the active agent is just "whichever the user created most recently."
+// Picks the most-recently-created agent. The active agent is "whichever
+// the user created most recently"; a future agent switcher will replace
+// this implicit rule.
 // Primary sort: `created_at` descending, compared by parsed timestamp so
 // the result is correct regardless of timezone suffix variation (chrono
 // emits `Z` today, but `+00:00` and offset-bearing forms are valid ISO

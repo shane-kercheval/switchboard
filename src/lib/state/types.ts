@@ -1,4 +1,4 @@
-// Internal frontend state types for the M2.5 unified-stream model.
+// Internal frontend state types for the unified-stream model.
 //
 // Companion to `$lib/types.ts` (wire-format types only). Component state
 // shape lives here; events on the IPC boundary live there. Reducers in
@@ -8,9 +8,8 @@
 // **Naming convention.** snake_case throughout, matching the wire-format
 // (`turn_id`, `agent_id`, `started_at`, `ended_at`). Aligning state shape
 // with wire shape eliminates rename-at-IPC-boundary drift — load-bearing
-// for M2.6's session-file rehydration, where disk-parsed turns flow
-// through the same reducer as live-stream turns without any field
-// translation.
+// for session-file rehydration, where disk-parsed turns flow through the
+// same reducer as live-stream turns without any field translation.
 
 import type {
   AgentId,
@@ -25,7 +24,7 @@ import type {
 
 /// Role-mixed turn entries — user prompts and agent responses live in the
 /// same chronological stream. Harness session files store user and assistant
-/// events as separate entries; this shape matches that, so M2.6 rehydration
+/// events as separate entries; this shape matches that, so disk rehydration
 /// produces the same structure as live-stream dispatch with no translation.
 ///
 /// `agent_id` is present on both roles because the unified transcript view
@@ -72,8 +71,8 @@ export type TurnItem = TextChunk | ToolCall;
 
 export type TextChunk = {
   item_kind: "text";
-  /// Mirrors wire `content_chunk.kind`. `"thinking"` is reserved for M3+
-  /// reasoning UI but not emitted in M2.
+  /// Mirrors wire `content_chunk.kind`. `"thinking"` is reserved for
+  /// future reasoning UI but not currently emitted.
   kind: ContentKind;
   text: string;
 };
@@ -88,8 +87,8 @@ export type TextChunk = {
 export type ToolCall = {
   item_kind: "tool";
   tool_use_id: string;
-  /// Mirrors wire `tool_started.kind`. `"builtin"` / `"mcp"` are emitted in
-  /// M2; `"plugin"` / `"other"` are reserved.
+  /// Mirrors wire `tool_started.kind`. `"builtin"` / `"mcp"` are emitted
+  /// today; `"plugin"` / `"other"` are reserved.
   kind: ToolKind;
   name: string;
   input: unknown;
@@ -160,18 +159,19 @@ export type AgentRuntime = {
   /// `TurnEnd` or `heartbeat_timeout`; cleared on the next successful turn.
   /// Does NOT gate sendability.
   last_error?: { message: string; kind: FailureKind };
-  /// Populated by live `SessionMeta` events or M2.6 disk hydration.
-  /// Undefined on agents whose first dispatch hasn't happened yet.
+  /// Populated by live `SessionMeta` events or by disk hydration of the
+  /// agent's session file. Undefined on agents whose first dispatch
+  /// hasn't happened yet.
   meta?: AgentMeta;
   /// Most-recent Codex `RateLimitEvent.info` payload. Opaque — the
   /// renderer reads `primary.used_percent` for the sidebar quota signal.
   /// Undefined for Claude agents (Claude doesn't emit rate-limit events).
   last_rate_limit?: unknown;
-  /// Disk-rehydration lifecycle. M2.6 owns the `"loading"` and `"failed"`
-  /// transitions; M2.5 always lands `"complete"` for newly-created agents
-  /// (nothing to hydrate at creation time). Compose-bar Send is gated on
-  /// this being `"complete"` (or `"failed"`, which enters degraded-dispatch
-  /// mode with a banner).
+  /// Disk-rehydration lifecycle. Newly-created agents start at
+  /// `"complete"` (nothing to hydrate); registered/attached agents pass
+  /// through `"pending"` → `"loading"` → `"complete"`. Compose-bar Send
+  /// is gated on this being `"complete"` (or `"failed"`, which enters
+  /// degraded-dispatch mode with a banner).
   hydration_status: "pending" | "loading" | "complete" | "failed";
   /// Non-blocking parser warnings surfaced by `load_transcript` — stale
   /// Codex sidecar, malformed JSONL lines, etc. Empty / undefined when no

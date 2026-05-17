@@ -20,8 +20,8 @@ use switchboard_harness::{DispatchError, EventStream, HarnessAdapter, Normalized
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-/// Per-agent dispatch state. Two states are enough for M1 — M4 may extend
-/// this with structured contention reasons.
+/// Per-agent dispatch state. Two states cover the current contention
+/// model; structured contention reasons are future work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AgentStatus {
@@ -219,15 +219,14 @@ fn channel_name(agent_id: AgentId) -> String {
 /// Stream-contract ownership: the **adapter** is responsible for ensuring
 /// exactly one terminal `TurnEnd` per turn. The dispatcher trusts that
 /// contract and does not synthesize a fallback — single ownership is the
-/// design (see `AGENTS.md`, M1.3 stream contract + M1.4 dispatcher rules).
+/// design (see `AGENTS.md`).
 ///
 /// If a terminal event is missing on stream close, that is an adapter bug
 /// (the upstream subprocess died silent AND the adapter failed to
-/// synthesize `TurnEnd(Failed)` per M1.3 step 7). The dispatcher's only
-/// response is to log a warning so the regression is visible, restore
-/// agent state, and let the failure surface to the M1.5 frontend reducer
-/// (which is responsible for handling "no terminal event observed within
-/// N seconds" as an error state).
+/// synthesize `TurnEnd(Failed)`). The dispatcher's only response is to log
+/// a warning so the regression is visible, restore agent state, and let
+/// the failure surface to the frontend reducer (which handles "no
+/// terminal event observed within N seconds" as an error state).
 async fn drain_stream(
     mut stream: EventStream,
     channel: String,

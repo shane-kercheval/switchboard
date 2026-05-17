@@ -25,11 +25,11 @@
 
   // App phase: drives which screen renders.
   //
-  // The "loaded" phase replaces M1.5's singleton-active-agent "active"
-  // phase per the M2.5 plan — no implicit focused agent. `agents` is the
-  // list registered with the state module on project load; the new
-  // Sidebar / UnifiedTranscript / ComposeBar components read transcripts
-  // and runtimes for these agents from the state module directly.
+  // The "loaded" phase carries the list of agents registered with the
+  // state module on project load. Sidebar / UnifiedTranscript / ComposeBar
+  // components read transcripts and runtimes for these agents from the
+  // state module directly — there is no implicit "focused agent" at the
+  // model level.
   type Phase =
     | { kind: "welcome" }
     | { kind: "directory-selector"; info: DirectoryInfo }
@@ -62,7 +62,7 @@
   /// the suppression rule only pushes on `"missing"`.
   ///
   /// Claude auth is `"unsupported"` always (keychain-based on macOS; no
-  /// reliable file signal — deferred to v2 per the M2.5 plan).
+  /// reliable file signal — deferred to a future release).
   let claudeBinary = $state<BinaryState>("checking");
   let codexBinary = $state<BinaryState>("checking");
   let codexAuth = $state<"available" | "missing" | "checking">("checking");

@@ -17,11 +17,11 @@ use crate::events::{AdapterEvent, ContentKind, TurnId, TurnOutcome};
 pub enum MockScenario {
     /// Emits three `ContentChunk`s followed by `TurnEnd(Completed)`. Used for
     /// dev-time UI iteration (no real `claude` needed) and as the standard
-    /// test double for the M1.4 dispatcher.
+    /// test double for the dispatcher.
     Streaming,
 
     /// Intentionally violates the stream contract — panics mid-stream before
-    /// `TurnEnd`. The **only** legitimate use is testing the M1.4 dispatcher's
+    /// `TurnEnd`. The **only** legitimate use is testing the dispatcher's
     /// `AgentIdleGuard` Drop path under producer-task panic. Never use in
     /// production code paths.
     Panic,
@@ -54,7 +54,7 @@ pub enum MockScenario {
 }
 
 /// A `HarnessAdapter` that produces canned events without spawning any subprocess.
-/// Selected at runtime via `SWITCHBOARD_HARNESS=mock` (see M1.3 step 9).
+/// Selected at runtime via `SWITCHBOARD_HARNESS=mock`.
 pub struct MockHarnessAdapter {
     scenario: MockScenario,
 }

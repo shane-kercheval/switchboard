@@ -27,12 +27,12 @@
   /// `crypto.randomUUID()` (v4-random), so lexicographic comparison
   /// against the dispatcher's v7-time-ordered agent turn_ids is
   /// effectively random. Stable sort + insertion order is the
-  /// deterministic tie-break for the M2.5 single-project model.
+  /// deterministic tie-break.
   ///
-  /// **M2.6 hydration may need stronger.** If disk-loaded transcripts
-  /// surface real cross-agent same-millisecond timestamp collisions,
-  /// promote to an explicit per-turn `sort_index` populated by the
-  /// reducer / hydrator.
+  /// **If disk-loaded transcripts surface real cross-agent
+  /// same-millisecond timestamp collisions**, promote to an explicit
+  /// per-turn `sort_index` populated by the reducer / hydrator. Not
+  /// observed yet.
   const allTurns = $derived.by(() => {
     const out: Turn[] = [];
     for (const agent of agents) {
@@ -95,8 +95,9 @@
   ///
   /// O(turns × items) per state change — fine because $derived caches
   /// and re-runs only when one of the tracked reads actually changes.
-  /// If M2.6 hydration surfaces this as a perf hotspot, see the M2.6 plan
-  /// note on transcript-scan complexity.
+  /// If long hydrated transcripts surface this as a perf hotspot, the
+  /// fix is to cache a counter on `AgentRuntime` and increment in the
+  /// reducer instead of scanning.
   const scrollSignal = $derived.by(() => {
     let n = allTurns.length;
     for (const turn of allTurns) {

@@ -3,8 +3,7 @@ import "@testing-library/jest-dom/vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import type { AgentRecord, DirectoryInfo, NormalizedEvent, ProjectSummary } from "$lib/types";
 
-// App.svelte tests focus narrowly on the primary phase-transition routing
-// of the M2.5 acceptance flow:
+// App.svelte tests focus narrowly on the primary phase-transition routing:
 //
 //   welcome → directory-selector → no-agent → loaded
 //
@@ -14,8 +13,8 @@ import type { AgentRecord, DirectoryInfo, NormalizedEvent, ProjectSummary } from
 // IPC commands fire, in what order, and which phase renders next).
 //
 // Edge cases (cancel error states, multi-project switcher, rebind UI
-// state-reset across phases) are deliberately deferred to M4 when the
-// project switcher exercises them harder.
+// state-reset across phases) are deferred until a project switcher exists
+// to exercise them.
 
 const invokeMock = vi.fn(
   async (_cmd: string, _args?: Record<string, unknown>): Promise<unknown> => null,
@@ -334,8 +333,8 @@ describe("App", () => {
     await fireEvent.click(screen.getByText("Open working directory"));
     await waitFor(() => expect(screen.getByText("Working directory")).toBeInTheDocument());
 
-    // Cancel from the directory-selector phase. M1.5 user flow — not deferred
-    // to M4 — so it gets a dedicated assertion.
+    // Cancel from the directory-selector phase — primary user flow, gets
+    // a dedicated assertion.
     const cancels = screen.getAllByRole("button", { name: /cancel/i });
     await fireEvent.click(cancels[cancels.length - 1]!);
 
@@ -345,13 +344,12 @@ describe("App", () => {
     });
   });
 
-  // M2.5 plan's "dynamic agent add" acceptance test. The first agent's
-  // session is already loaded; the user opens the sidebar "+" entry point,
-  // submits, and the new agent appears in the sidebar (and is registered
-  // in the state module so its events would flow on dispatch). The
-  // load-bearing property: the new agent's listener is wired before the
-  // phase transition completes, so an immediate dispatch wouldn't lose
-  // the first event.
+  // Dynamic agent add: the first agent's session is already loaded; the
+  // user opens the sidebar "+" entry point, submits, and the new agent
+  // appears in the sidebar (and is registered in the state module so its
+  // events would flow on dispatch). The load-bearing property: the new
+  // agent's listener is wired before the phase transition completes, so
+  // an immediate dispatch wouldn't lose the first event.
   it("loaded → add agent via sidebar modal: appends to phase.agents and registers a listener", async () => {
     const SECOND_AGENT: AgentRecord = {
       id: "44444444-4444-7000-8000-444444444444",

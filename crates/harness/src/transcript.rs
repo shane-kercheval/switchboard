@@ -1,6 +1,6 @@
 //! Shared types for transcript hydration from harness session files.
 //!
-//! `Turn` and `TurnItem` mirror M2.5's TS shape in `src/lib/state/types.ts`
+//! `Turn` and `TurnItem` mirror the TS shape in `src/lib/state/types.ts`
 //! verbatim. `items: Vec<TurnItem>` is a single ordered stream of text +
 //! tool entries — interleaved by arrival, not split into parallel arrays —
 //! so chronology observable from the session file survives serde without
@@ -17,7 +17,7 @@ use switchboard_core::AgentId;
 
 use crate::events::{ContentKind, McpServerStatus, ToolKind, TurnId, TurnUsage};
 
-/// One reconstructed turn. Discriminated by `role` matching M1's event-vocabulary
+/// One reconstructed turn. Discriminated by `role` matching the event-vocabulary
 /// convention. User turns carry just the prompt text; agent turns carry the
 /// ordered `items` stream plus per-turn usage and lifecycle status.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -56,7 +56,7 @@ pub enum TurnStatus {
 }
 
 /// One entry in an agent turn's `items` stream. Discriminated by `item_kind`
-/// matching M2.5's TS shape. Text variants carry a `kind` (text vs thinking)
+/// matching the TS shape. Text variants carry a `kind` (text vs thinking)
 /// from the live-event vocabulary; tool variants carry start/completion
 /// timestamps and the paired output (None until the matching completion
 /// record is observed).

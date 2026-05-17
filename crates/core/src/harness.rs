@@ -2,13 +2,13 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-/// Identifies which AI coding harness an agent is bound to. M1 had only Claude Code;
-/// M2.3 adds Codex. `#[non_exhaustive]` so further variants remain non-breaking.
+/// Identifies which AI coding harness an agent is bound to.
+/// `#[non_exhaustive]` so further variants remain non-breaking.
 ///
-/// **Session-id asymmetry** (load-bearing — see M1.2 invariant + M2.3 plan): Claude
-/// Code agents pre-generate `AgentRecord.session_id` at registration time; Codex
-/// agents leave it `None` and rely on a per-agent session-link sidecar populated
-/// from the `thread.started` stream event on first dispatch. The sidecar is the
+/// **Session-id asymmetry** (load-bearing): Claude Code agents pre-generate
+/// `AgentRecord.session_id` at registration time; Codex agents leave it
+/// `None` and rely on a per-agent session-link sidecar populated from the
+/// `thread.started` stream event on first dispatch. The sidecar is the
 /// system-of-record for Codex's captured `thread_id`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

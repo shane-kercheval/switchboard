@@ -298,7 +298,7 @@ impl ReconstructionState {
                 }
                 _ => {
                     // `thinking` and any other future block type — silently
-                    // skipped for now. M3+ reasoning UI will revisit.
+                    // skipped for now. Future reasoning UI work will revisit.
                 }
             }
         }

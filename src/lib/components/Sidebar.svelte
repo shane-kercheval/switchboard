@@ -3,9 +3,9 @@
   import { runtimes, transcripts } from "$lib/state/index.svelte";
   import { cn } from "$lib/utils";
 
-  /// `onAddAgent` is the "+ Add agent" entry point in the sidebar header
-  /// (Pass C.1). Optional so existing callers + tests that don't pass it
-  /// continue rendering; when absent, the button isn't shown.
+  /// `onAddAgent` is the "+ Add agent" entry point in the sidebar header.
+  /// Optional so existing callers + tests that don't pass it continue
+  /// rendering; when absent, the button isn't shown.
   let { agents, onAddAgent }: { agents: AgentRecord[]; onAddAgent?: () => void } = $props();
 
   function statusLabel(status: "idle" | "starting" | "processing" | undefined): string {
@@ -52,7 +52,7 @@
 
   /// Codex rate-limit signal — `primary.used_percent` from the most recent
   /// `RateLimitEvent`. Opaque on the wire so we do a defensive shape check;
-  /// returns undefined if the payload doesn't match what M2.4 emits.
+  /// returns undefined if the payload doesn't match the documented shape.
   function rateLimitPercent(payload: unknown): number | undefined {
     if (typeof payload !== "object" || payload === null) return undefined;
     const primary = (payload as { primary?: unknown }).primary;

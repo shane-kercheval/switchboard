@@ -47,11 +47,11 @@ pub struct ParserState {
     /// the message is the displayable text extracted from the assistant
     /// event. `parse_result` consumes via `.take()` and refines the terminal
     /// `TurnEnd` from `HarnessError` to `AuthFailure`. This is the
-    /// state-flag pattern that keeps the M1.3 "exactly one terminal event
-    /// per turn" contract intact — `parse_result` remains the sole emitter.
+    /// state-flag pattern that keeps the "exactly one terminal event per
+    /// turn" contract intact — `parse_result` remains the sole emitter.
     /// `None` discriminates "not seen" from "seen with no displayable text"
-    /// (which sets `Some(String::new())` and lets the M2.5 render layer
-    /// supply default copy).
+    /// (which sets `Some(String::new())` and lets the render layer supply
+    /// default copy).
     pending_auth_failure: Option<String>,
 }
 
@@ -62,7 +62,7 @@ pub struct ParserState {
 /// `agent_id` is used to anchor agent-scoped events (`SessionMeta`,
 /// `RateLimitEvent`) that have no turn anchor.
 ///
-/// `AdapterEvent::TurnStart` is never emitted here — it is dispatcher-owned (M1.4).
+/// `AdapterEvent::TurnStart` is never emitted here — it is dispatcher-owned.
 pub fn parse_line(
     line: &str,
     turn_id: TurnId,
@@ -131,8 +131,8 @@ fn parse_content_block_delta(
     // Interim: the `\n\n` separator is synthesized inline into the chunk text
     // here, which conflates parsing with presentation. A cleaner shape is a
     // structured `TextBlockBoundary` wire variant that lets the reducer / UI
-    // choose how to render block boundaries. Deferred — revisit during M2.5
-    // UI work if `\n\n` proves a rendering issue.
+    // choose how to render block boundaries. Future work if `\n\n` proves a
+    // rendering issue.
     let chunk_text = if state.pending_separator {
         state.pending_separator = false;
         format!("\n\n{text}")
@@ -156,10 +156,10 @@ fn parse_result(obj: &Value, turn_id: TurnId, state: &mut ParserState) -> ParseO
 
     let has_api_error = obj.get("api_error_status").is_some_and(|v| !v.is_null());
 
-    // Consume the auth-failure stash (state-flag pattern, M2.3). When the
-    // prior `assistant` envelope flagged auth failure, refine the terminal
+    // Consume the auth-failure stash (state-flag pattern). When the prior
+    // `assistant` envelope flagged auth failure, refine the terminal
     // outcome from `HarnessError` to `AuthFailure` — `parse_result` remains
-    // the sole `TurnEnd` emitter, preserving the M1.3 single-terminal-event
+    // the sole `TurnEnd` emitter, preserving the single-terminal-event
     // contract. Usage extraction below still runs (auth-failure results
     // carry zero-valued telemetry, which is legitimate, not noise).
     let auth_failure = state.pending_auth_failure.take();
@@ -195,10 +195,10 @@ fn parse_result(obj: &Value, turn_id: TurnId, state: &mut ParserState) -> ParseO
 /// Pull `TurnUsage` from a `result` event.
 ///
 /// `input_tokens` and `output_tokens` are **required** numeric fields: if
-/// either is missing or non-numeric, returns `None`. Per the M2.2 plan:
-/// malformed or missing usage → `None`, never a fabricated zero-Some. Zero
-/// values from a real harness (auth-failure synthetic responses, certain
-/// edge cases) DO produce a valid `Some` — what matters is whether the
+/// either is missing or non-numeric, returns `None`. Malformed or missing
+/// usage → `None`, never a fabricated zero-Some. Zero values from a real
+/// harness (auth-failure synthetic responses, certain edge cases) DO
+/// produce a valid `Some` — what matters is whether the
 /// schema is present, not whether the values are non-zero.
 ///
 /// Populated for both Completed and Failed turns. The harness charges for
@@ -325,20 +325,20 @@ fn parse_mcp_server_status(v: &Value) -> Option<McpServerStatus> {
 /// `parse_stream_event` (the envelope arrives after all the deltas), so we
 /// don't emit `ContentChunk`s from here — that would double-emit.
 ///
-/// **Auth-failure detection (M2.3, state-flag pattern).** If the envelope
-/// carries top-level `"error": "authentication_failed"`, stash the
-/// displayable message on `state.pending_auth_failure` for `parse_result` to
-/// consume; do **not** emit a terminal event here. The result envelope
-/// remains the sole `TurnEnd` emitter; the stash just refines its
-/// `FailureKind` from `HarnessError` to `AuthFailure`.
+/// **Auth-failure detection (state-flag pattern).** If the envelope carries
+/// top-level `"error": "authentication_failed"`, stash the displayable
+/// message on `state.pending_auth_failure` for `parse_result` to consume;
+/// do **not** emit a terminal event here. The result envelope remains the
+/// sole `TurnEnd` emitter; the stash just refines its `FailureKind` from
+/// `HarnessError` to `AuthFailure`.
 fn parse_assistant_envelope(obj: &Value, turn_id: TurnId, state: &mut ParserState) -> ParseOutcome {
     if obj.get("error").and_then(Value::as_str) == Some("authentication_failed") {
         // Extract displayable text: first text content block in `message.content`,
         // fall back to the raw error-field value. Empty extraction is preserved
         // as `Some(String::new())` — the `Some` discriminates "seen" from "not
         // seen"; the empty string is the parser's signal that no displayable
-        // message was available, and the M2.5 render layer supplies default
-        // copy. No hardcoded UI strings in the parser.
+        // message was available, and the render layer supplies default copy.
+        // No hardcoded UI strings in the parser.
         let message = obj
             .get("message")
             .and_then(|m| m.get("content"))
@@ -400,7 +400,7 @@ fn parse_assistant_envelope(obj: &Value, turn_id: TurnId, state: &mut ParserStat
 
 /// Claude-side tool kind classification. `mcp__` prefix → MCP per the
 /// documented Claude Code naming convention; otherwise treated as `Builtin`.
-/// `Plugin` / `Other` are reserved variants we don't emit in M2.2 (no
+/// `Plugin` / `Other` are reserved variants we don't currently emit (no
 /// reliable evidence on which Claude tool names map to those).
 ///
 /// `pub(crate)` so the session-file parser in `claude_code/session_file.rs`
@@ -416,7 +416,7 @@ pub(crate) fn classify_claude_tool_kind(name: &str) -> ToolKind {
 
 /// Parse a `user` envelope: emit `ToolCompleted` for each `tool_result`
 /// content block. (User envelopes also carry plain user messages, but
-/// those don't drive any adapter event in M2.2.)
+/// those don't drive any adapter event.)
 fn parse_user_envelope(obj: &Value, turn_id: TurnId) -> ParseOutcome {
     let Some(content) = obj
         .get("message")
@@ -462,8 +462,8 @@ fn parse_user_envelope(obj: &Value, turn_id: TurnId) -> ParseOutcome {
 /// **Mixed-content arrays** (e.g., `[image, text, image]`) emit only the
 /// joined text — non-text blocks are dropped silently with no per-block
 /// placeholder. The placeholder is only emitted when *every* block is
-/// non-text. M2.5 UI work may revisit per-block placeholders if rich tool
-/// output rendering surfaces a need.
+/// non-text. Per-block placeholders are future work if rich tool output
+/// rendering surfaces a need.
 fn stringify_tool_result_content(content: Option<&Value>) -> String {
     let Some(content) = content else {
         return String::new();
@@ -614,11 +614,11 @@ mod tests {
 
     #[test]
     fn result_with_missing_required_usage_fields_yields_none() {
-        // Per the M2.2 plan: malformed or missing usage → None, never a
-        // fabricated zero-Some. The Claude auth-failure synthetic response
-        // has `"usage":{}` (no input_tokens / output_tokens fields); that
-        // must surface as `usage: None` so consumers can distinguish
-        // "telemetry unparseable" from "real zero-usage turn."
+        // Malformed or missing usage → None, never a fabricated zero-Some.
+        // The Claude auth-failure synthetic response has `"usage":{}` (no
+        // input_tokens / output_tokens fields); that must surface as
+        // `usage: None` so consumers can distinguish "telemetry
+        // unparseable" from "real zero-usage turn."
         let line = r#"{"type":"result","is_error":true,"api_error_status":null,"result":"err","usage":{}}"#;
         match parse_one(line, tid()) {
             ParseOutcome::Event(AdapterEvent::TurnEnd { usage: None, .. }) => {}
@@ -858,7 +858,7 @@ mod tests {
 
     #[test]
     fn thinking_delta_is_skipped() {
-        // M2 invariant: ContentKind::Thinking is reserved but not emitted.
+        // ContentKind::Thinking is reserved but not currently emitted.
         // Thinking deltas must produce ParseOutcome::Skip.
         let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"deliberating"}}}"#;
         assert!(matches!(parse_one(line, tid()), ParseOutcome::Skip));
@@ -1019,12 +1019,12 @@ mod tests {
         assert_eq!(out, "answer");
     }
 
-    // --- Auth-failure state-flag pattern (M2.3) ---
+    // --- Auth-failure state-flag pattern ---
 
     /// Replays the captured Claude auth-failure fixture through `parse_line`
     /// with a shared `ParserState` across the three lines. Asserts:
     /// - The `assistant` envelope (line 2) emits no terminal event — just
-    ///   stashes `pending_auth_failure` on state. The M1.3 one-terminal-event
+    ///   stashes `pending_auth_failure` on state. The one-terminal-event
     ///   contract must hold; the assistant envelope cannot double-emit.
     /// - The `result` envelope (line 3) emits exactly one `TurnEnd` with
     ///   `kind: AuthFailure` (refined from `HarnessError`) and the message
@@ -1053,7 +1053,7 @@ mod tests {
         assert_eq!(
             turn_ends.len(),
             1,
-            "exactly one TurnEnd must be emitted (M1.3 contract); got {turn_ends:#?}"
+            "exactly one TurnEnd must be emitted per turn; got {turn_ends:#?}"
         );
         match turn_ends[0] {
             AdapterEvent::TurnEnd {

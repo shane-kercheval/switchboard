@@ -8,21 +8,23 @@ pub type TurnId = Uuid;
 
 /// Tells the reducer / UI which content rendering applies to a chunk.
 ///
-/// `Thinking` is reserved but not emitted in M2 — keeping the variant in the
-/// vocabulary now means M3+ reasoning UI lands without a wire-format break.
+/// `Thinking` is reserved but not currently emitted — keeping the variant
+/// in the vocabulary now means future reasoning UI lands without a
+/// wire-format break.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ContentKind {
     /// User-facing assistant text.
     Text,
-    /// Model thinking blocks. Reserved; not emitted in M2.
+    /// Model thinking blocks. Reserved; not currently emitted.
     Thinking,
 }
 
 /// Discriminates tool origin so the UI can label calls (built-in tool vs MCP
-/// vs plugin) without scraping the name. `Plugin` and `Other` are reserved but
-/// not emitted in M2 — same forward-compat pattern as `ContentKind::Thinking`.
+/// vs plugin) without scraping the name. `Plugin` and `Other` are reserved
+/// but not currently emitted — same forward-compat pattern as
+/// `ContentKind::Thinking`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -66,7 +68,7 @@ pub struct TurnUsage {
 }
 
 /// Events emitted by harness adapters. `TurnStart` is deliberately absent — it is
-/// dispatcher-owned (M1.4) and synthesized before the stream is established. Excluding
+/// dispatcher-owned and synthesized before the stream is established. Excluding
 /// it here makes the invariant type-enforced: no adapter author can accidentally emit it.
 ///
 /// Variant scope: `ContentChunk`, `ToolStarted`, `ToolCompleted`, `TurnEnd` are
@@ -261,9 +263,10 @@ impl From<AdapterEvent> for NormalizedEvent {
     }
 }
 
-/// Outcome of a completed turn. The `kind` field on `Failed` is load-bearing for
-/// M6's partial-failure policy: `HarnessError` (model/API issue) vs `AdapterFailure`
-/// (subprocess crash, parse error, infrastructure) have different retry semantics.
+/// Outcome of a completed turn. The `kind` field on `Failed` is load-bearing
+/// for retry policy: `HarnessError` (model/API issue) vs `AdapterFailure`
+/// (subprocess crash, parse error, infrastructure) have different retry
+/// semantics.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "status", rename_all = "snake_case")]
 #[non_exhaustive]

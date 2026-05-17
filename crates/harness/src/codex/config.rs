@@ -5,15 +5,14 @@
 //! - `<cwd>/.codex/config.toml` (project-level, loaded when present).
 //!
 //! Format: `[mcp_servers.<name>]` table entries. The names — not the table
-//! contents — are what Switchboard's `SessionMeta.mcp_servers` surfaces; per
-//! the M2.4 plan the registry is display-only. Switchboard does **not**
-//! enforce Codex's trust-list gate (which Codex itself uses to decide whether
-//! to load project-scope config): the small fidelity gap of showing
-//! project-scoped servers Codex wouldn't load for untrusted directories
-//! self-corrects on first interactive Codex use in that directory.
+//! contents — are what Switchboard's `SessionMeta.mcp_servers` surfaces;
+//! the registry is display-only. Switchboard does **not** enforce Codex's
+//! trust-list gate (which Codex itself uses to decide whether to load
+//! project-scope config): the small fidelity gap of showing project-scoped
+//! servers Codex wouldn't load for untrusted directories self-corrects on
+//! first interactive Codex use in that directory.
 //!
-//! **Partial-parse policy** (mirrors the M1 transcript skip-with-warning
-//! pattern for harness-owned files):
+//! **Partial-parse policy** (skip-with-warning for harness-owned files):
 //! - File not found → empty list, no warning (a missing config file is the
 //!   default state for new installs / un-configured projects).
 //! - File present but unreadable / top-level malformed → empty list + one

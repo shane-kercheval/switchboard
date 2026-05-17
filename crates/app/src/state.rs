@@ -9,8 +9,8 @@ use switchboard_dispatcher::{Dispatcher, EventEmitter};
 use switchboard_harness::HarnessAdapter;
 
 /// The single piece of state managed by Tauri. Multi-project from day 1 (per
-/// system-design §3); M1 only loads one project at a time, but the shape
-/// supports M4's project switcher without restructuring.
+/// system-design §3); only one project is loaded at a time today, but the
+/// shape supports a future project switcher without restructuring.
 ///
 /// **Lock-order convention** (when more than one of these mutexes is held
 /// at the same time): `registry_write` → `directory` → `projects` →
@@ -28,8 +28,8 @@ use switchboard_harness::HarnessAdapter;
 /// window between their internal "is this name unique?" read and the
 /// subsequent append; two concurrent IPC calls could otherwise both pass
 /// the uniqueness check and append colliding records. The mutex closes
-/// that window inside one process; cross-process serialization is M4's
-/// `instance.lock`.
+/// that window inside one process; cross-process serialization is future
+/// work (an `instance.lock` per directory).
 pub struct AppState {
     pub directory: Mutex<Option<Directory>>,
     pub projects: Mutex<HashMap<ProjectId, Project>>,
@@ -40,9 +40,10 @@ pub struct AppState {
     /// the guard is held.
     pub registry_write: Mutex<()>,
     pub dispatcher: Arc<Dispatcher>,
-    /// Adapter for `HarnessKind::ClaudeCode` agents. M2.3+: named fields per
-    /// harness replace M1/M2's single `adapter` field so the routing rule
-    /// (`send_message_impl` matches on `agent.harness`) is type-supported.
+    /// Adapter for `HarnessKind::ClaudeCode` agents. Named fields per harness
+    /// (one per supported `HarnessKind`) make the routing rule
+    /// (`send_message_impl` matches on `agent.harness`) type-supported —
+    /// adding a new harness forces a compiler-checked update here.
     pub claude_adapter: Arc<dyn HarnessAdapter>,
     /// Adapter for `HarnessKind::Codex` agents.
     pub codex_adapter: Arc<dyn HarnessAdapter>,

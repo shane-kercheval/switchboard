@@ -2,8 +2,9 @@
 ///
 /// Run with: `make test-live`
 ///
-/// Requires `claude` installed and authenticated. Not part of CI for M1 — M2
-/// sets up the integration CI workflow.
+/// Requires `claude` and/or `codex` installed and authenticated. Developer-local
+/// only — not run in CI. See `AGENTS.md` "Live testing against real harnesses"
+/// for the policy.
 use std::path::Path;
 
 use futures::StreamExt;
@@ -76,7 +77,7 @@ async fn live_basic_turn_completes() {
         "expected TurnEnd(Completed), got: {terminal:?}"
     );
 
-    // Drift detection for promoted M2 events — symmetric with the Codex
+    // Drift detection for promoted events — symmetric with the Codex
     // live test's enrichment assertions. Claude emits `SessionMeta` from
     // its `system/init` stream event on every dispatch; the wire-format
     // contract says `model`, `harness_version`, and `tools` are populated.
@@ -197,7 +198,7 @@ async fn live_session_continuity_across_turns() {
     );
 }
 
-// --- Codex live tests (M2.3) ---
+// --- Codex live tests ---
 
 fn live_codex_agent() -> AgentRecord {
     AgentRecord {
@@ -206,7 +207,7 @@ fn live_codex_agent() -> AgentRecord {
         name: "live-codex-agent".to_owned(),
         harness: HarnessKind::Codex,
         // Codex agents always have session_id = None — the per-agent
-        // session-link sidecar is the system-of-record (M2.3 invariant).
+        // session-link sidecar is the system-of-record.
         session_id: None,
         created_at: chrono::Utc::now(),
     }
@@ -266,7 +267,7 @@ async fn live_codex_basic_turn_completes() {
         "expected TurnEnd(Completed), got: {terminal:?}"
     );
 
-    // M2.4 post-terminal enrichment must fire for Codex turns:
+    // Post-terminal enrichment must fire for Codex turns:
     // - TurnEnd.usage.context_window is enriched from the session file's
     //   task_started.model_context_window (Codex's stream doesn't carry it).
     // - RateLimitEvent fires every turn from token_count.rate_limits.
@@ -276,7 +277,7 @@ async fn live_codex_basic_turn_completes() {
         AdapterEvent::TurnEnd { usage: Some(u), .. } => {
             assert!(
                 u.context_window.is_some(),
-                "M2.4: TurnEnd.usage.context_window must be enriched from session file (got None)"
+                "TurnEnd.usage.context_window must be enriched from session file (got None)"
             );
         }
         _ => panic!("expected TurnEnd with Some(usage), got: {terminal:?}"),
@@ -284,11 +285,11 @@ async fn live_codex_basic_turn_completes() {
     let rate_limit_idx = events
         .iter()
         .position(|e| matches!(e, AdapterEvent::RateLimitEvent { .. }))
-        .expect("M2.4: RateLimitEvent must fire post-terminal for Codex");
+        .expect("RateLimitEvent must fire post-terminal for Codex");
     let session_meta_idx = events
         .iter()
         .position(|e| matches!(e, AdapterEvent::SessionMeta { .. }))
-        .expect("M2.4: SessionMeta must fire on first turn for Codex");
+        .expect("SessionMeta must fire on first turn for Codex");
     assert!(
         terminal_idx < rate_limit_idx && rate_limit_idx < session_meta_idx,
         "enrichment events must arrive after TurnEnd in order: TurnEnd → RateLimitEvent → SessionMeta"

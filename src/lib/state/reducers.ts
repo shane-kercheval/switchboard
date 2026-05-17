@@ -1,4 +1,4 @@
-// Pure reducers for the M2.5 unified-stream model.
+// Pure reducers for the unified-stream model.
 //
 // Two reducers, one per state map:
 //
@@ -16,7 +16,7 @@
 // satisfies AGENTS.md's "deterministic — no time-of-day or wall-clock
 // dependencies in unit tests" rule.
 //
-// **Late-event drop semantics** (carried over from M1.5):
+// **Late-event drop semantics**:
 // - Events for unknown `turn_id` → dropped. Defense against cross-agent
 //   delivery bugs and races where a stream emits after the heartbeat has
 //   already failed the turn.
@@ -81,7 +81,7 @@ export function transcriptReducer(
       // between two text runs is NOT coalesced (it sits at its own
       // index in `items`, preserving the text/tool/text ordering
       // contract). Different ContentKind (text vs. thinking) stays
-      // separate so M3+ reasoning rendering doesn't accidentally fold
+      // separate so future reasoning rendering doesn't accidentally fold
       // into plain text.
       const lastIndex = existing.items.length - 1;
       const lastItem = lastIndex >= 0 ? existing.items[lastIndex] : undefined;
@@ -382,9 +382,10 @@ export function freshRuntime(agentId: AgentId): AgentRuntime {
   return {
     agent_id: agentId,
     run_status: "idle",
-    // M2.5 default: nothing to hydrate. M2.6 flips to "loading" at project
-    // open and lands on "complete" or "failed" once the session-file load
-    // finishes.
+    // Default for newly-created agents (create_agent flow): nothing to
+    // hydrate. The hydration flow flips this to "loading" on project open
+    // / attach, then lands on "complete" or "failed" once the session-file
+    // load finishes.
     hydration_status: "complete",
   };
 }

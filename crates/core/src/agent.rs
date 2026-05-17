@@ -16,9 +16,9 @@ pub type AgentId = Uuid;
 /// directory context through every call.
 ///
 /// `session_id` is pre-generated at agent creation time for Claude Code agents
-/// (passed to `claude` via `--session-id <uuid>` in M1.3). For future Codex
-/// agents it stays `None` — Codex assigns its own session ID from the stream
-/// and stores it in a per-agent sidecar.
+/// (passed to `claude` via `--session-id <uuid>`). For Codex agents it stays
+/// `None` — Codex assigns its own session ID from the stream and stores it
+/// in a per-agent sidecar.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentRecord {
     pub id: AgentId,
@@ -50,7 +50,7 @@ mod tests {
 
     #[test]
     fn session_id_serializes_as_null_when_none() {
-        // Codex (M2+) will land with session_id: None — make sure the wire shape
+        // Codex agents have `session_id: None` — make sure the wire shape
         // emits null rather than omitting the field (which would happen with
         // #[serde(skip_serializing_if = "Option::is_none")]). This test guards
         // against accidentally adding that attribute.

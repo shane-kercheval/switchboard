@@ -11,11 +11,12 @@
 //!   pre-generated at agent registration. The per-agent session-link sidecar
 //!   (see `sidecar.rs`) is the system-of-record for the captured `thread_id`.
 //!
-//! **Resume command-line asymmetry (M2.3 finding).** `codex exec resume` does
-//! **not** accept `-C` / `--cd`; verified against codex-cli 0.130.0 via the
-//! `--help` output and a live probe. The first-turn `codex exec` DOES accept
-//! `-C`. cwd is set instead via `tokio::process::Command::current_dir(cwd)`
-//! for both paths — Codex inherits cwd from the parent process automatically.
+//! **Resume command-line asymmetry.** `codex exec resume` does **not**
+//! accept `-C` / `--cd`; verified against codex-cli 0.130.0 via the
+//! `--help` output and a live probe. The first-turn `codex exec` DOES
+//! accept `-C`. cwd is set instead via
+//! `tokio::process::Command::current_dir(cwd)` for both paths — Codex
+//! inherits cwd from the parent process automatically.
 
 pub mod config;
 pub mod parser;
@@ -195,8 +196,8 @@ fn resolve_home_dir(override_path: Option<&Path>) -> PathBuf {
 
 /// Build the args for `codex exec [resume <id>]`. Flag set verified against
 /// codex-cli 0.130.0; see the module-level docstring and
-/// `docs/research/codex-cli-observed.md` §"Findings during M2.3" for the
-/// `-C`-on-resume rejection finding.
+/// `docs/research/codex-cli-observed.md` for the `-C`-on-resume rejection
+/// finding.
 fn build_args(prompt: &str, prior: Option<&SessionLinkRecord>) -> Vec<String> {
     if let Some(record) = prior {
         // Resume subcommand — NO `-C` (rejected by codex 0.130.0). cwd is
@@ -219,7 +220,7 @@ fn build_args(prompt: &str, prior: Option<&SessionLinkRecord>) -> Vec<String> {
             "-C".to_owned(),
             // The Command's `current_dir(cwd)` already pins the child's
             // process working directory; passing `-C cwd` is redundant but
-            // matches the M2.1 captured invocation shape for the first turn.
+            // matches the captured invocation shape for the first turn.
             // Using "." rather than the resolved cwd because cwd is already
             // set by Command::current_dir — "." is interpreted relative to
             // the child's pwd, which IS cwd. Avoids encoding the path twice.
@@ -231,9 +232,9 @@ fn build_args(prompt: &str, prior: Option<&SessionLinkRecord>) -> Vec<String> {
 
 // Parallel to `ClaudeCodeAdapter::run_producer` (which sits just under the
 // `too_many_lines` threshold). The Codex variant adds sidecar persistence,
-// EOF synthesis that consumes the buffered stdout error, and M2.4
-// post-terminal session-file enrichment. Splitting further would fragment
-// the per-line control flow without improving readability.
+// EOF synthesis that consumes the buffered stdout error, and post-terminal
+// session-file enrichment. Splitting further would fragment the per-line
+// control flow without improving readability.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_producer(
     mut child: tokio::process::Child,
@@ -264,7 +265,7 @@ async fn run_producer(
     let mut state = CodexParserState::default();
     // Once we've written the sidecar for this dispatch, ignore any
     // subsequent thread.started events (defensive — Codex emits one per
-    // dispatch in M2.1's fixtures).
+    // dispatch in observed fixtures).
     let mut sidecar_written = false;
     // Set on any error path that ends the producer loop with the subprocess
     // still potentially running. The child is then killed before awaiting
@@ -416,7 +417,7 @@ async fn run_producer(
                 %turn_id,
                 agent_id = %agent_id,
                 exit_code = ?status.code(),
-                "codex emitted turn.completed but subprocess exited non-zero — log-only per M1 policy (Codex exits 0 even on SIGTERM)"
+                "codex emitted turn.completed but subprocess exited non-zero — log-only (Codex exits 0 even on SIGTERM)"
             );
         }
         Err(e) => {
@@ -431,7 +432,7 @@ async fn run_producer(
     }
 }
 
-/// Run the M2.4 enrichment cycle for a parser-emitted `TurnEnd`:
+/// Run the post-terminal enrichment cycle for a parser-emitted `TurnEnd`:
 ///
 /// 1. Re-read the sidecar (single source of truth for `session_id` +
 ///    `session_partition_date` — never recompute the date from
@@ -546,9 +547,10 @@ async fn emit_terminal_with_enrichment(
 /// **Precedence: stream wins.** If the stream-parsed usage already carries
 /// `Some(window)`, enrichment is ignored — the stream is the canonical
 /// source for the field. Today Codex's stream never emits a `context_window`
-/// (M2.4 enrichment exists precisely to fill that gap), so the overlay
-/// always fires; a future Codex CLI variant that does populate the field
-/// would render this overlay a no-op rather than silently overwrite.
+/// (the post-terminal enrichment exists precisely to fill that gap), so
+/// the overlay always fires; a future Codex CLI variant that does
+/// populate the field would render this overlay a no-op rather than
+/// silently overwrite.
 ///
 /// Returns `None` if `usage` was `None` and the enrichment carried no
 /// `context_window` — fabricating a `Some` with all-zero tokens just to
@@ -572,8 +574,8 @@ fn apply_context_window(
 /// Write a session-link record on the first `thread.started` of the
 /// dispatch. Returns `None` on success, or `Some(TurnEnd{AdapterFailure})`
 /// to emit and terminate the stream on failure. Sidecar persistence is
-/// load-bearing for resume and M2.4 enrichment; silent swallow would create
-/// an unresumable agent, so continuing is worse than stopping.
+/// load-bearing for resume and post-terminal enrichment; silent swallow
+/// would create an unresumable agent, so continuing is worse than stopping.
 fn try_persist_sidecar(
     path: &Path,
     prior: Option<&SessionLinkRecord>,
@@ -687,7 +689,7 @@ mod tests {
 
     #[test]
     fn build_args_resume_includes_session_id_and_omits_dash_c() {
-        // The probe (M2.3 step 2) confirmed `codex exec resume` rejects -C.
+        // Verified against codex-cli 0.130.0: `codex exec resume` rejects -C.
         // This test pins the behaviour against regression.
         let prior = fresh_prior_record();
         let args = build_args("hello again", Some(&prior));

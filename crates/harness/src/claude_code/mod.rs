@@ -89,13 +89,13 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             // `kill_on_drop(true)` only fires when `child` is dropped — and
             // `child` is owned by `run_producer` (spawned task). Consumers
             // dropping the event stream does NOT propagate; the subprocess
-            // continues until natural exit. M4 cancellation will need a
-            // `CancellationToken` plumbed through so mid-turn cancel kills
-            // the subprocess properly.
+            // continues until natural exit. Future cancellation work will
+            // need a `CancellationToken` plumbed through so mid-turn cancel
+            // kills the subprocess properly.
             .kill_on_drop(true);
-        // Put the child in its own process group so M4's cancel can `killpg`
-        // the entire subprocess tree. M2 doesn't add `killpg`; M2.2 just
-        // establishes the group.
+        // Put the child in its own process group so a future `killpg` can
+        // tear down the entire subprocess tree. The group is established
+        // here even though cancellation isn't wired yet.
         #[cfg(unix)]
         command.process_group(0);
         let mut child = command.spawn().map_err(|e| {
@@ -272,7 +272,7 @@ async fn run_producer(
                     }
                     // Receiver drop is intentional: if the consumer disconnects
                     // mid-stream, we let the producer drain and exit cleanly.
-                    // Per-turn cancel (M4) will handle the shutdown case properly.
+                    // Future per-turn cancel work will handle shutdown properly.
                     let _ = tx.send(event);
                 }
                 if terminal_seen {
@@ -308,15 +308,15 @@ async fn run_producer(
     }
 
     // Reap subprocess. If the parser observed Completed but the exit code is
-    // non-zero, log the discrepancy — per M1 policy, we do not re-emit. M2
-    // revisits whether to hold terminal emission until after reconciliation.
+    // non-zero, log the discrepancy — we do not re-emit. Whether to hold
+    // terminal emission until after reconciliation is future work.
     match child.wait().await {
         Ok(status) if !status.success() && terminal_was_completed => {
             tracing::warn!(
                 %turn_id,
                 agent_id = %agent_id,
                 exit_code = ?status.code(),
-                "harness emitted result:completed but subprocess exited non-zero — log-only per M1 policy"
+                "harness emitted result:completed but subprocess exited non-zero — log-only"
             );
         }
         Err(e) => {

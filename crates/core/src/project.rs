@@ -55,19 +55,19 @@ impl Project {
     /// Append a new agent to this project's registry. Validates the name (regex +
     /// per-project uniqueness with hyphen↔underscore + case normalization), generates
     /// a UUID v7 `AgentId`, and (for Claude Code) pre-generates a UUID v7 `session_id`
-    /// the M1.3 adapter will pass via `--session-id <uuid>`.
+    /// the adapter will pass via `--session-id <uuid>`.
     ///
     /// # Concurrency
     ///
     /// Not safe to call concurrently against the *same `Project` instance* — the
     /// read-check-then-append sequence has a TOCTOU window. Callers must
-    /// serialize access (the M1.4 dispatcher / `AppState` mutex does this).
+    /// serialize access (the dispatcher / `AppState` mutex does this).
     /// Concurrent calls against *different* `Project` instances (in the same
-    /// or different directories) are fine; M4's `instance.lock` provides
-    /// cross-process serialization.
+    /// or different directories) are fine; cross-process serialization within
+    /// one directory is future work.
     pub fn register_agent(&self, name: &str, harness: HarnessKind) -> Result<AgentRecord> {
-        // Harness-asymmetry rule (M2.3): Claude Code pre-generates session_id
-        // at registration time; Codex leaves it None and relies on the per-agent
+        // Harness-asymmetry rule: Claude Code pre-generates session_id at
+        // registration time; Codex leaves it None and relies on the per-agent
         // session-link sidecar populated from `thread.started` on first dispatch.
         let session_id = match harness {
             HarnessKind::ClaudeCode => Some(Uuid::now_v7()),

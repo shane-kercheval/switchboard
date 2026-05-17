@@ -107,7 +107,7 @@ describe("event routing", () => {
     expect(turn.status).toBe("streaming");
   });
 
-  it("AgentIdle event flips run_status to idle (M2.4 contract)", async () => {
+  it("AgentIdle event flips run_status to idle", async () => {
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));
     fireTo(`agent:${AGENT_A}`, {

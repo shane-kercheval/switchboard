@@ -1,6 +1,6 @@
 <script lang="ts">
   /// Thin wrapper around `bits-ui` Dialog. Single import surface so future
-  /// modals (Pass D's settings, etc.) reuse the same primitive without each
+  /// modals (settings, etc.) reuse the same primitive without each
   /// component re-importing `bits-ui/dialog` directly.
   ///
   /// **What this gives you:** focus trap, escape-key dismissal, click-outside

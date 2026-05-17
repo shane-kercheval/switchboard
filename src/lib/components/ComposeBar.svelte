@@ -11,7 +11,7 @@
   /// Recipient preselect: most-recent recipient (ui.lastRecipientId) if it's
   /// still in the agents list; otherwise the first agent. Recomputed on
   /// every change to agents/lastRecipientId so adding an agent dynamically
-  /// (M2.5's create_agent flow) updates the picker without manual reset.
+  /// (the `create_agent` flow) updates the picker without manual reset.
   const defaultRecipient = $derived.by(() => {
     const lastId = ui.lastRecipientId;
     if (lastId !== null && agents.some((a) => a.id === lastId)) return lastId;
@@ -30,10 +30,10 @@
 
   /// Compose-bar Send is gated on three conditions:
   /// 1. Recipient exists.
-  /// 2. Hydration is complete (M2.6 may flip to "loading"; M2.5 always
-  ///    lands "complete" for newly-created agents). "failed" is also OK
-  ///    (degraded-dispatch mode — harness session still works; banner
-  ///    explains the gap).
+  /// 2. Hydration is complete. Newly-created agents land at "complete"
+  ///    immediately; registered/attached agents pass through "loading".
+  ///    "failed" is also OK (degraded-dispatch mode — harness session
+  ///    still works; banner explains the gap).
   /// 3. Run status is "idle" — closes the pre-TurnStart race (run_status
   ///    flips to "starting" the moment Send is clicked; second click in
   ///    the IPC window finds non-idle and rejects without firing
@@ -64,8 +64,9 @@
       await api.sendMessage(recipientId, submittedText);
       // Clear-only-if-unchanged: if the user typed new text during the
       // in-flight window, preserve it. If the prompt still matches what
-      // we submitted, clear it for the next message. M4+ may disable
-      // the textarea during in-flight to remove this case entirely.
+      // we submitted, clear it for the next message. Future work may
+      // disable the textarea during in-flight to remove this case
+      // entirely.
       if (prompt.trim() === submittedText) {
         prompt = "";
       }

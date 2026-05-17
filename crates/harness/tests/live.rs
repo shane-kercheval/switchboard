@@ -329,7 +329,7 @@ async fn live_codex_basic_turn_completes() {
     );
     let content = std::fs::read_to_string(&sidecar).unwrap();
     assert!(content.contains("session_id"));
-    assert!(content.contains("original_start_date_utc"));
+    assert!(content.contains("session_partition_date"));
 }
 
 #[tokio::test]
@@ -405,7 +405,7 @@ async fn live_codex_resume_reuses_session() {
         "real Codex echoes the same thread_id on resume"
     );
     assert_eq!(
-        r1["original_start_date_utc"], r2["original_start_date_utc"],
-        "resume preserves original_start_date_utc"
+        r1["session_partition_date"], r2["session_partition_date"],
+        "resume preserves session_partition_date"
     );
 }

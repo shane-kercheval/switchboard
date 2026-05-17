@@ -434,7 +434,7 @@ async fn run_producer(
 /// Run the M2.4 enrichment cycle for a parser-emitted `TurnEnd`:
 ///
 /// 1. Re-read the sidecar (single source of truth for `session_id` +
-///    `original_start_date_utc` — never recompute the date from
+///    `session_partition_date` — never recompute the date from
 ///    `Utc::today()` at enrichment time; see [`session_file`] module docs).
 /// 2. Read the Codex session file with the 200ms + 200ms retry policy.
 /// 3. Emit the (now-enriched) `TurnEnd`. The enriched `context_window`
@@ -473,7 +473,7 @@ async fn emit_terminal_with_enrichment(
         Ok(Some(record)) => {
             session_file::load_with_retry(
                 home_dir,
-                record.original_start_date_utc,
+                record.session_partition_date,
                 &record.session_id,
                 &TokioSleeper,
             )
@@ -580,19 +580,22 @@ fn try_persist_sidecar(
     thread_id: String,
     turn_id: TurnId,
 ) -> Option<AdapterEvent> {
-    // TODO(date-partition): Codex partitions session files by *local* date,
-    // not UTC. The `Utc::now().date_naive()` capture here (and the field
-    // name `original_start_date_utc`) baked the wrong assumption into the
-    // sidecar schema — users whose local date differs from UTC at sidecar
-    // write time will fail post-terminal enrichment because the locator
-    // looks under `~/.codex/sessions/<UTC-date>/` while Codex wrote to
-    // `~/.codex/sessions/<local-date>/`. Fix is a sidecar-schema contract
-    // change; see "Deferred from M2 — Codex session-file date-partition
-    // contract" in docs/implementation_plans/2026-05-12-v1-m2.md.
+    // Codex partitions session files by **local date** under
+    // `~/.codex/sessions/<YYYY>/<MM>/<DD>/`. Capture
+    // `chrono::Local::now().date_naive()` once on the first dispatch and
+    // copy it verbatim on every resume — never recompute. The sidecar's
+    // `session_partition_date` is the authoritative directory key for
+    // locating the rollout file at enrichment time, even if local date
+    // changes between dispatches (Codex keeps appending to the original
+    // file). If a future Codex CLI release switches partition behavior
+    // (e.g., to UTC), the right fix is to derive the date from the actual
+    // rollout file path rather than re-guess from a clock.
     let record = SessionLinkRecord {
         session_id: thread_id,
-        original_start_date_utc: prior
-            .map_or_else(|| Utc::now().date_naive(), |r| r.original_start_date_utc),
+        session_partition_date: prior.map_or_else(
+            || chrono::Local::now().date_naive(),
+            |r| r.session_partition_date,
+        ),
         started_at: Utc::now(),
     };
     match append_record(path, &record) {
@@ -655,7 +658,7 @@ mod tests {
     fn fresh_prior_record() -> SessionLinkRecord {
         SessionLinkRecord {
             session_id: "019e2c5f-aaaa-7000-8000-000000000001".to_owned(),
-            original_start_date_utc: NaiveDate::from_ymd_opt(2026, 5, 1).unwrap(),
+            session_partition_date: NaiveDate::from_ymd_opt(2026, 5, 1).unwrap(),
             started_at: Utc::now(),
         }
     }

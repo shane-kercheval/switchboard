@@ -177,15 +177,19 @@ pub fn create_agent_impl(
 /// 2. `existing_session_id` parses as UUID.
 /// 3. Per-harness session-file existence under `home_dir`. For Codex,
 ///    discovery also returns the parsed `YYYY-MM-DD` (the sidecar's
-///    `original_start_date_utc`).
-/// 4. Session-id collision scan across **all loaded projects** in the bound
-///    directory — Claude scans `AgentRecord.session_id`, Codex scans every
-///    project's `sessions/<agent_id>.jsonl` sidecar. Two `AgentRecord`s
-///    pointing at the same harness session is the same-session-parallel-
-///    invocation hazard (`docs/research/same-session-parallel-invocation.md`).
+///    `session_partition_date`).
+/// 4. Session-id collision scan across **all projects in the bound
+///    directory** (loaded or not — `enumerate_all_projects` walks every
+///    project on disk via `directory.list_projects()`). Claude scans
+///    `AgentRecord.session_id`, Codex scans every project's
+///    `sessions/<agent_id>.jsonl` sidecar. Two `AgentRecord`s pointing at
+///    the same harness session is the same-session-parallel-invocation
+///    hazard (`docs/research/same-session-parallel-invocation.md`);
+///    unloaded projects could still be opened and dispatched concurrently
+///    later, so loaded-only scope would miss the collision.
 /// 5. Register via the harness-specific `register_attached_*` method.
 /// 6. (Codex only) Append the first sidecar record with the discovered
-///    `original_start_date_utc`.
+///    `session_partition_date`.
 /// 7. (Codex only) Insert the new `agent_id` into `needs_session_meta` so
 ///    every dispatch up to and including the one that observes `SessionMeta`
 ///    runs with `is_first_dispatch_after_attach: true` — forces `SessionMeta`
@@ -232,7 +236,7 @@ pub fn attach_agent_impl(
             project.register_attached_claude_agent(name, session_uuid)?
         }
         HarnessKind::Codex => {
-            let (_path, original_start_date_utc) =
+            let (_path, session_partition_date) =
                 switchboard_harness::find_codex_session_file_for_attach(
                     home_dir,
                     existing_session_id,
@@ -254,7 +258,7 @@ pub fn attach_agent_impl(
             );
             let sidecar_record = switchboard_harness::codex::sidecar::SessionLinkRecord {
                 session_id: existing_session_id.to_owned(),
-                original_start_date_utc,
+                session_partition_date,
                 started_at: chrono::Utc::now(),
             };
             switchboard_harness::codex::sidecar::append_record(&sidecar_path, &sidecar_record)?;
@@ -1500,7 +1504,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(latest.session_id, session_id.to_string());
-        assert_eq!(latest.original_start_date_utc, date);
+        assert_eq!(latest.session_partition_date, date);
     }
 
     #[tokio::test]

@@ -244,8 +244,56 @@ async fn first_dispatch_writes_sidecar_with_captured_thread_id() {
     );
     // Sanity: shape includes the M2.4 contract fields.
     assert!(lines[0].contains("session_id"));
-    assert!(lines[0].contains("original_start_date_utc"));
+    assert!(lines[0].contains("session_partition_date"));
     assert!(lines[0].contains("started_at"));
+}
+
+#[tokio::test]
+async fn first_dispatch_captures_local_date_not_utc() {
+    // Pins the date-partition contract: Codex partitions session files by
+    // **local** date, so `try_persist_sidecar` captures
+    // `chrono::Local::now().date_naive()` (not `Utc::now()`). For hosts
+    // whose local date differs from UTC at sidecar write time (any user
+    // west of UTC after ~16:00 local, or east of UTC before ~08:00), a
+    // regression to `Utc::now()` surfaces here.
+    //
+    // **Detection is timezone-conditional.** On hosts where local date
+    // equals UTC date (CI at UTC; users at UTC) `Local::now() == Utc::now()`
+    // collapses the two paths, and a reverted-to-`Utc::now()` regression
+    // would pass this test. Clock-injection is the proper fix; deferred.
+    // For now this test is a developer-machine drift catcher (which is
+    // where `make test-live` runs anyway) plus a JSON-field-name pin.
+    //
+    // The acceptance window is `[local_before, local_after]` — a dispatch
+    // that legitimately straddles local midnight may write either date.
+    // Accepting arbitrary "yesterday" would be too loose: a `Utc::now()`
+    // regression on a UTC+N host during early-morning hours can produce
+    // yesterday-local while local-today is the right answer, and the
+    // before/after window correctly rejects that case.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let agent = codex_agent();
+
+    let local_before = chrono::Local::now().date_naive();
+    let _ = dispatch_fixture(&agent, tmp.path(), &fixture("text-only")).await;
+    let local_after = chrono::Local::now().date_naive();
+
+    let sidecar = tmp
+        .path()
+        .join(".switchboard")
+        .join("projects")
+        .join(agent.project_id.to_string())
+        .join("sessions")
+        .join(format!("{}.jsonl", agent.id));
+    let content = std::fs::read_to_string(&sidecar).unwrap();
+    let record: serde_json::Value = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+    let written_date: chrono::NaiveDate =
+        serde_json::from_value(record["session_partition_date"].clone()).unwrap();
+
+    assert!(
+        written_date == local_before || written_date == local_after,
+        "session_partition_date must be the LOCAL date at dispatch time \
+         (one of [{local_before}, {local_after}]), not the UTC date. wrote {written_date}",
+    );
 }
 
 #[tokio::test]
@@ -257,11 +305,11 @@ async fn resume_dispatch_appends_second_record_preserving_original_date() {
     //       same id; in tests, it's whatever the fixture says — and we use
     //       two distinguishable fixtures here to prove the producer records
     //       *each dispatch's* captured id, not just the first).
-    //   (b) original_start_date_utc is copied verbatim from the prior record
+    //   (b) session_partition_date is copied verbatim from the prior record
     //       on resume — never re-derived from Utc::today().
     //
     // The earlier first-fixture-twice shape couldn't catch a regression
-    // that read the prior record but failed to copy original_start_date_utc,
+    // that read the prior record but failed to copy session_partition_date,
     // because both records carried identical content from the same fixture.
     // Using a second fixture with a distinct thread_id exercises the
     // copy-vs-recompute distinction directly.
@@ -299,11 +347,11 @@ async fn resume_dispatch_appends_second_record_preserving_original_date() {
     // two fixtures emit different ids, so the recorded ids must differ).
     assert_eq!(r1["session_id"], "00000000-0000-7000-8000-000000000001");
     assert_eq!(r2["session_id"], "019aaaaa-bbbb-7777-8888-000000000042");
-    // original_start_date_utc preserved verbatim across records — even
+    // session_partition_date preserved verbatim across records — even
     // though session_id changed, the date must NOT be recomputed.
     assert_eq!(
-        r1["original_start_date_utc"], r2["original_start_date_utc"],
-        "resume must copy original_start_date_utc verbatim regardless of thread_id change"
+        r1["session_partition_date"], r2["session_partition_date"],
+        "resume must copy session_partition_date verbatim regardless of thread_id change"
     );
     // started_at differs per record (each dispatch gets a fresh wall-clock
     // stamp). Loose check — exact equality only on the date components is
@@ -658,7 +706,7 @@ async fn dispatch_with_corrupt_sidecar_returns_pre_stream_read_error() {
 //
 // These tests stage a temp `home_dir` (via `CodexAdapter::with_binary_and_home`)
 // and pre-write a Codex session file at the path the adapter will look up
-// via the sidecar's `session_id` + `original_start_date_utc`. The fixture's
+// via the sidecar's `session_id` + `session_partition_date`. The fixture's
 // hardcoded thread_id (`00000000-0000-7000-8000-000000000001`) is what
 // `fake_codex` echoes back via the `thread.started` stream event, so the
 // sidecar's session_id is predictable for staging.
@@ -703,7 +751,7 @@ fn write_sidecar(
     cwd: &Path,
     agent: &AgentRecord,
     session_id: &str,
-    original_start_date_utc: chrono::NaiveDate,
+    session_partition_date: chrono::NaiveDate,
 ) {
     let sidecar = cwd
         .join(".switchboard")
@@ -714,7 +762,7 @@ fn write_sidecar(
     std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
     let record = serde_json::json!({
         "session_id": session_id,
-        "original_start_date_utc": original_start_date_utc.format("%Y-%m-%d").to_string(),
+        "session_partition_date": session_partition_date.format("%Y-%m-%d").to_string(),
         "started_at": "2026-05-15T00:00:00Z",
     });
     std::fs::write(&sidecar, format!("{record}\n")).unwrap();
@@ -754,9 +802,11 @@ async fn first_turn_emits_enriched_turn_end_rate_limit_and_session_meta() {
     let home = tempfile::TempDir::new().unwrap();
     let agent = codex_agent();
 
-    // Stage session file at today's date (first-turn case — the adapter's
-    // try_persist_sidecar uses Utc::now().date_naive() for original_start_date_utc).
-    let today = chrono::Utc::now().date_naive();
+    // Stage session file at today's local date (first-turn case — the
+    // adapter's `try_persist_sidecar` captures `chrono::Local::now().date_naive()`
+    // for `session_partition_date` because Codex partitions session files
+    // by local date, not UTC).
+    let today = chrono::Local::now().date_naive();
     stage_session_file(
         home.path(),
         today,
@@ -957,7 +1007,7 @@ async fn attach_flow_first_dispatch_forces_session_meta_despite_sidecar_present(
 
 #[tokio::test]
 async fn cross_midnight_uses_sidecar_date_not_today() {
-    // Sidecar's original_start_date_utc says yesterday; host clock says
+    // Sidecar's session_partition_date says yesterday; host clock says
     // today. Lookup must use the sidecar's date.
     //
     // We can't move the host clock backwards in this test, so we stage the
@@ -985,7 +1035,7 @@ async fn cross_midnight_uses_sidecar_date_not_today() {
     assert_eq!(
         enriched_window,
         Some(Some(258_400)),
-        "lookup must use sidecar's original_start_date_utc (yesterday), not today"
+        "lookup must use sidecar's session_partition_date (yesterday), not today"
     );
     // Also confirms the RateLimitEvent path traverses the cross-day file.
     assert!(
@@ -1049,7 +1099,9 @@ async fn project_scope_mcp_config_overlays_user_scope() {
     let cwd = tempfile::TempDir::new().unwrap();
     let home = tempfile::TempDir::new().unwrap();
     let agent = codex_agent();
-    let today = chrono::Utc::now().date_naive();
+    // First-turn case: adapter writes sidecar with `Local::now()`. Stage
+    // the session file at the same local date.
+    let today = chrono::Local::now().date_naive();
     stage_session_file(
         home.path(),
         today,

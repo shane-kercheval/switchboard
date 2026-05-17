@@ -5,10 +5,13 @@
 //! JSONL file at `<directory>/.switchboard/projects/<project-id>/sessions/
 //! <agent_id>.jsonl`. This is the **M2.3→M2.4 contract**:
 //! - `session_id` drives M2.4's session-file filename glob.
-//! - `original_start_date_utc` drives M2.4's date-partition path lookup; it
-//!   is set on the very first dispatch and copied verbatim on every resume
-//!   (NEVER recomputed from `Utc::today()` — Codex appends to the original
-//!   spawn-date's session file even on cross-day resumes per M2.1 findings).
+//! - `session_partition_date` drives M2.4's date-partition path lookup; it
+//!   is set on the very first dispatch (from the **local** date — Codex
+//!   partitions its session files by local date, not UTC) and copied
+//!   verbatim on every resume (NEVER recomputed — Codex appends to the
+//!   original spawn-date's session file even on cross-day resumes per M2.1
+//!   findings). This field is a filesystem-lookup key, not a conversation
+//!   timestamp; UI transcript ordering uses event/turn timestamps in UTC.
 //!
 //! Each dispatch appends a new record. Latest-line-wins on resume lookups;
 //! the full history is retained for debugging. Duplicate records are
@@ -16,7 +19,7 @@
 //!
 //! **Failure semantics.** Sidecar persistence is load-bearing for resume
 //! (without it, the second turn would create a new session and lose
-//! context) and for M2.4 enrichment (without `original_start_date_utc`, the
+//! context) and for M2.4 enrichment (without `session_partition_date`, the
 //! adapter doesn't know which date-partitioned directory to look in).
 //! Silently swallowing a write error would create an unresumable agent, so
 //! callers (the producer task in [`crate::codex::mod`]) **immediately
@@ -43,7 +46,7 @@ use switchboard_core::{AgentId, ProjectId};
 ///
 /// **Schema is the M2.3→M2.4 contract.** Renaming or restructuring these
 /// fields requires coordinated M2.4 changes — M2.4 reads `session_id` (for
-/// the filename glob) and `original_start_date_utc` (for the date-partition
+/// the filename glob) and `session_partition_date` (for the date-partition
 /// directory) directly.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionLinkRecord {
@@ -51,14 +54,22 @@ pub struct SessionLinkRecord {
     /// first dispatch (or, for the attach-existing-session flow, parsed
     /// from the existing session file's path).
     pub session_id: String,
-    /// The UTC calendar date on which the session was originally spawned.
-    /// **Never recomputed.** On the first dispatch this is `Utc::today()`;
-    /// on every subsequent resume it is copied verbatim from the prior
-    /// record. Codex appends to the original spawn-date's session file
-    /// regardless of resume date (per M2.1 findings).
-    pub original_start_date_utc: NaiveDate,
+    /// The `YYYY/MM/DD` directory Codex used when partitioning this
+    /// session's rollout file. **Codex partitions by local date, not UTC**
+    /// — this field is captured from `chrono::Local::now().date_naive()` on
+    /// the first dispatch and **never recomputed**. On every subsequent
+    /// resume it is copied verbatim from the prior record; for the
+    /// attach-existing-session flow it is parsed from the path of the
+    /// matched rollout file. Codex appends to the original spawn-date's
+    /// session file regardless of resume date (per M2.1 findings).
+    ///
+    /// **Filesystem-lookup key, not a conversation timestamp.** UI
+    /// transcript ordering uses event/turn timestamps in UTC; this field
+    /// is solely for locating the Codex rollout file under
+    /// `~/.codex/sessions/<YYYY>/<MM>/<DD>/`.
+    pub session_partition_date: NaiveDate,
     /// Wall-clock time this specific record was written. Distinct from
-    /// `original_start_date_utc`: each dispatch gets a fresh `started_at`.
+    /// `session_partition_date`: each dispatch gets a fresh `started_at`.
     pub started_at: DateTime<Utc>,
 }
 
@@ -178,7 +189,9 @@ mod tests {
     fn fresh_record() -> SessionLinkRecord {
         SessionLinkRecord {
             session_id: Uuid::now_v7().to_string(),
-            original_start_date_utc: Utc::now().date_naive(),
+            // Fixed date for determinism; the value doesn't matter for
+            // the round-trip serialization tests in this module.
+            session_partition_date: NaiveDate::from_ymd_opt(2026, 5, 16).unwrap(),
             started_at: Utc::now(),
         }
     }
@@ -223,7 +236,7 @@ mod tests {
         append_record(&path, &first).unwrap();
         let second = SessionLinkRecord {
             session_id: first.session_id.clone(),
-            original_start_date_utc: first.original_start_date_utc,
+            session_partition_date: first.session_partition_date,
             started_at: first.started_at + chrono::Duration::seconds(60),
         };
         append_record(&path, &second).unwrap();
@@ -291,14 +304,14 @@ mod tests {
         // future rename surfaces here, not as a silent M2.4 lookup failure.
         let record = SessionLinkRecord {
             session_id: "019e2c5f-aaaa-7000-8000-000000000001".to_owned(),
-            original_start_date_utc: NaiveDate::from_ymd_opt(2026, 5, 15).unwrap(),
+            session_partition_date: NaiveDate::from_ymd_opt(2026, 5, 15).unwrap(),
             started_at: DateTime::parse_from_rfc3339("2026-05-15T12:30:45Z")
                 .unwrap()
                 .with_timezone(&Utc),
         };
         let json = serde_json::to_value(&record).unwrap();
         assert_eq!(json["session_id"], "019e2c5f-aaaa-7000-8000-000000000001");
-        assert_eq!(json["original_start_date_utc"], "2026-05-15");
+        assert_eq!(json["session_partition_date"], "2026-05-15");
         assert!(
             json["started_at"]
                 .as_str()

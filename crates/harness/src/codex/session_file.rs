@@ -27,11 +27,15 @@
 //!
 //! Codex session files live at
 //! `<home>/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-*-<session-uuid>.jsonl`.
-//! The date partition is the **original spawn date** (`Utc::today()` at first
-//! dispatch), not the current date — Codex appends to the original file even
-//! on cross-day resumes. The sidecar's `original_start_date_utc` is the
-//! authoritative date input; **never** call `Utc::today()` at enrichment
-//! time. (`docs/research/codex-cli-observed.md`.)
+//! **Codex partitions by local date, not UTC** — the directory key is
+//! captured from `chrono::Local::now().date_naive()` at first dispatch and
+//! stored in the sidecar as `session_partition_date`. Codex appends to the
+//! original-partition file even on cross-day resumes; the stored date is
+//! authoritative across local-date boundaries. **Never recompute the date
+//! from any wall-clock function at enrichment time** — always read from
+//! the sidecar. See `docs/research/codex-cli-observed.md` for the
+//! verification evidence and the fallback path if Codex ever changes
+//! partition behavior.
 //!
 //! ## `raw` field policy
 //!
@@ -90,13 +94,13 @@ pub struct Enrichment {
 /// given start date. Layout: `<home>/.codex/sessions/YYYY/MM/DD/`.
 /// `%Y` / `%m` / `%d` already zero-pad to the expected widths.
 #[must_use]
-pub fn session_directory(home_dir: &Path, original_start_date_utc: NaiveDate) -> PathBuf {
+pub fn session_directory(home_dir: &Path, session_partition_date: NaiveDate) -> PathBuf {
     home_dir
         .join(".codex")
         .join("sessions")
-        .join(original_start_date_utc.format("%Y").to_string())
-        .join(original_start_date_utc.format("%m").to_string())
-        .join(original_start_date_utc.format("%d").to_string())
+        .join(session_partition_date.format("%Y").to_string())
+        .join(session_partition_date.format("%m").to_string())
+        .join(session_partition_date.format("%d").to_string())
 }
 
 /// Locate the session file for `session_id` under `home_dir` for the given
@@ -117,10 +121,10 @@ pub fn session_directory(home_dir: &Path, original_start_date_utc: NaiveDate) ->
 #[must_use]
 pub fn locate_session_file(
     home_dir: &Path,
-    original_start_date_utc: NaiveDate,
+    session_partition_date: NaiveDate,
     session_id: &str,
 ) -> Option<PathBuf> {
-    let dir = session_directory(home_dir, original_start_date_utc);
+    let dir = session_directory(home_dir, session_partition_date);
     let entries = std::fs::read_dir(&dir).ok()?;
     let suffix = format!("-{session_id}.jsonl");
     let mut matches: Vec<PathBuf> = Vec::new();
@@ -185,7 +189,7 @@ pub enum AttachLookupError {
 /// Locate the Codex session file for an *existing* `session_id`, scanning
 /// **all** date partitions under `~/.codex/sessions/`. Returns the file path
 /// and the parsed `YYYY-MM-DD` from the directory tree (load-bearing for the
-/// attach-flow sidecar's `original_start_date_utc`).
+/// attach-flow sidecar's `session_partition_date`).
 ///
 /// **Distinct from `locate_session_file`.** `locate_session_file` is used by
 /// post-turn enrichment, where the agent has already committed to a
@@ -424,7 +428,7 @@ impl Sleeper for TokioSleeper {
 /// only flush-latency edge cases trigger the retries.
 pub async fn load_with_retry(
     home_dir: &Path,
-    original_start_date_utc: NaiveDate,
+    session_partition_date: NaiveDate,
     session_id: &str,
     sleeper: &dyn Sleeper,
 ) -> Enrichment {
@@ -435,13 +439,13 @@ pub async fn load_with_retry(
                 .sleep(Duration::from_millis(ENRICHMENT_RETRY_DELAY_MS))
                 .await;
         }
-        if let Some(path) = locate_session_file(home_dir, original_start_date_utc, session_id) {
+        if let Some(path) = locate_session_file(home_dir, session_partition_date, session_id) {
             return parse_session_file(&path);
         }
     }
     tracing::warn!(
         session_id = %session_id,
-        date = %original_start_date_utc,
+        date = %session_partition_date,
         "Codex session file not found after retry; TurnEnd will lack enriched fields"
     );
     Enrichment::default()
@@ -700,9 +704,10 @@ not valid json
 
     #[test]
     fn locate_session_file_finds_cross_day_when_pointed_at_yesterday() {
-        // Cross-midnight test: sidecar's original_start_date_utc says May
+        // Cross-midnight test: sidecar's session_partition_date says May
         // 15; host clock would say May 16. Lookup must use the sidecar's
-        // date, not Utc::today(), and find the file in May 15's directory.
+        // stored date (never recompute from any clock) and find the file
+        // in May 15's directory.
         let tmp = TempDir::new().unwrap();
         let yesterday = NaiveDate::from_ymd_opt(2026, 5, 15).unwrap();
         let session_id = "019e2c5f-aaaa-7000-8000-000000000001";

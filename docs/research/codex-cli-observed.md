@@ -256,7 +256,7 @@ codex exec resume 00000000-0000-7000-8000-000000000001 ...
 ```
 appends to `~/.codex/sessions/<original-spawn-YYYY>/<MM>/<DD>/rollout-<original-spawn-ISO-with-dashes>-00000000-0000-7000-8000-000000000001.jsonl` (filename and directory both keyed to the **original spawn date**, not resume date). File size grew (32417 → 35619 bytes in our probe); mtime updated; no new file created.
 
-→ `original_start_date_utc` in the session-link sidecar is genuinely load-bearing for M2.4's date-partitioned session-file lookup. Cross-day verification: not run (would require waiting 24h); the on-disk layout (date subdirs + the appended-to-original behavior) makes the cross-day path mechanical to test from a synthetic sidecar.
+→ `session_partition_date` in the session-link sidecar is genuinely load-bearing for M2.4's date-partitioned session-file lookup. Cross-day verification: not run (would require waiting 24h); the on-disk layout (date subdirs + the appended-to-original behavior) makes the cross-day path mechanical to test from a synthetic sidecar.
 
 ### NEW: MCP tool calls flow as a distinct item type — `mcp_tool_call`, not `command_execution`
 
@@ -480,7 +480,17 @@ The two variants are emitted in different points of the turn lifecycle and **don
 
 ### Path layout confirmed
 
-`~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-<ISO-with-dashes>-<thread_id>.jsonl` — verified verbatim. M2.4's date-partition lookup uses sidecar's `original_start_date_utc` for `<YYYY>/<MM>/<DD>` and `session_id` for the trailing `-<thread_id>.jsonl` glob.
+`~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-<ISO-with-dashes>-<thread_id>.jsonl` — verified verbatim. M2.4's date-partition lookup uses sidecar's `session_partition_date` for `<YYYY>/<MM>/<DD>` and `session_id` for the trailing `-<thread_id>.jsonl` glob.
+
+### NEW: Codex partitions session files by **local date**, not UTC
+
+Verified post-M2.5 while running `make test-live` from PDT (UTC-7):
+
+- `date -u` → `Sun May 17 01:15:44 UTC 2026`
+- `date` → `Sat May 16 18:15:44 PDT 2026`
+- File written at that moment: `~/.codex/sessions/2026/05/16/rollout-2026-05-16T18-11-24-<uuid>.jsonl` — the directory uses the **local** date, the filename's timestamp prefix uses the **local** wall clock. The session file's *internal* `"timestamp"` field is UTC; only the path partitioning is local-time.
+
+→ Switchboard's sidecar captures `session_partition_date` from `chrono::Local::now().date_naive()` on first dispatch and parses it from the matched rollout file's path on attach. Never recomputed from any clock on subsequent dispatches; the stored value is authoritative across local-date boundaries because Codex keeps appending to the original-partition file. If a future Codex CLI release switches partition behavior (e.g., to UTC), the right adjustment is to derive the partition date from the rollout file's path rather than re-guess from a clock.
 
 ### Net plan corrections for M2.4 step 3
 

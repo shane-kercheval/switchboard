@@ -580,6 +580,15 @@ fn try_persist_sidecar(
     thread_id: String,
     turn_id: TurnId,
 ) -> Option<AdapterEvent> {
+    // TODO(date-partition): Codex partitions session files by *local* date,
+    // not UTC. The `Utc::now().date_naive()` capture here (and the field
+    // name `original_start_date_utc`) baked the wrong assumption into the
+    // sidecar schema — users whose local date differs from UTC at sidecar
+    // write time will fail post-terminal enrichment because the locator
+    // looks under `~/.codex/sessions/<UTC-date>/` while Codex wrote to
+    // `~/.codex/sessions/<local-date>/`. Fix is a sidecar-schema contract
+    // change; see "Deferred from M2 — Codex session-file date-partition
+    // contract" in docs/implementation_plans/2026-05-12-v1-m2.md.
     let record = SessionLinkRecord {
         session_id: thread_id,
         original_start_date_utc: prior

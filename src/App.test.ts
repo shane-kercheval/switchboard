@@ -25,7 +25,12 @@ const invokeMock = vi.fn(
 const listenCallbacks = new Map<string, (e: { payload: NormalizedEvent }) => void>();
 const listenMock = vi.fn(async (event: string, handler: unknown): Promise<() => void> => {
   listenCallbacks.set(event, handler as (e: { payload: NormalizedEvent }) => void);
-  return () => {};
+  // Honest unlisten: mirrors Tauri's `listen()` return shape (call it to
+  // detach the handler). Intra-test mount/unmount cycles are rare today
+  // but a no-op would silently keep stale callbacks alive across them.
+  return () => {
+    listenCallbacks.delete(event);
+  };
 });
 const openDialogMock = vi.fn(async (_options: unknown): Promise<string | null> => null);
 
@@ -103,7 +108,9 @@ describe("App", () => {
     // Restore the capture-callback default after `.mockReset()` clears it.
     listenMock.mockImplementation(async (event: string, handler: unknown) => {
       listenCallbacks.set(event, handler as (e: { payload: NormalizedEvent }) => void);
-      return () => {};
+      return () => {
+        listenCallbacks.delete(event);
+      };
     });
     openDialogMock.mockReset();
   });
@@ -664,6 +671,23 @@ describe("App", () => {
       kind: "text",
       text: "ack",
     });
+
+    // Transcript shows the response text mid-stream (before terminal).
+    await waitFor(() => {
+      expect(screen.getByTestId("unified-transcript")).toHaveTextContent("ack");
+    });
+
+    // Codex post-terminal enrichment: turn_end is followed by
+    // rate_limit_event + session_meta + agent_idle, in that order. The
+    // load-bearing frontend invariant is that **run_status stays
+    // "processing" through the entire window** until `agent_idle` lands —
+    // so a fresh prompt typed mid-window must keep Send disabled. This
+    // test pins that invariant by re-populating the textarea after
+    // turn_end (the compose-bar clears it on submit) and asserting Send
+    // stays disabled after each post-terminal event except the final
+    // `agent_idle`. A regression that flipped run_status to idle on
+    // turn_end (the obvious-but-wrong simplification) would fail at the
+    // first post-turn_end assertion below.
     fireTo(channel, {
       type: "turn_end",
       turn_id: turnId,
@@ -675,15 +699,21 @@ describe("App", () => {
         context_window: 200000,
       },
     });
-    // Codex post-terminal enrichment: rate_limit_event and session_meta
-    // arrive AFTER turn_end and BEFORE agent_idle. The frontend must
-    // accept them on the same per-agent channel without flipping
-    // run_status to idle until agent_idle.
+    // Re-populate the textarea so Send-disabled is *only* a function of
+    // run_status, not of empty input.
+    await fireEvent.input(textarea, { target: { value: "next" } });
+    await waitFor(() => {
+      expect(screen.getByTestId("compose-send")).toBeDisabled();
+    });
+
     fireTo(channel, {
       type: "rate_limit_event",
       agent_id: CODEX_AGENT.id,
       info: { primary: { used_percent: 12.5 } },
     });
+    // Still in post-terminal window — Send must remain disabled.
+    expect(screen.getByTestId("compose-send")).toBeDisabled();
+
     fireTo(channel, {
       type: "session_meta",
       agent_id: CODEX_AGENT.id,
@@ -694,18 +724,13 @@ describe("App", () => {
       skills: [],
       raw: null,
     });
-    fireTo(channel, { type: "agent_idle", agent_id: CODEX_AGENT.id });
+    // session_meta is the last post-terminal event before agent_idle.
+    // Send must STILL be disabled — if a regression flipped run_status
+    // on session_meta (or earlier), this is where it surfaces.
+    expect(screen.getByTestId("compose-send")).toBeDisabled();
 
-    // Transcript shows the response text from the Codex-shape stream.
-    await waitFor(() => {
-      expect(screen.getByTestId("unified-transcript")).toHaveTextContent("ack");
-    });
-    // Send re-enabled only after agent_idle — not at turn_end, not at
-    // session_meta. Pin the load-bearing assertion: if a regression
-    // flipped run_status on turn_end (or anywhere before agent_idle),
-    // post-terminal events would race the user's next Send. (Textarea
-    // must be re-populated; compose-bar clears it on submit.)
-    await fireEvent.input(textarea, { target: { value: "again" } });
+    fireTo(channel, { type: "agent_idle", agent_id: CODEX_AGENT.id });
+    // Only now — after agent_idle — does Send re-enable.
     await waitFor(() => {
       expect(screen.getByTestId("compose-send")).not.toBeDisabled();
     });

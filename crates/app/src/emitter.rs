@@ -63,6 +63,14 @@ impl EventEmitter for SessionMetaObservingEmitter {
             == Some("session_meta")
             && payload.get("agent_id").and_then(serde_json::Value::as_str)
                 == Some(&self.agent_id_str);
+        // **Clear-before-forward ordering.** Today no consumer reads
+        // `needs_session_meta` in response to a wire `session_meta` event,
+        // so the ordering is unobservable in production. If a future
+        // feature does — e.g., a UI affordance that depends on the
+        // "post-attach mode" flag and reacts to SessionMeta — it would
+        // observe the flag already cleared by the time the event lands.
+        // Documented so the order isn't accidentally inverted in a
+        // future refactor.
         if is_session_meta_for_agent {
             lock(&self.needs_session_meta).remove(&self.agent_id);
         }

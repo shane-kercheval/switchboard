@@ -1233,6 +1233,13 @@ mod tests {
         }
 
         let flags = lock(&seen_flags).clone();
+        // Why dispatch #3 sees `true` (not `false`): `send_message_impl`
+        // reads the flag at dispatch start, BEFORE the adapter spawns the
+        // task that emits SessionMeta. The decorator only clears the
+        // flag once SessionMeta flows through the emitter, which happens
+        // AFTER `is_first_dispatch_after_attach` has already been
+        // captured into `DispatchOptions` for that dispatch. Dispatch #4
+        // is the first that observes the cleared flag.
         assert_eq!(
             flags,
             vec![true, true, true, false],

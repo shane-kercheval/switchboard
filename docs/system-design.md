@@ -34,7 +34,9 @@ This orchestration model has a useful side effect for prompt management. Because
 - **Multi-user collaboration.** Single-developer tool. Sharing workflows and configurations via git is supported as a side effect of file-based config, but there is no real-time collaboration model.
 - **Hosted / SaaS service.** Switchboard runs locally on the developer's machine. There is no managed cloud version, no shared backend, no remote agent execution. A future hosted service may eventually provide cross-machine sync of workflows, prompts, and project configuration; that is out of scope for v1.
 - **Arbitrary harness slash-command passthrough.** v1 does not support invoking arbitrary harness slash commands as input (`/model`, `/skill-name`, etc.). This is an upstream `claude -p` limitation; specific commands are worked around individually (see §9). Tracked in §12 (10.10).
-- **Per-turn dollar cost reporting.** *(Original v1 decision was a flat non-goal; the answer is now asymmetric across harness × auth method and the decision is open for M2 to resolve — see `2026-05-12-v1-m2.md`.)* The original rationale held when both harnesses metered subscription usage as opaque rate-limited consumption with no per-turn dollar mapping. That assumption broke for Claude Code on 2026-06-15, when Anthropic split `claude -p` / Agent SDK usage onto a separate dollar-denominated credit pool (Pro: $20/mo) distinct from interactive subscription quota — and `claude -p` already emits `total_cost_usd` natively, so the data is free. Codex on ChatGPT subscription is still rate-limited (consumption is a fraction of a rolling window, not dollars); API-key auth on either harness has always been pay-as-you-go. So each combination needs its own meaningful surface (dollars consumed, credits remaining, % of window, raw tokens) — see M2 for the resolved per-cell decisions. Token usage and context utilization are surfaced regardless.
+- **API-key authentication for the harnesses.** v1 is built around **subscription / tier auth only**: Claude Code via `claude login` (Pro / Max / Team subscription) and Codex via `codex login` (ChatGPT Plus / Pro). Switchboard does **not** support `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` flows in v1, and does **not** ship per-model pricing tables to derive dollars from token counts for pay-as-you-go users. This is a load-bearing product decision: it shapes the cost / quota surface (see §7 "Per-agent status and actions") and removes the maintenance burden of keeping pricing tables current with vendor releases. Users who have only API-key auth available are surfaced a clear error at agent-creation directing them to install and authenticate the harness's interactive CLI first. API-key support may be revisited in v2+ if user demand surfaces.
+- **Raw token counts in the UI.** Token usage is plumbed through the normalized event stream (and used to compute context utilization) but is not surfaced as a UI affordance for users in v1. The user-facing cost / quota surface is dollars (Claude Code, via `total_cost_usd`) or rate-limit / quota signals (Codex, via session-file `token_count.rate_limits`). See §7.
+- **Cross-harness dollar normalization.** Switchboard does not synthesize a single "total spend" number across a mixed-harness project. Claude Code's dollars and Codex's rate-limit signals live in different billing realities (separate vendors, separate auth tiers, different metering models per §2 below); aggregating them into one number would mislead. Per-agent and per-project aggregates within a harness are fine; cross-harness aggregation is not.
 - **Multi-agent parallel writes to project files.** A general property of any multi-agent setup; out of Switchboard's ownership. Users running multiple agents that write to the same files at the same time accept the conflict risk; resolving such conflicts is the user's responsibility (typically via git, file scoping, or workflow design that serializes writes).
 
 ## 3. Core concepts
@@ -409,19 +411,23 @@ The user opens Switchboard and sees a list of their projects. They open one, or 
 
 ### Inside a project
 
-The user sees the project's agents in a multi-pane layout — every agent's most recent output is visible at a glance, with one designated as the primary view (active focus for typing input, larger pane). Background agents (those not in the primary view) can be collapsed to a status row to reclaim space, or expanded to see their full output. Panes can be rearranged and resized within the main window. A persistent overview panel lists all agents with their real-time status (idle, processing, waiting on tool, errored) for quick triage.
+The user sees a **single unified transcript view** for the project — every turn from every agent appears in one chronologically-ordered stream, with each turn attributed to the agent that produced it (name + harness badge). Tool calls, errors, and per-turn metadata (cost / context utilization) nest under the turn they belong to. The user reads the project's conversation flow as one timeline; "Agent X responded at 10:02, then I forwarded to Agent Y at 10:03, then Y responded at 10:04" is legible at a glance without manually correlating across panes.
+
+A **per-agent overview sidebar** lists every agent in the project with its real-time operational state — name, harness badge, status (idle, processing, waiting on tool, errored), context utilization, last-turn cost (Claude Code) or quota signal (Codex). Clicking an agent in the sidebar surfaces its context menu (fork session, open session file, reset/remove, cancel in-flight turn). The sidebar is the agent-management surface; the unified transcript is the conversation surface.
+
+**No singleton "active" or "focused" agent.** All agents in a loaded project are equally first-class. The compose bar picks recipient(s) explicitly per send (single agent or multi-select) — no agent is the default recipient by virtue of being "viewed." Users may colloquially think of one agent as primary (e.g., the implementer in a review workflow) and others as secondary (the reviewers), but the architecture does not encode this — it's a label, not a structural concept.
 
 Agents in v1 are **project-scoped** — they're created within a project and stay there. Cross-project / global agent templates are a planned future direction (tracked in §11) — for example, a personal "writing editor" persona that knows your voice and applies across blog posts, docs, and emails, or a "domain expert" persona carrying institutional knowledge (a regulatory framework, your team's architecture conventions, a research methodology) reusable in any project that touches the area. Optionally these could be surfaced via semantic search over the project context, suggesting which template fits.
 
 ### Per-agent status and actions
 
-Each agent in the project surfaces real-time state alongside its conversation:
+Each agent's operational state is surfaced in the **overview sidebar** (per "Inside a project" above). State includes:
 
 - **Status**: idle, processing, waiting on tool, errored.
-- **Context utilization**: % of model context used, derived from the harness JSON (see §9 "Required harness commands"). Surfaced as a progress bar updated per turn (live for Claude Code; per-turn for Codex via session-file enrichment per 10.15) so the user can see when an agent approaches the auto-compact threshold.
-- **Token usage**: per turn and cumulative. Surfaced from the harness's reported usage counts. Whether to surface dollar cost / credit consumption alongside tokens is asymmetric per harness × auth method — see §3 "Non-goals" and the M2 design decision.
+- **Context utilization**: % of model context used, derived from the harness's reported context window and the most recent turn's input/output tokens. Surfaced as a progress bar so the user can see when an agent approaches the auto-compact threshold. For Claude Code: read live from the stream's `result` event. For Codex: enriched from the session file on turn completion (per resolved 10.15).
+- **Cost / quota signal**: harness-asymmetric per the v1 cost surface (§2). For Claude Code agents: per-turn dollars from `total_cost_usd` (drawn from the Agent SDK credit pool post-2026-06-15) and a derived session-aggregate (sum across the agent's turns in this project). For Codex agents: a quota signal surfaced from the session file's `token_count.rate_limits` payload (e.g., "% of 5h window remaining") — Codex does not expose a dollar number under subscription auth. **No raw token counts are surfaced in the UI for either harness** — the underlying tokens are plumbed through the normalized event stream and used to compute context utilization, but the user-facing surface is dollars (Claude) or quota (Codex), not "X input tokens." See §9 for the normalized event vocabulary.
 
-Each agent also exposes a context menu of user actions:
+Each agent also exposes a context menu of user actions (accessed from the sidebar entry, or from any of its turns in the unified transcript):
 
 - **Fork session** — create a new agent branched from the current state. Native in Claude Code via `--fork-session`. Unavailable for Codex agents in v1 (per resolved 10.14) — the menu item is shown only on Claude Code agents; Codex agents see an explanatory tooltip.
 - **Open session file** — open the underlying harness JSONL session file in the user's default editor for inspection or external tooling.
@@ -433,7 +439,7 @@ The user's core action — whether typing a fresh message, forwarding an agent's
 
 - **Source.** What is being sent — any combination of: free-form text the user types, and/or the output from one or more agents (latest turn by default; the user can pick a specific earlier turn). When multiple sources are combined, the optional wrapping prompt is the natural way to control how they're stitched together via template variables.
 - **Optional wrapping.** A prompt template from any provider (e.g. `local:code-review`, `tiddly:ai-review-feedback`) that the source(s) are rendered into. May be invoked via slash command in the message bar; the UI may accept a bare name if it matches exactly one configured provider (see §6 resolution rules).
-- **Recipients.** One or more agents to receive the (possibly wrapped) message. Currently focused agent is the default; multi-select picks any combination of agents in the project. If a recipient is busy with an in-flight turn, the compose bar accepts input (the user can draft) but Send is gated until the agent is idle; the gating reason ("busy in workflow X step N") is visible inline.
+- **Recipients.** One or more agents to receive the (possibly wrapped) message — picked explicitly per send via a recipient picker on the compose bar. No agent is the implicit default; the picker preselects whichever agent the user last sent to (a UI ergonomic, not a semantic privilege). Multi-select picks any combination of agents in the project. If a recipient is busy with an in-flight turn, the compose bar accepts input (the user can draft) but Send is gated until the agent is idle; the gating reason ("busy in workflow X step N") is visible inline.
 
 These three components compose freely. Typing a fresh message is just user text + no wrapping + one recipient. A fan-out is user text + optional wrapping + many recipients. Forwarding an agent's output is the agent's turn + optional wrapping + other agents. A **workflow** is the saved (and possibly sequenced) version of one or more of these compositions — see "Invoking a workflow" below.
 
@@ -447,7 +453,7 @@ A workflow is invoked by name. Switchboard prompts for the workflow's inputs (wh
 
 ### Watching a workflow run
 
-All participating agents stay simultaneously visible in their panes throughout workflow execution; status indicators show which are still running, waiting, or completed. The user can collapse background agents to focus on a specific one, or expand them all to watch the work in parallel. Workflow execution is independent of which pane has focus — agents continue running in the background regardless. When a workflow completes (all turns it initiated have reached a terminal state) or pauses on Primitive 5 (waiting for user input), the user is notified via OS-native notification (per §10 Form factor).
+Workflow turns appear in the unified project transcript as they happen — each turn attributed to its producing agent — so the user reads the workflow's progress as a single timeline. The overview sidebar shows real-time per-agent status (which agents are still running, waiting, or have completed their step) alongside cost / quota state. Workflow execution proceeds independently of the user's scroll position or interaction — agents keep running in the background regardless of where the user is reading. When a workflow completes (all turns it initiated have reached a terminal state) or pauses on Primitive 5 (waiting for user input), the user is notified via OS-native notification (per §10 Form factor).
 
 A **workflow-progress surface** (shape TBD — status row in the project header, side panel, or modal) shows each active workflow's name, current step, total steps, and per-step status. Multiple workflows can be in flight simultaneously (when they target disjoint agents — see "Agent contention" below); the surface lists each. When a workflow is paused on Primitive 5 (waiting for user input), the surface shows "step N of M — waiting for your input." For workflows using Primitive 6 (iterate over a list), the surface shows the iteration dimension as well, in the user's own vocabulary — e.g., "iteration 2 of 3 (milestone = "implement-handlers"), step 3 of 8" — using the loop variable name and value the workflow declared. On return after walk-away, this is the first thing the user sees: any workflow that was interrupted is surfaced with the same step (and iteration) detail and options to retry or abandon (see "Walking away" below).
 
@@ -510,9 +516,11 @@ To anchor the abstractions above, here is what a code-review workflow looks like
 
 The user has a project `feature-event-logs` open in Switchboard. They have three agents:
 
-- `implementer` (Claude Code, currently selected)
+- `implementer` (Claude Code)
 - `reviewer-claude` (Claude Code)
 - `reviewer-codex` (Codex)
+
+All three are listed in the overview sidebar. The unified project transcript shows their conversation history so far in chronological order.
 
 The user has previously authored a workflow in `.switchboard/workflows/review-and-aggregate.yaml`. The review prompt ships as a built-in local prompt (`local:code-review`); the aggregation wrapper is one the user keeps in Tiddly (`tiddly:ai-review-feedback`). Both work because Switchboard resolves each ID against the named provider.
 
@@ -539,7 +547,7 @@ The user has previously authored a workflow in `.switchboard/workflows/review-an
 
 **During execution:**
 
-All three agents stay simultaneously visible in their panes throughout. While both reviewers are running, the user can watch both streams in parallel — or collapse the reviewer panes down to just their status indicators (running / completed) and let them work in the background. When the implementer kicks in, its pane comes alive with the aggregation. The user doesn't have to switch around to know what's happening. The workflow-progress surface (per §7) shows where the workflow is overall — e.g., "review-and-aggregate: step 2 of 3 (waiting on reviewers)" — so the user can see the workflow-level view alongside the per-agent panes.
+Each reviewer's turn appears in the unified project transcript as it streams — attributed to `reviewer-claude` and `reviewer-codex` respectively — so the user reads both reviews interleaved chronologically as they land. The overview sidebar shows real-time status (running → completed) and per-agent cost / quota for each reviewer. When the implementer kicks in, its aggregated turn appears next in the same transcript, attributed to `implementer`. The workflow-progress surface (per §7) shows where the workflow is overall — e.g., "review-and-aggregate: step 2 of 3 (waiting on reviewers)" — alongside the transcript and sidebar.
 
 **Afterwards:**
 
@@ -620,7 +628,7 @@ The capabilities and behaviors Switchboard needs from each harness, with notes o
 - **Resume** a session by UUID. *(native, both — Claude Code: `--resume <uuid>`; Codex: `codex exec resume <uuid>`.)*
 - **Assign a session ID at spawn.** *(Claude Code only — `--session-id <uuid>`. Codex assigns its own; Switchboard captures it from the first stream event.)*
 - **Fork** a session from a checkpoint. *(Native in Claude Code via `--fork-session` with `--resume`. **Unavailable for Codex in v1** per resolved 10.14 — no non-interactive `codex exec fork` exists; Switchboard does not implement the workarounds (copy session JSONL; re-feed summarized prior context) for v1. Switchboard surfaces Fork only on Claude Code agents; Codex agents show a tooltip explaining the gap.)*
-- **Read session metadata** (model, session ID, tokens) from the stream. *(Asymmetric.)* Claude Code: `result.modelUsage.<model>.{contextWindow, maxOutputTokens}`. Codex: only token counts in `turn.completed.usage`; `model_context_window` is in the **session file** (not the stream). Whether to surface dollar cost alongside tokens is open per §3 "Non-goals" and resolved in M2.
+- **Read session metadata** (model, session ID, tokens) from the stream. *(Asymmetric.)* Claude Code: `result.modelUsage.<model>.{contextWindow, maxOutputTokens}` plus `total_cost_usd`. Codex: only token counts in `turn.completed.usage`; `model_context_window` and `token_count.rate_limits` are in the **session file** (not the stream). Per §2 non-goals, the v1 UI surfaces dollars for Claude Code (from `total_cost_usd`) and a rate-limit / quota signal for Codex (from the session-file `token_count.rate_limits`); raw tokens are plumbed through the event stream but not displayed.
 - **Derive context utilization.** *(Native for Claude Code, asymmetric for Codex.)* Claude Code exposes `contextWindow` per turn in the result event — Switchboard reads it directly. Codex's stream omits it; Switchboard reads the session file (per resolved 10.15). Open question 10.12 captures any further refinements.
 - **Surface compaction state.** *(No programmatic `/compact` in either harness; both do auto-compact at high utilization.)* Switchboard's role is to monitor utilization and surface warnings as the threshold approaches, not to drive compaction itself. Reimplementing summarization in Switchboard would underperform the harnesses' tuned compaction and is not planned (see open question 10.11).
 - **Read tool calls and tool results** from the stream. *(Asymmetric.)* Claude Code emits typed `tool_use` and `tool_result` content blocks (with named tools, including MCP tools). Codex routes everything through `command_execution` items (raw shell commands with `aggregated_output` and `exit_code`). Switchboard renders them differently per harness — there is no single unified rendering.
@@ -633,20 +641,56 @@ The two harness streams are structurally different (event-name vocabularies, con
 
 ```
 SessionMeta     { agent, model, harness_version, tools, mcp_servers, skills, raw }
-                // emitted once at first turn; populated from Claude Code's system/init
-                // event or Codex's session_meta record. Useful for UI diagnostics
-                // ("MCP server X failed to connect for this agent").
+                // emitted once at first turn. Sources vary by field and by harness:
+                //   model         — Claude live: system/init stream event.
+                //                   Claude rehydration: session-file system/init record (M2.6).
+                //                   Codex live + rehydration: session-file first
+                //                   turn_context record.
+                //   harness_version — Claude live: system/init.claude_code_version.
+                //                   Claude rehydration: session-file system/init.
+                //                   Codex live + rehydration: session-file session_meta.cli_version.
+                //   mcp_servers   — Claude live: system/init.mcp_servers (already
+                //                   merged across user/local/project scopes by Claude
+                //                   itself).
+                //                   Claude rehydration: Switchboard reads ~/.claude.json
+                //                   (user + local scopes) and <cwd>/.mcp.json (project
+                //                   scope) — Claude session files don't carry the registry
+                //                   (M2.6).
+                //                   Codex live + rehydration: Switchboard reads
+                //                   ~/.codex/config.toml + <cwd>/.codex/config.toml —
+                //                   Codex's non-interactive mode doesn't emit a registry
+                //                   event AND session files don't carry the registry.
+                //   skills        — Claude live: system/init.skills (already merged by
+                //                   Claude across ~/.claude/skills/ + <cwd>/.claude/skills/).
+                //                   Claude rehydration: Switchboard directory scan of the
+                //                   same two paths (M2.6, since session files don't carry
+                //                   the registry).
+                //                   Codex live + rehydration: Switchboard directory scan
+                //                   of ~/.agents/skills/ + <cwd>/.agents/skills/.
+                //   tools         — Claude live: system/init.tools (the merged builtin +
+                //                   MCP + dynamic list Claude reports).
+                //                   Claude rehydration: empty (session file lacks the
+                //                   equivalent record).
+                //                   Codex live + rehydration: empty (no equivalent source
+                //                   — command_execution + mcp_tool_call cover the
+                //                   dispatched-tool surface stream-side, but there's no
+                //                   available-tools registry separate from mcp_servers).
+                //                   Field is preserved across the wire for the populated
+                //                   Claude-live path; reserved for a future symmetric
+                //                   registry surface across harnesses.
+                // Display-only — the registry data informs the per-agent sidebar; it does
+                // not gate dispatch. Failures to read config/directories emit empty lists
+                // with a warning, never an error.
 TurnStart       { agent, session_id }
 ContentChunk    { agent, kind: thinking | text, data }
 ToolStarted     { agent, tool_use_id, kind, input }
                 // fires when the tool call is dispatched (lets the UI show
                 // "running tool... (3.2s elapsed)" before the result lands).
 ToolCompleted   { agent, tool_use_id, output, is_error }
-TurnEnd         { agent, outcome, stop_reason?,
-                  usage: { input, output, cached, reasoning, context_window? },
-                  permission_denials, raw_event }
+TurnEnd         { agent, outcome, ended_at,
+                  usage?: { input, output, cached, reasoning, context_window?, total_cost_usd? } }
                 // outcome = Completed
-                //         | Failed { kind: HarnessError | AdapterFailure, message }
+                //         | Failed { kind: HarnessError | AdapterFailure | AuthFailure, message }
                 //         | Cancelled { source: User | Workflow }   // added in M4 when per-turn cancel lands
                 //
                 // HarnessError: harness's terminal event reported is_error
@@ -656,6 +700,12 @@ TurnEnd         { agent, outcome, stop_reason?,
                 //   died, the parser hit malformed JSON, or stdout EOF arrived
                 //   without a terminal event (e.g., Codex parent silently exits
                 //   0 on SIGTERM). Infrastructure-level; not the user's fault.
+                // AuthFailure: subscription / tier auth is missing or expired.
+                //   Detected via stream events (Claude: `assistant.error ==
+                //   "authentication_failed"`; Codex: `turn.failed.error.message`
+                //   contains `"401 Unauthorized"`). Distinct from HarnessError
+                //   so the UI can render an auth-specific banner rather than
+                //   a generic error.
                 //
                 // Terminal event type is always TurnEnd. Terminal status lives
                 // in outcome — there is no separate TurnAborted / TurnTimeout /
@@ -710,7 +760,7 @@ To keep the integration suite affordable in time and API cost, every test prompt
 
 Switchboard ships as a **single-binary desktop application** rather than a TUI or browser-based tool. Reasoning:
 
-- The UX vision (multi-pane agent dashboards, real-time per-agent status, expand/collapse outputs, native context menus, slick aesthetics) is desktop-shaped — TUIs can approximate it but always feel cramped at the high end.
+- The UX vision (unified per-project transcript with per-agent attribution, real-time per-agent status sidebar, native context menus, slick aesthetics) is desktop-shaped — TUIs can approximate it but always feel cramped at the high end.
 - Single-binary distribution: download an installer or run a package-manager command, double-click. No language runtime prereq, no browser tab to manage, no separate server to start.
 - Native OS integration: dock icon, system notifications, native file dialogs, proper window management, system tray.
 - The "anyone who wants" audience benefits more from a polished desktop app than from either a TUI or a browser-tab UX.
@@ -814,4 +864,4 @@ Aggregated from inline flags above, plus a few additional:
 - **10.16** Disk usage of harness session files. Both harnesses persist transcripts indefinitely (Claude Code at `~/.claude/projects/<encoded-cwd>/*.jsonl`, Codex at `~/.codex/sessions/YYYY/MM/DD/...`). A long-lived project with many agents and many turns will accumulate. Should Switchboard offer pruning, surface totals, or otherwise manage this? Out of scope for v1, but the architecture should not preclude it.
 - **10.17** Network failure and retry policy. What does Switchboard do when a turn fails mid-workflow because of a transient API error or network blip? Working assumption: a single configurable retry on transient errors (rate-limit, 5xx) before marking the step as failed. Permanent errors (auth, invalid model, denied content) fail immediately. To be detailed in §7 once we have an implementation footprint.
 - **10.18** Stall detection. A turn with no stream events for T seconds is ambiguous (genuinely hung vs slow tool). UX (passive surface, prompt-to-cancel after threshold, or some other affordance) deferred to implementation, including a probe of whether either harness emits reliable heartbeats during long operations.
-- **10.19** Hard per-turn timeout. Distinct from 10.18 (passive stall detection — observation-only). Should Switchboard impose its own active per-turn timeout that hard-kills the subprocess after T seconds regardless of activity? Open sub-questions: default value (none / 5min / configurable?), per-workflow override, user-configurability, surfacing as `TurnEnd { outcome: Failed { kind: Timeout, ... } }` (the `FailureKind` enum already accommodates this — see system-design §9 / `docs/implementation_plans/2026-05-12-v1-m1.md` M1.3). Defer until there's concrete demand; runaway costs in long workflows could surface this as a real need.
+- **10.19** Hard per-turn timeout. Distinct from 10.18 (passive stall detection — observation-only). Should Switchboard impose its own active per-turn timeout that hard-kills the subprocess after T seconds regardless of activity? Open sub-questions: default value (none / 5min / configurable?), per-workflow override, user-configurability, surfacing as `TurnEnd { outcome: Failed { kind: Timeout, ... } }` (the `FailureKind` enum already accommodates this — see system-design §9 / `docs/implementation_plans/2026-05-12-v1-m1-scaffolding.md` M1.3). Defer until there's concrete demand; runaway costs in long workflows could surface this as a real need.

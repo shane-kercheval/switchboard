@@ -2,10 +2,27 @@
 // 1:1 onto a `#[tauri::command]` in `crates/app/src/lib.rs`.
 
 import { invoke } from "@tauri-apps/api/core";
-import type { AgentRecord, DirectoryInfo, ProjectId, ProjectSummary, TurnId } from "./types";
+import type {
+  AgentId,
+  AgentRecord,
+  DirectoryInfo,
+  HarnessKind,
+  LoadedTranscript,
+  ProjectId,
+  ProjectSummary,
+  TurnId,
+} from "./types";
 
 export async function checkClaudeBinary(): Promise<void> {
   await invoke<null>("check_claude_binary");
+}
+
+export async function checkCodexBinary(): Promise<void> {
+  await invoke<null>("check_codex_binary");
+}
+
+export async function checkCodexAuth(): Promise<void> {
+  await invoke<null>("check_codex_auth");
 }
 
 export async function pickDirectory(path: string): Promise<DirectoryInfo> {
@@ -32,8 +49,20 @@ export async function setActiveProject(projectId: ProjectId): Promise<void> {
   await invoke<null>("set_active_project", { projectId });
 }
 
-export async function createAgent(name: string): Promise<AgentRecord> {
-  return await invoke<AgentRecord>("create_agent", { name });
+export async function createAgent(name: string, harness: HarnessKind): Promise<AgentRecord> {
+  return await invoke<AgentRecord>("create_agent", { name, harness });
+}
+
+export async function attachAgent(
+  name: string,
+  harness: HarnessKind,
+  existingSessionId: string,
+): Promise<AgentRecord> {
+  return await invoke<AgentRecord>("attach_agent", {
+    name,
+    harness,
+    existingSessionId,
+  });
 }
 
 export async function listAgents(projectId?: ProjectId): Promise<AgentRecord[]> {
@@ -42,4 +71,8 @@ export async function listAgents(projectId?: ProjectId): Promise<AgentRecord[]> 
 
 export async function sendMessage(agentId: string, prompt: string): Promise<TurnId> {
   return await invoke<TurnId>("send_message", { agentId, prompt });
+}
+
+export async function loadTranscript(agentId: AgentId): Promise<LoadedTranscript> {
+  return await invoke<LoadedTranscript>("load_transcript", { agentId });
 }

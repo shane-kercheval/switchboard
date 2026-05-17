@@ -1,0 +1,78 @@
+/// Pure helpers for rendering harness-availability state. Shared between
+/// `App.svelte`'s banner stack and `CreateAgentForm`'s radio gating —
+/// keeping the copy in one place enforces the "tooltip text matches
+/// banner copy verbatim" design at the module level rather than relying
+/// on developer discipline.
+///
+/// **Scope discipline**: these are pure functions mapping typed inputs
+/// to user-facing strings / booleans. The `banners: HarnessBanner[]`
+/// derivation logic lives in `App.svelte` (with the suppression rule);
+/// don't grow this module to own that — the consumer keeps the
+/// orchestration, this module owns only the text and the gate predicate.
+
+import type { HarnessAvailability, HarnessBanner } from "./types";
+
+/// The user-facing string for a given banner. The `auth_missing` variant
+/// is type-narrowed to Codex (see `HarnessBanner` docstring) so this
+/// function doesn't branch on `harness` for that case.
+export function bannerCopy(banner: HarnessBanner): string {
+  if (banner.kind === "binary_missing") {
+    return banner.harness === "claude_code"
+      ? "Claude Code not found on PATH. Install from https://claude.com/code"
+      : "Codex not found on PATH. Install from https://github.com/openai/codex";
+  }
+  // auth_missing — type guarantees harness === "codex" in v1.
+  return "Codex not authenticated — run `codex login` and reload Switchboard. (API-key-only auth is not supported.)";
+}
+
+/// The inline message shown next to the harness picker when the selected
+/// harness is unavailable for a *real* reason (binary missing or auth
+/// missing). Returns `null` for `"checking"` — we don't surface scary
+/// "Checking…" copy during the brief probe window; the UI silently
+/// disables submission via `isHarnessSelectable` instead.
+///
+/// **Decoupled from `isHarnessSelectable` on purpose**: "is the user
+/// blocked?" and "what message do we show?" are different questions.
+/// Conflating them (e.g., returning a non-null sentinel for checking)
+/// would force the message-rendering site to filter out non-message
+/// states.
+export function harnessUnavailableReason(a: HarnessAvailability): string | null {
+  if (a.binary === "missing") {
+    return a.harness === "claude_code"
+      ? "Claude Code not found on PATH. Install from https://claude.com/code"
+      : "Codex not found on PATH. Install from https://github.com/openai/codex";
+  }
+  if (a.auth === "missing" && a.harness === "codex") {
+    return "Codex not authenticated — run `codex login` and reload Switchboard. (API-key-only auth is not supported.)";
+  }
+  // `auth === "missing"` for a non-Codex harness is structurally
+  // unreachable today (the discriminated-union variant for Claude has
+  // `auth: "unsupported"`). The explicit harness guard above is
+  // belt-and-suspenders symmetric with `bannerCopy`, so a future Claude
+  // auth probe widening Claude's auth field cannot silently render
+  // Codex copy on a Claude row.
+  return null;
+}
+
+/// Whether the radio for this harness should be enabled (and, when
+/// selected, whether Submit is enabled). False for `"checking"`,
+/// binary-missing, OR auth-missing. The `"checking"` arm is what
+/// closes the pre-probe fail-open window: until probes complete, the
+/// form doesn't accept submissions for that harness.
+///
+/// **Note vs `harnessUnavailableReason`**: this returns false for
+/// `"checking"` (block the user) while the reason function returns
+/// `null` for the same state (no inline message). The asymmetry is
+/// intentional — see that function's docstring.
+export function isHarnessSelectable(a: HarnessAvailability): boolean {
+  if (a.binary !== "available") return false;
+  if (a.auth === "missing" || a.auth === "checking") return false;
+  return true;
+}
+
+/// Stable `data-testid` for a banner so component tests can find each
+/// one independently when the stack renders multiple at once. Co-located
+/// with the copy so testid + copy stay aligned in one place.
+export function bannerTestid(banner: HarnessBanner): string {
+  return `banner-${banner.kind}-${banner.harness}`;
+}

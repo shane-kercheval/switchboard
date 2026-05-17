@@ -1,0 +1,1398 @@
+# M2 implementation plan: Both harnesses through the same abstraction
+
+> **Audience:** the AI coding agent implementing M2. Read this entire doc, plus the prerequisites listed below, **before writing any code**. Stop after each sub-milestone for human review.
+
+## How to use this plan
+
+1. **M1 must be complete and merged before M2 starts.** This plan assumes M1's deliverables are in place: Tauri shell, `crates/core` with `Project`/`AgentRecord`/registry, `crates/harness` with the `HarnessAdapter` trait + `ClaudeCodeAdapter`, `crates/dispatcher` with `Dispatcher`/`EventEmitter`/`AgentIdleGuard`, single-pane single-agent UI, hygiene CI. If you can't run the M1 acceptance flow on a fresh checkout, stop and fix M1 before starting M2.
+
+2. **Read these files first** (in order):
+   - `AGENTS.md` — project playbook. Captures established patterns, invariants, conventions, and where things live.
+   - `docs/system-design.md` — sections 2 (non-goals — note the v1 auth and cost-surface invariants), 3 (core concepts), 4 (functional primitives), 7 (user-facing model — **revised to unified transcript + per-agent sidebar**), 9 (harness integration — per-harness adapter design + normalized event vocabulary; M2 is where the full vocabulary lands), 10 (form factor).
+   - `docs/implementation_plans/2026-05-12-v1.md` — M2 section + critical-path preamble.
+   - `docs/research/codex-cli-observed.md` — **most M2-load-bearing file.** Ground-truth on Codex CLI behavior: stream events, session-file format, cancellation, errors, two-process model, rate limits in session file, stall-mitigation guidance.
+   - `docs/research/codex-noninteractive.md`, `docs/research/harness-comparison.md`, `docs/research/claude-code-cli-observed.md`.
+   - `docs/implementation_plans/2026-05-12-v1-m1-scaffolding.md` — to understand what's in place.
+
+3. **Implement sub-milestones M2.1 → M2.7 in order.** Each is self-contained: code + tests + doc updates. **Commit after each sub-milestone** (the user reviews, then signals to proceed). **Single PR for the whole milestone** — open it after M2.7 lands locally and `make check` is green. Per-sub-milestone branches are NOT required. (M2.8 was originally planned as an integration-CI workflow running live tests against subscription-auth secrets; deferred — see "Deferred from M2" at the end of this plan.)
+
+4. **Ask clarifying questions if you hit something the plan is silent on.** Otherwise the plan is committed — implement as written. Don't invent behavior the spec doesn't cover; surface the gap.
+
+5. **Per `~/.claude/CLAUDE.md`:** never remove or skip tests/functionality to get tests to pass; never commit on the user's behalf without explicit instruction; never add Claude as author/co-author; type-hint all functions in TypeScript / Python; in Rust, prefer explicit signatures over inference for public APIs.
+
+## Definition of done for M2 (as a whole)
+
+The M2 acceptance from `docs/implementation_plans/2026-05-12-v1.md`:
+
+> Spawn one Claude Code agent and one Codex agent in the same project; send a message to each; both agents' turns appear in the unified project transcript in chronological order, attributed by agent name + harness badge. Per-agent overview sidebar shows live status, per-turn dollar cost (Claude Code), rate-limit / quota signal (Codex), and context utilization for both. Restart the app, reopen the project — the prior transcript and per-agent state rehydrate from the harness session files; new turns continue cleanly from there. Spawning a second agent with a name that collides with the first after hyphen→underscore normalization is rejected with a clear error. Attempting to use Switchboard with only API-key auth surfaces a clear error at agent-creation. **Live-harness test suite** runs developer-locally (`make test-live`) against installed harnesses with at least one test per normalized event type.
+
+Do not consider M2 done until **all seven sub-milestones (M2.1–M2.7) are committed** and this end-to-end flow works on a clean macOS checkout with both `claude` and `codex` installed and authenticated.
+
+## Sub-milestone overview
+
+At-a-glance summary of what each sub-milestone delivers and why it's ordered where it is. Full plan bodies are below.
+
+| # | Sub-milestone | What it delivers | Why this order |
+|---|---|---|---|
+| **M2.1** | Codex CLI fixture capture + targeted probes | Hands-on Codex CLI captures (text-only, tool-use, errored, MCP, auth-failure, resume) saved as fixtures under `crates/harness/tests/fixtures/codex/`, plus findings appended to `docs/research/codex-cli-observed.md`. **Research, not implementation** — no Rust code written. | Ground later sub-milestones in observed CLI behavior, not assumptions. Surfaces plan-correcting findings (e.g., MCP tools flow as a distinct item type, not `command_execution`) before adapter code is written against them. |
+| **M2.2** | Process-group spawn + normalized event vocabulary expansion | Adds `ToolStarted`/`ToolCompleted`/`RateLimitEvent`/`SessionMeta` to `AdapterEvent`/`NormalizedEvent`, plus `kind: ContentKind` on `ContentChunk` and optional `usage: TurnUsage` on `TurnEnd`. Claude Code adapter emits the new events; subprocess spawn moves to its own process group on Unix. **Claude-only** — Codex comes in M2.3. | Bundle all wire-format breaks into one commit so M2.3 onward can build additively. Process-group convention established here so M2.3's `CodexAdapter` and M4's cancellation work both inherit it. |
+| **M2.3** | Codex adapter implementation | `CodexAdapter` implementing the same `HarnessAdapter` trait as `ClaudeCodeAdapter`. Spawns `codex exec --json`, parses the stream into the M2.2 vocabulary, handles session-id capture via per-agent sidecar, surfaces auth-failure as a typed variant. Stream-level events only — session-file enrichment (rate-limit signal, context window) lands in M2.4. | First validates the per-harness adapter trait with a second concrete implementation. Stream parsing comes before session-file enrichment because most events flow through the stream; the session file is supplementary. |
+| **M2.4** | Codex session-file enrichment | Per-agent background task that tails the Codex rollout JSONL after each turn, extracts `model_context_window` and `token_count.rate_limits`, emits `RateLimitEvent` + `SessionMeta`, and enriches `TurnEnd.usage.context_window` before emission. Closes the asymmetry exposed in M2.1 (rate-limits-and-context-window are session-file-only for Codex; in-stream for Claude). | Codex stream is otherwise complete; enrichment is the only place those two pieces of telemetry come from. Lives after M2.3 because the session-link sidecar (`session_partition_date`) is established there. |
+| **M2.5** | Unified project transcript view + per-agent sidebar + recipient-picker compose bar | Frontend pivots from M1's single-pane single-agent UI to the v1 unified-stream model: all agents' turns merged chronologically with per-agent attribution, per-agent sidebar showing status + cost/quota + context utilization, compose bar with recipient-picker. No singleton "active agent" at the model level. | Lands after both adapters work end-to-end (M2.3/M2.4) so the UI has real multi-agent data to render. Heavy frontend lift, isolated from the Rust adapter work. |
+| **M2.6** | Transcript persistence (load from harness session files) | Per-harness session-file parsers as free functions in `crates/harness/`; `load_transcript(agent_id)` Tauri command + reducer `hydrate` input. Project-open replays history from disk per-agent; live turns overlay loaded history. Switchboard maintains no separate transcript store. | Decouples from UI work in M2.5 (parsers don't depend on the unified-view rendering) but follows it because hydration UX (compose bar gated on `hydration_status`, attach-existing-session flow) shapes the parser API. |
+| **M2.7** | Live-harness test suite scaffolding | A real live-CLI test suite under `crates/harness/tests/`, `#[ignore]`-gated and run via `make test-live`. One live test per reliably-triggerable normalized event type, plus a `load_transcript` round-trip per harness. Establishes the live-testing convention for M3+. | Last sub-milestone because it tests everything built in M2.2–M2.6. Built on top of the fixture-driven integration tests added inline with each adapter sub-milestone — those guard regressions in `make check`; this guards upstream CLI drift on developer machines. |
+
+**Deferred from M2:** an integration-CI workflow that runs live tests in GitHub Actions against materialized subscription-auth secrets. Originally planned as M2.8; deferred due to token-rotation / device-binding / blast-radius / operational-tax concerns. Live tests remain developer-local; rationale + revisit conditions are documented at the bottom of this plan.
+
+**Also deferred (post-M2):** evaluating Codex's newer `codex app-server` mode (added v0.130, May 2026) as a replacement for `codex exec --json`. The new mode emits `item/agentMessage/delta` events for token-level streaming, which `codex exec --json` does not. Switchboard's current Codex adapter forfeits visible token-by-token streaming as a result. Migration is non-trivial — `app-server` is a long-lived JSON-RPC service, not a one-shot subprocess — so the assessment is a separate research pass owned outside M2. Refs: [PR #5546](https://github.com/openai/codex/pull/5546), [codex-rs/app-server/README.md](https://github.com/openai/codex/blob/main/codex-rs/app-server/README.md).
+
+## Resolved design decisions (locking in before implementation)
+
+These decisions were settled during M2 planning (2026-05-14). All later sub-milestones build on them; don't relitigate.
+
+### Auth: subscription / tier only
+
+v1 supports **only** subscription-authenticated CLIs: Claude Code via `claude login` (Pro / Max / Team) and Codex via `codex login` (ChatGPT Plus / Pro). API-key flows (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) are **not** supported in v1. **Load-bearing product decision** — this shapes the cost surface (below) and removes the burden of maintaining per-model pricing tables that drift with vendor releases. If a user has only API-key auth available, agent-creation surfaces a clear error directing them to authenticate the harness's interactive CLI first.
+
+### Cost / quota surface
+
+| | Claude Code | Codex |
+|---|---|---|
+| **Per-turn display** | dollars (`total_cost_usd` from `result` event; drawn from the Agent SDK credit pool post-2026-06-15) | quota / rate-limit signal (from session-file `token_count.rate_limits`; e.g., "% of 5h window remaining") |
+| **Session aggregate** | sum of per-turn dollars across the agent's turns in this project (computed at render time) | latest rate_limits snapshot (already cumulative within the window) |
+| **Where displayed** | per-turn dollar inline on each agent turn in the unified transcript; session aggregate in the per-agent sidebar | sidebar shows the latest rate-limit signal (cumulative window state). **Per-turn inline display for Codex is provisional pending M2.1 fixture review** — the value is window-cumulative rather than per-turn-incremental, so inline-on-each-turn may be redundant; M2.5 may end up with sidebar-only Codex display |
+| **Tokens** | plumbed through the event stream; used to compute context utilization (sidebar progress bar); **NOT displayed as raw numbers in the UI** | same |
+| **Pricing tables** | not shipped (subscription metering means no per-token dollar derivation needed) | not shipped |
+| **Cross-harness aggregation** | not synthesized — Claude $ and Codex % live in different billing realities | — |
+
+### Project = unit of work; no singleton "active" or "focused" agent
+
+A project hosts N equally first-class agents. The UI surfaces **one unified project transcript** (chronologically ordered, agent-attributed) and a **per-agent overview sidebar** (status, cost / quota, context utilization). Compose bar picks recipient(s) explicitly per send. No code path treats any agent as privileged or default-selected. Per system-design §7.
+
+### Transcript source-of-truth = harness session files
+
+Switchboard does **not** maintain its own persistent transcript store. The harness session files (`~/.claude/projects/<encoded-cwd>/<session-id>.jsonl` for Claude Code; `~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-*-<session-id>.jsonl` for Codex) are the authoritative record. On project open, all agents' transcripts are loaded from disk and merged chronologically into the unified view. Live in-flight turns overlay the loaded history.
+
+### Wire format: full `TurnUsage` shape (option B)
+
+`TurnEnd.usage` carries every token-related field the harness exposes (input, output, cached, reasoning, context_window) plus `total_cost_usd` for Claude Code. The UI uses `input_tokens` / `output_tokens` to compute context utilization and `total_cost_usd` to display dollars; raw tokens are never surfaced as UI affordances. Rationale: wire-format breaks are the most expensive thing to fix later — pay them once now even if M2 UI doesn't render every field.
+
+### PR strategy
+
+**Single PR for the whole M2 milestone.** Commits are sub-milestone-sized. User reviews each commit; agent does not commit on the user's behalf without explicit instruction. The "Stop for review after Mx.y" sections below mean: stop, summarize what landed, wait for the user to commit + approve, then proceed.
+
+## Open design decisions (resolve during M2)
+
+### `--dangerously-skip-permissions` vs. Claude Code auto mode
+
+M1 ships with `--dangerously-skip-permissions` as the headless invocation flag for Claude Code. Claude Code now has an [auto mode](https://code.claude.com/docs/en/auto-mode-config) that routes each tool call through a classifier instead of bypassing all permission checks — it blocks irreversible/destructive actions by default and is configurable via natural-language environment descriptions in `autoMode.environment` (`.claude/settings.json`).
+
+**The question for M2:** should the Claude Code adapter continue using `--dangerously-skip-permissions`, or switch to auto mode (or support both)?
+
+Tradeoffs:
+- **Auto mode** is strictly safer — the classifier still runs, blocking e.g. destructive filesystem ops or exfiltration attempts during a multi-agent workflow. Downside: requires users to configure `autoMode.environment` to whitelist their own repos/infra, or routine pushes and writes get blocked.
+- **`--dangerously-skip-permissions`** is zero-config and makes Switchboard work out of the box at the cost of no safety net.
+
+**Suggested resolution:** ship M2 with `--dangerously-skip-permissions` unchanged (same as M1) to avoid blocking progress, and track auto mode as a v2+ onboarding/config story — see the granular permission/sandbox item in the v2+ deferred list. If M2.1 fixture capture surfaces unexpected permission-denial behavior, revisit.
+
+## What's deliberately out of scope for M2
+
+These belong to later milestones — do not implement them, even if "easy":
+
+- Per-turn cancellation (M4) — M2 wires up process-group spawn but does NOT add the cancel button or `killpg` call.
+- Multi-recipient fan-out from the compose bar (M4) — M2's recipient picker is single-select. Workflows (M6) dispatch to multiple agents via different machinery.
+- Project switcher UI (M4) — M2 displays one project at a time. Background subscriptions for all loaded projects persist regardless.
+- Project-level `flock` for multi-instance protection (M4).
+- Slash commands / prompt providers (M5).
+- Workflows (M6).
+- Pause-for-user / iteration (M7).
+- First-launch acknowledgement dialog, tray, walk-away, signing, auto-updater (M8).
+- Codex fork (deferred to v2+ per resolved 10.14).
+- API-key auth flows.
+- Raw token counts in the UI.
+- Cross-harness dollar aggregation.
+
+If the implementing agent finds a "clearly minor" expansion of M2 scope tempting, **stop and ask**. M2 is already substantial.
+
+---
+
+## Sub-milestone M2.1 — Codex CLI fixture capture + targeted probes
+
+### Goal & outcome
+
+Lock in Codex's actual CLI behavior with captured fixtures and probe the remaining gaps before adapter code is written. After this sub-milestone:
+
+- Real `codex exec --json ...` output captured to `crates/harness/tests/fixtures/codex/` for each scenario the M2.3 parser needs (text-only turn, tool-using turn, errored turn, permission-denied turn, auth-failure turn).
+- `codex-cli-observed.md` extended with M2.1 findings (a "Findings during M2.1" subsection) covering: exact `turn.failed` payload shape across error categories; whether `token_count.rate_limits` lives in the stream or only in the session file (load-bearing for M2.3 vs M2.4); permission-denial behavior; MCP tool call routing.
+- Codex install method documented (candidate command + expected post-install state). Fresh-environment verification is developer-local — re-run the documented install path on a clean machine when adopting a new Codex version or when onboarding a new contributor.
+- **Auth-failure stderr shape** captured for both `claude` (expired / missing subscription) and `codex` (no `~/.codex/auth.json` and no `OPENAI_API_KEY`), so M2.3 / M2.5 can surface a typed `AuthFailure` error variant rather than a generic `AdapterFailure`.
+
+### Environment notes (carry-over from M1)
+
+- **Live-test convention.** M1 ships `make test-live` (defined in `Makefile`) which runs `cargo test -- --ignored` against the harness + dispatcher crates. Live tests are marked `#[ignore = "requires claude installed — run with: make test-live"]` per `crates/harness/tests/live.rs`. No `SWITCHBOARD_LIVE_HARNESS` env var exists; `#[ignore]` + `make test-live` is sufficient.
+- **Fixture loading is explicit.** Cargo does not auto-discover fixture files. Tests reference fixtures via `concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/<harness>")` plus `std::fs::read_to_string` at runtime — see `crates/harness/tests/claude_adapter.rs:11-13` for the established pattern. Don't use `include_str!`; keep loading consistent with M1.
+- **`tracing` in tests.** Production initializes the tracing subscriber in `crates/app/src/lib.rs`; in `cargo test`, no subscriber is set, so `tracing::warn!` is a silent no-op. This is the existing M1 convention (e.g., M1.3's exit-code reconciliation logs in prod, silent in tests). Tests that need to assert log content should install `tracing-subscriber::fmt().with_test_writer().try_init()` locally — no M2.1/M2.2 test needs this.
+
+### Fixture layout migration (one-time, in M2.1's commit)
+
+M1 fixtures currently sit flat at `crates/harness/tests/fixtures/*.jsonl`. M2.1 introduces Codex fixtures and adopts a **subdir-per-harness convention** going forward: `tests/fixtures/claude/` and `tests/fixtures/codex/`.
+
+- In the same M2.1 commit, move every existing M1 fixture from `crates/harness/tests/fixtures/*.jsonl` to `crates/harness/tests/fixtures/claude/*.jsonl`.
+- Update `crates/harness/tests/claude_adapter.rs`'s `FIXTURES` constant path-join accordingly (`/tests/fixtures/claude` instead of `/tests/fixtures`).
+- The Codex test files (added in M2.3) use a parallel constant pointing at `/tests/fixtures/codex`.
+- **Re-run `make test` immediately after the migration commit** — call this out in the commit message ("M2.1 includes a one-time M1 fixture migration to `tests/fixtures/claude/`; verify `make test` is green before continuing").
+
+### Implementation outline
+
+1. **Probe `codex exec --json` end-to-end** with the scenarios below. Capture each as `<scenario>.jsonl` under `crates/harness/tests/fixtures/codex/`.
+   - **Trivial text-only:** `codex exec --json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox "Reply with the single word ack."`
+   - **Tool-using:** a prompt that requires a shell command (e.g., "list the files in this directory using ls"). Captures the `command_execution` item flow.
+   - **Errored:** `codex exec --json -m invalid-model-name ...` — captures the `error` event + `turn.failed` shape.
+   - **Permission-denied** (best-effort): a prompt that would trigger a denial under stricter sandbox. With `--dangerously-bypass-approvals-and-sandbox`, denials may not fire — note the result either way.
+   - **Auth failure:** temporarily move `~/.codex/auth.json` aside (back it up first!) and run a normal prompt. Capture stderr verbatim and any stream output. Restore the file.
+
+   **Fixture sanitization.** After capture, sanitize fixtures to match M1's deterministic-UUID convention: replace captured UUIDs with the `00000000-0000-7000-8000-NNNNNNNNNNNN` pattern (sequentially numbered per fixture file), normalize timestamps to stable values, preserve event types, payload shapes, field names, and event ordering verbatim. M1's `crates/harness/tests/fixtures/claude/text-only.jsonl` (after the migration above) is the reference. Run sanitization as a post-capture pass; do not modify the live `codex exec --json` invocation.
+
+2. **Probe MCP tool flow (best-effort).** The probe's purpose: confirm whether MCP tool calls flow as `command_execution` items (same shape as shell commands) or a distinct item type. Configure any conveniently-available Codex MCP server (`@modelcontextprotocol/server-filesystem` is a zero-setup candidate, or any server already in `~/.codex/config.toml`); run a prompt invoking one of its tools; capture the stream. If no MCP server is available on the implementer's machine, document `not probed: no reproducible MCP server available` in the research-doc findings and proceed — M2.3 can default to assuming `command_execution` shape and refine if M2.4 fixture work surfaces contrary evidence.
+
+3. **Confirm `token_count.rate_limits` location.** `docs/research/codex-cli-observed.md` §"Rate limit info" already documents this as session-file only (not in stream). M2.1 is a **confirmation** probe, not discovery. Run a turn; capture both `rate-limits.stream.jsonl` (stdout) and `rate-limits.session.jsonl` (the corresponding session-file slice) side-by-side under `crates/harness/tests/fixtures/codex/`. Assert: stream contains no `rate_limits` payload; session file does. Append to research doc as: `M2.1 finding (confirmed): token_count.rate_limits lives in session file → M2.4 handles RateLimitEvent for Codex.` If contradicted (stream contains rate_limits), flag with verbatim JSON evidence — would require revisiting M2.3 parsing table and M2.4 scope.
+
+4. **Probe Codex resume + session-file behavior (same-day; cross-day best-effort).** Run `codex exec ...` once; capture the session-file location. Then run `codex exec resume <id> ...`. Does Codex append to the original session file, or create a new file?
+
+   **Cross-day handling.** macOS doesn't allow easy date-shifting without root, `faketime` isn't standard, and Docker is overkill. Capture a same-day resume fixture (works without time tricks); document the expected cross-day behavior from Codex source-of-truth notes; rely on M2.3/M2.4 unit tests with a **mocked sidecar `session_partition_date`** to prove the date-partition logic mechanically. Mark any cross-day live test `#[ignore = "requires cross-day window"]`. Full cross-day live verification is best-effort — manual two-day wait or future CI work — not blocking for M2.1.
+
+5. **Probe Claude Code auth-failure stderr.** Temporarily log out (`claude logout` if available, or move the auth-config file aside) and run `claude -p 'ack'`. Capture the stderr shape. Restore auth.
+
+   **Auth-failure stderr fixture location.** Store auth-failure stderr as plaintext at:
+   - `crates/harness/tests/fixtures/codex/auth-failure.stderr.txt`
+   - `crates/harness/tests/fixtures/claude/auth-failure.stderr.txt`
+
+   Verbatim, no leading/trailing trimming. If the harness also emits structured stdout on auth-failure, capture alongside as `auth-failure.jsonl` (sanitized per the fixture rule above). M2.3 reads these fixtures via `std::fs::read_to_string` at runtime (matching M1's fixture-loading convention) for the `AuthFailure` pattern-match.
+
+6. **Verify Codex install method.** Codex CLI is not on Homebrew. Document under a `### Install path (candidate)` subsection in `docs/research/codex-cli-observed.md`. Deliverable shape: a single shell snippet a fresh macOS machine can copy-paste (e.g., `npm install -g @openai/codex` or the appropriate published-release binary install), plus the expected post-install binary location (`which codex` output) and a `codex --version` smoke check confirming the install succeeded. Fresh-environment verification is developer-local (run the documented commands on a clean machine when validating).
+
+7. **Append findings to `docs/research/codex-cli-observed.md`** under a `## Findings during M2.1` subsection. Include real JSON line excerpts (sanitized to match the fixture convention), not paraphrased. Flag any contradictions with existing research.
+
+### Testing strategy
+
+Research, not implementation — no Rust tests. Validation:
+
+- Each fixture file is a real captured `.jsonl` from `codex exec --json`. Manually inspect; confirm event types claimed.
+- Auth-failure stderr is captured verbatim into a fixture file (separate from `.jsonl` stream captures).
+- The install-path probe is "did `codex --version` print on a fresh environment, yes/no" — answered locally. Re-verify per-developer when adopting a new Codex version.
+
+### Docs to update
+
+- `docs/research/codex-cli-observed.md` — append "Findings during M2.1" subsection.
+- `AGENTS.md` — add a "Codex CLI ground truth" pointer noting `docs/research/codex-cli-observed.md` is the authoritative reference for Codex behavior, and that `crates/harness/tests/fixtures/codex/` holds the captured fixtures the parser tests run against. Note the resume + date-partitioning gotcha (sessions resumed days later live in the original spawn-day's directory).
+
+### Verification
+
+#### Agent-runnable
+
+1. **Inspect captured fixtures** — `ls crates/harness/tests/fixtures/codex/`. Each scenario from step 1 has its own `.jsonl`; open one and confirm it's real captured stream-json.
+2. **Read the new "Findings during M2.1" subsection** in `docs/research/codex-cli-observed.md` — should include real JSON line excerpts, not just prose.
+3. **Spot-check one probe command** — pick one scenario and re-run; output should match the captured fixture modulo per-run UUIDs/timestamps.
+4. **Confirm the auth-failure findings** — fixture for the auth-failure stderr exists; document records the exact wording.
+5. **Confirm the `token_count.rate_limits` location finding** — the doc states explicitly whether it lives in stream or session-file (M2.3 vs M2.4 depends on this).
+
+#### Human-required
+
+1. **Verify the install path on a clean environment** — developer-local; run the documented install commands on a clean macOS machine when adopting a new Codex version. Not a per-PR check.
+
+### Commit and stop for review
+
+Commit message: `M2.1: Codex CLI fixture capture + probes`. Wait for user review before starting M2.2.
+
+---
+
+## Sub-milestone M2.2 — Process-group spawn + normalized event vocabulary expansion
+
+### Goal & outcome
+
+**M2.2 consumes nothing from M2.1's Codex fixture pass.** M2.2 is Claude-only — vocabulary expansion + process-group spawn + Claude Code parser extensions. M2.1 outputs (Codex fixtures, auth-failure stderr, rate-limits-location confirmation) flow into M2.3 onward.
+
+Expand the M1 vocabulary to the full M2 surface (still on Claude Code only — Codex comes in M2.3). Refactor the existing Claude Code adapter to use process-group spawn and `Stdio::null()` for stdin. After this sub-milestone:
+
+- `AdapterEvent` and `NormalizedEvent` (M1.3) gain four new variants: `ToolStarted`, `ToolCompleted`, `RateLimitEvent`, `SessionMeta`. `From<AdapterEvent> for NormalizedEvent` covers them all.
+- `ContentChunk` gains a `kind: ContentKind` field (`Text` / `Thinking`); `TurnEnd` gains an optional `usage: TurnUsage` field carrying tokens + `total_cost_usd` + `context_window`.
+- The Claude Code adapter parses and emits each new event type from its stream-json output.
+- The Claude Code adapter spawns its subprocess in its own process group (`Command::process_group(0)`) and closes stdin (`Stdio::null()`).
+- M1.5's TS types extended to include the new variants; reducer's default branch keeps the UI from crashing while new events arrive (rendering polish is M2.5+).
+
+### Implementation outline
+
+1. **Extend `AdapterEvent` and `NormalizedEvent`** with the four new variants AND two field additions on existing variants. Bundling all wire-breaks here pays the cost once.
+
+   Four new variants (match `system-design.md` §9 shapes):
+   ```rust
+   AdapterEvent::ToolStarted { turn_id, tool_use_id, kind: ToolKind, name: String, input: serde_json::Value }
+   AdapterEvent::ToolCompleted { turn_id, tool_use_id, output: String, is_error: bool }
+   AdapterEvent::RateLimitEvent { agent_id, info: serde_json::Value }
+   AdapterEvent::SessionMeta { agent_id, model: String, harness_version: String, tools: Vec<String>,
+                                mcp_servers: Vec<McpServerStatus>, skills: Vec<String>, raw: serde_json::Value }
+
+   pub enum ToolKind { Builtin, Mcp, Plugin, Other }
+   ```
+
+   Two field additions on existing variants (both wire-breaking — bundled here):
+   ```rust
+   // ContentChunk gains a `kind` field.
+   ContentChunk { turn_id, kind: ContentKind, text: String }
+
+   pub enum ContentKind {
+       Text,        // user-facing assistant text (what M1 emitted)
+       Thinking,    // model thinking blocks. M2 does NOT emit; reserved in the vocabulary
+                    // for v2 reasoning UI without a wire-break.
+   }
+
+   // TurnEnd gains an optional `usage` field.
+   TurnEnd { turn_id, outcome, ended_at, usage: Option<TurnUsage> }
+
+   pub struct TurnUsage {
+       pub input_tokens: u64,
+       pub output_tokens: u64,
+       pub cached_input_tokens: Option<u64>,
+       pub reasoning_output_tokens: Option<u64>,
+       pub context_window: Option<u32>,
+       pub total_cost_usd: Option<f64>,   // Claude Code only (from result.total_cost_usd).
+                                           // Codex: None (subscription auth has no dollar number).
+   }
+   ```
+
+   Claude Code populates `usage` from `result.usage` + `result.modelUsage.<model>.contextWindow` + `result.total_cost_usd`. Codex (M2.3 / M2.4) populates the token fields; `context_window` comes from session-file enrichment (M2.4); `total_cost_usd` stays `None`.
+
+   **Agent_id vs turn_id:** `SessionMeta` and `RateLimitEvent` are agent-scoped (system-design §9). `ToolStarted` / `ToolCompleted` / `ContentChunk` / `TurnEnd` are turn-scoped.
+
+   **Why agent-scoped events carry `agent_id` in the payload while turn-scoped events don't.** The asymmetry is intentional. Agent-scoped events have no turn anchor; `agent_id` in the payload makes them self-describing for logs, persistence, tests, and any future non-channel transport (e.g., M6's workflow event bus). Turn-scoped events skip `agent_id` because `turn_id` is globally unique (UUID v7) and self-discriminating — a turn record on its own implies its agent via the transcript map. The channel name (`agent:<agent_id>`) does make agent-scoped payload `agent_id` redundant *over the channel*, but the redundancy buys self-describing payloads everywhere else.
+
+   **Migration discipline.** All existing M1 roundtrip tests in `crates/harness/src/events.rs` construct the new shapes explicitly (`kind: ContentKind::Text`, `usage: None` where appropriate). Do **NOT** use `#[serde(default)]` to paper over the migration — every call site is updated in the M2.2 commit. Wire format is single-version; backward-compat shims are out of scope per AGENTS.md.
+
+2. **Update Claude Code adapter parsing.** Per `claude-code-cli-observed.md`. Extension lives in `crates/harness/src/parser.rs`:
+
+   **Forward-compat heads-up (per M2.1 findings):** when extending the `assistant`-event handler for `tool_use` blocks, structure it so that the top-level `event.error` field is also accessible from the same handler — M2.3 will key Claude's `AuthFailure` detection off `assistant.error == "authentication_failed"`, and a single-pass handler now avoids a structural rewrite at M2.3 time. Concretely: keep the `assistant`-event dispatch site general enough that adding `if event.error.is_some() { ... }` in M2.3 is a one-line drop-in, not a refactor.
+
+   - `system/init` event → emit `SessionMeta`.
+   - `assistant` events with `tool_use` content blocks → emit `ToolStarted` (with `tool_use_id` = the block's `id`, `name` = block's `name`, `input` = block's `input` as `serde_json::Value`).
+   - `user` events with `tool_result` content blocks → emit `ToolCompleted` (with `tool_use_id` = the block's `tool_use_id`, `output` = stringified `content`, `is_error` = the block's `is_error` flag).
+   - `rate_limit_event` events → emit `RateLimitEvent` (Claude Code emits this in-stream; not to be confused with Codex which puts rate-limit info in the session file — M2.4).
+   - `assistant` events with `text` content blocks → continue emitting `ContentChunk { kind: Text }` (M1 behavior; explicit `Text` kind now).
+   - `assistant` events with `thinking_delta` blocks → **continue to ignore.** (Reserved variant exists but is not emitted in M2.)
+   - `result` event → emit `TurnEnd { usage: Some(...) }` populated with tokens + cost + context_window.
+
+   **Implementation location — `parse_result`.** Extend the existing `crates/harness/src/parser.rs::parse_result` function (lines ~124-151; currently extracts `is_error`, `api_error_status`, `result`). Add extraction of `usage` (`input_tokens`, `output_tokens`, `cached_input_tokens` if present), `total_cost_usd`, and `modelUsage.<model>.contextWindow`. Don't create a parallel function; extend in place. Malformed or missing usage → `usage: None`, not fail the turn.
+
+   **`modelUsage` multi-key selection.** When `result.modelUsage` has multiple model keys (subordinate / routing models alongside the primary), select strategy:
+   1. If `result.model` (top-level field) matches a `modelUsage` key, use that entry — that's the authoritative "model that handled this turn" pointer.
+   2. Otherwise, use the entry with the largest `inputTokens` value — primary model did the heavy lifting; subordinate / routing models have minimal tokens.
+   3. If `modelUsage` is empty (M1's current fixtures produce this), `context_window` stays `None`.
+
+   Test the selection logic against a **synthetic multi-key fixture** constructed in-test (not captured) — real multi-key examples may not surface naturally during M2.1 capture.
+
+   **Tool event pairing is stateless.** Tool events carry their own `tool_use_id`; the parser does **not** track open `tool_use_id`s in `ParserState`. Out-of-order or orphan tool events are emitted to consumers as-is and handled at the reducer layer (M2.5). `ParserState` (currently tracks only text-block boundaries) is unchanged in M2.2. Future stateful pairing is a v2 concern if needed.
+
+   **`\n\n` inline separator stays.** The current workaround in `parser.rs::parse_content_block_delta` (joining adjacent text blocks with `\n\n`) stays in M2.2. A structured `TextBlockBoundary` wire variant for paragraph rendering is deferred — it's a separate rendering-model change and M2.2 already has substantial wire-format churn. Update the existing code comment at `parser.rs:104-109` to remove the "tracked in M2 / M2.2" reference; replace with "deferred — revisit during M2.5 UI work if `\n\n` proves a rendering issue." Don't leave the comment pointing at this milestone.
+
+   **Replace existing skipped-event tests, don't delete.** M1's `parser.rs:240` `assistant_message_is_skipped` and `parser.rs:254` `user_tool_result_event_is_skipped` assert the OPPOSITE of M2.2's new behavior (M2.2 turns these into `ToolStarted` / `ToolCompleted` emissions). Replace them with new tests that:
+   - Assert `assistant` events with `tool_use` blocks emit `ToolStarted`.
+   - Assert `user` events with `tool_result` blocks emit `ToolCompleted`.
+   - Assert `assistant` events with **only text content** (no `tool_use` blocks) still produce only `ContentChunk` events — preserves the boundary the old "skipped" tests were guarding.
+
+3. **Process-group spawn.** Replace `Command::new("claude")...spawn()` with `.process_group(0).spawn()` (Tokio's `Command` exposes this on Unix). Puts the harness in its own process group so M4's `killpg` reaches the whole tree. M2 doesn't add `killpg`.
+
+   **Tokio version + platform gate.** Verified: `Cargo.lock` resolves Tokio 1.52.3, which exposes `Command::process_group()` (added in Tokio 1.24). No version bump needed. M2 is macOS-only per M1; gate the call with `#[cfg(unix)]`. M2.3 mirrors the same pattern when introducing `CodexAdapter`.
+
+4. **Verify `Stdio::null()` is already set on `ClaudeCodeAdapter`** (per `crates/harness/src/claude_code.rs:76`, established in M1). The convention is in place. M2.3 will apply the same pattern when adding `CodexAdapter`. M2.2 step 4 is a documentation checkpoint — no code change to the Claude Code adapter.
+
+5. **Extend TS wire-type union for the new variants.** `src/lib/types.ts`'s `NormalizedEvent` discriminated union currently has only three variants. Add the four new variants (`tool_started`, `tool_completed`, `rate_limit_event`, `session_meta`) and the field additions on `content_chunk` (`kind`) and `turn_end` (`usage`). The reducer at `src/lib/reducer.ts:88` already has a `default:` arm — verified — that handles unknown discriminants gracefully (does not crash). M2.2 does **NOT** add per-variant reducer handling; that's M2.5 / M2.6 work. The new variants flow through the default arm until then.
+
+   Add a TS-side test that constructs an event with `type: 'tool_started'` and asserts the reducer returns the transcript unchanged (proving default-arm safety, not just type-check pass).
+
+### Testing strategy
+
+- **Wire-format roundtrip tests** for the four new variants AND field additions on `AdapterEvent` / `NormalizedEvent`. Assert snake_case discriminator + field names match M1.5 TS expectations. All existing M1 roundtrip tests are mechanically migrated to construct the new shapes explicitly (no `#[serde(default)]` shims per the migration discipline above).
+- **ContentChunk.kind roundtrip:** preserves `Text` vs `Thinking`.
+- **TurnEnd.usage roundtrip:** both `Some` (all fields populated) and `None` cases preserve correctly.
+- **`thinking_delta` skip test:** construct a `content_block_delta` event with `delta.type = 'thinking_delta'` and assert `ParseOutcome::Skip` (no event emitted). Plus a fixture-level assertion that every emitted `ContentChunk` from real fixtures carries `kind: ContentKind::Text` (no `Thinking` slips through). Both tests guard the "M2 does not emit Thinking" invariant.
+- **Replaced skipped-event tests** (per step 2 migration): new tests assert `assistant` + `tool_use` → `ToolStarted`; `user` + `tool_result` → `ToolCompleted`; `assistant` with only text → only `ContentChunk` (no spurious tool events).
+- **Parser fixture tests** extended:
+  - Existing `tool-use.jsonl` (after the M2.1 fixture migration: at `tests/fixtures/claude/tool-use.jsonl`) → asserts `ToolStarted` / `ToolCompleted` emitted alongside `ContentChunk`.
+  - Existing `text-only.jsonl` (at `tests/fixtures/claude/text-only.jsonl`) → asserts `SessionMeta` emitted from the first `system/init` event and `RateLimitEvent` from the in-stream `rate_limit_event`.
+- **New fixture `with-usage.jsonl`** at `crates/harness/tests/fixtures/claude/with-usage.jsonl` — a single successful turn with a `result` event containing populated `total_cost_usd`, populated `usage`, and a **non-empty `modelUsage`** matching the structure documented in `claude-code-cli-observed.md`. Tests against this fixture assert: `TurnEnd.usage.input_tokens > 0`, `output_tokens > 0`, `total_cost_usd > 0.0`, `context_window > 0`. Existing `text-only.jsonl` and `tool-use.jsonl` retain their empty-`modelUsage` shape (asserting the `context_window: None` path).
+- **`modelUsage` multi-key selection test:** construct a **synthetic** in-test result event with two model keys (e.g., a primary `claude-sonnet-X` with 1000 input tokens and a routing `claude-haiku-Y` with 50 input tokens); assert `context_window` derives from the primary model. Plus: if `result.model` is set to one of the keys, assert that one wins regardless of token count.
+- **Process-group spawn test:** assert `getpgid(child) != getpgid(parent)` for a spawned harness subprocess.
+- **Stdin EOF test:** spawn the fake harness with a fixture that would block on stdin → assert it terminates cleanly.
+- **TurnEnd.usage populated assertion:** unit test against the new `with-usage.jsonl` fixture → all fields populated correctly.
+- **TS default-arm pass-through:** construct a `NormalizedEvent` with `type: 'tool_started'` (and another for `session_meta`); pass through the reducer; assert the returned transcript is unchanged. Proves the default arm handles new variants without crashing, since M2.2 doesn't yet add per-variant handling.
+
+### Docs to update
+
+- `docs/system-design.md` §9 — the canonical home for the event vocabulary; already documents the M2 shapes (verified during M2.2 implementation). No edits expected unless a shape was missed.
+- `AGENTS.md` — add only the durable `process_group(0)` subprocess convention to "Subprocess gotchas," alongside the existing `Stdio::null()` entry. **Do not** add the event vocabulary or the "M2.2 paid the wire-breaks once" rationale to AGENTS.md — that's milestone-specific historical context that belongs in this plan, not the cross-cutting playbook (per the established AGENTS.md scope rule: no implementation details, no per-milestone references).
+- M1 cross-reference: note in M1.3 step 1 that M2.2 expands the vocabulary; M1's subset is intentional.
+
+### Verification
+
+#### Agent-runnable
+
+1. **`make test`** → exits 0; output includes new wire-format roundtrip tests + no-thinking-emitted parser test.
+2. **`make test-live`** — live Claude Code integration still passes; new tool-using fixture emits ToolStarted/ToolCompleted; first turn emits SessionMeta.
+3. **TurnEnd.usage live assertion** — extend the live test to assert `TurnEnd.usage` is `Some(...)` with non-zero `input_tokens`, `output_tokens`, `context_window`, and `total_cost_usd > 0.0`.
+4. **Process-group sanity check via test** — fixture-driven integration test asserts `getpgid(child) != getpgid(parent)`.
+5. **`make check`** → exits 0.
+
+#### Human-required
+
+1. **`make dev`** → app opens. Send "list the files in this directory using ls" via the M1.5 UI. Open WebView devtools console; new event types arrive (console.warn from the reducer's default branch — UI rendering of new types is M2.5+).
+
+### Commit and stop for review
+
+Commit message: `M2.2: process-group spawn + event vocabulary expansion`. Wait for user review before starting M2.3.
+
+---
+
+## Sub-milestone M2.3 — Codex adapter implementation
+
+### Goal & outcome
+
+A working `CodexAdapter` implementing the same `HarnessAdapter` trait as `ClaudeCodeAdapter`. After this sub-milestone:
+
+- Spawning a Codex agent and sending a message streams correctly through the normalized event pipeline (terminal `TurnEnd` fires, `ContentChunk { kind: Text }`s for the model's text, `ToolStarted` / `ToolCompleted` from both `command_execution` and `mcp_tool_call` items).
+- Codex's session-id-from-stream model is handled via a per-agent session-link sidecar.
+- Codex-specific quirks (two-process model, error event ordering, `AuthFailure` stream-based detection per M2.1 findings) all handled. SIGTERM-exits-0 is **not** a separately-handled case in M2.3 — the existing "EOF without terminal stream event → synthesize `AdapterFailure`" path (step 8) covers it implicitly. Explicit cancellation handling is M4 scope.
+- AppState reshape: named `claude_adapter` + `codex_adapter` fields replace the single `adapter`.
+
+This sub-milestone does NOT add session-file enrichment — that's M2.4. M2.3 emits `ContentChunk` + `TurnEnd` + `ToolStarted` / `ToolCompleted` from the stream alone. `RateLimitEvent` and `SessionMeta` land in M2.4 (M2.1 confirmed both are session-file-only for Codex).
+
+### Implementation outline
+
+**Scope.** Claude Code parsing landed in M2.2; M2.3 extends it with auth-failure detection only (state flag set in `parse_assistant_envelope`, consumed in `parse_result`). The `CodexAdapter` is entirely new. The `AuthFailure` variant is additive to the existing `FailureKind` enum; `HarnessKind::Codex` is additive to the existing `HarnessKind` enum (both are `#[non_exhaustive]`).
+
+**File layout** (pin these so the implementer doesn't guess):
+
+| What | Where | Notes |
+|---|---|---|
+| `CodexAdapter` struct + `dispatch` + producer task | `crates/harness/src/codex/mod.rs` (new module) | Separate module from `claude_code.rs` — Codex's stream vocabulary differs structurally (no `envelope`; `item.started`/`item.completed`; `thread.started` for session capture); colocating with Claude would hurt readability. |
+| Codex stream-event parser | `crates/harness/src/codex/parser.rs` | Inline `#[cfg(test)] mod tests` for fixture-replay unit tests. |
+| `fake_codex` test binary | `crates/harness/src/bin/fake_codex.rs` (new) | Parallel to `fake_claude`; supports `// exit:`, `// stderr:`, `// read_stdin` directives as appropriate. Used by `crates/harness/tests/codex_adapter.rs` for integration tests. |
+| Claude auth-failure extension | `crates/harness/src/parser.rs` (existing — adds `pending_auth_failure` field + signature changes) | Step 5; M2.2 already shipped the rest of the Claude parser. |
+| `HarnessKind::Codex` variant | `crates/core/src/harness.rs` | Step 10; wire-format roundtrip test inline. |
+| `FailureKind::AuthFailure` variant | `crates/harness/src/events.rs` | Step 14; wire-format roundtrip test inline alongside the existing `FailureKind` tests. |
+| AppState routing site | `crates/app/src/commands.rs::send_message_impl` (line ~200) | Step 11; `match agent.harness` branch. |
+| `check_codex_binary` + `create_agent` harness param | `crates/app/src/lib.rs` + `crates/app/src/commands.rs` | Step 12. |
+| TS wire-type extensions | `src/lib/types.ts` | "Docs to update" — `FailureKind` and `AgentRecord.harness` unions. |
+
+1. **`CodexAdapter` struct** implementing `HarnessAdapter`. Lives in `crates/harness/src/codex/mod.rs` (see file-layout table above). Constructor performs `which::which("codex")` for the binary check.
+
+2. **Command line construction:**
+   ```
+   codex exec --json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox -C <project_root> "<prompt>"
+   ```
+   For resume: `codex exec resume --json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox <session-id> "<prompt>"`. **`-C` / `--cd` is NOT accepted by the `resume` subcommand** (verified against codex-cli 0.130.0 via `codex exec resume --help` + live probe; passing `-C` produces `error: unexpected argument '-C' found`). cwd is set instead via `tokio::process::Command::current_dir(cwd)` — Codex's child process inherits cwd from the parent, so the `-C` flag is only needed to *override* that; omitting it is correct on resume. The first-turn `codex exec` invocation keeps `-C` (accepted there, and consistent with M2.1's captured fixtures). Resume positional order per `--help`: `[OPTIONS] [SESSION_ID] [PROMPT]` — flags first, then session_id, then prompt last. Process-group spawn + `Stdio::null()` per the M2.2 pattern.
+
+3. **Session-id handling** (Codex only). Per-agent session-link sidecar at `<directory>/.switchboard/projects/<project-id>/sessions/<agent_id>.jsonl`:
+   - Before dispatch: look up the most-recent record from the sidecar (latest line wins, append-only).
+   - If no record → first turn → spawn with `codex exec` (no resume).
+   - If a record exists → spawn with `codex exec resume <session_id>`.
+   - **On first stream event (`thread.started` with `thread_id`), append a new record to the sidecar IMMEDIATELY** (before any other parsing). Record shape (this is the M2.3→M2.4 contract — `session_partition_date` drives M2.4's date-partition path lookup, `session_id` drives the filename glob; do not rename or restructure these fields without coordinating M2.4 changes):
+     ```json
+     { "session_id": "<thread_id>", "session_partition_date": "YYYY-MM-DD", "started_at": "<RFC3339>" }
+     ```
+     `session_partition_date` is set to current **local** date (`chrono::Local::now().date_naive()`) **only on first dispatch** (when no prior record) — Codex partitions its session files by local date, not UTC. On subsequent resumes, **copy from the prior record** — never re-derive from any clock. Load-bearing for M2.4's date-partitioned session-file lookup.
+   - **Duplicate records on resume are allowed and intended** — each dispatch appends a new record (same `session_id`, same `session_partition_date`, fresh `started_at`). Latest line wins for resume lookups; history is debugging-useful.
+   - **Attach-existing-session case** (M2.5 `attach_agent` flow): write the first sidecar record at agent-creation time. `session_partition_date` is parsed from the existing session file's path.
+   - **Codex `AgentRecord.session_id` stays `None`** for the lifetime of the agent. Pre-generation at agent-creation time is Claude-only (per the M1.2 invariant). For Codex, the sidecar is the system-of-record for the captured `thread_id`; `AgentRecord.session_id` is never set.
+   - **Parent-directory creation.** Before the first sidecar append, ensure the parent directory exists via `std::fs::create_dir_all(<project-root>/.switchboard/projects/<project-id>/sessions)`. The existing `append_jsonl` helper (`crates/core/src/io.rs:19`) opens the file with `OpenOptions::new().create(true).append(true)` — that creates the file but **not** the parent directory.
+   - **Write-failure semantics.** Sidecar persistence is load-bearing for resume and M2.4 enrichment; silently swallowing an I/O error would create an unresumable Codex agent. If the sidecar write fails (I/O error, permission denied, disk full), the producer task **immediately terminates** the stream: synthesize `TurnEnd { outcome: Failed { kind: AdapterFailure, message: <I/O error string> } }` and stop. Don't continue parsing — any subsequent turn events for this turn are stranded behind a missing sidecar record. (This is post-`dispatch()`, so the failure can't surface as `DispatchError`; the in-band terminal event is the only escape hatch.)
+   - **Crash-safety inheritance.** Sidecar writes use the same `writeln!` + `flush()` pattern as `projects.jsonl` / `registry.jsonl` — no `file.sync_data()`, no parent-dir fsync. A power loss between write and writeback can leave a torn line. M1.5 review flagged this gap workspace-wide; M4 owns the fix. M2.3 inherits the same trade-off rather than introducing a new persistence model.
+
+4. **Stream parsing.** Read stdout line-by-line; parse each JSON line; map per the table:
+
+   | Codex stream event | Adapter action |
+   |---|---|
+   | `{type: "thread.started", thread_id: "..."}` | Capture thread_id; persist to session-link sidecar. No normalized event emitted. |
+   | `{type: "turn.started"}` | Ignored (TurnStart is dispatcher-emitted). **Note:** this is the Codex *stream* event; not to be confused with the session-file `task_started` payload referenced in M2.4 — those are separate Codex vocabularies (stream JSON vs rollout JSONL). |
+   | `{type: "item.completed", item: {type: "agent_message", text: "..."}}` | Emit `ContentChunk { kind: Text, text }`. |
+   | `{type: "item.started", item: {id, type: "command_execution", ...}}` | Emit `ToolStarted` with `kind: ToolKind::Builtin`, `name: "command_execution"`, `tool_use_id: item.id`. |
+   | `{type: "item.completed", item: {id, type: "command_execution", aggregated_output, exit_code, ...}}` | Emit `ToolCompleted` with `output: aggregated_output`, `is_error: exit_code != 0`, `tool_use_id: item.id` (matches the prior `ToolStarted`). |
+   | `{type: "item.started", item: {id, type: "mcp_tool_call", server, tool, ...}}` | Emit `ToolStarted` with `kind: ToolKind::Mcp`, `name: format!("{server}.{tool}")`, `tool_use_id: item.id`. |
+   | `{type: "item.completed", item: {id, type: "mcp_tool_call", server, tool, result, error, status}}` | Emit `ToolCompleted` with `tool_use_id: item.id`, `output:` the joined `result.content[*].text` strings if `result` is non-null, else the `error` field; `is_error: status == "failed" \|\| error != null`. |
+   | `{type: "turn.completed", usage: {...}}` | Emit `TurnEnd { outcome: Completed, usage: Some(...) }` populated with tokens (context_window stays `None` until M2.4 enrichment). |
+   | `{type: "event_msg", msg: {type: "token_count", rate_limits: {...}}}` | Ignored in M2.3 — M2.1 confirmed `rate_limits` is session-file-only; M2.4 handles `RateLimitEvent` emission. |
+   | `{type: "error", message: "..."}` | Buffer the message; the next `turn.failed` will surface it. Apply the error-message JSON unwrap (step 6) before display. |
+   | `{type: "turn.failed", error: {...}}` | Apply the error-message JSON unwrap (step 6) to `error.message`. Then emit `TurnEnd { outcome: Failed { kind, message } }` — `kind` is `AuthFailure` if the unwrapped message matches the auth pattern (step 5), else `HarnessError`. |
+   | All other event types | Ignored in M2 (some land in M2.4 via session file). |
+
+   **MCP coverage note.** The M2.1 fixture (`mcp-tool-call.jsonl`) covers the **failure path only** (`status: "failed"`, server returned an auth error). The success-path mapping (joining `result.content[*].text` for `ToolCompleted.output`) must be covered with **inline-constructed JSON in the test body**, not by chasing a working MCP server for a second live capture.
+
+   **Error-buffer location.** Buffer in the Codex producer task's local state — `let mut last_error: Option<String> = None;`. Each subsequent `error` event overwrites (**last error wins** — Codex emits multiple `Reconnecting... N/5` retry messages before the final `turn.failed`; the most recent message is the most informative). Both `turn.failed` and the EOF-synthesis path (step 8) consume this buffer. `last_error` is **stdout-parser-local only** — it never crosses task boundaries. Codex's stderr is drained by a separate concurrent task (step 9) into an independent `Arc<Mutex<VecDeque<String>>>` tail buffer for diagnostic context; the two buffers do **not** share memory or locking and must not be merged.
+
+   **MCP `output` extraction policy** (mirrors Claude's `stringify_tool_result_content` from M2.2):
+   - Iterate `result.content` array; for each block with `type == "text"`, take `text.as_str().unwrap_or("")` and append. Skip non-text blocks silently if any text block is present.
+   - If all content blocks are non-text, OR `content` is empty, OR `result` is `null`: emit `output: "[non-text tool result omitted]"`.
+   - `is_error` derives from `status` / `error` independently of `output` extraction.
+   - Never panic on malformed shapes — missing or wrong-typed fields collapse to the empty/error case.
+   - If `error` is non-null but non-string (object, array), stringify via compact `serde_json::to_string`.
+
+   **`agent_message` granularity.** Codex emits `item.completed` for `agent_message` **without a prior `item.started`**. Tool items (`command_execution`, `mcp_tool_call`) emit both; text messages emit only the completion. Don't write a parser branch for an `item.started` of `agent_message` — it never arrives in M2.1's fixtures.
+
+   **Forward-compat policy: defensive `item.started{agent_message}` handling.** If a future Codex CLI version *does* emit `item.started` with `item.type == "agent_message"`, the parser **must not** synthesize a `ToolStarted` — text messages are not tool calls; a phantom `ToolStarted` would corrupt the transcript. The right behavior is `tracing::warn!("Codex emitted item.started for agent_message; M2 expected only item.completed — CLI version may have changed")` and skip the event (no normalized emission). Don't crash; surface for diagnosis.
+
+5. **Auth-failure detection (stream-based for both harnesses).** Per M2.1 findings, both Codex and Claude Code surface auth-failure as stream events, not exit-code-plus-stderr.
+   - **Codex** — when a `turn.failed` event arrives, if `error.message` (after the unwrap in step 6) contains the substring `"401 Unauthorized"`, emit `TurnEnd { outcome: Failed { kind: AuthFailure, message } }`. Stderr is a secondary signal at most; do not gate detection on it. `turn.failed` is the terminal event; detection and emission happen at the same point.
+   - **Claude Code (state-flag pattern — DO NOT emit a second `TurnEnd`).** Claude's terminal event is `result`, which already owns the sole `TurnEnd` emission (`parse_result` at `crates/harness/src/parser.rs:139`). Auth-failure detection refines the `FailureKind`; it does **not** introduce a second emitter. The M1.3 one-terminal-event-per-turn contract must hold.
+     - **`ParserState` field shape.** Add a single field `pending_auth_failure: Option<String>` to `ParserState` (`crates/harness/src/parser.rs:34`). `None` = not seen; `Some(displayable_text)` = seen. The two-field shape (`auth_failure_seen: bool` + `auth_failure_message: Option<String>`) is rejected — it allows a representable-but-illegal state (`seen=true, message=None`). The single field makes invalid states unrepresentable; `parse_result` consumes via `if let Some(message) = state.pending_auth_failure.take() { ... }`.
+     - **Signature change.** `parse_assistant_envelope` (parser.rs:307) and `parse_result` (parser.rs:139) currently do not receive `ParserState` (`parse_line` at parser.rs:67-69 only passes `&Value` + `turn_id`). M2.3 changes both signatures to accept `&mut ParserState`; update the dispatch site in `parse_line` accordingly.
+     - **When `parse_assistant_envelope` sees an `assistant` event with top-level `"error": "authentication_failed"`**, extract the displayable text from the assistant event's `message.content` array — specifically the first text content block's `text` field. If no text block is present, fall back to the raw `error` field value (`"authentication_failed"`). If both extraction paths produce empty strings, set `pending_auth_failure = Some(String::new())` — the `Some` discriminates "seen" from "not seen"; the empty string is the parser's signal that no displayable message was available, and the M2.5 render layer supplies the default copy (no hardcoded UI strings in the parser).
+     - **When `parse_result` runs on the subsequent `result` line**, everything it does today still runs (usage extraction included — auth-failure `result` events still carry a `usage` block, typically zero-valued; that's legitimate telemetry, not noise). The only behavior change: if `state.pending_auth_failure.take()` returns `Some(msg)`, the emitted `TurnEnd` has `kind: AuthFailure` (with `msg`) instead of `HarnessError`.
+     - **Reset semantics.** `ParserState` is constructed fresh per dispatch in `run_producer` (`crates/harness/src/claude_code.rs:224`); cross-turn poisoning is structurally impossible (the producer task exits after `TurnEnd` and the next turn gets a new `ParserState`). No explicit reset needed.
+     - Do **not** key detection off `result.is_error`, `terminal_reason`, or the user-facing string `"Not logged in · Please run /login"` — see `docs/research/codex-cli-observed.md` §"Findings during M2.1" for why those are unstable discriminants.
+
+   Add a new `FailureKind::AuthFailure` variant to the existing `FailureKind` enum (alongside `HarnessError` + `AdapterFailure`). The frontend (M2.5) renders this as a clear "subscription auth required" banner rather than a generic error; the parser only sets the `kind` and surfaces whatever displayable text the stream carried — no hardcoded UI strings in the parser.
+
+6. **Error-message unwrap (Codex).** Before assigning `turn.failed.error.message` to `TurnOutcome::Failed.message`, attempt `serde_json::from_str::<Value>(&error_message_string).ok()`. If it parses and the resulting value has a nested `error.message` string, surface that nested string. If parsing fails (the plain-string case, e.g., the auth-failure shape), pass through the raw string unchanged. One-pass best-effort unwrap; never error on parse failure (both shapes must work). Cover both shapes with unit tests against `auth-failure.jsonl` (plain) and an invalid-model-style fixture (JSON-encoded). M2.1 documents both shapes in the findings section.
+
+7. **Streaming granularity.** Per `codex-cli-observed.md`, Codex emits `agent_message` `item.completed` when the message is **complete**, not as deltas. ContentChunk fires once per `agent_message` for Codex (vs hundreds per turn for Claude Code). The reducer accumulates either way.
+
+8. **Cancellation detection (foundational for M4).** Adapter handles "stdout EOF without `turn.completed` or `turn.failed`" — synthesize `TurnEnd { outcome: Failed { kind: AdapterFailure } }`. **Preserve buffered error messages on EOF** — if an `error` event was seen before EOF, apply the step 6 unwrap to its message, then concatenate with `" (stream ended without turn.failed)"`. **Codex exits 0 on SIGTERM even mid-stream** — but M2.3 doesn't need explicit detection here; this EOF-without-terminal-event synthesis catches it regardless of the child's exit code. Codex exit code 0 is not a success signal unless a `turn.completed` or `turn.failed` was observed on the stream first.
+
+9. **Subprocess lifecycle** — same pattern as M1.3 step 8: drain stdout, drain stderr concurrently, `await child.wait()` after the parser sees the terminal event. **Stderr drainage** uses the same `Arc<Mutex<VecDeque<String>>>` bounded-tail buffer + `drain_stderr` task pattern as `ClaudeCodeAdapter` (see `crates/harness/src/claude_code.rs:213-220` for the canonical shape). The stderr tail feeds the EOF-synthesized `AdapterFailure` message via `format_stderr_tail`. Codex's two-process tree (Node parent + Rust child) is handled by the M2.2 process-group spawn — `lines.next_line().await` on stdout + `child.wait().await` on the Node parent handle works correctly regardless of process count.
+
+10. **`HarnessKind::Codex` variant.** Add to `HarnessKind` in `crates/core/src/harness.rs` (currently only `ClaudeCode` exists; the enum is `#[non_exhaustive]` per its existing comment, so this is additive). Add a wire-format roundtrip test parallel to the existing `ClaudeCode` test at `crates/core/src/harness.rs:18-25` — serialize to `"codex"`, deserialize back.
+
+11. **AppState reshape.** Gain named fields:
+    ```rust
+    pub struct AppState {
+        // ... existing fields ...
+        pub claude_adapter: Arc<dyn HarnessAdapter>,
+        pub codex_adapter: Arc<dyn HarnessAdapter>,
+    }
+    ```
+    Replace the single `adapter` field. Dispatch routing happens in `send_message_impl` (`crates/app/src/commands.rs:200`) via `match agent.harness { HarnessKind::ClaudeCode => &state.claude_adapter, HarnessKind::Codex => &state.codex_adapter }`.
+
+12. **App-layer surface additions** — three call sites that need explicit changes:
+    - **`check_codex_binary` Tauri command** in `crates/app/src/lib.rs`, parallel to `check_claude_binary` (line 26). Backing free function `check_codex_binary_impl` in `crates/app/src/commands.rs`, parallel to `check_claude_binary_impl` (line 213). Inspects `state.codex_adapter.probe()`; under `SWITCHBOARD_HARNESS=mock` both probes return `Ok` per `MockHarnessAdapter::probe()`.
+    - **`create_agent_impl` harness parameter.** Today: `create_agent_impl(state, name)` at `crates/app/src/commands.rs:149` hardcodes `harness: HarnessKind::ClaudeCode`. Change to `create_agent_impl(state, name, harness)`; update the Tauri command at `crates/app/src/lib.rs:71` to accept the new arg. **Required, not defaulted** — v1 is pre-release; backward-compat for a never-shipped surface is wasted effort. Update all current TS callers (the M1 hardcoded path) in the same PR.
+    - **`send_message_impl` routing.** Existing function at `crates/app/src/commands.rs:200` currently uses the single `adapter` field. Replace with the `match agent.harness { ... }` dispatch from step 11.
+
+13. **Extend `SWITCHBOARD_HARNESS=mock` selection** to swap **both** adapters for `MockHarnessAdapter`:
+    - Unset or `"claude"` → `claude_adapter = ClaudeCodeAdapter`, `codex_adapter = CodexAdapter`.
+    - `"mock"` → both adapters = `MockHarnessAdapter::new()`.
+    - Any other value → panic with a listed-values error.
+
+14. **`AuthFailure` enum variant.** Add to `FailureKind`:
+    ```rust
+    pub enum FailureKind {
+        HarnessError,
+        AdapterFailure,
+        AuthFailure,   // NEW — subscription / tier auth missing or expired
+    }
+    ```
+    Wire-format roundtrip test for the new variant.
+
+### Testing strategy
+
+**Test-file placement.** Pinned to match AGENTS.md test taxonomy and the existing Claude layout:
+
+| Test | File |
+|---|---|
+| Codex parser fixture-driven unit tests | inline `#[cfg(test)] mod tests` in `crates/harness/src/codex/parser.rs` |
+| Codex adapter end-to-end via `fake_codex` | `crates/harness/tests/codex_adapter.rs` (new, parallel to `tests/claude_adapter.rs`) |
+| Codex auth-failure replay | Codex parser unit test |
+| Claude auth-failure replay (state-flag pattern) | `crates/harness/src/parser.rs` unit test (existing module) |
+| `FailureKind::AuthFailure` wire-format roundtrip | inline `#[cfg(test)]` in `crates/harness/src/events.rs` |
+| `HarnessKind::Codex` wire-format roundtrip | inline `#[cfg(test)]` in `crates/core/src/harness.rs` |
+| App routing test (right adapter selected per `agent.harness`) | `crates/app/src/commands.rs` test module |
+| `check_codex_binary` impl test | `crates/app/src/commands.rs` test module |
+| `create_agent_impl` with explicit harness | `crates/app/src/commands.rs` test module |
+| Live Codex smoke | extend `crates/harness/tests/live.rs` |
+
+**Test cases:**
+
+- **Fake-harness fixtures** for Codex: replay each M2.1 fixture through the parser and assert the expected `AdapterEvent` sequence.
+  - Trivial text turn: ContentChunk + TurnEnd(Completed).
+  - Tool-using turn (`command_execution`): ToolStarted + ToolCompleted + ContentChunk + TurnEnd(Completed).
+  - **MCP tool failure path** (from M2.1's `mcp-tool-call.jsonl` fixture): ToolStarted with `kind: ToolKind::Mcp`, `name = "<server>.<tool>"` + ToolCompleted with `is_error: true` and the error text surfaced in `output`.
+  - **MCP tool success path** (inline-constructed test JSON, no fixture — M2.1 coverage gap): ToolCompleted with `is_error: false` and `result.content[*].text` joined into `output`.
+  - **MCP tool edge cases** (inline-constructed test JSON): `result: null` → output `"[non-text tool result omitted]"`; empty `content` array → same; `content` with only non-text blocks (image/resource) → same; `content` with mixed text + non-text → only text joined; `text` field missing or non-string → treated as empty; non-string `error` → compact JSON stringification.
+  - Error turn: TurnEnd(Failed { kind: HarnessError }).
+  - **Auth-failure fixtures (both harnesses, stream-based per M2.1):** replay `codex/auth-failure.jsonl` through the Codex parser → adapter emits `TurnEnd(Failed { kind: AuthFailure })` triggered by `turn.failed.error.message` matching `"401 Unauthorized"`. Replay `claude/auth-failure.jsonl` through the Claude parser → adapter emits **exactly one** `TurnEnd(Failed { kind: AuthFailure })` (from `parse_result`, not from the assistant envelope) — the assistant-event handler sets `pending_auth_failure` and emits no terminal event; **assert `TurnEnd` count == 1** to guard against the double-emit regression. Usage extraction on the result line still runs (auth-failure `result` events carry a zero-valued `usage` block).
+  - **Second turn after auth restored** (Claude): construct two sequential dispatches sharing one agent; first dispatch's stream is the auth-failure fixture, second dispatch's stream is a successful turn. Assert second dispatch emits `TurnEnd(Completed)`, not `TurnEnd(AuthFailure)`. Guards against the per-dispatch `ParserState`-freshness invariant.
+  - **`item.started{agent_message}` defensive policy** (inline-constructed, forward-compat): synthesize an `item.started` with `item.type: "agent_message"` → assert zero `ToolStarted` emissions and (if convenient) a `tracing::warn!`.
+  - **Error-message JSON unwrap:** unit-test the unwrap helper on both shapes — plain-string input (from `auth-failure.jsonl`) passes through verbatim; JSON-encoded-JSON input surfaces the nested `error.message`.
+  - **Fixture-assertion discipline:** assert event types and structural shapes only — no specific UUIDs, timestamps, or capture-specific values.
+- **Error-buffer-preserved-on-EOF test:** fake harness emits `error` then EOFs → adapter synthesizes `TurnEnd(Failed{AdapterFailure})` with the unwrapped buffered error text + " (stream ended without turn.failed)" suffix.
+- **Sidecar parent-dir creation test:** point sidecar at a path whose parent directory does not exist → adapter creates parent + appends successfully on `thread.started`.
+- **Sidecar write-failure test:** make the sidecar path unwritable (e.g., parent is a regular file, or read-only directory in a tempdir) → producer task emits `TurnEnd(Failed { kind: AdapterFailure })` immediately and no further events follow.
+- **Live test** (`#[ignore]`-gated): `make test-live` runs `codex exec` for real; asserts a small response includes expected text.
+- **Session-id capture test:** spawn fake harness; drain stream; assert sidecar file gets a new line with the captured thread_id and `session_partition_date = <today>`.
+- **Resume test:** with sidecar pre-populated, dispatch and assert command-line uses `exec resume <id>`. Assert sidecar gets a second line with the same `session_id` and `session_partition_date` (copied from prior record).
+- **Stream-contract test:** fake harness EOFs without terminal event → adapter synthesizes `TurnEnd(Failed { kind: AdapterFailure })`.
+- **App routing test (replaces "two-adapter dispatcher test").** Wire two distinguishable mock adapters (one tagged `claude`, one tagged `codex`) into `AppState.claude_adapter` and `AppState.codex_adapter`. Create one Claude agent and one Codex agent in the registry. Dispatch to each through `send_message_impl`. Assert: the Claude agent's dispatch hit only the Claude-tagged mock; the Codex agent's dispatch hit only the Codex-tagged mock. This catches a regression where the `match agent.harness` branch hard-codes one adapter — invisible at the dispatcher layer (which is keyed by `AgentId` alone), visible only at the app routing layer.
+- **AuthFailure wire-format roundtrip:** `FailureKind::AuthFailure` serializes/deserializes correctly.
+- **HarnessKind::Codex wire-format roundtrip:** serializes to `"codex"`, deserializes back; parallels the existing `ClaudeCode` test at `crates/core/src/harness.rs:18-25`.
+
+### Docs to update
+
+- `docs/research/codex-cli-observed.md` — if implementation surfaces anything new (especially around resume or session-id capture timing), append to the M2.1 findings.
+- `docs/system-design.md` §9 — add `FailureKind::AuthFailure` to the event-vocabulary listing (event-vocabulary lives in system-design, not in AGENTS.md).
+- `AGENTS.md` — add the Codex session-link sidecar pattern; AppState named-fields convention (`claude_adapter` / `codex_adapter`); harness-asymmetry rule (Claude pre-assigns `session_id` at agent-creation; Codex's `AgentRecord.session_id` stays `None` and the sidecar is the system-of-record for the captured `thread_id`).
+- `src/lib/types.ts` — extend `FailureKind` union with `"auth_failure"` (currently `"harness_error" \| "adapter_failure"` at line 9); extend `AgentRecord.harness` from literal `"claude_code"` (line 126) to union `"claude_code" \| "codex"`. The reducer default arms already degrade gracefully on unknown discriminants, so no per-variant rendering is required in M2.3; the type contract just needs to match the new wire shape. Special auth-failure UI banner lands in M2.5.
+
+### Verification
+
+#### Agent-runnable
+
+1. **`make test`** → exits 0; output includes new Codex fixture-driven parser tests + app routing test + error-buffer-on-EOF test + auth-failure tests (both harnesses) + sidecar parent-dir + sidecar write-failure tests.
+2. **`make test-live`** → live Codex smoke test passes.
+3. **Session-link sidecar test** — extend live test to assert sidecar gets a record on `thread.started`, with valid `session_id`, `session_partition_date` (today), `started_at`. Second dispatch → two lines with the same `session_id` and `session_partition_date`.
+4. **Resume works (test, not manual)** — extend live test to dispatch twice; assert second invocation uses `codex exec resume <session-id>`.
+5. **App routing test** as above (right adapter selected per `agent.harness` — replaces the prior "two-adapter dispatcher test" framing; the substantive failure mode is at the App layer, not the dispatcher).
+6. **`make check`** → exits 0.
+
+#### Human-required
+
+1. **`make dev`** → app opens. Exercise the Codex-via-IPC path via devtools:
+   ```javascript
+   await window.__TAURI__.core.invoke('check_codex_binary');
+   await window.__TAURI__.core.invoke('create_agent', { name: 'codex-helper', harness: 'codex' });
+   const turnId = await window.__TAURI__.core.invoke('send_message', { agentId: '<id>', prompt: 'reply with ack' });
+   ```
+   Console shows: `turn_start` → `content_chunk` → `turn_end(completed)`. Confirms IPC path carries Codex events.
+
+### Commit and stop for review
+
+Commit message: `M2.3: Codex adapter implementation`. Wait for user review before starting M2.4.
+
+---
+
+## Sub-milestone M2.4 — Codex session-file enrichment
+
+### Goal & outcome
+
+The Codex adapter reads the session file after each turn's terminal event to fill in metadata the stream omits (per resolved 10.15). Per M2.1's findings, this includes some combination of `RateLimitEvent`, `SessionMeta`, and `TurnEnd.usage.context_window`.
+
+**`context_window` source-of-truth — single, consistent for both harnesses:** `TurnEnd.usage.context_window` is the single field for both harnesses. Claude Code reads from `result.modelUsage.<model>.contextWindow` (M2.2). Codex reads from session-file `task_started.model_context_window` and **enriches `TurnEnd.usage.context_window`** before emission. `SessionMeta` does NOT carry `context_window`.
+
+After this sub-milestone:
+
+- Codex agents' `RateLimitEvent` fires after each turn from session-file `event_msg/token_count.rate_limits`. (Confirmed session-file-only per M2.1; not in the stream.)
+- Codex agents' `SessionMeta` fires on first turn, reconstructed from multiple sources: `model` from the first `turn_context.payload.model` in the session file, `harness_version` from line-1 `session_meta.payload.cli_version`, `mcp_servers` from Codex's config files (`~/.codex/config.toml` user-level + `<cwd>/.codex/config.toml` project-level, merged), `skills` from directory scans of `~/.agents/skills/` + `<cwd>/.agents/skills/`. The available-tools/MCP-servers registry is not snapshotted to the Codex session file (verified against both MCP-free and MCP-actively-used sessions); reading the config files is the only way Switchboard can populate the sidebar's MCP list for Codex agents, since Codex's non-interactive `exec` mode never emits a `system/init`-equivalent registry event the way Claude does.
+- Per-turn context-window info flows through `TurnEnd.usage.context_window` for Codex (enriched from `event_msg/task_started.payload.model_context_window` before emission).
+
+### Implementation outline
+
+1. **Locate the session file.** Per `codex-cli-observed.md`: `~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-*-<session-uuid>.jsonl`. Build the path from the session-link sidecar (`session_id` + `session_partition_date`) — **NOT** `Utc::today()`. Use a glob (only `<timestamp>` is unknown). If multiple matches, pick most recent. Resume appends to the **original spawn-date's** session file even on cross-day resumes (per M2.1's findings); the sidecar's `session_partition_date` is the authoritative date input. `session_meta` is written once at line 1 of the file and is NOT repeated on resume — the line-1 read is correct for both first-turn and resumed sessions.
+
+2. **Read trigger.** Read the session file when the stream emits `turn.completed` or `turn.failed`. The file is updated synchronously by Codex; by terminal stream event time, the file should be up-to-date for that turn. (If empirically wrong, add a small retry-with-backoff loop and document.)
+
+3. **Parse session-file events** for what we care about. Mapping table (corrected per M2.4-prep findings — see `docs/research/codex-cli-observed.md` §"Findings during M2.4-prep" for verbatim shapes):
+
+   | Record | M2.4 action |
+   |---|---|
+   | `session_meta` (line 1) | Source `SessionMeta.harness_version` from `payload.cli_version`. Does **not** carry `model` / `tools` / `mcp_servers` — that's a documented M2.4-prep correction. |
+   | `turn_context` (first one) | Source `SessionMeta.model` from `payload.model`. Codex supports per-turn model overrides; we snapshot the first-turn model. |
+   | `event_msg` with `task_started` | Source `TurnEnd.usage.context_window` from `payload.model_context_window`. Match by `turn_id` to the right pending `TurnEnd` (one `task_started` per turn). |
+   | `event_msg` with `token_count` AND `rate_limits` non-null | Emit `RateLimitEvent { agent_id, info: payload.rate_limits }`. |
+   | `event_msg` with `token_count` AND `info` non-null (rate_limits absent/null) | Ignored — token usage already sourced from the stream's `turn.completed.usage` in M2.3. |
+   | All other record types (`turn_context` after the first, `response_item/*`, `event_msg/user_message`, `event_msg/agent_message`, `event_msg/task_complete`) | Ignored in M2. |
+
+   **SessionMeta emission shape for Codex** (one-shot, on first-turn enrichment): `SessionMeta { agent_id, model: <from first turn_context>, harness_version: <session_meta.cli_version>, tools: vec![], mcp_servers: <from config-loader, step 4>, skills: <from skills-scanner, step 4>, raw: <session_meta line as Value, with payload.base_instructions.text replaced by a sentinel> }`. `tools` stays `vec![]` because there is no project-wide "tools" registry separate from MCP and skills — Codex's stream-side `command_execution` and `mcp_tool_call` items already cover the dispatched tools; the M2 wire-format keeps the field for future symmetry with Claude's `system/init.tools` listing but emits empty for now.
+
+   **`raw` field strip — deliberate refinement.** Codex's `session_meta.payload.base_instructions.text` is the entire model system prompt (5–20KB per Codex session). It is never UI-rendered — `raw` exists for forward-compat field promotion only — and would otherwise dominate the per-agent IPC payload on every first dispatch. The session-file parser replaces it with `"<stripped — see codex-cli-observed.md>"`, preserving the surrounding `base_instructions` envelope so the field's existence stays introspectable. Claude's `system/init.raw` is ~1KB and stays unstripped; the volume asymmetry makes the cross-harness "symmetry" argument illusory here. Documented at the implementation site in `crates/harness/src/codex/session_file.rs`.
+
+4. **Codex registry loading (display-only).** Read Codex's MCP and skills config to populate `SessionMeta.mcp_servers` and `SessionMeta.skills`. This is informational — Switchboard does not gate dispatch on what's here; the sidebar just shows the user what each agent has available. Reads run on demand (each first-turn `SessionMeta` emission); no caching layer, no file watcher. **Partial-parse policy**: drop broken entries, keep valid ones, emit one `tracing::warn!` per dropped entry. **Total-parse failure** (file unreadable, top-level malformed): emit empty list + one warning. Either way, never a `Result` that propagates — these registries are display-only. Mirrors the M1 transcript skip-with-warning policy for harness-owned files.
+
+   - **MCP servers.** Load `~/.codex/config.toml` (user-level, always) + `<cwd>/.codex/config.toml` (project-level, if it exists). TOML format; parse the `[mcp_servers]` table. Merge by entry name with project-level winning. Switchboard does **not** consult Codex's trust list — the trust gate is Codex's runtime concern, not Switchboard's; the small fidelity gap (showing project-scoped servers Codex itself wouldn't load for untrusted directories) self-corrects when the user first runs Codex interactively in that directory.
+   - **Skills.** List `~/.agents/skills/` + `<cwd>/.agents/skills/` (directory scans, not TOML). Each immediate subdirectory containing a `SKILL.md` counts as one skill; the directory name is the skill name. Merge by name with cwd-scoped winning.
+   - **Lives in `crates/harness/src/codex/{config,skills}.rs`.** Two modules — MCP is config-file-derived, skills are directory-derived; same conceptual layer but distinct mechanics. Codex's module directory already exists from M2.3 (`mod.rs`, `parser.rs`, `sidecar.rs`); these are pure additions. See `docs/research/codex-cli-observed.md` §"MCP and skills registry sourcing" for the file shapes.
+
+5. **Emit ordering.** Per system-design §9: "Codex's source (session file) means the event arrives after the terminal event." Emit `RateLimitEvent` and (first-turn) `SessionMeta` AFTER `TurnEnd` for the turn. **Does NOT violate the M1.3 stream contract** — that contract is "exactly one `TurnEnd` per turn_id." `RateLimitEvent` and `SessionMeta` are *agent-scoped* events (carry `agent_id`, not `turn_id`) and can flow at any time on the per-agent channel. **`TurnEnd` is terminal for a turn, not for the per-agent channel.**
+
+   **Adapter lifecycle rule (load-bearing for Codex).** The adapter's event stream must remain open after emitting `TurnEnd` until the enrichment-derived events (`RateLimitEvent`, first-turn `SessionMeta`) have been emitted. Closing the stream immediately on `turn.completed` / `turn.failed` (the Claude Code pattern, where there's no post-terminal enrichment) would silently drop these. Concretely: the producer task awaits the enrichment read, emits the enrichment events on the per-agent channel, *then* closes the stream. `AgentIdleGuard` (held by the dispatcher's drain task) does not drop until the stream closes — so the agent stays `InFlight` during the enrichment window, and new dispatches are gated by the dispatcher's contention check until enrichment completes. This is correct behavior: the per-agent channel is mid-flow with the previous turn's metadata; a concurrent dispatch would race.
+
+6. **`TurnEnd` enrichment timing.** The session-file read happens after the terminal stream event arrives; enrichment writes back to the about-to-be-emitted TurnEnd's `usage.context_window`. **Delay TurnEnd emission until enrichment completes** (small added latency, single canonical event). On failure or timeout, emit TurnEnd without `context_window` rather than blocking forever.
+
+   **Timeout + retry shape:** start tight — initial timeout **200ms** with a single retry at **200ms backoff** (400ms worst case). Codex writes the session file synchronously per `docs/research/codex-cli-observed.md`; by the time `turn.completed` arrives over the stream, the file should already be on disk. 200ms is generous for that. If both attempts fail, emit `TurnEnd` without `usage.context_window` and `tracing::warn!`. The constants may be tuned during implementation if observed latencies suggest different values — document the chosen values in a code comment (not just the commit message) and append to `docs/research/codex-cli-observed.md` findings if they differ from the defaults.
+
+   **Applies to both terminal events.** This delay-and-enrich logic runs for both `turn.completed` and `turn.failed`. `task_started` carries `model_context_window` and is written to the session file before any failure occurs; rate-limit info is useful diagnostic context even on failed turns.
+
+   **Testing note (avoid wall-clock flake):** the timeout-and-retry behavior should be tested with injectable / mocked time, not by sleeping in tests and asserting wall-clock duration. Real CI timing on macOS is noisy enough to make wall-clock assertions flaky. Verify configured constants directly + use mocked retry behavior to assert the logic.
+
+7. **Lookup-strategy mechanics** for the date-partitioned path. If a session was started just before local midnight and the turn completes after, the session file is in the previous day's directory. Adapter uses the sidecar's `session_partition_date`, not the current date.
+
+### Testing strategy
+
+- **Session-file parser tests** with captured session-file fixtures (capture during M2.1 alongside stream fixtures).
+  - Parse a `session_meta` line → expected metadata fields.
+  - Parse a `task_started` event → extracts `model_context_window`.
+  - Parse a `token_count` event with rate_limits → produces RateLimitEvent.
+  - Malformed line → typed error, doesn't crash adapter.
+- **End-to-end test (live, env-var-gated):** Codex turn → adapter emits (a) `TurnEnd` whose `usage.context_window` is populated from the session file, (b) `RateLimitEvent` after the turn, (c) on first turn, `SessionMeta` carrying: `model` from the session file's first `turn_context`, `harness_version` from `cli_version`, `tools: vec![]`, `mcp_servers` matching the merged `~/.codex/config.toml` + `<cwd>/.codex/config.toml` result, `skills` matching the merged `~/.agents/skills/` + `<cwd>/.agents/skills/` directory listing.
+- **Config-loader fallback test:** dispatch with both `~/.codex/config.toml` and `<cwd>/.codex/config.toml` absent → `SessionMeta.mcp_servers: vec![]`, single `tracing::warn!` emitted, no error propagated. Same for `skills` with both directories absent.
+- **Partial-parse test:** `~/.codex/config.toml` with one malformed `[mcp_servers.<name>]` entry (e.g., missing required `command` field) → valid entries preserved in `SessionMeta.mcp_servers`, broken one dropped, per-entry `tracing::warn!` emitted.
+- **Date-boundary test:** simulate cross-midnight by mocking the sidecar's `session_partition_date` to yesterday → adapter looks in yesterday's directory; assert it finds a fixture there.
+- **Session file not yet written test:** edge case where file doesn't exist at terminal-event time → adapter retries briefly; if still absent, logs warning and skips enrichment (TurnEnd still fires cleanly without `context_window`).
+- **Enrichment retry-then-success:** simulate a slow write — file absent on first attempt, present on the retry → `usage.context_window` populated, no warning logged. Uses mocked time / dependency-injected sleeps; no wall-clock waits.
+- **Enrichment persistent failure:** file remains absent through both attempts → TurnEnd fires with `context_window: None`; `tracing::warn!` logged. Same mocked-time pattern.
+- **Adapter lifecycle — post-terminal events emit before stream closes:** replay a fake Codex `turn.completed` fixture through the adapter; assert the emitted event sequence is `TurnEnd` → `RateLimitEvent` → `SessionMeta` (first turn) → stream closed. Stream closing before the enrichment events would silently drop them; this test guards against the regression.
+- **Adapter lifecycle — dispatch blocked during enrichment:** attempt a second dispatch to the same agent while the first turn's enrichment is still mocked-in-flight → dispatcher returns `Err(Busy)` (agent still `InFlight`). After enrichment completes and the stream closes → second dispatch succeeds.
+
+### Docs to update
+
+- `docs/research/codex-cli-observed.md` — confirm or revise the session-file-vs-stream timing assumption based on implementation findings.
+- `AGENTS.md` — add Codex session-file enrichment pattern; "TurnEnd is terminal for a turn, not for the per-agent channel" rule; date-partition gotcha codified.
+
+### Verification
+
+#### Agent-runnable
+
+1. **`make test`** → exits 0; new session-file parser tests + date-boundary test + missing-file test all pass.
+2. **`make test-live`** → live Codex test now also asserts RateLimitEvent and SessionMeta arrive after TurnEnd, and `TurnEnd.usage.context_window` is populated.
+3. **Session file actually read (test)** — extend live test: after a Codex turn, locate the session file via the sidecar's `session_id`, parse `task_started`, assert `model_context_window` matches what `TurnEnd.usage.context_window` carried.
+4. **Cross-day session test** as above.
+5. **Missing session file test** as above.
+6. **`make check`** → exits 0.
+
+#### Human-required
+
+1. **`make dev`** → send a message to a Codex agent via devtools. Console: `turn_end` whose `usage.context_window` is populated; after `turn_end`, a `session_meta` event (first turn only) and a `rate_limit_event` (every turn).
+
+### Commit and stop for review
+
+Commit message: `M2.4: Codex session-file enrichment`. Wait for user review before starting M2.5.
+
+---
+
+## Sub-milestone M2.5 — Unified project transcript view + per-agent sidebar + recipient-picker compose bar
+
+### Goal & outcome
+
+The major UI sub-milestone. Replaces M1.5's single-pane single-agent view with the unified-stream model per system-design §7. After this sub-milestone:
+
+- The project view shows **one unified transcript** that interleaves all agents' turns chronologically, each attributed to its agent (name + harness badge).
+- A **per-agent overview sidebar** lists every agent in the project with status, cost / quota signal, context utilization, and a context menu (fork — Claude only; open session file; reset).
+- The compose bar has a **recipient picker** (single-select in M2; M4 extends to multi-select). The picker preselects the user's last-used agent as an ergonomic, not a semantic privilege.
+- The `create_agent` flow accepts a harness type and a binary-availability check (`check_claude_binary` / `check_codex_binary`).
+- An **attach existing session** affordance lets the user bring an externally-created harness session under Switchboard's management.
+- A binary-not-found / auth-not-configured banner surfaces per-harness when applicable.
+
+This sub-milestone displays in-memory transcript state only (live-stream events accumulated since project open). **Disk rehydration lands in M2.6** — until then, restarting the app loses prior transcripts.
+
+**Key model:**
+- **No singleton "active agent."** All agents in the loaded project are equally live; events for every agent flow into per-agent state regardless of UI focus.
+- **Per-agent state lives at the project level**, keyed by `agent_id`. Two state maps: `transcripts: { [agent_id]: Turn[] }` and `runtimes: { [agent_id]: AgentRuntime }`. The unified transcript view merges turns from all agents into one chronological list at render time.
+- **Subscriptions persist for all loaded projects**, lifetime of the app session. `set_active_project` is display-only and does not tear down listeners.
+
+### Risks / open design decisions to resolve at M2.5-start
+
+**A. AgentIdle vs TurnEnd boundary (load-bearing for the compose-bar enable/disable rule).** Surfaced during M2.4 review. There's a state-boundary mismatch between two layers:
+
+- The dispatcher holds `AgentIdleGuard` until the **adapter stream closes** (`crates/dispatcher/src/lib.rs::drain_stream`). For Codex agents, the stream now stays open past `TurnEnd` while post-terminal enrichment events (`RateLimitEvent`, first-turn `SessionMeta`) flow on the per-agent channel. The agent is `InFlight` for that 0–400ms window.
+- The current frontend (M1.5) clears `inFlightTurnId` on `turn_end` (`src/lib/components/AgentPane.svelte:102`), which re-enables the send button immediately.
+
+Today the window is tiny but real: a user who hits send in that window gets a confusing `Err(Busy)` from the dispatcher. M2.5's richer compose-bar UI will make the window more visible. Three resolution options:
+
+- **(a) Channel-close signal as `AgentIdle` event.** Dispatcher emits a new per-agent `AgentIdle { agent_id }` wire-format event when the `AgentIdleGuard` drops (i.e., when the adapter stream closes). The frontend keys the "send enabled" state off `AgentIdle`, not `TurnEnd`. Single source of truth; the event name reflects that this is an agent-level signal (not a turn-level one — `TurnEnd` already serves that role). **Recommended default.** Adds one wire-format event; no per-harness logic on the frontend.
+- **(b) Frontend quiescence timeout.** Frontend waits N ms after `TurnEnd` before re-enabling send. Brittle — picks the wrong threshold and we get either lingering "still working" UI or the original race back. Rejected.
+- **(c) Explicit `EnrichmentComplete` event after the enrichment-derived events.** More semantically narrow than (a) but duplicates state (now there are two "channel done" signals: the implicit channel close + this explicit event). Worse if a future harness has post-terminal work beyond enrichment.
+
+The decision should land before M2.5's frontend state-machine work starts. Coordination touches `crates/dispatcher/src/lib.rs` (emit point), `crates/harness/src/events.rs` (new variant), `src/lib/reducer.ts` (handler), and the per-agent state shape.
+
+**B. Attach-existing-session flow needs to force SessionMeta on first dispatch (Codex).** The Codex adapter today emits `SessionMeta` only when `prior.is_none()` at dispatch start (`crates/harness/src/codex/mod.rs::emit_terminal_with_enrichment`, see `TODO(M2.5)` comment). The attach flow pre-writes a sidecar record at attach time, so the first Switchboard-driven dispatch will see `prior.is_some()` and skip `SessionMeta` — leaving the sidebar's MCP/skills/model listing empty for attached Codex agents until the next dispatch on a different (non-attached) agent triggers some other path.
+
+Resolution: thread a `force_session_meta: bool` (or equivalent) through `dispatch()` and set it on the first post-attach send. Touches `HarnessAdapter::dispatch` signature, the Codex adapter's `is_first_turn` computation, and the attach-flow command handler.
+
+### Implementation outline
+
+1. **App-level transcript and runtime state, keyed by `agent_id`.** State lives at the app level (not nested under projects), since `agent_id` is globally unique (UUID v7) and subscriptions persist across all loaded projects. Project membership is a derived view: `activeProject.agents.flatMap(id => transcripts[id])`. Two state maps:
+
+   ```typescript
+   // Two role-distinguished turn variants. M1.5's reducer already has user-turn
+   // entries; M2 makes this a first-class wire-format shape so both live dispatch
+   // and disk rehydration produce the same structure. The unified transcript view
+   // collects both kinds from all agents and sorts by started_at.
+   //
+   // Agent turns carry a single ordered `items: TurnItem[]` list (interleaved
+   // text chunks + tool calls), NOT two parallel `chunks` / `tools` arrays.
+   // Real Claude turns produce text → tool → text patterns; splitting into
+   // two arrays would lose arrival order. `TurnItem` is discriminated by a
+   // state-only `item_kind` field ("text" | "tool"). See
+   // `src/lib/state/types.ts` for the shipped shape.
+   type Turn =
+     | { role: "user"; turn_id: string; agent_id: string; started_at: string; text: string }
+     | {
+         role: "agent";
+         turn_id: string;
+         agent_id: string;
+         started_at: string;
+         ended_at?: string;
+         status: "streaming" | "complete" | "failed";
+         items: TurnItem[];
+         usage?: TurnUsage;
+         error?: string;
+         error_kind?: FailureKind;
+       };
+
+   type AgentRuntime = {
+     agent_id: string;
+     // **Three-state run lifecycle**, NOT a two-state "idle | processing"
+     // and NOT a four-state machine with "errored". After a failed turn the
+     // agent IS sendable again — `run_status` flips back to "idle" on
+     // `AgentIdle` regardless of turn outcome; the failure surface is the
+     // separate `last_error` field, which is display-only and does NOT
+     // gate Send.
+     //
+     // - "idle":       dispatcher will accept a new send.
+     // - "starting":   user clicked Send; IPC is in flight; `TurnStart` hasn't
+     //                 arrived yet. Closes a ~100ms double-click race.
+     // - "processing": `TurnStart` arrived; backend `AgentIdleGuard` is held.
+     //
+     // `AgentIdle` is the **sole** path from "processing" back to "idle" —
+     // this is the load-bearing "sendability" invariant. See
+     // `src/lib/state/types.ts::AgentRuntime` for the full state-machine
+     // docstring, and the dispatcher's AGENTS.md contract for why
+     // `AgentIdle` (not `TurnEnd`) is the terminal sendability signal
+     // (Codex post-terminal enrichment emits `RateLimitEvent` + `SessionMeta`
+     // AFTER `TurnEnd`; flipping to idle on TurnEnd would surface
+     // `Busy` errors for users who Send quickly).
+     run_status: "idle" | "starting" | "processing";
+     in_flight_turn_id?: string;  // heartbeat scope
+     last_error?: { message: string; kind: FailureKind };  // display-only, does NOT gate Send
+     // Metadata-derived state (populated by hydrate.meta or by live SessionMeta events):
+     meta?: {
+       model: string;
+       harness_version: string;
+       tools: string[];
+       mcp_servers: { name: string; status: string }[];
+       skills: string[];
+     };
+     // last_rate_limit is also metadata-derived — populated by live RateLimitEvent
+     // OR by hydrate.last_rate_limit (Codex parser pulls the most recent
+     // token_count.rate_limits from the session file). Without hydration, Codex
+     // agents would have empty sidebar quota until the next turn after restart.
+     last_rate_limit?: unknown; // harness-specific, opaque
+     // Hydration lifecycle state. Send is gated on this being "complete"
+     // (or "failed" with degraded-dispatch UX — see compose-bar gating below).
+     hydration_status: "pending" | "loading" | "complete" | "failed";
+     // Transcript-derived: NOT stored — computed at render time from transcripts[agent_id].
+     // last_usage      = transcripts[id].filter(t => t.role === "agent").at(-1)?.usage
+     // session_total_cost = transcripts[id].filter(t => t.role === "agent")
+     //                        .reduce((sum, t) => sum + (t.usage?.total_cost_usd ?? 0), 0)
+     // Null-safe sum is load-bearing — Codex turns have total_cost_usd: null; without
+     // the ?? 0 the result would be NaN.
+   };
+
+   type TranscriptMap = { [agent_id: string]: Turn[] };  // role-mixed, sorted by started_at
+   type RuntimeMap = { [agent_id: string]: AgentRuntime };
+   ```
+
+   **Field naming:** snake_case throughout, matching the M1.5 event-vocabulary convention (`turn_id`, `agent_id`, `started_at`). TypeScript reads snake_case keys directly — no client-side renaming.
+
+   **Role split rationale:** harness session files store user and assistant events as separate entries. Fan-out (M4) and forwarding (M6) get awkward when prompt and response are conflated on one Turn (a single user message dispatched to 3 agents would otherwise duplicate the prompt on every agent's Turn). Ordering in the unified view is by `started_at`; explicit user→agent linking via field is not needed.
+
+   **State separation:** transcripts hold conversation content (user + agent turns); runtimes hold *only* metadata-derived operational state (`meta`, `last_rate_limit`). Transcript-derived values (`last_usage`, `session_total_cost`) are *not* stored — they derive at render time. This prevents drift between transcript and runtime; one source of truth per value.
+
+   **Live dispatch path:** when the user clicks Send, the compose-bar text becomes a `Turn::User` entry appended to `transcripts[recipient_id]` immediately (synthesized client-side, since the user is the source). `TurnStart` for the agent's response creates a `Turn::Agent` entry. Both share the same wire-format shape that rehydration produces from disk. **The user prompt is part of the turn, not "local UI state" that disappears on reload.**
+
+2. **Subscription lifecycle.** Per system-design §3 and M2 invariants:
+   - **Project open** (`open_project` / `create_project`): iterate `list_agents()`, register a per-agent listener (`agent:<agent_id>`) for each. Listener routes events into both transcript and runtime reducers by event type. **Other projects' listeners stay subscribed.**
+   - **Dynamic agent add** (`create_agent` / `attach_agent` success): register the new agent's listener immediately, before any send can occur.
+   - **`set_active_project`**: display-only — does NOT tear down listeners. Background events continue flowing into state for non-active projects.
+   - **App close**: process exit; no explicit cleanup needed.
+
+3. **Unified transcript view.** Pure Svelte component that:
+   - Reads `transcripts: TranscriptMap` from app-level state, filtered to the active project's agents.
+   - Computes `allTurns = activeProject.agents.flatMap(id => transcripts[id] ?? [])` and sorts by `started_at` (ISO-8601 strings sort lexicographically). **Stable sort, no `turn_id` tie-break** — JavaScript's `Array.prototype.sort` is stable per spec, and per-agent transcripts arrive in dispatch order. Equal timestamps therefore preserve their per-agent insertion order, which is the only ordering signal we actually have for a same-millisecond cross-agent tie.
+   - Renders each turn:
+     - **`role: "user"`** — rendered as a user-attributed entry showing the prompt text + recipient agent badge.
+     - **`role: "agent"`** — rendered with the agent's badge (name + harness icon), the streamed content (chunks), tool calls (nested), and inline cost / quota metadata.
+   - **Codex streaming visibility.** Codex emits one whole `agent_message` `item.completed` after the model finishes — there are no per-token deltas. A streaming Codex turn therefore has `status: "streaming"` but no text items in `items[]` for the duration. Without a UI affordance, the turn looks frozen for 5–30 seconds. **Render a small "processing…" indicator** gated on `turn.role === "agent" && turn.status === "streaming" && !turn.items.some(i => i.item_kind === "text")`. Claude Code turns (which have text items landing within ~100ms) naturally never trigger this condition for visible time.
+   - Handles streaming turns (live token-by-token rendering for Claude Code; whole-message for Codex per M2.3 step 6).
+
+4. **Per-agent overview sidebar.** Lists the active project's agents. For each agent, render derived values:
+   - **Metadata-derived** (read directly from `runtimes[id]`): `status` indicator; model + harness version + tool/MCP server list (from `meta`); latest rate-limit signal (Codex — from `last_rate_limit`).
+   - **Transcript-derived** (computed at render time from `transcripts[id]`):
+     - Claude session total cost: `transcripts[id].filter(t => t.role === "agent").reduce((sum, t) => sum + (t.usage?.total_cost_usd ?? 0), 0)`. The `?? 0` is load-bearing (Codex turns have `total_cost_usd: null`).
+     - Last-turn cost (Claude): `transcripts[id].filter(t => t.role === "agent").at(-1)?.usage?.total_cost_usd`.
+     - Context utilization bar: from `transcripts[id].filter(t => t.role === "agent").at(-1)?.usage` — gated on `input_tokens`, `output_tokens`, and `context_window` all being present. **Exact formula is pinned in M2.2** once `result.modelUsage.<model>.contextWindow` semantics are confirmed from real captured fixtures. Two candidate formulas:
+       - `last_turn.input_tokens / context_window` — "how full was the context going INTO the last call." Treats `input_tokens` as the running cumulative context size at call time (true if `modelUsage.contextWindow` represents window capacity; per-turn `input_tokens` includes accumulated history).
+       - `(last_turn.input_tokens + last_turn.output_tokens) / context_window` — "how full after the last turn finished." Adds the assistant's response since it'll be part of the next call's input.
+
+       The correct formula depends on whether `contextWindow` represents window capacity (max) or remaining capacity, and whether the harness includes the assistant's own response in the NEXT turn's `input_tokens` count (it does, but the question is whether to surface the post-turn state explicitly or wait for the next turn's input to reflect it). M2.2 fixture review answers this; pin the formula then. Label the bar accordingly ("context used" vs "context after last turn"). Add null-safety (`?? 0`) on both numerator components.
+   - **Sidebar context menu (fork / open session file / reset) — deferred to M4.** Originally listed here as M2.5 scope, but moved per Pass D scoping: (a) M2.5's manual-verification list does not require it (banners + flows are the gates); (b) `2026-05-12-v1.md:167` explicitly lists "Agent context menu: fork session, open session file, reset/remove" under M4; (c) M4 substantially reworks the sidebar (project switcher + multi-recipient compose), so any single-icon-button affordance built here would be thrown away. M2.5 ships without these items; M4 builds the full menu around a `bits-ui` Menu primitive. The `tauri-plugin-opener` integration and capability scoping (originally noted here) move with the items.
+
+5. **Compose bar recipient picker.** Replaces M1.5's implicit "send to the one displayed agent" model:
+   - A dropdown / picker showing all agents in the active project (name + harness badge).
+   - Single-select in M2 (multi-select lands in M4 for manual fan-out).
+   - Preselects the user's last-used agent as an ergonomic.
+   - Disabled / shows error if the chosen agent is busy.
+   - **Hydration gate (load-bearing):** Send is also disabled per recipient on `runtimes[agent_id].hydration_status !== "complete"`. While the chosen agent's transcript is hydrating from disk (in `"loading"`), the Send button shows an inline "loading history…" tooltip and rejects clicks. This is a real correctness guard — it eliminates a live ↔ disk turn_id race (the parser synthesizes turn_ids that won't match dispatcher-generated turn_ids, so dedup-by-turn_id can't reconcile a turn that exists in both live state and disk). By blocking dispatch until hydration finishes, we ensure live and disk turns never describe the same exchange. The "in-flight turns take precedence on hydrate" rule in M2.6 step 7 remains as defense-in-depth only.
+   - `hydration_status === "failed"` → degraded mode: Send is enabled (the harness session still works; we just couldn't load its history), but a non-blocking banner explains the gap.
+   - On Send: invoke `send_message(agentId, prompt)`. The resulting `TurnStart` flows into `transcripts[agentId]`; the unified view renders it in chronological order.
+
+   **Forward-looking note for v2 / M4 fan-out:** the Send gate eliminates the live ↔ disk turn_id race for M2's single-recipient model. Multi-recipient fan-out (M4) and workflows (M6+) may eventually want a first-class "exchange ID" or "message ID" model that pairs a user message to its N agent responses with a stable cross-source key. M2 explicitly does not go there — the gate is sufficient — but flag this as a v2+ consideration when fan-out or external session attachment grows more complex.
+
+6. **`create_agent` flow** (extending M1.5):
+   - Harness-type chooser (radio buttons / dropdown: "Claude Code" / "Codex"). Pre-fills with last-used or Claude Code default.
+   - Two creation modes side-by-side: **"Create new agent"** (M1 flow — pre-generates a session UUID for Claude; defers ID capture for Codex) and **"Attach existing session"** (see step 7).
+   - Binary-availability check before submit (calls `check_claude_binary` / `check_codex_binary`); rejects with inline error if the harness's binary isn't installed.
+
+7. **Attach existing session.** New Tauri command:
+   ```rust
+   #[tauri::command]
+   async fn attach_agent(
+       state: State<'_, AppState>,
+       name: String,
+       harness: HarnessKind,
+       existing_session_id: String,
+   ) -> Result<AgentRecord, AppError>;
+   ```
+   Validation (atomic check-and-register under the directory-level `registry_write` mutex — see M1's AppState):
+   - Name passes uniqueness + regex rules from `create_agent`.
+   - **Session-id uniqueness across all loaded projects in the bound directory.** The invariant in plain terms: *no two Switchboard agents may target the same underlying harness session in any scope where they could be dispatched concurrently.* In v1 (single bound directory, all loaded projects share one Switchboard process and one dispatcher), that effectively means scanning all projects under `<directory>/.switchboard/projects/<project-id>/`:
+     - For Claude attaches: scan every project's `registry.jsonl` for any `AgentRecord` whose `session_id` matches.
+     - For Codex attaches: scan every project's `sessions/*.jsonl` sidecar for any record with the matching `session_id`.
+   - If a match is found → `SessionAlreadyAttached { existing_agent_name, existing_agent_id, existing_project_name }`. Rationale: two AgentRecords pointing at the same harness session would each have their own `agent_id`, each pass the dispatcher's per-agent contention check, and could dispatch concurrently → same-session-parallel-invocation corruption (per system-design §7 / `docs/research/same-session-parallel-invocation.md`). The project boundary doesn't protect against this — the corruption hazard lives at the harness session level, not the project level. **M4's per-project `flock` doesn't catch this either** (different projects, different flocks); the in-process check is the only line of defense in v1.
+   - **Claude Code:** `existing_session_id` must be a valid UUID and `~/.claude/projects/<encoded-cwd>/<existing_session_id>.jsonl` must exist. If not → `SessionFileNotFound { harness, expected_path }`.
+   - **Codex:** `existing_session_id` must be a valid UUID and a session file must exist under `~/.codex/sessions/*/*/*/rollout-*-<existing_session_id>.jsonl` (glob across all date directories). Parse `<YYYY>-<MM>-<DD>` from the discovered file's path; stash for the session-link sidecar.
+
+   On success:
+   - Register `AgentRecord` with `session_id = Some(existing_session_id)` (Claude) or `None` (Codex; sidecar gets the link).
+   - **Claude Code:** dispatch from then on uses `--resume <session_id>` (no first-turn-vs-resume branch).
+   - **Codex:** write the **first** sidecar record at attach time with `session_id = existing_session_id`, `session_partition_date = <parsed-from-path>`, `started_at = <now>`. Subsequent dispatches use `codex exec resume`.
+
+   UI: "Attach existing session" toggle in the create-agent dialog swaps to attach mode — name + harness + existing session UUID. Inline errors on `SessionFileNotFound` (showing the searched pattern) and `SessionAlreadyAttached` (showing the existing agent's name).
+
+8. **`check_codex_binary` Tauri command** — mirrors `check_claude_binary` from M1.4. Returns `BinaryNotFound` if `which::which("codex")` fails. Startup checks both independently; renders **per-harness banners**:
+   - "Claude Code not found on PATH; Claude Code agents are unavailable until you install it." (with install link)
+   - "Codex not found on PATH; Codex agents are unavailable until you install it." (with install link)
+   - **Subscription auth detection (best-effort):** "Claude Code subscription not configured — run `claude login` and reload Switchboard. (API-key-only auth is not supported in v1.)"
+   - "Codex subscription not configured — run `codex login` and reload Switchboard. (API-key-only auth is not supported in v1.)"
+
+   **Auth-detection nuance — important.** The v1 subscription-only invariant means API-key flows are *unsupported*, but **unsupported does not mean reliably detected and blocked.** Switchboard's detection is best-effort and works by checking for the presence of expected auth files at default locations:
+   - **Codex:** check for `~/.codex/auth.json`. **Implemented in Pass D.**
+   - **Claude Code: not implemented; deferred to v2.** Pass D's research found no reliable file-presence signal for Claude auth on macOS — OAuth tokens live in the macOS keychain, not on disk. `~/.claude/settings.json` carries only UI preferences. The plan's original "check for an auth file at the default location (exact path determined by M2.1 probe)" produced no usable path because no such file consistently exists. Per the plan's own escape hatch — "Full robust auth detection (handling `CLAUDE_CONFIG_DIR` etc.) is a v2 polish" — Claude auth detection is left to v2. Claude's *binary*-missing banner does ship in Pass D.
+
+   **Known false-negative / false-positive cases** (applies to the Codex check that does ship):
+   - **`CLAUDE_CONFIG_DIR` set to a non-default path.** (Hypothetical — moot now that Claude auth detection is deferred, but preserved as the v2 design constraint.)
+   - **API-key-only setups (false positive).** A stale `~/.codex/auth.json` from a prior `codex login` may persist even after the user pivots to `OPENAI_API_KEY`-only auth. We report "authenticated"; a real dispatch may surface an `AuthFailure`. The banner's actionable copy ("run `codex login`") is still correct guidance under that case.
+
+   **Acceptance language:** "no detected harness auth file surfaces a clear error at agent-creation." Codex satisfies this. Claude is excluded by design and documented as v2. NOT "API-key auth is rejected" — Switchboard can't distinguish that case from a misconfigured runtime. The contract is: subscription auth is the only first-class, tested, supported path; we surface a clear guidance banner when local checks suggest it's missing; we don't guarantee detection of every unsupported configuration.
+
+9. **Heartbeat timeout** (M1.5 rule revised). Same 60-second threshold, same "transition to failed with `no response from harness — retry?`" message, per-turn keyed by `turn_id`. **Critical revision from M1.5:** the heartbeat resets on **any per-turn event** — `content_chunk`, `tool_started`, OR `tool_completed` — not just `content_chunk`. The M1.5 rule reset only on `content_chunk`, which the AGENTS.md M1.5 note flagged as unsafe once tool calls land (a 90-second `Bash` tool execution emits zero `content_chunk`s but plenty of `tool_*` events). M2 fixes this here. The reducer takes any per-turn event for the in-flight turn as a sign of liveness.
+
+### Testing strategy
+
+- **Unified-view role-mix rendering test:** mount with two agents; inject a `Turn::User` then `Turn::Agent` for agent A, then `Turn::User` then `Turn::Agent` for agent B, with interleaved `started_at` timestamps; assert the rendered view shows all four turns in chronological order, user turns attributed correctly (with recipient agent badge) and agent turns attributed correctly (with producing agent badge).
+- **Live dispatch creates a user turn:** Send "hi" via the compose bar with recipient = agent A; assert `transcripts[a]` immediately has a new `Turn::User` entry with `text: "hi"`, BEFORE any `TurnStart` arrives. Then `TurnStart` arrives → `Turn::Agent` appended.
+- **Codex streaming visibility:** inject a `Turn::Agent` with `status: "streaming"` and `chunks: []` → renderer shows the "processing…" indicator. Append a chunk → indicator goes away.
+- **Per-agent state isolation:** events on `agent:<id_a>` update `transcripts[a]` and `runtimes[a]`; events on `agent:<id_b>` update `transcripts[b]` and `runtimes[b]`; no cross-talk.
+- **Concurrent in-flight turns visible in the UI:** dispatch to agent A; while A is mid-stream (status: streaming), dispatch to agent B; assert both turns appear in the unified view simultaneously, both streaming, attributed correctly, no cross-talk in chunks. *(The backend has supported per-agent concurrent dispatch since M1.4 — `Dispatcher::send_message` is keyed per agent_id with no global lock. M2.5 is the first sub-milestone where the UI surfaces this; the test codifies that the UI doesn't accidentally serialize what the backend already parallelizes.)*
+- **Runtime reducer (metadata path only):** `SessionMeta` arrival populates `runtimes[id].meta`; `RateLimitEvent` populates `runtimes[id].last_rate_limit`; events for unknown `agent_id` are dropped. (Note: `TurnEnd.usage` does NOT update runtime state — it lands on the corresponding Turn::Agent in transcripts, and `last_usage` / `session_total_cost` derive at render time.)
+- **Transcript-derived render test:** inject a transcript with two Claude agent turns having `usage.total_cost_usd: 0.01` and `0.02` and a Codex turn with `usage.total_cost_usd: null` → sidebar shows `session_total_cost = 0.03` for the Claude agent (null-safe sum). For the Codex agent → empty / not-shown (no Claude-style display).
+- **Heartbeat reset on tool events:** inject `TurnStart` for a turn; advance mocked time 30s with no events; inject `tool_started` → heartbeat resets. Advance another 50s; inject `tool_completed` → heartbeat resets again. Advance another 50s with no events → at 60s past the last event, heartbeat fires, turn → failed. Codifies that all per-turn events (not just `content_chunk`) keep the turn alive. Uses mocked time, not real wall-clock waits.
+- **Hydration gate blocks dispatch:** mount the app; agent A's `hydration_status: "loading"` → Send button disabled when A is the picker's selection; attempt to send (e.g., via keyboard shortcut) → no `send_message` invocation. Hydration completes → `hydration_status: "complete"` → Send re-enabled. Then dispatch works.
+- **Hydration failure → degraded dispatch:** `hydration_status: "failed"` → Send is enabled (not blocked); transcript shows the failure banner; new dispatches work normally with empty prior history.
+- **Subscription persistence:** mount with two agents; subscribe; reload the unified view (component unmounts/remounts); events continue flowing into transcripts and runtimes.
+- **Dynamic agent add:** create a third agent; immediately dispatch; events arrive correctly with no missed first event.
+- **`set_active_project` preserves listeners:** open two projects A and B; dispatch to A's agent; mid-stream call `set_active_project(B.id)` (the Tauri command — there is no UI affordance in M2; project switcher UI lands in M4); A's listener stays subscribed (assert via listener registry); A's transcript continues receiving events; switching back to A shows fully-updated transcript.
+- **Banner UX test:** mount with `claude` installed but not `codex` → per-harness banner only for Codex; create-agent dialog disables the Codex entry.
+- **`attach_agent` validation tests** (`crates/core` + `crates/app` unit tests):
+  - Valid existing Claude UUID + session file → registered with `session_id = <provided>`.
+  - Claude UUID with no session file → `SessionFileNotFound` with expected path.
+  - Codex with matching session file under any date directory → registered; sidecar written with `session_partition_date` from the path.
+  - Codex with no matching file → `SessionFileNotFound` with searched pattern.
+  - **Cross-project session-id uniqueness:** open projects A and B in the same directory; attach session_id S to an agent in A; attempt to attach the same S to a new agent in B → `SessionAlreadyAttached { existing_project_name: A, ... }`. Original A record unchanged.
+  - **Atomic cross-project check-and-register:** two concurrent `attach_agent` calls with the same `existing_session_id` targeting projects A and B → exactly one succeeds; the directory-level `registry_write` mutex serializes them.
+  - **Same-project session-id uniqueness:** attach in project A; attempt to attach the same session_id again in A → `SessionAlreadyAttached`.
+  - Name-collision: attach-then-attach-with-same-name → name error.
+- **Attach-time hydration test moved to M2.6** — the "prior history appears on attach" behavior requires `load_transcript`, which lands in M2.6. M2.5's attach test asserts only "agent registered + can dispatch new turns"; M2.6 adds the hydration-on-attach verification.
+
+### Docs to update
+
+- `README.md` "Try it out" — extend M1.5's flow: create a Codex agent + a Claude agent in the same project; send messages; see the unified transcript.
+- `AGENTS.md` — add the project-level state model (transcripts + runtimes maps, both keyed by `agent_id`, with separate reducers but a shared per-agent listener); subscription lifecycle (creation on project open/create, dynamic-add on `create_agent` success, **listeners persist for ALL loaded projects for the lifetime of the app session — `set_active_project` is display-only**); per-harness banner UX. Document `attach_agent` as a peer of `create_agent`. Add the unified-transcript render-time merge convention. **Add the load-bearing v1 invariant: subscription auth only (no API-key flows in v1).**
+
+### Verification
+
+#### Agent-runnable
+
+1. **`make test`** → exits 0; output includes unified-view rendering tests + runtime reducer + subscription persistence + dynamic-add + `attach_agent` validation tests.
+2. **`make check`** → exits 0.
+
+#### Human-required
+
+1. **`make dev`** → app opens. Per-harness banner shows for any missing/unauthenticated harness.
+2. **Create both agents** — open a project; create one Claude Code agent and one Codex agent. Both appear in the overview sidebar with harness badges.
+3. **Send to both, see unified transcript** — send "What's 2+2?" to the Claude agent; wait for completion. Send "reply with ack" to the Codex agent. The unified transcript shows BOTH agents' turns in chronological order, each with its name + harness badge. Different streaming granularity is visible (Claude streams; Codex emits whole messages).
+4. **Interleave turns** — send another message to the Claude agent; both Claude turns appear in chronological order alongside the Codex turn. No "switching" needed; nothing is hidden.
+5. **Sidebar updates** — both agents' status, last-turn cost (Claude $) / rate-limit (Codex %), and context utilization populate.
+6. **Project swap preserves background activity** — open two projects A and B; dispatch in A; mid-stream, switch active project to B by invoking the Tauri command directly from devtools (the project switcher UI lands in M4 — for M2 the test path is `await window.__TAURI__.core.invoke('set_active_project', { projectId: '<B-id>' })`). Switch back to A the same way → transcript is fully updated with all events that arrived while away.
+7. **Concurrent two-agent in-flight** — dispatch to agent A (e.g., a Claude agent — long enough prompt to stream for several seconds). While A is mid-stream, switch the recipient picker to agent B and dispatch a turn there. Both turns visibly stream simultaneously in the unified view, each attributed to its agent, no cross-talk. This codifies that M2 ships concurrent multi-agent dispatch (not deferred to M4).
+8. **Dynamic agent add** — create a third agent; immediately send a message; events arrive cleanly.
+9. **Attach existing Claude session** — in a separate terminal: `claude -p --session-id $(uuidgen | tr A-Z a-z) --dangerously-skip-permissions 'remember the word PURPLE'` from the same working directory. Note the UUID. In Switchboard, "Attach existing session" → paste UUID → name `attached-claude` → submit. The agent appears in the sidebar; the transcript shows only the new agent's empty state for now (prior session history rehydrates in M2.6 — until then, the new agent has no visible history). Send "what word did I tell you to remember?" → reply references PURPLE (the harness session itself still has its prior context; we just don't render the prior turns in M2.5).
+10. **Attach existing Codex session** — similar flow with `codex exec ... 'remember the word ORANGE'`; capture `thread_id` from stream; attach. Agent appears in the sidebar. Send a follow-up referencing ORANGE → reply recalls it (harness session has context; UI doesn't yet render prior turns). Sidecar file at `<directory>/.switchboard/projects/<project-id>/sessions/<attached-codex-id>.jsonl` has one line with today's `session_partition_date`.
+11. **Attach with bad UUID** → inline error shows expected path; no agent registered.
+12. **Cross-project attach refused** — open two projects A and B in the same directory; attach session S to an agent in A. Switch to B (devtools `set_active_project`); attempt to attach S again → inline error "Session already attached to `<agent_name>` in project `<A>`."
+
+### Commit and stop for review
+
+Commit message: `M2.5: unified transcript view + per-agent sidebar + recipient-picker compose bar`. Wait for user review before starting M2.6.
+
+---
+
+## Sub-milestone M2.6 — Transcript persistence (load from harness session files)
+
+### Goal & outcome
+
+The unified project transcript rehydrates from each agent's harness session file on project open. After this sub-milestone:
+
+- On project open, Switchboard reads every agent's session file (Claude Code: `~/.claude/projects/<encoded-cwd>/<session_id>.jsonl`; Codex: `~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-*-<session_id>.jsonl`), parses it into `Turn[]`, and merges all agents' history into the unified view via the reducer.
+- Restarting the app and reopening the project shows the full prior conversation history; new turns continue cleanly.
+- Per-agent runtime state (`lastUsage`, `sessionTotalCost`, etc.) reflects loaded history.
+
+**Switchboard does NOT maintain its own persistent transcript store.** The harness session files are the source of truth. Switchboard reads them at render time (on project open).
+
+### Risks / open design decisions to resolve at M2.6-start
+
+**Transcript-scan complexity on long hydrated transcripts.** Three render-path scans share the same M2.6 concern:
+
+1. **Reducer** (`src/lib/state/reducers.ts`): `findTurn` (O(n)) + `map` (O(n)) per event. Streaming into a hydrated transcript: O(n) × hundreds of chunks = O(n²) for the turn.
+2. **Sidebar derivations** (`src/lib/components/Sidebar.svelte::sessionTotalCost` + `contextUtilization`): iterate the agent's full transcript on every render. Compounded across agents per render — O(agents × turns) per state change.
+3. **UnifiedTranscript autoscroll signal** (`src/lib/components/UnifiedTranscript.svelte::scrollSignal`): iterates all turns + all items per render. Bounded by Svelte's $derived caching but still O(agents × turns × items) on any reactive change.
+
+For typical live sessions (<100 turns, ~2 agents) all three are invisible. M2.6 hydration may produce **1000+ turn transcripts** on project open; the streaming UI would then noticeably stall.
+
+Mitigation if observed:
+- **Reducer**: refactor `TranscriptMap` from `Record<AgentId, Turn[]>` to `Record<AgentId, { order: TurnId[]; by_id: Map<TurnId, Turn> }>`. `findTurn` → O(1); `updateTurn` → O(1). Order-by-`started_at` for the unified-view merge happens at render time over the `order` arrays. Localized refactor (reducer + unified-view selector); the state shape change is M2.6-appropriate since hydration is what surfaces the load.
+- **Sidebar derivations**: precompute `Map<AgentId, { cost, util }>` via `$derived.by` at the Sidebar level (one pass per state change). Stronger: cache the running cost total in `AgentRuntime` and increment in `runtimeReducer::turn_end` — eliminates iteration entirely.
+- **Autoscroll signal**: same `runtimeReducer` cache pattern (increment a counter on tool completion) would let the signal be O(agents).
+
+Decision deferred until M2.6 has real hydrated transcripts to test against — Pass A/B don't introduce the latency, and an early refactor risks over-engineering for a profile we haven't taken.
+
+### Implementation outline
+
+0. **Module structure prep (Claude side only).** `crates/harness/src/claude_code.rs` is currently a single file; M2.6 needs it promoted to a module directory so `config.rs` and `skills.rs` can live alongside `mod.rs`. Concretely: rename `claude_code.rs` to `claude_code/mod.rs`; add `claude_code/config.rs` (MCP three-scope loader) and `claude_code/skills.rs` (directory scanner). Existing `pub` items stay accessible at the same `switchboard_harness::*` paths via re-exports in `mod.rs` — no API break for downstream consumers. **Codex side is additive only**: `crates/harness/src/codex/{config,skills}.rs` are pure additions to the existing module directory (`mod.rs`/`parser.rs`/`sidecar.rs` from M2.3 stay untouched).
+
+1. **Per-harness session-file parsers.** Free functions (not a trait — formats are too different to usefully abstract, and the mock adapter has no session file to mock):
+   ```rust
+   // crates/harness/src/session_file.rs (or similar)
+
+   /// Load Claude Code's session file for `session_id`.
+   /// `cwd` MUST be the user's bound working directory (the same directory the
+   /// subprocess was spawned in), NOT the .switchboard/projects/<id>/ metadata
+   /// directory — Claude Code's session-file path encoding depends on the user's
+   /// cwd, so passing the wrong one always misses the primary path.
+   pub fn load_claude_transcript(session_id: Uuid, cwd: &Path) -> Result<LoadedTranscript, LoadTranscriptError>;
+
+   /// Load Codex's session file for `session_id`.
+   /// `session_partition_date` MUST come from the session-link sidecar (see M2.3
+   /// step 3), NOT `Utc::today()` — Codex stores resumed sessions in the original
+   /// spawn-date directory, not the resume date.
+   /// `cwd` is the user's bound working directory — needed to load project-scoped
+   /// config files (`<cwd>/.codex/config.toml`, `<cwd>/.agents/skills/`) for
+   /// registry rehydration. Parallel to `load_claude_transcript`'s `cwd`.
+   pub fn load_codex_transcript(session_id: Uuid, session_partition_date: NaiveDate, cwd: &Path) -> Result<LoadedTranscript, LoadTranscriptError>;
+
+   pub struct LoadedTranscript {
+       /// Role-mixed turns in chronological order (user and agent).
+       pub turns: Vec<Turn>,
+       /// SessionMeta info reconstructed from the session file plus the harness's
+       /// config files. The session file carries `model` (Claude `assistant.message.model`
+       /// first occurrence; Codex first `turn_context.payload.model`) and `harness_version`
+       /// (Codex `session_meta.payload.cli_version`; not recoverable on disk for Claude).
+       /// The MCP-servers / skills registry is not snapshotted to either harness's session
+       /// file, so those fields come from the same harness config-loaders M2.4 uses for
+       /// Codex live dispatch — Claude reads its three MCP scopes (`~/.claude.json` user +
+       /// local nested under cwd, `<cwd>/.mcp.json` project) plus skills directories
+       /// (`~/.claude/skills/`, `<cwd>/.claude/skills/`); Codex reads `~/.codex/config.toml`
+       /// + `<cwd>/.codex/config.toml` for MCP and `~/.agents/skills/` + `<cwd>/.agents/skills/`
+       /// for skills. Config-loader failures emit empty lists + `tracing::warn!`, never an
+       /// error (this is display info, not load-bearing for dispatch). On hydrate, this
+       /// populates runtimes[agent_id].meta; live `SessionMeta` events on subsequent turns
+       /// overwrite with current data.
+       pub meta: Option<SessionMetaInfo>,
+       /// Most-recent rate_limits payload from the session file. Codex only (Claude Code's
+       /// rate-limit info lives in stream events, not the session file). Without this,
+       /// Codex agents' sidebar quota signal would be empty after restart until the next
+       /// turn completes.
+       pub last_rate_limit: Option<serde_json::Value>,
+       pub warnings: Vec<ParseWarning>,
+   }
+
+   pub struct ParseWarning {
+       pub line_number: usize,
+       pub reason: String,
+   }
+   ```
+
+   **Rust `Turn` enum** (the wire shape consumed by both live dispatch and hydration; matches M2.5's shipped `src/lib/state/types.ts` shape verbatim):
+   ```rust
+   #[derive(Debug, Clone, Serialize, Deserialize)]
+   #[serde(tag = "role", rename_all = "snake_case")]
+   pub enum Turn {
+       User {
+           turn_id: Uuid,
+           agent_id: Uuid,
+           started_at: DateTime<Utc>,
+           text: String,
+       },
+       Agent {
+           turn_id: Uuid,
+           agent_id: Uuid,
+           started_at: DateTime<Utc>,
+           ended_at: Option<DateTime<Utc>>,
+           status: TurnStatus,
+           items: Vec<TurnItem>,
+           usage: Option<TurnUsage>,
+       },
+   }
+
+   #[derive(Debug, Clone, Serialize, Deserialize)]
+   #[serde(tag = "item_kind", rename_all = "snake_case")]
+   pub enum TurnItem {
+       Text { kind: ContentKind, text: String },
+       Tool {
+           tool_use_id: String,
+           kind: ToolKind,
+           name: String,
+           input: serde_json::Value,
+           output: Option<String>,
+           is_error: Option<bool>,
+           started_at: DateTime<Utc>,
+           completed_at: Option<DateTime<Utc>>,
+       },
+   }
+
+   #[derive(Debug, Clone, Serialize, Deserialize)]
+   #[serde(rename_all = "snake_case")]
+   pub enum TurnStatus { Streaming, Complete, Failed }
+   ```
+
+   Snake_case throughout, matching M1's event-vocabulary convention. `items` is a single ordered stream (text chunks and tool calls interleaved by arrival), matching M2.5's TS `items: TurnItem[]` shape. Two parallel `chunks`+`tools` arrays would lose text↔tool ordering observable from the session file; single `items` preserves it through serde without any boundary translation.
+
+   The parser walks records in chronological order and appends to `items` as it goes. Tool calls open on the function_call / tool_use record (output/completed_at undefined) and fill in when paired with their completion record.
+
+   Each parser projects its harness's session-file JSONL into the `Turn` shape above. Parsing logic per harness:
+
+   - **Claude Code:** session-file format is JSONL but with a **different event vocabulary from the live stream** — record types include `assistant`, `user`, `system` (subtypes `local_command` / `api_error` / `away_summary` / `compact_boundary` / `turn_duration`), `agent-name`, `ai-title`, `attachment`, `file-history-snapshot`, `last-prompt`, `permission-mode`, `queue-operation`. **No `system/init` or `result` record on disk** — those are stream-only (verified post-M2.3, see `claude-code-cli-observed.md` §"Findings during M2.4-prep"). Cannot reuse the stream parser directly. `Turn::User` derives from `user` records; `Turn::Agent` accumulates from `assistant` records (content blocks for text + tool_use are appended to `items` in arrival order; terminal indicated by the next `user` record's appearance or session end). **Tool-call MCP detection on disk reuses M1.3's `classify_claude_tool_kind` (`crates/harness/src/parser.rs:348`) verbatim** — the `tool_use.name` field in `assistant.message.content` blocks has the same `mcp__<server>__<tool>` shape on disk as it does on the stream, so the prefix-based MCP vs Builtin discriminator transfers without modification. `usage` is best-effort from the `assistant.message.usage` payload Anthropic includes per-turn; `context_window` is **not recoverable from disk** (lives in stream-only `result.modelUsage`) — emit `usage.context_window: None` for rehydrated turns. `meta`: source `model` from the first `assistant.message.model`; `harness_version` is not on disk (no Claude analog of `cli_version` in any record) — emit `String::new()` (matches the empty-string-means-absent convention `parse_system_event` already uses for the same field's live-path fallback at `crates/harness/src/parser.rs`); `mcp_servers` from Claude's three-scope merge (`~/.claude.json` top-level `mcpServers` for user scope + nested project-path entry for local scope, `<cwd>/.mcp.json` for project scope; project-scope wins, local next, user last per Claude's documented precedence) via the shared config-loader in `crates/harness/src/claude_code/config.rs`; `skills` from `~/.claude/skills/` + `<cwd>/.claude/skills/` directory scan (subdirs containing a `SKILL.md`) via `crates/harness/src/claude_code/skills.rs`; `tools` stays `vec![]` for rehydration (the stream-side `system/init.tools` listing is the only populator; not on disk). **Partial-parse policy for both config and skills loaders** (same as M2.4 step 4): drop broken entries, keep valid ones, one `tracing::warn!` per dropped entry; total-parse failure → empty list + one warning; never error-propagate.
+
+     **Claude MCP three-scope test matrix** (six cases, must all pass before the loader is considered correct):
+     1. Server in user scope only → present in result.
+     2. Server in local scope only → present.
+     3. Server in project scope only → present.
+     4. Same name in all three scopes → project wins (assert value identity, not just name).
+     5. Same name in user + local only → local wins.
+     6. Malformed JSON in one scope → that scope contributes nothing, warning emitted, other scopes still load.
+     Missing-file-per-scope is the default state and contributes empty without a warning.
+
+   - **Codex:** session-file format differs from the stream. Line 1 is `session_meta`, then per-turn the records flow `event_msg/task_started` → `turn_context` → `response_item/message` (multiple) interleaved with `event_msg/user_message` / `event_msg/agent_message` / `event_msg/token_count` → `response_item/function_call` + `response_item/function_call_output` for tool calls (+ `event_msg/mcp_tool_call_end` for MCP calls) → `event_msg/task_complete`. **Per-turn Turn construction:**
+     - `Turn::User` derives from `event_msg/user_message` (the prompt the user submitted that turn).
+     - `Turn::Agent` opens on `event_msg/task_started`, closes on `event_msg/task_complete`. Text records (`event_msg/agent_message`) and tool records (`response_item/function_call` + paired `function_call_output`) are appended to `items` in chronological order, preserving interleaving. `usage` from the same turn's `event_msg/token_count` (filter on `info` non-null variant for token totals; the `rate_limits` variant is unrelated to per-turn token counts). `context_window` from `event_msg/task_started.payload.model_context_window`.
+     - **Tool calls** come from `response_item/function_call` paired with `response_item/function_call_output` by `call_id`. **MCP calls** are distinguished by the presence of a `namespace: "mcp__<server>__"` field on the function_call (reconstruct the `<server>.<tool>` form M2.3 emits stream-side: `name = format!("{server}.{tool}")` where `server = namespace.trim_start_matches("mcp__").trim_end_matches("__")` and `tool = function_call.name`). The companion `event_msg/mcp_tool_call_end` carries explicit `server`/`tool` fields and `duration`; use it to cross-check the namespace decoding and source `is_error` from `result.Ok.isError` or `result.Err` discriminant. Non-MCP function_calls (e.g., `exec_command`) get `kind: ToolKind::Builtin` and `name = function_call.name` verbatim.
+     - `meta`: source `model` from the first `turn_context.payload.model`; `harness_version` from `session_meta.payload.cli_version`; `mcp_servers` and `skills` from the same config-loaders M2.4 uses for live dispatch (`crates/harness/src/codex/{config,skills}.rs` — Codex MCP from `~/.codex/config.toml` + `<cwd>/.codex/config.toml` merge, skills from `~/.agents/skills/` + `<cwd>/.agents/skills/` directory scan; same partial-parse policy as M2.4 step 4); `tools` stays `vec![]`.
+     - `last_rate_limit`: most-recent `event_msg/token_count` payload where `rate_limits` is non-null (per M2.4's filtering rule).
+
+2. **`Turn.status` parser-level contract.** The parser surfaces `Turn.status: "streaming" | "complete" | "failed"` distinguishing observed-terminal vs not. **EOF without a terminal marker** is harness-specific:
+   - **Codex**: defaults to `Turn.status = "failed"`. Codex emits an explicit `event_msg/task_complete` per turn, so a missing one indicates genuine truncation.
+   - **Claude Code**: defaults to `Turn.status = "complete"`. Claude has no per-turn terminal marker on disk — the only signal a turn finished is the next user prompt arriving — so "truncated mid-turn" and "session ended cleanly on the last turn" are indistinguishable from disk state alone. Conservatively defaulting to `complete` matches the dominant case (sessions ended cleanly).
+
+3. **Parse-recovery semantics** (tightened per design review):
+   - **Localized malformed content** (single bad line that doesn't break adjacent turn boundaries) → skip with warning; the parser records the warning in `LoadedTranscript.warnings`.
+   - **Reconstruction-breaking corruption** (terminal marker destroyed, ordering broken, can't determine turn boundaries) → the affected turn is emitted with `Turn.status = "failed"` and reason "transcript reconstruction failed for this turn"; surrounding well-formed turns still emit normally; a warning records the issue.
+   - **In all cases**, the parser returns `Ok(LoadedTranscript { ... })` rather than `Err(...)` on partial corruption. The harness owns the file; refusing to render history because of one bad line the harness wrote is hostile UX. This DIFFERS from M1's `CorruptJsonl` fail-loud policy (which applies to our OWN JSONL files: `projects.jsonl`, `registry.jsonl` — those we wrote and corruption means our writer broke).
+   - **Missing file** → parser returns `Ok(LoadedTranscript { turns: vec![], warnings: vec![] })` (treat as fresh agent).
+   - **`Err(LoadTranscriptError)`** is reserved for unrecoverable conditions (path resolution failure, I/O error reading the file when it exists).
+
+4. **Claude path resolution** — primary + secondary fallback:
+   - **Primary:** `~/.claude/projects/<encoded-cwd>/<session_id>.jsonl` where `encoded-cwd` is the M1.5-verified path encoding.
+   - **Secondary (resilience fallback):** if the primary path doesn't exist, scan `~/.claude/projects/*/` for any `<session_id>.jsonl`. Session IDs are UUID v7 — globally unique — so a directory scan is correct. Documented as secondary; primary remains the contract.
+
+5. **Codex path resolution** — unchanged from M2.3: read from the session-link sidecar's `session_partition_date` + glob `~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-*-<session_id>.jsonl`.
+
+   **Stale sidecar handling.** If the sidecar exists but the session file at the recorded path doesn't (user deleted it, external rotation, etc.), `load_codex_transcript` returns `Ok(LoadedTranscript { turns: vec![], warnings: vec![ParseWarning { reason: "session file no longer at recorded path", .. }] })`. This is the same outcome shape as "agent created but never dispatched" — empty history plus a non-blocking warning. **Not** a `hydration_status: "failed"` result, because the lookup mechanism worked correctly (we knew where to look); the file just isn't there.
+
+   **No-sidecar handling.** If the Codex agent exists in the registry but has no sidecar (created, never dispatched), `load_codex_transcript` returns `Ok(LoadedTranscript { turns: vec![], warnings: vec![] })` with no warning. Distinguishable from stale-sidecar via the absent warning.
+
+   **`hydration_status: "failed"` scope.** Reserved for **lookup-mechanism breakage** — I/O error reading a file that exists, path-resolution panic, registry lookup failure. Per-line parse warnings (malformed JSON inside a file we found) stay inside `hydration_status: "complete"` with `LoadedTranscript.warnings` populated. The frontend's "failed" banner is for "I don't know where to look or can't read it"; it is not for "I read the file but some lines were garbled."
+
+6. **`load_transcript` Tauri command:**
+   ```rust
+   #[tauri::command]
+   async fn load_transcript(state: State<'_, AppState>, agent_id: String) -> Result<LoadedTranscript, AppError>;
+   ```
+   Looks up the agent's `AgentRecord` from the registry, dispatches to the appropriate parser based on `harness` field, returns the result.
+
+7. **Frontend hydration via the reducer.** New reducer input variant:
+   ```typescript
+   type ReducerInput =
+     | NormalizedEvent
+     | { type: "heartbeat_timeout"; turn_id: string }
+     | {
+         type: "hydrate";
+         agent_id: string;
+         turns: Turn[];                          // role-mixed (User + Agent)
+         meta?: SessionMetaInfo;                 // → runtimes[agent_id].meta
+         last_rate_limit?: unknown;              // → runtimes[agent_id].last_rate_limit (Codex)
+       };
+   ```
+   `hydrate` semantics:
+   - **Per-agent scope** (not globally destructive). Inserts loaded turns into `transcripts[agent_id]` and updates `runtimes[agent_id]` metadata fields.
+   - **In-flight turns take precedence.** If a turn with the same `turn_id` already exists in `transcripts[agent_id]`, it is NOT overwritten — the live in-flight state stays authoritative.
+   - **Hydration fills missing history.** New turns from `hydrate` are added; existing turns (including any in-flight that arrived during the disk read) are preserved.
+   - **Metadata hydration is also non-destructive:** if `runtimes[agent_id].meta` is already populated from a live `SessionMeta` event, the hydrated value is dropped (live > disk for active state). `last_rate_limit` follows the same rule.
+
+8. **Hydration timing.** Hydration runs in three cases:
+   - **Project open** (`open_project` / `create_project` success): iterate `list_agents()` and call `load_transcript(agent_id)` for each. Run **concurrently** via `Promise.all` / `futures::future::join_all` — disk reads are independent and serializing them multiplies project-open latency by N agents. Per-agent failures don't block other agents (each `Result` handled independently).
+   - **Attach-existing-session** (`attach_agent` success): immediately call `load_transcript(new_agent_id)` and feed the result through the `hydrate` reducer input BEFORE returning the AgentRecord to the UI. Without this, the attach use case ("bring an external `claude -p` session under orchestration and continue the conversation") loses its prior context until the next project reopen — which is exactly the use case the feature exists to support.
+   - **Dynamic agent add (`create_agent`):** no hydration needed (the agent is brand-new; there's no session file yet). The agent's empty transcript state is correct as-is.
+
+   The unified transcript view shows a skeleton / "loading transcript history…" placeholder per agent until its hydration resolves.
+
+   **`hydration_status` transitions** drive the M2.5 compose-bar gate:
+   - Initial state when an agent's record is added to `AppState`: `"pending"`.
+   - When `load_transcript(agent_id)` is invoked: `"loading"`. Send is disabled for this agent.
+   - On successful `LoadedTranscript` returned + applied via `hydrate` input: `"complete"`. Send re-enabled.
+   - On `LoadTranscriptError` (unrecoverable I/O / path resolution failure): `"failed"`. Send is re-enabled with degraded-mode UX (banner shown); the agent's transcript shows only live events for the rest of the session.
+
+   Per-agent failure does not block other agents' hydration. The `Promise.all` / `join_all` flow surfaces per-agent results independently.
+
+9. **Error handling.** `load_transcript` errors don't block the agent — the agent's transcript shows empty (or whatever live events have arrived) plus a non-blocking banner: "Transcript history could not be loaded for `<agent_name>`." Parse warnings (partial corruption) accumulate into a transcript-level banner: "N lines couldn't be parsed in this transcript."
+
+10. **Runtime state — explicit boundary between transcript-derived and metadata-derived values.** Per M2.5 step 1, the two categories have different storage and update paths:
+
+    **Metadata-derived (stored in `runtimes[agent_id]`):**
+    - `meta` (model, tools, mcp_servers, skills, harness_version) — populated by live `SessionMeta` events (Claude from `system/init` stream event; Codex from M2.4's first-turn enrichment that combines session-file records + config-file loading) OR by `hydrate.meta` from the M2.6 parsers that combine session-file records + the same config-loaders M2.4 uses. The two paths converge on the same registry content for each harness; precedence is live > hydrate when both arrive.
+    - `last_rate_limit` (Codex) — populated by live `RateLimitEvent` OR by `hydrate.last_rate_limit` from the most-recent `token_count.rate_limits` in the session file.
+
+    Without hydration of these fields, post-restart sidebar would show empty model / quota until the next live event fires — Codex agents could go an entire session showing empty quota state if they don't dispatch. Hence the parser surfaces them as separate fields on `LoadedTranscript`.
+
+    **Transcript-derived (NOT stored; computed at render time from `transcripts[agent_id]`):**
+    - `last_usage`:
+      ```typescript
+      transcripts[id].filter(t => t.role === "agent").at(-1)?.usage
+      ```
+    - `session_total_cost` (Claude only — Codex turns have `usage.total_cost_usd: null`):
+      ```typescript
+      transcripts[id]
+        .filter(t => t.role === "agent")
+        .reduce((sum, t) => sum + (t.usage?.total_cost_usd ?? 0), 0)
+      ```
+      The `?? 0` is load-bearing — without it, the sum would be `NaN` for any project containing Codex turns. Codify in tests.
+
+    Why no separate runtime-reducer-on-hydrate for these: there would be two sources for the same value (the turn's `usage` field AND a derived runtime field), creating drift risk. Render-time derivation is cheap (filter + reduce over the per-agent turn list) and impossible to drift.
+
+11. **No on-`TurnEnd` disk re-read** for fidelity alignment. The race risk (harness writes async; disk may lag) outweighs the speculative fidelity benefit for M2's text + simple-tool turns. **Hedge:** parser tests compare live-stream vs disk projections for the same turn (using captured fixtures from M2.1); if M2.6 implementation surfaces user-visible divergence, raise as a follow-up sub-milestone rather than silently adding the disk re-read.
+
+12. **Live ↔ disk asymmetries (pre-M4-flock).** Disk-as-source-of-truth introduces a small set of cases where the live in-memory model and the on-disk model can drift. These are explicit, documented behaviors in M2 — not bugs to fix here. M4's per-project `flock` forecloses some of them. Until then:
+
+    - **Heartbeat-timeout resurrection.** A frontend-only heartbeat-failed turn comes back as `complete` after reload (the harness actually finished the turn; the heartbeat was a defensive UI fallback against a contract violation that didn't actually happen). The disk version is correct.
+    - **Truncated mid-turn disk content is classified per step 2's harness-specific rule** (Codex: `failed`; Claude: `complete` — Claude has no on-disk terminal marker to distinguish "truncated" from "session ended cleanly"). Pre-flock, the Codex case could be (a) Switchboard crashed mid-turn, (b) another Switchboard process actively writing to the same session file, or (c) an external `codex exec resume` running in a separate terminal. We can't disambiguate from disk state alone. M4's `flock` (per-project, plus cross-project session-id uniqueness from M2.5 step 7) forecloses (a) and (b) for Switchboard-managed sessions; (c) remains a user-knowing-risk per system-design §7 "out-of-band harness use."
+    - **`session_total_cost` derivation across attaches.** When a session is attached after external turns, hydration loads those external turns and their `usage.total_cost_usd`. The cost aggregate reflects the *entire* session including external pre-attach work, not just turns dispatched by Switchboard. This is the right semantic for a per-agent cost view (the user wants the agent's total spend), but document it so the number isn't surprising.
+
+### Testing strategy
+
+**Parser-level tests** (one per harness, for each scenario):
+- Text-only turn → `Turn::User` (the prompt) followed by `Turn::Agent` (the response) in chronological order; agent turn has one text chunk + populated `usage`.
+- Tool-use turn → `Turn::User` + `Turn::Agent` with chunks + nested tool calls.
+- Multi-turn file → alternating `Turn::User` / `Turn::Agent` entries in chronological order; multi-message exchanges produce multiple pairs.
+- Truncated mid-turn (no terminal event) → final `Turn::Agent` has `status: "failed"`.
+- Empty file / missing file → `Ok(LoadedTranscript { turns: vec![], meta: None, last_rate_limit: None, warnings: vec![] })`.
+- Single malformed line → skipped; warning recorded; surrounding Turns intact.
+- Reconstruction-breaking corruption (terminal marker destroyed) → affected Turn `status: "failed"`; surrounding Turns intact; warning recorded.
+- **`meta` extraction:** parsed `LoadedTranscript.meta.model` matches the first `assistant.message.model` (Claude) / first `turn_context.payload.model` (Codex). `harness_version` matches `session_meta.payload.cli_version` for Codex; is `None` for Claude (not on disk). `mcp_servers` matches what the shared config-loader returns for each harness (Claude three-scope merge; Codex two-scope merge); `skills` matches what the directory scanner returns. `tools` stays empty for both. Loader failures emit empty + warning; tests cover both the happy path (real config files in a fixture cwd) and the missing-file path (no config files exist; loader returns empty cleanly).
+- **`last_rate_limit` extraction (Codex only):** session file with multiple `token_count` events → `LoadedTranscript.last_rate_limit` matches the *most recent* `rate_limits` payload, not the first.
+- **`last_rate_limit` absence (Claude):** Claude session file → `LoadedTranscript.last_rate_limit = None`.
+
+**Path resolution tests** (Claude):
+- Primary path exists → loads from primary.
+- Primary path missing, session file exists in a different encoded directory → fallback scan succeeds.
+- Primary missing, no file anywhere → `Ok(LoadedTranscript { turns: vec![], warnings: vec![] })`.
+
+**Path resolution tests** (Codex):
+- Sidecar present + session file in the date directory → loads correctly.
+- Sidecar `session_partition_date` differs from today; file is in the original-date directory → loads correctly (date-partition gotcha codified).
+
+**Reducer hydration tests:**
+- `hydrate` on empty transcript → loaded turns appear; `runtimes[id].meta` and `runtimes[id].last_rate_limit` populate from the hydrate payload.
+- `hydrate` when a turn with the same `turn_id` already exists → existing turn preserved (live takes precedence).
+- `hydrate` is per-agent — hydrating agent A doesn't touch agent B's transcripts or runtime.
+- `hydrate` is non-destructive for metadata — if `runtimes[id].meta` is already populated from a live SessionMeta event, the hydrated `meta` is dropped (live > disk).
+- **Live > hydrate precedence test:** hydrate sets `runtimes[id].meta.model = "model-A"`; subsequent live `SessionMeta` with `model: "model-B"` overwrites to "model-B"; further hydrate calls do NOT flip it back. Pins the precedence direction against regression (the "live > disk" rule applies once a live event has arrived, not just at the moment of first hydration).
+- **User turn rehydrates:** load a session file containing user→assistant pairs; the resulting transcript shows `Turn::User` entries with the original prompt text, ordered immediately before their corresponding `Turn::Agent`.
+
+**Transcript-derived render tests:**
+- **Null-safe `session_total_cost`:** transcript with two Claude `Turn::Agent`s (`usage.total_cost_usd: 0.01` and `0.02`) and one Codex `Turn::Agent` (`usage.total_cost_usd: null`) → derived `session_total_cost` = `0.03` (not `NaN`). Regression guard for the `?? 0` requirement.
+- `last_usage` filters out user turns (computed from `transcripts[id].filter(t => t.role === "agent").at(-1)?.usage`).
+
+**Parallel hydration test:** `open_project` with 5 agents → all 5 `load_transcript` calls run concurrently (assert via timing or instrumentation that total time < 5 × per-call time). A failure on one agent does not block the others.
+
+**Attach-time hydration test** (paired with M2.5 attach flow): create a project with one agent A; externally produce a Codex session with a prior turn; call `attach_agent` with that session_id → before the Tauri reply returns to the UI, the new agent's transcript already contains the prior turns. UI doesn't need to wait for project-reopen.
+
+**M1 carry-over regression test:** load a real M1-created Claude agent's session file via `load_transcript` → turns hydrate; `Turn::User` and `Turn::Agent` entries match what M1 lived through.
+
+**End-to-end test (live, env-var-gated):**
+- Send a turn to a Claude agent + a Codex agent in the same project.
+- "Restart" by tearing down and rebuilding `AppState` (or just call `load_transcript` for each).
+- Assert the loaded `Turn[]` matches what flowed through live events — both `Turn::User` and `Turn::Agent` entries, with `Turn::User.text` matching the original prompt.
+- Assert `last_usage` and `session_total_cost` (Claude) derive correctly from the loaded turns.
+- Assert `runtimes[id].meta` and (Codex) `runtimes[id].last_rate_limit` populate from hydration.
+
+### Docs to update
+
+- `AGENTS.md` — add the transcript-persistence model: source-of-truth = harness session files; load on project open; per-harness parsers as free functions; `hydrate` reducer input is per-agent and non-destructive; parse-recovery policy (skip-with-warning for harness files; fail-loud only for our own JSONL); Claude primary-then-fallback path resolution; heartbeat resurrection is documented behavior.
+- `docs/research/codex-cli-observed.md` — if implementation reveals that Codex session-file event vocabulary differs from what M2.1 captured (especially around turn boundaries), append to findings.
+
+### Verification
+
+#### Agent-runnable
+
+1. **`make test`** → exits 0; new parser tests + reducer hydration tests + path resolution tests + M1 carry-over regression all pass.
+2. **`make test-live`** → live end-to-end test passes (turn live, then load from disk, then assert match).
+3. **Hydration UX test (frontend)** — mounting the unified view kicks off `load_transcript` for every loaded agent; loading skeletons appear; loaded turns render; runtime sidebar populates from derived data.
+4. **Attach-time hydration test** (moved from M2.5) — externally produce a Claude or Codex session with a prior turn (e.g., `claude -p --session-id <uuid> 'remember PURPLE'` or `codex exec ... 'remember ORANGE'`). In Switchboard, attach that session via the M2.5 attach UI. Before any new dispatch, the unified transcript shows the prior turns rehydrated; sidebar shows derived `last_usage` / `session_total_cost` (Claude) / `last_rate_limit` (Codex).
+5. **`make check`** → exits 0.
+
+#### Human-required
+
+1. **`make dev`** → app opens. Create a Claude agent + a Codex agent. Send several messages. **Quit the app entirely (cmd-Q).** Reopen, open the same project. Both agents' prior turns are present in the unified transcript, attributed correctly, with cost / context utilization populated in the sidebar. Send a new message to either agent — new turn appends cleanly to the existing history.
+2. **Corrupted line tolerance** — manually append a malformed line (e.g., `{"oops":}`) to a harness session file. Reopen the project. Transcript still loads for the surrounding turns; a banner shows "1 line couldn't be parsed in `<agent_name>`'s transcript." The agent dispatches new turns normally.
+3. **Mid-turn restart** — start a turn, force-quit Switchboard mid-stream. Reopen. The interrupted turn shows as `failed` (no terminal event observed); user can dispatch a new turn normally.
+
+### Commit and stop for review
+
+Commit message: `M2.6: transcript persistence via harness session files`. Wait for user review before starting M2.7.
+
+---
+
+## Sub-milestone M2.7 — Live-harness test suite scaffolding
+
+### Goal & outcome
+
+A real live-harness test suite (per the AGENTS.md taxonomy: integration tests that spawn the real `claude` / `codex` CLI, `#[ignore]`-gated, run via `make test-live`) exercising both adapters against installed CLIs. After this sub-milestone:
+
+- Tests live as flat files directly under `crates/harness/tests/` (Cargo's canonical integration-test layout — each `.rs` file directly under `tests/` becomes its own test binary).
+- Each test is gated behind `#[ignore]` (matching the M1 convention in `crates/harness/tests/live.rs`) so it doesn't run in default `cargo test` passes. Run via `make test-live`. The `SWITCHBOARD_LIVE_HARNESS=1` env-var gate referenced in earlier drafts is NOT introduced — `#[ignore]` + `make test-live` is sufficient and already wired up in M1.
+- Coverage: at least one live test per adapter-emitted event type that's reliably triggerable against a real harness (`ContentChunk`, `ToolStarted`, `ToolCompleted`, `TurnEnd-Completed`, `TurnEnd-Failed-HarnessError` via invalid-model-name, `RateLimitEvent`, `SessionMeta`) plus a single dispatcher-smoke test for `TurnStart`. **`TurnEnd-Failed-AdapterFailure`** and **`TurnEnd-Failed-AuthFailure`** stay in fixture-driven tests (M2.2/M2.3) — hard to trigger reliably against a real subprocess. Plus a `load_transcript` end-to-end test per harness (M2.6 integration).
+- Every test prompt is constrained to a small expected response per system-design §9 (cheapest model, "reply with ack").
+
+This sub-milestone does NOT add CI for the live tests — they're developer-local per the "Deferred from M2" section.
+
+### Implementation outline
+
+1. **Test layout.** Flat files directly under `crates/harness/tests/`. Consolidate event-vocabulary coverage into a small set of files — exhaustive variation lives in M2.2/M2.3 fixture-driven integration tests; live tests cover the end-to-end real-CLI path:
+   - `tests/claude_happy_path.rs` / `tests/codex_happy_path.rs` — one tool-using turn per harness; asserts the full happy-path event vocabulary (`TurnStart` via dispatcher + `ContentChunk` + `ToolStarted` + `ToolCompleted` + `TurnEnd { outcome: Completed, usage: Some(...) }` + `SessionMeta` on first turn + `RateLimitEvent`).
+   - `tests/claude_error.rs` / `tests/codex_error.rs` — invalid model → `TurnEnd { outcome: Failed { kind: HarnessError } }`.
+   - `tests/claude_transcript_load.rs` / `tests/codex_transcript_load.rs` — M2.6 round-trip (live turn → load from disk → assert match).
+   - `tests/dispatcher_smoke.rs` — single TurnStart-emission test (Claude is fine; adapter-agnostic at the dispatcher layer).
+   - Shared setup in `tests/common/mod.rs`.
+   - **Do NOT use a nested `tests/integration/` subdirectory** — Cargo silently skips those.
+
+   Total: ~7 files. Rationale for consolidation: one happy-path tool-using turn naturally exercises most of the vocabulary; spreading these across 12 separate files multiplied live API calls and rate-limit pressure without adding regression coverage (fixture-driven integration tests in M2.2/M2.3 cover each event type's variations exhaustively without burning subscription quota).
+
+2. **Test helper module** (`tests/common/mod.rs`):
+   - `claude_adapter()` / `codex_adapter()` — constructs adapter with default test config (cheapest model).
+   - `tempdir_project()` — creates a tempdir-scoped Project.
+   - Utility to drain an `EventStream` into `Vec<AdapterEvent>` with a timeout.
+
+3. **Test files** — each gated by env var; constructs adapter; sends a small prompt; drains stream; asserts expected event appears.
+   - Specific event assertions per file name.
+   - `load_transcript` tests: send a turn live, then call `load_transcript`, assert the loaded Turn matches.
+   - **Fixture-assertion discipline:** assert event types and structural shapes; no per-run UUIDs / timestamps / specific dollar amounts.
+
+4. **Response-size discipline.** Every test uses the cheapest available model and "reply with ack"-shaped prompts. Per-test response size, not test count, is the constraint.
+
+5. **Documentation** — `crates/harness/tests/README.md` explaining how to run locally:
+   ```
+   # One-time setup
+   claude login   # subscription auth
+   codex login    # subscription auth
+
+   # Run live-harness suite
+   make test-live
+   ```
+   Note that subscription tier covers it (no per-call dollar cost).
+
+### Testing strategy
+
+This sub-milestone IS the testing strategy. Validation:
+- Manually break Claude Code adapter (e.g., make it ignore `system/init`) → SessionMeta live test fails. Restore.
+- Manually break Codex session-file enrichment → RateLimitEvent live test fails. Restore.
+- Manually break the Codex transcript parser → `codex_transcript_load.rs` fails. Restore.
+
+### Docs to update
+
+- New `crates/harness/tests/README.md` per step 5.
+- Top-level `README.md` "Local development" — point at the new live-test README.
+- `AGENTS.md` already documents the live-testing policy and the test-type vocabulary; M2.7 introduces the suite that the policy describes. No `AGENTS.md` edits needed unless a new cross-cutting convention surfaces (e.g., the `tests/common/mod.rs` helper module pattern, if we want to call it out).
+
+### Verification
+
+#### Agent-runnable
+
+1. **`make test`** (no env var) → all unit tests and fixture-driven integration tests pass; live tests reported as ignored.
+2. **`make test-live`** → all live tests pass. Should complete in 1–3 minutes.
+3. **Regression-catches-break validation** — intentionally break one adapter behavior; the relevant live test fails. Restore.
+4. **Test layout** — `ls crates/harness/tests/` → flat `.rs` files; NO `tests/integration/` subdirectory (Cargo silently skips nested subdirectories).
+5. **`make check`** → exits 0 (no env var; live suite not run).
+
+#### Human-required
+
+None — the live suite is fully agent-runnable.
+
+### Commit and stop for review
+
+Commit message: `M2.7: live-harness test suite scaffolding`. M2.7 is the final code-shipping sub-milestone in M2; after user review, open the M2 PR per the "After M2.7 — open the M2 PR" section below.
+
+---
+
+## Deferred from M2 — Integration CI workflow
+
+**Originally planned as M2.8; dropped during M2.2 implementation review.**
+
+The original M2.8 was a GitHub Actions workflow that would materialize Claude Code and Codex subscription auth files from CI secrets and run `make test-live` on every push and PR, with a secret-availability gate for fork PRs. The plan body for that sub-milestone is preserved in git history (last live version: commit prior to M2.7 work).
+
+**Why deferred:**
+
+- **Token rotation.** Subscription auth tokens refresh on use. A stored auth-file secret in GH becomes stale the first time the developer who created it next runs `claude` / `codex` locally; CI then fails with auth errors unrelated to code changes. There is no mechanism for a CI runner to write a refreshed token back to GH secrets.
+- **Device binding.** Some auth flows pin a token to the device that generated it; replaying the auth file on a fresh GHA runner can be rejected as a new-device sign-in, triggering re-auth that CI cannot complete.
+- **Blast radius.** A subscription auth file in a GH secret is functionally a credential to the real user account. Different threat model from a scoped API key — extraction (compromised workflow, log leak) grants arbitrary turn dispatch against the user's subscription.
+- **Operational tax.** Even when it works, a human must periodically re-login locally and update the GH secret. That friction never goes away.
+
+**Replacement model: developer-local live tests** (`make test-live`). Per the `AGENTS.md` Live testing section: run before merging adapter-touching PRs, after upstream CLI releases, periodically as sanity checks. Upstream regressions are detected reactively rather than proactively via scheduled CI — accepted trade-off.
+
+**Revisit when:** a clean auth model emerges (e.g., the harnesses ship machine-account auth tokens that don't rotate / don't device-bind, or Switchboard's threat model changes such that subscription credentials in CI secrets are tolerable). If revisited, the original M2.8 plan body is a starting point — auth-materialization + secret-availability gate were the right shape; only the auth model was wrong.
+
+## After M2.7 — open the M2 PR
+
+Once all seven sub-milestones (`M2.1` through `M2.7`) are committed and the local checkout is green:
+
+1. Push the `m2` branch.
+2. Open a PR titled `M2: Both harnesses through the same abstraction`.
+3. Confirm hygiene CI runs green on the PR.
+
+Run the full M2 acceptance flow on a fresh checkout (clone, install both harnesses, follow the README):
+
+1. Create a project.
+2. Create a Claude Code agent named `assistant` and a Codex agent named `codex-helper`.
+3. Confirm the hyphen↔underscore collision check works: try also creating `codex_helper` → rejected.
+4. Send a message to each agent via the recipient picker; both turns appear in the unified transcript in chronological order.
+5. Confirm per-agent overview sidebar populates for both: status, cost (Claude $) / quota (Codex %), context utilization.
+6. Restart the app; reopen the project; transcript history rehydrates from harness session files. New turns continue cleanly.
+7. Try with only API-key auth (no `claude login` / `codex login`) → clear error.
+8. Run `make test-live` locally — full live-harness suite passes.
+9. Confirm hygiene CI runs green on the M2 PR.
+
+---
+
+## Notes for the implementing agent
+
+- **Type hints / signatures.** All function signatures (Rust + TypeScript) fully typed; TypeScript stays `strict: true`; don't reach for `any`.
+- **No imports inside functions** unless absolutely necessary.
+- **No commits without explicit user instruction.** Stage and prepare; the user commits manually after reviewing each sub-milestone.
+- **No comments unless the why is non-obvious.** Code structure should be self-explanatory.
+- **Stop after each sub-milestone.** Summarize: (1) what landed, (2) what tests pass, (3) any open questions or surprises. Wait for the user to commit + signal before continuing.
+- **If a sub-milestone surfaces a question this plan didn't anticipate** — pause and ask. Don't pattern-match to "the spec probably says..." — check it.
+- **M1 backend abstractions are stable except where M2 explicitly extends them.** The extensions M2 makes are: (a) four new `AdapterEvent` / `NormalizedEvent` variants + two field additions on existing variants (M2.2); (b) the `CodexAdapter` + AppState `claude_adapter` / `codex_adapter` named-fields reshape (M2.3); (c) `FailureKind::AuthFailure` variant (M2.3); (d) per-harness session-file parsers + `LoadedTranscript` + `Turn` struct + new `{type: "hydrate", ...}` reducer input (M2.6). Outside those listed changes, if you find yourself wanting to change `HarnessAdapter`, the dispatcher, the `EventEmitter` trait, or the M1 registry layout — stop and ask. Frontend ownership reshuffles in M2.5 by design; the rule scopes to backend.
+- **Resolved decisions are committed.** The "Resolved design decisions" section at the top is not up for relitigation during implementation. If implementation evidence makes a resolved decision look wrong, surface it explicitly — don't quietly drift.

@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"00000000-0000-7000-8000-000000000002"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_0","type":"command_execution","command":"/bin/zsh -lc ls","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_0","type":"command_execution","command":"/bin/zsh -lc ls","aggregated_output":"alpha.txt\nbeta.txt\n","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"I saw two files: `alpha.txt` and `beta.txt`."}}
+{"type":"turn.completed","usage":{"input_tokens":31259,"cached_input_tokens":22784,"output_tokens":65,"reasoning_output_tokens":0}}

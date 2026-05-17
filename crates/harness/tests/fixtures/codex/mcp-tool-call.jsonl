@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"00000000-0000-7000-8000-000000000004"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_0","type":"mcp_tool_call","server":"example_mcp_server","tool":"list_tags","arguments":{},"result":null,"error":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_0","type":"mcp_tool_call","server":"example_mcp_server","tool":"list_tags","arguments":{},"result":{"content":[{"type":"text","text":"Invalid or expired token"}],"structured_content":null},"error":null,"status":"failed"}}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"I tried `example_mcp_server.list_tags`, but the MCP server returned: `Invalid or expired token`."}}
+{"type":"turn.completed","usage":{"input_tokens":31254,"cached_input_tokens":22784,"output_tokens":65,"reasoning_output_tokens":0}}

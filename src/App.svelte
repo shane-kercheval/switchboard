@@ -2,41 +2,144 @@
   import { onMount } from "svelte";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import * as api from "$lib/api";
-  import AgentPane from "$lib/components/AgentPane.svelte";
   import Banner from "$lib/components/Banner.svelte";
+  import ComposeBar from "$lib/components/ComposeBar.svelte";
+  import AddAgentModal from "$lib/components/AddAgentModal.svelte";
   import CreateAgentForm from "$lib/components/CreateAgentForm.svelte";
+  import type { AgentFormSubmit } from "$lib/components/CreateAgentForm.types";
   import DirectorySelector from "$lib/components/DirectorySelector.svelte";
+  import Sidebar from "$lib/components/Sidebar.svelte";
+  import UnifiedTranscript from "$lib/components/UnifiedTranscript.svelte";
   import WelcomeScreen from "$lib/components/WelcomeScreen.svelte";
-  import type { AgentRecord, DirectoryInfo, ProjectSummary } from "$lib/types";
-  import { basename, pickNewestAgent } from "$lib/utils";
+  import { hydrateAgent, registerAgent } from "$lib/state/index.svelte";
+  import type {
+    AgentRecord,
+    BinaryState,
+    DirectoryInfo,
+    HarnessAvailability,
+    HarnessBanner,
+    ProjectSummary,
+  } from "$lib/types";
+  import { bannerCopy, bannerTestid } from "$lib/harnessAvailability";
+  import { basename } from "$lib/utils";
 
   // App phase: drives which screen renders.
+  //
+  // The "loaded" phase carries the list of agents registered with the
+  // state module on project load. Sidebar / UnifiedTranscript / ComposeBar
+  // components read transcripts and runtimes for these agents from the
+  // state module directly — there is no implicit "focused agent" at the
+  // model level.
   type Phase =
     | { kind: "welcome" }
     | { kind: "directory-selector"; info: DirectoryInfo }
     | { kind: "no-agent"; directory: DirectoryInfo; project: ProjectSummary }
     | {
-        kind: "active";
+        kind: "loaded";
         directory: DirectoryInfo;
         project: ProjectSummary;
-        agent: AgentRecord;
+        agents: AgentRecord[];
       };
 
   let phase = $state<Phase>({ kind: "welcome" });
   let busy = $state<boolean>(false);
   let inlineError = $state<string | null>(null);
-  let banner = $state<string | null>(null);
 
-  // Startup binary probe. If it fails, show a non-blocking banner with the
-  // install link copy. UI flow proceeds either way — sending will fail until
-  // the user installs `claude` and reloads.
-  onMount(async () => {
-    try {
-      await api.checkClaudeBinary();
-    } catch {
-      banner = "Claude Code not found on PATH. Install from https://claude.com/code";
-    }
+  /// Per-harness availability state. **Stored as flat per-probe fields**
+  /// rather than as the `HarnessAvailability` discriminated union directly:
+  /// the union is the consumer-facing boundary type (banners + form
+  /// gating), but probe handlers write a single field at a time. Holding
+  /// the runtime state as union values would force every per-probe write
+  /// to re-construct the whole variant and read-then-spread the unchanged
+  /// fields, which is friction without benefit. Instead: flat fields here
+  /// → derived unions for consumers.
+  ///
+  /// Initial state uses `"checking"` to encode the pre-probe state in
+  /// the type system rather than fail-open-by-convention. Form gating
+  /// treats `"checking"` as not-selectable (silent disable) so a user
+  /// fast enough to reach the create form before probes complete can't
+  /// submit before we know. Banners stay hidden during checking because
+  /// the suppression rule only pushes on `"missing"`.
+  ///
+  /// Claude auth is `"unsupported"` always (keychain-based on macOS; no
+  /// reliable file signal — deferred to a future release).
+  let claudeBinary = $state<BinaryState>("checking");
+  let codexBinary = $state<BinaryState>("checking");
+  let codexAuth = $state<"available" | "missing" | "checking">("checking");
+
+  const claudeAvailability = $derived<HarnessAvailability>({
+    harness: "claude_code",
+    binary: claudeBinary,
+    auth: "unsupported",
   });
+  const codexAvailability = $derived<HarnessAvailability>({
+    harness: "codex",
+    binary: codexBinary,
+    auth: codexAuth,
+  });
+
+  /// Banner stack ordering: binary-missing first, then auth-missing.
+  /// Suppression rule: if a harness's binary is missing, its auth banner
+  /// is hidden (auth is irrelevant if the CLI isn't installed). Max two
+  /// banners visible (one per harness).
+  ///
+  /// The `auth_missing` push gates on `a.harness === "codex"` because
+  /// `HarnessBanner.auth_missing` is type-narrowed to Codex (v1 invariant).
+  const banners = $derived.by((): HarnessBanner[] => {
+    const result: HarnessBanner[] = [];
+    for (const a of [claudeAvailability, codexAvailability]) {
+      if (a.binary === "missing") {
+        result.push({ kind: "binary_missing", harness: a.harness });
+      } else if (a.auth === "missing" && a.harness === "codex") {
+        result.push({ kind: "auth_missing", harness: "codex" });
+      }
+    }
+    return result;
+  });
+
+  // Startup probes. Each probe writes its own slice as soon as it
+  // resolves — no `Promise.all` barrier. A slow `check_codex_auth`
+  // doesn't block the Claude binary state from leaving `"checking"`;
+  // a slow `check_codex_binary` doesn't block its own auth check
+  // from updating. The data model stays honest about *what we know
+  // now* vs *what we're still waiting on*, same principle as the
+  // `"checking"` state itself.
+  //
+  // UI flow proceeds regardless — sending to a missing-binary agent
+  // fails at dispatch with a typed error.
+  onMount(() => {
+    api.checkClaudeBinary().then(
+      () => (claudeBinary = "available"),
+      () => (claudeBinary = "missing"),
+    );
+    api.checkCodexBinary().then(
+      () => (codexBinary = "available"),
+      () => (codexBinary = "missing"),
+    );
+    api.checkCodexAuth().then(
+      () => (codexAuth = "available"),
+      () => (codexAuth = "missing"),
+    );
+  });
+
+  /// Register every agent in the loaded list with the state module before
+  /// the UI renders the 3-pane layout. registerAgent is idempotent under
+  /// concurrent calls (per the pendingRegistrations guard), so
+  /// Promise.all is safe — overlapping calls for the same agent_id share
+  /// one in-flight registration.
+  ///
+  /// Also kicks off transcript hydration per agent. `hydrateAgent` is
+  /// idempotent (tracked via its own attempted-set), so re-opening a
+  /// project after navigating away doesn't re-hydrate — important because
+  /// hydrated turns get fresh `turn_id`s at parse time and would otherwise
+  /// duplicate. Per-agent hydration runs concurrently; disk reads are
+  /// independent and per-agent failures don't block others.
+  async function registerAll(agents: AgentRecord[]): Promise<void> {
+    await Promise.all(agents.map((a) => registerAgent(a)));
+    // Fire-and-forget — hydration drives the `hydration_status` ladder,
+    // which the compose-bar gate observes reactively.
+    void Promise.all(agents.map((a) => hydrateAgent(a.id)));
+  }
 
   async function handlePickDirectory(): Promise<void> {
     inlineError = null;
@@ -64,7 +167,8 @@
       if (agents.length === 0) {
         phase = { kind: "no-agent", directory: dir, project };
       } else {
-        phase = { kind: "active", directory: dir, project, agent: pickNewestAgent(agents) };
+        await registerAll(agents);
+        phase = { kind: "loaded", directory: dir, project, agents };
       }
     } catch (err) {
       inlineError = err instanceof Error ? err.message : String(err);
@@ -99,7 +203,8 @@
       if (agents.length === 0) {
         phase = { kind: "no-agent", directory: dir, project };
       } else {
-        phase = { kind: "active", directory: dir, project, agent: pickNewestAgent(agents) };
+        await registerAll(agents);
+        phase = { kind: "loaded", directory: dir, project, agents };
       }
     } catch (err) {
       inlineError = err instanceof Error ? err.message : String(err);
@@ -108,23 +213,80 @@
     }
   }
 
-  async function handleCreateAgent(name: string): Promise<void> {
+  /// Shared core: invoke the right Tauri command for the submission shape,
+  /// then call `registerAgent` to wire listeners. Throws on either failure
+  /// so the caller can surface the error in its phase-specific UI.
+  ///
+  /// Attach kicks off transcript hydration immediately after registration:
+  /// the user is bringing an existing harness session under orchestration
+  /// and expects its prior history to appear. Create flow needs no
+  /// hydration (no session exists yet) — `hydration_status` stays
+  /// `"complete"` as `freshRuntime` initialized it.
+  async function createOrAttachAndRegister(submission: AgentFormSubmit): Promise<AgentRecord> {
+    const agent =
+      submission.mode === "create"
+        ? await api.createAgent(submission.name, submission.harness)
+        : await api.attachAgent(submission.name, submission.harness, submission.existingSessionId);
+    await registerAgent(agent);
+    if (submission.mode === "attach") {
+      void hydrateAgent(agent.id);
+    }
+    return agent;
+  }
+
+  async function handleCreateFirstAgent(submission: AgentFormSubmit): Promise<void> {
     if (phase.kind !== "no-agent") return;
     inlineError = null;
     busy = true;
     try {
-      const agent = await api.createAgent(name);
+      const agent = await createOrAttachAndRegister(submission);
       phase = {
-        kind: "active",
+        kind: "loaded",
         directory: phase.directory,
         project: phase.project,
-        agent,
+        agents: [agent],
       };
     } catch (err) {
       inlineError = err instanceof Error ? err.message : String(err);
     } finally {
       busy = false;
     }
+  }
+
+  /// Loaded-phase add-agent handler. Appends to `phase.agents` immutably
+  /// (matches the rest of App.svelte's reassignment pattern and sidesteps
+  /// the question of whether `$state` deep-tracks array mutations through
+  /// a discriminated-union narrowing — it does, but reassign is clearer).
+  let addAgentOpen = $state<boolean>(false);
+  let addAgentError = $state<string | null>(null);
+  let addAgentBusy = $state<boolean>(false);
+
+  async function handleAddAgentFromLoaded(submission: AgentFormSubmit): Promise<void> {
+    if (phase.kind !== "loaded") return;
+    addAgentError = null;
+    addAgentBusy = true;
+    try {
+      const agent = await createOrAttachAndRegister(submission);
+      phase = {
+        ...phase,
+        agents: [...phase.agents, agent],
+      };
+      addAgentOpen = false;
+    } catch (err) {
+      addAgentError = err instanceof Error ? err.message : String(err);
+    } finally {
+      addAgentBusy = false;
+    }
+  }
+
+  function handleAddAgentCancel(): void {
+    addAgentOpen = false;
+    addAgentError = null;
+  }
+
+  function openAddAgent(): void {
+    addAgentError = null;
+    addAgentOpen = true;
   }
 
   function handleCancel(): void {
@@ -134,18 +296,12 @@
 
   function currentDirectoryPath(): string | undefined {
     if (phase.kind === "directory-selector") return phase.info.path;
-    if (phase.kind === "no-agent" || phase.kind === "active") return phase.directory.path;
+    if (phase.kind === "no-agent" || phase.kind === "loaded") return phase.directory.path;
     return undefined;
   }
 
-  // M4 introduces an agent switcher; until then, only one agent is
-  // displayed at a time (the most recently created). In-flight turns on
-  // agents that are no longer displayed continue running on their per-agent
-  // channel but are effectively orphaned in the UI for M1.5 — known
-  // limitation. The pick logic itself lives in `$lib/utils.pickNewestAgent`.
-
   const breadcrumb = $derived.by(() => {
-    if (phase.kind === "active" || phase.kind === "no-agent") {
+    if (phase.kind === "loaded" || phase.kind === "no-agent") {
       return `${phase.project.name} — ${basename(phase.directory.path)}`;
     }
     return null;
@@ -153,9 +309,9 @@
 </script>
 
 <main class="flex h-full flex-col bg-white text-neutral-900">
-  {#if banner}
-    <Banner message={banner} />
-  {/if}
+  {#each banners as banner (bannerTestid(banner))}
+    <Banner message={bannerCopy(banner)} testid={bannerTestid(banner)} />
+  {/each}
   {#if breadcrumb}
     <div
       class="border-b border-neutral-200 px-4 py-2 text-xs text-neutral-600"
@@ -184,20 +340,30 @@
         onCancel={handleCancel}
       />
     {:else if phase.kind === "no-agent"}
-      <CreateAgentForm {busy} error={inlineError} onSubmit={handleCreateAgent} />
-    {:else if phase.kind === "active"}
-      <!--
-        Load-bearing: `{#key phase.agent.id}` forces AgentPane to unmount and
-        remount when the active agent changes (e.g., the user creates a new
-        agent in M4's agent-switcher). AgentPane's transcript, event-channel
-        subscription, and heartbeat timer are all initialised in onMount on
-        the assumption that `agent` does not change in-place. Don't remove
-        this `{#key}` without restructuring AgentPane to react to `agent`
-        prop changes (resetting state, re-subscribing).
-      -->
-      {#key phase.agent.id}
-        <AgentPane agent={phase.agent} />
-      {/key}
+      <CreateAgentForm
+        {busy}
+        error={inlineError}
+        onSubmit={handleCreateFirstAgent}
+        {claudeAvailability}
+        {codexAvailability}
+      />
+    {:else if phase.kind === "loaded"}
+      <div class="flex flex-1 overflow-hidden" data-testid="loaded-layout">
+        <Sidebar agents={phase.agents} onAddAgent={openAddAgent} />
+        <div class="flex flex-1 flex-col overflow-hidden">
+          <UnifiedTranscript agents={phase.agents} />
+          <ComposeBar agents={phase.agents} />
+        </div>
+      </div>
+      <AddAgentModal
+        bind:open={addAgentOpen}
+        busy={addAgentBusy}
+        error={addAgentError}
+        {claudeAvailability}
+        {codexAvailability}
+        onSubmit={handleAddAgentFromLoaded}
+        onCancel={handleAddAgentCancel}
+      />
     {/if}
   </div>
 </main>

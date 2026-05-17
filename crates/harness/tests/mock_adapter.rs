@@ -3,8 +3,8 @@ use std::path::Path;
 use futures::StreamExt;
 use switchboard_core::{AgentRecord, HarnessKind};
 use switchboard_harness::{
-    AdapterEvent, FailureKind, HarnessAdapter, MockHarnessAdapter, MockScenario, TurnId,
-    TurnOutcome,
+    AdapterEvent, DispatchOptions, FailureKind, HarnessAdapter, MockHarnessAdapter, MockScenario,
+    TurnId, TurnOutcome,
 };
 use uuid::Uuid;
 
@@ -22,7 +22,13 @@ fn fake_agent() -> AgentRecord {
 async fn drain(adapter: &MockHarnessAdapter, prompt: &str) -> Vec<AdapterEvent> {
     let turn_id: TurnId = Uuid::now_v7();
     let stream = adapter
-        .dispatch(&fake_agent(), Path::new("/tmp"), prompt, turn_id)
+        .dispatch(
+            &fake_agent(),
+            Path::new("/tmp"),
+            prompt,
+            turn_id,
+            DispatchOptions::default(),
+        )
         .await
         .expect("mock dispatch should not fail");
     stream.collect().await
@@ -75,16 +81,29 @@ async fn mock_turn_ids_match_dispatch_argument() {
     let adapter = MockHarnessAdapter::new();
     let turn_id: TurnId = Uuid::now_v7();
     let stream = adapter
-        .dispatch(&fake_agent(), Path::new("/tmp"), "test", turn_id)
+        .dispatch(
+            &fake_agent(),
+            Path::new("/tmp"),
+            "test",
+            turn_id,
+            DispatchOptions::default(),
+        )
         .await
         .unwrap();
     let events: Vec<AdapterEvent> = stream.collect().await;
 
     for event in &events {
+        // `MockScenario::Streaming` is documented to emit only ContentChunk
+        // and TurnEnd. If a future mock scenario starts emitting other
+        // variants, this test needs an explicit update — the wildcard
+        // panic is intentional, not stale.
         let event_turn_id = match event {
             AdapterEvent::ContentChunk { turn_id: tid, .. }
             | AdapterEvent::TurnEnd { turn_id: tid, .. } => *tid,
-            _ => unreachable!("M1 AdapterEvent has only ContentChunk and TurnEnd variants"),
+            other => panic!(
+                "MockScenario::Streaming should only emit ContentChunk / TurnEnd; \
+                 got {other:?}. Update this test if the mock's scenarios are extended."
+            ),
         };
         assert_eq!(
             event_turn_id, turn_id,
@@ -97,8 +116,9 @@ async fn mock_turn_ids_match_dispatch_argument() {
 async fn panic_scenario_ends_stream_without_turn_end() {
     // MockScenario::Panic intentionally violates the stream contract.
     // The stream ends after the first ContentChunk (task panics before TurnEnd).
-    // This test validates the panic scenario works as designed — the M1.4
-    // dispatcher test uses this to verify AgentIdleGuard restores Idle on panic.
+    // This test validates the panic scenario works as designed — the
+    // dispatcher tests use this to verify AgentIdleGuard restores Idle
+    // on panic.
     let adapter = MockHarnessAdapter::with_scenario(MockScenario::Panic);
     let events = drain(&adapter, "test").await;
 
@@ -124,7 +144,13 @@ async fn streaming_scenario_does_not_return_dispatch_error() {
     let adapter = MockHarnessAdapter::new();
     let turn_id: TurnId = Uuid::now_v7();
     let result = adapter
-        .dispatch(&fake_agent(), Path::new("/tmp"), "test", turn_id)
+        .dispatch(
+            &fake_agent(),
+            Path::new("/tmp"),
+            "test",
+            turn_id,
+            DispatchOptions::default(),
+        )
         .await;
     assert!(result.is_ok(), "mock should never return a DispatchError");
 }
@@ -132,7 +158,8 @@ async fn streaming_scenario_does_not_return_dispatch_error() {
 #[tokio::test]
 async fn completed_turn_outcome_wire_shape_roundtrips() {
     // Checks that TurnEnd(Completed) from the Streaming scenario serializes and
-    // deserializes correctly via the NormalizedEvent lifting path (used by M1.4 dispatcher).
+    // deserializes correctly via the NormalizedEvent lifting path (used by the
+    // dispatcher).
     use switchboard_harness::NormalizedEvent;
 
     let adapter = MockHarnessAdapter::new();
@@ -164,6 +191,7 @@ async fn failed_turn_outcome_wire_shape_roundtrips() {
             message: "bad model".to_owned(),
         },
         ended_at: chrono::Utc::now(),
+        usage: None,
     };
 
     let normalized = NormalizedEvent::from(event);

@@ -14,8 +14,9 @@ pub fn canonicalize_for_uniqueness(name: &str) -> String {
 
 /// Validates that a name matches `^[A-Za-z0-9_-]+$` and is non-empty.
 ///
-/// Per the M1.2 plan: no leading-character constraint — digit-first, hyphen-first,
-/// and underscore-first names are all accepted. Empty / whitespace-only is rejected.
+/// No leading-character constraint — digit-first, hyphen-first, and
+/// underscore-first names are all accepted. Empty / whitespace-only is
+/// rejected.
 pub fn validate_name(name: &str) -> Result<()> {
     if name.is_empty()
         || !name

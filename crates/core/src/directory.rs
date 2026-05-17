@@ -100,10 +100,10 @@ impl Directory {
     ///
     /// Not safe to call concurrently against the *same `Directory` instance* —
     /// the read-check-then-append sequence has a TOCTOU window. Callers must
-    /// serialize access (the M1.4 dispatcher / `AppState` mutex does this).
+    /// serialize access (the dispatcher / `AppState` mutex does this).
     /// Concurrent calls against *different* `Directory` instances (different
-    /// directories) are fine; M4's `instance.lock` provides cross-process
-    /// serialization within one directory.
+    /// directories) are fine; cross-process serialization within one
+    /// directory is future work.
     pub fn create_project(&self, name: &str) -> Result<Project> {
         self.assert_initialized()?;
         validate_name(name)?;
@@ -190,9 +190,9 @@ impl Directory {
 
 // `crates/core` deliberately stays free of a `tracing` dep — it's the
 // persistence layer, kept lean and Tauri-free. Rollback failures go to
-// stderr so they aren't completely silent in dev. A future v1.md M4 entry
-// tracks surfacing this as a structured `CoreError` variant so the app
-// layer can `tracing::warn!` it with full context.
+// stderr so they aren't completely silent in dev. Surfacing this as a
+// structured `CoreError` variant so the app layer can `tracing::warn!` it
+// with full context is future work.
 fn log_rollback_failure_to_stderr(path: &Path, err: &std::io::Error) {
     eprintln!(
         "switchboard-core: failed to roll back project directory {} after index append failure: {err}",

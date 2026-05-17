@@ -1,3 +1,9 @@
+pub mod config;
+pub mod session_file;
+pub mod skills;
+
+pub use session_file::load_claude_transcript;
+
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -64,11 +70,17 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         cwd: &Path,
         prompt: &str,
         turn_id: TurnId,
+        _options: crate::DispatchOptions,
     ) -> Result<EventStream, DispatchError> {
-        let binary = resolve_binary(&self.claude_binary_path)?;
+        // Claude Code emits `SessionMeta` from its `system/init` stream
+        // event on every dispatch — no first-turn gating — so the
+        // attach-flow override has nothing to do here. `_options` is
+        // accepted for trait conformance and intentionally unused.
+        let binary = crate::subprocess::resolve_binary(&self.claude_binary_path)?;
         let args = build_args(agent, prompt, cwd, None);
 
-        let mut child = tokio::process::Command::new(&binary)
+        let mut command = tokio::process::Command::new(&binary);
+        command
             .args(&args)
             .current_dir(cwd)
             .stdout(Stdio::piped())
@@ -77,18 +89,22 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             // `kill_on_drop(true)` only fires when `child` is dropped — and
             // `child` is owned by `run_producer` (spawned task). Consumers
             // dropping the event stream does NOT propagate; the subprocess
-            // continues until natural exit. M4 cancellation will need a
-            // `CancellationToken` plumbed through so mid-turn cancel kills
-            // the subprocess properly.
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    DispatchError::BinaryNotFound
-                } else {
-                    DispatchError::SpawnFailed(e)
-                }
-            })?;
+            // continues until natural exit. Future cancellation work will
+            // need a `CancellationToken` plumbed through so mid-turn cancel
+            // kills the subprocess properly.
+            .kill_on_drop(true);
+        // Put the child in its own process group so a future `killpg` can
+        // tear down the entire subprocess tree. The group is established
+        // here even though cancellation isn't wired yet.
+        #[cfg(unix)]
+        command.process_group(0);
+        let mut child = command.spawn().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                DispatchError::BinaryNotFound
+            } else {
+                DispatchError::SpawnFailed(e)
+            }
+        })?;
 
         let stdout = child.stdout.take().expect("stdout piped");
         let stderr = child.stderr.take().expect("stderr piped");
@@ -100,16 +116,6 @@ impl HarnessAdapter for ClaudeCodeAdapter {
 
         Ok(Box::pin(UnboundedReceiverStream::new(rx)))
     }
-}
-
-/// Use `which` for relative names (PATH lookup); trust absolute paths directly.
-/// Spawn itself will return `NotFound` for missing absolute paths and we map it
-/// to `BinaryNotFound` at the call site.
-fn resolve_binary(path: &Path) -> Result<PathBuf, DispatchError> {
-    if path.is_absolute() {
-        return Ok(path.to_owned());
-    }
-    which::which(path).map_err(|_| DispatchError::BinaryNotFound)
 }
 
 /// `home_override` is `None` in production (reads `$HOME`) and `Some(path)` in tests.
@@ -160,23 +166,34 @@ fn session_file_exists(cwd: &Path, session_id: &uuid::Uuid) -> bool {
 }
 
 /// Pure check — testable without touching the real `$HOME`.
-/// Claude Code stores sessions at `<home>/.claude/projects/<encoded-cwd>/<uuid>.jsonl`
-/// where the encoded cwd replaces both `/` and `.` with `-`. For example,
+fn session_exists_in(home: &Path, cwd: &Path, session_id: &uuid::Uuid) -> bool {
+    let Ok(canonical) = cwd.canonicalize() else {
+        return false;
+    };
+    claude_session_file_path(home, &canonical, session_id).exists()
+}
+
+/// Compute the canonical Claude Code session-file path. Claude Code stores
+/// sessions at `<home>/.claude/projects/<encoded-cwd>/<uuid>.jsonl` where the
+/// encoded cwd replaces both `/` and `.` with `-`. For example,
 /// `/Users/x/repo/.switchboard/projects/<id>` is encoded as
 /// `-Users-x-repo--switchboard-projects-<id>` — the leading dot of
 /// `.switchboard` becomes a dash, producing the double-dash `--switchboard`.
 /// The empirically-observed rule, confirmed against `~/.claude/projects/`
 /// listings for cwds containing dot-prefixed components.
-fn session_exists_in(home: &Path, cwd: &Path, session_id: &uuid::Uuid) -> bool {
-    let Ok(canonical) = cwd.canonicalize() else {
-        return false;
-    };
-    let encoded = encode_cwd(&canonical);
+///
+/// **Caller contract.** `cwd` must be a *canonical* absolute path (no
+/// symlinks, no `..`). The attach-flow caller resolves cwd via
+/// `Directory::at(...)` which canonicalizes; pass `directory.path` directly.
+/// Passing a non-canonical cwd produces a wrong encoding and the lookup will
+/// miss the real session file.
+#[must_use]
+pub fn claude_session_file_path(home: &Path, cwd: &Path, session_id: &uuid::Uuid) -> PathBuf {
+    let encoded = encode_cwd(cwd);
     home.join(".claude")
         .join("projects")
         .join(&encoded)
         .join(format!("{session_id}.jsonl"))
-        .exists()
 }
 
 /// Encodes a canonical absolute path the way Claude Code does for its
@@ -189,11 +206,6 @@ fn encode_cwd(canonical: &Path) -> String {
     canonical.to_string_lossy().replace(['/', '.'], "-")
 }
 
-/// Most recent stderr lines we keep around so we can include them in the
-/// synthesized failure message when the subprocess exits without a terminal
-/// event. Bounded to avoid unbounded growth on a chatty subprocess.
-const STDERR_TAIL_CAPACITY: usize = 16;
-
 async fn run_producer(
     mut child: tokio::process::Child,
     stdout: tokio::process::ChildStdout,
@@ -205,13 +217,15 @@ async fn run_producer(
     // Drain stderr concurrently; prevents pipe-full deadlock if the subprocess
     // writes to stderr while we block reading stdout. The shared `stderr_tail`
     // buffer captures the last few lines for inclusion in failure messages.
-    let stderr_tail: Arc<Mutex<VecDeque<String>>> =
-        Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_CAPACITY)));
-    let stderr_task = tokio::spawn(drain_stderr(
+    let stderr_tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::with_capacity(
+        crate::subprocess::STDERR_TAIL_CAPACITY,
+    )));
+    let stderr_task = tokio::spawn(crate::subprocess::drain_stderr(
         stderr,
         agent_id,
         turn_id,
         Arc::clone(&stderr_tail),
+        "claude",
     ));
 
     let mut terminal_seen = false;
@@ -222,8 +236,27 @@ async fn run_producer(
 
     loop {
         match lines.next_line().await {
-            Ok(Some(line)) => match parser::parse_line(&line, turn_id, &mut parser_state) {
-                ParseOutcome::Event(event) => {
+            Ok(Some(line)) => {
+                let outcome = parser::parse_line(&line, turn_id, agent_id, &mut parser_state);
+                let events = match outcome {
+                    ParseOutcome::Event(event) => vec![event],
+                    ParseOutcome::Events(events) => events,
+                    ParseOutcome::Skip => continue,
+                    ParseOutcome::Error(msg) => {
+                        let _ = tx.send(AdapterEvent::TurnEnd {
+                            turn_id,
+                            outcome: TurnOutcome::Failed {
+                                kind: FailureKind::AdapterFailure,
+                                message: format!("malformed JSON from harness: {msg}"),
+                            },
+                            ended_at: Utc::now(),
+                            usage: None,
+                        });
+                        terminal_seen = true;
+                        break;
+                    }
+                };
+                for event in events {
                     match &event {
                         AdapterEvent::TurnEnd {
                             outcome: TurnOutcome::Completed,
@@ -239,26 +272,13 @@ async fn run_producer(
                     }
                     // Receiver drop is intentional: if the consumer disconnects
                     // mid-stream, we let the producer drain and exit cleanly.
-                    // Per-turn cancel (M4) will handle the shutdown case properly.
+                    // Future per-turn cancel work will handle shutdown properly.
                     let _ = tx.send(event);
-                    if terminal_seen {
-                        break;
-                    }
                 }
-                ParseOutcome::Skip => {}
-                ParseOutcome::Error(msg) => {
-                    let _ = tx.send(AdapterEvent::TurnEnd {
-                        turn_id,
-                        outcome: TurnOutcome::Failed {
-                            kind: FailureKind::AdapterFailure,
-                            message: format!("malformed JSON from harness: {msg}"),
-                        },
-                        ended_at: Utc::now(),
-                    });
-                    terminal_seen = true;
+                if terminal_seen {
                     break;
                 }
-            },
+            }
             Ok(None) => break, // stdout EOF
             Err(e) => {
                 let _ = tx.send(AdapterEvent::TurnEnd {
@@ -268,6 +288,7 @@ async fn run_producer(
                         message: format!("stdout read error: {e}"),
                     },
                     ended_at: Utc::now(),
+                    usage: None,
                 });
                 terminal_seen = true;
                 break;
@@ -287,15 +308,15 @@ async fn run_producer(
     }
 
     // Reap subprocess. If the parser observed Completed but the exit code is
-    // non-zero, log the discrepancy — per M1 policy, we do not re-emit. M2
-    // revisits whether to hold terminal emission until after reconciliation.
+    // non-zero, log the discrepancy — we do not re-emit. Whether to hold
+    // terminal emission until after reconciliation is future work.
     match child.wait().await {
         Ok(status) if !status.success() && terminal_was_completed => {
             tracing::warn!(
                 %turn_id,
                 agent_id = %agent_id,
                 exit_code = ?status.code(),
-                "harness emitted result:completed but subprocess exited non-zero — log-only per M1 policy"
+                "harness emitted result:completed but subprocess exited non-zero — log-only"
             );
         }
         Err(e) => {
@@ -310,33 +331,6 @@ async fn run_producer(
     }
 }
 
-async fn drain_stderr(
-    stderr: tokio::process::ChildStderr,
-    agent_id: AgentId,
-    turn_id: TurnId,
-    tail: Arc<Mutex<VecDeque<String>>>,
-) {
-    let mut lines = tokio::io::BufReader::new(stderr).lines();
-    loop {
-        match lines.next_line().await {
-            Ok(Some(line)) => {
-                tracing::debug!(agent_id = %agent_id, %turn_id, "harness stderr: {line}");
-                if let Ok(mut buf) = tail.lock() {
-                    if buf.len() >= STDERR_TAIL_CAPACITY {
-                        buf.pop_front();
-                    }
-                    buf.push_back(line);
-                }
-            }
-            Ok(None) => break,
-            Err(e) => {
-                tracing::warn!(agent_id = %agent_id, %turn_id, error = %e, "stderr read error");
-                break;
-            }
-        }
-    }
-}
-
 /// Build the synthesized `TurnEnd(Failed)` event emitted when stdout EOFs
 /// without a terminal `result` event. Includes the captured stderr tail so
 /// the consumer can see the underlying cause (auth error, flag rejection).
@@ -344,7 +338,7 @@ fn synthesize_truncation_turn_end(
     turn_id: TurnId,
     stderr_tail: &Mutex<VecDeque<String>>,
 ) -> AdapterEvent {
-    let stderr_msg = format_stderr_tail(stderr_tail);
+    let stderr_msg = crate::subprocess::format_stderr_tail(stderr_tail);
     let message = if stderr_msg.is_empty() {
         "harness exited without terminal result event (no stderr captured)".to_owned()
     } else {
@@ -357,39 +351,7 @@ fn synthesize_truncation_turn_end(
             message,
         },
         ended_at: Utc::now(),
-    }
-}
-
-/// Bound the failure-message length so it stays readable in the UI.
-const STDERR_MESSAGE_MAX_LEN: usize = 800;
-
-/// Returns a single-line, length-bounded representation of the captured
-/// stderr tail. Empty string if no lines were captured. Length-bounding is
-/// performed on **char boundaries** — slicing a String by byte offsets can
-/// land mid-UTF-8 and panic (real risk with non-ASCII paths or error
-/// messages in stderr).
-fn format_stderr_tail(tail: &Mutex<VecDeque<String>>) -> String {
-    let Ok(buf) = tail.lock() else {
-        return String::new();
-    };
-    if buf.is_empty() {
-        return String::new();
-    }
-    let joined = buf.iter().cloned().collect::<Vec<_>>().join(" | ");
-    if joined.len() > STDERR_MESSAGE_MAX_LEN {
-        // Find the lowest char boundary at or after `joined.len() - MAX`.
-        // Walk byte positions forward from that target until we hit a
-        // valid boundary; result is guaranteed to be `<= MAX` chars worth
-        // of suffix (typically fewer if multi-byte chars sit at the edge).
-        let target = joined.len() - STDERR_MESSAGE_MAX_LEN;
-        let start = (target..=joined.len())
-            .find(|&i| joined.is_char_boundary(i))
-            .unwrap_or(joined.len());
-        let mut truncated = joined[start..].to_owned();
-        truncated.insert(0, '…');
-        truncated
-    } else {
-        joined
+        usage: None,
     }
 }
 
@@ -549,35 +511,6 @@ mod tests {
             !args.contains(&"--session-id".to_owned()),
             "must not pass --session-id when the session already exists"
         );
-    }
-
-    #[test]
-    fn format_stderr_tail_handles_non_ascii_at_truncation_boundary() {
-        // Regression: byte-slicing on a String can land mid-UTF-8 and
-        // panic with "byte index N is not a char boundary." Stderr from
-        // real subprocesses often contains paths or messages with
-        // multi-byte characters (e.g., accented usernames, emoji, smart
-        // quotes). Truncation must walk to a char boundary.
-        let tail: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
-        // 600 ASCII chars + a 3-byte "…" emoji repeated so multi-byte
-        // chars sit near the truncation boundary at byte 800.
-        let mut payload = "A".repeat(600);
-        for _ in 0..150 {
-            payload.push('…'); // 3 bytes per ellipsis
-        }
-        // payload is 600 + 450 = 1050 bytes, well over 800. The byte at
-        // position (len - 800) almost certainly lands mid-character.
-        tail.lock().unwrap().push_back(payload);
-
-        let result = format_stderr_tail(&tail);
-        // The leading-ellipsis prefix + char-boundary slicing means total
-        // bytes is bounded by STDERR_MESSAGE_MAX_LEN + a small constant
-        // (the prefix). Critically: NO PANIC.
-        assert!(
-            result.starts_with('…'),
-            "truncated output should be prefixed with …"
-        );
-        assert!(result.chars().count() < 850);
     }
 
     #[test]

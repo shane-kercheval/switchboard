@@ -1,0 +1,783 @@
+import { describe, expect, it } from "vitest";
+import type { NormalizedEvent, ReducerInput } from "$lib/types";
+import { _internal, freshRuntime, runtimeReducer, transcriptReducer } from "./reducers";
+import type { AgentRuntime, TextChunk, ToolCall, Turn } from "./types";
+
+const AGENT_A = "00000000-0000-7000-8000-000000000aaa";
+const AGENT_B = "00000000-0000-7000-8000-000000000bbb";
+const TURN_1 = "00000000-0000-7000-8000-000000000001";
+const TURN_2 = "00000000-0000-7000-8000-000000000002";
+
+// Fixed timestamp used as `receivedAt` across all transcriptReducer
+// invocations in tests. Pinning a constant makes tool-event ordering and
+// timestamp assertions deterministic.
+const RECEIVED_AT = "2026-05-16T00:00:00Z";
+
+function turnStart(turnId: string, startedAt = "2026-05-16T00:00:00Z"): NormalizedEvent {
+  return { type: "turn_start", turn_id: turnId, started_at: startedAt };
+}
+
+function contentChunk(turnId: string, text: string): NormalizedEvent {
+  return { type: "content_chunk", turn_id: turnId, kind: "text", text };
+}
+
+function turnEndCompleted(turnId: string, endedAt = "2026-05-16T00:00:05Z"): NormalizedEvent {
+  return {
+    type: "turn_end",
+    turn_id: turnId,
+    outcome: { status: "completed" },
+    ended_at: endedAt,
+  };
+}
+
+function turnEndFailed(turnId: string, message: string): NormalizedEvent {
+  return {
+    type: "turn_end",
+    turn_id: turnId,
+    outcome: { status: "failed", kind: "harness_error", message },
+    ended_at: "2026-05-16T00:00:05Z",
+  };
+}
+
+function reduce(turns: Turn[], input: ReducerInput, agentId: string = AGENT_A): Turn[] {
+  return transcriptReducer(turns, input, agentId, RECEIVED_AT);
+}
+
+describe("transcriptReducer", () => {
+  describe("turn_start", () => {
+    it("appends a streaming agent turn with empty items", () => {
+      const turns = reduce([], turnStart(TURN_1));
+      expect(turns).toHaveLength(1);
+      const turn = turns[0];
+      expect(turn).toMatchObject({
+        role: "agent",
+        turn_id: TURN_1,
+        agent_id: AGENT_A,
+        status: "streaming",
+        items: [],
+      });
+    });
+
+    it("is idempotent for duplicate turn_start with same turn_id", () => {
+      let turns = reduce([], turnStart(TURN_1));
+      turns = reduce(turns, turnStart(TURN_1));
+      expect(turns).toHaveLength(1);
+    });
+  });
+
+  describe("content_chunk → items", () => {
+    it("coalesces adjacent same-kind text chunks into one TextChunk item", () => {
+      // Real Claude streaming arrives in many small chunks per content_chunk
+      // event. Coalescing means the renderer produces one paragraph <div>,
+      // not N separately-rendered single-line <div>s.
+      let turns = reduce([], turnStart(TURN_1));
+      turns = reduce(turns, contentChunk(TURN_1, "hello "));
+      turns = reduce(turns, contentChunk(TURN_1, "world"));
+      const turn = turns[0];
+      if (turn?.role !== "agent") throw new Error("unreachable");
+      expect(turn.items).toEqual([{ item_kind: "text", kind: "text", text: "hello world" }]);
+    });
+
+    it("does NOT coalesce across a tool item — preserves text/tool/text ordering", () => {
+      // The interleaving contract: a tool between two text runs sits at
+      // its own index. The two text runs stay as separate items even
+      // though they're the same kind, because they're not adjacent.
+      let turns = reduce([], turnStart(TURN_1));
+      turns = reduce(turns, contentChunk(TURN_1, "before "));
+      turns = reduce(turns, {
+        type: "tool_started",
+        turn_id: TURN_1,
+        tool_use_id: "tool-1",
+        kind: "builtin",
+        name: "Bash",
+        input: {},
+      });
+      turns = reduce(turns, contentChunk(TURN_1, "after"));
+      const turn = turns[0];
+      if (turn?.role !== "agent") throw new Error("unreachable");
+      expect(turn.items).toHaveLength(3);
+      expect(turn.items[0]).toMatchObject({ item_kind: "text", text: "before " });
+      expect(turn.items[1]).toMatchObject({ item_kind: "tool", tool_use_id: "tool-1" });
+      expect(turn.items[2]).toMatchObject({ item_kind: "text", text: "after" });
+    });
+
+    it("does NOT coalesce across different ContentKind (text vs thinking)", () => {
+      // Future reasoning rendering will use kind: "thinking".
+      // Coalescing would silently fold a thinking block into a
+      // preceding text chunk, breaking reasoning-aware UI.
+      let turns = reduce([], turnStart(TURN_1));
+      turns = reduce(turns, { type: "content_chunk", turn_id: TURN_1, kind: "text", text: "hi" });
+      turns = reduce(turns, {
+        type: "content_chunk",
+        turn_id: TURN_1,
+        kind: "thinking",
+        text: "ponder",
+      });
+      const turn = turns[0];
+      if (turn?.role !== "agent") throw new Error("unreachable");
+      expect(turn.items).toHaveLength(2);
+      expect(turn.items[0]).toMatchObject({ kind: "text" });
+      expect(turn.items[1]).toMatchObject({ kind: "thinking" });
+    });
+
+    it("drops chunks for unknown turn_id", () => {
+      const turns = reduce([], contentChunk(TURN_1, "orphan"));
+      expect(turns).toHaveLength(0);
+    });
+
+    it("drops chunks for already-terminal turns", () => {
+      let turns = reduce([], turnStart(TURN_1));
+      turns = reduce(turns, turnEndCompleted(TURN_1));
+      turns = reduce(turns, contentChunk(TURN_1, "late"));
+      const turn = turns[0];
+      if (turn?.role !== "agent") throw new Error("unreachable");
+      expect(turn.items).toEqual([]);
+      expect(turn.status).toBe("complete");
+    });
+  });
+
+  describe("tool_started / tool_completed → items", () => {
+    function toolStarted(turnId: string, toolUseId: string, name = "Bash"): NormalizedEvent {
+      return {
+        type: "tool_started",
+        turn_id: turnId,
+        tool_use_id: toolUseId,
+        kind: "builtin",
+        name,
+        input: { command: "echo hi" },
+      };
+    }
+    function toolCompleted(
+      turnId: string,
+      toolUseId: string,
+      output = "hi\n",
+      isError = false,
+    ): NormalizedEvent {
+      return {
+        type: "tool_completed",
+        turn_id: turnId,
+        tool_use_id: toolUseId,
+        output,
+        is_error: isError,
+      };
+    }
+
+    it("appends a ToolCall to items with the listener-stamped started_at", () => {
+      let turns = reduce([], turnStart(TURN_1));
+      turns = reduce(turns, toolStarted(TURN_1, "tool-1"));
+      const turn = turns[0];
+      if (turn?.role !== "agent") throw new Error("unreachable");
+      expect(turn.items).toHaveLength(1);
+      const item = turn.items[0];
+      expect(item).toMatchObject({
+        item_kind: "tool",
+        tool_use_id: "tool-1",
+        kind: "builtin",
+        name: "Bash",
+        started_at: RECEIVED_AT,
+      });
+      if (item?.item_kind !== "tool") throw new Error("unreachable");
+      expect(item.output).toBeUndefined();
+      expect(item.completed_at).toBeUndefined();
+    });
+
+    it("populates output/is_error/completed_at on tool_completed", () => {
+      let turns = reduce([], turnStart(TURN_1));
+      turns = reduce(turns, toolStarted(TURN_1, "tool-1"));
+      turns = reduce(turns, toolCompleted(TURN_1, "tool-1", "done", false));
+      const turn = turns[0];
+      if (turn?.role !== "agent") throw new Error("unreachable");
+      const item = turn.items[0];
+      if (item?.item_kind !== "tool") throw new Error("unreachable");
+      expect(item).toMatchObject({
+        output: "done",
+        is_error: false,
+        completed_at: RECEIVED_AT,
+      });
+    });
+
+    it("preserves text/tool/text ORDERING in items (load-bearing for renderer)", () => {
+      // The reason items exists as a single ordered array instead of two
+      // separate arrays. Real Claude turns produce text → tool → text;
+      // the renderer needs to know which side of the tool each text chunk
+      // belongs on.
+      let turns = reduce([], turnStart(TURN_1));
+      turns = reduce(turns, contentChunk(TURN_1, "Running… "));
+      turns = reduce(turns, toolStarted(TURN_1, "tool-1"));
+      turns = reduce(turns, toolCompleted(TURN_1, "tool-1"));
+      turns = reduce(turns, contentChunk(TURN_1, "Done."));
+      const turn = turns[0];
+      if (turn?.role !== "agent") throw new Error("unreachable");
+
+      expect(turn.items).toHaveLength(3);
+      expect(turn.items[0]).toMatchObject({ item_kind: "text", text: "Running… " });
+      expect(turn.items[1]).toMatchObject({ item_kind: "tool", tool_use_id: "tool-1" });
+      expect(turn.items[2]).toMatchObject({ item_kind: "text", text: "Done." });
+    });
+
+    it("preserves ordering for multi-tool interleaving (text/tool/text/tool/text)", () => {
+      let turns = reduce([], turnStart(TURN_1));
+      turns = reduce(turns, contentChunk(TURN_1, "before "));
+      turns = reduce(turns, toolStarted(TURN_1, "tool-1", "First"));
+      turns = reduce(turns, toolCompleted(TURN_1, "tool-1"));
+      turns = reduce(turns, contentChunk(TURN_1, "between "));
+      turns = reduce(turns, toolStarted(TURN_1, "tool-2", "Second"));
+      turns = reduce(turns, toolCompleted(TURN_1, "tool-2"));
+      turns = reduce(turns, contentChunk(TURN_1, "after"));
+
+      const turn = turns[0];
+      if (turn?.role !== "agent") throw new Error("unreachable");
+      const sequence = turn.items.map((item) =>
+        item.item_kind === "text" ? `t:${item.text}` : `T:${item.tool_use_id}`,
+      );
+      expect(sequence).toEqual(["t:before ", "T:tool-1", "t:between ", "T:tool-2", "t:after"]);
+    });
+
+    it("ignores tool_completed with no matching tool_use_id", () => {
+      let turns = reduce([], turnStart(TURN_1));
+      turns = reduce(turns, toolCompleted(TURN_1, "no-such-tool"));
+      const turn = turns[0];
+      if (turn?.role !== "agent") throw new Error("unreachable");
+      expect(turn.items).toEqual([]);
+    });
+
+    it("ignores duplicate tool_started for the same tool_use_id", () => {
+      let turns = reduce([], turnStart(TURN_1));
+      turns = reduce(turns, toolStarted(TURN_1, "tool-1"));
+      turns = reduce(turns, toolStarted(TURN_1, "tool-1", "Different"));
+      const turn = turns[0];
+      if (turn?.role !== "agent") throw new Error("unreachable");
+      const toolItems = turn.items.filter((item): item is ToolCall => item.item_kind === "tool");
+      expect(toolItems).toHaveLength(1);
+      expect(toolItems[0]?.name).toBe("Bash"); // first one wins
+    });
+
+    it("tool_completed only mutates the matching item — others untouched", () => {
+      let turns = reduce([], turnStart(TURN_1));
+      turns = reduce(turns, toolStarted(TURN_1, "tool-1"));
+      turns = reduce(turns, contentChunk(TURN_1, "mid"));
+      turns = reduce(turns, toolStarted(TURN_1, "tool-2", "Other"));
+      turns = reduce(turns, toolCompleted(TURN_1, "tool-1", "first-output"));
+
+      const turn = turns[0];
+      if (turn?.role !== "agent") throw new Error("unreachable");
+      const tool1 = turn.items.find(
+        (item): item is ToolCall => item.item_kind === "tool" && item.tool_use_id === "tool-1",
+      );
+      const tool2 = turn.items.find(
+        (item): item is ToolCall => item.item_kind === "tool" && item.tool_use_id === "tool-2",
+      );
+      expect(tool1?.output).toBe("first-output");
+      expect(tool1?.completed_at).toBe(RECEIVED_AT);
+      // tool-2 still in-flight — completion fields undefined.
+      expect(tool2?.output).toBeUndefined();
+      expect(tool2?.completed_at).toBeUndefined();
+      // Text chunk in between is untouched.
+      const text = turn.items.find((item): item is TextChunk => item.item_kind === "text");
+      expect(text?.text).toBe("mid");
+    });
+  });
+
+  describe("turn_end", () => {
+    it("transitions a streaming turn to complete + records usage", () => {
+      let turns = reduce([], turnStart(TURN_1));
+      const ev: NormalizedEvent = {
+        type: "turn_end",
+        turn_id: TURN_1,
+        outcome: { status: "completed" },
+        ended_at: "2026-05-16T00:00:05Z",
+        usage: {
+          input_tokens: 100,
+          output_tokens: 20,
+          context_window: 200_000,
+          total_cost_usd: 0.012,
+        },
+      };
+      turns = reduce(turns, ev);
+      const turn = turns[0];
+      if (turn?.role !== "agent") throw new Error("unreachable");
+      expect(turn.status).toBe("complete");
+      expect(turn.ended_at).toBe("2026-05-16T00:00:05Z");
+      expect(turn.usage?.input_tokens).toBe(100);
+      expect(turn.usage?.total_cost_usd).toBe(0.012);
+    });
+
+    it("transitions to failed with error fields populated", () => {
+      let turns = reduce([], turnStart(TURN_1));
+      turns = reduce(turns, turnEndFailed(TURN_1, "rate limited"));
+      const turn = turns[0];
+      if (turn?.role !== "agent") throw new Error("unreachable");
+      expect(turn.status).toBe("failed");
+      expect(turn.error).toBe("rate limited");
+      expect(turn.error_kind).toBe("harness_error");
+    });
+
+    it("does NOT re-terminalize an already-complete turn", () => {
+      let turns = reduce([], turnStart(TURN_1));
+      turns = reduce(turns, turnEndCompleted(TURN_1));
+      turns = reduce(turns, turnEndFailed(TURN_1, "late failure"));
+      const turn = turns[0];
+      if (turn?.role !== "agent") throw new Error("unreachable");
+      expect(turn.status).toBe("complete");
+      expect(turn.error).toBeUndefined();
+    });
+  });
+
+  describe("heartbeat_timeout", () => {
+    it("transitions a streaming turn to failed with adapter_failure kind", () => {
+      let turns = reduce([], turnStart(TURN_1));
+      const ev: ReducerInput = {
+        type: "heartbeat_timeout",
+        turn_id: TURN_1,
+        at: "2026-05-16T00:01:00Z",
+      };
+      turns = reduce(turns, ev);
+      const turn = turns[0];
+      if (turn?.role !== "agent") throw new Error("unreachable");
+      expect(turn.status).toBe("failed");
+      expect(turn.error).toBe("no response from harness — retry?");
+      expect(turn.error_kind).toBe("adapter_failure");
+      expect(turn.ended_at).toBe("2026-05-16T00:01:00Z");
+    });
+  });
+
+  describe("hydrate", () => {
+    it("appends hydrated turns to an empty transcript in disk order", () => {
+      const turns = reduce([], {
+        type: "hydrate",
+        agent_id: AGENT_A,
+        turns: [
+          {
+            role: "user",
+            turn_id: TURN_1,
+            agent_id: AGENT_A,
+            started_at: "2026-05-14T00:00:01Z",
+            text: "say 1",
+          },
+          {
+            role: "agent",
+            turn_id: TURN_2,
+            agent_id: AGENT_A,
+            started_at: "2026-05-14T00:00:02Z",
+            status: "complete",
+            items: [{ item_kind: "text", kind: "text", text: "1" }],
+          },
+        ],
+      });
+      expect(turns).toHaveLength(2);
+      expect(turns[0]?.role).toBe("user");
+      expect(turns[1]?.role).toBe("agent");
+    });
+
+    it("preserves a live in-flight turn when hydrate carries the same turn_id", () => {
+      // Live turn lands first.
+      const livePrior = reduce([], turnStart(TURN_1));
+      // Hydrate carries a different (older) value for the SAME turn_id.
+      // The live state must win.
+      const hydrated = reduce(livePrior, {
+        type: "hydrate",
+        agent_id: AGENT_A,
+        turns: [
+          {
+            role: "agent",
+            turn_id: TURN_1,
+            agent_id: AGENT_A,
+            started_at: "1999-01-01T00:00:00Z",
+            status: "complete",
+            items: [{ item_kind: "text", kind: "text", text: "stale" }],
+          },
+        ],
+      });
+      // The live turn keeps its "streaming" status and its (empty) items.
+      const turn = hydrated.find((t) => t.turn_id === TURN_1);
+      expect(turn?.role).toBe("agent");
+      if (turn?.role === "agent") {
+        expect(turn.status).toBe("streaming");
+        expect(turn.items).toHaveLength(0);
+      }
+    });
+
+    it("merges hydrated turns alongside live ones without duplicating", () => {
+      // Two live turns already present.
+      let turns = reduce([], turnStart(TURN_1));
+      turns = reduce(turns, turnStart(TURN_2));
+      const hydrated = reduce(turns, {
+        type: "hydrate",
+        agent_id: AGENT_A,
+        turns: [
+          {
+            role: "user",
+            turn_id: "00000000-0000-7000-8000-000000000003",
+            agent_id: AGENT_A,
+            started_at: "2026-05-14T00:00:01Z",
+            text: "older prompt",
+          },
+        ],
+      });
+      expect(hydrated).toHaveLength(3);
+    });
+
+    it("translates LoadedTurn::Tool items into ToolCall state items", () => {
+      const turns = reduce([], {
+        type: "hydrate",
+        agent_id: AGENT_A,
+        turns: [
+          {
+            role: "agent",
+            turn_id: TURN_1,
+            agent_id: AGENT_A,
+            started_at: "2026-05-14T00:00:01Z",
+            status: "complete",
+            items: [
+              {
+                item_kind: "tool",
+                tool_use_id: "t1",
+                kind: "builtin",
+                name: "Bash",
+                input: { command: "ls" },
+                output: "ok",
+                is_error: false,
+                started_at: "2026-05-14T00:00:01Z",
+                completed_at: "2026-05-14T00:00:02Z",
+              },
+            ],
+          },
+        ],
+      });
+      const turn = turns[0];
+      if (turn === undefined || turn.role !== "agent") throw new Error("expected agent turn");
+      expect(turn.items).toHaveLength(1);
+      const item = turn.items[0];
+      if (item === undefined || item.item_kind !== "tool") throw new Error("expected tool item");
+      expect(item.tool_use_id).toBe("t1");
+      expect(item.output).toBe("ok");
+      expect(item.is_error).toBe(false);
+    });
+  });
+
+  describe("agent-scoped + unknown events", () => {
+    it("ignores rate_limit_event (transcript doesn't change)", () => {
+      const prev = reduce([], turnStart(TURN_1));
+      const next = reduce(prev, {
+        type: "rate_limit_event",
+        agent_id: AGENT_A,
+        info: { primary: { used_percent: 42 } },
+      });
+      expect(next).toBe(prev);
+    });
+
+    it("ignores agent_idle", () => {
+      const prev = reduce([], turnStart(TURN_1));
+      const next = reduce(prev, { type: "agent_idle", agent_id: AGENT_A });
+      expect(next).toBe(prev);
+    });
+
+    it("ignores unknown wire-format variants without crashing", () => {
+      const prev = reduce([], turnStart(TURN_1));
+      // Cast to bypass TS exhaustiveness — simulating a future Rust release
+      // adding a variant the frontend hasn't been rebuilt for.
+      const future = { type: "future_variant", payload: {} } as unknown as NormalizedEvent;
+      const next = reduce(prev, future);
+      expect(next).toBe(prev);
+    });
+  });
+
+  describe("purity — no new Date() inside reducer", () => {
+    it("uses the threaded receivedAt for tool started_at (deterministic)", () => {
+      const fixed = "2026-05-16T12:34:56.789Z";
+      let turns = transcriptReducer([], turnStart(TURN_1), AGENT_A, fixed);
+      turns = transcriptReducer(
+        turns,
+        {
+          type: "tool_started",
+          turn_id: TURN_1,
+          tool_use_id: "tool-1",
+          kind: "builtin",
+          name: "Bash",
+          input: {},
+        },
+        AGENT_A,
+        fixed,
+      );
+      const turn = turns[0];
+      if (turn?.role !== "agent") throw new Error("unreachable");
+      const tool = turn.items[0];
+      if (tool?.item_kind !== "tool") throw new Error("unreachable");
+      // Exact match — reducer must not have called new Date() internally.
+      expect(tool.started_at).toBe(fixed);
+    });
+  });
+});
+
+describe("runtimeReducer", () => {
+  function fresh(): AgentRuntime {
+    return freshRuntime(AGENT_A);
+  }
+
+  it("freshRuntime initializes with run_status=idle, hydration_status=complete", () => {
+    const r = fresh();
+    expect(r.run_status).toBe("idle");
+    // Default for newly-created agents: nothing to hydrate. The hydration
+    // flow flips this to "loading" on project open / attach.
+    expect(r.hydration_status).toBe("complete");
+    expect(r.in_flight_turn_id).toBeUndefined();
+    expect(r.last_error).toBeUndefined();
+  });
+
+  it("turn_start → processing + sets in_flight_turn_id + clears last_error", () => {
+    const r = runtimeReducer(
+      { ...fresh(), last_error: { message: "old", kind: "harness_error" } },
+      turnStart(TURN_1),
+    );
+    expect(r.run_status).toBe("processing");
+    expect(r.in_flight_turn_id).toBe(TURN_1);
+    expect(r.last_error).toBeUndefined();
+  });
+
+  it("turn_end (completed) does NOT flip run_status to idle (waits for AgentIdle)", () => {
+    // Load-bearing for Codex: post-TurnEnd enrichment events flow on the
+    // channel and the dispatcher is still InFlight. Send must remain
+    // gated until AgentIdle arrives.
+    let r = runtimeReducer(fresh(), turnStart(TURN_1));
+    r = runtimeReducer(r, turnEndCompleted(TURN_1));
+    expect(r.run_status).toBe("processing");
+  });
+
+  it("turn_end (failed) records last_error but keeps run_status=processing", () => {
+    let r = runtimeReducer(fresh(), turnStart(TURN_1));
+    r = runtimeReducer(r, turnEndFailed(TURN_1, "boom"));
+    expect(r.run_status).toBe("processing");
+    expect(r.last_error).toEqual({ message: "boom", kind: "harness_error" });
+  });
+
+  it("agent_idle → run_status=idle + clears in_flight_turn_id", () => {
+    let r = runtimeReducer(fresh(), turnStart(TURN_1));
+    r = runtimeReducer(r, { type: "agent_idle", agent_id: AGENT_A });
+    expect(r.run_status).toBe("idle");
+    expect(r.in_flight_turn_id).toBeUndefined();
+  });
+
+  it("agent_idle after failed turn preserves last_error (sendability ≠ health)", () => {
+    let r = runtimeReducer(fresh(), turnStart(TURN_1));
+    r = runtimeReducer(r, turnEndFailed(TURN_1, "boom"));
+    r = runtimeReducer(r, { type: "agent_idle", agent_id: AGENT_A });
+    expect(r.run_status).toBe("idle"); // sendable
+    expect(r.last_error?.message).toBe("boom"); // last failure still surfaced
+  });
+
+  it("agent_idle while starting is a no-op (guarded transition)", () => {
+    // A stray agent_idle in the starting window would race the sendability
+    // gate back open before the legitimate TurnStart arrived. The only
+    // legal path out of "starting" without going through "processing" is
+    // failSendStart (a state-module action, not an event). The reducer's
+    // agent_idle handler must guard against this.
+    const starting: AgentRuntime = { ...fresh(), run_status: "starting" };
+    const r = runtimeReducer(starting, { type: "agent_idle", agent_id: AGENT_A });
+    expect(r).toBe(starting); // no-op: same reference returned
+    expect(r.run_status).toBe("starting");
+  });
+
+  it("agent_idle while idle is a no-op (no spurious state churn)", () => {
+    const idle = fresh();
+    const r = runtimeReducer(idle, { type: "agent_idle", agent_id: AGENT_A });
+    expect(r).toBe(idle);
+  });
+
+  it("heartbeat_timeout records adapter_failure + clears in_flight_turn_id", () => {
+    let r = runtimeReducer(fresh(), turnStart(TURN_1));
+    r = runtimeReducer(r, {
+      type: "heartbeat_timeout",
+      turn_id: TURN_1,
+      at: "2026-05-16T00:01:00Z",
+    });
+    expect(r.last_error?.kind).toBe("adapter_failure");
+    expect(r.in_flight_turn_id).toBeUndefined();
+    // run_status stays "processing" — the backend hasn't released the
+    // guard yet; AgentIdle arrives later when the drain task ends.
+    expect(r.run_status).toBe("processing");
+  });
+
+  it("session_meta populates meta", () => {
+    const ev: NormalizedEvent = {
+      type: "session_meta",
+      agent_id: AGENT_A,
+      model: "claude-sonnet-4-6",
+      harness_version: "2.1.140",
+      tools: ["Bash", "Read"],
+      mcp_servers: [{ name: "tiddly", status: "connected" }],
+      skills: ["debug"],
+      raw: {},
+    };
+    const r = runtimeReducer(fresh(), ev);
+    expect(r.meta?.model).toBe("claude-sonnet-4-6");
+    expect(r.meta?.tools).toEqual(["Bash", "Read"]);
+    expect(r.meta?.mcp_servers).toEqual([{ name: "tiddly", status: "connected" }]);
+  });
+
+  it("rate_limit_event populates last_rate_limit", () => {
+    const r = runtimeReducer(fresh(), {
+      type: "rate_limit_event",
+      agent_id: AGENT_A,
+      info: { primary: { used_percent: 42.0 } },
+    });
+    expect(r.last_rate_limit).toEqual({ primary: { used_percent: 42.0 } });
+  });
+
+  it("ignores unknown wire-format variants without crashing", () => {
+    const prev = fresh();
+    const future = { type: "future_variant" } as unknown as NormalizedEvent;
+    expect(runtimeReducer(prev, future)).toBe(prev);
+  });
+
+  it("hydrate fills meta when currently empty + flips hydration_status to complete", () => {
+    const r = runtimeReducer(fresh(), {
+      type: "hydrate",
+      agent_id: AGENT_A,
+      turns: [],
+      meta: {
+        model: "claude-sonnet-4-6",
+        harness_version: "2.1.140",
+        tools: ["Bash"],
+        mcp_servers: [{ name: "srv", status: "configured" }],
+        skills: ["debug"],
+      },
+    });
+    expect(r.hydration_status).toBe("complete");
+    expect(r.meta?.model).toBe("claude-sonnet-4-6");
+  });
+
+  it("hydrate does NOT overwrite meta that a prior live event already populated", () => {
+    // Pre-populate meta via a live session_meta event.
+    let r = runtimeReducer(fresh(), {
+      type: "session_meta",
+      agent_id: AGENT_A,
+      model: "live-model",
+      harness_version: "live-version",
+      tools: [],
+      mcp_servers: [],
+      skills: [],
+      raw: {},
+    });
+    // Subsequent hydrate carries a different model — must NOT overwrite.
+    r = runtimeReducer(r, {
+      type: "hydrate",
+      agent_id: AGENT_A,
+      turns: [],
+      meta: {
+        model: "disk-model",
+        harness_version: "disk-version",
+        tools: [],
+        mcp_servers: [],
+        skills: [],
+      },
+    });
+    expect(r.meta?.model).toBe("live-model");
+  });
+
+  it("hydrate fills last_rate_limit when currently empty", () => {
+    const r = runtimeReducer(fresh(), {
+      type: "hydrate",
+      agent_id: AGENT_A,
+      turns: [],
+      last_rate_limit: { primary: { used_percent: 10.0 } },
+    });
+    expect(r.last_rate_limit).toEqual({ primary: { used_percent: 10.0 } });
+  });
+
+  it("live rate_limit_event always overwrites a previously hydrated value", () => {
+    let r = runtimeReducer(fresh(), {
+      type: "hydrate",
+      agent_id: AGENT_A,
+      turns: [],
+      last_rate_limit: { primary: { used_percent: 10.0 } },
+    });
+    r = runtimeReducer(r, {
+      type: "rate_limit_event",
+      agent_id: AGENT_A,
+      info: { primary: { used_percent: 99.0 } },
+    });
+    expect(r.last_rate_limit).toEqual({ primary: { used_percent: 99.0 } });
+  });
+
+  it("hydrate sets hydration_status=complete even with no payload", () => {
+    const r = runtimeReducer(
+      { ...fresh(), hydration_status: "loading" as const },
+      { type: "hydrate", agent_id: AGENT_A, turns: [] },
+    );
+    expect(r.hydration_status).toBe("complete");
+  });
+
+  it("hydrate threads warnings into parse_warnings", () => {
+    const r = runtimeReducer(fresh(), {
+      type: "hydrate",
+      agent_id: AGENT_A,
+      turns: [],
+      warnings: [
+        { line_number: 0, reason: "session file no longer at recorded path" },
+        { line_number: 42, reason: "malformed JSON: expected `,`" },
+      ],
+    });
+    expect(r.parse_warnings).toHaveLength(2);
+    expect(r.parse_warnings?.[0]?.reason).toBe("session file no longer at recorded path");
+  });
+
+  it("hydrate without warnings leaves parse_warnings undefined", () => {
+    const r = runtimeReducer(fresh(), { type: "hydrate", agent_id: AGENT_A, turns: [] });
+    expect(r.parse_warnings).toBeUndefined();
+  });
+});
+
+describe("_internal.appendUserTurn", () => {
+  it("synthesizes a user-role turn with caller-provided id/text/timestamp", () => {
+    const turns = _internal.appendUserTurn(
+      [],
+      AGENT_A,
+      "user-1",
+      "hi there",
+      "2026-05-16T00:00:00Z",
+    );
+    expect(turns).toHaveLength(1);
+    expect(turns[0]).toEqual({
+      role: "user",
+      turn_id: "user-1",
+      agent_id: AGENT_A,
+      started_at: "2026-05-16T00:00:00Z",
+      text: "hi there",
+    });
+  });
+
+  it("preserves prior turns (immutable append)", () => {
+    const prev: Turn[] = [
+      {
+        role: "agent",
+        turn_id: TURN_1,
+        agent_id: AGENT_A,
+        started_at: "2026-05-16T00:00:00Z",
+        status: "complete",
+        ended_at: "2026-05-16T00:00:05Z",
+        items: [{ item_kind: "text", kind: "text", text: "ack" }],
+      },
+    ];
+    const next = _internal.appendUserTurn(
+      prev,
+      AGENT_A,
+      "user-1",
+      "follow-up",
+      "2026-05-16T00:00:10Z",
+    );
+    expect(next).not.toBe(prev);
+    expect(next).toHaveLength(2);
+    expect(next[0]).toBe(prev[0]); // first element same reference
+  });
+});
+
+describe("cross-agent isolation", () => {
+  it("turn_start for one agent does not affect another agent's turns", () => {
+    const turnsA = reduce([], turnStart(TURN_1), AGENT_A);
+    const turnsB = reduce([], turnStart(TURN_2), AGENT_B);
+    expect(turnsA).toHaveLength(1);
+    expect(turnsB).toHaveLength(1);
+    expect((turnsA[0] as Extract<Turn, { role: "agent" }>).agent_id).toBe(AGENT_A);
+    expect((turnsB[0] as Extract<Turn, { role: "agent" }>).agent_id).toBe(AGENT_B);
+  });
+});

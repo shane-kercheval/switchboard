@@ -55,17 +55,92 @@ impl Project {
     /// Append a new agent to this project's registry. Validates the name (regex +
     /// per-project uniqueness with hyphen↔underscore + case normalization), generates
     /// a UUID v7 `AgentId`, and (for Claude Code) pre-generates a UUID v7 `session_id`
-    /// the M1.3 adapter will pass via `--session-id <uuid>`.
+    /// the adapter will pass via `--session-id <uuid>`.
     ///
     /// # Concurrency
     ///
     /// Not safe to call concurrently against the *same `Project` instance* — the
     /// read-check-then-append sequence has a TOCTOU window. Callers must
-    /// serialize access (the M1.4 dispatcher / `AppState` mutex does this).
+    /// serialize access (the dispatcher / `AppState` mutex does this).
     /// Concurrent calls against *different* `Project` instances (in the same
-    /// or different directories) are fine; M4's `instance.lock` provides
-    /// cross-process serialization.
+    /// or different directories) are fine; cross-process serialization within
+    /// one directory is future work.
     pub fn register_agent(&self, name: &str, harness: HarnessKind) -> Result<AgentRecord> {
+        // Harness-asymmetry rule: Claude Code pre-generates session_id at
+        // registration time; Codex leaves it None and relies on the per-agent
+        // session-link sidecar populated from `thread.started` on first dispatch.
+        let session_id = match harness {
+            HarnessKind::ClaudeCode => Some(Uuid::now_v7()),
+            HarnessKind::Codex => None,
+        };
+        self.register_agent_inner_with_id(name, harness, session_id, Uuid::now_v7())
+    }
+
+    /// Register an attached **Claude Code** agent — one that wraps an
+    /// already-existing harness session (e.g., a session the user started
+    /// outside Switchboard). The provided `session_id` is the existing
+    /// `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl` filename. Caller
+    /// (commands layer) is responsible for validating the session file
+    /// exists; this method only persists the record.
+    pub fn register_attached_claude_agent(
+        &self,
+        name: &str,
+        session_id: Uuid,
+    ) -> Result<AgentRecord> {
+        self.register_agent_inner_with_id(
+            name,
+            HarnessKind::ClaudeCode,
+            Some(session_id),
+            Uuid::now_v7(),
+        )
+    }
+
+    /// Register an attached **Codex** agent using a caller-supplied
+    /// `agent_id`. The attach-flow callable (`attach_agent_impl`) uses this
+    /// to **write the per-agent session-link sidecar before** committing
+    /// the `AgentRecord` to the registry:
+    ///
+    /// 1. Mint `agent_id` upfront.
+    /// 2. Compute the sidecar path from that id and write the link record.
+    /// 3. Call this method to append the registry record with the **same**
+    ///    id.
+    ///
+    /// **Why pre-generation is the public surface.** If the sidecar write
+    /// happened *after* the registry append and failed, the `AgentRecord`
+    /// would be orphaned: the adapter sees `prior.is_none()` on first
+    /// dispatch and creates a brand-new Codex session (not the attached
+    /// one), silently defeating the attach intent. The pre-generated-id
+    /// ordering inverts the failure mode — at worst an orphan sidecar
+    /// file with no `AgentRecord` pointing at it, invisible to dispatch
+    /// and the collision scan. **No "register-without-id" Codex variant
+    /// exists by design** — a parallel API that minted the id internally
+    /// would be a trap for future callers who'd then need to compute the
+    /// sidecar path post-register (the exact failure mode this method
+    /// prevents).
+    pub fn register_attached_codex_agent_with_id(
+        &self,
+        name: &str,
+        agent_id: crate::agent::AgentId,
+    ) -> Result<AgentRecord> {
+        self.register_agent_inner_with_id(name, HarnessKind::Codex, None, agent_id)
+    }
+
+    /// Shared validation + JSONL append. Caller decides the `session_id`
+    /// strategy (create vs. attach, per-harness) and the `agent_id`
+    /// (typically `Uuid::now_v7()` from the wrappers; the Codex attach flow
+    /// pre-mints to coordinate with sidecar-first writing). Private to
+    /// enforce the public surface invariants: create-path uses
+    /// `register_agent`, attach-path uses the harness-specific
+    /// `register_attached_*` methods, so a Claude attach without a
+    /// `session_id` (or a Codex attach with one) is unrepresentable at the
+    /// API boundary.
+    fn register_agent_inner_with_id(
+        &self,
+        name: &str,
+        harness: HarnessKind,
+        session_id: Option<Uuid>,
+        agent_id: Uuid,
+    ) -> Result<AgentRecord> {
         validate_name(name)?;
         let canonical = canonicalize_for_uniqueness(name);
         for existing in self.list_agents()? {
@@ -77,12 +152,8 @@ impl Project {
             }
         }
 
-        let session_id = match harness {
-            HarnessKind::ClaudeCode => Some(Uuid::now_v7()),
-        };
-
         let record = AgentRecord {
-            id: Uuid::now_v7(),
+            id: agent_id,
             project_id: self.id,
             name: name.to_owned(),
             harness,
@@ -240,6 +311,51 @@ mod tests {
         let (_tmp, project) = fresh_project();
         let err = project
             .register_agent("agent.1", HarnessKind::ClaudeCode)
+            .unwrap_err();
+        assert!(matches!(err, CoreError::InvalidName { .. }));
+    }
+
+    #[test]
+    fn register_attached_claude_persists_provided_session_id() {
+        let (_tmp, project) = fresh_project();
+        let provided = Uuid::now_v7();
+        let record = project
+            .register_attached_claude_agent("attached", provided)
+            .unwrap();
+        assert_eq!(record.harness, HarnessKind::ClaudeCode);
+        assert_eq!(record.session_id, Some(provided));
+        // Round-trips via the registry.
+        let listed = project.list_agents().unwrap();
+        assert_eq!(listed, vec![record]);
+    }
+
+    #[test]
+    fn register_attached_codex_leaves_session_id_none() {
+        let (_tmp, project) = fresh_project();
+        let record = project
+            .register_attached_codex_agent_with_id("attached", Uuid::now_v7())
+            .unwrap();
+        assert_eq!(record.harness, HarnessKind::Codex);
+        assert!(record.session_id.is_none());
+    }
+
+    #[test]
+    fn register_attached_enforces_name_uniqueness_across_create_and_attach() {
+        let (_tmp, project) = fresh_project();
+        project
+            .register_agent("agent-a", HarnessKind::ClaudeCode)
+            .unwrap();
+        let err = project
+            .register_attached_claude_agent("agent_a", Uuid::now_v7())
+            .unwrap_err();
+        assert!(matches!(err, CoreError::DuplicateAgentName { .. }));
+    }
+
+    #[test]
+    fn register_attached_validates_name() {
+        let (_tmp, project) = fresh_project();
+        let err = project
+            .register_attached_claude_agent("bad.name", Uuid::now_v7())
             .unwrap_err();
         assert!(matches!(err, CoreError::InvalidName { .. }));
     }

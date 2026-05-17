@@ -1,9 +1,8 @@
-//! End-to-end regression test for the M1.2 multi-project model + on-disk layout.
+//! End-to-end regression test for the multi-project model + on-disk layout.
 //!
-//! Covers the M1.2 plan verification steps 3 + 4: a tempdir with two projects
-//! that each have their own agents, named the same (`assistant`) across
-//! projects, with the on-disk file layout asserted against the system-design §3
-//! spec.
+//! Covers: a tempdir with two projects that each have their own agents, named
+//! the same (`assistant`) across projects, with the on-disk file layout
+//! asserted against the system-design §3 spec.
 
 use std::collections::HashSet;
 use std::fs;
@@ -100,8 +99,11 @@ fn assert_layout(directory: &Path, project_ids: &[uuid::Uuid]) {
     assert!(sb.join("prompts").is_dir());
     assert!(sb.join("projects").is_dir());
 
-    // M1 must NOT create the M2+/M4+/M6+ artifacts.
-    assert!(!sb.join("instance.lock").exists(), "instance.lock is M4+");
+    // Initial layout must NOT eagerly create artifacts that only get
+    // populated by later runtime events (cross-process lock, per-agent
+    // session sidecars, per-turn run logs). They appear lazily on first
+    // use, not at directory init.
+    assert!(!sb.join("instance.lock").exists());
 
     for project_id in project_ids {
         let project_root = sb.join("projects").join(project_id.to_string());
@@ -111,9 +113,12 @@ fn assert_layout(directory: &Path, project_ids: &[uuid::Uuid]) {
         );
         assert!(project_root.join("config.yaml").exists());
         assert!(project_root.join("registry.jsonl").exists());
-        // M2+/M6+ artifacts must not be created in M1.
-        assert!(!project_root.join("sessions").exists(), "sessions/ is M2+");
-        assert!(!project_root.join("runs").exists(), "runs/ is M6+");
+        // sessions/ is created lazily on the first Codex dispatch; runs/
+        // on the first turn that emits a run log. Neither exists yet
+        // here — only Claude agents have been registered and nothing has
+        // dispatched.
+        assert!(!project_root.join("sessions").exists());
+        assert!(!project_root.join("runs").exists());
     }
 
     // projects.jsonl is append-only with one ProjectSummary per line.

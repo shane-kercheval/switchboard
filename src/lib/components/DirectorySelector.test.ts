@@ -4,10 +4,10 @@ import { fireEvent, render, screen } from "@testing-library/svelte";
 import DirectorySelector from "./DirectorySelector.svelte";
 import type { DirectoryInfo, ProjectSummary } from "$lib/types";
 
-// The three render branches of DirectorySelector are user-visible CTAs in
-// the M1 acceptance flow. A regression that wired up the wrong callback or
-// rendered the wrong branch would silently take the user down the wrong
-// path; these tests cover that boundary.
+// The three render branches of DirectorySelector are user-visible CTAs.
+// A regression that wired up the wrong callback or rendered the wrong
+// branch would silently take the user down the wrong path; these tests
+// cover that boundary.
 
 function info(path: string, has_switchboard: boolean, projects: ProjectSummary[]): DirectoryInfo {
   return { path, has_switchboard, projects };

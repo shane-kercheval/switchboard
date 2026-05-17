@@ -57,12 +57,18 @@ macOS only for v1. Prerequisites:
 Common commands (run from the repo root):
 
 ```sh
-make install   # one-time: pnpm install --frozen-lockfile
-make dev       # run the Tauri dev shell
-make test      # run all Rust + frontend tests
-make lint      # clippy, eslint, svelte-check
-make check     # everything CI runs — run before opening a PR
+make install     # one-time: pnpm install --frozen-lockfile
+make dev         # run the Tauri dev shell
+make test        # run all Rust + frontend tests
+make lint        # clippy, eslint, svelte-check
+make check       # everything CI runs — run before opening a PR
+make test-live   # live-harness suite against real claude/codex (developer-local)
 ```
+
+`make test-live` exercises the adapters against the real `claude` and `codex`
+CLIs to catch upstream drift. See
+[`crates/harness/tests/README.md`](./crates/harness/tests/README.md) for what
+it covers and how to set it up.
 
 See [`AGENTS.md`](./AGENTS.md) for project orientation and conventions, and [`docs/implementation_plans/`](./docs/implementation_plans/) for the roadmap and per-phase implementation plans.
 

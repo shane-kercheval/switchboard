@@ -919,6 +919,25 @@ mod tests {
         }
     }
 
+    /// Drift-detection live test: if Codex moves its auth file (e.g., into
+    /// the macOS keychain), this assertion fails on the developer's machine
+    /// before the silent-misclassification regression ships to users. The
+    /// fixture tests above prove the path-existence check works; this one
+    /// proves the assumed path is still the path the real CLI writes to.
+    ///
+    /// Run with: `make test-live`.
+    #[test]
+    #[ignore = "requires codex login — run with: make test-live"]
+    fn live_check_codex_auth_finds_real_auth_file() {
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .expect("HOME must be set");
+        check_codex_auth_impl(&home).expect(
+            "Codex auth.json must live at ~/.codex/auth.json on a logged-in machine; \
+             if this fails, `codex login` may have changed the auth file location",
+        );
+    }
+
     #[test]
     fn check_codex_binary_with_missing_binary_returns_error() {
         use switchboard_harness::CodexAdapter;

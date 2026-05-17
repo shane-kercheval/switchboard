@@ -32,7 +32,7 @@ check:
 	pnpm test
 
 test-live:
-	cargo test --locked -p switchboard-harness -p switchboard-dispatcher -- --ignored
+	cargo test --locked -p switchboard-harness -p switchboard-dispatcher -p switchboard-app -- --ignored
 
 clean:
 	cargo clean

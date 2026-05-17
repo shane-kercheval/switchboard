@@ -41,22 +41,32 @@ fn codex_agent() -> AgentRecord {
     }
 }
 
-/// Find a `ToolStarted` / `ToolCompleted` pair sharing the same `tool_use_id`.
-/// The pair-by-id invariant is enforced by the lookup itself, so callers
-/// don't need to re-check that the ids match.
-fn paired_tool_call(events: &[AdapterEvent]) -> Option<(&AdapterEvent, &AdapterEvent)> {
-    let started = events
-        .iter()
-        .find(|e| matches!(e, AdapterEvent::ToolStarted { .. }))?;
-    let AdapterEvent::ToolStarted {
-        tool_use_id: started_id,
+/// Find a `ToolCompleted` whose `output` carries `sentinel` and is not an
+/// error, then return it paired with the `ToolStarted` sharing its
+/// `tool_use_id`. Searching the *completion* first (not the first
+/// `ToolStarted`) makes the test robust against a CLI emitting preliminary
+/// tools (e.g., Claude using `TodoWrite` before the real Read) — those
+/// would shadow the file-reading tool if we paired off the first start.
+fn tool_call_with_output<'a>(
+    events: &'a [AdapterEvent],
+    sentinel: &str,
+) -> Option<(&'a AdapterEvent, &'a AdapterEvent)> {
+    let completed = events.iter().find(|e| {
+        matches!(
+            e,
+            AdapterEvent::ToolCompleted { output, is_error, .. }
+                if !*is_error && output.contains(sentinel)
+        )
+    })?;
+    let AdapterEvent::ToolCompleted {
+        tool_use_id: completed_id,
         ..
-    } = started
+    } = completed
     else {
         unreachable!("filter above guarantees the variant");
     };
-    let completed = events.iter().find(|e| {
-        matches!(e, AdapterEvent::ToolCompleted { tool_use_id, .. } if tool_use_id == started_id)
+    let started = events.iter().find(|e| {
+        matches!(e, AdapterEvent::ToolStarted { tool_use_id, .. } if tool_use_id == completed_id)
     })?;
     Some((started, completed))
 }
@@ -83,28 +93,16 @@ async fn live_claude_emits_tool_started_and_tool_completed_for_file_read() {
         .expect("dispatch should succeed with real claude");
     let events: Vec<AdapterEvent> = stream.collect().await;
 
-    let (started, completed) = paired_tool_call(&events).unwrap_or_else(|| {
-        panic!("expected a ToolStarted/ToolCompleted pair; got events: {events:?}")
+    let (started, _completed) = tool_call_with_output(&events, CLAUDE_TOKEN).unwrap_or_else(|| {
+        panic!(
+            "expected a non-error ToolCompleted whose output contains {CLAUDE_TOKEN:?}; \
+                 got events: {events:?}"
+        )
     });
-
     let AdapterEvent::ToolStarted { name, .. } = started else {
         unreachable!();
     };
-    let AdapterEvent::ToolCompleted {
-        output, is_error, ..
-    } = completed
-    else {
-        unreachable!();
-    };
     assert!(!name.is_empty(), "ToolStarted.name must be non-empty");
-    assert!(
-        !*is_error,
-        "successful file read must report is_error: false"
-    );
-    assert!(
-        output.contains(CLAUDE_TOKEN),
-        "ToolCompleted.output must surface the staged file contents; got: {output:?}"
-    );
 
     let terminal = events
         .iter()
@@ -144,28 +142,16 @@ async fn live_codex_emits_tool_started_and_tool_completed_for_shell_command() {
         .expect("dispatch should succeed with real codex");
     let events: Vec<AdapterEvent> = stream.collect().await;
 
-    let (started, completed) = paired_tool_call(&events).unwrap_or_else(|| {
-        panic!("expected a ToolStarted/ToolCompleted pair; got events: {events:?}")
+    let (started, _completed) = tool_call_with_output(&events, CODEX_TOKEN).unwrap_or_else(|| {
+        panic!(
+            "expected a non-error ToolCompleted whose output contains {CODEX_TOKEN:?}; \
+                 got events: {events:?}"
+        )
     });
-
     let AdapterEvent::ToolStarted { name, .. } = started else {
         unreachable!();
     };
-    let AdapterEvent::ToolCompleted {
-        output, is_error, ..
-    } = completed
-    else {
-        unreachable!();
-    };
     assert!(!name.is_empty(), "ToolStarted.name must be non-empty");
-    assert!(
-        !*is_error,
-        "successful `cat MARKER.txt` must report is_error: false"
-    );
-    assert!(
-        output.contains(CODEX_TOKEN),
-        "ToolCompleted.output must surface the cat'd file contents; got: {output:?}"
-    );
 
     let terminal = events
         .iter()

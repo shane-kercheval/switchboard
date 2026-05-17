@@ -48,15 +48,29 @@ Coverage today:
   `TurnEnd { Completed }`, `SessionMeta`, `RateLimitEvent` (Codex), enriched
   `TurnEnd.usage.context_window`, sidecar shape (Codex), session resume
   (both harnesses).
-- `tool_use.rs` — `ToolStarted` and matching `ToolCompleted` (correlated by
-  `tool_use_id`, `is_error: false`) for a successful file-read / shell tool
-  call per harness.
-- `transcript_load.rs` — full M2.6 round-trip: dispatch a live turn, then
-  call `load_*_transcript` and assert the reconstructed `Turn::User` and
-  `Turn::Agent` match the live stream (text content, terminal status, no
-  parser warnings, model populated). The Codex test exercises the
-  sidecar-driven lookup path (`commands::load_transcript_impl`'s production
-  path).
+- `tool_use.rs` — per harness, plant a sentinel file, prompt for a
+  file-read / shell-cat tool, locate the `ToolCompleted` whose `output`
+  contains the sentinel (`is_error: false`), and assert a matching
+  `ToolStarted` was emitted for the same `tool_use_id`. Sentinel-driven
+  pairing keeps the test robust against the CLI emitting preliminary tools
+  (e.g., Claude using `TodoWrite` before the real Read).
+- `transcript_load.rs` — full transcript-hydration round-trip:
+  - Per harness, dispatch a live "ack" turn and assert the reconstructed
+    `Turn::User` + `Turn::Agent` match the live stream (text, terminal
+    status, no warnings) plus the sidebar contract: Claude hydrated
+    `usage.is_some()` with `context_window.is_none()` (stream-only field);
+    Codex hydrated `usage.context_window.is_some()` (enriched from
+    `task_started.model_context_window`) and `last_rate_limit.is_some()`
+    (from `token_count.rate_limits`); `meta.mcp_servers` / `skills` /
+    `tools` deserialize structurally. The Codex test exercises the
+    sidecar-driven lookup path (`commands::load_transcript_impl`'s
+    production path).
+  - Claude `live_claude_transcript_load_hydrates_tool_items`: dispatch a
+    Read-tool turn, load the transcript, assert the agent turn contains a
+    `TurnItem::Tool` with `is_error: Some(false)` and `output` carrying
+    the staged sentinel. Drift-detection for tool persistence — neither
+    `tool_use.rs` (live events only) nor the ack round-trip catches a CLI
+    bump that changes how tool calls are written to the session file.
 
 Dispatcher-layer live coverage (turn lifecycle ordering, session-id path
 encoding, cwd routing) lives alongside the dispatcher in

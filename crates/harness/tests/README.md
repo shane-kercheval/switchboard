@@ -38,6 +38,10 @@ total subscription cost is negligible.
 ## What's covered
 
 Live tests live in flat files directly under `crates/harness/tests/`.
+**Convention**: add a new file when the category has a distinct coverage
+focus (e.g., `tool_use.rs`, `transcript_load.rs`); extend `live.rs` for
+happy-path coverage of new event types.
+
 Coverage today:
 
 - `live.rs` — happy-path event vocabulary for both adapters: `ContentChunk`,

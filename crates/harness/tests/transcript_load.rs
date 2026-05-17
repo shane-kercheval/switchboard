@@ -4,12 +4,13 @@
 //! same `load_*_transcript` function the app calls during project open. The
 //! reconstructed `Turn::User` and `Turn::Agent` must match what the live
 //! stream emitted — same user prompt, agent reply text, terminal status,
-//! and no parser warnings.
+//! and no parser warnings — plus the sidebar-bearing metadata fields
+//! (per-harness usage, rate-limit, registries) survive the round-trip.
 //!
 //! The Codex test exercises the **sidecar-driven** lookup path (matches
 //! `commands::load_transcript_impl`'s production path). The Codex
 //! attach-existing-session locator (`find_codex_session_file_for_attach`)
-//! has its own M2.4-era coverage and is not duplicated here.
+//! has its own coverage and is not duplicated here.
 //!
 //! Run with: `make test-live`.
 
@@ -18,10 +19,12 @@ use std::path::PathBuf;
 use futures::StreamExt;
 use switchboard_core::{AgentRecord, HarnessKind};
 use switchboard_harness::{
-    AdapterEvent, ClaudeCodeAdapter, CodexAdapter, DispatchOptions, HarnessAdapter, Turn,
+    AdapterEvent, ClaudeCodeAdapter, CodexAdapter, DispatchOptions, HarnessAdapter, Turn, TurnItem,
     TurnStatus, codex::sidecar,
 };
 use uuid::Uuid;
+
+const CLAUDE_TOOL_TOKEN: &str = "SWITCHBOARD_TRANSCRIPT_TOOL_FA21E0";
 
 fn real_home() -> PathBuf {
     std::env::var_os("HOME")
@@ -81,16 +84,100 @@ async fn live_claude_transcript_load_round_trips() {
         "expected no parser warnings; got: {:?}",
         transcript.warnings
     );
-    assert!(
-        transcript.meta.is_some(),
-        "meta must be present after a live turn"
-    );
-    let model = transcript.meta.as_ref().map(|m| m.model.as_str()).unwrap();
-    assert!(!model.is_empty(), "meta.model must be populated");
+    assert_meta_structure(&transcript);
 
     let (user, agent_turn) = first_user_and_agent(&transcript.turns);
     assert_user(user, &agent.id, prompt);
     assert_agent_completed(agent_turn, &agent.id, &live_text);
+    assert_claude_agent_usage(agent_turn);
+}
+
+#[tokio::test]
+#[ignore = "requires claude installed — run with: make test-live"]
+async fn live_claude_transcript_load_hydrates_tool_items() {
+    // Drift-detection for tool-item persistence: tool_use.rs proves tool
+    // events emit live, and the text round-trip above proves text survives
+    // hydration. Neither catches a regression where tool calls stop being
+    // reconstructed from the on-disk session file (a CLI bump renaming a
+    // record type or field), which would silently break sidebar / transcript
+    // rendering of tool calls on project reopen.
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(tmp.path().join("MARKER.txt"), CLAUDE_TOOL_TOKEN).expect("write marker");
+
+    let adapter = ClaudeCodeAdapter::new();
+    let agent = AgentRecord {
+        id: Uuid::now_v7(),
+        project_id: Uuid::now_v7(),
+        name: "transcript-claude-tool".to_owned(),
+        harness: HarnessKind::ClaudeCode,
+        session_id: Some(Uuid::now_v7()),
+        created_at: chrono::Utc::now(),
+    };
+    let turn_id = Uuid::now_v7();
+    let stream = adapter
+        .dispatch(
+            &agent,
+            tmp.path(),
+            "Read the file MARKER.txt in the current directory using your Read tool. \
+             Reply with only the file's contents and nothing else.",
+            turn_id,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed with real claude");
+    let _events: Vec<AdapterEvent> = stream.collect().await;
+
+    let transcript = switchboard_harness::load_claude_transcript(
+        &real_home(),
+        tmp.path(),
+        agent.session_id.unwrap(),
+        agent.id,
+    )
+    .expect("load_claude_transcript must succeed");
+
+    assert!(
+        transcript.warnings.is_empty(),
+        "expected no parser warnings; got: {:?}",
+        transcript.warnings
+    );
+
+    let agent_turn = transcript
+        .turns
+        .iter()
+        .find(|t| matches!(t, Turn::Agent { .. }))
+        .expect("hydrated transcript must contain a Turn::Agent");
+    let Turn::Agent { items, .. } = agent_turn else {
+        unreachable!();
+    };
+
+    let tool_item = items
+        .iter()
+        .find_map(|item| match item {
+            TurnItem::Tool {
+                output,
+                is_error,
+                name,
+                ..
+            } => Some((output, is_error, name)),
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            panic!("hydrated agent turn must contain a TurnItem::Tool; items: {items:?}")
+        });
+    let (output, is_error, name) = tool_item;
+    assert!(!name.is_empty(), "hydrated tool item must carry a name");
+    assert_eq!(
+        *is_error,
+        Some(false),
+        "hydrated tool item must record is_error: Some(false)"
+    );
+    let output = output
+        .as_deref()
+        .expect("hydrated tool item must carry its output text");
+    assert!(
+        output.contains(CLAUDE_TOOL_TOKEN),
+        "hydrated tool output must surface the staged file contents; got: {output:?}"
+    );
 }
 
 #[tokio::test]
@@ -141,16 +228,16 @@ async fn live_codex_transcript_load_via_sidecar_round_trips() {
         "expected no parser warnings; got: {:?}",
         transcript.warnings
     );
+    assert_meta_structure(&transcript);
     assert!(
-        transcript.meta.is_some(),
-        "meta must be present after a live turn"
+        transcript.last_rate_limit.is_some(),
+        "Codex hydration must populate last_rate_limit from the session file"
     );
-    let model = transcript.meta.as_ref().map(|m| m.model.as_str()).unwrap();
-    assert!(!model.is_empty(), "meta.model must be populated");
 
     let (user, agent_turn) = first_user_and_agent(&transcript.turns);
     assert_user(user, &agent.id, prompt);
     assert_agent_completed(agent_turn, &agent.id, &live_text);
+    assert_codex_agent_usage(agent_turn);
 }
 
 fn first_user_and_agent(turns: &[Turn]) -> (&Turn, &Turn) {
@@ -186,14 +273,13 @@ fn assert_agent_completed(turn: &Turn, expected_agent_id: &Uuid, expected_live_t
     assert_eq!(agent_id, expected_agent_id, "agent.agent_id must match");
     assert_eq!(*status, TurnStatus::Complete, "agent turn must be Complete");
 
-    // Walk text items and confirm the live reply appears in the hydrated
-    // stream. Substring (not equality) because the live stream concatenates
-    // chunk-by-chunk and the hydrated form may be assembled from one or
-    // more text records.
+    // Substring (not equality) because the live stream concatenates chunk
+    // by chunk while the hydrated form may be assembled from one or more
+    // text records.
     let hydrated_text: String = items
         .iter()
         .filter_map(|item| match item {
-            switchboard_harness::TurnItem::Text { text, .. } => Some(text.as_str()),
+            TurnItem::Text { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect();
@@ -206,4 +292,51 @@ fn assert_agent_completed(turn: &Turn, expected_agent_id: &Uuid, expected_live_t
         hydrated_text.contains(live_trimmed),
         "hydrated agent text must contain live stream text;\nlive: {live_trimmed:?}\nhydrated: {hydrated_text:?}"
     );
+}
+
+/// Claude's session-file parser fills `usage` with token totals but cannot
+/// recover `context_window` from disk (it lives in the stream-only
+/// `result.modelUsage` field) — `None` is the documented contract.
+fn assert_claude_agent_usage(turn: &Turn) {
+    let Turn::Agent { usage, .. } = turn else {
+        unreachable!("caller already matched Turn::Agent");
+    };
+    let usage = usage
+        .as_ref()
+        .expect("Claude hydration must carry usage for completed turns");
+    assert!(
+        usage.context_window.is_none(),
+        "Claude hydrated usage.context_window must be None (stream-only field); got: {:?}",
+        usage.context_window
+    );
+}
+
+/// Codex's parser enriches `usage.context_window` from
+/// `task_started.model_context_window` and carries `last_rate_limit` from
+/// `token_count.rate_limits` — both load-bearing for the sidebar.
+fn assert_codex_agent_usage(turn: &Turn) {
+    let Turn::Agent { usage, .. } = turn else {
+        unreachable!("caller already matched Turn::Agent");
+    };
+    let usage = usage
+        .as_ref()
+        .expect("Codex hydration must carry usage for completed turns");
+    assert!(
+        usage.context_window.is_some(),
+        "Codex hydrated usage.context_window must be populated from the session file"
+    );
+}
+
+fn assert_meta_structure(transcript: &switchboard_harness::LoadedTranscript) {
+    let meta = transcript
+        .meta
+        .as_ref()
+        .expect("meta must be present after a live turn");
+    assert!(!meta.model.is_empty(), "meta.model must be populated");
+    // Registries are environment-dependent (developer's own MCP config /
+    // skills directory). We pin the structural contract — the fields
+    // deserialize as readable vectors — not the contents.
+    let _: &Vec<_> = &meta.mcp_servers;
+    let _: &Vec<_> = &meta.skills;
+    let _: &Vec<_> = &meta.tools;
 }

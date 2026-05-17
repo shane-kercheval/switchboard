@@ -2,10 +2,10 @@
 //!
 //! Each test prompts the real CLI to use a file-read / shell tool and asserts
 //! that `ToolStarted` is followed by a matching `ToolCompleted` (correlated by
-//! `tool_use_id`, `is_error: false`). Tool *names* differ across harnesses
-//! (Claude builtins like `Read`; Codex's normalized `command_execution`); the
-//! assertions key off `tool_use_id` correlation, not name strings, so a CLI
-//! rename of an underlying tool doesn't make these tests brittle.
+//! `tool_use_id`, `is_error: false`, output contains the staged sentinel).
+//! Tool *names* differ across harnesses (Claude builtins like `Read`; Codex's
+//! normalized `command_execution`); the matching keys off `tool_use_id`, not
+//! name strings, so a CLI rename of an underlying tool stays non-brittle.
 //!
 //! Run with: `make test-live`. Both tests are `#[ignore]`-gated.
 
@@ -15,6 +15,9 @@ use switchboard_harness::{
     AdapterEvent, ClaudeCodeAdapter, CodexAdapter, DispatchOptions, HarnessAdapter, TurnOutcome,
 };
 use uuid::Uuid;
+
+const CLAUDE_TOKEN: &str = "SWITCHBOARD_TOOL_LIVE_F2A98C";
+const CODEX_TOKEN: &str = "SWITCHBOARD_TOOL_LIVE_C0D3X1";
 
 fn claude_agent() -> AgentRecord {
     AgentRecord {
@@ -38,39 +41,31 @@ fn codex_agent() -> AgentRecord {
     }
 }
 
-/// Look for any `ToolStarted` and its matching `ToolCompleted` in `events`.
-/// Returns the matching pair, or `None` if no started/completed pair shares a
-/// `tool_use_id`. Keys off the id so the harness's normalized tool *name*
-/// can drift (e.g., Codex renaming `command_execution`) without invalidating
-/// the live-test contract.
-fn paired_tool_call(events: &[AdapterEvent]) -> Option<(AdapterEvent, AdapterEvent)> {
-    for ev in events {
-        if let AdapterEvent::ToolStarted { tool_use_id, .. } = ev {
-            let id = tool_use_id.clone();
-            if let Some(completed) = events.iter().find(|e| {
-                matches!(e, AdapterEvent::ToolCompleted { tool_use_id, .. } if tool_use_id == &id)
-            }) {
-                return Some((ev.clone(), completed.clone()));
-            }
-        }
-    }
-    None
+/// Find a `ToolStarted` / `ToolCompleted` pair sharing the same `tool_use_id`.
+/// The pair-by-id invariant is enforced by the lookup itself, so callers
+/// don't need to re-check that the ids match.
+fn paired_tool_call(events: &[AdapterEvent]) -> Option<(&AdapterEvent, &AdapterEvent)> {
+    let started = events
+        .iter()
+        .find(|e| matches!(e, AdapterEvent::ToolStarted { .. }))?;
+    let AdapterEvent::ToolStarted {
+        tool_use_id: started_id,
+        ..
+    } = started
+    else {
+        unreachable!("filter above guarantees the variant");
+    };
+    let completed = events.iter().find(|e| {
+        matches!(e, AdapterEvent::ToolCompleted { tool_use_id, .. } if tool_use_id == started_id)
+    })?;
+    Some((started, completed))
 }
 
 #[tokio::test]
 #[ignore = "requires claude installed — run with: make test-live"]
 async fn live_claude_emits_tool_started_and_tool_completed_for_file_read() {
-    // Stage a known file under a tempdir and prompt Claude to read it.
-    // Asserts the full tool-event lifecycle:
-    //   - ToolStarted with a stable tool_use_id
-    //   - matching ToolCompleted with the same tool_use_id
-    //   - is_error: false
-    //   - terminal TurnEnd(Completed)
-    // The token in the file is a unique sentinel so any reasonable model
-    // response that quotes file content will include it.
     let tmp = tempfile::TempDir::new().expect("tempdir");
-    let token = "SWITCHBOARD_TOOL_LIVE_F2A98C";
-    std::fs::write(tmp.path().join("MARKER.txt"), token).expect("write marker");
+    std::fs::write(tmp.path().join("MARKER.txt"), CLAUDE_TOKEN).expect("write marker");
 
     let adapter = ClaudeCodeAdapter::new();
     let agent = claude_agent();
@@ -92,28 +87,24 @@ async fn live_claude_emits_tool_started_and_tool_completed_for_file_read() {
         panic!("expected a ToolStarted/ToolCompleted pair; got events: {events:?}")
     });
 
-    match (&started, &completed) {
-        (
-            AdapterEvent::ToolStarted {
-                tool_use_id: start_id,
-                name,
-                ..
-            },
-            AdapterEvent::ToolCompleted {
-                tool_use_id: end_id,
-                is_error,
-                ..
-            },
-        ) => {
-            assert_eq!(start_id, end_id, "tool_use_id must correlate");
-            assert!(
-                !*is_error,
-                "successful file read must report is_error: false"
-            );
-            assert!(!name.is_empty(), "ToolStarted.name must be non-empty");
-        }
-        _ => unreachable!(),
-    }
+    let AdapterEvent::ToolStarted { name, .. } = started else {
+        unreachable!();
+    };
+    let AdapterEvent::ToolCompleted {
+        output, is_error, ..
+    } = completed
+    else {
+        unreachable!();
+    };
+    assert!(!name.is_empty(), "ToolStarted.name must be non-empty");
+    assert!(
+        !*is_error,
+        "successful file read must report is_error: false"
+    );
+    assert!(
+        output.contains(CLAUDE_TOKEN),
+        "ToolCompleted.output must surface the staged file contents; got: {output:?}"
+    );
 
     let terminal = events
         .iter()
@@ -134,15 +125,8 @@ async fn live_claude_emits_tool_started_and_tool_completed_for_file_read() {
 #[tokio::test]
 #[ignore = "requires codex installed — run with: make test-live"]
 async fn live_codex_emits_tool_started_and_tool_completed_for_shell_command() {
-    // Codex's most reliably-triggered tool is `command_execution` (shell).
-    // Plant a known file and prompt Codex to read it via its shell tool;
-    // the adapter normalizes the underlying CLI item type into a
-    // ToolStarted/ToolCompleted pair. Assertions key off tool_use_id
-    // correlation so renaming the internal item type doesn't break this
-    // test — a true regression would be the pair vanishing entirely.
     let tmp = tempfile::TempDir::new().expect("tempdir");
-    let token = "SWITCHBOARD_TOOL_LIVE_C0D3X1";
-    std::fs::write(tmp.path().join("MARKER.txt"), token).expect("write marker");
+    std::fs::write(tmp.path().join("MARKER.txt"), CODEX_TOKEN).expect("write marker");
 
     let adapter = CodexAdapter::new();
     let agent = codex_agent();
@@ -164,28 +148,24 @@ async fn live_codex_emits_tool_started_and_tool_completed_for_shell_command() {
         panic!("expected a ToolStarted/ToolCompleted pair; got events: {events:?}")
     });
 
-    match (&started, &completed) {
-        (
-            AdapterEvent::ToolStarted {
-                tool_use_id: start_id,
-                name,
-                ..
-            },
-            AdapterEvent::ToolCompleted {
-                tool_use_id: end_id,
-                is_error,
-                ..
-            },
-        ) => {
-            assert_eq!(start_id, end_id, "tool_use_id must correlate");
-            assert!(
-                !*is_error,
-                "successful `cat MARKER.txt` must report is_error: false"
-            );
-            assert!(!name.is_empty(), "ToolStarted.name must be non-empty");
-        }
-        _ => unreachable!(),
-    }
+    let AdapterEvent::ToolStarted { name, .. } = started else {
+        unreachable!();
+    };
+    let AdapterEvent::ToolCompleted {
+        output, is_error, ..
+    } = completed
+    else {
+        unreachable!();
+    };
+    assert!(!name.is_empty(), "ToolStarted.name must be non-empty");
+    assert!(
+        !*is_error,
+        "successful `cat MARKER.txt` must report is_error: false"
+    );
+    assert!(
+        output.contains(CODEX_TOKEN),
+        "ToolCompleted.output must surface the cat'd file contents; got: {output:?}"
+    );
 
     let terminal = events
         .iter()

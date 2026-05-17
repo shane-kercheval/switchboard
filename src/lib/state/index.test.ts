@@ -18,6 +18,13 @@ vi.mock("@tauri-apps/api/event", () => ({
   }),
 }));
 
+// Mock `invoke` so hydrateAgent's `loadTranscript` call resolves with
+// the staged value. Tests override per-call.
+const invokeMock = vi.fn();
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: (name: string, args: unknown) => invokeMock(name, args),
+}));
+
 // Dynamic import so the mocked `listen` is in place before the module's
 // internal state is constructed.
 async function loadState() {
@@ -53,6 +60,7 @@ function fireTo(channel: string, event: NormalizedEvent): void {
 beforeEach(() => {
   listeners.clear();
   unlistenSpies.clear();
+  invokeMock.mockReset();
 });
 
 afterEach(async () => {
@@ -624,5 +632,147 @@ describe("listener boundary stamps tool started_at / completed_at", () => {
     // Exact equality — proves the listener boundary stamped this, not
     // some other clock reading inside the reducer.
     expect(tool.started_at).toBe("2026-05-16T12:00:00.000Z");
+  });
+});
+
+describe("hydrateAgent", () => {
+  it("flips hydration_status pending → loading → complete and applies turns + meta", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    // Caller marks the runtime as pending before invoking hydrate (App.svelte
+    // does this for project-open / attach flows).
+    const r = state.runtimes[AGENT_A];
+    if (r === undefined) throw new Error("runtime missing");
+    state.runtimes[AGENT_A] = { ...r, hydration_status: "pending" };
+
+    invokeMock.mockResolvedValueOnce({
+      turns: [
+        {
+          role: "user",
+          turn_id: TURN_1,
+          agent_id: AGENT_A,
+          started_at: "2026-05-14T00:00:00Z",
+          text: "remember PURPLE",
+        },
+      ],
+      meta: {
+        model: "claude-sonnet-4-6",
+        harness_version: "2.1.140",
+        tools: [],
+        mcp_servers: [],
+        skills: [],
+      },
+      last_rate_limit: null,
+      warnings: [],
+    });
+
+    await state.hydrateAgent(AGENT_A);
+    expect(invokeMock).toHaveBeenCalledWith("load_transcript", { agentId: AGENT_A });
+    expect(state.runtimes[AGENT_A]?.hydration_status).toBe("complete");
+    expect(state.runtimes[AGENT_A]?.meta?.model).toBe("claude-sonnet-4-6");
+    expect(state.transcripts[AGENT_A]).toHaveLength(1);
+  });
+
+  it("flips to failed on IPC rejection", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    const r = state.runtimes[AGENT_A];
+    if (r === undefined) throw new Error("runtime missing");
+    state.runtimes[AGENT_A] = { ...r, hydration_status: "pending" };
+
+    invokeMock.mockRejectedValueOnce("path resolution failed");
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await state.hydrateAgent(AGENT_A);
+    expect(state.runtimes[AGENT_A]?.hydration_status).toBe("failed");
+
+    warnSpy.mockRestore();
+  });
+
+  it("is idempotent when called twice — second call no-ops after first attempt", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+
+    invokeMock.mockResolvedValueOnce({
+      turns: [],
+      meta: null,
+      last_rate_limit: null,
+      warnings: [],
+    });
+
+    await state.hydrateAgent(AGENT_A);
+    await state.hydrateAgent(AGENT_A);
+    // Second call returned without invoking IPC again.
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("does NOT re-hydrate after a project-reopen-style live state change", async () => {
+    // Regression test: parsers mint fresh turn_ids per parse, so the reducer's
+    // existingIds.has(t.turn_id) dedupe can't catch "same conversation, parsed
+    // twice." The idempotency Set is what prevents the duplicate. Pinned here
+    // against a refactor that re-introduces the manual flip-to-pending and
+    // bypasses the guard.
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+
+    invokeMock.mockResolvedValueOnce({
+      turns: [
+        {
+          role: "user",
+          turn_id: TURN_1,
+          agent_id: AGENT_A,
+          started_at: "2026-05-14T00:00:00Z",
+          text: "remember PURPLE",
+        },
+      ],
+      meta: null,
+      last_rate_limit: null,
+      warnings: [],
+    });
+    await state.hydrateAgent(AGENT_A);
+    expect(state.transcripts[AGENT_A]).toHaveLength(1);
+
+    // Simulate "user navigates away and back" — forcibly reset
+    // hydration_status; the second call must still no-op.
+    const r = state.runtimes[AGENT_A];
+    if (r === undefined) throw new Error("runtime missing");
+    state.runtimes[AGENT_A] = { ...r, hydration_status: "pending" };
+    await state.hydrateAgent(AGENT_A);
+
+    // No second IPC call; transcript stays at 1 turn (would be 2 if the
+    // bug re-introduced).
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+    expect(state.transcripts[AGENT_A]).toHaveLength(1);
+  });
+
+  it("surfaces ParseWarning entries onto runtime.parse_warnings", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    invokeMock.mockResolvedValueOnce({
+      turns: [],
+      meta: null,
+      last_rate_limit: null,
+      warnings: [{ line_number: 0, reason: "session file no longer at recorded path" }],
+    });
+    await state.hydrateAgent(AGENT_A);
+    expect(state.runtimes[AGENT_A]?.parse_warnings).toHaveLength(1);
+    expect(state.runtimes[AGENT_A]?.hydration_status).toBe("complete");
+  });
+
+  it("self-flips hydration_status from any starting state — no manual pre-flip needed", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    // Default freshRuntime is "complete" (create-flow default); hydrateAgent
+    // must still proceed without a manual flip-to-pending by the caller.
+    expect(state.runtimes[AGENT_A]?.hydration_status).toBe("complete");
+    invokeMock.mockResolvedValueOnce({
+      turns: [],
+      meta: null,
+      last_rate_limit: null,
+      warnings: [],
+    });
+    await state.hydrateAgent(AGENT_A);
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+    expect(state.runtimes[AGENT_A]?.hydration_status).toBe("complete");
   });
 });

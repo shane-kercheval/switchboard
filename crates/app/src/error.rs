@@ -136,6 +136,27 @@ pub enum AppError {
         harness: HarnessKind,
         expected_path: String,
     },
+
+    /// Transcript hydration failed at the lookup-mechanism level (I/O on a
+    /// file that exists, registry lookup failure). Per-line parse damage
+    /// degrades silently to warnings inside `LoadedTranscript` — it does
+    /// not surface here.
+    #[error(transparent)]
+    LoadTranscript(#[from] switchboard_harness::LoadTranscriptError),
+
+    /// Transcript hydration tripped over a corrupt Codex sidecar. Parallel
+    /// to [`AppError::AttachBlockedByCorruption`] but specific to the
+    /// hydration call path. Sidecars are Switchboard-owned JSONL; per the
+    /// AGENTS.md fail-loud invariant on our own files, corruption must
+    /// surface rather than degrade to "agent has no history."
+    #[error(
+        "cannot hydrate transcript: sidecar at {path} is corrupt — repair or remove before retrying"
+    )]
+    HydrationBlockedByCorruption {
+        path: PathBuf,
+        #[source]
+        source: switchboard_harness::codex::sidecar::SidecarError,
+    },
 }
 
 impl AppError {

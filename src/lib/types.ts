@@ -105,7 +105,75 @@ export type NormalizedEvent =
 // inside `reduce()`).
 export type HeartbeatTimeout = { type: "heartbeat_timeout"; turn_id: TurnId; at: string };
 
-export type ReducerInput = NormalizedEvent | HeartbeatTimeout;
+// Mirror of Rust `LoadedTranscript` from `crates/harness/src/transcript.rs`.
+// Used by the M2.6 transcript-hydration flow: `load_transcript` Tauri command
+// returns this shape; the reducer's `hydrate` input consumes it.
+export type LoadedTranscript = {
+  turns: LoadedTurn[];
+  meta?: SessionMetaInfo | null;
+  last_rate_limit?: unknown;
+  warnings: ParseWarning[];
+};
+
+export type ParseWarning = { line_number: number; reason: string };
+
+export type SessionMetaInfo = {
+  model: string;
+  harness_version: string;
+  tools: string[];
+  mcp_servers: McpServerStatus[];
+  skills: string[];
+};
+
+// Wire shape of `crate::transcript::Turn` — matches the in-state `Turn`
+// shape but is separate so the on-the-wire deserialization is explicit
+// and the state module can defensively normalize.
+export type LoadedTurn =
+  | { role: "user"; turn_id: TurnId; agent_id: AgentId; started_at: string; text: string }
+  | {
+      role: "agent";
+      turn_id: TurnId;
+      agent_id: AgentId;
+      started_at: string;
+      ended_at?: string | null;
+      status: "streaming" | "complete" | "failed";
+      items: LoadedTurnItem[];
+      usage?: TurnUsage | null;
+    };
+
+export type LoadedTurnItem =
+  | { item_kind: "text"; kind: ContentKind; text: string }
+  | {
+      item_kind: "tool";
+      tool_use_id: string;
+      kind: ToolKind;
+      name: string;
+      input: unknown;
+      output?: string | null;
+      is_error?: boolean | null;
+      started_at: string;
+      completed_at?: string | null;
+    };
+
+// Hydrate reducer input — frontend-synthesized after a `load_transcript`
+// IPC reply lands. Per-agent scope. Non-destructive: existing in-flight
+// turns + already-populated runtime metadata are preserved (live > disk).
+//
+// `warnings` carries `ParseWarning` entries surfaced by the per-harness
+// parser (stale Codex sidecar, malformed JSONL line, etc.) — non-blocking;
+// the hydration still succeeds with whatever could be salvaged. The
+// runtime reducer copies them onto `AgentRuntime.parse_warnings` for the
+// sidebar to render as a non-blocking indicator.
+export type Hydrate = {
+  type: "hydrate";
+  agent_id: AgentId;
+  turns: LoadedTurn[];
+  meta?: SessionMetaInfo | null;
+  last_rate_limit?: unknown;
+  warnings?: ParseWarning[];
+};
+
+export type ReducerInput = NormalizedEvent | HeartbeatTimeout | Hydrate;
 
 // Internal state types (Turn, AgentRuntime, etc.) live in
 // `src/lib/state/types.ts`. This file is wire-format-only.

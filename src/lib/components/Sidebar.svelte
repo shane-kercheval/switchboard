@@ -122,6 +122,19 @@
             {runtime.last_error.message}
           </div>
         {/if}
+        {#if runtime?.parse_warnings && runtime.parse_warnings.length > 0}
+          <div
+            class="mt-1 text-xs text-amber-700"
+            data-testid="agent-parse-warnings"
+            title={runtime.parse_warnings
+              .map((w) => `line ${w.line_number}: ${w.reason}`)
+              .join("\n")}
+          >
+            ⚠ {runtime.parse_warnings.length} transcript warning{runtime.parse_warnings.length === 1
+              ? ""
+              : "s"}
+          </div>
+        {/if}
         {#if runtime?.meta}
           <div class="mt-2 space-y-0.5 text-xs text-neutral-600" data-testid="agent-meta">
             <div>model: <span class="font-mono">{runtime.meta.model}</span></div>

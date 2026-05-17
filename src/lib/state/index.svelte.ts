@@ -35,7 +35,15 @@
 // + `failSendStart` on IPC error.
 
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { AgentId, AgentRecord, FailureKind, NormalizedEvent, TurnId } from "$lib/types";
+import { loadTranscript } from "$lib/api";
+import type {
+  AgentId,
+  AgentRecord,
+  FailureKind,
+  Hydrate,
+  NormalizedEvent,
+  TurnId,
+} from "$lib/types";
 import { HEARTBEAT_TIMEOUT_MS } from "$lib/types";
 import { _internal, freshRuntime, runtimeReducer, transcriptReducer } from "./reducers";
 import type { AgentRuntime, RuntimeMap, ToolCall, TranscriptMap, Turn } from "./types";
@@ -84,6 +92,82 @@ const pendingRegistrations = new Map<AgentId, Promise<void>>();
 type Heartbeat = { turn_id: TurnId; handle: ReturnType<typeof setTimeout> };
 // eslint-disable-next-line svelte/prefer-svelte-reactivity
 const heartbeats = new Map<AgentId, Heartbeat>();
+
+/// Agents this session has already attempted to hydrate. Once an agent is
+/// in this set, subsequent `hydrateAgent` calls are no-ops — regardless of
+/// whether the prior attempt succeeded, failed, or is in flight. The set
+/// stays sticky across success AND failure for the duration of the session.
+///
+/// **Why sticky across failure**: parsers mint fresh `turn_id`s per-turn at
+/// parse time. If hydration ran twice for the same session file, the second
+/// call's turns would have different ids than the first's, and the reducer's
+/// `existingIds.has(t.turn_id)` dedupe in the `hydrate` arm would NOT catch
+/// the duplication — the same conversation lands twice. Even on the failure
+/// branch, the safer default is "don't retry implicitly" rather than risk
+/// the duplicate-content case. An explicit retry UX (per-agent retry button)
+/// is M2.7+ work; it would mutate this set out-of-band.
+///
+/// **TODO(M-future)**: clear this set when the bound directory rebinds —
+/// the agents in a different directory are a different population. Out of
+/// scope for M2.6 (no directory-rebind path exists yet in the post-M2.5
+/// flow that wouldn't already reset the whole app state).
+// eslint-disable-next-line svelte/prefer-svelte-reactivity
+const hydrationAttempted = new Set<AgentId>();
+
+/// Hydrate an agent's transcript history from its harness session file.
+///
+/// Drives the `hydration_status` ladder: `pending` → `loading` → `complete`
+/// or `failed`. The hydrate reducer input is per-agent and non-destructive:
+/// live in-flight turns and already-populated runtime metadata are
+/// preserved (live > disk).
+///
+/// **Idempotency**. Tracked via `hydrationAttempted` (a module-scope Set),
+/// not via inspecting `hydration_status`. Earlier versions short-circuited
+/// on `complete`/`failed` — but that left the door open for a caller (e.g.,
+/// project-reopen) to forcibly reset `hydration_status: "pending"` and
+/// silently re-trigger hydration, producing duplicate turns since parsers
+/// mint fresh `turn_id`s at parse time. The set is authoritative; the
+/// status field is presentational.
+///
+/// **Failure scope** (matches the M2.6 plan's `hydration_status: "failed"`
+/// definition): only lookup-mechanism failures (IPC reject) land here. Per-
+/// line parse warnings flow through as `LoadedTranscript.warnings` inside
+/// an otherwise-`complete` result.
+export async function hydrateAgent(agentId: AgentId): Promise<void> {
+  const current = runtimes[agentId];
+  if (current === undefined) {
+    console.error("[switchboard] hydrateAgent called for unregistered agent", {
+      agent_id: agentId,
+    });
+    return;
+  }
+  if (hydrationAttempted.has(agentId)) return;
+  hydrationAttempted.add(agentId);
+  runtimes[agentId] = { ...current, hydration_status: "loading" };
+  try {
+    const loaded = await loadTranscript(agentId);
+    const hydrate: Hydrate = {
+      type: "hydrate",
+      agent_id: agentId,
+      turns: loaded.turns,
+      meta: loaded.meta ?? null,
+      last_rate_limit: loaded.last_rate_limit ?? null,
+      warnings: loaded.warnings,
+    };
+    const priorTurns = transcripts[agentId] ?? [];
+    transcripts[agentId] = transcriptReducer(priorTurns, hydrate, agentId, "");
+    const priorRuntime = runtimes[agentId];
+    if (priorRuntime !== undefined) {
+      runtimes[agentId] = runtimeReducer(priorRuntime, hydrate);
+    }
+  } catch (e) {
+    console.warn("[switchboard] hydrateAgent failed", { agent_id: agentId, error: e });
+    const after = runtimes[agentId];
+    if (after !== undefined) {
+      runtimes[agentId] = { ...after, hydration_status: "failed" };
+    }
+  }
+}
 
 /// Initialize state for an agent and subscribe to its event channel.
 ///
@@ -332,6 +416,7 @@ export const _testing = {
     }
     listenerRegistry.clear();
     pendingRegistrations.clear();
+    hydrationAttempted.clear();
     for (const heartbeat of heartbeats.values()) {
       clearTimeout(heartbeat.handle);
     }

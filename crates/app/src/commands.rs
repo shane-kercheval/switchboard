@@ -479,6 +479,72 @@ pub async fn send_message_impl(
         .await?)
 }
 
+/// Reload an agent's prior conversation history from its harness session
+/// file. Per-harness parsers project the on-disk records into a normalized
+/// `LoadedTranscript`. The frontend feeds the result through the reducer's
+/// `hydrate` input to populate the unified-view transcript.
+///
+/// **Error scope.** `Err(AppError::LoadTranscript)` is reserved for
+/// lookup-mechanism failures (I/O on a file that exists). Per-line parse
+/// damage degrades silently to `LoadedTranscript.warnings`; missing files
+/// degrade to `LoadedTranscript::default()`. Stale Codex sidecars (file at
+/// recorded path no longer exists) surface as a warning inside an
+/// otherwise-empty `Ok` result.
+///
+/// `home_dir` is passed in (not resolved here) so tests can stage a temp
+/// directory without mutating process-wide `$HOME`. The Tauri command shim
+/// reads `$HOME` and forwards.
+pub fn load_transcript_impl(
+    state: &AppState,
+    agent_id: AgentId,
+    home_dir: &Path,
+) -> Result<switchboard_harness::LoadedTranscript, AppError> {
+    let (project, agent) = lookup_agent(state, agent_id)?;
+    let directory = bound_directory(state)?;
+    match agent.harness {
+        HarnessKind::ClaudeCode => {
+            let Some(session_id) = agent.session_id else {
+                return Ok(switchboard_harness::LoadedTranscript::default());
+            };
+            Ok(switchboard_harness::load_claude_transcript(
+                home_dir,
+                &directory.path,
+                session_id,
+                agent.id,
+            )?)
+        }
+        HarnessKind::Codex => {
+            let sidecar_path = switchboard_harness::codex::sidecar::sidecar_path(
+                &directory.path,
+                project.id,
+                agent.id,
+            );
+            // Fail loud on corrupt sidecars per AGENTS.md (our own JSONL is
+            // never silently degraded). `Ok(None)` is the legitimate
+            // never-dispatched case; only that path falls through to the
+            // empty-transcript outcome.
+            let latest = switchboard_harness::codex::sidecar::read_latest(&sidecar_path).map_err(
+                |source| AppError::HydrationBlockedByCorruption {
+                    path: sidecar_path.clone(),
+                    source,
+                },
+            )?;
+            let (session_id, partition_date) = match latest {
+                Some(record) => (record.session_id, Some(record.session_partition_date)),
+                None => (String::new(), None),
+            };
+            Ok(switchboard_harness::load_codex_transcript(
+                home_dir,
+                &directory.path,
+                &session_id,
+                partition_date,
+                agent.id,
+            )?)
+        }
+        _ => Err(AppError::UnsupportedHarness),
+    }
+}
+
 pub fn check_claude_binary_impl(state: &AppState) -> Result<(), AppError> {
     state.claude_adapter.probe().map_err(AppError::Probe)
 }
@@ -2026,5 +2092,75 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, AppError::NoActiveProject));
+    }
+
+    #[tokio::test]
+    async fn load_transcript_for_claude_agent_with_no_session_file_returns_empty() {
+        let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let session_id = Uuid::now_v7();
+        // Stage the file so attach succeeds but the file content is empty.
+        stage_claude_session_file(tmp_home.path(), tmp_workdir.path(), &session_id);
+        let record = attach_agent_impl(
+            &state,
+            "x",
+            HarnessKind::ClaudeCode,
+            &session_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap();
+
+        let result = load_transcript_impl(&state, record.id, tmp_home.path()).unwrap();
+        assert!(result.turns.is_empty());
+        assert!(result.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn load_transcript_for_codex_agent_without_sidecar_returns_meta_only_empty() {
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        // Create a Codex agent the normal way (no sidecar — no first dispatch).
+        let record = create_agent_impl(&state, "codex_one", HarnessKind::Codex).unwrap();
+
+        let result = load_transcript_impl(&state, record.id, tmp_home.path()).unwrap();
+        assert!(result.turns.is_empty());
+        // Meta is populated from config loaders, never None.
+        assert!(result.meta.is_some());
+    }
+
+    #[tokio::test]
+    async fn load_transcript_for_missing_agent_returns_agent_not_found() {
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let err = load_transcript_impl(&state, Uuid::now_v7(), tmp_home.path()).unwrap_err();
+        assert!(matches!(err, AppError::AgentNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn load_transcript_for_codex_agent_with_corrupt_sidecar_returns_typed_error() {
+        // Sidecars are Switchboard-owned JSONL: corruption must fail loud,
+        // not silently degrade to "agent has no history." Parallel to the
+        // attach-time AttachBlockedByCorruption surfacing in
+        // check_codex_session_id_unique.
+        let (tmp_workdir, tmp_home, state, proj) = fresh_state_with_active_project("alpha").await;
+        let agent = create_agent_impl(&state, "codex_corrupt", HarnessKind::Codex).unwrap();
+
+        // Plant a corrupt sidecar under the canonical bound directory
+        // (macOS canonicalizes `/var` → `/private/var`; sidecar_path uses
+        // the directory we pass in verbatim, so we must use the canonical
+        // form to match what load_transcript_impl reads).
+        let canonical_workdir = tmp_workdir.path().canonicalize().unwrap();
+        let bad_sidecar = switchboard_harness::codex::sidecar::sidecar_path(
+            &canonical_workdir,
+            proj.id,
+            agent.id,
+        );
+        std::fs::create_dir_all(bad_sidecar.parent().unwrap()).unwrap();
+        std::fs::write(&bad_sidecar, b"this is not json\n").unwrap();
+
+        let err = load_transcript_impl(&state, agent.id, tmp_home.path()).unwrap_err();
+        match err {
+            AppError::HydrationBlockedByCorruption { path, .. } => {
+                assert_eq!(path, bad_sidecar);
+            }
+            other => panic!("expected HydrationBlockedByCorruption, got {other:?}"),
+        }
     }
 }

@@ -16,13 +16,20 @@ pub mod events;
 pub mod mock;
 mod parser;
 pub mod subprocess;
+pub mod transcript;
 
 pub use adapter::{DispatchError, DispatchOptions, EventStream, HarnessAdapter};
-pub use claude_code::{ClaudeCodeAdapter, claude_session_file_path};
+pub use claude_code::{ClaudeCodeAdapter, claude_session_file_path, load_claude_transcript};
 pub use codex::CodexAdapter;
-pub use codex::session_file::{AttachLookupError, find_codex_session_file_for_attach};
+pub use codex::session_file::{
+    AttachLookupError, find_codex_session_file_for_attach, load_codex_transcript,
+};
 pub use events::{
     AdapterEvent, ContentKind, FailureKind, McpServerStatus, NormalizedEvent, ToolKind, TurnId,
     TurnOutcome, TurnUsage,
 };
 pub use mock::{MockHarnessAdapter, MockScenario};
+pub use transcript::{
+    LoadTranscriptError, LoadedTranscript, ParseWarning, SessionMetaInfo, Turn, TurnItem,
+    TurnStatus,
+};

@@ -17,6 +17,7 @@ import type {
   ContentKind,
   FailureKind,
   McpServerStatus,
+  ParseWarning,
   ToolKind,
   TurnId,
   TurnUsage,
@@ -172,6 +173,11 @@ export type AgentRuntime = {
   /// this being `"complete"` (or `"failed"`, which enters degraded-dispatch
   /// mode with a banner).
   hydration_status: "pending" | "loading" | "complete" | "failed";
+  /// Non-blocking parser warnings surfaced by `load_transcript` — stale
+  /// Codex sidecar, malformed JSONL lines, etc. Empty / undefined when no
+  /// warnings landed. Display-only; never gates sendability or hydration
+  /// success.
+  parse_warnings?: ParseWarning[];
 };
 
 export type AgentMeta = {

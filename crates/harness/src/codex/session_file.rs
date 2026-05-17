@@ -46,13 +46,23 @@
 //! field of `base_instructions` to a sentinel; preserve the rest of the
 //! envelope verbatim so the surrounding shape stays observable.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::Value;
+use switchboard_core::AgentId;
+use uuid::Uuid;
 
-use crate::events::McpServerStatus;
+use crate::events::{ContentKind, McpServerStatus, ToolKind, TurnId, TurnUsage};
+use crate::transcript::{
+    LoadTranscriptError, LoadedTranscript, ParseWarning, SessionMetaInfo, Turn, TurnItem,
+    TurnStatus, merge_meta_with_loaders, stale_sidecar_warning,
+};
+
+use super::config::load_mcp_servers;
+use super::skills::load_skills;
 
 /// Per-attempt backoff between session-file read tries. Codex writes the
 /// session file synchronously per `docs/research/codex-cli-observed.md`; by
@@ -483,6 +493,514 @@ pub struct SessionMetaFields {
     pub mcp_servers: Vec<McpServerStatus>,
     pub skills: Vec<String>,
     pub raw: Value,
+}
+
+/// Load a Codex session file and project it into a
+/// [`crate::transcript::LoadedTranscript`]. Used by M2.6 transcript hydration
+/// on project open and on attach.
+///
+/// `session_partition_date` MUST come from the per-agent session-link sidecar
+/// (`crate::codex::sidecar::SessionLinkRecord.session_partition_date`). Codex
+/// partitions session files by **local date** at first dispatch and resumes
+/// append to the original-partition file across local-date boundaries; the
+/// stored date is authoritative — never recompute from `Local::today()`.
+///
+/// `cwd` is the user's bound working directory, used for project-scoped
+/// MCP config and skill loaders (same loaders M2.4 uses for live dispatch).
+///
+/// **Stale-sidecar case**: if `session_partition_date` is present but no
+/// session file lives at the recorded path (user deleted it, external
+/// rotation), returns `Ok(LoadedTranscript { turns: vec![], warnings: vec![<stale-sidecar warning>] })`.
+/// **Missing-sidecar case** (agent created, never dispatched): caller passes
+/// `None` for the date — returns `Ok(LoadedTranscript::default())` with no
+/// warning.
+pub fn load_codex_transcript(
+    home_dir: &Path,
+    cwd: &Path,
+    session_id: &str,
+    session_partition_date: Option<NaiveDate>,
+    agent_id: AgentId,
+) -> Result<LoadedTranscript, LoadTranscriptError> {
+    let Some(date) = session_partition_date else {
+        // Agent has no sidecar yet — created but never dispatched.
+        // Surface meta (loaded from config files) even with empty turns
+        // so the sidebar's model / registries populate the moment the
+        // agent is selected.
+        return Ok(LoadedTranscript {
+            meta: Some(merge_meta_with_loaders(
+                None,
+                load_mcp_servers(home_dir, cwd),
+                load_skills(home_dir, cwd),
+            )),
+            ..LoadedTranscript::default()
+        });
+    };
+
+    let Some(path) = locate_session_file(home_dir, date, session_id) else {
+        return Ok(LoadedTranscript {
+            meta: Some(merge_meta_with_loaders(
+                None,
+                load_mcp_servers(home_dir, cwd),
+                load_skills(home_dir, cwd),
+            )),
+            warnings: vec![stale_sidecar_warning()],
+            ..LoadedTranscript::default()
+        });
+    };
+
+    let content = std::fs::read_to_string(&path)?;
+
+    let mut transcript = parse_codex_transcript_content(&content, agent_id);
+    transcript.meta = Some(merge_meta_with_loaders(
+        transcript.meta.take(),
+        load_mcp_servers(home_dir, cwd),
+        load_skills(home_dir, cwd),
+    ));
+    Ok(transcript)
+}
+
+/// Parse Codex session-file content into a `LoadedTranscript` (no FS access).
+/// Exposed `pub(crate)` for unit tests that want to drive the parser without
+/// staging a temp file.
+pub(crate) fn parse_codex_transcript_content(content: &str, agent_id: AgentId) -> LoadedTranscript {
+    let mut state = CodexReconstruction::new(agent_id);
+    for (idx, line) in content.lines().enumerate() {
+        let line_number = idx + 1;
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Value>(line) {
+            Ok(record) => state.ingest(line_number, &record),
+            Err(e) => state.warn(line_number, format!("malformed JSON: {e}")),
+        }
+    }
+    let mut t = state.finalize();
+    // Use the existing enrichment parser to extract model/cli_version/last
+    // rate_limits, then merge into our LoadedTranscript shape. Single source
+    // of truth for meta fields.
+    let enrichment = parse_session_content(content);
+    t.last_rate_limit = enrichment.rate_limits;
+    t.meta = Some(SessionMetaInfo {
+        model: enrichment.model.unwrap_or_default(),
+        harness_version: enrichment.cli_version.unwrap_or_default(),
+        tools: vec![],
+        mcp_servers: vec![],
+        skills: vec![],
+    });
+    t
+}
+
+/// In-progress reconstruction state. Walks records in order, opening agent
+/// turns on `task_started` and closing on `task_complete` or EOF.
+struct CodexReconstruction {
+    agent_id: AgentId,
+    turns: Vec<Turn>,
+    current_agent: Option<CodexAgentBuilder>,
+    warnings: Vec<ParseWarning>,
+}
+
+struct CodexAgentBuilder {
+    turn_id: TurnId,
+    agent_id: AgentId,
+    started_at: DateTime<Utc>,
+    last_seen_at: DateTime<Utc>,
+    items: Vec<TurnItem>,
+    usage: Option<TurnUsage>,
+    context_window: Option<u32>,
+    pending_mcp_results: HashMap<String, McpResult>,
+}
+
+/// Captured `mcp_tool_call_end` payload — applied to the matching
+/// `function_call` item when both have been observed.
+struct McpResult {
+    server: String,
+    tool: String,
+    output: String,
+    is_error: bool,
+    completed_at: Option<DateTime<Utc>>,
+}
+
+impl CodexReconstruction {
+    fn new(agent_id: AgentId) -> Self {
+        Self {
+            agent_id,
+            turns: Vec::new(),
+            current_agent: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    fn warn(&mut self, line_number: usize, reason: impl Into<String>) {
+        self.warnings.push(ParseWarning {
+            line_number,
+            reason: reason.into(),
+        });
+    }
+
+    fn ingest(&mut self, line_number: usize, record: &Value) {
+        let record_type = record.get("type").and_then(Value::as_str).unwrap_or("");
+        let payload = record.get("payload");
+        let timestamp = record
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&Utc));
+
+        match record_type {
+            "event_msg" => self.handle_event_msg(line_number, payload, timestamp),
+            "response_item" => self.handle_response_item(line_number, payload, timestamp),
+            _ => {}
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn handle_event_msg(
+        &mut self,
+        line_number: usize,
+        payload: Option<&Value>,
+        timestamp: Option<DateTime<Utc>>,
+    ) {
+        let Some(p) = payload else { return };
+        let event_type = p.get("type").and_then(Value::as_str).unwrap_or("");
+        match event_type {
+            "task_started" => {
+                // Open a fresh agent turn. Close any predecessor first
+                // (defensive against missing task_complete records).
+                self.close_current_agent(TurnStatus::Failed);
+                let started_at = timestamp.unwrap_or_else(Utc::now);
+                let context_window = p
+                    .get("model_context_window")
+                    .and_then(Value::as_u64)
+                    .and_then(|v| u32::try_from(v).ok());
+                self.current_agent = Some(CodexAgentBuilder {
+                    turn_id: Uuid::now_v7(),
+                    agent_id: self.agent_id,
+                    started_at,
+                    last_seen_at: started_at,
+                    items: Vec::new(),
+                    usage: None,
+                    context_window,
+                    pending_mcp_results: HashMap::new(),
+                });
+            }
+            "task_complete" => {
+                self.close_current_agent(TurnStatus::Complete);
+            }
+            "user_message" => {
+                // Push to `self.turns` directly, not into `builder.items`:
+                // Codex emits `task_started` BEFORE `user_message`, so the
+                // agent builder is already open here. The user turn should
+                // appear chronologically before the agent turn the builder
+                // will eventually close (on `task_complete`). Since the
+                // open agent turn isn't yet in `self.turns`, a direct push
+                // at the current tail naturally places the user turn first;
+                // the agent turn slots in after on close.
+                let Some(message) = p.get("message").and_then(Value::as_str) else {
+                    return;
+                };
+                let started_at = timestamp.unwrap_or_else(Utc::now);
+                let user_turn = Turn::User {
+                    turn_id: Uuid::now_v7(),
+                    agent_id: self.agent_id,
+                    started_at,
+                    text: message.to_owned(),
+                };
+                self.turns.push(user_turn);
+            }
+            "agent_message" => {
+                let Some(message) = p.get("message").and_then(Value::as_str) else {
+                    return;
+                };
+                if let Some(builder) = self.current_agent.as_mut() {
+                    builder.items.push(TurnItem::Text {
+                        kind: ContentKind::Text,
+                        text: message.to_owned(),
+                    });
+                    if let Some(t) = timestamp {
+                        builder.last_seen_at = t;
+                    }
+                }
+            }
+            "token_count" => {
+                // `info.last_token_usage` carries per-turn tokens. `info` is
+                // null on the rate-limits-only variant — skip those.
+                let Some(builder) = self.current_agent.as_mut() else {
+                    return;
+                };
+                let Some(info) = p.get("info").filter(|v| !v.is_null()) else {
+                    return;
+                };
+                let last = info.get("last_token_usage").unwrap_or(info);
+                let input = last
+                    .get("input_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let output = last
+                    .get("output_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                builder.usage = Some(TurnUsage {
+                    input_tokens: input,
+                    output_tokens: output,
+                    cached_input_tokens: last.get("cached_input_tokens").and_then(Value::as_u64),
+                    reasoning_output_tokens: last
+                        .get("reasoning_output_tokens")
+                        .and_then(Value::as_u64),
+                    context_window: builder.context_window,
+                    total_cost_usd: None,
+                });
+            }
+            "mcp_tool_call_end" => {
+                let Some(call_id) = p.get("call_id").and_then(Value::as_str) else {
+                    self.warn(line_number, "mcp_tool_call_end missing call_id");
+                    return;
+                };
+                let invocation = p.get("invocation");
+                let server = invocation
+                    .and_then(|i| i.get("server"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                let tool = invocation
+                    .and_then(|i| i.get("tool"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                let (output, is_error) = decode_mcp_result(p.get("result"));
+                let result = McpResult {
+                    server,
+                    tool,
+                    output,
+                    is_error,
+                    completed_at: timestamp,
+                };
+                if let Some(builder) = self.current_agent.as_mut() {
+                    let matched = apply_mcp_result(&mut builder.items, call_id, &result);
+                    // Only stash for late-arrival pairing if the eager apply
+                    // didn't match (rare — Codex emits function_call first).
+                    // Stashing on match would leak unused entries.
+                    if !matched {
+                        builder
+                            .pending_mcp_results
+                            .insert(call_id.to_owned(), result);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_response_item(
+        &mut self,
+        line_number: usize,
+        payload: Option<&Value>,
+        timestamp: Option<DateTime<Utc>>,
+    ) {
+        let Some(p) = payload else { return };
+        let item_type = p.get("type").and_then(Value::as_str).unwrap_or("");
+        match item_type {
+            "function_call" => {
+                let Some(call_id) = p.get("call_id").and_then(Value::as_str) else {
+                    self.warn(line_number, "function_call missing call_id");
+                    return;
+                };
+                let raw_name = p.get("name").and_then(Value::as_str).unwrap_or("");
+                let arguments = p
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                    .unwrap_or(Value::Null);
+                let namespace = p.get("namespace").and_then(Value::as_str);
+                let (kind, name) = classify_codex_function_call(raw_name, namespace);
+                let started_at = timestamp.unwrap_or_else(Utc::now);
+                let Some(builder) = self.current_agent.as_mut() else {
+                    return;
+                };
+                let item = TurnItem::Tool {
+                    tool_use_id: call_id.to_owned(),
+                    kind,
+                    name,
+                    input: arguments,
+                    output: None,
+                    is_error: None,
+                    started_at,
+                    completed_at: None,
+                };
+                builder.items.push(item);
+                // If the matching mcp_tool_call_end already arrived, apply
+                // it now (shouldn't happen in practice — Codex writes the
+                // function_call before the end event — but defensive).
+                if let Some(result) = builder.pending_mcp_results.remove(call_id) {
+                    let _ = apply_mcp_result(&mut builder.items, call_id, &result);
+                }
+            }
+            "function_call_output" => {
+                let Some(call_id) = p.get("call_id").and_then(Value::as_str) else {
+                    self.warn(line_number, "function_call_output missing call_id");
+                    return;
+                };
+                let output = p
+                    .get("output")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                let completed_at = timestamp;
+                let Some(builder) = self.current_agent.as_mut() else {
+                    return;
+                };
+                let mut matched = false;
+                for item in &mut builder.items {
+                    if let TurnItem::Tool {
+                        tool_use_id,
+                        output: out,
+                        is_error,
+                        completed_at: cat,
+                        ..
+                    } = item
+                        && tool_use_id == call_id
+                    {
+                        // Don't overwrite an MCP-result-supplied output.
+                        if out.is_none() {
+                            *out = Some(output.clone());
+                            *is_error = Some(false);
+                            *cat = completed_at;
+                        }
+                        matched = true;
+                        break;
+                    }
+                }
+                if !matched {
+                    self.warn(
+                        line_number,
+                        format!("function_call_output for {call_id} did not match any open tool"),
+                    );
+                }
+            }
+            // `response_item/message` carries the structured model-API form
+            // of the conversation content (`content: [{type:"input_text",
+            // text:"..."}]`). We don't parse it — `event_msg/user_message`
+            // and `event_msg/agent_message` are the UI-friendly summaries
+            // that flow alongside in every observed Codex session, and
+            // consuming both would double-count text in the rehydrated
+            // transcript. Regression check: the session-file unit tests
+            // below (`load_codex_transcript_text_only_turn_produces_user_and_agent`
+            // and friends) construct fixtures using these `event_msg`
+            // records and assert non-empty `items`. If a future Codex
+            // release stops emitting `event_msg/agent_message`, those
+            // assertions fail before the parser change ships.
+            _ => {}
+        }
+    }
+
+    fn close_current_agent(&mut self, status: TurnStatus) {
+        let Some(builder) = self.current_agent.take() else {
+            return;
+        };
+        self.turns.push(Turn::Agent {
+            turn_id: builder.turn_id,
+            agent_id: builder.agent_id,
+            started_at: builder.started_at,
+            ended_at: Some(builder.last_seen_at),
+            status,
+            items: builder.items,
+            usage: builder.usage,
+        });
+    }
+
+    fn finalize(mut self) -> LoadedTranscript {
+        // Any in-progress agent turn at EOF is truncated — no task_complete
+        // observed before EOF. **Asymmetric with Claude on purpose**: Codex
+        // emits an explicit `event_msg/task_complete` per turn, so a missing
+        // one means genuine truncation. Claude's session file has no
+        // analogous terminal marker; its `finalize` defaults to Complete
+        // instead. See `crates/harness/src/claude_code/session_file.rs::
+        // ReconstructionState::finalize` for the other side of the
+        // asymmetry.
+        self.close_current_agent(TurnStatus::Failed);
+        LoadedTranscript {
+            turns: self.turns,
+            meta: None,
+            last_rate_limit: None,
+            warnings: self.warnings,
+        }
+    }
+}
+
+/// Decode a Codex `mcp_tool_call_end.result`. Variants:
+/// - `{"Ok": {"content": [{"type":"text","text":"..."}], "isError": false}}`
+/// - `{"Err": "error message"}`
+///
+/// Returns `(output_string, is_error)`.
+fn decode_mcp_result(result: Option<&Value>) -> (String, bool) {
+    let Some(result) = result else {
+        return (String::new(), false);
+    };
+    if let Some(ok) = result.get("Ok") {
+        let is_error = ok.get("isError").and_then(Value::as_bool).unwrap_or(false);
+        let content = ok.get("content").and_then(Value::as_array);
+        let text = content
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter_map(|b| {
+                        if b.get("type").and_then(Value::as_str) == Some("text") {
+                            b.get("text").and_then(Value::as_str).map(str::to_owned)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        (text, is_error)
+    } else if let Some(err) = result.get("Err") {
+        let msg = err.as_str().unwrap_or("").to_owned();
+        (msg, true)
+    } else {
+        (String::new(), false)
+    }
+}
+
+/// Discriminate built-in vs MCP function-call name. MCP calls carry a
+/// `namespace: "mcp__<server>__"` field; the surfaced name is
+/// `<server>.<tool>` (matching M2.3's stream-side emission).
+fn classify_codex_function_call(name: &str, namespace: Option<&str>) -> (ToolKind, String) {
+    if let Some(ns) = namespace
+        && ns.starts_with("mcp__")
+    {
+        let server = ns.trim_start_matches("mcp__").trim_end_matches("__");
+        return (ToolKind::Mcp, format!("{server}.{name}"));
+    }
+    (ToolKind::Builtin, name.to_owned())
+}
+
+/// Apply an MCP completion to the matching open tool item. Returns `true`
+/// when a matching tool was found and patched.
+fn apply_mcp_result(items: &mut [TurnItem], call_id: &str, result: &McpResult) -> bool {
+    for item in items {
+        if let TurnItem::Tool {
+            tool_use_id,
+            kind,
+            name,
+            output,
+            is_error,
+            completed_at,
+            ..
+        } = item
+            && tool_use_id == call_id
+        {
+            *kind = ToolKind::Mcp;
+            if !result.server.is_empty() && !result.tool.is_empty() {
+                *name = format!("{}.{}", result.server, result.tool);
+            }
+            *output = Some(result.output.clone());
+            *is_error = Some(result.is_error);
+            *completed_at = result.completed_at;
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -970,5 +1488,428 @@ not valid json
         };
         let result = build_session_meta_fields(&e, vec![], vec![]);
         assert!(result.is_some());
+    }
+
+    #[test]
+    fn load_codex_transcript_with_no_partition_date_returns_meta_only_empty() {
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let agent_id = Uuid::now_v7();
+        let result =
+            load_codex_transcript(home.path(), cwd.path(), "any-session", None, agent_id).unwrap();
+        assert!(result.turns.is_empty());
+        assert!(result.warnings.is_empty());
+        // meta is populated from config loaders (empty here since no config files).
+        assert!(result.meta.is_some());
+    }
+
+    #[test]
+    fn load_codex_transcript_with_missing_file_emits_stale_sidecar_warning() {
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let agent_id = Uuid::now_v7();
+        let date = NaiveDate::from_ymd_opt(2026, 5, 14).unwrap();
+        let result = load_codex_transcript(
+            home.path(),
+            cwd.path(),
+            "no-such-session-id",
+            Some(date),
+            agent_id,
+        )
+        .unwrap();
+        assert!(result.turns.is_empty());
+        assert_eq!(result.warnings.len(), 1);
+        assert_eq!(
+            result.warnings[0].reason,
+            "session file no longer at recorded path"
+        );
+    }
+
+    fn write_session_at(home: &Path, date: NaiveDate, session_id: &str, content: &str) -> PathBuf {
+        let dir = session_directory(home, date);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("rollout-2026-{session_id}.jsonl"));
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    fn jsonl_lines(records: &[Value]) -> String {
+        records
+            .iter()
+            .map(|r| serde_json::to_string(r).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn task_started(turn_id: &str, ts: &str, window: u64) -> Value {
+        serde_json::json!({
+            "timestamp": ts,
+            "type": "event_msg",
+            "payload": {
+                "type": "task_started",
+                "turn_id": turn_id,
+                "model_context_window": window
+            }
+        })
+    }
+
+    fn user_message(text: &str, ts: &str) -> Value {
+        serde_json::json!({
+            "timestamp": ts,
+            "type": "event_msg",
+            "payload": { "type": "user_message", "message": text }
+        })
+    }
+
+    fn agent_message(text: &str, ts: &str) -> Value {
+        serde_json::json!({
+            "timestamp": ts,
+            "type": "event_msg",
+            "payload": { "type": "agent_message", "message": text }
+        })
+    }
+
+    fn task_complete(turn_id: &str, ts: &str) -> Value {
+        serde_json::json!({
+            "timestamp": ts,
+            "type": "event_msg",
+            "payload": { "type": "task_complete", "turn_id": turn_id }
+        })
+    }
+
+    fn turn_context(model: &str, ts: &str) -> Value {
+        serde_json::json!({
+            "timestamp": ts,
+            "type": "turn_context",
+            "payload": { "model": model }
+        })
+    }
+
+    #[test]
+    fn load_codex_transcript_text_only_turn_produces_user_and_agent() {
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let agent_id = Uuid::now_v7();
+        let date = NaiveDate::from_ymd_opt(2026, 5, 14).unwrap();
+        let session_id = "019e27fa-ae19-7022-97a2-356e6e5f3360";
+        let content = jsonl_lines(&[
+            task_started(session_id, "2026-05-14T19:33:20Z", 258_400),
+            turn_context("gpt-5.4", "2026-05-14T19:33:20Z"),
+            user_message("hi", "2026-05-14T19:33:21Z"),
+            agent_message("hello", "2026-05-14T19:33:22Z"),
+            task_complete(session_id, "2026-05-14T19:33:23Z"),
+        ]);
+        write_session_at(home.path(), date, session_id, &content);
+
+        let result =
+            load_codex_transcript(home.path(), cwd.path(), session_id, Some(date), agent_id)
+                .unwrap();
+
+        assert_eq!(result.turns.len(), 2);
+        assert!(matches!(&result.turns[0], Turn::User { text, .. } if text == "hi"));
+        match &result.turns[1] {
+            Turn::Agent { items, status, .. } => {
+                assert!(matches!(status, TurnStatus::Complete));
+                assert_eq!(items.len(), 1);
+                assert!(matches!(&items[0], TurnItem::Text { text, .. } if text == "hello"));
+            }
+            _ => panic!("expected Agent turn"),
+        }
+        let meta = result.meta.unwrap();
+        assert_eq!(meta.model, "gpt-5.4");
+    }
+
+    #[test]
+    fn load_codex_transcript_function_call_pairs_with_output() {
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let agent_id = Uuid::now_v7();
+        let date = NaiveDate::from_ymd_opt(2026, 5, 14).unwrap();
+        let session_id = "019e27fa-ae19-7022-97a2-356e6e5f3361";
+        let function_call = serde_json::json!({
+            "timestamp": "2026-05-14T19:33:22Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "exec_command",
+                "call_id": "call_xyz",
+                "arguments": r#"{"cmd":"ls"}"#
+            }
+        });
+        let function_call_output = serde_json::json!({
+            "timestamp": "2026-05-14T19:33:23Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "call_xyz",
+                "output": "stdout: ok"
+            }
+        });
+        let content = jsonl_lines(&[
+            task_started(session_id, "2026-05-14T19:33:20Z", 258_400),
+            turn_context("gpt-5.4", "2026-05-14T19:33:20Z"),
+            user_message("run", "2026-05-14T19:33:21Z"),
+            function_call,
+            function_call_output,
+            task_complete(session_id, "2026-05-14T19:33:24Z"),
+        ]);
+        write_session_at(home.path(), date, session_id, &content);
+
+        let result =
+            load_codex_transcript(home.path(), cwd.path(), session_id, Some(date), agent_id)
+                .unwrap();
+        let Turn::Agent { items, .. } = &result.turns[1] else {
+            panic!("expected Agent turn");
+        };
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            TurnItem::Tool {
+                tool_use_id,
+                kind,
+                name,
+                output,
+                ..
+            } => {
+                assert_eq!(tool_use_id, "call_xyz");
+                assert_eq!(*kind, ToolKind::Builtin);
+                assert_eq!(name, "exec_command");
+                assert_eq!(output.as_deref(), Some("stdout: ok"));
+            }
+            _ => panic!("expected Tool item"),
+        }
+    }
+
+    #[test]
+    fn load_codex_transcript_function_call_with_mcp_namespace_classifies_as_mcp() {
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let agent_id = Uuid::now_v7();
+        let date = NaiveDate::from_ymd_opt(2026, 5, 14).unwrap();
+        let session_id = "019e27fa-ae19-7022-97a2-356e6e5f3362";
+        let function_call = serde_json::json!({
+            "timestamp": "2026-05-14T19:33:22Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "create_note",
+                "namespace": "mcp__tiddly_notes_bookmarks__",
+                "call_id": "call_mcp1",
+                "arguments": "{}"
+            }
+        });
+        let mcp_end = serde_json::json!({
+            "timestamp": "2026-05-14T19:33:23Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "mcp_tool_call_end",
+                "call_id": "call_mcp1",
+                "invocation": { "server": "tiddly_notes_bookmarks", "tool": "create_note" },
+                "result": { "Ok": { "content": [{"type":"text","text":"ok"}], "isError": false } }
+            }
+        });
+        let content = jsonl_lines(&[
+            task_started(session_id, "2026-05-14T19:33:20Z", 258_400),
+            turn_context("gpt-5.4", "2026-05-14T19:33:20Z"),
+            user_message("mcp call", "2026-05-14T19:33:21Z"),
+            function_call,
+            mcp_end,
+            task_complete(session_id, "2026-05-14T19:33:24Z"),
+        ]);
+        write_session_at(home.path(), date, session_id, &content);
+
+        let result =
+            load_codex_transcript(home.path(), cwd.path(), session_id, Some(date), agent_id)
+                .unwrap();
+        let Turn::Agent { items, .. } = &result.turns[1] else {
+            panic!("expected Agent turn");
+        };
+        match &items[0] {
+            TurnItem::Tool {
+                kind,
+                name,
+                output,
+                is_error,
+                ..
+            } => {
+                assert_eq!(*kind, ToolKind::Mcp);
+                assert_eq!(name, "tiddly_notes_bookmarks.create_note");
+                assert_eq!(output.as_deref(), Some("ok"));
+                assert_eq!(*is_error, Some(false));
+            }
+            _ => panic!("expected Tool item"),
+        }
+    }
+
+    #[test]
+    fn load_codex_transcript_token_count_populates_usage() {
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let agent_id = Uuid::now_v7();
+        let date = NaiveDate::from_ymd_opt(2026, 5, 14).unwrap();
+        let session_id = "019e27fa-ae19-7022-97a2-356e6e5f3363";
+        let token_count = serde_json::json!({
+            "timestamp": "2026-05-14T19:33:23Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "last_token_usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 50,
+                        "cached_input_tokens": 20,
+                        "reasoning_output_tokens": 5
+                    }
+                }
+            }
+        });
+        let content = jsonl_lines(&[
+            task_started(session_id, "2026-05-14T19:33:20Z", 258_400),
+            turn_context("gpt-5.4", "2026-05-14T19:33:20Z"),
+            user_message("hi", "2026-05-14T19:33:21Z"),
+            agent_message("hello", "2026-05-14T19:33:22Z"),
+            token_count,
+            task_complete(session_id, "2026-05-14T19:33:24Z"),
+        ]);
+        write_session_at(home.path(), date, session_id, &content);
+
+        let result =
+            load_codex_transcript(home.path(), cwd.path(), session_id, Some(date), agent_id)
+                .unwrap();
+        let Turn::Agent { usage, .. } = &result.turns[1] else {
+            panic!("expected Agent turn");
+        };
+        let usage = usage.as_ref().expect("usage populated");
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 50);
+        assert_eq!(usage.cached_input_tokens, Some(20));
+        assert_eq!(usage.context_window, Some(258_400));
+    }
+
+    #[test]
+    fn load_codex_transcript_truncated_mid_turn_marks_failed() {
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let agent_id = Uuid::now_v7();
+        let date = NaiveDate::from_ymd_opt(2026, 5, 14).unwrap();
+        let session_id = "019e27fa-ae19-7022-97a2-356e6e5f3364";
+        let content = jsonl_lines(&[
+            task_started(session_id, "2026-05-14T19:33:20Z", 258_400),
+            turn_context("gpt-5.4", "2026-05-14T19:33:20Z"),
+            user_message("hi", "2026-05-14T19:33:21Z"),
+            agent_message("hello", "2026-05-14T19:33:22Z"),
+            // No task_complete — truncated.
+        ]);
+        write_session_at(home.path(), date, session_id, &content);
+
+        let result =
+            load_codex_transcript(home.path(), cwd.path(), session_id, Some(date), agent_id)
+                .unwrap();
+        let Turn::Agent { status, .. } = &result.turns[1] else {
+            panic!("expected Agent turn");
+        };
+        assert!(matches!(status, TurnStatus::Failed));
+    }
+
+    #[test]
+    fn load_codex_transcript_malformed_line_is_skipped_with_warning() {
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let agent_id = Uuid::now_v7();
+        let date = NaiveDate::from_ymd_opt(2026, 5, 14).unwrap();
+        let session_id = "019e27fa-ae19-7022-97a2-356e6e5f3365";
+        let content = format!(
+            "{}\n{{ not valid\n{}\n{}",
+            serde_json::to_string(&task_started(session_id, "2026-05-14T19:33:20Z", 258_400))
+                .unwrap(),
+            serde_json::to_string(&agent_message("hello", "2026-05-14T19:33:22Z")).unwrap(),
+            serde_json::to_string(&task_complete(session_id, "2026-05-14T19:33:23Z")).unwrap(),
+        );
+        write_session_at(home.path(), date, session_id, &content);
+
+        let result =
+            load_codex_transcript(home.path(), cwd.path(), session_id, Some(date), agent_id)
+                .unwrap();
+        assert!(!result.warnings.is_empty(), "warning emitted for bad line");
+        assert_eq!(result.warnings[0].line_number, 2);
+    }
+
+    #[test]
+    fn load_codex_transcript_propagates_rate_limits_to_last_rate_limit() {
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let agent_id = Uuid::now_v7();
+        let date = NaiveDate::from_ymd_opt(2026, 5, 14).unwrap();
+        let session_id = "019e27fa-ae19-7022-97a2-356e6e5f3366";
+        let rate_limit_record = serde_json::json!({
+            "timestamp": "2026-05-14T19:33:23Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": null,
+                "rate_limits": { "primary": { "used_percent": 10.0 } }
+            }
+        });
+        let content = jsonl_lines(&[
+            task_started(session_id, "2026-05-14T19:33:20Z", 258_400),
+            turn_context("gpt-5.4", "2026-05-14T19:33:20Z"),
+            user_message("hi", "2026-05-14T19:33:21Z"),
+            agent_message("ok", "2026-05-14T19:33:22Z"),
+            rate_limit_record,
+            task_complete(session_id, "2026-05-14T19:33:24Z"),
+        ]);
+        write_session_at(home.path(), date, session_id, &content);
+
+        let result =
+            load_codex_transcript(home.path(), cwd.path(), session_id, Some(date), agent_id)
+                .unwrap();
+        let rl = result.last_rate_limit.unwrap();
+        assert_eq!(rl["primary"]["used_percent"].as_f64(), Some(10.0));
+    }
+
+    #[test]
+    fn load_codex_transcript_ignores_response_item_message_uses_agent_message() {
+        // Pin the canonical text source: even when a session file ALSO
+        // carries a `response_item/message` record with the structured
+        // model-API content, we extract the agent's text from
+        // `event_msg/agent_message`. Consuming both would double-count;
+        // this test fails loud if a future change parses `response_item/
+        // message` as a fallback.
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let agent_id = Uuid::now_v7();
+        let date = NaiveDate::from_ymd_opt(2026, 5, 14).unwrap();
+        let session_id = "019e27fa-ae19-7022-97a2-356e6e5f3367";
+        let response_item_message = serde_json::json!({
+            "timestamp": "2026-05-14T19:33:22Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "should-be-ignored" }]
+            }
+        });
+        let content = jsonl_lines(&[
+            task_started(session_id, "2026-05-14T19:33:20Z", 258_400),
+            turn_context("gpt-5.4", "2026-05-14T19:33:20Z"),
+            user_message("hi", "2026-05-14T19:33:21Z"),
+            response_item_message,
+            agent_message("from-event-msg", "2026-05-14T19:33:22Z"),
+            task_complete(session_id, "2026-05-14T19:33:24Z"),
+        ]);
+        write_session_at(home.path(), date, session_id, &content);
+
+        let result =
+            load_codex_transcript(home.path(), cwd.path(), session_id, Some(date), agent_id)
+                .unwrap();
+        let Turn::Agent { items, .. } = &result.turns[1] else {
+            panic!("expected Agent turn");
+        };
+        assert_eq!(items.len(), 1, "exactly one text item — no duplication");
+        match &items[0] {
+            TurnItem::Text { text, .. } => {
+                assert_eq!(text, "from-event-msg");
+            }
+            _ => panic!("expected Text item"),
+        }
     }
 }

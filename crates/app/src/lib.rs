@@ -17,8 +17,8 @@ use tauri::{Emitter, Manager, State};
 use crate::commands::{
     DirectoryInfo, attach_agent_impl, check_claude_binary_impl, check_codex_auth_impl,
     check_codex_binary_impl, create_agent_impl, create_project_impl, init_directory_impl,
-    list_agents_impl, list_projects_impl, open_project_impl, parse_uuid, pick_directory_impl,
-    send_message_impl, set_active_project_impl,
+    list_agents_impl, list_projects_impl, load_transcript_impl, open_project_impl, parse_uuid,
+    pick_directory_impl, send_message_impl, set_active_project_impl,
 };
 use crate::state::AppState;
 
@@ -134,6 +134,18 @@ async fn send_message(
     Ok(handle.turn_id.to_string())
 }
 
+#[tauri::command]
+async fn load_transcript(
+    state: State<'_, AppState>,
+    agent_id: String,
+) -> Result<switchboard_harness::LoadedTranscript, String> {
+    let id = parse_uuid(&agent_id).map_err(|e| e.to_string())?;
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    load_transcript_impl(state.inner(), id, &home).map_err(|e| e.to_string())
+}
+
 /// Bridges the dispatcher's `EventEmitter` abstraction onto Tauri's
 /// `AppHandle::emit`. Emit failures are logged — Tauri's `emit` returns
 /// `Err` when payload serialization fails, which can't happen for our
@@ -217,6 +229,7 @@ pub fn run() {
             attach_agent,
             list_agents,
             send_message,
+            load_transcript,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

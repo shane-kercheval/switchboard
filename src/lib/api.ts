@@ -3,9 +3,11 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  AgentId,
   AgentRecord,
   DirectoryInfo,
   HarnessKind,
+  LoadedTranscript,
   ProjectId,
   ProjectSummary,
   TurnId,
@@ -69,4 +71,8 @@ export async function listAgents(projectId?: ProjectId): Promise<AgentRecord[]> 
 
 export async function sendMessage(agentId: string, prompt: string): Promise<TurnId> {
   return await invoke<TurnId>("send_message", { agentId, prompt });
+}
+
+export async function loadTranscript(agentId: AgentId): Promise<LoadedTranscript> {
+  return await invoke<LoadedTranscript>("load_transcript", { agentId });
 }

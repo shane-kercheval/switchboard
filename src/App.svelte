@@ -11,7 +11,7 @@
   import Sidebar from "$lib/components/Sidebar.svelte";
   import UnifiedTranscript from "$lib/components/UnifiedTranscript.svelte";
   import WelcomeScreen from "$lib/components/WelcomeScreen.svelte";
-  import { registerAgent } from "$lib/state/index.svelte";
+  import { hydrateAgent, registerAgent } from "$lib/state/index.svelte";
   import type {
     AgentRecord,
     BinaryState,
@@ -127,8 +127,18 @@
   /// concurrent calls (per the pendingRegistrations guard), so
   /// Promise.all is safe — overlapping calls for the same agent_id share
   /// one in-flight registration.
+  ///
+  /// Also kicks off transcript hydration per agent. `hydrateAgent` is
+  /// idempotent (tracked via its own attempted-set), so re-opening a
+  /// project after navigating away doesn't re-hydrate — important because
+  /// hydrated turns get fresh `turn_id`s at parse time and would otherwise
+  /// duplicate. Per-agent hydration runs concurrently; disk reads are
+  /// independent and per-agent failures don't block others.
   async function registerAll(agents: AgentRecord[]): Promise<void> {
     await Promise.all(agents.map((a) => registerAgent(a)));
+    // Fire-and-forget — hydration drives the `hydration_status` ladder,
+    // which the compose-bar gate observes reactively.
+    void Promise.all(agents.map((a) => hydrateAgent(a.id)));
   }
 
   async function handlePickDirectory(): Promise<void> {
@@ -206,12 +216,21 @@
   /// Shared core: invoke the right Tauri command for the submission shape,
   /// then call `registerAgent` to wire listeners. Throws on either failure
   /// so the caller can surface the error in its phase-specific UI.
+  ///
+  /// Attach kicks off transcript hydration immediately after registration:
+  /// the user is bringing an existing harness session under orchestration
+  /// and expects its prior history to appear. Create flow needs no
+  /// hydration (no session exists yet) — `hydration_status` stays
+  /// `"complete"` as `freshRuntime` initialized it.
   async function createOrAttachAndRegister(submission: AgentFormSubmit): Promise<AgentRecord> {
     const agent =
       submission.mode === "create"
         ? await api.createAgent(submission.name, submission.harness)
         : await api.attachAgent(submission.name, submission.harness, submission.existingSessionId);
     await registerAgent(agent);
+    if (submission.mode === "attach") {
+      void hydrateAgent(agent.id);
+    }
     return agent;
   }
 

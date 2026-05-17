@@ -32,8 +32,16 @@
 // unchanged; the wire-format enums are `#[non_exhaustive]` on the Rust
 // side so this graceful-degradation is the supported behavior.
 
-import type { AgentId, FailureKind, NormalizedEvent, ReducerInput, TurnId } from "$lib/types";
-import type { AgentRuntime, ToolCall, Turn } from "./types";
+import type {
+  AgentId,
+  FailureKind,
+  LoadedTurn,
+  LoadedTurnItem,
+  NormalizedEvent,
+  ReducerInput,
+  TurnId,
+} from "$lib/types";
+import type { AgentRuntime, ToolCall, Turn, TurnItem } from "./types";
 
 export function transcriptReducer(
   turns: Turn[],
@@ -187,6 +195,18 @@ export function transcriptReducer(
       });
     }
 
+    case "hydrate": {
+      // Per-agent scope. Live in-flight turns take precedence: any turn_id
+      // already in the slice is preserved verbatim. New (disk-derived) turns
+      // append. Order: hydrated turns appear in the order the parser
+      // produced them, then any pre-existing live turns the listener
+      // appended (which is the typical case — hydrate fires AFTER project
+      // open, in-flight live turns may have already arrived).
+      const existingIds = new Set(turns.map((t) => t.turn_id));
+      const fromDisk = input.turns.filter((t) => !existingIds.has(t.turn_id)).map(loadedTurnToTurn);
+      return [...fromDisk, ...turns];
+    }
+
     // Agent-scoped events (rate_limit_event, session_meta, agent_idle) and
     // any future-added wire-format variants don't modify transcripts. The
     // wire-format enum is #[non_exhaustive] on the Rust side specifically
@@ -194,6 +214,45 @@ export function transcriptReducer(
     default:
       return turns;
   }
+}
+
+function loadedTurnToTurn(t: LoadedTurn): Turn {
+  if (t.role === "user") {
+    return {
+      role: "user",
+      turn_id: t.turn_id,
+      agent_id: t.agent_id,
+      started_at: t.started_at,
+      text: t.text,
+    };
+  }
+  return {
+    role: "agent",
+    turn_id: t.turn_id,
+    agent_id: t.agent_id,
+    started_at: t.started_at,
+    ended_at: t.ended_at ?? undefined,
+    status: t.status,
+    items: t.items.map(loadedItemToItem),
+    usage: t.usage ?? undefined,
+  };
+}
+
+function loadedItemToItem(item: LoadedTurnItem): TurnItem {
+  if (item.item_kind === "text") {
+    return { item_kind: "text", kind: item.kind, text: item.text };
+  }
+  return {
+    item_kind: "tool",
+    tool_use_id: item.tool_use_id,
+    kind: item.kind,
+    name: item.name,
+    input: item.input,
+    output: item.output ?? undefined,
+    is_error: item.is_error ?? undefined,
+    started_at: item.started_at,
+    completed_at: item.completed_at ?? undefined,
+  };
 }
 
 export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): AgentRuntime {
@@ -283,6 +342,36 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
 
     case "rate_limit_event":
       return { ...runtime, last_rate_limit: input.info };
+
+    case "hydrate": {
+      // **Fill-if-empty for scalars.** Live `session_meta` and
+      // `rate_limit_event` always overwrite; `hydrate.meta` /
+      // `hydrate.last_rate_limit` only fill when the runtime field is
+      // currently absent. Naturally handles a slow hydrate resolving
+      // after a live event already populated the same field — the late
+      // hydrate sees `Some(_)` and no-ops. Pinned by the
+      // `live_wins_over_subsequent_hydrate` test below.
+      const next: AgentRuntime = {
+        ...runtime,
+        hydration_status: "complete",
+      };
+      if (next.meta === undefined && input.meta != null) {
+        next.meta = {
+          model: input.meta.model,
+          harness_version: input.meta.harness_version,
+          tools: input.meta.tools,
+          mcp_servers: input.meta.mcp_servers,
+          skills: input.meta.skills,
+        };
+      }
+      if (next.last_rate_limit === undefined && input.last_rate_limit != null) {
+        next.last_rate_limit = input.last_rate_limit;
+      }
+      if (input.warnings !== undefined && input.warnings.length > 0) {
+        next.parse_warnings = input.warnings;
+      }
+      return next;
+    }
 
     default:
       return runtime;

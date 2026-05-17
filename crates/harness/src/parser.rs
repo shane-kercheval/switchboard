@@ -402,7 +402,11 @@ fn parse_assistant_envelope(obj: &Value, turn_id: TurnId, state: &mut ParserStat
 /// documented Claude Code naming convention; otherwise treated as `Builtin`.
 /// `Plugin` / `Other` are reserved variants we don't emit in M2.2 (no
 /// reliable evidence on which Claude tool names map to those).
-fn classify_claude_tool_kind(name: &str) -> ToolKind {
+///
+/// `pub(crate)` so the session-file parser in `claude_code/session_file.rs`
+/// can reuse the same prefix discriminator — disk and stream emit the same
+/// `mcp__<server>__<tool>` shape, so a single classifier covers both.
+pub(crate) fn classify_claude_tool_kind(name: &str) -> ToolKind {
     if name.starts_with("mcp__") {
         ToolKind::Mcp
     } else {

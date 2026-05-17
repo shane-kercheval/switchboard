@@ -341,6 +341,120 @@ describe("transcriptReducer", () => {
     });
   });
 
+  describe("hydrate", () => {
+    it("appends hydrated turns to an empty transcript in disk order", () => {
+      const turns = reduce([], {
+        type: "hydrate",
+        agent_id: AGENT_A,
+        turns: [
+          {
+            role: "user",
+            turn_id: TURN_1,
+            agent_id: AGENT_A,
+            started_at: "2026-05-14T00:00:01Z",
+            text: "say 1",
+          },
+          {
+            role: "agent",
+            turn_id: TURN_2,
+            agent_id: AGENT_A,
+            started_at: "2026-05-14T00:00:02Z",
+            status: "complete",
+            items: [{ item_kind: "text", kind: "text", text: "1" }],
+          },
+        ],
+      });
+      expect(turns).toHaveLength(2);
+      expect(turns[0]?.role).toBe("user");
+      expect(turns[1]?.role).toBe("agent");
+    });
+
+    it("preserves a live in-flight turn when hydrate carries the same turn_id", () => {
+      // Live turn lands first.
+      const livePrior = reduce([], turnStart(TURN_1));
+      // Hydrate carries a different (older) value for the SAME turn_id.
+      // The live state must win.
+      const hydrated = reduce(livePrior, {
+        type: "hydrate",
+        agent_id: AGENT_A,
+        turns: [
+          {
+            role: "agent",
+            turn_id: TURN_1,
+            agent_id: AGENT_A,
+            started_at: "1999-01-01T00:00:00Z",
+            status: "complete",
+            items: [{ item_kind: "text", kind: "text", text: "stale" }],
+          },
+        ],
+      });
+      // The live turn keeps its "streaming" status and its (empty) items.
+      const turn = hydrated.find((t) => t.turn_id === TURN_1);
+      expect(turn?.role).toBe("agent");
+      if (turn?.role === "agent") {
+        expect(turn.status).toBe("streaming");
+        expect(turn.items).toHaveLength(0);
+      }
+    });
+
+    it("merges hydrated turns alongside live ones without duplicating", () => {
+      // Two live turns already present.
+      let turns = reduce([], turnStart(TURN_1));
+      turns = reduce(turns, turnStart(TURN_2));
+      const hydrated = reduce(turns, {
+        type: "hydrate",
+        agent_id: AGENT_A,
+        turns: [
+          {
+            role: "user",
+            turn_id: "00000000-0000-7000-8000-000000000003",
+            agent_id: AGENT_A,
+            started_at: "2026-05-14T00:00:01Z",
+            text: "older prompt",
+          },
+        ],
+      });
+      expect(hydrated).toHaveLength(3);
+    });
+
+    it("translates LoadedTurn::Tool items into ToolCall state items", () => {
+      const turns = reduce([], {
+        type: "hydrate",
+        agent_id: AGENT_A,
+        turns: [
+          {
+            role: "agent",
+            turn_id: TURN_1,
+            agent_id: AGENT_A,
+            started_at: "2026-05-14T00:00:01Z",
+            status: "complete",
+            items: [
+              {
+                item_kind: "tool",
+                tool_use_id: "t1",
+                kind: "builtin",
+                name: "Bash",
+                input: { command: "ls" },
+                output: "ok",
+                is_error: false,
+                started_at: "2026-05-14T00:00:01Z",
+                completed_at: "2026-05-14T00:00:02Z",
+              },
+            ],
+          },
+        ],
+      });
+      const turn = turns[0];
+      if (turn === undefined || turn.role !== "agent") throw new Error("expected agent turn");
+      expect(turn.items).toHaveLength(1);
+      const item = turn.items[0];
+      if (item === undefined || item.item_kind !== "tool") throw new Error("expected tool item");
+      expect(item.tool_use_id).toBe("t1");
+      expect(item.output).toBe("ok");
+      expect(item.is_error).toBe(false);
+    });
+  });
+
   describe("agent-scoped + unknown events", () => {
     it("ignores rate_limit_event (transcript doesn't change)", () => {
       const prev = reduce([], turnStart(TURN_1));
@@ -512,6 +626,103 @@ describe("runtimeReducer", () => {
     const prev = fresh();
     const future = { type: "future_variant" } as unknown as NormalizedEvent;
     expect(runtimeReducer(prev, future)).toBe(prev);
+  });
+
+  it("hydrate fills meta when currently empty + flips hydration_status to complete", () => {
+    const r = runtimeReducer(fresh(), {
+      type: "hydrate",
+      agent_id: AGENT_A,
+      turns: [],
+      meta: {
+        model: "claude-sonnet-4-6",
+        harness_version: "2.1.140",
+        tools: ["Bash"],
+        mcp_servers: [{ name: "srv", status: "configured" }],
+        skills: ["debug"],
+      },
+    });
+    expect(r.hydration_status).toBe("complete");
+    expect(r.meta?.model).toBe("claude-sonnet-4-6");
+  });
+
+  it("hydrate does NOT overwrite meta that a prior live event already populated", () => {
+    // Pre-populate meta via a live session_meta event.
+    let r = runtimeReducer(fresh(), {
+      type: "session_meta",
+      agent_id: AGENT_A,
+      model: "live-model",
+      harness_version: "live-version",
+      tools: [],
+      mcp_servers: [],
+      skills: [],
+      raw: {},
+    });
+    // Subsequent hydrate carries a different model — must NOT overwrite.
+    r = runtimeReducer(r, {
+      type: "hydrate",
+      agent_id: AGENT_A,
+      turns: [],
+      meta: {
+        model: "disk-model",
+        harness_version: "disk-version",
+        tools: [],
+        mcp_servers: [],
+        skills: [],
+      },
+    });
+    expect(r.meta?.model).toBe("live-model");
+  });
+
+  it("hydrate fills last_rate_limit when currently empty", () => {
+    const r = runtimeReducer(fresh(), {
+      type: "hydrate",
+      agent_id: AGENT_A,
+      turns: [],
+      last_rate_limit: { primary: { used_percent: 10.0 } },
+    });
+    expect(r.last_rate_limit).toEqual({ primary: { used_percent: 10.0 } });
+  });
+
+  it("live rate_limit_event always overwrites a previously hydrated value", () => {
+    let r = runtimeReducer(fresh(), {
+      type: "hydrate",
+      agent_id: AGENT_A,
+      turns: [],
+      last_rate_limit: { primary: { used_percent: 10.0 } },
+    });
+    r = runtimeReducer(r, {
+      type: "rate_limit_event",
+      agent_id: AGENT_A,
+      info: { primary: { used_percent: 99.0 } },
+    });
+    expect(r.last_rate_limit).toEqual({ primary: { used_percent: 99.0 } });
+  });
+
+  it("hydrate sets hydration_status=complete even with no payload", () => {
+    const r = runtimeReducer(
+      { ...fresh(), hydration_status: "loading" as const },
+      { type: "hydrate", agent_id: AGENT_A, turns: [] },
+    );
+    expect(r.hydration_status).toBe("complete");
+  });
+
+  it("hydrate threads warnings into parse_warnings", () => {
+    const r = runtimeReducer(fresh(), {
+      type: "hydrate",
+      agent_id: AGENT_A,
+      turns: [],
+      warnings: [
+        { line_number: 0, reason: "session file no longer at recorded path" },
+        { line_number: 42, reason: "malformed JSON: expected `,`" },
+      ],
+    });
+    expect(r.parse_warnings).toHaveLength(2);
+    expect(r.parse_warnings?.[0]?.reason).toBe("session file no longer at recorded path");
+  });
+
+  it("hydrate without warnings leaves parse_warnings undefined", () => {
+    const r = runtimeReducer(fresh(), { type: "hydrate", agent_id: AGENT_A, turns: [] });
+    expect(r.parse_warnings).toBeUndefined();
   });
 });
 

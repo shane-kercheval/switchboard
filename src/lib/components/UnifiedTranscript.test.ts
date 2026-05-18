@@ -216,6 +216,50 @@ describe("UnifiedTranscript", () => {
     expect(turn).toHaveTextContent("Done.");
   });
 
+  it("suppresses empty tool output body while keeping the lifecycle badge", async () => {
+    // Harness-agnostic rule: a completed tool with `output === ""` renders
+    // the tool name + completed state but no `<pre>` output body.
+    // Defends against the regression where Gemini's live stream emits
+    // empty `output` for read-like tools, and the body block would
+    // otherwise render as a visible blank pre.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "agent-empty-tool",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:00Z",
+        status: "complete",
+        items: [
+          {
+            item_kind: "tool",
+            tool_use_id: "empty-tool",
+            kind: "builtin",
+            name: "read_file",
+            input: { file_path: "MARKER.txt" },
+            output: "",
+            is_error: false,
+            started_at: "2026-05-16T00:00:01Z",
+            completed_at: "2026-05-16T00:00:02Z",
+          },
+        ],
+      },
+    ];
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+
+    const tool = screen.getByTestId("turn-tool");
+    expect(tool).toHaveTextContent("read_file");
+    // Lifecycle badge: tool is completed and not an error, so no
+    // "running…" or "error" annotation should appear.
+    expect(tool).not.toHaveTextContent("running…");
+    expect(tool).not.toHaveTextContent("error");
+    // Body block suppressed — no <pre> child.
+    expect(tool.querySelector("pre")).toBeNull();
+  });
+
   it("shows processing… indicator for Codex turns with empty items array (streaming)", async () => {
     const state = await loadState();
     await state.registerAgent(CODEX_AGENT);

@@ -184,17 +184,19 @@ pub fn load_gemini_transcript(
 }
 
 /// Outcome of scanning one candidate file's `kind:"main"` headers against
-/// the requested target session.
+/// the requested target session. Public so the attach flow can reuse the
+/// same disambiguation rule as transcript hydration.
 #[derive(Debug, PartialEq, Eq)]
-enum CandidateMatch {
+pub enum CandidateMatch {
     /// No header in the file matches the target. Try the next candidate.
     NoTarget,
     /// The target is present in this file *and* the file contains records
     /// from more than one session (more than one distinct header
     /// `sessionId` observed). Cannot safely demix from file content alone;
-    /// the loader surfaces an ambiguity warning.
+    /// the loader surfaces an ambiguity warning and the attach flow
+    /// rejects with `AmbiguousSessionFile`.
     Ambiguous,
-    /// The target is the file's only session. Safe to hydrate.
+    /// The target is the file's only session. Safe to hydrate / attach.
     Unambiguous,
 }
 
@@ -202,7 +204,8 @@ enum CandidateMatch {
 /// Malformed JSON lines and lines without `kind:"main"` are skipped
 /// silently — only valid `main` headers with a parseable `sessionId`
 /// contribute to the distinct-session count.
-fn classify_candidate(content: &str, target: Uuid) -> CandidateMatch {
+#[must_use]
+pub fn classify_candidate(content: &str, target: Uuid) -> CandidateMatch {
     let mut distinct: Vec<Uuid> = Vec::new();
     for line in content.lines() {
         if line.trim().is_empty() {

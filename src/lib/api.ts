@@ -25,6 +25,14 @@ export async function checkCodexAuth(): Promise<void> {
   await invoke<null>("check_codex_auth");
 }
 
+export async function checkGeminiBinary(): Promise<void> {
+  await invoke<null>("check_gemini_binary");
+}
+
+export async function checkGeminiAuth(): Promise<void> {
+  await invoke<null>("check_gemini_auth");
+}
+
 export async function pickDirectory(path: string): Promise<DirectoryInfo> {
   return await invoke<DirectoryInfo>("pick_directory", { path });
 }

@@ -135,6 +135,25 @@ impl Project {
         self.register_agent_inner_with_id(name, HarnessKind::Codex, None, agent_id)
     }
 
+    /// Register an attached **Gemini** agent — one that wraps an
+    /// already-existing Gemini session. Mirrors the Claude pattern
+    /// (caller-controlled session UUID), not the Codex sidecar pattern.
+    /// The provided `session_id` is the UUID embedded in the Gemini
+    /// session-file filename's id8 prefix; the commands layer validates
+    /// the file exists (and is unambiguous) before calling this method.
+    pub fn register_attached_gemini_agent(
+        &self,
+        name: &str,
+        session_id: Uuid,
+    ) -> Result<AgentRecord> {
+        self.register_agent_inner_with_id(
+            name,
+            HarnessKind::Gemini,
+            Some(session_id),
+            Uuid::now_v7(),
+        )
+    }
+
     /// Shared validation + JSONL append. Caller decides the `session_id`
     /// strategy (create vs. attach, per-harness) and the `agent_id`
     /// (typically `Uuid::now_v7()` from the wrappers; the Codex attach flow

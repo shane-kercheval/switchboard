@@ -104,11 +104,17 @@
               "rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase",
               agent.harness === "claude_code"
                 ? "bg-orange-100 text-orange-800"
-                : "bg-blue-100 text-blue-800",
+                : agent.harness === "codex"
+                  ? "bg-blue-100 text-blue-800"
+                  : "bg-emerald-100 text-emerald-800",
             )}
             data-testid="agent-harness-badge"
           >
-            {agent.harness === "claude_code" ? "Claude" : "Codex"}
+            {agent.harness === "claude_code"
+              ? "Claude"
+              : agent.harness === "codex"
+                ? "Codex"
+                : "Gemini"}
           </span>
         </div>
         <div

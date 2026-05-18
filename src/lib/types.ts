@@ -183,7 +183,7 @@ export type ReducerInput = NormalizedEvent | HeartbeatTimeout | Hydrate;
 // per-agent session-link sidecar is the system-of-record for Codex's
 // captured thread_id); for Claude Code it's pre-generated at registration
 // time.
-export type HarnessKind = "claude_code" | "codex";
+export type HarnessKind = "claude_code" | "codex" | "gemini";
 
 /// Result of the startup-time per-harness probes. `binary` is the
 /// `which`-on-PATH check; `auth` is the best-effort subscription-auth
@@ -230,6 +230,11 @@ export type HarnessAvailability =
       harness: "codex";
       binary: BinaryState;
       auth: "available" | "missing" | "checking";
+    }
+  | {
+      harness: "gemini";
+      binary: BinaryState;
+      auth: "available" | "missing" | "checking";
     };
 
 /// Structured banner shape. The App.svelte banner-stack ordering rule:
@@ -237,15 +242,16 @@ export type HarnessAvailability =
 /// the auth banner is suppressed (auth is irrelevant if the CLI isn't
 /// installed).
 ///
-/// **v1 invariant encoded in the type**: `auth_missing` is Codex-only.
-/// Claude's auth is `"unsupported"` (keychain-based on macOS — see
-/// `HarnessAvailability` docstring). A future Claude auth probe must add
-/// a new banner variant or extend this one explicitly; the literal
-/// `harness: "codex"` arm prevents accidental "Codex not authenticated"
-/// copy from leaking onto Claude banners.
+/// **v1 invariant encoded in the type**: `auth_missing` is restricted to
+/// harnesses with file-detectable auth (Codex's `~/.codex/auth.json` and
+/// Gemini's `~/.gemini/settings.json`). Claude's auth is `"unsupported"`
+/// (keychain-based on macOS — see `HarnessAvailability` docstring). A
+/// future Claude auth probe must add a new banner variant or extend the
+/// `harness` literal explicitly; the closed set prevents accidental
+/// auth-banner copy from leaking onto Claude rows.
 export type HarnessBanner =
   | { kind: "binary_missing"; harness: HarnessKind }
-  | { kind: "auth_missing"; harness: "codex" };
+  | { kind: "auth_missing"; harness: "codex" | "gemini" };
 
 export type AgentRecord = {
   id: AgentId;

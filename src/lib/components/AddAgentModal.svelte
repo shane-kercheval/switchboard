@@ -24,6 +24,7 @@
     onCancel: () => void;
     claudeAvailability?: HarnessAvailability;
     codexAvailability?: HarnessAvailability;
+    geminiAvailability?: HarnessAvailability;
   };
 
   let {
@@ -34,9 +35,18 @@
     onCancel,
     claudeAvailability,
     codexAvailability,
+    geminiAvailability,
   }: Props = $props();
 </script>
 
 <Dialog bind:open title="Add an agent" onClose={onCancel}>
-  <CreateAgentForm {busy} {error} {onSubmit} {onCancel} {claudeAvailability} {codexAvailability} />
+  <CreateAgentForm
+    {busy}
+    {error}
+    {onSubmit}
+    {onCancel}
+    {claudeAvailability}
+    {codexAvailability}
+    {geminiAvailability}
+  />
 </Dialog>

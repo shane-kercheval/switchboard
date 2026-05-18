@@ -3,7 +3,7 @@
 //! to Tauri's `State<'_, AppState>` / `String` conventions; the free
 //! functions are what the unit tests target.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -269,6 +269,12 @@ pub fn attach_agent_impl(
             lock(&state.needs_session_meta).insert(record.id);
             record
         }
+        HarnessKind::Gemini => {
+            let candidate = locate_gemini_candidate(home_dir, &directory.path, session_uuid)?;
+            let _ = candidate;
+            check_gemini_session_id_unique(state, &session_uuid)?;
+            project.register_attached_gemini_agent(name, session_uuid)?
+        }
         _ => return Err(AppError::UnsupportedHarness),
     };
 
@@ -292,7 +298,11 @@ fn map_codex_attach_lookup_error(
             }
         }
         switchboard_harness::AttachLookupError::Ambiguous { session_id, paths } => {
-            AppError::AmbiguousSessionFile { session_id, paths }
+            AppError::AmbiguousSessionFile {
+                harness: HarnessKind::Codex,
+                session_id,
+                paths,
+            }
         }
         // `AttachLookupError` is `#[non_exhaustive]` across crate boundaries.
         // A future variant we don't recognize lands here with a non-misleading
@@ -368,6 +378,95 @@ fn check_claude_session_id_unique(state: &AppState, candidate: &Uuid) -> Result<
 /// The error is wrapped in `AttachBlockedByCorruption` so the user sees
 /// "the failure is about an *unrelated* agent's state, not your attach
 /// target."
+/// Cross-project Gemini session-id collision check. Gemini agents carry
+/// `AgentRecord.session_id = Some(uuid)` (Claude shape). Walks every
+/// project on disk in the bound directory and rejects if any agent
+/// already attached to the same UUID.
+fn check_gemini_session_id_unique(state: &AppState, candidate: &Uuid) -> Result<(), AppError> {
+    for project in enumerate_all_projects(state)? {
+        for agent in project.list_agents()? {
+            if agent.harness != HarnessKind::Gemini {
+                continue;
+            }
+            if agent.session_id == Some(*candidate) {
+                return Err(AppError::SessionAlreadyAttached {
+                    existing_agent_id: agent.id,
+                    existing_agent_name: agent.name,
+                    existing_project_id: project.id,
+                    existing_project_name: project.config.name.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Locate the Gemini session file for `session_id` in the cwd's
+/// `~/.gemini/tmp/<project-name>/chats/` directory. Wraps the M3.3
+/// `classify_candidate` header-scan so attach uses the same disambiguation
+/// rule as transcript hydration — divergence between attach and hydrate
+/// is the bug class M3.3's review caught.
+///
+/// Outcomes:
+/// - Exactly one candidate classifies `Unambiguous(target)` → returns its path.
+/// - Any candidate is `Ambiguous` (single file, multiple distinct session
+///   headers) → `AmbiguousSessionFile` with the candidate path. Under UUID
+///   v4 this is ~1/2^32, but `tracing::warn!` so the case is forensically
+///   visible if it ever fires in production.
+/// - No candidate matches → `SessionFileNotFound`.
+fn locate_gemini_candidate(
+    home_dir: &Path,
+    cwd: &Path,
+    session_id: Uuid,
+) -> Result<PathBuf, AppError> {
+    let candidates =
+        switchboard_harness::gemini_session_file_candidates(home_dir, cwd, &session_id);
+    let mut chosen: Option<PathBuf> = None;
+    for path in &candidates {
+        // A candidate that's unreadable cannot safely be claimed as the
+        // user's target — skip it. If every candidate is unreadable, the
+        // bottom-of-function path returns `SessionFileNotFound`, which is
+        // the right UX (the user verifies the file exists / re-runs).
+        let Ok(content) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        match switchboard_harness::gemini::session_file::classify_candidate(&content, session_id) {
+            switchboard_harness::gemini::session_file::CandidateMatch::Unambiguous => {
+                chosen = Some(path.clone());
+                break;
+            }
+            switchboard_harness::gemini::session_file::CandidateMatch::Ambiguous => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    path = %path.display(),
+                    "gemini attach: candidate file contains multiple session headers; rejecting as ambiguous"
+                );
+                return Err(AppError::AmbiguousSessionFile {
+                    harness: HarnessKind::Gemini,
+                    session_id: session_id.to_string(),
+                    paths: vec![path.clone()],
+                });
+            }
+            switchboard_harness::gemini::session_file::CandidateMatch::NoTarget => {}
+        }
+    }
+    chosen.ok_or_else(|| {
+        let expected = home_dir
+            .join(".gemini")
+            .join("tmp")
+            .join("<project>")
+            .join("chats")
+            .join(format!(
+                "session-*-{}.jsonl",
+                switchboard_harness::gemini::session_file::id_prefix(&session_id)
+            ));
+        AppError::SessionFileNotFound {
+            harness: HarnessKind::Gemini,
+            expected_path: expected.to_string_lossy().into_owned(),
+        }
+    })
+}
+
 fn check_codex_session_id_unique(
     state: &AppState,
     candidate: &str,
@@ -566,6 +665,10 @@ pub fn check_codex_binary_impl(state: &AppState) -> Result<(), AppError> {
     state.codex_adapter.probe().map_err(AppError::Probe)
 }
 
+pub fn check_gemini_binary_impl(state: &AppState) -> Result<(), AppError> {
+    state.gemini_adapter.probe().map_err(AppError::Probe)
+}
+
 /// Best-effort Codex subscription-auth detection. Returns `Ok(())` if the
 /// auth file is present at the default location (`<home>/.codex/auth.json`),
 /// `Err(AppError::AuthNotConfigured)` otherwise.
@@ -592,6 +695,43 @@ pub fn check_codex_auth_impl(home_dir: &Path) -> Result<(), AppError> {
             harness: HarnessKind::Codex,
             expected_path: auth_path.to_string_lossy().into_owned(),
         })
+    }
+}
+
+/// Supported Gemini auth methods. The file is considered authenticated
+/// iff `security.auth.selectedType` is one of these. Failing closed on
+/// missing/unknown values means a malformed or empty `settings.json`
+/// surfaces as "not authenticated," prompting the user to run `gemini`
+/// interactively rather than silently letting a dispatch fail with a
+/// less-actionable error.
+const SUPPORTED_GEMINI_AUTH_TYPES: &[&str] =
+    &["oauth-personal", "gemini-api-key", "vertex-ai", "workspace"];
+
+/// Best-effort Gemini subscription-auth detection. Reads
+/// `<home>/.gemini/settings.json` and checks
+/// `security.auth.selectedType` against the supported set. Returns
+/// `Err(AppError::AuthNotConfigured)` if the file is missing, unparseable,
+/// the field is absent, or the value isn't recognized. Mirrors
+/// `check_codex_auth_impl` shape; `home_dir` is a parameter so tests
+/// stage a temp directory without touching `$HOME`.
+pub fn check_gemini_auth_impl(home_dir: &Path) -> Result<(), AppError> {
+    let settings_path = home_dir.join(".gemini").join("settings.json");
+    let auth_err = || AppError::AuthNotConfigured {
+        harness: HarnessKind::Gemini,
+        expected_path: settings_path.to_string_lossy().into_owned(),
+    };
+    let bytes = std::fs::read(&settings_path).map_err(|_| auth_err())?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| auth_err())?;
+    let selected = value
+        .get("security")
+        .and_then(|s| s.get("auth"))
+        .and_then(|a| a.get("selectedType"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(auth_err)?;
+    if SUPPORTED_GEMINI_AUTH_TYPES.contains(&selected) {
+        Ok(())
+    } else {
+        Err(auth_err())
     }
 }
 
@@ -965,6 +1105,103 @@ mod tests {
         let state = AppState::new(claude, codex, gemini, emitter as Arc<dyn EventEmitter>);
         let err = check_codex_binary_impl(&state).unwrap_err();
         assert!(matches!(err, AppError::Probe(_)));
+    }
+
+    #[test]
+    fn check_gemini_binary_with_mock_adapter_returns_ok() {
+        let (_tmp, state, _) = fresh_state_with_mock();
+        assert!(check_gemini_binary_impl(&state).is_ok());
+    }
+
+    #[test]
+    fn check_gemini_binary_with_missing_binary_returns_error() {
+        use switchboard_harness::GeminiAdapter;
+        let claude: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let codex: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let gemini: Arc<dyn HarnessAdapter> =
+            Arc::new(GeminiAdapter::with_binary_path("/nonexistent/gemini-xyz"));
+        let emitter = Arc::new(RecordingEmitter::new());
+        let state = AppState::new(claude, codex, gemini, emitter as Arc<dyn EventEmitter>);
+        let err = check_gemini_binary_impl(&state).unwrap_err();
+        assert!(matches!(err, AppError::Probe(_)));
+    }
+
+    fn stage_gemini_settings(home: &Path, body: &str) {
+        std::fs::create_dir_all(home.join(".gemini")).unwrap();
+        std::fs::write(home.join(".gemini").join("settings.json"), body).unwrap();
+    }
+
+    #[test]
+    fn check_gemini_auth_returns_error_when_settings_missing() {
+        let tmp = TempDir::new().unwrap();
+        let err = check_gemini_auth_impl(tmp.path()).unwrap_err();
+        match err {
+            AppError::AuthNotConfigured {
+                harness,
+                expected_path,
+            } => {
+                assert_eq!(harness, HarnessKind::Gemini);
+                assert!(expected_path.contains(".gemini"));
+                assert!(expected_path.ends_with("settings.json"));
+            }
+            other => panic!("expected AuthNotConfigured, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_gemini_auth_returns_error_when_selected_type_missing() {
+        let tmp = TempDir::new().unwrap();
+        stage_gemini_settings(tmp.path(), r#"{"security":{"auth":{}}}"#);
+        assert!(matches!(
+            check_gemini_auth_impl(tmp.path()),
+            Err(AppError::AuthNotConfigured { .. })
+        ));
+    }
+
+    #[test]
+    fn check_gemini_auth_returns_error_when_selected_type_unknown() {
+        // Fail-closed: unknown auth type surfaces as not-authenticated
+        // rather than silently allowing the user past the gate.
+        let tmp = TempDir::new().unwrap();
+        stage_gemini_settings(
+            tmp.path(),
+            r#"{"security":{"auth":{"selectedType":"future-method"}}}"#,
+        );
+        assert!(matches!(
+            check_gemini_auth_impl(tmp.path()),
+            Err(AppError::AuthNotConfigured { .. })
+        ));
+    }
+
+    #[test]
+    fn check_gemini_auth_accepts_each_supported_selected_type() {
+        for selected in &["oauth-personal", "gemini-api-key", "vertex-ai", "workspace"] {
+            let tmp = TempDir::new().unwrap();
+            stage_gemini_settings(
+                tmp.path(),
+                &format!(r#"{{"security":{{"auth":{{"selectedType":"{selected}"}}}}}}"#),
+            );
+            assert!(
+                check_gemini_auth_impl(tmp.path()).is_ok(),
+                "expected Ok for selected_type={selected}"
+            );
+        }
+    }
+
+    /// Drift-detection live test: if Gemini moves its auth file or
+    /// renames the `security.auth.selectedType` key, this assertion fails
+    /// on the developer's machine before silent miscategorization ships.
+    #[test]
+    #[ignore = "requires gemini login — run with: make test-live"]
+    fn live_check_gemini_auth_finds_real_settings_file() {
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .expect("HOME must be set");
+        check_gemini_auth_impl(&home).expect(
+            "Gemini settings.json must live at ~/.gemini/settings.json with a supported \
+             `security.auth.selectedType` on a logged-in machine; if this fails, the \
+             Gemini CLI may have moved its auth file or renamed the field",
+        );
     }
 
     #[tokio::test]
@@ -1818,9 +2055,11 @@ mod tests {
         .unwrap_err();
         match err {
             AppError::AmbiguousSessionFile {
+                harness,
                 session_id: id,
                 paths,
             } => {
+                assert_eq!(harness, HarnessKind::Codex);
                 assert_eq!(id, id_str);
                 assert_eq!(paths.len(), 2);
             }
@@ -2233,5 +2472,328 @@ mod tests {
             }
             other => panic!("expected HydrationBlockedByCorruption, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Gemini attach tests
+    // -----------------------------------------------------------------
+
+    /// Stage `~/.gemini/projects.json` + a single Gemini session file
+    /// under `home/.gemini/tmp/<project>/chats/`. Returns the staged
+    /// path. The session file is a minimal `kind:"main"` header line so
+    /// `classify_candidate` returns `Unambiguous` for the target.
+    fn stage_gemini_session_file(home: &Path, cwd: &Path, session_id: &Uuid) -> PathBuf {
+        let canonical = cwd.canonicalize().unwrap();
+        let gemini = home.join(".gemini");
+        std::fs::create_dir_all(&gemini).unwrap();
+        let projects = serde_json::json!({
+            "projects": { canonical.to_str().unwrap(): "proj" }
+        });
+        std::fs::write(gemini.join("projects.json"), projects.to_string()).unwrap();
+        let chats = gemini.join("tmp").join("proj").join("chats");
+        std::fs::create_dir_all(&chats).unwrap();
+        let prefix = switchboard_harness::gemini::session_file::id_prefix(session_id);
+        let path = chats.join(format!("session-2026-05-18T00-00-{prefix}.jsonl"));
+        let header = format!(
+            r#"{{"sessionId":"{session_id}","projectHash":"x","startTime":"2026-05-18T00:00:00Z","lastUpdated":"2026-05-18T00:00:00Z","kind":"main"}}"#
+        );
+        std::fs::write(&path, format!("{header}\n")).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn attach_gemini_succeeds_when_session_file_exists() {
+        let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let session_id = Uuid::new_v4();
+        stage_gemini_session_file(tmp_home.path(), tmp_workdir.path(), &session_id);
+
+        let record = attach_agent_impl(
+            &state,
+            "attached",
+            HarnessKind::Gemini,
+            &session_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap();
+        assert_eq!(record.session_id, Some(session_id));
+        assert_eq!(record.harness, HarnessKind::Gemini);
+        // Gemini follows the Claude pattern (caller-controlled session
+        // UUID); no sidecar, no needs_session_meta override.
+        assert!(
+            !lock(&state.needs_session_meta).contains(&record.id),
+            "Gemini attach must NOT populate needs_session_meta"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_gemini_rejects_missing_session_file_with_expected_path() {
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let session_id = Uuid::new_v4();
+        let err = attach_agent_impl(
+            &state,
+            "attached",
+            HarnessKind::Gemini,
+            &session_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap_err();
+        match err {
+            AppError::SessionFileNotFound {
+                harness,
+                expected_path,
+            } => {
+                assert_eq!(harness, HarnessKind::Gemini);
+                assert!(expected_path.contains(".gemini"));
+            }
+            other => panic!("expected SessionFileNotFound, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_gemini_multi_candidate_picks_full_uuid_match() {
+        // Two files sharing the 8-char prefix in their filename, different
+        // timestamps. Each file holds a different conversation's header.
+        // `classify_candidate` picks the unambiguous-target file; the other
+        // is `NoTarget` and skipped.
+        let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let canonical = tmp_workdir.path().canonicalize().unwrap();
+        let gemini = tmp_home.path().join(".gemini");
+        std::fs::create_dir_all(&gemini).unwrap();
+        let projects = serde_json::json!({
+            "projects": { canonical.to_str().unwrap(): "proj" }
+        });
+        std::fs::write(gemini.join("projects.json"), projects.to_string()).unwrap();
+        let chats = gemini.join("tmp").join("proj").join("chats");
+        std::fs::create_dir_all(&chats).unwrap();
+
+        let id_a = Uuid::parse_str("00000000-0000-4000-8000-000000000010").unwrap();
+        let id_b = Uuid::parse_str("00000000-0000-4000-8000-000000000020").unwrap();
+        let prefix = switchboard_harness::gemini::session_file::id_prefix(&id_a);
+        assert_eq!(
+            prefix,
+            switchboard_harness::gemini::session_file::id_prefix(&id_b),
+            "test setup requires identical 8-char prefixes"
+        );
+        let header_a = format!(
+            r#"{{"sessionId":"{id_a}","projectHash":"x","startTime":"2026-05-18T00:00:00Z","lastUpdated":"2026-05-18T00:00:00Z","kind":"main"}}"#
+        );
+        let header_b = format!(
+            r#"{{"sessionId":"{id_b}","projectHash":"x","startTime":"2026-05-18T00:05:00Z","lastUpdated":"2026-05-18T00:05:00Z","kind":"main"}}"#
+        );
+        std::fs::write(
+            chats.join(format!("session-2026-05-18T00-00-{prefix}.jsonl")),
+            format!("{header_a}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            chats.join(format!("session-2026-05-18T00-05-{prefix}.jsonl")),
+            format!("{header_b}\n"),
+        )
+        .unwrap();
+
+        let record = attach_agent_impl(
+            &state,
+            "attached",
+            HarnessKind::Gemini,
+            &id_b.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap();
+        assert_eq!(record.session_id, Some(id_b));
+    }
+
+    #[tokio::test]
+    async fn attach_gemini_multi_candidate_with_no_match_returns_not_found() {
+        // A candidate file exists at the prefix glob, but its sessionId is
+        // for a different UUID — must not be claimed silently as the
+        // user's target.
+        let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let other = Uuid::parse_str("00000000-0000-4000-8000-000000000010").unwrap();
+        stage_gemini_session_file(tmp_home.path(), tmp_workdir.path(), &other);
+
+        let asked = Uuid::parse_str("00000000-0000-4000-8000-000000000099").unwrap();
+        assert_eq!(
+            switchboard_harness::gemini::session_file::id_prefix(&other),
+            switchboard_harness::gemini::session_file::id_prefix(&asked)
+        );
+        let err = attach_agent_impl(
+            &state,
+            "attached",
+            HarnessKind::Gemini,
+            &asked.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::SessionFileNotFound { harness, .. } if harness == HarnessKind::Gemini)
+        );
+    }
+
+    /// Pinning the M3.3 review regression: an ambiguous candidate (one
+    /// file, multiple distinct session headers) must surface as
+    /// `AmbiguousSessionFile`, never as `SessionFileNotFound` or a
+    /// silent merge. UUID v4 makes this ~1/2^32; the test ensures the
+    /// code path is correctly wired if it ever fires.
+    #[tokio::test]
+    async fn attach_gemini_ambiguous_candidate_surfaces_ambiguous_error() {
+        let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let canonical = tmp_workdir.path().canonicalize().unwrap();
+        let gemini = tmp_home.path().join(".gemini");
+        std::fs::create_dir_all(&gemini).unwrap();
+        let projects = serde_json::json!({
+            "projects": { canonical.to_str().unwrap(): "proj" }
+        });
+        std::fs::write(gemini.join("projects.json"), projects.to_string()).unwrap();
+        let chats = gemini.join("tmp").join("proj").join("chats");
+        std::fs::create_dir_all(&chats).unwrap();
+
+        let target = Uuid::parse_str("00000000-0000-4000-8000-000000000009").unwrap();
+        let other = Uuid::parse_str("00000000-0000-4000-8000-00000000000A").unwrap();
+        let prefix = switchboard_harness::gemini::session_file::id_prefix(&target);
+        let body = format!(
+            r#"{{"sessionId":"{target}","projectHash":"x","startTime":"2026-05-17T22:20:35.615Z","lastUpdated":"2026-05-17T22:20:35.615Z","kind":"main"}}
+{{"sessionId":"{other}","projectHash":"x","startTime":"2026-05-17T22:20:35.654Z","lastUpdated":"2026-05-17T22:20:35.654Z","kind":"main"}}
+"#
+        );
+        let staged = chats.join(format!("session-2026-05-17T22-20-{prefix}.jsonl"));
+        std::fs::write(&staged, body).unwrap();
+
+        let err = attach_agent_impl(
+            &state,
+            "attached",
+            HarnessKind::Gemini,
+            &target.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap_err();
+        match err {
+            AppError::AmbiguousSessionFile {
+                harness,
+                session_id,
+                paths,
+            } => {
+                assert_eq!(harness, HarnessKind::Gemini);
+                assert_eq!(session_id, target.to_string());
+                assert_eq!(paths, vec![staged]);
+            }
+            other => panic!("expected AmbiguousSessionFile, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_gemini_rejects_duplicate_name() {
+        let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let session_id = Uuid::new_v4();
+        stage_gemini_session_file(tmp_home.path(), tmp_workdir.path(), &session_id);
+        attach_agent_impl(
+            &state,
+            "attached",
+            HarnessKind::Gemini,
+            &session_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap();
+
+        // Reuse the same name; even with a different session UUID
+        // (which we'd have to stage too) the name-clash check fires
+        // first. We use the same name + same session for simplicity.
+        let other = Uuid::new_v4();
+        stage_gemini_session_file(tmp_home.path(), tmp_workdir.path(), &other);
+        let err = attach_agent_impl(
+            &state,
+            "attached",
+            HarnessKind::Gemini,
+            &other.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AppError::Core(switchboard_core::CoreError::DuplicateAgentName { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn attach_gemini_rejects_same_project_session_id_collision() {
+        let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let session_id = Uuid::new_v4();
+        stage_gemini_session_file(tmp_home.path(), tmp_workdir.path(), &session_id);
+        attach_agent_impl(
+            &state,
+            "first",
+            HarnessKind::Gemini,
+            &session_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap();
+
+        let err = attach_agent_impl(
+            &state,
+            "second",
+            HarnessKind::Gemini,
+            &session_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap_err();
+        match err {
+            AppError::SessionAlreadyAttached {
+                existing_agent_name,
+                ..
+            } => assert_eq!(existing_agent_name, "first"),
+            other => panic!("expected SessionAlreadyAttached, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_gemini_rejects_cross_project_session_id_collision() {
+        let (tmp_workdir, tmp_home, state, _proj_a) =
+            fresh_state_with_active_project("alpha").await;
+        let session_id = Uuid::new_v4();
+        stage_gemini_session_file(tmp_home.path(), tmp_workdir.path(), &session_id);
+        attach_agent_impl(
+            &state,
+            "first",
+            HarnessKind::Gemini,
+            &session_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap();
+
+        let proj_b = create_project_impl(&state, "beta").unwrap();
+        set_active_project_impl(&state, proj_b.id).unwrap();
+        let err = attach_agent_impl(
+            &state,
+            "first-in-beta",
+            HarnessKind::Gemini,
+            &session_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap_err();
+        match err {
+            AppError::SessionAlreadyAttached {
+                existing_project_name,
+                ..
+            } => assert_eq!(existing_project_name, "alpha"),
+            other => panic!("expected SessionAlreadyAttached, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_gemini_rejects_missing_projects_json_as_not_found() {
+        // No `~/.gemini/projects.json` at all → cwd resolution fails →
+        // candidate set is empty → SessionFileNotFound.
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let session_id = Uuid::new_v4();
+        let err = attach_agent_impl(
+            &state,
+            "attached",
+            HarnessKind::Gemini,
+            &session_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::SessionFileNotFound { harness, .. } if harness == HarnessKind::Gemini)
+        );
     }
 }

@@ -18,9 +18,10 @@ use tauri::{Emitter, Manager, State};
 
 use crate::commands::{
     DirectoryInfo, attach_agent_impl, check_claude_binary_impl, check_codex_auth_impl,
-    check_codex_binary_impl, create_agent_impl, create_project_impl, init_directory_impl,
-    list_agents_impl, list_projects_impl, load_transcript_impl, open_project_impl, parse_uuid,
-    pick_directory_impl, send_message_impl, set_active_project_impl,
+    check_codex_binary_impl, check_gemini_auth_impl, check_gemini_binary_impl, create_agent_impl,
+    create_project_impl, init_directory_impl, list_agents_impl, list_projects_impl,
+    load_transcript_impl, open_project_impl, parse_uuid, pick_directory_impl, send_message_impl,
+    set_active_project_impl,
 };
 use crate::state::AppState;
 
@@ -42,6 +43,19 @@ async fn check_codex_auth() -> Result<(), String> {
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
     check_codex_auth_impl(&home).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn check_gemini_binary(state: State<'_, AppState>) -> Result<(), String> {
+    check_gemini_binary_impl(state.inner()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn check_gemini_auth() -> Result<(), String> {
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    check_gemini_auth_impl(&home).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -225,6 +239,8 @@ pub fn run() {
             check_claude_binary,
             check_codex_binary,
             check_codex_auth,
+            check_gemini_binary,
+            check_gemini_auth,
             pick_directory,
             init_directory,
             list_projects,

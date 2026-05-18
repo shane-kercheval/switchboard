@@ -85,10 +85,11 @@ pub enum AppError {
     /// (manual copy, FS corruption). Surfacing the candidate list lets
     /// the user investigate rather than binding arbitrarily.
     #[error(
-        "ambiguous Codex session file for session_id {session_id}: {} candidates",
+        "ambiguous {harness} session file for session_id {session_id}: {} candidates",
         paths.len()
     )]
     AmbiguousSessionFile {
+        harness: HarnessKind,
         session_id: String,
         paths: Vec<PathBuf>,
     },

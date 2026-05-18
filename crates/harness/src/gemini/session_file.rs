@@ -1,4 +1,4 @@
-//! Gemini session-file path helpers.
+//! Gemini session-file path helpers and transcript hydration.
 //!
 //! Gemini stores session files under
 //! `~/.gemini/tmp/<project-name>/chats/session-<YYYY-MM-DDTHH-MM>-<id8>.jsonl`.
@@ -8,15 +8,16 @@
 //! the helpers exposed here return a *candidate set*; callers verify by
 //! reading the header `sessionId` field when collision-safety is required.
 //!
-//! **What this module owns in M3.2.**
+//! **What this module owns.**
 //! - Cwd → project-name lookup (`resolve_gemini_project_name`).
 //! - First-8-char-prefix glob over the chats directory
 //!   (`gemini_session_file_candidates`).
 //! - A single-file existence check used by `build_args` to pick
 //!   `--session-id` vs `--resume` (`session_file_exists_for`).
-//!
-//! Transcript hydration (`load_gemini_transcript`) lands in M3.3 on top of
-//! these helpers.
+//! - Transcript hydration (`load_gemini_transcript`) with two-layer
+//!   collision defense: path-layer demix for separate files sharing the
+//!   8-char prefix, content-layer ambiguity warning for files that
+//!   accumulated headers from more than one session.
 
 use std::path::{Path, PathBuf};
 
@@ -90,8 +91,9 @@ fn chats_dir(home_dir: &Path, project_name: &str) -> PathBuf {
 /// is missing or unreadable. Cwd is canonicalized internally via
 /// `resolve_gemini_project_name`. Used by:
 /// - `session_file_exists_for` (pick `--session-id` vs `--resume`).
-/// - The attach lookup (pick the right file when filenames collide; M3.4).
-/// - The transcript hydrator (M3.3).
+/// - The attach lookup (pick the right file when filenames collide).
+/// - The transcript hydrator (full session disambiguation by
+///   `sessionId` happens at the loader layer).
 #[must_use]
 pub fn gemini_session_file_candidates(
     home_dir: &Path,
@@ -168,34 +170,40 @@ pub fn load_gemini_transcript(
     if candidates.is_empty() {
         return Ok(LoadedTranscript::default());
     }
-    let Some(path) = select_candidate_by_header(&candidates, session_id)? else {
-        return Ok(LoadedTranscript::default());
-    };
-    let content = std::fs::read_to_string(&path)?;
-    Ok(parse_gemini_transcript_content(
-        &content, agent_id, session_id,
-    ))
-}
-
-/// Inspect each candidate's first non-blank line; pick the file whose
-/// first `kind:"main"` header carries `sessionId == target`. Returns
-/// `Ok(None)` if no candidate matches — this is how filename-level
-/// 8-char-prefix collisions (two sessions in different minutes, two
-/// separate files) get demixed at the path layer.
-fn select_candidate_by_header(
-    candidates: &[PathBuf],
-    target: Uuid,
-) -> Result<Option<PathBuf>, LoadTranscriptError> {
-    for path in candidates {
+    for path in &candidates {
         let content = std::fs::read_to_string(path)?;
-        if first_header_matches(&content, target) {
-            return Ok(Some(path.clone()));
+        match classify_candidate(&content, session_id) {
+            CandidateMatch::NoTarget => {}
+            CandidateMatch::Ambiguous => return Ok(ambiguous_session_warning()),
+            CandidateMatch::Unambiguous => {
+                return Ok(parse_gemini_transcript_content(&content, agent_id));
+            }
         }
     }
-    Ok(None)
+    Ok(LoadedTranscript::default())
 }
 
-fn first_header_matches(content: &str, target: Uuid) -> bool {
+/// Outcome of scanning one candidate file's `kind:"main"` headers against
+/// the requested target session.
+#[derive(Debug, PartialEq, Eq)]
+enum CandidateMatch {
+    /// No header in the file matches the target. Try the next candidate.
+    NoTarget,
+    /// The target is present in this file *and* the file contains records
+    /// from more than one session (more than one distinct header
+    /// `sessionId` observed). Cannot safely demix from file content alone;
+    /// the loader surfaces an ambiguity warning.
+    Ambiguous,
+    /// The target is the file's only session. Safe to hydrate.
+    Unambiguous,
+}
+
+/// Walk `content` line-by-line and classify the file against `target`.
+/// Malformed JSON lines and lines without `kind:"main"` are skipped
+/// silently — only valid `main` headers with a parseable `sessionId`
+/// contribute to the distinct-session count.
+fn classify_candidate(content: &str, target: Uuid) -> CandidateMatch {
+    let mut distinct: Vec<Uuid> = Vec::new();
     for line in content.lines() {
         if line.trim().is_empty() {
             continue;
@@ -203,31 +211,52 @@ fn first_header_matches(content: &str, target: Uuid) -> bool {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        if value.get("kind").and_then(Value::as_str) == Some("main")
-            && let Some(sid) = value.get("sessionId").and_then(Value::as_str)
-            && let Ok(uuid) = Uuid::parse_str(sid)
-        {
-            return uuid == target;
+        if value.get("kind").and_then(Value::as_str) != Some("main") {
+            continue;
         }
-        return false;
+        let Some(sid_str) = value.get("sessionId").and_then(Value::as_str) else {
+            continue;
+        };
+        let Ok(sid) = Uuid::parse_str(sid_str) else {
+            continue;
+        };
+        if !distinct.contains(&sid) {
+            distinct.push(sid);
+        }
     }
-    false
+    let contains_target = distinct.contains(&target);
+    match (contains_target, distinct.len()) {
+        (false, _) => CandidateMatch::NoTarget,
+        (true, 1) => CandidateMatch::Unambiguous,
+        (true, _) => CandidateMatch::Ambiguous,
+    }
+}
+
+fn ambiguous_session_warning() -> LoadedTranscript {
+    LoadedTranscript {
+        turns: Vec::new(),
+        meta: None,
+        last_rate_limit: None,
+        warnings: vec![ParseWarning {
+            line_number: 0,
+            reason:
+                "session-file contains records from multiple sessions; ambiguous, transcript not hydrated"
+                    .to_owned(),
+        }],
+    }
 }
 
 /// Parse Gemini session-file content into a `LoadedTranscript` (no FS
-/// access). Exposed `pub(crate)` for tests that want to drive the parser
-/// without staging temp files.
-///
-/// `target_session_id` is the session the caller asked for. The function
-/// surfaces a collision warning + empty turns when the file contains
-/// multiple distinct `kind:"main"` headers (intra-file prefix collision);
-/// otherwise it reconstructs turns from the file as a single conversation.
+/// access). The caller guarantees the file has been gated for
+/// ambiguity / target-session match by `classify_candidate`, so this
+/// function is pure reconstruction — it does not enforce any session
+/// invariant. Exposed `pub(crate)` for tests that want to drive
+/// reconstruction without staging a temp file.
 pub(crate) fn parse_gemini_transcript_content(
     content: &str,
     agent_id: AgentId,
-    target_session_id: Uuid,
 ) -> LoadedTranscript {
-    let mut state = GeminiReconstruction::new(agent_id, target_session_id);
+    let mut state = GeminiReconstruction::new(agent_id);
     for (idx, line) in content.lines().enumerate() {
         let line_number = idx + 1;
         if line.trim().is_empty() {
@@ -237,22 +266,16 @@ pub(crate) fn parse_gemini_transcript_content(
             Ok(record) => state.ingest(line_number, &record),
             Err(e) => state.warn(line_number, format!("malformed JSON: {e}")),
         }
-        if state.collision_detected {
-            break;
-        }
     }
     state.finalize()
 }
 
 struct GeminiReconstruction {
     agent_id: AgentId,
-    target_session_id: Uuid,
-    seen_session_id: Option<Uuid>,
     turns: Vec<Turn>,
     current_agent: Option<GeminiAgentBuilder>,
     warnings: Vec<ParseWarning>,
     model: Option<String>,
-    collision_detected: bool,
 }
 
 struct GeminiAgentBuilder {
@@ -296,16 +319,13 @@ struct GeminiToolCall {
 }
 
 impl GeminiReconstruction {
-    fn new(agent_id: AgentId, target_session_id: Uuid) -> Self {
+    fn new(agent_id: AgentId) -> Self {
         Self {
             agent_id,
-            target_session_id,
-            seen_session_id: None,
             turns: Vec::new(),
             current_agent: None,
             warnings: Vec::new(),
             model: None,
-            collision_detected: false,
         }
     }
 
@@ -320,34 +340,16 @@ impl GeminiReconstruction {
         if record.get("$set").is_some() {
             return;
         }
+        // Header records carry only session metadata, not transcript
+        // content. Ambiguity / target-session checks live at the loader
+        // (`classify_candidate`); reconstruction skips headers.
         if record.get("kind").and_then(Value::as_str) == Some("main") {
-            self.handle_header(line_number, record);
             return;
         }
         match record.get("type").and_then(Value::as_str) {
             Some("user") => self.handle_user(record),
             Some("gemini") => self.handle_gemini(line_number, record),
             _ => {}
-        }
-    }
-
-    fn handle_header(&mut self, line_number: usize, record: &Value) {
-        let Some(sid_str) = record.get("sessionId").and_then(Value::as_str) else {
-            return;
-        };
-        let Ok(sid) = Uuid::parse_str(sid_str) else {
-            self.warn(
-                line_number,
-                format!("invalid sessionId in header: {sid_str}"),
-            );
-            return;
-        };
-        match self.seen_session_id {
-            None => self.seen_session_id = Some(sid),
-            Some(existing) if existing == sid => {}
-            Some(_) => {
-                self.collision_detected = true;
-            }
         }
     }
 
@@ -464,17 +466,6 @@ impl GeminiReconstruction {
     }
 
     fn finalize(mut self) -> LoadedTranscript {
-        if self.collision_detected {
-            return LoadedTranscript {
-                turns: Vec::new(),
-                meta: None,
-                last_rate_limit: None,
-                warnings: vec![ParseWarning {
-                    line_number: 0,
-                    reason: "session-file contains records from multiple sessions; ambiguous, transcript not hydrated".to_owned(),
-                }],
-            };
-        }
         self.close_current_agent(TurnStatus::Complete);
         let meta = self.model.clone().map(|model| SessionMetaInfo {
             model,
@@ -483,12 +474,6 @@ impl GeminiReconstruction {
             mcp_servers: vec![],
             skills: vec![],
         });
-        // Target-session-id is currently used only for the multi-header
-        // ambiguity check (via `collision_detected`); reads via
-        // `seen_session_id` are not asserted because `select_candidate_by_header`
-        // already gated entry by the matching first-header sessionId.
-        let _ = self.target_session_id;
-        let _ = self.seen_session_id;
         LoadedTranscript {
             turns: self.turns,
             meta,
@@ -812,9 +797,8 @@ mod tests {
 
     #[test]
     fn parse_happy_path_fixture_round_trips_user_and_agent_turns() {
-        let session_id = Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
         let aid = agent_id();
-        let t = parse_gemini_transcript_content(HAPPY_PATH_FIXTURE, aid, session_id);
+        let t = parse_gemini_transcript_content(HAPPY_PATH_FIXTURE, aid);
 
         assert!(
             t.warnings.is_empty(),
@@ -853,8 +837,7 @@ mod tests {
 
     #[test]
     fn parse_tool_use_fixture_surfaces_real_tool_output_and_filters_update_topic() {
-        let session_id = Uuid::parse_str("00000000-0000-4000-8000-000000000002").unwrap();
-        let t = parse_gemini_transcript_content(TOOL_USE_FIXTURE, agent_id(), session_id);
+        let t = parse_gemini_transcript_content(TOOL_USE_FIXTURE, agent_id());
 
         assert!(
             t.warnings.is_empty(),
@@ -908,28 +891,55 @@ mod tests {
     }
 
     #[test]
-    fn parse_collision_fixture_returns_empty_with_warning_for_either_target() {
+    fn classify_candidate_recognizes_ambiguous_for_both_targets() {
+        // The captured fixture has two distinct headers (...009 and ...00A).
+        // Both UUIDs must classify as Ambiguous — the asymmetric path-layer
+        // gate that only checked the first header has been replaced with
+        // a full header scan.
         let target_a = Uuid::parse_str("00000000-0000-4000-8000-000000000009").unwrap();
         let target_b = Uuid::parse_str("00000000-0000-4000-8000-00000000000A").unwrap();
+        assert_eq!(
+            classify_candidate(INTERLEAVED_FIXTURE, target_a),
+            CandidateMatch::Ambiguous
+        );
+        assert_eq!(
+            classify_candidate(INTERLEAVED_FIXTURE, target_b),
+            CandidateMatch::Ambiguous
+        );
+    }
 
-        for target in [target_a, target_b] {
-            let t = parse_gemini_transcript_content(INTERLEAVED_FIXTURE, agent_id(), target);
-            assert!(
-                t.turns.is_empty(),
-                "ambiguous multi-header file must hydrate no turns (target {target}); got {:?}",
-                t.turns
-            );
-            assert_eq!(
-                t.warnings.len(),
-                1,
-                "exactly one collision warning expected"
-            );
-            assert!(
-                t.warnings[0].reason.contains("multiple sessions"),
-                "warning must surface the multi-session ambiguity: {:?}",
-                t.warnings[0]
-            );
-        }
+    #[test]
+    fn classify_candidate_returns_unambiguous_for_single_session_file() {
+        let target = Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
+        assert_eq!(
+            classify_candidate(HAPPY_PATH_FIXTURE, target),
+            CandidateMatch::Unambiguous
+        );
+    }
+
+    #[test]
+    fn classify_candidate_returns_no_target_when_target_absent() {
+        let unrelated = Uuid::parse_str("00000000-0000-4000-8000-0000000000ff").unwrap();
+        assert_eq!(
+            classify_candidate(HAPPY_PATH_FIXTURE, unrelated),
+            CandidateMatch::NoTarget
+        );
+    }
+
+    #[test]
+    fn classify_candidate_ignores_malformed_header_lines() {
+        // Malformed header lines should not contribute to the distinct-
+        // session count nor mask a valid target match later in the file.
+        let target = Uuid::parse_str("00000000-0000-4000-8000-0000000000cc").unwrap();
+        let body = format!(
+            r#"not-json-at-all
+{{"kind":"main"}}
+{{"sessionId":"{target}","kind":"main","startTime":"2026-05-18T00:00:00Z"}}"#
+        );
+        assert_eq!(
+            classify_candidate(&body, target),
+            CandidateMatch::Unambiguous
+        );
     }
 
     #[test]
@@ -939,7 +949,7 @@ mod tests {
         // produces no turns and no warnings.
         let only_sets = r#"{"$set":{"lastUpdated":"2026-05-18T00:00:00Z"}}
 {"$set":{"lastUpdated":"2026-05-18T00:00:01Z"}}"#;
-        let t = parse_gemini_transcript_content(only_sets, agent_id(), Uuid::new_v4());
+        let t = parse_gemini_transcript_content(only_sets, agent_id());
         assert!(t.turns.is_empty());
         assert!(t.warnings.is_empty());
     }
@@ -956,7 +966,7 @@ mod tests {
 {{"id":"g1","timestamp":"2026-05-18T00:00:02Z","type":"gemini","content":"first-draft","thoughts":[],"tokens":{{"input":1,"output":1,"cached":0}},"model":"gemini-3-flash-preview"}}
 {{"id":"g1","timestamp":"2026-05-18T00:00:03Z","type":"gemini","content":"final","thoughts":[],"tokens":{{"input":1,"output":1,"cached":0}},"model":"gemini-3-flash-preview"}}"#
         );
-        let t = parse_gemini_transcript_content(&body, agent_id(), session_id);
+        let t = parse_gemini_transcript_content(&body, agent_id());
         assert!(t.warnings.is_empty(), "no warnings: {:?}", t.warnings);
         let Turn::Agent { items, .. } = t
             .turns
@@ -991,7 +1001,7 @@ mod tests {
 {{"id":"u1","timestamp":"2026-05-18T00:00:01Z","type":"user","content":[{{"text":"think out loud"}}]}}
 {{"id":"g1","timestamp":"2026-05-18T00:00:02Z","type":"gemini","content":"reply","thoughts":[{{"subject":"plan","description":"do the thing"}}],"tokens":{{"input":1,"output":1,"cached":0}},"model":"gemini-3-flash-preview"}}"#
         );
-        let t = parse_gemini_transcript_content(&body, agent_id(), session_id);
+        let t = parse_gemini_transcript_content(&body, agent_id());
         let Turn::Agent { items, .. } = t
             .turns
             .iter()
@@ -1146,26 +1156,42 @@ mod tests {
     }
 
     #[test]
-    fn load_gemini_transcript_returns_collision_warning_on_multi_header_file() {
+    fn load_gemini_transcript_returns_collision_warning_on_multi_header_file_for_either_target() {
         // The captured worst-case fixture: one file, two distinct
-        // sessionId headers, events interleaved. Even when the path
-        // layer accepts the file (first header matches target), the
-        // parser detects the second header and refuses to hydrate.
-        let home = TempDir::new().unwrap();
-        let cwd = TempDir::new().unwrap();
-        let target = Uuid::parse_str("00000000-0000-4000-8000-000000000009").unwrap();
-        let prefix = id_prefix(&target);
-        stage_session_file(
-            home.path(),
-            cwd.path(),
-            "proj",
-            &format!("session-2026-05-17T22-20-{prefix}.jsonl"),
-            INTERLEAVED_FIXTURE,
-        );
+        // sessionId headers, events interleaved. Both targets must
+        // surface the ambiguity warning — silently empty for one and
+        // warning for the other would mean one of two collided agents
+        // looks "never dispatched" instead of "blocked on ambiguity."
+        let target_a = Uuid::parse_str("00000000-0000-4000-8000-000000000009").unwrap();
+        let target_b = Uuid::parse_str("00000000-0000-4000-8000-00000000000A").unwrap();
+        for target in [target_a, target_b] {
+            let home = TempDir::new().unwrap();
+            let cwd = TempDir::new().unwrap();
+            let prefix = id_prefix(&target);
+            stage_session_file(
+                home.path(),
+                cwd.path(),
+                "proj",
+                &format!("session-2026-05-17T22-20-{prefix}.jsonl"),
+                INTERLEAVED_FIXTURE,
+            );
 
-        let t = load_gemini_transcript(home.path(), cwd.path(), target, agent_id()).unwrap();
-        assert!(t.turns.is_empty());
-        assert_eq!(t.warnings.len(), 1);
-        assert!(t.warnings[0].reason.contains("multiple sessions"));
+            let t = load_gemini_transcript(home.path(), cwd.path(), target, agent_id()).unwrap();
+            assert!(
+                t.turns.is_empty(),
+                "ambiguous file must hydrate no turns (target {target}); got {:?}",
+                t.turns
+            );
+            assert_eq!(
+                t.warnings.len(),
+                1,
+                "exactly one warning expected for target {target}"
+            );
+            assert!(
+                t.warnings[0].reason.contains("multiple sessions"),
+                "warning must surface the ambiguity for target {target}: {:?}",
+                t.warnings[0]
+            );
+        }
     }
 }

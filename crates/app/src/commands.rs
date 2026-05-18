@@ -543,6 +543,17 @@ pub fn load_transcript_impl(
                 agent.id,
             )?)
         }
+        HarnessKind::Gemini => {
+            let Some(session_id) = agent.session_id else {
+                return Ok(switchboard_harness::LoadedTranscript::default());
+            };
+            Ok(switchboard_harness::load_gemini_transcript(
+                home_dir,
+                &directory.path,
+                session_id,
+                agent.id,
+            )?)
+        }
         _ => Err(AppError::UnsupportedHarness),
     }
 }

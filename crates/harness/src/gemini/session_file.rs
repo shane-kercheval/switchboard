@@ -20,7 +20,17 @@
 
 use std::path::{Path, PathBuf};
 
+use chrono::{DateTime, Utc};
+use serde_json::Value;
+use switchboard_core::AgentId;
 use uuid::Uuid;
+
+use crate::events::{ContentKind, ToolKind, TurnId, TurnUsage};
+use crate::gemini::parser::GEMINI_INTERNAL_TOOL_NAMES;
+use crate::transcript::{
+    LoadTranscriptError, LoadedTranscript, ParseWarning, SessionMetaInfo, Turn, TurnItem,
+    TurnStatus,
+};
 
 /// Take the first 8 hex chars of a UUID as Gemini's filename suffix would.
 /// Lowercase (Gemini emits lowercase hex in filenames).
@@ -124,6 +134,486 @@ pub fn gemini_session_file_candidates(
 #[must_use]
 pub fn session_file_exists_for(home_dir: &Path, cwd: &Path, session_id: &Uuid) -> bool {
     !gemini_session_file_candidates(home_dir, cwd, session_id).is_empty()
+}
+
+/// Load a Gemini session file for `session_id` and project a
+/// `LoadedTranscript`. Mirrors `load_claude_transcript` in shape; Gemini
+/// follows the Claude pattern (caller-controlled session ID, file on disk
+/// keyed by session UUID), not the Codex pattern (sidecar).
+///
+/// Returns `Ok(LoadedTranscript::default())` when:
+/// - `projects.json` doesn't list this cwd (agent never dispatched).
+/// - No session file matches the 8-char prefix in the project's chats
+///   directory.
+/// - The candidate set is non-empty but none of the candidates' first
+///   record matches the full target UUID (filename-level prefix collision
+///   resolved at the path layer).
+///
+/// Returns `Ok(LoadedTranscript { turns: vec![], warnings: [collision] })`
+/// when the matched file contains multiple distinct `kind:"main"` session
+/// headers (intra-file prefix collision — two sessions appended to the
+/// same file with colliding 8-char prefixes in the same minute). Under
+/// UUID v4 (the Gemini policy), the probability is ~1/2^32; the defense
+/// exists so the rare case fails loudly instead of silently merging
+/// transcripts.
+///
+/// `home_dir` is injected for testability.
+pub fn load_gemini_transcript(
+    home_dir: &Path,
+    cwd: &Path,
+    session_id: Uuid,
+    agent_id: AgentId,
+) -> Result<LoadedTranscript, LoadTranscriptError> {
+    let candidates = gemini_session_file_candidates(home_dir, cwd, &session_id);
+    if candidates.is_empty() {
+        return Ok(LoadedTranscript::default());
+    }
+    let Some(path) = select_candidate_by_header(&candidates, session_id)? else {
+        return Ok(LoadedTranscript::default());
+    };
+    let content = std::fs::read_to_string(&path)?;
+    Ok(parse_gemini_transcript_content(
+        &content, agent_id, session_id,
+    ))
+}
+
+/// Inspect each candidate's first non-blank line; pick the file whose
+/// first `kind:"main"` header carries `sessionId == target`. Returns
+/// `Ok(None)` if no candidate matches — this is how filename-level
+/// 8-char-prefix collisions (two sessions in different minutes, two
+/// separate files) get demixed at the path layer.
+fn select_candidate_by_header(
+    candidates: &[PathBuf],
+    target: Uuid,
+) -> Result<Option<PathBuf>, LoadTranscriptError> {
+    for path in candidates {
+        let content = std::fs::read_to_string(path)?;
+        if first_header_matches(&content, target) {
+            return Ok(Some(path.clone()));
+        }
+    }
+    Ok(None)
+}
+
+fn first_header_matches(content: &str, target: Uuid) -> bool {
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value.get("kind").and_then(Value::as_str) == Some("main")
+            && let Some(sid) = value.get("sessionId").and_then(Value::as_str)
+            && let Ok(uuid) = Uuid::parse_str(sid)
+        {
+            return uuid == target;
+        }
+        return false;
+    }
+    false
+}
+
+/// Parse Gemini session-file content into a `LoadedTranscript` (no FS
+/// access). Exposed `pub(crate)` for tests that want to drive the parser
+/// without staging temp files.
+///
+/// `target_session_id` is the session the caller asked for. The function
+/// surfaces a collision warning + empty turns when the file contains
+/// multiple distinct `kind:"main"` headers (intra-file prefix collision);
+/// otherwise it reconstructs turns from the file as a single conversation.
+pub(crate) fn parse_gemini_transcript_content(
+    content: &str,
+    agent_id: AgentId,
+    target_session_id: Uuid,
+) -> LoadedTranscript {
+    let mut state = GeminiReconstruction::new(agent_id, target_session_id);
+    for (idx, line) in content.lines().enumerate() {
+        let line_number = idx + 1;
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Value>(line) {
+            Ok(record) => state.ingest(line_number, &record),
+            Err(e) => state.warn(line_number, format!("malformed JSON: {e}")),
+        }
+        if state.collision_detected {
+            break;
+        }
+    }
+    state.finalize()
+}
+
+struct GeminiReconstruction {
+    agent_id: AgentId,
+    target_session_id: Uuid,
+    seen_session_id: Option<Uuid>,
+    turns: Vec<Turn>,
+    current_agent: Option<GeminiAgentBuilder>,
+    warnings: Vec<ParseWarning>,
+    model: Option<String>,
+    collision_detected: bool,
+}
+
+struct GeminiAgentBuilder {
+    turn_id: TurnId,
+    agent_id: AgentId,
+    started_at: DateTime<Utc>,
+    last_seen_at: DateTime<Utc>,
+    records: Vec<GeminiRecord>,
+    last_usage: Option<TurnUsage>,
+    last_model: Option<String>,
+}
+
+/// A buffered gemini-record in the current turn window. Records sharing
+/// `id` are deduped last-wins (Gemini accrues data into a record across
+/// multiple writes; the final copy is the complete one). Buffer preserves
+/// insertion order so emitted items follow the file's chronology.
+#[derive(Clone)]
+struct GeminiRecord {
+    id: String,
+    content: String,
+    thoughts: Vec<GeminiThought>,
+    tool_calls: Vec<GeminiToolCall>,
+    usage: Option<TurnUsage>,
+    model: Option<String>,
+}
+
+#[derive(Clone)]
+struct GeminiThought {
+    subject: String,
+    description: String,
+}
+
+#[derive(Clone)]
+struct GeminiToolCall {
+    id: String,
+    name: String,
+    args: Value,
+    output: Option<String>,
+    is_error: bool,
+    timestamp: Option<DateTime<Utc>>,
+}
+
+impl GeminiReconstruction {
+    fn new(agent_id: AgentId, target_session_id: Uuid) -> Self {
+        Self {
+            agent_id,
+            target_session_id,
+            seen_session_id: None,
+            turns: Vec::new(),
+            current_agent: None,
+            warnings: Vec::new(),
+            model: None,
+            collision_detected: false,
+        }
+    }
+
+    fn warn(&mut self, line_number: usize, reason: impl Into<String>) {
+        self.warnings.push(ParseWarning {
+            line_number,
+            reason: reason.into(),
+        });
+    }
+
+    fn ingest(&mut self, line_number: usize, record: &Value) {
+        if record.get("$set").is_some() {
+            return;
+        }
+        if record.get("kind").and_then(Value::as_str) == Some("main") {
+            self.handle_header(line_number, record);
+            return;
+        }
+        match record.get("type").and_then(Value::as_str) {
+            Some("user") => self.handle_user(record),
+            Some("gemini") => self.handle_gemini(line_number, record),
+            _ => {}
+        }
+    }
+
+    fn handle_header(&mut self, line_number: usize, record: &Value) {
+        let Some(sid_str) = record.get("sessionId").and_then(Value::as_str) else {
+            return;
+        };
+        let Ok(sid) = Uuid::parse_str(sid_str) else {
+            self.warn(
+                line_number,
+                format!("invalid sessionId in header: {sid_str}"),
+            );
+            return;
+        };
+        match self.seen_session_id {
+            None => self.seen_session_id = Some(sid),
+            Some(existing) if existing == sid => {}
+            Some(_) => {
+                self.collision_detected = true;
+            }
+        }
+    }
+
+    fn handle_user(&mut self, record: &Value) {
+        let text = record
+            .get("content")
+            .and_then(Value::as_array)
+            .and_then(|arr| arr.first())
+            .and_then(|item| item.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let started_at = parse_timestamp(record).unwrap_or_else(Utc::now);
+        self.close_current_agent(TurnStatus::Complete);
+        self.turns.push(Turn::User {
+            turn_id: Uuid::now_v7(),
+            agent_id: self.agent_id,
+            started_at,
+            text,
+        });
+    }
+
+    fn handle_gemini(&mut self, line_number: usize, record: &Value) {
+        let Some(id) = record.get("id").and_then(Value::as_str) else {
+            self.warn(line_number, "gemini record missing id; skipped");
+            return;
+        };
+        let timestamp = parse_timestamp(record);
+        let started_at = timestamp.unwrap_or_else(Utc::now);
+        let builder = self
+            .current_agent
+            .get_or_insert_with(|| GeminiAgentBuilder {
+                turn_id: Uuid::now_v7(),
+                agent_id: self.agent_id,
+                started_at,
+                last_seen_at: started_at,
+                records: Vec::new(),
+                last_usage: None,
+                last_model: None,
+            });
+        if let Some(t) = timestamp {
+            builder.last_seen_at = t;
+        }
+
+        let parsed = parse_gemini_record(id, record);
+        if let Some(usage) = parsed.usage.clone() {
+            builder.last_usage = Some(usage);
+        }
+        if let Some(model) = parsed.model.clone() {
+            builder.last_model = Some(model);
+        }
+
+        if let Some(existing) = builder.records.iter_mut().find(|r| r.id == parsed.id) {
+            *existing = parsed;
+        } else {
+            builder.records.push(parsed);
+        }
+    }
+
+    fn close_current_agent(&mut self, status: TurnStatus) {
+        let Some(builder) = self.current_agent.take() else {
+            return;
+        };
+        let mut items: Vec<TurnItem> = Vec::new();
+        for record in &builder.records {
+            if !record.content.is_empty() {
+                items.push(TurnItem::Text {
+                    kind: ContentKind::Text,
+                    text: record.content.clone(),
+                });
+            }
+            for thought in &record.thoughts {
+                items.push(TurnItem::Text {
+                    kind: ContentKind::Thinking,
+                    text: format!("{}\n{}", thought.subject, thought.description),
+                });
+            }
+            for tc in &record.tool_calls {
+                if GEMINI_INTERNAL_TOOL_NAMES.contains(&tc.name.as_str()) {
+                    continue;
+                }
+                let kind = if tc.name.starts_with("mcp__") {
+                    ToolKind::Mcp
+                } else {
+                    ToolKind::Builtin
+                };
+                let tc_ts = tc.timestamp.unwrap_or(builder.last_seen_at);
+                items.push(TurnItem::Tool {
+                    tool_use_id: tc.id.clone(),
+                    kind,
+                    name: tc.name.clone(),
+                    input: tc.args.clone(),
+                    output: tc.output.clone(),
+                    is_error: Some(tc.is_error),
+                    started_at: tc_ts,
+                    completed_at: Some(tc_ts),
+                });
+            }
+        }
+        if self.model.is_none()
+            && let Some(model) = builder.last_model.clone()
+        {
+            self.model = Some(model);
+        }
+        self.turns.push(Turn::Agent {
+            turn_id: builder.turn_id,
+            agent_id: builder.agent_id,
+            started_at: builder.started_at,
+            ended_at: Some(builder.last_seen_at),
+            status,
+            items,
+            usage: builder.last_usage,
+        });
+    }
+
+    fn finalize(mut self) -> LoadedTranscript {
+        if self.collision_detected {
+            return LoadedTranscript {
+                turns: Vec::new(),
+                meta: None,
+                last_rate_limit: None,
+                warnings: vec![ParseWarning {
+                    line_number: 0,
+                    reason: "session-file contains records from multiple sessions; ambiguous, transcript not hydrated".to_owned(),
+                }],
+            };
+        }
+        self.close_current_agent(TurnStatus::Complete);
+        let meta = self.model.clone().map(|model| SessionMetaInfo {
+            model,
+            harness_version: String::new(),
+            tools: vec![],
+            mcp_servers: vec![],
+            skills: vec![],
+        });
+        // Target-session-id is currently used only for the multi-header
+        // ambiguity check (via `collision_detected`); reads via
+        // `seen_session_id` are not asserted because `select_candidate_by_header`
+        // already gated entry by the matching first-header sessionId.
+        let _ = self.target_session_id;
+        let _ = self.seen_session_id;
+        LoadedTranscript {
+            turns: self.turns,
+            meta,
+            last_rate_limit: None,
+            warnings: self.warnings,
+        }
+    }
+}
+
+fn parse_timestamp(record: &Value) -> Option<DateTime<Utc>> {
+    record
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+fn parse_gemini_record(id: &str, record: &Value) -> GeminiRecord {
+    let content = record
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let thoughts = record
+        .get("thoughts")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| {
+                    let subject = t
+                        .get("subject")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    let description = t
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    if subject.is_empty() && description.is_empty() {
+                        None
+                    } else {
+                        Some(GeminiThought {
+                            subject,
+                            description,
+                        })
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let tool_calls = record
+        .get("toolCalls")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().map(parse_tool_call).collect())
+        .unwrap_or_default();
+    let usage = record.get("tokens").map(parse_tokens);
+    let model = record
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    GeminiRecord {
+        id: id.to_owned(),
+        content,
+        thoughts,
+        tool_calls,
+        usage,
+        model,
+    }
+}
+
+fn parse_tool_call(value: &Value) -> GeminiToolCall {
+    let id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let args = value.get("args").cloned().unwrap_or(Value::Null);
+    let status = value.get("status").and_then(Value::as_str).unwrap_or("");
+    let is_error = !status.is_empty() && status != "success";
+    let output = value
+        .get("result")
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.first())
+        .and_then(|first| first.get("functionResponse"))
+        .and_then(|fr| fr.get("response"))
+        .map(extract_response_output);
+    let timestamp = parse_timestamp(value);
+    GeminiToolCall {
+        id,
+        name,
+        args,
+        output,
+        is_error,
+        timestamp,
+    }
+}
+
+/// Extract a tool's user-visible output from its `functionResponse.response`.
+/// Prefers the `output` field (Gemini's read-like tools shape) but falls
+/// back to the entire response object stringified when `output` is absent.
+fn extract_response_output(response: &Value) -> String {
+    if let Some(output) = response.get("output").and_then(Value::as_str) {
+        return output.to_owned();
+    }
+    serde_json::to_string(response).unwrap_or_default()
+}
+
+fn parse_tokens(value: &Value) -> TurnUsage {
+    let input_tokens = value.get("input").and_then(Value::as_u64).unwrap_or(0);
+    let output_tokens = value.get("output").and_then(Value::as_u64).unwrap_or(0);
+    let cached_input_tokens = value.get("cached").and_then(Value::as_u64);
+    TurnUsage {
+        input_tokens,
+        output_tokens,
+        cached_input_tokens,
+        reasoning_output_tokens: None,
+        context_window: None,
+        total_cost_usd: None,
+    }
 }
 
 #[cfg(test)]
@@ -282,5 +772,400 @@ mod tests {
         assert!(session_file_exists_for(home.path(), cwd.path(), &uuid));
         let other = Uuid::new_v4();
         assert!(!session_file_exists_for(home.path(), cwd.path(), &other));
+    }
+
+    // -----------------------------------------------------------------
+    // Hydrator tests
+    // -----------------------------------------------------------------
+
+    const HAPPY_PATH_FIXTURE: &str =
+        include_str!("../../tests/fixtures/gemini/happy-path.session.jsonl");
+    const TOOL_USE_FIXTURE: &str =
+        include_str!("../../tests/fixtures/gemini/tool-use.session.jsonl");
+    const INTERLEAVED_FIXTURE: &str =
+        include_str!("../../tests/fixtures/gemini/interleaved-collision.session.jsonl");
+
+    fn agent_id() -> AgentId {
+        Uuid::now_v7()
+    }
+
+    /// Stage a session file under the canonical Gemini layout for `cwd`.
+    /// Returns the file path so a caller can assert against it if needed.
+    fn stage_session_file(
+        home: &Path,
+        cwd: &Path,
+        project_name: &str,
+        filename: &str,
+        body: &str,
+    ) -> PathBuf {
+        stage_projects_json_wrapped(home, cwd, project_name);
+        let chats = home
+            .join(".gemini")
+            .join("tmp")
+            .join(project_name)
+            .join("chats");
+        std::fs::create_dir_all(&chats).unwrap();
+        let path = chats.join(filename);
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn parse_happy_path_fixture_round_trips_user_and_agent_turns() {
+        let session_id = Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let aid = agent_id();
+        let t = parse_gemini_transcript_content(HAPPY_PATH_FIXTURE, aid, session_id);
+
+        assert!(
+            t.warnings.is_empty(),
+            "no warnings expected: {:?}",
+            t.warnings
+        );
+        assert_eq!(t.turns.len(), 2);
+        let Turn::User { text, .. } = &t.turns[0] else {
+            panic!("expected User turn first, got {:?}", t.turns[0]);
+        };
+        assert_eq!(text, "Reply with the single word 'ack' and nothing else.");
+        let Turn::Agent {
+            items,
+            usage,
+            status,
+            ..
+        } = &t.turns[1]
+        else {
+            panic!("expected Agent turn second");
+        };
+        assert_eq!(*status, TurnStatus::Complete);
+        assert_eq!(items.len(), 1);
+        let TurnItem::Text { kind, text } = &items[0] else {
+            panic!("expected Text item, got {:?}", items[0]);
+        };
+        assert_eq!(*kind, ContentKind::Text);
+        assert_eq!(text, "ack");
+        let usage = usage.as_ref().expect("usage from gemini record's tokens");
+        assert_eq!(usage.input_tokens, 10178);
+        assert_eq!(usage.output_tokens, 1);
+        assert_eq!(usage.cached_input_tokens, Some(0));
+
+        let meta = t.meta.as_ref().expect("meta from gemini record's model");
+        assert_eq!(meta.model, "gemini-3-flash-preview");
+    }
+
+    #[test]
+    fn parse_tool_use_fixture_surfaces_real_tool_output_and_filters_update_topic() {
+        let session_id = Uuid::parse_str("00000000-0000-4000-8000-000000000002").unwrap();
+        let t = parse_gemini_transcript_content(TOOL_USE_FIXTURE, agent_id(), session_id);
+
+        assert!(
+            t.warnings.is_empty(),
+            "no warnings expected: {:?}",
+            t.warnings
+        );
+        let Turn::Agent { items, .. } = t
+            .turns
+            .iter()
+            .find(|turn| matches!(turn, Turn::Agent { .. }))
+            .expect("agent turn present")
+        else {
+            unreachable!();
+        };
+
+        let mut update_topic_seen = false;
+        let mut read_file_output: Option<String> = None;
+        let mut final_text: Option<String> = None;
+        for item in items {
+            match item {
+                TurnItem::Tool { name, output, .. } => {
+                    if name == "update_topic" {
+                        update_topic_seen = true;
+                    } else if name == "read_file" {
+                        read_file_output = output.clone();
+                    }
+                }
+                TurnItem::Text {
+                    kind: ContentKind::Text,
+                    text,
+                } => {
+                    final_text = Some(text.clone());
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            !update_topic_seen,
+            "update_topic must be filtered from hydrated items"
+        );
+        assert_eq!(
+            read_file_output.as_deref(),
+            Some("SWITCHBOARD_GEMINI_PROBE_TOOL_5F8A21\n"),
+            "real read_file output from session file must surface (live stream is empty for read-like tools)"
+        );
+        assert_eq!(
+            final_text.as_deref(),
+            Some("SWITCHBOARD_GEMINI_PROBE_TOOL_5F8A21"),
+            "final assistant text item must be the sentinel"
+        );
+    }
+
+    #[test]
+    fn parse_collision_fixture_returns_empty_with_warning_for_either_target() {
+        let target_a = Uuid::parse_str("00000000-0000-4000-8000-000000000009").unwrap();
+        let target_b = Uuid::parse_str("00000000-0000-4000-8000-00000000000A").unwrap();
+
+        for target in [target_a, target_b] {
+            let t = parse_gemini_transcript_content(INTERLEAVED_FIXTURE, agent_id(), target);
+            assert!(
+                t.turns.is_empty(),
+                "ambiguous multi-header file must hydrate no turns (target {target}); got {:?}",
+                t.turns
+            );
+            assert_eq!(
+                t.warnings.len(),
+                1,
+                "exactly one collision warning expected"
+            );
+            assert!(
+                t.warnings[0].reason.contains("multiple sessions"),
+                "warning must surface the multi-session ambiguity: {:?}",
+                t.warnings[0]
+            );
+        }
+    }
+
+    #[test]
+    fn parse_filters_set_mutation_records() {
+        // $set lines appear between every real record in the captured
+        // fixtures. Direct assertion: a body of nothing but $set lines
+        // produces no turns and no warnings.
+        let only_sets = r#"{"$set":{"lastUpdated":"2026-05-18T00:00:00Z"}}
+{"$set":{"lastUpdated":"2026-05-18T00:00:01Z"}}"#;
+        let t = parse_gemini_transcript_content(only_sets, agent_id(), Uuid::new_v4());
+        assert!(t.turns.is_empty());
+        assert!(t.warnings.is_empty());
+    }
+
+    #[test]
+    fn parse_dedupes_gemini_records_by_id_last_wins() {
+        // Two gemini records sharing `id` collapse to the last one. The
+        // assertion: only the second record's content survives as a Text
+        // item.
+        let session_id = Uuid::parse_str("00000000-0000-4000-8000-0000000000aa").unwrap();
+        let body = format!(
+            r#"{{"sessionId":"{session_id}","kind":"main","startTime":"2026-05-18T00:00:00Z"}}
+{{"id":"u1","timestamp":"2026-05-18T00:00:01Z","type":"user","content":[{{"text":"hi"}}]}}
+{{"id":"g1","timestamp":"2026-05-18T00:00:02Z","type":"gemini","content":"first-draft","thoughts":[],"tokens":{{"input":1,"output":1,"cached":0}},"model":"gemini-3-flash-preview"}}
+{{"id":"g1","timestamp":"2026-05-18T00:00:03Z","type":"gemini","content":"final","thoughts":[],"tokens":{{"input":1,"output":1,"cached":0}},"model":"gemini-3-flash-preview"}}"#
+        );
+        let t = parse_gemini_transcript_content(&body, agent_id(), session_id);
+        assert!(t.warnings.is_empty(), "no warnings: {:?}", t.warnings);
+        let Turn::Agent { items, .. } = t
+            .turns
+            .iter()
+            .find(|turn| matches!(turn, Turn::Agent { .. }))
+            .expect("one agent turn")
+        else {
+            unreachable!();
+        };
+        let texts: Vec<&str> = items
+            .iter()
+            .filter_map(|item| match item {
+                TurnItem::Text {
+                    kind: ContentKind::Text,
+                    text,
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["final"],
+            "dedupe-by-id last-wins should drop 'first-draft'"
+        );
+    }
+
+    #[test]
+    fn parse_surfaces_thoughts_as_thinking_items() {
+        let session_id = Uuid::parse_str("00000000-0000-4000-8000-0000000000bb").unwrap();
+        let body = format!(
+            r#"{{"sessionId":"{session_id}","kind":"main","startTime":"2026-05-18T00:00:00Z"}}
+{{"id":"u1","timestamp":"2026-05-18T00:00:01Z","type":"user","content":[{{"text":"think out loud"}}]}}
+{{"id":"g1","timestamp":"2026-05-18T00:00:02Z","type":"gemini","content":"reply","thoughts":[{{"subject":"plan","description":"do the thing"}}],"tokens":{{"input":1,"output":1,"cached":0}},"model":"gemini-3-flash-preview"}}"#
+        );
+        let t = parse_gemini_transcript_content(&body, agent_id(), session_id);
+        let Turn::Agent { items, .. } = t
+            .turns
+            .iter()
+            .find(|turn| matches!(turn, Turn::Agent { .. }))
+            .expect("one agent turn")
+        else {
+            unreachable!();
+        };
+        let thinking = items
+            .iter()
+            .find_map(|item| match item {
+                TurnItem::Text {
+                    kind: ContentKind::Thinking,
+                    text,
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .expect("thinking item present");
+        assert!(thinking.contains("plan"));
+        assert!(thinking.contains("do the thing"));
+    }
+
+    #[test]
+    fn load_gemini_transcript_returns_default_when_projects_json_missing() {
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let session_id = Uuid::new_v4();
+        let t = load_gemini_transcript(home.path(), cwd.path(), session_id, agent_id()).unwrap();
+        assert!(t.turns.is_empty());
+        assert!(t.warnings.is_empty());
+        assert!(t.meta.is_none());
+    }
+
+    #[test]
+    fn load_gemini_transcript_returns_default_when_chats_dir_missing() {
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        stage_projects_json_wrapped(home.path(), cwd.path(), "proj");
+        let session_id = Uuid::new_v4();
+        let t = load_gemini_transcript(home.path(), cwd.path(), session_id, agent_id()).unwrap();
+        assert!(t.turns.is_empty());
+        assert!(t.warnings.is_empty());
+    }
+
+    #[test]
+    fn load_gemini_transcript_reads_happy_path_fixture() {
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let session_id = Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let prefix = id_prefix(&session_id);
+        stage_session_file(
+            home.path(),
+            cwd.path(),
+            "proj",
+            &format!("session-2026-05-17T22-11-{prefix}.jsonl"),
+            HAPPY_PATH_FIXTURE,
+        );
+
+        let t = load_gemini_transcript(home.path(), cwd.path(), session_id, agent_id()).unwrap();
+        assert_eq!(t.turns.len(), 2);
+        assert!(t.warnings.is_empty());
+    }
+
+    #[test]
+    fn load_gemini_transcript_path_layer_demixes_case1_collision() {
+        // Two separate files with identical 8-char prefix in their
+        // filename suffix (different timestamps in the filename). Each
+        // file holds a single conversation. `select_candidate_by_header`
+        // picks the right one by inspecting first-record sessionId.
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        stage_projects_json_wrapped(home.path(), cwd.path(), "proj");
+        let chats = home
+            .path()
+            .join(".gemini")
+            .join("tmp")
+            .join("proj")
+            .join("chats");
+        std::fs::create_dir_all(&chats).unwrap();
+
+        let id_a = Uuid::parse_str("00000000-0000-4000-8000-000000000010").unwrap();
+        let id_b = Uuid::parse_str("00000000-0000-4000-8000-000000000020").unwrap();
+        // Identical id8 prefixes (both start with "00000000"); different
+        // minute-precision timestamps in the filename → two separate
+        // files matching the same glob.
+        let prefix = id_prefix(&id_a);
+        assert_eq!(prefix, id_prefix(&id_b));
+
+        let body_a = format!(
+            r#"{{"sessionId":"{id_a}","kind":"main","startTime":"2026-05-18T00:00:00Z"}}
+{{"id":"u1","timestamp":"2026-05-18T00:00:01Z","type":"user","content":[{{"text":"alpha"}}]}}
+{{"id":"g1","timestamp":"2026-05-18T00:00:02Z","type":"gemini","content":"A","thoughts":[],"tokens":{{"input":1,"output":1,"cached":0}},"model":"gemini-3-flash-preview"}}"#
+        );
+        let body_b = format!(
+            r#"{{"sessionId":"{id_b}","kind":"main","startTime":"2026-05-18T00:05:00Z"}}
+{{"id":"u2","timestamp":"2026-05-18T00:05:01Z","type":"user","content":[{{"text":"beta"}}]}}
+{{"id":"g2","timestamp":"2026-05-18T00:05:02Z","type":"gemini","content":"B","thoughts":[],"tokens":{{"input":1,"output":1,"cached":0}},"model":"gemini-3-flash-preview"}}"#
+        );
+        std::fs::write(
+            chats.join(format!("session-2026-05-18T00-00-{prefix}.jsonl")),
+            body_a,
+        )
+        .unwrap();
+        std::fs::write(
+            chats.join(format!("session-2026-05-18T00-05-{prefix}.jsonl")),
+            body_b,
+        )
+        .unwrap();
+
+        // Each target loads only its own content; neither sees the other.
+        let t_a = load_gemini_transcript(home.path(), cwd.path(), id_a, agent_id()).unwrap();
+        let t_b = load_gemini_transcript(home.path(), cwd.path(), id_b, agent_id()).unwrap();
+        for (t, expected_prompt) in [(&t_a, "alpha"), (&t_b, "beta")] {
+            let Turn::User { text, .. } = t
+                .turns
+                .iter()
+                .find(|turn| matches!(turn, Turn::User { .. }))
+                .expect("user turn present")
+            else {
+                unreachable!();
+            };
+            assert_eq!(text, expected_prompt);
+        }
+    }
+
+    #[test]
+    fn load_gemini_transcript_returns_default_when_no_candidate_header_matches_target() {
+        // One file present matching the prefix glob, but its first header
+        // sessionId is for a different conversation. The path layer
+        // refuses to read it.
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let stored = Uuid::parse_str("00000000-0000-4000-8000-000000000010").unwrap();
+        let prefix = id_prefix(&stored);
+        let body = format!(
+            r#"{{"sessionId":"{stored}","kind":"main","startTime":"2026-05-18T00:00:00Z"}}
+{{"id":"u1","timestamp":"2026-05-18T00:00:01Z","type":"user","content":[{{"text":"x"}}]}}"#
+        );
+        stage_session_file(
+            home.path(),
+            cwd.path(),
+            "proj",
+            &format!("session-2026-05-18T00-00-{prefix}.jsonl"),
+            &body,
+        );
+
+        let asked_for = Uuid::parse_str("00000000-0000-4000-8000-000000000099").unwrap();
+        assert_eq!(prefix, id_prefix(&asked_for));
+        let t = load_gemini_transcript(home.path(), cwd.path(), asked_for, agent_id()).unwrap();
+        assert!(t.turns.is_empty());
+        assert!(t.warnings.is_empty());
+    }
+
+    #[test]
+    fn load_gemini_transcript_returns_collision_warning_on_multi_header_file() {
+        // The captured worst-case fixture: one file, two distinct
+        // sessionId headers, events interleaved. Even when the path
+        // layer accepts the file (first header matches target), the
+        // parser detects the second header and refuses to hydrate.
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let target = Uuid::parse_str("00000000-0000-4000-8000-000000000009").unwrap();
+        let prefix = id_prefix(&target);
+        stage_session_file(
+            home.path(),
+            cwd.path(),
+            "proj",
+            &format!("session-2026-05-17T22-20-{prefix}.jsonl"),
+            INTERLEAVED_FIXTURE,
+        );
+
+        let t = load_gemini_transcript(home.path(), cwd.path(), target, agent_id()).unwrap();
+        assert!(t.turns.is_empty());
+        assert_eq!(t.warnings.len(), 1);
+        assert!(t.warnings[0].reason.contains("multiple sessions"));
     }
 }

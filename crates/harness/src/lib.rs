@@ -35,6 +35,7 @@ pub use events::{
     TurnOutcome, TurnUsage,
 };
 pub use gemini::GeminiAdapter;
+pub use gemini::session_file::{gemini_session_file_candidates, load_gemini_transcript};
 pub use mock::{MockHarnessAdapter, MockScenario};
 pub use transcript::{
     LoadTranscriptError, LoadedTranscript, ParseWarning, SessionMetaInfo, Turn, TurnItem,

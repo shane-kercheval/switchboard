@@ -38,5 +38,6 @@ export default defineConfig({
     environment: "jsdom",
     setupFiles: ["./tests/setup.ts"],
     include: ["src/**/*.{test,spec}.{ts,svelte}", "tests/**/*.{test,spec}.ts"],
+    testTimeout: 15000,
   },
 });

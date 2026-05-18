@@ -32,11 +32,12 @@ use crate::parser::ParseOutcome;
 /// against this exact constant — keep them in lockstep when adding entries.
 pub const GEMINI_INTERNAL_TOOL_NAMES: &[&str] = &["update_topic"];
 
-/// Substrings that classify a Gemini error message as `AuthFailure`.
-/// Case-insensitive match. Tightening the rule reactively touches only this
-/// helper; both the in-stream `result.status:"error"` path and the
-/// exit-42 stderr path call it so auth-detection stays symmetric across
-/// failure surfaces.
+/// Substrings that flag a Gemini error message as an auth failure.
+/// Case-insensitive match. Tightening the rule reactively touches only
+/// `is_gemini_auth_failure_message`; both the in-stream `result.status:"error"`
+/// path and the exit-42 stderr path call it so auth-detection stays
+/// symmetric across failure surfaces. Each caller owns its non-auth
+/// fallback (stream → `HarnessError`; exit-42 → `AdapterFailure`).
 const AUTH_FAILURE_SUBSTRINGS: &[&str] =
     &["401 unauthorized", "permission_denied", "authentication"];
 
@@ -50,20 +51,17 @@ pub struct GeminiParserState {
     filtered_tool_ids: HashSet<String>,
 }
 
-/// Map a Gemini error message to a `FailureKind`. Used on both the
-/// in-stream `result.status:"error"` path and the exit-42 stderr path so
-/// auth-failure detection is symmetric. Substring match is case-insensitive
-/// and intentionally loose — Gemini hasn't been probed for the canonical
-/// auth-failure shape (would require breaking the developer's OAuth state),
-/// so any of three known substrings flips it. Falls back to `HarnessError`.
+/// Return `true` if the message looks like an auth failure. The two
+/// callers (in-stream `result.status:"error"` and exit-42 stderr) own
+/// their non-auth fallback — `HarnessError` and `AdapterFailure`
+/// respectively. Substring match is case-insensitive and intentionally
+/// loose: Gemini hasn't been probed for the canonical auth-failure shape
+/// (would require breaking the developer's OAuth state), so any of the
+/// known substrings flips it.
 #[must_use]
-pub fn classify_gemini_error(message: &str) -> FailureKind {
+pub fn is_gemini_auth_failure_message(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
-    if AUTH_FAILURE_SUBSTRINGS.iter().any(|s| lower.contains(s)) {
-        FailureKind::AuthFailure
-    } else {
-        FailureKind::HarnessError
-    }
+    AUTH_FAILURE_SUBSTRINGS.iter().any(|s| lower.contains(s))
 }
 
 /// Parse one Gemini stream-json line.
@@ -119,6 +117,19 @@ fn parse_message(obj: &Value, turn_id: TurnId) -> ParseOutcome {
     if role != "assistant" {
         // The `user` echo of the prompt is intentionally skipped; Switchboard
         // already has the prompt text from the caller.
+        return ParseOutcome::Skip;
+    }
+    // Require `delta: true`. Every observed assistant message in
+    // stream-json mode carries `delta:true` (multi-chunk streaming). If a
+    // future Gemini release also emits a final consolidated message
+    // *without* the delta flag, naively forwarding it would double-emit
+    // the same text and the user would see the response duplicated in the
+    // transcript. Warn-and-skip on non-delta surfaces the CLI behavior
+    // change instead of corrupting the rendered output.
+    if obj.get("delta").and_then(Value::as_bool) != Some(true) {
+        tracing::warn!(
+            "Gemini assistant message without delta:true — CLI version may have changed; skipping to avoid duplicate emission"
+        );
         return ParseOutcome::Skip;
     }
     let text = obj
@@ -194,10 +205,12 @@ fn parse_result(obj: &Value, turn_id: TurnId) -> ParseOutcome {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_owned();
-        TurnOutcome::Failed {
-            kind: classify_gemini_error(&message),
-            message,
-        }
+        let kind = if is_gemini_auth_failure_message(&message) {
+            FailureKind::AuthFailure
+        } else {
+            FailureKind::HarnessError
+        };
+        TurnOutcome::Failed { kind, message }
     };
     ParseOutcome::Event(AdapterEvent::TurnEnd {
         turn_id,
@@ -246,32 +259,25 @@ mod tests {
     }
 
     #[test]
-    fn classify_recognizes_auth_substrings() {
-        assert_eq!(
-            classify_gemini_error("API returned 401 Unauthorized"),
-            FailureKind::AuthFailure
-        );
-        assert_eq!(
-            classify_gemini_error("PERMISSION_DENIED: token invalid"),
-            FailureKind::AuthFailure
-        );
-        assert_eq!(
-            classify_gemini_error("Authentication failed; please re-login"),
-            FailureKind::AuthFailure
-        );
+    fn is_auth_failure_recognizes_known_substrings() {
+        assert!(is_gemini_auth_failure_message(
+            "API returned 401 Unauthorized"
+        ));
+        assert!(is_gemini_auth_failure_message(
+            "PERMISSION_DENIED: token invalid"
+        ));
+        assert!(is_gemini_auth_failure_message(
+            "Authentication failed; please re-login"
+        ));
     }
 
     #[test]
-    fn classify_falls_back_to_harness_error_for_unmatched() {
-        assert_eq!(
-            classify_gemini_error("[API Error: Requested entity was not found.]"),
-            FailureKind::HarnessError
-        );
-        assert_eq!(classify_gemini_error(""), FailureKind::HarnessError);
-        assert_eq!(
-            classify_gemini_error("model not available"),
-            FailureKind::HarnessError
-        );
+    fn is_auth_failure_returns_false_for_unmatched_messages() {
+        assert!(!is_gemini_auth_failure_message(
+            "[API Error: Requested entity was not found.]"
+        ));
+        assert!(!is_gemini_auth_failure_message(""));
+        assert!(!is_gemini_auth_failure_message("model not available"));
     }
 
     #[test]
@@ -326,6 +332,25 @@ mod tests {
         let mut s = GeminiParserState::default();
         assert!(matches!(
             parse_line(line, turn_id(), agent_id(), &mut s),
+            ParseOutcome::Skip
+        ));
+    }
+
+    #[test]
+    fn parse_assistant_message_without_delta_true_is_skipped() {
+        // Defends against a future Gemini CLI that emits a final consolidated
+        // assistant message after the streaming deltas. Naively forwarding it
+        // would double-emit the response text.
+        let no_delta = r#"{"type":"message","role":"assistant","content":"hello"}"#;
+        let delta_false =
+            r#"{"type":"message","role":"assistant","content":"hello","delta":false}"#;
+        let mut s = GeminiParserState::default();
+        assert!(matches!(
+            parse_line(no_delta, turn_id(), agent_id(), &mut s),
+            ParseOutcome::Skip
+        ));
+        assert!(matches!(
+            parse_line(delta_false, turn_id(), agent_id(), &mut s),
             ParseOutcome::Skip
         ));
     }

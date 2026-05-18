@@ -240,7 +240,7 @@ async fn auth_failure_inline_fixture_emits_auth_failure_kind() {
     // Inline-JSON fixture: M3.1 did not capture an auth-failure stream
     // because triggering one would break the developer's OAuth state. The
     // adapter's `result.status:"error"` path routes through
-    // `classify_gemini_error`, which matches any of three auth-signal
+    // `is_gemini_auth_failure_message`, which matches any of three auth-signal
     // substrings. We pin the round-trip here.
     let tmp = TempDir::new().unwrap();
     let inline_path = tmp.path().join("auth-failure.stream.jsonl");

@@ -32,16 +32,26 @@ pub fn id_prefix(session_id: &Uuid) -> String {
 }
 
 /// Resolve cwd → Gemini project-name via `~/.gemini/projects.json`.
-/// Returns `None` if the file is missing, unreadable, or contains no entry
-/// for the given cwd. Degrading to `None` lets the caller treat
-/// "never-dispatched-yet" identically to "lookup failed" — both produce an
-/// empty candidate set.
+/// Returns `None` if the file is missing, unreadable, the cwd doesn't
+/// exist on disk, or `projects.json` contains no entry for the canonical
+/// cwd. Degrading to `None` lets the caller treat "never-dispatched-yet"
+/// identically to "lookup failed" — both produce an empty candidate set.
+///
+/// **Cwd is canonicalized internally** (matches Claude's `session_exists_in`
+/// pattern). Gemini's `projects.json` is keyed by its own resolved working
+/// directory — on macOS, `/tmp/X` becomes `/private/tmp/X`. Without
+/// canonicalization, a non-canonical caller cwd would miss an existing
+/// entry, `build_args` would pick `--session-id` on the second turn, and
+/// Gemini would exit 42 because the session already exists. The
+/// production caller (`Directory::at`) canonicalizes already; this is
+/// defensive parity.
 #[must_use]
 pub fn resolve_gemini_project_name(home_dir: &Path, cwd: &Path) -> Option<String> {
+    let canonical = cwd.canonicalize().ok()?;
     let path = home_dir.join(".gemini").join("projects.json");
     let bytes = std::fs::read(&path).ok()?;
     let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    let cwd_str = cwd.to_str()?;
+    let cwd_str = canonical.to_str()?;
     // The file shape observed in M3.1 is `{"projects": {"<abs-cwd>": "<name>"}}`.
     // The "projects" wrapper key isn't guaranteed across Gemini CLI versions —
     // try both shapes (wrapped + flat) so we degrade gracefully.
@@ -65,10 +75,12 @@ fn chats_dir(home_dir: &Path, project_name: &str) -> PathBuf {
 }
 
 /// Enumerate session-file candidates matching `session-*-<id8>.jsonl` in
-/// the project's chats directory. Returns an empty vector if the chats
-/// directory is missing or unreadable. Used by:
-/// - `session_file_exists_for` (M3.2: pick `--session-id` vs `--resume`).
-/// - The attach lookup (M3.4: pick the right file when filenames collide).
+/// the project's chats directory. Returns an empty vector if the cwd
+/// doesn't exist, the project mapping is unknown, or the chats directory
+/// is missing or unreadable. Cwd is canonicalized internally via
+/// `resolve_gemini_project_name`. Used by:
+/// - `session_file_exists_for` (pick `--session-id` vs `--resume`).
+/// - The attach lookup (pick the right file when filenames collide; M3.4).
 /// - The transcript hydrator (M3.3).
 #[must_use]
 pub fn gemini_session_file_candidates(
@@ -125,24 +137,54 @@ mod tests {
         assert_eq!(id_prefix(&uuid), "abcdef12");
     }
 
+    /// Write `projects.json` mapping the canonical form of `cwd` → name.
+    /// Matches what the real Gemini CLI writes (it canonicalizes cwd before
+    /// recording the key).
+    fn stage_projects_json_wrapped(home: &Path, cwd: &Path, name: &str) {
+        let gemini = home.join(".gemini");
+        std::fs::create_dir_all(&gemini).unwrap();
+        let canonical = cwd.canonicalize().unwrap();
+        let body = serde_json::json!({
+            "projects": { canonical.to_str().unwrap(): name }
+        });
+        std::fs::write(gemini.join("projects.json"), body.to_string()).unwrap();
+    }
+
+    fn stage_projects_json_flat(home: &Path, cwd: &Path, name: &str) {
+        let gemini = home.join(".gemini");
+        std::fs::create_dir_all(&gemini).unwrap();
+        let canonical = cwd.canonicalize().unwrap();
+        let body = serde_json::json!({
+            canonical.to_str().unwrap(): name
+        });
+        std::fs::write(gemini.join("projects.json"), body.to_string()).unwrap();
+    }
+
     #[test]
     fn resolve_returns_none_when_projects_json_missing() {
         let home = TempDir::new().unwrap();
-        assert!(resolve_gemini_project_name(home.path(), Path::new("/tmp/x")).is_none());
+        let cwd = TempDir::new().unwrap();
+        assert!(resolve_gemini_project_name(home.path(), cwd.path()).is_none());
+    }
+
+    #[test]
+    fn resolve_returns_none_when_cwd_does_not_exist() {
+        // Canonicalize-fail → None. Non-existent cwd is indistinguishable
+        // from "never dispatched" at the lookup boundary.
+        let home = TempDir::new().unwrap();
+        assert!(
+            resolve_gemini_project_name(home.path(), Path::new("/definitely/not/a/real/path"))
+                .is_none()
+        );
     }
 
     #[test]
     fn resolve_reads_wrapped_projects_map() {
         let home = TempDir::new().unwrap();
-        let gemini = home.path().join(".gemini");
-        std::fs::create_dir_all(&gemini).unwrap();
-        std::fs::write(
-            gemini.join("projects.json"),
-            r#"{"projects":{"/tmp/cwd-abc":"my-project"}}"#,
-        )
-        .unwrap();
+        let cwd = TempDir::new().unwrap();
+        stage_projects_json_wrapped(home.path(), cwd.path(), "my-project");
         assert_eq!(
-            resolve_gemini_project_name(home.path(), Path::new("/tmp/cwd-abc")),
+            resolve_gemini_project_name(home.path(), cwd.path()),
             Some("my-project".to_owned())
         );
     }
@@ -150,38 +192,57 @@ mod tests {
     #[test]
     fn resolve_reads_flat_projects_map() {
         let home = TempDir::new().unwrap();
-        let gemini = home.path().join(".gemini");
-        std::fs::create_dir_all(&gemini).unwrap();
-        std::fs::write(
-            gemini.join("projects.json"),
-            r#"{"/tmp/cwd-flat":"flat-name"}"#,
-        )
-        .unwrap();
+        let cwd = TempDir::new().unwrap();
+        stage_projects_json_flat(home.path(), cwd.path(), "flat-name");
         assert_eq!(
-            resolve_gemini_project_name(home.path(), Path::new("/tmp/cwd-flat")),
+            resolve_gemini_project_name(home.path(), cwd.path()),
             Some("flat-name".to_owned())
+        );
+    }
+
+    /// Regression: cwd canonicalization must happen inside the lookup
+    /// helper so non-canonical caller paths (symlinks, `/tmp` vs
+    /// `/private/tmp` on macOS) still resolve to the canonical key the
+    /// Gemini CLI wrote. Without this, second-turn dispatches would
+    /// fall through to `--session-id`, Gemini exits 42, agents fail
+    /// silently after their first turn.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_canonicalizes_cwd_against_symlinked_path() {
+        let home = TempDir::new().unwrap();
+        let real = TempDir::new().unwrap();
+        let link_parent = TempDir::new().unwrap();
+        let link = link_parent.path().join("symlink-to-cwd");
+        std::os::unix::fs::symlink(real.path(), &link).unwrap();
+        stage_projects_json_wrapped(home.path(), real.path(), "via-canonical");
+
+        assert_eq!(
+            resolve_gemini_project_name(home.path(), &link),
+            Some("via-canonical".to_owned()),
+            "non-canonical cwd must resolve via canonicalize() to the key Gemini wrote"
         );
     }
 
     #[test]
     fn candidates_empty_when_project_unknown() {
         let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
         let uuid = Uuid::new_v4();
-        let hits = gemini_session_file_candidates(home.path(), Path::new("/tmp/unknown"), &uuid);
+        let hits = gemini_session_file_candidates(home.path(), cwd.path(), &uuid);
         assert!(hits.is_empty());
     }
 
     #[test]
     fn candidates_match_only_files_with_session_prefix_and_id_suffix() {
         let home = TempDir::new().unwrap();
-        let gemini = home.path().join(".gemini");
-        std::fs::create_dir_all(&gemini).unwrap();
-        std::fs::write(
-            gemini.join("projects.json"),
-            r#"{"projects":{"/tmp/c":"proj"}}"#,
-        )
-        .unwrap();
-        let chats = gemini.join("tmp").join("proj").join("chats");
+        let cwd = TempDir::new().unwrap();
+        stage_projects_json_wrapped(home.path(), cwd.path(), "proj");
+        let chats = home
+            .path()
+            .join(".gemini")
+            .join("tmp")
+            .join("proj")
+            .join("chats");
         std::fs::create_dir_all(&chats).unwrap();
 
         let uuid = Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
@@ -193,21 +254,21 @@ mod tests {
         std::fs::write(&non_matching_suffix, "").unwrap();
         std::fs::write(&non_matching_prefix, "").unwrap();
 
-        let hits = gemini_session_file_candidates(home.path(), Path::new("/tmp/c"), &uuid);
+        let hits = gemini_session_file_candidates(home.path(), cwd.path(), &uuid);
         assert_eq!(hits, vec![matching]);
     }
 
     #[test]
     fn session_file_exists_for_picks_up_matching_file() {
         let home = TempDir::new().unwrap();
-        let gemini = home.path().join(".gemini");
-        std::fs::create_dir_all(&gemini).unwrap();
-        std::fs::write(
-            gemini.join("projects.json"),
-            r#"{"projects":{"/tmp/c":"proj"}}"#,
-        )
-        .unwrap();
-        let chats = gemini.join("tmp").join("proj").join("chats");
+        let cwd = TempDir::new().unwrap();
+        stage_projects_json_wrapped(home.path(), cwd.path(), "proj");
+        let chats = home
+            .path()
+            .join(".gemini")
+            .join("tmp")
+            .join("proj")
+            .join("chats");
         std::fs::create_dir_all(&chats).unwrap();
 
         let uuid = Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
@@ -218,16 +279,8 @@ mod tests {
         )
         .unwrap();
 
-        assert!(session_file_exists_for(
-            home.path(),
-            Path::new("/tmp/c"),
-            &uuid
-        ));
+        assert!(session_file_exists_for(home.path(), cwd.path(), &uuid));
         let other = Uuid::new_v4();
-        assert!(!session_file_exists_for(
-            home.path(),
-            Path::new("/tmp/c"),
-            &other
-        ));
+        assert!(!session_file_exists_for(home.path(), cwd.path(), &other));
     }
 }

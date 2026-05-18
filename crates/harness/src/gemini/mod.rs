@@ -60,7 +60,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use crate::adapter::{DispatchError, EventStream, HarnessAdapter};
 use crate::events::{AdapterEvent, FailureKind, TurnId, TurnOutcome};
 
-use parser::{GeminiParserState, classify_gemini_error, parse_line};
+use parser::{GeminiParserState, is_gemini_auth_failure_message, parse_line};
 
 /// Stderr lines emitted by Gemini that carry no diagnostic value. The
 /// exit-42 handler filters them before classifying the remaining lines.
@@ -265,6 +265,15 @@ async fn run_producer(
     let mut terminal_seen = false;
     let mut terminal_was_completed = false;
     let mut state = GeminiParserState::default();
+    // Set on any error path that ends the producer loop with the subprocess
+    // still potentially running. Mirrors Codex's pattern; load-bearing for
+    // Gemini specifically because Gemini ignores bare-PID SIGTERM and
+    // requires process-group signaling (see docs/research/gemini-cli-observed.md,
+    // "SIGTERM behaviour" findings). Without the explicit kill, a Gemini
+    // process that keeps writing after we stop draining stdout would block
+    // on a full pipe and `child.wait()` would hang indefinitely, delaying
+    // `AgentIdle` and stranding the UI in an in-flight state.
+    let mut force_kill_child = false;
 
     let mut lines = tokio::io::BufReader::new(stdout).lines();
 
@@ -287,6 +296,7 @@ async fn run_producer(
                             usage: None,
                         });
                         terminal_seen = true;
+                        force_kill_child = true;
                         break;
                     }
                 };
@@ -329,9 +339,14 @@ async fn run_producer(
                     usage: None,
                 });
                 terminal_seen = true;
+                force_kill_child = true;
                 break;
             }
         }
+    }
+
+    if force_kill_child {
+        crate::subprocess::kill_subprocess_group(&mut child).await;
     }
 
     let _ = stderr_task.await;
@@ -366,36 +381,25 @@ async fn run_producer(
 
 /// Overlay the runtime-known `harness_version` onto a parser-emitted
 /// `SessionMeta`. The parser doesn't know the value (it's adapter-owned),
-/// so it emits with `""` and we fill it in here.
-fn inject_harness_version(event: AdapterEvent, version: &str) -> AdapterEvent {
+/// so it emits with `""` and we fill it in here. In-place mutation so a
+/// future field added to `SessionMeta` doesn't get silently dropped to its
+/// default.
+fn inject_harness_version(mut event: AdapterEvent, version: &str) -> AdapterEvent {
     if let AdapterEvent::SessionMeta {
-        agent_id,
-        model,
-        harness_version: _,
-        tools,
-        mcp_servers,
-        skills,
-        raw,
-    } = event
+        harness_version, ..
+    } = &mut event
     {
-        AdapterEvent::SessionMeta {
-            agent_id,
-            model,
-            harness_version: version.to_owned(),
-            tools,
-            mcp_servers,
-            skills,
-            raw,
-        }
-    } else {
-        event
+        version.clone_into(harness_version);
     }
+    event
 }
 
 /// Synthesize the terminal `TurnEnd(Failed)` event for the no-terminal-seen
-/// EOF case. Exit 42 with a recognizable stderr line → classify via
-/// `classify_gemini_error` (may yield `AuthFailure`); everything else falls
-/// through to `AdapterFailure` with the stderr tail attached.
+/// EOF case. Exit 42 with a recognizable stderr line → `AuthFailure` if
+/// the message matches the shared auth-substring set, else `AdapterFailure`
+/// (exit-42 is input rejection — not the model's fault, so `HarnessError`
+/// would be wrong). Everything else falls through to `AdapterFailure` with
+/// the stderr tail attached.
 fn synthesize_terminal_failure(
     turn_id: TurnId,
     stderr_tail: &Mutex<VecDeque<String>>,
@@ -404,13 +408,8 @@ fn synthesize_terminal_failure(
     if exit_code == Some(42) {
         let actionable = extract_actionable_stderr(stderr_tail);
         if !actionable.is_empty() {
-            let kind = classify_gemini_error(&actionable);
-            // `classify_gemini_error` returns `HarnessError` or
-            // `AuthFailure`; for exit-42 input-rejection cases without an
-            // auth substring, `AdapterFailure` is the more honest mapping
-            // (input was malformed; not the model's fault).
-            let kind = if matches!(kind, FailureKind::AuthFailure) {
-                kind
+            let kind = if is_gemini_auth_failure_message(&actionable) {
+                FailureKind::AuthFailure
             } else {
                 FailureKind::AdapterFailure
             };
@@ -506,10 +505,13 @@ mod tests {
         let agent = agent_with_session(session_id);
 
         // Pre-create the project mapping + a session file so the existence
-        // check sees the prefix-matched file.
+        // check sees the prefix-matched file. `projects.json` is keyed by
+        // the canonical cwd (Gemini canonicalizes before writing; the
+        // helper canonicalizes before reading).
         let gemini = home.path().join(".gemini");
         std::fs::create_dir_all(&gemini).unwrap();
-        let cwd_str = cwd.path().to_str().unwrap();
+        let canonical_cwd = cwd.path().canonicalize().unwrap();
+        let cwd_str = canonical_cwd.to_str().unwrap();
         std::fs::write(
             gemini.join("projects.json"),
             format!(r#"{{"projects":{{"{cwd_str}":"proj"}}}}"#),

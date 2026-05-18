@@ -5,17 +5,26 @@ use serde::{Deserialize, Serialize};
 /// Identifies which AI coding harness an agent is bound to.
 /// `#[non_exhaustive]` so further variants remain non-breaking.
 ///
-/// **Session-id asymmetry** (load-bearing): Claude Code agents pre-generate
-/// `AgentRecord.session_id` at registration time; Codex agents leave it
-/// `None` and rely on a per-agent session-link sidecar populated from the
-/// `thread.started` stream event on first dispatch. The sidecar is the
-/// system-of-record for Codex's captured `thread_id`.
+/// **Session-id asymmetry** (load-bearing): Claude Code and Gemini agents
+/// pre-generate `AgentRecord.session_id` at registration time (passed via
+/// `--session-id <uuid>` on first dispatch, `--resume <uuid>` thereafter);
+/// Codex agents leave it `None` and rely on a per-agent session-link
+/// sidecar populated from the `thread.started` stream event on first
+/// dispatch.
+///
+/// **UUID-version asymmetry** (load-bearing): Claude Code uses UUID v7
+/// (time-ordered) like the rest of Switchboard; Gemini uses UUID v4
+/// (random) because Gemini's session-file naming uses the first 8 hex chars
+/// of the session ID as a filename component, and UUID v7s minted in the
+/// same millisecond share their first 8 chars, causing on-disk session-file
+/// interleave under concurrent dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum HarnessKind {
     ClaudeCode,
     Codex,
+    Gemini,
 }
 
 /// User-facing names. Used in `thiserror` `#[error]` format strings that
@@ -35,6 +44,7 @@ impl fmt::Display for HarnessKind {
         match self {
             Self::ClaudeCode => f.write_str("Claude Code"),
             Self::Codex => f.write_str("Codex"),
+            Self::Gemini => f.write_str("Gemini"),
         }
     }
 }
@@ -68,8 +78,21 @@ mod tests {
     }
 
     #[test]
+    fn gemini_serializes_as_snake_case() {
+        let json = serde_json::to_string(&HarnessKind::Gemini).unwrap();
+        assert_eq!(json, "\"gemini\"");
+    }
+
+    #[test]
+    fn gemini_deserializes_from_snake_case() {
+        let parsed: HarnessKind = serde_json::from_str("\"gemini\"").unwrap();
+        assert_eq!(parsed, HarnessKind::Gemini);
+    }
+
+    #[test]
     fn display_uses_user_facing_names_with_space_for_claude() {
         assert_eq!(format!("{}", HarnessKind::ClaudeCode), "Claude Code");
         assert_eq!(format!("{}", HarnessKind::Codex), "Codex");
+        assert_eq!(format!("{}", HarnessKind::Gemini), "Gemini");
     }
 }

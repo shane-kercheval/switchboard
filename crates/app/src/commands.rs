@@ -449,6 +449,7 @@ pub async fn send_message_impl(
     let adapter: &dyn HarnessAdapter = match agent.harness {
         HarnessKind::ClaudeCode => state.claude_adapter.as_ref(),
         HarnessKind::Codex => state.codex_adapter.as_ref(),
+        HarnessKind::Gemini => state.gemini_adapter.as_ref(),
         _ => return Err(AppError::UnsupportedHarness),
     };
     // Read (don't drain) the attach-flow flag. The per-dispatch emitter
@@ -626,6 +627,7 @@ mod tests {
         let state = AppState::new(
             Arc::clone(&mock),
             Arc::clone(&mock),
+            Arc::clone(&mock),
             emitter.clone() as Arc<dyn EventEmitter>,
         );
         (tmp, state, emitter)
@@ -651,6 +653,7 @@ mod tests {
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
         let state = AppState::new(
+            Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
             emitter as Arc<dyn EventEmitter>,
@@ -823,6 +826,7 @@ mod tests {
         let state = Arc::new(AppState::new(
             Arc::clone(&mock),
             Arc::clone(&mock),
+            Arc::clone(&mock),
             emitter as Arc<dyn EventEmitter>,
         ));
         init_directory_impl(&state, tmp.path().to_str().unwrap())
@@ -882,8 +886,9 @@ mod tests {
             "/nonexistent/claude-xyz",
         ));
         let codex: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let gemini: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
-        let state = AppState::new(claude, codex, emitter as Arc<dyn EventEmitter>);
+        let state = AppState::new(claude, codex, gemini, emitter as Arc<dyn EventEmitter>);
         let err = check_claude_binary_impl(&state).unwrap_err();
         assert!(matches!(err, AppError::Probe(_)));
     }
@@ -944,8 +949,9 @@ mod tests {
         let claude: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let codex: Arc<dyn HarnessAdapter> =
             Arc::new(CodexAdapter::with_binary_path("/nonexistent/codex-xyz"));
+        let gemini: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
-        let state = AppState::new(claude, codex, emitter as Arc<dyn EventEmitter>);
+        let state = AppState::new(claude, codex, gemini, emitter as Arc<dyn EventEmitter>);
         let err = check_codex_binary_impl(&state).unwrap_err();
         assert!(matches!(err, AppError::Probe(_)));
     }
@@ -1026,11 +1032,12 @@ mod tests {
     /// `send_message_impl` selects an adapter via `match agent.harness`,
     /// and a regression that hard-codes one adapter would silently spawn
     /// the wrong binary. This test pins that routing against regression
-    /// using two distinguishable adapters tagged "claude" / "codex".
+    /// using three distinguishable adapters tagged per harness.
     #[tokio::test]
     async fn send_message_routes_to_adapter_matching_agent_harness() {
         let claude_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let codex_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gemini_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let claude: Arc<dyn HarnessAdapter> = Arc::new(TaggedMockAdapter {
             tag: "from-claude-adapter",
             dispatch_count: claude_count.clone(),
@@ -1039,8 +1046,17 @@ mod tests {
             tag: "from-codex-adapter",
             dispatch_count: codex_count.clone(),
         });
+        let gemini: Arc<dyn HarnessAdapter> = Arc::new(TaggedMockAdapter {
+            tag: "from-gemini-adapter",
+            dispatch_count: gemini_count.clone(),
+        });
         let emitter = Arc::new(RecordingEmitter::new());
-        let state = AppState::new(claude, codex, emitter.clone() as Arc<dyn EventEmitter>);
+        let state = AppState::new(
+            claude,
+            codex,
+            gemini,
+            emitter.clone() as Arc<dyn EventEmitter>,
+        );
         let tmp = TempDir::new().unwrap();
         init_directory_impl(&state, tmp.path().to_str().unwrap())
             .await
@@ -1049,6 +1065,7 @@ mod tests {
         set_active_project_impl(&state, proj.id).unwrap();
         let claude_agent = create_agent_impl(&state, "c1", HarnessKind::ClaudeCode).unwrap();
         let codex_agent = create_agent_impl(&state, "x1", HarnessKind::Codex).unwrap();
+        let gemini_agent = create_agent_impl(&state, "g1", HarnessKind::Gemini).unwrap();
 
         let claude_handle = send_message_impl(&state, claude_agent.id, "hi")
             .await
@@ -1058,6 +1075,10 @@ mod tests {
             .await
             .unwrap();
         codex_handle.join.await.unwrap();
+        let gemini_handle = send_message_impl(&state, gemini_agent.id, "hi")
+            .await
+            .unwrap();
+        gemini_handle.join.await.unwrap();
 
         assert_eq!(
             claude_count.load(std::sync::atomic::Ordering::SeqCst),
@@ -1069,13 +1090,19 @@ mod tests {
             1,
             "Codex agent dispatch must hit the Codex adapter exactly once"
         );
+        assert_eq!(
+            gemini_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "Gemini agent dispatch must hit the Gemini adapter exactly once"
+        );
 
         // Secondary check: the emitted ContentChunk tags match the
         // adapter-of-origin per agent_id. Catches mis-routing where dispatch
-        // counts are still 1/1 but the wrong adapter served each.
+        // counts are still 1/1/1 but the wrong adapter served each.
         let events = emitter.snapshot();
         let claude_channel = format!("agent:{}", claude_agent.id);
         let codex_channel = format!("agent:{}", codex_agent.id);
+        let gemini_channel = format!("agent:{}", gemini_agent.id);
         let claude_text = events
             .iter()
             .find(|(name, payload)| name == &claude_channel && payload["type"] == "content_chunk")
@@ -1084,8 +1111,13 @@ mod tests {
             .iter()
             .find(|(name, payload)| name == &codex_channel && payload["type"] == "content_chunk")
             .expect("content_chunk on codex channel");
+        let gemini_text = events
+            .iter()
+            .find(|(name, payload)| name == &gemini_channel && payload["type"] == "content_chunk")
+            .expect("content_chunk on gemini channel");
         assert_eq!(claude_text.1["text"], "from-claude-adapter");
         assert_eq!(codex_text.1["text"], "from-codex-adapter");
+        assert_eq!(gemini_text.1["text"], "from-gemini-adapter");
     }
 
     #[tokio::test]
@@ -1125,6 +1157,7 @@ mod tests {
         ));
         let emitter = Arc::new(RecordingEmitter::new());
         let state = AppState::new(
+            Arc::clone(&failing),
             Arc::clone(&failing),
             Arc::clone(&failing),
             emitter as Arc<dyn EventEmitter>,
@@ -1194,6 +1227,7 @@ mod tests {
         });
         let emitter = Arc::new(RecordingEmitter::new());
         let state = AppState::new(
+            Arc::clone(&adapter),
             Arc::clone(&adapter),
             Arc::clone(&adapter),
             emitter as Arc<dyn EventEmitter>,
@@ -1299,6 +1333,7 @@ mod tests {
         });
         let emitter = Arc::new(RecordingEmitter::new());
         let state = AppState::new(
+            Arc::clone(&adapter),
             Arc::clone(&adapter),
             Arc::clone(&adapter),
             emitter as Arc<dyn EventEmitter>,
@@ -1476,6 +1511,7 @@ mod tests {
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
         let state = AppState::new(
+            Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
             emitter as Arc<dyn EventEmitter>,
@@ -1913,6 +1949,7 @@ mod tests {
             let state_a = AppState::new(
                 Arc::clone(&mock),
                 Arc::clone(&mock),
+                Arc::clone(&mock),
                 emitter as Arc<dyn EventEmitter>,
             );
             init_directory_impl(&state_a, tmp_workdir.path().to_str().unwrap())
@@ -1936,6 +1973,7 @@ mod tests {
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
         let state_b = AppState::new(
+            Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
             emitter as Arc<dyn EventEmitter>,
@@ -1979,6 +2017,7 @@ mod tests {
             let state_a = AppState::new(
                 Arc::clone(&mock),
                 Arc::clone(&mock),
+                Arc::clone(&mock),
                 emitter as Arc<dyn EventEmitter>,
             );
             init_directory_impl(&state_a, tmp_workdir.path().to_str().unwrap())
@@ -1999,6 +2038,7 @@ mod tests {
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
         let state_b = AppState::new(
+            Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
             emitter as Arc<dyn EventEmitter>,
@@ -2093,6 +2133,7 @@ mod tests {
             let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
             let emitter = Arc::new(RecordingEmitter::new());
             let state = AppState::new(
+                Arc::clone(&mock),
                 Arc::clone(&mock),
                 Arc::clone(&mock),
                 emitter as Arc<dyn EventEmitter>,

@@ -11,7 +11,9 @@ mod state;
 use std::sync::Arc;
 
 use switchboard_dispatcher::EventEmitter;
-use switchboard_harness::{ClaudeCodeAdapter, CodexAdapter, HarnessAdapter, MockHarnessAdapter};
+use switchboard_harness::{
+    ClaudeCodeAdapter, CodexAdapter, GeminiAdapter, HarnessAdapter, MockHarnessAdapter,
+};
 use tauri::{Emitter, Manager, State};
 
 use crate::commands::{
@@ -162,28 +164,31 @@ impl EventEmitter for AppHandleEmitter {
     }
 }
 
-/// Reads `SWITCHBOARD_HARNESS` to decide which adapter pair to construct.
-/// - Unset or `"claude"` → `claude_adapter = ClaudeCodeAdapter`, `codex_adapter = CodexAdapter`.
-/// - `"mock"` → both adapters = `MockHarnessAdapter`.
+/// Reads `SWITCHBOARD_HARNESS` to decide which adapter triple to construct.
+/// - Unset or `"claude"` → real adapters for all three harnesses.
+/// - `"mock"` → all three adapters = `MockHarnessAdapter`.
 /// - Any other value → panic (silent fall-through to default would be a footgun).
 ///
-/// Returns `(claude_adapter, codex_adapter)`. Both are constructed under
-/// "claude"/unset because the `match agent.harness` routing in
-/// `send_message_impl` may dispatch to either at runtime; neither adapter's
-/// constructor performs a binary check, so missing CLIs only surface at
-/// `check_*_binary` time, not at app startup.
-fn build_adapters() -> (Arc<dyn HarnessAdapter>, Arc<dyn HarnessAdapter>) {
+/// Returns `(claude_adapter, codex_adapter, gemini_adapter)`. All three are
+/// constructed under "claude"/unset because the `match agent.harness`
+/// routing in `send_message_impl` may dispatch to any at runtime; no
+/// adapter's constructor performs a binary check, so missing CLIs only
+/// surface at `check_*_binary` time, not at app startup.
+fn build_adapters() -> (
+    Arc<dyn HarnessAdapter>,
+    Arc<dyn HarnessAdapter>,
+    Arc<dyn HarnessAdapter>,
+) {
     match std::env::var("SWITCHBOARD_HARNESS").as_deref() {
         Ok("mock") => {
-            tracing::info!(
-                "SWITCHBOARD_HARNESS=mock — using MockHarnessAdapter for both harnesses"
-            );
+            tracing::info!("SWITCHBOARD_HARNESS=mock — using MockHarnessAdapter for all harnesses");
             let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
-            (Arc::clone(&mock), mock)
+            (Arc::clone(&mock), Arc::clone(&mock), mock)
         }
         Ok("claude") | Err(_) => (
             Arc::new(ClaudeCodeAdapter::new()),
             Arc::new(CodexAdapter::new()),
+            Arc::new(GeminiAdapter::new()),
         ),
         Ok(other) => panic!(
             "invalid SWITCHBOARD_HARNESS={other:?}; expected one of: claude, mock (or unset for default)"
@@ -200,7 +205,7 @@ pub fn run() {
         )
         .try_init();
 
-    let (claude_adapter, codex_adapter) = build_adapters();
+    let (claude_adapter, codex_adapter, gemini_adapter) = build_adapters();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -211,6 +216,7 @@ pub fn run() {
             app.manage(AppState::new(
                 Arc::clone(&claude_adapter),
                 Arc::clone(&codex_adapter),
+                Arc::clone(&gemini_adapter),
                 emitter,
             ));
             Ok(())

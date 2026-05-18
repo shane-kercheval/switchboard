@@ -27,6 +27,13 @@ pub enum DispatchError {
     /// JSONL corruption), not silently treated as "no prior session."
     #[error("adapter pre-stream read failed: {0}")]
     PreStreamRead(String),
+    /// Caller-input validation failed before spawn — the supplied prompt is
+    /// not dispatch-shaped (e.g., empty/whitespace-only). The Gemini CLI
+    /// rejects empty prompts with exit 42; the adapter pre-validates so the
+    /// failure surfaces as a recognizable input error rather than a
+    /// subprocess crash.
+    #[error("invalid prompt: {0}")]
+    InvalidPrompt(String),
 }
 
 /// Per-dispatch options. Plumbed through `HarnessAdapter::dispatch` so

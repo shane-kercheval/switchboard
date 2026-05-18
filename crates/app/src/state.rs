@@ -47,6 +47,8 @@ pub struct AppState {
     pub claude_adapter: Arc<dyn HarnessAdapter>,
     /// Adapter for `HarnessKind::Codex` agents.
     pub codex_adapter: Arc<dyn HarnessAdapter>,
+    /// Adapter for `HarnessKind::Gemini` agents.
+    pub gemini_adapter: Arc<dyn HarnessAdapter>,
     pub emitter: Arc<dyn EventEmitter>,
     /// Set of `agent_id`s whose next dispatch must run with
     /// `DispatchOptions::is_first_dispatch_after_attach = true`. Populated by
@@ -91,6 +93,7 @@ impl AppState {
     pub fn new(
         claude_adapter: Arc<dyn HarnessAdapter>,
         codex_adapter: Arc<dyn HarnessAdapter>,
+        gemini_adapter: Arc<dyn HarnessAdapter>,
         emitter: Arc<dyn EventEmitter>,
     ) -> Self {
         Self {
@@ -101,6 +104,7 @@ impl AppState {
             dispatcher: Arc::new(Dispatcher::new()),
             claude_adapter,
             codex_adapter,
+            gemini_adapter,
             emitter,
             needs_session_meta: Arc::new(Mutex::new(HashSet::new())),
         }

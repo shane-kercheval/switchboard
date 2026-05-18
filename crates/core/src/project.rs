@@ -66,11 +66,21 @@ impl Project {
     /// or different directories) are fine; cross-process serialization within
     /// one directory is future work.
     pub fn register_agent(&self, name: &str, harness: HarnessKind) -> Result<AgentRecord> {
-        // Harness-asymmetry rule: Claude Code pre-generates session_id at
-        // registration time; Codex leaves it None and relies on the per-agent
-        // session-link sidecar populated from `thread.started` on first dispatch.
+        // Harness-asymmetry rule:
+        // - Claude Code pre-generates session_id (UUID v7) at registration
+        //   time; passed via `--session-id`/`--resume`.
+        // - Gemini pre-generates session_id (UUID **v4**) at registration
+        //   time; passed via `--session-id`/`--resume`. Gemini's session
+        //   filename embeds the first 8 hex chars of the session ID, and
+        //   UUID v7s minted in the same millisecond share their first 8
+        //   chars — concurrent Gemini dispatches in one cwd would interleave
+        //   on disk. v4's first 8 chars are random across 32 bits, so the
+        //   collision probability is ~1/2^32. Localized to Gemini.
+        // - Codex leaves it None and relies on the per-agent session-link
+        //   sidecar populated from `thread.started` on first dispatch.
         let session_id = match harness {
             HarnessKind::ClaudeCode => Some(Uuid::now_v7()),
+            HarnessKind::Gemini => Some(Uuid::new_v4()),
             HarnessKind::Codex => None,
         };
         self.register_agent_inner_with_id(name, harness, session_id, Uuid::now_v7())
@@ -268,6 +278,30 @@ mod tests {
 
         let listed = project.list_agents().unwrap();
         assert_eq!(listed, vec![record]);
+    }
+
+    #[test]
+    fn register_gemini_agent_mints_uuid_v4_session_id() {
+        // Load-bearing: v7 caused the on-disk session-file interleave
+        // hazard against Gemini's 8-char-prefix filename. If a future
+        // refactor accidentally swaps this back to `Uuid::now_v7()`,
+        // concurrent dispatches in one cwd corrupt transcripts.
+        let (_tmp, project) = fresh_project();
+        let record = project.register_agent("g", HarnessKind::Gemini).unwrap();
+        let session_id = record.session_id.expect("Gemini pre-generates session_id");
+        assert_eq!(
+            session_id.get_version_num(),
+            4,
+            "Gemini session_id must be UUID v4, got: {session_id} (version {})",
+            session_id.get_version_num()
+        );
+    }
+
+    #[test]
+    fn register_codex_agent_leaves_session_id_none() {
+        let (_tmp, project) = fresh_project();
+        let record = project.register_agent("c", HarnessKind::Codex).unwrap();
+        assert!(record.session_id.is_none());
     }
 
     #[test]

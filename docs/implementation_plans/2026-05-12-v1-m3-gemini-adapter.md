@@ -49,9 +49,9 @@ These were resolved during M3.1 and are not up for relitigation during M3.2+. Ea
    | `tool_use` (non-`update_topic`) | `ToolStarted { tool_use_id: tool_id, kind, name: tool_name, input: parameters }` |
    | `tool_result` (non-`update_topic`) | `ToolCompleted { tool_use_id: tool_id, output, is_error: status != "success" }` |
    | `result` status="success" | `TurnEnd { outcome: Completed, usage: <derived from stats> }` |
-   | `result` status="error" | `TurnEnd { outcome: Failed { kind: HarnessError, message: error.message } }` |
-   | EOF without `result` (cancelled) | `TurnEnd { outcome: Failed { kind: AdapterFailure, message: ... } }` |
-   | Exit 42 + empty stdout | `TurnEnd { outcome: Failed { kind: AdapterFailure, message: <stderr> } }` |
+   | `result` status="error" | `TurnEnd { Failed { kind: classify_gemini_error(error.message), message: error.message } }` — returns `AuthFailure` if auth substring matches, else `HarnessError`. See decision #8. |
+   | EOF without `result` (cancelled) | `TurnEnd { outcome: Failed { kind: AdapterFailure, message: "subprocess exited without terminal event" } }` |
+   | Exit 42 + empty stdout | `TurnEnd { Failed { kind: classify_gemini_error(actionable_stderr_line), message: actionable_stderr_line } }` — returns `AuthFailure` if auth substring matches, else `AdapterFailure`. See decision #8 + M3.2 step 10. |
 
 7. **Auth-mode detection from `~/.gemini/settings.json`**: `security.auth.selectedType` is a single string (`"oauth-personal"` / `"gemini-api-key"` / `"vertex-ai"` / Workspace-equivalent). The presence-check parallels the existing Codex auth probe (`~/.codex/auth.json`).
 
@@ -107,12 +107,18 @@ Spawn `gemini -p` as a per-turn subprocess, map its stream-json output onto the 
 
 ### Implementation outline
 
-1. **`HarnessKind::Gemini` variant.** Add to `crates/core/src/harness.rs` enum, the wire-format serde rename, and any pattern-matching exhaustive consumers. The enum is `#[non_exhaustive]` so additive variants don't break consumers, but every `match HarnessKind { ... }` site needs the new arm.
+1. **`HarnessKind::Gemini` variant.** Add to `crates/core/src/harness.rs` enum + the wire-format serde rename. The enum is `#[non_exhaustive]`, but match-site updates are still required. **Explicit match-site list** (so the implementor doesn't have to sweep):
+   - `crates/app/src/commands.rs::send_message_impl` — adapter selection.
+   - `crates/app/src/commands.rs::attach_agent_impl` — new Gemini arm (per M3.4 step 4), not catch-all fallthrough.
+   - `crates/app/src/commands.rs::load_transcript_impl` — new Gemini arm dispatches to `load_gemini_transcript` (M3.3).
+   - `crates/app/src/lib.rs` — adapter instantiation (mock vs. real).
+   - `src/lib/types.ts` — `HarnessKind` union widens to `"gemini"`.
+   - Frontend discriminated-union narrowing in `CreateAgentForm.svelte`, `Sidebar.svelte`, `UnifiedTranscript.svelte`, `harnessAvailability.ts`.
 
 2. **Module layout.** New crate-module `crates/harness/src/gemini/` mirroring the `codex/` structure:
    - `mod.rs` — the `GeminiAdapter` impl, `HarnessAdapter` impl, `build_args`, spawn glue. Module docstring names the deferred MCP / skills surface explicitly: "MCP server loading and skills discovery for Gemini are deferred; corresponding modules will land alongside their UI surface in a later milestone."
    - `parser.rs` — stream-JSON line-by-line parser converting Gemini events to `AdapterEvent`s. Hosts `GEMINI_INTERNAL_TOOL_NAMES` and `classify_gemini_error`.
-   - `session_file.rs` — path-lookup helpers for M3.2 resume detection + the full `load_gemini_transcript` impl (populated in M3.3).
+   - `session_file.rs` — path-lookup helpers introduced here (`gemini_session_file_glob`, `resolve_gemini_project_name`, full-sessionId collision-safety filter). M3.3 layers `load_gemini_transcript` on top of these helpers; M3.4's attach arm reuses them. **No helper duplication across sub-milestones** — each one calls the M3.2 helper, doesn't re-derive it.
    - **No `config.rs` / `skills.rs` placeholder modules.** For v1, the adapter emits `SessionMeta { mcp_servers: vec![], skills: vec![] }` directly. Empty stub modules would be dead code with a high risk of being treated as authoritative empty registries by future callers. The deferral is documented in the `mod.rs` docstring; a future contributor adds the modules when they're actually implemented.
 
 3. **`GeminiAdapter` struct.** Plain struct holding optional binary path override (for `fake_gemini` in tests, mirroring the Claude / Codex pattern). Implements `HarnessAdapter::dispatch` and `HarnessAdapter::probe`. Constructor `new()` uses `gemini` from `PATH`; `with_binary_path(path)` overrides.
@@ -144,7 +150,7 @@ Spawn `gemini -p` as a per-turn subprocess, map its stream-json output onto the 
    - Tokio `BufReader` (not std) on the async pipe.
 
 7. **Stream parser (`parser.rs`).** Line-by-line JSON deserialization. Each line is a record matched by `"type"` field. Handle:
-   - `init` → `AdapterEvent::SessionMeta { model, harness_version: <gemini --version output, captured once at adapter construction>, tools: vec![], mcp_servers: vec![], skills: vec![], raw: the_init_object }`.
+   - `init` → `AdapterEvent::SessionMeta { model, harness_version: <lazy-cached `gemini --version` output, or `""` if unavailable; see M3.2 step 11>, tools: vec![], mcp_servers: vec![], skills: vec![], raw: the_init_object }`.
    - `message` role=user → skip (the prompt echo).
    - `message` role=assistant `delta:true` → `AdapterEvent::ContentChunk { kind: ContentKind::Text, text }`.
    - `tool_use` where `tool_name == "update_topic"` → skip (per resolved decision #3).
@@ -241,7 +247,7 @@ Implement `load_gemini_transcript` so project re-open rehydrates Gemini agent tr
      - Each `thoughts[i]` as a `TurnItem::Text { kind: Thinking, text: thought.subject + "\n" + thought.description }` (or surface only `description` — implementation decides; document).
      - Each `toolCalls[i]` as a `TurnItem::Tool` — see step 4.
    - `Turn::Agent.usage`: take from the **last** gemini-record's `tokens` field. Map to `TurnUsage` (input/output/cached map directly; `total` is informational only; `thoughts` and `tool` token buckets don't have a `TurnUsage` field today and are dropped silently — capture as a follow-up question for v2 if cost UI evolves).
-   - `Turn::Agent.status`: **default `TurnStatus::Complete`**. Mark `TurnStatus::Failed` *only* when the file is clearly truncated (last non-blank line is partial JSON that fails to parse) or when parser warnings were emitted while reading the closing records. Prefer surfacing a `ParseWarning` via the M2.6 warnings channel over guessing the status. Heuristic-based "looks unfinished" markers (e.g., empty content + no toolCalls + no following user record) are **not** sufficient grounds to mark Failed — Gemini legitimately persists sparse records mid-turn.
+   - `Turn::Agent.status`: **default `TurnStatus::Complete`**. Mark `TurnStatus::Failed` *only* when the file is clearly truncated — the final non-blank line is partial JSON that fails to parse. Parser warnings emitted via the M2.6 warnings channel are surfaced to the UI but **never change the turn status** — keeping M2.6's non-blocking warning model intact. Heuristic "looks unfinished" markers (empty content + no toolCalls + no following user record) are **not** sufficient grounds to mark Failed — Gemini legitimately persists sparse records mid-turn.
 
 4. **`TurnItem::Tool` reconstruction.** From the gemini-record's `toolCalls[i]`:
    ```
@@ -299,7 +305,7 @@ The unified-stream UI accepts Gemini as a third equally-first-class harness, inc
 
 2. **Widen `HarnessBanner` for auth-detectable harnesses.** Today (`src/lib/types.ts:240-248`) `auth_missing` is typed as `harness: "codex"` literal — a v1-era hardcoding for the single auth-detectable harness. Widen to `harness: "codex" | "gemini"`. Update `bannerCopy` and `harnessUnavailableReason` (`src/lib/harnessAvailability.ts:18-39`) to switch on `banner.harness` for the auth-missing copy: Codex says "run `codex login`", Gemini says "run `gemini auth login`" (verify exact CLI command during implementation). Claude `auth_missing` remains unsupported — the v1 invariant that Claude auth detection is unavailable survives.
 
-3. **Add-agent form** (`src/lib/components/CreateAgentForm.svelte`). Add Gemini as a third option in the harness selector. The existing mode toggle (`"create" | "attach"`) becomes available for Gemini with **no per-harness gating** — Gemini supports both flows, mirroring Claude.
+3. **Add-agent form** (`src/lib/components/CreateAgentForm.svelte`). Add Gemini as a third option in the harness selector. The existing mode toggle (`"create" | "attach"`) stays **harness-generic** — Gemini supports both create and attach identically to Claude and Codex. **Do not add per-harness disable logic** for the attach mode (an earlier review iteration suggested it; the decision was reversed in favor of implementing Gemini attach as a first-class flow per step 4).
 
 4. **`attach_agent_impl` Gemini arm** (`crates/app/src/commands.rs`). Add a `HarnessKind::Gemini` arm parallel to Claude's:
    - Parse the user-supplied UUID via `parse_uuid`.
@@ -362,7 +368,7 @@ The live-harness suite covers Gemini's happy path, tool use, transcript round-tr
    - Extend `tests/live.rs` with `live_gemini_basic_turn_completes` and `live_gemini_resume_reuses_session` (happy-path + resume).
    - Extend `tests/tool_use.rs` with `live_gemini_emits_tool_started_and_tool_completed_for_file_read`. **Asserts lifecycle only** (not sentinel-in-output) per resolved decision #5 — adapter live test cannot rely on stream tool output content for Gemini.
    - Extend `tests/transcript_load.rs` with `live_gemini_transcript_load_via_session_file_round_trips` (text round-trip) and `live_gemini_transcript_load_hydrates_tool_items` (the sentinel-driven tool-output assertion lives here, against the session file, where the content actually exists).
-   - Optionally extend `crates/dispatcher/tests/live_end_to_end.rs` with a Gemini variant of the three-event-ordering check — small lift; skip if dispatcher coverage already proves harness-neutrality.
+   - **Required**: extend `crates/dispatcher/tests/live_end_to_end.rs` with a Gemini variant of the three-event-ordering check (`turn_start → content_chunk → turn_end → agent_idle`). This is the canonical empirical assertion of M3's headline claim — that the M2 dispatcher abstraction is genuinely harness-neutral — proved through the actual dispatcher code path, not just through adapter-layer fixtures. Mirror the existing Claude / Codex variants (~60 LOC).
 
 2. **`check_gemini_auth` live test.** Inline in `crates/app/src/commands.rs` `#[cfg(test)] mod tests`, marked `#[ignore]`, parallel to the existing `live_check_codex_auth_finds_real_auth_file`.
 
@@ -388,10 +394,11 @@ After M3.5 lands, on a clean checkout:
 1. Create a project.
 2. Add three agents: one Claude (`claude-helper`), one Codex (`codex-helper`), one Gemini (`gemini-helper`).
 3. Send a message to each via the recipient picker.
-4. All three agents' turns appear in the unified transcript in chronological order, attributed by agent name + harness badge.
-5. Per-agent sidebar populates for each (status, $ for Claude, % for Codex, no per-turn cost surface for Gemini in v1).
-6. Restart the app, reopen the project — all three transcripts rehydrate from their respective harness session files. New turns continue cleanly.
-7. The `AdapterEvent` / `NormalizedEvent` vocabulary is unchanged from M2 (additive changes only). If a non-additive change was needed, document the surprise prominently in the M3 PR body.
+4. **Attach test**: outside Switchboard, run `gemini -p "..." --session-id <known-uuid> --yolo --skip-trust` in some directory. In Switchboard's add-agent modal, attach to that UUID under a new agent name. Confirm the prior turn rehydrates correctly and that a follow-up dispatch resumes the session. Then create a second project and try attaching the same UUID under another agent name there — must be **rejected** with the cross-project session-uniqueness error.
+5. All three agents' turns (plus the attached agent) appear in the unified transcript in chronological order, attributed by agent name + harness badge.
+6. Per-agent sidebar populates for each (status, $ for Claude, % for Codex, no per-turn cost surface for Gemini in v1).
+7. Restart the app, reopen the project — all transcripts rehydrate from their respective harness session files. New turns continue cleanly.
+8. The `AdapterEvent` / `NormalizedEvent` / `HarnessAdapter` vocabulary is unchanged from M2 (additive changes only). If a non-additive change was needed, document the surprise prominently in the M3 PR body.
 
 ---
 
@@ -414,7 +421,7 @@ Once M3.2–M3.5 are committed and `make check` is green on `m3`:
 
 The following are real, but not M3 deliverables:
 
-- **MCP server / skills loading for Gemini.** Switchboard reads MCP server configs and skills directories for Claude and Codex (the `config.rs` / `skills.rs` modules). Gemini has parallel concepts (`gemini mcp` subcommand; `gemini skills` subcommand; `~/.gemini/settings.json` carries MCP server config). M3 ships `config.rs` and `skills.rs` as **placeholder modules** matching the file layout; populating them is a follow-up (likely M4 or M5).
+- **MCP server / skills loading for Gemini.** Switchboard reads MCP server configs and skills directories for Claude and Codex (the `config.rs` / `skills.rs` modules). Gemini has parallel concepts (`gemini mcp` subcommand; `gemini skills` subcommand; `~/.gemini/settings.json` carries MCP server config). **M3 does not create placeholder `config.rs` / `skills.rs` modules** for Gemini — the adapter emits `SessionMeta { mcp_servers: vec![], skills: vec![] }` directly. A future milestone (likely M4 or M5) adds the modules when the loaders are actually implemented; the deferral is documented in `gemini/mod.rs`'s docstring.
 - **Per-agent cost / credit / quota surface for Gemini.** The 1,000/day OAuth tier is per-account, not per-turn. Surfacing this in the UI is M5/M8 territory.
 - **Auth-failure stream-shape verification.** Deferred to M3.2's "best-effort substring match" approach, with a fixture captured reactively if a production user reports a misclassification.
 - **Gemini's `invoke_agent` sub-agent affordance.** Gemini's builtin sub-agent dispatch fires for substantive prompts and can take 60+ seconds wall-clock for a single user-perceived turn (verified empirically). M3 surfaces it as a single `ToolStarted` / `ToolCompleted` pair; the longer wall-clock is left for M4's per-turn stall / cancellation policy to address.
@@ -426,7 +433,14 @@ The following are real, but not M3 deliverables:
 - **Type hints / signatures.** All function signatures (Rust + TypeScript) fully typed; TypeScript stays `strict: true`; don't reach for `any`.
 - **No imports inside functions** unless absolutely necessary.
 - **No commits without explicit user instruction.** Stage and prepare; the user commits manually after reviewing each sub-milestone.
-- **No comments unless the why is non-obvious.** Code structure should be self-explanatory. *Do* preserve the rationale for the four resolved decisions (UUID-v4-for-Gemini-session-id, `--skip-trust`-always, `update_topic`-filtered, live-tool-output-may-be-empty) in the relevant module docstrings.
+- **No comments unless the why is non-obvious.** Code structure should be self-explanatory. *Do* preserve the rationale for these resolved decisions in the relevant module / function docstrings — each one defends against a class of "simplifying" refactor that would undo the decision:
+  - **UUID v4 for Gemini session IDs** (`gemini/mod.rs`): Gemini's 8-char-prefix filename collision under UUID v7's millisecond-shared prefixes.
+  - **`--skip-trust` always** (`gemini/mod.rs`): the workspace-trust gate blocks headless dispatches without it; Switchboard's bound cwd is by definition the user's working directory.
+  - **`GEMINI_INTERNAL_TOOL_NAMES` shared constant** (`gemini/parser.rs`): deny-list pattern; future internal tools may need adding here. Constant consumed by both the adapter and the hydrator so they stay in lockstep.
+  - **`classify_gemini_error` shared helper** (`gemini/parser.rs`): both the in-stream `result.status:"error"` path and the exit-42 stderr path call it so auth-failure detection is symmetric across failure surfaces.
+  - **`UnifiedTranscript`'s empty-output suppression** (component docstring or inline comment): the harness-agnostic rule exists because Gemini's stream emits empty `output` for read-like tools — without suppression, the live view shows blank tool bodies that "fill in" only after reopen.
+  - **Full-sessionId collision-safety filter in the hydrator** (`gemini/session_file.rs`): the parser's `current_session_id`-tracking rule defends against Gemini's 8-char-prefix filename collision; do not "simplify" by removing the full-UUID check.
+  - **Lazy version fetch via `OnceLock`** (`gemini/mod.rs`): the constructor stays cheap and non-failing per the M2 adapter pattern; version is fetched on first dispatch.
 - **Stop after each sub-milestone.** Summarize: (1) what landed, (2) what tests pass, (3) any open questions or surprises. Wait for the user to commit + signal before continuing.
 - **If a sub-milestone surfaces something M3.1's findings appendix didn't anticipate** — pause and ask. Don't pattern-match to "the spec probably says..." — check it against the captured fixtures or, if the answer is genuinely empirical, run one more small probe (cost: ~10k tokens) and append to the findings appendix.
 - **M2 backend abstractions are stable.** The whole *point* of M3 is to validate this. The expected extensions are (a) `HarnessKind::Gemini` variant on the existing enum (additive), (b) new `crates/harness/src/gemini/` module, (c) `gemini_adapter` field on `AppState`. Outside those listed changes, if you find yourself wanting to change `HarnessAdapter`, the dispatcher, the `EventEmitter` trait, or the wire-format types — **stop and ask** per the critical premise. That's exactly what M3 is supposed to detect.

@@ -1,0 +1,10 @@
+{"sessionId":"00000000-0000-4000-8000-000000000009","projectHash":"17a969daabf32999b3eb7cd4c235bcb4b10dab97244b2a8b99c93042610376df","startTime":"2026-05-17T22:20:35.615Z","lastUpdated":"2026-05-17T22:20:35.615Z","kind":"main"}
+{"sessionId":"00000000-0000-4000-8000-00000000000A","projectHash":"17a969daabf32999b3eb7cd4c235bcb4b10dab97244b2a8b99c93042610376df","startTime":"2026-05-17T22:20:35.654Z","lastUpdated":"2026-05-17T22:20:35.654Z","kind":"main"}
+{"id":"2f7dc435-a1eb-4de4-a5d5-6fc7fd5d8abd","timestamp":"2026-05-17T22:20:35.971Z","type":"user","content":[{"text":"Reply with only the word blue"}]}
+{"$set":{"lastUpdated":"2026-05-17T22:20:35.971Z"}}
+{"id":"249d470f-ac2e-43a4-989f-2338da45f72c","timestamp":"2026-05-17T22:20:36.021Z","type":"user","content":[{"text":"Reply with only the word red"}]}
+{"$set":{"lastUpdated":"2026-05-17T22:20:36.021Z"}}
+{"id":"769587cd-fbb0-4fea-a995-b4ba48287770","timestamp":"2026-05-17T22:20:37.254Z","type":"gemini","content":"blue","thoughts":[],"tokens":{"input":10172,"output":1,"cached":7582,"thoughts":31,"tool":0,"total":10204},"model":"gemini-3-flash-preview"}
+{"$set":{"lastUpdated":"2026-05-17T22:20:37.255Z"}}
+{"id":"f512ab4d-d825-4bee-9b0b-ec5e09d115fd","timestamp":"2026-05-17T22:20:43.995Z","type":"gemini","content":"red","thoughts":[],"tokens":{"input":10172,"output":1,"cached":7582,"thoughts":67,"tool":0,"total":10240},"model":"gemini-3-flash-preview"}
+{"$set":{"lastUpdated":"2026-05-17T22:20:43.995Z"}}

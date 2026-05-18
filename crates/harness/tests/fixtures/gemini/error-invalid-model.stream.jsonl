@@ -1,0 +1,3 @@
+{"type":"init","timestamp":"2026-05-17T22:16:55.729Z","session_id":"00000000-0000-4000-8000-000000000003","model":"does-not-exist-model"}
+{"type":"message","timestamp":"2026-05-17T22:16:55.731Z","role":"user","content":"say hi"}
+{"type":"result","timestamp":"2026-05-17T22:16:56.056Z","status":"error","error":{"type":"unknown","message":"[API Error: Requested entity was not found.]"},"stats":{"total_tokens":0,"input_tokens":0,"output_tokens":0,"cached":0,"input":0,"duration_ms":0,"tool_calls":0,"models":{"does-not-exist-model":{"total_tokens":0,"input_tokens":0,"output_tokens":0,"cached":0,"input":0}}}}

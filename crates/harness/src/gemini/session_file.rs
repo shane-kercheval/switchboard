@@ -187,6 +187,7 @@ pub fn load_gemini_transcript(
 /// the requested target session. Public so the attach flow can reuse the
 /// same disambiguation rule as transcript hydration.
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CandidateMatch {
     /// No header in the file matches the target. Try the next candidate.
     NoTarget,

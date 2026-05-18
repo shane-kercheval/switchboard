@@ -180,9 +180,10 @@ pub fn create_agent_impl(
 ///    `session_partition_date`).
 /// 4. Session-id collision scan across **all projects in the bound
 ///    directory** (loaded or not — `enumerate_all_projects` walks every
-///    project on disk via `directory.list_projects()`). Claude scans
-///    `AgentRecord.session_id`, Codex scans every project's
-///    `sessions/<agent_id>.jsonl` sidecar. Two `AgentRecord`s pointing at
+///    project on disk via `directory.list_projects()`). Claude and Gemini
+///    scan `AgentRecord.session_id` (caller-controlled UUID); Codex scans
+///    every project's `sessions/<agent_id>.jsonl` sidecar (Codex agents
+///    leave `AgentRecord.session_id = None`). Two `AgentRecord`s pointing at
 ///    the same harness session is the same-session-parallel-invocation
 ///    hazard (`docs/research/same-session-parallel-invocation.md`);
 ///    unloaded projects could still be opened and dispatched concurrently
@@ -271,7 +272,11 @@ pub fn attach_agent_impl(
         }
         HarnessKind::Gemini => {
             let candidate = locate_gemini_candidate(home_dir, &directory.path, session_uuid)?;
-            let _ = candidate;
+            tracing::debug!(
+                session_id = %session_uuid,
+                path = %candidate.display(),
+                "gemini attach: bound to candidate"
+            );
             check_gemini_session_id_unique(state, &session_uuid)?;
             project.register_attached_gemini_agent(name, session_uuid)?
         }
@@ -402,17 +407,23 @@ fn check_gemini_session_id_unique(state: &AppState, candidate: &Uuid) -> Result<
 }
 
 /// Locate the Gemini session file for `session_id` in the cwd's
-/// `~/.gemini/tmp/<project-name>/chats/` directory. Wraps the M3.3
-/// `classify_candidate` header-scan so attach uses the same disambiguation
-/// rule as transcript hydration — divergence between attach and hydrate
-/// is the bug class M3.3's review caught.
+/// `~/.gemini/tmp/<project-name>/chats/` directory. Wraps the shared
+/// header-scan classifier so attach uses the same disambiguation rule as
+/// transcript hydration — divergence between attach and hydrate is the
+/// exact bug class this helper exists to prevent.
 ///
 /// Outcomes:
-/// - Exactly one candidate classifies `Unambiguous(target)` → returns its path.
+/// - One candidate classifies as `Unambiguous` against the target → return
+///   its path.
 /// - Any candidate is `Ambiguous` (single file, multiple distinct session
 ///   headers) → `AmbiguousSessionFile` with the candidate path. Under UUID
-///   v4 this is ~1/2^32, but `tracing::warn!` so the case is forensically
+///   v4 this is ~1/2^32, but `tracing::warn!` keeps the case forensically
 ///   visible if it ever fires in production.
+/// - Candidate read fails (permissions, EIO, race-removed) →
+///   `AttachLookupFailed` carrying the path + source. Failing loud
+///   matches hydration's behavior; swallowing the error would silently
+///   collapse "session file unreadable" into "session does not exist"
+///   and send the user chasing UUID red herrings instead of `chmod`.
 /// - No candidate matches → `SessionFileNotFound`.
 fn locate_gemini_candidate(
     home_dir: &Path,
@@ -423,19 +434,19 @@ fn locate_gemini_candidate(
         switchboard_harness::gemini_session_file_candidates(home_dir, cwd, &session_id);
     let mut chosen: Option<PathBuf> = None;
     for path in &candidates {
-        // A candidate that's unreadable cannot safely be claimed as the
-        // user's target — skip it. If every candidate is unreadable, the
-        // bottom-of-function path returns `SessionFileNotFound`, which is
-        // the right UX (the user verifies the file exists / re-runs).
-        let Ok(content) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        match switchboard_harness::gemini::session_file::classify_candidate(&content, session_id) {
-            switchboard_harness::gemini::session_file::CandidateMatch::Unambiguous => {
+        let content =
+            std::fs::read_to_string(path).map_err(|err| AppError::AttachLookupFailed {
+                message: format!(
+                    "failed to read Gemini session candidate {}: {err}",
+                    path.display()
+                ),
+            })?;
+        match switchboard_harness::classify_gemini_candidate(&content, session_id) {
+            switchboard_harness::GeminiCandidateMatch::Unambiguous => {
                 chosen = Some(path.clone());
                 break;
             }
-            switchboard_harness::gemini::session_file::CandidateMatch::Ambiguous => {
+            switchboard_harness::GeminiCandidateMatch::Ambiguous => {
                 tracing::warn!(
                     session_id = %session_id,
                     path = %path.display(),
@@ -447,7 +458,13 @@ fn locate_gemini_candidate(
                     paths: vec![path.clone()],
                 });
             }
-            switchboard_harness::gemini::session_file::CandidateMatch::NoTarget => {}
+            // `NoTarget` plus any future additive variant of the
+            // `#[non_exhaustive]` enum we don't yet recognize: doesn't
+            // match this target, continue to the next candidate.
+            // Conservative default — safer to fall through to
+            // `SessionFileNotFound` than to bind an unknown classifier
+            // outcome to the user's UUID.
+            _ => {}
         }
     }
     chosen.ok_or_else(|| {
@@ -458,7 +475,7 @@ fn locate_gemini_candidate(
             .join("chats")
             .join(format!(
                 "session-*-{}.jsonl",
-                switchboard_harness::gemini::session_file::id_prefix(&session_id)
+                switchboard_harness::gemini_session_id_prefix(&session_id)
             ));
         AppError::SessionFileNotFound {
             harness: HarnessKind::Gemini,
@@ -2492,7 +2509,7 @@ mod tests {
         std::fs::write(gemini.join("projects.json"), projects.to_string()).unwrap();
         let chats = gemini.join("tmp").join("proj").join("chats");
         std::fs::create_dir_all(&chats).unwrap();
-        let prefix = switchboard_harness::gemini::session_file::id_prefix(session_id);
+        let prefix = switchboard_harness::gemini_session_id_prefix(session_id);
         let path = chats.join(format!("session-2026-05-18T00-00-{prefix}.jsonl"));
         let header = format!(
             r#"{{"sessionId":"{session_id}","projectHash":"x","startTime":"2026-05-18T00:00:00Z","lastUpdated":"2026-05-18T00:00:00Z","kind":"main"}}"#
@@ -2568,10 +2585,10 @@ mod tests {
 
         let id_a = Uuid::parse_str("00000000-0000-4000-8000-000000000010").unwrap();
         let id_b = Uuid::parse_str("00000000-0000-4000-8000-000000000020").unwrap();
-        let prefix = switchboard_harness::gemini::session_file::id_prefix(&id_a);
+        let prefix = switchboard_harness::gemini_session_id_prefix(&id_a);
         assert_eq!(
             prefix,
-            switchboard_harness::gemini::session_file::id_prefix(&id_b),
+            switchboard_harness::gemini_session_id_prefix(&id_b),
             "test setup requires identical 8-char prefixes"
         );
         let header_a = format!(
@@ -2613,8 +2630,8 @@ mod tests {
 
         let asked = Uuid::parse_str("00000000-0000-4000-8000-000000000099").unwrap();
         assert_eq!(
-            switchboard_harness::gemini::session_file::id_prefix(&other),
-            switchboard_harness::gemini::session_file::id_prefix(&asked)
+            switchboard_harness::gemini_session_id_prefix(&other),
+            switchboard_harness::gemini_session_id_prefix(&asked)
         );
         let err = attach_agent_impl(
             &state,
@@ -2629,8 +2646,8 @@ mod tests {
         );
     }
 
-    /// Pinning the M3.3 review regression: an ambiguous candidate (one
-    /// file, multiple distinct session headers) must surface as
+    /// Pin the ambiguity invariant: an ambiguous candidate (one file,
+    /// multiple distinct session headers) must surface as
     /// `AmbiguousSessionFile`, never as `SessionFileNotFound` or a
     /// silent merge. UUID v4 makes this ~1/2^32; the test ensures the
     /// code path is correctly wired if it ever fires.
@@ -2649,7 +2666,7 @@ mod tests {
 
         let target = Uuid::parse_str("00000000-0000-4000-8000-000000000009").unwrap();
         let other = Uuid::parse_str("00000000-0000-4000-8000-00000000000A").unwrap();
-        let prefix = switchboard_harness::gemini::session_file::id_prefix(&target);
+        let prefix = switchboard_harness::gemini_session_id_prefix(&target);
         let body = format!(
             r#"{{"sessionId":"{target}","projectHash":"x","startTime":"2026-05-17T22:20:35.615Z","lastUpdated":"2026-05-17T22:20:35.615Z","kind":"main"}}
 {{"sessionId":"{other}","projectHash":"x","startTime":"2026-05-17T22:20:35.654Z","lastUpdated":"2026-05-17T22:20:35.654Z","kind":"main"}}
@@ -2775,6 +2792,52 @@ mod tests {
                 ..
             } => assert_eq!(existing_project_name, "alpha"),
             other => panic!("expected SessionAlreadyAttached, got {other:?}"),
+        }
+    }
+
+    /// I/O errors on a candidate file must surface as `AttachLookupFailed`
+    /// rather than silently routing to `SessionFileNotFound`. The user's
+    /// remediation differs (chmod / fs repair vs. verify UUID); the wrong
+    /// error sends them chasing red herrings. Unix-only because file-mode
+    /// 0o000 has no Windows analog.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn attach_gemini_propagates_io_error_for_unreadable_candidate() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let session_id = Uuid::new_v4();
+        let path = stage_gemini_session_file(tmp_home.path(), tmp_workdir.path(), &session_id);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Self-check for root-equivalent containers: if `chmod 000` doesn't
+        // actually block reads (root ignores file modes), the failure path
+        // we're trying to exercise won't fire. Restore mode and skip.
+        if std::fs::read(&path).is_ok() {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            return;
+        }
+
+        let err = attach_agent_impl(
+            &state,
+            "attached",
+            HarnessKind::Gemini,
+            &session_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap_err();
+        // Restore mode **before** asserting so TempDir's Drop can rmdir
+        // even if the assertion fails on a future regression.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        match err {
+            AppError::AttachLookupFailed { message } => {
+                assert!(
+                    message.contains(path.to_str().unwrap()),
+                    "expected error to name the unreadable path, got: {message}"
+                );
+            }
+            other => panic!("expected AttachLookupFailed, got {other:?}"),
         }
     }
 

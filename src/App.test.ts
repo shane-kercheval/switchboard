@@ -78,17 +78,20 @@ const INFO_NO_SWITCHBOARD: DirectoryInfo = {
  * assuming any specific call order — App.svelte may legitimately reorder
  * sub-steps within a phase transition.
  *
- * The three startup probes (`check_claude_binary`, `check_codex_binary`,
- * `check_codex_auth`) default to success so non-banner tests don't need to
- * spell them out, but `unexpected invoke call` still throws for any IPC
- * the test didn't anticipate. Banner-failure tests use
- * `invokeMock.mockImplementation` directly to override individual probes.
+ * The five startup probes (`check_claude_binary`, `check_codex_binary`,
+ * `check_codex_auth`, `check_gemini_binary`, `check_gemini_auth`) default
+ * to success so non-banner tests don't need to spell them out, but
+ * `unexpected invoke call` still throws for any IPC the test didn't
+ * anticipate. Banner-failure tests use `invokeMock.mockImplementation`
+ * directly to override individual probes.
  */
 function setInvokeResponses(map: Record<string, unknown>): void {
   const withDefaults: Record<string, unknown> = {
     check_claude_binary: null,
     check_codex_binary: null,
     check_codex_auth: null,
+    check_gemini_binary: null,
+    check_gemini_auth: null,
     ...map,
   };
   invokeMock.mockImplementation(async (cmd: string) => {
@@ -137,7 +140,13 @@ describe("App", () => {
     invokeMock.mockImplementation(async (cmd: string) => {
       if (cmd === "check_claude_binary")
         throw new Error("harness probe failed: harness binary not found");
-      if (cmd === "check_codex_binary" || cmd === "check_codex_auth") return null;
+      if (
+        cmd === "check_codex_binary" ||
+        cmd === "check_codex_auth" ||
+        cmd === "check_gemini_binary" ||
+        cmd === "check_gemini_auth"
+      )
+        return null;
       throw new Error(`unexpected invoke call: ${cmd}`);
     });
     const App = (await import("./App.svelte")).default;
@@ -145,15 +154,23 @@ describe("App", () => {
     await waitFor(() => {
       expect(screen.getByTestId("banner-binary_missing-claude_code")).toBeInTheDocument();
     });
-    // The other harness's banners must NOT show — independent per-harness state.
+    // Other harnesses' banners must NOT show — independent per-harness state.
     expect(screen.queryByTestId("banner-binary_missing-codex")).not.toBeInTheDocument();
     expect(screen.queryByTestId("banner-auth_missing-codex")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("banner-binary_missing-gemini")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("banner-auth_missing-gemini")).not.toBeInTheDocument();
   });
 
   it("renders a Codex auth-missing banner when only the Codex auth probe fails", async () => {
     invokeMock.mockImplementation(async (cmd: string) => {
       if (cmd === "check_codex_auth") throw new Error("auth not configured");
-      if (cmd === "check_claude_binary" || cmd === "check_codex_binary") return null;
+      if (
+        cmd === "check_claude_binary" ||
+        cmd === "check_codex_binary" ||
+        cmd === "check_gemini_binary" ||
+        cmd === "check_gemini_auth"
+      )
+        return null;
       throw new Error(`unexpected invoke call: ${cmd}`);
     });
     const App = (await import("./App.svelte")).default;
@@ -163,10 +180,61 @@ describe("App", () => {
     });
   });
 
+  it("renders a Gemini auth-missing banner when only the Gemini auth probe fails", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "check_gemini_auth") throw new Error("auth not configured");
+      if (
+        cmd === "check_claude_binary" ||
+        cmd === "check_codex_binary" ||
+        cmd === "check_codex_auth" ||
+        cmd === "check_gemini_binary"
+      )
+        return null;
+      throw new Error(`unexpected invoke call: ${cmd}`);
+    });
+    const App = (await import("./App.svelte")).default;
+    render(App);
+    await waitFor(() => {
+      expect(screen.getByTestId("banner-auth_missing-gemini")).toBeInTheDocument();
+    });
+    // Codex auth banner unaffected — per-harness independence.
+    expect(screen.queryByTestId("banner-auth_missing-codex")).not.toBeInTheDocument();
+  });
+
+  it("Gemini binary missing suppresses Gemini auth banner (per-harness suppression)", async () => {
+    // Both Gemini probes fail. The binary banner surfaces; the auth
+    // banner is suppressed because auth is irrelevant when the CLI
+    // isn't installed. Per-harness independence: Claude/Codex stay
+    // clean.
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "check_gemini_binary" || cmd === "check_gemini_auth") throw new Error("missing");
+      if (
+        cmd === "check_claude_binary" ||
+        cmd === "check_codex_binary" ||
+        cmd === "check_codex_auth"
+      )
+        return null;
+      throw new Error(`unexpected invoke call: ${cmd}`);
+    });
+    const App = (await import("./App.svelte")).default;
+    render(App);
+    await waitFor(() => {
+      expect(screen.getByTestId("banner-binary_missing-gemini")).toBeInTheDocument();
+    });
+    expect(screen.queryByTestId("banner-auth_missing-gemini")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("banner-binary_missing-claude_code")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("banner-binary_missing-codex")).not.toBeInTheDocument();
+  });
+
   it("both binaries missing: two binary banners render simultaneously, no auth banner", async () => {
     invokeMock.mockImplementation(async (cmd: string) => {
       if (cmd === "check_claude_binary" || cmd === "check_codex_binary") throw new Error("missing");
-      if (cmd === "check_codex_auth") return null;
+      if (
+        cmd === "check_codex_auth" ||
+        cmd === "check_gemini_binary" ||
+        cmd === "check_gemini_auth"
+      )
+        return null;
       throw new Error(`unexpected invoke call: ${cmd}`);
     });
     const App = (await import("./App.svelte")).default;
@@ -194,6 +262,7 @@ describe("App", () => {
     invokeMock.mockImplementation(async (cmd: string) => {
       if (cmd === "check_claude_binary" || cmd === "check_codex_binary") throw new Error("missing");
       if (cmd === "check_codex_auth") return authPromise;
+      if (cmd === "check_gemini_binary" || cmd === "check_gemini_auth") return null;
       throw new Error(`unexpected invoke call: ${cmd}`);
     });
     const App = (await import("./App.svelte")).default;
@@ -214,7 +283,12 @@ describe("App", () => {
     // user can't act on the auth gap until they install the CLI.
     invokeMock.mockImplementation(async (cmd: string) => {
       if (cmd === "check_codex_binary" || cmd === "check_codex_auth") throw new Error("missing");
-      if (cmd === "check_claude_binary") return null;
+      if (
+        cmd === "check_claude_binary" ||
+        cmd === "check_gemini_binary" ||
+        cmd === "check_gemini_auth"
+      )
+        return null;
       throw new Error(`unexpected invoke call: ${cmd}`);
     });
     const App = (await import("./App.svelte")).default;
@@ -223,6 +297,9 @@ describe("App", () => {
       expect(screen.getByTestId("banner-binary_missing-codex")).toBeInTheDocument();
     });
     expect(screen.queryByTestId("banner-auth_missing-codex")).not.toBeInTheDocument();
+    // Gemini state stays clean — per-harness independence.
+    expect(screen.queryByTestId("banner-binary_missing-gemini")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("banner-auth_missing-gemini")).not.toBeInTheDocument();
   });
 
   it("welcome → directory-selector: clicking Open working directory invokes pick_directory and renders the selector", async () => {

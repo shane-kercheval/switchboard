@@ -424,8 +424,32 @@ Agents in v1 are **project-scoped** — they're created within a project and sta
 Each agent's operational state is surfaced in the **overview sidebar** (per "Inside a project" above). State includes:
 
 - **Status**: idle, processing, waiting on tool, errored.
-- **Context utilization**: % of model context used, derived from the harness's reported context window and the most recent turn's input/output tokens. Surfaced as a progress bar so the user can see when an agent approaches the auto-compact threshold. For Claude Code: read live from the stream's `result` event. For Codex: enriched from the session file on turn completion (per resolved 10.15).
-- **Cost / quota signal**: harness-asymmetric per the v1 cost surface (§2). For Claude Code agents: per-turn dollars from `total_cost_usd` (drawn from the Agent SDK credit pool post-2026-06-15) and a derived session-aggregate (sum across the agent's turns in this project). For Codex agents: a quota signal surfaced from the session file's `token_count.rate_limits` payload (e.g., "% of 5h window remaining") — Codex does not expose a dollar number under subscription auth. **No raw token counts are surfaced in the UI for either harness** — the underlying tokens are plumbed through the normalized event stream and used to compute context utilization, but the user-facing surface is dollars (Claude) or quota (Codex), not "X input tokens." See §9 for the normalized event vocabulary.
+- **Model**: the model identifier the harness reported on this dispatch (e.g. `claude-sonnet-4-5`, `gpt-5-codex`, `gemini-3-flash-preview`).
+- **MCP servers / skills**: counts of configured MCP servers and discovered skills for the agent's harness, loaded from per-harness config files and skills directories on each dispatch (see §9 for the per-harness paths). Display-only; failures degrade to empty counts.
+- **Context utilization**: % of model context used, derived from the harness's reported context window and the most recent turn's input/output tokens. Surfaced as a progress bar so the user can see when an agent approaches the auto-compact threshold. Per-harness availability — see "Per-harness sidebar surface" below.
+- **Cost / quota signal**: harness-asymmetric per the v1 cost surface (§2). Per-harness availability — see "Per-harness sidebar surface" below. **No raw token counts are surfaced in the UI for any harness** — the underlying tokens are plumbed through the normalized event stream and used to compute context utilization, but the user-facing surface is dollars (Claude) or quota (Codex), not "X input tokens." See §9 for the normalized event vocabulary.
+
+#### Per-harness sidebar surface
+
+Different harnesses expose different telemetry. The sidebar fields below are intentionally asymmetric — empty cells reflect what the harness itself emits (or doesn't), not Switchboard scope:
+
+| Field | Claude Code | Codex | Gemini |
+|---|---|---|---|
+| Status | ✓ | ✓ | ✓ |
+| Model | ✓ | ✓ | ✓ |
+| MCP servers (count) | ✓ | ✓ | ✓ |
+| Skills (count) | ✓ | ✓ | ✓ |
+| Cost $ (per turn + session aggregate) | ✓ | — | — |
+| Quota % (window used) | — | ✓ | — |
+| Context after last turn (%) | ✓ | ✓ | — |
+
+**Per-asymmetry rationale**:
+
+- **Cost $** — only Anthropic exposes `total_cost_usd` on completed turns (drawn from the Agent SDK credit pool post-2026-06-15). Codex (subscription auth) does not surface a dollar number; OpenAI's billing model under subscription is quota-based. Gemini's free OAuth tier has no per-turn dollar cost to display.
+- **Quota %** — only Codex emits a `RateLimitEvent` with `primary.used_percent`, reflecting OpenAI's sliding rate-limit window. Anthropic's tier is closer to a hard limit without a visible counter; Gemini's free OAuth tier likewise.
+- **Context after last turn (%)** — Claude reads its window from the stream's `result.modelUsage.<model>.contextWindow`; Codex enriches from the session file's `task_started.model_context_window`. Gemini's session file carries no analogous context-window field, so the bar can't compute the ratio. If upstream Gemini telemetry adds a context-window field, this asymmetry closes.
+
+Empty rows are not Switchboard-side roadmap items — they reflect what the underlying harness emits. If a harness adds a telemetry field upstream, the sidebar surface follows.
 
 Each agent also exposes a context menu of user actions (accessed from the sidebar entry, or from any of its turns in the unified transcript):
 

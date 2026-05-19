@@ -1,5 +1,3 @@
-use std::path::Path;
-
 use futures::StreamExt;
 use switchboard_core::{AgentRecord, HarnessKind};
 use switchboard_harness::{
@@ -45,11 +43,16 @@ async fn collect_events(
     agent: &AgentRecord,
     fixture_path: &str,
 ) -> Vec<AdapterEvent> {
+    // Use a fresh tempdir as cwd so the project-scope MCP / skills
+    // loaders (`<cwd>/.gemini/settings.json`, `<cwd>/.gemini/skills/`)
+    // can't pick up unrelated files from whatever real directory the
+    // tests happen to run in.
+    let cwd = TempDir::new().unwrap();
     let turn_id = Uuid::now_v7();
     let stream = adapter
         .dispatch(
             agent,
-            Path::new("/tmp"),
+            cwd.path(),
             fixture_path,
             turn_id,
             DispatchOptions::default(),
@@ -357,11 +360,12 @@ async fn exit_42_with_auth_stderr_classifies_as_auth_failure() {
 #[tokio::test]
 async fn dispatch_rejects_empty_prompt_with_invalid_prompt_error() {
     let (adapter, _home) = adapter();
+    let cwd = TempDir::new().unwrap();
     let agent = gemini_agent();
     let result = adapter
         .dispatch(
             &agent,
-            Path::new("/tmp"),
+            cwd.path(),
             "   \n\t",
             Uuid::now_v7(),
             DispatchOptions::default(),
@@ -443,4 +447,67 @@ async fn dispatch_puts_child_in_its_own_process_group() {
         "fake_gemini's pgid must differ from the test runner's pgid \
          (indicating GeminiAdapter applied process_group(0) at spawn)"
     );
+}
+
+/// Pins the contract that the adapter loads MCP servers and skills from
+/// the filesystem and injects them into the parser-emitted `SessionMeta`.
+/// The parser itself emits empty registries (the stream's `init` event
+/// doesn't carry MCP / skills); the adapter is what owns the loaders.
+/// This test exercises the wiring end-to-end so a future refactor
+/// dropping the injection (or rerouting the parser to bypass it) fails
+/// here.
+#[tokio::test]
+async fn session_meta_carries_loaded_mcp_servers_and_skills() {
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+
+    // Stage a user-scope MCP server.
+    let user_gemini = home.path().join(".gemini");
+    std::fs::create_dir_all(&user_gemini).unwrap();
+    std::fs::write(
+        user_gemini.join("settings.json"),
+        r#"{"mcpServers":{"user-mcp":{"command":"x"}}}"#,
+    )
+    .unwrap();
+
+    // Stage a workspace-scope skill.
+    let workspace_skill_dir = cwd
+        .path()
+        .join(".gemini")
+        .join("skills")
+        .join("workspace-skill");
+    std::fs::create_dir_all(&workspace_skill_dir).unwrap();
+    std::fs::write(workspace_skill_dir.join("SKILL.md"), "# skill").unwrap();
+
+    let adapter = GeminiAdapter::with_binary_and_home(FAKE_GEMINI, home.path());
+    let agent = gemini_agent();
+    let turn_id = Uuid::now_v7();
+    let stream = adapter
+        .dispatch(
+            &agent,
+            cwd.path(),
+            &fixture("happy-path.stream"),
+            turn_id,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed");
+    let events: Vec<AdapterEvent> = stream.collect().await;
+
+    let session_meta = events
+        .iter()
+        .find(|e| matches!(e, AdapterEvent::SessionMeta { .. }))
+        .expect("SessionMeta must be present");
+    match session_meta {
+        AdapterEvent::SessionMeta {
+            mcp_servers,
+            skills,
+            ..
+        } => {
+            let mcp_names: Vec<&str> = mcp_servers.iter().map(|s| s.name.as_str()).collect();
+            assert_eq!(mcp_names, vec!["user-mcp"]);
+            assert_eq!(skills, &vec!["workspace-skill".to_owned()]);
+        }
+        _ => unreachable!(),
+    }
 }

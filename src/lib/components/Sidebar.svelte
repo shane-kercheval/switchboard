@@ -159,7 +159,7 @@
         {/if}
         {#if rateLimit !== undefined}
           <div class="mt-2 text-xs text-neutral-700" data-testid="agent-rate-limit">
-            {rateLimit.toFixed(0)}% used
+            quota used: {rateLimit.toFixed(0)}%
           </div>
         {/if}
         {#if util !== undefined}

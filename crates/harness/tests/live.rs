@@ -489,14 +489,31 @@ async fn live_gemini_basic_turn_completes() {
     // - `harness_version` comes from a lazy `gemini --version` fetch on
     //   first dispatch; empty string is tolerated if the version probe
     //   fails (the field is display-only).
+    // - `mcp_servers` / `skills` come from the adapter's
+    //   loader injection (settings.json / ~/.agents/skills). Structural
+    //   checks only — content is developer-environment-dependent (we
+    //   don't pin a particular setup), matching Codex's live-test
+    //   discipline.
     let session_meta = events
         .iter()
         .find(|e| matches!(e, AdapterEvent::SessionMeta { .. }))
         .expect("Gemini must emit SessionMeta from stream init on every dispatch");
     match session_meta {
-        AdapterEvent::SessionMeta { model, tools, .. } => {
+        AdapterEvent::SessionMeta {
+            model,
+            tools,
+            mcp_servers,
+            skills,
+            ..
+        } => {
             assert!(!model.is_empty(), "SessionMeta.model must be non-empty");
             assert!(tools.is_empty(), "Gemini SessionMeta.tools is vec![]");
+            // Structural check only — the loader emits real entries when
+            // settings.json / ~/.agents/skills carry config, [] otherwise.
+            // Both shapes are valid; pinning content would couple the
+            // test to the developer's machine.
+            let _: &Vec<_> = mcp_servers;
+            let _: &Vec<_> = skills;
         }
         _ => unreachable!(),
     }

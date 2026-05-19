@@ -144,7 +144,7 @@ describe("Sidebar", () => {
     const Sidebar = (await import("./Sidebar.svelte")).default;
     render(Sidebar, { props: { agents: [CODEX_AGENT] } });
 
-    expect(screen.getByTestId("agent-rate-limit")).toHaveTextContent("43% used");
+    expect(screen.getByTestId("agent-rate-limit")).toHaveTextContent("quota used: 43%");
   });
 
   it("displays context-utilization bar from the latest agent turn's usage", async () => {

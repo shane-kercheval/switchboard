@@ -38,13 +38,18 @@
 //!   is acceptable to downstream consumers (the version field is
 //!   display-only).
 //!
-//! MCP server loading and skills discovery for Gemini are not yet
-//! implemented; the adapter emits
-//! `SessionMeta { mcp_servers: vec![], skills: vec![] }` until those
-//! loaders land.
+//! MCP server registry: loaded from `~/.gemini/settings.json` (user
+//! scope) and `<cwd>/.gemini/settings.json` (project / workspace scope).
+//! Skills: loaded from `~/.agents/skills/` (user scope) and
+//! `<cwd>/.gemini/skills/` (workspace scope). Both are display-only
+//! surfaces — failures degrade to empty lists with a warning, never
+//! propagate as `Result::Err`. See `config.rs` and `skills.rs` for the
+//! per-scope path layout and merge rules.
 
+pub mod config;
 pub mod parser;
 pub mod session_file;
+pub mod skills;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -151,6 +156,13 @@ impl HarnessAdapter for GeminiAdapter {
         let args = build_args(agent, prompt, cwd, &home_dir);
         let harness_version = self.resolve_version();
 
+        // Pre-load the MCP / skills registries once per dispatch. Mirrors
+        // Codex's "load fresh on every emission, no caching layer" policy
+        // — registry edits made between dispatches surface immediately
+        // without a Switchboard restart.
+        let mcp_servers = config::load_mcp_servers(&home_dir, cwd);
+        let skills_list = skills::load_skills(&home_dir, cwd);
+
         let mut command = tokio::process::Command::new(&binary);
         command
             .args(&args)
@@ -183,6 +195,8 @@ impl HarnessAdapter for GeminiAdapter {
             turn_id,
             agent_id,
             harness_version,
+            mcp_servers,
+            skills_list,
         ));
 
         Ok(Box::pin(UnboundedReceiverStream::new(rx)))
@@ -250,6 +264,8 @@ async fn run_producer(
     turn_id: TurnId,
     agent_id: AgentId,
     harness_version: String,
+    mcp_servers: Vec<crate::events::McpServerStatus>,
+    skills_list: Vec<String>,
 ) {
     let stderr_tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::with_capacity(
         crate::subprocess::STDERR_TAIL_CAPACITY,
@@ -303,9 +319,20 @@ async fn run_producer(
                 for event in events {
                     match &event {
                         AdapterEvent::SessionMeta { .. } => {
-                            // Parser doesn't know `harness_version`; we own
-                            // it here. Inject before forwarding.
-                            let event = inject_harness_version(event, &harness_version);
+                            // The parser knows only what the stream's
+                            // `init` event carries (model). The adapter
+                            // owns `harness_version` (lazy `gemini --version`
+                            // fetch) and the per-dispatch MCP / skills
+                            // registries (loaded from settings.json /
+                            // ~/.agents/skills). Inject all three before
+                            // forwarding so the sidebar populates
+                            // immediately.
+                            let event = inject_session_meta_fields(
+                                event,
+                                &harness_version,
+                                &mcp_servers,
+                                &skills_list,
+                            );
                             let _ = tx.send(event);
                             continue;
                         }
@@ -379,17 +406,28 @@ async fn run_producer(
     }
 }
 
-/// Overlay the runtime-known `harness_version` onto a parser-emitted
-/// `SessionMeta`. The parser doesn't know the value (it's adapter-owned),
-/// so it emits with `""` and we fill it in here. In-place mutation so a
-/// future field added to `SessionMeta` doesn't get silently dropped to its
-/// default.
-fn inject_harness_version(mut event: AdapterEvent, version: &str) -> AdapterEvent {
+/// Overlay the runtime-known fields onto a parser-emitted `SessionMeta`.
+/// The parser knows only `model` (from the stream's `init` event); the
+/// adapter owns `harness_version` (lazy version probe), `mcp_servers`,
+/// and `skills` (loaded from settings.json / ~/.agents/skills). In-place
+/// mutation so a future field added to `SessionMeta` doesn't get
+/// silently dropped to its default.
+fn inject_session_meta_fields(
+    mut event: AdapterEvent,
+    version: &str,
+    mcp: &[crate::events::McpServerStatus],
+    skills_list: &[String],
+) -> AdapterEvent {
     if let AdapterEvent::SessionMeta {
-        harness_version, ..
+        harness_version,
+        mcp_servers,
+        skills,
+        ..
     } = &mut event
     {
         version.clone_into(harness_version);
+        mcp.clone_into(mcp_servers);
+        skills_list.clone_into(skills);
     }
     event
 }

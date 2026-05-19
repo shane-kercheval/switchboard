@@ -27,10 +27,12 @@ use switchboard_core::AgentId;
 use uuid::Uuid;
 
 use crate::events::{ContentKind, ToolKind, TurnId, TurnUsage};
+use crate::gemini::config::load_mcp_servers;
 use crate::gemini::parser::GEMINI_INTERNAL_TOOL_NAMES;
+use crate::gemini::skills::load_skills;
 use crate::transcript::{
     LoadTranscriptError, LoadedTranscript, ParseWarning, SessionMetaInfo, Turn, TurnItem,
-    TurnStatus,
+    TurnStatus, merge_meta_with_loaders,
 };
 
 /// Take the first 8 hex chars of a UUID as Gemini's filename suffix would.
@@ -167,21 +169,72 @@ pub fn load_gemini_transcript(
     session_id: Uuid,
     agent_id: AgentId,
 ) -> Result<LoadedTranscript, LoadTranscriptError> {
-    let candidates = gemini_session_file_candidates(home_dir, cwd, &session_id);
+    let mut candidates = gemini_session_file_candidates(home_dir, cwd, &session_id);
     if candidates.is_empty() {
-        return Ok(LoadedTranscript::default());
+        // Never-dispatched-yet case — still surface MCP + skills so the
+        // sidebar populates the moment the agent is selected, matching
+        // Claude / Codex hydration shape.
+        return Ok(LoadedTranscript {
+            meta: Some(merge_meta_with_loaders(
+                None,
+                load_mcp_servers(home_dir, cwd),
+                load_skills(home_dir, cwd),
+            )),
+            ..LoadedTranscript::default()
+        });
     }
+    // Sort by filename so the merge below preserves chronology
+    // (filename embeds the per-invocation timestamp:
+    // `session-<YYYY-MM-DDTHH-MM>-<id8>.jsonl`).
+    candidates.sort();
+
+    // **Why we merge content across all matching files**: Gemini creates
+    // a new session file on each `--resume` invocation (a separate file
+    // per dispatch, distinct timestamp in the filename). Empirically, a
+    // multi-turn session can end up with one file holding the full
+    // conversation history and several near-empty stub files (just a
+    // header) representing later resume invocations that didn't append
+    // new content. Returning the first Unambiguous match (the previous
+    // behavior) is filesystem-iteration-order dependent and silently
+    // drops the conversation on a coin flip. Concatenating all matching
+    // files and feeding them to the parser is safe: the parser already
+    // dedupes gemini records by id (last-wins) and skips header records,
+    // so duplicate or interleaved data resolves cleanly.
+    let mut merged = String::new();
     for path in &candidates {
         let content = std::fs::read_to_string(path)?;
         match classify_candidate(&content, session_id) {
             CandidateMatch::NoTarget => {}
             CandidateMatch::Ambiguous => return Ok(ambiguous_session_warning()),
             CandidateMatch::Unambiguous => {
-                return Ok(parse_gemini_transcript_content(&content, agent_id));
+                merged.push_str(&content);
+                if !merged.ends_with('\n') {
+                    merged.push('\n');
+                }
             }
         }
     }
-    Ok(LoadedTranscript::default())
+
+    if merged.is_empty() {
+        // Candidates existed but none matched the target — same "fresh"
+        // outcome as the empty-candidates case; still surface registries.
+        return Ok(LoadedTranscript {
+            meta: Some(merge_meta_with_loaders(
+                None,
+                load_mcp_servers(home_dir, cwd),
+                load_skills(home_dir, cwd),
+            )),
+            ..LoadedTranscript::default()
+        });
+    }
+
+    let mut transcript = parse_gemini_transcript_content(&merged, agent_id);
+    transcript.meta = Some(merge_meta_with_loaders(
+        transcript.meta.take(),
+        load_mcp_servers(home_dir, cwd),
+        load_skills(home_dir, cwd),
+    ));
+    Ok(transcript)
 }
 
 /// Outcome of scanning one candidate file's `kind:"main"` headers against
@@ -1030,14 +1083,25 @@ mod tests {
     }
 
     #[test]
-    fn load_gemini_transcript_returns_default_when_projects_json_missing() {
+    fn load_gemini_transcript_returns_loader_meta_when_projects_json_missing() {
+        // Even with no session file (agent never dispatched), meta is
+        // populated from the MCP + skills loaders so the sidebar
+        // populates the moment the agent is selected. Matches the
+        // Claude / Codex hydration shape.
         let home = TempDir::new().unwrap();
         let cwd = TempDir::new().unwrap();
         let session_id = Uuid::new_v4();
         let t = load_gemini_transcript(home.path(), cwd.path(), session_id, agent_id()).unwrap();
         assert!(t.turns.is_empty());
         assert!(t.warnings.is_empty());
-        assert!(t.meta.is_none());
+        // Meta is Some with structurally-valid empty registries — no
+        // files are staged in this test so both loaders return [].
+        let meta = t
+            .meta
+            .expect("meta must be present even without a session file");
+        assert!(meta.mcp_servers.is_empty());
+        assert!(meta.skills.is_empty());
+        assert!(meta.model.is_empty());
     }
 
     #[test]
@@ -1068,6 +1132,132 @@ mod tests {
         let t = load_gemini_transcript(home.path(), cwd.path(), session_id, agent_id()).unwrap();
         assert_eq!(t.turns.len(), 2);
         assert!(t.warnings.is_empty());
+    }
+
+    #[test]
+    fn load_gemini_transcript_merges_content_across_multiple_files_with_same_session() {
+        // Real-world Gemini behavior: each `--resume` invocation creates
+        // a new session file with just a header; the actual conversation
+        // history lives in the first file (or any subset). All files
+        // share the same sessionId. The hydrator must merge content
+        // across all matching files so the user's conversation is
+        // visible regardless of which file `read_dir` happened to return
+        // first.
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        stage_projects_json_wrapped(home.path(), cwd.path(), "proj");
+        let chats = home
+            .path()
+            .join(".gemini")
+            .join("tmp")
+            .join("proj")
+            .join("chats");
+        std::fs::create_dir_all(&chats).unwrap();
+
+        let session_id = Uuid::parse_str("00000000-0000-4000-8000-0000000000bb").unwrap();
+        let prefix = id_prefix(&session_id);
+        let header = format!(
+            r#"{{"sessionId":"{session_id}","projectHash":"x","startTime":"2026-05-19T05:04:00Z","kind":"main"}}"#
+        );
+
+        // File 1: full conversation.
+        let full = format!(
+            r#"{header}
+{{"id":"u1","timestamp":"2026-05-19T05:04:01Z","type":"user","content":[{{"text":"hi"}}]}}
+{{"id":"g1","timestamp":"2026-05-19T05:04:02Z","type":"gemini","content":"hello","thoughts":[],"tokens":{{"input":10,"output":1,"cached":0}},"model":"gemini-3-flash-preview"}}
+"#
+        );
+        std::fs::write(
+            chats.join(format!("session-2026-05-19T05-04-{prefix}.jsonl")),
+            full,
+        )
+        .unwrap();
+        // Files 2 + 3: header-only stubs from later resume invocations.
+        std::fs::write(
+            chats.join(format!("session-2026-05-19T05-10-{prefix}.jsonl")),
+            format!("{header}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            chats.join(format!("session-2026-05-19T05-47-{prefix}.jsonl")),
+            format!("{header}\n"),
+        )
+        .unwrap();
+
+        let t = load_gemini_transcript(home.path(), cwd.path(), session_id, agent_id()).unwrap();
+        assert_eq!(
+            t.turns.len(),
+            2,
+            "merged hydration must surface the full conversation regardless of \
+             file-iteration order; got: {:?}",
+            t.turns
+        );
+        let meta = t.meta.expect("meta must be populated");
+        assert_eq!(
+            meta.model, "gemini-3-flash-preview",
+            "parser model from the content-bearing file must survive the merge"
+        );
+    }
+
+    #[test]
+    fn load_gemini_transcript_unambiguous_path_merges_loader_meta_with_parser_model() {
+        // Pins the contract that the loaded-session path (the
+        // `CandidateMatch::Unambiguous` branch) merges
+        // parser-extracted `model` with loader-loaded MCP / skills via
+        // `merge_meta_with_loaders`. Stages a real session file, a
+        // user-scope MCP server, and a workspace-scope skill — the
+        // hydrated meta must carry all three. A future regression that
+        // drops the merge in the Unambiguous branch fails here.
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+
+        // Stage MCP + skills.
+        let user_gemini = home.path().join(".gemini");
+        std::fs::create_dir_all(&user_gemini).unwrap();
+        std::fs::write(
+            user_gemini.join("settings.json"),
+            r#"{"mcpServers":{"loader-mcp":{"command":"x"}}}"#,
+        )
+        .unwrap();
+        let workspace_skill_dir = cwd
+            .path()
+            .join(".gemini")
+            .join("skills")
+            .join("loader-skill");
+        std::fs::create_dir_all(&workspace_skill_dir).unwrap();
+        std::fs::write(workspace_skill_dir.join("SKILL.md"), "# skill").unwrap();
+
+        // Stage a real session file.
+        let session_id = Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let prefix = id_prefix(&session_id);
+        stage_session_file(
+            home.path(),
+            cwd.path(),
+            "proj",
+            &format!("session-2026-05-17T22-11-{prefix}.jsonl"),
+            HAPPY_PATH_FIXTURE,
+        );
+
+        let t = load_gemini_transcript(home.path(), cwd.path(), session_id, agent_id()).unwrap();
+        assert_eq!(t.turns.len(), 2, "session file must have parsed");
+        assert!(t.warnings.is_empty());
+
+        let meta = t.meta.expect("meta must merge parser + loader output");
+        assert_eq!(
+            meta.model, "gemini-3-flash-preview",
+            "parser-extracted model must survive the loader merge"
+        );
+        let mcp_names: Vec<&str> = meta.mcp_servers.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            mcp_names,
+            vec!["loader-mcp"],
+            "loader-loaded MCP server must be present"
+        );
+        assert_eq!(
+            meta.skills,
+            vec!["loader-skill".to_owned()],
+            "loader-loaded skill must be present"
+        );
     }
 
     #[test]
@@ -1158,6 +1348,16 @@ mod tests {
         let t = load_gemini_transcript(home.path(), cwd.path(), asked_for, agent_id()).unwrap();
         assert!(t.turns.is_empty());
         assert!(t.warnings.is_empty());
+        // Even when no candidate matches the target, meta is populated
+        // from the MCP / skills loaders so the sidebar surfaces
+        // structurally consistent state — same outcome shape as the
+        // never-dispatched case. A future regression that drops the
+        // loader call in this branch fails here.
+        let meta = t
+            .meta
+            .expect("loader meta must be populated even when no candidate matches");
+        assert!(meta.mcp_servers.is_empty());
+        assert!(meta.skills.is_empty());
     }
 
     #[test]

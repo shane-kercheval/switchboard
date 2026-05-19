@@ -136,8 +136,9 @@ Project-wide rules that apply across all milestones. Milestone-specific mechanic
 
 - `docs/system-design.md` — canonical design (the "what and why").
 - `docs/implementation_plans/` — per-milestone plans and the v1 roadmap. Read the active milestone plan before changing scope; it's the ground truth for what to build.
-- `docs/research/` — harness ground-truth notes:
+- `docs/research/` — harness ground-truth notes (one per harness):
   - `claude-code-cli-observed.md`, `claude-code-headless.md` — Claude Code CLI behavior.
   - `codex-cli-observed.md`, `codex-noninteractive.md` — Codex CLI behavior.
-  - `harness-comparison.md` — cross-harness comparison driving the per-harness adapter design.
+  - `gemini-cli-observed.md` — Gemini CLI behavior.
   - `same-session-parallel-invocation.md` — why we enforce session-id uniqueness at the app layer.
+  - `archive/` — captured-in-time research that informed earlier milestones and is no longer maintained. See `docs/system-design.md` §9 for the living cross-harness comparison.

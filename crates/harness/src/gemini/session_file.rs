@@ -191,15 +191,37 @@ pub fn load_gemini_transcript(
     // **Why we merge content across all matching files**: Gemini creates
     // a new session file on each `--resume` invocation (a separate file
     // per dispatch, distinct timestamp in the filename). Empirically, a
-    // multi-turn session can end up with one file holding the full
+    // multi-turn session ends up with one file holding the full
     // conversation history and several near-empty stub files (just a
     // header) representing later resume invocations that didn't append
     // new content. Returning the first Unambiguous match (the previous
     // behavior) is filesystem-iteration-order dependent and silently
-    // drops the conversation on a coin flip. Concatenating all matching
-    // files and feeding them to the parser is safe: the parser already
-    // dedupes gemini records by id (last-wins) and skips header records,
-    // so duplicate or interleaved data resolves cleanly.
+    // drops the conversation on a coin flip.
+    //
+    // We rely on the observed pattern: only one matching file carries
+    // conversation records; the others contribute nothing under parsing.
+    // The parser dedupes gemini-records by id within an agent window
+    // (last-wins) and skips header records, which makes this safe for
+    // the observed pattern. The parser does **not** dedupe user-records
+    // across files — if Gemini ever writes the same user turn to two
+    // matching files, hydration will produce duplicate `Turn::User`
+    // entries (and the following gemini-records will attach to whichever
+    // user-record was parsed last). Audit the failure mode if the
+    // resume-creates-stub-file pattern ever changes; if it does, capture
+    // a fixture and add user-record dedup keyed on the on-disk record id.
+    //
+    // Ambiguity in any single candidate aborts the whole merge — even
+    // when prior candidates were clean. The clean files' content is
+    // discarded; the user sees the ambiguity warning + empty turns.
+    // Rationale: an ambiguous file (one file, multiple distinct
+    // sessions) means a different session wrote into this UUID's
+    // filename-prefix namespace. The clean files might still be
+    // correctly attributed, but we no longer trust our enumeration of
+    // "which files belong to this session" — surfacing partial content
+    // under an ambiguity warning would mislead the user about what's
+    // reliable. Under UUID v4 the probability is ~1/2^32 ×
+    // resume-invocation count, so the conservative bail rarely loses
+    // anything real.
     let mut merged = String::new();
     for path in &candidates {
         let content = std::fs::read_to_string(path)?;

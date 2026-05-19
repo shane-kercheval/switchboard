@@ -583,7 +583,7 @@ The user reads the implementer's response and decides what's next. Common follow
 
 Switchboard interacts with Claude Code and Codex through their non-interactive modes (`claude -p` and `codex exec`). The underlying sessions are real Claude Code / Codex sessions backed by the harnesses' own session files — they survive Switchboard, can be resumed later, and could in principle be opened in the harness's interactive TUI by the user if they wanted. Switchboard does not lock the user out of the harness; it just drives it.
 
-The architectural backbone of this section is the **per-harness adapter** pattern (design-pattern sense): one adapter per harness translates that harness's native event stream into a normalized internal stream the rest of Switchboard consumes. This keeps the workflow engine, UI, and persistence layer harness-agnostic, while letting each adapter handle its own quirks (event vocabularies, exit-code semantics, session-file richness, etc.). See "Per-harness adapter and normalized event stream" below for the shape; see [docs/research/harness-comparison.md](research/harness-comparison.md) for the cross-harness comparison that drove the design.
+The architectural backbone of this section is the **per-harness adapter** pattern (design-pattern sense): one adapter per harness translates that harness's native event stream into a normalized internal stream the rest of Switchboard consumes. This keeps the workflow engine, UI, and persistence layer harness-agnostic, while letting each adapter handle its own quirks (event vocabularies, exit-code semantics, session-file richness, etc.). See "Per-harness adapter and normalized event stream" below for the shape. Per-harness ground truth lives in the per-harness research docs ([claude-code-cli-observed.md](research/claude-code-cli-observed.md), [codex-cli-observed.md](research/codex-cli-observed.md), [gemini-cli-observed.md](research/gemini-cli-observed.md)).
 
 ### Process model
 
@@ -591,7 +591,7 @@ Per-message process spawn for v1: each turn invokes `claude -p --resume <session
 
 Switchboard runs `claude -p` in its **default** mode (no `--bare`) so the agent inherits the user's full environment: skills, hooks, plugins, MCP servers, CLAUDE.md, and auto-memory all load exactly as they would in an interactive session. The Codex equivalent (we do not pass `--ignore-user-config` or `--ephemeral`) gives the same outcome: the user's `~/.codex/config.toml` and session persistence are honored. This is deliberate — Switchboard's value is to orchestrate normal Claude Code / Codex sessions, not to amputate them. Anthropic has stated that `--bare` will become the `-p` default in a future release; when that happens, Switchboard will need to pass equivalent context-loading flags (`--mcp-config`, `--agents`, `--plugin-dir`, `--settings`, `--append-system-prompt`) to preserve current behavior. To make that change a one-place edit, harness command-line construction is centralized in a single "harness invoker" helper from day one. Tracked under open question 10.9; full background in [docs/research/claude-code-headless.md](research/claude-code-headless.md).
 
-Switchboard consumes the harness stream by spawning the process, reading stdout line-by-line as JSONL, and dispatching each event into the normalized event stream described below. Standard pipe-and-readline; no file-watching for the basic case. Full streaming details in [docs/research/harness-comparison.md](research/harness-comparison.md).
+Switchboard consumes the harness stream by spawning the process, reading stdout line-by-line as JSONL, and dispatching each event into the normalized event stream described below. Standard pipe-and-readline; no file-watching for the basic case. Per-harness stream details live in the per-harness observed-behavior docs under `docs/research/`.
 
 **Process group**: the harness is spawned in its own process group (Rust: `Command::process_group(0)`) so cancellation can `killpg` the entire group with one signal. This handles both Claude Code (single process) and Codex (Node parent + Rust child) uniformly — verified empirically; see the cancellation sections of the per-harness research notes. **Note**: Codex's parent process catches `SIGTERM` and exits with code `0`, so Switchboard cannot detect cancellation from the exit code alone — it relies on the absence of a terminal event in the stream (`turn.completed` or `turn.failed`).
 
@@ -625,130 +625,95 @@ A one-time first-launch acknowledgement dialog (with a checkbox the user must ti
 
 ### Harness capabilities Switchboard depends on
 
-The capabilities and behaviors Switchboard needs from each harness, with notes on what is exposed natively, derived, or unavailable. Hands-on probe results are documented in [docs/research/claude-code-cli-observed.md](research/claude-code-cli-observed.md), [docs/research/codex-cli-observed.md](research/codex-cli-observed.md), and [docs/research/harness-comparison.md](research/harness-comparison.md).
+The capabilities and behaviors Switchboard needs from each harness, with notes on what is exposed natively, derived, or unavailable. Hands-on probe results are documented in [docs/research/claude-code-cli-observed.md](research/claude-code-cli-observed.md), [docs/research/codex-cli-observed.md](research/codex-cli-observed.md), and [docs/research/gemini-cli-observed.md](research/gemini-cli-observed.md).
 
-**Summary table** (details in the prose below):
+| Capability | Claude Code | Codex | Gemini |
+|---|---|---|---|
+| Spawn with explicit flags | native | native | native |
+| Send + capture structured stream | native | native | native |
+| Detect turn completion | native | native | native |
+| Detect errors | native | native (asymmetric payload) | native |
+| Resume by UUID | native | native | native |
+| Assign session ID at spawn | native (`--session-id`) | unavailable (captured from stream → sidecar) | native (`--session-id`) |
+| Fork from checkpoint | native (`--fork-session`) | unavailable in v1 (per resolved 10.14) | unavailable in v1 |
+| Read context window in stream | native (`result.modelUsage`) | unavailable (session-file only) | unavailable (no analog field) |
+| Read cost in stream | native (`total_cost_usd`) | unavailable (subscription quota model) | unavailable (free OAuth tier) |
+| Read rate-limit / quota | unavailable (no public stream signal) | native (`token_count.rate_limits` in session file) | unavailable |
+| Tool calls + results in stream | native (typed blocks) | native (`command_execution` only) | native (filtered `update_topic`; output empty for read-like tools) |
+| Programmatic compaction | unavailable (auto only) | unavailable (auto only) | unavailable (auto only) |
+| Capture permission denials | native (`result.permission_denials`) | presumed (verification deferred) | not yet probed |
+| Run agents concurrently | confirmed | presumed | confirmed |
 
-| Capability | Claude Code | Codex |
-|---|---|---|
-| Spawn with explicit flags | native | native |
-| Send + capture structured stream | native | native |
-| Detect turn completion | native | native |
-| Detect errors | native | native (asymmetric payload) |
-| Resume by UUID | native | native |
-| Assign session ID at spawn | native | unavailable (captured from stream) |
-| Fork from checkpoint | native | unavailable in v1 (per resolved 10.14) |
-| Read session metadata (tokens, context window) | native | partial (context-window in session file) |
-| Derive context utilization | native | derived (session file) |
-| Programmatic compaction | unavailable (auto only) | unavailable (auto only) |
-| Tool calls + results in stream | native (typed blocks) | native (`command_execution` only) |
-| Capture permission denials | native | presumed (verification deferred) |
-| Run agents concurrently | confirmed | presumed |
+**Per-row notes** (only where the matrix needs elaboration):
 
-- **Spawn** a session with explicit flags. *(native, both)*
-- **Send** a message and capture the structured stream. *(native, both — `claude -p --output-format stream-json` and `codex exec --json`)*
-- **Detect turn completion.** *(native, both — single terminal event per turn.)* Claude Code emits `result`; Codex emits `turn.completed` on success and `turn.failed` on error. Switchboard's adapter waits for either.
-- **Detect errors.** *(native, both, but asymmetric.)* Claude Code: `result.is_error` and/or `result.api_error_status` (do not rely on `subtype` — it stays `"success"` even on error). Codex: a `turn.failed` event terminates the turn, payload carries the API error. Both harnesses also exit non-zero on error.
-- **Resume** a session by UUID. *(native, both — Claude Code: `--resume <uuid>`; Codex: `codex exec resume <uuid>`.)*
-- **Assign a session ID at spawn.** *(Claude Code only — `--session-id <uuid>`. Codex assigns its own; Switchboard captures it from the first stream event.)*
-- **Fork** a session from a checkpoint. *(Native in Claude Code via `--fork-session` with `--resume`. **Unavailable for Codex in v1** per resolved 10.14 — no non-interactive `codex exec fork` exists; Switchboard does not implement the workarounds (copy session JSONL; re-feed summarized prior context) for v1. Switchboard surfaces Fork only on Claude Code agents; Codex agents show a tooltip explaining the gap.)*
-- **Read session metadata** (model, session ID, tokens) from the stream. *(Asymmetric.)* Claude Code: `result.modelUsage.<model>.{contextWindow, maxOutputTokens}` plus `total_cost_usd`. Codex: only token counts in `turn.completed.usage`; `model_context_window` and `token_count.rate_limits` are in the **session file** (not the stream). Per §2 non-goals, the v1 UI surfaces dollars for Claude Code (from `total_cost_usd`) and a rate-limit / quota signal for Codex (from the session-file `token_count.rate_limits`); raw tokens are plumbed through the event stream but not displayed.
-- **Derive context utilization.** *(Native for Claude Code, asymmetric for Codex.)* Claude Code exposes `contextWindow` per turn in the result event — Switchboard reads it directly. Codex's stream omits it; Switchboard reads the session file (per resolved 10.15). Open question 10.12 captures any further refinements.
-- **Surface compaction state.** *(No programmatic `/compact` in either harness; both do auto-compact at high utilization.)* Switchboard's role is to monitor utilization and surface warnings as the threshold approaches, not to drive compaction itself. Reimplementing summarization in Switchboard would underperform the harnesses' tuned compaction and is not planned (see open question 10.11).
-- **Read tool calls and tool results** from the stream. *(Asymmetric.)* Claude Code emits typed `tool_use` and `tool_result` content blocks (with named tools, including MCP tools). Codex routes everything through `command_execution` items (raw shell commands with `aggregated_output` and `exit_code`). Switchboard renders them differently per harness — there is no single unified rendering.
-- **Capture permission denials.** *(Confirmed for Claude Code via `result.permission_denials`.)* Denials do **not** error the turn — the model receives them as feedback and adapts. Switchboard treats denials as a distinct UX category (informational, not failure). Codex behavior is presumed similar but not yet verified — §7 wording about Codex denials is hedged accordingly.
-- **Run agents concurrently.** *(Confirmed for Claude Code: three parallel `claude -p` from the same cwd produced three independent session files with no contention.)* This is what makes fan-out feasible. Codex's process model (parent + child) and per-session-file isolation suggest the same property holds; explicit verification deferred to implementation.
+- **Send + capture structured stream**: Claude `claude -p --output-format stream-json`; Codex `codex exec --json`; Gemini `gemini -p --output-format stream-json`.
+- **Detect turn completion**: single terminal event per turn for all three. Claude: `result`. Codex: `turn.completed` (success) or `turn.failed` (error). Gemini: `result.status:"success"` or `result.status:"error"`. The adapter waits for whichever terminal shape the harness emits.
+- **Detect errors**: Claude uses `result.is_error` and/or `result.api_error_status` (do **not** rely on `result.subtype` — stays `"success"` even on error). Codex: `turn.failed` event terminates the turn with the API error in the payload. Gemini: `result.status:"error"` with `error.message` — auth failures detected via substring match per `is_gemini_auth_failure_message`. All three exit non-zero on error.
+- **Assign session ID at spawn**: Claude and Gemini both let the caller pass `--session-id <uuid>`. Codex assigns its own; Switchboard captures it from the first stream event and persists to a per-agent sidecar. Note: Gemini uses UUID **v4** (not v7) because Gemini's session-file filename uses only the first 8 hex chars and v7s minted in the same millisecond share that prefix — see `gemini/mod.rs` for the rationale.
+- **Fork from checkpoint**: Claude `--fork-session` with `--resume`. Codex has no non-interactive `codex exec fork`; Gemini has no equivalent. The Fork affordance surfaces only on Claude Code agents; Codex and Gemini agents show a tooltip explaining the gap.
+- **Read context window in stream**: Claude is the only harness with this stream-side. Codex enriches from the session file's `task_started.model_context_window` per resolved 10.15. Gemini has neither a stream field nor a session-file analog — the context-utilization bar is hidden for Gemini agents (per the per-harness sidebar matrix in §7).
+- **Read cost in stream**: Claude only (Agent SDK credit pool post-2026-06-15). Codex doesn't expose dollar costs under subscription auth; Gemini's free OAuth tier doesn't either.
+- **Read rate-limit / quota**: Codex only — emitted as a `RateLimitEvent` enriched from the session file's `token_count.rate_limits` post-terminal. The other two harnesses don't surface a comparable signal.
+- **Tool calls + results in stream**: structurally divergent across harnesses. Claude emits typed `tool_use` / `tool_result` content blocks with named tools (including MCP). Codex routes everything through `command_execution` items (raw shell commands with `aggregated_output` and `exit_code`). Gemini emits `tool_use` / `tool_result` events; the adapter filters the `update_topic` internal tool, and `tool_result.output` is empty for read-like tools like `read_file` (the real content lives only in the session file — surfaces on transcript hydration). Switchboard renders these differently per harness; no single unified rendering. **No raw token counts are surfaced in the UI for any harness** — tokens are plumbed through the event stream and used internally (context utilization, debugging), but the user-facing surface is dollars (Claude) or quota (Codex) or empty (Gemini).
+- **Permission denials**: Claude's `result.permission_denials` is informational (not a turn-error); the model receives them as feedback and adapts. Codex and Gemini behaviors are presumed similar but unverified — §7 wording is hedged accordingly.
+- **Run agents concurrently**: Claude confirmed via three parallel `claude -p` invocations producing three independent session files. Gemini confirmed via the M3.1 collision probe (two concurrent processes with deliberately-colliding 8-char-prefix UUIDs surfaced the documented prefix-collision hazard, but both invocations completed independently). Codex's process model and per-session-file isolation suggest the property holds; explicit verification deferred.
 
 ### Per-harness adapter and normalized event stream
 
-The two harness streams are structurally different (event-name vocabularies, content shapes, where context-window / rate-limit info appears). To keep the rest of Switchboard harness-agnostic, the harness layer is organized around **per-harness adapters** that translate native events into a normalized internal event stream the rest of the system consumes:
+The three harness streams (Claude Code, Codex, Gemini) are structurally different (event-name vocabularies, content shapes, where context-window / rate-limit / cost info appears, what's in the session file vs. stream-only). To keep the rest of Switchboard harness-agnostic, the harness layer is organized around **per-harness adapters** that translate native events into a normalized internal event stream the rest of the system consumes.
 
-```
-SessionMeta     { agent, model, harness_version, tools, mcp_servers, skills, raw }
-                // emitted once at first turn. Sources vary by field and by harness:
-                //   model         — Claude live: system/init stream event.
-                //                   Claude rehydration: session-file system/init record (M2.6).
-                //                   Codex live + rehydration: session-file first
-                //                   turn_context record.
-                //   harness_version — Claude live: system/init.claude_code_version.
-                //                   Claude rehydration: session-file system/init.
-                //                   Codex live + rehydration: session-file session_meta.cli_version.
-                //   mcp_servers   — Claude live: system/init.mcp_servers (already
-                //                   merged across user/local/project scopes by Claude
-                //                   itself).
-                //                   Claude rehydration: Switchboard reads ~/.claude.json
-                //                   (user + local scopes) and <cwd>/.mcp.json (project
-                //                   scope) — Claude session files don't carry the registry
-                //                   (M2.6).
-                //                   Codex live + rehydration: Switchboard reads
-                //                   ~/.codex/config.toml + <cwd>/.codex/config.toml —
-                //                   Codex's non-interactive mode doesn't emit a registry
-                //                   event AND session files don't carry the registry.
-                //   skills        — Claude live: system/init.skills (already merged by
-                //                   Claude across ~/.claude/skills/ + <cwd>/.claude/skills/).
-                //                   Claude rehydration: Switchboard directory scan of the
-                //                   same two paths (M2.6, since session files don't carry
-                //                   the registry).
-                //                   Codex live + rehydration: Switchboard directory scan
-                //                   of ~/.agents/skills/ + <cwd>/.agents/skills/.
-                //   tools         — Claude live: system/init.tools (the merged builtin +
-                //                   MCP + dynamic list Claude reports).
-                //                   Claude rehydration: empty (session file lacks the
-                //                   equivalent record).
-                //                   Codex live + rehydration: empty (no equivalent source
-                //                   — command_execution + mcp_tool_call cover the
-                //                   dispatched-tool surface stream-side, but there's no
-                //                   available-tools registry separate from mcp_servers).
-                //                   Field is preserved across the wire for the populated
-                //                   Claude-live path; reserved for a future symmetric
-                //                   registry surface across harnesses.
-                // Display-only — the registry data informs the per-agent sidebar; it does
-                // not gate dispatch. Failures to read config/directories emit empty lists
-                // with a warning, never an error.
-TurnStart       { agent, session_id }
-ContentChunk    { agent, kind: thinking | text, data }
-ToolStarted     { agent, tool_use_id, kind, input }
-                // fires when the tool call is dispatched (lets the UI show
-                // "running tool... (3.2s elapsed)" before the result lands).
-ToolCompleted   { agent, tool_use_id, output, is_error }
-TurnEnd         { agent, outcome, ended_at,
-                  usage?: { input, output, cached, reasoning, context_window?, total_cost_usd? } }
-                // outcome = Completed
-                //         | Failed { kind: HarnessError | AdapterFailure | AuthFailure, message }
-                //         | Cancelled { source: User | Workflow }   // added in M4 when per-turn cancel lands
-                //
-                // HarnessError: harness's terminal event reported is_error
-                //   (bad model name, rate limit, transient API error,
-                //   invalid prompt content). The harness gave us a clean signal.
-                // AdapterFailure: synthesized by the adapter when the subprocess
-                //   died, the parser hit malformed JSON, or stdout EOF arrived
-                //   without a terminal event (e.g., Codex parent silently exits
-                //   0 on SIGTERM). Infrastructure-level; not the user's fault.
-                // AuthFailure: subscription / tier auth is missing or expired.
-                //   Detected via stream events (Claude: `assistant.error ==
-                //   "authentication_failed"`; Codex: `turn.failed.error.message`
-                //   contains `"401 Unauthorized"`). Distinct from HarnessError
-                //   so the UI can render an auth-specific banner rather than
-                //   a generic error.
-                //
-                // Terminal event type is always TurnEnd. Terminal status lives
-                // in outcome — there is no separate TurnAborted / TurnTimeout /
-                // TurnCancelled wire event. The kind field on Failed lets
-                // consumers (UI, M6 partial-failure rule) distinguish causes
-                // without proliferating event variants. Exactly one TurnEnd
-                // per turn.
-RateLimitEvent  { agent, info }
-                // info: harness-specific shape, surfaced for UI display, not
-                // interpreted by the workflow engine. Timing differs by harness:
-                // Claude Code can emit mid-turn; Codex's source (session file)
-                // means the event arrives after the terminal event.
-```
+Each adapter is responsible for: building the harness command line, spawning the process, parsing its native stream, normalizing into the event vocabulary below, and surfacing harness-specific metadata in `raw` so callers that need to dig in can. The workflow engine, UI, and persistence layer consume only the normalized stream.
 
-Each adapter (Claude Code, Codex) is responsible for: building the harness command line, spawning the process, parsing its native stream, normalizing into the events above, and surfacing harness-specific metadata in `raw_event` so callers that need to dig in can. The workflow engine, UI, and persistence layer consume only the normalized stream.
+#### Event vocabulary
 
-**Forward-compat note — §7 workflow status taxonomy.** §7 describes workflow-level status as "complete, cancelled, failed, interrupted." After M4 lands `Cancelled` as a top-level `TurnOutcome` variant, the per-turn vocabulary will be `Completed | Failed | Cancelled` — three statuses, not four. Where does "interrupted" map? Two reasonable resolutions for when M4 expansion picks this up: (a) fold into `Cancelled { source: User | Workflow | Signal }`, with `Signal` covering SIGINT/SIGTERM (cleanest — one variant, source field discriminates); (b) keep `Interrupted` as its own top-level `TurnOutcome` variant for OS-signal-driven shutdowns specifically. Decision deferred to M4, but flagged here so §7 and §9 don't silently drift in the meantime.
+The authoritative struct definitions live in [`crates/harness/src/events.rs`](../crates/harness/src/events.rs). The summary here is for design-doc readers who need a one-line orientation per event without opening the code.
 
-Reading Codex session files (in addition to the `--json` stream) is a committed v1 dependency for the Codex adapter (per resolved 10.15) — needed to fill in gaps the stream doesn't expose (rate limits, `model_context_window`, full reasoning blocks, `session_meta`). Multiple §7 and §9 commitments depend on this enrichment.
+| Event | Purpose |
+|---|---|
+| `SessionMeta { agent, model, harness_version, tools, mcp_servers, skills, raw }` | Emitted once at first turn. Carries session-scope metadata for the sidebar. Per-field sources differ by harness — see table below. |
+| `TurnStart { agent, session_id }` | A turn has begun. The UI uses this to lock the compose bar for the affected agent and start the busy indicator. |
+| `ContentChunk { agent, kind: thinking \| text, data }` | A piece of model output. The `kind` discriminator lets the UI render reasoning blocks separately from final response text. |
+| `ToolStarted { agent, tool_use_id, kind, input }` | A tool call was dispatched. Fires *before* the result lands so the UI can show "running tool... (3.2s elapsed)" rather than appearing frozen. |
+| `ToolCompleted { agent, tool_use_id, output, is_error }` | The tool returned. Paired with its `ToolStarted` via `tool_use_id`. |
+| `TurnEnd { agent, outcome, ended_at, usage? }` | Terminal event. Exactly one per turn. `usage` carries token counts and (where available) `context_window` / `total_cost_usd`. See *Terminal outcome variants* below. |
+| `RateLimitEvent { agent, info }` | Harness-specific quota signal, surfaced for UI display. The workflow engine doesn't interpret it. Codex emits this post-terminal from the session file; Claude has no comparable signal; Gemini has no comparable signal. |
+
+#### Terminal outcome variants
+
+`TurnEnd.outcome` is the discriminator that distinguishes success from each failure class:
+
+- **`Completed`** — harness reported a clean terminal event.
+- **`Failed { kind: HarnessError, message }`** — harness's terminal event reported `is_error`. Causes: bad model name, rate limit, transient API error, invalid prompt content. The harness gave us a clean error signal.
+- **`Failed { kind: AdapterFailure, message }`** — synthesized by the adapter. Causes: subprocess died, parser hit malformed JSON, or stdout EOF arrived without a terminal event (e.g., Codex parent silently exits 0 on SIGTERM). Infrastructure-level; not the user's fault.
+- **`Failed { kind: AuthFailure, message }`** — subscription / tier auth is missing or expired. Detected per-harness via stream substring match: Claude `assistant.error == "authentication_failed"`; Codex `turn.failed.error.message` contains `"401 Unauthorized"`; Gemini per `is_gemini_auth_failure_message` (see `gemini/parser.rs`). Distinct from `HarnessError` so the UI can render an auth-specific banner rather than a generic error.
+- **`Cancelled { source: User | Workflow }`** — reserved for M4 when per-turn cancellation lands.
+
+**Why a single terminal event type.** Terminal status lives in `outcome` — there is no separate `TurnAborted` / `TurnTimeout` / `TurnCancelled` wire event. The `kind` field on `Failed` lets consumers (UI, partial-failure rules) distinguish causes without proliferating variants at the event level. Exactly one `TurnEnd` per turn, always.
+
+#### SessionMeta per-harness sources
+
+For each `SessionMeta` field, where each harness sources the value live (from the stream) and on rehydration (parsing the session file plus any Switchboard-side fallback). Empty cells mean Switchboard returns the field's default (empty string or empty vec) for that harness on that path.
+
+| Field | Claude (live) | Claude (rehydration) | Codex (live + rehydration) | Gemini (live) | Gemini (rehydration) |
+|---|---|---|---|---|---|
+| `model` | `system/init` stream event | session-file `system/init` record | session-file first `turn_context` record | stream-init event | last gemini-record's `model` field |
+| `harness_version` | `system/init.claude_code_version` | session-file `system/init` | session-file `session_meta.cli_version` | lazy `gemini --version` (cached `OnceLock`; `""` on probe failure) | empty (session file lacks the field) |
+| `mcp_servers` | `system/init.mcp_servers` (Claude pre-merges scopes) | Switchboard reads `~/.claude.json` (user + local) + `<cwd>/.mcp.json` (project) | Switchboard reads `~/.codex/config.toml` + `<cwd>/.codex/config.toml` | adapter loader injects post-parse | Switchboard reads `~/.gemini/settings.json` + `<cwd>/.gemini/settings.json` |
+| `skills` | `system/init.skills` (Claude pre-merges scopes) | Switchboard directory-scans `~/.claude/skills/` + `<cwd>/.claude/skills/` | Switchboard directory-scans `~/.agents/skills/` + `<cwd>/.agents/skills/` | adapter loader injects post-parse | Switchboard directory-scans `~/.agents/skills/` + `<cwd>/.gemini/skills/` |
+| `tools` | `system/init.tools` (merged builtin + MCP + dynamic list) | empty | empty | empty | empty |
+
+**Cross-harness invariants** that apply to both `mcp_servers` and `skills`:
+
+- **Project / workspace scope wins on name collision.** Consistent with `git`, `npm`, every other config-stacking system, and the more-specific-scope-wins convention used by every registry-style loader in Switchboard. Tests pin direction (not just dedup) in each loader.
+- **`~/.agents/skills/` is a shared multi-harness user-scope path** used by both Codex and Gemini. Changes to its layout affect both loaders — audit together if path semantics ever shift.
+- **Display-only.** Failures to read config files / scan directories emit empty lists with a warning. Loader errors never propagate as `Result::Err`; dispatch is unaffected.
+
+The `tools` field is preserved across the wire for the populated Claude-live path; it's reserved for a future symmetric registry surface across harnesses (Codex and Gemini have no `init`-event tools list to draw from).
+
+#### Notes
+
+- **Codex session-file dependency.** Reading Codex session files in addition to the `--json` stream is a committed v1 dependency for the Codex adapter (per resolved 10.15) — needed to fill in gaps the stream doesn't expose (`rate_limits`, `model_context_window`, full reasoning blocks, `session_meta`). Multiple §7 and §9 commitments depend on this enrichment.
+- **Forward-compat — §7 workflow status taxonomy.** §7 describes workflow-level status as "complete, cancelled, failed, interrupted." After M4 lands `Cancelled` as a top-level `TurnOutcome` variant, the per-turn vocabulary will be `Completed | Failed | Cancelled` — three statuses, not four. Where does "interrupted" map? Two reasonable resolutions for when M4 expansion picks this up: (a) fold into `Cancelled { source: User | Workflow | Signal }`, with `Signal` covering SIGINT/SIGTERM (cleanest — one variant, source field discriminates); (b) keep `Interrupted` as its own top-level `TurnOutcome` variant for OS-signal-driven shutdowns specifically. Decision deferred to M4, but flagged here so §7 and §9 don't silently drift in the meantime.
 
 ### Passthrough mechanism
 
@@ -870,7 +835,7 @@ Aggregated from inline flags above, plus a few additional:
 - **5.1** Exact workflow DSL keywords and structure. Resolved in `docs/workflow-spec.md`. The spec pins down the template-function surface for dynamic agent sets (`responses_from(...)` returning a name → text mapping for Switchboard-aware prompts; `aggregated_responses(...)` returning the same data pre-formatted as a single text blob for cross-platform prompts; `last_output(agent)` and `agent_names(agents)` helpers); how invocation-time list inputs (`reviewer_agents: [agent]`) flow into template variables; the iteration variable scoping rules from Primitive 6.
 - **5.2** Passthrough mechanism for harness commands — namespacing. Partially blocked on 10.10; namespacing only matters once upstream allows arbitrary slash-command passthrough.
 - ~~**6.1** MiniJinja subset and template-available variables.~~ **Resolved in `docs/workflow-spec.md` §Templating** (supported / unsupported MiniJinja features, available variable scopes, built-in template functions).
-- ~~**10.1** What does Switchboard do when an agent's "next assistant response" is a tool call rather than text?~~ **Resolved by hands-on probe:** both harnesses run the model → tool_use → tool_result → model loop internally and emit a single terminal event per user-initiated turn (Claude Code: `result`; Codex: `turn.completed` / `turn.failed`). Switchboard always sees a complete turn — there is no "tool-call-only response" to handle. See [docs/research/harness-comparison.md](research/harness-comparison.md).
+- ~~**10.1** What does Switchboard do when an agent's "next assistant response" is a tool call rather than text?~~ **Resolved by hands-on probe:** all three harnesses run the model → tool_use → tool_result → model loop internally and emit a single terminal event per user-initiated turn (Claude Code: `result`; Codex: `turn.completed` / `turn.failed`; Gemini: `result`). Switchboard always sees a complete turn — there is no "tool-call-only response" to handle.
 - ~~**10.2** When two workflows reference the same agent, what happens? Disallow concurrent use? Queue? Refuse?~~ **Resolved by hands-on probe:** Switchboard enforces one in-flight turn per agent at the application layer; collisions are refused with a clear error. Queueing is deferred. See §7 "Agent contention" and [docs/research/same-session-parallel-invocation.md](research/same-session-parallel-invocation.md). The harnesses themselves do not error on same-session parallel invocation — they silently corrupt (Claude Code: orphan branch in session tree) or conflate (Codex: interleaved transcript) — so this enforcement must live in Switchboard.
 - **10.3** Persistence schema for project/agent registry and workflow-run checkpoints (kept under `<directory>/.switchboard/projects/<project-id>/`, per §3). The user-visible restart UX (interrupted-at-step-N + retry/abandon, including iteration index/value for Primitive 6) is committed in §7 "Walking away"; what remains open is the on-disk format (JSONL append-only, SQLite, or otherwise), atomicity guarantees on concurrent agent-spawn-during-write, and the eventual pruning story. Mid-step recovery (resuming an interrupted in-flight turn) remains out of scope.
 - ~~**10.4** Workflow versioning.~~ **Resolved (commitment).** Workflow runs execute against an immutable snapshot of the workflow file and its bound inputs, captured at invocation. Prompt resolution still happens at each step's dispatch (per §6 prompt resolution rules) — edits to a referenced prompt take effect on the next workflow invocation, not the in-flight run. Edits to the workflow file on disk after invocation do not affect the in-flight run or retries; the snapshot is what executes. Rationale: deterministic execution and deterministic retry; reload-on-retry would create incoherent "same run, different program" behavior given step-index checkpointing.

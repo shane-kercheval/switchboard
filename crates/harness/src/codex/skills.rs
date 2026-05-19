@@ -9,9 +9,12 @@
 //! - `~/.agents/skills/<name>/SKILL.md` — user-scope.
 //! - `<cwd>/.agents/skills/<name>/SKILL.md` — project-scope.
 //!
-//! Merge by name; project-scope wins (the merged surface is just the name
-//! list, so the win is observationally idempotent — see `config.rs` for the
-//! same pattern).
+//! Merge rule: **project > user** on name collision. Project entries seed
+//! the result; user-only entries are appended. The merged surface is just
+//! the name list (the registry is display-only). Matches the
+//! more-specific-scope-wins convention used across every registry-style
+//! loader in Switchboard (Claude / Codex / Gemini MCP + skills) and the
+//! broader ecosystem (git, npm, etc.).
 //!
 //! **Failure policy** mirrors the MCP loader: missing directory → empty list
 //! no warning; unreadable directory → empty list + warning; per-entry
@@ -84,16 +87,16 @@ fn scan_skills_directory(skills_dir: &Path) -> Vec<String> {
 }
 
 fn merge_scopes(user_skills: Vec<String>, project_skills: Vec<String>) -> Vec<String> {
-    let mut merged = user_skills;
-    for name in project_skills {
+    let mut merged = project_skills;
+    for name in user_skills {
         if !merged.iter().any(|existing| existing == &name) {
             merged.push(name);
         }
     }
-    // Don't re-sort after the project-scope append: the user-then-project
-    // ordering is a clearer story for the sidebar ("inherited from user
-    // first, project-specific after") than alphabetical across both. Within
-    // each scope the list is already sorted by `scan_skills_directory`.
+    // Don't re-sort after the user-scope append: the project-then-user
+    // ordering tells a clearer "more-specific-scope first" story for the
+    // sidebar than alphabetical across both. Within each scope the list
+    // is already sorted by `scan_skills_directory`.
     merged
 }
 
@@ -131,7 +134,10 @@ mod tests {
     }
 
     #[test]
-    fn project_scope_appends_non_colliding_skills() {
+    fn merge_seeds_with_project_scope_then_appends_user_only_entries() {
+        // Pins the merge direction (project > user) — not just the
+        // dedup behavior. A future flip back to user-first seeding
+        // changes the result-vec order and fails this assertion.
         let home = TempDir::new().unwrap();
         let cwd = TempDir::new().unwrap();
         let user_skills_dir = home.path().join(".agents").join("skills");
@@ -142,11 +148,22 @@ mod tests {
         make_skill(&project_skills_dir, "project_skill");
 
         let result = load_skills(home.path(), cwd.path());
-        assert_eq!(result, vec!["user_skill", "project_skill"]);
+        assert_eq!(
+            result,
+            vec!["project_skill", "user_skill"],
+            "project entries must seed the merged list; user-only entries append after"
+        );
     }
 
     #[test]
-    fn project_scope_does_not_duplicate_colliding_names() {
+    fn collision_dedup_preserves_project_first_order() {
+        // Stages both scopes with one colliding name and one unique
+        // name each. Pins:
+        // 1. The colliding name appears exactly once (dedup).
+        // 2. Project entries (collider + project_only) come first in
+        //    source order, then user-only entries append.
+        // Together these pin "project > user" without needing per-entry
+        // content surfaced on the API (today's surface is just names).
         let home = TempDir::new().unwrap();
         let cwd = TempDir::new().unwrap();
         let user_skills_dir = home.path().join(".agents").join("skills");
@@ -154,10 +171,16 @@ mod tests {
         std::fs::create_dir_all(&user_skills_dir).unwrap();
         std::fs::create_dir_all(&project_skills_dir).unwrap();
         make_skill(&user_skills_dir, "shared");
+        make_skill(&user_skills_dir, "user_only");
         make_skill(&project_skills_dir, "shared");
+        make_skill(&project_skills_dir, "project_only");
 
         let result = load_skills(home.path(), cwd.path());
-        assert_eq!(result, vec!["shared"]);
+        // scan_skills_directory sorts within scope; merge appends
+        // user-only after project, so the expected order is:
+        //   project's sorted entries: project_only, shared
+        //   then user-only (non-colliding): user_only
+        assert_eq!(result, vec!["project_only", "shared", "user_only"]);
     }
 
     #[test]

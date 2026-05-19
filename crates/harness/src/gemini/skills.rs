@@ -12,7 +12,12 @@
 //! - `<cwd>/.gemini/skills/<name>/SKILL.md` — workspace scope. The
 //!   `--scope workspace` flag writes here.
 //!
-//! Merge by name; collisions deduplicate. Surface is just the name list.
+//! Merge rule: **workspace > user** on name collision. The merged surface
+//! is just the name list (the registry is display-only). Workspace
+//! entries seed the result; user-only entries are appended. Matches the
+//! more-specific-scope-wins convention used across every registry-style
+//! loader in Switchboard (Claude / Codex / Gemini MCP + skills) and the
+//! broader ecosystem (git, npm, etc.).
 //!
 //! **Failure policy** mirrors the Claude and Codex skills loaders:
 //! missing directory → empty no warning; unreadable directory → empty +
@@ -73,8 +78,8 @@ fn scan_skills_directory(skills_dir: &Path) -> Vec<String> {
 }
 
 fn merge_scopes(user_skills: Vec<String>, workspace_skills: Vec<String>) -> Vec<String> {
-    let mut merged = user_skills;
-    for name in workspace_skills {
+    let mut merged = workspace_skills;
+    for name in user_skills {
         if !merged.iter().any(|existing| existing == &name) {
             merged.push(name);
         }
@@ -115,7 +120,10 @@ mod tests {
     }
 
     #[test]
-    fn workspace_scope_appends_non_colliding_skills() {
+    fn merge_seeds_with_workspace_scope_then_appends_user_only_entries() {
+        // Pins the merge direction (workspace > user) — not just the
+        // dedup behavior. A future flip back to user-first seeding
+        // changes the result-vec order and fails this assertion.
         let home = TempDir::new().unwrap();
         let cwd = TempDir::new().unwrap();
         let user_skills_dir = home.path().join(".agents").join("skills");
@@ -126,11 +134,23 @@ mod tests {
         make_skill(&workspace_skills_dir, "workspace_skill");
 
         let result = load_skills(home.path(), cwd.path());
-        assert_eq!(result, vec!["user_skill", "workspace_skill"]);
+        assert_eq!(
+            result,
+            vec!["workspace_skill", "user_skill"],
+            "workspace entries must seed the merged list; user-only entries append after"
+        );
     }
 
     #[test]
-    fn workspace_scope_does_not_duplicate_colliding_names() {
+    fn collision_dedup_preserves_workspace_first_order() {
+        // Stages both scopes with one colliding name and one unique
+        // name each. Pins:
+        // 1. The colliding name appears exactly once (dedup).
+        // 2. Workspace entries (collider + workspace_only) come first
+        //    in source order, then user-only entries append.
+        // Together these pin "workspace > user" without needing per-
+        // entry content surfaced on the API (today's surface is just
+        // names).
         let home = TempDir::new().unwrap();
         let cwd = TempDir::new().unwrap();
         let user_skills_dir = home.path().join(".agents").join("skills");
@@ -138,10 +158,16 @@ mod tests {
         std::fs::create_dir_all(&user_skills_dir).unwrap();
         std::fs::create_dir_all(&workspace_skills_dir).unwrap();
         make_skill(&user_skills_dir, "shared");
+        make_skill(&user_skills_dir, "user_only");
         make_skill(&workspace_skills_dir, "shared");
+        make_skill(&workspace_skills_dir, "workspace_only");
 
         let result = load_skills(home.path(), cwd.path());
-        assert_eq!(result, vec!["shared"]);
+        // scan_skills_directory sorts within scope; merge appends user-
+        // only after workspace, so the expected order is:
+        //   workspace's sorted entries: shared, workspace_only
+        //   then user-only (non-colliding): user_only
+        assert_eq!(result, vec!["shared", "workspace_only", "user_only"]);
     }
 
     #[test]

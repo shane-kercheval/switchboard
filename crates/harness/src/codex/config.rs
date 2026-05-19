@@ -125,25 +125,27 @@ fn load_mcp_names_from_file(path: &Path) -> Vec<String> {
 /// name conflicts. Project entries that collide replace the user-scope entry
 /// in place; non-colliding project entries append at the end.
 fn merge_scopes(user_names: Vec<String>, project_names: Vec<String>) -> Vec<McpServerStatus> {
-    let mut merged: Vec<McpServerStatus> = user_names
+    // Project entries seed the result; user-only entries append. This
+    // makes project literally win on name collision (a future surface
+    // that exposes per-entry detail would render the project version,
+    // not the user version) and matches the more-specific-scope-wins
+    // convention used across every registry-style loader in Switchboard
+    // (Claude / Codex / Gemini MCP + skills) and the broader ecosystem
+    // (git, npm, etc.).
+    let mut merged: Vec<McpServerStatus> = project_names
         .into_iter()
         .map(|name| McpServerStatus {
             name,
             status: CONFIGURED_STATUS.to_owned(),
         })
         .collect();
-    for project_name in project_names {
-        if !merged.iter().any(|existing| existing.name == project_name) {
+    for user_name in user_names {
+        if !merged.iter().any(|existing| existing.name == user_name) {
             merged.push(McpServerStatus {
-                name: project_name,
+                name: user_name,
                 status: CONFIGURED_STATUS.to_owned(),
             });
         }
-        // Name already present from user scope → project entry "wins" but
-        // the surfaced shape (just name + "configured" status) is identical,
-        // so no in-place replacement needed. The semantic distinction
-        // matters only when entry contents differ — which they might in
-        // Codex itself, but our sidebar doesn't render contents.
     }
     merged
 }
@@ -187,7 +189,10 @@ command = "beta-bin"
     }
 
     #[test]
-    fn project_scope_appends_non_colliding_entries() {
+    fn merge_seeds_with_project_scope_then_appends_user_only_entries() {
+        // Pins the merge direction (project > user) — not just the
+        // dedup behavior. A future flip back to user-first seeding
+        // changes the result-vec order and fails this assertion.
         let home = TempDir::new().unwrap();
         let cwd = TempDir::new().unwrap();
         let user_config = home.path().join(".codex").join("config.toml");
@@ -215,15 +220,22 @@ command = "y"
             .into_iter()
             .map(|e| e.name)
             .collect();
-        assert_eq!(names, vec!["user_only", "project_only"]);
+        assert_eq!(
+            names,
+            vec!["project_only", "user_only"],
+            "project entries must seed the merged list; user-only entries append after"
+        );
     }
 
     #[test]
-    fn project_scope_does_not_duplicate_colliding_entries() {
-        // Project scope "wins" on name conflict per the merge rule, but since
-        // we surface only the name + "configured" status (not entry
-        // contents), the merge is observationally idempotent — the merged
-        // list should still contain the name exactly once.
+    fn collision_dedup_preserves_project_first_order() {
+        // Stages both scopes with one colliding name and one unique
+        // name each. Pins:
+        // 1. The colliding name appears exactly once (dedup).
+        // 2. Project entries (project_only + shared) come first in
+        //    source order, then user-only entries append.
+        // Together these pin "project > user" without needing per-entry
+        // content surfaced on the API (today's surface is just names).
         let home = TempDir::new().unwrap();
         let cwd = TempDir::new().unwrap();
         let user_config = home.path().join(".codex").join("config.toml");
@@ -233,6 +245,8 @@ command = "y"
             r#"
 [mcp_servers.shared]
 command = "user-command"
+[mcp_servers.user_only]
+command = "u"
 "#,
         )
         .unwrap();
@@ -243,6 +257,8 @@ command = "user-command"
             r#"
 [mcp_servers.shared]
 command = "project-command"
+[mcp_servers.project_only]
+command = "p"
 "#,
         )
         .unwrap();
@@ -251,7 +267,13 @@ command = "project-command"
             .into_iter()
             .map(|e| e.name)
             .collect();
-        assert_eq!(names, vec!["shared"], "no duplicate on name collision");
+        assert_eq!(names.len(), 3, "exactly three distinct names");
+        // Project entries come first; among them, TOML map order is
+        // not guaranteed so we assert membership for the project pair
+        // and that user_only is last (the only user-only entry).
+        assert!(names[..2].contains(&"shared".to_owned()));
+        assert!(names[..2].contains(&"project_only".to_owned()));
+        assert_eq!(names[2], "user_only");
     }
 
     #[test]

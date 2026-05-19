@@ -78,22 +78,35 @@ Coverage today:
     - Gemini: `usage.is_some()` with `context_window.is_none()` (Gemini's
       session file has no context-window field) and `last_rate_limit` is
       `None` (no rate-limit telemetry in the session file).
-  - `live_claude_transcript_load_hydrates_tool_items` + the Gemini
-    counterpart: dispatch a Read-tool turn, load the transcript, assert
-    the agent turn contains a `TurnItem::Tool` with `is_error: Some(false)`
-    and `output` carrying the staged sentinel. For Gemini this is **load-
-    bearing** for the "live = best-effort, hydration = authoritative"
-    contract — the live stream emits empty tool output, hydration fills
-    it in. For both: drift-detection against a CLI bump renaming
-    tool-record fields in the session file.
+  - Tool-item hydration tests per harness
+    (`live_claude_transcript_load_hydrates_tool_items`,
+    `live_codex_transcript_load_hydrates_tool_items`,
+    `live_gemini_transcript_load_hydrates_tool_items`): dispatch a tool
+    turn (file read / shell `cat`), load the transcript, find the
+    `TurnItem::Tool` whose `output` contains the staged sentinel,
+    assert `is_error: Some(false)` and a non-empty name. Per-harness
+    motivation:
+    - Claude / Codex: drift-detection against a CLI bump renaming
+      tool-record fields in the session file (Claude's session-file
+      JSON shape; Codex's `function_call` / `function_call_output`
+      records).
+    - Gemini: **load-bearing** for the "live = best-effort, hydration =
+      authoritative" contract — the live stream emits empty tool
+      output, hydration fills it in.
 
 Dispatcher-layer live coverage (turn lifecycle ordering, session-id path
 encoding, cwd routing) lives alongside the dispatcher in
-`crates/dispatcher/tests/live_end_to_end.rs`. Includes a Gemini variant
-of the event-ordering check (`turn_start → content_chunk → turn_end →
-agent_idle`) that proves the dispatcher abstraction is genuinely
-harness-neutral through the real subprocess code path, not just through
-adapter-layer fixtures.
+`crates/dispatcher/tests/live_end_to_end.rs`. Per-harness event-ordering
+checks
+(`live_full_stack_emits_turn_start_then_content_then_turn_end` for
+Claude,
+`live_full_stack_codex_emits_turn_start_then_content_then_turn_end`,
+`live_full_stack_gemini_emits_turn_start_then_content_then_turn_end`)
+prove the dispatcher abstraction is genuinely harness-neutral through
+each real subprocess code path, not just through adapter-layer fixtures.
+A coupling regression in any dispatcher-internal layer (TurnId
+generation, AgentIdleGuard, EventEmitter forwarding, per-agent state)
+fails the relevant test.
 
 Live auth probes (`live_check_codex_auth_finds_real_auth_file`,
 `live_check_gemini_auth_finds_real_settings_file`) live inline in

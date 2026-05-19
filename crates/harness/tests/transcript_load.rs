@@ -25,6 +25,7 @@ use switchboard_harness::{
 use uuid::Uuid;
 
 const CLAUDE_TOOL_TOKEN: &str = "SWITCHBOARD_TRANSCRIPT_TOOL_FA21E0";
+const CODEX_TOOL_TOKEN: &str = "SWITCHBOARD_TRANSCRIPT_TOOL_C0D3X1";
 const GEMINI_TOOL_TOKEN: &str = "SWITCHBOARD_TRANSCRIPT_TOOL_GEM1N1";
 
 fn real_home() -> PathBuf {
@@ -242,6 +243,104 @@ async fn live_codex_transcript_load_via_sidecar_round_trips() {
     assert_user(user, &agent.id, prompt);
     assert_agent_completed(agent_turn, &agent.id, &live_text);
     assert_codex_agent_usage(agent_turn);
+}
+
+#[tokio::test]
+#[ignore = "requires codex installed — run with: make test-live"]
+async fn live_codex_transcript_load_hydrates_tool_items() {
+    // Drift-detection for Codex's tool-item hydration. The text
+    // round-trip above proves Codex's user/agent turns survive
+    // hydration; the live `tool_use.rs` test proves the shell tool
+    // emits paired ToolStarted/ToolCompleted events on the stream.
+    // Neither catches a regression where the on-disk session file's
+    // tool-record shape changes such that tool calls stop being
+    // reconstructed (a Codex CLI bump renaming `function_call` or its
+    // `output` payload field). Hydration is sidecar-driven and
+    // date-partition-dependent — structurally different from Claude's
+    // and Gemini's — so its tool-item path needs its own tripwire.
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(tmp.path().join("MARKER.txt"), CODEX_TOOL_TOKEN).expect("write marker");
+
+    let adapter = CodexAdapter::new();
+    let agent = AgentRecord {
+        id: Uuid::now_v7(),
+        project_id: Uuid::now_v7(),
+        name: "transcript-codex-tool".to_owned(),
+        harness: HarnessKind::Codex,
+        session_id: None,
+        created_at: chrono::Utc::now(),
+    };
+    let turn_id = Uuid::now_v7();
+    let stream = adapter
+        .dispatch(
+            &agent,
+            tmp.path(),
+            "Use your shell tool to run `cat MARKER.txt` in the current directory. \
+             Reply with only the file's contents and nothing else.",
+            turn_id,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed with real codex");
+    // Drain the stream to flush the subprocess; the session file isn't
+    // written until the stream completes. Dropping this line would
+    // race the hydration read against the subprocess.
+    let _events: Vec<AdapterEvent> = stream.collect().await;
+
+    let sidecar = sidecar::sidecar_path(tmp.path(), agent.project_id, agent.id);
+    let record = sidecar::read_latest(&sidecar)
+        .expect("sidecar must read cleanly")
+        .expect("sidecar must contain a record after a live dispatch");
+
+    let transcript = switchboard_harness::load_codex_transcript(
+        &real_home(),
+        tmp.path(),
+        &record.session_id,
+        Some(record.session_partition_date),
+        agent.id,
+    )
+    .expect("load_codex_transcript must succeed");
+    assert!(
+        transcript.warnings.is_empty(),
+        "expected no parser warnings; got: {:?}",
+        transcript.warnings
+    );
+
+    let agent_turn = transcript
+        .turns
+        .iter()
+        .find(|t| matches!(t, Turn::Agent { .. }))
+        .expect("hydrated transcript must contain a Turn::Agent");
+    let Turn::Agent { items, .. } = agent_turn else {
+        unreachable!();
+    };
+
+    // Find the tool item whose output carries the staged sentinel rather
+    // than picking the first tool item — robust against Codex emitting
+    // an additional preliminary tool before the shell `cat`.
+    let (is_error, name) = items
+        .iter()
+        .find_map(|item| match item {
+            TurnItem::Tool {
+                output: Some(output),
+                is_error,
+                name,
+                ..
+            } if output.contains(CODEX_TOOL_TOKEN) => Some((is_error, name)),
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "hydrated agent turn must contain a TurnItem::Tool whose output carries \
+                 {CODEX_TOOL_TOKEN:?}; items: {items:?}"
+            )
+        });
+    assert!(!name.is_empty(), "hydrated tool item must carry a name");
+    assert_eq!(
+        *is_error,
+        Some(false),
+        "hydrated tool item must record is_error: Some(false)"
+    );
 }
 
 fn first_user_and_agent(turns: &[Turn]) -> (&Turn, &Turn) {

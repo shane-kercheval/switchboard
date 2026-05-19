@@ -38,6 +38,11 @@ export default defineConfig({
     environment: "jsdom",
     setupFiles: ["./tests/setup.ts"],
     include: ["src/**/*.{test,spec}.{ts,svelte}", "tests/**/*.{test,spec}.ts"],
+    // 15s ceiling (vs. Vitest's 5s default) — CI runners cold-start
+    // Svelte component imports unpredictably and the suite saw sporadic
+    // timeout failures at the default. Lower this only if a fast,
+    // reliable component-mount path lands; flake recurrence is worse
+    // than the wider headroom.
     testTimeout: 15000,
   },
 });

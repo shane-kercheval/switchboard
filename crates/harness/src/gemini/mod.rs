@@ -24,7 +24,7 @@
 //!   context. The parser's `GEMINI_INTERNAL_TOOL_NAMES` deny-list filters
 //!   it from `ToolStarted` / `ToolCompleted` emission so it doesn't
 //!   pollute the unified transcript. Constant is shared with the hydrator
-//!   (M3.3) so the rule stays in lockstep across surfaces.
+//!   so the rule stays in lockstep across surfaces.
 //! - **Live tool output may be empty for read-like tools.** Gemini's
 //!   stream emits `output:""` for `read_file` and likely other user-data
 //!   tools even on success; the real content lives in the session file.
@@ -38,8 +38,8 @@
 //!   is acceptable to downstream consumers (the version field is
 //!   display-only).
 //!
-//! MCP server loading and skills discovery for Gemini are deferred to a
-//! later milestone; the adapter emits
+//! MCP server loading and skills discovery for Gemini are not yet
+//! implemented; the adapter emits
 //! `SessionMeta { mcp_servers: vec![], skills: vec![] }` until those
 //! loaders land.
 

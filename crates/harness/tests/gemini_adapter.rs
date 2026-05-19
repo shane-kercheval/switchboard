@@ -237,9 +237,9 @@ async fn error_invalid_model_fixture_emits_failed_with_harness_error_kind() {
 
 #[tokio::test]
 async fn auth_failure_inline_fixture_emits_auth_failure_kind() {
-    // Inline-JSON fixture: M3.1 did not capture an auth-failure stream
-    // because triggering one would break the developer's OAuth state. The
-    // adapter's `result.status:"error"` path routes through
+    // Inline-JSON fixture: live capture did not yield an auth-failure
+    // stream because triggering one would break the developer's OAuth
+    // state. The adapter's `result.status:"error"` path routes through
     // `is_gemini_auth_failure_message`, which matches any of three auth-signal
     // substrings. We pin the round-trip here.
     let tmp = TempDir::new().unwrap();

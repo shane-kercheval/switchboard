@@ -63,7 +63,7 @@ pub fn resolve_gemini_project_name(home_dir: &Path, cwd: &Path) -> Option<String
     let bytes = std::fs::read(&path).ok()?;
     let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     let cwd_str = canonical.to_str()?;
-    // The file shape observed in M3.1 is `{"projects": {"<abs-cwd>": "<name>"}}`.
+    // The observed file shape is `{"projects": {"<abs-cwd>": "<name>"}}`.
     // The "projects" wrapper key isn't guaranteed across Gemini CLI versions —
     // try both shapes (wrapped + flat) so we degrade gracefully.
     let map = value
@@ -132,7 +132,8 @@ pub fn gemini_session_file_candidates(
 /// ~1/2^32. Existence-by-prefix is effectively existence-by-full-id. A
 /// future cross-collision under an external test fixture would mis-route a
 /// first turn as a resume — handled by `--resume <unknown-uuid>` failing
-/// with exit 42, surfaced as `AdapterFailure`. Acceptable v1 behavior.
+/// with exit 42, surfaced as `AdapterFailure`. Acceptable trade-off
+/// given the probability.
 #[must_use]
 pub fn session_file_exists_for(home_dir: &Path, cwd: &Path, session_id: &Uuid) -> bool {
     !gemini_session_file_candidates(home_dir, cwd, session_id).is_empty()

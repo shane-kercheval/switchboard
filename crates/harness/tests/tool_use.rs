@@ -1,13 +1,21 @@
-//! Live tool-event coverage for both adapters.
+//! Live tool-event coverage across all three adapters.
 //!
 //! Each test prompts the real CLI to use a file-read / shell tool and asserts
-//! that `ToolStarted` is followed by a matching `ToolCompleted` (correlated by
-//! `tool_use_id`, `is_error: false`, output contains the staged sentinel).
-//! Tool *names* differ across harnesses (Claude builtins like `Read`; Codex's
-//! normalized `command_execution`); the matching keys off `tool_use_id`, not
-//! name strings, so a CLI rename of an underlying tool stays non-brittle.
+//! that `ToolStarted` is followed by a matching `ToolCompleted`. Pairing
+//! shape is per-harness:
 //!
-//! Run with: `make test-live`. Both tests are `#[ignore]`-gated.
+//! - Claude / Codex: sentinel-in-output (`ToolCompleted.output` contains the
+//!   staged sentinel, `is_error: false`), correlated by `tool_use_id`. A
+//!   CLI-side tool rename (`Read` → something else, normalized
+//!   `command_execution` → other) stays non-brittle because the matching
+//!   keys off the id, not the name.
+//! - Gemini: lifecycle-only — pair from the `ToolStarted` side by matching
+//!   the prompt's staged path against the `input` JSON. Gemini's stream
+//!   emits `tool_result.output = ""` for read-like tools (the real content
+//!   lives in the session file, surfaced via transcript hydration), so
+//!   sentinel-in-output pairing doesn't apply.
+//!
+//! Run with: `make test-live`. All tests are `#[ignore]`-gated.
 
 use futures::StreamExt;
 use switchboard_core::{AgentRecord, HarnessKind};

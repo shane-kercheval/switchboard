@@ -1,27 +1,32 @@
-//! Live end-to-end integration tests against real `claude`.
+//! Live end-to-end integration tests against real `claude` and `gemini`.
 //!
 //! Exercises the **full backend vertical slice** that a user actually
 //! triggers: `Directory::init` → `create_project` → `register_agent` →
-//! `Dispatcher::send_message` → real `claude` subprocess → events streamed
-//! back through the `EventEmitter`. Uses realistic on-disk paths so any
+//! `Dispatcher::send_message` → real subprocess → events streamed back
+//! through the `EventEmitter`. Uses realistic on-disk paths so any
 //! path-encoding rule or cwd-semantic decision is exercised against the
 //! actual layout.
 //!
 //! Why this layer matters: pure unit tests and adapter-only live tests can
-//! pass while the integration path still has a bug. Two real regressions
-//! that this layer guards against:
+//! pass while the integration path still has a bug. Concrete regressions
+//! this layer guards against:
 //!
 //! - The session-id encoding bug (`/` → `-` only, missing `. → -`) —
 //!   detected by `live_full_stack_two_consecutive_turns_succeed`, which
-//!   exercises session resume across two turns.
+//!   exercises session resume across two Claude turns.
 //! - The cwd bug (claude was spawned in `.switchboard/projects/<uuid>/`
 //!   instead of the user's bound working directory, so it couldn't see the
 //!   user's repo files) — detected by `live_full_stack_claude_sees_files_in_cwd`,
 //!   which writes a file into the working dir and asserts claude can read it.
+//! - A future dispatcher branch that's secretly harness-specific — the
+//!   Gemini event-ordering check (`live_full_stack_gemini_emits_turn_start_then_content_then_turn_end`)
+//!   asserts the same `turn_start → content_chunk → turn_end → agent_idle`
+//!   contract holds through a different real subprocess. Any accidental
+//!   coupling of the dispatcher to Claude-specific behavior surfaces here.
 //!
 //! Run with: `make test-live`. Gated behind `#[ignore]` because each test
-//! costs real claude credits (~$0.08–$0.16 per run) and requires
-//! authenticated `claude` on PATH.
+//! costs real credits and requires the corresponding CLI installed and
+//! authenticated.
 
 use std::sync::Arc;
 

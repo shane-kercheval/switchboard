@@ -2,15 +2,16 @@
 ///
 /// Run with: `make test-live`
 ///
-/// Requires `claude` and/or `codex` installed and authenticated. Developer-local
-/// only — not run in CI. See `AGENTS.md` "Live testing against real harnesses"
-/// for the policy.
+/// Requires `claude`, `codex`, and/or `gemini` installed and authenticated.
+/// Developer-local only — not run in CI. See `AGENTS.md` "Live testing
+/// against real harnesses" for the policy.
 use std::path::Path;
 
 use futures::StreamExt;
 use switchboard_core::{AgentRecord, HarnessKind};
 use switchboard_harness::{
-    AdapterEvent, ClaudeCodeAdapter, CodexAdapter, DispatchOptions, HarnessAdapter, TurnOutcome,
+    AdapterEvent, ClaudeCodeAdapter, CodexAdapter, DispatchOptions, GeminiAdapter, HarnessAdapter,
+    TurnOutcome,
 };
 use uuid::Uuid;
 
@@ -408,5 +409,146 @@ async fn live_codex_resume_reuses_session() {
     assert_eq!(
         r1["session_partition_date"], r2["session_partition_date"],
         "resume preserves session_partition_date"
+    );
+}
+
+// --- Gemini live tests ---
+
+fn live_gemini_agent() -> AgentRecord {
+    AgentRecord {
+        id: Uuid::now_v7(),
+        project_id: Uuid::now_v7(),
+        name: "live-gemini-agent".to_owned(),
+        harness: HarnessKind::Gemini,
+        // Gemini follows the Claude shape — caller-controlled session UUID.
+        // **UUID v4, not v7**: Gemini's session-file filename uses the first
+        // 8 hex chars of the session UUID, and v7s minted in the same
+        // millisecond share their first 8 chars. v4 makes the collision
+        // probability ~1/2^32. The production `Project::register_agent`
+        // honors this contract; tests must mint v4 explicitly here too.
+        session_id: Some(Uuid::new_v4()),
+        created_at: chrono::Utc::now(),
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires gemini installed — run with: make test-live"]
+async fn live_gemini_basic_turn_completes() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let adapter = GeminiAdapter::new();
+    let agent = live_gemini_agent();
+    let turn_id = Uuid::now_v7();
+
+    let stream = adapter
+        .dispatch(
+            &agent,
+            tmp.path(),
+            "Reply with the single word 'ack' and nothing else.",
+            turn_id,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed with real gemini");
+
+    let events: Vec<AdapterEvent> = stream.collect().await;
+
+    let text: String = events
+        .iter()
+        .filter_map(|e| {
+            if let AdapterEvent::ContentChunk { text, .. } = e {
+                Some(text.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert!(
+        text.to_lowercase().contains("ack"),
+        "expected 'ack' in response text, got: {text:?}"
+    );
+
+    let terminal = events
+        .iter()
+        .find(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+        .expect("should have a terminal TurnEnd");
+    assert!(
+        matches!(
+            terminal,
+            AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        ),
+        "expected TurnEnd(Completed), got: {terminal:?}"
+    );
+
+    // Gemini emits `SessionMeta` from its stream `init` event on every
+    // dispatch. The contract is asymmetric vs. Claude / Codex:
+    // - `model` populates from `init.model`.
+    // - `tools` is always `vec![]` — Gemini's `init` doesn't carry tools.
+    // - `harness_version` comes from a lazy `gemini --version` fetch on
+    //   first dispatch; empty string is tolerated if the version probe
+    //   fails (the field is display-only).
+    let session_meta = events
+        .iter()
+        .find(|e| matches!(e, AdapterEvent::SessionMeta { .. }))
+        .expect("Gemini must emit SessionMeta from stream init on every dispatch");
+    match session_meta {
+        AdapterEvent::SessionMeta { model, tools, .. } => {
+            assert!(!model.is_empty(), "SessionMeta.model must be non-empty");
+            assert!(tools.is_empty(), "Gemini SessionMeta.tools is vec![]");
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires gemini installed — run with: make test-live"]
+async fn live_gemini_resume_reuses_session() {
+    // Memorize-then-recall: definitive proof that `--resume` restores the
+    // prior turn's context (matches the Codex pattern, strictly stronger
+    // than "two completes succeed"). The adapter must detect the session
+    // file from turn 1 and switch from `--session-id` to `--resume` on
+    // turn 2. A regression in the path-lookup helper would surface here
+    // as the recall failing.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let adapter = GeminiAdapter::new();
+    let agent = live_gemini_agent();
+
+    let turn1 = Uuid::now_v7();
+    let stream1 = adapter
+        .dispatch(
+            &agent,
+            tmp.path(),
+            "Remember the word 'mango'. Reply with only 'ok'.",
+            turn1,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("first dispatch should succeed");
+    let _events1: Vec<AdapterEvent> = stream1.collect().await;
+
+    let turn2 = Uuid::now_v7();
+    let stream2 = adapter
+        .dispatch(
+            &agent,
+            tmp.path(),
+            "What word did I ask you to remember? Reply with only that word.",
+            turn2,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("resume dispatch should succeed");
+    let events2: Vec<AdapterEvent> = stream2.collect().await;
+    let recall_text: String = events2
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::ContentChunk { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        recall_text.to_lowercase().contains("mango"),
+        "--resume must restore the prior turn's context: turn2 reply was {recall_text:?}"
     );
 }

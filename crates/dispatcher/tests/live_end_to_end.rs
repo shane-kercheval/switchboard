@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use switchboard_core::{Directory, HarnessKind};
 use switchboard_dispatcher::{Dispatcher, EventEmitter, RecordingEmitter};
-use switchboard_harness::{ClaudeCodeAdapter, DispatchOptions, HarnessAdapter};
+use switchboard_harness::{ClaudeCodeAdapter, DispatchOptions, GeminiAdapter, HarnessAdapter};
 use tempfile::TempDir;
 
 /// Extracts the `outcome.status` strings from every `turn_end` event the
@@ -311,4 +311,92 @@ async fn live_full_stack_claude_sees_files_in_cwd() {
         "claude's response must contain the marker token (proves it read the file from the cwd); \
          got text: {text:?}"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires gemini installed and authenticated — run with: make test-live"]
+async fn live_full_stack_gemini_emits_turn_start_then_content_then_turn_end() {
+    // The canonical empirical assertion of M3's headline claim: the
+    // dispatcher abstraction is genuinely harness-neutral. Same
+    // event-ordering contract (turn_start → content_chunk → turn_end →
+    // agent_idle) must hold through the dispatcher for Gemini exactly
+    // as it does for Claude — proved through the real `gemini`
+    // subprocess code path, not just through adapter-layer fixtures.
+    //
+    // `Project::register_agent` mints UUID v4 for Gemini because session
+    // filenames use the first 8 hex chars of the session UUID and v7s
+    // minted in the same millisecond share that prefix. No special
+    // test-side handling needed; the production path honors this.
+    let tmp = TempDir::new().expect("tempdir");
+    let directory = Directory::at(tmp.path()).expect("Directory::at");
+    directory.init().expect("init");
+    let project = directory
+        .create_project("gemini-order-test")
+        .expect("project");
+    let agent = project
+        .register_agent("assistant", HarnessKind::Gemini)
+        .expect("agent");
+    assert!(
+        agent.session_id.is_some(),
+        "Gemini agents must have a pre-generated session_id (Claude-shape)"
+    );
+
+    let dispatcher = Arc::new(Dispatcher::new());
+    let adapter: Arc<dyn HarnessAdapter> = Arc::new(GeminiAdapter::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let channel = format!("agent:{}", agent.id);
+
+    let handle = dispatcher
+        .send_message(
+            &agent,
+            &project.directory,
+            "Reply with exactly: hi",
+            adapter.as_ref(),
+            Arc::clone(&emitter) as Arc<dyn EventEmitter>,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("send_message");
+    handle.join.await.expect("drain joined");
+
+    let kinds: Vec<String> = emitter
+        .snapshot()
+        .into_iter()
+        .filter(|(name, _)| name == &channel)
+        .map(|(_, payload)| payload["type"].as_str().unwrap_or("").to_owned())
+        .collect();
+
+    assert_eq!(
+        kinds.first().map(String::as_str),
+        Some("turn_start"),
+        "first event on the channel must be turn_start; got: {kinds:?}"
+    );
+    assert_eq!(
+        kinds.last().map(String::as_str),
+        Some("agent_idle"),
+        "last event must be agent_idle; got: {kinds:?}"
+    );
+    assert_eq!(
+        kinds.iter().filter(|k| *k == "turn_end").count(),
+        1,
+        "must be exactly one terminal event per turn; got: {kinds:?}"
+    );
+    assert_eq!(
+        kinds.iter().filter(|k| *k == "agent_idle").count(),
+        1,
+        "exactly one agent_idle per dispatch; got: {kinds:?}"
+    );
+    let turn_end_idx = kinds.iter().position(|k| k == "turn_end").unwrap();
+    let agent_idle_idx = kinds.iter().position(|k| k == "agent_idle").unwrap();
+    assert!(
+        turn_end_idx < agent_idle_idx,
+        "turn_end must precede agent_idle; got: {kinds:?}"
+    );
+    assert!(
+        kinds.iter().any(|k| k == "content_chunk"),
+        "at least one content_chunk expected for a real-gemini completion; got: {kinds:?}"
+    );
+
+    let statuses = turn_end_statuses(&emitter, &channel);
+    assert_eq!(statuses, vec!["completed".to_owned()]);
 }

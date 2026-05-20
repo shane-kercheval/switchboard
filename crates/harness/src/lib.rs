@@ -27,6 +27,7 @@ pub mod transcript;
 
 pub use adapter::{DispatchError, DispatchOptions, EventStream, HarnessAdapter};
 pub use antigravity::AntigravityAdapter;
+pub use antigravity::session_file::load_antigravity_transcript;
 pub use claude_code::{ClaudeCodeAdapter, claude_session_file_path, load_claude_transcript};
 pub use codex::CodexAdapter;
 pub use codex::session_file::{

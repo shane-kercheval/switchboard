@@ -145,18 +145,20 @@ pub enum AppError {
     #[error(transparent)]
     LoadTranscript(#[from] switchboard_harness::LoadTranscriptError),
 
-    /// Transcript hydration tripped over a corrupt Codex sidecar. Parallel
-    /// to [`AppError::AttachBlockedByCorruption`] but specific to the
-    /// hydration call path. Sidecars are Switchboard-owned JSONL; per the
-    /// AGENTS.md fail-loud invariant on our own files, corruption must
-    /// surface rather than degrade to "agent has no history."
+    /// Transcript hydration tripped over a corrupt per-agent sidecar (Codex or
+    /// Antigravity — both store the harness session link as Switchboard-owned
+    /// JSONL). Parallel to [`AppError::AttachBlockedByCorruption`] but specific
+    /// to the hydration call path. Per the AGENTS.md fail-loud invariant on our
+    /// own files, corruption must surface rather than degrade to "agent has no
+    /// history." Source is boxed because the two harnesses' sidecar error types
+    /// are distinct.
     #[error(
         "cannot hydrate transcript: sidecar at {path} is corrupt — repair or remove before retrying"
     )]
     HydrationBlockedByCorruption {
         path: PathBuf,
         #[source]
-        source: switchboard_harness::codex::sidecar::SidecarError,
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
     },
 }
 

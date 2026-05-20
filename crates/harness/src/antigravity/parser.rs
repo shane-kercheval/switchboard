@@ -25,10 +25,9 @@ use serde_json::Value;
 
 use crate::events::{AdapterEvent, ContentKind, ToolKind, TurnId};
 
-/// One record (line) of `transcript.jsonl`. Fields beyond these exist
-/// (`created_at`, etc.) but aren't load-bearing for event mapping;
-/// `#[serde]` ignores unknown fields by default, so the type tolerates the
-/// large, growing `type` vocabulary and any future field additions.
+/// One record (line) of `transcript.jsonl`. The fields below are the subset
+/// Switchboard consumes; `#[serde]` ignores any additional fields, so the type
+/// tolerates the large, growing `type` vocabulary and future field additions.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TranscriptRecord {
     #[serde(default)]
@@ -39,6 +38,16 @@ pub struct TranscriptRecord {
     pub record_type: String,
     #[serde(default)]
     pub status: Option<String>,
+    /// Raw RFC3339 UTC timestamp string the record was written. Kept as a
+    /// string (not a typed `DateTime`) so a present-but-unparseable value —
+    /// plausible if Antigravity drifts its timestamp format — degrades to a
+    /// dropped timestamp rather than failing the whole-record deserialize and
+    /// silently losing the user prompt or answer. Hydration parses it
+    /// leniently and carries the prior record's timestamp forward on failure
+    /// (deterministic, no wall-clock). The live path ignores it (process exit
+    /// is the live terminator).
+    #[serde(default)]
+    pub created_at: Option<String>,
     #[serde(default)]
     pub content: Option<String>,
     #[serde(default)]
@@ -63,14 +72,14 @@ impl TranscriptRecord {
     /// `MODEL` + `PLANNER_RESPONSE` is the model's turn: it carries
     /// `thinking`, optional `tool_calls`, and (when the model is done)
     /// final answer `content`.
-    fn is_planner_response(&self) -> bool {
+    pub(crate) fn is_planner_response(&self) -> bool {
         self.source == "MODEL" && self.record_type == "PLANNER_RESPONSE"
     }
 
     /// A `MODEL` record that is not a planner response is a tool result
     /// (`RUN_COMMAND`, `VIEW_FILE`, `CortexStep*`...). Its `content` is a
     /// pre-rendered text blob.
-    fn is_tool_result(&self) -> bool {
+    pub(crate) fn is_tool_result(&self) -> bool {
         self.source == "MODEL" && !self.is_planner_response()
     }
 
@@ -166,7 +175,7 @@ pub fn record_to_live_events(
 /// would be `Mcp`, but the transcript records the underlying tool name, not
 /// the Cortex step type, so we can't reliably distinguish MCP here yet.
 /// Defaults to `Builtin`; refine when an MCP probe pins the name shape.
-fn classify_tool_kind(_name: &str) -> ToolKind {
+pub(crate) fn classify_tool_kind(_name: &str) -> ToolKind {
     ToolKind::Builtin
 }
 

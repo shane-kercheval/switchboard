@@ -33,3 +33,7 @@ crates/app/gen/
 # Local switchboard state
 .switchboard/
 /.antigravitycli
+
+# fake_agy test-fixture control files (written into per-test cwds by
+# fixture-backed dispatches)
+.fake_agy.*

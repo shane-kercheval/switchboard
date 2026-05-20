@@ -35,6 +35,7 @@
 
 pub mod parser;
 pub mod paths;
+pub mod session_file;
 pub mod sidecar;
 
 use std::collections::VecDeque;
@@ -62,6 +63,16 @@ use sidecar::{SessionLinkRecord, append_record, read_latest, sidecar_path};
 /// The binary name on PATH. Centralized so the adapter and the pre-adapter
 /// binary probe agree on the name.
 pub const BINARY_NAME: &str = "agy";
+
+/// Control-file names for the `fake_agy` test fixture binary, read from the
+/// dispatch cwd. Defined in the library (not the bin) so the fixture binary
+/// and the integration tests share one source of truth and can't drift.
+/// Unused by production dispatch — `agy` ignores them.
+pub const FAKE_AGY_SCRIPT_FILE: &str = ".fake_agy.json";
+/// Append-only log of each `fake_agy` invocation's argv (one line per spawn),
+/// so tests can assert what flags the adapter passed across dispatches (e.g.
+/// `--conversation <healed-uuid>` on the post-fork resume).
+pub const FAKE_AGY_INVOCATIONS_FILE: &str = ".fake_agy.invocations";
 
 /// Poll interval for UUID-directory discovery and transcript tailing.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -178,6 +189,17 @@ impl HarnessAdapter for AntigravityAdapter {
             .stderr(Stdio::piped())
             .stdin(Stdio::null())
             .kill_on_drop(true);
+        // When a home override is set (tests), pass it to the child as `HOME`
+        // so the conversation directory the child writes
+        // (`$HOME/.gemini/antigravity-cli/brain/<uuid>/`) and the directory the
+        // producer watches resolve to the *same* path. Without this they'd
+        // diverge — the producer would watch the override while `agy` wrote to
+        // the real `$HOME` — and capture would silently never bind. Production
+        // never sets the override (`new()` reads the real `$HOME`), so this is
+        // a no-op there.
+        if let Some(home) = &self.home_dir_override {
+            command.env("HOME", home);
+        }
         #[cfg(unix)]
         command.process_group(0);
         let mut child = command.spawn().map_err(|e| {

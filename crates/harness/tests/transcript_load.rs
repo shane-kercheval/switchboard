@@ -19,8 +19,9 @@ use std::path::PathBuf;
 use futures::StreamExt;
 use switchboard_core::{AgentRecord, HarnessKind};
 use switchboard_harness::{
-    AdapterEvent, ClaudeCodeAdapter, CodexAdapter, DispatchOptions, GeminiAdapter, HarnessAdapter,
-    Turn, TurnItem, TurnStatus, codex::sidecar,
+    AdapterEvent, AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, DispatchOptions,
+    GeminiAdapter, HarnessAdapter, Turn, TurnItem, TurnStatus, antigravity, codex::sidecar,
+    load_antigravity_transcript,
 };
 use uuid::Uuid;
 
@@ -607,5 +608,83 @@ fn assert_gemini_agent_usage(turn: &Turn) {
         usage.context_window.is_none(),
         "Gemini hydrated usage.context_window must be None (no analog in session file); got: {:?}",
         usage.context_window
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires agy installed — run with: make test-live"]
+async fn live_antigravity_two_turns_hydrate_in_order() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let adapter = AntigravityAdapter::new();
+    let agent = AgentRecord {
+        id: Uuid::now_v7(),
+        project_id: Uuid::now_v7(),
+        name: "transcript-agy".to_owned(),
+        harness: HarnessKind::Antigravity,
+        // Antigravity agents carry session_id: None; the conversation UUID
+        // lives in the per-agent sidecar after the first dispatch.
+        session_id: None,
+        created_at: chrono::Utc::now(),
+    };
+
+    // Two prompts against the same agent: the second resumes via the sidecar
+    // and appends to the same transcript.jsonl (single-file-per-conversation).
+    for prompt in [
+        "Reply with only the single word 'one' and nothing else.",
+        "Reply with only the single word 'two' and nothing else.",
+    ] {
+        let stream = adapter
+            .dispatch(
+                &agent,
+                tmp.path(),
+                prompt,
+                Uuid::now_v7(),
+                DispatchOptions::default(),
+            )
+            .await
+            .expect("dispatch should succeed with real agy");
+        let _events: Vec<AdapterEvent> = stream.collect().await;
+    }
+
+    let sidecar = antigravity::sidecar::sidecar_path(tmp.path(), agent.project_id, agent.id);
+    let record = antigravity::sidecar::read_latest(&sidecar)
+        .expect("sidecar must read cleanly")
+        .expect("sidecar must contain a record after live dispatches");
+
+    let transcript =
+        load_antigravity_transcript(&real_home(), tmp.path(), record.conversation_id, agent.id)
+            .expect("load_antigravity_transcript must succeed");
+
+    assert!(
+        transcript.warnings.is_empty(),
+        "expected no parser warnings; got: {:?}",
+        transcript.warnings
+    );
+
+    // Both prompts surface as user turns, in dispatch order, attributed to the
+    // agent; each is followed by an agent turn.
+    let user_turns: Vec<&Turn> = transcript
+        .turns
+        .iter()
+        .filter(|t| matches!(t, Turn::User { .. }))
+        .collect();
+    assert!(
+        user_turns.len() >= 2,
+        "expected at least two user turns; got {}",
+        user_turns.len()
+    );
+    for turn in &transcript.turns {
+        let agent_id = match turn {
+            Turn::User { agent_id, .. } | Turn::Agent { agent_id, .. } => *agent_id,
+            _ => continue,
+        };
+        assert_eq!(agent_id, agent.id, "every turn attributed to the agent");
+    }
+    assert!(
+        transcript
+            .turns
+            .iter()
+            .any(|t| matches!(t, Turn::Agent { .. })),
+        "expected at least one agent turn"
     );
 }

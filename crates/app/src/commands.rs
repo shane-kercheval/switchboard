@@ -645,7 +645,7 @@ pub fn load_transcript_impl(
             let latest = switchboard_harness::codex::sidecar::read_latest(&sidecar_path).map_err(
                 |source| AppError::HydrationBlockedByCorruption {
                     path: sidecar_path.clone(),
-                    source,
+                    source: Box::new(source),
                 },
             )?;
             let (session_id, partition_date) = match latest {
@@ -668,6 +668,33 @@ pub fn load_transcript_impl(
                 home_dir,
                 &directory.path,
                 session_id,
+                agent.id,
+            )?)
+        }
+        HarnessKind::Antigravity => {
+            // Antigravity agents carry `session_id: None` — the conversation
+            // UUID is server-assigned and lives in the per-agent sidecar, so
+            // this follows the Codex shape (sidecar lookup), not the Gemini
+            // one (`agent.session_id`). Corrupt sidecar is fail-loud per the
+            // Switchboard-owned-JSONL invariant; `Ok(None)` is the legitimate
+            // never-dispatched case → empty transcript.
+            let sidecar_path = switchboard_harness::antigravity::sidecar::sidecar_path(
+                &directory.path,
+                project.id,
+                agent.id,
+            );
+            let latest = switchboard_harness::antigravity::sidecar::read_latest(&sidecar_path)
+                .map_err(|source| AppError::HydrationBlockedByCorruption {
+                    path: sidecar_path.clone(),
+                    source: Box::new(source),
+                })?;
+            let Some(record) = latest else {
+                return Ok(switchboard_harness::LoadedTranscript::default());
+            };
+            Ok(switchboard_harness::load_antigravity_transcript(
+                home_dir,
+                &directory.path,
+                record.conversation_id,
                 agent.id,
             )?)
         }
@@ -2719,6 +2746,79 @@ mod tests {
             }
             other => panic!("expected HydrationBlockedByCorruption, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn load_transcript_for_antigravity_agent_without_sidecar_returns_empty() {
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        // Antigravity agent never dispatched → no sidecar → empty transcript.
+        let record = create_agent_impl(&state, "agy_one", HarnessKind::Antigravity).unwrap();
+        let result = load_transcript_impl(&state, record.id, tmp_home.path()).unwrap();
+        assert!(result.turns.is_empty());
+    }
+
+    #[tokio::test]
+    async fn load_transcript_for_antigravity_agent_with_corrupt_sidecar_returns_typed_error() {
+        let (tmp_workdir, tmp_home, state, proj) = fresh_state_with_active_project("alpha").await;
+        let agent = create_agent_impl(&state, "agy_corrupt", HarnessKind::Antigravity).unwrap();
+        let canonical_workdir = tmp_workdir.path().canonicalize().unwrap();
+        let bad_sidecar = switchboard_harness::antigravity::sidecar::sidecar_path(
+            &canonical_workdir,
+            proj.id,
+            agent.id,
+        );
+        std::fs::create_dir_all(bad_sidecar.parent().unwrap()).unwrap();
+        std::fs::write(&bad_sidecar, b"this is not json\n").unwrap();
+
+        let err = load_transcript_impl(&state, agent.id, tmp_home.path()).unwrap_err();
+        match err {
+            AppError::HydrationBlockedByCorruption { path, .. } => assert_eq!(path, bad_sidecar),
+            other => panic!("expected HydrationBlockedByCorruption, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn load_transcript_for_antigravity_agent_hydrates_prior_turns() {
+        let (tmp_workdir, tmp_home, state, proj) = fresh_state_with_active_project("alpha").await;
+        let agent = create_agent_impl(&state, "agy_hydrate", HarnessKind::Antigravity).unwrap();
+        let canonical_workdir = tmp_workdir.path().canonicalize().unwrap();
+
+        // Sidecar: the server-assigned conversation UUID captured at dispatch.
+        let conversation_id = Uuid::new_v4();
+        let sidecar = switchboard_harness::antigravity::sidecar::sidecar_path(
+            &canonical_workdir,
+            proj.id,
+            agent.id,
+        );
+        switchboard_harness::antigravity::sidecar::append_record(
+            &sidecar,
+            &switchboard_harness::antigravity::sidecar::SessionLinkRecord {
+                conversation_id,
+                captured_at: chrono::Utc::now(),
+            },
+        )
+        .unwrap();
+
+        // Transcript: one user prompt + one model answer.
+        let transcript = switchboard_harness::antigravity::paths::transcript_path(
+            tmp_home.path(),
+            conversation_id,
+        );
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-05-19T19:00:00Z","content":"<USER_REQUEST>\nremember mango\n</USER_REQUEST>"}"#,
+                "\n",
+                r#"{"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-05-19T19:00:01Z","content":"mango"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let result = load_transcript_impl(&state, agent.id, tmp_home.path()).unwrap();
+        assert_eq!(result.turns.len(), 2);
+        assert!(result.meta.is_some());
     }
 
     // -----------------------------------------------------------------

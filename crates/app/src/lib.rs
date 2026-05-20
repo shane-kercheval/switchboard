@@ -12,7 +12,8 @@ use std::sync::Arc;
 
 use switchboard_dispatcher::EventEmitter;
 use switchboard_harness::{
-    ClaudeCodeAdapter, CodexAdapter, GeminiAdapter, HarnessAdapter, MockHarnessAdapter,
+    AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, GeminiAdapter, HarnessAdapter,
+    MockHarnessAdapter,
 };
 use tauri::{Emitter, Manager, State};
 
@@ -59,11 +60,8 @@ async fn check_gemini_auth() -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn check_antigravity_binary() -> Result<(), String> {
-    // No AppState lookup: Antigravity is not registered as an adapter
-    // until dispatch wiring lands. The binary probe is a direct PATH
-    // check against `agy`.
-    check_antigravity_binary_impl().map_err(|e| e.to_string())
+async fn check_antigravity_binary(state: State<'_, AppState>) -> Result<(), String> {
+    check_antigravity_binary_impl(state.inner()).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -198,12 +196,18 @@ impl EventEmitter for AppHandleEmitter {
 /// - `"mock"` → all three adapters = `MockHarnessAdapter`.
 /// - Any other value → panic (silent fall-through to default would be a footgun).
 ///
-/// Returns `(claude_adapter, codex_adapter, gemini_adapter)`. All three are
-/// constructed under "claude"/unset because the `match agent.harness`
+/// Returns `(claude_adapter, codex_adapter, gemini_adapter, antigravity_adapter)`.
+/// All are constructed under "claude"/unset because the `match agent.harness`
 /// routing in `send_message_impl` may dispatch to any at runtime; no
 /// adapter's constructor performs a binary check, so missing CLIs only
 /// surface at `check_*_binary` time, not at app startup.
+// A 4-tuple of the same trait object reads as "complex" to clippy, but a
+// named struct for a private one-call-site startup helper would be more
+// ceremony than it's worth — the tuple is destructured immediately at the
+// single call site in `run`.
+#[allow(clippy::type_complexity)]
 fn build_adapters() -> (
+    Arc<dyn HarnessAdapter>,
     Arc<dyn HarnessAdapter>,
     Arc<dyn HarnessAdapter>,
     Arc<dyn HarnessAdapter>,
@@ -212,12 +216,18 @@ fn build_adapters() -> (
         Ok("mock") => {
             tracing::info!("SWITCHBOARD_HARNESS=mock — using MockHarnessAdapter for all harnesses");
             let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
-            (Arc::clone(&mock), Arc::clone(&mock), mock)
+            (
+                Arc::clone(&mock),
+                Arc::clone(&mock),
+                Arc::clone(&mock),
+                mock,
+            )
         }
         Ok("claude") | Err(_) => (
             Arc::new(ClaudeCodeAdapter::new()),
             Arc::new(CodexAdapter::new()),
             Arc::new(GeminiAdapter::new()),
+            Arc::new(AntigravityAdapter::new()),
         ),
         Ok(other) => panic!(
             "invalid SWITCHBOARD_HARNESS={other:?}; expected one of: claude, mock (or unset for default)"
@@ -234,7 +244,7 @@ pub fn run() {
         )
         .try_init();
 
-    let (claude_adapter, codex_adapter, gemini_adapter) = build_adapters();
+    let (claude_adapter, codex_adapter, gemini_adapter, antigravity_adapter) = build_adapters();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -246,6 +256,7 @@ pub fn run() {
                 Arc::clone(&claude_adapter),
                 Arc::clone(&codex_adapter),
                 Arc::clone(&gemini_adapter),
+                Arc::clone(&antigravity_adapter),
                 emitter,
             ));
             Ok(())

@@ -566,6 +566,7 @@ pub async fn send_message_impl(
         HarnessKind::ClaudeCode => state.claude_adapter.as_ref(),
         HarnessKind::Codex => state.codex_adapter.as_ref(),
         HarnessKind::Gemini => state.gemini_adapter.as_ref(),
+        HarnessKind::Antigravity => state.antigravity_adapter.as_ref(),
         _ => return Err(AppError::UnsupportedHarness),
     };
     // Read (don't drain) the attach-flow flag. The per-dispatch emitter
@@ -686,12 +687,10 @@ pub fn check_gemini_binary_impl(state: &AppState) -> Result<(), AppError> {
     state.gemini_adapter.probe().map_err(AppError::Probe)
 }
 
-/// Probe `agy` on PATH. Free function (not adapter-driven) because no
-/// Antigravity adapter is registered in `AppState` until dispatch wiring
-/// lands; the underlying `which::which("agy")` lookup is identical to
-/// what the future adapter's `probe()` will do.
-pub fn check_antigravity_binary_impl() -> Result<(), AppError> {
-    switchboard_harness::antigravity::probe_binary().map_err(AppError::Probe)
+/// Probe `agy` on PATH via the registered Antigravity adapter — same shape
+/// as the other three harness binary checks.
+pub fn check_antigravity_binary_impl(state: &AppState) -> Result<(), AppError> {
+    state.antigravity_adapter.probe().map_err(AppError::Probe)
 }
 
 /// Supported macOS Keychain service / account for Antigravity auth.
@@ -865,6 +864,7 @@ mod tests {
             Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
+            Arc::clone(&mock),
             emitter.clone() as Arc<dyn EventEmitter>,
         );
         (tmp, state, emitter)
@@ -890,6 +890,7 @@ mod tests {
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
         let state = AppState::new(
+            Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
@@ -1064,6 +1065,7 @@ mod tests {
             Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
+            Arc::clone(&mock),
             emitter as Arc<dyn EventEmitter>,
         ));
         init_directory_impl(&state, tmp.path().to_str().unwrap())
@@ -1125,7 +1127,14 @@ mod tests {
         let codex: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let gemini: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
-        let state = AppState::new(claude, codex, gemini, emitter as Arc<dyn EventEmitter>);
+        let antigravity: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let state = AppState::new(
+            claude,
+            codex,
+            gemini,
+            antigravity,
+            emitter as Arc<dyn EventEmitter>,
+        );
         let err = check_claude_binary_impl(&state).unwrap_err();
         assert!(matches!(err, AppError::Probe(_)));
     }
@@ -1188,7 +1197,14 @@ mod tests {
             Arc::new(CodexAdapter::with_binary_path("/nonexistent/codex-xyz"));
         let gemini: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
-        let state = AppState::new(claude, codex, gemini, emitter as Arc<dyn EventEmitter>);
+        let antigravity: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let state = AppState::new(
+            claude,
+            codex,
+            gemini,
+            antigravity,
+            emitter as Arc<dyn EventEmitter>,
+        );
         let err = check_codex_binary_impl(&state).unwrap_err();
         assert!(matches!(err, AppError::Probe(_)));
     }
@@ -1207,7 +1223,14 @@ mod tests {
         let gemini: Arc<dyn HarnessAdapter> =
             Arc::new(GeminiAdapter::with_binary_path("/nonexistent/gemini-xyz"));
         let emitter = Arc::new(RecordingEmitter::new());
-        let state = AppState::new(claude, codex, gemini, emitter as Arc<dyn EventEmitter>);
+        let antigravity: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let state = AppState::new(
+            claude,
+            codex,
+            gemini,
+            antigravity,
+            emitter as Arc<dyn EventEmitter>,
+        );
         let err = check_gemini_binary_impl(&state).unwrap_err();
         assert!(matches!(err, AppError::Probe(_)));
     }
@@ -1341,8 +1364,41 @@ mod tests {
     #[test]
     #[ignore = "requires agy installed — run with: make test-live"]
     fn live_check_antigravity_binary_finds_real_agy_on_path() {
-        check_antigravity_binary_impl()
+        use switchboard_harness::AntigravityAdapter;
+        let claude: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let codex: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let gemini: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let antigravity: Arc<dyn HarnessAdapter> = Arc::new(AntigravityAdapter::new());
+        let emitter = Arc::new(RecordingEmitter::new());
+        let state = AppState::new(
+            claude,
+            codex,
+            gemini,
+            antigravity,
+            emitter as Arc<dyn EventEmitter>,
+        );
+        check_antigravity_binary_impl(&state)
             .expect("agy binary must be on PATH; install from https://antigravity.google/download");
+    }
+
+    #[test]
+    fn check_antigravity_binary_with_missing_binary_returns_error() {
+        use switchboard_harness::AntigravityAdapter;
+        let claude: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let codex: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let gemini: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let antigravity: Arc<dyn HarnessAdapter> =
+            Arc::new(AntigravityAdapter::with_binary_path("/nonexistent/agy-xyz"));
+        let emitter = Arc::new(RecordingEmitter::new());
+        let state = AppState::new(
+            claude,
+            codex,
+            gemini,
+            antigravity,
+            emitter as Arc<dyn EventEmitter>,
+        );
+        let err = check_antigravity_binary_impl(&state).unwrap_err();
+        assert!(matches!(err, AppError::Probe(_)));
     }
 
     /// Drift-detection live test: if Gemini moves its auth file or
@@ -1437,12 +1493,14 @@ mod tests {
     /// `send_message_impl` selects an adapter via `match agent.harness`,
     /// and a regression that hard-codes one adapter would silently spawn
     /// the wrong binary. This test pins that routing against regression
-    /// using three distinguishable adapters tagged per harness.
+    /// using four distinguishable adapters tagged per harness.
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Four harnesses × (construct + dispatch + assert) is inherently long but linear.
     async fn send_message_routes_to_adapter_matching_agent_harness() {
         let claude_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let codex_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let gemini_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let antigravity_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let claude: Arc<dyn HarnessAdapter> = Arc::new(TaggedMockAdapter {
             tag: "from-claude-adapter",
             dispatch_count: claude_count.clone(),
@@ -1455,11 +1513,16 @@ mod tests {
             tag: "from-gemini-adapter",
             dispatch_count: gemini_count.clone(),
         });
+        let antigravity: Arc<dyn HarnessAdapter> = Arc::new(TaggedMockAdapter {
+            tag: "from-antigravity-adapter",
+            dispatch_count: antigravity_count.clone(),
+        });
         let emitter = Arc::new(RecordingEmitter::new());
         let state = AppState::new(
             claude,
             codex,
             gemini,
+            antigravity,
             emitter.clone() as Arc<dyn EventEmitter>,
         );
         let tmp = TempDir::new().unwrap();
@@ -1471,6 +1534,7 @@ mod tests {
         let claude_agent = create_agent_impl(&state, "c1", HarnessKind::ClaudeCode).unwrap();
         let codex_agent = create_agent_impl(&state, "x1", HarnessKind::Codex).unwrap();
         let gemini_agent = create_agent_impl(&state, "g1", HarnessKind::Gemini).unwrap();
+        let antigravity_agent = create_agent_impl(&state, "a1", HarnessKind::Antigravity).unwrap();
 
         let claude_handle = send_message_impl(&state, claude_agent.id, "hi")
             .await
@@ -1484,6 +1548,10 @@ mod tests {
             .await
             .unwrap();
         gemini_handle.join.await.unwrap();
+        let antigravity_handle = send_message_impl(&state, antigravity_agent.id, "hi")
+            .await
+            .unwrap();
+        antigravity_handle.join.await.unwrap();
 
         assert_eq!(
             claude_count.load(std::sync::atomic::Ordering::SeqCst),
@@ -1500,10 +1568,15 @@ mod tests {
             1,
             "Gemini agent dispatch must hit the Gemini adapter exactly once"
         );
+        assert_eq!(
+            antigravity_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "Antigravity agent dispatch must hit the Antigravity adapter exactly once"
+        );
 
         // Secondary check: the emitted ContentChunk tags match the
         // adapter-of-origin per agent_id. Catches mis-routing where dispatch
-        // counts are still 1/1/1 but the wrong adapter served each.
+        // counts are still 1/1/1/1 but the wrong adapter served each.
         let events = emitter.snapshot();
         let claude_channel = format!("agent:{}", claude_agent.id);
         let codex_channel = format!("agent:{}", codex_agent.id);
@@ -1520,9 +1593,17 @@ mod tests {
             .iter()
             .find(|(name, payload)| name == &gemini_channel && payload["type"] == "content_chunk")
             .expect("content_chunk on gemini channel");
+        let antigravity_channel = format!("agent:{}", antigravity_agent.id);
+        let antigravity_text = events
+            .iter()
+            .find(|(name, payload)| {
+                name == &antigravity_channel && payload["type"] == "content_chunk"
+            })
+            .expect("content_chunk on antigravity channel");
         assert_eq!(claude_text.1["text"], "from-claude-adapter");
         assert_eq!(codex_text.1["text"], "from-codex-adapter");
         assert_eq!(gemini_text.1["text"], "from-gemini-adapter");
+        assert_eq!(antigravity_text.1["text"], "from-antigravity-adapter");
     }
 
     #[tokio::test]
@@ -1562,6 +1643,7 @@ mod tests {
         ));
         let emitter = Arc::new(RecordingEmitter::new());
         let state = AppState::new(
+            Arc::clone(&failing),
             Arc::clone(&failing),
             Arc::clone(&failing),
             Arc::clone(&failing),
@@ -1632,6 +1714,7 @@ mod tests {
         });
         let emitter = Arc::new(RecordingEmitter::new());
         let state = AppState::new(
+            Arc::clone(&adapter),
             Arc::clone(&adapter),
             Arc::clone(&adapter),
             Arc::clone(&adapter),
@@ -1738,6 +1821,7 @@ mod tests {
         });
         let emitter = Arc::new(RecordingEmitter::new());
         let state = AppState::new(
+            Arc::clone(&adapter),
             Arc::clone(&adapter),
             Arc::clone(&adapter),
             Arc::clone(&adapter),
@@ -1916,6 +2000,7 @@ mod tests {
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
         let state = AppState::new(
+            Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
@@ -2357,6 +2442,7 @@ mod tests {
                 Arc::clone(&mock),
                 Arc::clone(&mock),
                 Arc::clone(&mock),
+                Arc::clone(&mock),
                 emitter as Arc<dyn EventEmitter>,
             );
             init_directory_impl(&state_a, tmp_workdir.path().to_str().unwrap())
@@ -2380,6 +2466,7 @@ mod tests {
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
         let state_b = AppState::new(
+            Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
@@ -2425,6 +2512,7 @@ mod tests {
                 Arc::clone(&mock),
                 Arc::clone(&mock),
                 Arc::clone(&mock),
+                Arc::clone(&mock),
                 emitter as Arc<dyn EventEmitter>,
             );
             init_directory_impl(&state_a, tmp_workdir.path().to_str().unwrap())
@@ -2445,6 +2533,7 @@ mod tests {
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
         let state_b = AppState::new(
+            Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
@@ -2540,6 +2629,7 @@ mod tests {
             let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
             let emitter = Arc::new(RecordingEmitter::new());
             let state = AppState::new(
+                Arc::clone(&mock),
                 Arc::clone(&mock),
                 Arc::clone(&mock),
                 Arc::clone(&mock),

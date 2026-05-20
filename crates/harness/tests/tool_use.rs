@@ -20,14 +20,15 @@
 use futures::StreamExt;
 use switchboard_core::{AgentRecord, HarnessKind};
 use switchboard_harness::{
-    AdapterEvent, ClaudeCodeAdapter, CodexAdapter, DispatchOptions, GeminiAdapter, HarnessAdapter,
-    TurnOutcome,
+    AdapterEvent, AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, DispatchOptions,
+    GeminiAdapter, HarnessAdapter, TurnOutcome,
 };
 use uuid::Uuid;
 
 const CLAUDE_TOKEN: &str = "SWITCHBOARD_TOOL_LIVE_F2A98C";
 const CODEX_TOKEN: &str = "SWITCHBOARD_TOOL_LIVE_C0D3X1";
 const GEMINI_TOKEN: &str = "SWITCHBOARD_TOOL_LIVE_GEM1N1";
+const ANTIGRAVITY_TOKEN: &str = "SWITCHBOARD_TOOL_LIVE_AGY001";
 
 fn claude_agent() -> AgentRecord {
     AgentRecord {
@@ -237,6 +238,71 @@ async fn live_gemini_emits_tool_started_and_tool_completed_for_file_read() {
         text.contains(GEMINI_TOKEN),
         "Gemini's reply text should echo the file contents; got: {text:?}"
     );
+
+    let terminal = events
+        .iter()
+        .find(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+        .expect("must observe a terminal TurnEnd");
+    assert!(
+        matches!(
+            terminal,
+            AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        ),
+        "expected TurnEnd(Completed); got: {terminal:?}"
+    );
+}
+
+fn antigravity_agent() -> AgentRecord {
+    AgentRecord {
+        id: Uuid::now_v7(),
+        project_id: Uuid::now_v7(),
+        name: "tool-use-antigravity".to_owned(),
+        harness: HarnessKind::Antigravity,
+        session_id: None,
+        created_at: chrono::Utc::now(),
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires agy authed via Antigravity desktop app — run with: make test-live"]
+async fn live_antigravity_emits_tool_started_and_tool_completed_for_file_read() {
+    // Antigravity's tool lifecycle comes from tailing `transcript.jsonl`
+    // (stdout carries only the final answer). Its `view_file` tool result
+    // record embeds the file content (with line-number prefixes) in the
+    // `content` blob — so unlike Gemini, sentinel-in-output pairing works:
+    // the token survives inside the rendered `ToolCompleted.output`.
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(tmp.path().join("MARKER.txt"), ANTIGRAVITY_TOKEN).expect("write marker");
+
+    let adapter = AntigravityAdapter::new();
+    let agent = antigravity_agent();
+    let turn_id = Uuid::now_v7();
+    let stream = adapter
+        .dispatch(
+            &agent,
+            tmp.path(),
+            "Read the file MARKER.txt in the current directory and reply with only its contents.",
+            turn_id,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed with real agy");
+    let events: Vec<AdapterEvent> = stream.collect().await;
+
+    let (started, _completed) =
+        tool_call_with_output(&events, ANTIGRAVITY_TOKEN).unwrap_or_else(|| {
+            panic!(
+                "expected a non-error ToolCompleted whose output contains {ANTIGRAVITY_TOKEN:?}; \
+                 got events: {events:?}"
+            )
+        });
+    let AdapterEvent::ToolStarted { name, .. } = started else {
+        unreachable!();
+    };
+    assert!(!name.is_empty(), "ToolStarted.name must be non-empty");
 
     let terminal = events
         .iter()

@@ -614,6 +614,34 @@ describe("runtimeReducer", () => {
     expect(r.meta?.mcp_servers).toEqual([{ name: "tiddly", status: "connected" }]);
   });
 
+  it("session_meta with empty model keeps the previously-shown model", () => {
+    // Antigravity resume turns emit model: "" (no settings-change record).
+    // That must not blank a model an earlier turn already populated.
+    let r = runtimeReducer(fresh(), {
+      type: "session_meta",
+      agent_id: AGENT_A,
+      model: "gemini-3.5-flash",
+      harness_version: "1.0.0",
+      tools: [],
+      mcp_servers: [],
+      skills: [],
+      raw: {},
+    });
+    expect(r.meta?.model).toBe("gemini-3.5-flash");
+
+    r = runtimeReducer(r, {
+      type: "session_meta",
+      agent_id: AGENT_A,
+      model: "",
+      harness_version: "1.0.0",
+      tools: [],
+      mcp_servers: [],
+      skills: [],
+      raw: {},
+    });
+    expect(r.meta?.model).toBe("gemini-3.5-flash");
+  });
+
   it("rate_limit_event populates last_rate_limit", () => {
     const r = runtimeReducer(fresh(), {
       type: "rate_limit_event",

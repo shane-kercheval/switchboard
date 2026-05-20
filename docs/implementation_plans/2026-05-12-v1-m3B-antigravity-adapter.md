@@ -221,6 +221,14 @@ Functional outcomes:
 - Integration test using a real `transcript.jsonl` captured during M3B.2 live testing as a fixture under `crates/harness/tests/fixtures/antigravity/`.
 - Live hydration test: run two prompts against a single agent, reopen the project, verify both turns hydrate in the right order with correct attribution.
 - Document any known limitation (e.g., "encrypted-only conversations are silently skipped; users see them on project reopen as if they never happened") in a `Known limitations` section of `docs/research/antigravity-cli-observed.md`.
+- **`fake_agy` fixture binary + producer-orchestration hardening (carried over from M3B.2).** Build a `fake_agy` test binary (mirrors `fake_codex`/`fake_gemini`) that creates `brain/<uuid>/`, writes `transcript.jsonl` with timed appends, and drips stdout — so the dual-source producer's orchestration becomes hermetically testable (UUID-capture-then-tail ordering, cursor advancement across drains, partial-line handling, the stdout-EOF-plus-exit terminator). The pure pieces (`correlate_conversation_dir`, `is_conversation_not_found`, `user_request_body`, `classify_outcome`) are already unit-tested; the fixture covers the end-to-end sequences that are currently `make test-live`-only.
+
+  **Explicit acceptance criteria (not just "the fixture exists"):**
+  - **Fork-and-heal** is the load-bearing one. `fake_agy` simulates a stale `--conversation <uuid>`: it prints `Warning: conversation … not found`, mints a *new* `brain/<new-uuid>/` whose `USER_INPUT` echoes the prompt, drips an answer, and exits. The test must assert: (a) the sidecar heals — its latest record is `<new-uuid>`, not the stale one; (b) the forked turn's tool/thinking events surface (the new transcript is tailed); (c) a *subsequent* dispatch resumes the healed `<new-uuid>` (passes `--conversation <new-uuid>`).
+  - **Fast first-turn capture**: `fake_agy` exits immediately after dripping stdout but before the first poll tick could run; assert the post-exit final capture still persists the UUID.
+  - **Unresumable**: `fake_agy` drips an answer but creates *no* matching `brain/` dir (simulating a transcript-path break); assert the turn fails `AdapterFailure` (unresumable), not a silent `Completed`.
+
+  Also consider whether the expired-resume context loss warrants a user-visible signal (it currently only logs) — but do not widen the wire-format event vocabulary for it without a deliberate cross-harness design pass.
 
 ---
 

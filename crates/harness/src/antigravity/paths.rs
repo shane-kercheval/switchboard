@@ -30,14 +30,20 @@ pub fn antigravity_root(home_dir: &Path) -> PathBuf {
     home_dir.join(".gemini").join("antigravity-cli")
 }
 
+/// The `brain/` directory holding one subdirectory per conversation. The
+/// adapter watches this for a newly-created `<uuid>/` directory to capture
+/// the server-assigned conversation UUID after a first-turn spawn.
+#[must_use]
+pub fn brain_root(home_dir: &Path) -> PathBuf {
+    antigravity_root(home_dir).join("brain")
+}
+
 /// The per-conversation directory under `brain/`. Created by `agy` when a
 /// new conversation begins; its appearance is the adapter's signal that
 /// the server-assigned UUID has been captured.
 #[must_use]
 pub fn conversation_brain_dir(home_dir: &Path, conversation_id: Uuid) -> PathBuf {
-    antigravity_root(home_dir)
-        .join("brain")
-        .join(conversation_id.to_string())
+    brain_root(home_dir).join(conversation_id.to_string())
 }
 
 /// The plaintext JSONL transcript for a conversation. **This is the only

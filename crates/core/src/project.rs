@@ -78,10 +78,14 @@ impl Project {
         //   collision probability is ~1/2^32. Localized to Gemini.
         // - Codex leaves it None and relies on the per-agent session-link
         //   sidecar populated from `thread.started` on first dispatch.
+        // - Antigravity leaves it None for the same structural reason as
+        //   Codex: the conversation UUID is assigned server-side, so it
+        //   isn't knowable at registration time. The per-agent sidecar at
+        //   `<agent_id>.antigravity.jsonl` carries it after first dispatch.
         let session_id = match harness {
             HarnessKind::ClaudeCode => Some(Uuid::now_v7()),
             HarnessKind::Gemini => Some(Uuid::new_v4()),
-            HarnessKind::Codex => None,
+            HarnessKind::Codex | HarnessKind::Antigravity => None,
         };
         self.register_agent_inner_with_id(name, harness, session_id, Uuid::now_v7())
     }
@@ -320,6 +324,18 @@ mod tests {
     fn register_codex_agent_leaves_session_id_none() {
         let (_tmp, project) = fresh_project();
         let record = project.register_agent("c", HarnessKind::Codex).unwrap();
+        assert!(record.session_id.is_none());
+    }
+
+    #[test]
+    fn register_antigravity_agent_leaves_session_id_none() {
+        // Antigravity assigns the conversation UUID server-side; the
+        // adapter captures it post-spawn and writes the per-agent sidecar.
+        // Mirrors Codex's pattern.
+        let (_tmp, project) = fresh_project();
+        let record = project
+            .register_agent("a", HarnessKind::Antigravity)
+            .unwrap();
         assert!(record.session_id.is_none());
     }
 

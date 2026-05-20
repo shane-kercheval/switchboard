@@ -78,12 +78,13 @@ const INFO_NO_SWITCHBOARD: DirectoryInfo = {
  * assuming any specific call order — App.svelte may legitimately reorder
  * sub-steps within a phase transition.
  *
- * The five startup probes (`check_claude_binary`, `check_codex_binary`,
- * `check_codex_auth`, `check_gemini_binary`, `check_gemini_auth`) default
- * to success so non-banner tests don't need to spell them out, but
- * `unexpected invoke call` still throws for any IPC the test didn't
- * anticipate. Banner-failure tests use `invokeMock.mockImplementation`
- * directly to override individual probes.
+ * The seven startup probes (`check_claude_binary`, `check_codex_binary`,
+ * `check_codex_auth`, `check_gemini_binary`, `check_gemini_auth`,
+ * `check_antigravity_binary`, `check_antigravity_auth`) default to success
+ * so non-banner tests don't need to spell them out, but `unexpected
+ * invoke call` still throws for any IPC the test didn't anticipate.
+ * Banner-failure tests use `invokeMock.mockImplementation` directly to
+ * override individual probes.
  */
 function setInvokeResponses(map: Record<string, unknown>): void {
   const withDefaults: Record<string, unknown> = {
@@ -92,6 +93,8 @@ function setInvokeResponses(map: Record<string, unknown>): void {
     check_codex_auth: null,
     check_gemini_binary: null,
     check_gemini_auth: null,
+    check_antigravity_binary: null,
+    check_antigravity_auth: null,
     ...map,
   };
   invokeMock.mockImplementation(async (cmd: string) => {
@@ -144,7 +147,9 @@ describe("App", () => {
         cmd === "check_codex_binary" ||
         cmd === "check_codex_auth" ||
         cmd === "check_gemini_binary" ||
-        cmd === "check_gemini_auth"
+        cmd === "check_gemini_auth" ||
+        cmd === "check_antigravity_binary" ||
+        cmd === "check_antigravity_auth"
       )
         return null;
       throw new Error(`unexpected invoke call: ${cmd}`);
@@ -159,6 +164,8 @@ describe("App", () => {
     expect(screen.queryByTestId("banner-auth_missing-codex")).not.toBeInTheDocument();
     expect(screen.queryByTestId("banner-binary_missing-gemini")).not.toBeInTheDocument();
     expect(screen.queryByTestId("banner-auth_missing-gemini")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("banner-binary_missing-antigravity")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("banner-auth_missing-antigravity")).not.toBeInTheDocument();
   });
 
   it("renders a Codex auth-missing banner when only the Codex auth probe fails", async () => {
@@ -168,7 +175,9 @@ describe("App", () => {
         cmd === "check_claude_binary" ||
         cmd === "check_codex_binary" ||
         cmd === "check_gemini_binary" ||
-        cmd === "check_gemini_auth"
+        cmd === "check_gemini_auth" ||
+        cmd === "check_antigravity_binary" ||
+        cmd === "check_antigravity_auth"
       )
         return null;
       throw new Error(`unexpected invoke call: ${cmd}`);
@@ -187,7 +196,9 @@ describe("App", () => {
         cmd === "check_claude_binary" ||
         cmd === "check_codex_binary" ||
         cmd === "check_codex_auth" ||
-        cmd === "check_gemini_binary"
+        cmd === "check_gemini_binary" ||
+        cmd === "check_antigravity_binary" ||
+        cmd === "check_antigravity_auth"
       )
         return null;
       throw new Error(`unexpected invoke call: ${cmd}`);
@@ -197,8 +208,61 @@ describe("App", () => {
     await waitFor(() => {
       expect(screen.getByTestId("banner-auth_missing-gemini")).toBeInTheDocument();
     });
-    // Codex auth banner unaffected — per-harness independence.
+    // Codex / Antigravity auth banners unaffected — per-harness independence.
     expect(screen.queryByTestId("banner-auth_missing-codex")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("banner-auth_missing-antigravity")).not.toBeInTheDocument();
+  });
+
+  it("renders an Antigravity auth-missing banner when only the Antigravity auth probe fails", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "check_antigravity_auth") throw new Error("auth not configured");
+      if (
+        cmd === "check_claude_binary" ||
+        cmd === "check_codex_binary" ||
+        cmd === "check_codex_auth" ||
+        cmd === "check_gemini_binary" ||
+        cmd === "check_gemini_auth" ||
+        cmd === "check_antigravity_binary"
+      )
+        return null;
+      throw new Error(`unexpected invoke call: ${cmd}`);
+    });
+    const App = (await import("./App.svelte")).default;
+    render(App);
+    await waitFor(() => {
+      expect(screen.getByTestId("banner-auth_missing-antigravity")).toBeInTheDocument();
+    });
+    // Other harnesses' auth banners unaffected — per-harness independence.
+    expect(screen.queryByTestId("banner-auth_missing-codex")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("banner-auth_missing-gemini")).not.toBeInTheDocument();
+  });
+
+  it("Antigravity binary missing suppresses Antigravity auth banner (per-harness suppression)", async () => {
+    // Both Antigravity probes fail. Only the binary banner should show
+    // — the user can't act on the auth gap until they install `agy`.
+    // Per-harness independence: Claude/Codex/Gemini stay clean.
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "check_antigravity_binary" || cmd === "check_antigravity_auth")
+        throw new Error("missing");
+      if (
+        cmd === "check_claude_binary" ||
+        cmd === "check_codex_binary" ||
+        cmd === "check_codex_auth" ||
+        cmd === "check_gemini_binary" ||
+        cmd === "check_gemini_auth"
+      )
+        return null;
+      throw new Error(`unexpected invoke call: ${cmd}`);
+    });
+    const App = (await import("./App.svelte")).default;
+    render(App);
+    await waitFor(() => {
+      expect(screen.getByTestId("banner-binary_missing-antigravity")).toBeInTheDocument();
+    });
+    expect(screen.queryByTestId("banner-auth_missing-antigravity")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("banner-binary_missing-claude_code")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("banner-binary_missing-codex")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("banner-binary_missing-gemini")).not.toBeInTheDocument();
   });
 
   it("Gemini binary missing suppresses Gemini auth banner (per-harness suppression)", async () => {
@@ -211,7 +275,9 @@ describe("App", () => {
       if (
         cmd === "check_claude_binary" ||
         cmd === "check_codex_binary" ||
-        cmd === "check_codex_auth"
+        cmd === "check_codex_auth" ||
+        cmd === "check_antigravity_binary" ||
+        cmd === "check_antigravity_auth"
       )
         return null;
       throw new Error(`unexpected invoke call: ${cmd}`);
@@ -224,6 +290,8 @@ describe("App", () => {
     expect(screen.queryByTestId("banner-auth_missing-gemini")).not.toBeInTheDocument();
     expect(screen.queryByTestId("banner-binary_missing-claude_code")).not.toBeInTheDocument();
     expect(screen.queryByTestId("banner-binary_missing-codex")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("banner-binary_missing-antigravity")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("banner-auth_missing-antigravity")).not.toBeInTheDocument();
   });
 
   it("both binaries missing: two binary banners render simultaneously, no auth banner", async () => {
@@ -232,7 +300,9 @@ describe("App", () => {
       if (
         cmd === "check_codex_auth" ||
         cmd === "check_gemini_binary" ||
-        cmd === "check_gemini_auth"
+        cmd === "check_gemini_auth" ||
+        cmd === "check_antigravity_binary" ||
+        cmd === "check_antigravity_auth"
       )
         return null;
       throw new Error(`unexpected invoke call: ${cmd}`);
@@ -262,7 +332,13 @@ describe("App", () => {
     invokeMock.mockImplementation(async (cmd: string) => {
       if (cmd === "check_claude_binary" || cmd === "check_codex_binary") throw new Error("missing");
       if (cmd === "check_codex_auth") return authPromise;
-      if (cmd === "check_gemini_binary" || cmd === "check_gemini_auth") return null;
+      if (
+        cmd === "check_gemini_binary" ||
+        cmd === "check_gemini_auth" ||
+        cmd === "check_antigravity_binary" ||
+        cmd === "check_antigravity_auth"
+      )
+        return null;
       throw new Error(`unexpected invoke call: ${cmd}`);
     });
     const App = (await import("./App.svelte")).default;
@@ -286,7 +362,9 @@ describe("App", () => {
       if (
         cmd === "check_claude_binary" ||
         cmd === "check_gemini_binary" ||
-        cmd === "check_gemini_auth"
+        cmd === "check_gemini_auth" ||
+        cmd === "check_antigravity_binary" ||
+        cmd === "check_antigravity_auth"
       )
         return null;
       throw new Error(`unexpected invoke call: ${cmd}`);
@@ -297,9 +375,11 @@ describe("App", () => {
       expect(screen.getByTestId("banner-binary_missing-codex")).toBeInTheDocument();
     });
     expect(screen.queryByTestId("banner-auth_missing-codex")).not.toBeInTheDocument();
-    // Gemini state stays clean — per-harness independence.
+    // Gemini / Antigravity state stays clean — per-harness independence.
     expect(screen.queryByTestId("banner-binary_missing-gemini")).not.toBeInTheDocument();
     expect(screen.queryByTestId("banner-auth_missing-gemini")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("banner-binary_missing-antigravity")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("banner-auth_missing-antigravity")).not.toBeInTheDocument();
   });
 
   it("welcome → directory-selector: clicking Open working directory invokes pick_directory and renders the selector", async () => {

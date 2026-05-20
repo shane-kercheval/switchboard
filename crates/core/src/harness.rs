@@ -8,9 +8,11 @@ use serde::{Deserialize, Serialize};
 /// **Session-id asymmetry** (load-bearing): Claude Code and Gemini agents
 /// pre-generate `AgentRecord.session_id` at registration time (passed via
 /// `--session-id <uuid>` on first dispatch, `--resume <uuid>` thereafter);
-/// Codex agents leave it `None` and rely on a per-agent session-link
-/// sidecar populated from the `thread.started` stream event on first
-/// dispatch.
+/// Codex and Antigravity agents leave it `None` and rely on a per-agent
+/// session-link sidecar populated post-spawn — Codex from the
+/// `thread.started` stream event on first dispatch, Antigravity from the
+/// server-assigned conversation UUID captured by watching for a new
+/// `~/.gemini/antigravity-cli/brain/<uuid>/` directory.
 ///
 /// **UUID-version asymmetry** (load-bearing): Claude Code uses UUID v7
 /// (time-ordered) like the rest of Switchboard; Gemini uses UUID v4
@@ -25,6 +27,7 @@ pub enum HarnessKind {
     ClaudeCode,
     Codex,
     Gemini,
+    Antigravity,
 }
 
 /// User-facing names. Used in `thiserror` `#[error]` format strings that
@@ -45,6 +48,7 @@ impl fmt::Display for HarnessKind {
             Self::ClaudeCode => f.write_str("Claude Code"),
             Self::Codex => f.write_str("Codex"),
             Self::Gemini => f.write_str("Gemini"),
+            Self::Antigravity => f.write_str("Antigravity"),
         }
     }
 }
@@ -90,9 +94,22 @@ mod tests {
     }
 
     #[test]
+    fn antigravity_serializes_as_snake_case() {
+        let json = serde_json::to_string(&HarnessKind::Antigravity).unwrap();
+        assert_eq!(json, "\"antigravity\"");
+    }
+
+    #[test]
+    fn antigravity_deserializes_from_snake_case() {
+        let parsed: HarnessKind = serde_json::from_str("\"antigravity\"").unwrap();
+        assert_eq!(parsed, HarnessKind::Antigravity);
+    }
+
+    #[test]
     fn display_uses_user_facing_names_with_space_for_claude() {
         assert_eq!(format!("{}", HarnessKind::ClaudeCode), "Claude Code");
         assert_eq!(format!("{}", HarnessKind::Codex), "Codex");
         assert_eq!(format!("{}", HarnessKind::Gemini), "Gemini");
+        assert_eq!(format!("{}", HarnessKind::Antigravity), "Antigravity");
     }
 }

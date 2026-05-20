@@ -25,6 +25,7 @@
     claudeAvailability?: HarnessAvailability;
     codexAvailability?: HarnessAvailability;
     geminiAvailability?: HarnessAvailability;
+    antigravityAvailability?: HarnessAvailability;
   };
 
   let {
@@ -36,6 +37,7 @@
     claudeAvailability,
     codexAvailability,
     geminiAvailability,
+    antigravityAvailability,
   }: Props = $props();
 </script>
 
@@ -48,5 +50,6 @@
     {claudeAvailability}
     {codexAvailability}
     {geminiAvailability}
+    {antigravityAvailability}
   />
 </Dialog>

@@ -686,6 +686,75 @@ pub fn check_gemini_binary_impl(state: &AppState) -> Result<(), AppError> {
     state.gemini_adapter.probe().map_err(AppError::Probe)
 }
 
+/// Probe `agy` on PATH. Free function (not adapter-driven) because no
+/// Antigravity adapter is registered in `AppState` until dispatch wiring
+/// lands; the underlying `which::which("agy")` lookup is identical to
+/// what the future adapter's `probe()` will do.
+pub fn check_antigravity_binary_impl() -> Result<(), AppError> {
+    switchboard_harness::antigravity::probe_binary().map_err(AppError::Probe)
+}
+
+/// Supported macOS Keychain service / account for Antigravity auth.
+///
+/// Surprising load-bearing detail: the service name is `"gemini"`, NOT
+/// `"antigravity"`. Antigravity stores its credentials under the shared
+/// Gemini Keychain service to match the `~/.gemini/` directory namespace
+/// theme. Source: `security dump-keychain` on an authed dev machine
+/// showed `svce="gemini" acct="antigravity"`. Documented in
+/// `docs/research/antigravity-cli-observed.md` line 99.
+const ANTIGRAVITY_KEYCHAIN_SERVICE: &str = "gemini";
+const ANTIGRAVITY_KEYCHAIN_ACCOUNT: &str = "antigravity";
+
+/// Best-effort Antigravity subscription-auth detection. Invokes the macOS
+/// `security` CLI to look up the Antigravity Keychain entry. Returns
+/// `Ok(())` if the entry exists; `Err(AppError::AuthNotConfigured)`
+/// otherwise (including when `security` itself is missing — non-macOS
+/// hosts will surface as auth-missing, which is correct because
+/// Antigravity is macOS-only in v1).
+///
+/// Unlike Codex/Gemini, there is no on-disk config file we can probe —
+/// `agy` reads credentials exclusively via macOS Keychain. The signature
+/// therefore takes no `home_dir` parameter; the keychain lookup is
+/// system-wide. The Tauri shim drops the `$HOME` forwarding it does for
+/// the other harnesses.
+pub fn check_antigravity_auth_impl() -> Result<(), AppError> {
+    let probe_result = std::process::Command::new("security")
+        .args([
+            "find-generic-password",
+            "-s",
+            ANTIGRAVITY_KEYCHAIN_SERVICE,
+            "-a",
+            ANTIGRAVITY_KEYCHAIN_ACCOUNT,
+        ])
+        .status()
+        .map(|s| s.success());
+    interpret_antigravity_keychain_probe(&probe_result)
+}
+
+/// Pure interpretation of the `security` CLI's exit status. Factored out
+/// so unit tests can pin all three branches without invoking the actual
+/// CLI. Takes the result by reference because `std::io::Error` is not
+/// `Clone` and the function only inspects, never owns, the result.
+fn interpret_antigravity_keychain_probe(
+    probe_result: &std::io::Result<bool>,
+) -> Result<(), AppError> {
+    let expected_path = format!(
+        "macOS Keychain (service: {ANTIGRAVITY_KEYCHAIN_SERVICE}, account: {ANTIGRAVITY_KEYCHAIN_ACCOUNT})"
+    );
+    let auth_err = || AppError::AuthNotConfigured {
+        harness: HarnessKind::Antigravity,
+        expected_path: expected_path.clone(),
+    };
+    // `Ok(false)` (entry not in Keychain) and `Err(_)` (couldn't run
+    // `security` at all — non-macOS host, missing tool) both surface as
+    // auth-missing. The user-facing outcome is the same: the agent isn't
+    // dispatchable until they authenticate.
+    match probe_result {
+        Ok(true) => Ok(()),
+        Ok(false) | Err(_) => Err(auth_err()),
+    }
+}
+
 /// Best-effort Codex subscription-auth detection. Returns `Ok(())` if the
 /// auth file is present at the default location (`<home>/.codex/auth.json`),
 /// `Err(AppError::AuthNotConfigured)` otherwise.
@@ -1203,6 +1272,77 @@ mod tests {
                 "expected Ok for selected_type={selected}"
             );
         }
+    }
+
+    #[test]
+    fn interpret_antigravity_keychain_probe_ok_true_returns_ok() {
+        assert!(interpret_antigravity_keychain_probe(&Ok(true)).is_ok());
+    }
+
+    #[test]
+    fn interpret_antigravity_keychain_probe_ok_false_returns_auth_not_configured() {
+        let err = interpret_antigravity_keychain_probe(&Ok(false)).unwrap_err();
+        match err {
+            AppError::AuthNotConfigured {
+                harness,
+                expected_path,
+            } => {
+                assert_eq!(harness, HarnessKind::Antigravity);
+                // The message references Keychain, not a file path —
+                // Antigravity's auth lives in the macOS Keychain, and the
+                // string the user sees must communicate that.
+                assert!(
+                    expected_path.contains("Keychain"),
+                    "expected_path should reference Keychain: {expected_path}"
+                );
+                assert!(
+                    expected_path.contains("gemini"),
+                    "expected_path should pin the surprising service name: {expected_path}"
+                );
+                assert!(
+                    expected_path.contains("antigravity"),
+                    "expected_path should pin the account name: {expected_path}"
+                );
+            }
+            other => panic!("expected AuthNotConfigured, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interpret_antigravity_keychain_probe_io_error_returns_auth_not_configured() {
+        // Simulates `security` itself missing (non-macOS host, etc.).
+        // Auth is reported as missing, which is the correct user-facing
+        // outcome — Antigravity is macOS-only in v1, and a missing
+        // `security` CLI means we cannot demonstrate authentication.
+        let probe_result = Err::<bool, _>(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "security missing",
+        ));
+        let err = interpret_antigravity_keychain_probe(&probe_result).unwrap_err();
+        assert!(matches!(err, AppError::AuthNotConfigured { .. }));
+    }
+
+    /// Drift-detection live test: if Antigravity moves its auth from the
+    /// macOS Keychain or changes the service/account name, this assertion
+    /// fails on the developer's machine before silent miscategorization
+    /// ships.
+    #[test]
+    #[ignore = "requires agy authed via Antigravity desktop app — run with: make test-live"]
+    fn live_check_antigravity_auth_finds_real_keychain_entry() {
+        check_antigravity_auth_impl().expect(
+            "Antigravity Keychain entry must live at service=gemini account=antigravity on a \
+             logged-in machine; if this fails, Antigravity may have changed its keychain \
+             naming or removed Keychain-based auth entirely",
+        );
+    }
+
+    /// Drift-detection live test: if `agy` is renamed or moved off PATH,
+    /// surface here before users see a confusing dispatch-time error.
+    #[test]
+    #[ignore = "requires agy installed — run with: make test-live"]
+    fn live_check_antigravity_binary_finds_real_agy_on_path() {
+        check_antigravity_binary_impl()
+            .expect("agy binary must be on PATH; install from https://antigravity.google/download");
     }
 
     /// Drift-detection live test: if Gemini moves its auth file or

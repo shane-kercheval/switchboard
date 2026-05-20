@@ -25,6 +25,7 @@
     claudeAvailability?: HarnessAvailability;
     codexAvailability?: HarnessAvailability;
     geminiAvailability?: HarnessAvailability;
+    antigravityAvailability?: HarnessAvailability;
   };
 
   let {
@@ -35,6 +36,7 @@
     claudeAvailability = { harness: "claude_code", binary: "available", auth: "unsupported" },
     codexAvailability = { harness: "codex", binary: "available", auth: "available" },
     geminiAvailability = { harness: "gemini", binary: "available", auth: "available" },
+    antigravityAvailability = { harness: "antigravity", binary: "available", auth: "available" },
   }: Props = $props();
   let name = $state<string>("assistant");
   let harness = $state<HarnessKind>("claude_code");
@@ -53,18 +55,28 @@
   const claudeSelectable = $derived(isHarnessSelectable(claudeAvailability));
   const codexSelectable = $derived(isHarnessSelectable(codexAvailability));
   const geminiSelectable = $derived(isHarnessSelectable(geminiAvailability));
+  const antigravitySelectable = $derived(isHarnessSelectable(antigravityAvailability));
   const claudeReason = $derived(harnessUnavailableReason(claudeAvailability));
   const codexReason = $derived(harnessUnavailableReason(codexAvailability));
   const geminiReason = $derived(harnessUnavailableReason(geminiAvailability));
+  const antigravityReason = $derived(harnessUnavailableReason(antigravityAvailability));
   const selectedSelectable = $derived(
     harness === "claude_code"
       ? claudeSelectable
       : harness === "codex"
         ? codexSelectable
-        : geminiSelectable,
+        : harness === "gemini"
+          ? geminiSelectable
+          : antigravitySelectable,
   );
   const selectedReason = $derived(
-    harness === "claude_code" ? claudeReason : harness === "codex" ? codexReason : geminiReason,
+    harness === "claude_code"
+      ? claudeReason
+      : harness === "codex"
+        ? codexReason
+        : harness === "gemini"
+          ? geminiReason
+          : antigravityReason,
   );
 
   /// UUID shape check (any version — Codex and Claude use v4 / v7
@@ -202,6 +214,23 @@
           data-testid="harness-gemini"
         />
         Gemini
+      </label>
+      <label
+        class="flex items-center gap-1.5 {antigravitySelectable
+          ? ''
+          : 'cursor-not-allowed text-neutral-400'}"
+        title={antigravityReason ?? ""}
+      >
+        <input
+          type="radio"
+          name="harness"
+          value="antigravity"
+          checked={harness === "antigravity"}
+          disabled={!antigravitySelectable}
+          onchange={() => (harness = "antigravity")}
+          data-testid="harness-antigravity"
+        />
+        Antigravity
       </label>
     </div>
     {#if selectedReason}

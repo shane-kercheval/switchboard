@@ -2,6 +2,7 @@
   import type { AgentRecord } from "$lib/types";
   import { transcripts, type Turn } from "$lib/state/index.svelte";
   import { cn } from "$lib/utils";
+  import { HARNESS_BADGE_CLASS, HARNESS_LABEL } from "$lib/harnessDisplay";
 
   let { agents }: { agents: AgentRecord[] } = $props();
 
@@ -49,18 +50,16 @@
 
   function harnessBadgeClass(agentId: string): string {
     const harness = agentById[agentId]?.harness;
-    if (harness === "claude_code") return "bg-orange-100 text-orange-800";
-    if (harness === "codex") return "bg-blue-100 text-blue-800";
-    if (harness === "gemini") return "bg-emerald-100 text-emerald-800";
-    return "bg-neutral-100 text-neutral-800";
+    // `harness` is `undefined` only when `agentById[agentId]` is missing
+    // — i.e., the lookup itself failed. That case predates the introduction
+    // of HARNESS_BADGE_CLASS and renders the neutral fallback so a
+    // stale agentId doesn't crash the row.
+    return harness ? HARNESS_BADGE_CLASS[harness] : "bg-neutral-100 text-neutral-800";
   }
 
   function harnessLabel(agentId: string): string {
     const harness = agentById[agentId]?.harness;
-    if (harness === "claude_code") return "Claude";
-    if (harness === "codex") return "Codex";
-    if (harness === "gemini") return "Gemini";
-    return "?";
+    return harness ? HARNESS_LABEL[harness] : "?";
   }
 
   // Auto-pin to bottom unless the user has scrolled up. Mirrors the

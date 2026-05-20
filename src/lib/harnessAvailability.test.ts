@@ -57,6 +57,21 @@ const GEMINI_AUTH_MISSING: HarnessAvailability = {
   binary: "available",
   auth: "missing",
 };
+const ANTIGRAVITY_AVAILABLE: HarnessAvailability = {
+  harness: "antigravity",
+  binary: "available",
+  auth: "available",
+};
+const ANTIGRAVITY_BINARY_MISSING: HarnessAvailability = {
+  harness: "antigravity",
+  binary: "missing",
+  auth: "missing",
+};
+const ANTIGRAVITY_AUTH_MISSING: HarnessAvailability = {
+  harness: "antigravity",
+  binary: "available",
+  auth: "missing",
+};
 
 // **Verbatim-alignment contract**: `bannerCopy` and
 // `harnessUnavailableReason` must return identical strings for the same
@@ -99,6 +114,20 @@ describe("bannerCopy", () => {
       "Gemini not authenticated — run `gemini` interactively to sign in, then reload Switchboard.",
     );
   });
+
+  it("Antigravity binary_missing surfaces install link", () => {
+    const banner: HarnessBanner = { kind: "binary_missing", harness: "antigravity" };
+    expect(bannerCopy(banner)).toBe(
+      "Antigravity CLI (agy) not found on PATH. Install from https://antigravity.google/download",
+    );
+  });
+
+  it("Antigravity auth_missing surfaces desktop-app sign-in guidance", () => {
+    const banner: HarnessBanner = { kind: "auth_missing", harness: "antigravity" };
+    expect(bannerCopy(banner)).toBe(
+      "Antigravity not authenticated — sign in via the Antigravity desktop app and reload Switchboard.",
+    );
+  });
 });
 
 describe("harnessUnavailableReason", () => {
@@ -127,10 +156,21 @@ describe("harnessUnavailableReason", () => {
     expect(reason).toBe(bannerCopy({ kind: "auth_missing", harness: "gemini" }));
   });
 
+  it("Antigravity binary missing returns install copy (matches banner verbatim)", () => {
+    const reason = harnessUnavailableReason(ANTIGRAVITY_BINARY_MISSING);
+    expect(reason).toBe(bannerCopy({ kind: "binary_missing", harness: "antigravity" }));
+  });
+
+  it("Antigravity auth missing returns sign-in copy (matches banner verbatim)", () => {
+    const reason = harnessUnavailableReason(ANTIGRAVITY_AUTH_MISSING);
+    expect(reason).toBe(bannerCopy({ kind: "auth_missing", harness: "antigravity" }));
+  });
+
   it("available state returns null", () => {
     expect(harnessUnavailableReason(CLAUDE_AVAILABLE)).toBeNull();
     expect(harnessUnavailableReason(CODEX_AVAILABLE)).toBeNull();
     expect(harnessUnavailableReason(GEMINI_AVAILABLE)).toBeNull();
+    expect(harnessUnavailableReason(ANTIGRAVITY_AVAILABLE)).toBeNull();
   });
 
   it("checking state returns null (no scary inline copy during probe window)", () => {
@@ -143,6 +183,7 @@ describe("isHarnessSelectable", () => {
   it("returns true for fully-available harness", () => {
     expect(isHarnessSelectable(CLAUDE_AVAILABLE)).toBe(true);
     expect(isHarnessSelectable(CODEX_AVAILABLE)).toBe(true);
+    expect(isHarnessSelectable(ANTIGRAVITY_AVAILABLE)).toBe(true);
   });
 
   it("returns false for checking state (closes the pre-probe fail-open window)", () => {
@@ -153,11 +194,13 @@ describe("isHarnessSelectable", () => {
   it("returns false for binary missing", () => {
     expect(isHarnessSelectable(CLAUDE_BINARY_MISSING)).toBe(false);
     expect(isHarnessSelectable(CODEX_BINARY_MISSING)).toBe(false);
+    expect(isHarnessSelectable(ANTIGRAVITY_BINARY_MISSING)).toBe(false);
   });
 
   it("returns false for auth missing", () => {
     expect(isHarnessSelectable(CODEX_AUTH_MISSING)).toBe(false);
     expect(isHarnessSelectable(GEMINI_AUTH_MISSING)).toBe(false);
+    expect(isHarnessSelectable(ANTIGRAVITY_AUTH_MISSING)).toBe(false);
   });
 });
 

@@ -4,6 +4,7 @@
   import type { AgentRecord } from "$lib/types";
   import Button from "$lib/components/ui/Button.svelte";
   import Textarea from "$lib/components/ui/Textarea.svelte";
+  import { HARNESS_LABEL } from "$lib/harnessDisplay";
 
   let { agents }: { agents: AgentRecord[] } = $props();
 
@@ -105,7 +106,7 @@
       >
         {#each agents as agent (agent.id)}
           <option value={agent.id}>
-            {agent.name} ({agent.harness === "claude_code" ? "Claude" : "Codex"})
+            {agent.name} ({HARNESS_LABEL[agent.harness]})
           </option>
         {/each}
       </select>

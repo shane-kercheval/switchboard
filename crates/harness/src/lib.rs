@@ -15,6 +15,7 @@
 //!   Select via `SWITCHBOARD_HARNESS=mock` at app startup.
 
 pub mod adapter;
+pub mod antigravity;
 pub mod claude_code;
 pub mod codex;
 pub mod events;

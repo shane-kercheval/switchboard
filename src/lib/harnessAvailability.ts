@@ -16,13 +16,17 @@ const BINARY_COPY: Record<HarnessAvailability["harness"], string> = {
   claude_code: "Claude Code not found on PATH. Install from https://claude.com/code",
   codex: "Codex not found on PATH. Install from https://github.com/openai/codex",
   gemini: "Gemini CLI not found on PATH. Install from https://github.com/google-gemini/gemini-cli",
+  antigravity:
+    "Antigravity CLI (agy) not found on PATH. Install from https://antigravity.google/download",
 };
 
-const AUTH_COPY: Record<"codex" | "gemini", string> = {
+const AUTH_COPY: Record<"codex" | "gemini" | "antigravity", string> = {
   codex:
     "Codex not authenticated — run `codex login` and reload Switchboard. (API-key-only auth is not supported.)",
   gemini:
     "Gemini not authenticated — run `gemini` interactively to sign in, then reload Switchboard.",
+  antigravity:
+    "Antigravity not authenticated — sign in via the Antigravity desktop app and reload Switchboard.",
 };
 
 /// The user-facing string for a given banner. The `auth_missing` variant
@@ -50,7 +54,10 @@ export function harnessUnavailableReason(a: HarnessAvailability): string | null 
   if (a.binary === "missing") {
     return BINARY_COPY[a.harness];
   }
-  if (a.auth === "missing" && (a.harness === "codex" || a.harness === "gemini")) {
+  if (
+    a.auth === "missing" &&
+    (a.harness === "codex" || a.harness === "gemini" || a.harness === "antigravity")
+  ) {
     return AUTH_COPY[a.harness];
   }
   // `auth === "missing"` for a harness without file-detectable auth is

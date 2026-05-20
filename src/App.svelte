@@ -68,6 +68,8 @@
   let codexAuth = $state<"available" | "missing" | "checking">("checking");
   let geminiBinary = $state<BinaryState>("checking");
   let geminiAuth = $state<"available" | "missing" | "checking">("checking");
+  let antigravityBinary = $state<BinaryState>("checking");
+  let antigravityAuth = $state<"available" | "missing" | "checking">("checking");
 
   const claudeAvailability = $derived<HarnessAvailability>({
     harness: "claude_code",
@@ -84,22 +86,35 @@
     binary: geminiBinary,
     auth: geminiAuth,
   });
+  const antigravityAvailability = $derived<HarnessAvailability>({
+    harness: "antigravity",
+    binary: antigravityBinary,
+    auth: antigravityAuth,
+  });
 
   /// Banner stack ordering: binary-missing first, then auth-missing.
   /// Suppression rule: if a harness's binary is missing, its auth banner
   /// is hidden (auth is irrelevant if the CLI isn't installed). Max one
   /// banner per harness.
   ///
-  /// The `auth_missing` push gates on `a.harness === "codex" || "gemini"`
-  /// because `HarnessBanner.auth_missing` is type-narrowed to the
-  /// file-detectable-auth harnesses (Claude's auth probe is keychain-based
-  /// and unsupported in v1).
+  /// The `auth_missing` push gates on a closed set of harnesses with
+  /// detectable auth: Codex (`auth.json`), Gemini (`settings.json`), and
+  /// Antigravity (macOS Keychain). Claude's auth probe is keychain-based
+  /// and unsupported in v1.
   const banners = $derived.by((): HarnessBanner[] => {
     const result: HarnessBanner[] = [];
-    for (const a of [claudeAvailability, codexAvailability, geminiAvailability]) {
+    for (const a of [
+      claudeAvailability,
+      codexAvailability,
+      geminiAvailability,
+      antigravityAvailability,
+    ]) {
       if (a.binary === "missing") {
         result.push({ kind: "binary_missing", harness: a.harness });
-      } else if (a.auth === "missing" && (a.harness === "codex" || a.harness === "gemini")) {
+      } else if (
+        a.auth === "missing" &&
+        (a.harness === "codex" || a.harness === "gemini" || a.harness === "antigravity")
+      ) {
         result.push({ kind: "auth_missing", harness: a.harness });
       }
     }
@@ -136,6 +151,14 @@
     api.checkGeminiAuth().then(
       () => (geminiAuth = "available"),
       () => (geminiAuth = "missing"),
+    );
+    api.checkAntigravityBinary().then(
+      () => (antigravityBinary = "available"),
+      () => (antigravityBinary = "missing"),
+    );
+    api.checkAntigravityAuth().then(
+      () => (antigravityAuth = "available"),
+      () => (antigravityAuth = "missing"),
     );
   });
 
@@ -364,6 +387,7 @@
         {claudeAvailability}
         {codexAvailability}
         {geminiAvailability}
+        {antigravityAvailability}
       />
     {:else if phase.kind === "loaded"}
       <div class="flex flex-1 overflow-hidden" data-testid="loaded-layout">
@@ -380,6 +404,7 @@
         {claudeAvailability}
         {codexAvailability}
         {geminiAvailability}
+        {antigravityAvailability}
         onSubmit={handleAddAgentFromLoaded}
         onCancel={handleAddAgentCancel}
       />

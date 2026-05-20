@@ -32,3 +32,4 @@ crates/app/gen/
 
 # Local switchboard state
 .switchboard/
+/.antigravitycli

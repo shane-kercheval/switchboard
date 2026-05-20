@@ -30,6 +30,31 @@ pub fn antigravity_root(home_dir: &Path) -> PathBuf {
     home_dir.join(".gemini").join("antigravity-cli")
 }
 
+/// The `~/.gemini/config/` directory holding Antigravity's MCP-server config
+/// and plugin/skill tree. Note this is `~/.gemini/config/`, **not**
+/// `~/.gemini/antigravity-cli/` — the registries live in the shared
+/// `~/.gemini/` namespace alongside (not under) the per-conversation state.
+#[must_use]
+pub fn config_root(home_dir: &Path) -> PathBuf {
+    home_dir.join(".gemini").join("config")
+}
+
+/// The MCP-server config file: `~/.gemini/config/mcp_config.json`. Top-level
+/// `{ "mcpServers": { … } }` — same schema as Gemini's `settings.json`
+/// `mcpServers` key, different file.
+#[must_use]
+pub fn mcp_config_path(home_dir: &Path) -> PathBuf {
+    config_root(home_dir).join("mcp_config.json")
+}
+
+/// The plugins root: `~/.gemini/config/plugins/`. Each `<plugin>/skills/<skill>/`
+/// subtree with a `SKILL.md` is one skill, displayed qualified as
+/// `<plugin>/<skill>`.
+#[must_use]
+pub fn plugins_root(home_dir: &Path) -> PathBuf {
+    config_root(home_dir).join("plugins")
+}
+
 /// The `brain/` directory holding one subdirectory per conversation. The
 /// adapter watches this for a newly-created `<uuid>/` directory to capture
 /// the server-assigned conversation UUID after a first-turn spawn.

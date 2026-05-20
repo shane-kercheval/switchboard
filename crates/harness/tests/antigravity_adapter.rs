@@ -11,7 +11,7 @@ use std::path::Path;
 use futures::StreamExt;
 use serde_json::{Value, json};
 use switchboard_core::{AgentRecord, HarnessKind};
-use switchboard_harness::antigravity::paths::transcript_path;
+use switchboard_harness::antigravity::paths;
 use switchboard_harness::antigravity::sidecar::{
     SessionLinkRecord, append_record, read_latest, sidecar_path,
 };
@@ -76,6 +76,24 @@ fn drip(line: &str, delay_ms: u64) -> Value {
 
 fn write_script(cwd: &Path, script: &Value) {
     std::fs::write(cwd.join(FAKE_AGY_SCRIPT_FILE), script.to_string()).unwrap();
+}
+
+/// Stage a user-scope MCP config (one server "tiddly") and one plugin skill
+/// (`chrome-devtools-plugin/troubleshooting`) under `home`'s `~/.gemini/config`,
+/// so the registry loaders have something to surface.
+fn stage_registries(home: &Path) {
+    std::fs::create_dir_all(paths::config_root(home)).unwrap();
+    std::fs::write(
+        paths::mcp_config_path(home),
+        r#"{"mcpServers":{"tiddly":{"command":"tiddly-bin"}}}"#,
+    )
+    .unwrap();
+    let skill = paths::plugins_root(home)
+        .join("chrome-devtools-plugin")
+        .join("skills")
+        .join("troubleshooting");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(skill.join("SKILL.md"), "# troubleshooting").unwrap();
 }
 
 async fn dispatch(
@@ -332,11 +350,12 @@ async fn hydration_reconstructs_real_tool_use_transcript() {
     let agent = agy_agent();
     let uuid = Uuid::new_v4();
 
-    let dest = transcript_path(home.path(), uuid);
+    let dest = paths::transcript_path(home.path(), uuid);
     std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
     std::fs::copy(format!("{FIXTURES}/tool-use.transcript.jsonl"), &dest).unwrap();
 
-    let loaded = load_antigravity_transcript(home.path(), cwd.path(), uuid, agent.id).unwrap();
+    let loaded =
+        load_antigravity_transcript(home.path(), cwd.path(), Some(uuid), agent.id).unwrap();
 
     assert_eq!(loaded.turns.len(), 2, "one user + one agent turn");
     assert!(loaded.warnings.is_empty());
@@ -374,4 +393,108 @@ async fn hydration_reconstructs_real_tool_use_transcript() {
         other => panic!("expected agent turn, got {other:?}"),
     }
     assert_eq!(loaded.meta.unwrap().model, "Gemini 3.5 Flash");
+}
+
+/// Wiring seam (dispatch): the loaders run at dispatch time and their output
+/// must reach the emitted `SessionMeta`. Proves `ProducerCtx` → `SessionMeta`
+/// carries the loaded vecs, which the structural-only live test cannot.
+#[tokio::test]
+async fn dispatch_session_meta_carries_loaded_registries() {
+    let home = tempfile::TempDir::new().unwrap();
+    let cwd = tempfile::TempDir::new().unwrap();
+    let adapter = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home.path());
+    let agent = agy_agent();
+    let uuid = Uuid::new_v4();
+
+    stage_registries(home.path());
+    write_script(
+        cwd.path(),
+        &json!({
+            "conversation_uuid": uuid.to_string(),
+            "records": [
+                {"json": user_record("hi", "2026-05-19T19:00:00Z"), "delay_ms": 0},
+                {"json": terminal_record("2026-05-19T19:00:01Z", "ack"), "delay_ms": 0},
+            ],
+            "stdout": [drip("ack", 0)],
+            "exit_code": 0,
+        }),
+    );
+
+    let events = dispatch(&adapter, &agent, cwd.path(), "hi").await;
+    let meta = events
+        .iter()
+        .find(|e| matches!(e, AdapterEvent::SessionMeta { .. }))
+        .expect("SessionMeta emitted post-terminal");
+    match meta {
+        AdapterEvent::SessionMeta {
+            mcp_servers,
+            skills,
+            ..
+        } => {
+            assert!(
+                mcp_servers.iter().any(|s| s.name == "tiddly"),
+                "configured MCP server reached SessionMeta; got {mcp_servers:?}"
+            );
+            assert!(
+                skills.contains(&"chrome-devtools-plugin/troubleshooting".to_owned()),
+                "qualified skill reached SessionMeta; got {skills:?}"
+            );
+        }
+        other => panic!("expected SessionMeta, got {other:?}"),
+    }
+}
+
+/// Wiring seam (hydration): the same loaders feed `merge_meta_with_loaders`, so
+/// hydrated meta must carry non-empty registries alongside the parsed turns.
+#[tokio::test]
+async fn hydration_meta_carries_loaded_registries() {
+    let home = tempfile::TempDir::new().unwrap();
+    let cwd = tempfile::TempDir::new().unwrap();
+    let agent = agy_agent();
+    let uuid = Uuid::new_v4();
+
+    stage_registries(home.path());
+    let dest = paths::transcript_path(home.path(), uuid);
+    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+    std::fs::write(
+        &dest,
+        format!(
+            "{}\n{}\n",
+            user_record("hi", "2026-05-19T19:00:00Z"),
+            terminal_record("2026-05-19T19:00:01Z", "ack"),
+        ),
+    )
+    .unwrap();
+
+    let loaded =
+        load_antigravity_transcript(home.path(), cwd.path(), Some(uuid), agent.id).unwrap();
+    let meta = loaded.meta.expect("meta present");
+    assert!(meta.mcp_servers.iter().any(|s| s.name == "tiddly"));
+    assert!(
+        meta.skills
+            .contains(&"chrome-devtools-plugin/troubleshooting".to_owned())
+    );
+    // Registries layer onto the parsed turns, not replace them.
+    assert_eq!(loaded.turns.len(), 2);
+}
+
+/// Wiring seam (never-dispatched): `None` conversation id still surfaces the
+/// registries (the no-sidecar path that `commands.rs` routes through).
+#[tokio::test]
+async fn hydration_none_conversation_still_surfaces_registries() {
+    let home = tempfile::TempDir::new().unwrap();
+    let cwd = tempfile::TempDir::new().unwrap();
+    let agent = agy_agent();
+
+    stage_registries(home.path());
+    let loaded = load_antigravity_transcript(home.path(), cwd.path(), None, agent.id).unwrap();
+    assert!(loaded.turns.is_empty(), "never dispatched → no turns");
+    let meta = loaded
+        .meta
+        .expect("registry meta even with no conversation");
+    assert!(meta.mcp_servers.iter().any(|s| s.name == "tiddly"));
+    assert!(
+        meta.skills
+            .contains(&"chrome-devtools-plugin/troubleshooting".to_owned())
+    );
 }

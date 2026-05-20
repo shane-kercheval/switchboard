@@ -677,7 +677,8 @@ pub fn load_transcript_impl(
             // this follows the Codex shape (sidecar lookup), not the Gemini
             // one (`agent.session_id`). Corrupt sidecar is fail-loud per the
             // Switchboard-owned-JSONL invariant; `Ok(None)` is the legitimate
-            // never-dispatched case → empty transcript.
+            // never-dispatched case — passed through as `None` so the loader
+            // still surfaces registry meta (matching the Codex arm).
             let sidecar_path = switchboard_harness::antigravity::sidecar::sidecar_path(
                 &directory.path,
                 project.id,
@@ -688,13 +689,10 @@ pub fn load_transcript_impl(
                     path: sidecar_path.clone(),
                     source: Box::new(source),
                 })?;
-            let Some(record) = latest else {
-                return Ok(switchboard_harness::LoadedTranscript::default());
-            };
             Ok(switchboard_harness::load_antigravity_transcript(
                 home_dir,
                 &directory.path,
-                record.conversation_id,
+                latest.map(|record| record.conversation_id),
                 agent.id,
             )?)
         }
@@ -2749,12 +2747,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_transcript_for_antigravity_agent_without_sidecar_returns_empty() {
+    async fn load_transcript_for_antigravity_agent_without_sidecar_returns_meta_only_empty() {
         let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
-        // Antigravity agent never dispatched → no sidecar → empty transcript.
+        // Antigravity agent never dispatched → no sidecar → empty turns, but
+        // loader-derived registry meta still surfaces (mirrors the Codex arm)
+        // so the sidebar populates the moment the agent is selected.
         let record = create_agent_impl(&state, "agy_one", HarnessKind::Antigravity).unwrap();
         let result = load_transcript_impl(&state, record.id, tmp_home.path()).unwrap();
         assert!(result.turns.is_empty());
+        assert!(result.meta.is_some());
     }
 
     #[tokio::test]

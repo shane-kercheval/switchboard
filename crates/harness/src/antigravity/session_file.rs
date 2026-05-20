@@ -32,10 +32,13 @@ use super::{extract_model_from_record, paths, user_request_body};
 
 /// Load an Antigravity conversation's transcript into a [`LoadedTranscript`].
 ///
-/// `conversation_id` MUST come from the per-agent sidecar
+/// `conversation_id` comes from the per-agent sidecar
 /// ([`super::sidecar::SessionLinkRecord::conversation_id`]) — Antigravity
 /// agents carry `session_id: None`, since the UUID is assigned server-side and
-/// captured post-dispatch.
+/// captured post-dispatch. Pass `None` for an agent that has **never
+/// dispatched** (no sidecar yet): the result has empty turns but still carries
+/// the loader-derived MCP / skills registries, so the sidebar populates the
+/// moment the agent is selected — matching Codex's never-dispatched path.
 ///
 /// **Missing-transcript case** (conversation exists only as encrypted
 /// protobuf, or the sidecar points at a path that no longer exists): returns
@@ -43,15 +46,27 @@ use super::{extract_model_from_record, paths, user_request_body};
 /// degrading display, never blocking project open. Only an I/O error on a file
 /// that *does* exist raises [`LoadTranscriptError`].
 ///
-/// `cwd` is accepted for parity with the other loaders (it feeds their
-/// project-scoped MCP / skills loaders) and is unused here — the Antigravity
-/// MCP / skills loaders are not wired.
+/// `cwd` is the agent's bound working directory, forwarded to the MCP / skills
+/// loaders (currently user-scope only, so it is reserved for a future
+/// workspace scope).
 pub fn load_antigravity_transcript(
     home_dir: &Path,
-    _cwd: &Path,
-    conversation_id: Uuid,
+    cwd: &Path,
+    conversation_id: Option<Uuid>,
     agent_id: AgentId,
 ) -> Result<LoadedTranscript, LoadTranscriptError> {
+    // Display-only registries, loaded once and layered onto whatever turns
+    // (if any) the transcript yields.
+    let mcp_servers = super::config::load_mcp_servers(home_dir, cwd);
+    let skills = super::skills::load_skills(home_dir, cwd);
+
+    let Some(conversation_id) = conversation_id else {
+        return Ok(LoadedTranscript {
+            meta: Some(merge_meta_with_loaders(None, mcp_servers, skills)),
+            ..LoadedTranscript::default()
+        });
+    };
+
     let path = paths::transcript_path(home_dir, conversation_id);
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
@@ -62,7 +77,7 @@ pub fn load_antigravity_transcript(
                 "antigravity: transcript file absent; hydrating empty (encrypted-only conversation or rotated path)"
             );
             return Ok(LoadedTranscript {
-                meta: Some(merge_meta_with_loaders(None, vec![], vec![])),
+                meta: Some(merge_meta_with_loaders(None, mcp_servers, skills)),
                 ..LoadedTranscript::default()
             });
         }
@@ -70,14 +85,12 @@ pub fn load_antigravity_transcript(
     };
 
     let mut transcript = parse_antigravity_transcript_content(&content, agent_id);
-    // Antigravity MCP / skills loaders are not wired, so hydration merges empty
-    // registries — the merge preserves the parsed model and leaves the registry
-    // cells empty, the same way the other loaders degrade when their config
-    // files are absent.
+    // Layer the registries onto the parsed model — the same two-source merge
+    // the other loaders use.
     transcript.meta = Some(merge_meta_with_loaders(
         transcript.meta.take(),
-        vec![],
-        vec![],
+        mcp_servers,
+        skills,
     ));
     Ok(transcript)
 }

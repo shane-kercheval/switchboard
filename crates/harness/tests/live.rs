@@ -638,13 +638,28 @@ async fn live_antigravity_basic_turn_completes() {
     );
 
     // SessionMeta fires post-terminal. Model is best-effort from the user
-    // settings envelope; this adapter doesn't populate MCP/skills, so only
-    // structural checks here (matching Codex/Gemini live discipline).
+    // settings envelope; mcp_servers / skills come from the dispatch-time
+    // loader injection (`~/.gemini/config/mcp_config.json` and
+    // `~/.gemini/config/plugins/*/skills/*`). Structural-only checks — the
+    // dev env varies, so we assert presence and types, not values (matching
+    // Codex/Gemini live discipline).
     let session_meta = events
         .iter()
         .find(|e| matches!(e, AdapterEvent::SessionMeta { .. }))
         .expect("Antigravity must emit SessionMeta post-terminal");
-    assert!(matches!(session_meta, AdapterEvent::SessionMeta { .. }));
+    match session_meta {
+        AdapterEvent::SessionMeta {
+            tools,
+            mcp_servers,
+            skills,
+            ..
+        } => {
+            assert!(tools.is_empty(), "Antigravity SessionMeta.tools is vec![]");
+            let _: &Vec<_> = mcp_servers;
+            let _: &Vec<_> = skills;
+        }
+        other => panic!("expected SessionMeta, got {other:?}"),
+    }
 
     // Sidecar must exist after the first turn with the captured conversation
     // UUID — the system-of-record for resume / hydration.

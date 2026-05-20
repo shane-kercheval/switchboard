@@ -33,10 +33,12 @@
 //!
 //! Ground-truth reference: `docs/research/antigravity-cli-observed.md`.
 
+pub mod config;
 pub mod parser;
 pub mod paths;
 pub mod session_file;
 pub mod sidecar;
+pub mod skills;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -170,6 +172,12 @@ impl HarnessAdapter for AntigravityAdapter {
         let home_dir = resolve_home_dir(self.home_dir_override.as_deref());
         let harness_version = self.resolve_version();
 
+        // Display-only registries, read fresh per dispatch (config can change
+        // between turns). User scope only — `cwd` is passed for the future
+        // workspace scope but unused by the loaders today.
+        let mcp_servers = config::load_mcp_servers(&home_dir, cwd);
+        let skills = skills::load_skills(&home_dir, cwd);
+
         // Resume target: the conversation UUID captured on a prior dispatch,
         // read from the per-agent sidecar. Corrupt sidecar is fail-loud
         // (PreStreamRead) per the AGENTS.md Switchboard-owned-JSONL
@@ -225,6 +233,8 @@ impl HarnessAdapter for AntigravityAdapter {
             sidecar_file,
             resume_id,
             harness_version,
+            mcp_servers,
+            skills,
             prompt: prompt.to_owned(),
         }));
 
@@ -287,6 +297,11 @@ struct ProducerCtx {
     sidecar_file: PathBuf,
     resume_id: Option<Uuid>,
     harness_version: String,
+    /// MCP-server registry resolved at dispatch time (display-only). Carried
+    /// into the post-`TurnEnd` `SessionMeta` event.
+    mcp_servers: Vec<McpServerStatus>,
+    /// Skills registry (`<plugin>/<skill>` names) resolved at dispatch time.
+    skills: Vec<String>,
     /// The dispatch prompt — used to correlate the captured conversation
     /// directory to *this* dispatch (its `USER_INPUT` record echoes the
     /// prompt), so concurrent same-cwd dispatches can't bind each other's
@@ -312,6 +327,8 @@ async fn run_producer(ctx: ProducerCtx) {
         sidecar_file,
         resume_id,
         harness_version,
+        mcp_servers,
+        skills,
         prompt,
     } = ctx;
 
@@ -557,15 +574,15 @@ async fn run_producer(ctx: ProducerCtx) {
     // between TurnEnd and AgentIdle). Model is best-effort from the user
     // record's settings envelope and is empty on resume turns that didn't
     // change the model — the reducer's empty-model-keeps-prior rule prevents
-    // that from blanking the sidebar. MCP / skills are not populated by this
-    // adapter yet (no loaders wired); empty lists here.
+    // that from blanking the sidebar. MCP / skills are the display-only
+    // registries loaded at dispatch time.
     let _ = tx.send(AdapterEvent::SessionMeta {
         agent_id,
         model: model.unwrap_or_default(),
         harness_version,
         tools: Vec::new(),
-        mcp_servers: Vec::<McpServerStatus>::new(),
-        skills: Vec::new(),
+        mcp_servers,
+        skills,
         raw: serde_json::Value::Null,
     });
 }

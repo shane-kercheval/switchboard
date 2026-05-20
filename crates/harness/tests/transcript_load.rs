@@ -651,9 +651,13 @@ async fn live_antigravity_two_turns_hydrate_in_order() {
         .expect("sidecar must read cleanly")
         .expect("sidecar must contain a record after live dispatches");
 
-    let transcript =
-        load_antigravity_transcript(&real_home(), tmp.path(), record.conversation_id, agent.id)
-            .expect("load_antigravity_transcript must succeed");
+    let transcript = load_antigravity_transcript(
+        &real_home(),
+        tmp.path(),
+        Some(record.conversation_id),
+        agent.id,
+    )
+    .expect("load_antigravity_transcript must succeed");
 
     assert!(
         transcript.warnings.is_empty(),

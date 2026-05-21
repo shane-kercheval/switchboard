@@ -11,14 +11,18 @@ mod state;
 use std::sync::Arc;
 
 use switchboard_dispatcher::EventEmitter;
-use switchboard_harness::{ClaudeCodeAdapter, CodexAdapter, HarnessAdapter, MockHarnessAdapter};
+use switchboard_harness::{
+    AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, GeminiAdapter, HarnessAdapter,
+    MockHarnessAdapter,
+};
 use tauri::{Emitter, Manager, State};
 
 use crate::commands::{
-    DirectoryInfo, attach_agent_impl, check_claude_binary_impl, check_codex_auth_impl,
-    check_codex_binary_impl, create_agent_impl, create_project_impl, init_directory_impl,
-    list_agents_impl, list_projects_impl, load_transcript_impl, open_project_impl, parse_uuid,
-    pick_directory_impl, send_message_impl, set_active_project_impl,
+    DirectoryInfo, attach_agent_impl, check_antigravity_auth_impl, check_antigravity_binary_impl,
+    check_claude_binary_impl, check_codex_auth_impl, check_codex_binary_impl,
+    check_gemini_auth_impl, check_gemini_binary_impl, create_agent_impl, create_project_impl,
+    init_directory_impl, list_agents_impl, list_projects_impl, load_transcript_impl,
+    open_project_impl, parse_uuid, pick_directory_impl, send_message_impl, set_active_project_impl,
 };
 use crate::state::AppState;
 
@@ -40,6 +44,31 @@ async fn check_codex_auth() -> Result<(), String> {
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
     check_codex_auth_impl(&home).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn check_gemini_binary(state: State<'_, AppState>) -> Result<(), String> {
+    check_gemini_binary_impl(state.inner()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn check_gemini_auth() -> Result<(), String> {
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    check_gemini_auth_impl(&home).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn check_antigravity_binary(state: State<'_, AppState>) -> Result<(), String> {
+    check_antigravity_binary_impl(state.inner()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn check_antigravity_auth() -> Result<(), String> {
+    // No `$HOME` forwarding: Antigravity's auth lives in the macOS
+    // Keychain, not under `$HOME`. See the impl docstring.
+    check_antigravity_auth_impl().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -162,28 +191,43 @@ impl EventEmitter for AppHandleEmitter {
     }
 }
 
-/// Reads `SWITCHBOARD_HARNESS` to decide which adapter pair to construct.
-/// - Unset or `"claude"` → `claude_adapter = ClaudeCodeAdapter`, `codex_adapter = CodexAdapter`.
-/// - `"mock"` → both adapters = `MockHarnessAdapter`.
+/// Reads `SWITCHBOARD_HARNESS` to decide which adapter triple to construct.
+/// - Unset or `"claude"` → real adapters for all three harnesses.
+/// - `"mock"` → all three adapters = `MockHarnessAdapter`.
 /// - Any other value → panic (silent fall-through to default would be a footgun).
 ///
-/// Returns `(claude_adapter, codex_adapter)`. Both are constructed under
-/// "claude"/unset because the `match agent.harness` routing in
-/// `send_message_impl` may dispatch to either at runtime; neither adapter's
-/// constructor performs a binary check, so missing CLIs only surface at
-/// `check_*_binary` time, not at app startup.
-fn build_adapters() -> (Arc<dyn HarnessAdapter>, Arc<dyn HarnessAdapter>) {
+/// Returns `(claude_adapter, codex_adapter, gemini_adapter, antigravity_adapter)`.
+/// All are constructed under "claude"/unset because the `match agent.harness`
+/// routing in `send_message_impl` may dispatch to any at runtime; no
+/// adapter's constructor performs a binary check, so missing CLIs only
+/// surface at `check_*_binary` time, not at app startup.
+// A 4-tuple of the same trait object reads as "complex" to clippy, but a
+// named struct for a private one-call-site startup helper would be more
+// ceremony than it's worth — the tuple is destructured immediately at the
+// single call site in `run`.
+#[allow(clippy::type_complexity)]
+fn build_adapters() -> (
+    Arc<dyn HarnessAdapter>,
+    Arc<dyn HarnessAdapter>,
+    Arc<dyn HarnessAdapter>,
+    Arc<dyn HarnessAdapter>,
+) {
     match std::env::var("SWITCHBOARD_HARNESS").as_deref() {
         Ok("mock") => {
-            tracing::info!(
-                "SWITCHBOARD_HARNESS=mock — using MockHarnessAdapter for both harnesses"
-            );
+            tracing::info!("SWITCHBOARD_HARNESS=mock — using MockHarnessAdapter for all harnesses");
             let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
-            (Arc::clone(&mock), mock)
+            (
+                Arc::clone(&mock),
+                Arc::clone(&mock),
+                Arc::clone(&mock),
+                mock,
+            )
         }
         Ok("claude") | Err(_) => (
             Arc::new(ClaudeCodeAdapter::new()),
             Arc::new(CodexAdapter::new()),
+            Arc::new(GeminiAdapter::new()),
+            Arc::new(AntigravityAdapter::new()),
         ),
         Ok(other) => panic!(
             "invalid SWITCHBOARD_HARNESS={other:?}; expected one of: claude, mock (or unset for default)"
@@ -200,7 +244,7 @@ pub fn run() {
         )
         .try_init();
 
-    let (claude_adapter, codex_adapter) = build_adapters();
+    let (claude_adapter, codex_adapter, gemini_adapter, antigravity_adapter) = build_adapters();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -211,6 +255,8 @@ pub fn run() {
             app.manage(AppState::new(
                 Arc::clone(&claude_adapter),
                 Arc::clone(&codex_adapter),
+                Arc::clone(&gemini_adapter),
+                Arc::clone(&antigravity_adapter),
                 emitter,
             ));
             Ok(())
@@ -219,6 +265,10 @@ pub fn run() {
             check_claude_binary,
             check_codex_binary,
             check_codex_auth,
+            check_gemini_binary,
+            check_gemini_auth,
+            check_antigravity_binary,
+            check_antigravity_auth,
             pick_directory,
             init_directory,
             list_projects,

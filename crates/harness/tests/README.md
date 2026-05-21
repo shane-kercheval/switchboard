@@ -1,8 +1,8 @@
 # Harness live tests
 
 This directory holds the **live-harness test suite** — integration tests that
-spawn the real `claude` and `codex` CLIs and assert on the events the
-adapters emit. They are developer-local; CI does not run them.
+spawn the real `claude`, `codex`, and `gemini` CLIs and assert on the events
+the adapters emit. They are developer-local; CI does not run them.
 
 See `AGENTS.md` "Live testing against real harnesses" for the rationale
 (upstream CLI vendors silently change behavior we depend on; fixture-driven
@@ -16,12 +16,13 @@ tests can't catch that).
 
 ## How to run
 
-One-time setup — make sure both harnesses are installed and authenticated
-with subscription credentials (no API keys):
+One-time setup — make sure all three harnesses are installed and
+authenticated with subscription credentials (no API keys):
 
 ```sh
 claude login
 codex login
+gemini   # interactive sign-in (no `gemini auth login` subcommand)
 ```
 
 Then from the repo root:
@@ -44,41 +45,73 @@ happy-path coverage of new event types.
 
 Coverage today:
 
-- `live.rs` — happy-path event vocabulary for both adapters: `ContentChunk`,
-  `TurnEnd { Completed }`, `SessionMeta`, `RateLimitEvent` (Codex), enriched
-  `TurnEnd.usage.context_window`, sidecar shape (Codex), session resume
-  (both harnesses).
+- `live.rs` — happy-path event vocabulary for all three adapters:
+  `ContentChunk`, `TurnEnd { Completed }`, `SessionMeta`, `RateLimitEvent`
+  (Codex), enriched `TurnEnd.usage.context_window` (Claude / Codex),
+  sidecar shape (Codex), session resume (all three). Gemini's
+  `SessionMeta` carries `tools: vec![]` (its `init` doesn't list tools);
+  the test asserts the structural contract without requiring a populated
+  tools list.
 - `tool_use.rs` — per harness, plant a sentinel file, prompt for a
-  file-read / shell-cat tool, locate the `ToolCompleted` whose `output`
-  contains the sentinel (`is_error: false`), and assert a matching
-  `ToolStarted` was emitted for the same `tool_use_id`. Sentinel-driven
-  pairing keeps the test robust against the CLI emitting preliminary tools
-  (e.g., Claude using `TodoWrite` before the real Read).
+  file-read / shell-cat tool, assert `ToolStarted` + matching
+  `ToolCompleted` (`is_error: false`).
+  - Claude / Codex pair by sentinel-in-output: `ToolCompleted.output`
+    contains the staged sentinel. Robust against the CLI emitting
+    preliminary tools (e.g., Claude using `TodoWrite` before the real
+    Read).
+  - Gemini pairs by `tool_use_id` + `is_error: false` **without checking
+    output content**. Gemini's stream emits `tool_result.output = ""` for
+    read-like tools (real content lives in the session file). The
+    sentinel-in-output assertion for Gemini moves to `transcript_load.rs`
+    where the session file does carry it.
 - `transcript_load.rs` — full transcript-hydration round-trip:
   - Per harness, dispatch a live "ack" turn and assert the reconstructed
     `Turn::User` + `Turn::Agent` match the live stream (text, terminal
-    status, no warnings) plus the sidebar contract: Claude hydrated
-    `usage.is_some()` with `context_window.is_none()` (stream-only field);
-    Codex hydrated `usage.context_window.is_some()` (enriched from
-    `task_started.model_context_window`) and `last_rate_limit.is_some()`
-    (from `token_count.rate_limits`); `meta.mcp_servers` / `skills` /
-    `tools` deserialize structurally. The Codex test exercises the
-    sidecar-driven lookup path (`commands::load_transcript_impl`'s
-    production path).
-  - Claude `live_claude_transcript_load_hydrates_tool_items`: dispatch a
-    Read-tool turn, load the transcript, assert the agent turn contains a
-    `TurnItem::Tool` with `is_error: Some(false)` and `output` carrying
-    the staged sentinel. Drift-detection for tool persistence — neither
-    `tool_use.rs` (live events only) nor the ack round-trip catches a CLI
-    bump that changes how tool calls are written to the session file.
+    status, no warnings) plus the sidebar contract. Per-harness
+    `usage` / `last_rate_limit` shape:
+    - Claude: `usage.is_some()` with `context_window.is_none()`
+      (stream-only field).
+    - Codex: `usage.context_window.is_some()` (enriched from
+      `task_started.model_context_window`) and `last_rate_limit.is_some()`
+      (from `token_count.rate_limits`). Exercises the sidecar-driven
+      lookup path (`commands::load_transcript_impl`'s production path).
+    - Gemini: `usage.is_some()` with `context_window.is_none()` (Gemini's
+      session file has no context-window field) and `last_rate_limit` is
+      `None` (no rate-limit telemetry in the session file).
+  - Tool-item hydration tests per harness
+    (`live_claude_transcript_load_hydrates_tool_items`,
+    `live_codex_transcript_load_hydrates_tool_items`,
+    `live_gemini_transcript_load_hydrates_tool_items`): dispatch a tool
+    turn (file read / shell `cat`), load the transcript, find the
+    `TurnItem::Tool` whose `output` contains the staged sentinel,
+    assert `is_error: Some(false)` and a non-empty name. Per-harness
+    motivation:
+    - Claude / Codex: drift-detection against a CLI bump renaming
+      tool-record fields in the session file (Claude's session-file
+      JSON shape; Codex's `function_call` / `function_call_output`
+      records).
+    - Gemini: **load-bearing** for the "live = best-effort, hydration =
+      authoritative" contract — the live stream emits empty tool
+      output, hydration fills it in.
 
 Dispatcher-layer live coverage (turn lifecycle ordering, session-id path
 encoding, cwd routing) lives alongside the dispatcher in
-`crates/dispatcher/tests/live_end_to_end.rs`.
+`crates/dispatcher/tests/live_end_to_end.rs`. Per-harness event-ordering
+checks
+(`live_full_stack_emits_turn_start_then_content_then_turn_end` for
+Claude,
+`live_full_stack_codex_emits_turn_start_then_content_then_turn_end`,
+`live_full_stack_gemini_emits_turn_start_then_content_then_turn_end`)
+prove the dispatcher abstraction is genuinely harness-neutral through
+each real subprocess code path, not just through adapter-layer fixtures.
+A coupling regression in any dispatcher-internal layer (TurnId
+generation, AgentIdleGuard, EventEmitter forwarding, per-agent state)
+fails the relevant test.
 
-A live auth probe (`live_check_codex_auth_finds_real_auth_file`) lives
-inline in `crates/app/src/commands.rs` — it asserts that the real Codex
-auth file is at the path `check_codex_auth_impl` expects.
+Live auth probes (`live_check_codex_auth_finds_real_auth_file`,
+`live_check_gemini_auth_finds_real_settings_file`) live inline in
+`crates/app/src/commands.rs` — they assert the real auth files live at
+the paths `check_codex_auth_impl` and `check_gemini_auth_impl` expect.
 
 ## What's intentionally not covered live
 
@@ -92,3 +125,13 @@ auth file is at the path `check_codex_auth_impl` expects.
 - **`TurnEnd { Failed { kind: AdapterFailure } }`** and
   **`TurnEnd { Failed { kind: AuthFailure } }`** — same rationale: hard to
   trigger reliably against a real subprocess. Fixture coverage exists.
+- **Gemini tool-output content in the stream** — elided for read-like
+  tools (`tool_result.output = ""`), per
+  `docs/research/gemini-cli-observed.md`. Covered by
+  `live_gemini_transcript_load_hydrates_tool_items` against the session
+  file, which carries the real output.
+- **Gemini auth-failure stream shape** — cannot trigger without breaking
+  the developer's OAuth state. Covered fixture-driven via the inline-JSON
+  test in `gemini_adapter.rs`; the substring-matching rule
+  (`is_gemini_auth_failure_message`) is best-effort until a production
+  user reports a misclassification.

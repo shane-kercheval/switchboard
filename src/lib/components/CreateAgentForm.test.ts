@@ -40,6 +40,16 @@ const CODEX_CHECKING: HarnessAvailability = {
   binary: "checking",
   auth: "checking",
 };
+const GEMINI_AVAILABLE: HarnessAvailability = {
+  harness: "gemini",
+  binary: "available",
+  auth: "available",
+};
+const GEMINI_AUTH_MISSING: HarnessAvailability = {
+  harness: "gemini",
+  binary: "available",
+  auth: "missing",
+};
 
 const VALID_UUID = "019e2c5f-aaaa-7000-8000-000000000001";
 
@@ -131,6 +141,62 @@ describe("CreateAgentForm", () => {
     await fireEvent.click(screen.getByTestId("mode-attach"));
     await rerender({ onSubmit, busy: true });
     expect(screen.getByTestId("confirm-create-agent")).toHaveTextContent("Attaching…");
+  });
+
+  it("create mode + Gemini selection: submits {mode:create, harness:gemini}", async () => {
+    const { onSubmit } = renderForm();
+    await fireEvent.click(screen.getByTestId("harness-gemini"));
+    await fireEvent.click(screen.getByTestId("confirm-create-agent"));
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
+      mode: "create",
+      name: "assistant",
+      harness: "gemini",
+    } satisfies AgentFormSubmit);
+  });
+
+  it("attach mode + Gemini selection: submits {mode:attach, harness:gemini, ...}", async () => {
+    const { onSubmit } = renderForm();
+    await fireEvent.click(screen.getByTestId("mode-attach"));
+    await fireEvent.click(screen.getByTestId("harness-gemini"));
+    const sessionInput = screen.getByTestId("attach-session-id") as HTMLInputElement;
+    await fireEvent.input(sessionInput, { target: { value: VALID_UUID } });
+    await fireEvent.click(screen.getByTestId("confirm-create-agent"));
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
+      mode: "attach",
+      name: "assistant",
+      harness: "gemini",
+      existingSessionId: VALID_UUID,
+    } satisfies AgentFormSubmit);
+  });
+
+  it("Gemini auth missing: Gemini radio disabled; tooltip mentions interactive sign-in", async () => {
+    const onSubmit = vi.fn();
+    render(CreateAgentForm, {
+      props: {
+        onSubmit,
+        claudeAvailability: CLAUDE_AVAILABLE,
+        codexAvailability: CODEX_AVAILABLE,
+        geminiAvailability: GEMINI_AUTH_MISSING,
+      },
+    });
+    const geminiRadio = screen.getByTestId("harness-gemini") as HTMLInputElement;
+    expect(geminiRadio.disabled).toBe(true);
+    const geminiLabel = geminiRadio.closest("label");
+    expect(geminiLabel?.getAttribute("title")).toContain("gemini`");
+  });
+
+  it("all three harnesses available: Gemini radio enabled by default", () => {
+    const onSubmit = vi.fn();
+    render(CreateAgentForm, {
+      props: {
+        onSubmit,
+        claudeAvailability: CLAUDE_AVAILABLE,
+        codexAvailability: CODEX_AVAILABLE,
+        geminiAvailability: GEMINI_AVAILABLE,
+      },
+    });
+    const geminiRadio = screen.getByTestId("harness-gemini") as HTMLInputElement;
+    expect(geminiRadio.disabled).toBe(false);
   });
 
   it("attach mode + Codex selection: submits {mode:attach, harness:codex, ...}", async () => {

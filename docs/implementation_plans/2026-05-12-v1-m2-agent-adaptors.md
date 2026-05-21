@@ -11,7 +11,7 @@
    - `docs/system-design.md` — sections 2 (non-goals — note the v1 auth and cost-surface invariants), 3 (core concepts), 4 (functional primitives), 7 (user-facing model — **revised to unified transcript + per-agent sidebar**), 9 (harness integration — per-harness adapter design + normalized event vocabulary; M2 is where the full vocabulary lands), 10 (form factor).
    - `docs/implementation_plans/2026-05-12-v1.md` — M2 section + critical-path preamble.
    - `docs/research/codex-cli-observed.md` — **most M2-load-bearing file.** Ground-truth on Codex CLI behavior: stream events, session-file format, cancellation, errors, two-process model, rate limits in session file, stall-mitigation guidance.
-   - `docs/research/codex-noninteractive.md`, `docs/research/harness-comparison.md`, `docs/research/claude-code-cli-observed.md`.
+   - `docs/research/codex-noninteractive.md`, `docs/research/archive/harness-comparison.md`, `docs/research/claude-code-cli-observed.md`.
    - `docs/implementation_plans/2026-05-12-v1-m1-scaffolding.md` — to understand what's in place.
 
 3. **Implement sub-milestones M2.1 → M2.7 in order.** Each is self-contained: code + tests + doc updates. **Commit after each sub-milestone** (the user reviews, then signals to proceed). **Single PR for the whole milestone** — open it after M2.7 lands locally and `make check` is green. Per-sub-milestone branches are NOT required. (M2.8 was originally planned as an integration-CI workflow running live tests against subscription-auth secrets; deferred — see "Deferred from M2" at the end of this plan.)

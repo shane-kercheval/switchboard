@@ -66,12 +66,26 @@ impl Project {
     /// or different directories) are fine; cross-process serialization within
     /// one directory is future work.
     pub fn register_agent(&self, name: &str, harness: HarnessKind) -> Result<AgentRecord> {
-        // Harness-asymmetry rule: Claude Code pre-generates session_id at
-        // registration time; Codex leaves it None and relies on the per-agent
-        // session-link sidecar populated from `thread.started` on first dispatch.
+        // Harness-asymmetry rule:
+        // - Claude Code pre-generates session_id (UUID v7) at registration
+        //   time; passed via `--session-id`/`--resume`.
+        // - Gemini pre-generates session_id (UUID **v4**) at registration
+        //   time; passed via `--session-id`/`--resume`. Gemini's session
+        //   filename embeds the first 8 hex chars of the session ID, and
+        //   UUID v7s minted in the same millisecond share their first 8
+        //   chars — concurrent Gemini dispatches in one cwd would interleave
+        //   on disk. v4's first 8 chars are random across 32 bits, so the
+        //   collision probability is ~1/2^32. Localized to Gemini.
+        // - Codex leaves it None and relies on the per-agent session-link
+        //   sidecar populated from `thread.started` on first dispatch.
+        // - Antigravity leaves it None for the same structural reason as
+        //   Codex: the conversation UUID is assigned server-side, so it
+        //   isn't knowable at registration time. The per-agent sidecar at
+        //   `<agent_id>.antigravity.jsonl` carries it after first dispatch.
         let session_id = match harness {
             HarnessKind::ClaudeCode => Some(Uuid::now_v7()),
-            HarnessKind::Codex => None,
+            HarnessKind::Gemini => Some(Uuid::new_v4()),
+            HarnessKind::Codex | HarnessKind::Antigravity => None,
         };
         self.register_agent_inner_with_id(name, harness, session_id, Uuid::now_v7())
     }
@@ -123,6 +137,40 @@ impl Project {
         agent_id: crate::agent::AgentId,
     ) -> Result<AgentRecord> {
         self.register_agent_inner_with_id(name, HarnessKind::Codex, None, agent_id)
+    }
+
+    /// Register an attached **Gemini** agent — one that wraps an
+    /// already-existing Gemini session. Mirrors the Claude pattern
+    /// (caller-controlled session UUID), not the Codex sidecar pattern.
+    /// The provided `session_id` is the UUID embedded in the Gemini
+    /// session-file filename's id8 prefix; the commands layer validates
+    /// the file exists (and is unambiguous) before calling this method.
+    pub fn register_attached_gemini_agent(
+        &self,
+        name: &str,
+        session_id: Uuid,
+    ) -> Result<AgentRecord> {
+        self.register_agent_inner_with_id(
+            name,
+            HarnessKind::Gemini,
+            Some(session_id),
+            Uuid::now_v7(),
+        )
+    }
+
+    /// Register an attached **Antigravity** agent using a caller-supplied
+    /// `agent_id`. Mirrors the Codex sidecar pattern, not the Claude/Gemini
+    /// caller-controlled-UUID pattern: Antigravity's conversation UUID is
+    /// server-assigned and lives in the per-agent sidecar, so `session_id`
+    /// stays `None`. The attach flow pre-writes the sidecar before committing
+    /// the registry record (same pre-generated-id ordering and failure-mode
+    /// rationale as [`Self::register_attached_codex_agent_with_id`]).
+    pub fn register_attached_antigravity_agent_with_id(
+        &self,
+        name: &str,
+        agent_id: crate::agent::AgentId,
+    ) -> Result<AgentRecord> {
+        self.register_agent_inner_with_id(name, HarnessKind::Antigravity, None, agent_id)
     }
 
     /// Shared validation + JSONL append. Caller decides the `session_id`
@@ -271,6 +319,42 @@ mod tests {
     }
 
     #[test]
+    fn register_gemini_agent_mints_uuid_v4_session_id() {
+        // Load-bearing: v7 caused the on-disk session-file interleave
+        // hazard against Gemini's 8-char-prefix filename. If a future
+        // refactor accidentally swaps this back to `Uuid::now_v7()`,
+        // concurrent dispatches in one cwd corrupt transcripts.
+        let (_tmp, project) = fresh_project();
+        let record = project.register_agent("g", HarnessKind::Gemini).unwrap();
+        let session_id = record.session_id.expect("Gemini pre-generates session_id");
+        assert_eq!(
+            session_id.get_version_num(),
+            4,
+            "Gemini session_id must be UUID v4, got: {session_id} (version {})",
+            session_id.get_version_num()
+        );
+    }
+
+    #[test]
+    fn register_codex_agent_leaves_session_id_none() {
+        let (_tmp, project) = fresh_project();
+        let record = project.register_agent("c", HarnessKind::Codex).unwrap();
+        assert!(record.session_id.is_none());
+    }
+
+    #[test]
+    fn register_antigravity_agent_leaves_session_id_none() {
+        // Antigravity assigns the conversation UUID server-side; the
+        // adapter captures it post-spawn and writes the per-agent sidecar.
+        // Mirrors Codex's pattern.
+        let (_tmp, project) = fresh_project();
+        let record = project
+            .register_agent("a", HarnessKind::Antigravity)
+            .unwrap();
+        assert!(record.session_id.is_none());
+    }
+
+    #[test]
     fn project_name_delegates_to_config() {
         let (_tmp, project) = fresh_project();
         assert_eq!(project.name(), "test-project");
@@ -336,6 +420,16 @@ mod tests {
             .register_attached_codex_agent_with_id("attached", Uuid::now_v7())
             .unwrap();
         assert_eq!(record.harness, HarnessKind::Codex);
+        assert!(record.session_id.is_none());
+    }
+
+    #[test]
+    fn register_attached_antigravity_leaves_session_id_none() {
+        let (_tmp, project) = fresh_project();
+        let record = project
+            .register_attached_antigravity_agent_with_id("attached", Uuid::now_v7())
+            .unwrap();
+        assert_eq!(record.harness, HarnessKind::Antigravity);
         assert!(record.session_id.is_none());
     }
 

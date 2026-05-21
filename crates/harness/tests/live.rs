@@ -2,15 +2,16 @@
 ///
 /// Run with: `make test-live`
 ///
-/// Requires `claude` and/or `codex` installed and authenticated. Developer-local
-/// only — not run in CI. See `AGENTS.md` "Live testing against real harnesses"
-/// for the policy.
+/// Requires `claude`, `codex`, and/or `gemini` installed and authenticated.
+/// Developer-local only — not run in CI. See `AGENTS.md` "Live testing
+/// against real harnesses" for the policy.
 use std::path::Path;
 
 use futures::StreamExt;
 use switchboard_core::{AgentRecord, HarnessKind};
 use switchboard_harness::{
-    AdapterEvent, ClaudeCodeAdapter, CodexAdapter, DispatchOptions, HarnessAdapter, TurnOutcome,
+    AdapterEvent, AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, DispatchOptions,
+    GeminiAdapter, HarnessAdapter, TurnOutcome,
 };
 use uuid::Uuid;
 
@@ -408,5 +409,407 @@ async fn live_codex_resume_reuses_session() {
     assert_eq!(
         r1["session_partition_date"], r2["session_partition_date"],
         "resume preserves session_partition_date"
+    );
+}
+
+// --- Gemini live tests ---
+
+fn live_gemini_agent() -> AgentRecord {
+    AgentRecord {
+        id: Uuid::now_v7(),
+        project_id: Uuid::now_v7(),
+        name: "live-gemini-agent".to_owned(),
+        harness: HarnessKind::Gemini,
+        // Gemini follows the Claude shape — caller-controlled session UUID.
+        // **UUID v4, not v7**: Gemini's session-file filename uses the first
+        // 8 hex chars of the session UUID, and v7s minted in the same
+        // millisecond share their first 8 chars. v4 makes the collision
+        // probability ~1/2^32. The production `Project::register_agent`
+        // honors this contract; tests must mint v4 explicitly here too.
+        session_id: Some(Uuid::new_v4()),
+        created_at: chrono::Utc::now(),
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires gemini installed — run with: make test-live"]
+async fn live_gemini_basic_turn_completes() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let adapter = GeminiAdapter::new();
+    let agent = live_gemini_agent();
+    let turn_id = Uuid::now_v7();
+
+    let stream = adapter
+        .dispatch(
+            &agent,
+            tmp.path(),
+            "Reply with the single word 'ack' and nothing else.",
+            turn_id,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed with real gemini");
+
+    let events: Vec<AdapterEvent> = stream.collect().await;
+
+    let text: String = events
+        .iter()
+        .filter_map(|e| {
+            if let AdapterEvent::ContentChunk { text, .. } = e {
+                Some(text.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert!(
+        text.to_lowercase().contains("ack"),
+        "expected 'ack' in response text, got: {text:?}"
+    );
+
+    let terminal = events
+        .iter()
+        .find(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+        .expect("should have a terminal TurnEnd");
+    assert!(
+        matches!(
+            terminal,
+            AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        ),
+        "expected TurnEnd(Completed), got: {terminal:?}"
+    );
+
+    // Gemini emits `SessionMeta` from its stream `init` event on every
+    // dispatch. The contract is asymmetric vs. Claude / Codex:
+    // - `model` populates from `init.model`.
+    // - `tools` is always `vec![]` — Gemini's `init` doesn't carry tools.
+    // - `harness_version` comes from a lazy `gemini --version` fetch on
+    //   first dispatch; empty string is tolerated if the version probe
+    //   fails (the field is display-only).
+    // - `mcp_servers` / `skills` come from the adapter's
+    //   loader injection (settings.json / ~/.agents/skills). Structural
+    //   checks only — content is developer-environment-dependent (we
+    //   don't pin a particular setup), matching Codex's live-test
+    //   discipline.
+    let session_meta = events
+        .iter()
+        .find(|e| matches!(e, AdapterEvent::SessionMeta { .. }))
+        .expect("Gemini must emit SessionMeta from stream init on every dispatch");
+    match session_meta {
+        AdapterEvent::SessionMeta {
+            model,
+            tools,
+            mcp_servers,
+            skills,
+            ..
+        } => {
+            assert!(!model.is_empty(), "SessionMeta.model must be non-empty");
+            assert!(tools.is_empty(), "Gemini SessionMeta.tools is vec![]");
+            // Structural check only — the loader emits real entries when
+            // settings.json / ~/.agents/skills carry config, [] otherwise.
+            // Both shapes are valid; pinning content would couple the
+            // test to the developer's machine.
+            let _: &Vec<_> = mcp_servers;
+            let _: &Vec<_> = skills;
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires gemini installed — run with: make test-live"]
+async fn live_gemini_resume_reuses_session() {
+    // Memorize-then-recall: definitive proof that `--resume` restores the
+    // prior turn's context (matches the Codex pattern, strictly stronger
+    // than "two completes succeed"). The adapter must detect the session
+    // file from turn 1 and switch from `--session-id` to `--resume` on
+    // turn 2. A regression in the path-lookup helper would surface here
+    // as the recall failing.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let adapter = GeminiAdapter::new();
+    let agent = live_gemini_agent();
+
+    let turn1 = Uuid::now_v7();
+    let stream1 = adapter
+        .dispatch(
+            &agent,
+            tmp.path(),
+            "Remember the word 'mango'. Reply with only 'ok'.",
+            turn1,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("first dispatch should succeed");
+    let _events1: Vec<AdapterEvent> = stream1.collect().await;
+
+    let turn2 = Uuid::now_v7();
+    let stream2 = adapter
+        .dispatch(
+            &agent,
+            tmp.path(),
+            "What word did I ask you to remember? Reply with only that word.",
+            turn2,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("resume dispatch should succeed");
+    let events2: Vec<AdapterEvent> = stream2.collect().await;
+    let recall_text: String = events2
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::ContentChunk { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        recall_text.to_lowercase().contains("mango"),
+        "--resume must restore the prior turn's context: turn2 reply was {recall_text:?}"
+    );
+}
+
+// --- Antigravity live tests ---
+
+fn live_antigravity_agent() -> AgentRecord {
+    AgentRecord {
+        id: Uuid::now_v7(),
+        project_id: Uuid::now_v7(),
+        name: "live-antigravity-agent".to_owned(),
+        harness: HarnessKind::Antigravity,
+        // Antigravity assigns the conversation UUID server-side; the adapter
+        // captures it post-spawn into the per-agent sidecar. Always None.
+        session_id: None,
+        created_at: chrono::Utc::now(),
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires agy authed via Antigravity desktop app — run with: make test-live"]
+async fn live_antigravity_basic_turn_completes() {
+    // cwd is a tempdir so the sidecar lands in a clean location. Note: `agy`
+    // also writes a `.antigravitycli/` dir into cwd as a side effect — fine
+    // here because the tempdir is discarded.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let adapter = AntigravityAdapter::new();
+    let agent = live_antigravity_agent();
+    let turn_id = Uuid::now_v7();
+
+    let stream = adapter
+        .dispatch(
+            &agent,
+            tmp.path(),
+            "Reply with the single word 'ack' and nothing else.",
+            turn_id,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed with real agy");
+    let events: Vec<AdapterEvent> = stream.collect().await;
+
+    // Assistant text comes from the transcript's per-turn `PLANNER_RESPONSE`
+    // record, not stdout: `agy`'s stdout replays the whole conversation on
+    // resume, so the transcript is the clean per-turn source (tool lifecycle
+    // and thinking are tailed from the same file).
+    let text: String = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::ContentChunk { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        text.to_lowercase().contains("ack"),
+        "expected 'ack' in transcript-derived response text, got: {text:?}"
+    );
+
+    let terminal = events
+        .iter()
+        .find(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+        .expect("should have a terminal TurnEnd");
+    assert!(
+        matches!(
+            terminal,
+            AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        ),
+        "expected TurnEnd(Completed), got: {terminal:?}"
+    );
+
+    // SessionMeta fires post-terminal. Model is best-effort from the user
+    // settings envelope; mcp_servers / skills come from the dispatch-time
+    // loader injection (`~/.gemini/config/mcp_config.json` and
+    // `~/.gemini/config/plugins/*/skills/*`). Structural-only checks — the
+    // dev env varies, so we assert presence and types, not values (matching
+    // Codex/Gemini live discipline).
+    let session_meta = events
+        .iter()
+        .find(|e| matches!(e, AdapterEvent::SessionMeta { .. }))
+        .expect("Antigravity must emit SessionMeta post-terminal");
+    match session_meta {
+        AdapterEvent::SessionMeta {
+            tools,
+            mcp_servers,
+            skills,
+            ..
+        } => {
+            assert!(tools.is_empty(), "Antigravity SessionMeta.tools is vec![]");
+            let _: &Vec<_> = mcp_servers;
+            let _: &Vec<_> = skills;
+        }
+        other => panic!("expected SessionMeta, got {other:?}"),
+    }
+
+    // Sidecar must exist after the first turn with the captured conversation
+    // UUID — the system-of-record for resume / hydration.
+    let sidecar = tmp
+        .path()
+        .join(".switchboard")
+        .join("projects")
+        .join(agent.project_id.to_string())
+        .join("sessions")
+        .join(format!("{}.antigravity.jsonl", agent.id));
+    assert!(
+        sidecar.is_file(),
+        "sidecar must be written on first dispatch once the conversation UUID is captured"
+    );
+    let content = std::fs::read_to_string(&sidecar).unwrap();
+    assert!(content.contains("conversation_id"));
+}
+
+#[tokio::test]
+#[ignore = "requires agy authed via Antigravity desktop app — run with: make test-live"]
+async fn live_antigravity_adversarial_prompt_still_completes() {
+    // Guards the load-bearing assumption that `agy` echoes the dispatched
+    // prompt verbatim into the transcript's `<USER_REQUEST>` body. Capture
+    // correlates on exact prompt match and a miss is now fatal (unresumable
+    // → failed turn), so if `agy` reformats a non-trivial prompt (reindents
+    // multi-line, escapes quotes, mangles unicode), correlation would miss
+    // and this turn would FAIL. A `Completed` outcome proves the prompt was
+    // echoed verbatim and the exact-match gate is sound for realistic
+    // prompts. If this test fails, loosen `transcript_echoes_prompt` to a
+    // whitespace-normalized comparison (see its docstring).
+    let tmp = tempfile::TempDir::new().unwrap();
+    let adapter = AntigravityAdapter::new();
+    let agent = live_antigravity_agent();
+    let turn_id = Uuid::now_v7();
+
+    // Multi-line, indented, quoted, and unicode — the shapes most likely to
+    // be reformatted. Keep the actual task tiny so the response is cheap.
+    let prompt = "Follow these steps exactly:\n  1. Note the word \"café\".\n  2. Ignore everything else.\nReply with only the single word: ack";
+
+    let stream = adapter
+        .dispatch(
+            &agent,
+            tmp.path(),
+            prompt,
+            turn_id,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed with real agy");
+    let events: Vec<AdapterEvent> = stream.collect().await;
+
+    let terminal = events
+        .iter()
+        .find(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+        .expect("should have a terminal TurnEnd");
+    assert!(
+        matches!(
+            terminal,
+            AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        ),
+        "adversarial prompt must still correlate + complete (verbatim-echo assumption); \
+         got: {terminal:?}. If this is the unresumable AdapterFailure, agy reformatted the \
+         prompt — loosen transcript_echoes_prompt to a whitespace-normalized match."
+    );
+
+    // And the sidecar was captured — i.e. correlation actually matched.
+    let sidecar = tmp
+        .path()
+        .join(".switchboard")
+        .join("projects")
+        .join(agent.project_id.to_string())
+        .join("sessions")
+        .join(format!("{}.antigravity.jsonl", agent.id));
+    assert!(
+        sidecar.is_file(),
+        "correlation must have matched the adversarial prompt and persisted the sidecar"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires agy authed via Antigravity desktop app — run with: make test-live"]
+async fn live_antigravity_resume_reuses_session() {
+    // Memorize-then-recall: proof that `--conversation <uuid>` (driven by the
+    // sidecar-captured UUID) restores the prior turn's server-side context.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let adapter = AntigravityAdapter::new();
+    let agent = live_antigravity_agent();
+
+    let turn1 = Uuid::now_v7();
+    let stream1 = adapter
+        .dispatch(
+            &agent,
+            tmp.path(),
+            "Remember the word 'mango'. Reply with only 'ok'.",
+            turn1,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("first dispatch should succeed");
+    let _events1: Vec<AdapterEvent> = stream1.collect().await;
+
+    let turn2 = Uuid::now_v7();
+    let stream2 = adapter
+        .dispatch(
+            &agent,
+            tmp.path(),
+            "What word did I ask you to remember? Reply with only that word.",
+            turn2,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("resume dispatch should succeed");
+    let events2: Vec<AdapterEvent> = stream2.collect().await;
+    let recall_text: String = events2
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::ContentChunk { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        recall_text.to_lowercase().contains("mango"),
+        "--conversation resume must restore prior context: turn2 reply was {recall_text:?}"
+    );
+
+    // Two dispatches → two sidecar records, same conversation_id (resume
+    // reuses the captured UUID rather than minting a new conversation).
+    let sidecar = tmp
+        .path()
+        .join(".switchboard")
+        .join("projects")
+        .join(agent.project_id.to_string())
+        .join("sessions")
+        .join(format!("{}.antigravity.jsonl", agent.id));
+    let lines: Vec<String> = std::fs::read_to_string(&sidecar)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(lines.len(), 2, "two dispatches → two records");
+    let r1: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+    let r2: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
+    assert_eq!(
+        r1["conversation_id"], r2["conversation_id"],
+        "resume must reuse the captured conversation UUID"
     );
 }

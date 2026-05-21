@@ -3,7 +3,7 @@
 //! to Tauri's `State<'_, AppState>` / `String` conventions; the free
 //! functions are what the unit tests target.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -168,36 +168,42 @@ pub fn create_agent_impl(
     Ok(project.register_agent(name, harness)?)
 }
 
-/// Attach an existing harness session (Claude Code or Codex) as a new
-/// Switchboard agent in the active project.
+/// Attach an existing harness session (Claude Code, Codex, Gemini, or
+/// Antigravity) as a new Switchboard agent in the active project.
 ///
 /// Validation order (all under the directory-level `registry_write` mutex
 /// so the cross-project session-id check + register form one atomic step):
 /// 1. Active project resolved.
 /// 2. `existing_session_id` parses as UUID.
-/// 3. Per-harness session-file existence under `home_dir`. For Codex,
-///    discovery also returns the parsed `YYYY-MM-DD` (the sidecar's
-///    `session_partition_date`).
+/// 3. Per-harness session existence under `home_dir`. Claude / Gemini check a
+///    session file; Codex's discovery also returns the parsed `YYYY-MM-DD`
+///    (the sidecar's `session_partition_date`); Antigravity checks that the
+///    server-assigned conversation directory `brain/<uuid>/` exists (the
+///    transcript inside may be absent — hydration degrades gracefully).
 /// 4. Session-id collision scan across **all projects in the bound
 ///    directory** (loaded or not — `enumerate_all_projects` walks every
-///    project on disk via `directory.list_projects()`). Claude scans
-///    `AgentRecord.session_id`, Codex scans every project's
-///    `sessions/<agent_id>.jsonl` sidecar. Two `AgentRecord`s pointing at
-///    the same harness session is the same-session-parallel-invocation
-///    hazard (`docs/research/same-session-parallel-invocation.md`);
-///    unloaded projects could still be opened and dispatched concurrently
-///    later, so loaded-only scope would miss the collision.
+///    project on disk via `directory.list_projects()`). Claude and Gemini
+///    scan `AgentRecord.session_id` (caller-controlled UUID); Codex and
+///    Antigravity scan every project's `sessions/<agent_id>.*.jsonl` sidecar
+///    (those agents leave `AgentRecord.session_id = None` — the id lives in
+///    the sidecar). Two `AgentRecord`s pointing at the same harness session
+///    is the same-session-parallel-invocation hazard
+///    (`docs/research/same-session-parallel-invocation.md`); unloaded
+///    projects could still be opened and dispatched concurrently later, so
+///    loaded-only scope would miss the collision.
 /// 5. Register via the harness-specific `register_attached_*` method.
-/// 6. (Codex only) Append the first sidecar record with the discovered
-///    `session_partition_date`.
+/// 6. (Codex and Antigravity) Append the first sidecar record (Codex carries
+///    the discovered `session_partition_date`; Antigravity the captured
+///    `conversation_id`). Written **before** step 5 commits so a failed
+///    sidecar write leaves an orphan sidecar, never an orphan agent.
 /// 7. (Codex only) Insert the new `agent_id` into `needs_session_meta` so
 ///    every dispatch up to and including the one that observes `SessionMeta`
 ///    runs with `is_first_dispatch_after_attach: true` — forces `SessionMeta`
 ///    emission for the Codex sidebar. The per-dispatch emitter decorator
 ///    clears the flag once `session_meta` is genuinely observed on the wire.
-///    Claude attaches do **not** populate this set: Claude emits `SessionMeta`
-///    from its `system/init` stream event on every dispatch (see
-///    `crates/harness/src/claude_code.rs`), so the override has nothing to do.
+///    Claude and Antigravity attaches do **not** populate this set: both emit
+///    `SessionMeta` on every dispatch (Claude from `system/init`; Antigravity
+///    constructs it post-terminal each turn), so the override has nothing to do.
 ///
 /// `home_dir` is passed in (not resolved here) so tests can stage a temp
 /// directory without mutating process-wide `$HOME`. The Tauri command shim
@@ -269,6 +275,54 @@ pub fn attach_agent_impl(
             lock(&state.needs_session_meta).insert(record.id);
             record
         }
+        HarnessKind::Gemini => {
+            let candidate = locate_gemini_candidate(home_dir, &directory.path, session_uuid)?;
+            tracing::debug!(
+                session_id = %session_uuid,
+                path = %candidate.display(),
+                "gemini attach: bound to candidate"
+            );
+            check_gemini_session_id_unique(state, &session_uuid)?;
+            project.register_attached_gemini_agent(name, session_uuid)?
+        }
+        HarnessKind::Antigravity => {
+            // Claude-shaped attach: a conversation UUID maps to exactly one
+            // path (`brain/<uuid>/`), so validate that directory exists inline
+            // — no Codex/Gemini-style ambiguity locator (there is nothing to
+            // disambiguate). The brain dir, not the deeper
+            // `.system_generated/.../transcript.jsonl`, is the existence
+            // marker: a conversation present only as the encrypted `.pb` store
+            // (or whose transcript artifact was pruned) still attaches and
+            // hydrates empty, matching the loader's missing-transcript path.
+            let brain_dir = switchboard_harness::antigravity::paths::conversation_brain_dir(
+                home_dir,
+                session_uuid,
+            );
+            if !brain_dir.is_dir() {
+                return Err(AppError::SessionFileNotFound {
+                    harness,
+                    expected_path: brain_dir.to_string_lossy().into_owned(),
+                });
+            }
+            check_antigravity_session_id_unique(state, session_uuid, &directory.path)?;
+            // Sidecar-before-registry, pre-minted id — same ordering and
+            // inverted-blast-radius rationale as the Codex arm above.
+            let new_agent_id = Uuid::now_v7();
+            let sidecar_path = switchboard_harness::antigravity::sidecar::sidecar_path(
+                &directory.path,
+                project.id,
+                new_agent_id,
+            );
+            let sidecar_record = switchboard_harness::antigravity::sidecar::SessionLinkRecord {
+                conversation_id: session_uuid,
+                captured_at: chrono::Utc::now(),
+            };
+            switchboard_harness::antigravity::sidecar::append_record(
+                &sidecar_path,
+                &sidecar_record,
+            )?;
+            project.register_attached_antigravity_agent_with_id(name, new_agent_id)?
+        }
         _ => return Err(AppError::UnsupportedHarness),
     };
 
@@ -292,7 +346,11 @@ fn map_codex_attach_lookup_error(
             }
         }
         switchboard_harness::AttachLookupError::Ambiguous { session_id, paths } => {
-            AppError::AmbiguousSessionFile { session_id, paths }
+            AppError::AmbiguousSessionFile {
+                harness: HarnessKind::Codex,
+                session_id,
+                paths,
+            }
         }
         // `AttachLookupError` is `#[non_exhaustive]` across crate boundaries.
         // A future variant we don't recognize lands here with a non-misleading
@@ -368,6 +426,107 @@ fn check_claude_session_id_unique(state: &AppState, candidate: &Uuid) -> Result<
 /// The error is wrapped in `AttachBlockedByCorruption` so the user sees
 /// "the failure is about an *unrelated* agent's state, not your attach
 /// target."
+/// Cross-project Gemini session-id collision check. Gemini agents carry
+/// `AgentRecord.session_id = Some(uuid)` (Claude shape). Walks every
+/// project on disk in the bound directory and rejects if any agent
+/// already attached to the same UUID.
+fn check_gemini_session_id_unique(state: &AppState, candidate: &Uuid) -> Result<(), AppError> {
+    for project in enumerate_all_projects(state)? {
+        for agent in project.list_agents()? {
+            if agent.harness != HarnessKind::Gemini {
+                continue;
+            }
+            if agent.session_id == Some(*candidate) {
+                return Err(AppError::SessionAlreadyAttached {
+                    existing_agent_id: agent.id,
+                    existing_agent_name: agent.name,
+                    existing_project_id: project.id,
+                    existing_project_name: project.config.name.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Locate the Gemini session file for `session_id` in the cwd's
+/// `~/.gemini/tmp/<project-name>/chats/` directory. Wraps the shared
+/// header-scan classifier so attach uses the same disambiguation rule as
+/// transcript hydration — divergence between attach and hydrate is the
+/// exact bug class this helper exists to prevent.
+///
+/// Outcomes:
+/// - One candidate classifies as `Unambiguous` against the target → return
+///   its path.
+/// - Any candidate is `Ambiguous` (single file, multiple distinct session
+///   headers) → `AmbiguousSessionFile` with the candidate path. Under UUID
+///   v4 this is ~1/2^32, but `tracing::warn!` keeps the case forensically
+///   visible if it ever fires in production.
+/// - Candidate read fails (permissions, EIO, race-removed) →
+///   `AttachLookupFailed` carrying the path + source. Failing loud
+///   matches hydration's behavior; swallowing the error would silently
+///   collapse "session file unreadable" into "session does not exist"
+///   and send the user chasing UUID red herrings instead of `chmod`.
+/// - No candidate matches → `SessionFileNotFound`.
+fn locate_gemini_candidate(
+    home_dir: &Path,
+    cwd: &Path,
+    session_id: Uuid,
+) -> Result<PathBuf, AppError> {
+    let candidates =
+        switchboard_harness::gemini_session_file_candidates(home_dir, cwd, &session_id);
+    let mut chosen: Option<PathBuf> = None;
+    for path in &candidates {
+        let content =
+            std::fs::read_to_string(path).map_err(|err| AppError::AttachLookupFailed {
+                message: format!(
+                    "failed to read Gemini session candidate {}: {err}",
+                    path.display()
+                ),
+            })?;
+        match switchboard_harness::classify_gemini_candidate(&content, session_id) {
+            switchboard_harness::GeminiCandidateMatch::Unambiguous => {
+                chosen = Some(path.clone());
+                break;
+            }
+            switchboard_harness::GeminiCandidateMatch::Ambiguous => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    path = %path.display(),
+                    "gemini attach: candidate file contains multiple session headers; rejecting as ambiguous"
+                );
+                return Err(AppError::AmbiguousSessionFile {
+                    harness: HarnessKind::Gemini,
+                    session_id: session_id.to_string(),
+                    paths: vec![path.clone()],
+                });
+            }
+            // `NoTarget` plus any future additive variant of the
+            // `#[non_exhaustive]` enum we don't yet recognize: doesn't
+            // match this target, continue to the next candidate.
+            // Conservative default — safer to fall through to
+            // `SessionFileNotFound` than to bind an unknown classifier
+            // outcome to the user's UUID.
+            _ => {}
+        }
+    }
+    chosen.ok_or_else(|| {
+        let expected = home_dir
+            .join(".gemini")
+            .join("tmp")
+            .join("<project>")
+            .join("chats")
+            .join(format!(
+                "session-*-{}.jsonl",
+                switchboard_harness::gemini_session_id_prefix(&session_id)
+            ));
+        AppError::SessionFileNotFound {
+            harness: HarnessKind::Gemini,
+            expected_path: expected.to_string_lossy().into_owned(),
+        }
+    })
+}
+
 fn check_codex_session_id_unique(
     state: &AppState,
     candidate: &str,
@@ -384,11 +543,52 @@ fn check_codex_session_id_unique(
                 switchboard_harness::codex::sidecar::read_latest(&sidecar).map_err(|source| {
                     AppError::AttachBlockedByCorruption {
                         path: sidecar.clone(),
-                        source,
+                        source: Box::new(source),
                     }
                 })?;
             if let Some(record) = latest
                 && record.session_id == candidate
+            {
+                return Err(AppError::SessionAlreadyAttached {
+                    existing_agent_id: agent.id,
+                    existing_agent_name: agent.name,
+                    existing_project_id: project.id,
+                    existing_project_name: project.config.name.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reject attaching a conversation UUID already bound to another Antigravity
+/// agent in the directory. Mirrors the Codex check (the conversation id lives
+/// in the per-agent sidecar, not the `AgentRecord`, so the scan reads
+/// sidecars). The same-session-parallel-invocation risk is identical: two
+/// agents resuming one `--conversation <uuid>` would interleave server-side.
+/// Corrupt sidecars fail loud rather than being skipped — a skipped sidecar
+/// could let a duplicate attach through and violate the uniqueness contract.
+fn check_antigravity_session_id_unique(
+    state: &AppState,
+    candidate: Uuid,
+    directory: &Path,
+) -> Result<(), AppError> {
+    for project in enumerate_all_projects(state)? {
+        for agent in project.list_agents()? {
+            if agent.harness != HarnessKind::Antigravity {
+                continue;
+            }
+            let sidecar = switchboard_harness::antigravity::sidecar::sidecar_path(
+                directory, project.id, agent.id,
+            );
+            let latest = switchboard_harness::antigravity::sidecar::read_latest(&sidecar).map_err(
+                |source| AppError::AttachBlockedByCorruption {
+                    path: sidecar.clone(),
+                    source: Box::new(source),
+                },
+            )?;
+            if let Some(record) = latest
+                && record.conversation_id == candidate
             {
                 return Err(AppError::SessionAlreadyAttached {
                     existing_agent_id: agent.id,
@@ -449,6 +649,8 @@ pub async fn send_message_impl(
     let adapter: &dyn HarnessAdapter = match agent.harness {
         HarnessKind::ClaudeCode => state.claude_adapter.as_ref(),
         HarnessKind::Codex => state.codex_adapter.as_ref(),
+        HarnessKind::Gemini => state.gemini_adapter.as_ref(),
+        HarnessKind::Antigravity => state.antigravity_adapter.as_ref(),
         _ => return Err(AppError::UnsupportedHarness),
     };
     // Read (don't drain) the attach-flow flag. The per-dispatch emitter
@@ -527,7 +729,7 @@ pub fn load_transcript_impl(
             let latest = switchboard_harness::codex::sidecar::read_latest(&sidecar_path).map_err(
                 |source| AppError::HydrationBlockedByCorruption {
                     path: sidecar_path.clone(),
-                    source,
+                    source: Box::new(source),
                 },
             )?;
             let (session_id, partition_date) = match latest {
@@ -542,6 +744,42 @@ pub fn load_transcript_impl(
                 agent.id,
             )?)
         }
+        HarnessKind::Gemini => {
+            let Some(session_id) = agent.session_id else {
+                return Ok(switchboard_harness::LoadedTranscript::default());
+            };
+            Ok(switchboard_harness::load_gemini_transcript(
+                home_dir,
+                &directory.path,
+                session_id,
+                agent.id,
+            )?)
+        }
+        HarnessKind::Antigravity => {
+            // Antigravity agents carry `session_id: None` — the conversation
+            // UUID is server-assigned and lives in the per-agent sidecar, so
+            // this follows the Codex shape (sidecar lookup), not the Gemini
+            // one (`agent.session_id`). Corrupt sidecar is fail-loud per the
+            // Switchboard-owned-JSONL invariant; `Ok(None)` is the legitimate
+            // never-dispatched case — passed through as `None` so the loader
+            // still surfaces registry meta (matching the Codex arm).
+            let sidecar_path = switchboard_harness::antigravity::sidecar::sidecar_path(
+                &directory.path,
+                project.id,
+                agent.id,
+            );
+            let latest = switchboard_harness::antigravity::sidecar::read_latest(&sidecar_path)
+                .map_err(|source| AppError::HydrationBlockedByCorruption {
+                    path: sidecar_path.clone(),
+                    source: Box::new(source),
+                })?;
+            Ok(switchboard_harness::load_antigravity_transcript(
+                home_dir,
+                &directory.path,
+                latest.map(|record| record.conversation_id),
+                agent.id,
+            )?)
+        }
         _ => Err(AppError::UnsupportedHarness),
     }
 }
@@ -552,6 +790,77 @@ pub fn check_claude_binary_impl(state: &AppState) -> Result<(), AppError> {
 
 pub fn check_codex_binary_impl(state: &AppState) -> Result<(), AppError> {
     state.codex_adapter.probe().map_err(AppError::Probe)
+}
+
+pub fn check_gemini_binary_impl(state: &AppState) -> Result<(), AppError> {
+    state.gemini_adapter.probe().map_err(AppError::Probe)
+}
+
+/// Probe `agy` on PATH via the registered Antigravity adapter — same shape
+/// as the other three harness binary checks.
+pub fn check_antigravity_binary_impl(state: &AppState) -> Result<(), AppError> {
+    state.antigravity_adapter.probe().map_err(AppError::Probe)
+}
+
+/// Supported macOS Keychain service / account for Antigravity auth.
+///
+/// Surprising load-bearing detail: the service name is `"gemini"`, NOT
+/// `"antigravity"`. Antigravity stores its credentials under the shared
+/// Gemini Keychain service to match the `~/.gemini/` directory namespace
+/// theme. Source: `security dump-keychain` on an authed dev machine
+/// showed `svce="gemini" acct="antigravity"`. Documented in
+/// `docs/research/antigravity-cli-observed.md` line 99.
+const ANTIGRAVITY_KEYCHAIN_SERVICE: &str = "gemini";
+const ANTIGRAVITY_KEYCHAIN_ACCOUNT: &str = "antigravity";
+
+/// Best-effort Antigravity subscription-auth detection. Invokes the macOS
+/// `security` CLI to look up the Antigravity Keychain entry. Returns
+/// `Ok(())` if the entry exists; `Err(AppError::AuthNotConfigured)`
+/// otherwise (including when `security` itself is missing — non-macOS
+/// hosts will surface as auth-missing, which is correct because
+/// Antigravity is macOS-only in v1).
+///
+/// Unlike Codex/Gemini, there is no on-disk config file we can probe —
+/// `agy` reads credentials exclusively via macOS Keychain. The signature
+/// therefore takes no `home_dir` parameter; the keychain lookup is
+/// system-wide. The Tauri shim drops the `$HOME` forwarding it does for
+/// the other harnesses.
+pub fn check_antigravity_auth_impl() -> Result<(), AppError> {
+    let probe_result = std::process::Command::new("security")
+        .args([
+            "find-generic-password",
+            "-s",
+            ANTIGRAVITY_KEYCHAIN_SERVICE,
+            "-a",
+            ANTIGRAVITY_KEYCHAIN_ACCOUNT,
+        ])
+        .status()
+        .map(|s| s.success());
+    interpret_antigravity_keychain_probe(&probe_result)
+}
+
+/// Pure interpretation of the `security` CLI's exit status. Factored out
+/// so unit tests can pin all three branches without invoking the actual
+/// CLI. Takes the result by reference because `std::io::Error` is not
+/// `Clone` and the function only inspects, never owns, the result.
+fn interpret_antigravity_keychain_probe(
+    probe_result: &std::io::Result<bool>,
+) -> Result<(), AppError> {
+    let expected_path = format!(
+        "macOS Keychain (service: {ANTIGRAVITY_KEYCHAIN_SERVICE}, account: {ANTIGRAVITY_KEYCHAIN_ACCOUNT})"
+    );
+    let auth_err = || AppError::AuthNotConfigured {
+        harness: HarnessKind::Antigravity,
+        expected_path: expected_path.clone(),
+    };
+    // `Ok(false)` (entry not in Keychain) and `Err(_)` (couldn't run
+    // `security` at all — non-macOS host, missing tool) both surface as
+    // auth-missing. The user-facing outcome is the same: the agent isn't
+    // dispatchable until they authenticate.
+    match probe_result {
+        Ok(true) => Ok(()),
+        Ok(false) | Err(_) => Err(auth_err()),
+    }
 }
 
 /// Best-effort Codex subscription-auth detection. Returns `Ok(())` if the
@@ -580,6 +889,43 @@ pub fn check_codex_auth_impl(home_dir: &Path) -> Result<(), AppError> {
             harness: HarnessKind::Codex,
             expected_path: auth_path.to_string_lossy().into_owned(),
         })
+    }
+}
+
+/// Supported Gemini auth methods. The file is considered authenticated
+/// iff `security.auth.selectedType` is one of these. Failing closed on
+/// missing/unknown values means a malformed or empty `settings.json`
+/// surfaces as "not authenticated," prompting the user to run `gemini`
+/// interactively rather than silently letting a dispatch fail with a
+/// less-actionable error.
+const SUPPORTED_GEMINI_AUTH_TYPES: &[&str] =
+    &["oauth-personal", "gemini-api-key", "vertex-ai", "workspace"];
+
+/// Best-effort Gemini subscription-auth detection. Reads
+/// `<home>/.gemini/settings.json` and checks
+/// `security.auth.selectedType` against the supported set. Returns
+/// `Err(AppError::AuthNotConfigured)` if the file is missing, unparseable,
+/// the field is absent, or the value isn't recognized. Mirrors
+/// `check_codex_auth_impl` shape; `home_dir` is a parameter so tests
+/// stage a temp directory without touching `$HOME`.
+pub fn check_gemini_auth_impl(home_dir: &Path) -> Result<(), AppError> {
+    let settings_path = home_dir.join(".gemini").join("settings.json");
+    let auth_err = || AppError::AuthNotConfigured {
+        harness: HarnessKind::Gemini,
+        expected_path: settings_path.to_string_lossy().into_owned(),
+    };
+    let bytes = std::fs::read(&settings_path).map_err(|_| auth_err())?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| auth_err())?;
+    let selected = value
+        .get("security")
+        .and_then(|s| s.get("auth"))
+        .and_then(|a| a.get("selectedType"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(auth_err)?;
+    if SUPPORTED_GEMINI_AUTH_TYPES.contains(&selected) {
+        Ok(())
+    } else {
+        Err(auth_err())
     }
 }
 
@@ -626,6 +972,8 @@ mod tests {
         let state = AppState::new(
             Arc::clone(&mock),
             Arc::clone(&mock),
+            Arc::clone(&mock),
+            Arc::clone(&mock),
             emitter.clone() as Arc<dyn EventEmitter>,
         );
         (tmp, state, emitter)
@@ -651,6 +999,8 @@ mod tests {
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
         let state = AppState::new(
+            Arc::clone(&mock),
+            Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
             emitter as Arc<dyn EventEmitter>,
@@ -823,6 +1173,8 @@ mod tests {
         let state = Arc::new(AppState::new(
             Arc::clone(&mock),
             Arc::clone(&mock),
+            Arc::clone(&mock),
+            Arc::clone(&mock),
             emitter as Arc<dyn EventEmitter>,
         ));
         init_directory_impl(&state, tmp.path().to_str().unwrap())
@@ -882,8 +1234,16 @@ mod tests {
             "/nonexistent/claude-xyz",
         ));
         let codex: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let gemini: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
-        let state = AppState::new(claude, codex, emitter as Arc<dyn EventEmitter>);
+        let antigravity: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let state = AppState::new(
+            claude,
+            codex,
+            gemini,
+            antigravity,
+            emitter as Arc<dyn EventEmitter>,
+        );
         let err = check_claude_binary_impl(&state).unwrap_err();
         assert!(matches!(err, AppError::Probe(_)));
     }
@@ -944,10 +1304,226 @@ mod tests {
         let claude: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let codex: Arc<dyn HarnessAdapter> =
             Arc::new(CodexAdapter::with_binary_path("/nonexistent/codex-xyz"));
+        let gemini: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
-        let state = AppState::new(claude, codex, emitter as Arc<dyn EventEmitter>);
+        let antigravity: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let state = AppState::new(
+            claude,
+            codex,
+            gemini,
+            antigravity,
+            emitter as Arc<dyn EventEmitter>,
+        );
         let err = check_codex_binary_impl(&state).unwrap_err();
         assert!(matches!(err, AppError::Probe(_)));
+    }
+
+    #[test]
+    fn check_gemini_binary_with_mock_adapter_returns_ok() {
+        let (_tmp, state, _) = fresh_state_with_mock();
+        assert!(check_gemini_binary_impl(&state).is_ok());
+    }
+
+    #[test]
+    fn check_gemini_binary_with_missing_binary_returns_error() {
+        use switchboard_harness::GeminiAdapter;
+        let claude: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let codex: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let gemini: Arc<dyn HarnessAdapter> =
+            Arc::new(GeminiAdapter::with_binary_path("/nonexistent/gemini-xyz"));
+        let emitter = Arc::new(RecordingEmitter::new());
+        let antigravity: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let state = AppState::new(
+            claude,
+            codex,
+            gemini,
+            antigravity,
+            emitter as Arc<dyn EventEmitter>,
+        );
+        let err = check_gemini_binary_impl(&state).unwrap_err();
+        assert!(matches!(err, AppError::Probe(_)));
+    }
+
+    fn stage_gemini_settings(home: &Path, body: &str) {
+        std::fs::create_dir_all(home.join(".gemini")).unwrap();
+        std::fs::write(home.join(".gemini").join("settings.json"), body).unwrap();
+    }
+
+    #[test]
+    fn check_gemini_auth_returns_error_when_settings_missing() {
+        let tmp = TempDir::new().unwrap();
+        let err = check_gemini_auth_impl(tmp.path()).unwrap_err();
+        match err {
+            AppError::AuthNotConfigured {
+                harness,
+                expected_path,
+            } => {
+                assert_eq!(harness, HarnessKind::Gemini);
+                assert!(expected_path.contains(".gemini"));
+                assert!(expected_path.ends_with("settings.json"));
+            }
+            other => panic!("expected AuthNotConfigured, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_gemini_auth_returns_error_when_selected_type_missing() {
+        let tmp = TempDir::new().unwrap();
+        stage_gemini_settings(tmp.path(), r#"{"security":{"auth":{}}}"#);
+        assert!(matches!(
+            check_gemini_auth_impl(tmp.path()),
+            Err(AppError::AuthNotConfigured { .. })
+        ));
+    }
+
+    #[test]
+    fn check_gemini_auth_returns_error_when_selected_type_unknown() {
+        // Fail-closed: unknown auth type surfaces as not-authenticated
+        // rather than silently allowing the user past the gate.
+        let tmp = TempDir::new().unwrap();
+        stage_gemini_settings(
+            tmp.path(),
+            r#"{"security":{"auth":{"selectedType":"future-method"}}}"#,
+        );
+        assert!(matches!(
+            check_gemini_auth_impl(tmp.path()),
+            Err(AppError::AuthNotConfigured { .. })
+        ));
+    }
+
+    #[test]
+    fn check_gemini_auth_accepts_each_supported_selected_type() {
+        for selected in &["oauth-personal", "gemini-api-key", "vertex-ai", "workspace"] {
+            let tmp = TempDir::new().unwrap();
+            stage_gemini_settings(
+                tmp.path(),
+                &format!(r#"{{"security":{{"auth":{{"selectedType":"{selected}"}}}}}}"#),
+            );
+            assert!(
+                check_gemini_auth_impl(tmp.path()).is_ok(),
+                "expected Ok for selected_type={selected}"
+            );
+        }
+    }
+
+    #[test]
+    fn interpret_antigravity_keychain_probe_ok_true_returns_ok() {
+        assert!(interpret_antigravity_keychain_probe(&Ok(true)).is_ok());
+    }
+
+    #[test]
+    fn interpret_antigravity_keychain_probe_ok_false_returns_auth_not_configured() {
+        let err = interpret_antigravity_keychain_probe(&Ok(false)).unwrap_err();
+        match err {
+            AppError::AuthNotConfigured {
+                harness,
+                expected_path,
+            } => {
+                assert_eq!(harness, HarnessKind::Antigravity);
+                // The message references Keychain, not a file path —
+                // Antigravity's auth lives in the macOS Keychain, and the
+                // string the user sees must communicate that.
+                assert!(
+                    expected_path.contains("Keychain"),
+                    "expected_path should reference Keychain: {expected_path}"
+                );
+                assert!(
+                    expected_path.contains("gemini"),
+                    "expected_path should pin the surprising service name: {expected_path}"
+                );
+                assert!(
+                    expected_path.contains("antigravity"),
+                    "expected_path should pin the account name: {expected_path}"
+                );
+            }
+            other => panic!("expected AuthNotConfigured, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interpret_antigravity_keychain_probe_io_error_returns_auth_not_configured() {
+        // Simulates `security` itself missing (non-macOS host, etc.).
+        // Auth is reported as missing, which is the correct user-facing
+        // outcome — Antigravity is macOS-only in v1, and a missing
+        // `security` CLI means we cannot demonstrate authentication.
+        let probe_result = Err::<bool, _>(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "security missing",
+        ));
+        let err = interpret_antigravity_keychain_probe(&probe_result).unwrap_err();
+        assert!(matches!(err, AppError::AuthNotConfigured { .. }));
+    }
+
+    /// Drift-detection live test: if Antigravity moves its auth from the
+    /// macOS Keychain or changes the service/account name, this assertion
+    /// fails on the developer's machine before silent miscategorization
+    /// ships.
+    #[test]
+    #[ignore = "requires agy authed via Antigravity desktop app — run with: make test-live"]
+    fn live_check_antigravity_auth_finds_real_keychain_entry() {
+        check_antigravity_auth_impl().expect(
+            "Antigravity Keychain entry must live at service=gemini account=antigravity on a \
+             logged-in machine; if this fails, Antigravity may have changed its keychain \
+             naming or removed Keychain-based auth entirely",
+        );
+    }
+
+    /// Drift-detection live test: if `agy` is renamed or moved off PATH,
+    /// surface here before users see a confusing dispatch-time error.
+    #[test]
+    #[ignore = "requires agy installed — run with: make test-live"]
+    fn live_check_antigravity_binary_finds_real_agy_on_path() {
+        use switchboard_harness::AntigravityAdapter;
+        let claude: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let codex: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let gemini: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let antigravity: Arc<dyn HarnessAdapter> = Arc::new(AntigravityAdapter::new());
+        let emitter = Arc::new(RecordingEmitter::new());
+        let state = AppState::new(
+            claude,
+            codex,
+            gemini,
+            antigravity,
+            emitter as Arc<dyn EventEmitter>,
+        );
+        check_antigravity_binary_impl(&state)
+            .expect("agy binary must be on PATH; install from https://antigravity.google/download");
+    }
+
+    #[test]
+    fn check_antigravity_binary_with_missing_binary_returns_error() {
+        use switchboard_harness::AntigravityAdapter;
+        let claude: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let codex: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let gemini: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let antigravity: Arc<dyn HarnessAdapter> =
+            Arc::new(AntigravityAdapter::with_binary_path("/nonexistent/agy-xyz"));
+        let emitter = Arc::new(RecordingEmitter::new());
+        let state = AppState::new(
+            claude,
+            codex,
+            gemini,
+            antigravity,
+            emitter as Arc<dyn EventEmitter>,
+        );
+        let err = check_antigravity_binary_impl(&state).unwrap_err();
+        assert!(matches!(err, AppError::Probe(_)));
+    }
+
+    /// Drift-detection live test: if Gemini moves its auth file or
+    /// renames the `security.auth.selectedType` key, this assertion fails
+    /// on the developer's machine before silent miscategorization ships.
+    #[test]
+    #[ignore = "requires gemini login — run with: make test-live"]
+    fn live_check_gemini_auth_finds_real_settings_file() {
+        let home = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .expect("HOME must be set");
+        check_gemini_auth_impl(&home).expect(
+            "Gemini settings.json must live at ~/.gemini/settings.json with a supported \
+             `security.auth.selectedType` on a logged-in machine; if this fails, the \
+             Gemini CLI may have moved its auth file or renamed the field",
+        );
     }
 
     #[tokio::test]
@@ -1026,11 +1602,14 @@ mod tests {
     /// `send_message_impl` selects an adapter via `match agent.harness`,
     /// and a regression that hard-codes one adapter would silently spawn
     /// the wrong binary. This test pins that routing against regression
-    /// using two distinguishable adapters tagged "claude" / "codex".
+    /// using four distinguishable adapters tagged per harness.
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Four harnesses × (construct + dispatch + assert) is inherently long but linear.
     async fn send_message_routes_to_adapter_matching_agent_harness() {
         let claude_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let codex_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gemini_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let antigravity_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let claude: Arc<dyn HarnessAdapter> = Arc::new(TaggedMockAdapter {
             tag: "from-claude-adapter",
             dispatch_count: claude_count.clone(),
@@ -1039,8 +1618,22 @@ mod tests {
             tag: "from-codex-adapter",
             dispatch_count: codex_count.clone(),
         });
+        let gemini: Arc<dyn HarnessAdapter> = Arc::new(TaggedMockAdapter {
+            tag: "from-gemini-adapter",
+            dispatch_count: gemini_count.clone(),
+        });
+        let antigravity: Arc<dyn HarnessAdapter> = Arc::new(TaggedMockAdapter {
+            tag: "from-antigravity-adapter",
+            dispatch_count: antigravity_count.clone(),
+        });
         let emitter = Arc::new(RecordingEmitter::new());
-        let state = AppState::new(claude, codex, emitter.clone() as Arc<dyn EventEmitter>);
+        let state = AppState::new(
+            claude,
+            codex,
+            gemini,
+            antigravity,
+            emitter.clone() as Arc<dyn EventEmitter>,
+        );
         let tmp = TempDir::new().unwrap();
         init_directory_impl(&state, tmp.path().to_str().unwrap())
             .await
@@ -1049,6 +1642,8 @@ mod tests {
         set_active_project_impl(&state, proj.id).unwrap();
         let claude_agent = create_agent_impl(&state, "c1", HarnessKind::ClaudeCode).unwrap();
         let codex_agent = create_agent_impl(&state, "x1", HarnessKind::Codex).unwrap();
+        let gemini_agent = create_agent_impl(&state, "g1", HarnessKind::Gemini).unwrap();
+        let antigravity_agent = create_agent_impl(&state, "a1", HarnessKind::Antigravity).unwrap();
 
         let claude_handle = send_message_impl(&state, claude_agent.id, "hi")
             .await
@@ -1058,6 +1653,14 @@ mod tests {
             .await
             .unwrap();
         codex_handle.join.await.unwrap();
+        let gemini_handle = send_message_impl(&state, gemini_agent.id, "hi")
+            .await
+            .unwrap();
+        gemini_handle.join.await.unwrap();
+        let antigravity_handle = send_message_impl(&state, antigravity_agent.id, "hi")
+            .await
+            .unwrap();
+        antigravity_handle.join.await.unwrap();
 
         assert_eq!(
             claude_count.load(std::sync::atomic::Ordering::SeqCst),
@@ -1069,13 +1672,24 @@ mod tests {
             1,
             "Codex agent dispatch must hit the Codex adapter exactly once"
         );
+        assert_eq!(
+            gemini_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "Gemini agent dispatch must hit the Gemini adapter exactly once"
+        );
+        assert_eq!(
+            antigravity_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "Antigravity agent dispatch must hit the Antigravity adapter exactly once"
+        );
 
         // Secondary check: the emitted ContentChunk tags match the
         // adapter-of-origin per agent_id. Catches mis-routing where dispatch
-        // counts are still 1/1 but the wrong adapter served each.
+        // counts are still 1/1/1/1 but the wrong adapter served each.
         let events = emitter.snapshot();
         let claude_channel = format!("agent:{}", claude_agent.id);
         let codex_channel = format!("agent:{}", codex_agent.id);
+        let gemini_channel = format!("agent:{}", gemini_agent.id);
         let claude_text = events
             .iter()
             .find(|(name, payload)| name == &claude_channel && payload["type"] == "content_chunk")
@@ -1084,8 +1698,21 @@ mod tests {
             .iter()
             .find(|(name, payload)| name == &codex_channel && payload["type"] == "content_chunk")
             .expect("content_chunk on codex channel");
+        let gemini_text = events
+            .iter()
+            .find(|(name, payload)| name == &gemini_channel && payload["type"] == "content_chunk")
+            .expect("content_chunk on gemini channel");
+        let antigravity_channel = format!("agent:{}", antigravity_agent.id);
+        let antigravity_text = events
+            .iter()
+            .find(|(name, payload)| {
+                name == &antigravity_channel && payload["type"] == "content_chunk"
+            })
+            .expect("content_chunk on antigravity channel");
         assert_eq!(claude_text.1["text"], "from-claude-adapter");
         assert_eq!(codex_text.1["text"], "from-codex-adapter");
+        assert_eq!(gemini_text.1["text"], "from-gemini-adapter");
+        assert_eq!(antigravity_text.1["text"], "from-antigravity-adapter");
     }
 
     #[tokio::test]
@@ -1125,6 +1752,8 @@ mod tests {
         ));
         let emitter = Arc::new(RecordingEmitter::new());
         let state = AppState::new(
+            Arc::clone(&failing),
+            Arc::clone(&failing),
             Arc::clone(&failing),
             Arc::clone(&failing),
             emitter as Arc<dyn EventEmitter>,
@@ -1194,6 +1823,8 @@ mod tests {
         });
         let emitter = Arc::new(RecordingEmitter::new());
         let state = AppState::new(
+            Arc::clone(&adapter),
+            Arc::clone(&adapter),
             Arc::clone(&adapter),
             Arc::clone(&adapter),
             emitter as Arc<dyn EventEmitter>,
@@ -1299,6 +1930,8 @@ mod tests {
         });
         let emitter = Arc::new(RecordingEmitter::new());
         let state = AppState::new(
+            Arc::clone(&adapter),
+            Arc::clone(&adapter),
             Arc::clone(&adapter),
             Arc::clone(&adapter),
             emitter as Arc<dyn EventEmitter>,
@@ -1468,6 +2101,27 @@ mod tests {
         path
     }
 
+    /// Stage an Antigravity conversation under `home`: the `brain/<uuid>/`
+    /// directory always, and (optionally) a minimal one-turn `transcript.jsonl`.
+    fn stage_antigravity_conversation(home: &Path, uuid: Uuid, with_transcript: bool) {
+        let brain = switchboard_harness::antigravity::paths::conversation_brain_dir(home, uuid);
+        std::fs::create_dir_all(&brain).unwrap();
+        if with_transcript {
+            let transcript = switchboard_harness::antigravity::paths::transcript_path(home, uuid);
+            std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+            std::fs::write(
+                &transcript,
+                concat!(
+                    r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-05-19T19:00:00Z","content":"<USER_REQUEST>\nhi\n</USER_REQUEST>"}"#,
+                    "\n",
+                    r#"{"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-05-19T19:00:01Z","content":"ack"}"#,
+                    "\n",
+                ),
+            )
+            .unwrap();
+        }
+    }
+
     async fn fresh_state_with_active_project(
         name: &str,
     ) -> (TempDir, TempDir, AppState, switchboard_core::ProjectSummary) {
@@ -1476,6 +2130,8 @@ mod tests {
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
         let state = AppState::new(
+            Arc::clone(&mock),
+            Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
             emitter as Arc<dyn EventEmitter>,
@@ -1771,9 +2427,11 @@ mod tests {
         .unwrap_err();
         match err {
             AppError::AmbiguousSessionFile {
+                harness,
                 session_id: id,
                 paths,
             } => {
+                assert_eq!(harness, HarnessKind::Codex);
                 assert_eq!(id, id_str);
                 assert_eq!(paths.len(), 2);
             }
@@ -1913,6 +2571,8 @@ mod tests {
             let state_a = AppState::new(
                 Arc::clone(&mock),
                 Arc::clone(&mock),
+                Arc::clone(&mock),
+                Arc::clone(&mock),
                 emitter as Arc<dyn EventEmitter>,
             );
             init_directory_impl(&state_a, tmp_workdir.path().to_str().unwrap())
@@ -1936,6 +2596,8 @@ mod tests {
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
         let state_b = AppState::new(
+            Arc::clone(&mock),
+            Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
             emitter as Arc<dyn EventEmitter>,
@@ -1979,6 +2641,8 @@ mod tests {
             let state_a = AppState::new(
                 Arc::clone(&mock),
                 Arc::clone(&mock),
+                Arc::clone(&mock),
+                Arc::clone(&mock),
                 emitter as Arc<dyn EventEmitter>,
             );
             init_directory_impl(&state_a, tmp_workdir.path().to_str().unwrap())
@@ -1999,6 +2663,8 @@ mod tests {
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let emitter = Arc::new(RecordingEmitter::new());
         let state_b = AppState::new(
+            Arc::clone(&mock),
+            Arc::clone(&mock),
             Arc::clone(&mock),
             Arc::clone(&mock),
             emitter as Arc<dyn EventEmitter>,
@@ -2095,6 +2761,8 @@ mod tests {
             let state = AppState::new(
                 Arc::clone(&mock),
                 Arc::clone(&mock),
+                Arc::clone(&mock),
+                Arc::clone(&mock),
                 emitter as Arc<dyn EventEmitter>,
             );
             init_directory_impl(&state, tmp_workdir.path().to_str().unwrap())
@@ -2181,5 +2849,610 @@ mod tests {
             }
             other => panic!("expected HydrationBlockedByCorruption, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn attach_antigravity_succeeds_and_writes_sidecar() {
+        let (tmp_workdir, tmp_home, state, proj) = fresh_state_with_active_project("alpha").await;
+        let conversation_id = Uuid::now_v7();
+        stage_antigravity_conversation(tmp_home.path(), conversation_id, true);
+
+        let record = attach_agent_impl(
+            &state,
+            "attached-agy",
+            HarnessKind::Antigravity,
+            &conversation_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            record.session_id, None,
+            "Antigravity AgentRecord.session_id stays None (sidecar-carried)"
+        );
+        // Unlike Codex, Antigravity emits SessionMeta every turn, so attach
+        // does not force it via needs_session_meta.
+        assert!(
+            !lock(&state.needs_session_meta).contains(&record.id),
+            "Antigravity attach must not populate needs_session_meta"
+        );
+
+        let sidecar = switchboard_harness::antigravity::sidecar::sidecar_path(
+            tmp_workdir.path(),
+            proj.id,
+            record.id,
+        );
+        let latest = switchboard_harness::antigravity::sidecar::read_latest(&sidecar)
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.conversation_id, conversation_id);
+    }
+
+    #[tokio::test]
+    async fn attach_antigravity_brain_dir_without_transcript_succeeds_and_hydrates_empty() {
+        // The attach contract is "the conversation directory exists" — a
+        // brain dir without a transcript (encrypted-only / pruned) still
+        // attaches, and hydration then degrades to empty turns + registry
+        // meta, matching the loader's missing-transcript path.
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let conversation_id = Uuid::now_v7();
+        stage_antigravity_conversation(tmp_home.path(), conversation_id, false);
+
+        let record = attach_agent_impl(
+            &state,
+            "attached-agy",
+            HarnessKind::Antigravity,
+            &conversation_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap();
+
+        let result = load_transcript_impl(&state, record.id, tmp_home.path()).unwrap();
+        assert!(result.turns.is_empty(), "no transcript → no turns");
+        assert!(result.meta.is_some(), "registry meta still surfaces");
+    }
+
+    #[tokio::test]
+    async fn attach_antigravity_rejects_missing_brain_dir() {
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let conversation_id = Uuid::now_v7();
+        let err = attach_agent_impl(
+            &state,
+            "attached-agy",
+            HarnessKind::Antigravity,
+            &conversation_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap_err();
+        match err {
+            AppError::SessionFileNotFound {
+                harness,
+                expected_path,
+            } => {
+                assert_eq!(harness, HarnessKind::Antigravity);
+                assert!(expected_path.contains("antigravity-cli"));
+                assert!(expected_path.contains("brain"));
+            }
+            other => panic!("expected SessionFileNotFound, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_antigravity_rejects_duplicate_conversation_uuid() {
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let conversation_id = Uuid::now_v7();
+        stage_antigravity_conversation(tmp_home.path(), conversation_id, true);
+
+        attach_agent_impl(
+            &state,
+            "agy-one",
+            HarnessKind::Antigravity,
+            &conversation_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap();
+        let err = attach_agent_impl(
+            &state,
+            "agy-two",
+            HarnessKind::Antigravity,
+            &conversation_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap_err();
+        match err {
+            AppError::SessionAlreadyAttached {
+                existing_agent_name,
+                ..
+            } => assert_eq!(existing_agent_name, "agy-one"),
+            other => panic!("expected SessionAlreadyAttached, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_antigravity_fails_loud_on_corrupt_sidecar() {
+        // The uniqueness scan must fail loud on a corrupt sidecar rather than
+        // skip it — a skipped sidecar could let a duplicate conversation attach
+        // through, putting two agents on one server-side conversation. Twin of
+        // attach_codex_fails_loud_on_corrupt_sidecar_in_other_project.
+        let (tmp_workdir, tmp_home, state, proj) = fresh_state_with_active_project("alpha").await;
+
+        // Plant an existing Antigravity agent with a corrupt sidecar. The
+        // collision scan inside attach_agent_impl reads from the canonical
+        // bound-directory path (Directory::at canonicalizes; macOS resolves
+        // /var → /private/var), so plant — and assert — at that path.
+        let canonical_workdir = tmp_workdir.path().canonicalize().unwrap();
+        let ghost = proj_handle(&state, proj.id)
+            .register_attached_antigravity_agent_with_id("ghost", Uuid::now_v7())
+            .unwrap();
+        let bad_sidecar = switchboard_harness::antigravity::sidecar::sidecar_path(
+            &canonical_workdir,
+            proj.id,
+            ghost.id,
+        );
+        std::fs::create_dir_all(bad_sidecar.parent().unwrap()).unwrap();
+        std::fs::write(&bad_sidecar, b"this is not json\n").unwrap();
+
+        // Stage a valid brain dir for the newcomer so the brain-dir validation
+        // passes and the failure comes from the collision-scan corruption
+        // check, not the existence check.
+        let new_conversation = Uuid::now_v7();
+        stage_antigravity_conversation(tmp_home.path(), new_conversation, true);
+
+        let err = attach_agent_impl(
+            &state,
+            "newcomer",
+            HarnessKind::Antigravity,
+            &new_conversation.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap_err();
+        match err {
+            AppError::AttachBlockedByCorruption { path, .. } => assert_eq!(path, bad_sidecar),
+            other => panic!("expected AttachBlockedByCorruption, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn load_transcript_for_antigravity_agent_without_sidecar_returns_meta_only_empty() {
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        // Antigravity agent never dispatched → no sidecar → empty turns, but
+        // loader-derived registry meta still surfaces (mirrors the Codex arm)
+        // so the sidebar populates the moment the agent is selected.
+        let record = create_agent_impl(&state, "agy_one", HarnessKind::Antigravity).unwrap();
+        let result = load_transcript_impl(&state, record.id, tmp_home.path()).unwrap();
+        assert!(result.turns.is_empty());
+        assert!(result.meta.is_some());
+    }
+
+    #[tokio::test]
+    async fn load_transcript_for_antigravity_agent_with_corrupt_sidecar_returns_typed_error() {
+        let (tmp_workdir, tmp_home, state, proj) = fresh_state_with_active_project("alpha").await;
+        let agent = create_agent_impl(&state, "agy_corrupt", HarnessKind::Antigravity).unwrap();
+        let canonical_workdir = tmp_workdir.path().canonicalize().unwrap();
+        let bad_sidecar = switchboard_harness::antigravity::sidecar::sidecar_path(
+            &canonical_workdir,
+            proj.id,
+            agent.id,
+        );
+        std::fs::create_dir_all(bad_sidecar.parent().unwrap()).unwrap();
+        std::fs::write(&bad_sidecar, b"this is not json\n").unwrap();
+
+        let err = load_transcript_impl(&state, agent.id, tmp_home.path()).unwrap_err();
+        match err {
+            AppError::HydrationBlockedByCorruption { path, .. } => assert_eq!(path, bad_sidecar),
+            other => panic!("expected HydrationBlockedByCorruption, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn load_transcript_for_antigravity_agent_hydrates_prior_turns() {
+        let (tmp_workdir, tmp_home, state, proj) = fresh_state_with_active_project("alpha").await;
+        let agent = create_agent_impl(&state, "agy_hydrate", HarnessKind::Antigravity).unwrap();
+        let canonical_workdir = tmp_workdir.path().canonicalize().unwrap();
+
+        // Sidecar: the server-assigned conversation UUID captured at dispatch.
+        let conversation_id = Uuid::new_v4();
+        let sidecar = switchboard_harness::antigravity::sidecar::sidecar_path(
+            &canonical_workdir,
+            proj.id,
+            agent.id,
+        );
+        switchboard_harness::antigravity::sidecar::append_record(
+            &sidecar,
+            &switchboard_harness::antigravity::sidecar::SessionLinkRecord {
+                conversation_id,
+                captured_at: chrono::Utc::now(),
+            },
+        )
+        .unwrap();
+
+        // Transcript: one user prompt + one model answer.
+        let transcript = switchboard_harness::antigravity::paths::transcript_path(
+            tmp_home.path(),
+            conversation_id,
+        );
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-05-19T19:00:00Z","content":"<USER_REQUEST>\nremember mango\n</USER_REQUEST>"}"#,
+                "\n",
+                r#"{"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-05-19T19:00:01Z","content":"mango"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let result = load_transcript_impl(&state, agent.id, tmp_home.path()).unwrap();
+        assert_eq!(result.turns.len(), 2);
+        assert!(result.meta.is_some());
+    }
+
+    // -----------------------------------------------------------------
+    // Gemini attach tests
+    // -----------------------------------------------------------------
+
+    /// Stage `~/.gemini/projects.json` + a single Gemini session file
+    /// under `home/.gemini/tmp/<project>/chats/`. Returns the staged
+    /// path. The session file is a minimal `kind:"main"` header line so
+    /// `classify_candidate` returns `Unambiguous` for the target.
+    fn stage_gemini_session_file(home: &Path, cwd: &Path, session_id: &Uuid) -> PathBuf {
+        let canonical = cwd.canonicalize().unwrap();
+        let gemini = home.join(".gemini");
+        std::fs::create_dir_all(&gemini).unwrap();
+        let projects = serde_json::json!({
+            "projects": { canonical.to_str().unwrap(): "proj" }
+        });
+        std::fs::write(gemini.join("projects.json"), projects.to_string()).unwrap();
+        let chats = gemini.join("tmp").join("proj").join("chats");
+        std::fs::create_dir_all(&chats).unwrap();
+        let prefix = switchboard_harness::gemini_session_id_prefix(session_id);
+        let path = chats.join(format!("session-2026-05-18T00-00-{prefix}.jsonl"));
+        let header = format!(
+            r#"{{"sessionId":"{session_id}","projectHash":"x","startTime":"2026-05-18T00:00:00Z","lastUpdated":"2026-05-18T00:00:00Z","kind":"main"}}"#
+        );
+        std::fs::write(&path, format!("{header}\n")).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn attach_gemini_succeeds_when_session_file_exists() {
+        let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let session_id = Uuid::new_v4();
+        stage_gemini_session_file(tmp_home.path(), tmp_workdir.path(), &session_id);
+
+        let record = attach_agent_impl(
+            &state,
+            "attached",
+            HarnessKind::Gemini,
+            &session_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap();
+        assert_eq!(record.session_id, Some(session_id));
+        assert_eq!(record.harness, HarnessKind::Gemini);
+        // Gemini follows the Claude pattern (caller-controlled session
+        // UUID); no sidecar, no needs_session_meta override.
+        assert!(
+            !lock(&state.needs_session_meta).contains(&record.id),
+            "Gemini attach must NOT populate needs_session_meta"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_gemini_rejects_missing_session_file_with_expected_path() {
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let session_id = Uuid::new_v4();
+        let err = attach_agent_impl(
+            &state,
+            "attached",
+            HarnessKind::Gemini,
+            &session_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap_err();
+        match err {
+            AppError::SessionFileNotFound {
+                harness,
+                expected_path,
+            } => {
+                assert_eq!(harness, HarnessKind::Gemini);
+                assert!(expected_path.contains(".gemini"));
+            }
+            other => panic!("expected SessionFileNotFound, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_gemini_multi_candidate_picks_full_uuid_match() {
+        // Two files sharing the 8-char prefix in their filename, different
+        // timestamps. Each file holds a different conversation's header.
+        // `classify_candidate` picks the unambiguous-target file; the other
+        // is `NoTarget` and skipped.
+        let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let canonical = tmp_workdir.path().canonicalize().unwrap();
+        let gemini = tmp_home.path().join(".gemini");
+        std::fs::create_dir_all(&gemini).unwrap();
+        let projects = serde_json::json!({
+            "projects": { canonical.to_str().unwrap(): "proj" }
+        });
+        std::fs::write(gemini.join("projects.json"), projects.to_string()).unwrap();
+        let chats = gemini.join("tmp").join("proj").join("chats");
+        std::fs::create_dir_all(&chats).unwrap();
+
+        let id_a = Uuid::parse_str("00000000-0000-4000-8000-000000000010").unwrap();
+        let id_b = Uuid::parse_str("00000000-0000-4000-8000-000000000020").unwrap();
+        let prefix = switchboard_harness::gemini_session_id_prefix(&id_a);
+        assert_eq!(
+            prefix,
+            switchboard_harness::gemini_session_id_prefix(&id_b),
+            "test setup requires identical 8-char prefixes"
+        );
+        let header_a = format!(
+            r#"{{"sessionId":"{id_a}","projectHash":"x","startTime":"2026-05-18T00:00:00Z","lastUpdated":"2026-05-18T00:00:00Z","kind":"main"}}"#
+        );
+        let header_b = format!(
+            r#"{{"sessionId":"{id_b}","projectHash":"x","startTime":"2026-05-18T00:05:00Z","lastUpdated":"2026-05-18T00:05:00Z","kind":"main"}}"#
+        );
+        std::fs::write(
+            chats.join(format!("session-2026-05-18T00-00-{prefix}.jsonl")),
+            format!("{header_a}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            chats.join(format!("session-2026-05-18T00-05-{prefix}.jsonl")),
+            format!("{header_b}\n"),
+        )
+        .unwrap();
+
+        let record = attach_agent_impl(
+            &state,
+            "attached",
+            HarnessKind::Gemini,
+            &id_b.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap();
+        assert_eq!(record.session_id, Some(id_b));
+    }
+
+    #[tokio::test]
+    async fn attach_gemini_multi_candidate_with_no_match_returns_not_found() {
+        // A candidate file exists at the prefix glob, but its sessionId is
+        // for a different UUID — must not be claimed silently as the
+        // user's target.
+        let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let other = Uuid::parse_str("00000000-0000-4000-8000-000000000010").unwrap();
+        stage_gemini_session_file(tmp_home.path(), tmp_workdir.path(), &other);
+
+        let asked = Uuid::parse_str("00000000-0000-4000-8000-000000000099").unwrap();
+        assert_eq!(
+            switchboard_harness::gemini_session_id_prefix(&other),
+            switchboard_harness::gemini_session_id_prefix(&asked)
+        );
+        let err = attach_agent_impl(
+            &state,
+            "attached",
+            HarnessKind::Gemini,
+            &asked.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::SessionFileNotFound { harness, .. } if harness == HarnessKind::Gemini)
+        );
+    }
+
+    /// Pin the ambiguity invariant: an ambiguous candidate (one file,
+    /// multiple distinct session headers) must surface as
+    /// `AmbiguousSessionFile`, never as `SessionFileNotFound` or a
+    /// silent merge. UUID v4 makes this ~1/2^32; the test ensures the
+    /// code path is correctly wired if it ever fires.
+    #[tokio::test]
+    async fn attach_gemini_ambiguous_candidate_surfaces_ambiguous_error() {
+        let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let canonical = tmp_workdir.path().canonicalize().unwrap();
+        let gemini = tmp_home.path().join(".gemini");
+        std::fs::create_dir_all(&gemini).unwrap();
+        let projects = serde_json::json!({
+            "projects": { canonical.to_str().unwrap(): "proj" }
+        });
+        std::fs::write(gemini.join("projects.json"), projects.to_string()).unwrap();
+        let chats = gemini.join("tmp").join("proj").join("chats");
+        std::fs::create_dir_all(&chats).unwrap();
+
+        let target = Uuid::parse_str("00000000-0000-4000-8000-000000000009").unwrap();
+        let other = Uuid::parse_str("00000000-0000-4000-8000-00000000000A").unwrap();
+        let prefix = switchboard_harness::gemini_session_id_prefix(&target);
+        let body = format!(
+            r#"{{"sessionId":"{target}","projectHash":"x","startTime":"2026-05-17T22:20:35.615Z","lastUpdated":"2026-05-17T22:20:35.615Z","kind":"main"}}
+{{"sessionId":"{other}","projectHash":"x","startTime":"2026-05-17T22:20:35.654Z","lastUpdated":"2026-05-17T22:20:35.654Z","kind":"main"}}
+"#
+        );
+        let staged = chats.join(format!("session-2026-05-17T22-20-{prefix}.jsonl"));
+        std::fs::write(&staged, body).unwrap();
+
+        let err = attach_agent_impl(
+            &state,
+            "attached",
+            HarnessKind::Gemini,
+            &target.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap_err();
+        match err {
+            AppError::AmbiguousSessionFile {
+                harness,
+                session_id,
+                paths,
+            } => {
+                assert_eq!(harness, HarnessKind::Gemini);
+                assert_eq!(session_id, target.to_string());
+                assert_eq!(paths, vec![staged]);
+            }
+            other => panic!("expected AmbiguousSessionFile, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_gemini_rejects_duplicate_name() {
+        let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let session_id = Uuid::new_v4();
+        stage_gemini_session_file(tmp_home.path(), tmp_workdir.path(), &session_id);
+        attach_agent_impl(
+            &state,
+            "attached",
+            HarnessKind::Gemini,
+            &session_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap();
+
+        // Reuse the same name; even with a different session UUID
+        // (which we'd have to stage too) the name-clash check fires
+        // first. We use the same name + same session for simplicity.
+        let other = Uuid::new_v4();
+        stage_gemini_session_file(tmp_home.path(), tmp_workdir.path(), &other);
+        let err = attach_agent_impl(
+            &state,
+            "attached",
+            HarnessKind::Gemini,
+            &other.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AppError::Core(switchboard_core::CoreError::DuplicateAgentName { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn attach_gemini_rejects_same_project_session_id_collision() {
+        let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let session_id = Uuid::new_v4();
+        stage_gemini_session_file(tmp_home.path(), tmp_workdir.path(), &session_id);
+        attach_agent_impl(
+            &state,
+            "first",
+            HarnessKind::Gemini,
+            &session_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap();
+
+        let err = attach_agent_impl(
+            &state,
+            "second",
+            HarnessKind::Gemini,
+            &session_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap_err();
+        match err {
+            AppError::SessionAlreadyAttached {
+                existing_agent_name,
+                ..
+            } => assert_eq!(existing_agent_name, "first"),
+            other => panic!("expected SessionAlreadyAttached, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_gemini_rejects_cross_project_session_id_collision() {
+        let (tmp_workdir, tmp_home, state, _proj_a) =
+            fresh_state_with_active_project("alpha").await;
+        let session_id = Uuid::new_v4();
+        stage_gemini_session_file(tmp_home.path(), tmp_workdir.path(), &session_id);
+        attach_agent_impl(
+            &state,
+            "first",
+            HarnessKind::Gemini,
+            &session_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap();
+
+        let proj_b = create_project_impl(&state, "beta").unwrap();
+        set_active_project_impl(&state, proj_b.id).unwrap();
+        let err = attach_agent_impl(
+            &state,
+            "first-in-beta",
+            HarnessKind::Gemini,
+            &session_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap_err();
+        match err {
+            AppError::SessionAlreadyAttached {
+                existing_project_name,
+                ..
+            } => assert_eq!(existing_project_name, "alpha"),
+            other => panic!("expected SessionAlreadyAttached, got {other:?}"),
+        }
+    }
+
+    /// I/O errors on a candidate file must surface as `AttachLookupFailed`
+    /// rather than silently routing to `SessionFileNotFound`. The user's
+    /// remediation differs (chmod / fs repair vs. verify UUID); the wrong
+    /// error sends them chasing red herrings. Unix-only because file-mode
+    /// 0o000 has no Windows analog.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn attach_gemini_propagates_io_error_for_unreadable_candidate() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let session_id = Uuid::new_v4();
+        let path = stage_gemini_session_file(tmp_home.path(), tmp_workdir.path(), &session_id);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Self-check for root-equivalent containers: if `chmod 000` doesn't
+        // actually block reads (root ignores file modes), the failure path
+        // we're trying to exercise won't fire. Restore mode and skip.
+        if std::fs::read(&path).is_ok() {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            return;
+        }
+
+        let err = attach_agent_impl(
+            &state,
+            "attached",
+            HarnessKind::Gemini,
+            &session_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap_err();
+        // Restore mode **before** asserting so TempDir's Drop can rmdir
+        // even if the assertion fails on a future regression.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        match err {
+            AppError::AttachLookupFailed { message } => {
+                assert!(
+                    message.contains(path.to_str().unwrap()),
+                    "expected error to name the unreadable path, got: {message}"
+                );
+            }
+            other => panic!("expected AttachLookupFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_gemini_rejects_missing_projects_json_as_not_found() {
+        // No `~/.gemini/projects.json` at all → cwd resolution fails →
+        // candidate set is empty → SessionFileNotFound.
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let session_id = Uuid::new_v4();
+        let err = attach_agent_impl(
+            &state,
+            "attached",
+            HarnessKind::Gemini,
+            &session_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::SessionFileNotFound { harness, .. } if harness == HarnessKind::Gemini)
+        );
     }
 }

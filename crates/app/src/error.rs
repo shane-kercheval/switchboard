@@ -85,10 +85,11 @@ pub enum AppError {
     /// (manual copy, FS corruption). Surfacing the candidate list lets
     /// the user investigate rather than binding arbitrarily.
     #[error(
-        "ambiguous Codex session file for session_id {session_id}: {} candidates",
+        "ambiguous {harness} session file for session_id {session_id}: {} candidates",
         paths.len()
     )]
     AmbiguousSessionFile {
+        harness: HarnessKind,
         session_id: String,
         paths: Vec<PathBuf>,
     },
@@ -100,6 +101,13 @@ pub enum AppError {
     /// agent will look like a fresh-spawn to the adapter.
     #[error(transparent)]
     Sidecar(#[from] switchboard_harness::codex::sidecar::SidecarError),
+
+    /// Attach-flow (Antigravity): the per-agent session-link sidecar write
+    /// failed during attach. Same consequence as the Codex case — the
+    /// attached agent would look like a fresh-spawn (new server conversation)
+    /// on its first dispatch instead of resuming the attached one.
+    #[error(transparent)]
+    AntigravitySidecar(#[from] switchboard_harness::antigravity::sidecar::SidecarError),
 
     /// Attach-flow: the cross-project collision scan tripped over an
     /// unrelated agent's corrupt sidecar. Per the Switchboard-owned-JSONL
@@ -114,8 +122,10 @@ pub enum AppError {
     )]
     AttachBlockedByCorruption {
         path: PathBuf,
+        // Boxed because the collision scan reads Codex *or* Antigravity
+        // sidecars, whose error types differ.
         #[source]
-        source: switchboard_harness::codex::sidecar::SidecarError,
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
     },
 
     /// Attach-flow: catch-all for future `AttachLookupError` variants we
@@ -144,18 +154,20 @@ pub enum AppError {
     #[error(transparent)]
     LoadTranscript(#[from] switchboard_harness::LoadTranscriptError),
 
-    /// Transcript hydration tripped over a corrupt Codex sidecar. Parallel
-    /// to [`AppError::AttachBlockedByCorruption`] but specific to the
-    /// hydration call path. Sidecars are Switchboard-owned JSONL; per the
-    /// AGENTS.md fail-loud invariant on our own files, corruption must
-    /// surface rather than degrade to "agent has no history."
+    /// Transcript hydration tripped over a corrupt per-agent sidecar (Codex or
+    /// Antigravity — both store the harness session link as Switchboard-owned
+    /// JSONL). Parallel to [`AppError::AttachBlockedByCorruption`] but specific
+    /// to the hydration call path. Per the AGENTS.md fail-loud invariant on our
+    /// own files, corruption must surface rather than degrade to "agent has no
+    /// history." Source is boxed because the two harnesses' sidecar error types
+    /// are distinct.
     #[error(
         "cannot hydrate transcript: sidecar at {path} is corrupt — repair or remove before retrying"
     )]
     HydrationBlockedByCorruption {
         path: PathBuf,
         #[source]
-        source: switchboard_harness::codex::sidecar::SidecarError,
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
     },
 }
 

@@ -179,11 +179,11 @@ export type ReducerInput = NormalizedEvent | HeartbeatTimeout | Hydrate;
 // `src/lib/state/types.ts`. This file is wire-format-only.
 
 // Mirror of `crates/core::AgentRecord`. `session_id` is `null` for harnesses
-// that assign their own session ID (Codex — set to `null` for life; the
-// per-agent session-link sidecar is the system-of-record for Codex's
-// captured thread_id); for Claude Code it's pre-generated at registration
-// time.
-export type HarnessKind = "claude_code" | "codex";
+// that assign their own session ID (Codex and Antigravity — set to `null`
+// for life; the per-agent session-link sidecar is the system-of-record for
+// the captured conversation UUID); for Claude Code and Gemini it's
+// pre-generated at registration time.
+export type HarnessKind = "claude_code" | "codex" | "gemini" | "antigravity";
 
 /// Result of the startup-time per-harness probes. `binary` is the
 /// `which`-on-PATH check; `auth` is the best-effort subscription-auth
@@ -230,6 +230,16 @@ export type HarnessAvailability =
       harness: "codex";
       binary: BinaryState;
       auth: "available" | "missing" | "checking";
+    }
+  | {
+      harness: "gemini";
+      binary: BinaryState;
+      auth: "available" | "missing" | "checking";
+    }
+  | {
+      harness: "antigravity";
+      binary: BinaryState;
+      auth: "available" | "missing" | "checking";
     };
 
 /// Structured banner shape. The App.svelte banner-stack ordering rule:
@@ -237,15 +247,18 @@ export type HarnessAvailability =
 /// the auth banner is suppressed (auth is irrelevant if the CLI isn't
 /// installed).
 ///
-/// **v1 invariant encoded in the type**: `auth_missing` is Codex-only.
-/// Claude's auth is `"unsupported"` (keychain-based on macOS — see
-/// `HarnessAvailability` docstring). A future Claude auth probe must add
-/// a new banner variant or extend this one explicitly; the literal
-/// `harness: "codex"` arm prevents accidental "Codex not authenticated"
-/// copy from leaking onto Claude banners.
+/// **v1 invariant encoded in the type**: `auth_missing` is restricted to
+/// harnesses with detectable auth — Codex's `~/.codex/auth.json`,
+/// Gemini's `~/.gemini/settings.json`, and Antigravity's macOS Keychain
+/// entry (service `gemini`, account `antigravity`). Claude's auth is
+/// `"unsupported"` (keychain-based on macOS with no reliable probe yet —
+/// see `HarnessAvailability` docstring). A future Claude auth probe must
+/// add a new banner variant or extend the `harness` literal explicitly;
+/// the closed set prevents accidental auth-banner copy from leaking onto
+/// Claude rows.
 export type HarnessBanner =
   | { kind: "binary_missing"; harness: HarnessKind }
-  | { kind: "auth_missing"; harness: "codex" };
+  | { kind: "auth_missing"; harness: "codex" | "gemini" | "antigravity" };
 
 export type AgentRecord = {
   id: AgentId;

@@ -24,6 +24,8 @@
     /// that don't care about gating render unchanged.
     claudeAvailability?: HarnessAvailability;
     codexAvailability?: HarnessAvailability;
+    geminiAvailability?: HarnessAvailability;
+    antigravityAvailability?: HarnessAvailability;
   };
 
   let {
@@ -33,6 +35,8 @@
     onCancel,
     claudeAvailability = { harness: "claude_code", binary: "available", auth: "unsupported" },
     codexAvailability = { harness: "codex", binary: "available", auth: "available" },
+    geminiAvailability = { harness: "gemini", binary: "available", auth: "available" },
+    antigravityAvailability = { harness: "antigravity", binary: "available", auth: "available" },
   }: Props = $props();
   let name = $state<string>("assistant");
   let harness = $state<HarnessKind>("claude_code");
@@ -50,12 +54,30 @@
   /// user is blocked, but no scary "Checking…" copy renders.
   const claudeSelectable = $derived(isHarnessSelectable(claudeAvailability));
   const codexSelectable = $derived(isHarnessSelectable(codexAvailability));
+  const geminiSelectable = $derived(isHarnessSelectable(geminiAvailability));
+  const antigravitySelectable = $derived(isHarnessSelectable(antigravityAvailability));
   const claudeReason = $derived(harnessUnavailableReason(claudeAvailability));
   const codexReason = $derived(harnessUnavailableReason(codexAvailability));
+  const geminiReason = $derived(harnessUnavailableReason(geminiAvailability));
+  const antigravityReason = $derived(harnessUnavailableReason(antigravityAvailability));
   const selectedSelectable = $derived(
-    harness === "claude_code" ? claudeSelectable : codexSelectable,
+    harness === "claude_code"
+      ? claudeSelectable
+      : harness === "codex"
+        ? codexSelectable
+        : harness === "gemini"
+          ? geminiSelectable
+          : antigravitySelectable,
   );
-  const selectedReason = $derived(harness === "claude_code" ? claudeReason : codexReason);
+  const selectedReason = $derived(
+    harness === "claude_code"
+      ? claudeReason
+      : harness === "codex"
+        ? codexReason
+        : harness === "gemini"
+          ? geminiReason
+          : antigravityReason,
+  );
 
   /// UUID shape check (any version — Codex and Claude use v4 / v7
   /// respectively; the backend re-validates). This is a UX gate so the user
@@ -175,6 +197,40 @@
           data-testid="harness-codex"
         />
         Codex
+      </label>
+      <label
+        class="flex items-center gap-1.5 {geminiSelectable
+          ? ''
+          : 'cursor-not-allowed text-neutral-400'}"
+        title={geminiReason ?? ""}
+      >
+        <input
+          type="radio"
+          name="harness"
+          value="gemini"
+          checked={harness === "gemini"}
+          disabled={!geminiSelectable}
+          onchange={() => (harness = "gemini")}
+          data-testid="harness-gemini"
+        />
+        Gemini
+      </label>
+      <label
+        class="flex items-center gap-1.5 {antigravitySelectable
+          ? ''
+          : 'cursor-not-allowed text-neutral-400'}"
+        title={antigravityReason ?? ""}
+      >
+        <input
+          type="radio"
+          name="harness"
+          value="antigravity"
+          checked={harness === "antigravity"}
+          disabled={!antigravitySelectable}
+          onchange={() => (harness = "antigravity")}
+          data-testid="harness-antigravity"
+        />
+        Antigravity
       </label>
     </div>
     {#if selectedReason}

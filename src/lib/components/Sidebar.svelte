@@ -2,6 +2,7 @@
   import type { AgentRecord, AgentId } from "$lib/types";
   import { runtimes, transcripts } from "$lib/state/index.svelte";
   import { cn } from "$lib/utils";
+  import { HARNESS_BADGE_CLASS, HARNESS_LABEL } from "$lib/harnessDisplay";
 
   /// `onAddAgent` is the "+ Add agent" entry point in the sidebar header.
   /// Optional so existing callers + tests that don't pass it continue
@@ -102,13 +103,11 @@
           <span
             class={cn(
               "rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase",
-              agent.harness === "claude_code"
-                ? "bg-orange-100 text-orange-800"
-                : "bg-blue-100 text-blue-800",
+              HARNESS_BADGE_CLASS[agent.harness],
             )}
             data-testid="agent-harness-badge"
           >
-            {agent.harness === "claude_code" ? "Claude" : "Codex"}
+            {HARNESS_LABEL[agent.harness]}
           </span>
         </div>
         <div
@@ -153,7 +152,7 @@
         {/if}
         {#if rateLimit !== undefined}
           <div class="mt-2 text-xs text-neutral-700" data-testid="agent-rate-limit">
-            {rateLimit.toFixed(0)}% used
+            quota used: {rateLimit.toFixed(0)}%
           </div>
         {/if}
         {#if util !== undefined}

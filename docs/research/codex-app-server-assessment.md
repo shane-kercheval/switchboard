@@ -2,7 +2,7 @@
 
 **Captured:** 2026-05-16
 **Upstream version inspected:** codex `main` branch (≈ post-0.130.0, alphas through `0.131.0-alpha.22` on 2026-05-15). README pulled from `codex-rs/app-server/README.md@main` (~1950 lines), supporting sources from `codex-rs/protocol/src/protocol.rs`, `codex-rs/app-server-protocol/src/protocol/event_mapping.rs`, `codex-rs/exec/src/event_processor_with_jsonl_output.rs`, `codex-rs/app-server/tests/suite/v2/*.rs`, `codex-rs/app-server/tests/common/rollout.rs`, `codex-rs/app-server/src/main.rs`.
-**Companion to:** [codex-cli-observed.md](codex-cli-observed.md) (current `exec --json` behavior), [harness-comparison.md](harness-comparison.md) (normalization contract).
+**Companion to:** [codex-cli-observed.md](codex-cli-observed.md) (current `exec --json` behavior), [harness-comparison.md (archived)](archive/harness-comparison.md) (normalization contract).
 **Switchboard adapter under review:** `crates/harness/src/codex/` (mod 818 LOC, parser 936, session_file 969, sidecar 322, config 373, skills 219; events.rs ~679 — total ≈ 4.3k LOC including tests).
 
 ## TL;DR
@@ -304,5 +304,5 @@ Magnitude: **medium rewrite**. The mechanical line count cancels out (deletions 
 - Codex GitHub releases: https://github.com/openai/codex/releases — 0.130.0 on 2026-05-08, 0.131.0-alpha line through 2026-05-15 confirming active development pace.
 - Recent app-server PRs (search results, 2026-05-06 → 2026-05-16): #22877 (remote control UX), #22841 (memory prompt injection), #22792 (stop returning thread permission profiles), #22611 (permission ids + runtime workspace roots), #22404 (websocket listener restored with auth guard), #22338 (login issuer override gating), #21963 (websocket via HTTP upgrade), #21843 (TCP websocket removed), #21831 (daemon-safe restart), #21336 (sessionId moved onto Thread). Confirms upstream is actively reshaping the surface.
 - v0.130 release context — [Codex CLI v0.130 with remote-control](https://jls42.org/en/news/ia-actualites-10-may-2026): `codex remote-control` entrypoint, large-thread pagination, hot config reload.
-- Companion in-repo docs: [codex-cli-observed.md](codex-cli-observed.md), [codex-noninteractive.md](codex-noninteractive.md), [harness-comparison.md](harness-comparison.md).
+- Companion in-repo docs: [codex-cli-observed.md](codex-cli-observed.md), [codex-noninteractive.md](codex-noninteractive.md), [harness-comparison.md (archived)](archive/harness-comparison.md).
 - Switchboard adapter code under review: `/Users/shanekercheval/repos/switchboard/crates/harness/src/codex/{mod.rs, parser.rs, session_file.rs, sidecar.rs, config.rs, skills.rs}`, `/Users/shanekercheval/repos/switchboard/crates/harness/src/events.rs`.

@@ -332,7 +332,13 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
       return {
         ...runtime,
         meta: {
-          model: input.model,
+          // Empty model means "no model info on this event," not "set the
+          // model to blank." Antigravity only reports a model when the
+          // selection changed (first turn, or an explicit switch); on a
+          // plain resume it sends "" and must not erase the model an earlier
+          // turn already showed. Claude/Codex/Gemini always send a non-empty
+          // model, so this is a no-op for them.
+          model: input.model !== "" ? input.model : (runtime.meta?.model ?? ""),
           harness_version: input.harness_version,
           tools: input.tools,
           mcp_servers: input.mcp_servers,

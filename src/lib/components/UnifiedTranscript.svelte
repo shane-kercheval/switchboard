@@ -2,6 +2,7 @@
   import type { AgentRecord } from "$lib/types";
   import { transcripts, type Turn } from "$lib/state/index.svelte";
   import { cn } from "$lib/utils";
+  import { HARNESS_BADGE_CLASS, HARNESS_LABEL } from "$lib/harnessDisplay";
 
   let { agents }: { agents: AgentRecord[] } = $props();
 
@@ -49,16 +50,16 @@
 
   function harnessBadgeClass(agentId: string): string {
     const harness = agentById[agentId]?.harness;
-    if (harness === "claude_code") return "bg-orange-100 text-orange-800";
-    if (harness === "codex") return "bg-blue-100 text-blue-800";
-    return "bg-neutral-100 text-neutral-800";
+    // `harness` is `undefined` only when `agentById[agentId]` is missing
+    // — i.e., the lookup itself failed. That case predates the introduction
+    // of HARNESS_BADGE_CLASS and renders the neutral fallback so a
+    // stale agentId doesn't crash the row.
+    return harness ? HARNESS_BADGE_CLASS[harness] : "bg-neutral-100 text-neutral-800";
   }
 
   function harnessLabel(agentId: string): string {
     const harness = agentById[agentId]?.harness;
-    if (harness === "claude_code") return "Claude";
-    if (harness === "codex") return "Codex";
-    return "?";
+    return harness ? HARNESS_LABEL[harness] : "?";
   }
 
   // Auto-pin to bottom unless the user has scrolled up. Mirrors the
@@ -208,7 +209,19 @@
                     <span class="ml-auto text-red-700">error</span>
                   {/if}
                 </div>
-                {#if item.output !== undefined}
+                <!--
+                  Suppress empty `output` bodies. Harness-agnostic rule:
+                  Gemini's live stream emits `output:""` for read-like
+                  tools (the real content lives in the session file and
+                  arrives via hydration on project reopen). Suppressing
+                  empty bodies avoids "the live view shows nothing then
+                  the reopened view shows content" looking like a
+                  regression — both views show *something coherent*,
+                  with hydration adding detail. The lifecycle badge
+                  (started → completed, error indicator) still renders
+                  regardless.
+                -->
+                {#if item.output !== undefined && item.output !== ""}
                   <pre
                     class={cn(
                       "mt-1 max-h-40 overflow-y-auto font-mono text-[11px] whitespace-pre-wrap",

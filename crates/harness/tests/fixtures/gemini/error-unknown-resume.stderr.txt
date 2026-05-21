@@ -1,0 +1,3 @@
+Error resuming session: Invalid session identifier "99999999-9999-9999-9999-999999999999".
+  Searched for sessions in /Users/shanekercheval/.gemini/tmp/gemini-probe-happy/chats.
+  Use --list-sessions to see available sessions, then use --resume {number}, --resume {uuid}, or --resume latest.

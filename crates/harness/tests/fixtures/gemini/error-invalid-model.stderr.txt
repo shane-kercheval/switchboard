@@ -1,0 +1,16 @@
+YOLO mode is enabled. All tool calls will be automatically approved.
+YOLO mode is enabled. All tool calls will be automatically approved.
+Ripgrep is not available. Falling back to GrepTool.
+Error when talking to Gemini API Full report available at: /var/folders/x3/bq9yxrhs4j99fm9xdclj38hw0000gn/T/gemini-client-error-Turn.run-sendMessageStream-2026-05-17T22-16-56-030Z.json ModelNotFoundError: Requested entity was not found.
+    at classifyGoogleError (file:///Users/shanekercheval/.nvm/versions/node/v22.22.1/lib/node_modules/@google/gemini-cli/bundle/chunk-7VVHSNDQ.js:269998:12)
+    at retryWithBackoff (file:///Users/shanekercheval/.nvm/versions/node/v22.22.1/lib/node_modules/@google/gemini-cli/bundle/chunk-7VVHSNDQ.js:270707:31)
+    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)
+    at async GeminiChat.makeApiCallAndProcessStream (file:///Users/shanekercheval/.nvm/versions/node/v22.22.1/lib/node_modules/@google/gemini-cli/bundle/chunk-7VVHSNDQ.js:293631:28)
+    at async GeminiChat.streamWithRetries (file:///Users/shanekercheval/.nvm/versions/node/v22.22.1/lib/node_modules/@google/gemini-cli/bundle/chunk-7VVHSNDQ.js:293450:29)
+    at async Turn.run (file:///Users/shanekercheval/.nvm/versions/node/v22.22.1/lib/node_modules/@google/gemini-cli/bundle/chunk-7VVHSNDQ.js:294024:24)
+    at async GeminiClient.processTurn (file:///Users/shanekercheval/.nvm/versions/node/v22.22.1/lib/node_modules/@google/gemini-cli/bundle/chunk-7VVHSNDQ.js:306709:22)
+    at async GeminiClient.sendMessageStream (file:///Users/shanekercheval/.nvm/versions/node/v22.22.1/lib/node_modules/@google/gemini-cli/bundle/chunk-7VVHSNDQ.js:306797:14)
+    at async file:///Users/shanekercheval/.nvm/versions/node/v22.22.1/lib/node_modules/@google/gemini-cli/bundle/gemini-QSTQ2DBG.js:10859:26
+    at async main (file:///Users/shanekercheval/.nvm/versions/node/v22.22.1/lib/node_modules/@google/gemini-cli/bundle/gemini-QSTQ2DBG.js:16137:5) {
+  code: 404
+}

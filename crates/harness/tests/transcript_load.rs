@@ -19,12 +19,15 @@ use std::path::PathBuf;
 use futures::StreamExt;
 use switchboard_core::{AgentRecord, HarnessKind};
 use switchboard_harness::{
-    AdapterEvent, ClaudeCodeAdapter, CodexAdapter, DispatchOptions, HarnessAdapter, Turn, TurnItem,
-    TurnStatus, codex::sidecar,
+    AdapterEvent, AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, DispatchOptions,
+    GeminiAdapter, HarnessAdapter, Turn, TurnItem, TurnStatus, antigravity, codex::sidecar,
+    load_antigravity_transcript,
 };
 use uuid::Uuid;
 
 const CLAUDE_TOOL_TOKEN: &str = "SWITCHBOARD_TRANSCRIPT_TOOL_FA21E0";
+const CODEX_TOOL_TOKEN: &str = "SWITCHBOARD_TRANSCRIPT_TOOL_C0D3X1";
+const GEMINI_TOOL_TOKEN: &str = "SWITCHBOARD_TRANSCRIPT_TOOL_GEM1N1";
 
 fn real_home() -> PathBuf {
     std::env::var_os("HOME")
@@ -125,6 +128,9 @@ async fn live_claude_transcript_load_hydrates_tool_items() {
         )
         .await
         .expect("dispatch should succeed with real claude");
+    // Drain the stream to flush the subprocess; the session file isn't
+    // written until the stream completes. Dropping this line would
+    // race the hydration read against the subprocess.
     let _events: Vec<AdapterEvent> = stream.collect().await;
 
     let transcript = switchboard_harness::load_claude_transcript(
@@ -150,33 +156,33 @@ async fn live_claude_transcript_load_hydrates_tool_items() {
         unreachable!();
     };
 
-    let tool_item = items
+    // Find the tool item whose output carries the staged sentinel rather
+    // than picking the first tool item — robust against Claude emitting
+    // a preliminary tool (e.g., `TodoWrite`) before the file-reading
+    // tool. The harness suite must catch upstream drift without being
+    // brittle to harmless ordering changes.
+    let (is_error, name) = items
         .iter()
         .find_map(|item| match item {
             TurnItem::Tool {
-                output,
+                output: Some(output),
                 is_error,
                 name,
                 ..
-            } => Some((output, is_error, name)),
+            } if output.contains(CLAUDE_TOOL_TOKEN) => Some((is_error, name)),
             _ => None,
         })
         .unwrap_or_else(|| {
-            panic!("hydrated agent turn must contain a TurnItem::Tool; items: {items:?}")
+            panic!(
+                "hydrated agent turn must contain a TurnItem::Tool whose output carries \
+                 {CLAUDE_TOOL_TOKEN:?}; items: {items:?}"
+            )
         });
-    let (output, is_error, name) = tool_item;
     assert!(!name.is_empty(), "hydrated tool item must carry a name");
     assert_eq!(
         *is_error,
         Some(false),
         "hydrated tool item must record is_error: Some(false)"
-    );
-    let output = output
-        .as_deref()
-        .expect("hydrated tool item must carry its output text");
-    assert!(
-        output.contains(CLAUDE_TOOL_TOKEN),
-        "hydrated tool output must surface the staged file contents; got: {output:?}"
     );
 }
 
@@ -238,6 +244,104 @@ async fn live_codex_transcript_load_via_sidecar_round_trips() {
     assert_user(user, &agent.id, prompt);
     assert_agent_completed(agent_turn, &agent.id, &live_text);
     assert_codex_agent_usage(agent_turn);
+}
+
+#[tokio::test]
+#[ignore = "requires codex installed — run with: make test-live"]
+async fn live_codex_transcript_load_hydrates_tool_items() {
+    // Drift-detection for Codex's tool-item hydration. The text
+    // round-trip above proves Codex's user/agent turns survive
+    // hydration; the live `tool_use.rs` test proves the shell tool
+    // emits paired ToolStarted/ToolCompleted events on the stream.
+    // Neither catches a regression where the on-disk session file's
+    // tool-record shape changes such that tool calls stop being
+    // reconstructed (a Codex CLI bump renaming `function_call` or its
+    // `output` payload field). Hydration is sidecar-driven and
+    // date-partition-dependent — structurally different from Claude's
+    // and Gemini's — so its tool-item path needs its own tripwire.
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(tmp.path().join("MARKER.txt"), CODEX_TOOL_TOKEN).expect("write marker");
+
+    let adapter = CodexAdapter::new();
+    let agent = AgentRecord {
+        id: Uuid::now_v7(),
+        project_id: Uuid::now_v7(),
+        name: "transcript-codex-tool".to_owned(),
+        harness: HarnessKind::Codex,
+        session_id: None,
+        created_at: chrono::Utc::now(),
+    };
+    let turn_id = Uuid::now_v7();
+    let stream = adapter
+        .dispatch(
+            &agent,
+            tmp.path(),
+            "Use your shell tool to run `cat MARKER.txt` in the current directory. \
+             Reply with only the file's contents and nothing else.",
+            turn_id,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed with real codex");
+    // Drain the stream to flush the subprocess; the session file isn't
+    // written until the stream completes. Dropping this line would
+    // race the hydration read against the subprocess.
+    let _events: Vec<AdapterEvent> = stream.collect().await;
+
+    let sidecar = sidecar::sidecar_path(tmp.path(), agent.project_id, agent.id);
+    let record = sidecar::read_latest(&sidecar)
+        .expect("sidecar must read cleanly")
+        .expect("sidecar must contain a record after a live dispatch");
+
+    let transcript = switchboard_harness::load_codex_transcript(
+        &real_home(),
+        tmp.path(),
+        &record.session_id,
+        Some(record.session_partition_date),
+        agent.id,
+    )
+    .expect("load_codex_transcript must succeed");
+    assert!(
+        transcript.warnings.is_empty(),
+        "expected no parser warnings; got: {:?}",
+        transcript.warnings
+    );
+
+    let agent_turn = transcript
+        .turns
+        .iter()
+        .find(|t| matches!(t, Turn::Agent { .. }))
+        .expect("hydrated transcript must contain a Turn::Agent");
+    let Turn::Agent { items, .. } = agent_turn else {
+        unreachable!();
+    };
+
+    // Find the tool item whose output carries the staged sentinel rather
+    // than picking the first tool item — robust against Codex emitting
+    // an additional preliminary tool before the shell `cat`.
+    let (is_error, name) = items
+        .iter()
+        .find_map(|item| match item {
+            TurnItem::Tool {
+                output: Some(output),
+                is_error,
+                name,
+                ..
+            } if output.contains(CODEX_TOOL_TOKEN) => Some((is_error, name)),
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "hydrated agent turn must contain a TurnItem::Tool whose output carries \
+                 {CODEX_TOOL_TOKEN:?}; items: {items:?}"
+            )
+        });
+    assert!(!name.is_empty(), "hydrated tool item must carry a name");
+    assert_eq!(
+        *is_error,
+        Some(false),
+        "hydrated tool item must record is_error: Some(false)"
+    );
 }
 
 fn first_user_and_agent(turns: &[Turn]) -> (&Turn, &Turn) {
@@ -339,4 +443,252 @@ fn assert_meta_structure(transcript: &switchboard_harness::LoadedTranscript) {
     let _: &Vec<_> = &meta.mcp_servers;
     let _: &Vec<_> = &meta.skills;
     let _: &Vec<_> = &meta.tools;
+}
+
+#[tokio::test]
+#[ignore = "requires gemini installed — run with: make test-live"]
+async fn live_gemini_transcript_load_via_session_file_round_trips() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let adapter = GeminiAdapter::new();
+    let session_id = Uuid::new_v4();
+    let agent = AgentRecord {
+        id: Uuid::now_v7(),
+        project_id: Uuid::now_v7(),
+        name: "transcript-gemini".to_owned(),
+        harness: HarnessKind::Gemini,
+        session_id: Some(session_id),
+        created_at: chrono::Utc::now(),
+    };
+    let prompt = "Reply with only the single word 'ack' and nothing else.";
+    let turn_id = Uuid::now_v7();
+
+    let stream = adapter
+        .dispatch(
+            &agent,
+            tmp.path(),
+            prompt,
+            turn_id,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed with real gemini");
+    let live_events: Vec<AdapterEvent> = stream.collect().await;
+    let live_text = collect_text(&live_events);
+
+    let transcript = switchboard_harness::load_gemini_transcript(
+        &real_home(),
+        tmp.path(),
+        agent.session_id.unwrap(),
+        agent.id,
+    )
+    .expect("load_gemini_transcript must succeed");
+
+    assert!(
+        transcript.warnings.is_empty(),
+        "expected no parser warnings; got: {:?}",
+        transcript.warnings
+    );
+    assert_meta_structure(&transcript);
+
+    let (user, agent_turn) = first_user_and_agent(&transcript.turns);
+    assert_user(user, &agent.id, prompt);
+    assert_agent_completed(agent_turn, &agent.id, &live_text);
+    assert_gemini_agent_usage(agent_turn);
+    // Gemini's session file carries no rate-limit telemetry (unlike Codex).
+    assert!(
+        transcript.last_rate_limit.is_none(),
+        "Gemini hydration must leave last_rate_limit as None (no rate-limit field in session file)"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires gemini installed — run with: make test-live"]
+async fn live_gemini_transcript_load_hydrates_tool_items() {
+    // Where the sentinel-in-output assertion lives for Gemini. The live
+    // stream's `tool_result.output` is `""` for `read_file`, so
+    // `tool_use.rs` can only assert lifecycle. The session file carries
+    // the real `read_file` output, which hydration surfaces — this is
+    // the load-bearing test that the "live = best-effort, hydration =
+    // authoritative" contract holds for Gemini's read-like tools.
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    std::fs::write(tmp.path().join("MARKER.txt"), GEMINI_TOOL_TOKEN).expect("write marker");
+
+    let adapter = GeminiAdapter::new();
+    let session_id = Uuid::new_v4();
+    let agent = AgentRecord {
+        id: Uuid::now_v7(),
+        project_id: Uuid::now_v7(),
+        name: "transcript-gemini-tool".to_owned(),
+        harness: HarnessKind::Gemini,
+        session_id: Some(session_id),
+        created_at: chrono::Utc::now(),
+    };
+    let turn_id = Uuid::now_v7();
+    let stream = adapter
+        .dispatch(
+            &agent,
+            tmp.path(),
+            "Read the file MARKER.txt in the current directory and reply with only its contents.",
+            turn_id,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed with real gemini");
+    // Drain the stream to flush the subprocess; the session file isn't
+    // written until the stream completes. Dropping this line would
+    // race the hydration read against the subprocess.
+    let _events: Vec<AdapterEvent> = stream.collect().await;
+
+    let transcript = switchboard_harness::load_gemini_transcript(
+        &real_home(),
+        tmp.path(),
+        agent.session_id.unwrap(),
+        agent.id,
+    )
+    .expect("load_gemini_transcript must succeed");
+    assert!(
+        transcript.warnings.is_empty(),
+        "expected no parser warnings; got: {:?}",
+        transcript.warnings
+    );
+
+    let agent_turn = transcript
+        .turns
+        .iter()
+        .find(|t| matches!(t, Turn::Agent { .. }))
+        .expect("hydrated transcript must contain a Turn::Agent");
+    let Turn::Agent { items, .. } = agent_turn else {
+        unreachable!();
+    };
+
+    // Find the tool item whose output carries the staged sentinel rather
+    // than picking the first tool item — robust against Gemini emitting
+    // an additional preliminary tool before `read_file` (the harness
+    // suite is designed to catch upstream CLI drift without being
+    // brittle to harmless ordering changes).
+    let (is_error, name) = items
+        .iter()
+        .find_map(|item| match item {
+            TurnItem::Tool {
+                output: Some(output),
+                is_error,
+                name,
+                ..
+            } if output.contains(GEMINI_TOOL_TOKEN) => Some((is_error, name)),
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "hydrated agent turn must contain a TurnItem::Tool whose output carries \
+                 {GEMINI_TOOL_TOKEN:?}; items: {items:?}"
+            )
+        });
+    assert!(!name.is_empty(), "hydrated tool item must carry a name");
+    assert_eq!(
+        *is_error,
+        Some(false),
+        "hydrated tool item must record is_error: Some(false)"
+    );
+}
+
+/// Gemini's parser populates `usage` from the gemini record's `tokens`
+/// field but leaves `context_window` as `None` — Gemini's session file
+/// doesn't carry a context-window field analogous to Codex's
+/// `task_started.model_context_window`. The sidebar's context-utilization
+/// bar will not render for Gemini agents until upstream Gemini telemetry
+/// adds the field.
+fn assert_gemini_agent_usage(turn: &Turn) {
+    let Turn::Agent { usage, .. } = turn else {
+        unreachable!("caller already matched Turn::Agent");
+    };
+    let usage = usage
+        .as_ref()
+        .expect("Gemini hydration must carry usage for completed turns");
+    assert!(
+        usage.context_window.is_none(),
+        "Gemini hydrated usage.context_window must be None (no analog in session file); got: {:?}",
+        usage.context_window
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires agy installed — run with: make test-live"]
+async fn live_antigravity_two_turns_hydrate_in_order() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let adapter = AntigravityAdapter::new();
+    let agent = AgentRecord {
+        id: Uuid::now_v7(),
+        project_id: Uuid::now_v7(),
+        name: "transcript-agy".to_owned(),
+        harness: HarnessKind::Antigravity,
+        // Antigravity agents carry session_id: None; the conversation UUID
+        // lives in the per-agent sidecar after the first dispatch.
+        session_id: None,
+        created_at: chrono::Utc::now(),
+    };
+
+    // Two prompts against the same agent: the second resumes via the sidecar
+    // and appends to the same transcript.jsonl (single-file-per-conversation).
+    for prompt in [
+        "Reply with only the single word 'one' and nothing else.",
+        "Reply with only the single word 'two' and nothing else.",
+    ] {
+        let stream = adapter
+            .dispatch(
+                &agent,
+                tmp.path(),
+                prompt,
+                Uuid::now_v7(),
+                DispatchOptions::default(),
+            )
+            .await
+            .expect("dispatch should succeed with real agy");
+        let _events: Vec<AdapterEvent> = stream.collect().await;
+    }
+
+    let sidecar = antigravity::sidecar::sidecar_path(tmp.path(), agent.project_id, agent.id);
+    let record = antigravity::sidecar::read_latest(&sidecar)
+        .expect("sidecar must read cleanly")
+        .expect("sidecar must contain a record after live dispatches");
+
+    let transcript = load_antigravity_transcript(
+        &real_home(),
+        tmp.path(),
+        Some(record.conversation_id),
+        agent.id,
+    )
+    .expect("load_antigravity_transcript must succeed");
+
+    assert!(
+        transcript.warnings.is_empty(),
+        "expected no parser warnings; got: {:?}",
+        transcript.warnings
+    );
+
+    // Both prompts surface as user turns, in dispatch order, attributed to the
+    // agent; each is followed by an agent turn.
+    let user_turns: Vec<&Turn> = transcript
+        .turns
+        .iter()
+        .filter(|t| matches!(t, Turn::User { .. }))
+        .collect();
+    assert!(
+        user_turns.len() >= 2,
+        "expected at least two user turns; got {}",
+        user_turns.len()
+    );
+    for turn in &transcript.turns {
+        let agent_id = match turn {
+            Turn::User { agent_id, .. } | Turn::Agent { agent_id, .. } => *agent_id,
+            _ => continue,
+        };
+        assert_eq!(agent_id, agent.id, "every turn attributed to the agent");
+    }
+    assert!(
+        transcript
+            .turns
+            .iter()
+            .any(|t| matches!(t, Turn::Agent { .. })),
+        "expected at least one agent turn"
+    );
 }

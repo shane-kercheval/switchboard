@@ -1,8 +1,17 @@
-# Research: Claude Code vs Codex (headless comparison)
+# Research: Claude Code vs Codex (headless comparison) — ARCHIVED
+
+> **Status: archived (2026-05-19).** This is a captured-in-time pre-M2 research artifact that informed the initial per-harness adapter design. It compares only Claude Code and Codex (Gemini was added later in M3) and was never intended to be a living document. The "Updates the system-design needs" section at the bottom describes changes that have already flowed into `docs/system-design.md`.
+>
+> **Current per-harness ground truth lives in:**
+> - [`claude-code-cli-observed.md`](../claude-code-cli-observed.md)
+> - [`codex-cli-observed.md`](../codex-cli-observed.md)
+> - [`gemini-cli-observed.md`](../gemini-cli-observed.md)
+>
+> Don't update this file. If you need a cross-harness side-by-side, the §9 *Harness capabilities Switchboard depends on* and *Per-harness adapter and normalized event stream* tables in `docs/system-design.md` are the living source of truth.
 
 **Captured:** 2026-05-09
 **Tool versions:** Claude Code 2.1.138, codex-cli 0.128.0
-**Companion to:** [claude-code-cli-observed.md](claude-code-cli-observed.md), [codex-cli-observed.md](codex-cli-observed.md)
+**Companion to:** [claude-code-cli-observed.md](../claude-code-cli-observed.md), [codex-cli-observed.md](../codex-cli-observed.md)
 
 This note distills the per-harness observations into a side-by-side, focused on the design decisions Switchboard's §5 (harness integration) needs to make. Where the harnesses behave the same, we note it; where they diverge, we name the consequence.
 

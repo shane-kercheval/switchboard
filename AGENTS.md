@@ -140,5 +140,6 @@ Project-wide rules that apply across all milestones. Milestone-specific mechanic
   - `claude-code-cli-observed.md`, `claude-code-headless.md` — Claude Code CLI behavior.
   - `codex-cli-observed.md`, `codex-noninteractive.md` — Codex CLI behavior.
   - `gemini-cli-observed.md` — Gemini CLI behavior.
+  - `antigravity-cli-observed.md` — Antigravity CLI (`agy`) behavior (Google's Gemini-CLI replacement for free / Pro / Ultra tiers).
   - `same-session-parallel-invocation.md` — why we enforce session-id uniqueness at the app layer.
   - `archive/` — captured-in-time research that informed earlier milestones and is no longer maintained. See `docs/system-design.md` §9 for the living cross-harness comparison.

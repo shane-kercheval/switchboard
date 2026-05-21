@@ -2,7 +2,7 @@
 
 ## 1. What Switchboard is
 
-Switchboard is a **human-directed orchestrator for AI coding agents** — a desktop application you run alongside your existing Claude Code, Codex, and Gemini setup. It lets you spawn multiple agent sessions within a project, route messages between them, and define reusable workflows for common multi-agent operations like second-opinion code review, plan-and-implement, and parallel-solution adjudication.
+Switchboard is a **human-directed orchestrator for AI coding agents** — a desktop application you run alongside your existing Claude Code, Codex, Gemini, and Antigravity setup. It lets you spawn multiple agent sessions within a project, route messages between them, and define reusable workflows for common multi-agent operations like second-opinion code review, plan-and-implement, and parallel-solution adjudication.
 
 More precisely, it is a **workflow engine for primitives, not for processes**. It codifies the *shape* of common multi-agent operations (fan-out, fan-in with template wrapping, sequential handoff, pause-for-user-input, iteration) so they can be invoked with one command instead of manually copy-pasted. It does not impose any larger structure on top of those primitives — there is no built-in concept of "plan phase" or "review phase," no SDLC walkthrough, no opinionated process. The user composes workflows ad hoc and saves the ones they reuse.
 
@@ -14,19 +14,19 @@ This orchestration model has a useful side effect for prompt management. Because
 
 ### Goals
 
-- **Multi-agent spawn and management.** Multiple Claude Code, Codex, and Gemini agent instances run in a single project with user-assigned names.
+- **Multi-agent spawn and management.** Multiple Claude Code, Codex, Gemini, and Antigravity agent instances run in a single project with user-assigned names.
 - **Routing primitives.** Explicit fan-out (one source → many agents, where the source is either a human-composed message or another agent's output), fan-in (many agents → one recipient), and sequential handoff, with optional prompt-template wrapping.
 - **Reusable, parameterized workflows.** Workflows are files that compose primitives — invoked by name, parameterized at invocation time.
 - **Agent-friendly authoring.** Workflow files and other authorable artifacts (local prompts, project setup) are documented in instruction docs under `docs/agent-instructions/` designed for AI coding agents to consume. The intended authoring path is to point an existing Claude Code, Codex, or Gemini agent at the relevant instruction file and ask it to generate the artifact from a description, rather than learning the DSL by hand.
 - **Autonomous workflow execution.** A workflow continues to run after launch so the user can switch focus to other work without babysitting it (within the lifetime of the Switchboard host process; see §7).
 - **Configurable prompt providers.** Apply prompt templates from one or more configured prompt providers during routing, with parameterized substitution. Providers include a built-in local file store (prompts authored as files inside the project or the user's Switchboard config directory) and any MCP server that exposes prompts (for example [Tiddly](https://tiddly.me)). Provider configuration is centralized in Switchboard, so a user's prompt library works identically across Claude Code, Codex, and future agent backends without per-agent MCP setup. Does not extend to MCP *tools* or to model-discovered *skills*, which remain per-agent concerns.
 - **Zero-setup onboarding.** Switchboard ships with example prompts and example workflows in the local store so a new user can invoke a useful workflow within minutes of installation, without configuring an MCP server.
-- **Full access to the underlying harness.** Switchboard drives Claude Code, Codex, and Gemini; it doesn't replace them.
+- **Full access to the underlying harness.** Switchboard drives Claude Code, Codex, Gemini, and Antigravity; it doesn't replace them.
 - **Shareable, versioned configuration.** Workflows, local prompts, and project configuration are file-based and live inside the project's `.switchboard/` directory, so they version, diff, review, and share via the user's normal git workflow.
 
 ### Non-goals
 
-- **Replacing the Claude Code, Codex, or Gemini harness.** Compaction, tool rendering, permission policy, plan mode, hooks, and skills all live in the harnesses. Switchboard drives them via their non-interactive modes (`claude -p`, `codex exec`, `gemini -p`).
+- **Replacing the Claude Code, Codex, Gemini, or Antigravity harness.** Compaction, tool rendering, permission policy, plan mode, hooks, and skills all live in the harnesses. Switchboard drives them via their non-interactive modes (`claude -p`, `codex exec`, `gemini -p`, `agy -p`).
 - **Prescribing a software development lifecycle.** Switchboard does not know about "planner" or "reviewer" as roles with semantics. Roles are labels the user assigns; the tool is agnostic.
 - **Managing git, CI, or PR workflows.** Out of scope. Workflows can read agent outputs and route them; they don't run `git commit`, open PRs, or integrate with CI.
 - **Cross-session persistent agent memory** (vector DBs, RAG over prior sessions). Considered as a future feature; the v1 architecture should not preclude it but does not implement it.
@@ -45,13 +45,13 @@ This orchestration model has a useful side effect for prompt management. Because
 |---|---|
 | **Working directory** | An on-disk directory (typically a git repo) where Switchboard does its work. Identified by canonicalized path. One Switchboard-managed `.switchboard/` lives at the directory root and contains zero or more **projects**. |
 | **Project** | A named, task-scoped grouping of agents + workflow runs + runtime state, hosted within a working directory. (Workflow *definitions* are directory-scoped — shared across projects; projects own workflow *runs* — the in-flight invocations against their agents.) Each project has a UUID (`ProjectId`) and a user-supplied name (unique within its directory; can collide across directories). Multiple projects can coexist in the same working directory, allowing the user to run separate workstreams (backend / frontend / planning / etc.) on the same repo simultaneously. Project-specific state lives at `<directory>/.switchboard/projects/<project-id>/` (see directory layout below). |
-| **Agent** | A Claude Code, Codex, or Gemini session within a project, with a user-assigned name. Each agent has a persistent harness session ID under the hood. Agents are bound to their project, not directly to the directory. |
+| **Agent** | A Claude Code, Codex, Gemini, or Antigravity session within a project, with a user-assigned name. Each agent has a persistent harness session under the hood (a session ID, or a server-assigned conversation UUID carried in a per-agent sidecar for Codex / Antigravity). Agents are bound to their project, not directly to the directory. |
 | **Primitive** | An atomic operation Switchboard provides for a workflow to compose: spawn agent, send message, auto-forward output, fan-in with template, pause for user input, iterate over a list. Six exist in v1; see §4. (Saving and invoking a reusable workflow is the composition layer over these primitives, not itself a primitive — see §5.) |
 | **Workflow** | A named, parameterized composition of primitives — for example "fan-out review and aggregate." Defined as a YAML file under `<directory>/.switchboard/workflows/` (workflows are directory-scoped, shared across projects in that directory; rationale below). Invoked by name with arguments against a specific project. |
 | **Prompt template** | A named prompt definition resolved by ID at routing time. Used as message content (sent to an agent) or as a wrapper applied around aggregated outputs before forwarding (used in fan-in; see §4 Primitive 4). |
 | **Prompt provider** | A source of prompts Switchboard resolves IDs against. Two implementations ship in v1: `local` (file store) and any registered MCP-server provider. Addressed by prefix (e.g. `local:code-review`, `tiddly:code-review`). See §6. |
 | **Routing** | Message passing between agents. Includes fan-out (one source, many recipients), fan-in (many sources, one recipient, with template wrapping), and sequential handoff. |
-| **Harness session** | The underlying Claude Code, Codex, or Gemini session that backs an agent. Persisted on disk by the harness; resumed via `--resume`. |
+| **Harness session** | The underlying Claude Code, Codex, Gemini, or Antigravity session that backs an agent. Persisted on disk by the harness; resumed via `--resume` (or `--conversation <uuid>` for Antigravity). |
 
 A note on terminology: "session" in the agent ecosystem is overloaded. Switchboard uses **project** for its task-scoped workspace concept (multiple projects per working directory) and reserves **session** to mean the underlying harness session backing a single agent.
 
@@ -99,7 +99,7 @@ These six primitives cover everything Switchboard needs to do at the functional 
 
 Create a new agent within a project. User specifies:
 
-- Agent type (Claude Code, Codex, or Gemini).
+- Agent type (Claude Code, Codex, Gemini, or Antigravity).
 - Name (free-form label).
 - Optional initial prompt (sent as the first message after spawn to prime the agent with role context, project background, or any other instructions the user wants in place before the first real turn). Authored like any other prompt — free-form text or a fully-qualified prompt ID resolved through the prompt-provider system (§6).
 - Optional working directory override (defaults to project working directory).
@@ -433,21 +433,23 @@ Each agent's operational state is surfaced in the **overview sidebar** (per "Ins
 
 Different harnesses expose different telemetry. The sidebar fields below are intentionally asymmetric — empty cells reflect what the harness itself emits (or doesn't), not Switchboard scope:
 
-| Field | Claude Code | Codex | Gemini |
-|---|---|---|---|
-| Status | ✓ | ✓ | ✓ |
-| Model | ✓ | ✓ | ✓ |
-| MCP servers (count) | ✓ | ✓ | ✓ |
-| Skills (count) | ✓ | ✓ | ✓ |
-| Cost $ (per turn + session aggregate) | ✓ | — | — |
-| Quota % (window used) | — | ✓ | — |
-| Context after last turn (%) | ✓ | ✓ | — |
+| Field | Claude Code | Codex | Gemini | Antigravity |
+|---|---|---|---|---|
+| Status | ✓ | ✓ | ✓ | ✓ |
+| Model | ✓ | ✓ | ✓ | ✓ |
+| MCP servers (count) | ✓ | ✓ | ✓ | ✓ |
+| Skills (count) | ✓ | ✓ | ✓ | ✓ |
+| Cost $ (per turn + session aggregate) | ✓ | — | — | — |
+| Quota % (window used) | — | ✓ | — | — |
+| Context after last turn (%) | ✓ | ✓ | — | — |
 
 **Per-asymmetry rationale**:
 
-- **Cost $** — only Anthropic exposes `total_cost_usd` on completed turns (drawn from the Agent SDK credit pool post-2026-06-15). Codex (subscription auth) does not surface a dollar number; OpenAI's billing model under subscription is quota-based. Gemini's free OAuth tier has no per-turn dollar cost to display.
-- **Quota %** — only Codex emits a `RateLimitEvent` with `primary.used_percent`, reflecting OpenAI's sliding rate-limit window. Anthropic's tier is closer to a hard limit without a visible counter; Gemini's free OAuth tier likewise.
-- **Context after last turn (%)** — Claude reads its window from the stream's `result.modelUsage.<model>.contextWindow`; Codex enriches from the session file's `task_started.model_context_window`. Gemini's session file carries no analogous context-window field, so the bar can't compute the ratio. If upstream Gemini telemetry adds a context-window field, this asymmetry closes.
+- **Cost $** — only Anthropic exposes `total_cost_usd` on completed turns (drawn from the Agent SDK credit pool post-2026-06-15). Codex (subscription auth) does not surface a dollar number; OpenAI's billing model under subscription is quota-based. Gemini's free OAuth tier has no per-turn dollar cost to display. Antigravity surfaces no usage/cost/token data at all (it is a thin client to a server-side agent — all accounting is server-side and never written to disk).
+- **Quota %** — only Codex emits a `RateLimitEvent` with `primary.used_percent`, reflecting OpenAI's sliding rate-limit window. Anthropic's tier is closer to a hard limit without a visible counter; Gemini's free OAuth tier and Antigravity likewise expose none.
+- **Context after last turn (%)** — Claude reads its window from the stream's `result.modelUsage.<model>.contextWindow`; Codex enriches from the session file's `task_started.model_context_window`. Gemini's session file carries no analogous context-window field, and Antigravity's transcript carries no token/context data either, so neither can compute the ratio. If upstream telemetry adds a context-window field, the asymmetry closes.
+
+Antigravity's model / MCP / skills cells populate from its `SessionMeta` (model parsed from the user-settings envelope; MCP / skills from `~/.gemini/config/`); its cost / quota / context cells render "—".
 
 Empty rows are not Switchboard-side roadmap items — they reflect what the underlying harness emits. If a harness adds a telemetry field upstream, the sidebar surface follows.
 
@@ -587,7 +589,11 @@ The architectural backbone of this section is the **per-harness adapter** patter
 
 ### Process model
 
-Per-message process spawn for v1: each turn invokes `claude -p --resume <session-id>`, `codex exec resume <session-id>`, or `gemini -p --session-id <uuid>` (first turn) / `gemini -p --resume <uuid>` (subsequent turns), captures the structured output stream, and exits. State persists in the harness's session files between invocations. Long-lived agent processes can be considered later if latency matters.
+Per-message process spawn for v1: each turn invokes `claude -p --resume <session-id>`, `codex exec resume <session-id>`, `gemini -p --session-id <uuid>` (first turn) / `gemini -p --resume <uuid>` (subsequent turns), or `agy -p <prompt> [--conversation <uuid>] --dangerously-skip-permissions` (Antigravity), captures the output, and exits. State persists in the harness's session files between invocations. Long-lived agent processes can be considered later if latency matters.
+
+**Antigravity is the structural outlier.** `agy` is a thin client to a server-side agent with a contract unlike the other three: no structured stream (plain markdown drips to stdout, no `--output-format` flag); the conversation UUID is **server-assigned**, captured post-spawn by watching for a new `~/.gemini/antigravity-cli/brain/<uuid>/` directory and persisted to a per-agent sidecar (the `AgentRecord.session_id` stays `None`, like Codex); resume passes the captured UUID via `--conversation`; and the process exit — not a stream/transcript record — is the authoritative turn terminator (`agy` exits 0 on essentially every condition, so the exit code is useless for outcome detection). Auth is macOS-Keychain-only, and a stale token triggers an interactive-OAuth fallback the adapter detects on stdout and force-kills. Full ground truth in [docs/research/antigravity-cli-observed.md](research/antigravity-cli-observed.md).
+
+**Why both Gemini and Antigravity exist.** Both root under `~/.gemini/`, which can look redundant. Gemini remains supported for users whose Gemini CLI path still works (e.g. paid Workspace); Antigravity (`agy`) is added because Google directed free / Pro / Ultra users to it as the Gemini CLI's replacement for those tiers (observed 2026-05; see `antigravity-cli-observed.md`). They are separate adapters with separate config paths and contracts — see the research doc for the contract diff.
 
 Switchboard runs `claude -p` in its **default** mode (no `--bare`) so the agent inherits the user's full environment: skills, hooks, plugins, MCP servers, CLAUDE.md, and auto-memory all load exactly as they would in an interactive session. The Codex equivalent (we do not pass `--ignore-user-config` or `--ephemeral`) gives the same outcome: the user's `~/.codex/config.toml` and session persistence are honored. This is deliberate — Switchboard's value is to orchestrate normal Claude Code / Codex sessions, not to amputate them. Anthropic has stated that `--bare` will become the `-p` default in a future release; when that happens, Switchboard will need to pass equivalent context-loading flags (`--mcp-config`, `--agents`, `--plugin-dir`, `--settings`, `--append-system-prompt`) to preserve current behavior. To make that change a one-place edit, harness command-line construction is centralized in a single "harness invoker" helper from day one. Tracked under open question 10.9; full background in [docs/research/claude-code-headless.md](research/claude-code-headless.md).
 
@@ -599,14 +605,16 @@ Switchboard consumes the harness stream by spawning the process, reading stdout 
 
 - **Codex** passes `--skip-git-repo-check` unconditionally. Switchboard's safety guidance about git-tracked projects (see §9 "Safety guidance") sits at a higher layer than Codex's own check; we don't want Codex refusing to spawn in a non-git directory just because the user hasn't initialized a repo yet.
 - **Gemini** passes `--skip-trust` unconditionally. Gemini's workspace-trust gate otherwise blocks headless dispatches by default. Switchboard's bound cwd is by definition the user's working directory — the gate's question is already answered — so the adapter asserts this every spawn.
+- **Antigravity** passes `--dangerously-skip-permissions` unconditionally — the analog of Gemini's `--skip-trust` / `--yolo`. Without it, tool calls would block on interactive permission prompts that a headless dispatch can't answer. The bound cwd is the user's own workspace, so per-tool approval is auto-granted, consistent with the max-autonomy posture (§11).
 
 ### Permissions and sandboxing
 
-For v1, Switchboard runs all three harnesses with maximum autonomy — skip-permissions is effectively required, not optional:
+For v1, Switchboard runs all four harnesses with maximum autonomy — skip-permissions is effectively required, not optional:
 
 - Claude Code: `--dangerously-skip-permissions`
 - Codex: `--dangerously-bypass-approvals-and-sandbox` (also accepts `--yolo` as an undocumented alias in 0.128.0; relying on the long form is safer)
 - Gemini: `--yolo`
+- Antigravity: `--dangerously-skip-permissions`
 
 This is a deliberate v1 simplification. Headless mode has no native interactive permission prompt UX, and building one inside Switchboard (intercept denials at runtime, modal-prompt the user, re-issue the turn) is non-trivial work that we don't want to gate v1 on. Granular permission control is a deferred design decision — see §11.
 
@@ -629,44 +637,46 @@ A one-time first-launch acknowledgement dialog (with a checkbox the user must ti
 
 ### Harness capabilities Switchboard depends on
 
-The capabilities and behaviors Switchboard needs from each harness, with notes on what is exposed natively, derived, or unavailable. Hands-on probe results are documented in [docs/research/claude-code-cli-observed.md](research/claude-code-cli-observed.md), [docs/research/codex-cli-observed.md](research/codex-cli-observed.md), and [docs/research/gemini-cli-observed.md](research/gemini-cli-observed.md).
+The capabilities and behaviors Switchboard needs from each harness, with notes on what is exposed natively, derived, or unavailable. Hands-on probe results are documented in [docs/research/claude-code-cli-observed.md](research/claude-code-cli-observed.md), [docs/research/codex-cli-observed.md](research/codex-cli-observed.md), [docs/research/gemini-cli-observed.md](research/gemini-cli-observed.md), and [docs/research/antigravity-cli-observed.md](research/antigravity-cli-observed.md).
 
-| Capability | Claude Code | Codex | Gemini |
-|---|---|---|---|
-| Spawn with explicit flags | native | native | native |
-| Send + capture structured stream | native | native | native |
-| Detect turn completion | native | native | native |
-| Detect errors | native | native (asymmetric payload) | native |
-| Resume by UUID | native | native | native |
-| Assign session ID at spawn | native (`--session-id`) | unavailable (captured from stream → sidecar) | native (`--session-id`) |
-| Fork from checkpoint | native (`--fork-session`) | unavailable in v1 (per resolved 10.14) | unavailable in v1 |
-| Read context window in stream | native (`result.modelUsage`) | unavailable (session-file only) | unavailable (no analog field) |
-| Read cost in stream | native (`total_cost_usd`) | unavailable (subscription quota model) | unavailable (free OAuth tier) |
-| Read rate-limit / quota | unavailable (no public stream signal) | native (`token_count.rate_limits` in session file) | unavailable |
-| Tool calls + results in stream | native (typed blocks) | native (`command_execution` only) | native (filtered `update_topic`; output empty for read-like tools) |
-| Programmatic compaction | unavailable (auto only) | unavailable (auto only) | unavailable (auto only) |
-| Capture permission denials | native (`result.permission_denials`) | presumed (verification deferred) | not yet probed |
-| Run agents concurrently | confirmed | presumed | confirmed |
+| Capability | Claude Code | Codex | Gemini | Antigravity |
+|---|---|---|---|---|
+| Spawn with explicit flags | native | native | native | native |
+| Send + capture structured stream | native | native | native | **unavailable** (no structured stream; dual-source: stdout drip + `transcript.jsonl` tail) |
+| Detect turn completion | native | native | native | derived (process exit; no terminal stream/transcript record) |
+| Detect errors | native | native (asymmetric payload) | native | derived (stdout scan; `agy` exits 0 on essentially everything) |
+| Resume by UUID | native | native | native | native (`--conversation <uuid>`) |
+| Assign session ID at spawn | native (`--session-id`) | unavailable (captured from stream → sidecar) | native (`--session-id`) | unavailable (server-assigned; captured from `brain/<uuid>/` → sidecar) |
+| Fork from checkpoint | native (`--fork-session`) | unavailable in v1 (per resolved 10.14) | unavailable in v1 | unavailable in v1 |
+| Read context window in stream | native (`result.modelUsage`) | unavailable (session-file only) | unavailable (no analog field) | unavailable (no token/context data anywhere — server-side) |
+| Read cost in stream | native (`total_cost_usd`) | unavailable (subscription quota model) | unavailable (free OAuth tier) | unavailable (server-side) |
+| Read rate-limit / quota | unavailable (no public stream signal) | native (`token_count.rate_limits` in session file) | unavailable | unavailable |
+| Tool calls + results in stream | native (typed blocks) | native (`command_execution` only) | native (filtered `update_topic`; output empty for read-like tools) | derived (from `transcript.jsonl` tail, not a stream) |
+| Programmatic compaction | unavailable (auto only) | unavailable (auto only) | unavailable (auto only) | unavailable (server-side; auto behavior unverified) |
+| Capture permission denials | native (`result.permission_denials`) | presumed (verification deferred) | not yet probed | n/a (auto-approved via `--dangerously-skip-permissions`) |
+| Run agents concurrently | confirmed | presumed | confirmed | confirmed (distinct server-assigned UUIDs; no prefix-collision hazard) |
 
 **Per-row notes** (only where the matrix needs elaboration):
 
-- **Send + capture structured stream**: Claude `claude -p --output-format stream-json`; Codex `codex exec --json`; Gemini `gemini -p --output-format stream-json`.
-- **Detect turn completion**: single terminal event per turn for all three. Claude: `result`. Codex: `turn.completed` (success) or `turn.failed` (error). Gemini: `result.status:"success"` or `result.status:"error"`. The adapter waits for whichever terminal shape the harness emits.
-- **Detect errors**: Claude uses `result.is_error` and/or `result.api_error_status` (do **not** rely on `result.subtype` — stays `"success"` even on error). Codex: `turn.failed` event terminates the turn with the API error in the payload. Gemini: `result.status:"error"` with `error.message` — auth failures detected via substring match per `is_gemini_auth_failure_message`. All three exit non-zero on error.
-- **Assign session ID at spawn**: Claude and Gemini both let the caller pass `--session-id <uuid>`. Codex assigns its own; Switchboard captures it from the first stream event and persists to a per-agent sidecar. Note: Gemini uses UUID **v4** (not v7) because Gemini's session-file filename uses only the first 8 hex chars and v7s minted in the same millisecond share that prefix — see `gemini/mod.rs` for the rationale.
-- **Fork from checkpoint**: Claude `--fork-session` with `--resume`. Codex has no non-interactive `codex exec fork`; Gemini has no equivalent. The Fork affordance surfaces only on Claude Code agents; Codex and Gemini agents show a tooltip explaining the gap.
-- **Read context window in stream**: Claude is the only harness with this stream-side. Codex enriches from the session file's `task_started.model_context_window` per resolved 10.15. Gemini has neither a stream field nor a session-file analog — the context-utilization bar is hidden for Gemini agents (per the per-harness sidebar matrix in §7).
-- **Read cost in stream**: Claude only (Agent SDK credit pool post-2026-06-15). Codex doesn't expose dollar costs under subscription auth; Gemini's free OAuth tier doesn't either.
-- **Read rate-limit / quota**: Codex only — emitted as a `RateLimitEvent` enriched from the session file's `token_count.rate_limits` post-terminal. The other two harnesses don't surface a comparable signal.
-- **Tool calls + results in stream**: structurally divergent across harnesses. Claude emits typed `tool_use` / `tool_result` content blocks with named tools (including MCP). Codex routes everything through `command_execution` items (raw shell commands with `aggregated_output` and `exit_code`). Gemini emits `tool_use` / `tool_result` events; the adapter filters the `update_topic` internal tool, and `tool_result.output` is empty for read-like tools like `read_file` (the real content lives only in the session file — surfaces on transcript hydration). Switchboard renders these differently per harness; no single unified rendering. **No raw token counts are surfaced in the UI for any harness** — tokens are plumbed through the event stream and used internally (context utilization, debugging), but the user-facing surface is dollars (Claude) or quota (Codex) or empty (Gemini).
-- **Permission denials**: Claude's `result.permission_denials` is informational (not a turn-error); the model receives them as feedback and adapts. Codex and Gemini behaviors are presumed similar but unverified — §7 wording is hedged accordingly.
-- **Run agents concurrently**: Claude confirmed via three parallel `claude -p` invocations producing three independent session files. Gemini confirmed via the M3.1 collision probe (two concurrent processes with deliberately-colliding 8-char-prefix UUIDs surfaced the documented prefix-collision hazard, but both invocations completed independently). Codex's process model and per-session-file isolation suggest the property holds; explicit verification deferred.
+- **Send + capture structured stream**: Claude `claude -p --output-format stream-json`; Codex `codex exec --json`; Gemini `gemini -p --output-format stream-json`. **Antigravity has no structured-stream mode** — `agy -p` drips plain markdown to stdout, so its adapter is dual-source (stdout for assistant text + `transcript.jsonl` tail for tool lifecycle); see "Antigravity is the first adapter whose live stream is dual-source" above.
+- **Detect turn completion**: single terminal event per turn for the three structured-stream harnesses. Claude: `result`. Codex: `turn.completed` (success) or `turn.failed` (error). Gemini: `result.status:"success"` or `result.status:"error"`. The adapter waits for whichever terminal shape the harness emits. **Antigravity is the exception** — it has no terminal stream/transcript record, so the adapter uses **process exit** as the turn terminator (see Process model).
+- **Detect errors**: Claude uses `result.is_error` and/or `result.api_error_status` (do **not** rely on `result.subtype` — stays `"success"` even on error). Codex: `turn.failed` event terminates the turn with the API error in the payload. Gemini: `result.status:"error"` with `error.message` — auth failures detected via substring match per `is_gemini_auth_failure_message`. Those three exit non-zero on error. **Antigravity is the exception** — `agy` exits 0 on essentially every condition, so the adapter scans stdout for `Error:` / `Authentication required` lines instead of trusting the exit code.
+- **Assign session ID at spawn**: Claude and Gemini both let the caller pass `--session-id <uuid>`. Codex and Antigravity assign their own server-side and Switchboard captures it (Codex from the first stream event; Antigravity from the new `brain/<uuid>/` directory) and persists to a per-agent sidecar. Note: Gemini uses UUID **v4** (not v7) because Gemini's session-file filename uses only the first 8 hex chars and v7s minted in the same millisecond share that prefix — see `gemini/mod.rs` for the rationale.
+- **Fork from checkpoint**: Claude `--fork-session` with `--resume`. Codex has no non-interactive `codex exec fork`; Gemini and Antigravity have no equivalent. The Fork affordance surfaces only on Claude Code agents; the others show a tooltip explaining the gap.
+- **Read context window in stream**: Claude is the only harness with this stream-side. Codex enriches from the session file's `task_started.model_context_window` per resolved 10.15. Gemini has neither a stream field nor a session-file analog, and Antigravity exposes no token/context data anywhere (all server-side) — the context-utilization bar is hidden for both (per the per-harness sidebar matrix in §7).
+- **Read cost in stream**: Claude only (Agent SDK credit pool post-2026-06-15). Codex doesn't expose dollar costs under subscription auth; Gemini's free OAuth tier doesn't either; Antigravity surfaces no cost data at all.
+- **Read rate-limit / quota**: Codex only — emitted as a `RateLimitEvent` enriched from the session file's `token_count.rate_limits` post-terminal. The other three harnesses don't surface a comparable signal.
+- **Tool calls + results in stream**: structurally divergent across harnesses. Claude emits typed `tool_use` / `tool_result` content blocks with named tools (including MCP). Codex routes everything through `command_execution` items (raw shell commands with `aggregated_output` and `exit_code`). Gemini emits `tool_use` / `tool_result` events; the adapter filters the `update_topic` internal tool, and `tool_result.output` is empty for read-like tools like `read_file` (the real content lives only in the session file — surfaces on transcript hydration). Antigravity has no tool events in any stream — they're recovered from the `transcript.jsonl` tail (`PLANNER_RESPONSE.tool_calls` → `ToolStarted`; the following tool-result record → `ToolCompleted`, paired FIFO). Switchboard renders these differently per harness; no single unified rendering. **No raw token counts are surfaced in the UI for any harness** — tokens are plumbed through the event stream and used internally (context utilization, debugging), but the user-facing surface is dollars (Claude) or quota (Codex) or empty (Gemini / Antigravity).
+- **Permission denials**: Claude's `result.permission_denials` is informational (not a turn-error); the model receives them as feedback and adapts. Codex and Gemini behaviors are presumed similar but unverified — §7 wording is hedged accordingly. Antigravity runs with `--dangerously-skip-permissions`, so tool calls are auto-approved and no denial signal is produced.
+- **Run agents concurrently**: Claude confirmed via three parallel `claude -p` invocations producing three independent session files. Gemini confirmed via the M3.1 collision probe (two concurrent processes with deliberately-colliding 8-char-prefix UUIDs surfaced the documented prefix-collision hazard, but both invocations completed independently). Codex's process model and per-session-file isolation suggest the property holds; explicit verification deferred. Antigravity gets a distinct server-assigned UUID per conversation (no filename-prefix collision hazard), and the adapter correlates each dispatch to its conversation by exact prompt match — so byte-identical concurrent prompts in one cwd fail loud rather than mis-bind.
 
 ### Per-harness adapter and normalized event stream
 
-The three harness streams (Claude Code, Codex, Gemini) are structurally different (event-name vocabularies, content shapes, where context-window / rate-limit / cost info appears, what's in the session file vs. stream-only). To keep the rest of Switchboard harness-agnostic, the harness layer is organized around **per-harness adapters** that translate native events into a normalized internal event stream the rest of the system consumes.
+The four harness streams (Claude Code, Codex, Gemini, Antigravity) are structurally different (event-name vocabularies, content shapes, where context-window / rate-limit / cost info appears, what's in the session file vs. stream-only). To keep the rest of Switchboard harness-agnostic, the harness layer is organized around **per-harness adapters** that translate native events into a normalized internal event stream the rest of the system consumes.
 
 Each adapter is responsible for: building the harness command line, spawning the process, parsing its native stream, normalizing into the event vocabulary below, and surfacing harness-specific metadata in `raw` so callers that need to dig in can. The workflow engine, UI, and persistence layer consume only the normalized stream.
+
+**Antigravity is the first adapter whose live stream is dual-source.** Claude / Codex / Gemini parse a single structured JSONL stream from stdout. Antigravity has no structured stream, so its adapter composes the normalized events from two surfaces in parallel: **stdout** drips the model's final answer text (`ContentChunk { Text }`), while a **tail of the conversation's `transcript.jsonl`** yields tool lifecycle (`ToolStarted` / `ToolCompleted`) and `thinking` (`ContentChunk { Thinking }`). The same `transcript.jsonl` records the final answer too, but the live path does **not** re-emit it (stdout already streamed it) — only hydration on project reopen emits it. See [docs/research/antigravity-cli-observed.md](research/antigravity-cli-observed.md) for why.
 
 #### Event vocabulary
 
@@ -680,7 +690,7 @@ The authoritative struct definitions live in [`crates/harness/src/events.rs`](..
 | `ToolStarted { agent, tool_use_id, kind, input }` | A tool call was dispatched. Fires *before* the result lands so the UI can show "running tool... (3.2s elapsed)" rather than appearing frozen. |
 | `ToolCompleted { agent, tool_use_id, output, is_error }` | The tool returned. Paired with its `ToolStarted` via `tool_use_id`. |
 | `TurnEnd { agent, outcome, ended_at, usage? }` | Terminal event. Exactly one per turn. `usage` carries token counts and (where available) `context_window` / `total_cost_usd`. See *Terminal outcome variants* below. |
-| `RateLimitEvent { agent, info }` | Harness-specific quota signal, surfaced for UI display. The workflow engine doesn't interpret it. Codex emits this post-terminal from the session file; Claude has no comparable signal; Gemini has no comparable signal. |
+| `RateLimitEvent { agent, info }` | Harness-specific quota signal, surfaced for UI display. The workflow engine doesn't interpret it. Codex emits this post-terminal from the session file; Claude, Gemini, and Antigravity have no comparable signal. |
 
 #### Terminal outcome variants
 
@@ -698,13 +708,13 @@ The authoritative struct definitions live in [`crates/harness/src/events.rs`](..
 
 For each `SessionMeta` field, where each harness sources the value live (from the stream) and on rehydration (parsing the session file plus any Switchboard-side fallback). Empty cells mean Switchboard returns the field's default (empty string or empty vec) for that harness on that path.
 
-| Field | Claude (live) | Claude (rehydration) | Codex (live + rehydration) | Gemini (live) | Gemini (rehydration) |
-|---|---|---|---|---|---|
-| `model` | `system/init` stream event | session-file `system/init` record | session-file first `turn_context` record | stream-init event | last gemini-record's `model` field |
-| `harness_version` | `system/init.claude_code_version` | session-file `system/init` | session-file `session_meta.cli_version` | lazy `gemini --version` (cached `OnceLock`; `""` on probe failure) | empty (session file lacks the field) |
-| `mcp_servers` | `system/init.mcp_servers` (Claude pre-merges scopes) | Switchboard reads `~/.claude.json` (user + local) + `<cwd>/.mcp.json` (project) | Switchboard reads `~/.codex/config.toml` + `<cwd>/.codex/config.toml` | adapter loader injects post-parse | Switchboard reads `~/.gemini/settings.json` + `<cwd>/.gemini/settings.json` |
-| `skills` | `system/init.skills` (Claude pre-merges scopes) | Switchboard directory-scans `~/.claude/skills/` + `<cwd>/.claude/skills/` | Switchboard directory-scans `~/.agents/skills/` + `<cwd>/.agents/skills/` | adapter loader injects post-parse | Switchboard directory-scans `~/.agents/skills/` + `<cwd>/.gemini/skills/` |
-| `tools` | `system/init.tools` (merged builtin + MCP + dynamic list) | empty | empty | empty | empty |
+| Field | Claude (live) | Claude (rehydration) | Codex (live + rehydration) | Gemini (live) | Gemini (rehydration) | Antigravity (live + rehydration) |
+|---|---|---|---|---|---|---|
+| `model` | `system/init` stream event | session-file `system/init` record | session-file first `turn_context` record | stream-init event | last gemini-record's `model` field | parsed from the `USER_INPUT` record's `<USER_SETTINGS_CHANGE>` envelope (only present when the model changed — empty otherwise; the reducer keeps the prior model on empty) |
+| `harness_version` | `system/init.claude_code_version` | session-file `system/init` | session-file `session_meta.cli_version` | lazy `gemini --version` (cached `OnceLock`; `""` on probe failure) | empty (session file lacks the field) | live: lazy `agy --version` (cached `OnceLock`); rehydration: empty |
+| `mcp_servers` | `system/init.mcp_servers` (Claude pre-merges scopes) | Switchboard reads `~/.claude.json` (user + local) + `<cwd>/.mcp.json` (project) | Switchboard reads `~/.codex/config.toml` + `<cwd>/.codex/config.toml` | adapter loader injects post-parse | Switchboard reads `~/.gemini/settings.json` + `<cwd>/.gemini/settings.json` | Switchboard reads `~/.gemini/config/mcp_config.json` (user scope only) |
+| `skills` | `system/init.skills` (Claude pre-merges scopes) | Switchboard directory-scans `~/.claude/skills/` + `<cwd>/.claude/skills/` | Switchboard directory-scans `~/.agents/skills/` + `<cwd>/.agents/skills/` | adapter loader injects post-parse | Switchboard directory-scans `~/.agents/skills/` + `<cwd>/.gemini/skills/` | Switchboard scans `~/.gemini/config/plugins/<plugin>/skills/<skill>/SKILL.md`, displayed as `<plugin>/<skill>` (user scope only) |
+| `tools` | `system/init.tools` (merged builtin + MCP + dynamic list) | empty | empty | empty | empty | empty |
 
 **Cross-harness invariants** that apply to both `mcp_servers` and `skills`:
 
@@ -729,7 +739,7 @@ For harness commands Switchboard does not need to coordinate, the design *intent
 
 ### What we lose by going non-interactive
 
-The interactive Claude Code, Codex, and Gemini TUIs are not used. Switchboard renders the structured output stream itself. This means rendering tool calls, diffs, todo lists, and thinking blocks is Switchboard's responsibility.
+The interactive Claude Code, Codex, Gemini, and Antigravity TUIs are not used. Switchboard renders the output itself. This means rendering tool calls, diffs, todo lists, and thinking blocks is Switchboard's responsibility.
 
 What is **preserved** because the harness still runs in default mode: hooks fire, MCP servers connect and tools work, auto-invoked skills trigger normally, sub-agents (Claude Code's `Task` tool) spawn as expected, auto-compaction runs when context climbs.
 
@@ -737,12 +747,12 @@ What is **lost** in headless mode:
 
 - **Plan mode** (Claude Code's interactive plan/approve cycle) — REPL-only; no headless equivalent.
 - **User-invoked slash commands** — `/model`, `/clear`, `/compact`, and `/skill-name` are not accepted as input in `claude -p`. See the passthrough section above and open question 10.10.
-- **Programmatic compaction** — all three harnesses do auto-compact; none expose a triggerable `/compact` from headless. See open question 10.11.
+- **Programmatic compaction** — Claude / Codex / Gemini all auto-compact; none expose a triggerable `/compact` from headless. (Antigravity's compaction is server-side and unverified.) See open question 10.11.
 - **The harness's own TUI rendering** — Switchboard renders everything itself from the stream.
 
 ### Integration testing
 
-Switchboard's per-harness adapters are exercised by a **live-harness test suite** that runs against the real, installed Claude Code, Codex, and Gemini CLIs — not mocks. This is critical: adapter correctness depends on harness behavior we don't control (event vocabularies, exit codes, stream timing, session-file format), and fixture-only tests would silently lock in our current understanding while upstream releases drift. Live tests catch those regressions when a developer runs them locally.
+Switchboard's per-harness adapters are exercised by a **live-harness test suite** that runs against the real, installed Claude Code, Codex, Gemini, and Antigravity CLIs — not mocks. This is critical: adapter correctness depends on harness behavior we don't control (event vocabularies, exit codes, stream timing, session-file format), and fixture-only tests would silently lock in our current understanding while upstream releases drift. Live tests catch those regressions when a developer runs them locally.
 
 **Live tests are developer-local, not CI.** Subscription auth tokens (the only supported auth in v1) tend to rotate on use and can be device-bound, which makes them brittle as CI secrets and creates a non-trivial blast radius if leaked. The trade-off: upstream CLI changes are detected reactively (when a developer runs `make test-live`) rather than proactively via scheduled CI. The fixture-driven adapter tests are the default suite, run in CI; live tests run on demand. Full policy in [AGENTS.md](../AGENTS.md) "Live testing against real harnesses."
 
@@ -826,7 +836,7 @@ Decisions explicitly **not made** in this document, to be addressed in later doc
 
 - **Long-lived agent processes.** Per-message spawn for v1; may revisit if latency dominates. Cold-start latency should be benchmarked once early in implementation (default-mode `claude -p` loads skills, hooks, MCP servers, plugins, CLAUDE.md, and auto-memory each turn); revisit if consistently >2s.
 - **Visual workflow editor.** v1 is file-based, with agent-consumable authoring docs as the supported authoring path.
-- **Granular permission / sandbox config.** v1 runs all three harnesses with maximum autonomy (skip-permissions on); the off / restricted-mode user experience is deferred. Plausible future directions: **config-driven tool allowlists** (YAML per project / per agent, passed through as `--allowedTools` / `--permission-mode`), **interactive permission prompts** (Switchboard intercepts denials at runtime and pops a modal asking the user to allow / deny / always-allow, then re-issues the turn — pending a probe of harness resume-after-denial mechanics), and **per-workflow permission scoping** (a workflow step declares its required tools, Switchboard restricts the harness for the duration). Codex's separate approval-policy vs sandbox-mode distinction and Gemini's workspace-trust gate (currently bypassed unconditionally via `--skip-trust`; see §9 "Process model") are both part of this same design space — collapsed into the single max-autonomy posture in v1.
+- **Granular permission / sandbox config.** v1 runs all four harnesses with maximum autonomy (skip-permissions on); the off / restricted-mode user experience is deferred. Plausible future directions: **config-driven tool allowlists** (YAML per project / per agent, passed through as `--allowedTools` / `--permission-mode`), **interactive permission prompts** (Switchboard intercepts denials at runtime and pops a modal asking the user to allow / deny / always-allow, then re-issues the turn — pending a probe of harness resume-after-denial mechanics), and **per-workflow permission scoping** (a workflow step declares its required tools, Switchboard restricts the harness for the duration). Codex's separate approval-policy vs sandbox-mode distinction and Gemini's workspace-trust gate (currently bypassed unconditionally via `--skip-trust`; see §9 "Process model") are both part of this same design space — collapsed into the single max-autonomy posture in v1.
 - **Cross-session persistent agent memory.** Architecture should not preclude; not implemented in v1.
 - **Global / cross-project agent templates.** Agents in v1 are project-scoped. A future direction lets users define reusable agent templates (personas) that can be invoked from any project — for example, a personal "writing editor" persona that knows your voice and applies across blog posts, docs, and emails, or a "domain expert" persona carrying institutional knowledge (a regulatory framework, your team's architecture conventions, a research methodology) reusable in any project that touches the area. Optionally surfaced via semantic search over the project context to suggest which template fits. Distinct from "Cross-session persistent agent memory" above (memory is what an agent remembers across sessions; global templates are which agents are available to spawn).
 - **Multi-project workflows.** Each project is independent in v1. (Related to "Global / cross-project agent templates" above — both concern workflows that span more than one project.)
@@ -843,7 +853,7 @@ Aggregated from inline flags above, plus a few additional:
 - **5.1** Exact workflow DSL keywords and structure. Resolved in `docs/workflow-spec.md`. The spec pins down the template-function surface for dynamic agent sets (`responses_from(...)` returning a name → text mapping for Switchboard-aware prompts; `aggregated_responses(...)` returning the same data pre-formatted as a single text blob for cross-platform prompts; `last_output(agent)` and `agent_names(agents)` helpers); how invocation-time list inputs (`reviewer_agents: [agent]`) flow into template variables; the iteration variable scoping rules from Primitive 6.
 - **5.2** Passthrough mechanism for harness commands — namespacing. Partially blocked on 10.10; namespacing only matters once upstream allows arbitrary slash-command passthrough.
 - ~~**6.1** MiniJinja subset and template-available variables.~~ **Resolved in `docs/workflow-spec.md` §Templating** (supported / unsupported MiniJinja features, available variable scopes, built-in template functions).
-- ~~**10.1** What does Switchboard do when an agent's "next assistant response" is a tool call rather than text?~~ **Resolved by hands-on probe:** all three harnesses run the model → tool_use → tool_result → model loop internally and emit a single terminal event per user-initiated turn (Claude Code: `result`; Codex: `turn.completed` / `turn.failed`; Gemini: `result`). Switchboard always sees a complete turn — there is no "tool-call-only response" to handle.
+- ~~**10.1** What does Switchboard do when an agent's "next assistant response" is a tool call rather than text?~~ **Resolved by hands-on probe:** all three structured-stream harnesses run the model → tool_use → tool_result → model loop internally and emit a single terminal event per user-initiated turn (Claude Code: `result`; Codex: `turn.completed` / `turn.failed`; Gemini: `result`). Switchboard always sees a complete turn — there is no "tool-call-only response" to handle. (Antigravity, added later, emits no terminal stream event at all — it uses process exit as the turn terminator; see §9 "Process model".)
 - ~~**10.2** When two workflows reference the same agent, what happens? Disallow concurrent use? Queue? Refuse?~~ **Resolved by hands-on probe:** Switchboard enforces one in-flight turn per agent at the application layer; collisions are refused with a clear error. Queueing is deferred. See §7 "Agent contention" and [docs/research/same-session-parallel-invocation.md](research/same-session-parallel-invocation.md). The harnesses themselves do not error on same-session parallel invocation — they silently corrupt (Claude Code: orphan branch in session tree) or conflate (Codex: interleaved transcript) — so this enforcement must live in Switchboard.
 - **10.3 (partially resolved)** Persistence schema. **Resolved for what's shipped:** the project/agent registry and the Codex per-agent session-link sidecar are append-only JSONL under `<directory>/.switchboard/{projects.jsonl, projects/<project-id>/{registry.jsonl, sessions/<agent-id>.jsonl}}`. Switchboard-owned JSONL fails loud on corruption (see AGENTS.md). **Still open:** workflow-run checkpoints (M6+ work) — the on-disk shape for in-flight workflow state, atomicity guarantees on concurrent agent-spawn-during-write under that load, and the eventual pruning story. Mid-step recovery (resuming an interrupted in-flight turn) remains out of scope.
 - ~~**10.4** Workflow versioning.~~ **Resolved (commitment).** Workflow runs execute against an immutable snapshot of the workflow file and its bound inputs, captured at invocation. Prompt resolution still happens at each step's dispatch (per §6 prompt resolution rules) — edits to a referenced prompt take effect on the next workflow invocation, not the in-flight run. Edits to the workflow file on disk after invocation do not affect the in-flight run or retries; the snapshot is what executes. Rationale: deterministic execution and deterministic retry; reload-on-retry would create incoherent "same run, different program" behavior given step-index checkpointing.
@@ -853,7 +863,7 @@ Aggregated from inline flags above, plus a few additional:
 - **10.8** Whether the local store and the MCP-server provider need to expose the same template-arguments contract (variable names, types, defaults) so a prompt can move between them without breaking workflow files. Working assumption: yes; the local file's frontmatter mirrors what an MCP `prompts/get` response would carry.
 - **10.9 (monitoring)** `--bare` will become the `claude -p` default in a future Anthropic release ([source](https://code.claude.com/docs/en/headless)). When it lands, default `-p` no longer auto-loads skills, hooks, plugins, MCP servers, or CLAUDE.md, and Switchboard must explicitly pass `--mcp-config`, `--agents`, `--plugin-dir`, `--settings`, `--append-system-prompt`, etc. to preserve current behavior. Mitigation: harness command-line construction is centralized from day one (§9 "Process model"). Action: monitor Anthropic release notes; flip the helper when announced. Background in [docs/research/claude-code-headless.md](research/claude-code-headless.md).
 - **10.10 (monitoring)** Headless slash-command support. `claude -p` (CLI path) does not accept slash commands today, blocking §9's full passthrough vision. Tracked upstream at [anthropics/claude-code#837](https://github.com/anthropics/claude-code/issues/837) and [#38505](https://github.com/anthropics/claude-code/issues/38505). The Claude Agent SDK does support this, so a future SDK-based adapter is an alternative path; v1 stays on CLI for Claude/Codex consistency (see §9 passthrough).
-- **10.11** Compaction strategy. Programmatic `/compact` is unavailable in all three harnesses today; all three do auto-compact at high utilization. Working assumption: Switchboard monitors token usage, warns the user as the auto-compact threshold approaches, and defers actual compaction to the harness. We do not implement Switchboard-side summarization (would underperform the harnesses' tuned compaction). Alternative to consider: surface a "fork from checkpoint with summary" action that uses the existing fork primitive plus an explicit summarize-and-restart prompt, as a coarse user-driven alternative when the user wants to reclaim context outside auto-compact. Background in [docs/research/claude-code-headless.md](research/claude-code-headless.md) and [docs/research/codex-noninteractive.md](research/codex-noninteractive.md).
+- **10.11** Compaction strategy. Programmatic `/compact` is unavailable in Claude / Codex / Gemini today; all three do auto-compact at high utilization (Antigravity's compaction is server-side and unverified). Working assumption: Switchboard monitors token usage, warns the user as the auto-compact threshold approaches, and defers actual compaction to the harness. We do not implement Switchboard-side summarization (would underperform the harnesses' tuned compaction). Alternative to consider: surface a "fork from checkpoint with summary" action that uses the existing fork primitive plus an explicit summarize-and-restart prompt, as a coarse user-driven alternative when the user wants to reclaim context outside auto-compact. Background in [docs/research/claude-code-headless.md](research/claude-code-headless.md) and [docs/research/codex-noninteractive.md](research/codex-noninteractive.md).
 - ~~**10.12** Model→max-context map maintenance.~~ **Resolved (commitment).** No bundled model→max-context map ships in v1. Each harness sources the value from whatever it makes available: Claude reads `contextWindow` per turn from the stream's `result.modelUsage.<model>`; Codex enriches `task_started.model_context_window` from the session file post-terminal (per resolved 10.15); Gemini has neither a stream field nor a session-file analog, so `usage.context_window` stays `None` and the per-agent context-utilization bar is hidden for Gemini agents (per the §7 sidebar matrix). The harness-asymmetric sourcing is documented in the §9 SessionMeta source table; the "what the user sees" implications are documented in the §7 sidebar matrix.
 - **10.13 (monitoring)** Programmatic `/compact` exposure in either harness. Multiple Anthropic feature requests open ([anthropics/claude-code#5643](https://github.com/anthropics/claude-code/issues/5643), [#39275](https://github.com/anthropics/claude-code/issues/39275), [#39574](https://github.com/anthropics/claude-code/issues/39574), [#26488](https://github.com/anthropics/claude-code/issues/26488)); Codex equivalent not documented. When upstream lands, Switchboard can offer first-class compaction control inside workflows.
 - ~~**10.14** Codex non-interactive fork.~~ **Resolved for v1: option (a).** Fork is unavailable for Codex agents in v1 — the agent context-menu Fork action is shown only on Claude Code agents; Codex agents show an explanatory tooltip ("Fork is not available for Codex sessions in v1; see the docs for workarounds"). Workarounds (b) copy session JSONL and (c) re-feed summarized prior context are deferred to v2+ if user demand surfaces. The asymmetry is documented in §9 and the M4 deliverables.

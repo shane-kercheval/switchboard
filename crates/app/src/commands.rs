@@ -168,37 +168,42 @@ pub fn create_agent_impl(
     Ok(project.register_agent(name, harness)?)
 }
 
-/// Attach an existing harness session (Claude Code or Codex) as a new
-/// Switchboard agent in the active project.
+/// Attach an existing harness session (Claude Code, Codex, Gemini, or
+/// Antigravity) as a new Switchboard agent in the active project.
 ///
 /// Validation order (all under the directory-level `registry_write` mutex
 /// so the cross-project session-id check + register form one atomic step):
 /// 1. Active project resolved.
 /// 2. `existing_session_id` parses as UUID.
-/// 3. Per-harness session-file existence under `home_dir`. For Codex,
-///    discovery also returns the parsed `YYYY-MM-DD` (the sidecar's
-///    `session_partition_date`).
+/// 3. Per-harness session existence under `home_dir`. Claude / Gemini check a
+///    session file; Codex's discovery also returns the parsed `YYYY-MM-DD`
+///    (the sidecar's `session_partition_date`); Antigravity checks that the
+///    server-assigned conversation directory `brain/<uuid>/` exists (the
+///    transcript inside may be absent — hydration degrades gracefully).
 /// 4. Session-id collision scan across **all projects in the bound
 ///    directory** (loaded or not — `enumerate_all_projects` walks every
 ///    project on disk via `directory.list_projects()`). Claude and Gemini
-///    scan `AgentRecord.session_id` (caller-controlled UUID); Codex scans
-///    every project's `sessions/<agent_id>.jsonl` sidecar (Codex agents
-///    leave `AgentRecord.session_id = None`). Two `AgentRecord`s pointing at
-///    the same harness session is the same-session-parallel-invocation
-///    hazard (`docs/research/same-session-parallel-invocation.md`);
-///    unloaded projects could still be opened and dispatched concurrently
-///    later, so loaded-only scope would miss the collision.
+///    scan `AgentRecord.session_id` (caller-controlled UUID); Codex and
+///    Antigravity scan every project's `sessions/<agent_id>.*.jsonl` sidecar
+///    (those agents leave `AgentRecord.session_id = None` — the id lives in
+///    the sidecar). Two `AgentRecord`s pointing at the same harness session
+///    is the same-session-parallel-invocation hazard
+///    (`docs/research/same-session-parallel-invocation.md`); unloaded
+///    projects could still be opened and dispatched concurrently later, so
+///    loaded-only scope would miss the collision.
 /// 5. Register via the harness-specific `register_attached_*` method.
-/// 6. (Codex only) Append the first sidecar record with the discovered
-///    `session_partition_date`.
+/// 6. (Codex and Antigravity) Append the first sidecar record (Codex carries
+///    the discovered `session_partition_date`; Antigravity the captured
+///    `conversation_id`). Written **before** step 5 commits so a failed
+///    sidecar write leaves an orphan sidecar, never an orphan agent.
 /// 7. (Codex only) Insert the new `agent_id` into `needs_session_meta` so
 ///    every dispatch up to and including the one that observes `SessionMeta`
 ///    runs with `is_first_dispatch_after_attach: true` — forces `SessionMeta`
 ///    emission for the Codex sidebar. The per-dispatch emitter decorator
 ///    clears the flag once `session_meta` is genuinely observed on the wire.
-///    Claude attaches do **not** populate this set: Claude emits `SessionMeta`
-///    from its `system/init` stream event on every dispatch (see
-///    `crates/harness/src/claude_code.rs`), so the override has nothing to do.
+///    Claude and Antigravity attaches do **not** populate this set: both emit
+///    `SessionMeta` on every dispatch (Claude from `system/init`; Antigravity
+///    constructs it post-terminal each turn), so the override has nothing to do.
 ///
 /// `home_dir` is passed in (not resolved here) so tests can stage a temp
 /// directory without mutating process-wide `$HOME`. The Tauri command shim
@@ -279,6 +284,44 @@ pub fn attach_agent_impl(
             );
             check_gemini_session_id_unique(state, &session_uuid)?;
             project.register_attached_gemini_agent(name, session_uuid)?
+        }
+        HarnessKind::Antigravity => {
+            // Claude-shaped attach: a conversation UUID maps to exactly one
+            // path (`brain/<uuid>/`), so validate that directory exists inline
+            // — no Codex/Gemini-style ambiguity locator (there is nothing to
+            // disambiguate). The brain dir, not the deeper
+            // `.system_generated/.../transcript.jsonl`, is the existence
+            // marker: a conversation present only as the encrypted `.pb` store
+            // (or whose transcript artifact was pruned) still attaches and
+            // hydrates empty, matching the loader's missing-transcript path.
+            let brain_dir = switchboard_harness::antigravity::paths::conversation_brain_dir(
+                home_dir,
+                session_uuid,
+            );
+            if !brain_dir.is_dir() {
+                return Err(AppError::SessionFileNotFound {
+                    harness,
+                    expected_path: brain_dir.to_string_lossy().into_owned(),
+                });
+            }
+            check_antigravity_session_id_unique(state, session_uuid, &directory.path)?;
+            // Sidecar-before-registry, pre-minted id — same ordering and
+            // inverted-blast-radius rationale as the Codex arm above.
+            let new_agent_id = Uuid::now_v7();
+            let sidecar_path = switchboard_harness::antigravity::sidecar::sidecar_path(
+                &directory.path,
+                project.id,
+                new_agent_id,
+            );
+            let sidecar_record = switchboard_harness::antigravity::sidecar::SessionLinkRecord {
+                conversation_id: session_uuid,
+                captured_at: chrono::Utc::now(),
+            };
+            switchboard_harness::antigravity::sidecar::append_record(
+                &sidecar_path,
+                &sidecar_record,
+            )?;
+            project.register_attached_antigravity_agent_with_id(name, new_agent_id)?
         }
         _ => return Err(AppError::UnsupportedHarness),
     };
@@ -500,11 +543,52 @@ fn check_codex_session_id_unique(
                 switchboard_harness::codex::sidecar::read_latest(&sidecar).map_err(|source| {
                     AppError::AttachBlockedByCorruption {
                         path: sidecar.clone(),
-                        source,
+                        source: Box::new(source),
                     }
                 })?;
             if let Some(record) = latest
                 && record.session_id == candidate
+            {
+                return Err(AppError::SessionAlreadyAttached {
+                    existing_agent_id: agent.id,
+                    existing_agent_name: agent.name,
+                    existing_project_id: project.id,
+                    existing_project_name: project.config.name.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reject attaching a conversation UUID already bound to another Antigravity
+/// agent in the directory. Mirrors the Codex check (the conversation id lives
+/// in the per-agent sidecar, not the `AgentRecord`, so the scan reads
+/// sidecars). The same-session-parallel-invocation risk is identical: two
+/// agents resuming one `--conversation <uuid>` would interleave server-side.
+/// Corrupt sidecars fail loud rather than being skipped — a skipped sidecar
+/// could let a duplicate attach through and violate the uniqueness contract.
+fn check_antigravity_session_id_unique(
+    state: &AppState,
+    candidate: Uuid,
+    directory: &Path,
+) -> Result<(), AppError> {
+    for project in enumerate_all_projects(state)? {
+        for agent in project.list_agents()? {
+            if agent.harness != HarnessKind::Antigravity {
+                continue;
+            }
+            let sidecar = switchboard_harness::antigravity::sidecar::sidecar_path(
+                directory, project.id, agent.id,
+            );
+            let latest = switchboard_harness::antigravity::sidecar::read_latest(&sidecar).map_err(
+                |source| AppError::AttachBlockedByCorruption {
+                    path: sidecar.clone(),
+                    source: Box::new(source),
+                },
+            )?;
+            if let Some(record) = latest
+                && record.conversation_id == candidate
             {
                 return Err(AppError::SessionAlreadyAttached {
                     existing_agent_id: agent.id,
@@ -2017,6 +2101,27 @@ mod tests {
         path
     }
 
+    /// Stage an Antigravity conversation under `home`: the `brain/<uuid>/`
+    /// directory always, and (optionally) a minimal one-turn `transcript.jsonl`.
+    fn stage_antigravity_conversation(home: &Path, uuid: Uuid, with_transcript: bool) {
+        let brain = switchboard_harness::antigravity::paths::conversation_brain_dir(home, uuid);
+        std::fs::create_dir_all(&brain).unwrap();
+        if with_transcript {
+            let transcript = switchboard_harness::antigravity::paths::transcript_path(home, uuid);
+            std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+            std::fs::write(
+                &transcript,
+                concat!(
+                    r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-05-19T19:00:00Z","content":"<USER_REQUEST>\nhi\n</USER_REQUEST>"}"#,
+                    "\n",
+                    r#"{"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-05-19T19:00:01Z","content":"ack"}"#,
+                    "\n",
+                ),
+            )
+            .unwrap();
+        }
+    }
+
     async fn fresh_state_with_active_project(
         name: &str,
     ) -> (TempDir, TempDir, AppState, switchboard_core::ProjectSummary) {
@@ -2743,6 +2848,166 @@ mod tests {
                 assert_eq!(path, bad_sidecar);
             }
             other => panic!("expected HydrationBlockedByCorruption, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_antigravity_succeeds_and_writes_sidecar() {
+        let (tmp_workdir, tmp_home, state, proj) = fresh_state_with_active_project("alpha").await;
+        let conversation_id = Uuid::now_v7();
+        stage_antigravity_conversation(tmp_home.path(), conversation_id, true);
+
+        let record = attach_agent_impl(
+            &state,
+            "attached-agy",
+            HarnessKind::Antigravity,
+            &conversation_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            record.session_id, None,
+            "Antigravity AgentRecord.session_id stays None (sidecar-carried)"
+        );
+        // Unlike Codex, Antigravity emits SessionMeta every turn, so attach
+        // does not force it via needs_session_meta.
+        assert!(
+            !lock(&state.needs_session_meta).contains(&record.id),
+            "Antigravity attach must not populate needs_session_meta"
+        );
+
+        let sidecar = switchboard_harness::antigravity::sidecar::sidecar_path(
+            tmp_workdir.path(),
+            proj.id,
+            record.id,
+        );
+        let latest = switchboard_harness::antigravity::sidecar::read_latest(&sidecar)
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.conversation_id, conversation_id);
+    }
+
+    #[tokio::test]
+    async fn attach_antigravity_brain_dir_without_transcript_succeeds_and_hydrates_empty() {
+        // The attach contract is "the conversation directory exists" — a
+        // brain dir without a transcript (encrypted-only / pruned) still
+        // attaches, and hydration then degrades to empty turns + registry
+        // meta, matching the loader's missing-transcript path.
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let conversation_id = Uuid::now_v7();
+        stage_antigravity_conversation(tmp_home.path(), conversation_id, false);
+
+        let record = attach_agent_impl(
+            &state,
+            "attached-agy",
+            HarnessKind::Antigravity,
+            &conversation_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap();
+
+        let result = load_transcript_impl(&state, record.id, tmp_home.path()).unwrap();
+        assert!(result.turns.is_empty(), "no transcript → no turns");
+        assert!(result.meta.is_some(), "registry meta still surfaces");
+    }
+
+    #[tokio::test]
+    async fn attach_antigravity_rejects_missing_brain_dir() {
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let conversation_id = Uuid::now_v7();
+        let err = attach_agent_impl(
+            &state,
+            "attached-agy",
+            HarnessKind::Antigravity,
+            &conversation_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap_err();
+        match err {
+            AppError::SessionFileNotFound {
+                harness,
+                expected_path,
+            } => {
+                assert_eq!(harness, HarnessKind::Antigravity);
+                assert!(expected_path.contains("antigravity-cli"));
+                assert!(expected_path.contains("brain"));
+            }
+            other => panic!("expected SessionFileNotFound, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_antigravity_rejects_duplicate_conversation_uuid() {
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let conversation_id = Uuid::now_v7();
+        stage_antigravity_conversation(tmp_home.path(), conversation_id, true);
+
+        attach_agent_impl(
+            &state,
+            "agy-one",
+            HarnessKind::Antigravity,
+            &conversation_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap();
+        let err = attach_agent_impl(
+            &state,
+            "agy-two",
+            HarnessKind::Antigravity,
+            &conversation_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap_err();
+        match err {
+            AppError::SessionAlreadyAttached {
+                existing_agent_name,
+                ..
+            } => assert_eq!(existing_agent_name, "agy-one"),
+            other => panic!("expected SessionAlreadyAttached, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_antigravity_fails_loud_on_corrupt_sidecar() {
+        // The uniqueness scan must fail loud on a corrupt sidecar rather than
+        // skip it — a skipped sidecar could let a duplicate conversation attach
+        // through, putting two agents on one server-side conversation. Twin of
+        // attach_codex_fails_loud_on_corrupt_sidecar_in_other_project.
+        let (tmp_workdir, tmp_home, state, proj) = fresh_state_with_active_project("alpha").await;
+
+        // Plant an existing Antigravity agent with a corrupt sidecar. The
+        // collision scan inside attach_agent_impl reads from the canonical
+        // bound-directory path (Directory::at canonicalizes; macOS resolves
+        // /var → /private/var), so plant — and assert — at that path.
+        let canonical_workdir = tmp_workdir.path().canonicalize().unwrap();
+        let ghost = proj_handle(&state, proj.id)
+            .register_attached_antigravity_agent_with_id("ghost", Uuid::now_v7())
+            .unwrap();
+        let bad_sidecar = switchboard_harness::antigravity::sidecar::sidecar_path(
+            &canonical_workdir,
+            proj.id,
+            ghost.id,
+        );
+        std::fs::create_dir_all(bad_sidecar.parent().unwrap()).unwrap();
+        std::fs::write(&bad_sidecar, b"this is not json\n").unwrap();
+
+        // Stage a valid brain dir for the newcomer so the brain-dir validation
+        // passes and the failure comes from the collision-scan corruption
+        // check, not the existence check.
+        let new_conversation = Uuid::now_v7();
+        stage_antigravity_conversation(tmp_home.path(), new_conversation, true);
+
+        let err = attach_agent_impl(
+            &state,
+            "newcomer",
+            HarnessKind::Antigravity,
+            &new_conversation.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap_err();
+        match err {
+            AppError::AttachBlockedByCorruption { path, .. } => assert_eq!(path, bad_sidecar),
+            other => panic!("expected AttachBlockedByCorruption, got {other:?}"),
         }
     }
 

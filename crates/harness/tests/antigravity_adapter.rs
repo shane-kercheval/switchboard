@@ -395,6 +395,38 @@ async fn hydration_reconstructs_real_tool_use_transcript() {
     assert_eq!(loaded.meta.unwrap().model, "Gemini 3.5 Flash");
 }
 
+/// `agy` falls back to interactive OAuth when the keyring token is stale,
+/// printing `Authentication required…` to stdout and blocking ~30s. The
+/// producer fast-fails on that stdout line and emits `AuthFailure`. Driven by
+/// `fake_agy` (stdout drip) rather than a stderr fixture — it exercises the
+/// real stdout detection path non-destructively (no Keychain mutation).
+#[tokio::test]
+async fn auth_failure_line_on_stdout_emits_auth_failure() {
+    let home = tempfile::TempDir::new().unwrap();
+    let cwd = tempfile::TempDir::new().unwrap();
+    let adapter = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home.path());
+    let agent = agy_agent();
+
+    write_script(
+        cwd.path(),
+        &json!({
+            "conversation_uuid": Uuid::new_v4().to_string(),
+            "create_brain_dir": false,
+            "stdout": [drip("Authentication required. Please visit the URL to log in:", 0)],
+            "exit_code": 0,
+        }),
+    );
+
+    let events = dispatch(&adapter, &agent, cwd.path(), "hi").await;
+    match outcome(&events) {
+        TurnOutcome::Failed {
+            kind: FailureKind::AuthFailure,
+            ..
+        } => {}
+        other => panic!("expected AuthFailure, got {other:?}"),
+    }
+}
+
 /// Wiring seam (dispatch): the loaders run at dispatch time and their output
 /// must reach the emitted `SessionMeta`. Proves `ProducerCtx` → `SessionMeta`
 /// carries the loaded vecs, which the structural-only live test cannot.

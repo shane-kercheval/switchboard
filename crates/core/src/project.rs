@@ -158,6 +158,21 @@ impl Project {
         )
     }
 
+    /// Register an attached **Antigravity** agent using a caller-supplied
+    /// `agent_id`. Mirrors the Codex sidecar pattern, not the Claude/Gemini
+    /// caller-controlled-UUID pattern: Antigravity's conversation UUID is
+    /// server-assigned and lives in the per-agent sidecar, so `session_id`
+    /// stays `None`. The attach flow pre-writes the sidecar before committing
+    /// the registry record (same pre-generated-id ordering and failure-mode
+    /// rationale as [`Self::register_attached_codex_agent_with_id`]).
+    pub fn register_attached_antigravity_agent_with_id(
+        &self,
+        name: &str,
+        agent_id: crate::agent::AgentId,
+    ) -> Result<AgentRecord> {
+        self.register_agent_inner_with_id(name, HarnessKind::Antigravity, None, agent_id)
+    }
+
     /// Shared validation + JSONL append. Caller decides the `session_id`
     /// strategy (create vs. attach, per-harness) and the `agent_id`
     /// (typically `Uuid::now_v7()` from the wrappers; the Codex attach flow
@@ -405,6 +420,16 @@ mod tests {
             .register_attached_codex_agent_with_id("attached", Uuid::now_v7())
             .unwrap();
         assert_eq!(record.harness, HarnessKind::Codex);
+        assert!(record.session_id.is_none());
+    }
+
+    #[test]
+    fn register_attached_antigravity_leaves_session_id_none() {
+        let (_tmp, project) = fresh_project();
+        let record = project
+            .register_attached_antigravity_agent_with_id("attached", Uuid::now_v7())
+            .unwrap();
+        assert_eq!(record.harness, HarnessKind::Antigravity);
         assert!(record.session_id.is_none());
     }
 

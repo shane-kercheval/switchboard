@@ -39,7 +39,8 @@ use std::sync::Arc;
 use switchboard_core::{Directory, HarnessKind};
 use switchboard_dispatcher::{Dispatcher, EventEmitter, RecordingEmitter};
 use switchboard_harness::{
-    ClaudeCodeAdapter, CodexAdapter, DispatchOptions, GeminiAdapter, HarnessAdapter,
+    AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, DispatchOptions, GeminiAdapter,
+    HarnessAdapter,
 };
 use tempfile::TempDir;
 
@@ -501,4 +502,88 @@ async fn live_full_stack_codex_emits_turn_start_then_content_then_turn_end() {
 
     let statuses = turn_end_statuses(&emitter, &channel);
     assert_eq!(statuses, vec!["completed".to_owned()]);
+}
+
+#[tokio::test]
+#[ignore = "requires agy authed via Antigravity desktop app — run with: make test-live"]
+async fn live_full_stack_antigravity_two_turns_resume_through_dispatcher() {
+    // The full backend slice for Antigravity, exercising the load-bearing
+    // capture→resume path through the dispatcher (not just the adapter):
+    // turn 1 spawns a fresh conversation and the adapter captures the
+    // server-assigned UUID into the per-agent sidecar; turn 2 must read that
+    // sidecar and resume via `--conversation <uuid>`. Antigravity agents carry
+    // `session_id: None` (server-assigned, sidecar-carried), unlike Claude/
+    // Gemini. Also asserts the harness-neutral event-ordering contract holds
+    // through the real `agy` subprocess.
+    let tmp = TempDir::new().expect("tempdir");
+    let directory = Directory::at(tmp.path()).expect("Directory::at");
+    directory.init().expect("init");
+    let project = directory
+        .create_project("antigravity-e2e")
+        .expect("project");
+    let agent = project
+        .register_agent("assistant", HarnessKind::Antigravity)
+        .expect("agent");
+    assert!(
+        agent.session_id.is_none(),
+        "Antigravity agents carry session_id: None (server-assigned, sidecar-carried)"
+    );
+
+    let dispatcher = Arc::new(Dispatcher::new());
+    let adapter: Arc<dyn HarnessAdapter> = Arc::new(AntigravityAdapter::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let channel = format!("agent:{}", agent.id);
+
+    let handle1 = dispatcher
+        .send_message(
+            &agent,
+            &project.directory,
+            "Reply with exactly the word: ack",
+            adapter.as_ref(),
+            Arc::clone(&emitter) as Arc<dyn EventEmitter>,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("first send_message");
+    handle1.join.await.expect("first drain joined");
+
+    // Event-ordering contract on turn 1.
+    let kinds: Vec<String> = emitter
+        .snapshot()
+        .into_iter()
+        .filter(|(name, _)| name == &channel)
+        .map(|(_, payload)| payload["type"].as_str().unwrap_or("").to_owned())
+        .collect();
+    assert_eq!(
+        kinds.first().map(String::as_str),
+        Some("turn_start"),
+        "first event must be turn_start; got: {kinds:?}"
+    );
+    assert_eq!(
+        kinds.last().map(String::as_str),
+        Some("agent_idle"),
+        "last event must be agent_idle; got: {kinds:?}"
+    );
+
+    // Turn 2: the resume regression catch. The adapter must read the sidecar
+    // written by turn 1 and pass `--conversation <uuid>`.
+    let handle2 = dispatcher
+        .send_message(
+            &agent,
+            &project.directory,
+            "And again, exactly: ack",
+            adapter.as_ref(),
+            Arc::clone(&emitter) as Arc<dyn EventEmitter>,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("second send_message");
+    handle2.join.await.expect("second drain joined");
+
+    let statuses = turn_end_statuses(&emitter, &channel);
+    assert_eq!(
+        statuses,
+        vec!["completed".to_owned(), "completed".to_owned()],
+        "both turns must complete (turn 2 resumes via the captured UUID); got: {statuses:?}"
+    );
 }

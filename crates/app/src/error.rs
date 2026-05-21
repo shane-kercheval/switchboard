@@ -102,6 +102,13 @@ pub enum AppError {
     #[error(transparent)]
     Sidecar(#[from] switchboard_harness::codex::sidecar::SidecarError),
 
+    /// Attach-flow (Antigravity): the per-agent session-link sidecar write
+    /// failed during attach. Same consequence as the Codex case — the
+    /// attached agent would look like a fresh-spawn (new server conversation)
+    /// on its first dispatch instead of resuming the attached one.
+    #[error(transparent)]
+    AntigravitySidecar(#[from] switchboard_harness::antigravity::sidecar::SidecarError),
+
     /// Attach-flow: the cross-project collision scan tripped over an
     /// unrelated agent's corrupt sidecar. Per the Switchboard-owned-JSONL
     /// loud-fail invariant in `AGENTS.md`, corruption must surface rather
@@ -115,8 +122,10 @@ pub enum AppError {
     )]
     AttachBlockedByCorruption {
         path: PathBuf,
+        // Boxed because the collision scan reads Codex *or* Antigravity
+        // sidecars, whose error types differ.
         #[source]
-        source: switchboard_harness::codex::sidecar::SidecarError,
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
     },
 
     /// Attach-flow: catch-all for future `AttachLookupError` variants we

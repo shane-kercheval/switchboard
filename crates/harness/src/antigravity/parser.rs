@@ -106,14 +106,21 @@ pub struct AntigravityParserState {
 
 /// Map one transcript record to the **live** adapter events it produces.
 ///
-/// Live path: `thinking` → `ContentChunk{Thinking}`, tool calls →
-/// `ToolStarted`, tool results → `ToolCompleted`. The model's final answer
-/// `content` is intentionally **not** emitted here — stdout already streamed
-/// it live, and re-emitting from the transcript would double the text.
-/// User-input and conversation-history records are skipped (the UI already
-/// shows the user's prompt). Disk hydration on project reopen reuses
-/// [`TranscriptRecord`] but emits the answer content too, since there is no
-/// stdout to replay then.
+/// Live path: `thinking` → `ContentChunk{Thinking}`, the model's final answer
+/// `content` → `ContentChunk{Text}`, tool calls → `ToolStarted`, tool results
+/// → `ToolCompleted`. User-input and conversation-history records are skipped
+/// (the UI already shows the user's prompt).
+///
+/// **The transcript — not stdout — is the answer-text source.** `agy`'s stdout
+/// drip cannot be trusted for per-turn text: on a resume turn it replays the
+/// whole conversation's prior answers (observed in production), so emitting
+/// stdout would make each turn's bubble accumulate every earlier answer. The
+/// transcript records the completed `PLANNER_RESPONSE` per turn, and the
+/// resume cursor isolates only the new turn's records — so it is the clean,
+/// per-turn source. This makes the live path emit the same answer text that
+/// hydration reconstructs from disk. The cost: the answer lands when its
+/// record is written (turn completion) rather than char-streaming; thinking
+/// and tool lifecycle still stream live as their records arrive.
 pub fn record_to_live_events(
     rec: &TranscriptRecord,
     turn_id: TurnId,
@@ -128,6 +135,23 @@ pub fn record_to_live_events(
             turn_id,
             kind: ContentKind::Thinking,
             text: thinking.clone(),
+        });
+    }
+
+    // Final answer content (a planner response with text and no tool calls).
+    // Assumption (verified against captured transcripts — see the research
+    // doc's record-mapping section): a tool-calling `PLANNER_RESPONSE` carries
+    // its narration in `thinking` (emitted above), not `content`, and the
+    // answer always arrives as a separate no-tool-calls record. So gating on
+    // `is_terminal_answer` (no tool calls) drops no visible text. Revisit if a
+    // tool-calling record is ever seen with non-empty `content`.
+    if rec.is_terminal_answer()
+        && let Some(content) = &rec.content
+    {
+        out.push(AdapterEvent::ContentChunk {
+            turn_id,
+            kind: ContentKind::Text,
+            text: content.clone(),
         });
     }
 
@@ -232,8 +256,8 @@ mod tests {
         );
         let mut state = AntigravityParserState::default();
         let events = record_to_live_events(&rec, tid(), &mut state);
-        // Thinking emitted; final answer content NOT emitted (stdout has it).
-        assert_eq!(events.len(), 1);
+        // Thinking first, then the answer text — both from the transcript.
+        assert_eq!(events.len(), 2);
         assert!(matches!(
             &events[0],
             AdapterEvent::ContentChunk {
@@ -242,17 +266,31 @@ mod tests {
                 ..
             } if text == "deliberating"
         ));
+        assert!(matches!(
+            &events[1],
+            AdapterEvent::ContentChunk {
+                kind: ContentKind::Text,
+                text,
+                ..
+            } if text == "ack"
+        ));
     }
 
     #[test]
-    fn planner_response_final_answer_emits_nothing_live() {
-        // content-only PLANNER_RESPONSE: stdout already streamed the text,
-        // so the live path emits no ContentChunk for it.
+    fn planner_response_final_answer_emits_text_chunk() {
+        // content-only PLANNER_RESPONSE: the transcript is the answer-text
+        // source (stdout replays prior answers on resume and can't be
+        // trusted), so the live path emits the answer as a Text chunk.
         let rec = parse(
             r#"{"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"ack"}"#,
         );
         let mut state = AntigravityParserState::default();
-        assert!(record_to_live_events(&rec, tid(), &mut state).is_empty());
+        let events = record_to_live_events(&rec, tid(), &mut state);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            AdapterEvent::ContentChunk { kind: ContentKind::Text, text, .. } if text == "ack"
+        ));
         assert!(rec.is_terminal_answer());
     }
 

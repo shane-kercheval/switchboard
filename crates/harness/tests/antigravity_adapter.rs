@@ -130,10 +130,10 @@ fn count<P: Fn(&AdapterEvent) -> bool>(events: &[AdapterEvent], pred: P) -> usiz
 }
 
 /// A first turn that captures the server-assigned UUID, tails the transcript
-/// for tool lifecycle, streams the answer over stdout, and persists the
-/// sidecar. Timed record appends force some records to be tailed mid-loop and
-/// the rest in the post-exit drain — so the single-emission assertions also
-/// prove the cursor advances and never re-emits across drains.
+/// for tool lifecycle and the answer text, and persists the sidecar. Timed
+/// record appends force some records to be tailed mid-loop and the rest in the
+/// post-exit drain — so the single-emission assertions also prove the cursor
+/// advances and never re-emits across drains.
 #[tokio::test]
 async fn first_turn_captures_uuid_tails_tools_and_completes() {
     let home = tempfile::TempDir::new().unwrap();
@@ -177,7 +177,10 @@ async fn first_turn_captures_uuid_tails_tools_and_completes() {
             _ => None,
         })
         .collect();
-    assert!(text.contains("mango"), "stdout answer streamed as content");
+    assert!(
+        text.contains("mango"),
+        "answer text emitted from the transcript"
+    );
 
     // Sidecar healed/persisted with the captured UUID.
     let latest = read_latest(&sidecar_path(cwd.path(), agent.project_id, agent.id))
@@ -393,6 +396,111 @@ async fn hydration_reconstructs_real_tool_use_transcript() {
         other => panic!("expected agent turn, got {other:?}"),
     }
     assert_eq!(loaded.meta.unwrap().model, "Gemini 3.5 Flash");
+}
+
+/// Regression: on a resume turn `agy` replays the whole conversation's prior
+/// answers to stdout. The turn's bubble must contain only the **new** answer
+/// (sourced from the transcript's per-turn record), not the replayed history.
+#[tokio::test]
+async fn resume_turn_does_not_accumulate_prior_answers() {
+    let home = tempfile::TempDir::new().unwrap();
+    let cwd = tempfile::TempDir::new().unwrap();
+    let adapter = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home.path());
+    let agent = agy_agent();
+    let uuid = Uuid::new_v4();
+
+    // Turn 1 (fresh): answer "ALPHA".
+    write_script(
+        cwd.path(),
+        &json!({
+            "conversation_uuid": uuid.to_string(),
+            "records": [
+                {"json": user_record("first", "2026-05-19T19:00:00Z"), "delay_ms": 0},
+                {"json": terminal_record("2026-05-19T19:00:01Z", "ALPHA"), "delay_ms": 0},
+            ],
+            "stdout": [drip("ALPHA", 0)],
+            "exit_code": 0,
+        }),
+    );
+    let _ = dispatch(&adapter, &agent, cwd.path(), "first").await;
+
+    // Turn 2 (resume): the new answer is "BETA", but stdout replays "ALPHA"
+    // then "BETA" — the producer must emit only "BETA" (from the transcript).
+    write_script(
+        cwd.path(),
+        &json!({
+            "conversation_uuid": uuid.to_string(),
+            "records": [
+                {"json": user_record("second", "2026-05-19T19:05:00Z"), "delay_ms": 0},
+                {"json": terminal_record("2026-05-19T19:05:01Z", "BETA"), "delay_ms": 0},
+            ],
+            "stdout": [drip("ALPHA", 0), drip("BETA", 0)],
+            "exit_code": 0,
+        }),
+    );
+    let events = dispatch(&adapter, &agent, cwd.path(), "second").await;
+
+    let text: String = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::ContentChunk { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        text.contains("BETA"),
+        "new answer must appear; got {text:?}"
+    );
+    assert!(
+        !text.contains("ALPHA"),
+        "prior turn's answer must NOT accumulate into this turn; got {text:?}"
+    );
+}
+
+/// Output appeared but the transcript holds no terminal answer (a `tool_call`
+/// + result but no closing `PLANNER_RESPONSE`, e.g. a transcript-path break or
+/// truncation). Since stdout is no longer rendered, the turn must fail loud
+/// rather than complete with a blank bubble.
+#[tokio::test]
+async fn output_without_transcript_terminal_answer_fails_loud() {
+    let home = tempfile::TempDir::new().unwrap();
+    let cwd = tempfile::TempDir::new().unwrap();
+    let adapter = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home.path());
+    let agent = agy_agent();
+    let uuid = Uuid::new_v4();
+
+    write_script(
+        cwd.path(),
+        &json!({
+            "conversation_uuid": uuid.to_string(),
+            "records": [
+                {"json": user_record("do work", "2026-05-19T19:00:00Z"), "delay_ms": 0},
+                {"json": tool_call_record("2026-05-19T19:00:01Z"), "delay_ms": 0},
+                {"json": tool_result_record("2026-05-19T19:00:02Z", "ran"), "delay_ms": 0},
+                // No terminal PLANNER_RESPONSE answer record.
+            ],
+            "stdout": [drip("some stdout output", 0)],
+            "exit_code": 0,
+        }),
+    );
+
+    let events = dispatch(&adapter, &agent, cwd.path(), "do work").await;
+    // The tool still surfaced...
+    assert_eq!(
+        count(&events, |e| matches!(e, AdapterEvent::ToolCompleted { .. })),
+        1
+    );
+    // ...but with no readable answer the turn fails loud, not blank-Completed.
+    match outcome(&events) {
+        TurnOutcome::Failed {
+            kind: FailureKind::AdapterFailure,
+            message,
+        } => assert!(
+            message.contains("could not read the answer"),
+            "got: {message}"
+        ),
+        other => panic!("expected AdapterFailure, got {other:?}"),
+    }
 }
 
 /// `agy` falls back to interactive OAuth when the keyring token is stale,

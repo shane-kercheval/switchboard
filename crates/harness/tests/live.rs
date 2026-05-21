@@ -608,8 +608,10 @@ async fn live_antigravity_basic_turn_completes() {
         .expect("dispatch should succeed with real agy");
     let events: Vec<AdapterEvent> = stream.collect().await;
 
-    // Assistant text comes from stdout (the server-side drip), not the
-    // transcript — the load-bearing dual-source property.
+    // Assistant text comes from the transcript's per-turn `PLANNER_RESPONSE`
+    // record, not stdout: `agy`'s stdout replays the whole conversation on
+    // resume, so the transcript is the clean per-turn source (tool lifecycle
+    // and thinking are tailed from the same file).
     let text: String = events
         .iter()
         .filter_map(|e| match e {
@@ -619,7 +621,7 @@ async fn live_antigravity_basic_turn_completes() {
         .collect();
     assert!(
         text.to_lowercase().contains("ack"),
-        "expected 'ack' in stdout-derived response text, got: {text:?}"
+        "expected 'ack' in transcript-derived response text, got: {text:?}"
     );
 
     let terminal = events

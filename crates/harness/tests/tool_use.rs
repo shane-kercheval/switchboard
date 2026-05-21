@@ -269,11 +269,15 @@ fn antigravity_agent() -> AgentRecord {
 #[tokio::test]
 #[ignore = "requires agy authed via Antigravity desktop app — run with: make test-live"]
 async fn live_antigravity_emits_tool_started_and_tool_completed_for_file_read() {
-    // Antigravity's tool lifecycle comes from tailing `transcript.jsonl`
-    // (stdout carries only the final answer). Its `view_file` tool result
-    // record embeds the file content (with line-number prefixes) in the
-    // `content` blob — so unlike Gemini, sentinel-in-output pairing works:
-    // the token survives inside the rendered `ToolCompleted.output`.
+    // Antigravity's tool lifecycle AND answer text both come from tailing
+    // `transcript.jsonl` (stdout replays the whole conversation on resume, so
+    // it's a control channel only). Its `view_file` tool result record embeds
+    // the file content (with line-number prefixes) in the `content` blob — so
+    // unlike Gemini, sentinel-in-output pairing works: the token survives
+    // inside the rendered `ToolCompleted.output`. The `TurnEnd(Completed)`
+    // assertion below also validates the agentic-turn case for the new outcome
+    // rule: a tool-using turn must still produce a transcript terminal answer
+    // (`saw_terminal_answer`), or `classify_outcome` would now fail it loud.
     let tmp = tempfile::TempDir::new().expect("tempdir");
     std::fs::write(tmp.path().join("MARKER.txt"), ANTIGRAVITY_TOKEN).expect("write marker");
 

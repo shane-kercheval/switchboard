@@ -18,11 +18,20 @@
 //!   and discovered post-spawn by watching for a new
 //!   `~/.gemini/antigravity-cli/brain/<uuid>/` directory, then persisted to
 //!   the per-agent sidecar (see [`sidecar`]) for resume / hydration.
-//! - **Dual-source streaming.** Live assistant text comes from stdout; tool
-//!   lifecycle (`ToolStarted` / `ToolCompleted`) and `thinking` come from
-//!   tailing the conversation's `transcript.jsonl` (see [`paths`]). The
-//!   transcript records the *completed* `PLANNER_RESPONSE` text too, but the
-//!   live path does **not** re-emit it — stdout already streamed it.
+//! - **Transcript-sourced content; stdout is a control channel.** All
+//!   displayed content — assistant text, `thinking`, and tool lifecycle
+//!   (`ToolStarted` / `ToolCompleted`) — comes from tailing the conversation's
+//!   `transcript.jsonl` (see [`paths`]). stdout is **not** used for content:
+//!   on a resume turn `agy` replays the whole conversation's prior answers to
+//!   stdout, which would make each turn accumulate every earlier answer. The
+//!   transcript records one completed `PLANNER_RESPONSE` per turn and the
+//!   resume cursor isolates only the new turn's records, so it is the clean
+//!   per-turn source (and matches what hydration reconstructs from disk).
+//!   stdout is read only for control signals: the auth-failure fast-fail
+//!   below, `Error:` lines, and a "produced output" liveness signal (used to
+//!   tell output-without-a-readable-answer apart from no-output — *not* a
+//!   success signal; a turn is `Completed` only on a transcript terminal
+//!   answer).
 //! - **Auth fast-fail.** When the keyring token is stale, `agy -p` falls
 //!   back to interactive OAuth: it prints `Authentication required...`,
 //!   opens a browser, and blocks ~30s before timing out. There is no flag
@@ -54,7 +63,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use uuid::Uuid;
 
 use crate::adapter::{DispatchError, DispatchOptions, EventStream, HarnessAdapter};
-use crate::events::{AdapterEvent, ContentKind, FailureKind, McpServerStatus, TurnId, TurnOutcome};
+use crate::events::{AdapterEvent, FailureKind, McpServerStatus, TurnId, TurnOutcome};
 
 use parser::{
     AntigravityParserState, TranscriptRecord, first_error_line, is_auth_failure_line,
@@ -83,6 +92,15 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// up. Matches the user-visible "agent starting" pause we tolerate
 /// elsewhere; an early child exit short-circuits this.
 const UUID_CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Post-exit drain attempts for the terminal answer. The in-loop poll already
+/// catches the common case (the answer record lands before `agy` exits); this
+/// only covers the narrow window where the terminal `PLANNER_RESPONSE` is
+/// flushed just after exit. The answer text is now transcript-sourced and
+/// load-bearing for every turn, so a generous-but-bounded retry keeps the
+/// "no terminal answer → fail loud" classification from misfiring on flush lag.
+/// `attempt 0` reads immediately; the rest are spaced `POLL_INTERVAL` apart.
+const FINAL_DRAIN_ATTEMPTS: u32 = 6;
 
 /// Verify a binary name is on PATH, mapping a miss to `BinaryNotFound`.
 /// Used by [`AntigravityAdapter::probe`]; factored out so the negative-path
@@ -399,16 +417,18 @@ async fn run_producer(ctx: ProducerCtx) {
                         if trimmed.starts_with("Error:") || trimmed.starts_with("Warning:") {
                             stdout_buf.push(line);
                         } else if !trimmed.is_empty() {
-                            // Normal drip text → live assistant content. Also a
-                            // success signal: it means agy produced a visible
-                            // answer even if the transcript (the brittle
-                            // `.system_generated/` path) can't be read.
+                            // Normal drip text is **not** emitted as content: on a
+                            // resume turn `agy` replays the whole conversation's
+                            // prior answers to stdout, which would make each turn's
+                            // bubble accumulate every earlier answer. The answer
+                            // text comes from the transcript's per-turn
+                            // `PLANNER_RESPONSE` record instead (see
+                            // `record_to_live_events`). We still note that output
+                            // appeared — a "produced output" signal `classify_outcome`
+                            // uses to distinguish output-without-a-readable-answer
+                            // (fail loud) from no-output. It is **not** a success
+                            // signal: completion requires a transcript terminal answer.
                             saw_stdout_content = true;
-                            let _ = tx.send(AdapterEvent::ContentChunk {
-                                turn_id,
-                                kind: ContentKind::Text,
-                                text: format!("{line}\n"),
-                            });
                         }
                     }
                     Ok(None) | Err(_) => stdout_eof = true,
@@ -537,18 +557,31 @@ async fn run_producer(ctx: ProducerCtx) {
         }
     }
 
-    // Final transcript drain: catch any records flushed between the last poll
-    // tick and process exit, on the (possibly just re-pointed) transcript.
+    // Final transcript drain: catch records flushed between the last poll tick
+    // and process exit, on the (possibly just re-pointed) transcript. The
+    // answer text is transcript-sourced now (stdout replays history on resume),
+    // so this read is load-bearing for every turn's visible content — retry it
+    // a bounded number of times to cover the window where `agy` flushes the
+    // terminal record just after exiting. Stop as soon as the answer lands, or
+    // if no output appeared at all (nothing to wait for).
     if let Some(path) = &transcript_path {
-        drain_transcript(
-            path,
-            &mut cursor,
-            turn_id,
-            &mut parser_state,
-            &mut saw_terminal_answer,
-            &mut model,
-            &tx,
-        );
+        for attempt in 0..FINAL_DRAIN_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
+            drain_transcript(
+                path,
+                &mut cursor,
+                turn_id,
+                &mut parser_state,
+                &mut saw_terminal_answer,
+                &mut model,
+                &tx,
+            );
+            if saw_terminal_answer || !saw_stdout_content {
+                break;
+            }
+        }
     }
 
     let outcome = classify_outcome(
@@ -853,21 +886,28 @@ fn conversation_not_found(stdout_lines: &[String], stderr_tail: &Mutex<VecDeque<
 /// classification logic is unit-tested without spawning `agy`.
 ///
 /// Precedence: auth fast-fail → ambiguous capture → sidecar write failure →
-/// stdout `Error:` line → unresumable-with-a-streamed-reply (required
-/// recapture failed) → a visible answer streamed (transcript terminal answer
-/// OR stdout content) → no answer (adapter failure). A concrete `Error:` line
-/// wins over the generic unresumable classification. `agy` exits 0
-/// universally, so neither the exit code nor a transcript `status` drives
-/// this.
+/// stdout `Error:` line → unresumable-with-a-streamed-reply (required recapture
+/// failed) → **transcript terminal answer → Completed** → output-but-no-answer
+/// (adapter failure) → no output (adapter failure). A concrete `Error:` line
+/// wins over the generic unresumable classification. `agy` exits 0 universally,
+/// so neither the exit code nor a transcript `status` drives this.
 ///
-/// The stdout-content success fallback is load-bearing: the transcript path
-/// (`.system_generated/…`) is the most brittle contract in the adapter, and
-/// the answer streams independently over stdout. Without the fallback, a
-/// transcript-path break would misreport every working turn as failed.
+/// **Completed requires a transcript-derived terminal answer** (`saw_terminal_answer`).
+/// stdout is no longer the displayed answer — `agy` replays the whole
+/// conversation to stdout on resume, so we render only the transcript's
+/// per-turn `PLANNER_RESPONSE` record (see [`record_to_live_events`]). That
+/// makes `saw_stdout_content` mean only "agy produced *some* output," not "the
+/// user saw an answer." So if `agy` produced output but no terminal answer
+/// could be read from the transcript (e.g. the brittle `.system_generated/`
+/// path changed, or the answer record never landed), we fail **loud** with an
+/// actionable message rather than silently completing a blank turn — consistent
+/// with the adapter's fail-loud posture elsewhere (unresumable, ambiguous,
+/// fork-can't-heal). The producer gives the post-exit drain a bounded retry
+/// first, so this can't misfire on a normal flush lag.
 ///
 /// Stale-resume (conversation-not-found) is intentionally **not** a failure
-/// here — the producer heals it (recaptures the forked conversation) and the
-/// turn completes with a real answer.
+/// here — the producer heals it (recaptures the forked conversation, whose
+/// transcript carries the terminal answer) and the turn completes.
 fn classify_outcome(
     sig: &OutcomeSignals,
     stdout_lines: &[String],
@@ -917,8 +957,18 @@ fn classify_outcome(
             message: "Antigravity produced a reply but its conversation could not be located, so the agent cannot be resumed — retry; if it persists, the adapter's transcript path may need updating".to_owned(),
         };
     }
-    if sig.saw_terminal_answer || sig.saw_stdout_content {
+    if sig.saw_terminal_answer {
         return TurnOutcome::Completed;
+    }
+    // Output appeared on stdout but no terminal answer was readable from the
+    // transcript. Since stdout is no longer rendered, completing here would
+    // show the user a blank "successful" turn — fail loud instead so the cause
+    // (likely a `.system_generated/` transcript-path change) is visible.
+    if sig.saw_stdout_content {
+        return TurnOutcome::Failed {
+            kind: FailureKind::AdapterFailure,
+            message: "Antigravity produced output but Switchboard could not read the answer from the conversation transcript — the .system_generated/ transcript path may have changed (see docs/research/antigravity-cli-observed.md); retry".to_owned(),
+        };
     }
     let tail = crate::subprocess::format_stderr_tail(stderr_tail);
     let message = if tail.is_empty() {
@@ -1346,20 +1396,23 @@ mod tests {
     }
 
     #[test]
-    fn classify_outcome_stdout_content_only_is_completed() {
-        // The load-bearing fallback: transcript unreadable (saw_terminal_answer
-        // false) but stdout streamed a clean answer → Completed, not failure.
-        // Guards against the `.system_generated/` path break misreporting
-        // every working turn as failed.
+    fn classify_outcome_stdout_content_without_terminal_answer_fails_loud() {
+        // stdout is no longer the displayed answer (it replays prior answers on
+        // resume), so "agy produced output but no terminal answer was readable
+        // from the transcript" is a render failure, not a success — fail loud
+        // with an actionable message rather than completing a blank turn.
         let sig = OutcomeSignals {
             saw_terminal_answer: false,
             saw_stdout_content: true,
             ..ok_signals()
         };
-        assert!(matches!(
-            classify_outcome(&sig, &[], &empty_tail()),
-            TurnOutcome::Completed
-        ));
+        match classify_outcome(&sig, &[], &empty_tail()) {
+            TurnOutcome::Failed {
+                kind: FailureKind::AdapterFailure,
+                message,
+            } => assert!(message.contains("could not read the answer")),
+            other => panic!("expected AdapterFailure, got {other:?}"),
+        }
     }
 
     #[test]

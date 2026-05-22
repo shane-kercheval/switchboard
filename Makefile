@@ -1,4 +1,7 @@
-.PHONY: dev test lint fmt check clean install test-live
+.PHONY: dev test lint fmt check clean install test-live test-live-claude test-live-codex test-live-gemini test-live-antigravity
+
+# Crates that carry live (`#[ignore]`-gated) harness tests.
+LIVE_PKGS := -p switchboard-harness -p switchboard-dispatcher -p switchboard-app
 
 install:
 	pnpm install --frozen-lockfile
@@ -32,7 +35,24 @@ check:
 	pnpm test
 
 test-live:
-	cargo test --locked -p switchboard-harness -p switchboard-dispatcher -p switchboard-app -- --ignored
+	cargo test --locked $(LIVE_PKGS) -- --ignored
+
+# Per-harness live tests, to spend subscription quota on only the harness you
+# care about (e.g. after a CLI version bump). Each filters by the harness name,
+# which every live test for that harness carries (see the naming convention in
+# AGENTS.md). Preview without spending quota by appending `--list` to the
+# underlying cargo command.
+test-live-claude:
+	cargo test --locked $(LIVE_PKGS) claude -- --ignored
+
+test-live-codex:
+	cargo test --locked $(LIVE_PKGS) codex -- --ignored
+
+test-live-gemini:
+	cargo test --locked $(LIVE_PKGS) gemini -- --ignored
+
+test-live-antigravity:
+	cargo test --locked $(LIVE_PKGS) antigravity -- --ignored
 
 clean:
 	cargo clean

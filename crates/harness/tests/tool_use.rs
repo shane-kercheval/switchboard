@@ -1,4 +1,4 @@
-//! Live tool-event coverage across all three adapters.
+//! Live tool-event coverage across all four adapters.
 //!
 //! Each test prompts the real CLI to use a file-read / shell tool and asserts
 //! that `ToolStarted` is followed by a matching `ToolCompleted`. Pairing
@@ -20,8 +20,8 @@
 use futures::StreamExt;
 use switchboard_core::{AgentRecord, HarnessKind};
 use switchboard_harness::{
-    AdapterEvent, AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, DispatchOptions,
-    GeminiAdapter, HarnessAdapter, TurnOutcome,
+    AdapterEvent, AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, ContentKind,
+    DispatchOptions, GeminiAdapter, HarnessAdapter, TurnOutcome,
 };
 use uuid::Uuid;
 
@@ -321,6 +321,19 @@ async fn live_antigravity_emits_tool_started_and_tool_completed_for_file_read() 
             }
         ),
         "expected TurnEnd(Completed); got: {terminal:?}"
+    );
+
+    // The agentic turn must surface a non-empty assistant answer — the
+    // transcript-derived terminal text. This asserts directly what
+    // `TurnEnd(Completed)` proves only transitively under the current
+    // classifier (Completed requires a transcript terminal answer), guarding
+    // against a future classifier/parser refactor weakening that coupling.
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AdapterEvent::ContentChunk { kind: ContentKind::Text, text, .. } if !text.trim().is_empty()
+        )),
+        "expected a non-empty Text answer chunk on a tool-using turn; got: {events:?}"
     );
 }
 

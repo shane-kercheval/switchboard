@@ -1288,7 +1288,7 @@ mod tests {
     /// Run with: `make test-live`.
     #[test]
     #[ignore = "requires codex login — run with: make test-live"]
-    fn live_check_codex_auth_finds_real_auth_file() {
+    fn live_codex_check_auth_finds_real_auth_file() {
         let home = std::env::var_os("HOME")
             .map(std::path::PathBuf::from)
             .expect("HOME must be set");
@@ -1460,7 +1460,7 @@ mod tests {
     /// ships.
     #[test]
     #[ignore = "requires agy authed via Antigravity desktop app — run with: make test-live"]
-    fn live_check_antigravity_auth_finds_real_keychain_entry() {
+    fn live_antigravity_check_auth_finds_real_keychain_entry() {
         check_antigravity_auth_impl().expect(
             "Antigravity Keychain entry must live at service=gemini account=antigravity on a \
              logged-in machine; if this fails, Antigravity may have changed its keychain \
@@ -1472,7 +1472,7 @@ mod tests {
     /// surface here before users see a confusing dispatch-time error.
     #[test]
     #[ignore = "requires agy installed — run with: make test-live"]
-    fn live_check_antigravity_binary_finds_real_agy_on_path() {
+    fn live_antigravity_check_binary_finds_real_agy_on_path() {
         use switchboard_harness::AntigravityAdapter;
         let claude: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
         let codex: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
@@ -1515,7 +1515,7 @@ mod tests {
     /// on the developer's machine before silent miscategorization ships.
     #[test]
     #[ignore = "requires gemini login — run with: make test-live"]
-    fn live_check_gemini_auth_finds_real_settings_file() {
+    fn live_gemini_check_auth_finds_real_settings_file() {
         let home = std::env::var_os("HOME")
             .map(std::path::PathBuf::from)
             .expect("HOME must be set");

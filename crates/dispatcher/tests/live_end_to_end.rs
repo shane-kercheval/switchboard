@@ -13,18 +13,18 @@
 //! this layer guards against:
 //!
 //! - The session-id encoding bug (`/` → `-` only, missing `. → -`) —
-//!   detected by `live_full_stack_two_consecutive_turns_succeed`, which
+//!   detected by `live_claude_full_stack_two_consecutive_turns_succeed`, which
 //!   exercises session resume across two Claude turns.
 //! - The cwd bug (claude was spawned in `.switchboard/projects/<uuid>/`
 //!   instead of the user's bound working directory, so it couldn't see the
-//!   user's repo files) — detected by `live_full_stack_claude_sees_files_in_cwd`,
+//!   user's repo files) — detected by `live_claude_full_stack_sees_files_in_cwd`,
 //!   which writes a file into the working dir and asserts claude can read it.
 //! - A future dispatcher branch that's secretly harness-specific — the
 //!   per-harness event-ordering checks
-//!   (`live_full_stack_emits_turn_start_then_content_then_turn_end` for
+//!   (`live_claude_full_stack_emits_turn_start_then_content_then_turn_end` for
 //!   Claude,
-//!   `live_full_stack_codex_emits_turn_start_then_content_then_turn_end`,
-//!   `live_full_stack_gemini_emits_turn_start_then_content_then_turn_end`)
+//!   `live_codex_full_stack_emits_turn_start_then_content_then_turn_end`,
+//!   `live_gemini_full_stack_emits_turn_start_then_content_then_turn_end`)
 //!   assert the same `turn_start → content_chunk → turn_end → agent_idle`
 //!   contract holds through every harness's real subprocess. Any accidental
 //!   coupling of the dispatcher to one harness's behavior surfaces in the
@@ -68,7 +68,7 @@ fn agent_text(emitter: &Arc<RecordingEmitter>, channel: &str) -> String {
 
 #[tokio::test]
 #[ignore = "requires claude installed and authenticated — run with: make test-live"]
-async fn live_full_stack_two_consecutive_turns_succeed() {
+async fn live_claude_full_stack_two_consecutive_turns_succeed() {
     // Reproduces the full backend vertical slice. Creates a working
     // directory, initializes the .switchboard/ layout, registers a project +
     // agent exactly like the app does, then dispatches two turns. The
@@ -138,7 +138,7 @@ async fn live_full_stack_two_consecutive_turns_succeed() {
 
 #[tokio::test]
 #[ignore = "requires claude installed and authenticated — run with: make test-live"]
-async fn live_full_stack_emits_turn_start_then_content_then_turn_end() {
+async fn live_claude_full_stack_emits_turn_start_then_content_then_turn_end() {
     // Confirms the event-order contract end-to-end through the dispatcher.
     // The reducer relies on `turn_start` arriving before any `content_chunk`
     // and exactly one `turn_end` per turn; if the dispatcher's ordering
@@ -219,7 +219,7 @@ async fn live_full_stack_emits_turn_start_then_content_then_turn_end() {
 
 #[tokio::test]
 #[ignore = "requires claude installed and authenticated — run with: make test-live"]
-async fn live_full_stack_paths_with_dot_components_resolve_correctly() {
+async fn live_claude_full_stack_paths_with_dot_components_resolve_correctly() {
     // Direct regression test for the path-encoding bug. The user's bound
     // working directory can contain dots (hidden directories, dotted
     // usernames, etc.). The path-encoding rule must apply the same way at
@@ -275,7 +275,7 @@ async fn live_full_stack_paths_with_dot_components_resolve_correctly() {
 
 #[tokio::test]
 #[ignore = "requires claude installed and authenticated — run with: make test-live"]
-async fn live_full_stack_claude_sees_files_in_cwd() {
+async fn live_claude_full_stack_sees_files_in_cwd() {
     // Regression test for the cwd-routing rule: claude must be spawned in
     // the user's bound working directory, NOT in
     // `<dir>/.switchboard/projects/<uuid>/` (the Switchboard-internal
@@ -329,7 +329,7 @@ async fn live_full_stack_claude_sees_files_in_cwd() {
 
 #[tokio::test]
 #[ignore = "requires gemini installed and authenticated — run with: make test-live"]
-async fn live_full_stack_gemini_emits_turn_start_then_content_then_turn_end() {
+async fn live_gemini_full_stack_emits_turn_start_then_content_then_turn_end() {
     // The canonical empirical assertion of M3's headline claim: the
     // dispatcher abstraction is genuinely harness-neutral. Same
     // event-ordering contract (turn_start → content_chunk → turn_end →
@@ -417,7 +417,7 @@ async fn live_full_stack_gemini_emits_turn_start_then_content_then_turn_end() {
 
 #[tokio::test]
 #[ignore = "requires codex installed and authenticated — run with: make test-live"]
-async fn live_full_stack_codex_emits_turn_start_then_content_then_turn_end() {
+async fn live_codex_full_stack_emits_turn_start_then_content_then_turn_end() {
     // Symmetric coverage with the Claude and Gemini dispatcher-layer
     // tests. The dispatcher's per-turn machinery (TurnId generation,
     // AgentIdleGuard, EventEmitter forwarding, per-agent state tracking)
@@ -506,7 +506,7 @@ async fn live_full_stack_codex_emits_turn_start_then_content_then_turn_end() {
 
 #[tokio::test]
 #[ignore = "requires agy authed via Antigravity desktop app — run with: make test-live"]
-async fn live_full_stack_antigravity_two_turns_resume_through_dispatcher() {
+async fn live_antigravity_full_stack_two_turns_resume_through_dispatcher() {
     // The full backend slice for Antigravity, exercising the load-bearing
     // capture→resume path through the dispatcher (not just the adapter):
     // turn 1 spawns a fresh conversation and the adapter captures the

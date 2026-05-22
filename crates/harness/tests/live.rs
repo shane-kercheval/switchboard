@@ -28,7 +28,7 @@ fn live_agent() -> AgentRecord {
 
 #[tokio::test]
 #[ignore = "requires claude installed — run with: make test-live"]
-async fn live_basic_turn_completes() {
+async fn live_claude_basic_turn_completes() {
     let adapter = ClaudeCodeAdapter::new();
     let agent = live_agent();
     let turn_id = Uuid::now_v7();
@@ -122,7 +122,7 @@ async fn live_basic_turn_completes() {
 
 #[tokio::test]
 #[ignore = "requires claude installed — run with: make test-live"]
-async fn live_session_continuity_across_turns() {
+async fn live_claude_resume_reuses_session() {
     // Verifies that session state persists across turns: the first turn uses
     // --session-id to create the session; the second reuses the same session_id
     // and the adapter automatically switches to --resume.

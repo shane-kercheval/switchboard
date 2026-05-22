@@ -53,7 +53,9 @@ For each harness:
 
 **Working assumption** (now grounded in the probe):
 
-> Switchboard enforces one in-flight turn per agent at the application layer. A dispatch (whether from a workflow step or a manual user send) against an agent that's already mid-turn refuses with a clear error ("agent X is busy, currently running step N of workflow P"). The user can switch focus to inspect the busy agent. Queueing is not implemented in v1; refuse-on-collision is the v1 default.
+> Switchboard enforces one in-flight turn per agent at the application layer. A dispatch against an agent that's already mid-turn must not start a second concurrent turn. The user can switch focus to inspect the busy agent.
+
+**Update (M4 decision):** the original working assumption above said "queueing is not implemented; refuse-on-collision is the v1 default." This was revised in M4. The core rule (one in-flight turn per agent — the reason this whole note exists) is unchanged. What changed is the *response* to a collision: a **manual compose-bar send** to a busy agent is now **queued** (per-agent FIFO, in-memory), while a **workflow-step** collision still **refuses** with a clear error (so autonomous collisions surface rather than silently serialize). See system-design §7 "Agent contention".
 
 This works because:
 - Workflows within a single session are serialized by the orchestrator; workflow-internal collisions don't occur by construction.

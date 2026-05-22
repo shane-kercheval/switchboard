@@ -2,9 +2,10 @@
 //! projects, dispatcher, and harness adapter for the lifetime of the app.
 
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
 use std::sync::{Arc, Mutex};
 
-use switchboard_core::{AgentId, Directory, Project, ProjectId};
+use switchboard_core::{AgentId, AgentRecord, Directory, Project, ProjectId};
 use switchboard_dispatcher::{Dispatcher, EventEmitter};
 use switchboard_harness::HarnessAdapter;
 
@@ -14,13 +15,18 @@ use switchboard_harness::HarnessAdapter;
 ///
 /// **Lock-order convention** (when more than one of these mutexes is held
 /// at the same time): `registry_write` → `directory` → `projects` →
-/// `active_project_id` → `needs_session_meta`. Always acquire in this
-/// order. Violating the order can deadlock under concurrent access.
-/// Single-lock acquisitions (which most callers do) are unaffected — the
-/// convention only matters when nesting. `needs_session_meta` is the
-/// tail because both `attach_agent_impl` (under `registry_write`) and
-/// `send_message_impl` (no other locks held) acquire it briefly with no
-/// `.await` crossing the guard.
+/// `active_project_id` → `needs_session_meta` → `project_locks` →
+/// `agents_by_id`. Always acquire in this order. Violating the order can
+/// deadlock under concurrent access. Single-lock acquisitions (which most
+/// callers do) are unaffected — the convention only matters when nesting.
+/// `needs_session_meta` is the tail because both `attach_agent_impl` (under
+/// `registry_write`) and `send_message_impl` (no other locks held) acquire
+/// it briefly with no `.await` crossing the guard. `project_locks` and
+/// `agents_by_id` (M4.1) are leaf maps acquired briefly; they are never
+/// nested with *each other*, but they are taken while `directory` is held
+/// during a rebind (and while `registry_write` is held during open/create) —
+/// both of which precede them in the order, so those nestings are compliant.
+/// When nesting them, follow the documented tail order.
 ///
 /// `registry_write` serializes append-only-log mutations
 /// (`create_project`, `register_agent`, `init_directory`).
@@ -89,6 +95,30 @@ pub struct AppState {
     /// `projects` and `active_project_id` — a stale `agent_id` from a
     /// previous directory's attach must not leak across rebinds.
     pub needs_session_meta: Arc<Mutex<HashSet<AgentId>>>,
+
+    /// Per-project inter-process lock handles (M4.1). One entry per loaded
+    /// project, holding an advisory exclusive lock (std `File::try_lock`,
+    /// stable since Rust 1.89 — `flock` on unix) on
+    /// `<directory>/.switchboard/projects/<id>/instance.lock`. Acquired in
+    /// the project-open/create path before the project is inserted into
+    /// `projects`; the live `File` *is* the lock, so dropping it (removing
+    /// the entry on rebind, or the process exiting/crashing) releases the
+    /// lock — no explicit unlock or stale-lock cleanup needed. This is an
+    /// inter-process guard only: a second Switchboard process opening the
+    /// same project is refused (`AppError::ProjectLocked`); intra-process
+    /// re-open returns the already-loaded handle without re-locking.
+    pub project_locks: Mutex<HashMap<ProjectId, File>>,
+
+    /// Canonical agent-lookup index (M4.1): `AgentId → AgentRecord`. The
+    /// record carries `project_id`, so this single map answers "which
+    /// project owns this agent, and what is its record" without scanning
+    /// every loaded project's `registry.jsonl` from disk (the prior
+    /// `lookup_agent` hot path). Populated on project open, agent
+    /// register/attach, and `list_agents`; cleared on directory rebind.
+    /// v1 has no agent/project deletion, so invalidation is insert-only
+    /// within a directory session plus a full clear on rebind. `AgentRecord`
+    /// is immutable after registration, so a cached copy never goes stale.
+    pub agents_by_id: Mutex<HashMap<AgentId, AgentRecord>>,
 }
 
 impl AppState {
@@ -111,6 +141,8 @@ impl AppState {
             antigravity_adapter,
             emitter,
             needs_session_meta: Arc::new(Mutex::new(HashSet::new())),
+            project_locks: Mutex::new(HashMap::new()),
+            agents_by_id: Mutex::new(HashMap::new()),
         }
     }
 }

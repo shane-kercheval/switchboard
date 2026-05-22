@@ -65,6 +65,16 @@ impl Project {
     /// Concurrent calls against *different* `Project` instances (in the same
     /// or different directories) are fine; cross-process serialization within
     /// one directory is future work.
+    ///
+    /// # Durability
+    ///
+    /// On the rare path where `append_jsonl` reports a post-write durability
+    /// (fsync) failure, this returns `Err` even though the record may already
+    /// be on disk (`append_jsonl` syncs after writing). The caller must not
+    /// treat that as "nothing happened": a subsequent retry can hit
+    /// `DuplicateAgentName` because the record is visible, and the agent will
+    /// appear on the next `list_agents`. There is no destructive cleanup to
+    /// undo here (unlike `Directory::create_project`), so no rollback applies.
     pub fn register_agent(&self, name: &str, harness: HarnessKind) -> Result<AgentRecord> {
         // Harness-asymmetry rule:
         // - Claude Code pre-generates session_id (UUID v7) at registration

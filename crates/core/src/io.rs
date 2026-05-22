@@ -16,11 +16,36 @@ use crate::error::{CoreError, Result};
 ///
 /// Serialization failures map to `CoreError::Serialize` — distinct from
 /// `CoreError::CorruptJsonl`, which means "data already on disk is malformed."
+///
+/// **Durability — and the contract callers must honor.** After writing we
+/// `sync_data()` the file (and, only when this call *created* the file, fsync
+/// the parent directory so the new directory entry is durable). These logs are
+/// append-only sources of truth; a torn or lost line from a power loss between
+/// the userspace write and writeback bricks future reads (`read_jsonl` is
+/// fail-loud — see `CorruptJsonl`), so the fsync is the crash-safety this layer
+/// promises. A **sync failure is returned as an error** (it is the kernel
+/// reporting that durability could not be confirmed — `flush` only reaches the
+/// OS page cache, not stable storage), so the durability guarantee stays
+/// enforceable for high-frequency callers that depend on it (the M4.2 journal).
+///
+/// **Critical caller contract:** because the sync happens *after* `writeln!`,
+/// an `Err` from `append_jsonl` does **not** mean "the record was not written"
+/// — the line may already be on disk and visible. So a caller must **never
+/// destructively roll back** (delete the artifact the record refers to) on an
+/// append error: doing so after a possible commit leaves a dangling reference.
+/// Keep the artifact and surface the error (see `Directory::create_project`).
+/// The parent-directory fsync has no portable Windows equivalent, so it's gated
+/// to unix; Windows durability is deferred.
 pub(crate) fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let line = serde_json::to_string(value).map_err(|source| CoreError::Serialize {
         path: path.to_owned(),
         source,
     })?;
+    // Whether *this* call creates the file decides if the parent directory
+    // entry needs syncing — appends to an existing file leave the entry
+    // unchanged, so a dir fsync there is pure overhead (load-bearing for the
+    // high-frequency logs that reuse this path: the M4.2 journal, M6 runs).
+    let created = !path.exists();
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -28,6 +53,13 @@ pub(crate) fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         .map_err(|e| CoreError::io(path, e))?;
     writeln!(file, "{line}").map_err(|e| CoreError::io(path, e))?;
     file.flush().map_err(|e| CoreError::io(path, e))?;
+    file.sync_data().map_err(|e| CoreError::io(path, e))?;
+    #[cfg(unix)]
+    if created && let Some(parent) = path.parent() {
+        File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| CoreError::io(parent, e))?;
+    }
     Ok(())
 }
 

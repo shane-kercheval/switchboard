@@ -3,6 +3,7 @@
 //! to Tauri's `State<'_, AppState>` / `String` conventions; the free
 //! functions are what the unit tests target.
 
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -92,6 +93,10 @@ pub async fn init_directory_impl(state: &AppState, path: &str) -> Result<Directo
             // leak into the newly-bound directory's first dispatch — the
             // agent_id wouldn't even resolve.
             lock(&state.needs_session_meta).clear();
+            // Drop prior-directory project locks (releasing each `flock` as
+            // its `File` drops) and the stale register-cache entries (M4.1).
+            lock(&state.project_locks).clear();
+            lock(&state.agents_by_id).clear();
         }
         *current = Some(directory);
     }
@@ -117,6 +122,12 @@ pub fn create_project_impl(state: &AppState, name: &str) -> Result<ProjectSummar
         name: project.config.name.clone(),
         created_at: project.config.created_at,
     };
+    // Lock kept LOCAL until commit (same pattern as `open_project_impl`). A
+    // fresh project id can't be contended, but keeping the handle local means
+    // a failure before the final inserts can't strand it. A new project has
+    // no agents, so there is nothing to cache.
+    let lock_handle = acquire_project_lock(project.id, &project.root)?;
+    lock(&state.project_locks).insert(project.id, lock_handle);
     lock(&state.projects).insert(project.id, project);
     Ok(summary)
 }
@@ -125,6 +136,28 @@ pub fn open_project_impl(
     state: &AppState,
     project_id: ProjectId,
 ) -> Result<ProjectSummary, AppError> {
+    // Fast path (lock-free): already loaded → intra-process re-open is a
+    // no-op returning the existing handle, with no second lock acquisition
+    // (`flock` is the inter-process guard only; a process re-locking its own
+    // held file via a second fd would spuriously conflict). Keeping this
+    // check lock-free means M4.6 project switches don't serialize against
+    // creates/registers.
+    if let Some(loaded) = lock(&state.projects).get(&project_id) {
+        return Ok(ProjectSummary {
+            id: loaded.id,
+            name: loaded.config.name.clone(),
+            created_at: loaded.config.created_at,
+        });
+    }
+    // Serialize first-opens (against each other and against create/register)
+    // so two concurrent opens of the same not-yet-loaded project don't both
+    // try to flock it — the second would conflict with this process's own
+    // first handle and spuriously report `ProjectLocked` for an idempotent
+    // action. `registry_write` is the head of the lock order, so taking it
+    // here is order-safe.
+    let _open = lock(&state.registry_write);
+    // Re-check under the guard: another thread may have loaded it while we
+    // waited → return the existing handle without re-locking.
     if let Some(loaded) = lock(&state.projects).get(&project_id) {
         return Ok(ProjectSummary {
             id: loaded.id,
@@ -139,6 +172,21 @@ pub fn open_project_impl(
         name: project.config.name.clone(),
         created_at: project.config.created_at,
     };
+    // Own the inter-process lock (fail fast on contention), but keep the
+    // handle LOCAL until every fallible step has succeeded. If the registry
+    // read below fails (e.g. `CorruptJsonl`), `lock_handle` drops here and the
+    // flock is released — no wedged lock, and the error surfaces as the
+    // corruption it is rather than a misleading `ProjectLocked` on retry.
+    let lock_handle = acquire_project_lock(project.id, &project.root)?;
+    let agents = project.list_agents()?;
+    // All fallible work done — commit the shared maps together.
+    lock(&state.project_locks).insert(project.id, lock_handle);
+    {
+        let mut cache = lock(&state.agents_by_id);
+        for agent in agents {
+            cache.insert(agent.id, agent);
+        }
+    }
     lock(&state.projects).insert(project.id, project);
     Ok(summary)
 }
@@ -165,7 +213,9 @@ pub fn create_agent_impl(
         .get(&active)
         .cloned()
         .ok_or(AppError::ProjectNotLoaded(active))?;
-    Ok(project.register_agent(name, harness)?)
+    let record = project.register_agent(name, harness)?;
+    lock(&state.agents_by_id).insert(record.id, record.clone());
+    Ok(record)
 }
 
 /// Attach an existing harness session (Claude Code, Codex, Gemini, or
@@ -326,6 +376,10 @@ pub fn attach_agent_impl(
         _ => return Err(AppError::UnsupportedHarness),
     };
 
+    // Register-cache (M4.1): the new attached agent's project is `active`,
+    // which is loaded (resolved above), so a subsequent `lookup_agent` hits
+    // the cache without a disk scan.
+    lock(&state.agents_by_id).insert(record.id, record.clone());
     Ok(record)
 }
 
@@ -614,7 +668,16 @@ pub fn list_agents_impl(
         .get(&pid)
         .cloned()
         .ok_or(AppError::ProjectNotLoaded(pid))?;
-    Ok(project.list_agents()?)
+    let agents = project.list_agents()?;
+    // Keep the register-cache (M4.1) in sync with what's on disk for this
+    // project (insert-only — v1 has no agent deletion).
+    {
+        let mut cache = lock(&state.agents_by_id);
+        for agent in &agents {
+            cache.insert(agent.id, agent.clone());
+        }
+    }
+    Ok(agents)
 }
 
 /// Resolves the agent (across all loaded projects) and dispatches the turn
@@ -937,16 +1000,50 @@ fn bound_directory(state: &AppState) -> Result<Directory, AppError> {
 }
 
 fn lookup_agent(state: &AppState, agent_id: AgentId) -> Result<(Project, AgentRecord), AppError> {
-    // Clone the project handles out so we don't hold the projects lock
-    // while doing disk I/O via `list_agents`.
-    let candidates: Vec<Project> = lock(&state.projects).values().cloned().collect();
-    for project in candidates {
-        let agents = project.list_agents()?;
-        if let Some(agent) = agents.into_iter().find(|a| a.id == agent_id) {
-            return Ok((project, agent));
+    // Register-cache hit (M4.1): the cached `AgentRecord` carries its
+    // `project_id`, so we resolve the owning project without scanning every
+    // loaded project's `registry.jsonl` from disk. The project is always
+    // loaded when its agents are cached (the cache is populated on open and
+    // cleared on rebind together with `projects`), so a missing project here
+    // is a genuine ProjectNotLoaded, not a stale-cache artifact.
+    let agent = lock(&state.agents_by_id)
+        .get(&agent_id)
+        .cloned()
+        .ok_or(AppError::AgentNotFound(agent_id))?;
+    let project = lock(&state.projects)
+        .get(&agent.project_id)
+        .cloned()
+        .ok_or(AppError::ProjectNotLoaded(agent.project_id))?;
+    Ok((project, agent))
+}
+
+/// Filename of the per-project inter-process lock inside its metadata dir.
+const INSTANCE_LOCK_FILE: &str = "instance.lock";
+
+/// Acquire the per-project advisory file lock (M4.1) using the standard
+/// library's `File::try_lock` (stable since Rust 1.89 — no external crate
+/// needed). Returns the live `File` handle that *is* the lock — the caller
+/// stores it in `AppState.project_locks` for the project's loaded lifetime;
+/// dropping it (rebind, process exit/crash) releases the lock with no explicit
+/// unlock. Contention (another process holds it) maps to `ProjectLocked`; any
+/// other I/O failure to `ProjectLockIo`.
+fn acquire_project_lock(project_id: ProjectId, root: &Path) -> Result<File, AppError> {
+    let lock_path = root.join(INSTANCE_LOCK_FILE);
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        // The file is a pure lock token — we never write content to it, so
+        // neither truncate nor preserve matters; pick the non-destructive one.
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|source| AppError::ProjectLockIo { project_id, source })?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(AppError::ProjectLocked(project_id)),
+        Err(std::fs::TryLockError::Error(source)) => {
+            Err(AppError::ProjectLockIo { project_id, source })
         }
     }
-    Err(AppError::AgentNotFound(agent_id))
 }
 
 pub(crate) fn parse_uuid(value: &str) -> Result<Uuid, AppError> {
@@ -3454,5 +3551,171 @@ mod tests {
         assert!(
             matches!(err, AppError::SessionFileNotFound { harness, .. } if harness == HarnessKind::Gemini)
         );
+    }
+
+    // ---- M4.1: project instance lock + register-cache ----
+
+    fn mock_app_state() -> AppState {
+        let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        AppState::new(
+            Arc::clone(&mock),
+            Arc::clone(&mock),
+            Arc::clone(&mock),
+            Arc::clone(&mock),
+            Arc::new(RecordingEmitter::new()) as Arc<dyn EventEmitter>,
+        )
+    }
+
+    #[tokio::test]
+    async fn project_lock_refuses_second_process_then_releases_on_rebind() {
+        let (tmp_workdir, _home, state_a, proj) = fresh_state_with_active_project("alpha").await;
+
+        // A second Switchboard "process" binds the same directory and opens
+        // the same project — refused while state_a holds the instance lock.
+        // (Independent `open()`s of the same lock file conflict under flock,
+        // even within one OS process, which is what lets this run in-process.)
+        let state_b = mock_app_state();
+        init_directory_impl(&state_b, tmp_workdir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let err = open_project_impl(&state_b, proj.id).unwrap_err();
+        assert!(
+            matches!(err, AppError::ProjectLocked(id) if id == proj.id),
+            "second process must be refused with ProjectLocked, got {err:?}"
+        );
+
+        // state_a rebinds elsewhere → its lock `File` drops → released.
+        let other = TempDir::new().unwrap();
+        init_directory_impl(&state_a, other.path().to_str().unwrap())
+            .await
+            .unwrap();
+        open_project_impl(&state_b, proj.id)
+            .expect("lock released on rebind; second process can now open");
+    }
+
+    #[tokio::test]
+    async fn intra_process_reopen_is_noop_and_does_not_relock() {
+        let (_tmp, _home, state, proj) = fresh_state_with_active_project("alpha").await;
+        // `create_project` already loaded + locked it; re-open is a no-op
+        // returning the same project, with no second lock acquired.
+        let again = open_project_impl(&state, proj.id).unwrap();
+        assert_eq!(again.id, proj.id);
+        assert_eq!(
+            lock(&state.project_locks).len(),
+            1,
+            "intra-process re-open must not acquire a second lock"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_cache_populates_clears_on_rebind_and_repopulates_on_open() {
+        let (tmp_workdir, _home, state, proj) = fresh_state_with_active_project("alpha").await;
+        let agent = create_agent_impl(&state, "assistant", HarnessKind::ClaudeCode).unwrap();
+
+        // create_agent populated the cache → lookup resolves the owning
+        // project without scanning any registry from disk.
+        assert!(lock(&state.agents_by_id).contains_key(&agent.id));
+        let (project, found) = lookup_agent(&state, agent.id).unwrap();
+        assert_eq!(found.id, agent.id);
+        assert_eq!(project.id, proj.id);
+
+        // Rebind elsewhere clears the cache; the stale agent no longer resolves.
+        let other = TempDir::new().unwrap();
+        init_directory_impl(&state, other.path().to_str().unwrap())
+            .await
+            .unwrap();
+        assert!(lock(&state.agents_by_id).is_empty());
+        assert!(matches!(
+            lookup_agent(&state, agent.id),
+            Err(AppError::AgentNotFound(_))
+        ));
+
+        // Rebind back and open the project → cache repopulated from disk.
+        init_directory_impl(&state, tmp_workdir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        open_project_impl(&state, proj.id).unwrap();
+        let (project2, found2) = lookup_agent(&state, agent.id).unwrap();
+        assert_eq!(found2.id, agent.id);
+        assert_eq!(project2.id, proj.id);
+    }
+
+    #[tokio::test]
+    async fn open_with_corrupt_registry_errors_without_wedging_the_lock() {
+        let (tmp_workdir, _home, state, proj) = fresh_state_with_active_project("alpha").await;
+        let agent = create_agent_impl(&state, "assistant", HarnessKind::ClaudeCode).unwrap();
+
+        // Simulate a fresh process that hasn't loaded this project: drop the
+        // in-memory maps (clearing project_locks releases the flock).
+        lock(&state.projects).clear();
+        lock(&state.project_locks).clear();
+        lock(&state.agents_by_id).clear();
+
+        // Corrupt the on-disk registry with a torn line after the valid record.
+        let registry = tmp_workdir
+            .path()
+            .join(".switchboard")
+            .join("projects")
+            .join(proj.id.to_string())
+            .join("registry.jsonl");
+        let good_line = serde_json::to_string(&agent).unwrap();
+        std::fs::write(&registry, format!("{good_line}\nthis is not json\n")).unwrap();
+
+        // Open must surface the corruption — not a misleading ProjectLocked —
+        // and must not strand the lock handle.
+        let err = open_project_impl(&state, proj.id).unwrap_err();
+        assert!(
+            matches!(err, AppError::Core(CoreError::CorruptJsonl { .. })),
+            "expected CorruptJsonl, got {err:?}"
+        );
+        assert!(
+            lock(&state.project_locks).is_empty(),
+            "a failed open must not leave the lock handle stranded"
+        );
+
+        // Repair the registry → open now succeeds (the lock was never wedged).
+        std::fs::write(&registry, format!("{good_line}\n")).unwrap();
+        open_project_impl(&state, proj.id)
+            .expect("open succeeds after repair; the lock was not wedged");
+        let (_p, a) = lookup_agent(&state, agent.id).unwrap();
+        assert_eq!(a.id, agent.id);
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_open_of_same_project_is_idempotent() {
+        let (_tmp, _home, state, proj) = fresh_state_with_active_project("alpha").await;
+        // Simulate not-yet-loaded so both threads race the first-open path.
+        lock(&state.projects).clear();
+        lock(&state.project_locks).clear();
+        lock(&state.agents_by_id).clear();
+
+        // Two concurrent opens of the same not-loaded project must both
+        // succeed — one loads it, the other re-checks under the serialization
+        // guard and returns the existing handle — never one spuriously
+        // ProjectLocked against this process's own first handle.
+        let (r1, r2) = std::thread::scope(|s| {
+            let h1 = s.spawn(|| open_project_impl(&state, proj.id));
+            let h2 = s.spawn(|| open_project_impl(&state, proj.id));
+            (h1.join().unwrap(), h2.join().unwrap())
+        });
+        assert!(r1.is_ok(), "first concurrent open failed: {r1:?}");
+        assert!(r2.is_ok(), "second concurrent open failed: {r2:?}");
+        assert_eq!(
+            lock(&state.project_locks).len(),
+            1,
+            "exactly one lock handle for the project"
+        );
+        assert_eq!(lock(&state.projects).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn distinct_projects_lock_independently() {
+        let (_tmp, _home, state, alpha) = fresh_state_with_active_project("alpha").await;
+        let beta = create_project_impl(&state, "beta").unwrap();
+        // Per-project lock, not per-directory: both are held simultaneously.
+        assert_eq!(lock(&state.project_locks).len(), 2);
+        // Both remain openable (intra-process re-open is a no-op).
+        open_project_impl(&state, alpha.id).unwrap();
+        open_project_impl(&state, beta.id).unwrap();
     }
 }

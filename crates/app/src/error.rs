@@ -33,6 +33,23 @@ pub enum AppError {
     #[error("project {0} is not loaded")]
     ProjectNotLoaded(ProjectId),
 
+    /// The project's `instance.lock` is held by another Switchboard process.
+    /// Inter-process guard (M4.1): one Switchboard process per project. The
+    /// frontend surfaces this as "This project is already open in another
+    /// Switchboard window."
+    #[error("project {0} is already open in another Switchboard process")]
+    ProjectLocked(ProjectId),
+
+    /// Failed to open or `flock` a project's `instance.lock` for a reason
+    /// other than contention (e.g. the metadata directory is unwritable).
+    /// Distinct from `ProjectLocked`, which means "another process holds it."
+    #[error("failed to acquire instance lock for project {project_id}: {source}")]
+    ProjectLockIo {
+        project_id: ProjectId,
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error("agent {0} not found in any loaded project")]
     AgentNotFound(AgentId),
 

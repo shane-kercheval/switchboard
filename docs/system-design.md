@@ -57,7 +57,7 @@ A note on terminology: "session" in the agent ecosystem is overloaded. Switchboa
 
 ### Why multiple projects per working directory
 
-A single working directory (a git repo) often hosts multiple in-flight workstreams: planning a feature while implementing another, backend changes alongside frontend changes, several `plan-*.md` documents being drafted in parallel. Switchboard accommodates this by letting the user create multiple **projects** under the same working directory — each with its own agents, workflows-in-flight, and state. Switching the active project in the UI is a display change only; non-active projects keep running in the background (workflows don't pause, agents don't unsubscribe). v1 is single-window; multi-window is not in scope.
+A single working directory (a git repo) often hosts multiple in-flight workstreams: planning a feature while implementing another, backend changes alongside frontend changes, several `plan-*.md` documents being drafted in parallel. Switchboard accommodates this by letting the user create multiple **projects** under the same working directory — each with its own agents, workflows-in-flight, and state. Switching the displayed project in the UI is a display change only; the other projects keep running in the background (workflows don't pause, agents don't unsubscribe), whether they live in the same working directory or another one the user has added. v1 is single-window; multi-window is not in scope.
 
 ### Directory layout
 
@@ -77,13 +77,28 @@ Switchboard-managed state lives in a `.switchboard/` directory at the working di
             ├── registry.jsonl  # agent registry for this project (append-only)
             ├── sessions/       # M2+ — Codex session-link sidecar files (per agent)
             └── runs/           # M6+ — workflow-run checkpoints
+
+~/.config/switchboard/          # user-global config (illustrative Linux/XDG path; resolved via the `directories` crate —
+│                               #   on macOS this is ~/Library/Application Support/switchboard/)
+├── config.yaml                 # personal preferences (prompt library location, accounts)
+├── prompts/                    # optional personal prompt library (see §6)
+└── workspace.yaml              # app-managed: the working directories the user works across,
+                                #   each with a cached snapshot of its projects
 ```
+
+Switchboard is **single-instance**: launching it again focuses the running window rather than starting a second process, so there is exactly one writer of `workspace.yaml`. The per-project `instance.lock` (below) remains as defense-in-depth for the pathological case of two processes (e.g. a dev build alongside the bundled app); multi-window is out of scope for v1.
 
 **What's directory-scoped vs project-scoped:** workflows and local prompts are directory-scoped — defined once per repo, reusable across projects. Agents, runtime state, workflow runs, and harness session links are project-scoped — each project has its own. Rationale: workflow definitions and prompt libraries are about *how to do the work*; they belong to the repo. Agents and runtime state are about *the work in progress*; they belong to the project (the task).
 
 The directory-level `config.yaml`, `workflows/`, and `prompts/` are intended to be checked into git and shared. Everything else — `projects.jsonl`, the entire `projects/` tree (including per-project `config.yaml`, `registry.jsonl`, `journal.jsonl`, `sessions/`, `runs/`), and lock files — is local-machine runtime data and should be `.gitignore`d.
 
-State is kept directory-local (not user-global) so that opening the directory from a different machine surfaces "no projects yet" explicitly rather than silently dereferencing stale registry entries.
+### Working directories and the workspace
+
+Each working directory owns its projects: the source of truth for a directory's projects and their state is that directory's own `.switchboard/`, so a directory is self-contained and travels with its git repo. Switchboard tracks the set of working directories the user works across in a user-global `workspace.yaml` and presents the projects from all of them as a single flat list — the user opens Switchboard and sees every project across every directory at once, each labelled with its directory, without choosing a directory first.
+
+`workspace.yaml` records, per directory, its path and a cached snapshot of its projects (each the project's `{ id, name, created_at }`, so an unavailable directory's rows keep their identity and ordering). The cache lets the flat list render even when a directory is temporarily unavailable (unmounted, moved, or deleted): its projects appear marked unavailable with a remove action, rather than silently vanishing. The cache is refreshed from a directory's `.switchboard/` whenever that directory is read successfully **and** after any project create/rename in it — the directory's own state always wins, and the cache is consulted only when the directory can't be read. Projects are addressed by their globally-unique `ProjectId`; each carries its owning directory for routing (the agent spawn cwd) and labelling.
+
+Adding a directory appends it to `workspace.yaml`; removing one drops its entry and leaves the directory's on-disk `.switchboard/` untouched (re-adding the directory restores its projects — removing from the workspace is not deletion). Re-pointing a moved directory to a new path is a planned affordance.
 
 **Conversation source of truth — a split.** Switchboard keeps no full transcript store, but the harness session files do not hold *everything* either: they cannot faithfully represent the user's side of a multi-agent conversation — a fan-out replicates the user's prompt across every recipient's file, and an instantly-cancelled send is written to none. So the model is a split:
 
@@ -189,7 +204,7 @@ A general-purpose DAG scheduler (topological sort over arbitrary node dependenci
 
 ## 5. Workflows
 
-A **workflow** is a named, parameterized composition of the primitives in §4, defined as a YAML file in the project directory. Invoking a workflow fills in its parameters and runs it.
+A **workflow** is a named, parameterized composition of the primitives in §4, defined as a directory-scoped YAML file under `<directory>/.switchboard/workflows/` (shared across the projects in that working directory). Invoking a workflow fills in its parameters and runs it. Directory-scoped resources (workflows, local prompts) resolve relative to the owning directory of the project the workflow runs against — there is no single "current" directory in the flat workspace model.
 
 Workflow definition format (illustrative; the authoritative schema is `docs/workflow-spec.md`):
 
@@ -414,7 +429,7 @@ This section describes the conceptual user experience. The desktop form factor a
 
 ### Project list
 
-The user opens Switchboard and sees a list of their projects. They open one, or create a new one. A project is bound to a working directory.
+The user opens Switchboard and sees a single flat list of all their projects, drawn from every working directory they've added, each project labelled with its directory. They open one, create a new one in any of their directories, or add another working directory. Projects from a currently-unavailable directory still appear, marked unavailable, with the option to remove the directory from the list. A project is bound to a working directory; switching which project is displayed is a display change only — projects in other directories keep running in the background (see §3).
 
 ### Inside a project
 

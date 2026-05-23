@@ -37,7 +37,7 @@ use crate::error::{CoreError, Result};
 /// The parent-directory fsync has no portable Windows equivalent, so it's gated
 /// to unix; Windows durability is deferred.
 pub(crate) fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let line = serde_json::to_string(value).map_err(|source| CoreError::Serialize {
+    let mut line = serde_json::to_string(value).map_err(|source| CoreError::Serialize {
         path: path.to_owned(),
         source,
     })?;
@@ -51,7 +51,16 @@ pub(crate) fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         .append(true)
         .open(path)
         .map_err(|e| CoreError::io(path, e))?;
-    writeln!(file, "{line}").map_err(|e| CoreError::io(path, e))?;
+    // Write the record and its newline terminator in a single `write_all` of
+    // one buffer, rather than `writeln!` (which can issue the content and the
+    // `\n` as separate syscalls). One write narrows the window in which a crash
+    // mid-append could leave a torn, unterminated line. (It does not *eliminate*
+    // torn lines — a single large write can still partially fail — so the read
+    // path stays fail-loud on corruption; recovering a torn trailing line is a
+    // separate hardening of `read_jsonl`.)
+    line.push('\n');
+    file.write_all(line.as_bytes())
+        .map_err(|e| CoreError::io(path, e))?;
     file.flush().map_err(|e| CoreError::io(path, e))?;
     file.sync_data().map_err(|e| CoreError::io(path, e))?;
     #[cfg(unix)]

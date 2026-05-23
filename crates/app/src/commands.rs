@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use switchboard_core::{
     AgentId, AgentRecord, Directory, HarnessKind, Project, ProjectId, ProjectSummary,
 };
-use switchboard_dispatcher::{DispatchHandle, EventEmitter};
-use switchboard_harness::HarnessAdapter;
+use switchboard_dispatcher::{CancelOutcome, ConversationJournal, DispatchHandle, EventEmitter};
+use switchboard_harness::{CancelSource, HarnessAdapter};
 use uuid::Uuid;
 
 use crate::error::AppError;
@@ -725,6 +725,8 @@ pub async fn send_message_impl(
     let is_first_dispatch_after_attach = lock(&state.needs_session_meta).contains(&agent_id);
     let options = switchboard_harness::DispatchOptions {
         is_first_dispatch_after_attach,
+        // The dispatcher overwrites `cancel_token` with the turn's token.
+        ..Default::default()
     };
     let observing_emitter: Arc<dyn EventEmitter> =
         Arc::new(crate::emitter::SessionMetaObservingEmitter::new(
@@ -732,6 +734,16 @@ pub async fn send_message_impl(
             Arc::clone(&state.needs_session_meta),
             agent_id,
         ));
+    // Mint the `send_id` backend-side for M4.2 (single-recipient sends each
+    // get their own, trivially-grouped id). M4.7 moves minting to the frontend
+    // so a fan-out's recipients share one — an additive parameter change, not
+    // a schema change. The journal sink is bound to this project's
+    // `journal.jsonl` and the `send_id`.
+    let send_id = Uuid::now_v7();
+    let journal: Arc<dyn ConversationJournal> = Arc::new(crate::journal::ProjectJournal::new(
+        project.journal_path(),
+        send_id,
+    ));
     Ok(state
         .dispatcher
         .send_message(
@@ -741,8 +753,46 @@ pub async fn send_message_impl(
             adapter,
             observing_emitter,
             options,
+            journal,
         )
         .await?)
+}
+
+/// Cancel an agent's in-flight turn (user-initiated stop). Idempotent: a
+/// clean no-op (`NothingToCancel`) when the agent has no cancellable in-flight
+/// turn — idle, unknown, or already past its terminal event (e.g. during
+/// Codex's post-terminal enrichment window). The adapter performs the
+/// harness-specific kill; the dispatcher synthesizes the `Cancelled` terminal.
+pub fn cancel_turn_impl(state: &AppState, agent_id: AgentId) -> CancelOutcome {
+    state.dispatcher.cancel(agent_id, CancelSource::User)
+}
+
+/// Cancel every in-flight turn for `agents`, await their drains, then release
+/// `project_ids`' instance locks — strictly in that order, so a project lock
+/// is never released while one of its agents' turns is still live (which would
+/// reopen the double-drive race the lock guards). The reusable
+/// cancel-and-drain lifecycle primitive: standalone and unit-tested in M4.2;
+/// M4.6 wires it to remove-directory (passing one directory's agents +
+/// project), and the app-quit handler is deferred to M8.
+// Exercised by tests but not yet on a production call path — the
+// remove-working-directory lifecycle consumes it once that command exists.
+#[allow(dead_code)]
+pub async fn drain_agents_then_release_locks(
+    state: &AppState,
+    agents: &[AgentId],
+    project_ids: &[ProjectId],
+    source: CancelSource,
+) {
+    for &agent_id in agents {
+        state.dispatcher.cancel(agent_id, source);
+    }
+    for &agent_id in agents {
+        state.dispatcher.wait_until_idle(agent_id).await;
+    }
+    let mut locks = lock(&state.project_locks);
+    for project_id in project_ids {
+        locks.remove(project_id);
+    }
 }
 
 /// Reload an agent's prior conversation history from its harness session
@@ -1074,6 +1124,38 @@ mod tests {
             emitter.clone() as Arc<dyn EventEmitter>,
         );
         (tmp, state, emitter)
+    }
+
+    /// Like `fresh_state_with_mock` but every harness adapter runs the given
+    /// scenario — used by the cancellation tests, which need the
+    /// `AwaitCancellation` scenario (parks until the token fires) to keep a
+    /// turn deterministically in flight.
+    fn fresh_state_with_scenario(
+        scenario: switchboard_harness::MockScenario,
+    ) -> (TempDir, AppState, Arc<RecordingEmitter>) {
+        let tmp = TempDir::new().unwrap();
+        let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::with_scenario(scenario));
+        let emitter = Arc::new(RecordingEmitter::new());
+        let state = AppState::new(
+            Arc::clone(&mock),
+            Arc::clone(&mock),
+            Arc::clone(&mock),
+            Arc::clone(&mock),
+            emitter.clone() as Arc<dyn EventEmitter>,
+        );
+        (tmp, state, emitter)
+    }
+
+    /// Stand up a directory + project + Claude agent and return the agent and
+    /// its project id. Shared setup for the cancellation/lifecycle tests.
+    async fn project_with_agent(state: &AppState, tmp: &TempDir) -> (AgentRecord, ProjectId) {
+        init_directory_impl(state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_impl(state, "proj").unwrap();
+        set_active_project_impl(state, project.id).unwrap();
+        let agent = create_agent_impl(state, "assistant", HarnessKind::ClaudeCode).unwrap();
+        (agent, project.id)
     }
 
     #[tokio::test]
@@ -3717,5 +3799,115 @@ mod tests {
         // Both remain openable (intra-process re-open is a no-op).
         open_project_impl(&state, alpha.id).unwrap();
         open_project_impl(&state, beta.id).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_turn_cancels_in_flight_turn() {
+        let (tmp, state, _emitter) =
+            fresh_state_with_scenario(switchboard_harness::MockScenario::AwaitCancellation);
+        let (agent, _project_id) = project_with_agent(&state, &tmp).await;
+
+        let handle = send_message_impl(&state, agent.id, "long task")
+            .await
+            .unwrap();
+        assert_eq!(
+            state.dispatcher.agent_status(agent.id),
+            Some(switchboard_dispatcher::AgentStatus::InFlight)
+        );
+
+        let outcome = cancel_turn_impl(&state, agent.id);
+        assert_eq!(outcome, CancelOutcome::Requested);
+
+        handle.join.await.unwrap();
+        assert_eq!(
+            state.dispatcher.agent_status(agent.id),
+            Some(switchboard_dispatcher::AgentStatus::Idle)
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_turn_on_idle_agent_is_a_no_op() {
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        let (agent, _project_id) = project_with_agent(&state, &tmp).await;
+        // Never dispatched → nothing to cancel.
+        assert_eq!(
+            cancel_turn_impl(&state, agent.id),
+            CancelOutcome::NothingToCancel
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_helper_cancels_drains_then_releases_lock() {
+        let (tmp, state, emitter) =
+            fresh_state_with_scenario(switchboard_harness::MockScenario::AwaitCancellation);
+        let (agent, project_id) = project_with_agent(&state, &tmp).await;
+
+        let handle = send_message_impl(&state, agent.id, "long task")
+            .await
+            .unwrap();
+        assert_eq!(
+            state.dispatcher.agent_status(agent.id),
+            Some(switchboard_dispatcher::AgentStatus::InFlight)
+        );
+        assert!(
+            lock(&state.project_locks).contains_key(&project_id),
+            "project lock is held while the turn is live"
+        );
+
+        drain_agents_then_release_locks(&state, &[agent.id], &[project_id], CancelSource::Shutdown)
+            .await;
+
+        // The turn drained (Idle) and the lock was released — in that order.
+        assert_eq!(
+            state.dispatcher.agent_status(agent.id),
+            Some(switchboard_dispatcher::AgentStatus::Idle)
+        );
+        assert!(
+            !lock(&state.project_locks).contains_key(&project_id),
+            "project lock released only after the turn drained"
+        );
+
+        // A Cancelled{Shutdown} terminal was synthesized for the drained turn.
+        let channel = format!("agent:{}", agent.id);
+        let cancelled = emitter.snapshot().into_iter().any(|(name, v)| {
+            name == channel
+                && v["type"] == "turn_end"
+                && v["outcome"]["status"] == "cancelled"
+                && v["outcome"]["source"] == "shutdown"
+        });
+        assert!(cancelled, "drain helper cancels with source = shutdown");
+
+        handle.join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_message_writes_send_record_to_project_journal() {
+        // End-to-end through the app sink: a completed turn writes one `send`
+        // record (the user's side) and no `outcome` record (content is in the
+        // harness file) to the project's journal.jsonl.
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        let (agent, project_id) = project_with_agent(&state, &tmp).await;
+
+        let handle = send_message_impl(&state, agent.id, "journal me")
+            .await
+            .unwrap();
+        handle.join.await.unwrap();
+
+        let project = lock(&state.projects).get(&project_id).cloned().unwrap();
+        let records = switchboard_core::journal::read_records(&project.journal_path()).unwrap();
+        assert_eq!(
+            records.len(),
+            1,
+            "one send record, no outcome for a completed turn"
+        );
+        match &records[0] {
+            switchboard_core::JournalRecord::Send {
+                prompt, agent_id, ..
+            } => {
+                assert_eq!(prompt, "journal me");
+                assert_eq!(*agent_id, agent.id);
+            }
+            other => panic!("expected a send record, got {other:?}"),
+        }
     }
 }

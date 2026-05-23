@@ -45,7 +45,11 @@ export type Turn =
       agent_id: AgentId;
       started_at: string;
       ended_at?: string;
-      status: "streaming" | "complete" | "failed";
+      /// `"cancelled"` is a terminal state distinct from `"failed"`: the user
+      /// (or a workflow / shutdown) stopped the turn, it is not an error. Full
+      /// cancelled-turn presentation (partial output labelled cancelled) is a
+      /// later milestone; this status keeps the distinction in state today.
+      status: "streaming" | "complete" | "failed" | "cancelled";
       /// Ordered stream of turn content items — text chunks and tool calls
       /// interleaved in arrival order. Real Claude turns produce
       /// text → tool → text patterns; two separate arrays would lose that

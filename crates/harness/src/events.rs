@@ -267,12 +267,37 @@ impl From<AdapterEvent> for NormalizedEvent {
 /// for retry policy: `HarnessError` (model/API issue) vs `AdapterFailure`
 /// (subprocess crash, parse error, infrastructure) have different retry
 /// semantics.
+///
+/// `Cancelled` is distinct from `Failed` because cancellation is
+/// **intent-bearing, not an error** — the user (or a workflow, or shutdown)
+/// deliberately stopped the turn, and the frontend renders it differently
+/// from a harness failure. The cancelled terminal is **dispatcher-stamped,
+/// not adapter-emitted**: a binary cancellation token can't carry intent, and
+/// the dispatcher is the only layer that knows *why* it fired the token, so it
+/// synthesizes this variant with the `source` it recorded. `source` also lets
+/// M6 (workflow cancel) and M8 (shutdown) reuse the same mechanism.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "status", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum TurnOutcome {
     Completed,
     Failed { kind: FailureKind, message: String },
+    Cancelled { source: CancelSource },
+}
+
+/// Who initiated a cancellation. Carried on `TurnOutcome::Cancelled` so the
+/// UI (and persisted journal) can distinguish a user pressing stop from a
+/// workflow aborting a step or the app shutting down.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum CancelSource {
+    /// The user cancelled an in-flight turn (compose-bar / context-menu stop).
+    User,
+    /// A workflow aborted the turn (M6).
+    Workflow,
+    /// App shutdown or working-directory removal drained the turn.
+    Shutdown,
 }
 
 /// Discriminates the cause of a failed turn for retry-policy decisions.
@@ -415,6 +440,27 @@ mod tests {
         assert_eq!(value["outcome"]["message"], "bad model");
         let parsed: NormalizedEvent = serde_json::from_value(value).unwrap();
         assert_eq!(parsed, event);
+    }
+
+    #[test]
+    fn turn_end_cancelled_wire_shape() {
+        for (source, tag) in [
+            (CancelSource::User, "user"),
+            (CancelSource::Workflow, "workflow"),
+            (CancelSource::Shutdown, "shutdown"),
+        ] {
+            let event = NormalizedEvent::TurnEnd {
+                turn_id: fresh_turn_id(),
+                outcome: TurnOutcome::Cancelled { source },
+                ended_at: fresh_time(),
+                usage: None,
+            };
+            let value = serde_json::to_value(&event).unwrap();
+            assert_eq!(value["outcome"]["status"], "cancelled");
+            assert_eq!(value["outcome"]["source"], tag);
+            let parsed: NormalizedEvent = serde_json::from_value(value).unwrap();
+            assert_eq!(parsed, event);
+        }
     }
 
     #[test]

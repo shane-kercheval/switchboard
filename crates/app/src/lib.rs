@@ -6,6 +6,7 @@
 mod commands;
 mod emitter;
 mod error;
+mod journal;
 mod state;
 
 use std::sync::Arc;
@@ -18,11 +19,12 @@ use switchboard_harness::{
 use tauri::{Emitter, Manager, State};
 
 use crate::commands::{
-    DirectoryInfo, attach_agent_impl, check_antigravity_auth_impl, check_antigravity_binary_impl,
-    check_claude_binary_impl, check_codex_auth_impl, check_codex_binary_impl,
-    check_gemini_auth_impl, check_gemini_binary_impl, create_agent_impl, create_project_impl,
-    init_directory_impl, list_agents_impl, list_projects_impl, load_transcript_impl,
-    open_project_impl, parse_uuid, pick_directory_impl, send_message_impl, set_active_project_impl,
+    DirectoryInfo, attach_agent_impl, cancel_turn_impl, check_antigravity_auth_impl,
+    check_antigravity_binary_impl, check_claude_binary_impl, check_codex_auth_impl,
+    check_codex_binary_impl, check_gemini_auth_impl, check_gemini_binary_impl, create_agent_impl,
+    create_project_impl, init_directory_impl, list_agents_impl, list_projects_impl,
+    load_transcript_impl, open_project_impl, parse_uuid, pick_directory_impl, send_message_impl,
+    set_active_project_impl,
 };
 use crate::state::AppState;
 
@@ -164,6 +166,16 @@ async fn send_message(
 }
 
 #[tauri::command]
+async fn cancel_turn(state: State<'_, AppState>, agent_id: String) -> Result<(), String> {
+    let id = parse_uuid(&agent_id).map_err(|e| e.to_string())?;
+    // Idempotent stop — the dispatcher no-ops if there's nothing to cancel.
+    // The synthesized `Cancelled` terminal + return-to-idle flow back to the
+    // frontend over the per-agent event channel, so the command just acks.
+    cancel_turn_impl(state.inner(), id);
+    Ok(())
+}
+
+#[tauri::command]
 async fn load_transcript(
     state: State<'_, AppState>,
     agent_id: String,
@@ -279,6 +291,7 @@ pub fn run() {
             attach_agent,
             list_agents,
             send_message,
+            cancel_turn,
             load_transcript,
         ])
         .run(tauri::generate_context!())

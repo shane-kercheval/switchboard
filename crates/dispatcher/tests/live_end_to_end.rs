@@ -37,12 +37,19 @@
 use std::sync::Arc;
 
 use switchboard_core::{Directory, HarnessKind};
-use switchboard_dispatcher::{Dispatcher, EventEmitter, RecordingEmitter};
+use switchboard_dispatcher::{
+    ConversationJournal, Dispatcher, EventEmitter, NoopJournal, RecordingEmitter,
+};
 use switchboard_harness::{
     AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, DispatchOptions, GeminiAdapter,
     HarnessAdapter,
 };
 use tempfile::TempDir;
+
+/// Live tests assert on real-harness stream behavior, not journaling.
+fn noop_journal() -> Arc<dyn ConversationJournal> {
+    Arc::new(NoopJournal)
+}
 
 /// Extracts the `outcome.status` strings from every `turn_end` event the
 /// emitter saw on the given channel, in arrival order. Tests assert against
@@ -105,6 +112,7 @@ async fn live_claude_full_stack_two_consecutive_turns_succeed() {
             adapter.as_ref(),
             Arc::clone(&emitter) as Arc<dyn EventEmitter>,
             DispatchOptions::default(),
+            noop_journal(),
         )
         .await
         .expect("first send_message");
@@ -122,6 +130,7 @@ async fn live_claude_full_stack_two_consecutive_turns_succeed() {
             adapter.as_ref(),
             Arc::clone(&emitter) as Arc<dyn EventEmitter>,
             DispatchOptions::default(),
+            noop_journal(),
         )
         .await
         .expect("second send_message");
@@ -167,6 +176,7 @@ async fn live_claude_full_stack_emits_turn_start_then_content_then_turn_end() {
             adapter.as_ref(),
             Arc::clone(&emitter) as Arc<dyn EventEmitter>,
             DispatchOptions::default(),
+            noop_journal(),
         )
         .await
         .expect("send_message");
@@ -253,6 +263,7 @@ async fn live_claude_full_stack_paths_with_dot_components_resolve_correctly() {
                 adapter.as_ref(),
                 Arc::clone(&emitter) as Arc<dyn EventEmitter>,
                 DispatchOptions::default(),
+                noop_journal(),
             )
             .await
             .unwrap_or_else(|e| panic!("send_message #{} failed: {e:?}", i + 1));
@@ -314,6 +325,7 @@ async fn live_claude_full_stack_sees_files_in_cwd() {
             adapter.as_ref(),
             Arc::clone(&emitter) as Arc<dyn EventEmitter>,
             DispatchOptions::default(),
+            noop_journal(),
         )
         .await
         .expect("send_message");
@@ -368,6 +380,7 @@ async fn live_gemini_full_stack_emits_turn_start_then_content_then_turn_end() {
             adapter.as_ref(),
             Arc::clone(&emitter) as Arc<dyn EventEmitter>,
             DispatchOptions::default(),
+            noop_journal(),
         )
         .await
         .expect("send_message");
@@ -457,6 +470,7 @@ async fn live_codex_full_stack_emits_turn_start_then_content_then_turn_end() {
             adapter.as_ref(),
             Arc::clone(&emitter) as Arc<dyn EventEmitter>,
             DispatchOptions::default(),
+            noop_journal(),
         )
         .await
         .expect("send_message");
@@ -542,6 +556,7 @@ async fn live_antigravity_full_stack_two_turns_resume_through_dispatcher() {
             adapter.as_ref(),
             Arc::clone(&emitter) as Arc<dyn EventEmitter>,
             DispatchOptions::default(),
+            noop_journal(),
         )
         .await
         .expect("first send_message");
@@ -575,6 +590,7 @@ async fn live_antigravity_full_stack_two_turns_resume_through_dispatcher() {
             adapter.as_ref(),
             Arc::clone(&emitter) as Arc<dyn EventEmitter>,
             DispatchOptions::default(),
+            noop_journal(),
         )
         .await
         .expect("second send_message");

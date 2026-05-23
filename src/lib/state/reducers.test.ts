@@ -321,6 +321,23 @@ describe("transcriptReducer", () => {
       expect(turn.status).toBe("complete");
       expect(turn.error).toBeUndefined();
     });
+
+    it("transitions to cancelled (distinct from failed, no error fields)", () => {
+      let turns = reduce([], turnStart(TURN_1));
+      const ev: NormalizedEvent = {
+        type: "turn_end",
+        turn_id: TURN_1,
+        outcome: { status: "cancelled", source: "user" },
+        ended_at: "2026-05-16T00:00:05Z",
+      };
+      turns = reduce(turns, ev);
+      const turn = turns[0];
+      if (turn?.role !== "agent") throw new Error("unreachable");
+      expect(turn.status).toBe("cancelled");
+      expect(turn.ended_at).toBe("2026-05-16T00:00:05Z");
+      expect(turn.error).toBeUndefined();
+      expect(turn.error_kind).toBeUndefined();
+    });
   });
 
   describe("heartbeat_timeout", () => {

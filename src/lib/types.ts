@@ -12,10 +12,13 @@ export type FailureKind = "harness_error" | "adapter_failure" | "auth_failure";
 // `assistant.error == "authentication_failed"` and Codex's
 // `turn.failed.error` containing `"401 Unauthorized"`.
 
+// Who initiated a cancellation. Carried on the `cancelled` outcome.
+export type CancelSource = "user" | "workflow" | "shutdown";
+
 export type TurnOutcome =
   | { status: "completed" }
-  | { status: "failed"; kind: FailureKind; message: string };
-// Future: | { status: "cancelled"; source: CancelSource } — added when per-turn cancel lands.
+  | { status: "failed"; kind: FailureKind; message: string }
+  | { status: "cancelled"; source: CancelSource };
 
 // ContentChunk.kind discriminates rendering. `thinking` is reserved in the
 // wire format but not currently emitted — future reasoning UI can land

@@ -52,6 +52,14 @@ impl Project {
         &self.config.name
     }
 
+    /// Path to this project's conversation journal (`journal.jsonl`) — the
+    /// Switchboard-owned record of user sends + non-completed-turn outcomes
+    /// (see [`crate::journal`]). Runtime data; `.gitignore`d like the rest of
+    /// `projects/`.
+    pub fn journal_path(&self) -> PathBuf {
+        self.root.join("journal.jsonl")
+    }
+
     /// Append a new agent to this project's registry. Validates the name (regex +
     /// per-project uniqueness with hyphen↔underscore + case normalization), generates
     /// a UUID v7 `AgentId`, and (for Claude Code) pre-generates a UUID v7 `session_id`

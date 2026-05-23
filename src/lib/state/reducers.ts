@@ -170,6 +170,14 @@ export function transcriptReducer(
           usage: input.usage ?? undefined,
         });
       }
+      if (input.outcome.status === "cancelled") {
+        return updateTurn(turns, input.turn_id, {
+          ...existing,
+          status: "cancelled",
+          ended_at: input.ended_at,
+          usage: input.usage ?? undefined,
+        });
+      }
       return updateTurn(turns, input.turn_id, {
         ...existing,
         status: "failed",
@@ -283,7 +291,10 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
       // on the per-agent channel (Codex). `AgentIdle` is the signal for
       // "dispatcher will accept a new send." This is the load-bearing
       // distinction that makes the compose-bar gate correct for Codex.
-      if (input.outcome.status === "completed") {
+      // Completed and cancelled are not errors — leave runtime untouched
+      // (AgentIdle clears in_flight_turn_id). Only a real failure surfaces
+      // last_error.
+      if (input.outcome.status === "completed" || input.outcome.status === "cancelled") {
         return runtime;
       }
       return {

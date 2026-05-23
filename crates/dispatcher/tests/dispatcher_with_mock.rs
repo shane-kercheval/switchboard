@@ -9,15 +9,87 @@
 //! surface.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
-use switchboard_core::{AgentRecord, HarnessKind};
+use switchboard_core::{AgentId, AgentRecord, HarnessKind};
 use switchboard_dispatcher::{
-    AgentStatus, Dispatcher, DispatcherError, EventEmitter, RecordingEmitter,
+    AgentStatus, CancelOutcome, ConversationJournal, Dispatcher, DispatcherError, EventEmitter,
+    JournalError, NoopJournal, RecordingEmitter,
 };
-use switchboard_harness::{DispatchOptions, MockHarnessAdapter, MockScenario, TurnId};
+use switchboard_harness::{
+    CancelSource, DispatchOptions, MockHarnessAdapter, MockScenario, TurnId, TurnOutcome,
+};
 use uuid::Uuid;
+
+/// These tests don't assert on journaling — the journal is exercised directly
+/// in the journal-specific tests below and in core. A no-op keeps the
+/// `send_message` call sites focused on dispatch/emit behavior.
+fn noop_journal() -> Arc<dyn ConversationJournal> {
+    Arc::new(NoopJournal)
+}
+
+/// Captures journal calls so tests can assert the send/outcome partition
+/// (send at turn-start for every turn; outcome only for non-completed turns).
+#[derive(Default)]
+struct RecordingJournal {
+    sends: Mutex<Vec<(TurnId, String)>>,
+    outcomes: Mutex<Vec<(TurnId, TurnOutcome)>>,
+}
+
+impl ConversationJournal for RecordingJournal {
+    fn record_send(
+        &self,
+        turn_id: TurnId,
+        _agent_id: AgentId,
+        prompt: &str,
+        _at: DateTime<Utc>,
+    ) -> Result<(), JournalError> {
+        self.sends
+            .lock()
+            .unwrap()
+            .push((turn_id, prompt.to_owned()));
+        Ok(())
+    }
+    fn record_outcome(
+        &self,
+        turn_id: TurnId,
+        _agent_id: AgentId,
+        outcome: &TurnOutcome,
+        _started_at: DateTime<Utc>,
+        _ended_at: DateTime<Utc>,
+    ) {
+        self.outcomes
+            .lock()
+            .unwrap()
+            .push((turn_id, outcome.clone()));
+    }
+}
+
+/// A journal whose fail-closed `record_send` always errors — used to assert
+/// the dispatcher refuses to start a turn it can't persist.
+struct FailingJournal;
+
+impl ConversationJournal for FailingJournal {
+    fn record_send(
+        &self,
+        _turn_id: TurnId,
+        _agent_id: AgentId,
+        _prompt: &str,
+        _at: DateTime<Utc>,
+    ) -> Result<(), JournalError> {
+        Err(JournalError("disk on fire".into()))
+    }
+    fn record_outcome(
+        &self,
+        _: TurnId,
+        _: AgentId,
+        _: &TurnOutcome,
+        _: DateTime<Utc>,
+        _: DateTime<Utc>,
+    ) {
+    }
+}
 
 fn agent_record() -> AgentRecord {
     AgentRecord {
@@ -63,6 +135,7 @@ async fn send_message_idle_then_inflight_then_idle() {
             &adapter,
             as_emitter(&emitter),
             DispatchOptions::default(),
+            noop_journal(),
         )
         .await
         .unwrap();
@@ -97,6 +170,7 @@ async fn send_message_emits_turn_start_before_content_chunks() {
             &adapter,
             as_emitter(&emitter),
             DispatchOptions::default(),
+            noop_journal(),
         )
         .await
         .unwrap();
@@ -150,6 +224,7 @@ async fn concurrent_send_to_same_agent_returns_busy() {
             &adapter,
             as_emitter(&emitter),
             DispatchOptions::default(),
+            noop_journal(),
         )
         .await
         .unwrap();
@@ -163,6 +238,7 @@ async fn concurrent_send_to_same_agent_returns_busy() {
             &adapter,
             as_emitter(&emitter),
             DispatchOptions::default(),
+            noop_journal(),
         )
         .await;
     assert!(matches!(result, Err(DispatcherError::Busy)));
@@ -178,6 +254,7 @@ async fn concurrent_send_to_same_agent_returns_busy() {
             &adapter,
             as_emitter(&emitter),
             DispatchOptions::default(),
+            noop_journal(),
         )
         .await
         .unwrap();
@@ -200,6 +277,7 @@ async fn concurrent_send_to_different_agents_both_succeed() {
             &adapter,
             as_emitter(&emitter),
             DispatchOptions::default(),
+            noop_journal(),
         )
         .await
         .unwrap();
@@ -211,6 +289,7 @@ async fn concurrent_send_to_different_agents_both_succeed() {
             &adapter,
             as_emitter(&emitter),
             DispatchOptions::default(),
+            noop_journal(),
         )
         .await
         .unwrap();
@@ -251,6 +330,7 @@ async fn panic_in_producer_still_restores_agent_to_idle() {
             &adapter,
             as_emitter(&emitter),
             DispatchOptions::default(),
+            noop_journal(),
         )
         .await
         .unwrap();
@@ -304,6 +384,7 @@ async fn truncated_stream_without_turn_end_returns_to_idle() {
             &adapter,
             as_emitter(&emitter),
             DispatchOptions::default(),
+            noop_journal(),
         )
         .await
         .unwrap();
@@ -341,6 +422,7 @@ async fn dispatch_failure_emits_no_turn_start_and_leaves_agent_idle() {
             &adapter,
             as_emitter(&emitter),
             DispatchOptions::default(),
+            noop_journal(),
         )
         .await;
 
@@ -377,6 +459,7 @@ async fn dispatch_failure_emits_no_turn_start_and_leaves_agent_idle() {
             &healthy_adapter,
             as_emitter(&emitter),
             DispatchOptions::default(),
+            noop_journal(),
         )
         .await
         .unwrap();
@@ -413,6 +496,7 @@ async fn agent_idle_is_last_event_and_unblocks_next_send() {
             &adapter,
             as_emitter(&emitter),
             DispatchOptions::default(),
+            noop_journal(),
         )
         .await
         .unwrap();
@@ -451,6 +535,7 @@ async fn agent_idle_is_last_event_and_unblocks_next_send() {
             &adapter,
             as_emitter(&emitter),
             DispatchOptions::default(),
+            noop_journal(),
         )
         .await
         .expect("second send must not return Busy after AgentIdle");
@@ -494,6 +579,7 @@ async fn agent_idle_is_last_after_codex_post_terminal_enrichment_sequence() {
             &adapter,
             as_emitter(&emitter),
             DispatchOptions::default(),
+            noop_journal(),
         )
         .await
         .unwrap();
@@ -529,5 +615,398 @@ async fn agent_idle_is_last_after_codex_post_terminal_enrichment_sequence() {
         last_idx,
         type_sequence.len() - 1,
         "AgentIdle must be strictly the final event — no trailing events allowed"
+    );
+}
+
+#[tokio::test]
+async fn cancel_in_flight_synthesizes_cancelled_then_idle_and_unblocks_next_send() {
+    // The adapter (mock) cooperates: it parks until the token fires, then
+    // ends its stream WITHOUT a terminal event (mirroring a real adapter's
+    // cancel path). The dispatcher must synthesize TurnEnd { Cancelled }.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let adapter = MockHarnessAdapter::with_scenario(MockScenario::AwaitCancellation);
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+
+    let handle = dispatcher
+        .send_message(
+            &agent,
+            Path::new("/tmp/project"),
+            "long task",
+            &adapter,
+            as_emitter(&emitter),
+            DispatchOptions::default(),
+            noop_journal(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        dispatcher.cancel(agent.id, CancelSource::User),
+        CancelOutcome::Requested,
+        "cancelling an in-flight turn requests cancellation"
+    );
+    handle.join.await.unwrap();
+
+    let events = emitter.snapshot();
+    let types: Vec<&str> = events.iter().map(|(_, v)| event_type(v)).collect();
+    assert_eq!(
+        types,
+        vec!["turn_start", "content_chunk", "turn_end", "agent_idle"],
+        "dispatcher synthesizes the cancelled terminal then AgentIdle"
+    );
+    let terminal = &events[2].1;
+    assert_eq!(terminal["outcome"]["status"], "cancelled");
+    assert_eq!(
+        terminal["outcome"]["source"], "user",
+        "the dispatcher stamps the source it was cancelled with"
+    );
+    assert_eq!(dispatcher.agent_status(agent.id), Some(AgentStatus::Idle));
+
+    // Re-promptable immediately: a fresh send is not refused as Busy.
+    let streaming = MockHarnessAdapter::new();
+    let next = dispatcher
+        .send_message(
+            &agent,
+            Path::new("/tmp/project"),
+            "next",
+            &streaming,
+            as_emitter(&emitter),
+            DispatchOptions::default(),
+            noop_journal(),
+        )
+        .await
+        .expect("agent is re-promptable after cancellation");
+    next.join.await.unwrap();
+    assert_eq!(dispatcher.agent_status(agent.id), Some(AgentStatus::Idle));
+}
+
+#[tokio::test]
+async fn cancel_when_not_in_flight_is_a_typed_no_op() {
+    let dispatcher = Arc::new(Dispatcher::new());
+    let agent = agent_record();
+    // Never dispatched.
+    assert_eq!(
+        dispatcher.cancel(agent.id, CancelSource::User),
+        CancelOutcome::NothingToCancel
+    );
+}
+
+#[tokio::test]
+async fn cancel_after_terminal_is_a_no_op_and_emits_no_extra_cancelled() {
+    // A completed turn clears its token on the terminal event, so a cancel
+    // arriving afterwards (the post-terminal enrichment window, or just late)
+    // is a typed no-op — no synthesized Cancelled, the turn stays completed.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let adapter = MockHarnessAdapter::new(); // Streaming → completes
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+
+    let handle = dispatcher
+        .send_message(
+            &agent,
+            Path::new("/tmp/project"),
+            "hi",
+            &adapter,
+            as_emitter(&emitter),
+            DispatchOptions::default(),
+            noop_journal(),
+        )
+        .await
+        .unwrap();
+    handle.join.await.unwrap();
+
+    assert_eq!(
+        dispatcher.cancel(agent.id, CancelSource::User),
+        CancelOutcome::NothingToCancel,
+        "token was cleared on the completed terminal → nothing to cancel"
+    );
+
+    // Exactly one terminal, and it is `completed` — no spurious cancelled.
+    let terminal_statuses: Vec<String> = emitter
+        .snapshot()
+        .into_iter()
+        .filter(|(_, v)| event_type(v) == "turn_end")
+        .map(|(_, v)| v["outcome"]["status"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(terminal_statuses, vec!["completed".to_owned()]);
+}
+
+#[tokio::test]
+async fn completed_turn_journals_send_but_no_outcome() {
+    let dispatcher = Arc::new(Dispatcher::new());
+    let adapter = MockHarnessAdapter::new(); // Streaming → completes
+    let emitter = Arc::new(RecordingEmitter::new());
+    let journal = Arc::new(RecordingJournal::default());
+    let agent = agent_record();
+
+    let handle = dispatcher
+        .send_message(
+            &agent,
+            Path::new("/tmp/project"),
+            "hello world",
+            &adapter,
+            as_emitter(&emitter),
+            DispatchOptions::default(),
+            Arc::clone(&journal) as Arc<dyn ConversationJournal>,
+        )
+        .await
+        .unwrap();
+    handle.join.await.unwrap();
+
+    let sends = journal.sends.lock().unwrap();
+    assert_eq!(sends.len(), 1, "the send is journaled at turn-start");
+    assert_eq!(sends[0].0, handle.turn_id);
+    assert_eq!(sends[0].1, "hello world");
+    assert!(
+        journal.outcomes.lock().unwrap().is_empty(),
+        "a completed turn writes no outcome record — its content lives in the harness file"
+    );
+}
+
+#[tokio::test]
+async fn cancelled_turn_journals_send_and_a_cancelled_outcome() {
+    let dispatcher = Arc::new(Dispatcher::new());
+    let adapter = MockHarnessAdapter::with_scenario(MockScenario::AwaitCancellation);
+    let emitter = Arc::new(RecordingEmitter::new());
+    let journal = Arc::new(RecordingJournal::default());
+    let agent = agent_record();
+
+    let handle = dispatcher
+        .send_message(
+            &agent,
+            Path::new("/tmp/project"),
+            "long task",
+            &adapter,
+            as_emitter(&emitter),
+            DispatchOptions::default(),
+            Arc::clone(&journal) as Arc<dyn ConversationJournal>,
+        )
+        .await
+        .unwrap();
+    dispatcher.cancel(agent.id, CancelSource::Workflow);
+    handle.join.await.unwrap();
+
+    assert_eq!(journal.sends.lock().unwrap().len(), 1);
+    let outcomes = journal.outcomes.lock().unwrap();
+    assert_eq!(
+        outcomes.len(),
+        1,
+        "a cancelled turn writes one outcome record"
+    );
+    assert_eq!(outcomes[0].0, handle.turn_id);
+    assert_eq!(
+        outcomes[0].1,
+        TurnOutcome::Cancelled {
+            source: CancelSource::Workflow
+        },
+        "the journaled outcome carries the stamped source"
+    );
+}
+
+#[tokio::test]
+async fn wait_until_idle_returns_after_cancellation_drains() {
+    let dispatcher = Arc::new(Dispatcher::new());
+    let adapter = MockHarnessAdapter::with_scenario(MockScenario::AwaitCancellation);
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+
+    let handle = dispatcher
+        .send_message(
+            &agent,
+            Path::new("/tmp/project"),
+            "long task",
+            &adapter,
+            as_emitter(&emitter),
+            DispatchOptions::default(),
+            noop_journal(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        dispatcher.agent_status(agent.id),
+        Some(AgentStatus::InFlight)
+    );
+
+    dispatcher.cancel(agent.id, CancelSource::Shutdown);
+    // Without joining the handle directly, wait for the drain to complete.
+    dispatcher.wait_until_idle(agent.id).await;
+    assert_eq!(dispatcher.agent_status(agent.id), Some(AgentStatus::Idle));
+    handle.join.await.unwrap();
+}
+
+#[tokio::test]
+async fn wait_until_idle_returns_immediately_when_idle_or_unknown() {
+    let dispatcher = Arc::new(Dispatcher::new());
+    let agent = agent_record();
+    // Unknown agent — returns immediately (no panic, no hang).
+    dispatcher.wait_until_idle(agent.id).await;
+}
+
+#[tokio::test]
+async fn failed_turn_journals_send_and_a_failed_outcome() {
+    let dispatcher = Arc::new(Dispatcher::new());
+    let adapter = MockHarnessAdapter::with_scenario(MockScenario::Fails);
+    let emitter = Arc::new(RecordingEmitter::new());
+    let journal = Arc::new(RecordingJournal::default());
+    let agent = agent_record();
+
+    let handle = dispatcher
+        .send_message(
+            &agent,
+            Path::new("/tmp/project"),
+            "will fail",
+            &adapter,
+            as_emitter(&emitter),
+            DispatchOptions::default(),
+            Arc::clone(&journal) as Arc<dyn ConversationJournal>,
+        )
+        .await
+        .unwrap();
+    handle.join.await.unwrap();
+
+    assert_eq!(journal.sends.lock().unwrap().len(), 1);
+    let outcomes = journal.outcomes.lock().unwrap();
+    assert_eq!(outcomes.len(), 1, "a failed turn writes one outcome record");
+    assert_eq!(outcomes[0].0, handle.turn_id);
+    assert!(
+        matches!(outcomes[0].1, TurnOutcome::Failed { .. }),
+        "the journaled outcome is the failure"
+    );
+    // Token cleared on the failed terminal → cancel is now a no-op.
+    assert_eq!(
+        dispatcher.cancel(agent.id, CancelSource::User),
+        CancelOutcome::NothingToCancel
+    );
+}
+
+#[tokio::test]
+async fn cancellation_latches_and_drops_a_late_real_terminal() {
+    // The adapter emits a real `Completed` terminal *after* cancel fires
+    // (a buffered result that lost the race). The dispatcher must drop it and
+    // the synthesized `Cancelled` must win — the user pressed stop, so the
+    // turn is cancelled, not completed.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let adapter = MockHarnessAdapter::with_scenario(MockScenario::TerminalAfterCancel);
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+
+    let handle = dispatcher
+        .send_message(
+            &agent,
+            Path::new("/tmp/project"),
+            "racing turn",
+            &adapter,
+            as_emitter(&emitter),
+            DispatchOptions::default(),
+            noop_journal(),
+        )
+        .await
+        .unwrap();
+    dispatcher.cancel(agent.id, CancelSource::User);
+    handle.join.await.unwrap();
+
+    let snapshot = emitter.snapshot();
+    let terminal_statuses: Vec<String> = snapshot
+        .iter()
+        .filter(|(_, v)| event_type(v) == "turn_end")
+        .map(|(_, v)| v["outcome"]["status"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        terminal_statuses,
+        vec!["cancelled".to_owned()],
+        "exactly one terminal, and the late real Completed was dropped in favor of Cancelled"
+    );
+
+    // Partial output is preserved past the cancel (system-design §7): the
+    // content the agent produced *after* the token fired but before the kill
+    // is still emitted — only the late terminal is suppressed, not content.
+    let chunks: Vec<String> = snapshot
+        .iter()
+        .filter(|(_, v)| event_type(v) == "content_chunk")
+        .map(|(_, v)| v["text"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        chunks,
+        vec!["before-cancel".to_owned(), "after-cancel".to_owned()]
+    );
+}
+
+#[tokio::test]
+async fn send_record_failure_aborts_the_turn_without_starting_it() {
+    // Fail-closed precondition: if the user's send can't be journaled, the turn
+    // must not start — no events, no subprocess, agent left idle.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let adapter = MockHarnessAdapter::new();
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+
+    let result = dispatcher
+        .send_message(
+            &agent,
+            Path::new("/tmp/project"),
+            "unpersistable",
+            &adapter,
+            as_emitter(&emitter),
+            DispatchOptions::default(),
+            Arc::new(FailingJournal),
+        )
+        .await;
+
+    assert!(matches!(result, Err(DispatcherError::Journal(_))));
+    assert!(
+        emitter.is_empty(),
+        "no TurnStart (or any event) is emitted when the send can't be journaled"
+    );
+    assert_eq!(
+        dispatcher.agent_status(agent.id),
+        Some(AgentStatus::Idle),
+        "guard dropped on the early return → agent back to Idle"
+    );
+}
+
+#[tokio::test]
+async fn dispatch_failure_after_send_journals_a_failed_outcome() {
+    // The send is journaled before dispatch; if dispatch then fails, a Failed
+    // marker is recorded so the turn isn't an orphan user message on restart.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let adapter = MockHarnessAdapter::with_scenario(MockScenario::DispatchFails);
+    let emitter = Arc::new(RecordingEmitter::new());
+    let journal = Arc::new(RecordingJournal::default());
+    let agent = agent_record();
+
+    let result = dispatcher
+        .send_message(
+            &agent,
+            Path::new("/tmp/project"),
+            "send then fail to start",
+            &adapter,
+            as_emitter(&emitter),
+            DispatchOptions::default(),
+            Arc::clone(&journal) as Arc<dyn ConversationJournal>,
+        )
+        .await;
+
+    assert!(matches!(result, Err(DispatcherError::Dispatch(_))));
+    assert!(
+        emitter.is_empty(),
+        "no TurnStart on a pre-stream dispatch failure"
+    );
+    assert_eq!(
+        journal.sends.lock().unwrap().len(),
+        1,
+        "the send was journaled before dispatch"
+    );
+    let outcomes = journal.outcomes.lock().unwrap();
+    assert_eq!(
+        outcomes.len(),
+        1,
+        "the dispatch failure is journaled as a Failed marker"
+    );
+    assert!(matches!(outcomes[0].1, TurnOutcome::Failed { .. }));
+    assert_eq!(
+        dispatcher.agent_status(agent.id),
+        Some(AgentStatus::Idle),
+        "guard dropped → agent back to Idle"
     );
 }

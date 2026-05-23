@@ -986,6 +986,7 @@ async fn attach_flow_first_dispatch_forces_session_meta_despite_sidecar_present(
 
     let options = DispatchOptions {
         is_first_dispatch_after_attach: true,
+        ..Default::default()
     };
     let events = dispatch_with_home_and_options(
         &agent,

@@ -606,3 +606,19 @@ These remain unverified and should be confirmed during M3.2:
 - `interleaved-collision.session.jsonl` — two-session interleave demonstrating the prefix-collision hazard.
 
 API budget used: ~7 small turns + 2 zero-API probes (workspace-trust rejection, empty-prompt rejection). Roughly 1% of the 1,000-req/day free OAuth tier. Comfortable headroom remains for M3.2 implementation probes.
+
+## Cancellation / SIGTERM (M4.3) — wired and verified end-to-end
+
+M4.3 wires token-driven cancellation: the adapter's producer `select!`s the
+stdout read against the turn's `CancellationToken`; on cancel it kills the
+subprocess **process group** via `terminate_then_kill` (SIGTERM → ~2s grace →
+SIGKILL — `crates/harness/src/subprocess.rs`) and ends the stream without a
+terminal event (the dispatcher synthesizes `TurnEnd { Cancelled }`).
+
+This composes with the already-confirmed SIGTERM behaviour above
+("process-group kill is clean; exit code is 0"): a process-group SIGTERM tears
+`gemini` down within milliseconds, so the grace window is rarely reached.
+
+**Verified end-to-end (2026-05-23):** `live_gemini_cancel_terminates_and_synthesizes_cancelled`
+(run via `make test-live` / `make test-live-gemini`) passes — firing the token
+mid-turn produces a `Cancelled` outcome with the agent returning to idle.

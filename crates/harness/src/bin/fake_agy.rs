@@ -28,7 +28,11 @@
 //!   "warning_not_found": "<stale-uuid>", // optional: emit the fork "conversation not found" signal
 //!   "records": [ {"json": "<raw transcript.jsonl line>", "delay_ms": 0} ],
 //!   "stdout": [ {"text": "<answer line>", "delay_ms": 0} ],
-//!   "exit_code": 0
+//!   "exit_code": 0,
+//!   "hang": false                    // true → after writing records/stdout, sleep
+//!                                    //   indefinitely instead of exiting, so a
+//!                                    //   cancellation test can fire the token while
+//!                                    //   the adapter is still polling. Stays killable.
 //! }
 //! ```
 //!
@@ -59,6 +63,11 @@ struct Script {
     stdout: Vec<Drip>,
     #[serde(default)]
     exit_code: i32,
+    /// When true, park indefinitely after writing records/stdout (never exit
+    /// on our own), so a cancellation test can fire the token mid-turn. Stays
+    /// killable (a sleeping process dies on SIGTERM/SIGKILL).
+    #[serde(default)]
+    hang: bool,
 }
 
 #[derive(Deserialize)]
@@ -158,6 +167,16 @@ fn main() {
         }
         let _ = writeln!(out, "{}", line.text);
         let _ = out.flush();
+    }
+
+    if script.hang {
+        // Records + stdout are written (so the adapter correlates the UUID and
+        // tails the transcript); now stay alive so the turn is still in flight
+        // when the cancellation test fires the token. Only the adapter's
+        // cancel kill ends us.
+        loop {
+            std::thread::park();
+        }
     }
 
     std::process::exit(script.exit_code);

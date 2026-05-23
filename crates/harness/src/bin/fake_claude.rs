@@ -16,6 +16,11 @@
 //!   `// pgid_to:<path>` — write the child's own process-group id (decimal
 //!     ASCII, single line) to the given path before streaming. Tests use
 //!     this to assert the adapter put us in our own process group.
+//!   `// hang` — flush any lines emitted so far, then sleep indefinitely
+//!     (never exit on our own). Leaves the adapter's stdout read parked, so a
+//!     cancellation test can fire the token mid-stream (or, if `// hang` is the
+//!     first directive, pre-first-output) and assert the adapter kills us. The
+//!     process stays killable (a sleeping thread dies on SIGTERM/SIGKILL).
 //!
 //! A fixed "`fake_claude`: done" line is always written to stderr so tests can
 //! verify the stderr drain path handles output without deadlocking.
@@ -83,6 +88,16 @@ fn main() {
                 let _ = path;
             }
             continue;
+        }
+
+        if line.trim() == "// hang" {
+            // Park indefinitely with stdout still open, so the adapter's read
+            // stays blocked. Only an external signal (the adapter's cancel
+            // kill) ends us. Loop so we never return on our own.
+            out.flush().ok();
+            loop {
+                std::thread::park();
+            }
         }
 
         if line.trim().is_empty() {

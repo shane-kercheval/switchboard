@@ -930,6 +930,19 @@ async fn cancellation_latches_and_drops_a_late_real_terminal() {
         chunks,
         vec!["before-cancel".to_owned(), "after-cancel".to_owned()]
     );
+
+    // Agent-scoped enrichment (rate-limit / session-meta) arriving after the
+    // cancel but before stream-close reflects the agent's *real* state, so it
+    // is forwarded as-is — the latch suppresses only the terminal, not content
+    // or metadata. Contract: the dispatcher owns exactly the synthesized
+    // `Cancelled` terminal; everything the adapter emitted before the stream
+    // closed flows through.
+    assert!(
+        snapshot
+            .iter()
+            .any(|(_, v)| event_type(v) == "rate_limit_event"),
+        "post-cancel agent-scoped enrichment must still be forwarded"
+    );
 }
 
 #[tokio::test]

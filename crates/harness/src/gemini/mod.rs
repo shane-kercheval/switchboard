@@ -61,6 +61,7 @@ use chrono::Utc;
 use switchboard_core::{AgentId, AgentRecord};
 use tokio::io::AsyncBufReadExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_util::sync::CancellationToken;
 
 use crate::adapter::{DispatchError, EventStream, HarnessAdapter};
 use crate::events::{AdapterEvent, FailureKind, TurnId, TurnOutcome};
@@ -143,7 +144,7 @@ impl HarnessAdapter for GeminiAdapter {
         cwd: &Path,
         prompt: &str,
         turn_id: TurnId,
-        _options: crate::DispatchOptions,
+        options: crate::DispatchOptions,
     ) -> Result<EventStream, DispatchError> {
         if prompt.trim().is_empty() {
             return Err(DispatchError::InvalidPrompt(
@@ -197,6 +198,7 @@ impl HarnessAdapter for GeminiAdapter {
             harness_version,
             mcp_servers,
             skills_list,
+            options.cancel_token,
         ));
 
         Ok(Box::pin(UnboundedReceiverStream::new(rx)))
@@ -266,6 +268,7 @@ async fn run_producer(
     harness_version: String,
     mcp_servers: Vec<crate::events::McpServerStatus>,
     skills_list: Vec<String>,
+    cancel_token: CancellationToken,
 ) {
     let stderr_tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::with_capacity(
         crate::subprocess::STDERR_TAIL_CAPACITY,
@@ -280,6 +283,11 @@ async fn run_producer(
 
     let mut terminal_seen = false;
     let mut terminal_was_completed = false;
+    // Set when cancellation fires: kill the group and end the stream with NO
+    // terminal event (the dispatcher synthesizes `Cancelled`). Distinct from
+    // `force_kill_child`, which is an error path that still emits a `Failed`
+    // terminal.
+    let mut cancelled = false;
     let mut state = GeminiParserState::default();
     // Set on any error path that ends the producer loop with the subprocess
     // still potentially running. Mirrors Codex's pattern; load-bearing for
@@ -294,7 +302,16 @@ async fn run_producer(
     let mut lines = tokio::io::BufReader::new(stdout).lines();
 
     loop {
-        match lines.next_line().await {
+        // `select!` over the read AND the cancellation token so a parked read
+        // (Gemini buffering its whole response) still notices a cancel.
+        let line = tokio::select! {
+            line = lines.next_line() => line,
+            () = cancel_token.cancelled() => {
+                cancelled = true;
+                break;
+            }
+        };
+        match line {
             Ok(Some(line)) => {
                 let outcome = parse_line(&line, turn_id, agent_id, &mut state);
                 let events = match outcome {
@@ -372,8 +389,17 @@ async fn run_producer(
         }
     }
 
+    if cancelled {
+        // Cancellation path: kill the group and end the stream with NO
+        // terminal event (the dispatcher synthesizes `Cancelled`). Kill before
+        // awaiting the stderr drain — a parked subprocess holds stderr open.
+        crate::subprocess::terminate_then_kill(&mut child).await;
+        let _ = stderr_task.await;
+        return;
+    }
+
     if force_kill_child {
-        crate::subprocess::kill_subprocess_group(&mut child).await;
+        crate::subprocess::terminate_then_kill(&mut child).await;
     }
 
     let _ = stderr_task.await;

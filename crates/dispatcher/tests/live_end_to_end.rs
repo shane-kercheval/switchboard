@@ -38,11 +38,11 @@ use std::sync::Arc;
 
 use switchboard_core::{Directory, HarnessKind};
 use switchboard_dispatcher::{
-    ConversationJournal, Dispatcher, EventEmitter, NoopJournal, RecordingEmitter,
+    AgentStatus, ConversationJournal, Dispatcher, EventEmitter, NoopJournal, RecordingEmitter,
 };
 use switchboard_harness::{
-    AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, DispatchOptions, GeminiAdapter,
-    HarnessAdapter,
+    AntigravityAdapter, CancelSource, ClaudeCodeAdapter, CodexAdapter, DispatchOptions,
+    GeminiAdapter, HarnessAdapter,
 };
 use tempfile::TempDir;
 
@@ -602,4 +602,120 @@ async fn live_antigravity_full_stack_two_turns_resume_through_dispatcher() {
         vec!["completed".to_owned(), "completed".to_owned()],
         "both turns must complete (turn 2 resumes via the captured UUID); got: {statuses:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Live cancellation tests (M4.3). Each dispatches a turn through the real CLI,
+// fires the cancellation token while it is in flight, and asserts the
+// dispatcher synthesizes a `Cancelled` terminal and the agent returns to idle
+// and is re-promptable. These exercise the full stack the fixture tests can't:
+// real subprocess + real `select!` cancel path + dispatcher synthesis.
+//
+// Reliability note: the token is fired immediately after `send_message`
+// returns, while the harness is still spawning / mid-turn — a real CLI's
+// spawn+model latency is many orders of magnitude larger than the gap between
+// the call returning and `cancel`, so the turn is reliably in flight.
+// ---------------------------------------------------------------------------
+
+/// The `outcome.source` of the single `turn_end` on the channel, if cancelled.
+fn cancelled_source(emitter: &Arc<RecordingEmitter>, channel: &str) -> Option<String> {
+    emitter
+        .snapshot()
+        .into_iter()
+        .filter(|(name, payload)| name == channel && payload["type"] == "turn_end")
+        .find_map(|(_, payload)| {
+            if payload["outcome"]["status"] == "cancelled" {
+                payload["outcome"]["source"].as_str().map(str::to_owned)
+            } else {
+                None
+            }
+        })
+}
+
+async fn live_cancel_case(harness: HarnessKind, adapter: Arc<dyn HarnessAdapter>) {
+    let tmp = TempDir::new().expect("tempdir");
+    let directory = Directory::at(tmp.path()).expect("Directory::at");
+    directory.init().expect("init .switchboard/");
+    let project = directory
+        .create_project("cancel-test")
+        .expect("create_project");
+    let agent = project
+        .register_agent("assistant", harness)
+        .expect("register_agent");
+
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let channel = format!("agent:{}", agent.id);
+
+    let handle = dispatcher
+        .send_message(
+            &agent,
+            &project.directory,
+            "Count slowly to one hundred, one number per line.",
+            adapter.as_ref(),
+            Arc::clone(&emitter) as Arc<dyn EventEmitter>,
+            DispatchOptions::default(),
+            noop_journal(),
+        )
+        .await
+        .expect("send_message");
+
+    // Fire the token while the turn is in flight; the adapter must kill the
+    // subprocess group and end the stream, and the dispatcher must synthesize
+    // `Cancelled { User }`. Timeout-wrapped so a real CLI that ignored the
+    // cancel path surfaces as a clear failure (with the events) rather than a
+    // hung developer-local test.
+    dispatcher.cancel(agent.id, CancelSource::User);
+    tokio::time::timeout(std::time::Duration::from_secs(30), handle.join)
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "turn did not drain within 30s of cancel — cancellation may have hung; events: {:?}",
+                emitter.snapshot()
+            )
+        })
+        .expect("drain joined");
+
+    assert_eq!(
+        cancelled_source(&emitter, &channel).as_deref(),
+        Some("user"),
+        "expected a cancelled terminal stamped `user`; events: {:?}",
+        emitter.snapshot()
+    );
+    assert_eq!(
+        dispatcher.agent_status(agent.id),
+        Some(AgentStatus::Idle),
+        "agent must return to idle after cancellation"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires claude installed and authenticated — run with: make test-live"]
+async fn live_claude_cancel_terminates_and_synthesizes_cancelled() {
+    live_cancel_case(HarnessKind::ClaudeCode, Arc::new(ClaudeCodeAdapter::new())).await;
+}
+
+#[tokio::test]
+#[ignore = "requires codex installed and authenticated — run with: make test-live"]
+async fn live_codex_cancel_terminates_and_synthesizes_cancelled() {
+    // Codex is the load-bearing case: it exits 0 on SIGTERM and emits no
+    // terminal event, so only the dispatcher's token-driven synthesis produces
+    // `Cancelled` here.
+    live_cancel_case(HarnessKind::Codex, Arc::new(CodexAdapter::new())).await;
+}
+
+#[tokio::test]
+#[ignore = "requires gemini installed and authenticated — run with: make test-live"]
+async fn live_gemini_cancel_terminates_and_synthesizes_cancelled() {
+    live_cancel_case(HarnessKind::Gemini, Arc::new(GeminiAdapter::new())).await;
+}
+
+#[tokio::test]
+#[ignore = "requires agy authed via Antigravity desktop app — run with: make test-live"]
+async fn live_antigravity_cancel_terminates_and_synthesizes_cancelled() {
+    live_cancel_case(
+        HarnessKind::Antigravity,
+        Arc::new(AntigravityAdapter::new()),
+    )
+    .await;
 }

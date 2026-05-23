@@ -222,6 +222,13 @@ impl HarnessAdapter for MockHarnessAdapter {
                         kind: ContentKind::Text,
                         text: "after-cancel".to_owned(),
                     });
+                    // Agent-scoped enrichment buffered behind the cancel — it
+                    // reflects real agent state and is forwarded as-is (only the
+                    // terminal is the dispatcher's to synthesize).
+                    let _ = tx.send(AdapterEvent::RateLimitEvent {
+                        agent_id,
+                        info: serde_json::json!({"primary": {"used_percent": 50.0}}),
+                    });
                     // A real terminal that lost the race with cancellation —
                     // the dispatcher must drop this in favor of Cancelled.
                     let _ = tx.send(AdapterEvent::TurnEnd {

@@ -60,6 +60,7 @@ use chrono::Utc;
 use switchboard_core::{AgentId, AgentRecord};
 use tokio::io::AsyncBufReadExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::adapter::{DispatchError, DispatchOptions, EventStream, HarnessAdapter};
@@ -175,7 +176,7 @@ impl HarnessAdapter for AntigravityAdapter {
         cwd: &Path,
         prompt: &str,
         turn_id: TurnId,
-        _options: DispatchOptions,
+        options: DispatchOptions,
     ) -> Result<EventStream, DispatchError> {
         if prompt.trim().is_empty() {
             // `agy -p ""` exits 0 with "Error: empty prompt" — pre-validate
@@ -254,6 +255,7 @@ impl HarnessAdapter for AntigravityAdapter {
             mcp_servers,
             skills,
             prompt: prompt.to_owned(),
+            cancel_token: options.cancel_token,
         }));
 
         Ok(Box::pin(UnboundedReceiverStream::new(rx)))
@@ -325,6 +327,9 @@ struct ProducerCtx {
     /// prompt), so concurrent same-cwd dispatches can't bind each other's
     /// conversation.
     prompt: String,
+    /// Fired by the dispatcher to cancel the turn. Watched as an arm of the
+    /// producer's existing `select!`.
+    cancel_token: CancellationToken,
 }
 
 /// Drive a single Antigravity turn to completion, emitting normalized
@@ -348,6 +353,7 @@ async fn run_producer(ctx: ProducerCtx) {
         mcp_servers,
         skills,
         prompt,
+        cancel_token,
     } = ctx;
 
     let stderr_tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::with_capacity(
@@ -396,6 +402,11 @@ async fn run_producer(ctx: ProducerCtx) {
     // must fail loudly rather than silently complete on the stdout answer.
     let mut unresumable = false;
     let mut stdout_eof = false;
+    // Set when cancellation fires: kill the group and end the stream with NO
+    // terminal event (the dispatcher synthesizes `Cancelled`). Unlike the
+    // stdout-draining adapters, Antigravity already uses `select!` to tail the
+    // transcript on a tick — cancellation is just one more arm.
+    let mut cancelled = false;
     let mut exit_status: Option<std::process::ExitStatus> = None;
     let capture_deadline = spawn_time + UUID_CAPTURE_TIMEOUT;
 
@@ -469,6 +480,13 @@ async fn run_producer(ctx: ProducerCtx) {
                     exit_status = Some(status);
                 }
             }
+            () = cancel_token.cancelled() => {
+                // Cancellation: break the loop and let the post-loop
+                // `if cancelled` handler kill the group and end the stream with
+                // NO terminal event (the dispatcher synthesizes `Cancelled`).
+                cancelled = true;
+                break;
+            }
         }
 
         // Abort paths: stop immediately and force-kill below.
@@ -489,11 +507,22 @@ async fn run_producer(ctx: ProducerCtx) {
         }
     }
 
+    if cancelled {
+        // Cancellation path: kill the group and end the stream with NO
+        // terminal event (the dispatcher synthesizes `Cancelled`). Skip the
+        // post-exit recapture / `classify_outcome` / `TurnEnd` / `SessionMeta`
+        // below. Kill before awaiting the stderr drain — a parked subprocess
+        // holds stderr open.
+        crate::subprocess::terminate_then_kill(&mut child).await;
+        let _ = stderr_task.await;
+        return;
+    }
+
     // Force-kill if we broke out while the child may still be running (auth
     // fast-fail, or capture timeout with the process hung on OAuth).
+    // `terminate_then_kill` reaps the child itself, so no trailing `wait`.
     if exit_status.is_none() {
-        crate::subprocess::kill_subprocess_group(&mut child).await;
-        let _ = child.wait().await;
+        crate::subprocess::terminate_then_kill(&mut child).await;
     }
     // Drain stderr before scanning it for the resume-not-found signal below.
     let _ = stderr_task.await;

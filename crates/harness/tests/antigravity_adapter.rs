@@ -638,3 +638,60 @@ async fn hydration_none_conversation_still_surfaces_registries() {
             .contains(&"chrome-devtools-plugin/troubleshooting".to_owned())
     );
 }
+
+#[tokio::test]
+async fn cancel_terminates_and_emits_no_terminal() {
+    // Antigravity already uses `select!` to tail the transcript on a tick;
+    // cancellation is one more arm. The script `hang`s after writing its
+    // records, so the turn is still in flight when we fire the token. On
+    // cancel the adapter kills the process and ends the stream with NO
+    // terminal event (the dispatcher synthesizes `Cancelled`). The
+    // timeout-wrapped collect proves the kill actually tore the process down
+    // (a failed kill would leave the producer's drain awaiting forever).
+    use tokio_util::sync::CancellationToken;
+
+    let home = tempfile::TempDir::new().unwrap();
+    let cwd = tempfile::TempDir::new().unwrap();
+    let adapter = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home.path());
+    let agent = agy_agent();
+    let uuid = Uuid::new_v4();
+
+    write_script(
+        cwd.path(),
+        &json!({
+            "conversation_uuid": uuid.to_string(),
+            "records": [
+                {"json": user_record("long running", "2026-05-19T19:00:00Z"), "delay_ms": 0},
+            ],
+            "stdout": [],
+            "hang": true,
+        }),
+    );
+
+    let token = CancellationToken::new();
+    let options = DispatchOptions {
+        cancel_token: token.clone(),
+        ..Default::default()
+    };
+    let stream = adapter
+        .dispatch(&agent, cwd.path(), "long running", Uuid::now_v7(), options)
+        .await
+        .expect("dispatch should succeed");
+
+    // Let the adapter spawn `agy`, capture the UUID, and settle into its poll
+    // loop, then cancel mid-turn. `hang: true` keeps the turn in flight.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    token.cancel();
+
+    let events: Vec<AdapterEvent> =
+        tokio::time::timeout(std::time::Duration::from_secs(15), stream.collect())
+            .await
+            .expect("stream must end promptly after cancel, not hang");
+
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::TurnEnd { .. })),
+        "adapter must emit no terminal event on cancel; got: {events:?}"
+    );
+}

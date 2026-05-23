@@ -34,6 +34,7 @@ use chrono::Utc;
 use switchboard_core::{AgentId, AgentRecord};
 use tokio::io::AsyncBufReadExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_util::sync::CancellationToken;
 
 use crate::adapter::{DispatchError, EventStream, HarnessAdapter};
 use crate::events::{AdapterEvent, FailureKind, TurnId, TurnOutcome, TurnUsage};
@@ -174,6 +175,7 @@ impl HarnessAdapter for CodexAdapter {
             home_dir,
             cwd.to_owned(),
             force_session_meta,
+            options.cancel_token,
         ));
 
         Ok(Box::pin(UnboundedReceiverStream::new(rx)))
@@ -248,6 +250,7 @@ async fn run_producer(
     home_dir: PathBuf,
     cwd: PathBuf,
     force_session_meta: bool,
+    cancel_token: CancellationToken,
 ) {
     let stderr_tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::with_capacity(
         crate::subprocess::STDERR_TAIL_CAPACITY,
@@ -262,6 +265,12 @@ async fn run_producer(
 
     let mut terminal_seen = false;
     let mut terminal_was_completed = false;
+    // Set when cancellation fires: kill the group and end the stream with NO
+    // terminal event. Codex is the load-bearing case for token-driven (not
+    // exit-code/terminal-event-driven) cancellation — it exits 0 on SIGTERM
+    // and emits no terminal event, so only the dispatcher's synthesized
+    // `Cancelled` (from the fired token) is authoritative.
+    let mut cancelled = false;
     let mut state = CodexParserState::default();
     // Once we've written the sidecar for this dispatch, ignore any
     // subsequent thread.started events (defensive — Codex emits one per
@@ -277,7 +286,16 @@ async fn run_producer(
     let mut lines = tokio::io::BufReader::new(stdout).lines();
 
     'lines: loop {
-        match lines.next_line().await {
+        // `select!` over the read AND the cancellation token so a parked read
+        // still notices a cancel. Codex's two-process tree dies via `killpg`.
+        let line = tokio::select! {
+            line = lines.next_line() => line,
+            () = cancel_token.cancelled() => {
+                cancelled = true;
+                break 'lines;
+            }
+        };
+        match line {
             Ok(Some(line)) => {
                 let outcome = parse_line(&line, turn_id, &mut state);
 
@@ -392,8 +410,19 @@ async fn run_producer(
         }
     }
 
+    if cancelled {
+        // Cancellation path: kill the (two-process) group and end the stream
+        // with NO terminal event — the dispatcher synthesizes `Cancelled`.
+        // Kill before awaiting the stderr drain (a parked subprocess holds
+        // stderr open) and skip the truncation synthesis + exit reconciliation
+        // (Codex exits 0 on SIGTERM, so neither would be meaningful here).
+        crate::subprocess::terminate_then_kill(&mut child).await;
+        let _ = stderr_task.await;
+        return;
+    }
+
     if force_kill_child {
-        crate::subprocess::kill_subprocess_group(&mut child).await;
+        crate::subprocess::terminate_then_kill(&mut child).await;
     }
 
     let _ = stderr_task.await;

@@ -370,6 +370,17 @@ Tested: `agy -p "Count from 1 to 100 slowly"` backgrounded, then `kill -TERM <pi
 - **Switchboard's existing `Command::process_group(0)` + `killpg` pattern is unnecessary here** — `agy` does not fork persistent children. But it remains correct (a no-op for `agy` is fine).
 - **Exit code 0 on cancellation matches Gemini.** The adapter cannot distinguish "completed turn" from "cancelled mid-turn" by exit code alone — it must check for a `PLANNER_RESPONSE` terminal record in the transcript file (or whatever terminal-step heuristic applies — given the JSONL has no explicit "turn complete" record, this is non-trivial).
 
+**M4.3 wiring.** Cancellation is now token-driven: the producer's existing
+`select!` (transcript-tail tick) gains a `CancellationToken` arm; on cancel it
+kills via `terminate_then_kill` (SIGTERM → ~2s grace → SIGKILL on the process
+group) and ends the stream without a terminal event — the dispatcher
+synthesizes `TurnEnd { Cancelled }` from the fired token, so the
+exit-0/no-terminal-record problem above is irrelevant on the cancel path (the
+adapter never tries to infer the outcome). **Verified end-to-end (2026-05-23):**
+`live_antigravity_cancel_terminates_and_synthesizes_cancelled` (run via
+`make test-live` / `make test-live-antigravity`) passes — firing the token
+mid-turn produces a `Cancelled` outcome with the agent returning to idle.
+
 ## Error paths
 
 | Probe | Stdout | Stderr | Exit |

@@ -14,6 +14,7 @@ use chrono::Utc;
 use switchboard_core::{AgentId, AgentRecord};
 use tokio::io::AsyncBufReadExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_util::sync::CancellationToken;
 
 use crate::adapter::{DispatchError, EventStream, HarnessAdapter};
 use crate::events::{AdapterEvent, FailureKind, TurnId, TurnOutcome};
@@ -70,12 +71,13 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         cwd: &Path,
         prompt: &str,
         turn_id: TurnId,
-        _options: crate::DispatchOptions,
+        options: crate::DispatchOptions,
     ) -> Result<EventStream, DispatchError> {
-        // Claude Code emits `SessionMeta` from its `system/init` stream
-        // event on every dispatch — no first-turn gating — so the
-        // attach-flow override has nothing to do here. `_options` is
-        // accepted for trait conformance and intentionally unused.
+        // Claude Code emits `SessionMeta` from its `system/init` stream event
+        // on every dispatch — no first-turn gating — so
+        // `options.is_first_dispatch_after_attach` has nothing to do here.
+        // `options.cancel_token` IS used: it's watched in the producer's
+        // `select!` to cancel the turn.
         let binary = crate::subprocess::resolve_binary(&self.claude_binary_path)?;
         let args = build_args(agent, prompt, cwd, None);
 
@@ -86,16 +88,15 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .stdin(Stdio::null())
-            // `kill_on_drop(true)` only fires when `child` is dropped — and
-            // `child` is owned by `run_producer` (spawned task). Consumers
-            // dropping the event stream does NOT propagate; the subprocess
-            // continues until natural exit. Future cancellation work will
-            // need a `CancellationToken` plumbed through so mid-turn cancel
-            // kills the subprocess properly.
+            // Belt-and-suspenders teardown: `kill_on_drop` fires only when
+            // `child` is dropped, which happens if the producer task itself is
+            // dropped/aborted. Intentional cancellation flows through
+            // `options.cancel_token` (watched in `run_producer`), which kills
+            // the whole process group; `kill_on_drop` just covers the
+            // producer-task-teardown edge.
             .kill_on_drop(true);
-        // Put the child in its own process group so a future `killpg` can
-        // tear down the entire subprocess tree. The group is established
-        // here even though cancellation isn't wired yet.
+        // Own process group so `killpg` (in the cancel path) tears down the
+        // entire subprocess tree, not just the spawned PID.
         #[cfg(unix)]
         command.process_group(0);
         let mut child = command.spawn().map_err(|e| {
@@ -112,7 +113,15 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let agent_id = agent.id;
 
-        tokio::spawn(run_producer(child, stdout, stderr, tx, turn_id, agent_id));
+        tokio::spawn(run_producer(
+            child,
+            stdout,
+            stderr,
+            tx,
+            turn_id,
+            agent_id,
+            options.cancel_token,
+        ));
 
         Ok(Box::pin(UnboundedReceiverStream::new(rx)))
     }
@@ -206,6 +215,10 @@ fn encode_cwd(canonical: &Path) -> String {
     canonical.to_string_lossy().replace(['/', '.'], "-")
 }
 
+// Parallels the Codex / Gemini producers: a single per-line control-flow loop
+// plus the cancel and post-loop terminal handling. Splitting it would fragment
+// that flow without improving readability.
+#[allow(clippy::too_many_lines)]
 async fn run_producer(
     mut child: tokio::process::Child,
     stdout: tokio::process::ChildStdout,
@@ -213,6 +226,7 @@ async fn run_producer(
     tx: tokio::sync::mpsc::UnboundedSender<AdapterEvent>,
     turn_id: TurnId,
     agent_id: AgentId,
+    cancel_token: CancellationToken,
 ) {
     // Drain stderr concurrently; prevents pipe-full deadlock if the subprocess
     // writes to stderr while we block reading stdout. The shared `stderr_tail`
@@ -230,12 +244,28 @@ async fn run_producer(
 
     let mut terminal_seen = false;
     let mut terminal_was_completed = false;
+    // Set when the cancellation token fires. On cancel the adapter kills the
+    // subprocess group and ends the stream WITHOUT a terminal event — the
+    // dispatcher synthesizes `TurnEnd { Cancelled { source } }` (it owns the
+    // cancel outcome; a binary token can't carry the source). So the cancel
+    // path must skip the truncation synthesis below.
+    let mut cancelled = false;
     let mut parser_state = ParserState::default();
 
     let mut lines = tokio::io::BufReader::new(stdout).lines();
 
     loop {
-        match lines.next_line().await {
+        // `select!` over the next-line read AND the cancellation token, so a
+        // parked read (a buffering harness producing no output yet) does not
+        // block noticing a cancel.
+        let line = tokio::select! {
+            line = lines.next_line() => line,
+            () = cancel_token.cancelled() => {
+                cancelled = true;
+                break;
+            }
+        };
+        match line {
             Ok(Some(line)) => {
                 let outcome = parser::parse_line(&line, turn_id, agent_id, &mut parser_state);
                 let events = match outcome {
@@ -270,9 +300,6 @@ async fn run_producer(
                         }
                         _ => {}
                     }
-                    // Receiver drop is intentional: if the consumer disconnects
-                    // mid-stream, we let the producer drain and exit cleanly.
-                    // Future per-turn cancel work will handle shutdown properly.
                     let _ = tx.send(event);
                 }
                 if terminal_seen {
@@ -294,6 +321,18 @@ async fn run_producer(
                 break;
             }
         }
+    }
+
+    if cancelled {
+        // Cancellation path: kill the subprocess group (SIGTERM → grace →
+        // SIGKILL, leaving Claude's session file resumable with the incomplete
+        // turn absent) and end the stream with NO terminal event. The
+        // dispatcher synthesizes the `Cancelled` terminal. Kill *before*
+        // awaiting the stderr drain: a parked subprocess still holds stderr
+        // open, so awaiting the drain first would block until the kill anyway.
+        crate::subprocess::terminate_then_kill(&mut child).await;
+        let _ = stderr_task.await;
+        return;
     }
 
     // Wait for the stderr drain to finish before reading the tail — gives the

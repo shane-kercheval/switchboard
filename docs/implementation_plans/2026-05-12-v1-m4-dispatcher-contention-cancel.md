@@ -345,10 +345,10 @@ The flat project list aggregates projects across all workspace directories; a pr
 
 **Eager registry, lazy hydration.** On startup, load every workspace directory's projects and their agent rosters (cheap — `list_projects` + `list_agents` per directory, backed by the M4.1 register-cache; an unavailable directory contributes its cached snapshot instead). Defer transcript hydration (the expensive session-file parse) until the first time a project becomes active; cache the hydrated state and don't re-hydrate on subsequent switches. Show a loading indicator during first hydration. Background agents stream regardless of hydration (live events append to the per-agent transcript; hydration backfills history).
 
-**Hydration merge — the conversation journal (decision 6, review Topic 3).** Hydrating a project no longer takes user turns from harness session files, and it becomes **project-scoped**, not per-agent (review found the current `load_transcript(agent_id)` per-agent shape can't dedup fan-out user messages across agents). Add a project-level backend command — `load_project_conversation(project_id)` — returning a merged shape: grouped user sends, completed-turn agent content, failed/cancelled outcome markers, parse warnings, and metadata. (If you keep the per-agent `load_transcript`, add a separate `load_conversation_journal(project_id)` and specify the exact frontend merge algorithm + tests — but the single project-scoped command is preferred.) The two sources **partition** by completed-vs-not, so there is no correlation or dedup between them. The merge is, ordered by timestamp (`started_at` for turns; for a user message, the `min(at)` of its `send_id` group):
+**Hydration merge — the conversation journal (decision 6, review Topic 3).** Hydrating a project no longer takes user turns from harness session files, and it becomes **project-scoped**, not per-agent (review found the current `load_transcript(agent_id)` per-agent shape can't dedup fan-out user messages across agents). Add a project-level backend command — `load_project_conversation(project_id)` — returning a merged shape: grouped user sends, agent content, failed/cancelled outcome markers, parse warnings, and metadata. (If you keep the per-agent `load_transcript`, add a separate `load_conversation_journal(project_id)` and specify the exact frontend merge algorithm + tests — but the single project-scoped command is preferred.) The three rendered kinds are **disjoint** — user messages only from the journal, agent content only from harness files, markers only from the journal — so there is **no correlation or dedup** between sources. **Canonical worked examples (5 scenarios) live in system-design §7 "Unified history after restart"; build and test against those.** The merge is, ordered by timestamp (`started_at` for turns; for a user message, the `min(at)` of its `send_id` group):
 - **user turns** ← the journal's *send* records, **grouped by `send_id`** and rendered once, attributed to the union of their `agent_id`s (a fan-out shows "User → B|C" a single time; a prompt replicated across N harness files is never shown N times). A partially-queued fan-out shows only the recipients whose turns started (decision 6) — intended, not a bug.
-- **completed-turn content** ← harness session files, **assistant-role content only**, for turns that completed — filter out the harness files' *user-role* entries (they are per-agent context, not the canonical user record). Harness representations of *failed* turns are not rendered here; their marker comes from the journal (next bullet), so there is no double-render.
-- **failed / cancelled turns** ← the journal's *outcome* records (the failure reason rides in the record). No journal↔harness correlation needed — the partition guarantees these turns aren't also coming from the harness side (decision 5/6).
+- **agent content** ← harness session files, **assistant-role content only** — filter out the harness files' *user-role* entries (they are per-agent context, not the canonical user record). Render **whatever assistant content the harness persisted**, not only completed turns: Claude/Codex persist nothing for an aborted turn (so those show a marker only), but a harness that persists partial content has it rendered automatically, above that turn's marker — **no suppression guard, no completed-vs-not filter** (system-design §3/§7; the refined "show-partial-iff-the-harness-persisted-it" decision, 2026-05-24). Switchboard persists no agent content of its own.
+- **failed / cancelled turns** ← the journal's *outcome* records (the failure reason rides in the record), overlaid by timestamp. No journal↔harness correlation needed: markers and content are disjoint kinds, so a marker never double-renders against harness content — it annotates it.
 
 Live in-flight turns continue to overlay via the reducer as today; the journal/harness merge is the post-hydration backfill. The frontend turn-status union needs a `cancelled` value (distinct from `failed`). **Per-agent view (decision 14): enabled, not surfaced** — the raw per-agent harness file (including the user message as that agent saw it) stays available for a future "what did this agent see" view; M4 keeps the data but does not build that UI.
 
@@ -381,6 +381,7 @@ Outcomes:
 - One Send to N recipients creates N independent turns; idle recipients start immediately, busy recipients are queued (M4.4), and the user can see which are which inline.
 - Cancelling or erroring one recipient's turn has no effect on the others.
 - Removing a queued recipient's message returns its text to the user (Switchboard never silently discards authored text).
+- The fan-out renders as one grouped unit in the unified transcript (the single user message + its N responses, visually bracketed as one send), and while any of its turns are live the group offers a single **cancel-send** control that stops exactly that send's turns.
 
 ### Implementation Outline
 
@@ -394,6 +395,15 @@ Outcomes:
 
 **No backend `send_message_many` required.** Frontend preflight + per-recipient calls are sufficient for M4; do not build a batch backend command unless testing shows the per-call path is inadequate.
 
+**Fan-out grouping + cancel-send (system-design §7 "Cancel a send").** Render the N responses of one `send_id` as a visually bracketed group under the single user message (a bordered/labelled group in the chronological stream — not side-by-side columns, which fight the unified timeline). While any turn in the group is live (running or queued), show a single **cancel-send** control on the group.
+
+Cancel-send must be **scoped to the `send_id`, decided by each recipient's actor — never a frontend loop of per-agent `cancel_turn`**, because by the time the user clicks, a recipient may have finished this send's turn and started a *later, unrelated* turn; cancelling that agent unconditionally would kill the wrong turn (the same TOCTOU the actor model exists to remove). Add a dispatcher capability — `cancel_send(send_id, recipients, source)` — that delivers a send-scoped command to each recipient's actor; the actor (single authority over its own current turn + backlog):
+- fires the in-flight turn's cancel token **iff** the running `WorkItem.send_id == send_id` (→ a normal synthesized `Cancelled{source}` for that turn, identical to a single `cancel_turn`);
+- removes any **queued** backlog items whose `send_id` matches (these never started, so no journal trace — and unlike single queued-message removal, their text is **not** restored to the compose bar: cancel-send is an explicit stop, not an edit);
+- otherwise no-ops (already past this send, or never had it).
+
+This reuses the M4.4 actor's existing `Cancel` + backlog-removal primitives, gated on `send_id` instead of acting unconditionally / by `message_id`. There is **no aggregate send outcome** — each stopped recipient is its own per-turn `cancelled` marker (system-design §7); the grouping is purely a UI affordance. `send_id` is already plumbed end-to-end (M4.2) and rides on each `WorkItem` (M4.4).
+
 ### Definition of Done
 
 - **Component tests (mock `invoke` + `listen`):**
@@ -402,8 +412,14 @@ Outcomes:
   - Remove a queued recipient → text returns to compose bar, no turn dispatched for it.
   - Per-recipient IPC failure after optimistic append fails only that recipient.
   - A multi-select send renders the user's message once (one user turn keyed by `send_id`), not once per recipient.
-- **Manual verification (or explicit can't-run note):** fan out to 2–3 agents in `make dev`; confirm parallel streaming and correct queued behavior when one is busy.
-- **Docs:** none beyond inline rationale; the semantics live in system-design §7.
+- **Cancel-send (dispatcher, mock adapter):**
+  - A send to two agents, both in-flight: `cancel_send` produces a `Cancelled` terminal for **both** turns; both agents return to idle.
+  - A send to two agents where one already completed its turn and started a **later** turn (different `send_id`): `cancel_send` cancels only the still-on-this-send recipient; the later turn is **untouched** (the scoping guard — would fail a naive per-agent loop).
+  - A send with one in-flight + one queued (same `send_id`): `cancel_send` cancels the in-flight turn and **removes** the queued one (it never dispatches; its text is not restored).
+  - A `cancel_send` for a `send_id` whose turns have all completed is a no-op.
+- **Component test:** the fan-out group shows a cancel-send control while any turn is live and hides it once all settle; clicking it invokes the send-scoped command.
+- **Manual verification (or explicit can't-run note):** fan out to 2–3 agents in `make dev`; confirm parallel streaming, correct queued behavior when one is busy, and that cancel-send stops the group's turns without touching unrelated later turns.
+- **Docs:** none beyond inline rationale; the semantics live in system-design §7 ("Cancel a send" + "Unified history after restart").
 
 ---
 

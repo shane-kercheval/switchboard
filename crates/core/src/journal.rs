@@ -14,11 +14,15 @@
 //! (one at turn-start, one at a non-completed terminal), so the fsync pressure
 //! is negligible.
 //!
-//! **Known limitation:** the *partial* content streamed before a turn was
-//! cancelled or failed is in-memory only and is not persisted here — only the
-//! outcome marker survives a restart (the failure reason / cancel source, no
-//! agent content). The live UI shows partial output until the next turn or a
-//! restart; "open session file" exposes whatever the harness wrote.
+//! **Partial content of an aborted turn:** never persisted *here* — the journal
+//! holds only the outcome marker (failure reason / cancel source, no agent
+//! content). The live UI shows partial output from the dispatcher's in-memory
+//! stream buffer until the next turn or a restart. After restart, any partial
+//! shown comes solely from the harness session file, and Switchboard adds none
+//! of its own — so the post-restart partial is whatever that harness chose to
+//! keep (Claude Code and Codex keep nothing for an aborted turn → marker only;
+//! a harness that persists partial would have it rendered automatically). See
+//! system-design §3 and §7 "Unified history after restart".
 
 use std::path::Path;
 

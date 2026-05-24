@@ -290,30 +290,28 @@ On success it builds `DispatchOptions` (`is_first_dispatch_after_attach` read fr
 
 ---
 
-## M4.5 — Event coalescing + concurrency load test
+## M4.5 — Event coalescing — **DECIDED AGAINST (2026-05-24), based on measurement**
 
-### Goal & Outcome
+**Outcome: not implemented.** The original intent was per-agent text-chunk coalescing (batch high-frequency token deltas over a ~25ms window into fewer IPC events) to keep the UI responsive under multi-agent fan-out. We built it, then measured the actual streaming behavior of the real harnesses at the adapter level (the exact input to the coalescing buffer) and reverted it: **the high-frequency token-delta flood the milestone assumed does not exist.**
 
-Keep the UI responsive under multi-agent fan-out by coalescing high-frequency text deltas, and prove the concurrent-streaming path holds up.
+### The measurement (adapter-level `ContentChunk` inter-arrival gaps, ~4–5 KB generation)
 
-Outcomes:
-- Streamed text chunks for an agent are batched over a short window into fewer, larger UI events; structured and terminal events are never coalesced or reordered.
-- 3+ agents streaming simultaneously do not produce UI-blocking event floods.
-- Text still appears effectively real-time to the user.
+| Harness | content chunks | mean bytes/chunk | p50 inter-chunk gap | gaps < 25 ms (would coalesce) |
+|---|---|---|---|---|
+| Claude | 40 | 103 B | **413 ms** | 5% (2 of 39) |
+| Gemini | 35 | 119 B | **97 ms** | 3% (1 of 34) |
+| Codex | **1** | whole reply | — | n/a (one chunk per turn) |
+| Antigravity | **0** | — | — | emits no content-chunk events on this path |
 
-### Implementation Outline
+A 14× larger generation (≈290 B → ≈4–5 KB) did **not** tighten the gaps — Claude's p50 rose. The pacing is gated by model token-generation speed, not buffering, so chunks arrive 100–400 ms apart regardless of response size. Codex emits the entire reply as a single `ContentChunk`; Antigravity produced none. A 25 ms coalescing window would therefore fire on **3–5%** of chunk pairs (Claude/Gemini), do nothing for Codex, and have nothing to act on for Antigravity. Multi-agent fan-out is ~15–55 IPC events/sec total across 5 agents — not a flood, and the frontend already merges adjacent chunks in reducer state.
 
-**Targeted coalescing, not the ring buffer.** The M1.4 deferral lists several options (§10 ring buffer, coalescing, rate limiting, size caps). Choose **per-agent text-chunk coalescing on a short time window** (~25ms is a reasonable starting point — make it a named constant with a rationale comment, tunable). The volume driver is token deltas; structured events (ToolStarted/Completed, TurnEnd/Cancelled, RateLimit, SessionMeta) are low-frequency and must pass through immediately and in order. **Flush the coalescing buffer before emitting any structured or terminal event** so text never arrives after the event that logically follows it.
+### Why reverted rather than kept dormant
 
-**Where it lives (review Topic 5 — not a generic emitter wrapper).** `EventEmitter::emit` is synchronous, so a wrapper around it cannot host a timer cleanly (it would block, spawn unmanaged timer tasks, or risk reordering). Put the coalescing in the **per-agent actor's turn-drain loop** (M4.4) — already an async `select!` over the adapter event stream and the actor's command channel; coalescing **adds a third arm: a flush interval**. (Pre-M4.4 this was framed as introducing a `select!` to a plain `drain_stream` loop; M4.4's actor turn loop is already a `select!`, so M4.5 extends it with the flush arm rather than introducing the construct.) Keep a per-turn text buffer in the actor's local scope, flush on tick, and flush before any non-text event and on stream end/cancel. Because the buffer is actor-task-local (one per turn), it is **not** shared mutable state and has no lock-order impact. Keep it backend-side of the IPC boundary so the wire carries fewer, larger messages; do not change the `NormalizedEvent` wire shape — coalescing concatenates `ContentChunk` text, it introduces no variant. (The frontend already coalesces adjacent chunks in reducer state, so this targets IPC volume, not render shape.)
+Carrying a tuning constant + an extra `select!` arm in the safety-critical cancel/terminal turn loop, for a flood that measurement shows doesn't occur, is unjustified complexity (and the const would have been a guess, not a tuned value). If a future CLI version flips to true token-level streaming (gaps < 25 ms), we'd see it immediately via the same adapter measurement and could re-introduce coalescing in roughly an hour. The M1.4 backpressure deferral's premise ("hundreds of token deltas per turn") is the thing measurement falsified — see the annotated note in `2026-05-12-v1.md`.
 
-**Interaction with cancellation (M4.2/M4.3):** the synthesized `Cancelled` terminal event must trigger a flush of any buffered text first, so partial output already shown is consistent up to the cancel point.
+The concurrency angle is already covered: `concurrent_send_to_different_agents_both_succeed` (dispatcher) and the two-agent app-layer test prove the actor model runs N independent agents with no cross-agent event interleaving. A 3+-agent variant exercises no new code path (everything is keyed by `agent_id` in one map), so no separate load test was kept.
 
-### Definition of Done
-
-- **Unit/integration tests:** a burst of N text chunks within the window emits as one (or few) coalesced event(s) with concatenated text in order; a structured event interleaved in the burst forces a flush and preserves ordering (all preceding text emitted before the structured event); a terminal/cancel event flushes pending text.
-- **Load test:** drive 3+ concurrent mock streams each emitting many chunks; assert no unbounded growth and that ordering invariants hold per agent. This is the "load-tests the concurrent-streaming path under heavier fan-out" the v1 outline asks for.
-- **Docs:** the coalescing window constant carries a rationale comment; note that the ring-buffer/durable-snapshot option is deliberately deferred (M8) unless load testing shows coalescing is insufficient.
+**If revisited:** re-measure first. Only implement if real harnesses are observed streaming `ContentChunk`s faster than the chosen window for a sustained stretch. The richer §10 ring buffer / durable snapshot remains an M8 item regardless.
 ---
 
 ## M4.6 — Project switcher (frontend + state reshape)

@@ -35,6 +35,21 @@ pub enum AppError {
     #[error("no working directory has been initialised — call init_directory first")]
     NoDirectory,
 
+    /// Persisting the user-global workspace registry (`workspace.yaml`) failed.
+    /// The registry is convenience state (the cross-directory project list and
+    /// its cached snapshot), so callers treat this as best-effort and log
+    /// rather than abort — but `save` still surfaces it for the rare caller
+    /// that wants to react.
+    // Constructed only by `workspace::save`, whose production callers land in
+    // the next M4.6 increment; tests exercise it today.
+    #[allow(dead_code)]
+    #[error("failed to persist workspace registry at {path}: {source}")]
+    WorkspacePersist {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error("no active project — call set_active_project first")]
     NoActiveProject,
 

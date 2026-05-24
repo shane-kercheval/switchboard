@@ -3,20 +3,27 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use switchboard_core::{AgentId, AgentRecord, Directory, Project, ProjectId};
 use switchboard_dispatcher::{Dispatcher, EventEmitter};
 use switchboard_harness::HarnessAdapter;
 
+use crate::workspace::{self, Workspace};
+
 /// The single piece of state managed by Tauri. Multi-project from day 1 (per
 /// system-design §3); only one project is loaded at a time today, but the
 /// shape supports a future project switcher without restructuring.
 ///
 /// **Lock-order convention** (when more than one of these mutexes is held
-/// at the same time): `registry_write` → `directory` → `projects` →
-/// `active_project_id` → `needs_session_meta` → `project_locks` →
-/// `agents_by_id`. Always acquire in this order. Violating the order can
+/// at the same time): `workspace` → `registry_write` → `directory` →
+/// `projects` → `active_project_id` → `needs_session_meta` →
+/// `project_locks` → `agents_by_id`. Always acquire in this order. `workspace`
+/// is at the head because it is the app-owned user-global registry that sits
+/// above any single directory's state; today it is only ever acquired alone
+/// (no nesting yet), but placing it first keeps a future nesting compliant.
+/// Violating the order can
 /// deadlock under concurrent access. Single-lock acquisitions (which most
 /// callers do) are unaffected — the convention only matters when nesting.
 /// `needs_session_meta` is the tail because both `attach_agent_impl` (under
@@ -119,6 +126,18 @@ pub struct AppState {
     /// within a directory session plus a full clear on rebind. `AgentRecord`
     /// is immutable after registration, so a cached copy never goes stale.
     pub agents_by_id: Mutex<HashMap<AgentId, AgentRecord>>,
+
+    /// User-global workspace registry — the set of working directories the app
+    /// knows about plus a cached snapshot of each directory's projects (see
+    /// `crate::workspace`). Convenience state, not load-bearing: it backs the
+    /// flat cross-directory project list. Defaults to empty; production
+    /// hydrates it from `workspace.yaml` via [`AppState::with_workspace`].
+    pub workspace: Mutex<Workspace>,
+
+    /// Resolved path of `workspace.yaml`, or `None` when no global location was
+    /// resolved (tests, or an exotic host with no home dir). `persist_workspace`
+    /// is a no-op while this is `None`, so tests never touch user-global state.
+    pub workspace_path: Option<PathBuf>,
 }
 
 impl AppState {
@@ -143,7 +162,49 @@ impl AppState {
             needs_session_meta: Arc::new(Mutex::new(HashSet::new())),
             project_locks: Mutex::new(HashMap::new()),
             agents_by_id: Mutex::new(HashMap::new()),
+            workspace: Mutex::new(Workspace::default()),
+            workspace_path: None,
         }
+    }
+
+    /// Builder step that loads the workspace registry from `path` and records
+    /// the path for later persistence. Production calls this after `new`; tests
+    /// skip it so `workspace_path` stays `None` and the registry stays empty.
+    #[must_use]
+    pub fn with_workspace(mut self, path: PathBuf) -> Self {
+        let outcome = workspace::load(&path);
+        self.workspace = Mutex::new(outcome.workspace);
+        // Only enable persistence when the read was trustworthy. If the file
+        // existed but couldn't be read, `persistable` is false and we leave
+        // `workspace_path` None so a later save never overwrites a registry we
+        // failed to load (see `workspace::LoadOutcome`).
+        self.workspace_path = outcome.persistable.then_some(path);
+        self
+    }
+}
+
+/// Persist the workspace registry to disk if a `workspace_path` is configured.
+/// Best-effort: a `None` path is a no-op (tests), and a save failure is logged
+/// rather than propagated — the registry is convenience state, like the cached
+/// project snapshot it holds, and must not break the operation that triggered
+/// the save.
+// Lands ahead of its production callers (the next M4.6 increment calls this
+// after directory add/remove). Exercised by this module's tests today.
+#[allow(dead_code)]
+pub(crate) fn persist_workspace(state: &AppState) {
+    let Some(path) = state.workspace_path.as_ref() else {
+        return;
+    };
+    // Snapshot under the lock, then release it before touching disk — never
+    // hold a state mutex across filesystem I/O (single-writer app, so the next
+    // mutation's persist captures anything that lands after this clone).
+    let snapshot = lock(&state.workspace).clone();
+    if let Err(e) = workspace::save(path, &snapshot) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %e,
+            "failed to persist workspace registry"
+        );
     }
 }
 
@@ -151,4 +212,50 @@ impl AppState {
 /// here can panic with the lock held, so this is defensive only.
 pub(crate) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use switchboard_dispatcher::RecordingEmitter;
+    use switchboard_harness::MockHarnessAdapter;
+    use tempfile::tempdir;
+
+    use super::*;
+
+    fn mock_state() -> AppState {
+        let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let emitter: Arc<dyn EventEmitter> = Arc::new(RecordingEmitter::new());
+        AppState::new(
+            Arc::clone(&mock),
+            Arc::clone(&mock),
+            Arc::clone(&mock),
+            mock,
+            emitter,
+        )
+    }
+
+    #[test]
+    fn persist_workspace_with_no_path_writes_nothing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("workspace.yaml");
+
+        let state = mock_state();
+        lock(&state.workspace).add(path.clone());
+        persist_workspace(&state);
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn persist_workspace_with_path_round_trips() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("workspace.yaml");
+
+        let state = mock_state().with_workspace(path.clone());
+        lock(&state.workspace).add(PathBuf::from("/some/dir"));
+        persist_workspace(&state);
+
+        let loaded = workspace::load(&path).workspace;
+        assert_eq!(&loaded, &*lock(&state.workspace));
+    }
 }

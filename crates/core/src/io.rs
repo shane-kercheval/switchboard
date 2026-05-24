@@ -100,7 +100,7 @@ pub(crate) fn read_jsonl<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
     Ok(out)
 }
 
-pub(crate) fn read_yaml<T: DeserializeOwned>(path: &Path) -> Result<T> {
+pub fn read_yaml<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let bytes = std::fs::read(path).map_err(|e| CoreError::io(path, e))?;
     serde_norway::from_slice(&bytes).map_err(|source| CoreError::CorruptYaml {
         path: path.to_owned(),
@@ -112,7 +112,7 @@ pub(crate) fn read_yaml<T: DeserializeOwned>(path: &Path) -> Result<T> {
 /// directory* as the target, then `rename` over the target. Same-filesystem
 /// rename is atomic on POSIX/Windows; a cross-filesystem temp dir would
 /// degrade to copy+delete and defeat the purpose, so we stay adjacent.
-pub(crate) fn write_yaml<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+pub fn write_yaml<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let yaml = serde_norway::to_string(value).map_err(|source| CoreError::CorruptYaml {
         path: path.to_owned(),
         source,

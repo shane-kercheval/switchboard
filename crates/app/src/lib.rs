@@ -9,6 +9,7 @@ mod emitter;
 mod error;
 mod journal;
 mod state;
+mod workspace;
 
 use std::sync::Arc;
 
@@ -292,13 +293,27 @@ pub fn run() {
             let emitter: Arc<dyn EventEmitter> = Arc::new(AppHandleEmitter {
                 app: app.handle().clone(),
             });
-            app.manage(AppState::new(
+            let state = AppState::new(
                 Arc::clone(&claude_adapter),
                 Arc::clone(&codex_adapter),
                 Arc::clone(&gemini_adapter),
                 Arc::clone(&antigravity_adapter),
                 emitter,
-            ));
+            );
+            // Resolve the user-global `workspace.yaml` location. If no home
+            // directory is resolvable (exotic host), skip workspace persistence
+            // entirely — the registry stays empty and `persist_workspace` is a
+            // no-op, which is safe since the registry is convenience state.
+            let state = if let Some(dirs) = directories::ProjectDirs::from("", "", "switchboard") {
+                let path = dirs.config_dir().join("workspace.yaml");
+                state.with_workspace(path)
+            } else {
+                tracing::warn!(
+                    "no home directory resolved — workspace registry persistence disabled"
+                );
+                state
+            };
+            app.manage(state);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

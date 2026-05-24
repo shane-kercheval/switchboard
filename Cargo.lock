@@ -3037,6 +3037,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "directories",
+ "futures",
  "serde",
  "serde_json",
  "switchboard-core",

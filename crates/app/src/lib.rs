@@ -20,14 +20,15 @@ use switchboard_harness::{
 };
 use tauri::{Emitter, Manager, State};
 
+use crate::commands::ProjectConversation;
 use crate::commands::{
     DirectoryInfo, ProjectListing, attach_agent_impl, cancel_turn_impl,
     check_antigravity_auth_impl, check_antigravity_binary_impl, check_claude_binary_impl,
     check_codex_auth_impl, check_codex_binary_impl, check_gemini_auth_impl,
     check_gemini_binary_impl, create_agent_impl, create_project_impl, init_directory_impl,
-    list_agents_impl, list_projects_impl, load_transcript_impl, open_project_impl, parse_uuid,
-    pick_directory_impl, remove_directory_impl, remove_queued_message_impl, send_message_impl,
-    set_active_project_impl,
+    list_agents_impl, list_projects_impl, load_project_conversation_impl, load_transcript_impl,
+    open_project_impl, parse_uuid, pick_directory_impl, remove_directory_impl,
+    remove_queued_message_impl, send_message_impl, set_active_project_impl,
 };
 use crate::state::AppState;
 
@@ -227,6 +228,20 @@ async fn load_transcript(
     load_transcript_impl(state.inner(), id, &home).map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn load_project_conversation(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<ProjectConversation, String> {
+    let id = parse_uuid(&project_id).map_err(|e| e.to_string())?;
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    load_project_conversation_impl(state.inner(), id, &home)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Bridges the dispatcher's `EventEmitter` abstraction onto Tauri's
 /// `AppHandle::emit`. Emit failures are logged — Tauri's `emit` returns
 /// `Err` when payload serialization fails, which can't happen for our
@@ -354,6 +369,7 @@ pub fn run() {
             remove_queued_message,
             cancel_turn,
             load_transcript,
+            load_project_conversation,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

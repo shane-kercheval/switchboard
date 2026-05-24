@@ -11,6 +11,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use switchboard_core::{
     AgentId, AgentRecord, CoreError, Directory, HarnessKind, Project, ProjectId, ProjectSummary,
+    SendId,
 };
 use switchboard_dispatcher::{
     CancelOutcome, DispatchContextFactory, OnBusy, RemovedQueuedMessage, SendOutcome,
@@ -1121,6 +1122,21 @@ pub fn load_transcript_impl(
     home_dir: &Path,
 ) -> Result<switchboard_harness::LoadedTranscript, AppError> {
     let (project, agent) = lookup_agent(state, agent_id)?;
+    load_agent_transcript(&project, &agent, home_dir)
+}
+
+/// Load one agent's prior conversation from its harness session file. The
+/// harness-dispatch body factored out of [`load_transcript_impl`] so the
+/// project-level conversation loader can reuse it per agent. Error scope and
+/// missing-file/corruption behavior match the per-agent command: lookup-I/O
+/// and per-harness defaults degrade to an empty transcript; corrupt
+/// Switchboard-owned sidecars are fail-loud
+/// ([`AppError::HydrationBlockedByCorruption`]).
+fn load_agent_transcript(
+    project: &Project,
+    agent: &AgentRecord,
+    home_dir: &Path,
+) -> Result<switchboard_harness::LoadedTranscript, AppError> {
     // The cwd / sidecar root is the project's own owning directory.
     let directory_path = project.directory.clone();
     match agent.harness {
@@ -1201,6 +1217,345 @@ pub fn load_transcript_impl(
         }
         _ => Err(AppError::UnsupportedHarness),
     }
+}
+
+/// The unified, post-restart project conversation: the merge of Switchboard's
+/// conversation journal (the user's sends + non-completed-turn outcome markers)
+/// with the project's per-agent harness transcripts (agent-produced content),
+/// ordered by timestamp. The wire contract the unified-view frontend consumes.
+///
+/// The three rendered kinds in `items` are disjoint by source (system-design
+/// §3 / §7 "Unified history after restart"): user messages come only from the
+/// journal, agent content only from harness files, failed/cancelled markers
+/// only from the journal — so no correlation or de-dup between sources is
+/// performed.
+///
+/// **Same-turn `AgentTurn` + `Outcome` overlap is intentional, not duplication.**
+/// A non-completed turn can legitimately produce *both* an
+/// [`ConversationItem::AgentTurn`] with `status: Failed` and (possibly partial)
+/// harness-persisted `items`, *and* a journal-sourced [`ConversationItem::Outcome`]
+/// marker for the *same* `turn_id` (system-design §7). They are complementary:
+/// the `AgentTurn` carries the partial content, the `Outcome` carries the
+/// authoritative non-completed status that annotates it. Consumers render both;
+/// the merge deliberately does not correlate or de-dup across the two sources.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ProjectConversation {
+    pub items: Vec<ConversationItem>,
+    pub agents: Vec<AgentConversationMeta>,
+}
+
+/// One rendered entry in the unified transcript. Tagged `kind` to match the
+/// wire convention; `#[non_exhaustive]` so a future rendered kind lands
+/// additively for consumers.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ConversationItem {
+    /// The user's side of a send, sourced from the journal. A fan-out renders
+    /// once (grouped by `send_id`); `agent_ids` are the group's recipients in
+    /// first-seen order. `text` is the prompt (identical across the group);
+    /// `at` is the earliest `at` in the group.
+    UserMessage {
+        send_id: SendId,
+        agent_ids: Vec<AgentId>,
+        text: String,
+        at: chrono::DateTime<chrono::Utc>,
+    },
+    /// One agent's completed (or harness-failed) turn content, sourced from the
+    /// harness session file. Harness user-role turns are dropped — the journal
+    /// is the canonical record of the user's words.
+    AgentTurn {
+        turn_id: switchboard_harness::TurnId,
+        agent_id: AgentId,
+        started_at: chrono::DateTime<chrono::Utc>,
+        ended_at: Option<chrono::DateTime<chrono::Utc>>,
+        status: switchboard_harness::TurnStatus,
+        items: Vec<switchboard_harness::TurnItem>,
+        usage: Option<switchboard_harness::TurnUsage>,
+    },
+    /// A non-completed-turn marker (failed or cancelled), sourced from the
+    /// journal. Carries no agent content; `reason` is a best-effort
+    /// human-readable detail parsed from the opaque outcome value.
+    Outcome {
+        turn_id: switchboard_harness::TurnId,
+        send_id: SendId,
+        agent_id: AgentId,
+        status: OutcomeStatus,
+        reason: Option<String>,
+        at: chrono::DateTime<chrono::Utc>,
+    },
+}
+
+/// The non-completed terminal kinds the journal records. This is where
+/// `cancelled` enters the rendered model — `TurnStatus` (harness-sourced) has
+/// no `Cancelled` because the harness never persists a cancelled turn.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum OutcomeStatus {
+    Cancelled,
+    Failed,
+}
+
+/// Per-agent session metadata carried alongside the merged items, so the
+/// unified view can populate per-agent meta / quota without re-loading.
+///
+/// Warnings and load errors are agent-scoped (not project-scoped) so the
+/// unified view can attribute them: `warnings` are this agent's per-line parse
+/// degradations from its harness transcript; `load_error`, when present, means
+/// this agent's transcript failed to load entirely (e.g. corrupt sidecar) — its
+/// turns are absent but the rest of the project (journal + healthy agents) still
+/// renders. One bad agent never blanks the project.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct AgentConversationMeta {
+    pub agent_id: AgentId,
+    pub meta: Option<switchboard_harness::SessionMetaInfo>,
+    pub last_rate_limit: Option<serde_json::Value>,
+    pub warnings: Vec<switchboard_harness::ParseWarning>,
+    pub load_error: Option<String>,
+}
+
+/// Pure merge of the two conversation sources into the unified transcript. No
+/// I/O — the testable core. See [`ProjectConversation`] for the disjoint-source
+/// contract and system-design §7 for the worked scenarios this implements.
+fn merge_project_conversation(
+    journal: Vec<switchboard_core::JournalRecord>,
+    agent_transcripts: Vec<(
+        AgentId,
+        switchboard_harness::LoadedTranscript,
+        Option<String>,
+    )>,
+) -> ProjectConversation {
+    let mut items: Vec<ConversationItem> = Vec::new();
+
+    // User messages ← `Send` records grouped by `send_id`. One rendered message
+    // per group: recipients in first-seen order (dedup-preserving), prompt from
+    // any record (identical across the group), `at` = min of the group.
+    // `index_of` maps a send_id to its slot in `user_messages`, preserving
+    // first-appearance order without a separate removal pass.
+    let mut index_of: HashMap<SendId, usize> = HashMap::new();
+    let mut user_messages: Vec<(SendId, Vec<AgentId>, String, chrono::DateTime<chrono::Utc>)> =
+        Vec::new();
+    for record in journal {
+        match record {
+            switchboard_core::JournalRecord::Send {
+                send_id,
+                agent_id,
+                prompt,
+                at,
+                ..
+            } => {
+                if let Some(&i) = index_of.get(&send_id) {
+                    let entry = &mut user_messages[i];
+                    if !entry.1.contains(&agent_id) {
+                        entry.1.push(agent_id);
+                    }
+                    if at < entry.3 {
+                        entry.3 = at;
+                    }
+                } else {
+                    // The prompt is shared across a fan-out's recipients (M4.2),
+                    // so taking the first record's prompt is correct for M4; M6
+                    // templated per-recipient prompts will need this revisited.
+                    index_of.insert(send_id, user_messages.len());
+                    user_messages.push((send_id, vec![agent_id], prompt, at));
+                }
+            }
+            switchboard_core::JournalRecord::Outcome {
+                turn_id,
+                send_id,
+                agent_id,
+                outcome,
+                started_at,
+                ..
+            } => {
+                let (status, reason) = parse_outcome(&outcome);
+                items.push(ConversationItem::Outcome {
+                    turn_id,
+                    send_id,
+                    agent_id,
+                    status,
+                    reason,
+                    at: started_at,
+                });
+            }
+            // A future journal-record kind we don't yet render — degrade by
+            // skipping it rather than failing the whole load.
+            _ => {}
+        }
+    }
+    for (send_id, agent_ids, text, at) in user_messages {
+        items.push(ConversationItem::UserMessage {
+            send_id,
+            agent_ids,
+            text,
+            at,
+        });
+    }
+
+    // Agent turns ← each agent's harness transcript, keeping only `Turn::Agent`
+    // (drop `Turn::User`). Warnings and any load error are agent-scoped: attach
+    // them to this transcript's `AgentConversationMeta` so the unified view can
+    // attribute them (one bad agent never blanks the project).
+    let mut agents: Vec<AgentConversationMeta> = Vec::new();
+    for (agent_id, transcript, load_error) in agent_transcripts {
+        for turn in transcript.turns {
+            if let switchboard_harness::Turn::Agent {
+                turn_id,
+                agent_id,
+                started_at,
+                ended_at,
+                status,
+                items: turn_items,
+                usage,
+            } = turn
+            {
+                items.push(ConversationItem::AgentTurn {
+                    turn_id,
+                    agent_id,
+                    started_at,
+                    ended_at,
+                    status,
+                    items: turn_items,
+                    usage,
+                });
+            }
+        }
+        agents.push(AgentConversationMeta {
+            agent_id,
+            meta: transcript.meta,
+            last_rate_limit: transcript.last_rate_limit,
+            warnings: transcript.warnings,
+            load_error,
+        });
+    }
+
+    // Sort ascending by an explicit `(timestamp, kind_rank)` key so that at an
+    // equal instant a user message always precedes the content/markers it
+    // annotates: `UserMessage` (0) < `AgentTurn` (1) < `Outcome` (2). The common
+    // failed-to-start/cancelled case has `Send.at == Outcome.started_at`, so a
+    // timestamp-only sort would render the marker before its own message.
+    items.sort_by_key(conversation_item_sort_key);
+
+    ProjectConversation { items, agents }
+}
+
+/// The sort key for an item — its own timestamp (`UserMessage`→`at`,
+/// `AgentTurn`→`started_at`, `Outcome`→`at`).
+fn conversation_item_timestamp(item: &ConversationItem) -> chrono::DateTime<chrono::Utc> {
+    match item {
+        ConversationItem::UserMessage { at, .. } | ConversationItem::Outcome { at, .. } => *at,
+        ConversationItem::AgentTurn { started_at, .. } => *started_at,
+    }
+}
+
+/// The ordering key for an item: its timestamp, tie-broken by kind rank so a
+/// user message (0) sorts before agent content (1) and an outcome marker (2) at
+/// the same instant.
+fn conversation_item_sort_key(item: &ConversationItem) -> (chrono::DateTime<chrono::Utc>, u8) {
+    let rank = match item {
+        ConversationItem::UserMessage { .. } => 0,
+        ConversationItem::AgentTurn { .. } => 1,
+        ConversationItem::Outcome { .. } => 2,
+    };
+    (conversation_item_timestamp(item), rank)
+}
+
+/// Parse the opaque journal outcome value into the rendered status + reason.
+/// The value is the terminal outcome's wire shape, e.g.
+/// `{"status":"cancelled","source":"user"}` or
+/// `{"status":"failed","kind":"harness_error","message":"…"}`. Anything other
+/// than an explicit `cancelled` reads as `failed` (the conservative default for
+/// a non-completed terminal we couldn't classify). `reason` is the `message`
+/// for failures, the `source` for cancellations — `None` if absent.
+fn parse_outcome(outcome: &serde_json::Value) -> (OutcomeStatus, Option<String>) {
+    let status_str = outcome.get("status").and_then(serde_json::Value::as_str);
+    match status_str {
+        Some("cancelled") => (
+            OutcomeStatus::Cancelled,
+            outcome
+                .get("source")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+        ),
+        _ => (
+            OutcomeStatus::Failed,
+            outcome
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+        ),
+    }
+}
+
+/// Rebuild a project's unified conversation after restart by merging its
+/// conversation journal with each agent's harness transcript. Resolves the
+/// project (loaded fast-path, else via the owning directory), reads the journal
+/// (missing file → empty, like the per-agent default-on-missing), and loads
+/// each agent's transcript via [`load_agent_transcript`] on the blocking pool,
+/// in parallel.
+///
+/// **Per-agent load errors are non-fatal.** Unlike [`load_transcript_impl`]
+/// (single-agent, fail-loud), a corrupt sidecar or read failure for *one* agent
+/// here is recorded on that agent's [`AgentConversationMeta::load_error`] (with
+/// an empty transcript for it) and the rest of the project — journal plus the
+/// healthy agents — still renders. Corruption stays loud (surfaced per-agent),
+/// just not fatal to the whole project.
+///
+/// `home_dir` is passed in (not resolved here) so tests can stage a temp
+/// directory without mutating process-wide `$HOME`; the Tauri command shim
+/// reads `$HOME` and forwards.
+pub async fn load_project_conversation_impl(
+    state: &AppState,
+    project_id: ProjectId,
+    home_dir: &Path,
+) -> Result<ProjectConversation, AppError> {
+    // Resolve the project and collect each agent's *owned* inputs while holding
+    // the lock, then release it before doing any read+parse. `load_agent_transcript`
+    // is CPU-bound (parsing a real session file is ~1s for 30 MB), so it runs on
+    // the blocking pool — never on an async executor worker.
+    let project = match lock(&state.projects).get(&project_id).cloned() {
+        Some(loaded) => loaded,
+        None => find_project_in_directories(state, project_id)?,
+    };
+    let journal = switchboard_core::journal::read_records(&project.journal_path())?;
+    let agents = project.list_agents()?;
+
+    // Parse each agent's transcript in parallel on the blocking pool. A
+    // per-agent load error is recorded on that agent (empty transcript + the
+    // error string) rather than aborting the whole project — the journal and
+    // the healthy agents still render.
+    let loads = agents.into_iter().map(|agent| {
+        let project = project.clone();
+        let home_dir = home_dir.to_path_buf();
+        async move {
+            let agent_id = agent.id;
+            let result = tokio::task::spawn_blocking(move || {
+                load_agent_transcript(&project, &agent, &home_dir)
+            })
+            .await;
+            match result {
+                Ok(Ok(transcript)) => (agent_id, transcript, None),
+                Ok(Err(err)) => (
+                    agent_id,
+                    switchboard_harness::LoadedTranscript::default(),
+                    Some(err.to_string()),
+                ),
+                Err(join_err) => (
+                    agent_id,
+                    switchboard_harness::LoadedTranscript::default(),
+                    Some(join_err.to_string()),
+                ),
+            }
+        }
+    });
+    let agent_transcripts: Vec<(
+        AgentId,
+        switchboard_harness::LoadedTranscript,
+        Option<String>,
+    )> = futures::future::join_all(loads).await;
+
+    Ok(merge_project_conversation(journal, agent_transcripts))
 }
 
 pub fn check_claude_binary_impl(state: &AppState) -> Result<(), AppError> {
@@ -5059,6 +5414,598 @@ mod tests {
         assert!(
             state.dispatcher.agent_slot_count() == 0,
             "no orphan dispatcher actor survives the race"
+        );
+    }
+
+    // ---- load_project_conversation: pure-merge unit tests (system-design §7) ----
+
+    use chrono::{DateTime, TimeZone, Utc};
+    use switchboard_core::JournalRecord;
+    use switchboard_harness::{ContentKind, LoadedTranscript, Turn, TurnItem, TurnStatus};
+
+    /// A fixed instant offset by `secs` seconds — deterministic timestamps so
+    /// ordering assertions don't depend on wall-clock.
+    fn at(secs: i64) -> DateTime<Utc> {
+        Utc.timestamp_opt(1_700_000_000 + secs, 0).single().unwrap()
+    }
+
+    fn send_record(
+        send_id: SendId,
+        turn_id: Uuid,
+        agent_id: AgentId,
+        prompt: &str,
+        t: i64,
+    ) -> JournalRecord {
+        JournalRecord::Send {
+            send_id,
+            turn_id,
+            agent_id,
+            prompt: prompt.to_owned(),
+            at: at(t),
+        }
+    }
+
+    fn outcome_record(
+        send_id: SendId,
+        turn_id: Uuid,
+        agent_id: AgentId,
+        outcome: serde_json::Value,
+        t: i64,
+    ) -> JournalRecord {
+        JournalRecord::Outcome {
+            send_id,
+            turn_id,
+            agent_id,
+            outcome,
+            started_at: at(t),
+            ended_at: at(t + 1),
+        }
+    }
+
+    fn agent_turn(turn_id: Uuid, agent_id: AgentId, text: &str, t: i64) -> Turn {
+        Turn::Agent {
+            turn_id,
+            agent_id,
+            started_at: at(t),
+            ended_at: Some(at(t + 1)),
+            status: TurnStatus::Complete,
+            items: vec![TurnItem::Text {
+                kind: ContentKind::Text,
+                text: text.to_owned(),
+            }],
+            usage: None,
+        }
+    }
+
+    fn user_turn(turn_id: Uuid, agent_id: AgentId, text: &str, t: i64) -> Turn {
+        Turn::User {
+            turn_id,
+            agent_id,
+            started_at: at(t),
+            text: text.to_owned(),
+        }
+    }
+
+    fn transcript_of(turns: Vec<Turn>) -> LoadedTranscript {
+        LoadedTranscript {
+            turns,
+            meta: None,
+            last_rate_limit: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn merge_single_completed_turn_drops_harness_user_role() {
+        // §7 scenario 1: one Send + a harness transcript with a user-role copy
+        // and an assistant reply → [UserMessage(from journal), AgentTurn].
+        let send_id = Uuid::now_v7();
+        let turn_id = Uuid::now_v7();
+        let agent = Uuid::now_v7();
+        let journal = vec![send_record(send_id, turn_id, agent, "hello", 0)];
+        let transcript = transcript_of(vec![
+            user_turn(turn_id, agent, "hello", 1),
+            agent_turn(turn_id, agent, "hi there", 2),
+        ]);
+
+        let merged = merge_project_conversation(journal, vec![(agent, transcript, None)]);
+
+        assert_eq!(merged.items.len(), 2, "one user message + one agent turn");
+        match &merged.items[0] {
+            ConversationItem::UserMessage {
+                agent_ids, text, ..
+            } => {
+                assert_eq!(text, "hello", "user text comes from the journal");
+                assert_eq!(agent_ids, &vec![agent]);
+            }
+            other => panic!("expected user message first, got {other:?}"),
+        }
+        assert!(
+            matches!(merged.items[1], ConversationItem::AgentTurn { .. }),
+            "second item is the agent turn"
+        );
+        let user_count = merged
+            .items
+            .iter()
+            .filter(|i| matches!(i, ConversationItem::UserMessage { .. }))
+            .count();
+        assert_eq!(user_count, 1, "harness user-role turn never duplicates it");
+    }
+
+    #[test]
+    fn merge_fan_out_both_complete_renders_user_message_once() {
+        // §7 scenario 2: two Sends sharing one send_id + two agents each with an
+        // agent turn → ONE UserMessage(agent_ids = [B, C]) then both turns.
+        let send_id = Uuid::now_v7();
+        let b = Uuid::now_v7();
+        let c = Uuid::now_v7();
+        let tb = Uuid::now_v7();
+        let tc = Uuid::now_v7();
+        let journal = vec![
+            send_record(send_id, tb, b, "status?", 0),
+            send_record(send_id, tc, c, "status?", 0),
+        ];
+        let b_t = transcript_of(vec![agent_turn(tb, b, "b reply", 2)]);
+        let c_t = transcript_of(vec![agent_turn(tc, c, "c reply", 3)]);
+
+        let merged = merge_project_conversation(journal, vec![(b, b_t, None), (c, c_t, None)]);
+
+        let user_msgs: Vec<&ConversationItem> = merged
+            .items
+            .iter()
+            .filter(|i| matches!(i, ConversationItem::UserMessage { .. }))
+            .collect();
+        assert_eq!(user_msgs.len(), 1, "fan-out renders the user message once");
+        match user_msgs[0] {
+            ConversationItem::UserMessage { agent_ids, .. } => {
+                assert_eq!(agent_ids, &vec![b, c], "both recipients, first-seen order");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert_eq!(
+            merged
+                .items
+                .iter()
+                .filter(|i| matches!(i, ConversationItem::AgentTurn { .. }))
+                .count(),
+            2,
+            "both agent turns present"
+        );
+    }
+
+    #[test]
+    fn merge_failed_to_start_yields_failed_marker_no_orphan() {
+        // §7 scenario 4: Send + Failed outcome, no harness content → marker.
+        let send_id = Uuid::now_v7();
+        let turn_id = Uuid::now_v7();
+        let agent = Uuid::now_v7();
+        let journal = vec![
+            send_record(send_id, turn_id, agent, "run build", 0),
+            outcome_record(
+                send_id,
+                turn_id,
+                agent,
+                serde_json::json!({"status": "failed", "kind": "harness_error", "message": "spawn failed"}),
+                1,
+            ),
+        ];
+
+        let merged =
+            merge_project_conversation(journal, vec![(agent, transcript_of(Vec::new()), None)]);
+
+        assert_eq!(merged.items.len(), 2);
+        assert!(matches!(
+            merged.items[0],
+            ConversationItem::UserMessage { .. }
+        ));
+        match &merged.items[1] {
+            ConversationItem::Outcome { status, reason, .. } => {
+                assert_eq!(*status, OutcomeStatus::Failed);
+                assert_eq!(reason.as_deref(), Some("spawn failed"));
+            }
+            other => panic!("expected a failed outcome marker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_cancelled_mid_stream_yields_marker_only() {
+        // §7 scenario 5 (Claude/Codex): Send + cancelled outcome, no harness
+        // content → marker only, no partial agent turn.
+        let send_id = Uuid::now_v7();
+        let turn_id = Uuid::now_v7();
+        let agent = Uuid::now_v7();
+        let journal = vec![
+            send_record(send_id, turn_id, agent, "write a long essay", 0),
+            outcome_record(
+                send_id,
+                turn_id,
+                agent,
+                serde_json::json!({"status": "cancelled", "source": "user"}),
+                1,
+            ),
+        ];
+
+        let merged =
+            merge_project_conversation(journal, vec![(agent, transcript_of(Vec::new()), None)]);
+
+        assert!(
+            !merged
+                .items
+                .iter()
+                .any(|i| matches!(i, ConversationItem::AgentTurn { .. })),
+            "no agent turn when the harness persisted nothing"
+        );
+        match merged.items.last() {
+            Some(ConversationItem::Outcome { status, reason, .. }) => {
+                assert_eq!(*status, OutcomeStatus::Cancelled);
+                assert_eq!(reason.as_deref(), Some("user"), "reason from source");
+            }
+            other => panic!("expected a cancelled marker last, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_mixed_fan_out_complete_and_cancelled_compose_by_timestamp() {
+        // §7 closing paragraph: one send_id, B completes (harness turn), C is
+        // cancelled (journal marker) → one UserMessage{B,C}, then B's turn, then
+        // C's marker, ordered by timestamp.
+        let send_id = Uuid::now_v7();
+        let b = Uuid::now_v7();
+        let c = Uuid::now_v7();
+        let tb = Uuid::now_v7();
+        let tc = Uuid::now_v7();
+        let journal = vec![
+            send_record(send_id, tb, b, "do X", 0),
+            send_record(send_id, tc, c, "do X", 0),
+            outcome_record(
+                send_id,
+                tc,
+                c,
+                serde_json::json!({"status": "cancelled", "source": "user"}),
+                3,
+            ),
+        ];
+        let b_t = transcript_of(vec![agent_turn(tb, b, "done", 2)]);
+
+        let merged = merge_project_conversation(
+            journal,
+            vec![(b, b_t, None), (c, transcript_of(Vec::new()), None)],
+        );
+
+        assert_eq!(merged.items.len(), 3);
+        match &merged.items[0] {
+            ConversationItem::UserMessage { agent_ids, .. } => {
+                assert_eq!(agent_ids, &vec![b, c]);
+            }
+            other => panic!("expected user message first, got {other:?}"),
+        }
+        assert!(
+            matches!(&merged.items[1], ConversationItem::AgentTurn { agent_id, .. } if *agent_id == b),
+            "B's completed turn comes before C's later cancel marker"
+        );
+        assert!(
+            matches!(&merged.items[2], ConversationItem::Outcome { agent_id, status, .. } if *agent_id == c && *status == OutcomeStatus::Cancelled),
+            "C's cancel marker last"
+        );
+    }
+
+    #[test]
+    fn merge_drops_harness_user_role_turns() {
+        // A harness user-role turn never surfaces as a UserMessage — those come
+        // only from the journal.
+        let agent = Uuid::now_v7();
+        let turn_id = Uuid::now_v7();
+        let transcript = transcript_of(vec![user_turn(turn_id, agent, "from harness", 0)]);
+
+        let merged = merge_project_conversation(Vec::new(), vec![(agent, transcript, None)]);
+
+        assert!(
+            merged.items.is_empty(),
+            "harness user-role turns produce no rendered items"
+        );
+    }
+
+    #[test]
+    fn merge_orders_all_kinds_strictly_ascending_by_timestamp() {
+        // Interleave the three kinds out of order; the merge sorts by timestamp.
+        let send_id = Uuid::now_v7();
+        let agent = Uuid::now_v7();
+        let t_user = Uuid::now_v7();
+        let t_turn = Uuid::now_v7();
+        let t_out = Uuid::now_v7();
+        let journal = vec![
+            send_record(send_id, t_user, agent, "msg", 0),
+            outcome_record(
+                send_id,
+                t_out,
+                agent,
+                serde_json::json!({"status": "failed", "message": "x"}),
+                4,
+            ),
+        ];
+        let transcript = transcript_of(vec![agent_turn(t_turn, agent, "mid", 2)]);
+
+        let merged = merge_project_conversation(journal, vec![(agent, transcript, None)]);
+
+        let stamps: Vec<DateTime<Utc>> = merged
+            .items
+            .iter()
+            .map(conversation_item_timestamp)
+            .collect();
+        let mut sorted = stamps.clone();
+        sorted.sort();
+        assert_eq!(stamps, sorted, "items are sorted ascending by timestamp");
+        assert_eq!(stamps, vec![at(0), at(2), at(4)]);
+    }
+
+    #[test]
+    fn merge_equal_timestamp_orders_user_message_before_its_outcome() {
+        // The common failed-to-start/cancelled case: `Send.at == Outcome.started_at`.
+        // The user message must still render before its own outcome marker.
+        let send_id = Uuid::now_v7();
+        let turn_id = Uuid::now_v7();
+        let agent = Uuid::now_v7();
+        let journal = vec![
+            send_record(send_id, turn_id, agent, "run build", 0),
+            outcome_record(
+                send_id,
+                turn_id,
+                agent,
+                serde_json::json!({"status": "failed", "message": "spawn failed"}),
+                0,
+            ),
+        ];
+
+        let merged =
+            merge_project_conversation(journal, vec![(agent, transcript_of(Vec::new()), None)]);
+
+        assert_eq!(merged.items.len(), 2);
+        assert!(
+            matches!(merged.items[0], ConversationItem::UserMessage { .. }),
+            "user message precedes the outcome at an equal instant"
+        );
+        assert!(matches!(
+            merged.items[1],
+            ConversationItem::Outcome {
+                status: OutcomeStatus::Failed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn merge_equal_timestamp_orders_user_message_before_agent_turn() {
+        // An AgentTurn whose `started_at` equals a send's `at` → UserMessage first.
+        let send_id = Uuid::now_v7();
+        let turn_id = Uuid::now_v7();
+        let agent = Uuid::now_v7();
+        let journal = vec![send_record(send_id, turn_id, agent, "hello", 0)];
+        let transcript = transcript_of(vec![agent_turn(turn_id, agent, "hi", 0)]);
+
+        let merged = merge_project_conversation(journal, vec![(agent, transcript, None)]);
+
+        assert_eq!(merged.items.len(), 2);
+        assert!(
+            matches!(merged.items[0], ConversationItem::UserMessage { .. }),
+            "user message precedes the agent turn at an equal instant"
+        );
+        assert!(matches!(
+            merged.items[1],
+            ConversationItem::AgentTurn { .. }
+        ));
+    }
+
+    #[test]
+    fn merge_same_turn_agent_turn_and_outcome_both_render_content_then_marker() {
+        // A non-completed turn can produce BOTH a harness-persisted partial
+        // AgentTurn (status Failed) AND a journal Outcome for the same turn_id.
+        // The merge keeps both (no correlation/dedup), ordered content-then-marker.
+        let send_id = Uuid::now_v7();
+        let turn_id = Uuid::now_v7();
+        let agent = Uuid::now_v7();
+        let failed_turn = Turn::Agent {
+            turn_id,
+            agent_id: agent,
+            started_at: at(1),
+            ended_at: None,
+            status: TurnStatus::Failed,
+            items: vec![TurnItem::Text {
+                kind: ContentKind::Text,
+                text: "partial output".to_owned(),
+            }],
+            usage: None,
+        };
+        let journal = vec![
+            send_record(send_id, turn_id, agent, "do work", 0),
+            outcome_record(
+                send_id,
+                turn_id,
+                agent,
+                serde_json::json!({"status": "failed", "message": "died"}),
+                1,
+            ),
+        ];
+
+        let merged = merge_project_conversation(
+            journal,
+            vec![(agent, transcript_of(vec![failed_turn]), None)],
+        );
+
+        // UserMessage(0), AgentTurn(1), Outcome(1) — at equal t=1 the turn (rank 1)
+        // precedes the marker (rank 2); neither is deduped against the other.
+        assert_eq!(merged.items.len(), 3);
+        assert!(matches!(
+            merged.items[0],
+            ConversationItem::UserMessage { .. }
+        ));
+        assert!(
+            matches!(&merged.items[1], ConversationItem::AgentTurn { turn_id: tid, status, .. }
+                if *tid == turn_id && *status == TurnStatus::Failed),
+            "the partial failed turn is kept as content"
+        );
+        assert!(
+            matches!(&merged.items[2], ConversationItem::Outcome { turn_id: tid, status, .. }
+                if *tid == turn_id && *status == OutcomeStatus::Failed),
+            "the journal marker for the same turn_id is also kept, after the content"
+        );
+    }
+
+    #[test]
+    fn merge_attributes_parse_warnings_to_their_agent() {
+        // Two agents each with a distinct parse warning → each warning is
+        // attributable to its own AgentConversationMeta.
+        let a = Uuid::now_v7();
+        let b = Uuid::now_v7();
+        let warn = |reason: &str| switchboard_harness::ParseWarning {
+            line_number: 1,
+            reason: reason.to_owned(),
+        };
+        let a_t = LoadedTranscript {
+            turns: Vec::new(),
+            meta: None,
+            last_rate_limit: None,
+            warnings: vec![warn("a busted")],
+        };
+        let b_t = LoadedTranscript {
+            turns: Vec::new(),
+            meta: None,
+            last_rate_limit: None,
+            warnings: vec![warn("b busted")],
+        };
+
+        let merged = merge_project_conversation(Vec::new(), vec![(a, a_t, None), (b, b_t, None)]);
+
+        let a_meta = merged.agents.iter().find(|m| m.agent_id == a).unwrap();
+        let b_meta = merged.agents.iter().find(|m| m.agent_id == b).unwrap();
+        assert_eq!(a_meta.warnings, vec![warn("a busted")]);
+        assert_eq!(b_meta.warnings, vec![warn("b busted")]);
+        assert!(a_meta.load_error.is_none());
+        assert!(b_meta.load_error.is_none());
+    }
+
+    #[test]
+    fn merge_carries_per_agent_load_error_without_dropping_others() {
+        // One agent's transcript failed to load (empty transcript + load_error);
+        // the journal items and the healthy agent's turn still render.
+        let send_id = Uuid::now_v7();
+        let healthy = Uuid::now_v7();
+        let broken = Uuid::now_v7();
+        let th = Uuid::now_v7();
+        let journal = vec![send_record(send_id, th, healthy, "go", 0)];
+        let healthy_t = transcript_of(vec![agent_turn(th, healthy, "ok", 1)]);
+
+        let merged = merge_project_conversation(
+            journal,
+            vec![
+                (healthy, healthy_t, None),
+                (
+                    broken,
+                    transcript_of(Vec::new()),
+                    Some("sidecar corrupt".to_owned()),
+                ),
+            ],
+        );
+
+        assert!(
+            merged
+                .items
+                .iter()
+                .any(|i| matches!(i, ConversationItem::UserMessage { .. })),
+            "journal item still present"
+        );
+        assert!(
+            merged
+                .items
+                .iter()
+                .any(|i| matches!(i, ConversationItem::AgentTurn { agent_id, .. } if *agent_id == healthy)),
+            "healthy agent's turn still present"
+        );
+        let broken_meta = merged.agents.iter().find(|m| m.agent_id == broken).unwrap();
+        assert_eq!(broken_meta.load_error.as_deref(), Some("sidecar corrupt"));
+    }
+
+    #[test]
+    fn parse_outcome_classifies_status_and_reason() {
+        let (s, r) = parse_outcome(&serde_json::json!({"status": "cancelled", "source": "user"}));
+        assert_eq!(s, OutcomeStatus::Cancelled);
+        assert_eq!(r.as_deref(), Some("user"));
+
+        let (s, r) = parse_outcome(&serde_json::json!({"status": "failed", "message": "boom"}));
+        assert_eq!(s, OutcomeStatus::Failed);
+        assert_eq!(r.as_deref(), Some("boom"));
+
+        // Missing detail → None; an unknown status falls back to Failed.
+        let (s, r) = parse_outcome(&serde_json::json!({"status": "weird"}));
+        assert_eq!(s, OutcomeStatus::Failed);
+        assert_eq!(r, None);
+    }
+
+    // ---- load_project_conversation_impl: command-level wiring ----
+
+    #[tokio::test]
+    async fn load_project_conversation_wires_journal_with_empty_transcripts() {
+        // A real project + a Claude agent that never dispatched (no session ⇒
+        // empty transcript). Append journal records directly, then assert the
+        // command surfaces the journal-sourced items.
+        let (tmp, state, _) = fresh_state_with_mock();
+        let (agent, project_id) = project_with_agent(&state, &tmp).await;
+        let project = lock(&state.projects).get(&project_id).cloned().unwrap();
+        let send_id = Uuid::now_v7();
+        let turn_id = Uuid::now_v7();
+        switchboard_core::journal::append_record(
+            &project.journal_path(),
+            &send_record(send_id, turn_id, agent.id, "hi", 0),
+        )
+        .unwrap();
+        switchboard_core::journal::append_record(
+            &project.journal_path(),
+            &outcome_record(
+                send_id,
+                turn_id,
+                agent.id,
+                serde_json::json!({"status": "cancelled", "source": "user"}),
+                1,
+            ),
+        )
+        .unwrap();
+
+        let home = tmp.path().to_path_buf();
+        let conv = load_project_conversation_impl(&state, project_id, &home)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            conv.items.len(),
+            2,
+            "journal user message + cancel marker (empty transcript adds none)"
+        );
+        assert!(matches!(
+            conv.items[0],
+            ConversationItem::UserMessage { .. }
+        ));
+        assert!(matches!(
+            conv.items[1],
+            ConversationItem::Outcome {
+                status: OutcomeStatus::Cancelled,
+                ..
+            }
+        ));
+        assert_eq!(conv.agents.len(), 1, "the one agent's meta is carried");
+    }
+
+    #[tokio::test]
+    async fn load_project_conversation_missing_journal_has_no_user_items() {
+        let (tmp, state, _) = fresh_state_with_mock();
+        let (_agent, project_id) = project_with_agent(&state, &tmp).await;
+
+        let home = tmp.path().to_path_buf();
+        let conv = load_project_conversation_impl(&state, project_id, &home)
+            .await
+            .unwrap();
+
+        assert!(
+            conv.items.is_empty(),
+            "no journal ⇒ no user/outcome items; empty transcript adds none"
         );
     }
 }

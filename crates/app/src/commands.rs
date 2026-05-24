@@ -3,13 +3,14 @@
 //! to Tauri's `State<'_, AppState>` / `String` conventions; the free
 //! functions are what the unit tests target.
 
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use switchboard_core::{
-    AgentId, AgentRecord, Directory, HarnessKind, Project, ProjectId, ProjectSummary,
+    AgentId, AgentRecord, CoreError, Directory, HarnessKind, Project, ProjectId, ProjectSummary,
 };
 use switchboard_dispatcher::{
     CancelOutcome, DispatchContextFactory, OnBusy, RemovedQueuedMessage, SendOutcome,
@@ -19,7 +20,7 @@ use uuid::Uuid;
 
 use crate::dispatch_context::ProjectDispatchContextFactory;
 use crate::error::AppError;
-use crate::state::{AppState, lock};
+use crate::state::{AppState, lock, persist_workspace};
 
 /// Returned by `init_directory_impl` — gives the caller everything it needs
 /// to render the directory header (path) and project list in one round trip.
@@ -28,6 +29,18 @@ pub struct DirectoryInfo {
     pub path: String,
     pub has_switchboard: bool,
     pub projects: Vec<ProjectSummary>,
+}
+
+/// One row of the flat cross-directory project list (`list_projects_impl`).
+/// Carries the owning directory path and whether that directory is currently
+/// available (loaded + readable). Wire type — serialized to the frontend.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ProjectListing {
+    pub id: ProjectId,
+    pub name: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub directory: String,
+    pub available: bool,
 }
 
 /// Read-only inspection. Canonicalizes the path, checks whether
@@ -54,15 +67,16 @@ pub async fn pick_directory_impl(path: &str) -> Result<DirectoryInfo, AppError> 
     })
 }
 
-/// Idempotent for the same path: creates `.switchboard/` if missing and
-/// binds the directory in `AppState`. Re-binding to a *different* canonical
-/// path clears the loaded-project cache and the active project, so the
-/// frontend can't subsequently dispatch to an agent from the previous
-/// directory (which would resolve to a now-stale `project.directory`).
+/// Additive + idempotent: creates `.switchboard/` if missing and adds the
+/// directory to the multi-directory workspace. The directory is keyed by its
+/// **canonical** path (`Directory::at` canonicalizes), so two spellings of the
+/// same directory collapse to one entry. Re-initializing an already-loaded
+/// directory just refreshes the handle and its cached project snapshot — it
+/// never clears other directories or any shared map. Adding a *new* directory
+/// leaves every already-loaded directory's projects, locks, and caches intact.
 ///
-/// In-flight dispatches on agents from the prior directory keep running
-/// (their `AgentIdleGuard` and event channels are dispatcher-owned and
-/// agent-scoped) — graceful cleanup of those is future work.
+/// Also registers the canonical path in the user-global workspace registry
+/// (`workspace.yaml`) and refreshes that directory's cached project snapshot.
 pub async fn init_directory_impl(state: &AppState, path: &str) -> Result<DirectoryInfo, AppError> {
     // Serialize against concurrent registry writes (create_project,
     // register_agent). init_directory creates `.switchboard/` structure
@@ -76,49 +90,275 @@ pub async fn init_directory_impl(state: &AppState, path: &str) -> Result<Directo
     // points at a directory with an incompatible existing config).
     directory.config()?;
     let projects = directory.list_projects()?;
+    let canonical = directory.path.clone();
     let info = DirectoryInfo {
-        path: directory.path.to_string_lossy().into_owned(),
+        path: canonical.to_string_lossy().into_owned(),
         has_switchboard: directory.has_switchboard(),
-        projects,
+        projects: projects.clone(),
     };
 
-    // Atomic-ish: if the new path differs from the current one, clear the
-    // project caches before swapping in the new directory binding so the
-    // loaded-projects/active-project state never references a directory we
-    // are no longer bound to.
+    // Insert (or refresh) the handle. Re-init of an already-loaded canonical
+    // path replaces only its own handle — every other loaded directory and all
+    // shared maps are untouched (the additive contract).
+    lock(&state.directories).insert(canonical.clone(), directory);
+
+    // Register in the user-global workspace and refresh its cached snapshot.
+    // The registry compares paths as-given, so only ever feed it canonical
+    // paths (decision: "Directory identity is canonicalized at the boundary").
     {
-        let mut current = lock(&state.directory);
-        let rebinding = matches!(current.as_ref(), Some(d) if d.path != directory.path);
-        if rebinding {
-            lock(&state.projects).clear();
-            *lock(&state.active_project_id) = None;
-            // A pending one-shot from a prior directory's attach must not
-            // leak into the newly-bound directory's first dispatch — the
-            // agent_id wouldn't even resolve.
-            lock(&state.needs_session_meta).clear();
-            // Drop prior-directory project locks (releasing each `flock` as
-            // its `File` drops) and the stale register-cache entries (M4.1).
-            lock(&state.project_locks).clear();
-            lock(&state.agents_by_id).clear();
-        }
-        *current = Some(directory);
+        let mut workspace = lock(&state.workspace);
+        workspace.add(canonical.clone());
+        workspace.refresh_cache(&canonical, projects);
     }
+    persist_workspace(state);
+
     Ok(info)
 }
 
-pub fn list_projects_impl(state: &AppState) -> Result<Vec<ProjectSummary>, AppError> {
-    let directory = bound_directory(state)?;
-    Ok(directory.list_projects()?)
+/// Remove a directory from the workspace. Drains any in-flight turns on its
+/// agents, releases its project locks, drops its loaded projects/agents, and
+/// removes it from the workspace registry. **Never deletes `.switchboard/` on
+/// disk** — re-initializing the same path restores its projects. Idempotent:
+/// removing an absent/unavailable directory is `Ok`.
+pub async fn remove_directory_impl(state: &AppState, path: &str) -> Result<(), AppError> {
+    let canonical = canonicalize_boundary(path);
+
+    // **Teardown ordering (load-bearing).** Remove every piece of *routable*
+    // in-memory state FIRST — atomically under `registry_write`, with no `.await`
+    // crossing the guard — then release the guard and drain the actors. Clearing
+    // the maps before releasing the guard closes the teardown race two ways:
+    //   - a racing `send` can no longer resolve the agent (it misses
+    //     `agents_by_id` → `AgentNotFound`), and a racing `create_*` /
+    //     `open_project` can no longer resolve the removed directory or its
+    //     now-cleared active project;
+    //   - the narrow window where a send already passed `lookup_agent` but
+    //     hasn't reached the dispatcher is closed by the dispatcher's own
+    //     `Closing` slot — the late `Enqueue` is rejected, not resurrected.
+    // So the actor drain (below) cannot be outrun by a new turn, and no orphan
+    // actor/subprocess survives.
+    //
+    // `registry_write` serializes us against `create_project` / `create_agent` /
+    // `attach` / first-open (all take it). It is `std::sync::Mutex` (its guard is
+    // `!Send`), so it must be released before the drain `.await`.
+    let agent_ids: Vec<AgentId>;
+    let project_ids: Vec<ProjectId>;
+    {
+        let write = lock(&state.registry_write);
+
+        let loaded = lock(&state.directories).contains_key(&canonical);
+        if !loaded {
+            // Not loaded — nothing routable to clear. Drop the guard, then fall
+            // through to the always-run workspace removal below.
+            drop(write);
+            lock(&state.workspace).remove(&canonical);
+            persist_workspace(state);
+            return Ok(());
+        }
+
+        // Collect under brief, independent lock acquisitions, never nesting out
+        // of the documented lock order. Snapshot the agent ids BEFORE clearing
+        // `agents_by_id`.
+        let pids: Vec<ProjectId> = lock(&state.projects)
+            .values()
+            .filter(|p| p.directory == canonical)
+            .map(|p| p.id)
+            .collect();
+        let project_set: HashSet<ProjectId> = pids.iter().copied().collect();
+        let aids: Vec<AgentId> = lock(&state.agents_by_id)
+            .values()
+            .filter(|r| project_set.contains(&r.project_id))
+            .map(|r| r.id)
+            .collect();
+
+        // Clear routable state, each a brief independent acquisition, in the
+        // documented lock order (directories → projects → active_project_id →
+        // needs_session_meta → agents_by_id). **Do NOT touch `project_locks`
+        // here** — the drain helper releases those locks AFTER the turns drain.
+        lock(&state.directories).remove(&canonical);
+        {
+            let mut projects = lock(&state.projects);
+            projects.retain(|id, _| !project_set.contains(id));
+        }
+        {
+            let mut active = lock(&state.active_project_id);
+            if matches!(*active, Some(id) if project_set.contains(&id)) {
+                *active = None;
+            }
+        }
+        {
+            let mut needs = lock(&state.needs_session_meta);
+            needs.retain(|id| !aids.contains(id));
+        }
+        {
+            let mut agents = lock(&state.agents_by_id);
+            agents.retain(|_, r| !project_set.contains(&r.project_id));
+        }
+
+        agent_ids = aids;
+        project_ids = pids;
+        // `write` drops here — the guard is released BEFORE the drain `.await`.
+    }
+
+    // Shut down each agent's dispatcher actor (cancels + drains any live turn)
+    // and release the named project locks. Holds no other state lock across the
+    // await.
+    drain_agents_then_release_locks(state, &agent_ids, &project_ids, CancelSource::Shutdown).await;
+
+    // Always drop the workspace entry + persist (idempotent for absent dirs).
+    lock(&state.workspace).remove(&canonical);
+    persist_workspace(state);
+    Ok(())
 }
 
-pub fn create_project_impl(state: &AppState, name: &str) -> Result<ProjectSummary, AppError> {
+/// *The* directory-identity chokepoint. Every command that resolves a working
+/// directory to its canonical key — `init_directory_impl`, `create_project_impl`,
+/// `remove_directory_impl` — funnels through here so a directory is identified
+/// the same way on the way in (init/create) and on the way out (remove).
+///
+/// Canonicalizes via `std::fs::canonicalize` when the path exists on disk
+/// (matching `Directory::at`, which is how loaded directories were keyed), and
+/// falls back to the path as-given when it does not — so an unmounted/moved
+/// directory still matches the canonical key stored while it was available.
+fn canonicalize_boundary(path: &str) -> PathBuf {
+    let raw = Path::new(path);
+    std::fs::canonicalize(raw).unwrap_or_else(|_| raw.to_path_buf())
+}
+
+/// Flat cross-directory project list. Iterates the workspace registry in
+/// insertion order; for each entry, reads projects from disk if the directory
+/// is loaded (refreshing the cached snapshot, `available: true`), else falls
+/// back to the cached snapshot (`available: false`).
+///
+/// **Persist-on-change only.** This is a hot read path (the UI hits it on every
+/// project switch), so it persists `workspace.yaml` iff at least one cached
+/// snapshot actually changed — avoiding a write storm of identical files.
+///
+/// **Corrupt vs. unavailable.** A loaded directory whose `list_projects` read
+/// fails is *not* uniformly treated as "serve cache." A missing index / I/O
+/// error (`CoreError::Io` / `MissingAppendOnlyFile` — unmounted, transient)
+/// falls back to the cached snapshot as `available: false`. A *corruption*
+/// error (`CoreError::CorruptJsonl` / `CorruptYaml` / `UnsupportedConfigVersion`
+/// — a damaged Switchboard-owned file) is logged loudly and does **not** refresh
+/// or persist the cache from the bad read; it still degrades to `available:
+/// false` for now (the wire shape is unchanged — see below), but the read
+/// boundary no longer makes corruption silently indistinguishable from
+/// unmounted. One corrupt directory must never fail the whole aggregation — the
+/// other directories still list.
+//
+// `available: bool` is intentionally kept (no status enum / `errored` variant):
+// that is a frontend-facing wire change that lands additively with the switcher
+// UI. For now corruption is distinct only in the logs.
+//
+// Returns `Result` even though it never errors today: it is the
+// `#[tauri::command]` chokepoint for the cross-directory list. Keeping the
+// fallible shape avoids a breaking signature change at the IPC boundary.
+#[allow(clippy::unnecessary_wraps)]
+pub fn list_projects_impl(state: &AppState) -> Result<Vec<ProjectListing>, AppError> {
+    let entry_paths: Vec<PathBuf> = lock(&state.workspace)
+        .entries()
+        .iter()
+        .map(|e| e.path.clone())
+        .collect();
+
+    let mut listings: Vec<ProjectListing> = Vec::new();
+    let mut cache_changed = false;
+    for path in &entry_paths {
+        let dir_str = path.to_string_lossy().into_owned();
+        let loaded = lock(&state.directories).get(path).cloned();
+
+        // Distinguish three outcomes for a loaded directory's read:
+        //   Some(summaries) → fresh read, refresh cache, available.
+        //   None            → not loaded OR a transient/unavailable read error
+        //                     (I/O, missing index) → serve cache, unavailable.
+        // A corruption error logs loudly and also serves cache without
+        // refreshing/persisting it (so the bad read can't overwrite the last
+        // good snapshot).
+        let fresh = match loaded
+            .as_ref()
+            .map(switchboard_core::Directory::list_projects)
+        {
+            Some(Ok(summaries)) => Some(summaries),
+            None | Some(Err(CoreError::Io { .. } | CoreError::MissingAppendOnlyFile { .. })) => {
+                None
+            }
+            Some(Err(
+                e @ (CoreError::CorruptJsonl { .. }
+                | CoreError::CorruptYaml { .. }
+                | CoreError::UnsupportedConfigVersion { .. }),
+            )) => {
+                tracing::error!(
+                    directory = %dir_str,
+                    error = %e,
+                    "directory registry is corrupt — listing its cached snapshot as unavailable; not refreshing cache from the bad read"
+                );
+                None
+            }
+            // Any other (future) CoreError variant: treat conservatively as
+            // unavailable rather than refreshing the cache from a read we can't
+            // classify. `CoreError` is `#[non_exhaustive]`.
+            Some(Err(e)) => {
+                tracing::warn!(
+                    directory = %dir_str,
+                    error = %e,
+                    "directory registry read failed with an unclassified error — serving cached snapshot as unavailable"
+                );
+                None
+            }
+        };
+
+        if let Some(summaries) = fresh {
+            if lock(&state.workspace).refresh_cache(path, summaries.clone()) {
+                cache_changed = true;
+            }
+            for s in summaries {
+                listings.push(ProjectListing {
+                    id: s.id,
+                    name: s.name,
+                    created_at: s.created_at,
+                    directory: dir_str.clone(),
+                    available: true,
+                });
+            }
+        } else {
+            let cached: Vec<ProjectSummary> = lock(&state.workspace)
+                .entries()
+                .iter()
+                .find(|e| &e.path == path)
+                .map(|e| e.cached_projects.clone())
+                .unwrap_or_default();
+            for s in cached {
+                listings.push(ProjectListing {
+                    id: s.id,
+                    name: s.name,
+                    created_at: s.created_at,
+                    directory: dir_str.clone(),
+                    available: false,
+                });
+            }
+        }
+    }
+    if cache_changed {
+        persist_workspace(state);
+    }
+    Ok(listings)
+}
+
+pub fn create_project_impl(
+    state: &AppState,
+    name: &str,
+    directory_path: &str,
+) -> Result<ProjectSummary, AppError> {
     // Serialize the uniqueness check + JSONL append against concurrent
     // `create_project` / `register_agent` / `init_directory` calls. Without
     // this, two concurrent IPC calls could both pass the canonical-name
     // uniqueness check (which reads disk) and then both append colliding
     // records (which write disk).
     let _write = lock(&state.registry_write);
-    let directory = bound_directory(state)?;
+    let canonical = canonicalize_boundary(directory_path);
+    let directory = lock(&state.directories)
+        .get(&canonical)
+        .cloned()
+        .ok_or(AppError::NoDirectory)?;
     let project = directory.create_project(name)?;
     let summary = ProjectSummary {
         id: project.id,
@@ -132,6 +372,13 @@ pub fn create_project_impl(state: &AppState, name: &str) -> Result<ProjectSummar
     let lock_handle = acquire_project_lock(project.id, &project.root)?;
     lock(&state.project_locks).insert(project.id, lock_handle);
     lock(&state.projects).insert(project.id, project);
+
+    // Refresh the workspace cache for this directory so the flat list reflects
+    // the new project even before the next `list_projects` round-trip.
+    if let Ok(summaries) = directory.list_projects() {
+        lock(&state.workspace).refresh_cache(&canonical, summaries);
+        persist_workspace(state);
+    }
     Ok(summary)
 }
 
@@ -168,8 +415,7 @@ pub fn open_project_impl(
             created_at: loaded.config.created_at,
         });
     }
-    let directory = bound_directory(state)?;
-    let project = directory.open_project(project_id)?;
+    let project = find_project_in_directories(state, project_id)?;
     let summary = ProjectSummary {
         id: project.id,
         name: project.config.name.clone(),
@@ -233,11 +479,16 @@ pub fn create_agent_impl(
 ///    (the sidecar's `session_partition_date`); Antigravity checks that the
 ///    server-assigned conversation directory `brain/<uuid>/` exists (the
 ///    transcript inside may be absent — hydration degrades gracefully).
-/// 4. Session-id collision scan across **all projects in the bound
-///    directory** (loaded or not — `enumerate_all_projects` walks every
-///    project on disk via `directory.list_projects()`). Claude and Gemini
-///    scan `AgentRecord.session_id` (caller-controlled UUID); Codex and
-///    Antigravity scan every project's `sessions/<agent_id>.*.jsonl` sidecar
+/// 4. Session-id collision scan (loaded or not — the scan walks projects on
+///    disk). Scope differs by harness: Claude and Gemini scan only the active
+///    project's **own directory** (`enumerate_directory_projects`) because
+///    their session ids are caller-controlled and cwd-namespaced, so a widened
+///    scan would false-reject a legitimately-distinct same-id-different-cwd
+///    session. Codex and Antigravity scan **all loaded directories**
+///    (`enumerate_all_projects`) because their ids are server-assigned and
+///    globally unique. Claude and Gemini scan `AgentRecord.session_id`
+///    (caller-controlled UUID); Codex and Antigravity scan every project's
+///    `sessions/<agent_id>.*.jsonl` sidecar
 ///    (those agents leave `AgentRecord.session_id = None` — the id lives in
 ///    the sidecar). Two `AgentRecord`s pointing at the same harness session
 ///    is the same-session-parallel-invocation hazard
@@ -274,7 +525,12 @@ pub fn attach_agent_impl(
         .get(&active)
         .cloned()
         .ok_or(AppError::ProjectNotLoaded(active))?;
-    let directory = bound_directory(state)?;
+    // The active project's owning directory — the cwd that namespaces Claude /
+    // Gemini session files and the root of Codex / Antigravity sidecars.
+    let directory = lock(&state.directories)
+        .get(&project.directory)
+        .cloned()
+        .ok_or(AppError::NoDirectory)?;
 
     let session_uuid = parse_uuid(existing_session_id)?;
 
@@ -291,7 +547,7 @@ pub fn attach_agent_impl(
                     expected_path: expected.to_string_lossy().into_owned(),
                 });
             }
-            check_claude_session_id_unique(state, &session_uuid)?;
+            check_claude_session_id_unique(state, &directory, &session_uuid)?;
             project.register_attached_claude_agent(name, session_uuid)?
         }
         HarnessKind::Codex => {
@@ -301,7 +557,7 @@ pub fn attach_agent_impl(
                     existing_session_id,
                 )
                 .map_err(map_codex_attach_lookup_error(harness, home_dir))?;
-            check_codex_session_id_unique(state, existing_session_id, &directory.path)?;
+            check_codex_session_id_unique(state, existing_session_id)?;
             // Pre-mint the AgentId so we can write the sidecar **before**
             // committing the registry record. If the sidecar write fails,
             // the registry stays untouched — at worst an orphan sidecar
@@ -335,7 +591,7 @@ pub fn attach_agent_impl(
                 path = %candidate.display(),
                 "gemini attach: bound to candidate"
             );
-            check_gemini_session_id_unique(state, &session_uuid)?;
+            check_gemini_session_id_unique(state, &directory, &session_uuid)?;
             project.register_attached_gemini_agent(name, session_uuid)?
         }
         HarnessKind::Antigravity => {
@@ -357,7 +613,7 @@ pub fn attach_agent_impl(
                     expected_path: brain_dir.to_string_lossy().into_owned(),
                 });
             }
-            check_antigravity_session_id_unique(state, session_uuid, &directory.path)?;
+            check_antigravity_session_id_unique(state, session_uuid)?;
             // Sidecar-before-registry, pre-minted id — same ordering and
             // inverted-blast-radius rationale as the Codex arm above.
             let new_agent_id = Uuid::now_v7();
@@ -423,20 +679,51 @@ fn map_codex_attach_lookup_error(
     }
 }
 
-/// Enumerate every project on disk under the bound directory, preferring
-/// the in-memory `state.projects` entry for already-loaded projects (avoids
-/// a redundant disk read of the same `config.yaml`). Unloaded projects are
-/// constructed via `directory.open_project(id)`, which is a pure read —
-/// it does **not** mutate `state.projects` or register any listeners.
+/// Enumerate every project on disk across **all loaded directories**,
+/// preferring the in-memory `state.projects` entry for already-loaded projects
+/// (avoids a redundant disk read of the same `config.yaml`). Unloaded projects
+/// are constructed via `directory.open_project(id)`, a pure read that does
+/// **not** mutate `state.projects` or register any listeners.
 ///
-/// Used by the attach-flow collision scans. A v1 directory typically holds
-/// a handful of projects so the disk cost is small; if a directory ever
-/// grows to dozens of projects, attach latency may become visible — flag
-/// as a future optimization (cache `Project` handles + invalidate on
-/// rebind), not a current concern.
+/// Used by the Codex / Antigravity attach-flow collision scans, whose session
+/// ids are server-assigned and globally unique — a collision across *any* two
+/// loaded directories is a genuine same-session-parallel-invocation hazard, so
+/// the scan must span every directory the app holds.
 fn enumerate_all_projects(state: &AppState) -> Result<Vec<Project>, AppError> {
-    let directory = bound_directory(state)?;
-    let loaded = lock(&state.projects);
+    let directories: Vec<Directory> = lock(&state.directories).values().cloned().collect();
+    // Snapshot the loaded-project map under the lock, then release it before any
+    // disk I/O (`list_projects` / `open_project`). Holding `state.projects`
+    // across filesystem reads — now amplified across every directory and taken
+    // under `registry_write` — would serialize unrelated work behind disk
+    // latency. Same no-lock-across-I/O discipline as `persist_workspace`.
+    let loaded: HashMap<ProjectId, Project> = lock(&state.projects).clone();
+    let mut all: Vec<Project> = Vec::new();
+    for directory in directories {
+        for summary in directory.list_projects()? {
+            if let Some(p) = loaded.get(&summary.id) {
+                all.push(p.clone());
+            } else {
+                all.push(directory.open_project(summary.id)?);
+            }
+        }
+    }
+    Ok(all)
+}
+
+/// Enumerate every project on disk under a **single** directory, preferring
+/// the in-memory `state.projects` entry for already-loaded projects.
+///
+/// Used by the Claude / Gemini attach-flow collision scans. Those harnesses'
+/// session ids are caller-supplied and namespaced by cwd (the directory), so a
+/// scan must stay **per-directory** — widening it across directories would
+/// false-reject a legitimately-distinct same-id-different-cwd session.
+fn enumerate_directory_projects(
+    state: &AppState,
+    directory: &Directory,
+) -> Result<Vec<Project>, AppError> {
+    // Snapshot the loaded-project map under the lock, then release it before the
+    // disk reads below (see `enumerate_all_projects` for the rationale).
+    let loaded: HashMap<ProjectId, Project> = lock(&state.projects).clone();
     let mut all: Vec<Project> = Vec::new();
     for summary in directory.list_projects()? {
         if let Some(p) = loaded.get(&summary.id) {
@@ -448,14 +735,20 @@ fn enumerate_all_projects(state: &AppState) -> Result<Vec<Project>, AppError> {
     Ok(all)
 }
 
-/// Cross-project Claude session-id collision check. Walks every project on
-/// disk in the bound directory — not just `state.projects` — because an
-/// unloaded project's `AgentRecord` could still be opened later and
+/// Per-directory Claude session-id collision check. Walks every project on
+/// disk in the **attach's target directory** — not just `state.projects` —
+/// because an unloaded project's `AgentRecord` could still be opened later and
 /// dispatched concurrently, which is the same-session-parallel-invocation
-/// hazard the invariant is defending against. Held under `registry_write`
-/// so it's atomic with the subsequent register.
-fn check_claude_session_id_unique(state: &AppState, candidate: &Uuid) -> Result<(), AppError> {
-    for project in enumerate_all_projects(state)? {
+/// hazard the invariant is defending against. Scoped per-directory because
+/// Claude session ids are cwd-namespaced (the same id under a different cwd is
+/// a distinct session). Held under `registry_write` so it's atomic with the
+/// subsequent register.
+fn check_claude_session_id_unique(
+    state: &AppState,
+    directory: &Directory,
+    candidate: &Uuid,
+) -> Result<(), AppError> {
+    for project in enumerate_directory_projects(state, directory)? {
         for agent in project.list_agents()? {
             if agent.session_id == Some(*candidate) {
                 return Err(AppError::SessionAlreadyAttached {
@@ -483,12 +776,17 @@ fn check_claude_session_id_unique(state: &AppState, candidate: &Uuid) -> Result<
 /// The error is wrapped in `AttachBlockedByCorruption` so the user sees
 /// "the failure is about an *unrelated* agent's state, not your attach
 /// target."
-/// Cross-project Gemini session-id collision check. Gemini agents carry
-/// `AgentRecord.session_id = Some(uuid)` (Claude shape). Walks every
-/// project on disk in the bound directory and rejects if any agent
-/// already attached to the same UUID.
-fn check_gemini_session_id_unique(state: &AppState, candidate: &Uuid) -> Result<(), AppError> {
-    for project in enumerate_all_projects(state)? {
+/// Per-directory Gemini session-id collision check. Gemini agents carry
+/// `AgentRecord.session_id = Some(uuid)` (Claude shape). Walks every project on
+/// disk in the **attach's target directory** and rejects if any agent already
+/// attached to the same UUID. Scoped per-directory for the same cwd-namespacing
+/// reason as Claude.
+fn check_gemini_session_id_unique(
+    state: &AppState,
+    directory: &Directory,
+    candidate: &Uuid,
+) -> Result<(), AppError> {
+    for project in enumerate_directory_projects(state, directory)? {
         for agent in project.list_agents()? {
             if agent.harness != HarnessKind::Gemini {
                 continue;
@@ -584,18 +882,22 @@ fn locate_gemini_candidate(
     })
 }
 
-fn check_codex_session_id_unique(
-    state: &AppState,
-    candidate: &str,
-    directory: &Path,
-) -> Result<(), AppError> {
+/// Cross-directory Codex session-id collision check. Codex session ids are
+/// server-assigned and globally unique, so the scan spans **all loaded
+/// directories** (`enumerate_all_projects`). Each project's sidecar lives under
+/// its own owning directory (`project.directory`), so the sidecar path is
+/// derived per-project, not from a single attach directory.
+fn check_codex_session_id_unique(state: &AppState, candidate: &str) -> Result<(), AppError> {
     for project in enumerate_all_projects(state)? {
         for agent in project.list_agents()? {
             if agent.harness != HarnessKind::Codex {
                 continue;
             }
-            let sidecar =
-                switchboard_harness::codex::sidecar::sidecar_path(directory, project.id, agent.id);
+            let sidecar = switchboard_harness::codex::sidecar::sidecar_path(
+                &project.directory,
+                project.id,
+                agent.id,
+            );
             let latest =
                 switchboard_harness::codex::sidecar::read_latest(&sidecar).map_err(|source| {
                     AppError::AttachBlockedByCorruption {
@@ -619,24 +921,25 @@ fn check_codex_session_id_unique(
 }
 
 /// Reject attaching a conversation UUID already bound to another Antigravity
-/// agent in the directory. Mirrors the Codex check (the conversation id lives
-/// in the per-agent sidecar, not the `AgentRecord`, so the scan reads
-/// sidecars). The same-session-parallel-invocation risk is identical: two
-/// agents resuming one `--conversation <uuid>` would interleave server-side.
-/// Corrupt sidecars fail loud rather than being skipped — a skipped sidecar
-/// could let a duplicate attach through and violate the uniqueness contract.
-fn check_antigravity_session_id_unique(
-    state: &AppState,
-    candidate: Uuid,
-    directory: &Path,
-) -> Result<(), AppError> {
+/// agent across **all loaded directories**. Mirrors the Codex check (the
+/// conversation id lives in the per-agent sidecar, not the `AgentRecord`, so
+/// the scan reads sidecars) and is likewise cross-directory: Antigravity
+/// conversation ids are server-assigned and globally unique. The
+/// same-session-parallel-invocation risk is identical: two agents resuming one
+/// `--conversation <uuid>` would interleave server-side. Each project's sidecar
+/// lives under its own owning directory (`project.directory`). Corrupt sidecars
+/// fail loud rather than being skipped — a skipped sidecar could let a
+/// duplicate attach through and violate the uniqueness contract.
+fn check_antigravity_session_id_unique(state: &AppState, candidate: Uuid) -> Result<(), AppError> {
     for project in enumerate_all_projects(state)? {
         for agent in project.list_agents()? {
             if agent.harness != HarnessKind::Antigravity {
                 continue;
             }
             let sidecar = switchboard_harness::antigravity::sidecar::sidecar_path(
-                directory, project.id, agent.id,
+                &project.directory,
+                project.id,
+                agent.id,
             );
             let latest = switchboard_harness::antigravity::sidecar::read_latest(&sidecar).map_err(
                 |source| AppError::AttachBlockedByCorruption {
@@ -818,7 +1121,8 @@ pub fn load_transcript_impl(
     home_dir: &Path,
 ) -> Result<switchboard_harness::LoadedTranscript, AppError> {
     let (project, agent) = lookup_agent(state, agent_id)?;
-    let directory = bound_directory(state)?;
+    // The cwd / sidecar root is the project's own owning directory.
+    let directory_path = project.directory.clone();
     match agent.harness {
         HarnessKind::ClaudeCode => {
             let Some(session_id) = agent.session_id else {
@@ -826,14 +1130,14 @@ pub fn load_transcript_impl(
             };
             Ok(switchboard_harness::load_claude_transcript(
                 home_dir,
-                &directory.path,
+                &directory_path,
                 session_id,
                 agent.id,
             )?)
         }
         HarnessKind::Codex => {
             let sidecar_path = switchboard_harness::codex::sidecar::sidecar_path(
-                &directory.path,
+                &directory_path,
                 project.id,
                 agent.id,
             );
@@ -853,7 +1157,7 @@ pub fn load_transcript_impl(
             };
             Ok(switchboard_harness::load_codex_transcript(
                 home_dir,
-                &directory.path,
+                &directory_path,
                 &session_id,
                 partition_date,
                 agent.id,
@@ -865,7 +1169,7 @@ pub fn load_transcript_impl(
             };
             Ok(switchboard_harness::load_gemini_transcript(
                 home_dir,
-                &directory.path,
+                &directory_path,
                 session_id,
                 agent.id,
             )?)
@@ -879,7 +1183,7 @@ pub fn load_transcript_impl(
             // never-dispatched case — passed through as `None` so the loader
             // still surfaces registry meta (matching the Codex arm).
             let sidecar_path = switchboard_harness::antigravity::sidecar::sidecar_path(
-                &directory.path,
+                &directory_path,
                 project.id,
                 agent.id,
             );
@@ -890,7 +1194,7 @@ pub fn load_transcript_impl(
                 })?;
             Ok(switchboard_harness::load_antigravity_transcript(
                 home_dir,
-                &directory.path,
+                &directory_path,
                 latest.map(|record| record.conversation_id),
                 agent.id,
             )?)
@@ -1044,11 +1348,48 @@ pub fn check_gemini_auth_impl(home_dir: &Path) -> Result<(), AppError> {
     }
 }
 
-fn bound_directory(state: &AppState) -> Result<Directory, AppError> {
-    lock(&state.directory)
-        .as_ref()
-        .cloned()
-        .ok_or(AppError::NoDirectory)
+/// Find a not-yet-loaded project's owning directory by searching every loaded
+/// directory for the one whose on-disk project list contains `project_id`, then
+/// read the project from it. Used by `open_project_impl` (lazy-lock-on-open):
+/// the directory is known to be loaded (the flat list only offers projects from
+/// loaded directories), but the project handle itself may not be in
+/// `state.projects` yet.
+/// Locate the project across every loaded directory, opening it from the
+/// directory that lists it.
+///
+/// **Resilience to an unrelated corrupt directory.** Iteration order over
+/// `state.directories` is a `HashMap`'s nondeterministic order, so a corrupt
+/// *unrelated* directory could be visited before the healthy one that owns the
+/// target. We therefore **skip-and-log** a directory whose `list_projects`
+/// errors and keep searching, rather than propagating mid-iteration and failing
+/// the open of a perfectly healthy project. Only when no directory yields the
+/// project do we return `ProjectNotLoaded`.
+///
+/// (Contrast `enumerate_all_projects`, the collision scan, which deliberately
+/// fails loud — a scan that can't read a directory must not let a possibly
+/// colliding attach through.)
+fn find_project_in_directories(
+    state: &AppState,
+    project_id: ProjectId,
+) -> Result<Project, AppError> {
+    let directories: Vec<Directory> = lock(&state.directories).values().cloned().collect();
+    for directory in directories {
+        let summaries = match directory.list_projects() {
+            Ok(summaries) => summaries,
+            Err(e) => {
+                tracing::warn!(
+                    directory = %directory.path.display(),
+                    error = %e,
+                    "skipping directory while locating project — its registry could not be read"
+                );
+                continue;
+            }
+        };
+        if summaries.iter().any(|s| s.id == project_id) {
+            return directory.open_project(project_id).map_err(AppError::from);
+        }
+    }
+    Err(AppError::ProjectNotLoaded(project_id))
 }
 
 fn lookup_agent(state: &AppState, agent_id: AgentId) -> Result<(Project, AgentRecord), AppError> {
@@ -1113,6 +1454,22 @@ mod tests {
     use switchboard_dispatcher::{EventEmitter, RecordingEmitter};
     use switchboard_harness::{ClaudeCodeAdapter, HarnessAdapter, MockHarnessAdapter};
     use tempfile::TempDir;
+
+    /// Test convenience: create a project in the sole loaded directory. Most
+    /// tests load exactly one directory, so this keeps their call sites terse
+    /// while the production API requires an explicit directory path.
+    fn create_project_in_only_dir(state: &AppState, name: &str) -> ProjectSummary {
+        let path = {
+            let dirs = lock(&state.directories);
+            assert_eq!(
+                dirs.len(),
+                1,
+                "create_project_in_only_dir requires exactly one loaded directory"
+            );
+            dirs.keys().next().unwrap().to_string_lossy().into_owned()
+        };
+        create_project_impl(state, name, &path).unwrap()
+    }
 
     fn fresh_state_with_mock() -> (TempDir, AppState, Arc<RecordingEmitter>) {
         let tmp = TempDir::new().unwrap();
@@ -1190,7 +1547,7 @@ mod tests {
         init_directory_impl(state, tmp.path().to_str().unwrap())
             .await
             .unwrap();
-        let project = create_project_impl(state, "proj").unwrap();
+        let project = create_project_in_only_dir(state, "proj");
         set_active_project_impl(state, project.id).unwrap();
         let agent = create_agent_impl(state, "assistant", HarnessKind::ClaudeCode).unwrap();
         (agent, project.id)
@@ -1209,8 +1566,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn init_directory_to_different_path_clears_projects_and_unbinds_old_agents() {
-        // First directory: create a project + agent.
+    async fn adding_a_second_directory_leaves_the_first_intact() {
+        // Additive is the new contract (replacing the old "rebind clears
+        // everything"): adding a second directory must not disturb the first
+        // directory's loaded projects, locks, register-cache, active project,
+        // or in-flight one-shots.
         let tmp_a = TempDir::new().unwrap();
         let tmp_b = TempDir::new().unwrap();
         let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
@@ -1226,33 +1586,27 @@ mod tests {
         init_directory_impl(&state, tmp_a.path().to_str().unwrap())
             .await
             .unwrap();
-        let proj = create_project_impl(&state, "alpha").unwrap();
+        let proj = create_project_in_only_dir(&state, "alpha");
         set_active_project_impl(&state, proj.id).unwrap();
         let agent = create_agent_impl(&state, "assistant", HarnessKind::ClaudeCode).unwrap();
 
-        // Simulate a stale attach-flow one-shot from the old directory.
-        lock(&state.needs_session_meta).insert(agent.id);
-
-        // Rebind to a different directory.
+        // Add a second directory.
         let info_b = init_directory_impl(&state, tmp_b.path().to_str().unwrap())
             .await
             .unwrap();
-
-        // Loaded-project state was cleared, active project unset, and the
-        // attach-flow flag drained — a stale agent_id from a previous
-        // directory's attach must not leak into the new binding.
         assert_eq!(info_b.projects.len(), 0);
-        assert!(lock(&state.projects).is_empty());
-        assert!(lock(&state.active_project_id).is_none());
-        assert!(lock(&state.needs_session_meta).is_empty());
 
-        // The actual user-visible bug guard: sending to the old agent ID
-        // now returns AgentNotFound (not a silent dispatch against the old
-        // project's cwd).
-        let err = send_message_impl(&state, agent.id, "should fail")
+        // The first directory's state is fully intact.
+        assert_eq!(lock(&state.directories).len(), 2, "both directories loaded");
+        assert!(lock(&state.projects).contains_key(&proj.id));
+        assert!(lock(&state.project_locks).contains_key(&proj.id));
+        assert!(lock(&state.agents_by_id).contains_key(&agent.id));
+        assert_eq!(*lock(&state.active_project_id), Some(proj.id));
+
+        // Sending to the original agent still resolves and dispatches.
+        send_message_impl(&state, agent.id, "still works")
             .await
-            .unwrap_err();
-        assert!(matches!(err, AppError::AgentNotFound(_)));
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1262,7 +1616,7 @@ mod tests {
             .await
             .unwrap();
         // Second call must succeed and preserve any created projects.
-        create_project_impl(&state, "alpha").unwrap();
+        create_project_in_only_dir(&state, "alpha");
         let info = init_directory_impl(&state, tmp.path().to_str().unwrap())
             .await
             .unwrap();
@@ -1271,10 +1625,12 @@ mod tests {
     }
 
     #[test]
-    fn list_projects_without_init_errors() {
+    fn list_projects_with_empty_workspace_is_empty() {
+        // The flat list is workspace-driven: with no directories added, it is
+        // an empty list (not an error) — the cross-directory model has no
+        // single "bound directory" whose absence is an error.
         let (_tmp, state, _) = fresh_state_with_mock();
-        let err = list_projects_impl(&state).unwrap_err();
-        assert!(matches!(err, AppError::NoDirectory));
+        assert!(list_projects_impl(&state).unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1283,7 +1639,7 @@ mod tests {
         init_directory_impl(&state, tmp.path().to_str().unwrap())
             .await
             .unwrap();
-        let summary = create_project_impl(&state, "alpha").unwrap();
+        let summary = create_project_in_only_dir(&state, "alpha");
         // open_project on an already-loaded project is a no-op equivalent.
         let reopened = open_project_impl(&state, summary.id).unwrap();
         assert_eq!(reopened.id, summary.id);
@@ -1327,7 +1683,7 @@ mod tests {
         init_directory_impl(&state, tmp.path().to_str().unwrap())
             .await
             .unwrap();
-        let project = create_project_impl(&state, "alpha").unwrap();
+        let project = create_project_in_only_dir(&state, "alpha");
         set_active_project_impl(&state, project.id).unwrap();
         let agent = create_agent_impl(
             &state,
@@ -1407,18 +1763,25 @@ mod tests {
             Arc::clone(&mock),
             emitter as Arc<dyn EventEmitter>,
         ));
-        init_directory_impl(&state, tmp.path().to_str().unwrap())
+        let info = init_directory_impl(&state, tmp.path().to_str().unwrap())
             .await
             .unwrap();
+        let dir_path = info.path;
 
         let state_a = Arc::clone(&state);
         let state_b = Arc::clone(&state);
+        let dir_a = dir_path.clone();
+        let dir_b = dir_path;
         // Run on real threads so the mutex contention is real (not
         // single-threaded cooperative scheduling). The work inside
         // create_project_impl is synchronous once it enters the locked
         // section.
-        let a = tokio::task::spawn_blocking(move || create_project_impl(&state_a, "shared-name"));
-        let b = tokio::task::spawn_blocking(move || create_project_impl(&state_b, "shared-name"));
+        let a = tokio::task::spawn_blocking(move || {
+            create_project_impl(&state_a, "shared-name", &dir_a)
+        });
+        let b = tokio::task::spawn_blocking(move || {
+            create_project_impl(&state_b, "shared-name", &dir_b)
+        });
         let results = [a.await.unwrap(), b.await.unwrap()];
 
         let successes = results.iter().filter(|r| r.is_ok()).count();
@@ -1444,7 +1807,7 @@ mod tests {
         init_directory_impl(&state, tmp.path().to_str().unwrap())
             .await
             .unwrap();
-        let project = create_project_impl(&state, "alpha").unwrap();
+        let project = create_project_in_only_dir(&state, "alpha");
         set_active_project_impl(&state, project.id).unwrap();
         let err = send_message_impl(&state, Uuid::now_v7(), "hi")
             .await
@@ -1762,8 +2125,8 @@ mod tests {
         init_directory_impl(&state, tmp.path().to_str().unwrap())
             .await
             .unwrap();
-        let proj_a = create_project_impl(&state, "alpha").unwrap();
-        let proj_b = create_project_impl(&state, "beta").unwrap();
+        let proj_a = create_project_in_only_dir(&state, "alpha");
+        let proj_b = create_project_in_only_dir(&state, "beta");
         set_active_project_impl(&state, proj_a.id).unwrap();
         create_agent_impl(&state, "a-agent", switchboard_core::HarnessKind::ClaudeCode).unwrap();
         set_active_project_impl(&state, proj_b.id).unwrap();
@@ -1868,7 +2231,7 @@ mod tests {
         init_directory_impl(&state, tmp.path().to_str().unwrap())
             .await
             .unwrap();
-        let proj = create_project_impl(&state, "alpha").unwrap();
+        let proj = create_project_in_only_dir(&state, "alpha");
         set_active_project_impl(&state, proj.id).unwrap();
         let claude_agent = create_agent_impl(&state, "c1", HarnessKind::ClaudeCode).unwrap();
         let codex_agent = create_agent_impl(&state, "x1", HarnessKind::Codex).unwrap();
@@ -1977,7 +2340,7 @@ mod tests {
         init_directory_impl(&state, tmp.path().to_str().unwrap())
             .await
             .unwrap();
-        let proj = create_project_impl(&state, "alpha").unwrap();
+        let proj = create_project_in_only_dir(&state, "alpha");
         set_active_project_impl(&state, proj.id).unwrap();
         let agent = create_agent_impl(&state, "a", HarnessKind::ClaudeCode).unwrap();
         lock(&state.needs_session_meta).insert(agent.id);
@@ -2023,7 +2386,7 @@ mod tests {
         init_directory_impl(&state, tmp.path().to_str().unwrap())
             .await
             .unwrap();
-        let proj = create_project_impl(&state, "alpha").unwrap();
+        let proj = create_project_in_only_dir(&state, "alpha");
         set_active_project_impl(&state, proj.id).unwrap();
         let agent = create_agent_impl(&state, "a", HarnessKind::ClaudeCode).unwrap();
         lock(&state.needs_session_meta).insert(agent.id);
@@ -2111,7 +2474,7 @@ mod tests {
         init_directory_impl(&state, tmp.path().to_str().unwrap())
             .await
             .unwrap();
-        let proj = create_project_impl(&state, "alpha").unwrap();
+        let proj = create_project_in_only_dir(&state, "alpha");
         set_active_project_impl(&state, proj.id).unwrap();
         let agent_default = create_agent_impl(&state, "a", HarnessKind::ClaudeCode).unwrap();
         send_message_impl(&state, agent_default.id, "hi")
@@ -2230,7 +2593,7 @@ mod tests {
         init_directory_impl(&state, tmp.path().to_str().unwrap())
             .await
             .unwrap();
-        let proj = create_project_impl(&state, "alpha").unwrap();
+        let proj = create_project_in_only_dir(&state, "alpha");
         set_active_project_impl(&state, proj.id).unwrap();
         let agent = create_agent_impl(&state, "a", HarnessKind::Codex).unwrap();
         // Simulate the Codex-attach state: the flag is set on a real attach,
@@ -2279,8 +2642,8 @@ mod tests {
         init_directory_impl(&state, tmp.path().to_str().unwrap())
             .await
             .unwrap();
-        let proj_a = create_project_impl(&state, "alpha").unwrap();
-        let proj_b = create_project_impl(&state, "beta").unwrap();
+        let proj_a = create_project_in_only_dir(&state, "alpha");
+        let proj_b = create_project_in_only_dir(&state, "beta");
 
         // Two projects in same directory; same agent name in each is fine.
         set_active_project_impl(&state, proj_a.id).unwrap();
@@ -2343,7 +2706,7 @@ mod tests {
         init_directory_impl(&state, tmp.path().to_str().unwrap())
             .await
             .unwrap();
-        create_project_impl(&state, "alpha").unwrap();
+        create_project_in_only_dir(&state, "alpha");
 
         // Use a fresh state with no directory bound — pick_directory is
         // stateless, it just inspects the path.
@@ -2444,7 +2807,7 @@ mod tests {
         init_directory_impl(&state, tmp_workdir.path().to_str().unwrap())
             .await
             .unwrap();
-        let proj = create_project_impl(&state, name).unwrap();
+        let proj = create_project_in_only_dir(&state, name);
         set_active_project_impl(&state, proj.id).unwrap();
         (tmp_workdir, tmp_home, state, proj)
     }
@@ -2583,7 +2946,7 @@ mod tests {
         // Two projects in the same directory. Attach session_id S in alpha;
         // attempt to attach the same S in beta → SessionAlreadyAttached.
         let (tmp_workdir, tmp_home, state, alpha) = fresh_state_with_active_project("alpha").await;
-        let beta = create_project_impl(&state, "beta").unwrap();
+        let beta = create_project_in_only_dir(&state, "beta");
         let session_id = Uuid::now_v7();
         stage_claude_session_file(tmp_home.path(), tmp_workdir.path(), &session_id);
 
@@ -2646,7 +3009,7 @@ mod tests {
     #[tokio::test]
     async fn attach_codex_rejects_cross_project_session_id_collision() {
         let (tmp_workdir, tmp_home, state, _alpha) = fresh_state_with_active_project("alpha").await;
-        let beta = create_project_impl(&state, "beta").unwrap();
+        let beta = create_project_in_only_dir(&state, "beta");
         let session_id = Uuid::now_v7();
         let date = chrono::NaiveDate::from_ymd_opt(2026, 5, 10).unwrap();
         stage_codex_session_file(tmp_home.path(), date, &session_id.to_string());
@@ -2883,7 +3246,7 @@ mod tests {
             init_directory_impl(&state_a, tmp_workdir.path().to_str().unwrap())
                 .await
                 .unwrap();
-            let proj_a = create_project_impl(&state_a, "alpha").unwrap();
+            let proj_a = create_project_in_only_dir(&state_a, "alpha");
             set_active_project_impl(&state_a, proj_a.id).unwrap();
             attach_agent_impl(
                 &state_a,
@@ -2910,7 +3273,7 @@ mod tests {
         init_directory_impl(&state_b, tmp_workdir.path().to_str().unwrap())
             .await
             .unwrap();
-        let proj_b = create_project_impl(&state_b, "beta").unwrap();
+        let proj_b = create_project_in_only_dir(&state_b, "beta");
         set_active_project_impl(&state_b, proj_b.id).unwrap();
 
         let err = attach_agent_impl(
@@ -2953,7 +3316,7 @@ mod tests {
             init_directory_impl(&state_a, tmp_workdir.path().to_str().unwrap())
                 .await
                 .unwrap();
-            let proj_a = create_project_impl(&state_a, "alpha").unwrap();
+            let proj_a = create_project_in_only_dir(&state_a, "alpha");
             set_active_project_impl(&state_a, proj_a.id).unwrap();
             attach_agent_impl(
                 &state_a,
@@ -2977,7 +3340,7 @@ mod tests {
         init_directory_impl(&state_b, tmp_workdir.path().to_str().unwrap())
             .await
             .unwrap();
-        let proj_b = create_project_impl(&state_b, "beta").unwrap();
+        let proj_b = create_project_in_only_dir(&state_b, "beta");
         set_active_project_impl(&state_b, proj_b.id).unwrap();
 
         let err = attach_agent_impl(
@@ -3677,7 +4040,7 @@ mod tests {
         )
         .unwrap();
 
-        let proj_b = create_project_impl(&state, "beta").unwrap();
+        let proj_b = create_project_in_only_dir(&state, "beta");
         set_active_project_impl(&state, proj_b.id).unwrap();
         let err = attach_agent_impl(
             &state,
@@ -3775,7 +4138,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn project_lock_refuses_second_process_then_releases_on_rebind() {
+    async fn project_lock_refuses_second_process_then_releases_on_remove() {
         let (tmp_workdir, _home, state_a, proj) = fresh_state_with_active_project("alpha").await;
 
         // A second Switchboard "process" binds the same directory and opens
@@ -3792,13 +4155,12 @@ mod tests {
             "second process must be refused with ProjectLocked, got {err:?}"
         );
 
-        // state_a rebinds elsewhere → its lock `File` drops → released.
-        let other = TempDir::new().unwrap();
-        init_directory_impl(&state_a, other.path().to_str().unwrap())
+        // state_a removes the directory → its lock `File` drops → released.
+        remove_directory_impl(&state_a, tmp_workdir.path().to_str().unwrap())
             .await
             .unwrap();
         open_project_impl(&state_b, proj.id)
-            .expect("lock released on rebind; second process can now open");
+            .expect("lock released on remove; second process can now open");
     }
 
     #[tokio::test]
@@ -3816,7 +4178,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_cache_populates_clears_on_rebind_and_repopulates_on_open() {
+    async fn register_cache_populates_clears_on_remove_and_repopulates_on_open() {
         let (tmp_workdir, _home, state, proj) = fresh_state_with_active_project("alpha").await;
         let agent = create_agent_impl(&state, "assistant", HarnessKind::ClaudeCode).unwrap();
 
@@ -3827,9 +4189,9 @@ mod tests {
         assert_eq!(found.id, agent.id);
         assert_eq!(project.id, proj.id);
 
-        // Rebind elsewhere clears the cache; the stale agent no longer resolves.
-        let other = TempDir::new().unwrap();
-        init_directory_impl(&state, other.path().to_str().unwrap())
+        // Removing the directory prunes its cache entries; the stale agent no
+        // longer resolves.
+        remove_directory_impl(&state, tmp_workdir.path().to_str().unwrap())
             .await
             .unwrap();
         assert!(lock(&state.agents_by_id).is_empty());
@@ -3838,7 +4200,8 @@ mod tests {
             Err(AppError::AgentNotFound(_))
         ));
 
-        // Rebind back and open the project → cache repopulated from disk.
+        // Re-init the same directory and open the project → cache repopulated
+        // from disk (the `.switchboard/` state was never deleted).
         init_directory_impl(&state, tmp_workdir.path().to_str().unwrap())
             .await
             .unwrap();
@@ -3919,7 +4282,7 @@ mod tests {
     #[tokio::test]
     async fn distinct_projects_lock_independently() {
         let (_tmp, _home, state, alpha) = fresh_state_with_active_project("alpha").await;
-        let beta = create_project_impl(&state, "beta").unwrap();
+        let beta = create_project_in_only_dir(&state, "beta");
         // Per-project lock, not per-directory: both are held simultaneously.
         assert_eq!(lock(&state.project_locks).len(), 2);
         // Both remain openable (intra-process re-open is a no-op).
@@ -4128,5 +4491,574 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::QueuedMessageNotFound(id) if id == unknown));
+    }
+
+    // ---- M4.6: multi-directory workspace ----
+
+    #[tokio::test]
+    async fn two_spellings_of_same_directory_collapse_to_one() {
+        // Init the same directory under two spellings (a plain path and one
+        // with a redundant `/./` component). `Directory::at` canonicalizes, so
+        // both must collapse to a single `directories` entry, a single
+        // workspace entry, and its projects must list exactly once.
+        let (tmp, state, _) = fresh_state_with_mock();
+        let plain = tmp.path().to_str().unwrap().to_owned();
+        let dotted = format!("{plain}/./");
+
+        init_directory_impl(&state, &plain).await.unwrap();
+        let project = create_project_in_only_dir(&state, "alpha");
+        init_directory_impl(&state, &dotted).await.unwrap();
+
+        assert_eq!(
+            lock(&state.directories).len(),
+            1,
+            "two spellings must collapse to one loaded directory"
+        );
+        assert_eq!(
+            lock(&state.workspace).entries().len(),
+            1,
+            "two spellings must collapse to one workspace entry"
+        );
+        let listings = list_projects_impl(&state).unwrap();
+        assert_eq!(listings.len(), 1, "the project lists exactly once");
+        assert_eq!(listings[0].id, project.id);
+        assert!(listings[0].available);
+    }
+
+    #[tokio::test]
+    async fn remove_directory_drains_turns_releases_locks_and_preserves_disk() {
+        let (tmp, state, emitter) =
+            fresh_state_with_scenario(switchboard_harness::MockScenario::AwaitCancellation);
+        let (agent, project_id) = project_with_agent(&state, &tmp).await;
+
+        send_message_impl(&state, agent.id, "long task")
+            .await
+            .unwrap();
+        within(
+            &emitter,
+            "turn_start",
+            emitter.wait_for_type("turn_start", 1),
+        )
+        .await;
+        assert!(lock(&state.project_locks).contains_key(&project_id));
+
+        remove_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        // The in-flight turn was drained with source = shutdown, the lock
+        // released, and all in-memory state for the directory dropped.
+        let channel = format!("agent:{}", agent.id);
+        let cancelled = emitter.snapshot().into_iter().any(|(name, v)| {
+            name == channel
+                && v["type"] == "turn_end"
+                && v["outcome"]["status"] == "cancelled"
+                && v["outcome"]["source"] == "shutdown"
+        });
+        assert!(
+            cancelled,
+            "remove drains the live turn with source = shutdown"
+        );
+        assert!(!lock(&state.project_locks).contains_key(&project_id));
+        assert!(lock(&state.projects).is_empty());
+        assert!(lock(&state.agents_by_id).is_empty());
+        assert!(lock(&state.directories).is_empty());
+        assert!(lock(&state.workspace).entries().is_empty());
+        assert!(lock(&state.active_project_id).is_none());
+
+        // `.switchboard/` was never deleted — re-init restores the project.
+        assert!(tmp.path().join(".switchboard").is_dir());
+        let info = init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(info.projects.len(), 1);
+        assert_eq!(info.projects[0].id, project_id);
+
+        // Removing an absent/never-added directory is Ok (idempotent).
+        let absent = TempDir::new().unwrap();
+        remove_directory_impl(&state, absent.path().to_str().unwrap())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_projects_aggregates_across_two_directories() {
+        let (tmp_a, state, _) = fresh_state_with_mock();
+        let tmp_b = TempDir::new().unwrap();
+
+        init_directory_impl(&state, tmp_a.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let dir_a = lock(&state.directories)
+            .keys()
+            .next()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let alpha = create_project_impl(&state, "alpha", &dir_a).unwrap();
+
+        let info_b = init_directory_impl(&state, tmp_b.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let dir_b = info_b.path.clone();
+        let beta = create_project_impl(&state, "beta", &dir_b).unwrap();
+
+        let listings = list_projects_impl(&state).unwrap();
+        assert_eq!(listings.len(), 2, "both directories' projects aggregate");
+
+        let alpha_row = listings.iter().find(|l| l.id == alpha.id).unwrap();
+        let beta_row = listings.iter().find(|l| l.id == beta.id).unwrap();
+        assert_eq!(alpha_row.directory, dir_a);
+        assert_eq!(beta_row.directory, dir_b);
+        assert!(alpha_row.available && beta_row.available);
+    }
+
+    #[tokio::test]
+    async fn codex_session_id_collision_rejected_across_two_directories() {
+        // Codex ids are server-assigned + globally unique, so a collision
+        // across two distinct directories must be rejected.
+        let tmp_home = TempDir::new().unwrap();
+        let tmp_a = TempDir::new().unwrap();
+        let tmp_b = TempDir::new().unwrap();
+        let state = mock_app_state();
+        let session_id = Uuid::now_v7();
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 5, 10).unwrap();
+        stage_codex_session_file(tmp_home.path(), date, &session_id.to_string());
+
+        let info_a = init_directory_impl(&state, tmp_a.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let alpha = create_project_impl(&state, "alpha", &info_a.path).unwrap();
+        set_active_project_impl(&state, alpha.id).unwrap();
+        attach_agent_impl(
+            &state,
+            "a",
+            HarnessKind::Codex,
+            &session_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap();
+
+        // Second directory, attempt to attach the same Codex session id.
+        let info_b = init_directory_impl(&state, tmp_b.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let beta = create_project_impl(&state, "beta", &info_b.path).unwrap();
+        set_active_project_impl(&state, beta.id).unwrap();
+        let err = attach_agent_impl(
+            &state,
+            "b",
+            HarnessKind::Codex,
+            &session_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::SessionAlreadyAttached { .. }),
+            "Codex id collision across directories must be rejected, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_same_session_id_in_two_directories_is_allowed() {
+        // Claude ids are cwd-namespaced. The same UUID under two different
+        // directories is a genuinely-distinct session (different on-disk file),
+        // so the per-directory scan must allow it.
+        let tmp_home = TempDir::new().unwrap();
+        let tmp_a = TempDir::new().unwrap();
+        let tmp_b = TempDir::new().unwrap();
+        let state = mock_app_state();
+        let session_id = Uuid::now_v7();
+        // Stage the same session id under each directory's cwd namespace.
+        stage_claude_session_file(tmp_home.path(), tmp_a.path(), &session_id);
+        stage_claude_session_file(tmp_home.path(), tmp_b.path(), &session_id);
+
+        let info_a = init_directory_impl(&state, tmp_a.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let alpha = create_project_impl(&state, "alpha", &info_a.path).unwrap();
+        set_active_project_impl(&state, alpha.id).unwrap();
+        attach_agent_impl(
+            &state,
+            "a",
+            HarnessKind::ClaudeCode,
+            &session_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap();
+
+        let info_b = init_directory_impl(&state, tmp_b.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let beta = create_project_impl(&state, "beta", &info_b.path).unwrap();
+        set_active_project_impl(&state, beta.id).unwrap();
+        attach_agent_impl(
+            &state,
+            "b",
+            HarnessKind::ClaudeCode,
+            &session_id.to_string(),
+            tmp_home.path(),
+        )
+        .expect("same Claude id under a different directory is a distinct session");
+    }
+
+    // ---- M4.6 hardening: directory-identity helper, list resilience ----
+
+    #[tokio::test]
+    async fn create_project_canonicalization_matches_init_directory_key() {
+        // The dedup invariant the flat cross-directory list depends on: the key
+        // `create_project_impl` resolves a directory by (`canonicalize_boundary`)
+        // must equal the key `init_directory_impl` stored for that directory
+        // (`Directory::at`'s canonical path). Feed `create_project` a noisy
+        // spelling of the same path and assert it still finds the loaded
+        // directory and creates the project there.
+        let (tmp, state, _) = fresh_state_with_mock();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let stored_key = lock(&state.directories).keys().next().unwrap().clone();
+
+        let noisy = format!("{}/./", tmp.path().to_str().unwrap());
+        let summary = create_project_impl(&state, "alpha", &noisy).unwrap();
+
+        let project = lock(&state.projects).get(&summary.id).cloned().unwrap();
+        assert_eq!(
+            project.directory, stored_key,
+            "create_project must resolve to the same canonical key init stored"
+        );
+        assert_eq!(
+            lock(&state.directories).len(),
+            1,
+            "no second directory entry was created"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_projects_with_no_changes_performs_no_write() {
+        // Persist-on-change: a second list with nothing changed must not rewrite
+        // workspace.yaml.
+        let dir = TempDir::new().unwrap();
+        let ws_path = dir.path().join("workspace.yaml");
+        let tmp = TempDir::new().unwrap();
+        let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let emitter = Arc::new(RecordingEmitter::new());
+        let state = AppState::new(
+            Arc::clone(&mock),
+            Arc::clone(&mock),
+            Arc::clone(&mock),
+            Arc::clone(&mock),
+            emitter as Arc<dyn EventEmitter>,
+        )
+        .with_workspace(ws_path.clone());
+
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        create_project_in_only_dir(&state, "alpha");
+
+        // First list refreshes the cache (project added since last persist) and
+        // writes the file.
+        list_projects_impl(&state).unwrap();
+        let first_mtime = std::fs::metadata(&ws_path).unwrap().modified().unwrap();
+
+        // Second list: nothing changed → no write, so mtime is unchanged.
+        list_projects_impl(&state).unwrap();
+        let second_mtime = std::fs::metadata(&ws_path).unwrap().modified().unwrap();
+        assert_eq!(
+            first_mtime, second_mtime,
+            "an unchanged list must not rewrite workspace.yaml"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_projects_unmounted_directory_falls_back_to_cache_without_write() {
+        // A directory present in the workspace but not loaded (unmounted) serves
+        // its cached snapshot as unavailable, and produces no write.
+        let dir = TempDir::new().unwrap();
+        let ws_path = dir.path().join("workspace.yaml");
+        let tmp = TempDir::new().unwrap();
+        let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let emitter = Arc::new(RecordingEmitter::new());
+        let state = AppState::new(
+            Arc::clone(&mock),
+            Arc::clone(&mock),
+            Arc::clone(&mock),
+            Arc::clone(&mock),
+            emitter as Arc<dyn EventEmitter>,
+        )
+        .with_workspace(ws_path.clone());
+
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let proj = create_project_in_only_dir(&state, "alpha");
+        // Prime the cache + persist.
+        list_projects_impl(&state).unwrap();
+
+        // Simulate the directory becoming unavailable: drop the loaded handle.
+        let key = lock(&state.projects)
+            .get(&proj.id)
+            .map(|p| p.directory.clone())
+            .unwrap();
+        lock(&state.directories).remove(&key);
+        let before = std::fs::metadata(&ws_path).unwrap().modified().unwrap();
+
+        let listings = list_projects_impl(&state).unwrap();
+        assert_eq!(listings.len(), 1, "cached snapshot still lists the project");
+        assert!(!listings[0].available, "unloaded directory is unavailable");
+        let after = std::fs::metadata(&ws_path).unwrap().modified().unwrap();
+        assert_eq!(before, after, "cache-fallback path must not rewrite");
+    }
+
+    #[tokio::test]
+    async fn list_projects_corrupt_directory_does_not_fail_others_or_refresh_cache() {
+        // A corrupt registry in directory A must not refresh/persist A's cache
+        // and must not fail the listing of healthy directory B.
+        let dir = TempDir::new().unwrap();
+        let ws_path = dir.path().join("workspace.yaml");
+        let tmp_a = TempDir::new().unwrap();
+        let tmp_b = TempDir::new().unwrap();
+        let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let emitter = Arc::new(RecordingEmitter::new());
+        let state = AppState::new(
+            Arc::clone(&mock),
+            Arc::clone(&mock),
+            Arc::clone(&mock),
+            Arc::clone(&mock),
+            emitter as Arc<dyn EventEmitter>,
+        )
+        .with_workspace(ws_path.clone());
+
+        let info_a = init_directory_impl(&state, tmp_a.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let alpha = create_project_impl(&state, "alpha", &info_a.path).unwrap();
+        let info_b = init_directory_impl(&state, tmp_b.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let beta = create_project_impl(&state, "beta", &info_b.path).unwrap();
+        // Prime caches for both.
+        list_projects_impl(&state).unwrap();
+        let cached_a_before: Vec<ProjectSummary> = lock(&state.workspace)
+            .entries()
+            .iter()
+            .find(|e| e.path == tmp_a.path().canonicalize().unwrap())
+            .map(|e| e.cached_projects.clone())
+            .unwrap();
+
+        // Corrupt A's projects index (Switchboard-owned JSONL).
+        let index_a = tmp_a.path().join(".switchboard").join("projects.jsonl");
+        std::fs::write(&index_a, "{ this is not valid json\n").unwrap();
+
+        let listings = list_projects_impl(&state).unwrap();
+        // B still lists; A degrades to its cached snapshot as unavailable.
+        let beta_row = listings
+            .iter()
+            .find(|l| l.id == beta.id)
+            .expect("healthy directory B still lists");
+        assert!(beta_row.available);
+        let alpha_row = listings
+            .iter()
+            .find(|l| l.id == alpha.id)
+            .expect("corrupt directory A still lists from cache");
+        assert!(
+            !alpha_row.available,
+            "corrupt directory degrades to unavailable"
+        );
+
+        // A's cache was NOT refreshed from the corrupt read.
+        let cached_a_after: Vec<ProjectSummary> = lock(&state.workspace)
+            .entries()
+            .iter()
+            .find(|e| e.path == tmp_a.path().canonicalize().unwrap())
+            .map(|e| e.cached_projects.clone())
+            .unwrap();
+        assert_eq!(
+            cached_a_before, cached_a_after,
+            "corrupt read must not overwrite the last-good cached snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_project_skips_corrupt_unrelated_directory() {
+        // find_project_in_directories must skip-and-log a corrupt unrelated
+        // directory (A) and still open a healthy project in directory B.
+        let (tmp_a, state, _) = fresh_state_with_mock();
+        let tmp_b = TempDir::new().unwrap();
+        let info_a = init_directory_impl(&state, tmp_a.path().to_str().unwrap())
+            .await
+            .unwrap();
+        // A has a project so its (now-corrupt) index would otherwise be read.
+        create_project_impl(&state, "alpha", &info_a.path).unwrap();
+        let info_b = init_directory_impl(&state, tmp_b.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let beta = create_project_impl(&state, "beta", &info_b.path).unwrap();
+
+        // Evict B from the loaded set so open must locate it via directory scan.
+        lock(&state.projects).remove(&beta.id);
+        lock(&state.project_locks).remove(&beta.id);
+
+        // Corrupt A's registry. HashMap iteration order is nondeterministic, so
+        // A may be visited before B.
+        let index_a = tmp_a.path().join(".switchboard").join("projects.jsonl");
+        std::fs::write(&index_a, "{ corrupt\n").unwrap();
+
+        let reopened = open_project_impl(&state, beta.id)
+            .expect("open of a healthy project succeeds despite an unrelated corrupt directory");
+        assert_eq!(reopened.id, beta.id);
+    }
+
+    // ---- M4.6 hardening: remove_directory teardown-race tests ----
+
+    #[tokio::test]
+    async fn remove_directory_races_send_no_second_turn_and_no_orphan_actor() {
+        // (a) A `send` racing a `remove_directory` of its agent's directory must
+        // not produce a second `turn_start` after removal begins, and no orphan
+        // dispatcher actor may survive. The first send parks a turn in flight;
+        // remove drains it while a concurrent late send is issued.
+        let (tmp, state, emitter) =
+            fresh_state_with_scenario(switchboard_harness::MockScenario::AwaitCancellation);
+        let (agent, _project_id) = project_with_agent(&state, &tmp).await;
+        let state = Arc::new(state);
+
+        // First send starts + parks the turn.
+        send_message_impl(&state, agent.id, "blocker")
+            .await
+            .unwrap();
+        within(
+            &emitter,
+            "blocker turn_start",
+            emitter.wait_for_type("turn_start", 1),
+        )
+        .await;
+        assert_eq!(count_type(&emitter.snapshot(), "turn_start"), 1);
+
+        // Race: remove the directory concurrently with another send to the same
+        // agent. Whichever interleaving wins, the cleared `agents_by_id` +
+        // dispatcher `Closing` slot guarantee the late send never yields a
+        // second turn.
+        let path = tmp.path().to_str().unwrap().to_owned();
+        let remove_state = Arc::clone(&state);
+        let send_state = Arc::clone(&state);
+        let agent_id = agent.id;
+        let remover =
+            tokio::spawn(async move { remove_directory_impl(&remove_state, &path).await });
+        let sender =
+            tokio::spawn(async move { send_message_impl(&send_state, agent_id, "late").await });
+        remover.await.unwrap().unwrap();
+        let _ = sender.await.unwrap();
+
+        // No second turn ever started, and no actor/subprocess survives.
+        assert_eq!(
+            count_type(&emitter.snapshot(), "turn_start"),
+            1,
+            "the late send must not produce a second turn_start"
+        );
+        assert!(
+            state.dispatcher.agent_slot_count() == 0,
+            "no orphan dispatcher actor survives removal"
+        );
+        assert!(lock(&state.agents_by_id).is_empty());
+        assert!(lock(&state.projects).is_empty());
+        assert!(lock(&state.project_locks).is_empty());
+        assert!(lock(&state.directories).is_empty());
+    }
+
+    #[tokio::test]
+    async fn remove_directory_races_create_agent_and_create_project() {
+        // (b) create_agent / create_project racing a remove of the same
+        // directory must not strand state for a removed directory. After the
+        // race settles, the directory is gone and no project/agent for it
+        // survives in the routable maps.
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        let (_agent, _project_id) = project_with_agent(&state, &tmp).await;
+        let state = Arc::new(state);
+
+        let path = tmp.path().to_str().unwrap().to_owned();
+        let dir_path = lock(&state.directories)
+            .keys()
+            .next()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        let remove_state = Arc::clone(&state);
+        let agent_state = Arc::clone(&state);
+        let project_state = Arc::clone(&state);
+        let remove_path = path.clone();
+        let remover =
+            tokio::spawn(async move { remove_directory_impl(&remove_state, &remove_path).await });
+        // create_agent / create_project are synchronous; run them on blocking
+        // tasks so they truly race the async remove.
+        let agent_h = tokio::task::spawn_blocking(move || {
+            create_agent_impl(&agent_state, "racer", HarnessKind::ClaudeCode)
+        });
+        let project_h = tokio::task::spawn_blocking(move || {
+            create_project_impl(&project_state, "racer-proj", &dir_path)
+        });
+        remover.await.unwrap().unwrap();
+        let _ = agent_h.await.unwrap();
+        let _ = project_h.await.unwrap();
+
+        // The directory is gone. `registry_write` serializes the racers against
+        // remove, so any create that happened to land BEFORE remove is torn
+        // down by it (its project lives under the removed directory), and any
+        // that landed AFTER could not resolve the directory/active project.
+        assert!(lock(&state.directories).is_empty());
+        let no_survivor_under_removed = lock(&state.projects)
+            .values()
+            .all(|p| p.directory.to_string_lossy() != *path);
+        assert!(
+            no_survivor_under_removed,
+            "no project for the removed directory survives in the routable map"
+        );
+        assert!(
+            state.dispatcher.agent_slot_count() == 0,
+            "no orphan dispatcher actor survives the race"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_directory_races_open_project() {
+        // (c) open_project of one of the removed directory's projects, racing
+        // the remove. Either the open wins (project loaded, then it is a
+        // distinct directory's state — but here it's the same directory, so
+        // remove tears it down) or remove wins (open fails to resolve). Either
+        // way no post-remove project/lock/actor survives for the directory.
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        let (_agent, project_id) = project_with_agent(&state, &tmp).await;
+        // Evict the project from the loaded set so open takes the first-open
+        // (directory-scan) path and genuinely races the remove.
+        let state = Arc::new(state);
+        {
+            lock(&state.projects).remove(&project_id);
+            lock(&state.project_locks).remove(&project_id);
+        }
+
+        let path = tmp.path().to_str().unwrap().to_owned();
+        let remove_state = Arc::clone(&state);
+        let open_state = Arc::clone(&state);
+        let remover =
+            tokio::spawn(async move { remove_directory_impl(&remove_state, &path).await });
+        let opener =
+            tokio::task::spawn_blocking(move || open_project_impl(&open_state, project_id));
+        remover.await.unwrap().unwrap();
+        let _ = opener.await.unwrap();
+
+        // The directory is removed; nothing routable for it survives.
+        assert!(lock(&state.directories).is_empty());
+        assert!(
+            !lock(&state.projects).contains_key(&project_id),
+            "no post-remove project survives for the removed directory"
+        );
+        assert!(
+            !lock(&state.project_locks).contains_key(&project_id),
+            "no post-remove lock survives"
+        );
+        assert!(
+            state.dispatcher.agent_slot_count() == 0,
+            "no orphan dispatcher actor survives the race"
+        );
     }
 }

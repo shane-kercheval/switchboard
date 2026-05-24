@@ -34,12 +34,6 @@ pub struct Workspace {
     entries: Vec<DirectoryEntry>,
 }
 
-// The mutation/query surface and `save`/`persist_workspace` land ahead of their
-// production callers (the next M4.6 increment wires the workspace into the
-// command layer). They are exercised by this module's and `state.rs`'s tests
-// today; the allow keeps the foundational, deliberately-unwired-yet API from
-// tripping `-D warnings` until those callers arrive.
-#[allow(dead_code)]
 impl Workspace {
     /// Add a directory to the registry. Idempotent: a second add of an
     /// already-known path is a no-op that preserves the existing entry's
@@ -70,10 +64,18 @@ impl Workspace {
 
     /// Replace the cached project snapshot for `path`. No-op if `path` is not a
     /// known entry (we only cache projects for directories the user added).
-    pub fn refresh_cache(&mut self, path: &Path, projects: Vec<ProjectSummary>) {
+    /// Returns whether the snapshot actually changed — callers on hot read
+    /// paths (`list_projects`) use this to persist `workspace.yaml` only when
+    /// something changed, avoiding a write storm on every project switch.
+    pub fn refresh_cache(&mut self, path: &Path, projects: Vec<ProjectSummary>) -> bool {
         if let Some(entry) = self.entries.iter_mut().find(|entry| entry.path == path) {
+            if entry.cached_projects == projects {
+                return false;
+            }
             entry.cached_projects = projects;
+            return true;
         }
+        false
     }
 
     pub fn entries(&self) -> &[DirectoryEntry] {
@@ -151,7 +153,6 @@ pub fn load(path: &Path) -> LoadOutcome {
 
 /// Persist the workspace registry to `path`, creating the parent directory if
 /// needed. Atomic temp-write + rename via `switchboard_core::write_yaml`.
-#[allow(dead_code)]
 pub fn save(path: &Path, workspace: &Workspace) -> Result<(), AppError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|source| AppError::WorkspacePersist {
@@ -243,6 +244,30 @@ mod tests {
 
         workspace.refresh_cache(Path::new("/unknown"), vec![summary("x")]);
         assert_eq!(workspace.entries().len(), 1);
+    }
+
+    #[test]
+    fn refresh_cache_reports_whether_snapshot_changed() {
+        let mut workspace = Workspace::default();
+        workspace.add(PathBuf::from("/a"));
+
+        let one = summary("one");
+        assert!(
+            workspace.refresh_cache(Path::new("/a"), vec![one.clone()]),
+            "first non-empty snapshot is a change"
+        );
+        assert!(
+            !workspace.refresh_cache(Path::new("/a"), vec![one.clone()]),
+            "an identical snapshot is not a change"
+        );
+        assert!(
+            workspace.refresh_cache(Path::new("/a"), vec![one, summary("two")]),
+            "a differing snapshot is a change"
+        );
+        assert!(
+            !workspace.refresh_cache(Path::new("/unknown"), vec![summary("x")]),
+            "an unknown path is never a change"
+        );
     }
 
     #[test]

@@ -40,9 +40,6 @@ pub enum AppError {
     /// its cached snapshot), so callers treat this as best-effort and log
     /// rather than abort — but `save` still surfaces it for the rare caller
     /// that wants to react.
-    // Constructed only by `workspace::save`, whose production callers land in
-    // the next M4.6 increment; tests exercise it today.
-    #[allow(dead_code)]
     #[error("failed to persist workspace registry at {path}: {source}")]
     WorkspacePersist {
         path: PathBuf,

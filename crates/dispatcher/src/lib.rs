@@ -359,6 +359,15 @@ impl Dispatcher {
         }
     }
 
+    /// Number of live agent slots — `Active` actors plus any mid-teardown
+    /// `Closing` slots. Zero means no actor (and therefore no harness
+    /// subprocess) is being kept alive. Used to assert that teardown leaves no
+    /// orphan actor.
+    #[must_use]
+    pub fn agent_slot_count(&self) -> usize {
+        lock(&self.agents).len()
+    }
+
     /// Accept a send for `agent_id`, spawning the agent's actor on first use.
     /// Returns `SendOutcome::Accepted(message_id)` immediately for the
     /// `Enqueue` (compose-bar) path; under `FailFast` it awaits the actor's

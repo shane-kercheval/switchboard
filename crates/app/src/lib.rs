@@ -21,12 +21,13 @@ use switchboard_harness::{
 use tauri::{Emitter, Manager, State};
 
 use crate::commands::{
-    DirectoryInfo, attach_agent_impl, cancel_turn_impl, check_antigravity_auth_impl,
-    check_antigravity_binary_impl, check_claude_binary_impl, check_codex_auth_impl,
-    check_codex_binary_impl, check_gemini_auth_impl, check_gemini_binary_impl, create_agent_impl,
-    create_project_impl, init_directory_impl, list_agents_impl, list_projects_impl,
-    load_transcript_impl, open_project_impl, parse_uuid, pick_directory_impl,
-    remove_queued_message_impl, send_message_impl, set_active_project_impl,
+    DirectoryInfo, ProjectListing, attach_agent_impl, cancel_turn_impl,
+    check_antigravity_auth_impl, check_antigravity_binary_impl, check_claude_binary_impl,
+    check_codex_auth_impl, check_codex_binary_impl, check_gemini_auth_impl,
+    check_gemini_binary_impl, create_agent_impl, create_project_impl, init_directory_impl,
+    list_agents_impl, list_projects_impl, load_transcript_impl, open_project_impl, parse_uuid,
+    pick_directory_impl, remove_directory_impl, remove_queued_message_impl, send_message_impl,
+    set_active_project_impl,
 };
 use crate::state::AppState;
 
@@ -88,16 +89,26 @@ async fn init_directory(state: State<'_, AppState>, path: String) -> Result<Dire
 }
 
 #[tauri::command]
-async fn list_projects(state: State<'_, AppState>) -> Result<Vec<ProjectSummary>, String> {
+async fn remove_directory(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    remove_directory_impl(state.inner(), &path)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn list_projects(state: State<'_, AppState>) -> Result<Vec<ProjectListing>, String> {
     list_projects_impl(state.inner()).map_err(|e| e.to_string())
 }
+
+// TODO(M4.6 frontend): list_workspace_directories command for the switcher (incl. empty dirs)
 
 #[tauri::command]
 async fn create_project(
     state: State<'_, AppState>,
     name: String,
+    directory: String,
 ) -> Result<ProjectSummary, String> {
-    create_project_impl(state.inner(), &name).map_err(|e| e.to_string())
+    create_project_impl(state.inner(), &name, &directory).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -313,6 +324,11 @@ pub fn run() {
                 );
                 state
             };
+            // Cold start: open a `Directory` handle for every workspace entry so
+            // restored directories report `available: true` and participate in
+            // the cross-harness session-id collision scan. Unopenable
+            // directories (unmounted/moved) are skipped and stay unavailable.
+            crate::state::eager_load_directories(&state);
             app.manage(state);
             Ok(())
         })
@@ -326,6 +342,7 @@ pub fn run() {
             check_antigravity_auth,
             pick_directory,
             init_directory,
+            remove_directory,
             list_projects,
             create_project,
             open_project,

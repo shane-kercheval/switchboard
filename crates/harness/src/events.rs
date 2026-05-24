@@ -6,6 +6,14 @@ use uuid::Uuid;
 /// UUID v7 turn identifier — consistent with `AgentId` and `ProjectId`.
 pub type TurnId = Uuid;
 
+/// UUID v7 identifier minted by the dispatcher for every accepted send (idle or
+/// queued), returned synchronously to the caller. A turn later started for that
+/// message carries the same `message_id` on its `TurnStart`, letting the
+/// frontend correlate "the message I sent/queued" with "the turn now running."
+/// A message that fails before any turn starts is reported via
+/// [`NormalizedEvent::MessageFailed`] keyed by this id.
+pub type MessageId = Uuid;
+
 /// Tells the reducer / UI which content rendering applies to a chunk.
 ///
 /// `Thinking` is reserved but not currently emitted — keeping the variant
@@ -133,6 +141,10 @@ pub enum AdapterEvent {
 pub enum NormalizedEvent {
     TurnStart {
         turn_id: TurnId,
+        /// Correlates this turn to the accepted send (idle or dequeued) that
+        /// produced it — see [`MessageId`]. The frontend flips its optimistic
+        /// message bubble (keyed by `message_id`) from queued/sending to running.
+        message_id: MessageId,
         started_at: DateTime<Utc>,
     },
     ContentChunk {
@@ -171,6 +183,20 @@ pub enum NormalizedEvent {
         mcp_servers: Vec<McpServerStatus>,
         skills: Vec<String>,
         raw: serde_json::Value,
+    },
+    /// A send **failed before any turn started**: either the journal write of
+    /// the user's send failed (no durable record, no outcome marker), or the
+    /// adapter failed to launch before `TurnStart` (the send was journaled and
+    /// a `Failed` outcome marker references the minted turn, but no turn went
+    /// live on the wire). Keyed by `message_id` (there is no live `turn_id`);
+    /// carries no prompt — the frontend still holds the optimistically-rendered
+    /// text and just marks that bubble failed. The async analogue of the
+    /// pre-actor synchronous fail-closed `Err`.
+    MessageFailed {
+        message_id: MessageId,
+        agent_id: AgentId,
+        error: String,
+        at: DateTime<Utc>,
     },
     /// Emitted by the dispatcher as the **last event on the per-agent
     /// channel** for a dispatch — immediately before `AgentIdleGuard`
@@ -339,14 +365,37 @@ mod tests {
     #[test]
     fn turn_start_wire_shape() {
         let turn_id = fresh_turn_id();
+        let message_id = Uuid::now_v7();
         let started_at = fresh_time();
         let event = NormalizedEvent::TurnStart {
             turn_id,
+            message_id,
             started_at,
         };
         let value = serde_json::to_value(&event).unwrap();
         assert_eq!(value["type"], "turn_start");
         assert_eq!(value["turn_id"], turn_id.to_string());
+        assert_eq!(value["message_id"], message_id.to_string());
+        let parsed: NormalizedEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, event);
+    }
+
+    #[test]
+    fn message_failed_wire_shape() {
+        let message_id = Uuid::now_v7();
+        let agent_id = Uuid::now_v7();
+        let at = fresh_time();
+        let event = NormalizedEvent::MessageFailed {
+            message_id,
+            agent_id,
+            error: "journal write failed".to_owned(),
+            at,
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["type"], "message_failed");
+        assert_eq!(value["message_id"], message_id.to_string());
+        assert_eq!(value["agent_id"], agent_id.to_string());
+        assert_eq!(value["error"], "journal write failed");
         let parsed: NormalizedEvent = serde_json::from_value(value).unwrap();
         assert_eq!(parsed, event);
     }

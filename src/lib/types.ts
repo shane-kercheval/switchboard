@@ -46,8 +46,15 @@ export type TurnUsage = {
   total_cost_usd?: number | null;
 };
 
+// Identifier minted by the dispatcher for every accepted send (idle or
+// queued), returned synchronously from `send_message`. The turn later started
+// for that message carries the same `message_id` on its `turn_start`, so the
+// optimistic user bubble (keyed by `message_id`) can flip to running. A send
+// that fails before any turn starts surfaces as `message_failed`.
+export type MessageId = string;
+
 export type NormalizedEvent =
-  | { type: "turn_start"; turn_id: TurnId; started_at: string }
+  | { type: "turn_start"; turn_id: TurnId; message_id: MessageId; started_at: string }
   | { type: "content_chunk"; turn_id: TurnId; kind: ContentKind; text: string }
   | {
       type: "tool_started";
@@ -94,7 +101,12 @@ export type NormalizedEvent =
   // sole event that flips `run_status` from `processing` back to `idle`
   // (the only path out of `processing` — see `AgentRuntime.run_status`
   // docstring in `src/lib/state/types.ts` for the full state machine).
-  | { type: "agent_idle"; agent_id: AgentId };
+  | { type: "agent_idle"; agent_id: AgentId }
+  // A send failed before any turn started (journal write failed, or the
+  // adapter failed to launch pre-`turn_start`). Keyed by `message_id` — there
+  // is no live turn. Carries no prompt; the frontend still holds the
+  // optimistically-rendered text and marks that bubble failed.
+  | { type: "message_failed"; message_id: MessageId; agent_id: AgentId; error: string; at: string };
 
 // Synthetic reducer input — fired by the state module's heartbeat timer
 // when no per-turn activity has been observed for HEARTBEAT_TIMEOUT_MS

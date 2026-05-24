@@ -267,7 +267,9 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
   switch (input.type) {
     case "turn_start":
       // Backend-confirmed dispatch: `starting → processing`. The
-      // user-clicked Send transition (`idle → starting`) is driven by
+      // correlated `message_id` matches the `pending_message_id` recorded
+      // when `send_message` resolved; we adopt the real `turn_id` here.
+      // The user-clicked Send transition (`idle → starting`) is driven by
       // the `dispatchUserTurn` state-module action — caller-driven,
       // outside the reducer. The reducer handles only the backend
       // event side of the state machine. See `AgentRuntime.run_status`
@@ -276,13 +278,37 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
       // Sets unconditionally (not guarded on prior state): a regression
       // that emitted `TurnStart` while the runtime was `idle` should
       // still land on `processing` rather than silently dropping the
-      // event. `last_error` is cleared so a successful new dispatch
-      // doesn't surface stale failure state.
+      // event. `last_error` and `pending_message_id` are cleared so a
+      // successful new dispatch doesn't surface stale state.
       return {
         ...runtime,
         run_status: "processing",
         in_flight_turn_id: input.turn_id,
         last_error: undefined,
+        pending_message_id: undefined,
+      };
+
+    case "message_failed":
+      // A send failed before any turn started (journal write failed, or
+      // the adapter failed to launch pre-`TurnStart`). The event-driven
+      // analogue of the `failSendStart` action: `starting → idle`,
+      // re-enabling Send, with the error surfaced for the sidebar. Guarded
+      // to only fire from `"starting"` — a stray `message_failed` once the
+      // agent is already `processing` (its turn did start) must not stomp a
+      // live turn. Correlated to this agent's optimistic dispatch via the
+      // `pending_message_id` recorded at send-accept time.
+      if (runtime.run_status !== "starting") return runtime;
+      if (
+        runtime.pending_message_id !== undefined &&
+        runtime.pending_message_id !== input.message_id
+      ) {
+        return runtime;
+      }
+      return {
+        ...runtime,
+        run_status: "idle",
+        pending_message_id: undefined,
+        last_error: { message: input.error, kind: "adapter_failure" },
       };
 
     case "turn_end":

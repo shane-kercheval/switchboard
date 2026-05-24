@@ -7,14 +7,20 @@ const AGENT_A = "00000000-0000-7000-8000-000000000aaa";
 const AGENT_B = "00000000-0000-7000-8000-000000000bbb";
 const TURN_1 = "00000000-0000-7000-8000-000000000001";
 const TURN_2 = "00000000-0000-7000-8000-000000000002";
+const MESSAGE_1 = "00000000-0000-7000-8000-0000000000f1";
+const MESSAGE_2 = "00000000-0000-7000-8000-0000000000f2";
 
 // Fixed timestamp used as `receivedAt` across all transcriptReducer
 // invocations in tests. Pinning a constant makes tool-event ordering and
 // timestamp assertions deterministic.
 const RECEIVED_AT = "2026-05-16T00:00:00Z";
 
-function turnStart(turnId: string, startedAt = "2026-05-16T00:00:00Z"): NormalizedEvent {
-  return { type: "turn_start", turn_id: turnId, started_at: startedAt };
+function turnStart(
+  turnId: string,
+  messageId = MESSAGE_1,
+  startedAt = "2026-05-16T00:00:00Z",
+): NormalizedEvent {
+  return { type: "turn_start", turn_id: turnId, message_id: messageId, started_at: startedAt };
 }
 
 function contentChunk(turnId: string, text: string): NormalizedEvent {
@@ -541,14 +547,22 @@ describe("runtimeReducer", () => {
     expect(r.last_error).toBeUndefined();
   });
 
-  it("turn_start → processing + sets in_flight_turn_id + clears last_error", () => {
+  it("turn_start → processing + sets in_flight_turn_id + clears last_error + clears pending_message_id", () => {
+    // Correlates the optimistic "starting" send (keyed by pending_message_id)
+    // to its real turn_id; the receipt is consumed once the turn starts.
     const r = runtimeReducer(
-      { ...fresh(), last_error: { message: "old", kind: "harness_error" } },
-      turnStart(TURN_1),
+      {
+        ...fresh(),
+        run_status: "starting",
+        pending_message_id: MESSAGE_1,
+        last_error: { message: "old", kind: "harness_error" },
+      },
+      turnStart(TURN_1, MESSAGE_1),
     );
     expect(r.run_status).toBe("processing");
     expect(r.in_flight_turn_id).toBe(TURN_1);
     expect(r.last_error).toBeUndefined();
+    expect(r.pending_message_id).toBeUndefined();
   });
 
   it("turn_end (completed) does NOT flip run_status to idle (waits for AgentIdle)", () => {
@@ -598,6 +612,59 @@ describe("runtimeReducer", () => {
     const idle = fresh();
     const r = runtimeReducer(idle, { type: "agent_idle", agent_id: AGENT_A });
     expect(r).toBe(idle);
+  });
+
+  it("message_failed while starting → idle + records adapter_failure (event-driven failSendStart)", () => {
+    // Pre-turn failure for the optimistic send: the dispatcher accepted it
+    // (minted MESSAGE_1) but failed before any turn_start. Mirrors the
+    // failSendStart action, but triggered by the event.
+    const starting: AgentRuntime = {
+      ...fresh(),
+      run_status: "starting",
+      pending_message_id: MESSAGE_1,
+    };
+    const r = runtimeReducer(starting, {
+      type: "message_failed",
+      message_id: MESSAGE_1,
+      agent_id: AGENT_A,
+      error: "journal write failed",
+      at: "2026-05-16T00:00:00Z",
+    });
+    expect(r.run_status).toBe("idle");
+    expect(r.pending_message_id).toBeUndefined();
+    expect(r.last_error).toEqual({ message: "journal write failed", kind: "adapter_failure" });
+  });
+
+  it("message_failed for a different message_id is a no-op (correlation guard)", () => {
+    const starting: AgentRuntime = {
+      ...fresh(),
+      run_status: "starting",
+      pending_message_id: MESSAGE_1,
+    };
+    const r = runtimeReducer(starting, {
+      type: "message_failed",
+      message_id: MESSAGE_2,
+      agent_id: AGENT_A,
+      error: "stale",
+      at: "2026-05-16T00:00:00Z",
+    });
+    expect(r).toBe(starting); // no-op: same reference
+  });
+
+  it("message_failed while processing is a no-op (turn already started; must not stomp)", () => {
+    // turn_start raced ahead of the (out-of-protocol) message_failed; the
+    // turn is live and the failure intuition is wrong.
+    let r = runtimeReducer({ ...fresh(), run_status: "starting" }, turnStart(TURN_1, MESSAGE_1));
+    expect(r.run_status).toBe("processing");
+    r = runtimeReducer(r, {
+      type: "message_failed",
+      message_id: MESSAGE_1,
+      agent_id: AGENT_A,
+      error: "ignored",
+      at: "2026-05-16T00:00:00Z",
+    });
+    expect(r.run_status).toBe("processing");
+    expect(r.last_error).toBeUndefined();
   });
 
   it("heartbeat_timeout records adapter_failure + clears in_flight_turn_id", () => {

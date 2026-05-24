@@ -50,6 +50,7 @@ const AGENT_A = "00000000-0000-7000-8000-000000000aaa";
 const AGENT_B = "00000000-0000-7000-8000-000000000bbb";
 const TURN_1 = "00000000-0000-7000-8000-000000000001";
 const TURN_2 = "00000000-0000-7000-8000-000000000002";
+const MESSAGE_1 = "00000000-0000-7000-8000-0000000000f1";
 
 function fireTo(channel: string, event: NormalizedEvent): void {
   const cb = listeners.get(channel);
@@ -98,6 +99,7 @@ describe("event routing", () => {
     fireTo(`agent:${AGENT_A}`, {
       type: "turn_start",
       turn_id: TURN_1,
+      message_id: MESSAGE_1,
       started_at: "2026-05-15T00:00:00Z",
     });
     expect(state.transcripts[AGENT_A]).toHaveLength(1);
@@ -113,6 +115,7 @@ describe("event routing", () => {
     fireTo(`agent:${AGENT_A}`, {
       type: "turn_start",
       turn_id: TURN_1,
+      message_id: MESSAGE_1,
       started_at: "2026-05-15T00:00:00Z",
     });
     expect(state.runtimes[AGENT_A]?.run_status).toBe("processing");
@@ -160,11 +163,13 @@ describe("per-agent isolation", () => {
     fireTo(`agent:${AGENT_A}`, {
       type: "turn_start",
       turn_id: TURN_1,
+      message_id: MESSAGE_1,
       started_at: "2026-05-15T00:00:00Z",
     });
     fireTo(`agent:${AGENT_B}`, {
       type: "turn_start",
       turn_id: TURN_2,
+      message_id: MESSAGE_1,
       started_at: "2026-05-15T00:00:01Z",
     });
     expect(state.transcripts[AGENT_A]).toHaveLength(1);
@@ -180,6 +185,7 @@ describe("per-agent isolation", () => {
     fireTo(`agent:${AGENT_A}`, {
       type: "turn_start",
       turn_id: TURN_1,
+      message_id: MESSAGE_1,
       started_at: "2026-05-15T00:00:00Z",
     });
     // Only A is processing — B stays idle.
@@ -196,6 +202,7 @@ describe("heartbeat orchestration", () => {
     fireTo(`agent:${AGENT_A}`, {
       type: "turn_start",
       turn_id: TURN_1,
+      message_id: MESSAGE_1,
       started_at: "2026-05-15T00:00:00Z",
     });
     expect(state._testing.hasHeartbeat(AGENT_A)).toBe(true);
@@ -218,6 +225,7 @@ describe("heartbeat orchestration", () => {
     fireTo(`agent:${AGENT_A}`, {
       type: "turn_start",
       turn_id: TURN_1,
+      message_id: MESSAGE_1,
       started_at: "2026-05-15T00:00:00Z",
     });
     // Just before the original deadline.
@@ -244,6 +252,7 @@ describe("heartbeat orchestration", () => {
     fireTo(`agent:${AGENT_A}`, {
       type: "turn_start",
       turn_id: TURN_1,
+      message_id: MESSAGE_1,
       started_at: "2026-05-15T00:00:00Z",
     });
     vi.advanceTimersByTime(HEARTBEAT_TIMEOUT_MS - 100);
@@ -278,6 +287,7 @@ describe("heartbeat orchestration", () => {
     fireTo(`agent:${AGENT_A}`, {
       type: "turn_start",
       turn_id: TURN_1,
+      message_id: MESSAGE_1,
       started_at: "2026-05-15T00:00:00Z",
     });
     fireTo(`agent:${AGENT_A}`, {
@@ -303,6 +313,7 @@ describe("heartbeat orchestration", () => {
     fireTo(`agent:${AGENT_A}`, {
       type: "turn_start",
       turn_id: TURN_1,
+      message_id: MESSAGE_1,
       started_at: "2026-05-15T00:00:00Z",
     });
     // Stale event for TURN_2 (which doesn't exist on this agent). Must
@@ -456,6 +467,7 @@ describe("failSendStart", () => {
     fireTo(`agent:${AGENT_A}`, {
       type: "turn_start",
       turn_id: TURN_1,
+      message_id: MESSAGE_1,
       started_at: "2026-05-16T00:00:00Z",
     });
     expect(state.runtimes[AGENT_A]?.run_status).toBe("processing");
@@ -499,6 +511,7 @@ describe("state machine — starting → processing transition", () => {
     fireTo(`agent:${AGENT_A}`, {
       type: "turn_start",
       turn_id: TURN_1,
+      message_id: MESSAGE_1,
       started_at: "2026-05-16T00:00:00Z",
     });
 
@@ -515,6 +528,7 @@ describe("_testing.reset", () => {
     fireTo(`agent:${AGENT_A}`, {
       type: "turn_start",
       turn_id: TURN_1,
+      message_id: MESSAGE_1,
       started_at: "2026-05-16T00:00:00Z",
     });
 
@@ -582,6 +596,7 @@ describe("invariant violation surfacing", () => {
     fireTo(`agent:${AGENT_A}`, {
       type: "turn_start",
       turn_id: TURN_1,
+      message_id: MESSAGE_1,
       started_at: "2026-05-16T00:00:00Z",
     });
 
@@ -615,6 +630,7 @@ describe("listener boundary stamps tool started_at / completed_at", () => {
     fireTo(`agent:${AGENT_A}`, {
       type: "turn_start",
       turn_id: TURN_1,
+      message_id: MESSAGE_1,
       started_at: "2026-05-16T00:00:00Z",
     });
     fireTo(`agent:${AGENT_A}`, {

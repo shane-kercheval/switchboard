@@ -708,7 +708,7 @@ describe("App", () => {
       set_active_project: null,
       list_agents: [],
       create_agent: AGENT,
-      send_message: "77777777-7777-7000-8000-777777777777", // turn_id
+      send_message: "77777777-7777-7000-8000-777777777777", // message_id (accepted-send receipt)
     });
     openDialogMock.mockResolvedValueOnce(PATH);
 
@@ -734,12 +734,16 @@ describe("App", () => {
       expect(sendCalls[0]?.[1]).toEqual({ agentId: AGENT.id, prompt: "hi" });
     });
 
+    // The accepted-send receipt (message_id) the mock returned — the
+    // correlated turn_start carries it back.
+    const messageId = "77777777-7777-7000-8000-777777777777";
     // Fire the recorded Claude event sequence through the captured listener.
     const turnId = "88888888-8888-7000-8000-888888888888";
     const channel = `agent:${AGENT.id}`;
     fireTo(channel, {
       type: "turn_start",
       turn_id: turnId,
+      message_id: messageId,
       started_at: "2026-05-16T00:00:00Z",
     });
     fireTo(channel, {
@@ -787,7 +791,7 @@ describe("App", () => {
       set_active_project: null,
       list_agents: [],
       create_agent: CODEX_AGENT,
-      send_message: "aaaaaaaa-aaaa-7000-8000-aaaaaaaaaaaa", // turn_id
+      send_message: "aaaaaaaa-aaaa-7000-8000-aaaaaaaaaaaa", // message_id (accepted-send receipt)
     });
     openDialogMock.mockResolvedValueOnce(PATH);
 
@@ -813,11 +817,13 @@ describe("App", () => {
       expect(sendCalls[0]?.[1]).toEqual({ agentId: CODEX_AGENT.id, prompt: "ack?" });
     });
 
+    const messageId = "aaaaaaaa-aaaa-7000-8000-aaaaaaaaaaaa";
     const turnId = "bbbbbbbb-bbbb-7000-8000-bbbbbbbbbbbb";
     const channel = `agent:${CODEX_AGENT.id}`;
     fireTo(channel, {
       type: "turn_start",
       turn_id: turnId,
+      message_id: messageId,
       started_at: "2026-05-16T00:00:00Z",
     });
     fireTo(channel, {

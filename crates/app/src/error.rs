@@ -4,8 +4,7 @@
 use std::path::PathBuf;
 
 use switchboard_core::{AgentId, CoreError, HarnessKind, ProjectId};
-use switchboard_dispatcher::DispatcherError;
-use switchboard_harness::DispatchError;
+use switchboard_harness::{DispatchError, MessageId};
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -13,14 +12,23 @@ pub enum AppError {
     #[error(transparent)]
     Core(#[from] CoreError),
 
-    #[error(transparent)]
-    Dispatcher(#[from] DispatcherError),
+    /// The agent was busy and the caller requested fail-fast (workflow §7).
+    /// Not reachable on the compose-bar `Enqueue` path (which queues); kept for
+    /// the future workflow-step dispatch path.
+    #[error("agent is busy")]
+    AgentBusy,
+
+    /// `remove_queued_message` targeted an id that is no longer enqueued —
+    /// already dequeued/started, already removed, or never existed. The
+    /// frontend uses this to avoid fake-restoring composer text for a message
+    /// that is already running.
+    #[error("queued message {0} not found (already started or removed)")]
+    QueuedMessageNotFound(MessageId),
 
     /// Pre-dispatch harness check failed (e.g., binary not on PATH).
-    /// Distinct from `Dispatcher` because the call site is the adapter's
-    /// `probe()` method — not dispatcher business — and the frontend gates
-    /// behaviour on it (`check_claude_binary` banner) independently of any
-    /// dispatch attempt.
+    /// Distinct because the call site is the adapter's `probe()` method, and
+    /// the frontend gates behaviour on it (`check_claude_binary` banner)
+    /// independently of any dispatch attempt.
     #[error("harness probe failed: {0}")]
     Probe(DispatchError),
 

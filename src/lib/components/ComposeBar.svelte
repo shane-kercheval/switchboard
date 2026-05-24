@@ -1,5 +1,11 @@
 <script lang="ts">
-  import { dispatchUserTurn, failSendStart, runtimes, ui } from "$lib/state/index.svelte";
+  import {
+    dispatchUserTurn,
+    failSendStart,
+    recordSendAccepted,
+    runtimes,
+    ui,
+  } from "$lib/state/index.svelte";
   import * as api from "$lib/api";
   import type { AgentRecord } from "$lib/types";
   import Button from "$lib/components/ui/Button.svelte";
@@ -62,7 +68,13 @@
     dispatchUserTurn(recipientId, userTurnId, submittedText);
 
     try {
-      await api.sendMessage(recipientId, submittedText);
+      const messageId = await api.sendMessage(recipientId, submittedText);
+      // Record the accepted-send receipt so the eventual `turn_start` /
+      // `message_failed` event (both carry this `message_id`) correlates
+      // back to this dispatch. Guarded inside the state module — a no-op
+      // if TurnStart already raced the IPC reply and flipped the agent to
+      // "processing".
+      recordSendAccepted(recipientId, messageId);
       // Clear-only-if-unchanged: if the user typed new text during the
       // in-flight window, preserve it. If the prompt still matches what
       // we submitted, clear it for the next message. Future work may
@@ -71,8 +83,8 @@
       if (prompt.trim() === submittedText) {
         prompt = "";
       }
-      // TurnStart will arrive on the channel and flip run_status →
-      // "processing". Nothing further to do here.
+      // TurnStart (or message_failed) will arrive on the channel and flip
+      // run_status. Nothing further to do here.
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       sendError = message;

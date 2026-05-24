@@ -39,6 +39,7 @@ import type {
   AgentRecord,
   FailureKind,
   Hydrate,
+  MessageId,
   NormalizedEvent,
   TurnId,
 } from "$lib/types";
@@ -261,8 +262,34 @@ export function dispatchUserTurn(
     ...runtime,
     run_status: "starting",
     last_error: undefined,
+    // The send hasn't been accepted yet — `recordSendAccepted` fills the
+    // `message_id` once `send_message` resolves. Cleared here so a stale
+    // receipt from a prior send can't linger into this dispatch.
+    pending_message_id: undefined,
   };
   ui.lastRecipientId = agentId;
+}
+
+/// Record the accepted-send receipt (`message_id`) for the agent's in-flight
+/// `"starting"` dispatch. Called by the compose-bar after `send_message`
+/// resolves. The recorded `message_id` is what correlates the eventual
+/// `turn_start` / `message_failed` event back to this optimistic dispatch
+/// (see `AgentRuntime.run_status` docstring for the full state machine).
+///
+/// **Guarded**: only writes while `"starting"`. If `turn_start` raced the
+/// IPC reply (the agent is already `"processing"`), the receipt is moot —
+/// the turn correlated itself already, and stamping a stale `message_id`
+/// would be incorrect.
+export function recordSendAccepted(agentId: AgentId, messageId: MessageId): void {
+  const runtime = runtimes[agentId];
+  if (runtime === undefined) {
+    console.error("[switchboard] recordSendAccepted called for unregistered agent", {
+      agent_id: agentId,
+    });
+    return;
+  }
+  if (runtime.run_status !== "starting") return;
+  runtimes[agentId] = { ...runtime, pending_message_id: messageId };
 }
 
 /// Mark a send-start failure: the compose-bar called `dispatchUserTurn`,
@@ -297,6 +324,7 @@ export function failSendStart(
     ...runtime,
     run_status: "idle",
     last_error: error,
+    pending_message_id: undefined,
   };
 }
 

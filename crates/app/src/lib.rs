@@ -4,6 +4,7 @@
 //! is the Tauri wiring layer.
 
 mod commands;
+mod dispatch_context;
 mod emitter;
 mod error;
 mod journal;
@@ -23,8 +24,8 @@ use crate::commands::{
     check_antigravity_binary_impl, check_claude_binary_impl, check_codex_auth_impl,
     check_codex_binary_impl, check_gemini_auth_impl, check_gemini_binary_impl, create_agent_impl,
     create_project_impl, init_directory_impl, list_agents_impl, list_projects_impl,
-    load_transcript_impl, open_project_impl, parse_uuid, pick_directory_impl, send_message_impl,
-    set_active_project_impl,
+    load_transcript_impl, open_project_impl, parse_uuid, pick_directory_impl,
+    remove_queued_message_impl, send_message_impl, set_active_project_impl,
 };
 use crate::state::AppState;
 
@@ -155,14 +156,41 @@ async fn send_message(
     prompt: String,
 ) -> Result<String, String> {
     let id = parse_uuid(&agent_id).map_err(|e| e.to_string())?;
-    // Returns as soon as TurnStart has been emitted; the JoinHandle drops
-    // here and the drain task detaches, continuing in the background. The
-    // load-bearing ordering invariant (TurnId returned synchronously,
-    // TurnStart already on the wire) is preserved.
-    let handle = send_message_impl(state.inner(), id, &prompt)
+    // Returns the minted `message_id` immediately (the send is accepted, not
+    // necessarily started). The turn's `turn_id` and lifecycle flow over the
+    // per-agent event channel; the correlated `TurnStart` carries this
+    // `message_id`, and a pre-`TurnStart` failure surfaces as `MessageFailed`.
+    let message_id = send_message_impl(state.inner(), id, &prompt)
         .await
         .map_err(|e| e.to_string())?;
-    Ok(handle.turn_id.to_string())
+    Ok(message_id.to_string())
+}
+
+#[tauri::command]
+async fn remove_queued_message(
+    state: State<'_, AppState>,
+    agent_id: String,
+    message_id: String,
+) -> Result<RemovedQueued, String> {
+    let aid = parse_uuid(&agent_id).map_err(|e| e.to_string())?;
+    let mid = parse_uuid(&message_id).map_err(|e| e.to_string())?;
+    let removed = remove_queued_message_impl(state.inner(), aid, mid)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(RemovedQueued {
+        agent_id: removed.agent_id.to_string(),
+        send_id: removed.send_id.to_string(),
+        prompt: removed.prompt,
+    })
+}
+
+/// Wire result of `remove_queued_message` — the removed message's payload, so
+/// the compose bar can restore the text the user had queued.
+#[derive(serde::Serialize)]
+struct RemovedQueued {
+    agent_id: String,
+    send_id: String,
+    prompt: String,
 }
 
 #[tauri::command]
@@ -291,6 +319,7 @@ pub fn run() {
             attach_agent,
             list_agents,
             send_message,
+            remove_queued_message,
             cancel_turn,
             load_transcript,
         ])

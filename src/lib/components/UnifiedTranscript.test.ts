@@ -314,6 +314,7 @@ describe("UnifiedTranscript", () => {
     fireTo(`agent:${CLAUDE_AGENT.id}`, {
       type: "turn_start",
       turn_id: "turn-1",
+      message_id: "msg-1",
       started_at: "2026-05-16T00:00:00Z",
     });
     fireTo(`agent:${CLAUDE_AGENT.id}`, {

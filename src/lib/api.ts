@@ -8,9 +8,9 @@ import type {
   DirectoryInfo,
   HarnessKind,
   LoadedTranscript,
+  MessageId,
   ProjectId,
   ProjectSummary,
-  TurnId,
 } from "./types";
 
 export async function checkClaudeBinary(): Promise<void> {
@@ -85,8 +85,12 @@ export async function listAgents(projectId?: ProjectId): Promise<AgentRecord[]> 
   return await invoke<AgentRecord[]>("list_agents", { projectId });
 }
 
-export async function sendMessage(agentId: string, prompt: string): Promise<TurnId> {
-  return await invoke<TurnId>("send_message", { agentId, prompt });
+// Returns the accepted-send receipt (`message_id`), NOT the turn_id. The
+// turn's real `turn_id` arrives later on the correlated `turn_start` event
+// (matched by `message_id`); a failure before the turn starts arrives as a
+// `message_failed` event keyed by the same `message_id`.
+export async function sendMessage(agentId: string, prompt: string): Promise<MessageId> {
+  return await invoke<MessageId>("send_message", { agentId, prompt });
 }
 
 export async function loadTranscript(agentId: AgentId): Promise<LoadedTranscript> {

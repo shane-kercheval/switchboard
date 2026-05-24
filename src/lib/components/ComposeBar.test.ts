@@ -312,7 +312,12 @@ describe("ComposeBar", () => {
   it("Send re-enables after TurnStart → AgentIdle sequence completes", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
-    invokeMock.mockResolvedValueOnce("turn-1");
+    // send_message resolves with the accepted-send receipt (message_id); the
+    // correlated turn_start later carries that same message_id and a distinct
+    // turn_id.
+    const messageId = "msg-1";
+    const turnId = "turn-1";
+    invokeMock.mockResolvedValueOnce(messageId);
 
     const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { agents: [AGENT_A] } });
@@ -324,15 +329,22 @@ describe("ComposeBar", () => {
     await waitFor(() => {
       expect(state.runtimes[AGENT_A.id]?.run_status).toBe("starting");
     });
+    // The accepted-send receipt is recorded for correlation.
+    await waitFor(() => {
+      expect(state.runtimes[AGENT_A.id]?.pending_message_id).toBe(messageId);
+    });
     fireTo(`agent:${AGENT_A.id}`, {
       type: "turn_start",
-      turn_id: "turn-1",
+      turn_id: turnId,
+      message_id: messageId,
       started_at: "2026-05-16T00:00:00Z",
     });
     expect(state.runtimes[AGENT_A.id]?.run_status).toBe("processing");
+    expect(state.runtimes[AGENT_A.id]?.in_flight_turn_id).toBe(turnId);
+    expect(state.runtimes[AGENT_A.id]?.pending_message_id).toBeUndefined();
     fireTo(`agent:${AGENT_A.id}`, {
       type: "turn_end",
-      turn_id: "turn-1",
+      turn_id: turnId,
       outcome: { status: "completed" },
       ended_at: "2026-05-16T00:00:01Z",
     });
@@ -344,5 +356,44 @@ describe("ComposeBar", () => {
     // Send is back to enabled after entering a fresh prompt.
     await fireEvent.input(textarea, { target: { value: "again" } });
     expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("message_failed (pre-turn failure) re-enables Send and surfaces the error", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const messageId = "msg-fail-1";
+    invokeMock.mockResolvedValueOnce(messageId);
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { agents: [AGENT_A] } });
+
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "hi" } });
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    await waitFor(() => {
+      expect(state.runtimes[AGENT_A.id]?.pending_message_id).toBe(messageId);
+    });
+    expect(state.runtimes[AGENT_A.id]?.run_status).toBe("starting");
+
+    // The send was accepted but failed before any turn started — arrives as
+    // a message_failed event keyed by the same message_id.
+    fireTo(`agent:${AGENT_A.id}`, {
+      type: "message_failed",
+      message_id: messageId,
+      agent_id: AGENT_A.id,
+      error: "journal write failed",
+      at: "2026-05-16T00:00:00Z",
+    });
+
+    // run_status flips back to idle (Send re-enabled) and the error surfaces.
+    expect(state.runtimes[AGENT_A.id]?.run_status).toBe("idle");
+    expect(state.runtimes[AGENT_A.id]?.pending_message_id).toBeUndefined();
+    expect(state.runtimes[AGENT_A.id]?.last_error).toEqual({
+      message: "journal write failed",
+      kind: "adapter_failure",
+    });
+    // The optimistic user turn is preserved (the user did submit it).
+    expect((state.transcripts[AGENT_A.id] ?? []).length).toBe(1);
   });
 });

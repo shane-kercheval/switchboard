@@ -11,10 +11,13 @@ use serde::{Deserialize, Serialize};
 use switchboard_core::{
     AgentId, AgentRecord, Directory, HarnessKind, Project, ProjectId, ProjectSummary,
 };
-use switchboard_dispatcher::{CancelOutcome, ConversationJournal, DispatchHandle, EventEmitter};
-use switchboard_harness::{CancelSource, HarnessAdapter};
+use switchboard_dispatcher::{
+    CancelOutcome, DispatchContextFactory, OnBusy, RemovedQueuedMessage, SendOutcome,
+};
+use switchboard_harness::{CancelSource, HarnessAdapter, MessageId};
 use uuid::Uuid;
 
+use crate::dispatch_context::ProjectDispatchContextFactory;
 use crate::error::AppError;
 use crate::state::{AppState, lock};
 
@@ -680,20 +683,18 @@ pub fn list_agents_impl(
     Ok(agents)
 }
 
-/// Resolves the agent (across all loaded projects) and dispatches the turn
-/// through the dispatcher. Returns the `DispatchHandle` (`turn_id` + drain
-/// `JoinHandle`) as soon as the adapter's `dispatch()` returns and
-/// `TurnStart` has been emitted — the drain task continues in the
-/// background.
-///
-/// The Tauri command shim discards the `JoinHandle`, returning just the
-/// `TurnId` to the frontend; tests `.await` the handle for deterministic
-/// drain completion (instead of polling agent status).
+/// Resolves the agent (across all loaded projects) and accepts the send into
+/// the dispatcher, returning the minted `MessageId` immediately. The turn's
+/// `turn_id` and lifecycle flow over the per-agent event channel (the
+/// correlated `TurnStart` carries this `message_id`); a failure before the turn
+/// starts surfaces as a `MessageFailed` event. The `Result` carries only
+/// **routing** failures (unknown agent, unsupported harness), resolved here
+/// before the dispatcher is touched.
 pub async fn send_message_impl(
     state: &AppState,
     agent_id: AgentId,
     prompt: &str,
-) -> Result<DispatchHandle, AppError> {
+) -> Result<MessageId, AppError> {
     let (project, agent) = lookup_agent(state, agent_id)?;
     // Claude is spawned with cwd = the user's bound working directory (the
     // folder they opened), NOT the per-project metadata directory inside
@@ -709,53 +710,53 @@ pub async fn send_message_impl(
     // through the Claude adapter would silently spawn the wrong binary.
     // App routing test in the test module below pins this against
     // regression.
-    let adapter: &dyn HarnessAdapter = match agent.harness {
-        HarnessKind::ClaudeCode => state.claude_adapter.as_ref(),
-        HarnessKind::Codex => state.codex_adapter.as_ref(),
-        HarnessKind::Gemini => state.gemini_adapter.as_ref(),
-        HarnessKind::Antigravity => state.antigravity_adapter.as_ref(),
+    let adapter: Arc<dyn HarnessAdapter> = match agent.harness {
+        HarnessKind::ClaudeCode => Arc::clone(&state.claude_adapter),
+        HarnessKind::Codex => Arc::clone(&state.codex_adapter),
+        HarnessKind::Gemini => Arc::clone(&state.gemini_adapter),
+        HarnessKind::Antigravity => Arc::clone(&state.antigravity_adapter),
         _ => return Err(AppError::UnsupportedHarness),
     };
-    // Read (don't drain) the attach-flow flag. The per-dispatch emitter
-    // decorator clears the flag if-and-only-if a `session_meta` event is
-    // observed on the wire. Pre-stream errors and mid-stream failures both
-    // leave the flag intact, so the next retry still forces SessionMeta.
-    // See `AppState::needs_session_meta` and `crate::emitter` for the full
-    // contract; the four-dispatch test below pins the invariant.
-    let is_first_dispatch_after_attach = lock(&state.needs_session_meta).contains(&agent_id);
-    let options = switchboard_harness::DispatchOptions {
-        is_first_dispatch_after_attach,
-        // The dispatcher overwrites `cancel_token` with the turn's token.
-        ..Default::default()
-    };
-    let observing_emitter: Arc<dyn EventEmitter> =
-        Arc::new(crate::emitter::SessionMetaObservingEmitter::new(
-            Arc::clone(&state.emitter),
-            Arc::clone(&state.needs_session_meta),
-            agent_id,
-        ));
-    // Mint the `send_id` backend-side for M4.2 (single-recipient sends each
-    // get their own, trivially-grouped id). M4.7 moves minting to the frontend
-    // so a fan-out's recipients share one — an additive parameter change, not
-    // a schema change. The journal sink is bound to this project's
-    // `journal.jsonl` and the `send_id`.
-    let send_id = Uuid::now_v7();
-    let journal: Arc<dyn ConversationJournal> = Arc::new(crate::journal::ProjectJournal::new(
+    // The actor (created on first send) owns this builder and calls it per turn
+    // — so `is_first_dispatch_after_attach` is read live, never frozen at
+    // enqueue. See `crate::dispatch_context` and `AppState::needs_session_meta`.
+    let factory: Arc<dyn DispatchContextFactory> = Arc::new(ProjectDispatchContextFactory::new(
+        agent.clone(),
+        project.directory.clone(),
         project.journal_path(),
-        send_id,
+        adapter,
+        Arc::clone(&state.emitter),
+        Arc::clone(&state.needs_session_meta),
     ));
-    Ok(state
+    // Mint the `send_id` backend-side for M4.2 (single-recipient sends each get
+    // their own, trivially-grouped id). M4.7 moves minting to the frontend so a
+    // fan-out's recipients share one — an additive parameter change.
+    let send_id = Uuid::now_v7();
+    match state
         .dispatcher
-        .send_message(
-            &agent,
-            &project.directory,
-            prompt,
-            adapter,
-            observing_emitter,
-            options,
-            journal,
-        )
-        .await?)
+        .send_message(agent_id, prompt, send_id, factory, OnBusy::Enqueue)
+        .await
+    {
+        SendOutcome::Accepted(message_id) => Ok(message_id),
+        // Unreachable on the Enqueue path; FailFast (workflow §7) is not used
+        // here yet. Map defensively so a future caller can't silently misread.
+        SendOutcome::Busy => Err(AppError::AgentBusy),
+    }
+}
+
+/// Remove a not-yet-dispatched queued message by id, returning its payload so
+/// the compose bar can restore the text. Race-safe: `NotQueued` (already
+/// dequeued/started or never existed) maps to [`AppError::QueuedMessageNotFound`].
+pub async fn remove_queued_message_impl(
+    state: &AppState,
+    agent_id: AgentId,
+    message_id: MessageId,
+) -> Result<RemovedQueuedMessage, AppError> {
+    state
+        .dispatcher
+        .remove_queued_message(agent_id, message_id)
+        .await
+        .map_err(|_| AppError::QueuedMessageNotFound(message_id))
 }
 
 /// Cancel an agent's in-flight turn (user-initiated stop). Idempotent: a
@@ -783,11 +784,12 @@ pub async fn drain_agents_then_release_locks(
     project_ids: &[ProjectId],
     source: CancelSource,
 ) {
+    // `shutdown_agent` is atomic per agent: it abandons the backlog, cancels any
+    // running turn, drains it, and only then returns — so no *fresh* turn starts
+    // mid-teardown (the orphan-subprocess problem M4.3 fixed) and the lock is
+    // never released while a turn is still driving the harness session.
     for &agent_id in agents {
-        state.dispatcher.cancel(agent_id, source);
-    }
-    for &agent_id in agents {
-        state.dispatcher.wait_until_idle(agent_id).await;
+        state.dispatcher.shutdown_agent(agent_id, source).await;
     }
     let mut locks = lock(&state.project_locks);
     for project_id in project_ids {
@@ -1108,7 +1110,7 @@ mod tests {
 
     use async_trait::async_trait;
     use switchboard_core::CoreError;
-    use switchboard_dispatcher::RecordingEmitter;
+    use switchboard_dispatcher::{EventEmitter, RecordingEmitter};
     use switchboard_harness::{ClaudeCodeAdapter, HarnessAdapter, MockHarnessAdapter};
     use tempfile::TempDir;
 
@@ -1144,6 +1146,42 @@ mod tests {
             emitter.clone() as Arc<dyn EventEmitter>,
         );
         (tmp, state, emitter)
+    }
+
+    /// Default deadline for any emitter `wait_for*` so a logic bug fails as a
+    /// bounded timeout rather than hanging the suite.
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Await an emitter wait-future under the shared timeout, panicking with a
+    /// snapshot of what *was* recorded if it doesn't resolve in time. The actor
+    /// model is fire-and-forget, so tests await turn/chain completion by waiting
+    /// for the recorded `agent_idle` (or other terminal) event rather than a
+    /// per-send join handle.
+    async fn within<F: std::future::Future<Output = ()>>(
+        emitter: &RecordingEmitter,
+        label: &str,
+        fut: F,
+    ) {
+        assert!(
+            tokio::time::timeout(WAIT, fut).await.is_ok(),
+            "timed out waiting for {label}; recorded events: {:?}",
+            emitter
+                .snapshot()
+                .iter()
+                .map(|(n, v)| (n.clone(), v["type"].as_str().unwrap_or("?").to_owned()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Extract the `message_id` from an event payload, asserting it parses.
+    fn extract_message_id(value: &serde_json::Value) -> MessageId {
+        let s = value["message_id"].as_str().expect("event has message_id");
+        Uuid::parse_str(s).expect("message_id parses as UUID")
+    }
+
+    /// Count recorded events whose wire `type` tag equals `ty`.
+    fn count_type(events: &[(String, serde_json::Value)], ty: &str) -> usize {
+        events.iter().filter(|(_, v)| v["type"] == ty).count()
     }
 
     /// Stand up a directory + project + Claude agent and return the agent and
@@ -1298,9 +1336,16 @@ mod tests {
         )
         .unwrap();
 
-        let DispatchHandle { turn_id, join } =
-            send_message_impl(&state, agent.id, "hello").await.unwrap();
-        join.await.unwrap();
+        let message_id = send_message_impl(&state, agent.id, "hello").await.unwrap();
+        // Fire-and-forget actor model: await the turn completing by waiting for
+        // its terminal `agent_idle` (the dispatcher's last event for the turn)
+        // rather than a join handle.
+        within(
+            &emitter,
+            "agent_idle",
+            emitter.wait_for_type("agent_idle", 1),
+        )
+        .await;
 
         let events = emitter.snapshot();
         assert!(!events.is_empty(), "expected events to be emitted");
@@ -1308,11 +1353,17 @@ mod tests {
         for (name, _) in &events {
             assert_eq!(name, &channel);
         }
+        // The first event is the dispatcher-owned TurnStart, and it carries the
+        // `message_id` returned by `send_message_impl` (replaces the old
+        // `DispatchHandle.turn_id` correlation assertion).
         assert_eq!(events[0].1["type"], "turn_start");
-        assert_eq!(events[0].1["turn_id"], turn_id.to_string());
+        assert_eq!(extract_message_id(&events[0].1), message_id);
+        // Terminal `agent_idle` was emitted (the actor returned to idle) —
+        // the event-based equivalent of the old `agent_status == Idle` check.
         assert_eq!(
-            state.dispatcher.agent_status(agent.id),
-            Some(switchboard_dispatcher::AgentStatus::Idle)
+            count_type(&events, "agent_idle"),
+            1,
+            "turn reached idle exactly once"
         );
     }
 
@@ -1824,22 +1875,45 @@ mod tests {
         let gemini_agent = create_agent_impl(&state, "g1", HarnessKind::Gemini).unwrap();
         let antigravity_agent = create_agent_impl(&state, "a1", HarnessKind::Antigravity).unwrap();
 
-        let claude_handle = send_message_impl(&state, claude_agent.id, "hi")
+        // Four distinct agents → four independent actors. Each
+        // `send_message_impl` returns immediately; await each agent's turn
+        // completing via the cumulative `agent_idle` count (one per agent).
+        send_message_impl(&state, claude_agent.id, "hi")
             .await
             .unwrap();
-        claude_handle.join.await.unwrap();
-        let codex_handle = send_message_impl(&state, codex_agent.id, "hi")
+        within(
+            &emitter,
+            "claude agent_idle",
+            emitter.wait_for_type("agent_idle", 1),
+        )
+        .await;
+        send_message_impl(&state, codex_agent.id, "hi")
             .await
             .unwrap();
-        codex_handle.join.await.unwrap();
-        let gemini_handle = send_message_impl(&state, gemini_agent.id, "hi")
+        within(
+            &emitter,
+            "codex agent_idle",
+            emitter.wait_for_type("agent_idle", 2),
+        )
+        .await;
+        send_message_impl(&state, gemini_agent.id, "hi")
             .await
             .unwrap();
-        gemini_handle.join.await.unwrap();
-        let antigravity_handle = send_message_impl(&state, antigravity_agent.id, "hi")
+        within(
+            &emitter,
+            "gemini agent_idle",
+            emitter.wait_for_type("agent_idle", 3),
+        )
+        .await;
+        send_message_impl(&state, antigravity_agent.id, "hi")
             .await
             .unwrap();
-        antigravity_handle.join.await.unwrap();
+        within(
+            &emitter,
+            "antigravity agent_idle",
+            emitter.wait_for_type("agent_idle", 4),
+        )
+        .await;
 
         assert_eq!(
             claude_count.load(std::sync::atomic::Ordering::SeqCst),
@@ -1899,7 +1973,7 @@ mod tests {
         // Read-don't-drain: a successful dispatch that does NOT carry a
         // session_meta event must leave the flag intact, so a follow-up
         // dispatch still forces SessionMeta.
-        let (tmp, state, _) = fresh_state_with_mock();
+        let (tmp, state, emitter) = fresh_state_with_mock();
         init_directory_impl(&state, tmp.path().to_str().unwrap())
             .await
             .unwrap();
@@ -1908,8 +1982,13 @@ mod tests {
         let agent = create_agent_impl(&state, "a", HarnessKind::ClaudeCode).unwrap();
         lock(&state.needs_session_meta).insert(agent.id);
 
-        let handle = send_message_impl(&state, agent.id, "hi").await.unwrap();
-        handle.join.await.unwrap();
+        send_message_impl(&state, agent.id, "hi").await.unwrap();
+        within(
+            &emitter,
+            "agent_idle",
+            emitter.wait_for_type("agent_idle", 1),
+        )
+        .await;
 
         // MockHarnessAdapter's Streaming scenario emits TurnStart + chunks +
         // TurnEnd + AgentIdle — no SessionMeta — so the decorator never fires
@@ -1922,9 +2001,12 @@ mod tests {
 
     #[tokio::test]
     async fn needs_session_meta_persists_through_pre_stream_error() {
-        // Pre-stream Err paths (binary missing, spawn failure) also leave
+        // Pre-stream failure paths (binary missing, spawn failure) also leave
         // the flag set: read-don't-drain means there's nothing to "restore"
-        // — the flag was never moved.
+        // — the flag was never moved. Under the actor model the send is
+        // accepted synchronously and the dispatch failure surfaces as a
+        // `MessageFailed` event (the async analogue of the old pre-stream
+        // `Err`); the flag-persistence behavior is unchanged.
         use switchboard_harness::MockScenario;
         let failing: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::with_scenario(
             MockScenario::DispatchFails,
@@ -1935,7 +2017,7 @@ mod tests {
             Arc::clone(&failing),
             Arc::clone(&failing),
             Arc::clone(&failing),
-            emitter as Arc<dyn EventEmitter>,
+            emitter.clone() as Arc<dyn EventEmitter>,
         );
         let tmp = TempDir::new().unwrap();
         init_directory_impl(&state, tmp.path().to_str().unwrap())
@@ -1946,11 +2028,28 @@ mod tests {
         let agent = create_agent_impl(&state, "a", HarnessKind::ClaudeCode).unwrap();
         lock(&state.needs_session_meta).insert(agent.id);
 
-        let err = send_message_impl(&state, agent.id, "hi").await.unwrap_err();
-        assert!(matches!(err, AppError::Dispatcher(_)));
+        // Routing succeeds → the send is accepted; the dispatch failure is
+        // reported asynchronously via `message_failed`, keyed by this id.
+        let message_id = send_message_impl(&state, agent.id, "hi").await.unwrap();
+        within(
+            &emitter,
+            "message_failed",
+            emitter.wait_for_type("message_failed", 1),
+        )
+        .await;
+        let failed = emitter
+            .snapshot()
+            .into_iter()
+            .find(|(_, v)| v["type"] == "message_failed")
+            .expect("a message_failed event");
+        assert_eq!(
+            extract_message_id(&failed.1),
+            message_id,
+            "message_failed is keyed by the accepted send's message_id"
+        );
         assert!(
             lock(&state.needs_session_meta).contains(&agent.id),
-            "flag must persist through pre-stream Err so a retry still forces SessionMeta"
+            "flag must persist through pre-stream failure so a retry still forces SessionMeta"
         );
     }
 
@@ -2006,7 +2105,7 @@ mod tests {
             Arc::clone(&adapter),
             Arc::clone(&adapter),
             Arc::clone(&adapter),
-            emitter as Arc<dyn EventEmitter>,
+            emitter.clone() as Arc<dyn EventEmitter>,
         );
         let tmp = TempDir::new().unwrap();
         init_directory_impl(&state, tmp.path().to_str().unwrap())
@@ -2015,21 +2114,33 @@ mod tests {
         let proj = create_project_impl(&state, "alpha").unwrap();
         set_active_project_impl(&state, proj.id).unwrap();
         let agent_default = create_agent_impl(&state, "a", HarnessKind::ClaudeCode).unwrap();
-        let handle = send_message_impl(&state, agent_default.id, "hi")
+        send_message_impl(&state, agent_default.id, "hi")
             .await
             .unwrap();
-        handle.join.await.unwrap();
+        within(
+            &emitter,
+            "first agent_idle",
+            emitter.wait_for_type("agent_idle", 1),
+        )
+        .await;
         assert!(
             !saw_flag.load(Ordering::SeqCst),
             "default send must pass is_first_dispatch_after_attach=false"
         );
 
-        // Now stash the flag and re-send for the same agent — adapter must see true.
+        // Now stash the flag and re-send for the same agent — adapter must see
+        // true. Sends to the same agent chain through one actor, so await the
+        // second turn's own idle (cumulative count 2) before asserting.
         lock(&state.needs_session_meta).insert(agent_default.id);
-        let handle = send_message_impl(&state, agent_default.id, "again")
+        send_message_impl(&state, agent_default.id, "again")
             .await
             .unwrap();
-        handle.join.await.unwrap();
+        within(
+            &emitter,
+            "second agent_idle",
+            emitter.wait_for_type("agent_idle", 2),
+        )
+        .await;
         assert!(
             saw_flag.load(Ordering::SeqCst),
             "post-attach send must pass is_first_dispatch_after_attach=true"
@@ -2113,7 +2224,7 @@ mod tests {
             Arc::clone(&adapter),
             Arc::clone(&adapter),
             Arc::clone(&adapter),
-            emitter as Arc<dyn EventEmitter>,
+            emitter.clone() as Arc<dyn EventEmitter>,
         );
         let tmp = TempDir::new().unwrap();
         init_directory_impl(&state, tmp.path().to_str().unwrap())
@@ -2127,10 +2238,19 @@ mod tests {
         // directly to isolate the read-don't-drain behavior under test.
         lock(&state.needs_session_meta).insert(agent.id);
 
-        // Run four dispatches sequentially. Each completes before the next.
-        for _ in 0..4 {
-            let handle = send_message_impl(&state, agent.id, "hi").await.unwrap();
-            handle.join.await.unwrap();
+        // Run four dispatches sequentially. Sends to the same agent chain
+        // through one actor; the actor reads the flag when each turn STARTS,
+        // so each dispatch must fully complete (await its `agent_idle`) before
+        // the next is sent — otherwise the actor could start turn N+1 before
+        // turn N's SessionMeta-driven clear lands.
+        for completed in 1..=4 {
+            send_message_impl(&state, agent.id, "hi").await.unwrap();
+            within(
+                &emitter,
+                "agent_idle",
+                emitter.wait_for_type("agent_idle", completed),
+            )
+            .await;
         }
 
         let flags = lock(&seen_flags).clone();
@@ -2178,14 +2298,20 @@ mod tests {
         )
         .unwrap();
 
-        let (handle_a, handle_b) = tokio::join!(
+        let (accepted_a, accepted_b) = tokio::join!(
             send_message_impl(&state, agent_a.id, "A's prompt"),
             send_message_impl(&state, agent_b.id, "B's prompt"),
         );
-        let handle_a = handle_a.unwrap();
-        let handle_b = handle_b.unwrap();
-        handle_a.join.await.unwrap();
-        handle_b.join.await.unwrap();
+        accepted_a.unwrap();
+        accepted_b.unwrap();
+        // Two independent actors → await both turns reaching idle (cumulative
+        // `agent_idle` count of 2 across the two distinct channels).
+        within(
+            &emitter,
+            "both agent_idle",
+            emitter.wait_for_type("agent_idle", 2),
+        )
+        .await;
 
         let events = emitter.snapshot();
         let ch_a = format!("agent:{}", agent_a.id);
@@ -3803,26 +3929,43 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_turn_cancels_in_flight_turn() {
-        let (tmp, state, _emitter) =
+        // App-level cancel routing: the detailed cancellation state machine is
+        // covered in the dispatcher crate; here we assert that cancel is
+        // delivered to a live turn (`Requested`) and that the turn then reaches
+        // a cancelled terminal + idle. "In flight" is observed via the emitted
+        // `turn_start` (the actor started the turn) rather than `agent_status`.
+        let (tmp, state, emitter) =
             fresh_state_with_scenario(switchboard_harness::MockScenario::AwaitCancellation);
         let (agent, _project_id) = project_with_agent(&state, &tmp).await;
 
-        let handle = send_message_impl(&state, agent.id, "long task")
+        send_message_impl(&state, agent.id, "long task")
             .await
             .unwrap();
-        assert_eq!(
-            state.dispatcher.agent_status(agent.id),
-            Some(switchboard_dispatcher::AgentStatus::InFlight)
-        );
+        // Wait until the actor has actually started the turn (the
+        // `AwaitCancellation` scenario then parks until the cancel token fires).
+        within(
+            &emitter,
+            "turn_start",
+            emitter.wait_for_type("turn_start", 1),
+        )
+        .await;
 
         let outcome = cancel_turn_impl(&state, agent.id);
         assert_eq!(outcome, CancelOutcome::Requested);
 
-        handle.join.await.unwrap();
-        assert_eq!(
-            state.dispatcher.agent_status(agent.id),
-            Some(switchboard_dispatcher::AgentStatus::Idle)
-        );
+        // The cancel drives the turn to a cancelled terminal and back to idle —
+        // the event-based equivalent of the old `agent_status == Idle` check.
+        within(
+            &emitter,
+            "agent_idle",
+            emitter.wait_for_type("agent_idle", 1),
+        )
+        .await;
+        let channel = format!("agent:{}", agent.id);
+        let cancelled = emitter.snapshot().into_iter().any(|(name, v)| {
+            name == channel && v["type"] == "turn_end" && v["outcome"]["status"] == "cancelled"
+        });
+        assert!(cancelled, "cancel synthesizes a cancelled terminal");
     }
 
     #[tokio::test]
@@ -3842,13 +3985,17 @@ mod tests {
             fresh_state_with_scenario(switchboard_harness::MockScenario::AwaitCancellation);
         let (agent, project_id) = project_with_agent(&state, &tmp).await;
 
-        let handle = send_message_impl(&state, agent.id, "long task")
+        send_message_impl(&state, agent.id, "long task")
             .await
             .unwrap();
-        assert_eq!(
-            state.dispatcher.agent_status(agent.id),
-            Some(switchboard_dispatcher::AgentStatus::InFlight)
-        );
+        // Wait until the turn is actually live (started) before draining — the
+        // event-based equivalent of the old `agent_status == InFlight` check.
+        within(
+            &emitter,
+            "turn_start",
+            emitter.wait_for_type("turn_start", 1),
+        )
+        .await;
         assert!(
             lock(&state.project_locks).contains_key(&project_id),
             "project lock is held while the turn is live"
@@ -3857,17 +4004,13 @@ mod tests {
         drain_agents_then_release_locks(&state, &[agent.id], &[project_id], CancelSource::Shutdown)
             .await;
 
-        // The turn drained (Idle) and the lock was released — in that order.
-        assert_eq!(
-            state.dispatcher.agent_status(agent.id),
-            Some(switchboard_dispatcher::AgentStatus::Idle)
-        );
-        assert!(
-            !lock(&state.project_locks).contains_key(&project_id),
-            "project lock released only after the turn drained"
-        );
-
-        // A Cancelled{Shutdown} terminal was synthesized for the drained turn.
+        // `shutdown_agent` returns only after the turn is cancelled and drained,
+        // so by the time the helper returns the cancelled-shutdown `turn_end`
+        // must already be on the wire — the event-based equivalent of the old
+        // `agent_status == Idle` check (the actor tears down on shutdown rather
+        // than emitting `agent_idle`, so the drained turn's terminal is the
+        // observable proof it finished). The lock must have been released after
+        // — never before — that drain.
         let channel = format!("agent:{}", agent.id);
         let cancelled = emitter.snapshot().into_iter().any(|(name, v)| {
             name == channel
@@ -3875,9 +4018,14 @@ mod tests {
                 && v["outcome"]["status"] == "cancelled"
                 && v["outcome"]["source"] == "shutdown"
         });
-        assert!(cancelled, "drain helper cancels with source = shutdown");
-
-        handle.join.await.unwrap();
+        assert!(
+            cancelled,
+            "drain helper cancels with source = shutdown and the turn drained before returning"
+        );
+        assert!(
+            !lock(&state.project_locks).contains_key(&project_id),
+            "project lock released only after the turn drained"
+        );
     }
 
     #[tokio::test]
@@ -3885,13 +4033,20 @@ mod tests {
         // End-to-end through the app sink: a completed turn writes one `send`
         // record (the user's side) and no `outcome` record (content is in the
         // harness file) to the project's journal.jsonl.
-        let (tmp, state, _emitter) = fresh_state_with_mock();
+        let (tmp, state, emitter) = fresh_state_with_mock();
         let (agent, project_id) = project_with_agent(&state, &tmp).await;
 
-        let handle = send_message_impl(&state, agent.id, "journal me")
+        send_message_impl(&state, agent.id, "journal me")
             .await
             .unwrap();
-        handle.join.await.unwrap();
+        // The send record is written at turn-start, but await the terminal
+        // `agent_idle` so the whole turn (and its journaling) has settled.
+        within(
+            &emitter,
+            "agent_idle",
+            emitter.wait_for_type("agent_idle", 1),
+        )
+        .await;
 
         let project = lock(&state.projects).get(&project_id).cloned().unwrap();
         let records = switchboard_core::journal::read_records(&project.journal_path()).unwrap();
@@ -3909,5 +4064,69 @@ mod tests {
             }
             other => panic!("expected a send record, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn remove_queued_message_returns_payload_and_prevents_dispatch() {
+        // Send twice to a busy agent: the first turn parks in flight
+        // (AwaitCancellation), so the second send is queued behind it. Removing
+        // the queued message by its MessageId returns its payload and ensures it
+        // never dispatches.
+        let (tmp, state, emitter) =
+            fresh_state_with_scenario(switchboard_harness::MockScenario::AwaitCancellation);
+        let (agent, _project_id) = project_with_agent(&state, &tmp).await;
+
+        // First send starts the turn and parks it.
+        send_message_impl(&state, agent.id, "blocker")
+            .await
+            .unwrap();
+        within(
+            &emitter,
+            "blocker turn_start",
+            emitter.wait_for_type("turn_start", 1),
+        )
+        .await;
+
+        // Second send queues behind the in-flight turn.
+        let queued_id = send_message_impl(&state, agent.id, "queued").await.unwrap();
+
+        let removed = remove_queued_message_impl(&state, agent.id, queued_id)
+            .await
+            .expect("the queued message is removable");
+        assert_eq!(removed.agent_id, agent.id);
+        assert_eq!(removed.prompt, "queued");
+
+        // Removing it again (now unknown) → QueuedMessageNotFound.
+        let err = remove_queued_message_impl(&state, agent.id, queued_id)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::QueuedMessageNotFound(id) if id == queued_id));
+
+        // Let the blocker finish; only the blocker's turn ever started.
+        cancel_turn_impl(&state, agent.id);
+        within(
+            &emitter,
+            "agent_idle",
+            emitter.wait_for_type("agent_idle", 1),
+        )
+        .await;
+        assert_eq!(
+            count_type(&emitter.snapshot(), "turn_start"),
+            1,
+            "the removed message never dispatched"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_queued_message_unknown_id_errors() {
+        // No actor for the agent (never dispatched) → NotQueued maps to
+        // QueuedMessageNotFound.
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        let (agent, _project_id) = project_with_agent(&state, &tmp).await;
+        let unknown = Uuid::now_v7();
+        let err = remove_queued_message_impl(&state, agent.id, unknown)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::QueuedMessageNotFound(id) if id == unknown));
     }
 }

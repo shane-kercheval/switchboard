@@ -16,6 +16,7 @@ import type {
   ContentKind,
   FailureKind,
   McpServerStatus,
+  MessageId,
   ParseWarning,
   ToolKind,
   TurnId,
@@ -124,36 +125,53 @@ export type AgentRuntime = {
   /// combined with `hydration_status`:
   ///
   /// - `"idle"` — dispatcher will accept a new send. Compose-bar Send enabled.
-  /// - `"starting"` — user clicked Send; IPC is in flight; `TurnStart` hasn't
-  ///   arrived yet. Compose-bar Send disabled. Without this state, a
-  ///   second click in the ~100ms gap between user-submit and backend-emit
-  ///   would slip through the frontend gate and surface a confusing
-  ///   `Busy` error from the dispatcher.
-  /// - `"processing"` — `TurnStart` has arrived; the backend's
+  /// - `"starting"` — user clicked Send; the send has been accepted (a
+  ///   `message_id` minted) but the correlated `TurnStart` hasn't arrived
+  ///   yet. Compose-bar Send disabled. Without this state, a second click in
+  ///   the gap between user-submit and backend-emit would slip through the
+  ///   frontend gate and surface a confusing `Busy` error from the
+  ///   dispatcher. An idle recipient leaves this state almost immediately
+  ///   (TurnStart arrives at once); a busy recipient's send is queued
+  ///   server-side and stays in `"starting"` until its turn later dispatches.
+  /// - `"processing"` — the correlated `TurnStart` has arrived; the backend's
   ///   `AgentIdleGuard` is held. Compose-bar Send disabled.
+  ///
+  /// **`message_id` correlation.** `send_message` returns a `message_id`
+  /// (the accepted-send receipt), recorded in `pending_message_id` while
+  /// `"starting"`. The turn the dispatcher later starts for that send carries
+  /// the same `message_id` on its `turn_start`; a pre-turn failure surfaces as
+  /// a `message_failed` carrying it. The reducer correlates either event back
+  /// to this `pending_message_id`.
   ///
   /// State machine:
   ///
   /// ```
-  /// idle  --dispatchUserTurn-->  starting
-  /// starting  --(turn_start event)-->  processing
+  /// idle  --dispatchUserTurn-->  starting        (records pending_message_id)
+  /// starting  --(turn_start event, matched message_id)-->  processing
+  /// starting  --(message_failed event, matched message_id)-->  idle
   /// starting  --(failSendStart action)-->  idle
   /// processing  --(agent_idle event)-->  idle
   /// ```
   ///
-  /// `failSendStart` is the **only legal path** from `starting` back to
-  /// `idle` without going through `processing` — `agent_idle` is guarded
-  /// to only flip `processing → idle` (a stray `agent_idle` in the
-  /// starting window must not race the gate open).
+  /// `message_failed` / `failSendStart` are the **only legal paths** from
+  /// `starting` back to `idle` without going through `processing` —
+  /// `agent_idle` is guarded to only flip `processing → idle` (a stray
+  /// `agent_idle` in the starting window must not race the gate open).
   ///
   /// **Stuck-in-starting diagnostic.** If an agent remains in `"starting"`
-  /// indefinitely, either: (a) the dispatcher accepted `send_message` but
-  /// never emitted `TurnStart` (dispatcher regression — TurnStart is
-  /// dispatcher-emitted and contractually guaranteed per AGENTS.md), or
-  /// (b) the compose-bar caller forgot to invoke `failSendStart` on IPC
-  /// failure. Look at `crates/dispatcher/src/lib.rs::send_message` and
-  /// the compose-bar's catch block respectively.
+  /// indefinitely with no queued backlog ahead of it, either: (a) the
+  /// dispatcher accepted `send_message` but never emitted `TurnStart`
+  /// (dispatcher regression — TurnStart is dispatcher-emitted and
+  /// contractually guaranteed per AGENTS.md), or (b) the compose-bar caller
+  /// forgot to invoke `failSendStart` on IPC failure. Look at
+  /// `crates/dispatcher/src/lib.rs` and the compose-bar's catch block
+  /// respectively.
   run_status: "idle" | "starting" | "processing";
+  /// The accepted-send receipt for the in-flight `"starting"` send, used to
+  /// correlate the eventual `turn_start` / `message_failed` event back to
+  /// this optimistic dispatch. Set when `send_message` resolves; cleared on
+  /// the correlated `turn_start`, `message_failed`, or `failSendStart`.
+  pending_message_id?: MessageId;
   /// The turn the heartbeat timer is tracking. Distinct from `run_status`
   /// because for fast-events races the entire stream can fire before the
   /// IPC reply lands; this tracking key lets late events still extend the

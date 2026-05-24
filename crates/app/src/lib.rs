@@ -314,6 +314,17 @@ pub fn run() {
     let (claude_adapter, codex_adapter, gemini_adapter, antigravity_adapter) = build_adapters();
 
     tauri::Builder::default()
+        // Must be the first plugin registered. A second launch of the app
+        // hands its argv/cwd to the already-running instance via this callback
+        // (instead of starting a rival process); we surface the existing window
+        // rather than spawn a duplicate. Single-instance keeps one
+        // `workspace.yaml` writer, so there is no cross-process clobber.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
             let emitter: Arc<dyn EventEmitter> = Arc::new(AppHandleEmitter {

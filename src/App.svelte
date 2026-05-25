@@ -7,62 +7,31 @@
   import AddAgentModal from "$lib/components/AddAgentModal.svelte";
   import CreateAgentForm from "$lib/components/CreateAgentForm.svelte";
   import type { AgentFormSubmit } from "$lib/components/CreateAgentForm.types";
-  import DirectorySelector from "$lib/components/DirectorySelector.svelte";
+  import ProjectsSidebar from "$lib/components/ProjectsSidebar.svelte";
   import Sidebar from "$lib/components/Sidebar.svelte";
   import UnifiedTranscript from "$lib/components/UnifiedTranscript.svelte";
   import WelcomeScreen from "$lib/components/WelcomeScreen.svelte";
+  import Dialog from "$lib/components/ui/Dialog.svelte";
+  import Input from "$lib/components/ui/Input.svelte";
+  import Button from "$lib/components/ui/Button.svelte";
   import { hydrateAgent, registerAgent } from "$lib/state/index.svelte";
-  import type {
-    AgentRecord,
-    BinaryState,
-    DirectoryInfo,
-    HarnessAvailability,
-    HarnessBanner,
-    ProjectSummary,
-  } from "$lib/types";
+  import {
+    activateProject,
+    addAgentToActiveProject,
+    addDirectory,
+    agentsByProject,
+    conversations,
+    createProjectAndActivate,
+    loadWorkspace,
+    projects,
+    selection,
+  } from "$lib/state/workspace.svelte";
+  import type { AgentRecord, BinaryState, HarnessAvailability, HarnessBanner } from "$lib/types";
   import { bannerCopy, bannerTestid } from "$lib/harnessAvailability";
   import { basename } from "$lib/utils";
 
-  // App phase: drives which screen renders.
-  //
-  // The "loaded" phase carries the list of agents registered with the
-  // state module on project load. Sidebar / UnifiedTranscript / ComposeBar
-  // components read transcripts and runtimes for these agents from the
-  // state module directly — there is no implicit "focused agent" at the
-  // model level.
-  type Phase =
-    | { kind: "welcome" }
-    | { kind: "directory-selector"; info: DirectoryInfo }
-    | { kind: "no-agent"; directory: DirectoryInfo; project: ProjectSummary }
-    | {
-        kind: "loaded";
-        directory: DirectoryInfo;
-        project: ProjectSummary;
-        agents: AgentRecord[];
-      };
-
-  let phase = $state<Phase>({ kind: "welcome" });
-  let busy = $state<boolean>(false);
-  let inlineError = $state<string | null>(null);
-
-  /// Per-harness availability state. **Stored as flat per-probe fields**
-  /// rather than as the `HarnessAvailability` discriminated union directly:
-  /// the union is the consumer-facing boundary type (banners + form
-  /// gating), but probe handlers write a single field at a time. Holding
-  /// the runtime state as union values would force every per-probe write
-  /// to re-construct the whole variant and read-then-spread the unchanged
-  /// fields, which is friction without benefit. Instead: flat fields here
-  /// → derived unions for consumers.
-  ///
-  /// Initial state uses `"checking"` to encode the pre-probe state in
-  /// the type system rather than fail-open-by-convention. Form gating
-  /// treats `"checking"` as not-selectable (silent disable) so a user
-  /// fast enough to reach the create form before probes complete can't
-  /// submit before we know. Banners stay hidden during checking because
-  /// the suppression rule only pushes on `"missing"`.
-  ///
-  /// Claude auth is `"unsupported"` always (keychain-based on macOS; no
-  /// reliable file signal — deferred to a future release).
+  // --- Per-harness availability probes (unchanged from the single-directory
+  // model; see the flat-field rationale below). ---
   let claudeBinary = $state<BinaryState>("checking");
   let codexBinary = $state<BinaryState>("checking");
   let codexAuth = $state<"available" | "missing" | "checking">("checking");
@@ -92,15 +61,6 @@
     auth: antigravityAuth,
   });
 
-  /// Banner stack ordering: binary-missing first, then auth-missing.
-  /// Suppression rule: if a harness's binary is missing, its auth banner
-  /// is hidden (auth is irrelevant if the CLI isn't installed). Max one
-  /// banner per harness.
-  ///
-  /// The `auth_missing` push gates on a closed set of harnesses with
-  /// detectable auth: Codex (`auth.json`), Gemini (`settings.json`), and
-  /// Antigravity (macOS Keychain). Claude's auth probe is keychain-based
-  /// and unsupported in v1.
   const banners = $derived.by((): HarnessBanner[] => {
     const result: HarnessBanner[] = [];
     for (const a of [
@@ -121,16 +81,11 @@
     return result;
   });
 
-  // Startup probes. Each probe writes its own slice as soon as it
-  // resolves — no `Promise.all` barrier. A slow `check_codex_auth`
-  // doesn't block the Claude binary state from leaving `"checking"`;
-  // a slow `check_codex_binary` doesn't block its own auth check
-  // from updating. The data model stays honest about *what we know
-  // now* vs *what we're still waiting on*, same principle as the
-  // `"checking"` state itself.
-  //
-  // UI flow proceeds regardless — sending to a missing-binary agent
-  // fails at dispatch with a typed error.
+  let dirError = $state<string | null>(null);
+
+  // Startup: kick off the harness probes (each writes its own slice as it
+  // resolves — no barrier) and eagerly load the workspace registry (directory
+  // list + flat project list). Per-project rosters/hydration stay lazy.
   onMount(() => {
     api.checkClaudeBinary().then(
       () => (claudeBinary = "available"),
@@ -160,157 +115,131 @@
       () => (antigravityAuth = "available"),
       () => (antigravityAuth = "missing"),
     );
+    void loadWorkspace().catch((err) => {
+      dirError = err instanceof Error ? err.message : String(err);
+    });
   });
 
-  /// Register every agent in the loaded list with the state module before
-  /// the UI renders the 3-pane layout. registerAgent is idempotent under
-  /// concurrent calls (per the pendingRegistrations guard), so
-  /// Promise.all is safe — overlapping calls for the same agent_id share
-  /// one in-flight registration.
-  ///
-  /// Also kicks off transcript hydration per agent. `hydrateAgent` is
-  /// idempotent (tracked via its own attempted-set), so re-opening a
-  /// project after navigating away doesn't re-hydrate — important because
-  /// hydrated turns get fresh `turn_id`s at parse time and would otherwise
-  /// duplicate. Per-agent hydration runs concurrently; disk reads are
-  /// independent and per-agent failures don't block others.
-  async function registerAll(agents: AgentRecord[]): Promise<void> {
-    await Promise.all(agents.map((a) => registerAgent(a)));
-    // Fire-and-forget — hydration drives the `hydration_status` ladder,
-    // which the compose-bar gate observes reactively.
-    void Promise.all(agents.map((a) => hydrateAgent(a.id)));
+  // The displayed project's roster + hydrated conversation. `rosterLoaded`
+  // distinguishes "roster still loading on first activation" (key absent) from
+  // "loaded and genuinely empty" (key present, length 0) so the first-agent
+  // prompt doesn't flash before the roster resolves.
+  const activeAgents = $derived<AgentRecord[]>(
+    selection.activeProjectId !== null ? (agentsByProject[selection.activeProjectId] ?? []) : [],
+  );
+  const rosterLoaded = $derived(
+    selection.activeProjectId !== null && selection.activeProjectId in agentsByProject,
+  );
+  const activeConvo = $derived(
+    selection.activeProjectId !== null ? conversations[selection.activeProjectId] : undefined,
+  );
+  const activeProject = $derived(
+    projects.list.find((p) => p.id === selection.activeProjectId) ?? null,
+  );
+
+  function retryActivation(): void {
+    if (selection.activeProjectId !== null) void activateProject(selection.activeProjectId);
   }
 
-  async function handlePickDirectory(): Promise<void> {
-    inlineError = null;
+  // Folder picking is the one place a directory enters the model — an internal
+  // detail of "new project" (where it lives) and "add existing" (where to look),
+  // never a managed object in the UI.
+  async function pickFolder(): Promise<string | null> {
     const result = await openDialog({ directory: true, multiple: false });
-    if (result === null || typeof result !== "string") return;
-    busy = true;
+    return typeof result === "string" ? result : null;
+  }
+
+  // Add existing: point at a folder; every Switchboard project already in it
+  // flows into the flat list.
+  async function handleAddExisting(): Promise<void> {
+    dirError = null;
+    const folder = await pickFolder();
+    if (folder === null) return;
     try {
-      const info = await api.pickDirectory(result);
-      phase = { kind: "directory-selector", info };
+      await addDirectory(folder);
     } catch (err) {
-      inlineError = err instanceof Error ? err.message : String(err);
-    } finally {
-      busy = false;
+      dirError = err instanceof Error ? err.message : String(err);
     }
   }
 
-  async function handleInitAndCreate(projectName: string): Promise<void> {
-    inlineError = null;
-    busy = true;
+  // New project: a small modal collects the target folder + a name.
+  let newProjectOpen = $state<boolean>(false);
+  let newProjectFolder = $state<string | null>(null);
+  let newProjectName = $state<string>("");
+  let newProjectBusy = $state<boolean>(false);
+  let newProjectError = $state<string | null>(null);
+
+  function openNewProject(): void {
+    newProjectFolder = null;
+    newProjectName = "";
+    newProjectError = null;
+    newProjectOpen = true;
+  }
+
+  async function chooseNewProjectFolder(): Promise<void> {
+    const folder = await pickFolder();
+    if (folder === null) return;
+    newProjectFolder = folder;
+    if (newProjectName.trim() === "") newProjectName = basename(folder);
+  }
+
+  const newProjectValid = $derived(newProjectFolder !== null && newProjectName.trim() !== "");
+
+  async function submitNewProject(): Promise<void> {
+    if (!newProjectValid || newProjectFolder === null) return;
+    newProjectError = null;
+    newProjectBusy = true;
     try {
-      const dir = await api.initDirectory(currentDirectoryPath()!);
-      const project = await api.createProject(projectName);
-      await api.setActiveProject(project.id);
-      const agents = await api.listAgents(project.id);
-      if (agents.length === 0) {
-        phase = { kind: "no-agent", directory: dir, project };
-      } else {
-        await registerAll(agents);
-        phase = { kind: "loaded", directory: dir, project, agents };
-      }
+      await createProjectAndActivate(newProjectName.trim(), newProjectFolder);
+      newProjectOpen = false;
     } catch (err) {
-      inlineError = err instanceof Error ? err.message : String(err);
+      newProjectError = err instanceof Error ? err.message : String(err);
     } finally {
-      busy = false;
+      newProjectBusy = false;
     }
   }
 
-  async function handleCreateProject(projectName: string): Promise<void> {
-    inlineError = null;
-    busy = true;
-    try {
-      const dir = await api.initDirectory(currentDirectoryPath()!);
-      const project = await api.createProject(projectName);
-      await api.setActiveProject(project.id);
-      phase = { kind: "no-agent", directory: dir, project };
-    } catch (err) {
-      inlineError = err instanceof Error ? err.message : String(err);
-    } finally {
-      busy = false;
-    }
-  }
-
-  async function handleSelectProject(project: ProjectSummary): Promise<void> {
-    inlineError = null;
-    busy = true;
-    try {
-      const dir = await api.initDirectory(currentDirectoryPath()!);
-      await api.openProject(project.id);
-      await api.setActiveProject(project.id);
-      const agents = await api.listAgents(project.id);
-      if (agents.length === 0) {
-        phase = { kind: "no-agent", directory: dir, project };
-      } else {
-        await registerAll(agents);
-        phase = { kind: "loaded", directory: dir, project, agents };
-      }
-    } catch (err) {
-      inlineError = err instanceof Error ? err.message : String(err);
-    } finally {
-      busy = false;
-    }
-  }
-
-  /// Shared core: invoke the right Tauri command for the submission shape,
-  /// then call `registerAgent` to wire listeners. Throws on either failure
-  /// so the caller can surface the error in its phase-specific UI.
-  ///
-  /// Attach kicks off transcript hydration immediately after registration:
-  /// the user is bringing an existing harness session under orchestration
-  /// and expects its prior history to appear. Create flow needs no
-  /// hydration (no session exists yet) — `hydration_status` stays
-  /// `"complete"` as `freshRuntime` initialized it.
-  async function createOrAttachAndRegister(submission: AgentFormSubmit): Promise<AgentRecord> {
+  /// Create or attach an agent into the active project, register its listeners,
+  /// and add it to the active roster. Attach kicks off per-agent hydration so
+  /// the brought-in harness session's history appears.
+  async function createOrAttachAndRegister(submission: AgentFormSubmit): Promise<void> {
     const agent =
       submission.mode === "create"
         ? await api.createAgent(submission.name, submission.harness)
         : await api.attachAgent(submission.name, submission.harness, submission.existingSessionId);
     await registerAgent(agent);
+    addAgentToActiveProject(agent);
     if (submission.mode === "attach") {
       void hydrateAgent(agent.id);
     }
-    return agent;
   }
 
+  // First-agent form (center, when the active project has no agents).
+  let firstAgentBusy = $state<boolean>(false);
+  let firstAgentError = $state<string | null>(null);
+
   async function handleCreateFirstAgent(submission: AgentFormSubmit): Promise<void> {
-    if (phase.kind !== "no-agent") return;
-    inlineError = null;
-    busy = true;
+    firstAgentError = null;
+    firstAgentBusy = true;
     try {
-      const agent = await createOrAttachAndRegister(submission);
-      phase = {
-        kind: "loaded",
-        directory: phase.directory,
-        project: phase.project,
-        agents: [agent],
-      };
+      await createOrAttachAndRegister(submission);
     } catch (err) {
-      inlineError = err instanceof Error ? err.message : String(err);
+      firstAgentError = err instanceof Error ? err.message : String(err);
     } finally {
-      busy = false;
+      firstAgentBusy = false;
     }
   }
 
-  /// Loaded-phase add-agent handler. Appends to `phase.agents` immutably
-  /// (matches the rest of App.svelte's reassignment pattern and sidesteps
-  /// the question of whether `$state` deep-tracks array mutations through
-  /// a discriminated-union narrowing — it does, but reassign is clearer).
+  // Add-agent modal (from the right sidebar, when agents already exist).
   let addAgentOpen = $state<boolean>(false);
   let addAgentError = $state<string | null>(null);
   let addAgentBusy = $state<boolean>(false);
 
-  async function handleAddAgentFromLoaded(submission: AgentFormSubmit): Promise<void> {
-    if (phase.kind !== "loaded") return;
+  async function handleAddAgent(submission: AgentFormSubmit): Promise<void> {
     addAgentError = null;
     addAgentBusy = true;
     try {
-      const agent = await createOrAttachAndRegister(submission);
-      phase = {
-        ...phase,
-        agents: [...phase.agents, agent],
-      };
+      await createOrAttachAndRegister(submission);
       addAgentOpen = false;
     } catch (err) {
       addAgentError = err instanceof Error ? err.message : String(err);
@@ -319,95 +248,150 @@
     }
   }
 
-  function handleAddAgentCancel(): void {
-    addAgentOpen = false;
-    addAgentError = null;
-  }
-
   function openAddAgent(): void {
     addAgentError = null;
     addAgentOpen = true;
   }
 
-  function handleCancel(): void {
-    phase = { kind: "welcome" };
-    inlineError = null;
+  function handleAddAgentCancel(): void {
+    addAgentOpen = false;
+    addAgentError = null;
   }
-
-  function currentDirectoryPath(): string | undefined {
-    if (phase.kind === "directory-selector") return phase.info.path;
-    if (phase.kind === "no-agent" || phase.kind === "loaded") return phase.directory.path;
-    return undefined;
-  }
-
-  const breadcrumb = $derived.by(() => {
-    if (phase.kind === "loaded" || phase.kind === "no-agent") {
-      return `${phase.project.name} — ${basename(phase.directory.path)}`;
-    }
-    return null;
-  });
 </script>
 
 <main class="flex h-full flex-col bg-white text-neutral-900">
   {#each banners as banner (bannerTestid(banner))}
     <Banner message={bannerCopy(banner)} testid={bannerTestid(banner)} />
   {/each}
-  {#if breadcrumb}
-    <div
-      class="border-b border-neutral-200 px-4 py-2 text-xs text-neutral-600"
-      data-testid="breadcrumb"
-    >
-      {breadcrumb}
-    </div>
-  {/if}
 
-  <div class="flex flex-1 flex-col overflow-hidden">
-    {#if phase.kind === "welcome"}
-      <WelcomeScreen onPickDirectory={handlePickDirectory} />
-      {#if inlineError}
-        <p class="px-8 pb-4 text-center text-xs text-red-700" data-testid="error">
-          {inlineError}
-        </p>
-      {/if}
-    {:else if phase.kind === "directory-selector"}
-      <DirectorySelector
-        info={phase.info}
-        {busy}
-        error={inlineError}
-        onInitAndCreate={handleInitAndCreate}
-        onCreateProject={handleCreateProject}
-        onSelectProject={handleSelectProject}
-        onCancel={handleCancel}
-      />
-    {:else if phase.kind === "no-agent"}
-      <CreateAgentForm
-        {busy}
-        error={inlineError}
-        onSubmit={handleCreateFirstAgent}
-        {claudeAvailability}
-        {codexAvailability}
-        {geminiAvailability}
-        {antigravityAvailability}
-      />
-    {:else if phase.kind === "loaded"}
-      <div class="flex flex-1 overflow-hidden" data-testid="loaded-layout">
-        <Sidebar agents={phase.agents} onAddAgent={openAddAgent} />
-        <div class="flex flex-1 flex-col overflow-hidden">
-          <UnifiedTranscript agents={phase.agents} />
-          <ComposeBar agents={phase.agents} />
+  <div class="flex flex-1 overflow-hidden">
+    <ProjectsSidebar onNewProject={openNewProject} onAddExisting={handleAddExisting} />
+
+    <div class="flex flex-1 flex-col overflow-hidden" data-testid="workspace-main">
+      {#if selection.activeProjectId === null}
+        {#if projects.list.length === 0}
+          <WelcomeScreen onNewProject={openNewProject} onAddExisting={handleAddExisting} />
+        {:else}
+          <div class="flex flex-1 items-center justify-center p-8 text-sm text-neutral-500">
+            Select a project.
+          </div>
+        {/if}
+      {:else if selection.activationError !== null}
+        <div
+          class="flex flex-1 flex-col items-center justify-center gap-3 p-8 text-center"
+          data-testid="activation-error"
+        >
+          <p class="text-sm text-red-700">Couldn't open this project.</p>
+          <p class="max-w-md text-xs text-neutral-500">{selection.activationError}</p>
+          <button
+            type="button"
+            class="rounded border border-neutral-300 px-3 py-1 text-sm text-neutral-700 hover:bg-neutral-100"
+            data-testid="activation-retry"
+            onclick={retryActivation}
+          >
+            Retry
+          </button>
         </div>
-      </div>
-      <AddAgentModal
-        bind:open={addAgentOpen}
-        busy={addAgentBusy}
-        error={addAgentError}
-        {claudeAvailability}
-        {codexAvailability}
-        {geminiAvailability}
-        {antigravityAvailability}
-        onSubmit={handleAddAgentFromLoaded}
-        onCancel={handleAddAgentCancel}
-      />
+      {:else if !rosterLoaded}
+        <div
+          class="flex flex-1 items-center justify-center p-8 text-sm text-neutral-500"
+          data-testid="project-loading"
+        >
+          Loading project…
+        </div>
+      {:else if activeAgents.length === 0}
+        <div class="flex flex-1 flex-col overflow-y-auto">
+          <CreateAgentForm
+            busy={firstAgentBusy}
+            error={firstAgentError}
+            onSubmit={handleCreateFirstAgent}
+            {claudeAvailability}
+            {codexAvailability}
+            {geminiAvailability}
+            {antigravityAvailability}
+          />
+        </div>
+      {:else}
+        {#if activeProject}
+          <div
+            class="border-b border-neutral-200 px-4 py-2 text-xs text-neutral-600"
+            data-testid="breadcrumb"
+          >
+            {activeProject.name} — {basename(activeProject.directory)}
+          </div>
+        {/if}
+        <UnifiedTranscript
+          agents={activeAgents}
+          overlay={activeConvo?.items ?? []}
+          loadStatus={activeConvo?.status ?? "complete"}
+        />
+        <ComposeBar agents={activeAgents} />
+      {/if}
+    </div>
+
+    {#if selection.activeProjectId !== null && rosterLoaded}
+      <Sidebar agents={activeAgents} onAddAgent={openAddAgent} />
     {/if}
   </div>
+
+  {#if dirError}
+    <p class="border-t border-neutral-200 px-4 py-2 text-xs text-red-700" data-testid="error">
+      {dirError}
+    </p>
+  {/if}
+
+  <Dialog bind:open={newProjectOpen} title="New project" onClose={() => (newProjectOpen = false)}>
+    <div class="space-y-3" data-testid="new-project-form">
+      <div class="space-y-1">
+        <span class="block text-xs text-neutral-600">Folder</span>
+        <div class="flex items-center gap-2">
+          <Button data-testid="new-project-choose-folder" onclick={chooseNewProjectFolder}>
+            Choose folder…
+          </Button>
+          {#if newProjectFolder}
+            <span class="truncate font-mono text-xs text-neutral-600" title={newProjectFolder}>
+              {newProjectFolder}
+            </span>
+          {/if}
+        </div>
+      </div>
+      <div class="space-y-1">
+        <label for="new-project-name" class="block text-xs text-neutral-600">Name</label>
+        <Input
+          id="new-project-name"
+          data-testid="new-project-name"
+          placeholder="project name"
+          bind:value={newProjectName}
+          disabled={newProjectBusy}
+          onkeydown={(e: KeyboardEvent) => {
+            if (e.key === "Enter") void submitNewProject();
+          }}
+        />
+      </div>
+      {#if newProjectError}
+        <p class="text-xs text-red-700" data-testid="new-project-error">{newProjectError}</p>
+      {/if}
+      <div class="flex justify-end">
+        <Button
+          data-testid="new-project-submit"
+          disabled={!newProjectValid || newProjectBusy}
+          onclick={submitNewProject}
+        >
+          Create
+        </Button>
+      </div>
+    </div>
+  </Dialog>
+
+  <AddAgentModal
+    bind:open={addAgentOpen}
+    busy={addAgentBusy}
+    error={addAgentError}
+    {claudeAvailability}
+    {codexAvailability}
+    {geminiAvailability}
+    {antigravityAvailability}
+    onSubmit={handleAddAgent}
+    onCancel={handleAddAgentCancel}
+  />
 </main>

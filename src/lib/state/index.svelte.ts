@@ -348,6 +348,38 @@ export function failSendStart(
   };
 }
 
+/// Mark an agent as already-hydrated so the per-agent `hydrateAgent` path
+/// won't re-parse it. Used by the project-scoped hydration in the workspace
+/// store, which hydrates roster agents through `applyAgentHydrate` directly:
+/// without this, a later `hydrateAgent` call on the same agent would re-parse
+/// its session file and duplicate its turns (the reducer dedups by `turn_id`,
+/// but parsers mint fresh ids each parse). Keeps the "hydrate an agent at most
+/// once per session" invariant holding regardless of which path runs first.
+export function markHydrationAttempted(agentId: AgentId): void {
+  hydrationAttempted.add(agentId);
+}
+
+/// Tear down per-agent state for the given agents: unsubscribe their event
+/// channels, cancel heartbeats, and drop their transcript/runtime/guard
+/// entries. Called when a directory is removed (the frontend lifecycle teardown
+/// matching the backend drain) so a remove-then-re-add of the same project ids
+/// — ids are persisted on disk and survive removal — starts clean rather than
+/// reusing stale listeners, transcripts, or hydration guards.
+export function unregisterAgents(agentIds: AgentId[]): void {
+  for (const agentId of agentIds) {
+    const unlisten = listenerRegistry.get(agentId);
+    if (unlisten !== undefined) {
+      unlisten();
+      listenerRegistry.delete(agentId);
+    }
+    pendingRegistrations.delete(agentId);
+    hydrationAttempted.delete(agentId);
+    clearHeartbeat(agentId);
+    delete transcripts[agentId];
+    delete runtimes[agentId];
+  }
+}
+
 // --- internal ---
 
 function handleEvent(agentId: AgentId, event: NormalizedEvent): void {

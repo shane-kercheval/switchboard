@@ -63,7 +63,7 @@
   }
 </script>
 
-<aside class="flex w-64 flex-col border-r border-neutral-200 bg-neutral-50" data-testid="sidebar">
+<aside class="flex w-64 flex-col border-l border-neutral-200 bg-neutral-50" data-testid="sidebar">
   <div
     class="flex items-center justify-between border-b border-neutral-200 px-4 py-3 text-xs font-semibold tracking-wide text-neutral-500 uppercase"
   >
@@ -119,6 +119,11 @@
         {#if runtime?.last_error}
           <div class="mt-1 text-xs text-red-700" data-testid="agent-last-error">
             {runtime.last_error.message}
+          </div>
+        {/if}
+        {#if runtime?.hydration_error}
+          <div class="mt-1 text-xs text-red-700" data-testid="agent-hydration-error">
+            history failed to load: {runtime.hydration_error}
           </div>
         {/if}
         {#if runtime?.parse_warnings && runtime.parse_warnings.length > 0}

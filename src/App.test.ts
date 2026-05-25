@@ -1,899 +1,803 @@
 import { vi, describe, it, expect, beforeEach, afterEach } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
-import type { AgentRecord, DirectoryInfo, NormalizedEvent, ProjectSummary } from "$lib/types";
+import type {
+  AgentRecord,
+  NormalizedEvent,
+  ProjectConversation,
+  ProjectListing,
+  ProjectSummary,
+} from "$lib/types";
 
-// App.svelte tests focus narrowly on the primary phase-transition routing:
+// App.svelte tests focus on the workspace-level orchestration: eager registry
+// load, lazy per-project activation (roster + hydration), display-only project
+// switching (listeners persist), the not-persistable signal, and the
+// post-restart merged-conversation render. Per-screen UI (ProjectsSidebar /
+// Sidebar / UnifiedTranscript / ComposeBar) has its own component tests; these
+// verify the glue.
 //
-//   welcome → directory-selector → no-agent → loaded
-//
-// Plus the cancel-back-to-welcome path. Per-screen UI is already covered by
-// Sidebar / UnifiedTranscript / ComposeBar / DirectorySelector tests; these
-// tests verify the App-level orchestration that glues them together (which
-// IPC commands fire, in what order, and which phase renders next).
-//
-// Edge cases (cancel error states, multi-project switcher, rebind UI
-// state-reset across phases) are deferred until a project switcher exists
-// to exercise them.
+// The IPC layer is mocked with a small **stateful fake backend** so flows read
+// naturally (add directory → create project → activate → send) without
+// asserting brittle call orders.
 
-const invokeMock = vi.fn(
-  async (_cmd: string, _args?: Record<string, unknown>): Promise<unknown> => null,
-);
-// `agent:<id>` event-channel callbacks captured here so E2E tests can fire
-// a recorded sequence into the state module and assert the round trip.
 const listenCallbacks = new Map<string, (e: { payload: NormalizedEvent }) => void>();
+function fireTo(channel: string, event: NormalizedEvent): void {
+  const cb = listenCallbacks.get(channel);
+  if (cb === undefined) throw new Error(`no listener registered for ${channel}`);
+  cb({ payload: event });
+}
 const listenMock = vi.fn(async (event: string, handler: unknown): Promise<() => void> => {
   listenCallbacks.set(event, handler as (e: { payload: NormalizedEvent }) => void);
-  // Honest unlisten: mirrors Tauri's `listen()` return shape (call it to
-  // detach the handler). Intra-test mount/unmount cycles are rare today
-  // but a no-op would silently keep stale callbacks alive across them.
   return () => {
     listenCallbacks.delete(event);
   };
 });
 const openDialogMock = vi.fn(async (_options: unknown): Promise<string | null> => null);
 
-function fireTo(channel: string, event: NormalizedEvent): void {
-  const cb = listenCallbacks.get(channel);
-  if (cb === undefined) throw new Error(`no listener registered for ${channel}`);
-  cb({ payload: event });
+// --- stateful fake backend ---
+type Backend = {
+  persistable: boolean;
+  dirs: Map<string, { available: boolean }>;
+  projects: ProjectListing[];
+  rosters: Map<string, AgentRecord[]>;
+  conversations: Map<string, ProjectConversation>;
+  activeProjectId: string | null;
+  probeFailures: Set<string>;
+  agentQueue: AgentRecord[];
+  sendMessageId: string;
+  loadConvoCalls: string[];
+  failOpenFor: Set<string>;
+  failConvoFor: Set<string>;
+};
+let backend: Backend;
+let agentSeq = 0;
+
+function freshBackend(): Backend {
+  return {
+    persistable: true,
+    dirs: new Map(),
+    projects: [],
+    rosters: new Map(),
+    conversations: new Map(),
+    activeProjectId: null,
+    probeFailures: new Set(),
+    agentQueue: [],
+    sendMessageId: "77777777-7777-7000-8000-777777777777",
+    loadConvoCalls: [],
+    failOpenFor: new Set(),
+    failConvoFor: new Set(),
+  };
 }
+
+const PROBES = [
+  "check_claude_binary",
+  "check_codex_binary",
+  "check_codex_auth",
+  "check_gemini_binary",
+  "check_gemini_auth",
+  "check_antigravity_binary",
+  "check_antigravity_auth",
+];
+
+function summaryFor(id: string): ProjectSummary {
+  const row = backend.projects.find((p) => p.id === id);
+  if (row === undefined) throw new Error(`open of unknown project ${id}`);
+  return { id: row.id, name: row.name, created_at: row.created_at };
+}
+
+const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Promise<unknown> => {
+  if (PROBES.includes(cmd)) {
+    if (backend.probeFailures.has(cmd)) throw new Error(`probe failed: ${cmd}`);
+    return null;
+  }
+  switch (cmd) {
+    case "list_workspace_directories":
+      return {
+        directories: [...backend.dirs].map(([path, d]) => ({ path, available: d.available })),
+        persistable: backend.persistable,
+      };
+    case "list_projects":
+      // Only projects in registered directories surface (matches the real
+      // backend: the workspace registry gates which projects are listed).
+      return backend.projects.filter((p) => backend.dirs.has(p.directory));
+    case "init_directory": {
+      const path = args?.path as string;
+      backend.dirs.set(path, { available: true });
+      return { path, has_switchboard: true, projects: [] };
+    }
+    case "remove_directory": {
+      const path = args?.path as string;
+      backend.dirs.delete(path);
+      backend.projects = backend.projects.filter((p) => p.directory !== path);
+      return null;
+    }
+    case "create_project": {
+      const id = `00000000-0000-7000-8000-0000000c${(backend.projects.length + 1)
+        .toString()
+        .padStart(4, "0")}`;
+      const row: ProjectListing = {
+        id,
+        name: args?.name as string,
+        created_at: "2026-05-20T00:00:00Z",
+        directory: args?.directory as string,
+        available: true,
+        last_activity: "2026-05-20T00:00:00Z",
+      };
+      backend.projects.push(row);
+      backend.rosters.set(id, []);
+      return summaryFor(id);
+    }
+    case "open_project": {
+      const pid = args?.projectId as string;
+      if (backend.failOpenFor.has(pid)) throw new Error("project is locked by another process");
+      return summaryFor(pid);
+    }
+    case "set_active_project":
+      backend.activeProjectId = args?.projectId as string;
+      return null;
+    case "list_agents": {
+      const pid = (args?.projectId as string) ?? backend.activeProjectId;
+      return backend.rosters.get(pid ?? "") ?? [];
+    }
+    case "create_agent":
+    case "attach_agent": {
+      const agent =
+        backend.agentQueue.shift() ??
+        ({
+          id: `00000000-0000-7000-8000-00000000a${(++agentSeq).toString().padStart(3, "0")}`,
+          project_id: backend.activeProjectId ?? "",
+          name: args?.name as string,
+          harness: args?.harness as AgentRecord["harness"],
+          session_id: null,
+          created_at: "2026-05-20T00:00:01Z",
+        } satisfies AgentRecord);
+      const pid = backend.activeProjectId ?? "";
+      backend.rosters.set(pid, [...(backend.rosters.get(pid) ?? []), agent]);
+      return agent;
+    }
+    case "load_transcript":
+      return { turns: [], warnings: [] };
+    case "load_project_conversation": {
+      const pid = args?.projectId as string;
+      backend.loadConvoCalls.push(pid);
+      if (backend.failConvoFor.has(pid)) throw new Error("conversation load failed");
+      return backend.conversations.get(pid) ?? { items: [], agents: [] };
+    }
+    case "send_message":
+      return backend.sendMessageId;
+    default:
+      throw new Error(`unexpected invoke call: ${cmd}`);
+  }
+});
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: (cmd: string, args?: Record<string, unknown>) => invokeMock(cmd, args),
 }));
-
 vi.mock("@tauri-apps/api/event", () => ({
   listen: (event: string, handler: unknown) => listenMock(event, handler),
 }));
-
 vi.mock("@tauri-apps/plugin-dialog", () => ({
   open: (options: unknown) => openDialogMock(options),
 }));
 
-const PATH = "/tmp/sw-test";
-const PROJECT: ProjectSummary = {
-  id: "11111111-1111-7000-8000-111111111111",
-  name: "alpha",
-  created_at: "2026-05-13T00:00:00Z",
-};
-const AGENT: AgentRecord = {
-  id: "22222222-2222-7000-8000-222222222222",
-  project_id: PROJECT.id,
-  name: "assistant",
-  harness: "claude_code",
-  session_id: "33333333-3333-7000-8000-333333333333",
-  created_at: "2026-05-13T00:00:01Z",
-};
+const DIR_A = "/tmp/sw-a";
+const DIR_B = "/tmp/sw-b";
 
-const INFO_NO_SWITCHBOARD: DirectoryInfo = {
-  path: PATH,
-  has_switchboard: false,
-  projects: [],
-};
-
-/**
- * Drives `invokeMock` with a per-command lookup so tests can be declarative
- * about which commands succeed (and with what return value) without
- * assuming any specific call order — App.svelte may legitimately reorder
- * sub-steps within a phase transition.
- *
- * The seven startup probes (`check_claude_binary`, `check_codex_binary`,
- * `check_codex_auth`, `check_gemini_binary`, `check_gemini_auth`,
- * `check_antigravity_binary`, `check_antigravity_auth`) default to success
- * so non-banner tests don't need to spell them out, but `unexpected
- * invoke call` still throws for any IPC the test didn't anticipate.
- * Banner-failure tests use `invokeMock.mockImplementation` directly to
- * override individual probes.
- */
-function setInvokeResponses(map: Record<string, unknown>): void {
-  const withDefaults: Record<string, unknown> = {
-    check_claude_binary: null,
-    check_codex_binary: null,
-    check_codex_auth: null,
-    check_gemini_binary: null,
-    check_gemini_auth: null,
-    check_antigravity_binary: null,
-    check_antigravity_auth: null,
-    ...map,
+function listing(
+  over: Partial<ProjectListing> & { id: string; directory: string },
+): ProjectListing {
+  return {
+    name: "alpha",
+    created_at: "2026-05-20T00:00:00Z",
+    available: true,
+    last_activity: "2026-05-20T00:00:00Z",
+    ...over,
   };
-  invokeMock.mockImplementation(async (cmd: string) => {
-    if (!(cmd in withDefaults)) {
-      throw new Error(`unexpected invoke call: ${cmd}`);
-    }
-    return withDefaults[cmd];
-  });
+}
+
+function agent(over: Partial<AgentRecord> & { id: string; project_id: string }): AgentRecord {
+  return {
+    name: "assistant",
+    harness: "claude_code",
+    session_id: "33333333-3333-7000-8000-333333333333",
+    created_at: "2026-05-20T00:00:01Z",
+    ...over,
+  };
+}
+
+/// Seed a directory with one project and (optionally) a roster + conversation,
+/// so a test can mount straight into a populated workspace.
+function seedProject(opts: {
+  projectId: string;
+  directory?: string;
+  agents?: AgentRecord[];
+  conversation?: ProjectConversation;
+  available?: boolean;
+  lastActivity?: string;
+  name?: string;
+}): void {
+  const dir = opts.directory ?? DIR_A;
+  backend.dirs.set(dir, { available: opts.available ?? true });
+  backend.projects.push(
+    listing({
+      id: opts.projectId,
+      directory: dir,
+      name: opts.name ?? "alpha",
+      available: opts.available ?? true,
+      last_activity: opts.lastActivity ?? "2026-05-20T00:00:00Z",
+    }),
+  );
+  backend.rosters.set(opts.projectId, opts.agents ?? []);
+  if (opts.conversation !== undefined) backend.conversations.set(opts.projectId, opts.conversation);
+}
+
+async function mountApp() {
+  const App = (await import("./App.svelte")).default;
+  return render(App);
 }
 
 describe("App", () => {
   beforeEach(() => {
-    invokeMock.mockReset();
-    listenMock.mockReset();
+    backend = freshBackend();
+    agentSeq = 0;
     listenCallbacks.clear();
-    // Restore the capture-callback default after `.mockReset()` clears it.
-    listenMock.mockImplementation(async (event: string, handler: unknown) => {
-      listenCallbacks.set(event, handler as (e: { payload: NormalizedEvent }) => void);
-      return () => {
-        listenCallbacks.delete(event);
-      };
-    });
+    invokeMock.mockClear();
+    listenMock.mockClear();
     openDialogMock.mockReset();
   });
 
-  // The state-rune module is a singleton; tests that register agents
-  // would otherwise leak state across runs. Drain via the test-only
-  // reset helper.
   afterEach(async () => {
-    const { _testing } = await import("$lib/state/index.svelte");
-    _testing.reset();
+    const idx = await import("$lib/state/index.svelte");
+    idx._testing.reset();
+    const ws = await import("$lib/state/workspace.svelte");
+    ws._testing.reset();
   });
 
-  it("mounts and renders the welcome screen when all harness probes succeed", async () => {
-    setInvokeResponses({});
-    const App = (await import("./App.svelte")).default;
-    render(App);
+  // --- harness availability banners (workspace empty → welcome) ---
+
+  it("renders the welcome state (New / Add existing) with no banners when probes succeed and no projects exist", async () => {
+    await mountApp();
     expect(screen.getByText("Switchboard")).toBeInTheDocument();
-    expect(screen.getByText("Open working directory")).toBeInTheDocument();
-    await waitFor(() => {
-      expect(screen.queryByTestId(/^banner-/)).not.toBeInTheDocument();
-    });
+    expect(screen.getByTestId("welcome-new-project")).toBeInTheDocument();
+    expect(screen.getByTestId("welcome-add-existing")).toBeInTheDocument();
+    // The flat project sidebar is always present (no separate welcome phase).
+    expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByTestId(/^banner-/)).not.toBeInTheDocument());
   });
 
   it("renders a Claude binary-missing banner when only the Claude probe fails", async () => {
-    invokeMock.mockImplementation(async (cmd: string) => {
-      if (cmd === "check_claude_binary")
-        throw new Error("harness probe failed: harness binary not found");
-      if (
-        cmd === "check_codex_binary" ||
-        cmd === "check_codex_auth" ||
-        cmd === "check_gemini_binary" ||
-        cmd === "check_gemini_auth" ||
-        cmd === "check_antigravity_binary" ||
-        cmd === "check_antigravity_auth"
-      )
-        return null;
-      throw new Error(`unexpected invoke call: ${cmd}`);
-    });
-    const App = (await import("./App.svelte")).default;
-    render(App);
-    await waitFor(() => {
-      expect(screen.getByTestId("banner-binary_missing-claude_code")).toBeInTheDocument();
-    });
-    // Other harnesses' banners must NOT show — independent per-harness state.
+    backend.probeFailures.add("check_claude_binary");
+    await mountApp();
+    await waitFor(() =>
+      expect(screen.getByTestId("banner-binary_missing-claude_code")).toBeInTheDocument(),
+    );
     expect(screen.queryByTestId("banner-binary_missing-codex")).not.toBeInTheDocument();
-    expect(screen.queryByTestId("banner-auth_missing-codex")).not.toBeInTheDocument();
-    expect(screen.queryByTestId("banner-binary_missing-gemini")).not.toBeInTheDocument();
-    expect(screen.queryByTestId("banner-auth_missing-gemini")).not.toBeInTheDocument();
-    expect(screen.queryByTestId("banner-binary_missing-antigravity")).not.toBeInTheDocument();
-    expect(screen.queryByTestId("banner-auth_missing-antigravity")).not.toBeInTheDocument();
   });
 
   it("renders a Codex auth-missing banner when only the Codex auth probe fails", async () => {
-    invokeMock.mockImplementation(async (cmd: string) => {
-      if (cmd === "check_codex_auth") throw new Error("auth not configured");
-      if (
-        cmd === "check_claude_binary" ||
-        cmd === "check_codex_binary" ||
-        cmd === "check_gemini_binary" ||
-        cmd === "check_gemini_auth" ||
-        cmd === "check_antigravity_binary" ||
-        cmd === "check_antigravity_auth"
-      )
-        return null;
-      throw new Error(`unexpected invoke call: ${cmd}`);
-    });
-    const App = (await import("./App.svelte")).default;
-    render(App);
-    await waitFor(() => {
-      expect(screen.getByTestId("banner-auth_missing-codex")).toBeInTheDocument();
-    });
+    backend.probeFailures.add("check_codex_auth");
+    await mountApp();
+    await waitFor(() =>
+      expect(screen.getByTestId("banner-auth_missing-codex")).toBeInTheDocument(),
+    );
   });
 
   it("renders a Gemini auth-missing banner when only the Gemini auth probe fails", async () => {
-    invokeMock.mockImplementation(async (cmd: string) => {
-      if (cmd === "check_gemini_auth") throw new Error("auth not configured");
-      if (
-        cmd === "check_claude_binary" ||
-        cmd === "check_codex_binary" ||
-        cmd === "check_codex_auth" ||
-        cmd === "check_gemini_binary" ||
-        cmd === "check_antigravity_binary" ||
-        cmd === "check_antigravity_auth"
-      )
-        return null;
-      throw new Error(`unexpected invoke call: ${cmd}`);
-    });
-    const App = (await import("./App.svelte")).default;
-    render(App);
-    await waitFor(() => {
-      expect(screen.getByTestId("banner-auth_missing-gemini")).toBeInTheDocument();
-    });
-    // Codex / Antigravity auth banners unaffected — per-harness independence.
+    backend.probeFailures.add("check_gemini_auth");
+    await mountApp();
+    await waitFor(() =>
+      expect(screen.getByTestId("banner-auth_missing-gemini")).toBeInTheDocument(),
+    );
     expect(screen.queryByTestId("banner-auth_missing-codex")).not.toBeInTheDocument();
-    expect(screen.queryByTestId("banner-auth_missing-antigravity")).not.toBeInTheDocument();
   });
 
-  it("renders an Antigravity auth-missing banner when only the Antigravity auth probe fails", async () => {
-    invokeMock.mockImplementation(async (cmd: string) => {
-      if (cmd === "check_antigravity_auth") throw new Error("auth not configured");
-      if (
-        cmd === "check_claude_binary" ||
-        cmd === "check_codex_binary" ||
-        cmd === "check_codex_auth" ||
-        cmd === "check_gemini_binary" ||
-        cmd === "check_gemini_auth" ||
-        cmd === "check_antigravity_binary"
-      )
-        return null;
-      throw new Error(`unexpected invoke call: ${cmd}`);
-    });
-    const App = (await import("./App.svelte")).default;
-    render(App);
-    await waitFor(() => {
-      expect(screen.getByTestId("banner-auth_missing-antigravity")).toBeInTheDocument();
-    });
-    // Other harnesses' auth banners unaffected — per-harness independence.
+  it("suppresses a harness's auth banner when its binary is also missing", async () => {
+    backend.probeFailures.add("check_codex_binary");
+    backend.probeFailures.add("check_codex_auth");
+    await mountApp();
+    await waitFor(() =>
+      expect(screen.getByTestId("banner-binary_missing-codex")).toBeInTheDocument(),
+    );
     expect(screen.queryByTestId("banner-auth_missing-codex")).not.toBeInTheDocument();
-    expect(screen.queryByTestId("banner-auth_missing-gemini")).not.toBeInTheDocument();
   });
 
-  it("Antigravity binary missing suppresses Antigravity auth banner (per-harness suppression)", async () => {
-    // Both Antigravity probes fail. Only the binary banner should show
-    // — the user can't act on the auth gap until they install `agy`.
-    // Per-harness independence: Claude/Codex/Gemini stay clean.
-    invokeMock.mockImplementation(async (cmd: string) => {
-      if (cmd === "check_antigravity_binary" || cmd === "check_antigravity_auth")
-        throw new Error("missing");
-      if (
-        cmd === "check_claude_binary" ||
-        cmd === "check_codex_binary" ||
-        cmd === "check_codex_auth" ||
-        cmd === "check_gemini_binary" ||
-        cmd === "check_gemini_auth"
-      )
-        return null;
-      throw new Error(`unexpected invoke call: ${cmd}`);
-    });
-    const App = (await import("./App.svelte")).default;
-    render(App);
-    await waitFor(() => {
-      expect(screen.getByTestId("banner-binary_missing-antigravity")).toBeInTheDocument();
-    });
-    expect(screen.queryByTestId("banner-auth_missing-antigravity")).not.toBeInTheDocument();
-    expect(screen.queryByTestId("banner-binary_missing-claude_code")).not.toBeInTheDocument();
-    expect(screen.queryByTestId("banner-binary_missing-codex")).not.toBeInTheDocument();
-    expect(screen.queryByTestId("banner-binary_missing-gemini")).not.toBeInTheDocument();
-  });
-
-  it("Gemini binary missing suppresses Gemini auth banner (per-harness suppression)", async () => {
-    // Both Gemini probes fail. The binary banner surfaces; the auth
-    // banner is suppressed because auth is irrelevant when the CLI
-    // isn't installed. Per-harness independence: Claude/Codex stay
-    // clean.
-    invokeMock.mockImplementation(async (cmd: string) => {
-      if (cmd === "check_gemini_binary" || cmd === "check_gemini_auth") throw new Error("missing");
-      if (
-        cmd === "check_claude_binary" ||
-        cmd === "check_codex_binary" ||
-        cmd === "check_codex_auth" ||
-        cmd === "check_antigravity_binary" ||
-        cmd === "check_antigravity_auth"
-      )
-        return null;
-      throw new Error(`unexpected invoke call: ${cmd}`);
-    });
-    const App = (await import("./App.svelte")).default;
-    render(App);
-    await waitFor(() => {
-      expect(screen.getByTestId("banner-binary_missing-gemini")).toBeInTheDocument();
-    });
-    expect(screen.queryByTestId("banner-auth_missing-gemini")).not.toBeInTheDocument();
-    expect(screen.queryByTestId("banner-binary_missing-claude_code")).not.toBeInTheDocument();
-    expect(screen.queryByTestId("banner-binary_missing-codex")).not.toBeInTheDocument();
-    expect(screen.queryByTestId("banner-binary_missing-antigravity")).not.toBeInTheDocument();
-    expect(screen.queryByTestId("banner-auth_missing-antigravity")).not.toBeInTheDocument();
-  });
-
-  it("both binaries missing: two binary banners render simultaneously, no auth banner", async () => {
-    invokeMock.mockImplementation(async (cmd: string) => {
-      if (cmd === "check_claude_binary" || cmd === "check_codex_binary") throw new Error("missing");
-      if (
-        cmd === "check_codex_auth" ||
-        cmd === "check_gemini_binary" ||
-        cmd === "check_gemini_auth" ||
-        cmd === "check_antigravity_binary" ||
-        cmd === "check_antigravity_auth"
-      )
-        return null;
-      throw new Error(`unexpected invoke call: ${cmd}`);
-    });
-    const App = (await import("./App.svelte")).default;
-    render(App);
+  it("renders two binary banners simultaneously when two binaries are missing", async () => {
+    backend.probeFailures.add("check_claude_binary");
+    backend.probeFailures.add("check_codex_binary");
+    await mountApp();
     await waitFor(() => {
       expect(screen.getByTestId("banner-binary_missing-claude_code")).toBeInTheDocument();
       expect(screen.getByTestId("banner-binary_missing-codex")).toBeInTheDocument();
     });
-    // Suppression rule applies per-harness independently — Codex auth banner
-    // hidden because Codex binary is missing.
-    expect(screen.queryByTestId("banner-auth_missing-codex")).not.toBeInTheDocument();
   });
 
-  it("slow probe doesn't block fast probes — each updates its slice independently", async () => {
-    // `check_codex_auth` never resolves; `check_claude_binary` and
-    // `check_codex_binary` both fail fast. The Claude + Codex binary
-    // banners must surface even while the auth probe is still in flight.
-    // Pins the per-probe-resolution invariant (no Promise.all barrier).
-    const authPromise = new Promise<null>(() => {
-      // Intentionally never resolves. Each test runs in its own
-      // singleton-state context (the `afterEach` reset drains
-      // listeners); the hung promise is GC'd when the test scope
-      // tears down.
-    });
-    invokeMock.mockImplementation(async (cmd: string) => {
-      if (cmd === "check_claude_binary" || cmd === "check_codex_binary") throw new Error("missing");
-      if (cmd === "check_codex_auth") return authPromise;
-      if (
-        cmd === "check_gemini_binary" ||
-        cmd === "check_gemini_auth" ||
-        cmd === "check_antigravity_binary" ||
-        cmd === "check_antigravity_auth"
-      )
-        return null;
-      throw new Error(`unexpected invoke call: ${cmd}`);
-    });
-    const App = (await import("./App.svelte")).default;
-    render(App);
-    // Both binary banners surface without waiting on the hung auth probe.
-    await waitFor(() => {
-      expect(screen.getByTestId("banner-binary_missing-claude_code")).toBeInTheDocument();
-      expect(screen.getByTestId("banner-binary_missing-codex")).toBeInTheDocument();
-    });
-    // Auth banner is correctly suppressed (Codex binary missing), but
-    // also wouldn't surface independently since the probe hasn't
-    // resolved yet.
-    expect(screen.queryByTestId("banner-auth_missing-codex")).not.toBeInTheDocument();
+  // --- adding projects ---
+
+  it("add existing project: pointing at a folder brings its existing projects into the flat list", async () => {
+    // The folder already has a Switchboard project on disk; adding it surfaces
+    // that project in the list (the directory is invisible plumbing).
+    backend.projects.push(listing({ id: "p-x", directory: DIR_A, name: "existing-proj" }));
+    backend.rosters.set("p-x", []);
+    openDialogMock.mockResolvedValueOnce(DIR_A);
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("welcome-add-existing")).toBeInTheDocument());
+
+    await fireEvent.click(screen.getByTestId("welcome-add-existing"));
+    await waitFor(() => expect(screen.getByText("existing-proj")).toBeInTheDocument());
+    expect(
+      invokeMock.mock.calls.some(([c, a]) => c === "init_directory" && a?.path === DIR_A),
+    ).toBe(true);
+    // No directory rows anywhere — folders are not a managed object.
+    expect(screen.queryByTestId("directory-row")).not.toBeInTheDocument();
   });
 
-  it("suppresses Codex auth banner when Codex binary is also missing (auth is irrelevant)", async () => {
-    // Both Codex probes fail. Only the binary banner should show — the
-    // user can't act on the auth gap until they install the CLI.
-    invokeMock.mockImplementation(async (cmd: string) => {
-      if (cmd === "check_codex_binary" || cmd === "check_codex_auth") throw new Error("missing");
-      if (
-        cmd === "check_claude_binary" ||
-        cmd === "check_gemini_binary" ||
-        cmd === "check_gemini_auth" ||
-        cmd === "check_antigravity_binary" ||
-        cmd === "check_antigravity_auth"
-      )
-        return null;
-      throw new Error(`unexpected invoke call: ${cmd}`);
-    });
-    const App = (await import("./App.svelte")).default;
-    render(App);
-    await waitFor(() => {
-      expect(screen.getByTestId("banner-binary_missing-codex")).toBeInTheDocument();
-    });
-    expect(screen.queryByTestId("banner-auth_missing-codex")).not.toBeInTheDocument();
-    // Gemini / Antigravity state stays clean — per-harness independence.
-    expect(screen.queryByTestId("banner-binary_missing-gemini")).not.toBeInTheDocument();
-    expect(screen.queryByTestId("banner-auth_missing-gemini")).not.toBeInTheDocument();
-    expect(screen.queryByTestId("banner-binary_missing-antigravity")).not.toBeInTheDocument();
-    expect(screen.queryByTestId("banner-auth_missing-antigravity")).not.toBeInTheDocument();
+  it("new project: choosing a folder + name creates the project and activates it", async () => {
+    openDialogMock.mockResolvedValueOnce(DIR_A);
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("welcome-new-project")).toBeInTheDocument());
+
+    await fireEvent.click(screen.getByTestId("welcome-new-project"));
+    await waitFor(() => expect(screen.getByTestId("new-project-form")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("new-project-choose-folder"));
+    const nameInput = screen.getByTestId("new-project-name") as HTMLInputElement;
+    await fireEvent.input(nameInput, { target: { value: "brand-new" } });
+    await fireEvent.click(screen.getByTestId("new-project-submit"));
+
+    // Created in the chosen folder, then activated → its (empty) roster prompts
+    // for a first agent.
+    await waitFor(() => expect(screen.getByText("brand-new")).toBeInTheDocument());
+    const createCalls = invokeMock.mock.calls.filter(([c]) => c === "create_project");
+    expect(createCalls).toHaveLength(1);
+    expect(createCalls[0]?.[1]).toEqual({ name: "brand-new", directory: DIR_A });
   });
 
-  it("welcome → directory-selector: clicking Open working directory invokes pick_directory and renders the selector", async () => {
-    setInvokeResponses({
-      check_claude_binary: null,
-      pick_directory: INFO_NO_SWITCHBOARD,
-    });
-    openDialogMock.mockResolvedValueOnce(PATH);
-
-    const App = (await import("./App.svelte")).default;
-    render(App);
-    await waitFor(() => {
-      expect(screen.getByText("Open working directory")).toBeInTheDocument();
-    });
-
-    await fireEvent.click(screen.getByText("Open working directory"));
-
-    await waitFor(() => {
-      expect(screen.getByText("Working directory")).toBeInTheDocument();
-    });
-    // Asserts on the IPC sequence — would catch a handler that rendered the
-    // right phase but skipped the inspect call (or vice versa).
-    expect(openDialogMock).toHaveBeenCalledOnce();
-    const pickCalls = invokeMock.mock.calls.filter(([cmd]) => cmd === "pick_directory");
-    expect(pickCalls).toHaveLength(1);
-    expect(pickCalls[0]?.[1]).toEqual({ path: PATH });
+  it("surfaces the not-persistable state distinctly from a fresh install", async () => {
+    backend.persistable = false;
+    backend.dirs.set(DIR_A, { available: true });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("not-persistable-banner")).toBeInTheDocument());
+    // The workspace shell renders (sidebar present), not a bare welcome with no warning.
+    expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument();
   });
 
-  it("directory-selector → no-agent: confirming Initialize fires init_directory + create_project + set_active_project + list_agents, then renders Create agent", async () => {
-    setInvokeResponses({
-      check_claude_binary: null,
-      pick_directory: INFO_NO_SWITCHBOARD,
-      init_directory: { ...INFO_NO_SWITCHBOARD, has_switchboard: true },
-      create_project: PROJECT,
-      set_active_project: null,
-      list_agents: [],
-    });
-    openDialogMock.mockResolvedValueOnce(PATH);
+  // --- workspace: project list + lazy activation ---
 
-    const App = (await import("./App.svelte")).default;
-    render(App);
-    await waitFor(() => expect(screen.getByText("Open working directory")).toBeInTheDocument());
-    await fireEvent.click(screen.getByText("Open working directory"));
-    await waitFor(() => expect(screen.getByTestId("confirm-init")).toBeInTheDocument());
-
-    await fireEvent.click(screen.getByTestId("confirm-init"));
+  it("eager-loads the flat project list across directories without hydrating transcripts", async () => {
+    seedProject({ projectId: "p-a", directory: DIR_A, name: "alpha" });
+    seedProject({ projectId: "p-b", directory: DIR_B, name: "beta" });
+    await mountApp();
 
     await waitFor(() => {
-      expect(screen.getByText("Create an agent")).toBeInTheDocument();
+      expect(screen.getAllByTestId("project-row")).toHaveLength(2);
     });
-    // The IPC sequence must include all four backend steps. A handler that
-    // skipped any one (e.g., forgot to call set_active_project) would render
-    // the right next-phase but leave AppState mis-configured.
-    const cmds = invokeMock.mock.calls.map(([cmd]) => cmd);
-    expect(cmds).toContain("init_directory");
-    expect(cmds).toContain("create_project");
-    expect(cmds).toContain("set_active_project");
-    expect(cmds).toContain("list_agents");
+    // Eager registry only — no project's conversation is hydrated at startup.
+    expect(backend.loadConvoCalls).toEqual([]);
   });
 
-  it("no-agent → loaded: submitting Create agent invokes create_agent and renders the 3-pane layout", async () => {
-    setInvokeResponses({
-      check_claude_binary: null,
-      pick_directory: INFO_NO_SWITCHBOARD,
-      init_directory: { ...INFO_NO_SWITCHBOARD, has_switchboard: true },
-      create_project: PROJECT,
-      set_active_project: null,
-      list_agents: [],
-      create_agent: AGENT,
+  it("first activation loads the roster + hydrates once; re-activation does not re-hydrate", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
     });
-    openDialogMock.mockResolvedValueOnce(PATH);
+    seedProject({ projectId: "p-b", directory: DIR_B, name: "beta" });
+    await mountApp();
+    await waitFor(() => expect(screen.getAllByTestId("project-row").length).toBe(2));
 
-    const App = (await import("./App.svelte")).default;
-    render(App);
-    await waitFor(() => expect(screen.getByText("Open working directory")).toBeInTheDocument());
-    await fireEvent.click(screen.getByText("Open working directory"));
-    await waitFor(() => expect(screen.getByTestId("confirm-init")).toBeInTheDocument());
-    await fireEvent.click(screen.getByTestId("confirm-init"));
+    const rowA = screen.getByText("alpha");
+    await fireEvent.click(rowA);
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+    // Hydration is fire-and-forget just after the roster renders.
+    await waitFor(() => expect(backend.loadConvoCalls).toEqual(["p-a"]));
+
+    // Switch to B then back to A — A must not re-hydrate.
+    await fireEvent.click(screen.getByText("beta"));
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+    expect(backend.loadConvoCalls.filter((p) => p === "p-a")).toHaveLength(1);
+  });
+
+  it("switching projects is display-only: a backgrounded agent's listener still updates state", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    seedProject({
+      projectId: "p-b",
+      directory: DIR_B,
+      name: "beta",
+      agents: [agent({ id: "ag-2", project_id: "p-b", name: "helper" })],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getAllByTestId("project-row").length).toBe(2));
+
+    // Activate A (registers ag-1's listener), then switch to B.
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("beta"));
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+
+    // A background turn for ag-1 (in directory A) arrives AFTER the switch.
+    // Its listener must still be alive and update state — proving switching
+    // didn't unregister it.
+    const turnId = "88888888-8888-7000-8000-888888888888";
+    fireTo(`agent:ag-1`, {
+      type: "turn_start",
+      turn_id: turnId,
+      message_id: backend.sendMessageId,
+      started_at: "2026-05-20T01:00:00Z",
+    });
+    fireTo(`agent:ag-1`, { type: "content_chunk", turn_id: turnId, kind: "text", text: "bg work" });
+
+    // Switch back to A; the background turn's content is present.
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() =>
+      expect(screen.getByTestId("unified-transcript")).toHaveTextContent("bg work"),
+    );
+  });
+
+  // --- first agent + add agent ---
+
+  it("a project with no agents shows the create-agent form; creating one renders the transcript", async () => {
+    seedProject({ projectId: "p-a", directory: DIR_A, name: "alpha", agents: [] });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
+
+    await fireEvent.click(screen.getByText("alpha"));
     await waitFor(() => expect(screen.getByTestId("confirm-create-agent")).toBeInTheDocument());
 
     await fireEvent.click(screen.getByTestId("confirm-create-agent"));
-
-    // The "loaded" phase renders Sidebar + UnifiedTranscript + ComposeBar.
     await waitFor(() => {
-      expect(screen.getByTestId("loaded-layout")).toBeInTheDocument();
-      expect(screen.getByTestId("sidebar")).toBeInTheDocument();
       expect(screen.getByTestId("unified-transcript")).toBeInTheDocument();
       expect(screen.getByTestId("compose-textarea")).toBeInTheDocument();
+      expect(screen.getByTestId("sidebar")).toBeInTheDocument();
     });
-    // Sidebar surfaces the agent's name.
-    expect(screen.getByTestId("agent-name")).toHaveTextContent("assistant");
-
-    const createAgentCalls = invokeMock.mock.calls.filter(([cmd]) => cmd === "create_agent");
-    expect(createAgentCalls).toHaveLength(1);
-    expect(createAgentCalls[0]?.[1]).toEqual({ name: "assistant", harness: "claude_code" });
+    const createCalls = invokeMock.mock.calls.filter(([c]) => c === "create_agent");
+    expect(createCalls).toHaveLength(1);
+    expect(createCalls[0]?.[1]).toEqual({ name: "assistant", harness: "claude_code" });
   });
 
-  it("directory-selector → welcome: clicking Cancel returns to the welcome screen", async () => {
-    setInvokeResponses({
-      check_claude_binary: null,
-      pick_directory: INFO_NO_SWITCHBOARD,
+  it("add agent via the sidebar modal registers a listener and appends to the roster", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
     });
-    openDialogMock.mockResolvedValueOnce(PATH);
+    backend.agentQueue.push(
+      agent({ id: "ag-2", project_id: "p-a", name: "second", harness: "codex", session_id: null }),
+    );
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("sidebar")).toBeInTheDocument());
 
-    const App = (await import("./App.svelte")).default;
-    render(App);
-    await waitFor(() => expect(screen.getByText("Open working directory")).toBeInTheDocument());
-    await fireEvent.click(screen.getByText("Open working directory"));
-    await waitFor(() => expect(screen.getByText("Working directory")).toBeInTheDocument());
-
-    // Cancel from the directory-selector phase — primary user flow, gets
-    // a dedicated assertion.
-    const cancels = screen.getAllByRole("button", { name: /cancel/i });
-    await fireEvent.click(cancels[cancels.length - 1]!);
-
-    await waitFor(() => {
-      expect(screen.getByText("Open working directory")).toBeInTheDocument();
-      expect(screen.queryByText("Working directory")).not.toBeInTheDocument();
-    });
-  });
-
-  // Dynamic agent add: the first agent's session is already loaded; the
-  // user opens the sidebar "+" entry point, submits, and the new agent
-  // appears in the sidebar (and is registered in the state module so its
-  // events would flow on dispatch). The load-bearing property: the new
-  // agent's listener is wired before the phase transition completes, so
-  // an immediate dispatch wouldn't lose the first event.
-  it("loaded → add agent via sidebar modal: appends to phase.agents and registers a listener", async () => {
-    const SECOND_AGENT: AgentRecord = {
-      id: "44444444-4444-7000-8000-444444444444",
-      project_id: PROJECT.id,
-      name: "second",
-      harness: "codex",
-      session_id: null,
-      created_at: "2026-05-13T00:00:02Z",
-    };
-    setInvokeResponses({
-      check_claude_binary: null,
-      pick_directory: INFO_NO_SWITCHBOARD,
-      init_directory: { ...INFO_NO_SWITCHBOARD, has_switchboard: true },
-      create_project: PROJECT,
-      set_active_project: null,
-      list_agents: [],
-      create_agent: AGENT,
-    });
-    openDialogMock.mockResolvedValueOnce(PATH);
-
-    // Walk through to the loaded phase with one agent already present.
-    const App = (await import("./App.svelte")).default;
-    render(App);
-    await waitFor(() => expect(screen.getByText("Open working directory")).toBeInTheDocument());
-    await fireEvent.click(screen.getByText("Open working directory"));
-    await waitFor(() => expect(screen.getByTestId("confirm-init")).toBeInTheDocument());
-    await fireEvent.click(screen.getByTestId("confirm-init"));
-    await waitFor(() => expect(screen.getByTestId("confirm-create-agent")).toBeInTheDocument());
-    await fireEvent.click(screen.getByTestId("confirm-create-agent"));
-    await waitFor(() => expect(screen.getByTestId("loaded-layout")).toBeInTheDocument());
-
-    // listen() count at the loaded boundary — registerAgent wires one
-    // listener per agent. Captures the baseline so we can assert the
-    // second-agent registration adds exactly one more.
-    const listenCallsBeforeAdd = listenMock.mock.calls.length;
-
-    // Now swap create_agent to return the second agent for the next call.
-    // (setInvokeResponses replaces the dispatch table; preserve everything
-    // else.)
-    setInvokeResponses({
-      check_claude_binary: null,
-      pick_directory: INFO_NO_SWITCHBOARD,
-      init_directory: { ...INFO_NO_SWITCHBOARD, has_switchboard: true },
-      create_project: PROJECT,
-      set_active_project: null,
-      list_agents: [],
-      create_agent: SECOND_AGENT,
-    });
-
-    // Sidebar's "+" opens the modal. The modal renders a CreateAgentForm
-    // (embedded variant — same data-testid="confirm-create-agent").
+    const listenBefore = listenMock.mock.calls.length;
     await fireEvent.click(screen.getByTestId("sidebar-add-agent"));
     await waitFor(() => expect(screen.getByTestId("dialog-content")).toBeInTheDocument());
-    // Scope queries to the modal — Sidebar also uses `data-testid="agent-name"`
-    // for each agent row, so a global getByTestId("agent-name") would match
-    // multiple after the modal opens.
     const modal = screen.getByTestId("dialog-content");
-
-    // Default form values (mode=create, harness=claude_code, name=assistant)
-    // would collide with the existing agent's name. Change the name to
-    // something unique before submitting.
     const nameInput = within(modal).getByTestId("agent-name") as HTMLInputElement;
     await fireEvent.input(nameInput, { target: { value: "second" } });
     await fireEvent.click(within(modal).getByTestId("harness-codex"));
     await fireEvent.click(within(modal).getByTestId("confirm-create-agent"));
 
-    // The new agent should land in the sidebar (immutable phase update).
-    // Both agents render side-by-side; assert the second is now present.
     await waitFor(() => {
       const names = screen.getAllByTestId("agent-name");
       expect(names.some((n) => n.textContent === "second")).toBe(true);
     });
-
-    // Modal closes after successful submission.
-    expect(screen.queryByTestId("dialog-content")).not.toBeInTheDocument();
-
-    // create_agent IPC fired with the form's values (proves the modal's
-    // submission was correctly threaded through createOrAttachAndRegister).
-    const createAgentCalls = invokeMock.mock.calls.filter(([cmd]) => cmd === "create_agent");
-    expect(createAgentCalls).toHaveLength(2); // first agent + this one
-    expect(createAgentCalls[1]?.[1]).toEqual({ name: "second", harness: "codex" });
-
-    // Exactly one additional listener was registered — the load-bearing
-    // property for "immediately dispatch and no events miss." A regression
-    // that updated phase.agents without calling registerAgent would still
-    // render the sidebar but silently drop events.
-    expect(listenMock.mock.calls.length).toBe(listenCallsBeforeAdd + 1);
-    expect(listenMock.mock.calls.at(-1)?.[0]).toBe(`agent:${SECOND_AGENT.id}`);
+    expect(listenMock.mock.calls.length).toBe(listenBefore + 1);
+    expect(listenMock.mock.calls.at(-1)?.[0]).toBe("agent:ag-2");
   });
 
-  // Companion to the "dynamic agent add" test above, exercising the
-  // **attach existing session** code path through the same modal. The
-  // load-bearing assertion is the IPC shape: a regression that mis-wired
-  // the form's `attach` mode to call `create_agent` (or to ship
-  // existing_session_id under the wrong field) would still render the
-  // sidebar agent but silently never reuse the existing harness session.
-  it("loaded → attach agent via sidebar modal: invokes attach_agent with existing_session_id and registers a listener", async () => {
-    const EXISTING_SESSION_ID = "55555555-5555-7000-8000-555555555555";
-    const ATTACHED_AGENT: AgentRecord = {
-      id: "66666666-6666-7000-8000-666666666666",
-      project_id: PROJECT.id,
-      name: "attached-claude",
-      harness: "claude_code",
-      session_id: EXISTING_SESSION_ID,
-      created_at: "2026-05-13T00:00:03Z",
+  // --- post-restart merged conversation ---
+
+  it("renders the merged post-restart conversation: grouped user message, agent content, and failed/cancelled markers", async () => {
+    const convo: ProjectConversation = {
+      items: [
+        {
+          kind: "user_message",
+          send_id: "s-1",
+          agent_ids: ["ag-1"],
+          text: "do the thing",
+          at: "2026-05-20T00:00:00Z",
+        },
+        {
+          kind: "agent_turn",
+          turn_id: "t-done",
+          agent_id: "ag-1",
+          started_at: "2026-05-20T00:00:00Z",
+          ended_at: "2026-05-20T00:00:02Z",
+          status: "complete",
+          items: [{ item_kind: "text", kind: "text", text: "did the thing" }],
+          usage: null,
+        },
+        // A failed send and a cancelled send, each at its own send's instant.
+        {
+          kind: "user_message",
+          send_id: "s-2",
+          agent_ids: ["ag-1"],
+          text: "second ask",
+          at: "2026-05-20T00:01:00Z",
+        },
+        {
+          kind: "outcome",
+          turn_id: "t-fail",
+          send_id: "s-2",
+          agent_id: "ag-1",
+          status: "failed",
+          reason: "boom",
+          at: "2026-05-20T00:01:00Z",
+        },
+        {
+          kind: "user_message",
+          send_id: "s-3",
+          agent_ids: ["ag-1"],
+          text: "third ask",
+          at: "2026-05-20T00:02:00Z",
+        },
+        {
+          kind: "outcome",
+          turn_id: "t-cancel",
+          send_id: "s-3",
+          agent_id: "ag-1",
+          status: "cancelled",
+          reason: "user",
+          at: "2026-05-20T00:02:00Z",
+        },
+      ],
+      agents: [
+        { agent_id: "ag-1", meta: null, last_rate_limit: null, warnings: [], load_error: null },
+      ],
     };
-    setInvokeResponses({
-      pick_directory: INFO_NO_SWITCHBOARD,
-      init_directory: { ...INFO_NO_SWITCHBOARD, has_switchboard: true },
-      create_project: PROJECT,
-      set_active_project: null,
-      list_agents: [],
-      create_agent: AGENT,
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+      conversation: convo,
     });
-    openDialogMock.mockResolvedValueOnce(PATH);
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
 
-    const App = (await import("./App.svelte")).default;
-    render(App);
-    await waitFor(() => expect(screen.getByText("Open working directory")).toBeInTheDocument());
-    await fireEvent.click(screen.getByText("Open working directory"));
-    await waitFor(() => expect(screen.getByTestId("confirm-init")).toBeInTheDocument());
-    await fireEvent.click(screen.getByTestId("confirm-init"));
-    await waitFor(() => expect(screen.getByTestId("confirm-create-agent")).toBeInTheDocument());
-    await fireEvent.click(screen.getByTestId("confirm-create-agent"));
-    await waitFor(() => expect(screen.getByTestId("loaded-layout")).toBeInTheDocument());
-
-    const listenCallsBeforeAttach = listenMock.mock.calls.length;
-
-    setInvokeResponses({
-      pick_directory: INFO_NO_SWITCHBOARD,
-      init_directory: { ...INFO_NO_SWITCHBOARD, has_switchboard: true },
-      create_project: PROJECT,
-      set_active_project: null,
-      list_agents: [],
-      attach_agent: ATTACHED_AGENT,
-    });
-
-    await fireEvent.click(screen.getByTestId("sidebar-add-agent"));
-    await waitFor(() => expect(screen.getByTestId("dialog-content")).toBeInTheDocument());
-    const modal = screen.getByTestId("dialog-content");
-
-    // Switch the modal from "create" mode (default) to "attach".
-    await fireEvent.click(within(modal).getByTestId("mode-attach"));
-
-    const nameInput = within(modal).getByTestId("agent-name") as HTMLInputElement;
-    await fireEvent.input(nameInput, { target: { value: "attached-claude" } });
-    const sessionInput = within(modal).getByTestId("attach-session-id") as HTMLInputElement;
-    await fireEvent.input(sessionInput, { target: { value: EXISTING_SESSION_ID } });
-    await fireEvent.click(within(modal).getByTestId("confirm-create-agent"));
-
-    // Sidebar shows the attached agent.
     await waitFor(() => {
-      const names = screen.getAllByTestId("agent-name");
-      expect(names.some((n) => n.textContent === "attached-claude")).toBe(true);
+      expect(screen.getByTestId("unified-transcript")).toHaveTextContent("did the thing");
     });
-    // Modal closes after successful submission.
-    expect(screen.queryByTestId("dialog-content")).not.toBeInTheDocument();
+    const transcript = screen.getByTestId("unified-transcript");
+    expect(transcript).toHaveTextContent("do the thing");
+    // The failed and cancelled markers render (from the journal overlay).
+    expect(within(transcript).getByTestId("outcome-failed")).toBeInTheDocument();
+    expect(within(transcript).getByTestId("outcome-cancelled")).toBeInTheDocument();
 
-    // attach_agent IPC fired with the attach-shaped payload. A regression
-    // that fell back to create_agent (wrong command) or dropped the
-    // existing_session_id field would fail this check.
-    const attachCalls = invokeMock.mock.calls.filter(([cmd]) => cmd === "attach_agent");
-    expect(attachCalls).toHaveLength(1);
-    expect(attachCalls[0]?.[1]).toEqual({
-      name: "attached-claude",
-      harness: "claude_code",
-      // camelCase at the IPC boundary — Tauri converts to Rust snake_case
-      // on the way in. See `src/lib/api.ts::attachAgent`.
-      existingSessionId: EXISTING_SESSION_ID,
-    });
-    // No create_agent call leaked from the attach path.
-    const createAgentCallsForAttach = invokeMock.mock.calls.filter(
-      ([cmd, args]) =>
-        cmd === "create_agent" && (args as Record<string, unknown>)?.["name"] === "attached-claude",
-    );
-    expect(createAgentCallsForAttach).toHaveLength(0);
+    // The user message renders once per send (grouped), not duplicated.
+    const userRows = within(transcript)
+      .getAllByTestId("turn")
+      .filter((el) => el.getAttribute("data-role") === "user");
+    expect(userRows).toHaveLength(3);
 
-    // Listener for the new agent registered. Same load-bearing property
-    // as the dynamic-add test: a regression that updated phase.agents
-    // without wiring the channel would still render the sidebar but
-    // silently drop dispatch events.
-    expect(listenMock.mock.calls.length).toBe(listenCallsBeforeAttach + 1);
-    expect(listenMock.mock.calls.at(-1)?.[0]).toBe(`agent:${ATTACHED_AGENT.id}`);
+    // A marker never sorts above the prompt that caused it: within the
+    // rendered order, each user message precedes its same-instant marker.
+    const order = transcript.textContent ?? "";
+    expect(order.indexOf("second ask")).toBeLessThan(order.indexOf("boom"));
+    expect(order.indexOf("third ask")).toBeLessThan(order.indexOf("cancelled"));
   });
 
-  // The pair of E2E tests below exercise the full round trip:
-  //   compose-bar Send → invoke("send_message") → captured listen callback
-  //   → reducer → UI render → run_status returns to idle.
-  // Per-layer unit tests cover each piece in isolation; these pin the
-  // wiring through App.svelte against IPC-field renames or listener-
-  // registration regressions. One test per harness because the
-  // post-terminal event ordering differs (Codex emits RateLimitEvent +
-  // SessionMeta between TurnEnd and AgentIdle).
-  it("E2E (Claude): send → turn_start → content_chunk → turn_end → agent_idle renders the response and unblocks Send", async () => {
-    setInvokeResponses({
-      pick_directory: INFO_NO_SWITCHBOARD,
-      init_directory: { ...INFO_NO_SWITCHBOARD, has_switchboard: true },
-      create_project: PROJECT,
-      set_active_project: null,
-      list_agents: [],
-      create_agent: AGENT,
-      send_message: "77777777-7777-7000-8000-777777777777", // message_id (accepted-send receipt)
+  // --- E2E send ---
+
+  it("E2E send: send → turn_start → content_chunk → turn_end → agent_idle renders and unblocks Send", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
     });
-    openDialogMock.mockResolvedValueOnce(PATH);
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
 
-    const App = (await import("./App.svelte")).default;
-    render(App);
-    await waitFor(() => expect(screen.getByText("Open working directory")).toBeInTheDocument());
-    await fireEvent.click(screen.getByText("Open working directory"));
-    await waitFor(() => expect(screen.getByTestId("confirm-init")).toBeInTheDocument());
-    await fireEvent.click(screen.getByTestId("confirm-init"));
-    await waitFor(() => expect(screen.getByTestId("confirm-create-agent")).toBeInTheDocument());
-    await fireEvent.click(screen.getByTestId("confirm-create-agent"));
-    await waitFor(() => expect(screen.getByTestId("loaded-layout")).toBeInTheDocument());
-
-    // Type the prompt and Send.
     const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
     await fireEvent.input(textarea, { target: { value: "hi" } });
     await fireEvent.click(screen.getByTestId("compose-send"));
 
-    // IPC for send_message fired with the right args.
     await waitFor(() => {
-      const sendCalls = invokeMock.mock.calls.filter(([cmd]) => cmd === "send_message");
+      const sendCalls = invokeMock.mock.calls.filter(([c]) => c === "send_message");
       expect(sendCalls).toHaveLength(1);
-      expect(sendCalls[0]?.[1]).toEqual({ agentId: AGENT.id, prompt: "hi" });
+      expect(sendCalls[0]?.[1]).toEqual({ agentId: "ag-1", prompt: "hi" });
     });
 
-    // The accepted-send receipt (message_id) the mock returned — the
-    // correlated turn_start carries it back.
-    const messageId = "77777777-7777-7000-8000-777777777777";
-    // Fire the recorded Claude event sequence through the captured listener.
     const turnId = "88888888-8888-7000-8000-888888888888";
-    const channel = `agent:${AGENT.id}`;
+    const channel = "agent:ag-1";
     fireTo(channel, {
       type: "turn_start",
       turn_id: turnId,
-      message_id: messageId,
-      started_at: "2026-05-16T00:00:00Z",
+      message_id: backend.sendMessageId,
+      started_at: "2026-05-20T00:00:00Z",
     });
-    fireTo(channel, {
-      type: "content_chunk",
-      turn_id: turnId,
-      kind: "text",
-      text: "hello back",
-    });
+    fireTo(channel, { type: "content_chunk", turn_id: turnId, kind: "text", text: "hello back" });
     fireTo(channel, {
       type: "turn_end",
       turn_id: turnId,
       outcome: { status: "completed" },
-      ended_at: "2026-05-16T00:00:01Z",
+      ended_at: "2026-05-20T00:00:01Z",
       usage: null,
     });
-    fireTo(channel, { type: "agent_idle", agent_id: AGENT.id });
+    fireTo(channel, { type: "agent_idle", agent_id: "ag-1" });
 
-    // Transcript shows the streamed text.
-    await waitFor(() => {
-      expect(screen.getByTestId("unified-transcript")).toHaveTextContent("hello back");
-    });
-    // Send is re-enabled (run_status flipped back to idle on agent_idle).
-    // Send-disabled state also depends on the textarea having content; the
-    // compose bar clears the textarea on submit, so a fresh prompt must
-    // be typed to observe the re-enabled state.
+    await waitFor(() =>
+      expect(screen.getByTestId("unified-transcript")).toHaveTextContent("hello back"),
+    );
     await fireEvent.input(textarea, { target: { value: "again" } });
-    await waitFor(() => {
-      expect(screen.getByTestId("compose-send")).not.toBeDisabled();
-    });
+    await waitFor(() => expect(screen.getByTestId("compose-send")).not.toBeDisabled());
   });
 
-  it("E2E (Codex): post-terminal sequence (turn_end → rate_limit_event → session_meta → agent_idle) lands metadata and unblocks Send", async () => {
-    const CODEX_AGENT: AgentRecord = {
-      id: "99999999-9999-7000-8000-999999999999",
-      project_id: PROJECT.id,
-      name: "codex-bot",
-      harness: "codex",
-      session_id: null,
-      created_at: "2026-05-13T00:00:04Z",
+  // --- directory removal lifecycle (store-level: the `removeDirectory` +
+  // teardown primitive that M8's project-delete will reuse; there is no
+  // directory-removal UI in this milestone) ---
+
+  it("removeDirectory drops the directory's projects and tears down its agents' listeners", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    seedProject({ projectId: "p-b", directory: DIR_B, name: "beta" });
+    await mountApp();
+    await waitFor(() => expect(screen.getAllByTestId("project-row").length).toBe(2));
+
+    // Activate p-a so ag-1's listener is registered, then remove its directory.
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+    expect(listenCallbacks.has("agent:ag-1")).toBe(true);
+
+    const ws = await import("$lib/state/workspace.svelte");
+    await ws.removeDirectory(DIR_A);
+
+    await waitFor(() => {
+      const names = screen.getAllByTestId("project-row").map((r) => r.textContent);
+      expect(names.some((n) => n?.includes("beta"))).toBe(true);
+      expect(names.some((n) => n?.includes("alpha"))).toBe(false);
+    });
+    // Teardown: the removed agent's listener is gone (no leak), and the backend
+    // drain command fired.
+    expect(listenCallbacks.has("agent:ag-1")).toBe(false);
+    expect(
+      invokeMock.mock.calls.some(([c, a]) => c === "remove_directory" && a?.path === DIR_A),
+    ).toBe(true);
+  });
+
+  it("remove-then-re-add reuses no stale state: re-activation re-opens the project", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+
+    const ws = await import("$lib/state/workspace.svelte");
+    await ws.removeDirectory(DIR_A);
+    await waitFor(() => expect(screen.queryByTestId("project-row")).not.toBeInTheDocument());
+
+    // Re-add the same directory + project id (ids persist on disk). The stale
+    // memoized load must NOT be reused: re-activation re-opens the project.
+    const openCallsBefore = invokeMock.mock.calls.filter(([c]) => c === "open_project").length;
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    await ws.loadWorkspace();
+
+    await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+    const openCallsAfter = invokeMock.mock.calls.filter(([c]) => c === "open_project").length;
+    expect(openCallsAfter).toBeGreaterThan(openCallsBefore);
+  });
+
+  it("a failed activation shows a center error + retry, not an endless loading state", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    backend.failOpenFor.add("p-a");
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
+
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("activation-error")).toBeInTheDocument());
+    expect(screen.queryByTestId("project-loading")).not.toBeInTheDocument();
+
+    // Recover and retry — the project opens.
+    backend.failOpenFor.delete("p-a");
+    await fireEvent.click(screen.getByTestId("activation-retry"));
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+    expect(screen.queryByTestId("activation-error")).not.toBeInTheDocument();
+  });
+
+  it("an unreadable workspace with no recovered directories shows the not-persistable banner, not welcome", async () => {
+    backend.persistable = false; // empty dirs + not persistable
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("not-persistable-banner")).toBeInTheDocument());
+    expect(screen.queryByText("Open working directory")).not.toBeInTheDocument();
+  });
+
+  it("a whole-project conversation load failure shows the load-failed banner; live sends still work", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    backend.failConvoFor.add("p-a");
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
+
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByTestId("transcript-load-failed")).toBeInTheDocument());
+  });
+
+  it("a per-agent transcript load error surfaces in the sidebar without blanking the project", async () => {
+    const convo: ProjectConversation = {
+      items: [
+        {
+          kind: "agent_turn",
+          turn_id: "t-ok",
+          agent_id: "ag-ok",
+          started_at: "2026-05-20T00:00:00Z",
+          ended_at: "2026-05-20T00:00:01Z",
+          status: "complete",
+          items: [{ item_kind: "text", kind: "text", text: "healthy history" }],
+          usage: null,
+        },
+      ],
+      agents: [
+        { agent_id: "ag-ok", meta: null, last_rate_limit: null, warnings: [], load_error: null },
+        {
+          agent_id: "ag-bad",
+          meta: null,
+          last_rate_limit: null,
+          warnings: [],
+          load_error: "corrupt sidecar",
+        },
+      ],
     };
-    setInvokeResponses({
-      pick_directory: INFO_NO_SWITCHBOARD,
-      init_directory: { ...INFO_NO_SWITCHBOARD, has_switchboard: true },
-      create_project: PROJECT,
-      set_active_project: null,
-      list_agents: [],
-      create_agent: CODEX_AGENT,
-      send_message: "aaaaaaaa-aaaa-7000-8000-aaaaaaaaaaaa", // message_id (accepted-send receipt)
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [
+        agent({ id: "ag-ok", project_id: "p-a", name: "healthy" }),
+        agent({
+          id: "ag-bad",
+          project_id: "p-a",
+          name: "broken",
+          harness: "codex",
+          session_id: null,
+        }),
+      ],
+      conversation: convo,
     });
-    openDialogMock.mockResolvedValueOnce(PATH);
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
 
-    const App = (await import("./App.svelte")).default;
-    render(App);
-    await waitFor(() => expect(screen.getByText("Open working directory")).toBeInTheDocument());
-    await fireEvent.click(screen.getByText("Open working directory"));
-    await waitFor(() => expect(screen.getByTestId("confirm-init")).toBeInTheDocument());
-    await fireEvent.click(screen.getByTestId("confirm-init"));
-    await waitFor(() => expect(screen.getByTestId("confirm-create-agent")).toBeInTheDocument());
-    // The create-agent form defaults to Claude; switch to Codex.
-    await fireEvent.click(screen.getByTestId("harness-codex"));
-    await fireEvent.click(screen.getByTestId("confirm-create-agent"));
-    await waitFor(() => expect(screen.getByTestId("loaded-layout")).toBeInTheDocument());
-
-    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
-    await fireEvent.input(textarea, { target: { value: "ack?" } });
-    await fireEvent.click(screen.getByTestId("compose-send"));
-
-    await waitFor(() => {
-      const sendCalls = invokeMock.mock.calls.filter(([cmd]) => cmd === "send_message");
-      expect(sendCalls).toHaveLength(1);
-      expect(sendCalls[0]?.[1]).toEqual({ agentId: CODEX_AGENT.id, prompt: "ack?" });
-    });
-
-    const messageId = "aaaaaaaa-aaaa-7000-8000-aaaaaaaaaaaa";
-    const turnId = "bbbbbbbb-bbbb-7000-8000-bbbbbbbbbbbb";
-    const channel = `agent:${CODEX_AGENT.id}`;
-    fireTo(channel, {
-      type: "turn_start",
-      turn_id: turnId,
-      message_id: messageId,
-      started_at: "2026-05-16T00:00:00Z",
-    });
-    fireTo(channel, {
-      type: "content_chunk",
-      turn_id: turnId,
-      kind: "text",
-      text: "ack",
-    });
-
-    // Transcript shows the response text mid-stream (before terminal).
-    await waitFor(() => {
-      expect(screen.getByTestId("unified-transcript")).toHaveTextContent("ack");
-    });
-
-    // Codex post-terminal enrichment: turn_end is followed by
-    // rate_limit_event + session_meta + agent_idle, in that order. The
-    // load-bearing frontend invariant is that **run_status stays
-    // "processing" through the entire window** until `agent_idle` lands —
-    // so a fresh prompt typed mid-window must keep Send disabled. This
-    // test pins that invariant by re-populating the textarea after
-    // turn_end (the compose-bar clears it on submit) and asserting Send
-    // stays disabled after each post-terminal event except the final
-    // `agent_idle`. A regression that flipped run_status to idle on
-    // turn_end (the obvious-but-wrong simplification) would fail at the
-    // first post-turn_end assertion below.
-    fireTo(channel, {
-      type: "turn_end",
-      turn_id: turnId,
-      outcome: { status: "completed" },
-      ended_at: "2026-05-16T00:00:01Z",
-      usage: {
-        input_tokens: 100,
-        output_tokens: 5,
-        context_window: 200000,
-      },
-    });
-    // Re-populate the textarea so Send-disabled is *only* a function of
-    // run_status, not of empty input.
-    await fireEvent.input(textarea, { target: { value: "next" } });
-    await waitFor(() => {
-      expect(screen.getByTestId("compose-send")).toBeDisabled();
-    });
-
-    fireTo(channel, {
-      type: "rate_limit_event",
-      agent_id: CODEX_AGENT.id,
-      info: { primary: { used_percent: 12.5 } },
-    });
-    // Still in post-terminal window — Send must remain disabled.
-    expect(screen.getByTestId("compose-send")).toBeDisabled();
-
-    fireTo(channel, {
-      type: "session_meta",
-      agent_id: CODEX_AGENT.id,
-      model: "gpt-test",
-      harness_version: "0.130.0",
-      tools: [],
-      mcp_servers: [{ name: "fs", status: "connected" }],
-      skills: [],
-      raw: null,
-    });
-    // session_meta is the last post-terminal event before agent_idle.
-    // Send must STILL be disabled — if a regression flipped run_status
-    // on session_meta (or earlier), this is where it surfaces.
-    expect(screen.getByTestId("compose-send")).toBeDisabled();
-
-    fireTo(channel, { type: "agent_idle", agent_id: CODEX_AGENT.id });
-    // Only now — after agent_idle — does Send re-enable.
-    await waitFor(() => {
-      expect(screen.getByTestId("compose-send")).not.toBeDisabled();
-    });
+    await waitFor(() =>
+      expect(screen.getByTestId("unified-transcript")).toHaveTextContent("healthy history"),
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("agent-hydration-error")).toHaveTextContent("corrupt sidecar"),
+    );
   });
 });

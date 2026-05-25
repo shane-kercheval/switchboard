@@ -36,7 +36,13 @@ import type {
   ProjectListing,
   WorkspaceDirectoryInfo,
 } from "$lib/types";
-import { applyAgentHydrate, registerAgent, runtimes } from "./index.svelte";
+import {
+  applyAgentHydrate,
+  markHydrationAttempted,
+  registerAgent,
+  runtimes,
+  unregisterAgents,
+} from "./index.svelte";
 
 /// Per-project hydrated overlay. `items` holds only `user_message` and
 /// `outcome` kinds (agent content is routed to per-agent state); `status`
@@ -60,7 +66,17 @@ export const projects = $state<{ list: ProjectListing[] }>({ list: [] });
 
 /// The displayed project. Display-only — switching does not stop other
 /// projects' agents or tear down their event subscriptions.
-export const selection = $state<{ activeProjectId: ProjectId | null }>({ activeProjectId: null });
+///
+/// `activationError` holds the message when opening the displayed project
+/// failed (locked by another process, directory went unavailable, removed
+/// concurrently). It always pertains to the current `activeProjectId`: cleared
+/// on every (re)activation and switch, set only on the current one's failure.
+/// The center pane renders a retry affordance instead of an endless loading
+/// state when it's set.
+export const selection = $state<{
+  activeProjectId: ProjectId | null;
+  activationError: string | null;
+}>({ activeProjectId: null, activationError: null });
 
 /// Per-project agent rosters, populated lazily on first activation.
 export const agentsByProject = $state<Record<ProjectId, AgentRecord[]>>({});
@@ -104,43 +120,68 @@ export async function addDirectory(path: string): Promise<void> {
   await loadWorkspace();
 }
 
-/// Remove a working directory: drains its projects' in-flight turns, releases
-/// their locks, drops the entry (leaving `.switchboard/` on disk), then
-/// refreshes the registry. Clears the active selection if the displayed project
-/// belonged to the removed directory.
+/// Remove a working directory: drains its projects' in-flight turns and
+/// releases their locks on the backend (leaving `.switchboard/` on disk), and
+/// performs the matching **frontend lifecycle teardown** so a remove-then-re-add
+/// of the same project ids (ids are persisted on disk and survive removal)
+/// starts clean. Without the teardown, the stale memoized `loadStarted` promise
+/// would make re-activation skip `open_project`/`list_agents` and leave the
+/// backend with an unloaded "active" project, and the removed agents' listeners
+/// would leak.
 export async function removeDirectory(path: string): Promise<void> {
-  const activeId = selection.activeProjectId;
-  const activeRow = projects.list.find((p) => p.id === activeId);
+  // Snapshot the affected project + agent ids BEFORE the await — `loadWorkspace`
+  // (below) will drop these projects from the list, so capture them now.
+  const removedProjectIds = projects.list.filter((p) => p.directory === path).map((p) => p.id);
+  const removedAgentIds = removedProjectIds.flatMap((id) =>
+    (agentsByProject[id] ?? []).map((a) => a.id),
+  );
+  const activeRemoved = removedProjectIds.includes(selection.activeProjectId ?? "");
+
   await api.removeDirectory(path);
-  if (activeRow !== undefined && activeRow.directory === path) {
+
+  // Backend drop succeeded — tear down the matching frontend state.
+  unregisterAgents(removedAgentIds);
+  for (const id of removedProjectIds) {
+    delete agentsByProject[id];
+    delete conversations[id];
+    loadStarted.delete(id);
+    hydrationStarted.delete(id);
+  }
+  if (activeRemoved) {
     selection.activeProjectId = null;
+    selection.activationError = null;
   }
   await loadWorkspace();
 }
 
 /// Create a project in `directory`, refresh the registry, and activate it.
+/// Registers the folder first (idempotent `init_directory`): `create_project`
+/// requires its target directory to already be a loaded workspace directory, so
+/// a brand-new folder must be added before the project can be created in it.
 export async function createProjectAndActivate(name: string, directory: string): Promise<void> {
+  await api.initDirectory(directory);
   const summary = await api.createProject(name, directory);
   await loadWorkspace();
   await activateProject(summary.id);
 }
 
-/// Display the given project. Loads its roster + hydrates its conversation on
-/// first activation (once), then re-issues `set_active_project` on every switch
-/// so the backend's active project tracks the displayed one. Bumps the
-/// project's recency so the just-viewed project floats to the top of the list.
+/// Display the given project. The switch is immediate (responsive); the backend
+/// work happens behind it. Loads the roster + hydrates the conversation on
+/// first activation (once), then issues `set_active_project` — but only after
+/// open/list/register succeed, so the backend's active project never points at
+/// one that failed to load. On failure, records `activationError` (the center
+/// pane shows a retry affordance instead of an endless loading state); the
+/// error is cleared here on every (re)activation, so switching away or retrying
+/// clears a stale failure.
 export async function activateProject(projectId: ProjectId): Promise<void> {
   selection.activeProjectId = projectId;
-  bumpActivity(projectId);
-  await ensureProjectLoaded(projectId);
-  await api.setActiveProject(projectId);
-}
-
-function bumpActivity(projectId: ProjectId): void {
-  const row = projects.list.find((p) => p.id === projectId);
-  if (row === undefined) return;
-  row.last_activity = new Date().toISOString();
-  projects.list = sortByActivity(projects.list);
+  selection.activationError = null;
+  try {
+    await ensureProjectLoaded(projectId);
+    await api.setActiveProject(projectId);
+  } catch (err) {
+    selection.activationError = err instanceof Error ? err.message : String(err);
+  }
 }
 
 function ensureProjectLoaded(projectId: ProjectId): Promise<void> {
@@ -174,6 +215,10 @@ export async function hydrateProject(projectId: ProjectId): Promise<void> {
     const convo = await api.loadProjectConversation(projectId);
 
     const overlay: ConversationItem[] = [];
+    // Function-local computation scratch — recreated each call, never observed
+    // reactively (the reactive sinks are `conversations` and the per-agent
+    // `transcripts`/`runtimes`), so a plain Map/Set is correct here.
+    // eslint-disable-next-line svelte/prefer-svelte-reactivity
     const turnsByAgent = new Map<AgentId, LoadedTurn[]>();
     for (const item of convo.items) {
       if (item.kind === "agent_turn") {
@@ -195,19 +240,30 @@ export async function hydrateProject(projectId: ProjectId): Promise<void> {
       }
     }
 
+    // eslint-disable-next-line svelte/prefer-svelte-reactivity
     const metaByAgent = new Map(convo.agents.map((m) => [m.agent_id, m]));
+    // eslint-disable-next-line svelte/prefer-svelte-reactivity
     const agentIds = new Set<AgentId>([
       ...turnsByAgent.keys(),
       ...convo.agents.map((a) => a.agent_id),
     ]);
     for (const agentId of agentIds) {
+      // Hydrating through `applyAgentHydrate` (or recording the failure) counts
+      // as this agent's one hydration for the session — mark it so the
+      // per-agent `hydrateAgent` path won't later re-parse and duplicate turns.
+      markHydrationAttempted(agentId);
       const meta = metaByAgent.get(agentId);
       if (meta?.load_error != null) {
-        // This agent's transcript failed to load — mark its hydration failed
-        // (surfaced in the sidebar) but keep the rest of the project rendering.
+        // This agent's transcript failed to load — record the error (surfaced
+        // in the sidebar, distinct from a failed turn) but keep the rest of the
+        // project rendering.
         const rt = runtimes[agentId];
         if (rt !== undefined) {
-          runtimes[agentId] = { ...rt, hydration_status: "failed" };
+          runtimes[agentId] = {
+            ...rt,
+            hydration_status: "failed",
+            hydration_error: meta.load_error,
+          };
         }
         continue;
       }
@@ -246,6 +302,7 @@ export const _testing = {
     workspace.persistable = true;
     projects.list = [];
     selection.activeProjectId = null;
+    selection.activationError = null;
     loadStarted.clear();
     hydrationStarted.clear();
     for (const key of Object.keys(agentsByProject)) delete agentsByProject[key];

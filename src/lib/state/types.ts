@@ -195,6 +195,13 @@ export type AgentRuntime = {
   /// is gated on this being `"complete"` (or `"failed"`, which enters
   /// degraded-dispatch mode with a banner).
   hydration_status: "pending" | "loading" | "complete" | "failed";
+  /// Set when this agent's transcript failed to load entirely during
+  /// project-scoped hydration (a corrupt sidecar / unreadable session file —
+  /// the backend's per-agent `load_error`). Distinct from `last_error` (a
+  /// failed *turn*): this is "couldn't load history," not "a turn errored."
+  /// The rest of the project still renders; the sidebar surfaces this so the
+  /// user knows which agent's history is missing and why.
+  hydration_error?: string;
   /// Non-blocking parser warnings surfaced by `load_transcript` — stale
   /// Codex sidecar, malformed JSONL lines, etc. Empty / undefined when no
   /// warnings landed. Display-only; never gates sendability or hydration

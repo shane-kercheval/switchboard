@@ -21,6 +21,15 @@ export const HARNESS_LABEL: Record<HarnessKind, string> = {
   antigravity: "Antigravity",
 };
 
+/// Brand/icon-derived accent colors for transcript attribution and compact
+/// harness identity. Chosen from the actual icon artwork.
+export const HARNESS_COLOR: Record<HarnessKind, string> = {
+  claude_code: "#d97757",
+  codex: "#3831ff",
+  gemini: "#17b967",
+  antigravity: "#3187fe",
+};
+
 /// Token-driven harness badge classes (soft background + strong foreground),
 /// consumed by the `Badge` primitive. Themes correctly in light and dark via
 /// the semantic `harness-*` tokens.

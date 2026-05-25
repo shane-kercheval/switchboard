@@ -27,6 +27,13 @@
     sm: "h-6 w-6",
     md: "h-8 w-8",
   };
+
+  const SCALE_CLASS: Record<HarnessKind, string> = {
+    claude_code: "scale-95",
+    codex: "scale-110",
+    gemini: "scale-95",
+    antigravity: "scale-110",
+  };
 </script>
 
 <img
@@ -34,5 +41,10 @@
   alt={HARNESS_LABEL[harness]}
   title={HARNESS_LABEL[harness]}
   data-testid={testid}
-  class={cn("shrink-0 rounded-[5px] object-contain", SIZE_CLASS[size], className)}
+  class={cn(
+    "shrink-0 rounded-[5px] object-contain",
+    SIZE_CLASS[size],
+    SCALE_CLASS[harness],
+    className,
+  )}
 />

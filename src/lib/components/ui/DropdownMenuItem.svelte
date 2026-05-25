@@ -19,8 +19,8 @@
 <Bits.Item
   {onSelect}
   class={cn(
-    "text-fg flex w-full cursor-pointer items-center px-3 py-2 text-left outline-none select-none",
-    "data-highlighted:bg-panel",
+    "text-fg flex w-full cursor-pointer items-center rounded-md px-2.5 py-1.5 text-left leading-5 outline-none select-none",
+    "data-highlighted:bg-panel/80",
     className,
   )}
   {...rest}

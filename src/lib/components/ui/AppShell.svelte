@@ -17,7 +17,7 @@
 
 <div class="flex flex-1 overflow-hidden">
   {@render left()}
-  <div class="flex flex-1 flex-col overflow-hidden" data-testid={centerTestid}>
+  <div class="bg-raised flex flex-1 flex-col overflow-hidden" data-testid={centerTestid}>
     {@render center()}
   </div>
   {#if right}

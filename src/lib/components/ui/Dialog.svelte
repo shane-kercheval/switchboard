@@ -16,6 +16,8 @@
   /// happens; today the single composite is enough.
   import type { Snippet } from "svelte";
   import { Dialog as BitsDialog } from "bits-ui";
+  import { cn } from "$lib/utils";
+  import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
 
   type Props = {
     /// Two-way bound open state — caller controls the modal's visibility.
@@ -45,17 +47,35 @@
     <BitsDialog.Overlay class="fixed inset-0 z-40 bg-black/40" data-testid="dialog-overlay" />
     <BitsDialog.Content
       class={[
-        "border-border bg-raised fixed top-1/2 left-1/2 z-50 w-full -translate-x-1/2 -translate-y-1/2 rounded-md border shadow-lg",
+        "border-border/90 bg-raised fixed top-1/2 left-1/2 z-50 w-[calc(100vw-2rem)] -translate-x-1/2 -translate-y-1/2 rounded-lg border shadow-[0_18px_60px_rgba(0,0,0,0.22)]",
         contentClass ?? "max-w-md",
       ].join(" ")}
       data-testid="dialog-content"
     >
-      <BitsDialog.Title
-        class="border-border text-fg border-b px-4 py-3 text-sm font-semibold"
-        data-testid="dialog-title"
-      >
-        {title}
-      </BitsDialog.Title>
+      <div class="border-border/80 flex items-center justify-between gap-3 border-b px-4 py-3">
+        <BitsDialog.Title class="text-fg text-sm font-semibold" data-testid="dialog-title">
+          {title}
+        </BitsDialog.Title>
+        <BitsDialog.Close
+          class={cn(ICON_BUTTON_CLASS, "hover:bg-panel")}
+          aria-label="Close dialog"
+          data-testid="dialog-close"
+        >
+          <svg
+            width="16"
+            height="16"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M18 6 6 18M6 6l12 12" />
+          </svg>
+        </BitsDialog.Close>
+      </div>
       <div class="p-4">
         {@render children()}
       </div>

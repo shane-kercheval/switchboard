@@ -106,33 +106,46 @@
   }
 </script>
 
-<div class="border-border bg-panel border-t p-3">
-  {#if agents.length > 1}
-    <div class="mb-2 flex items-center gap-2 text-xs">
-      <label for="recipient-picker" class="text-muted">To:</label>
-      <select
-        id="recipient-picker"
-        data-testid="recipient-picker"
-        bind:value={recipientId}
-        class="border-border bg-raised text-fg rounded border px-2 py-1 font-mono text-xs"
+<div class="bg-raised px-5 pt-2 pb-4">
+  <div
+    class="border-border bg-raised rounded-xl border p-2.5 shadow-[0_10px_32px_rgba(0,0,0,0.08)]"
+  >
+    {#if agents.length > 1}
+      <div class="mb-1.5 flex items-center gap-2 text-xs">
+        <label for="recipient-picker" class="text-muted">To</label>
+        <select
+          id="recipient-picker"
+          data-testid="recipient-picker"
+          bind:value={recipientId}
+          class="border-border/80 bg-panel/70 text-fg h-7 min-w-36 rounded-md border px-2 text-xs"
+        >
+          {#each agents as agent (agent.id)}
+            <option value={agent.id}>
+              {agent.name} ({HARNESS_LABEL[agent.harness]})
+            </option>
+          {/each}
+        </select>
+      </div>
+    {/if}
+    <div class="flex items-end gap-2">
+      <Textarea
+        data-testid="compose-textarea"
+        placeholder="Type a message…  (⌘+Enter to send)"
+        rows={3}
+        bind:value={prompt}
+        onkeydown={handleKey}
+        class="min-h-16 border-0 bg-transparent p-1 shadow-none focus-visible:ring-0"
+      />
+      <Button
+        data-testid="compose-send"
+        onclick={handleSubmit}
+        disabled={sendDisabled}
+        size="sm"
+        class="h-8 shrink-0 px-3"
       >
-        {#each agents as agent (agent.id)}
-          <option value={agent.id}>
-            {agent.name} ({HARNESS_LABEL[agent.harness]})
-          </option>
-        {/each}
-      </select>
+        Send
+      </Button>
     </div>
-  {/if}
-  <div class="flex gap-2">
-    <Textarea
-      data-testid="compose-textarea"
-      placeholder="Type a message…  (⌘+Enter to send)"
-      rows={3}
-      bind:value={prompt}
-      onkeydown={handleKey}
-    />
-    <Button data-testid="compose-send" onclick={handleSubmit} disabled={sendDisabled}>Send</Button>
   </div>
   {#if sendError}
     <p class="text-status-failed mt-2 text-xs" data-testid="compose-send-error">

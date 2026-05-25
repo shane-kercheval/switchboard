@@ -16,6 +16,8 @@
   import Button from "$lib/components/ui/Button.svelte";
   import AppShell from "$lib/components/ui/AppShell.svelte";
   import EmptyState from "$lib/components/ui/EmptyState.svelte";
+  import SidebarToggleButton from "$lib/components/ui/SidebarToggleButton.svelte";
+  import { windowDragRegion } from "$lib/windowDrag";
   import { hydrateAgent, registerAgent } from "$lib/state/index.svelte";
   import {
     activateProject,
@@ -84,6 +86,8 @@
   });
 
   let dirError = $state<string | null>(null);
+  let projectsSidebarOpen = $state<boolean>(true);
+  let agentsSidebarOpen = $state<boolean>(true);
 
   // Startup: kick off the harness probes (each writes its own slice as it
   // resolves — no barrier) and eagerly load the workspace registry (directory
@@ -268,11 +272,37 @@
 
   <AppShell centerTestid="workspace-main">
     {#snippet left()}
-      <ProjectsSidebar onNewProject={openNewProject} onAddExisting={handleAddExisting} />
+      {#if projectsSidebarOpen}
+        <ProjectsSidebar
+          onNewProject={openNewProject}
+          onAddExisting={handleAddExisting}
+          onToggleSidebar={() => (projectsSidebarOpen = false)}
+        />
+      {:else}
+        <aside
+          class="border-border/80 bg-panel/80 flex w-40 shrink-0 flex-col border-r"
+          data-testid="projects-sidebar-collapsed"
+        >
+          <div
+            class="flex h-11 shrink-0 items-center px-2 pl-20"
+            data-tauri-drag-region
+            use:windowDragRegion
+          >
+            <SidebarToggleButton
+              side="left"
+              expanded={false}
+              label="Show projects sidebar"
+              testid="projects-sidebar-toggle"
+              onclick={() => (projectsSidebarOpen = true)}
+            />
+          </div>
+        </aside>
+      {/if}
     {/snippet}
 
     {#snippet center()}
       {#if selection.activeProjectId === null}
+        <div class="bg-raised h-11 shrink-0" data-tauri-drag-region use:windowDragRegion></div>
         {#if projects.list.length === 0}
           <WelcomeScreen onNewProject={openNewProject} onAddExisting={handleAddExisting} />
         {:else}
@@ -307,22 +337,42 @@
         </div>
       {:else}
         {#if activeProject}
-          <div class="border-border text-muted border-b px-4 py-2 text-xs" data-testid="breadcrumb">
-            {activeProject.name} — {basename(activeProject.directory)}
+          <div
+            class="border-border/80 bg-raised flex h-11 shrink-0 items-center gap-2 border-b px-3 pl-4"
+            data-testid="breadcrumb"
+            data-tauri-drag-region
+            use:windowDragRegion
+          >
+            <div class="flex min-w-0 flex-1 items-center gap-2">
+              <div class="text-fg truncate text-sm font-semibold">{activeProject.name}</div>
+              <div class="text-muted shrink-0 text-xs">·</div>
+              <div class="text-muted truncate text-xs" title={activeProject.directory}>
+                {activeProject.directory}
+              </div>
+            </div>
+            <SidebarToggleButton
+              side="right"
+              expanded={agentsSidebarOpen}
+              label={agentsSidebarOpen ? "Hide agents sidebar" : "Show agents sidebar"}
+              testid="agents-sidebar-toggle"
+              onclick={() => (agentsSidebarOpen = !agentsSidebarOpen)}
+              class="hover:bg-panel"
+            />
           </div>
         {/if}
-        <UnifiedTranscript
-          agents={activeAgents}
-          overlay={activeConvo?.items ?? []}
-          loadStatus={activeConvo?.status ?? "complete"}
-        />
-        <ComposeBar agents={activeAgents} />
-      {/if}
-    {/snippet}
-
-    {#snippet right()}
-      {#if selection.activeProjectId !== null && rosterLoaded}
-        <Sidebar agents={activeAgents} onAddAgent={openAddAgent} />
+        <div class="flex min-h-0 flex-1 overflow-hidden">
+          <div class="flex min-w-0 flex-1 flex-col overflow-hidden">
+            <UnifiedTranscript
+              agents={activeAgents}
+              overlay={activeConvo?.items ?? []}
+              loadStatus={activeConvo?.status ?? "complete"}
+            />
+            <ComposeBar agents={activeAgents} />
+          </div>
+          {#if agentsSidebarOpen}
+            <Sidebar agents={activeAgents} onAddAgent={openAddAgent} />
+          {/if}
+        </div>
       {/if}
     {/snippet}
   </AppShell>

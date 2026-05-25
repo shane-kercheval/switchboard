@@ -115,6 +115,15 @@
       existingSessionId = "";
     }
   }
+
+  // Visual classes for a harness option (a native radio styled as a segmented
+  // pill). Selection is driven off `harness`, gating off `selectable`.
+  function harnessOptionClass(kind: HarnessKind, selectable: boolean): string {
+    const selected = harness === kind;
+    if (selected) return "bg-primary text-primary-fg";
+    if (!selectable) return "text-muted cursor-not-allowed opacity-60";
+    return "text-muted hover:bg-raised";
+  }
 </script>
 
 <!--
@@ -129,15 +138,15 @@
 -->
 {#snippet formBody()}
   <div
-    class="border-border bg-raised flex gap-2 rounded-md border p-1"
+    class="border-border bg-panel/70 flex gap-1 rounded-md border p-0.5"
     role="tablist"
     data-testid="mode-toggle"
   >
     <button
       type="button"
-      class="flex-1 rounded px-2 py-1 text-xs font-medium {mode === 'create'
+      class="h-8 flex-1 rounded px-2 text-xs font-medium transition-colors {mode === 'create'
         ? 'bg-primary text-primary-fg'
-        : 'text-muted hover:bg-panel'}"
+        : 'text-muted hover:bg-raised'}"
       role="tab"
       aria-selected={mode === "create"}
       data-testid="mode-create"
@@ -148,9 +157,9 @@
     </button>
     <button
       type="button"
-      class="flex-1 rounded px-2 py-1 text-xs font-medium {mode === 'attach'
+      class="h-8 flex-1 rounded px-2 text-xs font-medium transition-colors {mode === 'attach'
         ? 'bg-primary text-primary-fg'
-        : 'text-muted hover:bg-panel'}"
+        : 'text-muted hover:bg-raised'}"
       role="tab"
       aria-selected={mode === "attach"}
       data-testid="mode-attach"
@@ -161,66 +170,87 @@
     </button>
   </div>
 
-  <fieldset class="space-y-1" disabled={busy}>
+  <fieldset class="space-y-1.5" disabled={busy}>
     <legend class="text-muted text-xs">Harness</legend>
-    <div class="flex gap-3 text-sm" data-testid="harness-picker">
+    <!-- Native radios (real arrow-key + screen-reader semantics, grouped/labeled
+         by the fieldset+legend) styled as a segmented control: the input is
+         visually hidden and the label is the pill; `has-[:focus-visible]` lights
+         the pill when the radio is keyboard-focused. -->
+    <div
+      class="border-border bg-panel/70 grid grid-cols-4 gap-1 rounded-md border p-0.5"
+      data-testid="harness-picker"
+    >
       <label
-        class="flex items-center gap-1.5 {claudeSelectable ? '' : 'text-muted cursor-not-allowed'}"
+        class="has-[:focus-visible]:ring-accent flex h-8 items-center justify-center rounded px-2 text-xs font-medium transition-colors has-[:focus-visible]:ring-2 {harnessOptionClass(
+          'claude_code',
+          claudeSelectable,
+        )}"
         title={claudeReason ?? ""}
       >
         <input
           type="radio"
           name="harness"
           value="claude_code"
+          class="sr-only"
           checked={harness === "claude_code"}
-          disabled={!claudeSelectable}
+          disabled={busy || !claudeSelectable}
           onchange={() => (harness = "claude_code")}
           data-testid="harness-claude"
         />
         Claude Code
       </label>
       <label
-        class="flex items-center gap-1.5 {codexSelectable ? '' : 'text-muted cursor-not-allowed'}"
+        class="has-[:focus-visible]:ring-accent flex h-8 items-center justify-center rounded px-2 text-xs font-medium transition-colors has-[:focus-visible]:ring-2 {harnessOptionClass(
+          'codex',
+          codexSelectable,
+        )}"
         title={codexReason ?? ""}
       >
         <input
           type="radio"
           name="harness"
           value="codex"
+          class="sr-only"
           checked={harness === "codex"}
-          disabled={!codexSelectable}
+          disabled={busy || !codexSelectable}
           onchange={() => (harness = "codex")}
           data-testid="harness-codex"
         />
         Codex
       </label>
       <label
-        class="flex items-center gap-1.5 {geminiSelectable ? '' : 'text-muted cursor-not-allowed'}"
+        class="has-[:focus-visible]:ring-accent flex h-8 items-center justify-center rounded px-2 text-xs font-medium transition-colors has-[:focus-visible]:ring-2 {harnessOptionClass(
+          'gemini',
+          geminiSelectable,
+        )}"
         title={geminiReason ?? ""}
       >
         <input
           type="radio"
           name="harness"
           value="gemini"
+          class="sr-only"
           checked={harness === "gemini"}
-          disabled={!geminiSelectable}
+          disabled={busy || !geminiSelectable}
           onchange={() => (harness = "gemini")}
           data-testid="harness-gemini"
         />
         Gemini
       </label>
       <label
-        class="flex items-center gap-1.5 {antigravitySelectable
-          ? ''
-          : 'text-muted cursor-not-allowed'}"
+        class="has-[:focus-visible]:ring-accent flex h-8 items-center justify-center rounded px-2 text-xs font-medium transition-colors has-[:focus-visible]:ring-2 {harnessOptionClass(
+          'antigravity',
+          antigravitySelectable,
+        )}"
         title={antigravityReason ?? ""}
       >
         <input
           type="radio"
           name="harness"
           value="antigravity"
+          class="sr-only"
           checked={harness === "antigravity"}
-          disabled={!antigravitySelectable}
+          disabled={busy || !antigravitySelectable}
           onchange={() => (harness = "antigravity")}
           data-testid="harness-antigravity"
         />
@@ -236,7 +266,7 @@
 
   <label class="block space-y-1">
     <span class="text-muted text-xs">Agent name</span>
-    <Input bind:value={name} disabled={busy} data-testid="agent-name" />
+    <Input bind:value={name} disabled={busy} data-testid="agent-name" class="h-8 px-2" />
   </label>
 
   {#if mode === "attach"}
@@ -247,6 +277,7 @@
         disabled={busy}
         placeholder="00000000-0000-0000-0000-000000000000"
         data-testid="attach-session-id"
+        class="h-8 px-2"
       />
       {#if existingSessionId.trim() !== "" && !sessionIdValid}
         <span class="text-status-failed block text-xs" data-testid="attach-session-id-error">
@@ -263,6 +294,7 @@
     {#if onCancel}
       <Button
         variant="secondary"
+        size="sm"
         data-testid="cancel-create-agent"
         disabled={busy}
         onclick={onCancel}
@@ -270,7 +302,12 @@
         Cancel
       </Button>
     {/if}
-    <Button data-testid="confirm-create-agent" disabled={!canSubmit} onclick={handleSubmit}>
+    <Button
+      size="sm"
+      data-testid="confirm-create-agent"
+      disabled={!canSubmit}
+      onclick={handleSubmit}
+    >
       {#if busy}
         {mode === "create" ? "Creating…" : "Attaching…"}
       {:else}
@@ -282,13 +319,13 @@
 
 {#if onCancel}
   <!-- Embedded: bare form, modal supplies its own title/centering. -->
-  <div class="space-y-4" data-testid="create-agent-form-embedded">
+  <div class="space-y-3.5" data-testid="create-agent-form-embedded">
     {@render formBody()}
   </div>
 {:else}
   <!-- Standalone: page-fill centered card + heading. -->
   <div class="flex h-full flex-col items-center justify-center gap-6 p-8">
-    <div class="border-border bg-panel w-full max-w-md space-y-4 rounded-md border p-6">
+    <div class="border-border bg-panel w-full max-w-md space-y-4 rounded-md border p-5">
       <div class="space-y-1">
         <h2 class="text-fg text-lg font-semibold">Create an agent</h2>
         <p class="text-muted text-sm">Agents live inside the active project.</p>

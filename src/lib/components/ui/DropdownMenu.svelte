@@ -45,7 +45,7 @@
       sideOffset={4}
       data-testid={contentTestid}
       class={cn(
-        "border-border bg-raised z-50 min-w-44 overflow-hidden rounded-md border py-1 text-sm shadow-lg",
+        "border-border/90 bg-raised z-50 min-w-44 rounded-lg border p-1 text-[13px] shadow-[0_10px_28px_rgba(0,0,0,0.10)] outline-none focus:outline-none",
         contentClass,
       )}
     >

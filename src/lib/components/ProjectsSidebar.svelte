@@ -15,12 +15,20 @@
   import StatusDot from "$lib/components/ui/StatusDot.svelte";
   import Badge from "$lib/components/ui/Badge.svelte";
   import ThemeToggle from "$lib/components/ui/ThemeToggle.svelte";
+  import SidebarToggleButton from "$lib/components/ui/SidebarToggleButton.svelte";
+  import PlusIcon from "$lib/components/ui/PlusIcon.svelte";
+  import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
+  import { windowDragRegion } from "$lib/windowDrag";
 
   /// The sidebar is a flat list of projects — folders are never surfaced as a
   /// managed object. The single "+" opens a menu to create a new project or add
   /// an existing one; both delegate to App (which owns the folder dialog + the
   /// new-project modal). Project removal/archive are deferred to M8.
-  let { onNewProject, onAddExisting }: { onNewProject: () => void; onAddExisting: () => void } =
+  let {
+    onNewProject,
+    onAddExisting,
+    onToggleSidebar,
+  }: { onNewProject: () => void; onAddExisting: () => void; onToggleSidebar: () => void } =
     $props();
 
   /// Whether any agent in a project is mid-turn — drives the "background
@@ -36,6 +44,21 @@
 </script>
 
 <SidebarPanel side="left" width="w-72" testid="projects-sidebar">
+  <div
+    class="flex h-11 shrink-0 items-center justify-end px-3"
+    data-tauri-drag-region
+    use:windowDragRegion
+  >
+    <ThemeToggle />
+    <SidebarToggleButton
+      side="left"
+      expanded={true}
+      label="Hide projects sidebar"
+      testid="projects-sidebar-toggle"
+      onclick={onToggleSidebar}
+    />
+  </div>
+
   {#if !workspace.persistable}
     <div
       class="border-warning/30 bg-warning-soft text-warning border-b px-3 py-2 text-xs"
@@ -50,11 +73,11 @@
       <DropdownMenu
         triggerTestid="add-project"
         triggerLabel="Add a project"
-        triggerClass="rounded px-1.5 py-0.5 text-sm font-bold text-fg hover:bg-raised"
+        triggerClass={ICON_BUTTON_CLASS}
         contentTestid="add-project-menu"
       >
         {#snippet trigger()}
-          +
+          <PlusIcon />
         {/snippet}
         <DropdownMenuItem onSelect={onNewProject} data-testid="menu-new-project">
           New project
@@ -66,15 +89,15 @@
     {/snippet}
 
     {#if projects.list.length === 0}
-      <p class="text-muted px-4 py-3 text-xs">No projects yet.</p>
+      <p class="text-muted px-3 py-3 text-xs">No projects yet.</p>
     {/if}
-    <div class="flex flex-col gap-0.5 p-2">
+    <div class="flex flex-col gap-0.5 px-2 pb-2">
       {#each projects.list as project (project.id)}
         <button
           type="button"
           class={cn(
-            "hover:bg-raised/60 flex w-full flex-col items-start gap-0.5 rounded-md px-3 py-2 text-left transition-colors",
-            project.id === selection.activeProjectId && "bg-raised hover:bg-raised shadow-sm",
+            "group hover:bg-raised/70 flex w-full flex-col items-start gap-0.5 rounded-md px-2.5 py-2 text-left transition-colors",
+            project.id === selection.activeProjectId && "bg-raised hover:bg-raised",
           )}
           data-testid="project-row"
           data-project-id={project.id}
@@ -82,7 +105,7 @@
           onclick={() => activateProject(project.id)}
         >
           <div class="flex w-full items-center gap-2">
-            <span class="text-fg truncate font-mono text-sm font-semibold">
+            <span class="text-fg truncate text-[13px] font-semibold">
               {project.name}
             </span>
             {#if isBusy(project.id)}
@@ -92,7 +115,7 @@
               <Badge class="ml-auto" testid="project-unavailable">unavailable</Badge>
             {/if}
           </div>
-          <div class="text-muted flex w-full items-center gap-1 text-[11px]">
+          <div class="text-muted flex w-full items-center gap-1 text-[11px] leading-4">
             <span class="truncate" title={project.directory}>{basename(project.directory)}</span>
             <span>·</span>
             <span class="shrink-0">{relativeTime(project.last_activity)}</span>
@@ -101,8 +124,4 @@
       {/each}
     </div>
   </SidebarSection>
-
-  <div class="border-border flex shrink-0 items-center justify-end border-t px-2 py-1.5">
-    <ThemeToggle />
-  </div>
 </SidebarPanel>

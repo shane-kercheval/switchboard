@@ -15,7 +15,7 @@
 
 <div class="flex min-h-0 flex-1 flex-col">
   <div
-    class="border-border text-muted flex shrink-0 items-center justify-between border-b px-4 py-3 text-xs font-semibold tracking-wide uppercase"
+    class="text-muted flex h-8 shrink-0 items-center justify-between px-3 text-[11px] leading-none font-semibold tracking-wide uppercase"
   >
     <span>{title}</span>
     {#if action}

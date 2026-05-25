@@ -20,9 +20,9 @@
 
 <aside
   class={cn(
-    "bg-panel flex flex-col",
+    "bg-panel/80 flex shrink-0 flex-col",
     width,
-    side === "left" ? "border-border border-r" : "border-border border-l",
+    side === "left" ? "border-border/80 border-r" : "border-border/80 border-l",
   )}
   data-testid={testid}
 >

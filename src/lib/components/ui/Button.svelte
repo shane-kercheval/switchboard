@@ -35,12 +35,12 @@
     ghost: "bg-transparent text-fg hover:bg-panel",
   };
 
-  const sizes: Record<Size, string> = {
-    default: "h-10 px-4 text-sm",
-    sm: "h-8 px-3 text-xs",
+  const BUTTON_SIZE_CLASS: Record<Size, string> = {
+    default: "h-8 px-3 text-sm",
+    sm: "h-7 px-2.5 text-xs",
   };
 </script>
 
-<button class={cn(base, variants[variant], sizes[size], className)} {...rest}>
+<button class={cn(base, variants[variant], BUTTON_SIZE_CLASS[size], className)} {...rest}>
   {@render children()}
 </button>

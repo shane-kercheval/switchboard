@@ -170,3 +170,14 @@ body {
   background-color: var(--surface);
   color: var(--fg);
 }
+
+/* Window dragging is driven by the `windowDragRegion` action (and Tauri's
+   `data-tauri-drag-region` handler) calling `startDragging()`, NOT by CSS:
+   `-webkit-app-region`/`app-region` is a Chromium feature and is inert in
+   macOS WKWebView. Only the cursor/selection hints below actually apply; the
+   "don't drag from interactive elements" exclusions live in that action's
+   `closest(...)` check + the `[data-tauri-no-drag]` marker. */
+[data-tauri-drag-region] {
+  cursor: default;
+  user-select: none;
+}

@@ -6,6 +6,8 @@
   import SidebarPanel from "$lib/components/ui/SidebarPanel.svelte";
   import SidebarSection from "$lib/components/ui/SidebarSection.svelte";
   import Badge from "$lib/components/ui/Badge.svelte";
+  import PlusIcon from "$lib/components/ui/PlusIcon.svelte";
+  import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
 
   /// `onAddAgent` is the "+ Add agent" entry point in the sidebar header.
   /// Optional so existing callers + tests that don't pass it continue
@@ -66,27 +68,27 @@
   }
 </script>
 
-<SidebarPanel side="right" width="w-64" testid="sidebar">
+<SidebarPanel side="right" width="w-60" testid="sidebar">
   <SidebarSection title="Agents">
     {#snippet action()}
       {#if onAddAgent}
         <button
           type="button"
-          class="text-fg hover:bg-raised rounded px-1.5 py-0.5 text-sm font-bold"
+          class={ICON_BUTTON_CLASS}
           title="Add agent"
           aria-label="Add agent"
           data-testid="sidebar-add-agent"
           onclick={onAddAgent}
         >
-          +
+          <PlusIcon />
         </button>
       {/if}
     {/snippet}
 
     {#if agents.length === 0}
-      <p class="text-muted px-4 py-3 text-xs">No agents in this project yet.</p>
+      <p class="text-muted px-3 py-3 text-xs">No agents in this project yet.</p>
     {/if}
-    <div class="flex flex-col gap-1.5 p-2">
+    <div class="flex flex-col gap-1 px-2 pb-2">
       {#each agents as agent (agent.id)}
         {@const runtime = runtimes[agent.id]}
         {@const cost = sessionTotalCost(agent.id)}
@@ -94,12 +96,12 @@
         {@const rateLimit =
           agent.harness === "codex" ? rateLimitPercent(runtime?.last_rate_limit) : undefined}
         <div
-          class="border-border rounded-md border px-3 py-2.5"
+          class="hover:bg-raised/60 rounded-md px-2.5 py-2 transition-colors"
           data-testid="sidebar-agent"
           data-agent-id={agent.id}
         >
-          <div class="flex items-baseline justify-between gap-2">
-            <span class="text-fg font-mono text-sm font-semibold" data-testid="agent-name">
+          <div class="flex items-center justify-between gap-2">
+            <span class="text-fg truncate text-[13px] font-semibold" data-testid="agent-name">
               {agent.name}
             </span>
             <Badge variant="harness" harness={agent.harness} testid="agent-harness-badge">
@@ -107,7 +109,7 @@
             </Badge>
           </div>
           <div
-            class={cn("mt-1 text-xs", statusClass(runtime?.run_status))}
+            class={cn("mt-0.5 text-[11px] leading-4", statusClass(runtime?.run_status))}
             data-testid="agent-run-status"
           >
             {statusLabel(runtime?.run_status)}
@@ -137,8 +139,13 @@
             </div>
           {/if}
           {#if runtime?.meta}
-            <div class="text-muted mt-2 space-y-0.5 text-xs" data-testid="agent-meta">
-              <div>model: <span class="font-mono">{runtime.meta.model}</span></div>
+            <div
+              class="text-muted mt-1.5 space-y-0.5 text-[11px] leading-4"
+              data-testid="agent-meta"
+            >
+              <div class="truncate" title={runtime.meta.model}>
+                model: <span class="font-mono">{runtime.meta.model}</span>
+              </div>
               {#if runtime.meta.mcp_servers.length > 0}
                 <div>mcp: {runtime.meta.mcp_servers.length}</div>
               {/if}
@@ -148,21 +155,21 @@
             </div>
           {/if}
           {#if agent.harness === "claude_code" && cost > 0}
-            <div class="text-fg mt-2 text-xs" data-testid="agent-cost">
+            <div class="text-fg mt-1.5 text-xs" data-testid="agent-cost">
               ${cost.toFixed(4)}
             </div>
           {/if}
           {#if rateLimit !== undefined}
-            <div class="text-fg mt-2 text-xs" data-testid="agent-rate-limit">
+            <div class="text-fg mt-1.5 text-xs" data-testid="agent-rate-limit">
               quota used: {rateLimit.toFixed(0)}%
             </div>
           {/if}
           {#if util !== undefined}
-            <div class="mt-2" data-testid="agent-context-bar">
+            <div class="mt-1.5" data-testid="agent-context-bar">
               <div class="text-muted mb-0.5 text-[10px]">
                 context after last turn: {(util * 100).toFixed(0)}%
               </div>
-              <div class="bg-border h-1 w-full overflow-hidden rounded">
+              <div class="bg-border/80 h-1 w-full overflow-hidden rounded">
                 <div
                   class="bg-fg h-full"
                   style:width="{Math.min(util * 100, 100).toFixed(1)}%"

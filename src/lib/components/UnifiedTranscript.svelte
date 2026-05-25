@@ -95,7 +95,7 @@
   bind:this={container}
   onscroll={onScroll}
   data-testid="unified-transcript"
-  class="flex-1 overflow-y-auto p-4"
+  class="flex-1 overflow-y-auto px-5 py-4"
 >
   {#if loadStatus === "loading"}
     <p class="text-muted mb-3 text-xs italic" data-testid="transcript-loading">Loading history…</p>
@@ -109,18 +109,18 @@
     <p class="text-muted text-sm">No messages yet. Type a prompt below.</p>
   {/if}
 
-  <div class="space-y-4">
+  <div class="mx-auto max-w-4xl space-y-5">
     {#each rows as row (row.key)}
       {#if row.kind === "user"}
-        <div class="space-y-1" data-testid="turn" data-role="user">
-          <div class="flex items-center gap-2 text-xs font-semibold tracking-wide uppercase">
+        <div class="space-y-1.5" data-testid="turn" data-role="user">
+          <div class="flex items-center gap-2 text-[11px] font-semibold tracking-wide uppercase">
             <span class="text-muted">You</span>
             <span class="text-muted">→</span>
-            <span class="text-fg font-mono" data-testid="turn-recipient">
+            <span class="text-fg" data-testid="turn-recipient">
               {recipientNames(row.agent_ids)}
             </span>
           </div>
-          <div class="text-fg text-sm whitespace-pre-wrap">{row.text}</div>
+          <div class="text-fg text-sm leading-6 whitespace-pre-wrap">{row.text}</div>
         </div>
       {:else if row.kind === "outcome"}
         <div
@@ -128,7 +128,7 @@
           data-testid="turn-outcome"
           data-status={row.status}
         >
-          <span class="text-fg font-mono">{agentName(row.agent_id)}</span>
+          <span class="text-fg font-semibold">{agentName(row.agent_id)}</span>
           {#if row.status === "cancelled"}
             <span class="text-muted" data-testid="outcome-cancelled">cancelled</span>
           {:else}
@@ -141,9 +141,9 @@
       {:else}
         {@const turn = row.turn}
         {@const harness = agentById[turn.agent_id]?.harness}
-        <div class="space-y-1" data-testid="turn" data-role="agent">
-          <div class="flex items-center gap-2 text-xs font-semibold tracking-wide uppercase">
-            <span class="text-fg font-mono" data-testid="turn-agent-name">
+        <div class="space-y-1.5" data-testid="turn" data-role="agent">
+          <div class="flex items-center gap-2 text-[11px] font-semibold tracking-wide uppercase">
+            <span class="text-fg" data-testid="turn-agent-name">
               {agentName(turn.agent_id)}
             </span>
             {#if harness}
@@ -164,10 +164,10 @@
           {/if}
           {#each turn.items as item, i (i)}
             {#if item.item_kind === "text"}
-              <div class="text-fg text-sm whitespace-pre-wrap">{item.text}</div>
+              <div class="text-fg text-sm leading-6 whitespace-pre-wrap">{item.text}</div>
             {:else}
               <div
-                class="border-border bg-panel rounded border p-2 text-xs"
+                class="border-border/80 bg-panel/80 rounded-md border p-2 text-xs"
                 data-testid="turn-tool"
                 data-tool-use-id={item.tool_use_id}
               >

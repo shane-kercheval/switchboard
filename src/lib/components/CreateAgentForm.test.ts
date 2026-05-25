@@ -169,7 +169,7 @@ describe("CreateAgentForm", () => {
     } satisfies AgentFormSubmit);
   });
 
-  it("Gemini auth missing: Gemini radio disabled; tooltip mentions interactive sign-in", async () => {
+  it("Gemini auth missing: Gemini control disabled; tooltip mentions interactive sign-in", async () => {
     const onSubmit = vi.fn();
     render(CreateAgentForm, {
       props: {
@@ -179,13 +179,12 @@ describe("CreateAgentForm", () => {
         geminiAvailability: GEMINI_AUTH_MISSING,
       },
     });
-    const geminiRadio = screen.getByTestId("harness-gemini") as HTMLInputElement;
-    expect(geminiRadio.disabled).toBe(true);
-    const geminiLabel = geminiRadio.closest("label");
-    expect(geminiLabel?.getAttribute("title")).toContain("gemini`");
+    const geminiControl = screen.getByTestId("harness-gemini") as HTMLInputElement;
+    expect(geminiControl.disabled).toBe(true);
+    expect(geminiControl.closest("label")?.getAttribute("title")).toContain("gemini`");
   });
 
-  it("all three harnesses available: Gemini radio enabled by default", () => {
+  it("all three harnesses available: Gemini control enabled by default", () => {
     const onSubmit = vi.fn();
     render(CreateAgentForm, {
       props: {
@@ -195,8 +194,8 @@ describe("CreateAgentForm", () => {
         geminiAvailability: GEMINI_AVAILABLE,
       },
     });
-    const geminiRadio = screen.getByTestId("harness-gemini") as HTMLInputElement;
-    expect(geminiRadio.disabled).toBe(false);
+    const geminiControl = screen.getByTestId("harness-gemini") as HTMLInputElement;
+    expect(geminiControl.disabled).toBe(false);
   });
 
   it("attach mode + Codex selection: submits {mode:attach, harness:codex, ...}", async () => {
@@ -222,7 +221,7 @@ describe("CreateAgentForm", () => {
     expect(submit.disabled).toBe(true);
   });
 
-  it("Codex binary missing: Codex radio disabled with tooltip; submit blocked", async () => {
+  it("Codex binary missing: Codex control disabled with tooltip; submit blocked", async () => {
     const onSubmit = vi.fn();
     render(CreateAgentForm, {
       props: {
@@ -231,15 +230,15 @@ describe("CreateAgentForm", () => {
         codexAvailability: CODEX_BINARY_MISSING,
       },
     });
-    const codexRadio = screen.getByTestId("harness-codex") as HTMLInputElement;
-    expect(codexRadio.disabled).toBe(true);
-    // Tooltip lives on the wrapping label.
-    const codexLabel = codexRadio.closest("label");
-    expect(codexLabel?.getAttribute("title")).toContain("Codex not found on PATH");
+    const codexControl = screen.getByTestId("harness-codex") as HTMLInputElement;
+    expect(codexControl.disabled).toBe(true);
+    expect(codexControl.closest("label")?.getAttribute("title")).toContain(
+      "Codex not found on PATH",
+    );
 
-    // Claude radio still selectable + submit succeeds with Claude.
-    const claudeRadio = screen.getByTestId("harness-claude") as HTMLInputElement;
-    expect(claudeRadio.disabled).toBe(false);
+    // Claude control still selectable + submit succeeds with Claude.
+    const claudeControl = screen.getByTestId("harness-claude") as HTMLInputElement;
+    expect(claudeControl.disabled).toBe(false);
     await fireEvent.click(screen.getByTestId("confirm-create-agent"));
     expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
       mode: "create",
@@ -248,7 +247,7 @@ describe("CreateAgentForm", () => {
     } satisfies AgentFormSubmit);
   });
 
-  it("Codex auth missing (binary available): Codex radio disabled; tooltip mentions codex login", async () => {
+  it("Codex auth missing (binary available): Codex control disabled; tooltip mentions codex login", async () => {
     const onSubmit = vi.fn();
     render(CreateAgentForm, {
       props: {
@@ -257,13 +256,12 @@ describe("CreateAgentForm", () => {
         codexAvailability: CODEX_AUTH_MISSING,
       },
     });
-    const codexRadio = screen.getByTestId("harness-codex") as HTMLInputElement;
-    expect(codexRadio.disabled).toBe(true);
-    const codexLabel = codexRadio.closest("label");
-    expect(codexLabel?.getAttribute("title")).toContain("codex login");
+    const codexControl = screen.getByTestId("harness-codex") as HTMLInputElement;
+    expect(codexControl.disabled).toBe(true);
+    expect(codexControl.closest("label")?.getAttribute("title")).toContain("codex login");
   });
 
-  it("Claude binary missing: Claude radio disabled, Codex remains selectable", async () => {
+  it("Claude binary missing: Claude control disabled, Codex remains selectable", async () => {
     const onSubmit = vi.fn();
     render(CreateAgentForm, {
       props: {
@@ -272,10 +270,10 @@ describe("CreateAgentForm", () => {
         codexAvailability: CODEX_AVAILABLE,
       },
     });
-    const claudeRadio = screen.getByTestId("harness-claude") as HTMLInputElement;
-    expect(claudeRadio.disabled).toBe(true);
-    const codexRadio = screen.getByTestId("harness-codex") as HTMLInputElement;
-    expect(codexRadio.disabled).toBe(false);
+    const claudeControl = screen.getByTestId("harness-claude") as HTMLInputElement;
+    expect(claudeControl.disabled).toBe(true);
+    const codexControl = screen.getByTestId("harness-codex") as HTMLInputElement;
+    expect(codexControl.disabled).toBe(false);
   });
 
   it("selecting an unavailable harness shows inline gating message and disables submit", async () => {
@@ -295,7 +293,7 @@ describe("CreateAgentForm", () => {
     expect(submit.disabled).toBe(true);
   });
 
-  it("checking state: both radios disabled, submit disabled, no inline message (silent disable)", () => {
+  it("checking state: both controls disabled, submit disabled, no inline message (silent disable)", () => {
     const onSubmit = vi.fn();
     render(CreateAgentForm, {
       props: {
@@ -304,7 +302,7 @@ describe("CreateAgentForm", () => {
         codexAvailability: CODEX_CHECKING,
       },
     });
-    // Both radios are disabled — closes the pre-probe fail-open window.
+    // Both controls are disabled — closes the pre-probe fail-open window.
     expect((screen.getByTestId("harness-claude") as HTMLInputElement).disabled).toBe(true);
     expect((screen.getByTestId("harness-codex") as HTMLInputElement).disabled).toBe(true);
     // Submit is gated alongside.
@@ -315,7 +313,7 @@ describe("CreateAgentForm", () => {
     expect(screen.queryByTestId("harness-unavailable")).not.toBeInTheDocument();
   });
 
-  it("both harnesses available: no gating message, no radio disabled", () => {
+  it("both harnesses available: no gating message, no control disabled", () => {
     const onSubmit = vi.fn();
     render(CreateAgentForm, {
       props: {

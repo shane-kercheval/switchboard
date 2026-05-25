@@ -2,6 +2,7 @@
   /// Cycles the theme: system → light → dark → system. Shows the icon for the
   /// current mode (monitor / sun / moon) with the mode in the tooltip.
   import { theme, type ThemeMode } from "$lib/theme.svelte";
+  import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
 
   const NEXT: Record<ThemeMode, ThemeMode> = {
     system: "light",
@@ -20,7 +21,7 @@
   title={`Theme: ${theme.mode}`}
   aria-label={`Theme: ${theme.mode}. Click to change.`}
   data-testid="theme-toggle"
-  class="text-muted hover:bg-raised hover:text-fg inline-flex h-7 w-7 items-center justify-center rounded-md"
+  class={ICON_BUTTON_CLASS}
 >
   {#if theme.mode === "light"}
     <!-- sun -->

@@ -14,6 +14,8 @@
   import Dialog from "$lib/components/ui/Dialog.svelte";
   import Input from "$lib/components/ui/Input.svelte";
   import Button from "$lib/components/ui/Button.svelte";
+  import AppShell from "$lib/components/ui/AppShell.svelte";
+  import EmptyState from "$lib/components/ui/EmptyState.svelte";
   import { hydrateAgent, registerAgent } from "$lib/state/index.svelte";
   import {
     activateProject,
@@ -259,46 +261,38 @@
   }
 </script>
 
-<main class="flex h-full flex-col bg-white text-neutral-900">
+<main class="bg-surface text-fg flex h-full flex-col">
   {#each banners as banner (bannerTestid(banner))}
     <Banner message={bannerCopy(banner)} testid={bannerTestid(banner)} />
   {/each}
 
-  <div class="flex flex-1 overflow-hidden">
-    <ProjectsSidebar onNewProject={openNewProject} onAddExisting={handleAddExisting} />
+  <AppShell centerTestid="workspace-main">
+    {#snippet left()}
+      <ProjectsSidebar onNewProject={openNewProject} onAddExisting={handleAddExisting} />
+    {/snippet}
 
-    <div class="flex flex-1 flex-col overflow-hidden" data-testid="workspace-main">
+    {#snippet center()}
       {#if selection.activeProjectId === null}
         {#if projects.list.length === 0}
           <WelcomeScreen onNewProject={openNewProject} onAddExisting={handleAddExisting} />
         {:else}
-          <div class="flex flex-1 items-center justify-center p-8 text-sm text-neutral-500">
-            Select a project.
-          </div>
+          <EmptyState title="Select a project." />
         {/if}
       {:else if selection.activationError !== null}
-        <div
-          class="flex flex-1 flex-col items-center justify-center gap-3 p-8 text-center"
-          data-testid="activation-error"
+        <EmptyState
+          testid="activation-error"
+          tone="error"
+          title="Couldn't open this project."
+          description={selection.activationError}
         >
-          <p class="text-sm text-red-700">Couldn't open this project.</p>
-          <p class="max-w-md text-xs text-neutral-500">{selection.activationError}</p>
-          <button
-            type="button"
-            class="rounded border border-neutral-300 px-3 py-1 text-sm text-neutral-700 hover:bg-neutral-100"
-            data-testid="activation-retry"
-            onclick={retryActivation}
-          >
-            Retry
-          </button>
-        </div>
+          {#snippet action()}
+            <Button variant="secondary" data-testid="activation-retry" onclick={retryActivation}>
+              Retry
+            </Button>
+          {/snippet}
+        </EmptyState>
       {:else if !rosterLoaded}
-        <div
-          class="flex flex-1 items-center justify-center p-8 text-sm text-neutral-500"
-          data-testid="project-loading"
-        >
-          Loading project…
-        </div>
+        <EmptyState testid="project-loading" title="Loading project…" />
       {:else if activeAgents.length === 0}
         <div class="flex flex-1 flex-col overflow-y-auto">
           <CreateAgentForm
@@ -313,10 +307,7 @@
         </div>
       {:else}
         {#if activeProject}
-          <div
-            class="border-b border-neutral-200 px-4 py-2 text-xs text-neutral-600"
-            data-testid="breadcrumb"
-          >
+          <div class="border-border text-muted border-b px-4 py-2 text-xs" data-testid="breadcrumb">
             {activeProject.name} — {basename(activeProject.directory)}
           </div>
         {/if}
@@ -327,15 +318,17 @@
         />
         <ComposeBar agents={activeAgents} />
       {/if}
-    </div>
+    {/snippet}
 
-    {#if selection.activeProjectId !== null && rosterLoaded}
-      <Sidebar agents={activeAgents} onAddAgent={openAddAgent} />
-    {/if}
-  </div>
+    {#snippet right()}
+      {#if selection.activeProjectId !== null && rosterLoaded}
+        <Sidebar agents={activeAgents} onAddAgent={openAddAgent} />
+      {/if}
+    {/snippet}
+  </AppShell>
 
   {#if dirError}
-    <p class="border-t border-neutral-200 px-4 py-2 text-xs text-red-700" data-testid="error">
+    <p class="border-border text-status-failed border-t px-4 py-2 text-xs" data-testid="error">
       {dirError}
     </p>
   {/if}
@@ -343,20 +336,20 @@
   <Dialog bind:open={newProjectOpen} title="New project" onClose={() => (newProjectOpen = false)}>
     <div class="space-y-3" data-testid="new-project-form">
       <div class="space-y-1">
-        <span class="block text-xs text-neutral-600">Folder</span>
+        <span class="text-muted block text-xs">Folder</span>
         <div class="flex items-center gap-2">
           <Button data-testid="new-project-choose-folder" onclick={chooseNewProjectFolder}>
             Choose folder…
           </Button>
           {#if newProjectFolder}
-            <span class="truncate font-mono text-xs text-neutral-600" title={newProjectFolder}>
+            <span class="text-muted truncate font-mono text-xs" title={newProjectFolder}>
               {newProjectFolder}
             </span>
           {/if}
         </div>
       </div>
       <div class="space-y-1">
-        <label for="new-project-name" class="block text-xs text-neutral-600">Name</label>
+        <label for="new-project-name" class="text-muted block text-xs">Name</label>
         <Input
           id="new-project-name"
           data-testid="new-project-name"
@@ -369,7 +362,7 @@
         />
       </div>
       {#if newProjectError}
-        <p class="text-xs text-red-700" data-testid="new-project-error">{newProjectError}</p>
+        <p class="text-status-failed text-xs" data-testid="new-project-error">{newProjectError}</p>
       {/if}
       <div class="flex justify-end">
         <Button

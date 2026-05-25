@@ -90,10 +90,13 @@ Adopt shadcn-svelte primitives where they exist (`Button`, `DropdownMenu`, `Badg
 
 Factor the layout scaffolding that App.svelte + the two sidebars currently inline. Keep these thin — composition, not policy (they take children/snippets). The `AppShell` encodes the pane structure + responsive/overflow behavior once.
 
+`AppShell` and `EmptyState` are wired into App.svelte now (App-level scaffolding has no other home). `SidebarPanel` + `SidebarSection` are built and unit-tested here but **adopted by `ProjectsSidebar` / the agents `Sidebar` in M-UI.4**, so each sidebar is refactored once (shell + content together) rather than touched twice. App.svelte's own inline color literals (main background, breadcrumb, error footer, new-project modal labels) are tokenized in this milestone since they live in the file being refactored.
+
 ### Definition of Done
 
-- Existing layout reproduced via the primitives with no visual regression in light mode; dark mode correct.
-- Empty/loading/error center states (today ad-hoc divs in App.svelte) go through `EmptyState`.
+- App.svelte's three-pane layout reproduced via `AppShell` with no visual regression in light mode; dark mode correct.
+- Empty/loading/error center states (previously ad-hoc divs in App.svelte) go through `EmptyState`; the `activation-error`/`activation-retry`/`project-loading` testids are preserved.
+- `SidebarPanel` / `SidebarSection` exist and are unit-tested, ready for adoption in M-UI.4.
 
 ---
 

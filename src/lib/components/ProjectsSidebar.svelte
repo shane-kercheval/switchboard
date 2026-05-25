@@ -14,7 +14,7 @@
   import DropdownMenuItem from "$lib/components/ui/DropdownMenuItem.svelte";
   import StatusDot from "$lib/components/ui/StatusDot.svelte";
   import Badge from "$lib/components/ui/Badge.svelte";
-  import ThemeToggle from "$lib/components/ui/ThemeToggle.svelte";
+  import SettingsButton from "$lib/components/ui/SettingsButton.svelte";
   import SidebarToggleButton from "$lib/components/ui/SidebarToggleButton.svelte";
   import PlusIcon from "$lib/components/ui/PlusIcon.svelte";
   import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
@@ -27,9 +27,18 @@
   let {
     onNewProject,
     onAddExisting,
+    onOpenSettings,
+    onProjectSelect,
     onToggleSidebar,
-  }: { onNewProject: () => void; onAddExisting: () => void; onToggleSidebar: () => void } =
-    $props();
+    settingsOpen = false,
+  }: {
+    onNewProject: () => void;
+    onAddExisting: () => void;
+    onOpenSettings: () => void;
+    onProjectSelect: () => void;
+    onToggleSidebar: () => void;
+    settingsOpen?: boolean;
+  } = $props();
 
   /// Whether any agent in a project is mid-turn — drives the "background
   /// activity" dot so the user knows a non-displayed project is doing
@@ -49,7 +58,7 @@
     data-tauri-drag-region
     use:windowDragRegion
   >
-    <ThemeToggle />
+    <SettingsButton pressed={settingsOpen} testid="settings-button" onclick={onOpenSettings} />
     <SidebarToggleButton
       side="left"
       expanded={true}
@@ -102,7 +111,10 @@
           data-testid="project-row"
           data-project-id={project.id}
           data-active={project.id === selection.activeProjectId}
-          onclick={() => activateProject(project.id)}
+          onclick={() => {
+            onProjectSelect();
+            void activateProject(project.id);
+          }}
         >
           <div class="flex w-full items-center gap-2">
             <span class="text-fg truncate text-[13px] font-semibold">

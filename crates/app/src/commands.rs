@@ -1673,6 +1673,8 @@ pub fn check_antigravity_auth_impl() -> Result<(), AppError> {
             "-a",
             ANTIGRAVITY_KEYCHAIN_ACCOUNT,
         ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()
         .map(|s| s.success());
     interpret_antigravity_keychain_probe(&probe_result)

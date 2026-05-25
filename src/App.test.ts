@@ -818,9 +818,7 @@ describe("App", () => {
 
     // Collapse — same testid, but now lives in the center title bar.
     await fireEvent.click(within(sidebar).getByTestId("projects-sidebar-toggle"));
-    await waitFor(() =>
-      expect(screen.queryByTestId("projects-sidebar")).not.toBeInTheDocument(),
-    );
+    await waitFor(() => expect(screen.queryByTestId("projects-sidebar")).not.toBeInTheDocument());
     // Re-open control is now in the DOM (in the title bar).
     expect(screen.getByTestId("projects-sidebar-toggle")).toBeInTheDocument();
 
@@ -852,5 +850,157 @@ describe("App", () => {
     // Re-show.
     await fireEvent.click(screen.getByTestId("agents-sidebar-toggle"));
     await waitFor(() => expect(screen.getByTestId("sidebar")).toBeInTheDocument());
+  });
+
+  it("settings button toggles settings without changing the selected project", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+    expect(screen.getByTestId("project-row")).toHaveAttribute("data-active", "true");
+
+    await fireEvent.click(
+      within(screen.getByTestId("projects-sidebar")).getByTestId("settings-button"),
+    );
+    await waitFor(() => expect(screen.getByTestId("settings-view")).toBeInTheDocument());
+    expect(screen.getByTestId("project-row")).toHaveAttribute("data-active", "true");
+    expect(screen.getByText("Theme")).toBeInTheDocument();
+    expect(screen.getByText("Shortcuts")).toBeInTheDocument();
+
+    await fireEvent.click(
+      within(screen.getByTestId("projects-sidebar")).getByTestId("settings-button"),
+    );
+    await waitFor(() => expect(screen.queryByTestId("settings-view")).not.toBeInTheDocument());
+    expect(screen.getByTestId("compose-textarea")).toBeInTheDocument();
+
+    await fireEvent.click(
+      within(screen.getByTestId("projects-sidebar")).getByTestId("settings-button"),
+    );
+    await waitFor(() => expect(screen.getByTestId("settings-view")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("settings-close"));
+    await waitFor(() => expect(screen.queryByTestId("settings-view")).not.toBeInTheDocument());
+    expect(screen.getByTestId("project-row")).toHaveAttribute("data-active", "true");
+    expect(screen.getByTestId("compose-textarea")).toBeInTheDocument();
+  });
+
+  it("settings button label reflects open/closed state for assistive technology", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+
+    const settingsBtn = within(screen.getByTestId("projects-sidebar")).getByTestId(
+      "settings-button",
+    );
+    expect(settingsBtn).toHaveAttribute("aria-label", "Open settings");
+
+    await fireEvent.click(settingsBtn);
+    await waitFor(() => expect(screen.getByTestId("settings-view")).toBeInTheDocument());
+    expect(settingsBtn).toHaveAttribute("aria-label", "Close settings");
+
+    await fireEvent.click(settingsBtn);
+    await waitFor(() => expect(screen.queryByTestId("settings-view")).not.toBeInTheDocument());
+    expect(settingsBtn).toHaveAttribute("aria-label", "Open settings");
+  });
+
+  it("settings is reachable from the title bar when the projects sidebar is collapsed", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+
+    // Collapse the sidebar — the settings button moves to the center title bar.
+    const sidebar = screen.getByTestId("projects-sidebar");
+    await fireEvent.click(within(sidebar).getByTestId("projects-sidebar-toggle"));
+    await waitFor(() =>
+      expect(screen.queryByTestId("projects-sidebar")).not.toBeInTheDocument(),
+    );
+
+    // Settings button is now in the title bar with the correct closed-state label.
+    const titleBarBtn = screen.getByTestId("settings-button");
+    expect(titleBarBtn).toHaveAttribute("aria-label", "Open settings");
+
+    // Opening and closing works from the title bar.
+    await fireEvent.click(titleBarBtn);
+    await waitFor(() => expect(screen.getByTestId("settings-view")).toBeInTheDocument());
+    expect(titleBarBtn).toHaveAttribute("aria-label", "Close settings");
+
+    await fireEvent.click(titleBarBtn);
+    await waitFor(() => expect(screen.queryByTestId("settings-view")).not.toBeInTheDocument());
+  });
+
+  it("global shortcuts toggle sidebars and open settings", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+
+    await fireEvent.keyDown(window, { key: "b", metaKey: true });
+    await waitFor(() => expect(screen.queryByTestId("projects-sidebar")).not.toBeInTheDocument());
+    await fireEvent.keyDown(window, { key: "b", metaKey: true });
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("sidebar")).toBeInTheDocument());
+    expect(screen.getByTestId("project-row")).toHaveAttribute("data-active", "true");
+
+    await fireEvent.keyDown(window, { key: "B", metaKey: true, shiftKey: true });
+    await waitFor(() => expect(screen.queryByTestId("sidebar")).not.toBeInTheDocument());
+    await fireEvent.keyDown(window, { key: "B", metaKey: true, shiftKey: true });
+    await waitFor(() => expect(screen.getByTestId("sidebar")).toBeInTheDocument());
+
+    await fireEvent.keyDown(window, { key: ",", metaKey: true });
+    await waitFor(() => expect(screen.getByTestId("settings-view")).toBeInTheDocument());
+    expect(screen.getByTestId("project-row")).toHaveAttribute("data-active", "true");
+
+    await fireEvent.keyDown(window, { key: ",", metaKey: true });
+    await waitFor(() => expect(screen.queryByTestId("settings-view")).not.toBeInTheDocument());
+    expect(screen.getByTestId("compose-textarea")).toBeInTheDocument();
+  });
+
+  it("global shortcuts are suppressed when focus is inside an editable element", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+
+    const textarea = screen.getByTestId("compose-textarea");
+
+    // ⌘B fired from the textarea must not toggle the projects sidebar.
+    await fireEvent.keyDown(textarea, { key: "b", metaKey: true });
+    expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument();
+
+    // ⌘⇧B must not toggle the agents sidebar.
+    expect(screen.getByTestId("sidebar")).toBeInTheDocument();
+    await fireEvent.keyDown(textarea, { key: "B", metaKey: true, shiftKey: true });
+    expect(screen.getByTestId("sidebar")).toBeInTheDocument();
+
+    // ⌘, must not open settings.
+    await fireEvent.keyDown(textarea, { key: ",", metaKey: true });
+    expect(screen.queryByTestId("settings-view")).not.toBeInTheDocument();
   });
 });

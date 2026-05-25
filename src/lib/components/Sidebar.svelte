@@ -2,10 +2,9 @@
   import type { AgentRecord, AgentId } from "$lib/types";
   import { runtimes, transcripts } from "$lib/state/index.svelte";
   import { cn } from "$lib/utils";
-  import { HARNESS_LABEL } from "$lib/harnessDisplay";
   import SidebarPanel from "$lib/components/ui/SidebarPanel.svelte";
   import SidebarSection from "$lib/components/ui/SidebarSection.svelte";
-  import Badge from "$lib/components/ui/Badge.svelte";
+  import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
   import PlusIcon from "$lib/components/ui/PlusIcon.svelte";
   import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
 
@@ -104,9 +103,7 @@
             <span class="text-fg truncate text-[13px] font-semibold" data-testid="agent-name">
               {agent.name}
             </span>
-            <Badge variant="harness" harness={agent.harness} testid="agent-harness-badge">
-              {HARNESS_LABEL[agent.harness]}
-            </Badge>
+            <HarnessIcon harness={agent.harness} size="md" testid="agent-harness-icon" />
           </div>
           <div
             class={cn("mt-0.5 text-[11px] leading-4", statusClass(runtime?.run_status))}

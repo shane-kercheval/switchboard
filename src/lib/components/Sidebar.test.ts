@@ -38,7 +38,7 @@ afterEach(async () => {
 });
 
 describe("Sidebar", () => {
-  it("renders one row per agent with name and harness badge", async () => {
+  it("renders one row per agent with name and harness icon", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     await state.registerAgent(CODEX_AGENT);
@@ -51,9 +51,9 @@ describe("Sidebar", () => {
     expect(rows[0]).toHaveAttribute("data-agent-id", CLAUDE_AGENT.id);
     expect(rows[1]).toHaveAttribute("data-agent-id", CODEX_AGENT.id);
 
-    const badges = screen.getAllByTestId("agent-harness-badge");
-    expect(badges[0]).toHaveTextContent("Claude");
-    expect(badges[1]).toHaveTextContent("Codex");
+    const icons = screen.getAllByTestId("agent-harness-icon");
+    expect(icons[0]).toHaveAttribute("alt", "Claude");
+    expect(icons[1]).toHaveAttribute("alt", "Codex");
   });
 
   it("renders empty-state message when no agents", async () => {

@@ -8,6 +8,7 @@
   import CreateAgentForm from "$lib/components/CreateAgentForm.svelte";
   import type { AgentFormSubmit } from "$lib/components/CreateAgentForm.types";
   import ProjectsSidebar from "$lib/components/ProjectsSidebar.svelte";
+  import SettingsView from "$lib/components/SettingsView.svelte";
   import Sidebar from "$lib/components/Sidebar.svelte";
   import UnifiedTranscript from "$lib/components/UnifiedTranscript.svelte";
   import WelcomeScreen from "$lib/components/WelcomeScreen.svelte";
@@ -16,8 +17,8 @@
   import Button from "$lib/components/ui/Button.svelte";
   import AppShell from "$lib/components/ui/AppShell.svelte";
   import EmptyState from "$lib/components/ui/EmptyState.svelte";
+  import SettingsButton from "$lib/components/ui/SettingsButton.svelte";
   import SidebarToggleButton from "$lib/components/ui/SidebarToggleButton.svelte";
-  import ThemeToggle from "$lib/components/ui/ThemeToggle.svelte";
   import { windowDragRegion } from "$lib/windowDrag";
   import { hydrateAgent, registerAgent } from "$lib/state/index.svelte";
   import {
@@ -89,6 +90,52 @@
   let dirError = $state<string | null>(null);
   let projectsSidebarOpen = $state<boolean>(true);
   let agentsSidebarOpen = $state<boolean>(true);
+  let settingsOpen = $state<boolean>(false);
+
+  function isEditableShortcutTarget(target: EventTarget | null): boolean {
+    if (!(target instanceof HTMLElement)) return false;
+    return (
+      target.isContentEditable ||
+      target.tagName === "INPUT" ||
+      target.tagName === "TEXTAREA" ||
+      target.tagName === "SELECT"
+    );
+  }
+
+  function handleGlobalKeydown(event: KeyboardEvent): void {
+    if (isEditableShortcutTarget(event.target)) return;
+
+    const command = event.metaKey || event.ctrlKey;
+    if (!command || event.altKey) return;
+
+    const key = event.key.toLowerCase();
+    if (key === "," && !event.shiftKey) {
+      event.preventDefault();
+      toggleSettings();
+    } else if (key === "b" && event.shiftKey) {
+      event.preventDefault();
+      agentsSidebarOpen = !agentsSidebarOpen;
+    } else if (key === "b") {
+      event.preventDefault();
+      projectsSidebarOpen = !projectsSidebarOpen;
+    }
+  }
+
+  function openSettings(): void {
+    settingsOpen = true;
+  }
+
+  function closeSettings(): void {
+    settingsOpen = false;
+  }
+
+  function toggleSettings(): void {
+    if (settingsOpen) {
+      closeSettings();
+    } else {
+      openSettings();
+    }
+  }
 
   // Startup: kick off the harness probes (each writes its own slice as it
   // resolves — no barrier) and eagerly load the workspace registry (directory
@@ -125,6 +172,11 @@
     void loadWorkspace().catch((err) => {
       dirError = err instanceof Error ? err.message : String(err);
     });
+
+    window.addEventListener("keydown", handleGlobalKeydown);
+    return () => {
+      window.removeEventListener("keydown", handleGlobalKeydown);
+    };
   });
 
   // The displayed project's roster + hydrated conversation. `rosterLoaded`
@@ -199,6 +251,7 @@
     try {
       await createProjectAndActivate(newProjectName.trim(), newProjectFolder);
       newProjectOpen = false;
+      settingsOpen = false;
     } catch (err) {
       newProjectError = err instanceof Error ? err.message : String(err);
     } finally {
@@ -273,18 +326,24 @@
         <ProjectsSidebar
           onNewProject={openNewProject}
           onAddExisting={handleAddExisting}
+          onOpenSettings={toggleSettings}
+          onProjectSelect={() => (settingsOpen = false)}
           onToggleSidebar={() => (projectsSidebarOpen = false)}
+          {settingsOpen}
         />
       {/if}
     {/snippet}
 
     {#snippet center()}
       {@const showAgentsToggle =
-        selection.activeProjectId !== null && rosterLoaded && activeAgents.length > 0}
+        !settingsOpen &&
+        selection.activeProjectId !== null &&
+        rosterLoaded &&
+        activeAgents.length > 0}
       <!--
         One title bar spanning the center pane, draggable. When the projects
         sidebar is collapsed there is no left column, so this bar absorbs the
-        traffic-light clearance + the re-open and theme controls — the title bar
+        traffic-light clearance + the re-open and settings controls — the title bar
         then extends edge-to-edge like a native window. `pl-20` clears the macOS
         traffic lights positioned at {x:16} in tauri.conf.json; keep the two in
         sync if that position changes.
@@ -297,7 +356,11 @@
         use:windowDragRegion
       >
         {#if !projectsSidebarOpen}
-          <ThemeToggle />
+          <SettingsButton
+            pressed={settingsOpen}
+            testid="settings-button"
+            onclick={toggleSettings}
+          />
           <SidebarToggleButton
             side="left"
             expanded={false}
@@ -306,7 +369,11 @@
             onclick={() => (projectsSidebarOpen = true)}
           />
         {/if}
-        {#if activeProject}
+        {#if settingsOpen}
+          <div class="flex min-w-0 flex-1 items-center gap-2" data-testid="breadcrumb">
+            <div class="text-fg truncate text-sm font-semibold">Settings</div>
+          </div>
+        {:else if activeProject}
           <div class="flex min-w-0 flex-1 items-center gap-2" data-testid="breadcrumb">
             <div class="text-fg truncate text-sm font-semibold">{activeProject.name}</div>
             <div class="text-muted shrink-0 text-xs">·</div>
@@ -334,7 +401,9 @@
       {/each}
 
       <div class="flex min-h-0 flex-1 flex-col overflow-hidden">
-        {#if selection.activeProjectId === null}
+        {#if settingsOpen}
+          <SettingsView onClose={closeSettings} />
+        {:else if selection.activeProjectId === null}
           {#if projects.list.length === 0}
             <WelcomeScreen onNewProject={openNewProject} onAddExisting={handleAddExisting} />
           {:else}

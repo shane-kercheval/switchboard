@@ -95,7 +95,7 @@
   bind:this={container}
   onscroll={onScroll}
   data-testid="unified-transcript"
-  class="flex-1 overflow-y-auto px-5 py-4"
+  class="flex-1 overflow-y-auto px-8 py-4"
 >
   {#if loadStatus === "loading"}
     <p class="text-muted mb-3 text-xs italic" data-testid="transcript-loading">Loading history…</p>
@@ -109,7 +109,7 @@
     <p class="text-muted text-sm">No messages yet. Type a prompt below.</p>
   {/if}
 
-  <div class="mx-auto max-w-4xl space-y-5">
+  <div class="space-y-5">
     {#each rows as row (row.key)}
       {#if row.kind === "user"}
         <div class="space-y-1.5" data-testid="turn" data-role="user">

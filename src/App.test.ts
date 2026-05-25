@@ -800,4 +800,57 @@ describe("App", () => {
       expect(screen.getByTestId("agent-hydration-error")).toHaveTextContent("corrupt sidecar"),
     );
   });
+
+  // --- sidebar collapse / expand ---
+
+  it("projects sidebar: toggle collapses and re-opens; the control moves between sidebar and title bar", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+    // The toggle is inside the sidebar when open.
+    const sidebar = screen.getByTestId("projects-sidebar");
+    expect(within(sidebar).getByTestId("projects-sidebar-toggle")).toBeInTheDocument();
+
+    // Collapse — same testid, but now lives in the center title bar.
+    await fireEvent.click(within(sidebar).getByTestId("projects-sidebar-toggle"));
+    await waitFor(() =>
+      expect(screen.queryByTestId("projects-sidebar")).not.toBeInTheDocument(),
+    );
+    // Re-open control is now in the DOM (in the title bar).
+    expect(screen.getByTestId("projects-sidebar-toggle")).toBeInTheDocument();
+
+    // Re-open.
+    await fireEvent.click(screen.getByTestId("projects-sidebar-toggle"));
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+  });
+
+  it("agents sidebar: toggle hides and re-shows the sidebar while the title bar persists", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("sidebar")).toBeInTheDocument());
+    expect(screen.getByTestId("agents-sidebar-toggle")).toBeInTheDocument();
+
+    // Hide.
+    await fireEvent.click(screen.getByTestId("agents-sidebar-toggle"));
+    await waitFor(() => expect(screen.queryByTestId("sidebar")).not.toBeInTheDocument());
+    // Title bar (breadcrumb) and compose area remain usable.
+    expect(screen.getByTestId("breadcrumb")).toBeInTheDocument();
+    expect(screen.getByTestId("compose-textarea")).toBeInTheDocument();
+
+    // Re-show.
+    await fireEvent.click(screen.getByTestId("agents-sidebar-toggle"));
+    await waitFor(() => expect(screen.getByTestId("sidebar")).toBeInTheDocument());
+  });
 });

@@ -21,6 +21,7 @@
   title={`Theme: ${theme.mode}`}
   aria-label={`Theme: ${theme.mode}. Click to change.`}
   data-testid="theme-toggle"
+  data-tauri-no-drag
   class={ICON_BUTTON_CLASS}
 >
   {#if theme.mode === "light"}

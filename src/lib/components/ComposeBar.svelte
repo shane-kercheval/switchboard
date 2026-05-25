@@ -106,7 +106,7 @@
   }
 </script>
 
-<div class="bg-raised px-5 pt-2 pb-4">
+<div class="bg-raised px-4 pt-2 pb-4">
   <div
     class="border-border bg-raised rounded-xl border p-2.5 shadow-[0_10px_32px_rgba(0,0,0,0.08)]"
   >

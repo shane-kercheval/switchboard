@@ -1,18 +1,22 @@
 <script lang="ts">
-  /// The three-pane horizontal layout (left | center | right), encoding the
-  /// flex + overflow behavior once. Thin composition: each pane is a snippet,
-  /// the right pane optional. App-level chrome (banners, footer, modals) stays
-  /// in the consumer — this owns only the pane row.
+  /// Two-pane horizontal layout (left | center), encoding the flex + overflow
+  /// behavior once. App-level chrome (banners, footer, modals) stays in the
+  /// consumer — this owns only the pane row.
+  ///
+  /// There is intentionally no right slot. The agents sidebar lives inside the
+  /// center snippet so the title bar (which must span both the content column
+  /// and the sidebar) can be a single element at the top of the center pane.
+  /// A right slot at this level would make the title bar stop at the content
+  /// column edge, leaving the sidebar without a header.
   import type { Snippet } from "svelte";
 
   type Props = {
     left: Snippet;
     center: Snippet;
-    right?: Snippet;
     centerTestid?: string;
   };
 
-  let { left, center, right, centerTestid }: Props = $props();
+  let { left, center, centerTestid }: Props = $props();
 </script>
 
 <div class="flex flex-1 overflow-hidden">
@@ -20,7 +24,4 @@
   <div class="bg-raised flex flex-1 flex-col overflow-hidden" data-testid={centerTestid}>
     {@render center()}
   </div>
-  {#if right}
-    {@render right()}
-  {/if}
 </div>

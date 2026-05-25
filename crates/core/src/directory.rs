@@ -1,6 +1,7 @@
 use std::fs::create_dir_all;
 use std::path::{Path, PathBuf};
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, Result};
@@ -9,7 +10,8 @@ use crate::name::{canonicalize_for_uniqueness, validate_name};
 use crate::project::{self, Project, ProjectId, ProjectSummary};
 
 use crate::paths::{
-    CONFIG_FILE, PROJECTS_DIR, PROJECTS_INDEX, PROMPTS_DIR, SWITCHBOARD_DIR, WORKFLOWS_DIR,
+    CONFIG_FILE, JOURNAL_FILE, PROJECTS_DIR, PROJECTS_INDEX, PROMPTS_DIR, SWITCHBOARD_DIR,
+    WORKFLOWS_DIR,
 };
 
 const DIRECTORY_CONFIG_VERSION: u32 = 1;
@@ -146,6 +148,32 @@ impl Directory {
         project::load(&self.path, summary.id, root)
     }
 
+    /// Best-effort "last activity" timestamp for a project, used to order the
+    /// cross-directory project list by recency. Returns the later of the
+    /// project's conversation-journal modification time and `fallback`
+    /// (typically the project's `created_at`).
+    ///
+    /// The journal (`journal.jsonl`) is appended on every user send and every
+    /// non-completed-turn outcome, so its mtime is a cheap recency proxy that
+    /// needs no transcript parse — `O(1)` per project, safe to call for every
+    /// project at startup. It reflects *send* time, not the eventual response
+    /// time, for a completed turn; that's close enough for ordering. A missing
+    /// or unreadable journal (never-dispatched project) yields `fallback`.
+    pub fn project_last_activity(&self, id: ProjectId, fallback: DateTime<Utc>) -> DateTime<Utc> {
+        let journal = self
+            .projects_dir()
+            .join(id.to_string())
+            .join(JOURNAL_FILE);
+        let mtime = std::fs::metadata(&journal)
+            .and_then(|m| m.modified())
+            .ok()
+            .map(DateTime::<Utc>::from);
+        match mtime {
+            Some(t) if t > fallback => t,
+            _ => fallback,
+        }
+    }
+
     /// Reads the directory-level config. Errors with `UnsupportedConfigVersion`
     /// if the on-disk `version` doesn't match this build.
     pub fn config(&self) -> Result<DirectoryConfig> {
@@ -256,6 +284,42 @@ mod tests {
         std::fs::remove_file(directory.projects_index_path()).unwrap();
         let err = directory.list_projects().unwrap_err();
         assert!(matches!(err, CoreError::MissingAppendOnlyFile { .. }));
+    }
+
+    #[test]
+    fn project_last_activity_without_journal_returns_fallback() {
+        let tmp = TempDir::new().unwrap();
+        let directory = Directory::at(tmp.path()).unwrap();
+        directory.init().unwrap();
+        let project = directory.create_project("alpha").unwrap();
+
+        // No dispatch has happened, so there is no journal file — the recency
+        // key falls back to the supplied timestamp (the project's created_at).
+        let fallback = DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(directory.project_last_activity(project.id, fallback), fallback);
+    }
+
+    #[test]
+    fn project_last_activity_uses_journal_mtime_when_newer() {
+        let tmp = TempDir::new().unwrap();
+        let directory = Directory::at(tmp.path()).unwrap();
+        directory.init().unwrap();
+        let project = directory.create_project("alpha").unwrap();
+        // Touch the journal so it exists with a current mtime.
+        std::fs::write(project.journal_path(), b"{}\n").unwrap();
+
+        // A fallback far in the past must lose to the just-written journal's
+        // mtime; a fallback far in the future must win (journal isn't newer).
+        let past = DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let future = DateTime::parse_from_rfc3339("2999-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(directory.project_last_activity(project.id, past) > past);
+        assert_eq!(directory.project_last_activity(project.id, future), future);
     }
 
     #[test]

@@ -10,7 +10,7 @@ use crate::error::{CoreError, Result};
 use crate::harness::HarnessKind;
 use crate::io::{append_jsonl, read_jsonl, read_yaml, write_yaml};
 use crate::name::{canonicalize_for_uniqueness, validate_name};
-use crate::paths::{CONFIG_FILE, REGISTRY_FILE};
+use crate::paths::{CONFIG_FILE, JOURNAL_FILE, REGISTRY_FILE};
 
 pub type ProjectId = Uuid;
 
@@ -57,7 +57,7 @@ impl Project {
     /// (see [`crate::journal`]). Runtime data; `.gitignore`d like the rest of
     /// `projects/`.
     pub fn journal_path(&self) -> PathBuf {
-        self.root.join("journal.jsonl")
+        self.root.join(JOURNAL_FILE)
     }
 
     /// Append a new agent to this project's registry. Validates the name (regex +

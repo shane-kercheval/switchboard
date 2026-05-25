@@ -290,6 +290,89 @@ export type ProjectSummary = {
   created_at: string;
 };
 
+// Mirror of Rust `ProjectListing` (`crates/app/src/commands.rs`) — one row of
+// the flat cross-directory project list. `directory` is the owning directory's
+// path (label + spawn cwd); `available` is whether that directory is currently
+// loaded/readable; `last_activity` is the recency-ordering key (journal mtime
+// or `created_at`).
+export type ProjectListing = {
+  id: ProjectId;
+  name: string;
+  created_at: string;
+  directory: string;
+  available: boolean;
+  last_activity: string;
+};
+
+// Mirror of Rust `WorkspaceDirectoryInfo` / `WorkspaceDirectories`. The
+// switcher renders directory rows independent of projects (so empty directories
+// appear), and `persistable === false` means an existing `workspace.yaml`
+// couldn't be read this session — surfaced distinctly from a fresh install so a
+// transient read error doesn't lure the user into re-adding directories that
+// then silently fail to save.
+export type WorkspaceDirectoryInfo = {
+  path: string;
+  available: boolean;
+};
+
+export type WorkspaceDirectories = {
+  directories: WorkspaceDirectoryInfo[];
+  persistable: boolean;
+};
+
+// Mirror of Rust `ProjectConversation` / `ConversationItem` / `OutcomeStatus` /
+// `AgentConversationMeta` (`crates/app/src/commands.rs`). The post-restart
+// unified history: the three `ConversationItem` kinds are disjoint sources
+// (user messages ← journal, agent content ← harness files, outcome markers ←
+// journal), so there is no cross-source dedup. Items arrive pre-sorted by
+// timestamp (user message before its content/markers at equal instants).
+export type OutcomeStatus = "cancelled" | "failed";
+
+export type ConversationItem =
+  | {
+      kind: "user_message";
+      send_id: string;
+      agent_ids: AgentId[];
+      text: string;
+      at: string;
+    }
+  | {
+      kind: "agent_turn";
+      turn_id: TurnId;
+      agent_id: AgentId;
+      started_at: string;
+      ended_at?: string | null;
+      status: "streaming" | "complete" | "failed";
+      items: LoadedTurnItem[];
+      usage?: TurnUsage | null;
+    }
+  | {
+      kind: "outcome";
+      turn_id: TurnId;
+      send_id: string;
+      agent_id: AgentId;
+      status: OutcomeStatus;
+      reason?: string | null;
+      at: string;
+    };
+
+// Per-agent metadata carried alongside the merged items. `warnings` and
+// `load_error` are agent-scoped: one agent's transcript failing to load leaves
+// its `load_error` set (and turns absent) while the rest of the project still
+// renders.
+export type AgentConversationMeta = {
+  agent_id: AgentId;
+  meta?: SessionMetaInfo | null;
+  last_rate_limit?: unknown;
+  warnings: ParseWarning[];
+  load_error?: string | null;
+};
+
+export type ProjectConversation = {
+  items: ConversationItem[];
+  agents: AgentConversationMeta[];
+};
+
 export type DirectoryInfo = {
   path: string;
   has_switchboard: boolean;

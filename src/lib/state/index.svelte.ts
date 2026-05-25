@@ -143,26 +143,46 @@ export async function hydrateAgent(agentId: AgentId): Promise<void> {
   runtimes[agentId] = { ...current, hydration_status: "loading" };
   try {
     const loaded = await loadTranscript(agentId);
-    const hydrate: Hydrate = {
-      type: "hydrate",
-      agent_id: agentId,
-      turns: loaded.turns,
-      meta: loaded.meta ?? null,
-      last_rate_limit: loaded.last_rate_limit ?? null,
-      warnings: loaded.warnings,
-    };
-    const priorTurns = transcripts[agentId] ?? [];
-    transcripts[agentId] = transcriptReducer(priorTurns, hydrate, agentId, "");
-    const priorRuntime = runtimes[agentId];
-    if (priorRuntime !== undefined) {
-      runtimes[agentId] = runtimeReducer(priorRuntime, hydrate);
-    }
+    applyAgentHydrate(agentId, loaded);
   } catch (e) {
     console.warn("[switchboard] hydrateAgent failed", { agent_id: agentId, error: e });
     const after = runtimes[agentId];
     if (after !== undefined) {
       runtimes[agentId] = { ...after, hydration_status: "failed" };
     }
+  }
+}
+
+/// Apply a resolved hydration payload to an agent's transcript + runtime via
+/// the non-destructive `hydrate` reducer path (live in-flight turns win over
+/// disk; the runtime reducer flips `hydration_status` to `"complete"` and fills
+/// meta/rate-limit only where absent). Shared by the per-agent `hydrateAgent`
+/// path and the project-scoped hydration in the workspace store, which feeds
+/// agent-turn content regrouped from `load_project_conversation`. The caller
+/// owns idempotency (the per-agent `hydrationAttempted` set / the per-project
+/// hydration guard) — this helper only applies.
+export function applyAgentHydrate(
+  agentId: AgentId,
+  loaded: {
+    turns: Hydrate["turns"];
+    meta?: Hydrate["meta"];
+    last_rate_limit?: Hydrate["last_rate_limit"];
+    warnings?: Hydrate["warnings"];
+  },
+): void {
+  const hydrate: Hydrate = {
+    type: "hydrate",
+    agent_id: agentId,
+    turns: loaded.turns,
+    meta: loaded.meta ?? null,
+    last_rate_limit: loaded.last_rate_limit ?? null,
+    warnings: loaded.warnings,
+  };
+  const priorTurns = transcripts[agentId] ?? [];
+  transcripts[agentId] = transcriptReducer(priorTurns, hydrate, agentId, "");
+  const priorRuntime = runtimes[agentId];
+  if (priorRuntime !== undefined) {
+    runtimes[agentId] = runtimeReducer(priorRuntime, hydrate);
   }
 }
 

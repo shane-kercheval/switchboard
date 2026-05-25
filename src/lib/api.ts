@@ -9,8 +9,11 @@ import type {
   HarnessKind,
   LoadedTranscript,
   MessageId,
+  ProjectConversation,
   ProjectId,
+  ProjectListing,
   ProjectSummary,
+  WorkspaceDirectories,
 } from "./types";
 
 export async function checkClaudeBinary(): Promise<void> {
@@ -49,12 +52,34 @@ export async function initDirectory(path: string): Promise<DirectoryInfo> {
   return await invoke<DirectoryInfo>("init_directory", { path });
 }
 
-export async function listProjects(): Promise<ProjectSummary[]> {
-  return await invoke<ProjectSummary[]>("list_projects");
+// The flat cross-directory project list. Each row carries its owning directory
+// and availability; ordering is left to the caller (the switcher sorts by
+// `last_activity`).
+export async function listProjects(): Promise<ProjectListing[]> {
+  return await invoke<ProjectListing[]>("list_projects");
 }
 
-export async function createProject(name: string): Promise<ProjectSummary> {
-  return await invoke<ProjectSummary>("create_project", { name });
+// Every registered workspace directory (including empty ones) plus the
+// persistability signal — the switcher's directory rows.
+export async function listWorkspaceDirectories(): Promise<WorkspaceDirectories> {
+  return await invoke<WorkspaceDirectories>("list_workspace_directories");
+}
+
+export async function createProject(name: string, directory: string): Promise<ProjectSummary> {
+  return await invoke<ProjectSummary>("create_project", { name, directory });
+}
+
+// Removes a directory from the workspace: drains its projects' in-flight turns,
+// releases their locks, and drops the entry — leaving `.switchboard/` on disk.
+export async function removeDirectory(path: string): Promise<void> {
+  await invoke<null>("remove_directory", { path });
+}
+
+// The merged post-restart conversation for a project (journal user-messages +
+// harness agent content + journal outcome markers). Replaces per-agent
+// `loadTranscript` for the unified view.
+export async function loadProjectConversation(projectId: ProjectId): Promise<ProjectConversation> {
+  return await invoke<ProjectConversation>("load_project_conversation", { projectId });
 }
 
 export async function openProject(projectId: ProjectId): Promise<ProjectSummary> {

@@ -22,13 +22,14 @@ use tauri::{Emitter, Manager, State};
 
 use crate::commands::ProjectConversation;
 use crate::commands::{
-    DirectoryInfo, ProjectListing, attach_agent_impl, cancel_turn_impl,
+    DirectoryInfo, ProjectListing, WorkspaceDirectories, attach_agent_impl, cancel_turn_impl,
     check_antigravity_auth_impl, check_antigravity_binary_impl, check_claude_binary_impl,
     check_codex_auth_impl, check_codex_binary_impl, check_gemini_auth_impl,
     check_gemini_binary_impl, create_agent_impl, create_project_impl, init_directory_impl,
-    list_agents_impl, list_projects_impl, load_project_conversation_impl, load_transcript_impl,
-    open_project_impl, parse_uuid, pick_directory_impl, remove_directory_impl,
-    remove_queued_message_impl, send_message_impl, set_active_project_impl,
+    list_agents_impl, list_projects_impl, list_workspace_directories_impl,
+    load_project_conversation_impl, load_transcript_impl, open_project_impl, parse_uuid,
+    pick_directory_impl, remove_directory_impl, remove_queued_message_impl, send_message_impl,
+    set_active_project_impl,
 };
 use crate::state::AppState;
 
@@ -101,7 +102,12 @@ async fn list_projects(state: State<'_, AppState>) -> Result<Vec<ProjectListing>
     list_projects_impl(state.inner()).map_err(|e| e.to_string())
 }
 
-// TODO(M4.6 frontend): list_workspace_directories command for the switcher (incl. empty dirs)
+#[tauri::command]
+async fn list_workspace_directories(
+    state: State<'_, AppState>,
+) -> Result<WorkspaceDirectories, String> {
+    Ok(list_workspace_directories_impl(state.inner()))
+}
 
 #[tauri::command]
 async fn create_project(
@@ -370,6 +376,7 @@ pub fn run() {
             init_directory,
             remove_directory,
             list_projects,
+            list_workspace_directories,
             create_project,
             open_project,
             set_active_project,

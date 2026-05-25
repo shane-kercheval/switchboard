@@ -42,6 +42,12 @@ pub struct ProjectListing {
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub directory: String,
     pub available: bool,
+    /// Recency-ordering key for the flat project list: the later of the
+    /// project's journal mtime and `created_at` (see
+    /// [`switchboard_core::Directory::project_last_activity`]). For an
+    /// unavailable directory (served from the cache) this is just `created_at`
+    /// — its journal can't be stat'd while the directory is unreadable.
+    pub last_activity: chrono::DateTime<chrono::Utc>,
 }
 
 /// Read-only inspection. Canonicalizes the path, checks whether
@@ -311,13 +317,21 @@ pub fn list_projects_impl(state: &AppState) -> Result<Vec<ProjectListing>, AppEr
             if lock(&state.workspace).refresh_cache(path, summaries.clone()) {
                 cache_changed = true;
             }
+            // `fresh` is `Some` only when the directory was loaded and read
+            // cleanly, so `loaded` is `Some` here — stat each project's journal
+            // for its recency key.
+            let directory = loaded.as_ref();
             for s in summaries {
+                let last_activity = directory.map_or(s.created_at, |d| {
+                    d.project_last_activity(s.id, s.created_at)
+                });
                 listings.push(ProjectListing {
                     id: s.id,
                     name: s.name,
                     created_at: s.created_at,
                     directory: dir_str.clone(),
                     available: true,
+                    last_activity,
                 });
             }
         } else {
@@ -334,6 +348,7 @@ pub fn list_projects_impl(state: &AppState) -> Result<Vec<ProjectListing>, AppEr
                     created_at: s.created_at,
                     directory: dir_str.clone(),
                     available: false,
+                    last_activity: s.created_at,
                 });
             }
         }
@@ -342,6 +357,56 @@ pub fn list_projects_impl(state: &AppState) -> Result<Vec<ProjectListing>, AppEr
         persist_workspace(state);
     }
     Ok(listings)
+}
+
+/// One directory row for the workspace switcher.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorkspaceDirectoryInfo {
+    pub path: String,
+    /// Whether the directory is currently loaded (openable on disk). An
+    /// unavailable directory (unmounted/moved) still appears so the user can
+    /// see and remove its cached entry.
+    pub available: bool,
+}
+
+/// The switcher's view of the workspace registry: every registered directory
+/// plus whether registry changes persist this session.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorkspaceDirectories {
+    pub directories: Vec<WorkspaceDirectoryInfo>,
+    /// `false` when an existing `workspace.yaml` couldn't be read at startup
+    /// (`workspace_path` left `None`). The UI surfaces this distinctly from a
+    /// fresh install so a transient read error doesn't masquerade as a clean
+    /// slate and lure the user into re-adding directories that silently fail to
+    /// save (see [`crate::workspace::LoadOutcome`]).
+    pub persistable: bool,
+}
+
+/// Every registered workspace directory for the switcher — including ones with
+/// no projects yet (which `list_projects` omits) — plus the persistability
+/// signal. Distinct from `list_projects` (the flat project list); the switcher
+/// needs directory rows independent of project rows to render empty directories
+/// and the add/remove-directory affordances.
+pub fn list_workspace_directories_impl(state: &AppState) -> WorkspaceDirectories {
+    let entry_paths: Vec<PathBuf> = lock(&state.workspace)
+        .entries()
+        .iter()
+        .map(|e| e.path.clone())
+        .collect();
+    let directories = {
+        let loaded = lock(&state.directories);
+        entry_paths
+            .into_iter()
+            .map(|path| WorkspaceDirectoryInfo {
+                available: loaded.contains_key(&path),
+                path: path.to_string_lossy().into_owned(),
+            })
+            .collect()
+    };
+    WorkspaceDirectories {
+        directories,
+        persistable: state.workspace_path.is_some(),
+    }
 }
 
 pub fn create_project_impl(
@@ -4966,6 +5031,65 @@ mod tests {
         assert_eq!(alpha_row.directory, dir_a);
         assert_eq!(beta_row.directory, dir_b);
         assert!(alpha_row.available && beta_row.available);
+    }
+
+    #[tokio::test]
+    async fn list_workspace_directories_includes_empty_directory_and_reports_persistable() {
+        let dir = TempDir::new().unwrap();
+        let ws_path = dir.path().join("workspace.yaml");
+        let tmp = TempDir::new().unwrap();
+        let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let emitter = Arc::new(RecordingEmitter::new());
+        let state = AppState::new(
+            Arc::clone(&mock),
+            Arc::clone(&mock),
+            Arc::clone(&mock),
+            Arc::clone(&mock),
+            emitter as Arc<dyn EventEmitter>,
+        )
+        .with_workspace(ws_path);
+
+        // A directory with no projects must still appear in the switcher —
+        // unlike `list_projects`, which emits zero rows for it.
+        let info = init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            list_projects_impl(&state).unwrap().is_empty(),
+            "no projects created yet"
+        );
+
+        let ws = list_workspace_directories_impl(&state);
+        assert!(ws.persistable, "a readable workspace.yaml is persistable");
+        assert_eq!(ws.directories.len(), 1);
+        assert_eq!(ws.directories[0].path, info.path);
+        assert!(
+            ws.directories[0].available,
+            "a freshly-initialized directory is loaded"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_workspace_directories_marks_unloaded_directory_unavailable_and_not_persistable() {
+        // `fresh_state_with_mock` builds state with no `workspace_path`, the
+        // not-persistable case (an unreadable existing workspace.yaml).
+        let (_tmp, state, _) = fresh_state_with_mock();
+        // Register a directory in the registry without loading it into
+        // `state.directories` — as if it were unmounted at startup.
+        let phantom = PathBuf::from("/definitely/not/mounted");
+        lock(&state.workspace).add(phantom.clone());
+
+        let ws = list_workspace_directories_impl(&state);
+        assert!(
+            !ws.persistable,
+            "state with no workspace_path is not persistable"
+        );
+        assert_eq!(ws.directories.len(), 1);
+        assert_eq!(ws.directories[0].path, phantom.to_string_lossy());
+        assert!(
+            !ws.directories[0].available,
+            "a registered-but-unloaded directory is unavailable"
+        );
     }
 
     #[tokio::test]

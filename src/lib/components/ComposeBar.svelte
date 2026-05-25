@@ -106,15 +106,15 @@
   }
 </script>
 
-<div class="border-t border-neutral-200 bg-neutral-50 p-3">
+<div class="border-border bg-panel border-t p-3">
   {#if agents.length > 1}
     <div class="mb-2 flex items-center gap-2 text-xs">
-      <label for="recipient-picker" class="text-neutral-600">To:</label>
+      <label for="recipient-picker" class="text-muted">To:</label>
       <select
         id="recipient-picker"
         data-testid="recipient-picker"
         bind:value={recipientId}
-        class="rounded border border-neutral-300 bg-white px-2 py-1 font-mono text-xs"
+        class="border-border bg-raised text-fg rounded border px-2 py-1 font-mono text-xs"
       >
         {#each agents as agent (agent.id)}
           <option value={agent.id}>
@@ -135,7 +135,7 @@
     <Button data-testid="compose-send" onclick={handleSubmit} disabled={sendDisabled}>Send</Button>
   </div>
   {#if sendError}
-    <p class="mt-2 text-xs text-red-700" data-testid="compose-send-error">
+    <p class="text-status-failed mt-2 text-xs" data-testid="compose-send-error">
       Send failed: {sendError}
     </p>
   {/if}

@@ -3,7 +3,8 @@
   import { transcripts, type Turn } from "$lib/state/index.svelte";
   import { buildUnifiedRows } from "$lib/state/unified";
   import { cn } from "$lib/utils";
-  import { HARNESS_BADGE_CLASS, HARNESS_LABEL } from "$lib/harnessDisplay";
+  import { HARNESS_LABEL } from "$lib/harnessDisplay";
+  import Badge from "$lib/components/ui/Badge.svelte";
 
   /// `agents` is the active project's roster (for attribution + flattening
   /// their per-agent transcripts). `overlay` is the project's hydrated
@@ -40,16 +41,6 @@
 
   function agentName(agentId: string): string {
     return agentById[agentId]?.name ?? "unknown";
-  }
-
-  function harnessBadgeClass(agentId: string): string {
-    const harness = agentById[agentId]?.harness;
-    return harness ? HARNESS_BADGE_CLASS[harness] : "bg-neutral-100 text-neutral-800";
-  }
-
-  function harnessLabel(agentId: string): string {
-    const harness = agentById[agentId]?.harness;
-    return harness ? HARNESS_LABEL[harness] : "?";
   }
 
   function recipientNames(agentIds: string[]): string {
@@ -107,17 +98,15 @@
   class="flex-1 overflow-y-auto p-4"
 >
   {#if loadStatus === "loading"}
-    <p class="mb-3 text-xs text-neutral-500 italic" data-testid="transcript-loading">
-      Loading history…
-    </p>
+    <p class="text-muted mb-3 text-xs italic" data-testid="transcript-loading">Loading history…</p>
   {:else if loadStatus === "failed"}
-    <p class="mb-3 text-xs text-red-700" data-testid="transcript-load-failed">
+    <p class="text-status-failed mb-3 text-xs" data-testid="transcript-load-failed">
       Couldn't load this project's conversation history.
     </p>
   {/if}
 
   {#if rows.length === 0 && loadStatus !== "loading"}
-    <p class="text-sm text-neutral-500">No messages yet. Type a prompt below.</p>
+    <p class="text-muted text-sm">No messages yet. Type a prompt below.</p>
   {/if}
 
   <div class="space-y-4">
@@ -125,13 +114,13 @@
       {#if row.kind === "user"}
         <div class="space-y-1" data-testid="turn" data-role="user">
           <div class="flex items-center gap-2 text-xs font-semibold tracking-wide uppercase">
-            <span class="text-neutral-500">You</span>
-            <span class="text-neutral-400">→</span>
-            <span class="font-mono text-neutral-700" data-testid="turn-recipient">
+            <span class="text-muted">You</span>
+            <span class="text-muted">→</span>
+            <span class="text-fg font-mono" data-testid="turn-recipient">
               {recipientNames(row.agent_ids)}
             </span>
           </div>
-          <div class="text-sm whitespace-pre-wrap text-neutral-900">{row.text}</div>
+          <div class="text-fg text-sm whitespace-pre-wrap">{row.text}</div>
         </div>
       {:else if row.kind === "outcome"}
         <div
@@ -139,78 +128,70 @@
           data-testid="turn-outcome"
           data-status={row.status}
         >
-          <span class="font-mono text-neutral-700">{agentName(row.agent_id)}</span>
+          <span class="text-fg font-mono">{agentName(row.agent_id)}</span>
           {#if row.status === "cancelled"}
-            <span class="text-neutral-500" data-testid="outcome-cancelled">cancelled</span>
+            <span class="text-muted" data-testid="outcome-cancelled">cancelled</span>
           {:else}
-            <span class="text-red-700" data-testid="outcome-failed">failed</span>
+            <span class="text-status-failed" data-testid="outcome-failed">failed</span>
           {/if}
           {#if row.reason}
-            <span class="text-neutral-500">— {row.reason}</span>
+            <span class="text-muted">— {row.reason}</span>
           {/if}
         </div>
       {:else}
         {@const turn = row.turn}
+        {@const harness = agentById[turn.agent_id]?.harness}
         <div class="space-y-1" data-testid="turn" data-role="agent">
           <div class="flex items-center gap-2 text-xs font-semibold tracking-wide uppercase">
-            <span class="font-mono text-neutral-700" data-testid="turn-agent-name">
+            <span class="text-fg font-mono" data-testid="turn-agent-name">
               {agentName(turn.agent_id)}
             </span>
-            <span class={cn("rounded px-1.5 py-0.5 text-[10px]", harnessBadgeClass(turn.agent_id))}>
-              {harnessLabel(turn.agent_id)}
-            </span>
+            {#if harness}
+              <Badge variant="harness" {harness}>{HARNESS_LABEL[harness]}</Badge>
+            {:else}
+              <Badge>?</Badge>
+            {/if}
             {#if turn.status === "streaming"}
-              <span class="text-amber-700" data-testid="turn-streaming">streaming…</span>
+              <span class="text-status-processing" data-testid="turn-streaming">streaming…</span>
             {:else if turn.status === "failed"}
-              <span class="text-red-700">failed</span>
+              <span class="text-status-failed">failed</span>
             {:else if turn.status === "cancelled"}
-              <span class="text-neutral-500">cancelled</span>
+              <span class="text-muted">cancelled</span>
             {/if}
           </div>
           {#if turn.status === "streaming" && turn.items.length === 0}
-            <div class="text-xs text-neutral-500 italic" data-testid="turn-processing">
-              processing…
-            </div>
+            <div class="text-muted text-xs italic" data-testid="turn-processing">processing…</div>
           {/if}
           {#each turn.items as item, i (i)}
             {#if item.item_kind === "text"}
-              <div class="text-sm whitespace-pre-wrap text-neutral-800">{item.text}</div>
+              <div class="text-fg text-sm whitespace-pre-wrap">{item.text}</div>
             {:else}
               <div
-                class="rounded border border-neutral-200 bg-neutral-50 p-2 text-xs"
+                class="border-border bg-panel rounded border p-2 text-xs"
                 data-testid="turn-tool"
                 data-tool-use-id={item.tool_use_id}
               >
-                <div class="flex items-center gap-1.5 font-semibold text-neutral-700">
-                  <span
-                    class={cn(
-                      "rounded px-1 py-0.5 text-[9px] uppercase",
-                      item.kind === "mcp"
-                        ? "bg-blue-100 text-blue-800"
-                        : "bg-neutral-200 text-neutral-700",
-                    )}
-                  >
-                    {item.kind}
-                  </span>
+                <div class="text-fg flex items-center gap-1.5 font-semibold">
+                  <Badge>{item.kind}</Badge>
                   <span class="font-mono">{item.name}</span>
                   {#if item.completed_at === undefined}
-                    <span class="ml-auto text-amber-700 italic">running…</span>
+                    <span class="text-status-processing ml-auto italic">running…</span>
                   {:else if item.is_error}
-                    <span class="ml-auto text-red-700">error</span>
+                    <span class="text-status-failed ml-auto">error</span>
                   {/if}
                 </div>
                 {#if item.output !== undefined && item.output !== ""}
                   <pre
                     class={cn(
                       "mt-1 max-h-40 overflow-y-auto font-mono text-[11px] whitespace-pre-wrap",
-                      item.is_error ? "text-red-800" : "text-neutral-600",
+                      item.is_error ? "text-status-failed" : "text-muted",
                     )}>{item.output}</pre>
                 {/if}
               </div>
             {/if}
           {/each}
           {#if turn.status === "failed" && turn.error}
-            <div class="text-xs text-red-700" data-testid="turn-error">{turn.error}</div>
+            <div class="text-status-failed text-xs" data-testid="turn-error">{turn.error}</div>
           {/if}
         </div>
       {/if}

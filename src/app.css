@@ -39,6 +39,12 @@
   --destructive: #dc2626;
   --destructive-fg: #ffffff;
 
+  /* caution / warning — its own role, distinct from run-status "processing"
+     so re-tuning run state can't silently drag warnings along (name a role,
+     not a hue). Same amber as processing today; decoupled for the future. */
+  --warning: #b45309;
+  --warning-soft: #fef3c7;
+
   /* run status — strong foreground + soft background */
   --status-idle: #71717a;
   --status-idle-soft: #f4f4f5;
@@ -78,6 +84,9 @@
   --destructive: #b91c1c;
   --destructive-fg: #fafafa;
 
+  --warning: #fbbf24;
+  --warning-soft: #422006;
+
   --status-idle: #a1a1aa;
   --status-idle-soft: #27272a;
   --status-processing: #fbbf24;
@@ -116,6 +125,9 @@
 
   --color-destructive: var(--destructive);
   --color-destructive-fg: var(--destructive-fg);
+
+  --color-warning: var(--warning);
+  --color-warning-soft: var(--warning-soft);
 
   --color-status-idle: var(--status-idle);
   --color-status-idle-soft: var(--status-idle-soft);

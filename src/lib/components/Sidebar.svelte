@@ -2,7 +2,10 @@
   import type { AgentRecord, AgentId } from "$lib/types";
   import { runtimes, transcripts } from "$lib/state/index.svelte";
   import { cn } from "$lib/utils";
-  import { HARNESS_BADGE_CLASS, HARNESS_LABEL } from "$lib/harnessDisplay";
+  import { HARNESS_LABEL } from "$lib/harnessDisplay";
+  import SidebarPanel from "$lib/components/ui/SidebarPanel.svelte";
+  import SidebarSection from "$lib/components/ui/SidebarSection.svelte";
+  import Badge from "$lib/components/ui/Badge.svelte";
 
   /// `onAddAgent` is the "+ Add agent" entry point in the sidebar header.
   /// Optional so existing callers + tests that don't pass it continue
@@ -15,8 +18,8 @@
   }
 
   function statusClass(status: "idle" | "starting" | "processing" | undefined): string {
-    if (status === "starting" || status === "processing") return "text-amber-700";
-    return "text-neutral-500";
+    if (status === "starting" || status === "processing") return "text-status-processing";
+    return "text-muted";
   }
 
   /// Claude session-total cost — null-safe sum across the agent's completed
@@ -63,117 +66,112 @@
   }
 </script>
 
-<aside class="flex w-64 flex-col border-l border-neutral-200 bg-neutral-50" data-testid="sidebar">
-  <div
-    class="flex items-center justify-between border-b border-neutral-200 px-4 py-3 text-xs font-semibold tracking-wide text-neutral-500 uppercase"
-  >
-    <span>Agents</span>
-    {#if onAddAgent}
-      <button
-        type="button"
-        class="rounded px-1.5 py-0.5 text-sm font-bold text-neutral-700 hover:bg-neutral-200"
-        title="Add agent"
-        aria-label="Add agent"
-        data-testid="sidebar-add-agent"
-        onclick={onAddAgent}
-      >
-        +
-      </button>
-    {/if}
-  </div>
-  <div class="flex-1 overflow-y-auto">
-    {#if agents.length === 0}
-      <p class="px-4 py-3 text-xs text-neutral-500">No agents in this project yet.</p>
-    {/if}
-    {#each agents as agent (agent.id)}
-      {@const runtime = runtimes[agent.id]}
-      {@const cost = sessionTotalCost(agent.id)}
-      {@const util = contextUtilization(agent.id)}
-      {@const rateLimit =
-        agent.harness === "codex" ? rateLimitPercent(runtime?.last_rate_limit) : undefined}
-      <div
-        class="border-b border-neutral-200 px-4 py-3"
-        data-testid="sidebar-agent"
-        data-agent-id={agent.id}
-      >
-        <div class="flex items-baseline justify-between gap-2">
-          <span class="font-mono text-sm font-semibold text-neutral-900" data-testid="agent-name">
-            {agent.name}
-          </span>
-          <span
-            class={cn(
-              "rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase",
-              HARNESS_BADGE_CLASS[agent.harness],
-            )}
-            data-testid="agent-harness-badge"
-          >
-            {HARNESS_LABEL[agent.harness]}
-          </span>
-        </div>
-        <div
-          class={cn("mt-1 text-xs", statusClass(runtime?.run_status))}
-          data-testid="agent-run-status"
+<SidebarPanel side="right" width="w-64" testid="sidebar">
+  <SidebarSection title="Agents">
+    {#snippet action()}
+      {#if onAddAgent}
+        <button
+          type="button"
+          class="text-fg hover:bg-raised rounded px-1.5 py-0.5 text-sm font-bold"
+          title="Add agent"
+          aria-label="Add agent"
+          data-testid="sidebar-add-agent"
+          onclick={onAddAgent}
         >
-          {statusLabel(runtime?.run_status)}
-        </div>
-        {#if runtime?.last_error}
-          <div class="mt-1 text-xs text-red-700" data-testid="agent-last-error">
-            {runtime.last_error.message}
+          +
+        </button>
+      {/if}
+    {/snippet}
+
+    {#if agents.length === 0}
+      <p class="text-muted px-4 py-3 text-xs">No agents in this project yet.</p>
+    {/if}
+    <div class="flex flex-col gap-1.5 p-2">
+      {#each agents as agent (agent.id)}
+        {@const runtime = runtimes[agent.id]}
+        {@const cost = sessionTotalCost(agent.id)}
+        {@const util = contextUtilization(agent.id)}
+        {@const rateLimit =
+          agent.harness === "codex" ? rateLimitPercent(runtime?.last_rate_limit) : undefined}
+        <div
+          class="border-border rounded-md border px-3 py-2.5"
+          data-testid="sidebar-agent"
+          data-agent-id={agent.id}
+        >
+          <div class="flex items-baseline justify-between gap-2">
+            <span class="text-fg font-mono text-sm font-semibold" data-testid="agent-name">
+              {agent.name}
+            </span>
+            <Badge variant="harness" harness={agent.harness} testid="agent-harness-badge">
+              {HARNESS_LABEL[agent.harness]}
+            </Badge>
           </div>
-        {/if}
-        {#if runtime?.hydration_error}
-          <div class="mt-1 text-xs text-red-700" data-testid="agent-hydration-error">
-            history failed to load: {runtime.hydration_error}
-          </div>
-        {/if}
-        {#if runtime?.parse_warnings && runtime.parse_warnings.length > 0}
           <div
-            class="mt-1 text-xs text-amber-700"
-            data-testid="agent-parse-warnings"
-            title={runtime.parse_warnings
-              .map((w) => `line ${w.line_number}: ${w.reason}`)
-              .join("\n")}
+            class={cn("mt-1 text-xs", statusClass(runtime?.run_status))}
+            data-testid="agent-run-status"
           >
-            ⚠ {runtime.parse_warnings.length} transcript warning{runtime.parse_warnings.length === 1
-              ? ""
-              : "s"}
+            {statusLabel(runtime?.run_status)}
           </div>
-        {/if}
-        {#if runtime?.meta}
-          <div class="mt-2 space-y-0.5 text-xs text-neutral-600" data-testid="agent-meta">
-            <div>model: <span class="font-mono">{runtime.meta.model}</span></div>
-            {#if runtime.meta.mcp_servers.length > 0}
-              <div>mcp: {runtime.meta.mcp_servers.length}</div>
-            {/if}
-            {#if runtime.meta.skills.length > 0}
-              <div>skills: {runtime.meta.skills.length}</div>
-            {/if}
-          </div>
-        {/if}
-        {#if agent.harness === "claude_code" && cost > 0}
-          <div class="mt-2 text-xs text-neutral-700" data-testid="agent-cost">
-            ${cost.toFixed(4)}
-          </div>
-        {/if}
-        {#if rateLimit !== undefined}
-          <div class="mt-2 text-xs text-neutral-700" data-testid="agent-rate-limit">
-            quota used: {rateLimit.toFixed(0)}%
-          </div>
-        {/if}
-        {#if util !== undefined}
-          <div class="mt-2" data-testid="agent-context-bar">
-            <div class="mb-0.5 text-[10px] text-neutral-500">
-              context after last turn: {(util * 100).toFixed(0)}%
+          {#if runtime?.last_error}
+            <div class="text-status-failed mt-1 text-xs" data-testid="agent-last-error">
+              {runtime.last_error.message}
             </div>
-            <div class="h-1 w-full overflow-hidden rounded bg-neutral-200">
-              <div
-                class="h-full bg-neutral-700"
-                style:width="{Math.min(util * 100, 100).toFixed(1)}%"
-              ></div>
+          {/if}
+          {#if runtime?.hydration_error}
+            <div class="text-status-failed mt-1 text-xs" data-testid="agent-hydration-error">
+              history failed to load: {runtime.hydration_error}
             </div>
-          </div>
-        {/if}
-      </div>
-    {/each}
-  </div>
-</aside>
+          {/if}
+          {#if runtime?.parse_warnings && runtime.parse_warnings.length > 0}
+            <div
+              class="text-warning mt-1 text-xs"
+              data-testid="agent-parse-warnings"
+              title={runtime.parse_warnings
+                .map((w) => `line ${w.line_number}: ${w.reason}`)
+                .join("\n")}
+            >
+              ⚠ {runtime.parse_warnings.length} transcript warning{runtime.parse_warnings.length ===
+              1
+                ? ""
+                : "s"}
+            </div>
+          {/if}
+          {#if runtime?.meta}
+            <div class="text-muted mt-2 space-y-0.5 text-xs" data-testid="agent-meta">
+              <div>model: <span class="font-mono">{runtime.meta.model}</span></div>
+              {#if runtime.meta.mcp_servers.length > 0}
+                <div>mcp: {runtime.meta.mcp_servers.length}</div>
+              {/if}
+              {#if runtime.meta.skills.length > 0}
+                <div>skills: {runtime.meta.skills.length}</div>
+              {/if}
+            </div>
+          {/if}
+          {#if agent.harness === "claude_code" && cost > 0}
+            <div class="text-fg mt-2 text-xs" data-testid="agent-cost">
+              ${cost.toFixed(4)}
+            </div>
+          {/if}
+          {#if rateLimit !== undefined}
+            <div class="text-fg mt-2 text-xs" data-testid="agent-rate-limit">
+              quota used: {rateLimit.toFixed(0)}%
+            </div>
+          {/if}
+          {#if util !== undefined}
+            <div class="mt-2" data-testid="agent-context-bar">
+              <div class="text-muted mb-0.5 text-[10px]">
+                context after last turn: {(util * 100).toFixed(0)}%
+              </div>
+              <div class="bg-border h-1 w-full overflow-hidden rounded">
+                <div
+                  class="bg-fg h-full"
+                  style:width="{Math.min(util * 100, 100).toFixed(1)}%"
+                ></div>
+              </div>
+            </div>
+          {/if}
+        </div>
+      {/each}
+    </div>
+  </SidebarSection>
+</SidebarPanel>

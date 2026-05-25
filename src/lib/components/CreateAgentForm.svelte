@@ -129,15 +129,15 @@
 -->
 {#snippet formBody()}
   <div
-    class="flex gap-2 rounded-md border border-neutral-200 bg-white p-1"
+    class="border-border bg-raised flex gap-2 rounded-md border p-1"
     role="tablist"
     data-testid="mode-toggle"
   >
     <button
       type="button"
       class="flex-1 rounded px-2 py-1 text-xs font-medium {mode === 'create'
-        ? 'bg-neutral-900 text-white'
-        : 'text-neutral-700 hover:bg-neutral-100'}"
+        ? 'bg-primary text-primary-fg'
+        : 'text-muted hover:bg-panel'}"
       role="tab"
       aria-selected={mode === "create"}
       data-testid="mode-create"
@@ -149,8 +149,8 @@
     <button
       type="button"
       class="flex-1 rounded px-2 py-1 text-xs font-medium {mode === 'attach'
-        ? 'bg-neutral-900 text-white'
-        : 'text-neutral-700 hover:bg-neutral-100'}"
+        ? 'bg-primary text-primary-fg'
+        : 'text-muted hover:bg-panel'}"
       role="tab"
       aria-selected={mode === "attach"}
       data-testid="mode-attach"
@@ -162,12 +162,10 @@
   </div>
 
   <fieldset class="space-y-1" disabled={busy}>
-    <legend class="text-xs text-neutral-600">Harness</legend>
+    <legend class="text-muted text-xs">Harness</legend>
     <div class="flex gap-3 text-sm" data-testid="harness-picker">
       <label
-        class="flex items-center gap-1.5 {claudeSelectable
-          ? ''
-          : 'cursor-not-allowed text-neutral-400'}"
+        class="flex items-center gap-1.5 {claudeSelectable ? '' : 'text-muted cursor-not-allowed'}"
         title={claudeReason ?? ""}
       >
         <input
@@ -182,9 +180,7 @@
         Claude Code
       </label>
       <label
-        class="flex items-center gap-1.5 {codexSelectable
-          ? ''
-          : 'cursor-not-allowed text-neutral-400'}"
+        class="flex items-center gap-1.5 {codexSelectable ? '' : 'text-muted cursor-not-allowed'}"
         title={codexReason ?? ""}
       >
         <input
@@ -199,9 +195,7 @@
         Codex
       </label>
       <label
-        class="flex items-center gap-1.5 {geminiSelectable
-          ? ''
-          : 'cursor-not-allowed text-neutral-400'}"
+        class="flex items-center gap-1.5 {geminiSelectable ? '' : 'text-muted cursor-not-allowed'}"
         title={geminiReason ?? ""}
       >
         <input
@@ -218,7 +212,7 @@
       <label
         class="flex items-center gap-1.5 {antigravitySelectable
           ? ''
-          : 'cursor-not-allowed text-neutral-400'}"
+          : 'text-muted cursor-not-allowed'}"
         title={antigravityReason ?? ""}
       >
         <input
@@ -234,20 +228,20 @@
       </label>
     </div>
     {#if selectedReason}
-      <p class="text-xs text-red-700" data-testid="harness-unavailable">
+      <p class="text-status-failed text-xs" data-testid="harness-unavailable">
         {selectedReason}
       </p>
     {/if}
   </fieldset>
 
   <label class="block space-y-1">
-    <span class="text-xs text-neutral-600">Agent name</span>
+    <span class="text-muted text-xs">Agent name</span>
     <Input bind:value={name} disabled={busy} data-testid="agent-name" />
   </label>
 
   {#if mode === "attach"}
     <label class="block space-y-1">
-      <span class="text-xs text-neutral-600"> Existing session UUID </span>
+      <span class="text-muted text-xs"> Existing session UUID </span>
       <Input
         bind:value={existingSessionId}
         disabled={busy}
@@ -255,7 +249,7 @@
         data-testid="attach-session-id"
       />
       {#if existingSessionId.trim() !== "" && !sessionIdValid}
-        <span class="block text-xs text-red-700" data-testid="attach-session-id-error">
+        <span class="text-status-failed block text-xs" data-testid="attach-session-id-error">
           Must be a UUID (8-4-4-4-12 hex characters).
         </span>
       {/if}
@@ -263,7 +257,7 @@
   {/if}
 
   {#if error}
-    <p class="text-xs text-red-700" data-testid="error">{error}</p>
+    <p class="text-status-failed text-xs" data-testid="error">{error}</p>
   {/if}
   <div class="flex justify-end gap-2">
     {#if onCancel}
@@ -294,10 +288,10 @@
 {:else}
   <!-- Standalone: page-fill centered card + heading. -->
   <div class="flex h-full flex-col items-center justify-center gap-6 p-8">
-    <div class="w-full max-w-md space-y-4 rounded-md border border-neutral-200 bg-neutral-50 p-6">
+    <div class="border-border bg-panel w-full max-w-md space-y-4 rounded-md border p-6">
       <div class="space-y-1">
-        <h2 class="text-lg font-semibold text-neutral-900">Create an agent</h2>
-        <p class="text-sm text-neutral-600">Agents live inside the active project.</p>
+        <h2 class="text-fg text-lg font-semibold">Create an agent</h2>
+        <p class="text-muted text-sm">Agents live inside the active project.</p>
       </div>
       {@render formBody()}
     </div>

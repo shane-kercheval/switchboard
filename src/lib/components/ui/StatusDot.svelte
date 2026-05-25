@@ -11,10 +11,11 @@
     /// + tooltip. When omitted, the dot is decorative (a sibling text label
     /// carries the meaning) and is hidden from assistive tech.
     label?: string;
+    testid?: string;
     class?: string;
   };
 
-  let { status, label, class: className }: Props = $props();
+  let { status, label, testid, class: className }: Props = $props();
 
   const DOT: Record<BadgeStatus, string> = {
     idle: "bg-status-idle",
@@ -26,6 +27,7 @@
 
 <span
   class={cn("inline-block h-1.5 w-1.5 shrink-0 rounded-full", DOT[status], className)}
+  data-testid={testid}
   title={label}
   aria-label={label}
   aria-hidden={label ? undefined : "true"}

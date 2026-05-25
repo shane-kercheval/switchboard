@@ -12,9 +12,15 @@
   /// a misuse (e.g. `variant="harness"` without `harness`) is a compile error
   /// rather than a silent degrade to a blank neutral chip.
   type Props =
-    | { variant: "harness"; harness: HarnessKind; class?: string; children: Snippet }
-    | { variant: "status"; status: BadgeStatus; class?: string; children: Snippet }
-    | { variant?: "neutral"; class?: string; children: Snippet };
+    | {
+        variant: "harness";
+        harness: HarnessKind;
+        class?: string;
+        testid?: string;
+        children: Snippet;
+      }
+    | { variant: "status"; status: BadgeStatus; class?: string; testid?: string; children: Snippet }
+    | { variant?: "neutral"; class?: string; testid?: string; children: Snippet };
 
   let props: Props = $props();
 
@@ -40,6 +46,7 @@
     tone,
     props.class,
   )}
+  data-testid={props.testid}
 >
   {@render props.children()}
 </span>

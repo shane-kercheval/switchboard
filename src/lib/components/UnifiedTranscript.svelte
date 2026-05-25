@@ -3,6 +3,7 @@
   import { transcripts, type Turn } from "$lib/state/index.svelte";
   import { buildUnifiedRows } from "$lib/state/unified";
   import { cn } from "$lib/utils";
+  import { HARNESS_COLOR } from "$lib/harnessDisplay";
   import Badge from "$lib/components/ui/Badge.svelte";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
 
@@ -45,6 +46,11 @@
 
   function recipientNames(agentIds: string[]): string {
     return agentIds.map(agentName).join(" | ");
+  }
+
+  function agentBorderColor(agentId: string): string {
+    const harness = agentById[agentId]?.harness;
+    return harness ? HARNESS_COLOR[harness] : "var(--border)";
   }
 
   // Auto-pin to bottom unless the user has scrolled up.
@@ -112,7 +118,7 @@
   <div class="space-y-5">
     {#each rows as row (row.key)}
       {#if row.kind === "user"}
-        <div class="space-y-1.5" data-testid="turn" data-role="user">
+        <div class="border-border space-y-1.5 border-l pl-3" data-testid="turn" data-role="user">
           <div class="flex items-center gap-2 text-[11px] font-semibold tracking-wide uppercase">
             <span class="text-muted">You</span>
             <span class="text-muted">→</span>
@@ -124,7 +130,8 @@
         </div>
       {:else if row.kind === "outcome"}
         <div
-          class="flex items-center gap-2 text-xs"
+          class="flex items-center gap-2 border-l pl-3 text-xs"
+          style:border-left-color={agentBorderColor(row.agent_id)}
           data-testid="turn-outcome"
           data-status={row.status}
         >
@@ -141,7 +148,12 @@
       {:else}
         {@const turn = row.turn}
         {@const harness = agentById[turn.agent_id]?.harness}
-        <div class="space-y-1.5" data-testid="turn" data-role="agent">
+        <div
+          class="space-y-1.5 border-l pl-3"
+          style:border-left-color={agentBorderColor(turn.agent_id)}
+          data-testid="turn"
+          data-role="agent"
+        >
           <div class="flex items-center gap-2 text-[11px] font-semibold tracking-wide uppercase">
             <span class="text-fg" data-testid="turn-agent-name">
               {agentName(turn.agent_id)}

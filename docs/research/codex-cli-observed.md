@@ -503,6 +503,30 @@ Verified post-M2.5 while running `make test-live` from PDT (UTC-7):
 
 
 
+## Findings: usage-limit / out-of-credits error shape (2026-05-25, codex-cli 0.133.0)
+
+Captured the real shape when the ChatGPT-subscription account is **out of Codex credits** (a perishable state worth probing while it lasted). Faithful adapter invocation (`codex exec --json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox … < /dev/null`). **Exit code 1.** Stream:
+
+```jsonl
+{"type":"thread.started","thread_id":"019e60ae-…"}
+{"type":"turn.started"}
+{"type":"error","message":"You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 1:00 PM."}
+{"type":"turn.failed","error":{"message":"You've hit your usage limit. … or try again at 1:00 PM."}}
+```
+
+The wall surfaces as a standalone `error` event **and** the terminal `turn.failed.error.message` carrying the same text (a reset time — "try again at 1:00 PM" — plus an upgrade link).
+
+**Alignment with the adapter — correct, verified against `codex/parser.rs`:**
+
+- **One terminal, no double-count.** `parse_error_event` only buffers the `error` payload into `state.last_error` (transcript-local fallback, non-terminal); the single `TurnEnd` comes from `parse_turn_failed` using `turn.failed.error.message` as canonical. The earlier standalone `error` does not emit a terminal. Matches the "exactly one `TurnEnd`" contract.
+- **Classified `FailureKind::HarnessError`** (not `AuthFailure`): `is_codex_auth_failure` keys on the substring `"401 Unauthorized"`, which a usage-limit message does **not** contain. Per the taxonomy this is right — `HarnessError`'s definition explicitly includes "rate limit", and the user *is* authenticated (out of credits, not logged out). The **verbatim message is preserved**, so the actionable text (reset time + upgrade/credits links) reaches the UI.
+- **Event-driven detection** means exit code 1 is irrelevant — the `turn.failed` is authoritative (consistent with Codex-exits-0-on-SIGTERM handling elsewhere).
+- **stderr noise is not surfaced.** This probe's stderr carried `Reading additional input from stdin...` (the known preamble, silenced in production by `Stdio::null()`) and an unrelated `rmcp` transport error (a misconfigured MCP server in the probe env: "url is invalid: relative URL without a base"). Neither reaches the user: on a real `turn.failed` the canonical message is `turn.failed.error.message`; stderr is appended only on the `AdapterFailure` / stream-ended-without-`turn.failed` fallback path, which did not fire here.
+
+**Design note — the hard wall is distinct from the rate-limit telemetry.** The cost/quota surface (system-design §7) reads Codex's *approaching*-limit signal from session-file `token_count.rate_limits` (a "how close am I" %). The **hard wall** ("you've hit your limit, retry at X") arrives instead as a **failed turn** (`HarnessError` + message) — a different signal on a different path. The verbatim message is the actionable surface; v1 does not parse the reset time or special-case "quota exhausted" vs. a generic harness error.
+
+**Resolved → scheduled for M4.9 (v1, not deferred).** An out-of-credits / usage-limit hit *will* get distinct UI treatment in v1 (like `AuthFailure`'s banner) rather than rendering as a generic `HarnessError` — Switchboard's multi-agent fan-out can burn Codex quota fast, and Codex headless shares the interactive subscription pool (see the billing note). Tracked in [`../implementation_plans/2026-05-12-v1-m4-dispatcher-contention-cancel.md` §M4.9 "Harness quota / usage-limit surfacing"](../implementation_plans/2026-05-12-v1-m4-dispatcher-contention-cancel.md), which adds a distinct `FailureKind` + a recognizable surface. **Note:** that M4.9 section is itself an AI-drafted proposal **not yet human-reviewed** — scope may change on review. Until M4.9 lands, the v1 behavior here (verbatim `HarnessError` message) remains correct and sufficient.
+
 ## MCP and skills registry sourcing
 
 For the user-facing sidebar listing of MCP servers and skills, Switchboard reads Codex's config files directly (the session file and stream don't carry the registry — see prior findings). The scope tables below are the authoritative in-repo summary; see [OpenAI's Codex Config Reference](https://developers.openai.com/codex/config-reference) and [Codex MCP docs](https://developers.openai.com/codex/mcp) for upstream documentation.

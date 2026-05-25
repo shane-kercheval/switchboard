@@ -71,6 +71,7 @@ Backend hardening + new mechanism first, then the UI that sits on top of it. The
 - **M4.6 — Project switcher (frontend + state reshape).** Always-loaded directory/project-list/active-project state; switcher UI; eager-load + lazy-hydrate; background listeners stay alive.
 - **M4.7 — Multi-recipient compose + fan-out.** Multi-select recipients; N independent dispatches; queueing UX for busy recipients.
 - **M4.8 — Context menu: cancel + open session file.** Per-agent actions in sidebar + transcript.
+- **M4.9 — Harness quota / usage-limit surfacing.** Distinct `FailureKind` + recognizable UI for "out of credits / usage limit" (vs generic harness error). **⚠️ DRAFT — not yet human-reviewed** (added from the 2026-05-25 Codex probe + a "v1, not v2" decision); see the section for the per-harness research prerequisite.
 
 **Dependency notes:** M4.1 is foundational for all. M4.2 must precede M4.3 (contract before adapters) and M4.4 (queue keys off the turn lifecycle and idle signal) and M4.8 (the UI action calls the command). M4.7 depends on M4.4. M4.6 has no hard dependency on the cancellation work and could move earlier if convenient, but is sequenced after the backend hardening so the switcher is built against final state shapes.
 
@@ -461,6 +462,49 @@ This is a small sub-milestone — compress accordingly. Add a context menu (side
 
 - **Tests:** cancel action is disabled when the agent is idle and enabled when in-flight, and invokes the command; open-session-file invokes the opener with the correct path (mock the opener). Keep these light — the heavy cancellation logic is tested in M4.2/M4.3.
 - **Docs:** note in the component which actions are intentionally absent in M4 and why.
+
+---
+
+## M4.9 — Harness quota / usage-limit surfacing
+
+> **⚠️ DRAFT — not yet human-reviewed.** This sub-milestone was drafted by an AI agent from a probe finding (the Codex out-of-credits capture, 2026-05-25) and a maintainer "do this in v1, not v2" decision. The scope, the `FailureKind` approach, the sequencing, and the per-harness research plan have **not** been reviewed or approved by a human. Treat it as a proposal pending review, not settled scope — unlike the other M4 sub-milestones above.
+
+### Goal & Outcome
+
+When an agent's turn fails because the user is **out of credits / has hit a usage limit**, surface it as its own recognizable state — not as a generic harness error. This is a v1 product requirement (resolves the "open product question" in `docs/research/codex-cli-observed.md`), **not** a v2 deferral: Switchboard's multi-agent fan-out can burn a subscription's quota fast, and (per the billing notes) `claude -p` moves to a separate Agent-SDK credit pool on 2026-06-15, so "this agent is out of credits" is a first-class state a user hits in normal operation.
+
+Outcomes:
+- A turn that fails on a usage/quota wall is classified as a distinct `FailureKind` (not `HarnessError`), and the UI renders it recognizably — mirroring how `AuthFailure` is treated (a clear "out of credits / usage limit — retry at HH:MM or upgrade" surface, not a generic red error) — in the transcript turn and the per-agent sidebar status.
+- The verbatim harness message (which carries the reset time + upgrade/credits links) is preserved as the body; the user can act on it without leaving Switchboard.
+- The dispatcher stays harness-agnostic — detection lives entirely in each adapter (the M2/M3 abstraction principle).
+
+### Sequencing & prerequisite research (do this first)
+
+Sequence **after M4.6–M4.8** — it renders on the final state / `Sidebar` / transcript shapes those land, and reuses the `Turn.error_kind` discrimination hook.
+
+**Prerequisite — capture each harness's real quota-exhaustion shape before writing detection; do not guess the strings.** Quota behavior diverges sharply per harness, so detection is per-adapter, and only one shape is captured so far:
+- **Codex — captured** (2026-05-25, see `codex-cli-observed.md` §"usage-limit / out-of-credits error shape"): a `turn.failed` whose `error.message` is `"You've hit your usage limit … try again at 1:00 PM"`. Fails the turn. Detection = message substring, like the existing `is_codex_auth_failure` 401 check.
+- **Gemini — partially seen, needs a real capture.** Observed *in passing* on stderr during the subagent probe: `"You have exhausted your capacity on this model. Your quota will reset after Ns"`, after which Gemini **retried/backed off and completed** rather than failing the turn. So Gemini may not emit a failed turn at all under quota — it may just stall. Confirm whether a hard wall ever surfaces as a `result`/`error` event, or whether it only ever degrades to a stall (in which case Gemini's answer is "nothing to classify" + the M8 stall-detection path — record that as the result).
+- **Claude — NOT captured; capture opportunistically.** Claude Code has its own usage-limit/rate-limit shape (and the 2026-06-15 Agent-SDK-credit-pool split makes `claude -p` exhaustion a distinct, real state). Probe it the next time a limit is hittable — same disciplined faithful-flags capture as the Codex one — and record the exact stream/`result` shape before implementing Claude detection.
+- **Antigravity** — unknown; capture if/when hittable. Lower priority.
+
+A focused `#[ignore]`-gated live capture or a recorded fixture per harness is the right artifact; detection strings must cite an observed message, not a guess.
+
+### Implementation Outline
+
+**Backend — a distinct `FailureKind`.** Add a variant (recommend `UsageLimit`; `RateLimited`/`QuotaExhausted` are alternatives — settle in expansion) to `FailureKind` in `crates/harness/src/events.rs`. It is **additive** to the `#[non_exhaustive]` enum (same shape as M4.2's `Cancelled` addition); the TS wire union gets the variant and the reducer default branch degrades gracefully (existing convention). Each adapter's terminal-failure path classifies into it from the observed message (Codex: the captured substring; Claude: its captured shape; Gemini: only if a hard wall actually surfaces). The verbatim message stays the `message` body — detection only sets the `kind`. Keep it per-adapter; **no `match harness {…}` in the dispatcher or `commands.rs`** (regression check, same as cancellation).
+
+**Frontend — a distinct surface, reusing the existing hook.** `Turn` already carries `error_kind: FailureKind` with a state comment anticipating per-kind rendering ("HarnessError → retry; AuthFailure → run login"). Branch on the new kind to render the recognizable quota surface in the transcript turn and the per-agent `Sidebar` status (reuse `Banner.svelte`). **Prerequisite check:** confirm whether `AuthFailure`'s distinct rendering is actually *built* today or merely carried as `error_kind` and rendered generically. If the per-kind failure render doesn't yet exist, M4.9 builds that small surface (and `AuthFailure` benefits too) — in-scope and the right place for it.
+
+**Reset time is preserved, not parsed (v1).** The "try again at HH:MM" lives in the verbatim message; v1 does not parse it into a structured retry/queue affordance. A future "auto-retry at reset" is explicitly out of scope.
+
+### Definition of Done
+
+- Each supported harness's quota-exhaustion shape is **captured (observed, not guessed)** and recorded in its research doc; detection strings cite the observation. Where a harness has no hard-wall failed turn (e.g. Gemini stalls/retries), that negative result is recorded as the answer rather than a forced classification.
+- `FailureKind::UsageLimit` (or chosen name) added additively; Codex (and Claude, once captured) classify into it with the verbatim message preserved; a fixture / `#[ignore]`-live test per captured harness asserts the classification.
+- The frontend renders the new kind distinctly (transcript + sidebar), verified by a component test; if `AuthFailure` rendering had to be built, it is covered too.
+- Dispatcher / `commands.rs` contain zero harness-specific quota branches (abstraction held).
+- The "open product question" in `codex-cli-observed.md` is updated to "resolved → implemented in M4.9."
 
 ---
 

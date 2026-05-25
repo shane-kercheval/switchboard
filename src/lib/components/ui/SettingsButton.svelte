@@ -10,13 +10,7 @@
     class?: string;
   };
 
-  let {
-    label,
-    pressed = false,
-    testid,
-    onclick,
-    class: className,
-  }: Props = $props();
+  let { label, pressed = false, testid, onclick, class: className }: Props = $props();
 
   const resolvedLabel = $derived(label ?? (pressed ? "Close settings" : "Open settings"));
 </script>

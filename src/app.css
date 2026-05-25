@@ -9,13 +9,15 @@
 /* ─── Semantic token model ───────────────────────────────────────────────
    Components reference these semantic roles, never raw palette hues. Light
    and dark are two mappings of the SAME names; adding dark mode anywhere is
-   "use the token." Four groups:
+   "use the token." Groups:
      - neutral surfaces (layered: surface → panel → raised → border → text)
      - primary (monochrome high-contrast action/selection)
      - accent (teal — focus rings, links, selected emphasis; narrow use)
-     - status (run state) and harness identity (per-harness chips)
-   Each colored role (status, harness) carries a strong foreground + a soft
-   background so a chip is `bg-{role}-soft text-{role}`. */
+     - destructive / warning action+caution surfaces
+     - status (run state) — strong foreground + soft background, so a status
+       chip/dot is `bg-status-{state}-soft text-status-{state}`.
+   Harness identity is conveyed by `HarnessIcon` (brand artwork) and the
+   `HARNESS_COLOR` map (transcript attribution), not by color tokens. */
 :root {
   /* neutral surfaces */
   --surface: #fafafa;
@@ -54,16 +56,6 @@
   --status-failed-soft: #fee2e2;
   --status-cancelled: #71717a;
   --status-cancelled-soft: #f4f4f5;
-
-  /* harness identity — strong foreground + soft background */
-  --harness-claude: #9a3412;
-  --harness-claude-soft: #ffedd5;
-  --harness-codex: #1e40af;
-  --harness-codex-soft: #dbeafe;
-  --harness-gemini: #065f46;
-  --harness-gemini-soft: #d1fae5;
-  --harness-antigravity: #6b21a8;
-  --harness-antigravity-soft: #f3e8ff;
 }
 
 .dark {
@@ -95,15 +87,6 @@
   --status-failed-soft: #450a0a;
   --status-cancelled: #a1a1aa;
   --status-cancelled-soft: #27272a;
-
-  --harness-claude: #fdba74;
-  --harness-claude-soft: #431407;
-  --harness-codex: #93c5fd;
-  --harness-codex-soft: #172554;
-  --harness-gemini: #6ee7b7;
-  --harness-gemini-soft: #022c22;
-  --harness-antigravity: #d8b4fe;
-  --harness-antigravity-soft: #3b0764;
 }
 
 /* `inline` so the generated utilities reference the CSS variables by name
@@ -137,15 +120,6 @@
   --color-status-failed-soft: var(--status-failed-soft);
   --color-status-cancelled: var(--status-cancelled);
   --color-status-cancelled-soft: var(--status-cancelled-soft);
-
-  --color-harness-claude: var(--harness-claude);
-  --color-harness-claude-soft: var(--harness-claude-soft);
-  --color-harness-codex: var(--harness-codex);
-  --color-harness-codex-soft: var(--harness-codex-soft);
-  --color-harness-gemini: var(--harness-gemini);
-  --color-harness-gemini-soft: var(--harness-gemini-soft);
-  --color-harness-antigravity: var(--harness-antigravity);
-  --color-harness-antigravity-soft: var(--harness-antigravity-soft);
 
   --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   --font-mono:

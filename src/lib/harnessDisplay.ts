@@ -29,13 +29,3 @@ export const HARNESS_COLOR: Record<HarnessKind, string> = {
   gemini: "#17b967",
   antigravity: "#3187fe",
 };
-
-/// Token-driven harness badge classes (soft background + strong foreground),
-/// consumed by the `Badge` primitive. Themes correctly in light and dark via
-/// the semantic `harness-*` tokens.
-export const HARNESS_BADGE_TOKEN: Record<HarnessKind, string> = {
-  claude_code: "bg-harness-claude-soft text-harness-claude",
-  codex: "bg-harness-codex-soft text-harness-codex",
-  gemini: "bg-harness-gemini-soft text-harness-gemini",
-  antigravity: "bg-harness-antigravity-soft text-harness-antigravity",
-};

@@ -160,10 +160,7 @@ impl Directory {
     /// time, for a completed turn; that's close enough for ordering. A missing
     /// or unreadable journal (never-dispatched project) yields `fallback`.
     pub fn project_last_activity(&self, id: ProjectId, fallback: DateTime<Utc>) -> DateTime<Utc> {
-        let journal = self
-            .projects_dir()
-            .join(id.to_string())
-            .join(JOURNAL_FILE);
+        let journal = self.projects_dir().join(id.to_string()).join(JOURNAL_FILE);
         let mtime = std::fs::metadata(&journal)
             .and_then(|m| m.modified())
             .ok()
@@ -298,7 +295,10 @@ mod tests {
         let fallback = DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        assert_eq!(directory.project_last_activity(project.id, fallback), fallback);
+        assert_eq!(
+            directory.project_last_activity(project.id, fallback),
+            fallback
+        );
     }
 
     #[test]

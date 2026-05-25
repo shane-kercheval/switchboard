@@ -83,6 +83,7 @@ After either command, commit both the manifest change and the lockfile diff in o
 - Svelte 5 runes (`$state`, `$derived`, `$effect`).
 - Wire-format types match Rust `#[serde(tag = "type", rename_all = "snake_case")]` — TS uses discriminated unions with snake_case keys. New variants land additively (`#[non_exhaustive]` on the Rust side; reducer default branches on the TS side that degrade gracefully on unknown discriminants).
 - `DateTime<Utc>` serializes as ISO-8601 string; consumers convert at the boundary if they need `Date` objects.
+- **Styling & components: see `docs/ui-conventions.md`.** Reach for a `src/lib/components/ui/` primitive before hand-rolling; a component that needs a color names a semantic token (`bg-surface`, `text-status-failed`), never a raw palette hue. That doc is the source of truth for the token model, the primitive set, and theming.
 
 ### Both languages
 
@@ -137,6 +138,7 @@ Project-wide rules that apply across all milestones. Milestone-specific mechanic
 ## Authoritative docs
 
 - `docs/system-design.md` — canonical design (the "what and why").
+- `docs/ui-conventions.md` — frontend styling + component conventions (token model, `ui/` primitives, theming).
 - `docs/implementation_plans/` — per-milestone plans and the v1 roadmap. Read the active milestone plan before changing scope; it's the ground truth for what to build.
 - `docs/research/` — harness ground-truth notes (one per harness):
   - `claude-code-cli-observed.md`, `claude-code-headless.md` — Claude Code CLI behavior.

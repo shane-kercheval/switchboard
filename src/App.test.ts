@@ -926,9 +926,7 @@ describe("App", () => {
     // Collapse the sidebar — the settings button moves to the center title bar.
     const sidebar = screen.getByTestId("projects-sidebar");
     await fireEvent.click(within(sidebar).getByTestId("projects-sidebar-toggle"));
-    await waitFor(() =>
-      expect(screen.queryByTestId("projects-sidebar")).not.toBeInTheDocument(),
-    );
+    await waitFor(() => expect(screen.queryByTestId("projects-sidebar")).not.toBeInTheDocument());
 
     // Settings button is now in the title bar with the correct closed-state label.
     const titleBarBtn = screen.getByTestId("settings-button");

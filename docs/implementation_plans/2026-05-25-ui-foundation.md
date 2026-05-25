@@ -111,7 +111,7 @@ Migrate screen by screen, replacing inline styling with primitives + semantic to
 ### Definition of Done
 
 - All existing frontend tests pass unchanged (or with only selector updates where a primitive renames a wrapper — behavior assertions unchanged).
-- Manual verification in `make dev`, light **and** dark: each screen reviewed for consistency. (State explicitly if the GUI can't be run in a given environment.)
+- Manual verification in `make dev`, light **and** dark: each screen reviewed for consistency. (State explicitly if the GUI can't be run in a given environment.) The class-presence unit tests prove a primitive _requests_ a token, not that it _resolves_ correctly in dark (jsdom has no CSS cascade) — so this dark pass is a **per-primitive checklist** (Button, Badge ×4 harness + ×4 status, StatusDot, DropdownMenu, Input, Textarea, Dialog, destructive Button), not an end-of-milestone vibe-check. Each must be eyeballed in dark.
 - Grep shows no remaining raw status/harness color literals (`text-amber-700`, `text-red-700`, `bg-*-100` harness badges) outside the token definitions.
 
 ---

@@ -33,6 +33,12 @@
   --accent: #0d9488;
   --accent-fg: #ffffff;
 
+  /* destructive action surface — a solid fill (distinct from the soft
+     status-failed chip) so a destructive button carries primary-level weight.
+     fg must clear contrast on the fill in both themes. */
+  --destructive: #dc2626;
+  --destructive-fg: #ffffff;
+
   /* run status — strong foreground + soft background */
   --status-idle: #71717a;
   --status-idle-soft: #f4f4f5;
@@ -67,6 +73,10 @@
 
   --accent: #2dd4bf;
   --accent-fg: #042f2e;
+
+  /* deeper, less-glary red on a dark surface; white text clears contrast */
+  --destructive: #b91c1c;
+  --destructive-fg: #fafafa;
 
   --status-idle: #a1a1aa;
   --status-idle-soft: #27272a;
@@ -103,6 +113,9 @@
 
   --color-accent: var(--accent);
   --color-accent-fg: var(--accent-fg);
+
+  --color-destructive: var(--destructive);
+  --color-destructive-fg: var(--destructive-fg);
 
   --color-status-idle: var(--status-idle);
   --color-status-idle-soft: var(--status-idle-soft);

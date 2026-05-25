@@ -45,13 +45,13 @@
     <BitsDialog.Overlay class="fixed inset-0 z-40 bg-black/40" data-testid="dialog-overlay" />
     <BitsDialog.Content
       class={[
-        "fixed top-1/2 left-1/2 z-50 w-full -translate-x-1/2 -translate-y-1/2 rounded-md border border-neutral-200 bg-white shadow-lg",
+        "border-border bg-raised fixed top-1/2 left-1/2 z-50 w-full -translate-x-1/2 -translate-y-1/2 rounded-md border shadow-lg",
         contentClass ?? "max-w-md",
       ].join(" ")}
       data-testid="dialog-content"
     >
       <BitsDialog.Title
-        class="border-b border-neutral-200 px-4 py-3 text-sm font-semibold text-neutral-900"
+        class="border-border text-fg border-b px-4 py-3 text-sm font-semibold"
         data-testid="dialog-title"
       >
         {title}

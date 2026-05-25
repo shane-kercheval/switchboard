@@ -322,6 +322,39 @@ The `system/init` event — which the M1 parser reads to populate `SessionMeta.t
 
 For both harnesses, the conversation **content** rehydrates fine — `assistant`/`user` records (Claude) and `response_item/message` records (Codex) carry the turn text + tool calls. The on-disk gap is specifically the **registry of available capabilities**, which the harnesses treat as a runtime/configuration concern rather than a per-session artifact. This is M2.6's design problem, not a regression in shipped code.
 
+## Subagent (`Agent` tool) representation — stream vs disk (2026-05-24, claude-code 2.1.149/2.1.150)
+
+Default `claude -p` (which Switchboard uses) loads the user's full environment, so the model can **delegate to subagents** mid-turn — the built-in `Explore`/`Plan`/`general-purpose` agents or any user-defined `.claude/agents/*.md`. This is auto-invoked behavior (the model decides to delegate); it is *not* exotic. Two hands-on probes (a trivial "reply pong" subagent and a tool-using "run `echo hello-from-subagent` and report" subagent) established exactly how this surfaces. **It surfaces differently on the live stream vs. on disk, and the live shape mis-attributes subagent work to the parent turn.** This is the ground truth behind the follow-up work item [`../implementation_plans/2026-05-24-subagent-rendering-fidelity.md`](../implementation_plans/2026-05-24-subagent-rendering-fidelity.md).
+
+**The tool is named `Agent`, not `Task`** in this CLI era. It appears as a normal `tool_use` block: `{ "name": "Agent", "input": { "description", "subagent_type", "prompt" } }`. (System-design §9 calls it "the `Task` tool" — stale; update to `Agent`.)
+
+**Live stream — subagent-internal events are emitted, tagged with `parent_tool_use_id`.** Each top-level stream record carries a `parent_tool_use_id` field: `null` for the parent agent's own events, and set to the `Agent` tool_use's id for any event produced *by* the subagent. A tool-using subagent produces this sequence (parent agent's `Agent` call has id `toolu_017e…`):
+
+```
+assistant  parent_tool_use_id=null        content: tool_use  name=Agent      (toolu_017e…)  ← parent
+assistant  parent_tool_use_id=toolu_017e… content: tool_use  name=Bash       (toolu_01UE…)  ← SUBAGENT's own call
+user       parent_tool_use_id=toolu_017e… content: tool_result            (Bash output)     ← SUBAGENT's own result
+user       parent_tool_use_id=null        content: tool_result            (Agent aggregate) ← subagent's report to parent
+```
+
+New `system` subtypes also appear during a subagent run: `task_started`, `task_notification`, `status` (alongside the existing set). `parse_system_event` only acts on `subtype == "init"` and skips all others, so these are handled gracefully (no error) — confirmed by the existing `system_non_init_subtype_is_skipped` test.
+
+**On disk — the subagent's internals live in a separate sidecar file, NOT inline.** The main session file (`~/.claude/projects/<encoded-cwd>/<session>.jsonl`) records only the parent's `Agent` tool_use + its aggregate `tool_result`. The subagent's own `Bash` call is written to a **separate** transcript at:
+
+```
+~/.claude/projects/<encoded-cwd>/<session-id>/subagents/agent-<id>.jsonl
+```
+
+There are **no `isSidechain:true` records** in the main file in this era (the older inline-sidechain layout is gone). New top-level record types observed in the 2.1.149/150 main file (beyond the M2.4-prep list): `ai-title`, `attachment`, `last-prompt`, `queue-operation` — all non-conversation metadata the rehydration parser should skip.
+
+**The load-bearing consequence (for the parser and M4.6 rehydration):** the parser (`crates/harness/src/parser.rs`) **does not read `parent_tool_use_id`**. So:
+
+- **Live:** `parse_assistant_envelope` / `parse_user_envelope` emit `ToolStarted{name:"Bash"}` / `ToolCompleted` for the subagent's internal call **with the parent's `turn_id`** — rendering the subagent's work as the *parent agent's own* tool calls, interleaved between the `Agent` `ToolStarted` and its `ToolCompleted`. A subagent doing N tool calls floods the parent turn with N mis-attributed calls.
+- **Disk/rehydration:** `session_file.rs` reads only the main file (it does not descend into `subagents/`), so the rehydrated turn shows just the `Agent` call + its aggregate result — the nested calls are absent.
+- **Net:** the *same turn renders differently live vs. after restart* — live over-shows (nested calls, mis-attributed); rehydrate under-shows (only the `Agent` summary). Neither corrupts data; it's a rendering-fidelity + consistency gap. The disk view is the *correct* abstraction level ("a delegation is one tool call from the parent's view"), and matches how Gemini's `invoke_agent` already surfaces (one `ToolStarted`/`ToolCompleted` pair — though whether Gemini *also* leaks a tool-using subagent's internals into its stream is not yet probed; see the follow-up item).
+
+Probe commands (reproducible; `--include-partial-messages --verbose --dangerously-skip-permissions`, fixed `--session-id`, throwaway cwd) are recorded in the follow-up work item.
+
 ## Things still worth probing
 
 - **`--input-format stream-json`** — for sending follow-up messages mid-stream without restarting the process. Could matter for the "long-lived agent process" deferred decision.

@@ -423,6 +423,33 @@ For each contract Switchboard's Gemini adapter relies on, here is the Antigravit
 | Concurrent-dispatch safety | UUID-v7 first-8-char filename collision risk (use UUID v4) | No filename collision risk — full-UUID directories | **Same** (no concern here) |
 | `.gitignore` impact in cwd | None — Gemini doesn't write into the user's cwd | `<cwd>/.antigravitycli/<project-uuid>.json` symlink IS written on first invocation | **Different** (new gitignore consideration) |
 
+## Subagent (`invoke_subagent`) representation — separate conversation, no mis-attribution (2026-05-24, agy 1.0.2)
+
+Probed whether a subagent's *internal* tool calls leak into the parent conversation's transcript (the Antigravity analogue of [Claude's mis-attribution gap](claude-code-cli-observed.md) — see [`../implementation_plans/2026-05-24-subagent-rendering-fidelity.md`](../implementation_plans/2026-05-24-subagent-rendering-fidelity.md)). Prompt: "Use a subagent to run the shell command `echo hello-from-subagent` and report its output." **Answer: no leak — Antigravity isolates the subagent more strongly than either Claude or Gemini.**
+
+**A subagent runs as its own `brain/<uuid>` conversation.** The single dispatch produced **two** new brain dirs: the parent (carries `.agents/agents/command_runner/agent.json` — the subagent it defined — plus a `messages/` dir) and a **wholly separate** conversation for the subagent's own execution. The subagent's `run_command` (`echo hello-from-subagent`) is recorded only in the *subagent's* conversation, which Switchboard **never tails** (Switchboard only knows the parent's UUID; it didn't spawn the subagent and has no sidecar for it).
+
+**The parent transcript surfaces the delegation as ordinary tool calls, not the subagent's internals.** Parent `transcript.jsonl` record sequence:
+
+```
+USER_INPUT
+PLANNER_RESPONSE  tool_calls=[define_subagent]
+GENERIC           (MODEL-sourced → is_tool_result → completes define_subagent)
+PLANNER_RESPONSE  tool_calls=[invoke_subagent]   args carry the subagent's prompt + role
+INVOKE_SUBAGENT   (MODEL-sourced → is_tool_result → completes invoke_subagent)
+PLANNER_RESPONSE  (terminal answer text)
+```
+
+So our parser (`antigravity/parser.rs`, `record_to_live_events`) emits, for the parent turn: `ToolStarted{define_subagent}`→`ToolCompleted`, `ToolStarted{invoke_subagent}`→`ToolCompleted`, then the answer `ContentChunk` + `TurnEnd`. The subagent's `run_command` appears **nowhere** in what Switchboard reads. **No parser change needed** — this is already the "a delegation is one (here, two) tool call(s) from the parent's view" shape.
+
+The FIFO tool-pairing in `record_to_live_events` (`pending_tool_ids.pop_front()`) pairs correctly here because the calls are **sequential** — each tool-result record lands before the next tool call (`define_subagent`→`GENERIC`, then `invoke_subagent`→`INVOKE_SUBAGENT`). (A record carrying *multiple concurrent* `tool_calls` followed by interleaved results could expose a FIFO mis-pair, but that shape wasn't produced by the subagent flow and is a separate general concern, not a subagent gap.)
+
+**Net cross-harness:** the subagent mis-attribution gap is **Claude-only**. Gemini (`invoke_agent`) is opaque; Antigravity (`invoke_subagent`) runs the subagent in a separate conversation. Both already match the target shape the Claude fix aims for.
+
+### Aside confirmed during this probe: `agy -p` blocks indefinitely on an open stdin
+
+`agy -p <prompt>` with stdin left attached (no EOF) **hangs forever** — it never creates a `brain/<uuid>` dir, never emits, never exits (observed on both a trivial `ack` prompt and the subagent prompt; not quota-related). Redirecting `< /dev/null` makes it complete normally (exit 0, brain dir created). Unlike Gemini (which warns "no stdin data received in 3s, proceeding"), `agy` has **no stdin timeout**. This is why Switchboard's adapter spawning with `Stdio::null()` is **load-bearing, not hygiene** — without it the harness would hang every turn. (Also a reminder for manual probing: always run `agy -p … < /dev/null`.)
+
 ## Pending verification / unclear after probing
 
 1. **Auth-failure shape.** Requires revoking the Keychain entry; not probed. Expected to surface as a stdout/stderr error since `agy` has no JSON envelope.

@@ -527,6 +527,23 @@ Probe used Python's `subprocess.Popen(start_new_session=True)` (equivalent to Sw
 
 **Bonus finding**: Gemini's `invoke_agent` builtin tool can dispatch internal sub-agents that take a long time to complete (~47s for a "count to 100" sub-agent). For Switchboard's M4 per-turn timeout work, this means a single Gemini "turn" can legitimately exceed 60s of wall clock even on a simple-looking prompt. Generous defaults required.
 
+### CONFIRMED: `invoke_agent` subagents are OPAQUE in the stream — no mis-attribution (2026-05-24, gemini 0.42.0)
+
+Follow-up to the bonus finding above, probing a **tool-using** subagent (the earlier note used a "count to 100" subagent that ran no tools). Prompt dispatched a `generalist` subagent instructed to run `echo hello-from-subagent` and report; invocation `gemini -p … --output-format stream-json --yolo --skip-trust`. Stream:
+
+```
+tool_use     tool_name=update_topic     (Gemini's planning/UI tool — unrelated)
+tool_use     tool_name=invoke_agent     parameters={prompt, agent_name:"generalist"}
+tool_result  tool_id=update_topic…      status=success
+tool_result  tool_id=invoke_agent…      status=success            (no `output` field)
+message      role=assistant             "done"
+result
+```
+
+**The subagent's internal `run_shell_command` does NOT appear as a stream tool event** — there is no nested/parent-tagged tool call, and `run_shell_command`/`run_command` appear nowhere in the stream. The subagent runs fully opaquely: the stream shows only the `invoke_agent` `tool_use`/`tool_result` pair, and the parent agent's final `message`. (The subagent's reported output didn't even surface in a top-level message here — the assistant just said "done".)
+
+**Implication:** Gemini does **not** have Claude's subagent mis-attribution gap (see [`claude-code-cli-observed.md` §"Subagent (`Agent` tool) representation"](claude-code-cli-observed.md) and [`../implementation_plans/2026-05-24-subagent-rendering-fidelity.md`](../implementation_plans/2026-05-24-subagent-rendering-fidelity.md)). Our adapter maps `invoke_agent` → one `ToolStarted`/`ToolCompleted` pair and the subagent internals never reach the parser. **No Gemini parser change needed** — `invoke_agent`-as-one-tool-call is already the target shape the Claude fix aims for. (Caveat: the probe hit free-tier quota — 3 "exhausted your capacity" retries — but still completed with valid structure; quota affected timing, not the event shapes.)
+
 ### CRITICAL — NEW: concurrent dispatches in the same cwd can corrupt the on-disk session file if session-id prefixes collide
 
 **This is the most important M3 finding** and a real abstraction-load-bearing surprise. Two concurrent `gemini -p` invocations from the same cwd with session IDs that happen to share their first 8 hex characters write to the **same** session file (`session-<startTime>-<prefix>.jsonl`), interleaving each other's records.

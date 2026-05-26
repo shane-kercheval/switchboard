@@ -70,7 +70,7 @@ Backend hardening + new mechanism first, then the UI that sits on top of it. The
 
 - **M4.6 — Project switcher (frontend + state reshape).** Always-loaded directory/project-list/active-project state; switcher UI; eager-load + lazy-hydrate; background listeners stay alive.
 - **M4.7 — Multi-recipient compose + fan-out.** Multi-select recipients; N independent dispatches; queueing UX for busy recipients.
-- **M4.8 — Context menu: cancel + open session file.** Per-agent actions in sidebar + transcript.
+- **M4.8 — Per-agent actions: cancel, stop, open + resume session.** Solo-turn cancel in the transcript; sidebar kebab with stop-agent (cancel + clear queue, new `CancelAgent` command), open session file, and copy a TUI-resume command (all four harnesses; copy-only, with collision warning).
 - **M4.9 — Harness quota / usage-limit surfacing.** Distinct `FailureKind` + recognizable UI for "out of credits / usage limit" (vs generic harness error). **⚠️ DRAFT — not yet human-reviewed** (added from the 2026-05-25 Codex probe + a "v1, not v2" decision); see the section for the per-harness research prerequisite.
 
 **Dependency notes:** M4.1 is foundational for all. M4.2 must precede M4.3 (contract before adapters) and M4.4 (queue keys off the turn lifecycle and idle signal) and M4.8 (the UI action calls the command). M4.7 depends on M4.4. M4.6 has no hard dependency on the cancellation work and could move earlier if convenient, but is sequenced after the backend hardening so the switcher is built against final state shapes.
@@ -446,28 +446,64 @@ This reuses the M4.4 actor's existing `Cancel` + backlog-removal primitives, gat
 
 ---
 
-## M4.8 — Context menu: cancel + open session file
+## M4.8 — Per-agent actions: cancel, stop, open + resume session
 
 ### Goal & Outcome
 
-Surface the per-agent actions M4 supports directly where the user works.
+Surface the per-agent actions M4 supports directly where the user works. Cancel lives in two places by scope: a **send/turn-scoped** cancel inline in the transcript (alongside the M4.7 fan-out cancel affordances), and an **agent-scoped** stop in the sidebar that also clears the agent's queued backlog. Session-file actions (open in the default app; copy a TUI-resume command) live behind a single per-agent menu in the sidebar.
 
 Outcomes:
-- The user can cancel an agent's in-flight turn from the sidebar entry and from the agent's turns in the transcript.
-- The user can open an agent's underlying harness session file in their default editor.
+- The user can cancel an agent's in-flight **solo** turn inline in the transcript (the fan-out cancel affordances already exist from M4.7).
+- The user can **stop an agent** from the sidebar — cancels its in-flight turn *and* drops all of its queued (not-yet-started) sends, leaving the agent loaded and idle.
+- The user can **open** an agent's underlying harness session file in the OS default app.
+- The user can **copy a ready-to-run TUI-resume command** for the agent's session, with a prominent session-collision warning.
 
 ### Implementation Outline
 
-This is a small sub-milestone — compress accordingly. Add a context menu (sidebar entry + transcript turn) exposing exactly two actions for M4:
-- **Cancel in-flight turn** — enabled only when the agent's `run_status` is in-flight; calls `cancel_turn(agent_id)` (M4.2). Show the partial output remaining (M4.2/system-design §7) labelled cancelled.
-- **Open session file** — opens the harness JSONL session file via the OS default opener (Tauri's shell/opener capability). The path is derivable from the agent's harness + session-id (the adapters already encode these paths; reuse that logic rather than re-deriving the encoding).
+A small sub-milestone, but it spans a tiny backend addition plus per-adapter command knowledge — compress the UI accordingly. Four actions:
 
-**Explicitly deferred from M4** (record in a comment / the plan, so the next agent doesn't add them speculatively): fork-session and reset/remove. They are part of the v1 product (system-design §7 lists them) but bring deletion/lifecycle complexity (and fork is Claude-only) that is out of M4's scope.
+**1. Cancel a solo in-flight turn (transcript, send/turn-scoped).** The M4.7 fan-out group already renders per-recipient `Cancel` + a group `Cancel send` (both call `cancelSend(send_id, …)`). A **single-recipient** streaming turn has no cancel today — add a small inline `Cancel` on a solo streaming turn matching the fan-out card style. It calls the existing `cancel_turn(agent_id)` (M4.2). Show the partial output remaining (M4.2/system-design §7) labelled cancelled.
+
+**2. Stop an agent (sidebar, agent-scoped — needs a small new backend command).** "Stop this agent" must cancel the running turn **and** drop every queued send, with the agent staying loaded (idle), ready for new work. None of the existing commands do exactly this:
+- `cancel_turn`/`Command::Cancel` cancels only the in-flight turn — the backlog would then keep draining.
+- `cancel_send`/`Command::CancelSend` clears only the queued items matching one `send_id`.
+- `Shutdown` cancels current + clears the backlog but also **closes the actor** (removes the agent) — too much.
+
+So add a new dispatcher command — **`Command::CancelAgent { source }`** (name TBD; `StopAgent` is the alternative) — that fires the running turn's cancellation token (if any) **and** `backlog.clear()`s the queue, **without** shutting the actor down. Expose `dispatcher.cancel_agent(agent_id, source)` + a `cancel_agent_impl` app shim and `#[tauri::command]`. Dropped queued sends were never journaled (the journal writes a send record only at turn-start — system-design §3), so there is nothing to persist on clear; this stays consistent with the existing invariant. Enabled when the agent has anything live (in-flight or queued).
+
+**3. Open session file (default app).** Open the harness JSONL session file via the OS default opener (Tauri's opener capability). The path is derivable from the agent's harness + session-id — reuse the adapters' existing path-encoding logic (`claude_session_file_path`, the Codex sidecar's date/session pair, etc.), do **not** re-derive the encoding.
+
+**4. Copy TUI-resume command (per-adapter, all four harnesses).** Render a click-open panel (not hover-expand) in the sidebar menu showing the exact command to resume this session interactively in the user's own terminal, a `Copy` button, and a session-collision warning. We **only copy** the command — Switchboard never launches a terminal and never executes it — which entirely sidesteps the same-session-parallel-invocation hazard (`docs/research/same-session-parallel-invocation.md`) at our layer: the user owns the timing, and the warning makes the risk explicit (*"Don't run this while the agent is active in Switchboard — two processes writing one session file will corrupt it."*).
+
+The resume command is the **interactive** form of each harness's invocation — i.e. drop the headless print/exec mode (`-p` / `exec --json` / `--print`) but **keep the same dangerous-skip flag** the adapter already passes, and pass **no `--model`** (the adapters pass none today, so resume uses the harness default — matching current behavior). Because session-file paths are cwd-derived for some harnesses (Claude especially), the copied line **sets the working directory first** (`cd "<project-dir>" && …`) so it resolves regardless of where the user's terminal sits.
+
+Add a per-adapter method on the `HarnessAdapter` trait — e.g. `fn resume_command(&self, agent: &AgentRecord, cwd: &Path) -> Option<Vec<String>>` (program + args; `None` for a harness with no usable resume-by-id form) — sibling to the existing `build_args`. The app shell-quotes the tokens, prepends the `cd`, and exposes the assembled string via a Tauri command for the panel to display/copy. Keep flag knowledge in the adapter; **no `match harness {…}` in the app/`commands.rs`** (same regression discipline as cancellation).
+
+**Best-effort resume commands — verify by live testing before shipping.** Derived from the per-harness research docs + current adapter flags; the maintainer will run each against the real CLI and we correct any that differ (capture, don't guess — same discipline as M4.9). All four are in scope.
+
+| Harness | Headless form (today) | Interactive TUI-resume (this milestone, to verify) |
+| --- | --- | --- |
+| **Claude Code** | `claude -p "…" --dangerously-skip-permissions --resume <uuid>` | `claude --resume <session-id> --dangerously-skip-permissions` |
+| **Codex** | `codex exec resume <id> --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox "…"` | `codex resume <session-id> --dangerously-bypass-approvals-and-sandbox` (top-level `resume` is the interactive variant; `--skip-git-repo-check` is exec-only — confirm whether interactive needs it) |
+| **Gemini** | `gemini -p "…" [--session-id\|--resume <uuid>] --skip-trust` | `gemini --session-id <session-id> --skip-trust` (interactive `-r/--resume` takes `latest`/index, **not** a uuid — re-passing `--session-id` is the uuid-stable path; confirm it continues rather than forks) |
+| **Antigravity** | `agy -p "…" --conversation <uuid> --dangerously-skip-permissions` | `agy --conversation <session-id> --dangerously-skip-permissions` (drop `-p`; `--prompt-interactive` is the seeded-interactive variant if a starting prompt is wanted) |
+
+**UI placement.** All per-agent inspect/lifecycle actions live behind a single kebab (`⋯`) on the **sidebar** agent entry: `Stop agent`, `Open session file`, and `Resume in terminal…` (the trailing `…` signals it opens the copy panel rather than acting immediately). The transcript gains only the solo-turn inline `Cancel` (#1) — it does not duplicate the sidebar menu.
+
+**Explicitly deferred from M4** (record in a comment / the plan, so the next agent doesn't add them speculatively):
+- **Auto-launching the resume in a terminal** and an **"Open with…" app picker** (VS Code / Sublime / iTerm2 / …). Both need macOS app-detection + per-terminal launch plumbing, and the auto-launch reintroduces the same-session collision that copy-only avoids. Higher value but a separate, larger piece; intentionally out of M4. Copy-only is the deliberate thin slice.
+- **Fork-session and reset/remove.** Part of the v1 product (system-design §7) but bring deletion/lifecycle complexity (and fork is Claude-only) that is out of M4's scope.
 
 ### Definition of Done
 
-- **Tests:** cancel action is disabled when the agent is idle and enabled when in-flight, and invokes the command; open-session-file invokes the opener with the correct path (mock the opener). Keep these light — the heavy cancellation logic is tested in M4.2/M4.3.
-- **Docs:** note in the component which actions are intentionally absent in M4 and why.
+- **Tests:**
+  - Solo-turn `Cancel` is present only on a solo *streaming* turn (not idle, not historical) and invokes `cancel_turn`.
+  - `Stop agent` is enabled when the agent is in-flight **or** has queued sends, disabled when fully idle, and invokes `cancel_agent`. A dispatcher-level test asserts `CancelAgent` cancels the running turn **and** empties the backlog while the actor stays alive (a subsequent `Send` is accepted and dispatches).
+  - `Open session file` invokes the opener with the correct path (mock the opener).
+  - `Resume in terminal…` panel renders the per-adapter command string for each harness (unit-test each adapter's `resume_command` tokens against the table above) and the `Copy` action writes it to the clipboard; the collision warning is present.
+  - Keep UI tests light — the heavy cancellation logic is tested in M4.2/M4.3.
+- **Live verification:** run each harness's copied resume command against the real CLI (maintainer-tested) and correct any flag that differs before shipping.
+- **Docs:** note in the component which actions are intentionally absent in M4 (auto-launch, app-picker, fork, reset/remove) and why.
 
 ---
 

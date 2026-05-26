@@ -167,11 +167,13 @@
 {/snippet}
 
 {#snippet userMessage(row: Extract<UnifiedRow, { kind: "user" }>)}
-  <div class="border-border space-y-1.5 border-l pl-3" data-testid="turn" data-role="user">
+  <div class="space-y-1.5" data-testid="turn" data-role="user">
     <div class="flex items-center gap-2 text-[11px] font-semibold tracking-wide uppercase">
       <span class="text-fg" data-testid="turn-author">User</span>
     </div>
-    <div class="text-fg text-sm leading-6 whitespace-pre-wrap">{row.text}</div>
+    <div class="border-border border-l pl-3">
+      <div class="text-fg text-sm leading-6 whitespace-pre-wrap">{row.text}</div>
+    </div>
   </div>
 {/snippet}
 
@@ -194,18 +196,18 @@
 
 {#snippet agentRow(turn: AgentTurn)}
   {@const harness = agentById[turn.agent_id]?.harness}
-  <div
-    class="space-y-1.5 border-l pl-3"
-    style:border-left-color={agentBorderColor(turn.agent_id)}
-    data-testid="turn"
-    data-role="agent"
-  >
+  <div class="space-y-1.5" data-testid="turn" data-role="agent">
     <div class="flex items-center gap-2 text-[11px] font-semibold tracking-wide uppercase">
       <span class="text-fg" data-testid="turn-agent-name">{agentName(turn.agent_id)}</span>
       {#if harness}<HarnessIcon {harness} testid="turn-harness-icon" />{:else}<Badge>?</Badge>{/if}
-      {@render turnStatusLabel(turn.status)}
     </div>
-    {@render turnBody(turn)}
+    <div
+      class="space-y-1.5 border-l pl-3"
+      style:border-left-color={agentBorderColor(turn.agent_id)}
+    >
+      {@render turnStatusLabel(turn.status)}
+      {@render turnBody(turn)}
+    </div>
   </div>
 {/snippet}
 
@@ -265,8 +267,7 @@
               {@const state = columnState(col.rows)}
               {@const harness = agentById[col.agent_id]?.harness}
               <div
-                class="space-y-1.5 border-l pl-3"
-                style:border-left-color={agentBorderColor(col.agent_id)}
+                class="space-y-1.5"
                 data-testid="fanout-column"
                 data-agent-id={col.agent_id}
                 data-state={state}
@@ -291,23 +292,28 @@
                     >
                   {/if}
                 </div>
-                {#each col.rows as r (r.key)}
-                  {#if r.kind === "agent"}
-                    {@render turnStatusLabel(r.turn.status)}
-                    {@render turnBody(r.turn)}
-                  {:else}
-                    {#if r.status === "cancelled"}
-                      <span class="text-muted text-xs" data-testid="outcome-cancelled"
-                        >cancelled</span
-                      >
+                <div
+                  class="space-y-1.5 border-l pl-3"
+                  style:border-left-color={agentBorderColor(col.agent_id)}
+                >
+                  {#each col.rows as r (r.key)}
+                    {#if r.kind === "agent"}
+                      {@render turnStatusLabel(r.turn.status)}
+                      {@render turnBody(r.turn)}
                     {:else}
-                      <span class="text-status-failed text-xs" data-testid="outcome-failed"
-                        >failed</span
-                      >
+                      {#if r.status === "cancelled"}
+                        <span class="text-muted text-xs" data-testid="outcome-cancelled"
+                          >cancelled</span
+                        >
+                      {:else}
+                        <span class="text-status-failed text-xs" data-testid="outcome-failed"
+                          >failed</span
+                        >
+                      {/if}
+                      {#if r.reason}<span class="text-muted text-xs">— {r.reason}</span>{/if}
                     {/if}
-                    {#if r.reason}<span class="text-muted text-xs">— {r.reason}</span>{/if}
-                  {/if}
-                {/each}
+                  {/each}
+                </div>
               </div>
             {/each}
           </div>

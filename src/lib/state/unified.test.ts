@@ -256,6 +256,30 @@ describe("groupRenderBlocks", () => {
     expect(fan.columns.every((c) => c.rows.length === 0)).toBe(true);
   });
 
+  it("orders fan-out columns by the canonical roster, not the recipient set's order", () => {
+    // The restored user message lists recipients [B, A] (e.g. journal order),
+    // but the roster (sidebar/chips) order is [A, B]. Columns must follow the
+    // roster so the layout is identical live and after restart — and will track
+    // user-defined reordering later.
+    const rows = buildUnifiedRows(
+      [
+        agentTurn("ta", AGENT_A, "2026-05-16T00:00:01Z", SEND_1),
+        agentTurn("tb", AGENT_B, "2026-05-16T00:00:02Z", SEND_1),
+      ],
+      [
+        {
+          kind: "user_message",
+          send_id: SEND_1,
+          agent_ids: [AGENT_B, AGENT_A],
+          text: "fan out",
+          at: "2026-05-16T00:00:00Z",
+        },
+      ],
+    );
+    const fan = fanoutOf(groupRenderBlocks(rows, [AGENT_A, AGENT_B]));
+    expect(fan.columns.map((c) => c.agent_id)).toEqual([AGENT_A, AGENT_B]);
+  });
+
   it("leaves a single-recipient send as standalone rows (no fan-out block)", () => {
     const rows = buildUnifiedRows(
       [

@@ -42,7 +42,12 @@
 
   /// Group the flat rows into render blocks: standalone rows, plus one block per
   /// fan-out whose responses lay out as per-recipient columns.
-  const blocks = $derived(groupRenderBlocks(rows));
+  const blocks = $derived(
+    groupRenderBlocks(
+      rows,
+      agents.map((a) => a.id),
+    ),
+  );
 
   function agentName(agentId: string): string {
     return agentById[agentId]?.name ?? "unknown";

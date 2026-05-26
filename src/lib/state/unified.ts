@@ -196,10 +196,15 @@ export function buildUnifiedRows(turns: Turn[], overlay: ConversationItem[]): Un
 /// standalone rows (the user row, then its agent row) exactly as before.
 ///
 /// The fan-out's agent + outcome rows (matched by `send_id`) are pulled out of
-/// the flat stream into the group's columns — ordered by the recipient set
-/// (`user.agent_ids`), a **stable** order so streaming arrival never reshuffles
-/// columns. The group is anchored at the user message's position in the
-/// timeline; rows belonging to other sends flow normally around it.
+/// the flat stream into the group's columns. Columns are ordered by
+/// `agentOrder` — the project's canonical roster order, the same list that
+/// drives the sidebar and the compose-bar chips — so a fan-out's columns match
+/// that order both live and after restart (the recipient set's own order
+/// differs between the two: live is dispatch order, restored is journal order),
+/// and will follow user-defined roster reordering once that lands. A recipient
+/// absent from `agentOrder` sorts to the end (stable). The group is anchored at
+/// the user message's position in the timeline; rows belonging to other sends
+/// flow normally around it.
 type NonUserRow = Exclude<UnifiedRow, { kind: "user" }>;
 
 /// The recipient an agent/outcome row belongs to (agent rows carry it under
@@ -208,7 +213,13 @@ function rowAgentId(row: NonUserRow): AgentId {
   return row.kind === "agent" ? row.turn.agent_id : row.agent_id;
 }
 
-export function groupRenderBlocks(rows: UnifiedRow[]): RenderBlock[] {
+export function groupRenderBlocks(rows: UnifiedRow[], agentOrder: AgentId[] = []): RenderBlock[] {
+  // Canonical column ordering: an agent's index in the roster. Recipients not
+  // in the roster (shouldn't happen, but stay defensive) sort to the end.
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity
+  const orderIndex = new Map<AgentId, number>();
+  agentOrder.forEach((id, i) => orderIndex.set(id, i));
+  const rankOf = (id: AgentId): number => orderIndex.get(id) ?? Number.MAX_SAFE_INTEGER;
   // Pass 1: identify fan-out sends (a user row to >1 recipient) and bucket
   // every agent/outcome row of those sends by recipient.
   // eslint-disable-next-line svelte/prefer-svelte-reactivity
@@ -254,10 +265,12 @@ export function groupRenderBlocks(rows: UnifiedRow[]): RenderBlock[] {
         key: `f:${row.send_id}`,
         send_id: row.send_id,
         user: row,
-        columns: row.agent_ids.map((agent_id) => ({
-          agent_id,
-          rows: perAgent.get(agent_id) ?? [],
-        })),
+        columns: [...row.agent_ids]
+          .sort((a, b) => rankOf(a) - rankOf(b))
+          .map((agent_id) => ({
+            agent_id,
+            rows: perAgent.get(agent_id) ?? [],
+          })),
       });
     } else if (row.kind !== "user" && row.send_id !== undefined && fanoutUsers.has(row.send_id)) {
       // Routed into its fan-out's column above — don't emit standalone.

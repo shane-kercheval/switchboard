@@ -74,7 +74,20 @@ The `stream-json` output emits one JSON object per line. Observed event types in
    - `agents`: list of agent names (built-in + user)
    - `skills`: list of skill names (built-in + user)
    - `plugins`, `memory_paths`, `output_style`, `analytics_disabled`, `fast_mode_state`
-2. **`rate_limit_event`** — `{status, resetsAt, rateLimitType, overageStatus, ...}`. Useful for surfacing "X minutes until quota refreshes."
+2. **`rate_limit_event`** — `{status, resetsAt, rateLimitType, overageStatus, ...}`. Useful for surfacing "X minutes until quota refreshes." Our parser copies the whole `rate_limit_info` object verbatim into `RateLimitEvent.info` (`parser.rs:parse_rate_limit_event`), so any field below reaches the frontend's `last_rate_limit` without a parser change.
+
+   **Overage / usage-credit shape (CONFIRMED 2026-05-25, claude-code 2.1.x).** Probed `claude -p` after the 5-hour subscription window was exhausted but with usage credits enabled. **The turn still succeeds — exit 0, `result.subtype: "success"` — overage is served transparently; Claude does not fail the turn the way Codex does.** The only signal that the turn was billed to credits rather than the subscription is in `rate_limit_info`:
+
+   ```json
+   {"status":"rejected","rateLimitType":"five_hour","resetsAt":1779755400,
+    "overageStatus":"allowed","isUsingOverage":true,"overageResetsAt":1780272000}
+   ```
+
+   - `isUsingOverage: true` is **the** discriminator. Normal-quota turns (see `tests/fixtures/claude/text-only.jsonl`) emit `{"status":"allowed","resetsAt":…,"rateLimitType":"five_hour"}` with **no** `overageStatus` / `isUsingOverage` / `overageResetsAt` fields at all.
+   - `status: "rejected"` here means the underlying five-hour window is exhausted (not that the request was rejected — the request succeeded via overage).
+   - `resetsAt` is the 5-hour window reset; `overageResetsAt` is the (weekly) overage/billing window. Both are unix epoch seconds.
+
+   **M4.9 relevance:** this is the Claude input that was previously "not captured." Unlike Codex (hard turn failure with a usage-limit message), Claude's quota crossing is *silent and soft* — the turn completes on credits. So M4.9's Claude surface is a **proactive warning** ("you're now spending usage credits"), not a failure render; it keys off `isUsingOverage`, not a `FailureKind`. The data already reaches `last_rate_limit`; the gap is purely frontend (`Sidebar.svelte` only renders a quota figure for `harness === "codex"`, via a `used_percent` field the Claude shape doesn't carry). Ties into the 2026-06-15 Agent-SDK credit-pool billing story.
 3. **`assistant`** events — one per assistant message. Body matches the Anthropic API message format with `content` blocks. Block types observed:
    - `thinking` (with a `signature` for redacted thinking; the `thinking` field itself may be empty)
    - `tool_use` (with `id`, `name`, `input`, `caller: {type: "direct"}`)

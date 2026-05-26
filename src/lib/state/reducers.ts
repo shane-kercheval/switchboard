@@ -37,17 +37,23 @@ import type {
   FailureKind,
   LoadedTurn,
   LoadedTurnItem,
+  MessageId,
   NormalizedEvent,
   ReducerInput,
+  SendId,
   TurnId,
 } from "$lib/types";
-import type { AgentRuntime, ToolCall, Turn, TurnItem } from "./types";
+import type { AgentRuntime, PendingSend, ToolCall, Turn, TurnItem } from "./types";
 
 export function transcriptReducer(
   turns: Turn[],
   input: ReducerInput,
   agentId: AgentId,
   receivedAt: string,
+  // The send this turn belongs to, supplied by the caller for `turn_start`
+  // (popped from the agent's pending-send FIFO). Stamped onto the new agent
+  // turn so a fan-out's live responses group like its historical ones.
+  sendId?: SendId,
 ): Turn[] {
   switch (input.type) {
     case "turn_start": {
@@ -63,6 +69,7 @@ export function transcriptReducer(
           role: "agent",
           turn_id: input.turn_id,
           agent_id: agentId,
+          send_id: sendId,
           started_at: input.started_at,
           status: "streaming",
           items: [],
@@ -238,6 +245,7 @@ function loadedTurnToTurn(t: LoadedTurn): Turn {
     role: "agent",
     turn_id: t.turn_id,
     agent_id: t.agent_id,
+    send_id: t.send_id ?? undefined,
     started_at: t.started_at,
     ended_at: t.ended_at ?? undefined,
     status: t.status,
@@ -285,31 +293,33 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
         run_status: "processing",
         in_flight_turn_id: input.turn_id,
         last_error: undefined,
-        pending_message_id: undefined,
+        // Consume the pending-send entry this turn belongs to (by message_id,
+        // else the front — see `pickPendingIndex`).
+        pending_sends: removePending(
+          runtime.pending_sends,
+          pickPendingIndex(runtime.pending_sends, input.message_id),
+        ),
       };
 
-    case "message_failed":
-      // A send failed before any turn started (journal write failed, or
-      // the adapter failed to launch pre-`TurnStart`). The event-driven
-      // analogue of the `failSendStart` action: `starting → idle`,
-      // re-enabling Send, with the error surfaced for the sidebar. Guarded
-      // to only fire from `"starting"` — a stray `message_failed` once the
-      // agent is already `processing` (its turn did start) must not stomp a
-      // live turn. Correlated to this agent's optimistic dispatch via the
-      // `pending_message_id` recorded at send-accept time.
-      if (runtime.run_status !== "starting") return runtime;
-      if (
-        runtime.pending_message_id !== undefined &&
-        runtime.pending_message_id !== input.message_id
-      ) {
-        return runtime;
-      }
-      return {
-        ...runtime,
-        run_status: "idle",
-        pending_message_id: undefined,
-        last_error: { message: input.error, kind: "adapter_failure" },
+    case "message_failed": {
+      // A send failed before any turn started (journal write failed, or the
+      // adapter failed to launch pre-`TurnStart`). Prune its pending entry (by
+      // message_id, else front) and surface the error. A truly stray event
+      // (no pending sends) is ignored.
+      const idx = pickPendingIndex(runtime.pending_sends, input.message_id);
+      if (idx < 0) return runtime;
+      const pending_sends = removePending(runtime.pending_sends, idx);
+      const last_error: { message: string; kind: FailureKind } = {
+        message: input.error,
+        kind: "adapter_failure",
       };
+      // Flip to idle only if this was the *starting* send. A queued send that
+      // fails pre-start (the agent is `processing` another turn) must not stomp
+      // the live turn — `AgentIdle` settles run_status when the backlog drains.
+      return runtime.run_status === "starting"
+        ? { ...runtime, run_status: "idle", pending_sends, last_error }
+        : { ...runtime, pending_sends, last_error };
+    }
 
     case "turn_end":
       // **Do NOT flip run_status to "idle" here.** The dispatcher holds
@@ -437,6 +447,33 @@ function findTurn(turns: Turn[], turnId: TurnId): Turn | undefined {
   return turns.find((t) => t.turn_id === turnId);
 }
 
+/// The pending-send entry a backend event refers to: the one whose receipt
+/// matches `messageId`, else the front (covers the race where `turn_start` /
+/// `message_failed` beats the `send_message` IPC receipt, so the entry has no
+/// `message_id` yet — the backend runs turns in dispatch order, so the front is
+/// the next to start). `-1` when there are no pending sends (a stray event).
+function pickPendingIndex(pending: PendingSend[] | undefined, messageId: MessageId): number {
+  if (pending === undefined || pending.length === 0) return -1;
+  const byMsg = pending.findIndex((p) => p.message_id === messageId);
+  if (byMsg >= 0) return byMsg;
+  // No receipt match. Fall back to the front *only* if it hasn't recorded its
+  // receipt yet — the race where the event beat `recordSendAccepted`. If the
+  // front already has a (different) receipt, this event doesn't correlate to
+  // any pending send: it's stray/stale, so don't consume anything.
+  return pending[0]?.message_id === undefined ? 0 : -1;
+}
+
+/// Remove `index` from the pending list, returning `undefined` (not `[]`) when
+/// it empties so a fresh runtime and a fully-drained one compare equal.
+function removePending(
+  pending: PendingSend[] | undefined,
+  index: number,
+): PendingSend[] | undefined {
+  if (pending === undefined || index < 0 || index >= pending.length) return pending;
+  const next = [...pending.slice(0, index), ...pending.slice(index + 1)];
+  return next.length === 0 ? undefined : next;
+}
+
 function updateTurn(turns: Turn[], turnId: TurnId, next: Turn): Turn[] {
   return turns.map((t) => (t.turn_id === turnId ? next : t));
 }
@@ -454,6 +491,7 @@ function appendUserTurnImpl(
   turnId: TurnId,
   text: string,
   startedAt: string,
+  sendId?: SendId,
 ): Turn[] {
   return [
     ...turns,
@@ -461,6 +499,7 @@ function appendUserTurnImpl(
       role: "user",
       turn_id: turnId,
       agent_id: agentId,
+      send_id: sendId,
       started_at: startedAt,
       text,
     },

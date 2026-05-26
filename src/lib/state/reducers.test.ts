@@ -547,14 +547,14 @@ describe("runtimeReducer", () => {
     expect(r.last_error).toBeUndefined();
   });
 
-  it("turn_start → processing + sets in_flight_turn_id + clears last_error + clears pending_message_id", () => {
-    // Correlates the optimistic "starting" send (keyed by pending_message_id)
-    // to its real turn_id; the receipt is consumed once the turn starts.
+  it("turn_start → processing + sets in_flight_turn_id + clears last_error + consumes the pending send", () => {
+    // Correlates the optimistic "starting" send (its pending entry) to its real
+    // turn_id; the entry is consumed once the turn starts.
     const r = runtimeReducer(
       {
         ...fresh(),
         run_status: "starting",
-        pending_message_id: MESSAGE_1,
+        pending_sends: [{ send_id: "send-1", user_turn_id: "user-1", message_id: MESSAGE_1 }],
         last_error: { message: "old", kind: "harness_error" },
       },
       turnStart(TURN_1, MESSAGE_1),
@@ -562,7 +562,7 @@ describe("runtimeReducer", () => {
     expect(r.run_status).toBe("processing");
     expect(r.in_flight_turn_id).toBe(TURN_1);
     expect(r.last_error).toBeUndefined();
-    expect(r.pending_message_id).toBeUndefined();
+    expect(r.pending_sends).toBeUndefined();
   });
 
   it("turn_end (completed) does NOT flip run_status to idle (waits for AgentIdle)", () => {
@@ -621,7 +621,7 @@ describe("runtimeReducer", () => {
     const starting: AgentRuntime = {
       ...fresh(),
       run_status: "starting",
-      pending_message_id: MESSAGE_1,
+      pending_sends: [{ send_id: "send-1", user_turn_id: "user-1", message_id: MESSAGE_1 }],
     };
     const r = runtimeReducer(starting, {
       type: "message_failed",
@@ -631,15 +631,18 @@ describe("runtimeReducer", () => {
       at: "2026-05-16T00:00:00Z",
     });
     expect(r.run_status).toBe("idle");
-    expect(r.pending_message_id).toBeUndefined();
+    expect(r.pending_sends).toBeUndefined();
     expect(r.last_error).toEqual({ message: "journal write failed", kind: "adapter_failure" });
   });
 
   it("message_failed for a different message_id is a no-op (correlation guard)", () => {
+    // The pending send already recorded receipt MESSAGE_1, so a message_failed
+    // for MESSAGE_2 correlates to nothing (not the front, since the front isn't
+    // pre-receipt) — it must not consume the live pending send.
     const starting: AgentRuntime = {
       ...fresh(),
       run_status: "starting",
-      pending_message_id: MESSAGE_1,
+      pending_sends: [{ send_id: "send-1", user_turn_id: "user-1", message_id: MESSAGE_1 }],
     };
     const r = runtimeReducer(starting, {
       type: "message_failed",

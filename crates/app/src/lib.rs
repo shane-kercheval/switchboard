@@ -22,11 +22,11 @@ use tauri::{Emitter, Manager, State};
 
 use crate::commands::ProjectConversation;
 use crate::commands::{
-    DirectoryInfo, ProjectListing, WorkspaceDirectories, attach_agent_impl, cancel_turn_impl,
-    check_antigravity_auth_impl, check_antigravity_binary_impl, check_claude_binary_impl,
-    check_codex_auth_impl, check_codex_binary_impl, check_gemini_auth_impl,
-    check_gemini_binary_impl, create_agent_impl, create_project_impl, init_directory_impl,
-    list_agents_impl, list_projects_impl, list_workspace_directories_impl,
+    DirectoryInfo, ProjectListing, WorkspaceDirectories, attach_agent_impl, cancel_send_impl,
+    cancel_turn_impl, check_antigravity_auth_impl, check_antigravity_binary_impl,
+    check_claude_binary_impl, check_codex_auth_impl, check_codex_binary_impl,
+    check_gemini_auth_impl, check_gemini_binary_impl, create_agent_impl, create_project_impl,
+    init_directory_impl, list_agents_impl, list_projects_impl, list_workspace_directories_impl,
     load_project_conversation_impl, load_transcript_impl, open_project_impl, parse_uuid,
     pick_directory_impl, remove_directory_impl, remove_queued_message_impl, send_message_impl,
     set_active_project_impl,
@@ -173,13 +173,18 @@ async fn send_message(
     state: State<'_, AppState>,
     agent_id: String,
     prompt: String,
+    send_id: String,
 ) -> Result<String, String> {
     let id = parse_uuid(&agent_id).map_err(|e| e.to_string())?;
+    // The frontend mints one `send_id` per Send and passes it on every
+    // per-recipient call, so a fan-out's turns share it (hydration groups the
+    // user's message once).
+    let sid = parse_uuid(&send_id).map_err(|e| e.to_string())?;
     // Returns the minted `message_id` immediately (the send is accepted, not
     // necessarily started). The turn's `turn_id` and lifecycle flow over the
     // per-agent event channel; the correlated `TurnStart` carries this
     // `message_id`, and a pre-`TurnStart` failure surfaces as `MessageFailed`.
-    let message_id = send_message_impl(state.inner(), id, &prompt)
+    let message_id = send_message_impl(state.inner(), id, &prompt, sid)
         .await
         .map_err(|e| e.to_string())?;
     Ok(message_id.to_string())
@@ -219,6 +224,25 @@ async fn cancel_turn(state: State<'_, AppState>, agent_id: String) -> Result<(),
     // The synthesized `Cancelled` terminal + return-to-idle flow back to the
     // frontend over the per-agent event channel, so the command just acks.
     cancel_turn_impl(state.inner(), id);
+    Ok(())
+}
+
+#[tauri::command]
+async fn cancel_send(
+    state: State<'_, AppState>,
+    send_id: String,
+    recipients: Vec<String>,
+) -> Result<(), String> {
+    let sid = parse_uuid(&send_id).map_err(|e| e.to_string())?;
+    let agent_ids = recipients
+        .iter()
+        .map(|r| parse_uuid(r))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    // Send-scoped, idempotent stop — each recipient's actor decides whether its
+    // current turn belongs to this send; the synthesized `Cancelled` terminals
+    // flow back over the per-agent event channels, so the command just acks.
+    cancel_send_impl(state.inner(), sid, &agent_ids);
     Ok(())
 }
 
@@ -386,6 +410,7 @@ pub fn run() {
             send_message,
             remove_queued_message,
             cancel_turn,
+            cancel_send,
             load_transcript,
             load_project_conversation,
         ])

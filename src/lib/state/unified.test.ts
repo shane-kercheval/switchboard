@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ConversationItem } from "$lib/types";
-import { buildUnifiedRows, type UnifiedRow } from "./unified";
+import { buildUnifiedRows, groupRenderBlocks, type RenderBlock, type UnifiedRow } from "./unified";
 import type { Turn } from "./types";
 
 const AGENT_A = "00000000-0000-7000-8000-000000000aaa";
@@ -8,15 +8,29 @@ const AGENT_B = "00000000-0000-7000-8000-000000000bbb";
 const TURN_1 = "00000000-0000-7000-8000-000000000001";
 const SEND_1 = "00000000-0000-7000-8000-0000000000d1";
 
-function userTurn(turnId: string, agentId: string, startedAt: string, text = "hi"): Turn {
-  return { role: "user", turn_id: turnId, agent_id: agentId, started_at: startedAt, text };
+function userTurn(
+  turnId: string,
+  agentId: string,
+  startedAt: string,
+  text = "hi",
+  sendId?: string,
+): Turn {
+  return {
+    role: "user",
+    turn_id: turnId,
+    agent_id: agentId,
+    send_id: sendId,
+    started_at: startedAt,
+    text,
+  };
 }
 
-function agentTurn(turnId: string, agentId: string, startedAt: string): Turn {
+function agentTurn(turnId: string, agentId: string, startedAt: string, sendId?: string): Turn {
   return {
     role: "agent",
     turn_id: turnId,
     agent_id: agentId,
+    send_id: sendId,
     started_at: startedAt,
     status: "complete",
     items: [],
@@ -112,5 +126,98 @@ describe("buildUnifiedRows", () => {
       },
     ];
     expect(buildUnifiedRows([], overlay)).toHaveLength(0);
+  });
+
+  it("collapses a live fan-out's user turns (shared send_id) into one row", () => {
+    // Two recipients of one Send each get an optimistic user turn with the same
+    // send_id; the unified row renders the user's message once.
+    const rows = buildUnifiedRows(
+      [
+        userTurn(TURN_1, AGENT_A, "2026-05-16T00:00:00Z", "fan out", SEND_1),
+        userTurn(
+          "00000000-0000-7000-8000-000000000002",
+          AGENT_B,
+          "2026-05-16T00:00:00Z",
+          "fan out",
+          SEND_1,
+        ),
+      ],
+      [],
+    );
+    const users = rows.filter((r) => r.kind === "user");
+    expect(users).toHaveLength(1);
+    expect((users[0] as Extract<UnifiedRow, { kind: "user" }>).agent_ids).toEqual([
+      AGENT_A,
+      AGENT_B,
+    ]);
+  });
+});
+
+describe("groupRenderBlocks", () => {
+  function fanoutOf(blocks: RenderBlock[]): Extract<RenderBlock, { kind: "fanout" }> {
+    const f = blocks.find((b) => b.kind === "fanout");
+    if (f === undefined || f.kind !== "fanout") throw new Error("no fanout block");
+    return f;
+  }
+
+  it("groups a fan-out's responses into per-recipient columns in recipient order", () => {
+    const rows = buildUnifiedRows(
+      [
+        userTurn(TURN_1, AGENT_A, "2026-05-16T00:00:00Z", "fan out", SEND_1),
+        userTurn("u2", AGENT_B, "2026-05-16T00:00:00Z", "fan out", SEND_1),
+        // B's response streams in before A's — columns must NOT reshuffle.
+        agentTurn("tb", AGENT_B, "2026-05-16T00:00:01Z", SEND_1),
+        agentTurn("ta", AGENT_A, "2026-05-16T00:00:02Z", SEND_1),
+      ],
+      [],
+    );
+    const blocks = groupRenderBlocks(rows);
+    // One fan-out block, and the agent rows are NOT also standalone.
+    expect(blocks.filter((b) => b.kind === "fanout")).toHaveLength(1);
+    expect(blocks.filter((b) => b.kind === "row" && b.row.kind === "agent")).toHaveLength(0);
+    const fan = fanoutOf(blocks);
+    expect(fan.columns.map((c) => c.agent_id)).toEqual([AGENT_A, AGENT_B]);
+    expect(fan.columns[0]?.rows.map((r) => r.key)).toEqual(["a:ta"]);
+    expect(fan.columns[1]?.rows.map((r) => r.key)).toEqual(["a:tb"]);
+  });
+
+  it("routes a per-recipient outcome marker into that recipient's column", () => {
+    const rows = buildUnifiedRows(
+      [
+        userTurn(TURN_1, AGENT_A, "2026-05-16T00:00:00Z", "fan out", SEND_1),
+        userTurn("u2", AGENT_B, "2026-05-16T00:00:00Z", "fan out", SEND_1),
+        agentTurn("ta", AGENT_A, "2026-05-16T00:00:01Z", SEND_1),
+      ],
+      [
+        {
+          kind: "outcome",
+          turn_id: "tb",
+          send_id: SEND_1,
+          agent_id: AGENT_B,
+          status: "cancelled",
+          reason: "user",
+          at: "2026-05-16T00:00:01Z",
+        },
+      ],
+    );
+    const fan = fanoutOf(groupRenderBlocks(rows));
+    expect(fan.columns[0]?.rows.map((r) => r.kind)).toEqual(["agent"]);
+    expect(fan.columns[1]?.rows.map((r) => r.kind)).toEqual(["outcome"]);
+  });
+
+  it("leaves a single-recipient send as standalone rows (no fan-out block)", () => {
+    const rows = buildUnifiedRows(
+      [
+        userTurn(TURN_1, AGENT_A, "2026-05-16T00:00:00Z", "solo", SEND_1),
+        agentTurn("ta", AGENT_A, "2026-05-16T00:00:01Z", SEND_1),
+      ],
+      [],
+    );
+    const blocks = groupRenderBlocks(rows);
+    expect(blocks.every((b) => b.kind === "row")).toBe(true);
+    expect(blocks.map((b) => (b.kind === "row" ? b.row.kind : "fanout"))).toEqual([
+      "user",
+      "agent",
+    ]);
   });
 });

@@ -1063,6 +1063,7 @@ pub async fn send_message_impl(
     state: &AppState,
     agent_id: AgentId,
     prompt: &str,
+    send_id: SendId,
 ) -> Result<MessageId, AppError> {
     let (project, agent) = lookup_agent(state, agent_id)?;
     // Claude is spawned with cwd = the user's bound working directory (the
@@ -1097,10 +1098,10 @@ pub async fn send_message_impl(
         Arc::clone(&state.emitter),
         Arc::clone(&state.needs_session_meta),
     ));
-    // Mint the `send_id` backend-side for M4.2 (single-recipient sends each get
-    // their own, trivially-grouped id). M4.7 moves minting to the frontend so a
-    // fan-out's recipients share one — an additive parameter change.
-    let send_id = Uuid::now_v7();
+    // `send_id` is minted by the frontend and shared across a fan-out's
+    // recipients (one `send_message` call per recipient with the same id), so
+    // hydration groups the user's message once. A single-recipient send is a
+    // trivially-grouped 1-element fan-out with its own id.
     match state
         .dispatcher
         .send_message(agent_id, prompt, send_id, factory, OnBusy::Enqueue)
@@ -1135,6 +1136,18 @@ pub async fn remove_queued_message_impl(
 /// harness-specific kill; the dispatcher synthesizes the `Cancelled` terminal.
 pub fn cancel_turn_impl(state: &AppState, agent_id: AgentId) -> CancelOutcome {
     state.dispatcher.cancel(agent_id, CancelSource::User)
+}
+
+/// Cancel a whole send across its `recipients` (system-design §7 "Cancel a
+/// send"). Send-scoped and actor-decided: each recipient cancels its in-flight
+/// turn iff that turn belongs to `send_id` and drops any still-queued item of
+/// the send, never touching a later, unrelated turn. Fire-and-forget — the
+/// per-turn `Cancelled` terminals + return-to-idle flow back over the per-agent
+/// event channels, so this just delegates and acks.
+pub fn cancel_send_impl(state: &AppState, send_id: SendId, recipients: &[AgentId]) {
+    state
+        .dispatcher
+        .cancel_send(send_id, recipients, CancelSource::User);
 }
 
 /// Cancel every in-flight turn for `agents`, await their drains, then release
@@ -1329,9 +1342,16 @@ pub enum ConversationItem {
     /// One agent's completed (or harness-failed) turn content, sourced from the
     /// harness session file. Harness user-role turns are dropped — the journal
     /// is the canonical record of the user's words.
+    ///
+    /// `send_id` is recovered by joining this turn's `turn_id` against the
+    /// journal's `Send` records (which persist `send_id` + `turn_id` at
+    /// turn-start), so a fan-out's historical responses group the same way live
+    /// ones do. `None` when no journal `Send` matches (e.g. a turn whose
+    /// send-record write failed, or pre-journal history).
     AgentTurn {
         turn_id: switchboard_harness::TurnId,
         agent_id: AgentId,
+        send_id: Option<SendId>,
         started_at: chrono::DateTime<chrono::Utc>,
         ended_at: Option<chrono::DateTime<chrono::Utc>>,
         status: switchboard_harness::TurnStatus,
@@ -1401,15 +1421,20 @@ fn merge_project_conversation(
     let mut index_of: HashMap<SendId, usize> = HashMap::new();
     let mut user_messages: Vec<(SendId, Vec<AgentId>, String, chrono::DateTime<chrono::Utc>)> =
         Vec::new();
+    // `turn_id → send_id` from `Send` records, used to tag each harness
+    // `AgentTurn` with the send it belongs to so a fan-out's responses group
+    // the same way live ones do.
+    let mut send_id_of_turn: HashMap<switchboard_harness::TurnId, SendId> = HashMap::new();
     for record in journal {
         match record {
             switchboard_core::JournalRecord::Send {
                 send_id,
+                turn_id,
                 agent_id,
                 prompt,
                 at,
-                ..
             } => {
+                send_id_of_turn.insert(turn_id, send_id);
                 if let Some(&i) = index_of.get(&send_id) {
                     let entry = &mut user_messages[i];
                     if !entry.1.contains(&agent_id) {
@@ -1478,6 +1503,7 @@ fn merge_project_conversation(
                 items.push(ConversationItem::AgentTurn {
                     turn_id,
                     agent_id,
+                    send_id: send_id_of_turn.get(&turn_id).copied(),
                     started_at,
                     ended_at,
                     status,
@@ -1975,6 +2001,17 @@ mod tests {
         (agent, project.id)
     }
 
+    /// Single-recipient send helper for tests that don't correlate a fan-out's
+    /// shared `send_id` — mints a fresh one per call, mirroring the frontend's
+    /// per-Send minting.
+    async fn send_msg(
+        state: &AppState,
+        agent_id: AgentId,
+        prompt: &str,
+    ) -> Result<MessageId, AppError> {
+        send_message_impl(state, agent_id, prompt, Uuid::now_v7()).await
+    }
+
     #[tokio::test]
     async fn init_directory_creates_switchboard_layout() {
         let (tmp, state, _) = fresh_state_with_mock();
@@ -2026,9 +2063,7 @@ mod tests {
         assert_eq!(*lock(&state.active_project_id), Some(proj.id));
 
         // Sending to the original agent still resolves and dispatches.
-        send_message_impl(&state, agent.id, "still works")
-            .await
-            .unwrap();
+        send_msg(&state, agent.id, "still works").await.unwrap();
     }
 
     #[tokio::test]
@@ -2114,7 +2149,7 @@ mod tests {
         )
         .unwrap();
 
-        let message_id = send_message_impl(&state, agent.id, "hello").await.unwrap();
+        let message_id = send_msg(&state, agent.id, "hello").await.unwrap();
         // Fire-and-forget actor model: await the turn completing by waiting for
         // its terminal `agent_idle` (the dispatcher's last event for the turn)
         // rather than a join handle.
@@ -2231,9 +2266,7 @@ mod tests {
             .unwrap();
         let project = create_project_in_only_dir(&state, "alpha");
         set_active_project_impl(&state, project.id).unwrap();
-        let err = send_message_impl(&state, Uuid::now_v7(), "hi")
-            .await
-            .unwrap_err();
+        let err = send_msg(&state, Uuid::now_v7(), "hi").await.unwrap_err();
         assert!(matches!(err, AppError::AgentNotFound(_)));
     }
 
@@ -2663,36 +2696,28 @@ mod tests {
         // Four distinct agents → four independent actors. Each
         // `send_message_impl` returns immediately; await each agent's turn
         // completing via the cumulative `agent_idle` count (one per agent).
-        send_message_impl(&state, claude_agent.id, "hi")
-            .await
-            .unwrap();
+        send_msg(&state, claude_agent.id, "hi").await.unwrap();
         within(
             &emitter,
             "claude agent_idle",
             emitter.wait_for_type("agent_idle", 1),
         )
         .await;
-        send_message_impl(&state, codex_agent.id, "hi")
-            .await
-            .unwrap();
+        send_msg(&state, codex_agent.id, "hi").await.unwrap();
         within(
             &emitter,
             "codex agent_idle",
             emitter.wait_for_type("agent_idle", 2),
         )
         .await;
-        send_message_impl(&state, gemini_agent.id, "hi")
-            .await
-            .unwrap();
+        send_msg(&state, gemini_agent.id, "hi").await.unwrap();
         within(
             &emitter,
             "gemini agent_idle",
             emitter.wait_for_type("agent_idle", 3),
         )
         .await;
-        send_message_impl(&state, antigravity_agent.id, "hi")
-            .await
-            .unwrap();
+        send_msg(&state, antigravity_agent.id, "hi").await.unwrap();
         within(
             &emitter,
             "antigravity agent_idle",
@@ -2767,7 +2792,7 @@ mod tests {
         let agent = create_agent_impl(&state, "a", HarnessKind::ClaudeCode).unwrap();
         lock(&state.needs_session_meta).insert(agent.id);
 
-        send_message_impl(&state, agent.id, "hi").await.unwrap();
+        send_msg(&state, agent.id, "hi").await.unwrap();
         within(
             &emitter,
             "agent_idle",
@@ -2815,7 +2840,7 @@ mod tests {
 
         // Routing succeeds → the send is accepted; the dispatch failure is
         // reported asynchronously via `message_failed`, keyed by this id.
-        let message_id = send_message_impl(&state, agent.id, "hi").await.unwrap();
+        let message_id = send_msg(&state, agent.id, "hi").await.unwrap();
         within(
             &emitter,
             "message_failed",
@@ -2899,9 +2924,7 @@ mod tests {
         let proj = create_project_in_only_dir(&state, "alpha");
         set_active_project_impl(&state, proj.id).unwrap();
         let agent_default = create_agent_impl(&state, "a", HarnessKind::ClaudeCode).unwrap();
-        send_message_impl(&state, agent_default.id, "hi")
-            .await
-            .unwrap();
+        send_msg(&state, agent_default.id, "hi").await.unwrap();
         within(
             &emitter,
             "first agent_idle",
@@ -2917,9 +2940,7 @@ mod tests {
         // true. Sends to the same agent chain through one actor, so await the
         // second turn's own idle (cumulative count 2) before asserting.
         lock(&state.needs_session_meta).insert(agent_default.id);
-        send_message_impl(&state, agent_default.id, "again")
-            .await
-            .unwrap();
+        send_msg(&state, agent_default.id, "again").await.unwrap();
         within(
             &emitter,
             "second agent_idle",
@@ -3029,7 +3050,7 @@ mod tests {
         // the next is sent — otherwise the actor could start turn N+1 before
         // turn N's SessionMeta-driven clear lands.
         for completed in 1..=4 {
-            send_message_impl(&state, agent.id, "hi").await.unwrap();
+            send_msg(&state, agent.id, "hi").await.unwrap();
             within(
                 &emitter,
                 "agent_idle",
@@ -3084,8 +3105,8 @@ mod tests {
         .unwrap();
 
         let (accepted_a, accepted_b) = tokio::join!(
-            send_message_impl(&state, agent_a.id, "A's prompt"),
-            send_message_impl(&state, agent_b.id, "B's prompt"),
+            send_msg(&state, agent_a.id, "A's prompt"),
+            send_msg(&state, agent_b.id, "B's prompt"),
         );
         accepted_a.unwrap();
         accepted_b.unwrap();
@@ -4723,9 +4744,7 @@ mod tests {
             fresh_state_with_scenario(switchboard_harness::MockScenario::AwaitCancellation);
         let (agent, _project_id) = project_with_agent(&state, &tmp).await;
 
-        send_message_impl(&state, agent.id, "long task")
-            .await
-            .unwrap();
+        send_msg(&state, agent.id, "long task").await.unwrap();
         // Wait until the actor has actually started the turn (the
         // `AwaitCancellation` scenario then parks until the cancel token fires).
         within(
@@ -4765,14 +4784,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancel_send_impl_cancels_every_recipient_of_the_send() {
+        // App-level routing: the send-scoped cancellation semantics (the
+        // `send_id` scoping guard, queued-item removal) are covered in the
+        // dispatcher crate. Here we assert the impl fans the cancel out to all
+        // recipients of one shared `send_id`, driving each to a cancelled
+        // terminal.
+        let (tmp, state, emitter) =
+            fresh_state_with_scenario(switchboard_harness::MockScenario::AwaitCancellation);
+        let (agent_a, _project_id) = project_with_agent(&state, &tmp).await;
+        let agent_b = create_agent_impl(&state, "assistant-2", HarnessKind::ClaudeCode).unwrap();
+
+        // One Send fanned out to both: same `send_id`, one call per recipient.
+        let send_id = Uuid::now_v7();
+        send_message_impl(&state, agent_a.id, "fan-out", send_id)
+            .await
+            .unwrap();
+        send_message_impl(&state, agent_b.id, "fan-out", send_id)
+            .await
+            .unwrap();
+        within(
+            &emitter,
+            "both turns in flight",
+            emitter.wait_for_type("turn_start", 2),
+        )
+        .await;
+
+        cancel_send_impl(&state, send_id, &[agent_a.id, agent_b.id]);
+
+        within(
+            &emitter,
+            "both agents idle",
+            emitter.wait_for_type("agent_idle", 2),
+        )
+        .await;
+        for agent in [&agent_a, &agent_b] {
+            let channel = format!("agent:{}", agent.id);
+            let cancelled = emitter.snapshot().into_iter().any(|(name, v)| {
+                name == channel && v["type"] == "turn_end" && v["outcome"]["status"] == "cancelled"
+            });
+            assert!(
+                cancelled,
+                "recipient {} is driven to a cancelled terminal by cancel_send",
+                agent.name
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn drain_helper_cancels_drains_then_releases_lock() {
         let (tmp, state, emitter) =
             fresh_state_with_scenario(switchboard_harness::MockScenario::AwaitCancellation);
         let (agent, project_id) = project_with_agent(&state, &tmp).await;
 
-        send_message_impl(&state, agent.id, "long task")
-            .await
-            .unwrap();
+        send_msg(&state, agent.id, "long task").await.unwrap();
         // Wait until the turn is actually live (started) before draining — the
         // event-based equivalent of the old `agent_status == InFlight` check.
         within(
@@ -4821,9 +4886,7 @@ mod tests {
         let (tmp, state, emitter) = fresh_state_with_mock();
         let (agent, project_id) = project_with_agent(&state, &tmp).await;
 
-        send_message_impl(&state, agent.id, "journal me")
-            .await
-            .unwrap();
+        send_msg(&state, agent.id, "journal me").await.unwrap();
         // The send record is written at turn-start, but await the terminal
         // `agent_idle` so the whole turn (and its journaling) has settled.
         within(
@@ -4862,9 +4925,7 @@ mod tests {
         let (agent, _project_id) = project_with_agent(&state, &tmp).await;
 
         // First send starts the turn and parks it.
-        send_message_impl(&state, agent.id, "blocker")
-            .await
-            .unwrap();
+        send_msg(&state, agent.id, "blocker").await.unwrap();
         within(
             &emitter,
             "blocker turn_start",
@@ -4873,7 +4934,7 @@ mod tests {
         .await;
 
         // Second send queues behind the in-flight turn.
-        let queued_id = send_message_impl(&state, agent.id, "queued").await.unwrap();
+        let queued_id = send_msg(&state, agent.id, "queued").await.unwrap();
 
         let removed = remove_queued_message_impl(&state, agent.id, queued_id)
             .await
@@ -4953,9 +5014,7 @@ mod tests {
             fresh_state_with_scenario(switchboard_harness::MockScenario::AwaitCancellation);
         let (agent, project_id) = project_with_agent(&state, &tmp).await;
 
-        send_message_impl(&state, agent.id, "long task")
-            .await
-            .unwrap();
+        send_msg(&state, agent.id, "long task").await.unwrap();
         within(
             &emitter,
             "turn_start",
@@ -5404,9 +5463,7 @@ mod tests {
         let state = Arc::new(state);
 
         // First send starts + parks the turn.
-        send_message_impl(&state, agent.id, "blocker")
-            .await
-            .unwrap();
+        send_msg(&state, agent.id, "blocker").await.unwrap();
         within(
             &emitter,
             "blocker turn_start",
@@ -5425,8 +5482,7 @@ mod tests {
         let agent_id = agent.id;
         let remover =
             tokio::spawn(async move { remove_directory_impl(&remove_state, &path).await });
-        let sender =
-            tokio::spawn(async move { send_message_impl(&send_state, agent_id, "late").await });
+        let sender = tokio::spawn(async move { send_msg(&send_state, agent_id, "late").await });
         remover.await.unwrap().unwrap();
         let _ = sender.await.unwrap();
 
@@ -5697,6 +5753,39 @@ mod tests {
             2,
             "both agent turns present"
         );
+        // Both responses recover the shared send_id (joined by turn_id against
+        // the journal Sends), so the frontend groups them the same way it
+        // groups a live fan-out.
+        for item in &merged.items {
+            if let ConversationItem::AgentTurn { send_id: sid, .. } = item {
+                assert_eq!(
+                    *sid,
+                    Some(send_id),
+                    "each historical fan-out response is tagged with the shared send_id"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn merge_agent_turn_without_a_matching_send_has_no_send_id() {
+        // A harness turn with no journal Send record (e.g. pre-journal history
+        // or a send whose record write failed) → send_id is None, not a panic.
+        let agent = Uuid::now_v7();
+        let orphan_turn = Uuid::now_v7();
+        let transcript = transcript_of(vec![agent_turn(orphan_turn, agent, "reply", 1)]);
+
+        let merged = merge_project_conversation(Vec::new(), vec![(agent, transcript, None)]);
+
+        let tagged = merged
+            .items
+            .iter()
+            .find_map(|i| match i {
+                ConversationItem::AgentTurn { send_id, .. } => Some(*send_id),
+                _ => None,
+            })
+            .expect("one agent turn");
+        assert_eq!(tagged, None, "no journal Send ⇒ untagged, gracefully");
     }
 
     #[test]

@@ -137,6 +137,15 @@ enum Command {
     },
     /// Cancel the running turn (out-of-band; no-op if none is live).
     Cancel(CancelSource),
+    /// Cancel a whole *send* on this agent: fire the running turn's cancel
+    /// token **iff** the running item's `send_id` matches, and drop any queued
+    /// items of that send. No-op otherwise (already past this send, or never
+    /// had it). Out-of-band, no reply — effects surface as the turn's
+    /// synthesized `Cancelled` terminal.
+    CancelSend {
+        send_id: SendId,
+        source: CancelSource,
+    },
     /// Close the actor: reject further work, clear the backlog, cancel any
     /// running turn, drain it, then signal `reply` and exit.
     Shutdown {
@@ -455,6 +464,24 @@ impl Dispatcher {
         }
     }
 
+    /// Cancel a whole send across its `recipients` (system-design §7 "Cancel a
+    /// send"). Delivers a send-scoped command to each recipient's actor; each
+    /// actor — the single authority over its own running turn + backlog —
+    /// cancels its in-flight turn **iff** that turn belongs to `send_id` and
+    /// drops any still-queued item of the send, never touching a *later,
+    /// unrelated* turn (the TOCTOU a frontend per-agent `cancel_turn` loop
+    /// would hit). Fire-and-forget: per-recipient effects arrive as that turn's
+    /// synthesized `Cancelled` terminal on the event stream; there is no
+    /// aggregate send outcome.
+    pub fn cancel_send(&self, send_id: SendId, recipients: &[AgentId], source: CancelSource) {
+        let agents = lock(&self.agents);
+        for &agent_id in recipients {
+            if let Some(AgentSlot::Active(tx)) = agents.get(&agent_id) {
+                let _ = tx.send(Command::CancelSend { send_id, source });
+            }
+        }
+    }
+
     /// Remove a not-yet-dispatched queued message by id, returning its payload
     /// so the UI can restore the composer text. **Race-safe** (the actor is the
     /// single authority): if the id is no longer enqueued — already
@@ -684,6 +711,11 @@ fn apply_idle_command(
         }
         // No turn live ⇒ cancel is a no-op.
         Command::Cancel(_) => IdleAfter::Continue,
+        // No turn live ⇒ only this send's *queued* items can exist; drop them.
+        Command::CancelSend { send_id, source: _ } => {
+            backlog.retain(|m| m.send_id != send_id);
+            IdleAfter::Continue
+        }
         // The caller (`agent_actor`) abandons the backlog (emitting
         // `MessageFailed` for each queued message) before replying.
         Command::Shutdown { source: _, reply } => IdleAfter::Shutdown(reply),
@@ -784,7 +816,16 @@ async fn run_turn(
     );
 
     drain_turn(
-        agent_id, channel, turn_id, started_at, &emitter, &journal, &token, stream, commands,
+        agent_id,
+        channel,
+        turn_id,
+        item.send_id,
+        started_at,
+        &emitter,
+        &journal,
+        &token,
+        stream,
+        commands,
         backlog,
     )
     .await
@@ -792,11 +833,15 @@ async fn run_turn(
 
 /// Drain a single turn's event stream while multiplexing commands. Returns
 /// whether the actor should keep draining its backlog or shut down.
-#[allow(clippy::too_many_arguments)]
+// The command-multiplexing select! loop is one cohesive state machine; splitting
+// it to satisfy the line/arg pedantic lints would scatter the cancel/enqueue/
+// shutdown handling that must be read together.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn drain_turn(
     agent_id: AgentId,
     channel: &str,
     turn_id: TurnId,
+    running_send_id: SendId,
     started_at: DateTime<Utc>,
     emitter: &Arc<dyn EventEmitter>,
     journal: &Arc<dyn ConversationJournal>,
@@ -870,6 +915,19 @@ async fn drain_turn(
                     }
                     Some(Command::Remove { message_id, reply }) => {
                         let _ = reply.send(remove_from_backlog(backlog, agent_id, message_id));
+                    }
+                    Some(Command::CancelSend { send_id, source }) => {
+                        // Fire the running turn's cancel token only if this turn
+                        // belongs to the send (post-terminal cancel is a no-op
+                        // via the token-presence guard); either way drop any
+                        // still-queued items of the same send. A send maps to at
+                        // most one item per agent, so these are mutually
+                        // exclusive in practice.
+                        if running_send_id == send_id && !terminal_seen {
+                            cancel_source.get_or_insert(source);
+                            token.cancel();
+                        }
+                        backlog.retain(|m| m.send_id != send_id);
                     }
                     Some(Command::Shutdown { source, reply }) => {
                         // Cancel the running turn and keep draining to its

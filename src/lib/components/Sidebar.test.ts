@@ -67,7 +67,7 @@ describe("Sidebar", () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     // Drive run_status by dispatching a user turn.
-    state.dispatchUserTurn(CLAUDE_AGENT.id, "user-1", "hi", "2026-05-16T00:00:00Z");
+    state.dispatchUserTurn(CLAUDE_AGENT.id, "user-1", "hi", "s1", "2026-05-16T00:00:00Z");
     expect(state.runtimes[CLAUDE_AGENT.id]?.run_status).toBe("starting");
 
     const Sidebar = (await import("./Sidebar.svelte")).default;
@@ -79,8 +79,8 @@ describe("Sidebar", () => {
   it("surfaces last_error from a failed turn", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
-    state.dispatchUserTurn(CLAUDE_AGENT.id, "user-1", "hi", "2026-05-16T00:00:00Z");
-    state.failSendStart(CLAUDE_AGENT.id, {
+    state.dispatchUserTurn(CLAUDE_AGENT.id, "user-1", "hi", "s1", "2026-05-16T00:00:00Z");
+    state.failSendStart(CLAUDE_AGENT.id, "user-1", {
       message: "could not connect",
       kind: "adapter_failure",
     });

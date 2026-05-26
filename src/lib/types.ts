@@ -53,6 +53,12 @@ export type TurnUsage = {
 // that fails before any turn starts surfaces as `message_failed`.
 export type MessageId = string;
 
+// Identifier the frontend mints once per Send action and passes on every
+// per-recipient `send_message` call, so a fan-out's turns share it (the
+// backend groups the user's message once by `send_id`, and `cancel_send` is
+// scoped to it).
+export type SendId = string;
+
 export type NormalizedEvent =
   | { type: "turn_start"; turn_id: TurnId; message_id: MessageId; started_at: string }
   | { type: "content_chunk"; turn_id: TurnId; kind: ContentKind; text: string }
@@ -149,6 +155,7 @@ export type LoadedTurn =
       role: "agent";
       turn_id: TurnId;
       agent_id: AgentId;
+      send_id?: SendId | null;
       started_at: string;
       ended_at?: string | null;
       status: "streaming" | "complete" | "failed";
@@ -340,6 +347,10 @@ export type ConversationItem =
       kind: "agent_turn";
       turn_id: TurnId;
       agent_id: AgentId;
+      // Recovered by joining this turn's `turn_id` against the journal's Send
+      // records, so a historical fan-out's responses group by `send_id` exactly
+      // like live ones. Null when no Send matched (pre-journal / failed write).
+      send_id?: SendId | null;
       started_at: string;
       ended_at?: string | null;
       status: "streaming" | "complete" | "failed";

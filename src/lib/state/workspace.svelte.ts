@@ -227,6 +227,7 @@ export async function hydrateProject(projectId: ProjectId): Promise<void> {
           role: "agent",
           turn_id: item.turn_id,
           agent_id: item.agent_id,
+          send_id: item.send_id ?? null,
           started_at: item.started_at,
           ended_at: item.ended_at ?? null,
           status: item.status,

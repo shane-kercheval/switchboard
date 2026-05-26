@@ -329,9 +329,9 @@ describe("ComposeBar", () => {
     await waitFor(() => {
       expect(state.runtimes[AGENT_A.id]?.run_status).toBe("starting");
     });
-    // The accepted-send receipt is recorded for correlation.
+    // The accepted-send receipt is recorded on the pending entry for correlation.
     await waitFor(() => {
-      expect(state.runtimes[AGENT_A.id]?.pending_message_id).toBe(messageId);
+      expect(state.runtimes[AGENT_A.id]?.pending_sends?.[0]?.message_id).toBe(messageId);
     });
     fireTo(`agent:${AGENT_A.id}`, {
       type: "turn_start",
@@ -341,7 +341,7 @@ describe("ComposeBar", () => {
     });
     expect(state.runtimes[AGENT_A.id]?.run_status).toBe("processing");
     expect(state.runtimes[AGENT_A.id]?.in_flight_turn_id).toBe(turnId);
-    expect(state.runtimes[AGENT_A.id]?.pending_message_id).toBeUndefined();
+    expect(state.runtimes[AGENT_A.id]?.pending_sends).toBeUndefined();
     fireTo(`agent:${AGENT_A.id}`, {
       type: "turn_end",
       turn_id: turnId,
@@ -372,7 +372,7 @@ describe("ComposeBar", () => {
     await fireEvent.click(screen.getByTestId("compose-send"));
 
     await waitFor(() => {
-      expect(state.runtimes[AGENT_A.id]?.pending_message_id).toBe(messageId);
+      expect(state.runtimes[AGENT_A.id]?.pending_sends?.[0]?.message_id).toBe(messageId);
     });
     expect(state.runtimes[AGENT_A.id]?.run_status).toBe("starting");
 
@@ -388,7 +388,7 @@ describe("ComposeBar", () => {
 
     // run_status flips back to idle (Send re-enabled) and the error surfaces.
     expect(state.runtimes[AGENT_A.id]?.run_status).toBe("idle");
-    expect(state.runtimes[AGENT_A.id]?.pending_message_id).toBeUndefined();
+    expect(state.runtimes[AGENT_A.id]?.pending_sends).toBeUndefined();
     expect(state.runtimes[AGENT_A.id]?.last_error).toEqual({
       message: "journal write failed",
       kind: "adapter_failure",

@@ -64,17 +64,21 @@
     // Local UUID for the user-turn id — frontend-only, never crosses the
     // IPC boundary. Distinct from the backend-assigned turn_id (which is
     // the agent's response turn).
+    // One send_id per Send action, shared across recipients once compose is
+    // multi-recipient (single recipient today → a trivially-grouped 1-element
+    // fan-out).
+    const sendId = crypto.randomUUID();
     const userTurnId = crypto.randomUUID();
-    dispatchUserTurn(recipientId, userTurnId, submittedText);
+    dispatchUserTurn(recipientId, userTurnId, submittedText, sendId);
 
     try {
-      const messageId = await api.sendMessage(recipientId, submittedText);
+      const messageId = await api.sendMessage(recipientId, submittedText, sendId);
       // Record the accepted-send receipt so the eventual `turn_start` /
       // `message_failed` event (both carry this `message_id`) correlates
       // back to this dispatch. Guarded inside the state module — a no-op
       // if TurnStart already raced the IPC reply and flipped the agent to
       // "processing".
-      recordSendAccepted(recipientId, messageId);
+      recordSendAccepted(recipientId, userTurnId, messageId);
       // Clear-only-if-unchanged: if the user typed new text during the
       // in-flight window, preserve it. If the prompt still matches what
       // we submitted, clear it for the next message. Future work may
@@ -94,7 +98,7 @@
       // IPC failure was spurious). Prompt text is preserved
       // unconditionally on failure so the user can retry without
       // retyping.
-      failSendStart(recipientId, { message, kind: "adapter_failure" });
+      failSendStart(recipientId, userTurnId, { message, kind: "adapter_failure" });
     }
   }
 

@@ -13,6 +13,7 @@ import type {
   ProjectId,
   ProjectListing,
   ProjectSummary,
+  SendId,
   WorkspaceDirectories,
 } from "./types";
 
@@ -113,9 +114,23 @@ export async function listAgents(projectId?: ProjectId): Promise<AgentRecord[]> 
 // Returns the accepted-send receipt (`message_id`), NOT the turn_id. The
 // turn's real `turn_id` arrives later on the correlated `turn_start` event
 // (matched by `message_id`); a failure before the turn starts arrives as a
-// `message_failed` event keyed by the same `message_id`.
-export async function sendMessage(agentId: string, prompt: string): Promise<MessageId> {
-  return await invoke<MessageId>("send_message", { agentId, prompt });
+// `message_failed` event keyed by the same `message_id`. `sendId` is minted
+// once per Send and passed on every per-recipient call so a fan-out's turns
+// share it.
+export async function sendMessage(
+  agentId: string,
+  prompt: string,
+  sendId: SendId,
+): Promise<MessageId> {
+  return await invoke<MessageId>("send_message", { agentId, prompt, sendId });
+}
+
+// Cancel a whole send across its recipients (send-scoped, actor-decided): each
+// recipient cancels its in-flight turn iff it belongs to `sendId` and drops any
+// still-queued item of the send, never touching a later, unrelated turn. The
+// per-turn cancelled terminals flow back over the agent event channels.
+export async function cancelSend(sendId: SendId, recipients: AgentId[]): Promise<void> {
+  await invoke("cancel_send", { sendId, recipients });
 }
 
 export async function loadTranscript(agentId: AgentId): Promise<LoadedTranscript> {

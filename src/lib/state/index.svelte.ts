@@ -41,6 +41,7 @@ import type {
   Hydrate,
   MessageId,
   NormalizedEvent,
+  SendId,
   TurnId,
 } from "$lib/types";
 import { HEARTBEAT_TIMEOUT_MS } from "$lib/types";
@@ -258,6 +259,7 @@ export function dispatchUserTurn(
   agentId: AgentId,
   userTurnId: TurnId,
   text: string,
+  sendId: SendId,
   // Timestamp generation, not reactive state.
   // eslint-disable-next-line svelte/prefer-svelte-reactivity
   startedAt: string = new Date().toISOString(),
@@ -269,38 +271,42 @@ export function dispatchUserTurn(
     });
     return;
   }
-  if (runtime.run_status !== "idle") {
-    console.error("[switchboard] dispatchUserTurn called while agent not idle", {
-      agent_id: agentId,
-      run_status: runtime.run_status,
-    });
-    return;
-  }
   const existing = transcripts[agentId] ?? [];
-  transcripts[agentId] = _internal.appendUserTurn(existing, agentId, userTurnId, text, startedAt);
-  runtimes[agentId] = {
-    ...runtime,
-    run_status: "starting",
-    last_error: undefined,
-    // The send hasn't been accepted yet — `recordSendAccepted` fills the
-    // `message_id` once `send_message` resolves. Cleared here so a stale
-    // receipt from a prior send can't linger into this dispatch.
-    pending_message_id: undefined,
-  };
+  transcripts[agentId] = _internal.appendUserTurn(
+    existing,
+    agentId,
+    userTurnId,
+    text,
+    startedAt,
+    sendId,
+  );
+  // Append a pending-send entry regardless of whether the agent is idle or
+  // busy — send-while-busy is un-gated (the backend queues), so a second send
+  // just lines up behind the running turn. The entry (keyed by user_turn_id,
+  // receipt filled later) is what stamps each response's `send_id` and lets a
+  // failure prune the right send.
+  const pending = [...(runtime.pending_sends ?? []), { send_id: sendId, user_turn_id: userTurnId }];
+  // Only an idle agent transitions to "starting" (the run_status machine
+  // governs the single running turn); a send to a busy agent leaves its
+  // run_status alone — its turn waits in the backend queue and surfaces when
+  // its `turn_start` arrives.
+  runtimes[agentId] =
+    runtime.run_status === "idle"
+      ? { ...runtime, run_status: "starting", last_error: undefined, pending_sends: pending }
+      : { ...runtime, pending_sends: pending };
   ui.lastRecipientId = agentId;
 }
 
-/// Record the accepted-send receipt (`message_id`) for the agent's in-flight
-/// `"starting"` dispatch. Called by the compose-bar after `send_message`
-/// resolves. The recorded `message_id` is what correlates the eventual
-/// `turn_start` / `message_failed` event back to this optimistic dispatch
-/// (see `AgentRuntime.run_status` docstring for the full state machine).
-///
-/// **Guarded**: only writes while `"starting"`. If `turn_start` raced the
-/// IPC reply (the agent is already `"processing"`), the receipt is moot —
-/// the turn correlated itself already, and stamping a stale `message_id`
-/// would be incorrect.
-export function recordSendAccepted(agentId: AgentId, messageId: MessageId): void {
+/// Record the accepted-send receipt (`message_id`) onto this send's pending
+/// entry (matched by `user_turn_id`). Called by the compose-bar after
+/// `send_message` resolves; the receipt lets the correlated `turn_start` /
+/// `message_failed` event find the right entry. A no-op if the entry is already
+/// gone (its `turn_start` / failure raced the IPC reply and consumed it).
+export function recordSendAccepted(
+  agentId: AgentId,
+  userTurnId: TurnId,
+  messageId: MessageId,
+): void {
   const runtime = runtimes[agentId];
   if (runtime === undefined) {
     console.error("[switchboard] recordSendAccepted called for unregistered agent", {
@@ -308,23 +314,27 @@ export function recordSendAccepted(agentId: AgentId, messageId: MessageId): void
     });
     return;
   }
-  if (runtime.run_status !== "starting") return;
-  runtimes[agentId] = { ...runtime, pending_message_id: messageId };
+  const pending = runtime.pending_sends;
+  if (pending === undefined) return;
+  const idx = pending.findIndex((p) => p.user_turn_id === userTurnId);
+  const entry = idx >= 0 ? pending[idx] : undefined;
+  if (entry === undefined) return;
+  const next = [...pending];
+  next[idx] = { ...entry, message_id: messageId };
+  runtimes[agentId] = { ...runtime, pending_sends: next };
 }
 
-/// Mark a send-start failure: the compose-bar called `dispatchUserTurn`,
-/// then invoked the `send_message` Tauri IPC which rejected before the
-/// backend's `TurnStart` could arrive. Restores `run_status` to `"idle"`
-/// (re-enabling Send for retry) and surfaces `last_error` for the sidebar.
-///
-/// **Guarded transition**: only flips `"starting" → "idle"`. If
-/// `TurnStart` raced ahead and the agent is already `"processing"`, this
-/// is a no-op — the backend is genuinely processing the turn and the
-/// frontend's "send failed" intuition was wrong. The optimistic user
-/// turn stays in the transcript regardless (the user did submit it; the
-/// failure is a separate surface).
+/// Mark a send-start failure: the compose-bar called `dispatchUserTurn`, then
+/// invoked the `send_message` Tauri IPC which rejected before the backend's
+/// `TurnStart` arrived. Prunes this send's pending entry (by `user_turn_id`,
+/// wherever it sits — a queued send's entry is not at the front) and surfaces
+/// `last_error`. Flips `run_status` back to `"idle"` only if this was the
+/// *starting* send; a queued send failing while another turn is `processing`
+/// must not stomp the live turn. The optimistic user turn stays in the
+/// transcript (the user did submit it; the failure is a separate surface).
 export function failSendStart(
   agentId: AgentId,
+  userTurnId: TurnId,
   error?: { message: string; kind: FailureKind },
 ): void {
   const runtime = runtimes[agentId];
@@ -334,18 +344,17 @@ export function failSendStart(
     });
     return;
   }
-  if (runtime.run_status !== "starting") {
-    // No-op — TurnStart raced ahead, or the agent is otherwise not in
-    // the starting state. The frontend's "send failed" intuition was
-    // wrong; the backend is actually processing.
-    return;
-  }
-  runtimes[agentId] = {
-    ...runtime,
-    run_status: "idle",
-    last_error: error,
-    pending_message_id: undefined,
-  };
+  const pending = runtime.pending_sends;
+  const idx = pending?.findIndex((p) => p.user_turn_id === userTurnId) ?? -1;
+  // Entry already gone ⇒ TurnStart raced ahead and consumed it; the backend is
+  // genuinely processing this send. No-op (don't stomp the live turn).
+  if (pending === undefined || idx < 0) return;
+  const remaining = [...pending.slice(0, idx), ...pending.slice(idx + 1)];
+  const pending_sends = remaining.length === 0 ? undefined : remaining;
+  runtimes[agentId] =
+    runtime.run_status === "starting"
+      ? { ...runtime, run_status: "idle", last_error: error, pending_sends }
+      : { ...runtime, last_error: error, pending_sends };
 }
 
 /// Mark an agent as already-hydrated so the per-agent `hydrateAgent` path
@@ -382,6 +391,20 @@ export function unregisterAgents(agentIds: AgentId[]): void {
 
 // --- internal ---
 
+/// The `send_id` of the pending entry a `turn_start { message_id }` belongs to:
+/// the entry matching `messageId`, else the front (covers the race where the
+/// IPC receipt hasn't been recorded yet). Mirrors `reducers.ts::pickPendingIndex`
+/// so the transcript stamp and the runtime removal pick the same entry.
+function pendingSendIdFor(runtime: AgentRuntime, messageId: MessageId): SendId | undefined {
+  const pending = runtime.pending_sends;
+  const front = pending?.[0];
+  if (front === undefined) return undefined;
+  const byMsg = pending?.find((p) => p.message_id === messageId);
+  if (byMsg !== undefined) return byMsg.send_id;
+  // Front-fallback only during the pre-receipt race (mirrors pickPendingIndex).
+  return front.message_id === undefined ? front.send_id : undefined;
+}
+
 function handleEvent(agentId: AgentId, event: NormalizedEvent): void {
   // Check runtime BEFORE applying any reducer. If runtime is missing,
   // applying transcriptReducer first would mutate transcripts while the
@@ -406,7 +429,13 @@ function handleEvent(agentId: AgentId, event: NormalizedEvent): void {
   const receivedAt = new Date().toISOString();
 
   const priorTurns = transcripts[agentId] ?? [];
-  transcripts[agentId] = transcriptReducer(priorTurns, event, agentId, receivedAt);
+  // On turn_start, find the pending-send entry this turn belongs to (by
+  // message_id, else the front — the backend runs turns in dispatch order) and
+  // pass its send_id so the new agent turn is stamped; `runtimeReducer` removes
+  // the same entry in lockstep.
+  const sendId =
+    event.type === "turn_start" ? pendingSendIdFor(priorRuntime, event.message_id) : undefined;
+  transcripts[agentId] = transcriptReducer(priorTurns, event, agentId, receivedAt, sendId);
   runtimes[agentId] = runtimeReducer(priorRuntime, event);
   manageHeartbeat(agentId, event);
 }

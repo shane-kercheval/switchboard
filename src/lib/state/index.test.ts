@@ -339,7 +339,7 @@ describe("dispatchUserTurn", () => {
   it("synchronously appends a user-role turn before any event arrives", async () => {
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));
-    state.dispatchUserTurn(AGENT_A, "user-1", "hello", "2026-05-16T00:00:00Z");
+    state.dispatchUserTurn(AGENT_A, "user-1", "hello", "s1", "2026-05-16T00:00:00Z");
     const turns = state.transcripts[AGENT_A] ?? [];
     expect(turns).toHaveLength(1);
     expect(turns[0]?.role).toBe("user");
@@ -351,7 +351,7 @@ describe("dispatchUserTurn", () => {
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));
     expect(state.runtimes[AGENT_A]?.run_status).toBe("idle");
-    state.dispatchUserTurn(AGENT_A, "user-1", "hello", "2026-05-16T00:00:00Z");
+    state.dispatchUserTurn(AGENT_A, "user-1", "hello", "s1", "2026-05-16T00:00:00Z");
     expect(state.runtimes[AGENT_A]?.run_status).toBe("starting");
   });
 
@@ -368,7 +368,7 @@ describe("dispatchUserTurn", () => {
       ...before,
       last_error: { message: "old failure", kind: "harness_error" },
     };
-    state.dispatchUserTurn(AGENT_A, "user-1", "retry", "2026-05-16T00:00:00Z");
+    state.dispatchUserTurn(AGENT_A, "user-1", "retry", "s1", "2026-05-16T00:00:00Z");
     expect(state.runtimes[AGENT_A]?.last_error).toBeUndefined();
   });
 
@@ -376,7 +376,7 @@ describe("dispatchUserTurn", () => {
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));
     await state.registerAgent(agentRecord(AGENT_B));
-    state.dispatchUserTurn(AGENT_B, "user-1", "hi", "2026-05-16T00:00:00Z");
+    state.dispatchUserTurn(AGENT_B, "user-1", "hi", "s1", "2026-05-16T00:00:00Z");
     expect(state.ui.lastRecipientId).toBe(AGENT_B);
     // After dispatch, B's run_status is "starting" — a second dispatch
     // to B in this window is gated by the defense (see below). Use a
@@ -386,7 +386,7 @@ describe("dispatchUserTurn", () => {
     // advance via the legitimate path: simulate the turn lifecycle
     // turn_start → agent_idle. For this picker-ergonomic test, the
     // cleanest path is to dispatch to a different agent. A is still idle.
-    state.dispatchUserTurn(AGENT_A, "user-2", "hi again", "2026-05-16T00:00:01Z");
+    state.dispatchUserTurn(AGENT_A, "user-2", "hi again", "s1", "2026-05-16T00:00:01Z");
     expect(state.ui.lastRecipientId).toBe(AGENT_A);
   });
 
@@ -394,7 +394,7 @@ describe("dispatchUserTurn", () => {
     const state = await loadState();
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     // No registerAgent call — runtime doesn't exist.
-    state.dispatchUserTurn(AGENT_A, "user-1", "hello", "2026-05-16T00:00:00Z");
+    state.dispatchUserTurn(AGENT_A, "user-1", "hello", "s1", "2026-05-16T00:00:00Z");
     expect(errSpy).toHaveBeenCalledWith(
       "[switchboard] dispatchUserTurn called for unregistered agent",
       expect.objectContaining({ agent_id: AGENT_A }),
@@ -404,27 +404,27 @@ describe("dispatchUserTurn", () => {
     errSpy.mockRestore();
   });
 
-  it("rejects calls while agent is not idle (defense-in-depth)", async () => {
-    // The compose-bar should gate on run_status === "idle". If a bug let
-    // a second dispatch through, the state action defends by no-op'ing
-    // and logging. The first user turn stays; no phantom second user
-    // turn for a dispatch that won't happen.
+  it("queues a second send while the agent is busy (send-while-busy un-gated)", async () => {
+    // Send-while-busy is no longer rejected: the backend queues, so a second
+    // dispatch appends its optimistic user turn and lines its send up behind
+    // the running one (the FIFO that stamps each response's send_id). The
+    // first send's run_status ("starting") is left alone.
     const state = await loadState();
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     await state.registerAgent(agentRecord(AGENT_A));
-    state.dispatchUserTurn(AGENT_A, "user-1", "first", "2026-05-16T00:00:00Z");
-    // Now agent is "starting" — second dispatch should reject.
-    state.dispatchUserTurn(AGENT_A, "user-2", "second", "2026-05-16T00:00:01Z");
+    state.dispatchUserTurn(AGENT_A, "user-1", "first", "send-1", "2026-05-16T00:00:00Z");
+    state.dispatchUserTurn(AGENT_A, "user-2", "second", "send-2", "2026-05-16T00:00:01Z");
 
-    expect(errSpy).toHaveBeenCalledWith(
-      "[switchboard] dispatchUserTurn called while agent not idle",
-      expect.objectContaining({ agent_id: AGENT_A, run_status: "starting" }),
-    );
-    // Only ONE user turn appended.
+    // No "not idle" rejection — both sends are accepted.
+    expect(errSpy).not.toHaveBeenCalled();
     const turns = state.transcripts[AGENT_A] ?? [];
-    expect(turns).toHaveLength(1);
-    if (turns[0]?.role !== "user") throw new Error("unreachable");
-    expect(turns[0]?.text).toBe("first");
+    expect(turns.map((t) => (t.role === "user" ? t.text : "?"))).toEqual(["first", "second"]);
+    // Both sends line up in dispatch order; the running turn stays "starting".
+    expect(state.runtimes[AGENT_A]?.pending_sends?.map((p) => p.send_id)).toEqual([
+      "send-1",
+      "send-2",
+    ]);
+    expect(state.runtimes[AGENT_A]?.run_status).toBe("starting");
     errSpy.mockRestore();
   });
 });
@@ -433,10 +433,13 @@ describe("failSendStart", () => {
   it("flips starting → idle and records the error", async () => {
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));
-    state.dispatchUserTurn(AGENT_A, "user-1", "hello", "2026-05-16T00:00:00Z");
+    state.dispatchUserTurn(AGENT_A, "user-1", "hello", "s1", "2026-05-16T00:00:00Z");
     expect(state.runtimes[AGENT_A]?.run_status).toBe("starting");
 
-    state.failSendStart(AGENT_A, { message: "Tauri IPC failed", kind: "adapter_failure" });
+    state.failSendStart(AGENT_A, "user-1", {
+      message: "Tauri IPC failed",
+      kind: "adapter_failure",
+    });
 
     expect(state.runtimes[AGENT_A]?.run_status).toBe("idle");
     expect(state.runtimes[AGENT_A]?.last_error).toEqual({
@@ -448,8 +451,8 @@ describe("failSendStart", () => {
   it("preserves the optimistic user turn (user did submit; failure is separate)", async () => {
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));
-    state.dispatchUserTurn(AGENT_A, "user-1", "hello", "2026-05-16T00:00:00Z");
-    state.failSendStart(AGENT_A, { message: "boom", kind: "adapter_failure" });
+    state.dispatchUserTurn(AGENT_A, "user-1", "hello", "s1", "2026-05-16T00:00:00Z");
+    state.failSendStart(AGENT_A, "user-1", { message: "boom", kind: "adapter_failure" });
     const turns = state.transcripts[AGENT_A] ?? [];
     expect(turns).toHaveLength(1);
     expect(turns[0]?.role).toBe("user");
@@ -463,7 +466,7 @@ describe("failSendStart", () => {
     // must not stomp the genuine "processing" state.
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));
-    state.dispatchUserTurn(AGENT_A, "user-1", "hello", "2026-05-16T00:00:00Z");
+    state.dispatchUserTurn(AGENT_A, "user-1", "hello", "s1", "2026-05-16T00:00:00Z");
     fireTo(`agent:${AGENT_A}`, {
       type: "turn_start",
       turn_id: TURN_1,
@@ -472,7 +475,7 @@ describe("failSendStart", () => {
     });
     expect(state.runtimes[AGENT_A]?.run_status).toBe("processing");
 
-    state.failSendStart(AGENT_A, { message: "ignored", kind: "adapter_failure" });
+    state.failSendStart(AGENT_A, "user-1", { message: "ignored", kind: "adapter_failure" });
 
     // No-op: still processing, no last_error.
     expect(state.runtimes[AGENT_A]?.run_status).toBe("processing");
@@ -482,7 +485,7 @@ describe("failSendStart", () => {
   it("is a no-op while idle (idempotent)", async () => {
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));
-    state.failSendStart(AGENT_A, { message: "ignored", kind: "adapter_failure" });
+    state.failSendStart(AGENT_A, "user-1", { message: "ignored", kind: "adapter_failure" });
     expect(state.runtimes[AGENT_A]?.run_status).toBe("idle");
     expect(state.runtimes[AGENT_A]?.last_error).toBeUndefined();
   });
@@ -490,12 +493,63 @@ describe("failSendStart", () => {
   it("logs to console.error for unregistered agents", async () => {
     const state = await loadState();
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    state.failSendStart(AGENT_A);
+    state.failSendStart(AGENT_A, "user-1");
     expect(errSpy).toHaveBeenCalledWith(
       "[switchboard] failSendStart called for unregistered agent",
       expect.objectContaining({ agent_id: AGENT_A }),
     );
     errSpy.mockRestore();
+  });
+});
+
+describe("pending-send pruning (fan-out / queue correctness)", () => {
+  it("prunes a failed send's entry so the next send's response isn't mis-stamped", async () => {
+    // Regression: a send that fails before turn_start must not leave a stale
+    // pending entry that the *next* send's turn_start would consume — which
+    // would stamp the retry's response with the failed send's send_id.
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    state.dispatchUserTurn(AGENT_A, "u1", "first", "send-A", "2026-05-16T00:00:00Z");
+    state.failSendStart(AGENT_A, "u1", { message: "ipc down", kind: "adapter_failure" });
+    expect(state.runtimes[AGENT_A]?.pending_sends).toBeUndefined();
+
+    // Retry succeeds; its turn_start must stamp the retry's send_id.
+    state.dispatchUserTurn(AGENT_A, "u2", "retry", "send-B", "2026-05-16T00:00:01Z");
+    state.recordSendAccepted(AGENT_A, "u2", MESSAGE_1);
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_start",
+      turn_id: TURN_1,
+      message_id: MESSAGE_1,
+      started_at: "2026-05-16T00:00:02Z",
+    });
+    const agentTurn = (state.transcripts[AGENT_A] ?? []).find((t) => t.role === "agent");
+    expect(agentTurn?.role === "agent" ? agentTurn.send_id : null).toBe("send-B");
+  });
+
+  it("prunes a queued send's IPC failure without stomping the running turn", async () => {
+    // Send-while-busy: a queued send's pending entry can fail (IPC) while a
+    // different turn is processing. The failure must prune that entry and
+    // surface the error, but leave run_status === "processing" untouched.
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    state.dispatchUserTurn(AGENT_A, "u1", "running", "send-A", "2026-05-16T00:00:00Z");
+    state.recordSendAccepted(AGENT_A, "u1", MESSAGE_1);
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_start",
+      turn_id: TURN_1,
+      message_id: MESSAGE_1,
+      started_at: "2026-05-16T00:00:01Z",
+    });
+    expect(state.runtimes[AGENT_A]?.run_status).toBe("processing");
+
+    // Queue a second send while busy, then its IPC fails.
+    state.dispatchUserTurn(AGENT_A, "u2", "queued", "send-B", "2026-05-16T00:00:02Z");
+    expect(state.runtimes[AGENT_A]?.pending_sends?.map((p) => p.send_id)).toEqual(["send-B"]);
+    state.failSendStart(AGENT_A, "u2", { message: "queue ipc down", kind: "adapter_failure" });
+
+    expect(state.runtimes[AGENT_A]?.pending_sends).toBeUndefined();
+    expect(state.runtimes[AGENT_A]?.run_status).toBe("processing");
+    expect(state.runtimes[AGENT_A]?.last_error?.message).toBe("queue ipc down");
   });
 });
 
@@ -505,7 +559,7 @@ describe("state machine — starting → processing transition", () => {
     // accepts and emits TurnStart → processing.
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));
-    state.dispatchUserTurn(AGENT_A, "user-1", "hello", "2026-05-16T00:00:00Z");
+    state.dispatchUserTurn(AGENT_A, "user-1", "hello", "s1", "2026-05-16T00:00:00Z");
     expect(state.runtimes[AGENT_A]?.run_status).toBe("starting");
 
     fireTo(`agent:${AGENT_A}`, {

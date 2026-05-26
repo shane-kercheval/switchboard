@@ -605,7 +605,9 @@ describe("App", () => {
     await waitFor(() => {
       const sendCalls = invokeMock.mock.calls.filter(([c]) => c === "send_message");
       expect(sendCalls).toHaveLength(1);
-      expect(sendCalls[0]?.[1]).toEqual({ agentId: "ag-1", prompt: "hi" });
+      expect(sendCalls[0]?.[1]).toMatchObject({ agentId: "ag-1", prompt: "hi" });
+      // A frontend-minted send_id rides along on every send.
+      expect(typeof (sendCalls[0]?.[1] as { sendId?: unknown }).sendId).toBe("string");
     });
 
     const turnId = "88888888-8888-7000-8000-888888888888";

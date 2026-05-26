@@ -1932,3 +1932,378 @@ async fn cancel_after_completed_turn_writes_no_cancelled_outcome() {
         "the send was journaled at turn-start"
     );
 }
+
+// ── cancel_send (send-scoped cancellation across a fan-out's recipients) ──────
+//
+// A fan-out is N independent turns sharing one `send_id` (one per recipient
+// agent). `cancel_send` must stop exactly that send's turns — cancelling an
+// in-flight turn iff its `send_id` matches and dropping a still-queued item of
+// the send — while never touching a recipient's *later, unrelated* turn (the
+// TOCTOU a naive frontend per-agent `cancel_turn` loop would hit).
+
+/// Sources of every synthesized `Cancelled` terminal recorded on an emitter.
+fn cancelled_sources(emitter: &RecordingEmitter) -> Vec<String> {
+    emitter
+        .snapshot()
+        .iter()
+        .filter(|(_, v)| event_type(v) == "turn_end" && v["outcome"]["status"] == "cancelled")
+        .map(|(_, v)| v["outcome"]["source"].as_str().unwrap_or("?").to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn cancel_send_cancels_every_in_flight_turn_of_the_send() {
+    // Two recipients, both in-flight on the same send. cancel_send stops both.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let agent_a = agent_record();
+    let agent_b = agent_record();
+    let emitter_a = Arc::new(RecordingEmitter::new());
+    let emitter_b = Arc::new(RecordingEmitter::new());
+    let factory_a = TestFactory::new(
+        MockScenario::AwaitCancellation,
+        agent_a.clone(),
+        Arc::clone(&emitter_a),
+        noop_journal(),
+    );
+    let factory_b = TestFactory::new(
+        MockScenario::AwaitCancellation,
+        agent_b.clone(),
+        Arc::clone(&emitter_b),
+        noop_journal(),
+    );
+
+    let send_id = Uuid::now_v7();
+    dispatcher
+        .send_message(
+            agent_a.id,
+            "to A and B",
+            send_id,
+            factory_a as Arc<dyn DispatchContextFactory>,
+            OnBusy::Enqueue,
+        )
+        .await;
+    dispatcher
+        .send_message(
+            agent_b.id,
+            "to A and B",
+            send_id,
+            factory_b as Arc<dyn DispatchContextFactory>,
+            OnBusy::Enqueue,
+        )
+        .await;
+    within(
+        &emitter_a,
+        "A turn_start",
+        emitter_a.wait_for_type("turn_start", 1),
+    )
+    .await;
+    within(
+        &emitter_b,
+        "B turn_start",
+        emitter_b.wait_for_type("turn_start", 1),
+    )
+    .await;
+
+    dispatcher.cancel_send(send_id, &[agent_a.id, agent_b.id], CancelSource::User);
+
+    within(
+        &emitter_a,
+        "A agent_idle",
+        emitter_a.wait_for_type("agent_idle", 1),
+    )
+    .await;
+    within(
+        &emitter_b,
+        "B agent_idle",
+        emitter_b.wait_for_type("agent_idle", 1),
+    )
+    .await;
+    assert_eq!(
+        cancelled_sources(&emitter_a),
+        vec!["user"],
+        "A's turn is cancelled by the user-sourced cancel_send"
+    );
+    assert_eq!(
+        cancelled_sources(&emitter_b),
+        vec!["user"],
+        "B's turn is cancelled by the same cancel_send"
+    );
+}
+
+#[tokio::test]
+async fn cancel_send_is_scoped_and_spares_a_later_unrelated_turn() {
+    // The scoping guard. Recipient A finishes the send's turn and starts a
+    // LATER, unrelated turn (different send_id); recipient B is still on the
+    // send. cancel_send(send_id) must cancel only B — A's later turn untouched.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let agent_a = agent_record();
+    let agent_b = agent_record();
+    let emitter_a = Arc::new(RecordingEmitter::new());
+    let emitter_b = Arc::new(RecordingEmitter::new());
+    // A: first turn streams to completion, second turn parks (in-flight).
+    let factory_a = TestFactory::sequence(
+        [MockScenario::Streaming, MockScenario::AwaitCancellation],
+        agent_a.clone(),
+        Arc::clone(&emitter_a),
+        noop_journal(),
+    );
+    let factory_b = TestFactory::new(
+        MockScenario::AwaitCancellation,
+        agent_b.clone(),
+        Arc::clone(&emitter_b),
+        noop_journal(),
+    );
+
+    let send_id = Uuid::now_v7();
+    let later_send_id = Uuid::now_v7();
+
+    // A's turn on the send completes.
+    dispatcher
+        .send_message(
+            agent_a.id,
+            "the send",
+            send_id,
+            factory_a.clone() as Arc<dyn DispatchContextFactory>,
+            OnBusy::Enqueue,
+        )
+        .await;
+    within(
+        &emitter_a,
+        "A first idle",
+        emitter_a.wait_for_type("agent_idle", 1),
+    )
+    .await;
+    // A starts a later, unrelated turn (different send), now in-flight.
+    dispatcher
+        .send_message(
+            agent_a.id,
+            "unrelated follow-up",
+            later_send_id,
+            factory_a as Arc<dyn DispatchContextFactory>,
+            OnBusy::Enqueue,
+        )
+        .await;
+    within(
+        &emitter_a,
+        "A second turn_start",
+        emitter_a.wait_for_type("turn_start", 2),
+    )
+    .await;
+    // B is still on the send, in-flight.
+    dispatcher
+        .send_message(
+            agent_b.id,
+            "the send",
+            send_id,
+            factory_b as Arc<dyn DispatchContextFactory>,
+            OnBusy::Enqueue,
+        )
+        .await;
+    within(
+        &emitter_b,
+        "B turn_start",
+        emitter_b.wait_for_type("turn_start", 1),
+    )
+    .await;
+
+    dispatcher.cancel_send(send_id, &[agent_a.id, agent_b.id], CancelSource::User);
+
+    within(
+        &emitter_b,
+        "B agent_idle",
+        emitter_b.wait_for_type("agent_idle", 1),
+    )
+    .await;
+    assert_eq!(
+        cancelled_sources(&emitter_b),
+        vec!["user"],
+        "B (still on the send) is cancelled"
+    );
+
+    // Prove A's later turn was spared *deterministically* via the cancel
+    // source. `cancel_send` uses `User`; the direct cancel below uses
+    // `Shutdown`. A's later turn can only be cancelled once, so its single
+    // cancelled terminal's source tells us who cancelled it: if the scoping
+    // guard were broken, `cancel_send` (User) would have won and the source
+    // would read "user". A correct guard means only the direct `Shutdown`
+    // cancel reaches it. This avoids the timing gap of checking
+    // `is_empty()` before A's `CancelSend` was even processed.
+    dispatcher.cancel(agent_a.id, CancelSource::Shutdown);
+    within(
+        &emitter_a,
+        "A second idle",
+        emitter_a.wait_for_type("agent_idle", 2),
+    )
+    .await;
+    assert_eq!(
+        cancelled_sources(&emitter_a),
+        vec!["shutdown"],
+        "A's later turn was cancelled only by the direct Shutdown cancel — \
+         cancel_send (User) for the earlier send did not touch it"
+    );
+}
+
+#[tokio::test]
+async fn cancel_send_cancels_in_flight_and_removes_a_queued_recipient_of_the_send() {
+    // Recipient X is in-flight on the send; recipient Y is busy on an unrelated
+    // turn with the send's message QUEUED behind it. cancel_send cancels X and
+    // removes Y's queued item — which therefore never dispatches — without
+    // touching Y's unrelated in-flight turn.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let agent_x = agent_record();
+    let agent_y = agent_record();
+    let emitter_x = Arc::new(RecordingEmitter::new());
+    let emitter_y = Arc::new(RecordingEmitter::new());
+    let factory_x = TestFactory::new(
+        MockScenario::AwaitCancellation,
+        agent_x.clone(),
+        Arc::clone(&emitter_x),
+        noop_journal(),
+    );
+    // Y: first (unrelated) turn parks; if the queued send item ever dispatched
+    // it would stream — proving via its ABSENCE that removal worked.
+    let factory_y = TestFactory::sequence(
+        [MockScenario::AwaitCancellation, MockScenario::Streaming],
+        agent_y.clone(),
+        Arc::clone(&emitter_y),
+        noop_journal(),
+    );
+
+    let send_id = Uuid::now_v7();
+    let unrelated_send_id = Uuid::now_v7();
+
+    // Y is busy on an unrelated turn.
+    dispatcher
+        .send_message(
+            agent_y.id,
+            "Y unrelated",
+            unrelated_send_id,
+            factory_y as Arc<dyn DispatchContextFactory>,
+            OnBusy::Enqueue,
+        )
+        .await;
+    within(
+        &emitter_y,
+        "Y turn_start",
+        emitter_y.wait_for_type("turn_start", 1),
+    )
+    .await;
+    // The fan-out: X in-flight, Y enqueued behind its unrelated turn.
+    dispatcher
+        .send_message(
+            agent_y.id,
+            "the send",
+            send_id,
+            // Factory ignored — Y's actor already exists and owns its builder.
+            TestFactory::new(
+                MockScenario::Streaming,
+                agent_y.clone(),
+                Arc::clone(&emitter_y),
+                noop_journal(),
+            ) as Arc<dyn DispatchContextFactory>,
+            OnBusy::Enqueue,
+        )
+        .await;
+    dispatcher
+        .send_message(
+            agent_x.id,
+            "the send",
+            send_id,
+            factory_x as Arc<dyn DispatchContextFactory>,
+            OnBusy::Enqueue,
+        )
+        .await;
+    within(
+        &emitter_x,
+        "X turn_start",
+        emitter_x.wait_for_type("turn_start", 1),
+    )
+    .await;
+
+    dispatcher.cancel_send(send_id, &[agent_x.id, agent_y.id], CancelSource::User);
+
+    within(
+        &emitter_x,
+        "X agent_idle",
+        emitter_x.wait_for_type("agent_idle", 1),
+    )
+    .await;
+    assert_eq!(
+        cancelled_sources(&emitter_x),
+        vec!["user"],
+        "X's in-flight turn on the send is cancelled"
+    );
+
+    // Free Y's unrelated turn; with the queued send item removed, Y goes idle
+    // WITHOUT ever dispatching it.
+    dispatcher.cancel(agent_y.id, CancelSource::User);
+    within(
+        &emitter_y,
+        "Y agent_idle",
+        emitter_y.wait_for_type("agent_idle", 1),
+    )
+    .await;
+    assert_eq!(
+        count_type(&emitter_y.snapshot(), "turn_start"),
+        1,
+        "Y's queued send item was removed and never dispatched (only its unrelated turn started)"
+    );
+}
+
+#[tokio::test]
+async fn cancel_send_for_a_completed_send_is_a_noop() {
+    // Every turn of the send already finished. cancel_send is a no-op — no new
+    // cancelled terminal, no extra events.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let agent = agent_record();
+    let emitter = Arc::new(RecordingEmitter::new());
+    let factory = TestFactory::new(
+        MockScenario::Streaming,
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+    );
+
+    let send_id = Uuid::now_v7();
+    dispatcher
+        .send_message(agent.id, "quick", send_id, factory, OnBusy::Enqueue)
+        .await;
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+
+    dispatcher.cancel_send(send_id, &[agent.id], CancelSource::User);
+
+    // Deterministic drain instead of a wall-clock sleep: dispatch a fresh turn.
+    // The actor processes commands in order, so by the time this second turn
+    // starts it has already processed (and no-op'd) the CancelSend — any
+    // erroneous re-cancel would have fired before this turn_start.
+    dispatcher
+        .send_message(
+            agent.id,
+            "next",
+            Uuid::now_v7(),
+            TestFactory::new(
+                MockScenario::Streaming,
+                agent.clone(),
+                Arc::clone(&emitter),
+                noop_journal(),
+            ),
+            OnBusy::Enqueue,
+        )
+        .await;
+    within(
+        &emitter,
+        "second turn_start",
+        emitter.wait_for_type("turn_start", 2),
+    )
+    .await;
+
+    assert!(
+        cancelled_sources(&emitter).is_empty(),
+        "cancel_send on a fully-completed send produces no cancelled terminal"
+    );
+}

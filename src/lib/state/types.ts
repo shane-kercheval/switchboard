@@ -18,6 +18,7 @@ import type {
   McpServerStatus,
   MessageId,
   ParseWarning,
+  SendId,
   ToolKind,
   TurnId,
   TurnUsage,
@@ -37,6 +38,12 @@ export type Turn =
       role: "user";
       turn_id: TurnId;
       agent_id: AgentId;
+      /// The Send this user turn belongs to. A fan-out's recipients share one,
+      /// so the unified view groups the user's message once (and renders the N
+      /// responses as one side-by-side group). Live turns carry it from the
+      /// frontend-minted id; hydrated history recovers it from the journal.
+      /// Optional until the fan-out grouping pass consumes it.
+      send_id?: SendId;
       started_at: string;
       text: string;
     }
@@ -44,6 +51,11 @@ export type Turn =
       role: "agent";
       turn_id: TurnId;
       agent_id: AgentId;
+      /// The Send this response belongs to (groups a fan-out's responses
+      /// side-by-side). Live: stamped from the dispatching send. Hydrated:
+      /// recovered by the backend's journal join — `undefined` when no Send
+      /// matched (pre-journal history).
+      send_id?: SendId;
       started_at: string;
       ended_at?: string;
       /// `"cancelled"` is a terminal state distinct from `"failed"`: the user
@@ -101,6 +113,17 @@ export type ToolCall = {
   is_error?: boolean;
   started_at: string;
   completed_at?: string;
+};
+
+/// One optimistic send awaiting its `turn_start`. `user_turn_id` keys the
+/// optimistic user turn in the transcript (so a client-side IPC failure can
+/// prune the right entry wherever it sits in the list); `message_id` is the
+/// accepted-send receipt, filled by `recordSendAccepted` once `send_message`
+/// resolves (absent during the window before that, hence optional).
+export type PendingSend = {
+  send_id: SendId;
+  user_turn_id: TurnId;
+  message_id?: MessageId;
 };
 
 /// Per-agent operational state.
@@ -167,11 +190,24 @@ export type AgentRuntime = {
   /// `crates/dispatcher/src/lib.rs` and the compose-bar's catch block
   /// respectively.
   run_status: "idle" | "starting" | "processing";
-  /// The accepted-send receipt for the in-flight `"starting"` send, used to
-  /// correlate the eventual `turn_start` / `message_failed` event back to
-  /// this optimistic dispatch. Set when `send_message` resolves; cleared on
-  /// the correlated `turn_start`, `message_failed`, or `failSendStart`.
-  pending_message_id?: MessageId;
+  /// Ordered list of sends dispatched to this agent that haven't yet produced a
+  /// `turn_start` — the optimistic user turns still waiting on their response.
+  /// One entry per send, in dispatch order (the order the backend runs them).
+  ///
+  /// This single structure replaces the old scalar `pending_message_id`: it
+  /// must track *several* pending sends at once, because send-while-busy is
+  /// un-gated (a send to a busy agent queues behind the running turn). Each
+  /// entry carries enough identity to prune the *right* one on every path that
+  /// ends a send without a `turn_start`:
+  /// - `turn_start` consumes the entry matching its `message_id` (else the
+  ///   front, covering the race where the IPC receipt hasn't landed yet) and
+  ///   stamps that response's `send_id`.
+  /// - `message_failed` prunes the matching/front entry (a pre-start failure is
+  ///   always the next-to-run send).
+  /// - a client-side IPC failure (`failSendStart`) prunes by `user_turn_id` —
+  ///   a queued send's failed entry can be anywhere in the list, not the front.
+  /// - cancel-send prunes every entry of the cancelled `send_id`.
+  pending_sends?: PendingSend[];
   /// The turn the heartbeat timer is tracking. Distinct from `run_status`
   /// because for fast-events races the entire stream can fire before the
   /// IPC reply lands; this tracking key lets late events still extend the

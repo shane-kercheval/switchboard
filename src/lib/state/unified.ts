@@ -45,6 +45,12 @@ export type UnifiedRow =
       send_id?: string;
       agent_ids: AgentId[];
       text: string;
+      // True for this-session sends (built from per-agent transcripts), false
+      // for journal-sourced history (the overlay). A live fan-out groups even
+      // before any recipient responds — so all-busy sends show their per-recipient
+      // queued columns and cancel-send affordance immediately; a historical
+      // fan-out only groups once its responses can be correlated.
+      live: boolean;
     }
   | { kind: "agent"; at: string; rank: 1; key: string; send_id?: string; turn: AgentTurn }
   | {
@@ -140,6 +146,7 @@ export function buildUnifiedRows(turns: Turn[], overlay: ConversationItem[]): Un
       send_id: g.send_id,
       agent_ids: g.agent_ids,
       text: g.text,
+      live: true,
     });
   }
 
@@ -153,6 +160,7 @@ export function buildUnifiedRows(turns: Turn[], overlay: ConversationItem[]): Un
         send_id: item.send_id,
         agent_ids: item.agent_ids,
         text: item.text,
+        live: false,
       });
     } else if (item.kind === "outcome") {
       rows.push({
@@ -223,13 +231,14 @@ export function groupRenderBlocks(rows: UnifiedRow[]): RenderBlock[] {
     colsBySend.set(row.send_id, perAgent);
   }
 
-  // Only group a fan-out that actually has correlated content. A multi-recipient
-  // user message whose responses can't be correlated to it (e.g. historical
-  // turns with no recoverable send_id, or a just-dispatched send before any
-  // response) renders as a plain user message — its responses flow in the
-  // stream — rather than a group of empty "queued" columns.
-  for (const sendId of [...fanoutUsers.keys()]) {
-    if (!colsBySend.has(sendId)) fanoutUsers.delete(sendId);
+  // A *live* fan-out always groups, even before any recipient responds, so an
+  // all-busy send shows its per-recipient queued columns and cancel-send
+  // affordance right away. A *historical* (journal-sourced) fan-out only groups
+  // once its responses can be correlated: an uncorrelated multi-recipient
+  // history row (no recoverable send_id match) renders as a plain user message
+  // — its responses flow in the stream — rather than a group of empty columns.
+  for (const [sendId, user] of [...fanoutUsers.entries()]) {
+    if (!user.live && !colsBySend.has(sendId)) fanoutUsers.delete(sendId);
   }
 
   // Pass 2: emit blocks in order. A fan-out user row becomes a group anchored

@@ -18,6 +18,7 @@
 
   let prompt = $state<string>("");
   let sendError = $state<string | null>(null);
+  let composeEl = $state<HTMLDivElement | undefined>(undefined);
 
   /// Recipient set — every agent is shown as a toggle chip (click to add/drop);
   /// `@name` is the keyboard path to the same toggle. Sticky across sends
@@ -40,12 +41,18 @@
   // Keyboard routes to the recipient chips, working even while typing (the
   // modifier chord inserts no text). Window-level so they fire regardless of
   // focus. Mod+Shift+A selects every agent; Mod+1..9 toggles the Nth agent
-  // (same order as the sidebar). Clear is Esc (handled in the composer keydown).
+  // (same order as the sidebar).
+  //
+  // Escape also clears recipients, but — unlike the Mod chords — it carries a
+  // destructive side effect and Escape is overloaded across the app, so it's
+  // scoped to compose-surface focus (textarea or a chip). Outside the composer,
+  // Escape is left alone for whatever else owns it.
   $effect(() => {
     function onKeydown(e: KeyboardEvent): void {
-      // Escape (regardless of focus — a chip may have it): first dismiss the @
-      // menu, otherwise clear the recipient set. The draft text is untouched.
       if (e.key === "Escape") {
+        if (composeEl === undefined || !composeEl.contains(document.activeElement)) return;
+        // First dismiss the @ menu, otherwise clear the recipient set. The draft
+        // text is untouched either way.
         if (menuOpen) {
           menuOpen = false;
           e.preventDefault();
@@ -227,7 +234,7 @@
   }
 </script>
 
-<div class="bg-raised px-4 pt-2 pb-4">
+<div class="bg-raised px-4 pt-2 pb-4" bind:this={composeEl}>
   <div
     class="border-border bg-raised rounded-xl border p-2.5 shadow-[0_10px_32px_rgba(0,0,0,0.08)]"
   >

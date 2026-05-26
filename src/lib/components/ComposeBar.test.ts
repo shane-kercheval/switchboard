@@ -297,7 +297,7 @@ describe("ComposeBar", () => {
     expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "true");
   });
 
-  it("Clear and Escape-on-empty both deselect all recipients", async () => {
+  it("Clear and Escape (with composer focus) both deselect all recipients", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
@@ -309,10 +309,32 @@ describe("ComposeBar", () => {
     await fireEvent.click(screen.getByTestId("recipient-clear"));
     expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "false");
 
-    // Re-select, then clear via Escape on an empty composer.
+    // Re-select, then clear via Escape while the composer holds focus.
     await fireEvent.click(chip(AGENT_A.id));
     expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "true");
-    await fireEvent.keyDown(screen.getByTestId("compose-textarea"), { key: "Escape" });
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    textarea.focus();
+    await fireEvent.keyDown(window, { key: "Escape" });
     expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "false");
+  });
+
+  it("Escape is a no-op when focus is outside the composer", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { agents: [AGENT_A, AGENT_B] } });
+    expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "true");
+
+    // Focus an element outside the compose surface; Escape must not clear the
+    // recipients (Escape is overloaded across the app and only owns the
+    // composer's selection while the composer has focus).
+    const outside = document.createElement("button");
+    document.body.appendChild(outside);
+    outside.focus();
+    await fireEvent.keyDown(window, { key: "Escape" });
+    expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "true");
+    outside.remove();
   });
 });

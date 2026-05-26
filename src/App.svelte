@@ -444,7 +444,9 @@
                 overlay={activeConvo?.items ?? []}
                 loadStatus={activeConvo?.status ?? "complete"}
               />
-              <ComposeBar agents={activeAgents} />
+              {#key selection.activeProjectId}
+                <ComposeBar agents={activeAgents} />
+              {/key}
             </div>
             {#if agentsSidebarOpen}
               <Sidebar agents={activeAgents} onAddAgent={openAddAgent} />

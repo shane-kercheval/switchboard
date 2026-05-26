@@ -1542,19 +1542,24 @@ fn merge_project_conversation(
                 _ => None,
             })
             .collect();
-        // Correlate from the END: the most-recent turns answer the most-recent
-        // completed sends. Turns with no send to pair (older than the first
-        // journaled send — e.g. pre-journaling session history) get no send_id
-        // and render un-grouped. This tolerates count drift without misgrouping.
+        // Correlate turns to completed sends by order, accounting for an
+        // asymmetry between the two lists' unpaired extras:
+        //   - Extra *turns* sit at the FRONT — pre-journaling session history,
+        //     older than the first journaled send. End-align turns so the most
+        //     recent ones pair with sends; the leading unpaired turns get no
+        //     send_id and render un-grouped.
+        //   - Extra *sends* sit at the BACK — an in-flight send whose turn has
+        //     started but not yet produced harness content. Front-align sends
+        //     (`send_offset = 0`) so the trailing in-flight send is dropped
+        //     rather than mislabeling a completed turn.
         let completed = sends_by_agent.get(&agent_id).map_or(&[][..], Vec::as_slice);
         let pairs = agent_turns.len().min(completed.len());
         let turn_offset = agent_turns.len() - pairs;
-        let send_offset = completed.len() - pairs;
         for (j, (turn_id, a_id, started_at, ended_at, status, t_items, usage)) in
             agent_turns.into_iter().enumerate()
         {
             let send_id = if j >= turn_offset {
-                completed.get(send_offset + (j - turn_offset)).copied()
+                completed.get(j - turn_offset).copied()
             } else {
                 None
             };
@@ -5842,6 +5847,51 @@ mod tests {
         assert_eq!(send_at(12), Some(Some(send_id)), "recent c grouped");
         assert_eq!(send_at(0), Some(None), "old b un-grouped");
         assert_eq!(send_at(1), Some(None), "old c un-grouped");
+    }
+
+    #[test]
+    fn merge_in_flight_send_does_not_mislabel_completed_turns() {
+        // Regression: viewing a project while an agent is mid-response. The agent
+        // has two COMPLETED turns (each answering an earlier send) plus a third
+        // send that has started but not yet produced harness content (in-flight:
+        // Send record, no Outcome, no agent turn). The in-flight send sits at the
+        // BACK of the completed-sends list. End-aligning the sends would pair it
+        // with the most-recent completed turn and shift every label by one;
+        // front-aligning drops it so the two completed turns keep their own sends.
+        let agent = Uuid::now_v7();
+        let s1 = Uuid::now_v7();
+        let s2 = Uuid::now_v7();
+        let s3 = Uuid::now_v7(); // in-flight
+        let t1 = Uuid::now_v7();
+        let t2 = Uuid::now_v7();
+        let journal = vec![
+            send_record(s1, t1, agent, "first", 0),
+            send_record(s2, t2, agent, "second", 2),
+            send_record(s3, Uuid::now_v7(), agent, "third (in flight)", 4),
+        ];
+        let transcript = transcript_of(vec![
+            agent_turn(t1, agent, "first reply", 1),
+            agent_turn(t2, agent, "second reply", 3),
+        ]);
+
+        let merged = merge_project_conversation(journal, vec![(agent, transcript, None)]);
+
+        let send_at = |t: i64| {
+            merged.items.iter().find_map(|i| match i {
+                ConversationItem::AgentTurn {
+                    started_at,
+                    send_id,
+                    ..
+                } if *started_at == at(t) => Some(*send_id),
+                _ => None,
+            })
+        };
+        assert_eq!(send_at(1), Some(Some(s1)), "first reply keeps its own send");
+        assert_eq!(
+            send_at(3),
+            Some(Some(s2)),
+            "second reply keeps its own send, not the in-flight one"
+        );
     }
 
     #[test]

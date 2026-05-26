@@ -205,20 +205,26 @@ describe("groupRenderBlocks", () => {
     expect(fan.columns[1]?.rows.map((r) => r.kind)).toEqual(["outcome"]);
   });
 
-  it("renders a multi-recipient message with no correlated responses as a plain row", () => {
-    // Historical/uncorrelated: the user message went to two agents, but the
-    // agent turns carry no matching send_id (couldn't be correlated). It must
-    // render as a plain user message + standalone responses — NOT a group of
-    // empty "queued" columns.
+  it("renders a historical multi-recipient message with no correlated responses as a plain row", () => {
+    // Historical/uncorrelated: the user message comes from the journal overlay
+    // (live=false) and went to two agents, but the agent turns carry no matching
+    // send_id (couldn't be correlated). It must render as a plain user message +
+    // standalone responses — NOT a group of empty "queued" columns.
     const rows = buildUnifiedRows(
       [
-        userTurn(TURN_1, AGENT_A, "2026-05-16T00:00:00Z", "fan out", SEND_1),
-        userTurn("u2", AGENT_B, "2026-05-16T00:00:00Z", "fan out", SEND_1),
         // Responses with NO send_id (uncorrelated).
         agentTurn("ta", AGENT_A, "2026-05-16T00:00:01Z"),
         agentTurn("tb", AGENT_B, "2026-05-16T00:00:02Z"),
       ],
-      [],
+      [
+        {
+          kind: "user_message",
+          send_id: SEND_1,
+          agent_ids: [AGENT_A, AGENT_B],
+          text: "fan out",
+          at: "2026-05-16T00:00:00Z",
+        },
+      ],
     );
     const blocks = groupRenderBlocks(rows);
     expect(blocks.filter((b) => b.kind === "fanout")).toHaveLength(0);
@@ -228,6 +234,26 @@ describe("groupRenderBlocks", () => {
       "agent",
       "agent",
     ]);
+  });
+
+  it("groups a LIVE all-busy fan-out with no responses yet (queued columns)", () => {
+    // Every recipient is busy, so the send queues and no response has streamed
+    // in. A live fan-out (user turns from this session) must still group, so the
+    // per-recipient queued columns and cancel-send affordance show immediately —
+    // unlike the historical uncorrelated case, which degrades to a plain row.
+    const rows = buildUnifiedRows(
+      [
+        userTurn(TURN_1, AGENT_A, "2026-05-16T00:00:00Z", "fan out", SEND_1),
+        userTurn("u2", AGENT_B, "2026-05-16T00:00:00Z", "fan out", SEND_1),
+      ],
+      [],
+    );
+    const blocks = groupRenderBlocks(rows);
+    expect(blocks.filter((b) => b.kind === "fanout")).toHaveLength(1);
+    const fan = fanoutOf(blocks);
+    // Both recipient columns present (in recipient order), each still empty.
+    expect(fan.columns.map((c) => c.agent_id)).toEqual([AGENT_A, AGENT_B]);
+    expect(fan.columns.every((c) => c.rows.length === 0)).toBe(true);
   });
 
   it("leaves a single-recipient send as standalone rows (no fan-out block)", () => {

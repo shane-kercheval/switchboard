@@ -167,7 +167,11 @@
 {/snippet}
 
 {#snippet userMessage(row: Extract<UnifiedRow, { kind: "user" }>)}
-  <div class="space-y-1.5" data-testid="turn" data-role="user">
+  <div
+    class="-mx-3 min-w-0 flex-1 space-y-1.5 rounded-md bg-panel/45 px-3 py-2"
+    data-testid="turn"
+    data-role="user"
+  >
     <div class="flex items-center gap-2 text-[11px] font-semibold tracking-wide uppercase">
       <span class="text-fg" data-testid="turn-author">User</span>
     </div>
@@ -229,7 +233,7 @@
     <p class="text-muted text-sm">No messages yet. Type a prompt below.</p>
   {/if}
 
-  <div class="space-y-5">
+  <div class="space-y-7">
     {#each blocks as block (block.kind === "fanout" ? block.key : block.row.key)}
       {#if block.kind === "row"}
         {#if block.row.kind === "user"}
@@ -243,7 +247,7 @@
         {@const liveAgents = block.columns
           .filter((c) => isLive(columnState(c.rows)))
           .map((c) => c.agent_id)}
-        <div class="space-y-2" data-testid="fanout-group">
+        <div class="space-y-4" data-testid="fanout-group">
           <div class="flex items-start justify-between gap-2">
             {@render userMessage(block.user)}
             {#if liveAgents.length > 0}

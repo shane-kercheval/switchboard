@@ -31,9 +31,12 @@
   --primary: #18181b;
   --primary-fg: #fafafa;
 
-  /* teal accent */
-  --accent: #0d9488;
+  /* green accent — focus rings, links, and selected-state emphasis (e.g. the
+     compose recipient chips). `-soft` is the light tint used for a selected
+     chip's fill, with `--accent` as its readable foreground. */
+  --accent: #15803d;
   --accent-fg: #ffffff;
+  --accent-soft: #dcfce7;
 
   /* destructive action surface — a solid fill (distinct from the soft
      status-failed chip) so a destructive button carries primary-level weight.
@@ -69,8 +72,9 @@
   --primary: #fafafa;
   --primary-fg: #18181b;
 
-  --accent: #2dd4bf;
-  --accent-fg: #042f2e;
+  --accent: #4ade80;
+  --accent-fg: #052e16;
+  --accent-soft: #14532d;
 
   /* deeper, less-glary red on a dark surface; white text clears contrast */
   --destructive: #b91c1c;
@@ -105,6 +109,7 @@
 
   --color-accent: var(--accent);
   --color-accent-fg: var(--accent-fg);
+  --color-accent-soft: var(--accent-soft);
 
   --color-destructive: var(--destructive);
   --color-destructive-fg: var(--destructive-fg);

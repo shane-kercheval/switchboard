@@ -1,11 +1,15 @@
 <script lang="ts">
   import type { AgentRecord, ConversationItem } from "$lib/types";
-  import { transcripts, type Turn } from "$lib/state/index.svelte";
-  import { buildUnifiedRows } from "$lib/state/unified";
+  import { cancelSend, transcripts, type Turn } from "$lib/state/index.svelte";
+  import { buildUnifiedRows, groupRenderBlocks, type UnifiedRow } from "$lib/state/unified";
   import { cn } from "$lib/utils";
   import { HARNESS_COLOR } from "$lib/harnessDisplay";
   import Badge from "$lib/components/ui/Badge.svelte";
+  import Button from "$lib/components/ui/Button.svelte";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
+
+  type AgentTurn = Extract<Turn, { role: "agent" }>;
+  type NonUserRow = Exclude<UnifiedRow, { kind: "user" }>;
 
   /// `agents` is the active project's roster (for attribution + flattening
   /// their per-agent transcripts). `overlay` is the project's hydrated
@@ -27,10 +31,6 @@
     return map;
   });
 
-  /// The active project's per-agent turns (live + hydrated agent content and
-  /// this-session user turns), merged with the journal overlay into one
-  /// chronological row list. The merge applies the `(timestamp, kind_rank)`
-  /// tiebreak so a failed/cancelled marker never sorts above its own prompt.
   const rows = $derived.by(() => {
     const turns: Turn[] = [];
     for (const agent of agents) {
@@ -40,18 +40,35 @@
     return buildUnifiedRows(turns, overlay);
   });
 
+  /// Group the flat rows into render blocks: standalone rows, plus one block per
+  /// fan-out whose responses lay out as per-recipient columns.
+  const blocks = $derived(groupRenderBlocks(rows));
+
   function agentName(agentId: string): string {
     return agentById[agentId]?.name ?? "unknown";
-  }
-
-  function recipientNames(agentIds: string[]): string {
-    return agentIds.map(agentName).join(" | ");
   }
 
   function agentBorderColor(agentId: string): string {
     const harness = agentById[agentId]?.harness;
     return harness ? HARNESS_COLOR[harness] : "var(--border)";
   }
+
+  /// A fan-out column's state, derived from its rows: the response turn's status
+  /// if present, else an outcome marker's status, else "queued" (dispatched, no
+  /// turn yet). "streaming"/"queued" are *live* — they keep cancel-send active.
+  type ColumnState = "queued" | "streaming" | "complete" | "failed" | "cancelled";
+  function columnState(colRows: NonUserRow[]): ColumnState {
+    for (let i = colRows.length - 1; i >= 0; i--) {
+      const r = colRows[i]!;
+      if (r.kind === "agent") return r.turn.status;
+    }
+    for (let i = colRows.length - 1; i >= 0; i--) {
+      const r = colRows[i]!;
+      if (r.kind === "outcome") return r.status;
+    }
+    return "queued";
+  }
+  const isLive = (s: ColumnState): boolean => s === "queued" || s === "streaming";
 
   // Auto-pin to bottom unless the user has scrolled up.
   let container = $state<HTMLDivElement | null>(null);
@@ -97,6 +114,96 @@
   });
 </script>
 
+{#snippet turnBody(turn: AgentTurn)}
+  {#if turn.status === "streaming" && turn.items.length === 0}
+    <div class="text-muted text-xs italic" data-testid="turn-processing">processing…</div>
+  {/if}
+  {#each turn.items as item, i (i)}
+    {#if item.item_kind === "text"}
+      <div class="text-fg text-sm leading-6 whitespace-pre-wrap">{item.text}</div>
+    {:else}
+      <div
+        class="border-border/80 bg-panel/80 rounded-md border p-2 text-xs"
+        data-testid="turn-tool"
+        data-tool-use-id={item.tool_use_id}
+      >
+        <div class="text-fg flex items-center gap-1.5 font-semibold">
+          <Badge>{item.kind}</Badge>
+          <span class="font-mono">{item.name}</span>
+          {#if item.completed_at === undefined}
+            <span class="text-status-processing ml-auto italic">running…</span>
+          {:else if item.is_error}
+            <span class="text-status-failed ml-auto">error</span>
+          {/if}
+        </div>
+        {#if item.output !== undefined && item.output !== ""}
+          <pre
+            class={cn(
+              "mt-1 max-h-40 overflow-y-auto font-mono text-[11px] whitespace-pre-wrap",
+              item.is_error ? "text-status-failed" : "text-muted",
+            )}>{item.output}</pre>
+        {/if}
+      </div>
+    {/if}
+  {/each}
+  {#if turn.status === "failed" && turn.error}
+    <div class="text-status-failed text-xs" data-testid="turn-error">{turn.error}</div>
+  {/if}
+{/snippet}
+
+{#snippet turnStatusLabel(status: AgentTurn["status"])}
+  {#if status === "streaming"}
+    <span class="text-status-processing" data-testid="turn-streaming">streaming…</span>
+  {:else if status === "failed"}
+    <span class="text-status-failed">failed</span>
+  {:else if status === "cancelled"}
+    <span class="text-muted">cancelled</span>
+  {/if}
+{/snippet}
+
+{#snippet userMessage(row: Extract<UnifiedRow, { kind: "user" }>)}
+  <div class="border-border space-y-1.5 border-l pl-3" data-testid="turn" data-role="user">
+    <div class="flex items-center gap-2 text-[11px] font-semibold tracking-wide uppercase">
+      <span class="text-fg" data-testid="turn-author">User</span>
+    </div>
+    <div class="text-fg text-sm leading-6 whitespace-pre-wrap">{row.text}</div>
+  </div>
+{/snippet}
+
+{#snippet outcomeRow(row: Extract<UnifiedRow, { kind: "outcome" }>)}
+  <div
+    class="flex items-center gap-2 border-l pl-3 text-xs"
+    style:border-left-color={agentBorderColor(row.agent_id)}
+    data-testid="turn-outcome"
+    data-status={row.status}
+  >
+    <span class="text-fg font-semibold">{agentName(row.agent_id)}</span>
+    {#if row.status === "cancelled"}
+      <span class="text-muted" data-testid="outcome-cancelled">cancelled</span>
+    {:else}
+      <span class="text-status-failed" data-testid="outcome-failed">failed</span>
+    {/if}
+    {#if row.reason}<span class="text-muted">— {row.reason}</span>{/if}
+  </div>
+{/snippet}
+
+{#snippet agentRow(turn: AgentTurn)}
+  {@const harness = agentById[turn.agent_id]?.harness}
+  <div
+    class="space-y-1.5 border-l pl-3"
+    style:border-left-color={agentBorderColor(turn.agent_id)}
+    data-testid="turn"
+    data-role="agent"
+  >
+    <div class="flex items-center gap-2 text-[11px] font-semibold tracking-wide uppercase">
+      <span class="text-fg" data-testid="turn-agent-name">{agentName(turn.agent_id)}</span>
+      {#if harness}<HarnessIcon {harness} testid="turn-harness-icon" />{:else}<Badge>?</Badge>{/if}
+      {@render turnStatusLabel(turn.status)}
+    </div>
+    {@render turnBody(turn)}
+  </div>
+{/snippet}
+
 <div
   bind:this={container}
   onscroll={onScroll}
@@ -116,95 +223,89 @@
   {/if}
 
   <div class="space-y-5">
-    {#each rows as row (row.key)}
-      {#if row.kind === "user"}
-        <div class="border-border space-y-1.5 border-l pl-3" data-testid="turn" data-role="user">
-          <div class="flex items-center gap-2 text-[11px] font-semibold tracking-wide uppercase">
-            <span class="text-muted">You</span>
-            <span class="text-muted">→</span>
-            <span class="text-fg" data-testid="turn-recipient">
-              {recipientNames(row.agent_ids)}
-            </span>
-          </div>
-          <div class="text-fg text-sm leading-6 whitespace-pre-wrap">{row.text}</div>
-        </div>
-      {:else if row.kind === "outcome"}
-        <div
-          class="flex items-center gap-2 border-l pl-3 text-xs"
-          style:border-left-color={agentBorderColor(row.agent_id)}
-          data-testid="turn-outcome"
-          data-status={row.status}
-        >
-          <span class="text-fg font-semibold">{agentName(row.agent_id)}</span>
-          {#if row.status === "cancelled"}
-            <span class="text-muted" data-testid="outcome-cancelled">cancelled</span>
-          {:else}
-            <span class="text-status-failed" data-testid="outcome-failed">failed</span>
-          {/if}
-          {#if row.reason}
-            <span class="text-muted">— {row.reason}</span>
-          {/if}
-        </div>
+    {#each blocks as block (block.kind === "fanout" ? block.key : block.row.key)}
+      {#if block.kind === "row"}
+        {#if block.row.kind === "user"}
+          {@render userMessage(block.row)}
+        {:else if block.row.kind === "outcome"}
+          {@render outcomeRow(block.row)}
+        {:else}
+          {@render agentRow(block.row.turn)}
+        {/if}
       {:else}
-        {@const turn = row.turn}
-        {@const harness = agentById[turn.agent_id]?.harness}
-        <div
-          class="space-y-1.5 border-l pl-3"
-          style:border-left-color={agentBorderColor(turn.agent_id)}
-          data-testid="turn"
-          data-role="agent"
-        >
-          <div class="flex items-center gap-2 text-[11px] font-semibold tracking-wide uppercase">
-            <span class="text-fg" data-testid="turn-agent-name">
-              {agentName(turn.agent_id)}
-            </span>
-            {#if harness}
-              <HarnessIcon {harness} testid="turn-harness-icon" />
-            {:else}
-              <Badge>?</Badge>
-            {/if}
-            {#if turn.status === "streaming"}
-              <span class="text-status-processing" data-testid="turn-streaming">streaming…</span>
-            {:else if turn.status === "failed"}
-              <span class="text-status-failed">failed</span>
-            {:else if turn.status === "cancelled"}
-              <span class="text-muted">cancelled</span>
+        {@const liveAgents = block.columns
+          .filter((c) => isLive(columnState(c.rows)))
+          .map((c) => c.agent_id)}
+        <div class="space-y-2" data-testid="fanout-group">
+          <div class="flex items-start justify-between gap-2">
+            {@render userMessage(block.user)}
+            {#if liveAgents.length > 0}
+              <Button
+                variant="ghost"
+                size="sm"
+                class="text-status-failed shrink-0"
+                data-testid="fanout-cancel-send"
+                onclick={() => cancelSend(block.send_id, liveAgents)}
+              >
+                Cancel send
+              </Button>
             {/if}
           </div>
-          {#if turn.status === "streaming" && turn.items.length === 0}
-            <div class="text-muted text-xs italic" data-testid="turn-processing">processing…</div>
-          {/if}
-          {#each turn.items as item, i (i)}
-            {#if item.item_kind === "text"}
-              <div class="text-fg text-sm leading-6 whitespace-pre-wrap">{item.text}</div>
-            {:else}
+          <!-- Side-by-side on wide viewports; stacks vertically below `lg`. -->
+          <div
+            class="grid gap-4"
+            style:grid-template-columns={`repeat(${block.columns.length}, minmax(0, 1fr))`}
+          >
+            {#each block.columns as col (col.agent_id)}
+              {@const state = columnState(col.rows)}
+              {@const harness = agentById[col.agent_id]?.harness}
               <div
-                class="border-border/80 bg-panel/80 rounded-md border p-2 text-xs"
-                data-testid="turn-tool"
-                data-tool-use-id={item.tool_use_id}
+                class="space-y-1.5 border-l pl-3"
+                style:border-left-color={agentBorderColor(col.agent_id)}
+                data-testid="fanout-column"
+                data-agent-id={col.agent_id}
+                data-state={state}
               >
-                <div class="text-fg flex items-center gap-1.5 font-semibold">
-                  <Badge>{item.kind}</Badge>
-                  <span class="font-mono">{item.name}</span>
-                  {#if item.completed_at === undefined}
-                    <span class="text-status-processing ml-auto italic">running…</span>
-                  {:else if item.is_error}
-                    <span class="text-status-failed ml-auto">error</span>
+                <div
+                  class="flex items-center gap-2 text-[11px] font-semibold tracking-wide uppercase"
+                >
+                  <span class="text-fg" data-testid="turn-agent-name"
+                    >{agentName(col.agent_id)}</span
+                  >
+                  {#if harness}<HarnessIcon {harness} />{/if}
+                  {#if state === "queued"}
+                    <span class="text-status-processing" data-testid="fanout-queued">queued…</span>
+                  {/if}
+                  {#if isLive(state)}
+                    <button
+                      type="button"
+                      class="text-muted hover:text-status-failed ml-auto text-[10px] normal-case"
+                      data-testid="fanout-card-cancel"
+                      aria-label={`Cancel ${agentName(col.agent_id)}`}
+                      onclick={() => cancelSend(block.send_id, [col.agent_id])}>Cancel</button
+                    >
                   {/if}
                 </div>
-                {#if item.output !== undefined && item.output !== ""}
-                  <pre
-                    class={cn(
-                      "mt-1 max-h-40 overflow-y-auto font-mono text-[11px] whitespace-pre-wrap",
-                      item.is_error ? "text-status-failed" : "text-muted",
-                    )}>{item.output}</pre>
-                {/if}
+                {#each col.rows as r (r.key)}
+                  {#if r.kind === "agent"}
+                    {@render turnStatusLabel(r.turn.status)}
+                    {@render turnBody(r.turn)}
+                  {:else}
+                    {#if r.status === "cancelled"}
+                      <span class="text-muted text-xs" data-testid="outcome-cancelled"
+                        >cancelled</span
+                      >
+                    {:else}
+                      <span class="text-status-failed text-xs" data-testid="outcome-failed"
+                        >failed</span
+                      >
+                    {/if}
+                    {#if r.reason}<span class="text-muted text-xs">— {r.reason}</span>{/if}
+                  {/if}
+                {/each}
               </div>
-            {/if}
-          {/each}
-          {#if turn.status === "failed" && turn.error}
-            <div class="text-status-failed text-xs" data-testid="turn-error">{turn.error}</div>
-          {/if}
+            {/each}
+          </div>
         </div>
       {/if}
     {/each}

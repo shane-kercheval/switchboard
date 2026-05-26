@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
-import { render, screen, waitFor } from "@testing-library/svelte";
+import { fireEvent, render, screen, waitFor } from "@testing-library/svelte";
 import type { AgentRecord, NormalizedEvent } from "$lib/types";
 
 const listeners = new Map<string, (e: { payload: NormalizedEvent }) => void>();
@@ -9,6 +9,13 @@ vi.mock("@tauri-apps/api/event", () => ({
     listeners.set(name, cb);
     return vi.fn();
   }),
+}));
+
+const invokeMock = vi.fn(
+  async (_cmd: string, _args?: Record<string, unknown>): Promise<unknown> => null,
+);
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: (cmd: string, args?: Record<string, unknown>) => invokeMock(cmd, args),
 }));
 
 async function loadState() {
@@ -40,7 +47,10 @@ const CODEX_AGENT: AgentRecord = {
 
 beforeEach(() => {
   listeners.clear();
+  invokeMock.mockReset();
 });
+
+const SEND_1 = "00000000-0000-7000-8000-0000000000d1";
 
 afterEach(async () => {
   const { _testing } = await loadState();
@@ -154,7 +164,7 @@ describe("UnifiedTranscript", () => {
     expect(turns[1]).toHaveAttribute("data-role", "agent");
   });
 
-  it("attributes user turns to their recipient agent (You → agentname)", async () => {
+  it("labels the user's own turn as 'User' (recipients are shown by the responses)", async () => {
     const state = await loadState();
     await state.registerAgent(CODEX_AGENT);
     state.transcripts[CODEX_AGENT.id] = [
@@ -170,7 +180,7 @@ describe("UnifiedTranscript", () => {
     const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CODEX_AGENT] } });
 
-    expect(screen.getByTestId("turn-recipient")).toHaveTextContent("bob");
+    expect(screen.getByTestId("turn-author")).toHaveTextContent("User");
   });
 
   it("renders interleaved text/tool/text items in order", async () => {
@@ -361,5 +371,169 @@ describe("UnifiedTranscript", () => {
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
 
     expect(screen.getByTestId("turn-error")).toHaveTextContent("rate limited");
+  });
+});
+
+describe("UnifiedTranscript — fan-out groups", () => {
+  function seedFanout(
+    state: Awaited<ReturnType<typeof loadState>>,
+    aliceResponse: { status: "streaming" | "complete"; text?: string } | null,
+    bobResponse: { status: "streaming" | "complete"; text?: string } | null,
+  ): void {
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "u-alice",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: SEND_1,
+        started_at: "2026-05-16T00:00:00Z",
+        text: "fan out",
+      },
+      ...(aliceResponse
+        ? [
+            {
+              role: "agent" as const,
+              turn_id: "a-alice",
+              agent_id: CLAUDE_AGENT.id,
+              send_id: SEND_1,
+              started_at: "2026-05-16T00:00:01Z",
+              status: aliceResponse.status,
+              items: aliceResponse.text
+                ? [{ item_kind: "text" as const, kind: "text" as const, text: aliceResponse.text }]
+                : [],
+            },
+          ]
+        : []),
+    ];
+    state.transcripts[CODEX_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "u-bob",
+        agent_id: CODEX_AGENT.id,
+        send_id: SEND_1,
+        started_at: "2026-05-16T00:00:00Z",
+        text: "fan out",
+      },
+      ...(bobResponse
+        ? [
+            {
+              role: "agent" as const,
+              turn_id: "a-bob",
+              agent_id: CODEX_AGENT.id,
+              send_id: SEND_1,
+              started_at: "2026-05-16T00:00:02Z",
+              status: bobResponse.status,
+              items: bobResponse.text
+                ? [{ item_kind: "text" as const, kind: "text" as const, text: bobResponse.text }]
+                : [],
+            },
+          ]
+        : []),
+    ];
+  }
+
+  it("renders one group with the user message once and a column per recipient", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    seedFanout(
+      state,
+      { status: "complete", text: "alice reply" },
+      { status: "complete", text: "bob reply" },
+    );
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT, CODEX_AGENT] } });
+
+    expect(screen.getByTestId("fanout-group")).toBeInTheDocument();
+    // The user's message renders once, labeled "User" (recipients are the columns).
+    const authors = screen.getAllByTestId("turn-author");
+    expect(authors).toHaveLength(1);
+    expect(authors[0]).toHaveTextContent("User");
+    // One column per recipient, in recipient order, each with its response.
+    const columns = screen.getAllByTestId("fanout-column");
+    expect(columns).toHaveLength(2);
+    expect(columns[0]).toHaveAttribute("data-agent-id", CLAUDE_AGENT.id);
+    expect(columns[0]).toHaveTextContent("alice reply");
+    expect(columns[1]).toHaveAttribute("data-agent-id", CODEX_AGENT.id);
+    expect(columns[1]).toHaveTextContent("bob reply");
+  });
+
+  it("shows a queued indicator for a recipient with no response yet", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    // Alice responded; bob is still queued (busy agent).
+    seedFanout(state, { status: "complete", text: "alice reply" }, null);
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT, CODEX_AGENT] } });
+
+    expect(screen.getByTestId("fanout-queued")).toBeInTheDocument();
+    const columns = screen.getAllByTestId("fanout-column");
+    expect(columns[1]).toHaveAttribute("data-state", "queued");
+  });
+
+  it("offers cancel-send while any turn is live and invokes the send-scoped command", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    // Alice streaming, bob queued → group is live.
+    seedFanout(state, { status: "streaming", text: "thinking" }, null);
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT, CODEX_AGENT] } });
+
+    await fireEvent.click(screen.getByTestId("fanout-cancel-send"));
+    expect(invokeMock).toHaveBeenCalledWith(
+      "cancel_send",
+      expect.objectContaining({ sendId: SEND_1 }),
+    );
+    const call = invokeMock.mock.calls.find(([c]) => c === "cancel_send");
+    expect((call?.[1] as { recipients: string[] }).recipients.sort()).toEqual(
+      [CLAUDE_AGENT.id, CODEX_AGENT.id].sort(),
+    );
+  });
+
+  it("hides cancel-send once every recipient has settled", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    seedFanout(state, { status: "complete", text: "a" }, { status: "complete", text: "b" });
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT, CODEX_AGENT] } });
+
+    expect(screen.queryByTestId("fanout-cancel-send")).toBeNull();
+  });
+
+  it("renders a single-recipient send as a normal row, not a fan-out group", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "u-1",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: SEND_1,
+        started_at: "2026-05-16T00:00:00Z",
+        text: "solo",
+      },
+      {
+        role: "agent",
+        turn_id: "a-1",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: SEND_1,
+        started_at: "2026-05-16T00:00:01Z",
+        status: "complete",
+        items: [{ item_kind: "text", kind: "text", text: "ok" }],
+      },
+    ];
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+
+    expect(screen.queryByTestId("fanout-group")).toBeNull();
+    expect(screen.getAllByTestId("turn")).toHaveLength(2);
   });
 });

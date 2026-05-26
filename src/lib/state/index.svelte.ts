@@ -33,7 +33,7 @@
 // IPC error.
 
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { loadTranscript } from "$lib/api";
+import { cancelSend as apiCancelSend, loadTranscript } from "$lib/api";
 import type {
   AgentId,
   AgentRecord,
@@ -355,6 +355,40 @@ export function failSendStart(
     runtime.run_status === "starting"
       ? { ...runtime, run_status: "idle", last_error: error, pending_sends }
       : { ...runtime, last_error: error, pending_sends };
+}
+
+/// Cancel a whole send across `agentIds` (the group cancel-send control, or a
+/// single-element list for one recipient's Cancel). Delegates to the
+/// send-scoped backend command, which cancels each recipient's in-flight turn
+/// (→ a `Cancelled` `turn_end` flows back and the agent turn renders cancelled)
+/// and drops still-queued items. A *queued* item is dropped silently — no
+/// event — so for those recipients we prune the pending entry and synthesize a
+/// cancelled agent turn here, otherwise the optimistic "queued" card would
+/// spin forever. Running turns need no optimistic handling (the backend's
+/// terminal arrives).
+export function cancelSend(sendId: SendId, agentIds: AgentId[]): void {
+  for (const agentId of agentIds) {
+    const rt = runtimes[agentId];
+    const pending = rt?.pending_sends;
+    if (rt === undefined || pending === undefined) continue;
+    const remaining = pending.filter((p) => p.send_id !== sendId);
+    if (remaining.length === pending.length) continue; // no queued item for this send here
+    runtimes[agentId] = { ...rt, pending_sends: remaining.length > 0 ? remaining : undefined };
+    transcripts[agentId] = [
+      ...(transcripts[agentId] ?? []),
+      {
+        role: "agent",
+        turn_id: crypto.randomUUID(),
+        agent_id: agentId,
+        send_id: sendId,
+        // eslint-disable-next-line svelte/prefer-svelte-reactivity
+        started_at: new Date().toISOString(),
+        status: "cancelled",
+        items: [],
+      },
+    ];
+  }
+  void apiCancelSend(sendId, agentIds);
 }
 
 /// Mark an agent as already-hydrated so the per-agent `hydrateAgent` path

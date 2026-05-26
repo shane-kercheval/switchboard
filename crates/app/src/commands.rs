@@ -1403,6 +1403,10 @@ pub struct AgentConversationMeta {
 /// Pure merge of the two conversation sources into the unified transcript. No
 /// I/O — the testable core. See [`ProjectConversation`] for the disjoint-source
 /// contract and system-design §7 for the worked scenarios this implements.
+// One linear pass over the journal + one over the transcripts; splitting it
+// would scatter the user-message grouping, outcome collection, and order-zip
+// correlation that are read together.
+#[allow(clippy::too_many_lines)]
 fn merge_project_conversation(
     journal: Vec<switchboard_core::JournalRecord>,
     agent_transcripts: Vec<(
@@ -1421,20 +1425,27 @@ fn merge_project_conversation(
     let mut index_of: HashMap<SendId, usize> = HashMap::new();
     let mut user_messages: Vec<(SendId, Vec<AgentId>, String, chrono::DateTime<chrono::Utc>)> =
         Vec::new();
-    // `turn_id → send_id` from `Send` records, used to tag each harness
-    // `AgentTurn` with the send it belongs to so a fan-out's responses group
-    // the same way live ones do.
-    let mut send_id_of_turn: HashMap<switchboard_harness::TurnId, SendId> = HashMap::new();
+    // The journal's `turn_id` is the dispatcher's, distinct from the harness
+    // session file's own turn ids, so they can't be joined directly. Instead we
+    // correlate each agent's harness turns to its sends by ORDER: the Nth
+    // *completed* agent turn answers the Nth completed send dispatched to it
+    // (the dispatcher runs an agent's turns FIFO and journals in that order).
+    // `agent_sends` is each agent's sends in order; `non_completed` is the
+    // (agent, send) pairs that failed/cancelled — those leave no clean harness
+    // turn (only an Outcome marker, which already carries its own send_id), so
+    // they're excluded from the order-zip below to keep it aligned.
+    let mut agent_sends: HashMap<AgentId, Vec<SendId>> = HashMap::new();
+    let mut non_completed: HashMap<AgentId, std::collections::HashSet<SendId>> = HashMap::new();
     for record in journal {
         match record {
             switchboard_core::JournalRecord::Send {
                 send_id,
-                turn_id,
                 agent_id,
                 prompt,
                 at,
+                ..
             } => {
-                send_id_of_turn.insert(turn_id, send_id);
+                agent_sends.entry(agent_id).or_default().push(send_id);
                 if let Some(&i) = index_of.get(&send_id) {
                     let entry = &mut user_messages[i];
                     if !entry.1.contains(&agent_id) {
@@ -1459,6 +1470,7 @@ fn merge_project_conversation(
                 started_at,
                 ..
             } => {
+                non_completed.entry(agent_id).or_default().insert(send_id);
                 let (status, reason) = parse_outcome(&outcome);
                 items.push(ConversationItem::Outcome {
                     turn_id,
@@ -1483,34 +1495,79 @@ fn merge_project_conversation(
         });
     }
 
+    // Per-agent FIFO of *completed* sends (non-completed excluded — they leave
+    // no clean harness turn), drained in order to stamp each harness turn with
+    // the send it answered.
+    let mut sends_by_agent: HashMap<AgentId, Vec<SendId>> = HashMap::new();
+    for (agent_id, sends) in agent_sends {
+        let excluded = non_completed.get(&agent_id);
+        let kept: Vec<SendId> = sends
+            .into_iter()
+            .filter(|s| !excluded.is_some_and(|e| e.contains(s)))
+            .collect();
+        sends_by_agent.insert(agent_id, kept);
+    }
+
     // Agent turns ← each agent's harness transcript, keeping only `Turn::Agent`
     // (drop `Turn::User`). Warnings and any load error are agent-scoped: attach
     // them to this transcript's `AgentConversationMeta` so the unified view can
     // attribute them (one bad agent never blanks the project).
     let mut agents: Vec<AgentConversationMeta> = Vec::new();
     for (agent_id, transcript, load_error) in agent_transcripts {
-        for turn in transcript.turns {
-            if let switchboard_harness::Turn::Agent {
-                turn_id,
-                agent_id,
-                started_at,
-                ended_at,
-                status,
-                items: turn_items,
-                usage,
-            } = turn
-            {
-                items.push(ConversationItem::AgentTurn {
+        // This agent's Agent-role turns, in order.
+        type HarnessTurn = (
+            switchboard_harness::TurnId,
+            AgentId,
+            chrono::DateTime<chrono::Utc>,
+            Option<chrono::DateTime<chrono::Utc>>,
+            switchboard_harness::TurnStatus,
+            Vec<switchboard_harness::TurnItem>,
+            Option<switchboard_harness::TurnUsage>,
+        );
+        let agent_turns: Vec<HarnessTurn> = transcript
+            .turns
+            .into_iter()
+            .filter_map(|t| match t {
+                switchboard_harness::Turn::Agent {
                     turn_id,
                     agent_id,
-                    send_id: send_id_of_turn.get(&turn_id).copied(),
                     started_at,
                     ended_at,
                     status,
-                    items: turn_items,
+                    items,
                     usage,
-                });
-            }
+                } => Some((
+                    turn_id, agent_id, started_at, ended_at, status, items, usage,
+                )),
+                _ => None,
+            })
+            .collect();
+        // Correlate from the END: the most-recent turns answer the most-recent
+        // completed sends. Turns with no send to pair (older than the first
+        // journaled send — e.g. pre-journaling session history) get no send_id
+        // and render un-grouped. This tolerates count drift without misgrouping.
+        let completed = sends_by_agent.get(&agent_id).map_or(&[][..], Vec::as_slice);
+        let pairs = agent_turns.len().min(completed.len());
+        let turn_offset = agent_turns.len() - pairs;
+        let send_offset = completed.len() - pairs;
+        for (j, (turn_id, a_id, started_at, ended_at, status, t_items, usage)) in
+            agent_turns.into_iter().enumerate()
+        {
+            let send_id = if j >= turn_offset {
+                completed.get(send_offset + (j - turn_offset)).copied()
+            } else {
+                None
+            };
+            items.push(ConversationItem::AgentTurn {
+                turn_id,
+                agent_id: a_id,
+                send_id,
+                started_at,
+                ended_at,
+                status,
+                items: t_items,
+                usage,
+            });
         }
         agents.push(AgentConversationMeta {
             agent_id,
@@ -5712,6 +5769,130 @@ mod tests {
             .filter(|i| matches!(i, ConversationItem::UserMessage { .. }))
             .count();
         assert_eq!(user_count, 1, "harness user-role turn never duplicates it");
+    }
+
+    #[test]
+    fn merge_groups_fan_out_by_order_when_journal_and_harness_turn_ids_differ() {
+        // The journal's turn_id (dispatcher) is unrelated to the harness session
+        // file's turn_id, so correlation is by ORDER, not id match. Both
+        // recipients' first turn answers the one shared send.
+        let send_id = Uuid::now_v7();
+        let b = Uuid::now_v7();
+        let c = Uuid::now_v7();
+        let journal = vec![
+            send_record(send_id, Uuid::now_v7(), b, "go", 0),
+            send_record(send_id, Uuid::now_v7(), c, "go", 0),
+        ];
+        // Harness turn ids are freshly minted, deliberately != the journal ids.
+        let b_t = transcript_of(vec![agent_turn(Uuid::now_v7(), b, "b reply", 2)]);
+        let c_t = transcript_of(vec![agent_turn(Uuid::now_v7(), c, "c reply", 3)]);
+
+        let merged = merge_project_conversation(journal, vec![(b, b_t, None), (c, c_t, None)]);
+
+        for item in &merged.items {
+            if let ConversationItem::AgentTurn { send_id: sid, .. } = item {
+                assert_eq!(
+                    *sid,
+                    Some(send_id),
+                    "order-zip stamps the shared send_id despite mismatched turn ids"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn merge_end_aligns_recent_turns_when_session_has_pre_journaling_history() {
+        // Regression for the drift bug: each agent's session file has an OLD turn
+        // (predating journaling → no Send record) plus a RECENT fan-out turn
+        // (journaled with a shared send_id). End-alignment pairs the most-recent
+        // turns with the send; the older, unjournaled turns get no send_id. A
+        // naive count-equality gate would refuse to correlate *any* of the
+        // agent's turns here, breaking the recent fan-out.
+        let send_id = Uuid::now_v7();
+        let b = Uuid::now_v7();
+        let c = Uuid::now_v7();
+        let journal = vec![
+            send_record(send_id, Uuid::now_v7(), b, "Hello", 10),
+            send_record(send_id, Uuid::now_v7(), c, "Hello", 10),
+        ];
+        let b_t = transcript_of(vec![
+            agent_turn(Uuid::now_v7(), b, "old b", 0),
+            agent_turn(Uuid::now_v7(), b, "recent b", 11),
+        ]);
+        let c_t = transcript_of(vec![
+            agent_turn(Uuid::now_v7(), c, "old c", 1),
+            agent_turn(Uuid::now_v7(), c, "recent c", 12),
+        ]);
+
+        let merged = merge_project_conversation(journal, vec![(b, b_t, None), (c, c_t, None)]);
+
+        // Look up an agent turn's send_id by its start time.
+        let send_at = |t: i64| {
+            merged.items.iter().find_map(|i| match i {
+                ConversationItem::AgentTurn {
+                    started_at,
+                    send_id,
+                    ..
+                } if *started_at == at(t) => Some(*send_id),
+                _ => None,
+            })
+        };
+        // Recent turns (10s+) carry the shared send_id; old turns (0/1s) don't.
+        assert_eq!(send_at(11), Some(Some(send_id)), "recent b grouped");
+        assert_eq!(send_at(12), Some(Some(send_id)), "recent c grouped");
+        assert_eq!(send_at(0), Some(None), "old b un-grouped");
+        assert_eq!(send_at(1), Some(None), "old c un-grouped");
+    }
+
+    #[test]
+    fn merge_partial_fan_out_failure_still_groups_the_completed_recipient() {
+        // One recipient completes, the other fails. The completed turn is still
+        // tagged with the shared send_id (so it groups), and the failure marker
+        // carries the send_id too (so it routes into the failed recipient's
+        // column). The failed send is excluded from the order-zip so it doesn't
+        // misalign the completed recipient.
+        let send_id = Uuid::now_v7();
+        let b = Uuid::now_v7(); // completes
+        let c = Uuid::now_v7(); // fails
+        let journal = vec![
+            send_record(send_id, Uuid::now_v7(), b, "go", 0),
+            send_record(send_id, Uuid::now_v7(), c, "go", 0),
+            outcome_record(
+                send_id,
+                Uuid::now_v7(),
+                c,
+                serde_json::json!({"status": "failed", "kind": "harness_error", "message": "x"}),
+                1,
+            ),
+        ];
+        let b_t = transcript_of(vec![agent_turn(Uuid::now_v7(), b, "b reply", 2)]);
+        let c_t = transcript_of(Vec::new()); // c failed → no clean harness turn
+
+        let merged = merge_project_conversation(journal, vec![(b, b_t, None), (c, c_t, None)]);
+
+        let b_turn_send = merged
+            .items
+            .iter()
+            .find_map(|i| match i {
+                ConversationItem::AgentTurn {
+                    agent_id, send_id, ..
+                } if *agent_id == b => Some(*send_id),
+                _ => None,
+            })
+            .expect("b's completed turn");
+        assert_eq!(b_turn_send, Some(send_id), "completed recipient groups");
+
+        let c_outcome_send = merged
+            .items
+            .iter()
+            .find_map(|i| match i {
+                ConversationItem::Outcome {
+                    agent_id, send_id, ..
+                } if *agent_id == c => Some(*send_id),
+                _ => None,
+            })
+            .expect("c's failure marker");
+        assert_eq!(c_outcome_send, send_id, "failure marker keeps the send_id");
     }
 
     #[test]

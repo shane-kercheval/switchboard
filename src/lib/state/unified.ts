@@ -223,6 +223,15 @@ export function groupRenderBlocks(rows: UnifiedRow[]): RenderBlock[] {
     colsBySend.set(row.send_id, perAgent);
   }
 
+  // Only group a fan-out that actually has correlated content. A multi-recipient
+  // user message whose responses can't be correlated to it (e.g. historical
+  // turns with no recoverable send_id, or a just-dispatched send before any
+  // response) renders as a plain user message — its responses flow in the
+  // stream — rather than a group of empty "queued" columns.
+  for (const sendId of [...fanoutUsers.keys()]) {
+    if (!colsBySend.has(sendId)) fanoutUsers.delete(sendId);
+  }
+
   // Pass 2: emit blocks in order. A fan-out user row becomes a group anchored
   // at its position (columns in recipient order — stable); the fan-out's
   // agent/outcome rows are skipped (they live in the group). Everything else is

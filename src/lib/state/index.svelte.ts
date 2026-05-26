@@ -33,7 +33,7 @@
 // IPC error.
 
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { cancelSend as apiCancelSend, loadTranscript } from "$lib/api";
+import { cancelSend as apiCancelSend, cancelTurn as apiCancelTurn, loadTranscript } from "$lib/api";
 import type {
   AgentId,
   AgentRecord,
@@ -389,6 +389,10 @@ export function cancelSend(sendId: SendId, agentIds: AgentId[]): void {
     ];
   }
   void apiCancelSend(sendId, agentIds);
+}
+
+export function cancelTurn(agentId: AgentId): void {
+  void apiCancelTurn(agentId);
 }
 
 /// Mark an agent as already-hydrated so the per-agent `hydrateAgent` path

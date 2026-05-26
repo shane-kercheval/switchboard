@@ -1,11 +1,10 @@
 <script lang="ts">
   import type { AgentRecord, ConversationItem } from "$lib/types";
-  import { cancelSend, transcripts, type Turn } from "$lib/state/index.svelte";
+  import { cancelSend, cancelTurn, transcripts, type Turn } from "$lib/state/index.svelte";
   import { buildUnifiedRows, groupRenderBlocks, type UnifiedRow } from "$lib/state/unified";
   import { cn } from "$lib/utils";
   import { HARNESS_COLOR } from "$lib/harnessDisplay";
   import Badge from "$lib/components/ui/Badge.svelte";
-  import Button from "$lib/components/ui/Button.svelte";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
 
   type AgentTurn = Extract<Turn, { role: "agent" }>;
@@ -157,13 +156,34 @@
 {/snippet}
 
 {#snippet turnStatusLabel(status: AgentTurn["status"])}
-  {#if status === "streaming"}
-    <span class="text-status-processing" data-testid="turn-streaming">streaming…</span>
-  {:else if status === "failed"}
+  {#if status === "failed"}
     <span class="text-status-failed">failed</span>
   {:else if status === "cancelled"}
     <span class="text-muted">cancelled</span>
   {/if}
+{/snippet}
+
+{#snippet liveTurnControl(onclick: () => void, label: string, testid: string)}
+  <button
+    type="button"
+    class="group text-muted hover:bg-status-failed-soft hover:text-status-failed focus-visible:ring-accent focus-visible:bg-status-failed-soft focus-visible:text-status-failed inline-flex h-6 w-6 items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none"
+    data-testid={testid}
+    aria-label={label}
+    onclick={onclick}
+  >
+    <span
+      class="border-muted/30 border-t-muted block h-5 w-5 animate-spin rounded-full border-2 group-hover:hidden group-focus-visible:hidden"
+      aria-hidden="true"
+    ></span>
+    <svg
+      viewBox="0 0 24 24"
+      fill="currentColor"
+      class="hidden h-5 w-5 group-hover:block group-focus-visible:block"
+      aria-hidden="true"
+    >
+      <rect x="5" y="5" width="14" height="14" rx="2.25" />
+    </svg>
+  </button>
 {/snippet}
 
 {#snippet userMessage(row: Extract<UnifiedRow, { kind: "user" }>)}
@@ -204,6 +224,13 @@
     <div class="flex items-center gap-2 text-[11px] font-semibold tracking-wide uppercase">
       <span class="text-fg" data-testid="turn-agent-name">{agentName(turn.agent_id)}</span>
       {#if harness}<HarnessIcon {harness} testid="turn-harness-icon" />{:else}<Badge>?</Badge>{/if}
+      {#if turn.status === "streaming"}
+        {@render liveTurnControl(
+          () => cancelTurn(turn.agent_id),
+          `Cancel turn for ${agentName(turn.agent_id)}`,
+          "turn-live-control",
+        )}
+      {/if}
     </div>
     <div
       class="space-y-1.5 border-l pl-3"
@@ -244,23 +271,9 @@
           {@render agentRow(block.row.turn)}
         {/if}
       {:else}
-        {@const liveAgents = block.columns
-          .filter((c) => isLive(columnState(c.rows)))
-          .map((c) => c.agent_id)}
         <div class="space-y-4" data-testid="fanout-group">
           <div class="flex items-start justify-between gap-2">
             {@render userMessage(block.user)}
-            {#if liveAgents.length > 0}
-              <Button
-                variant="ghost"
-                size="sm"
-                class="text-status-failed shrink-0"
-                data-testid="fanout-cancel-send"
-                onclick={() => cancelSend(block.send_id, liveAgents)}
-              >
-                Cancel send
-              </Button>
-            {/if}
           </div>
           <!-- Side-by-side on wide viewports; stacks vertically below `lg`. -->
           <div
@@ -283,17 +296,15 @@
                     >{agentName(col.agent_id)}</span
                   >
                   {#if harness}<HarnessIcon {harness} />{/if}
+                  {#if isLive(state)}
+                    {@render liveTurnControl(
+                      () => cancelSend(block.send_id, [col.agent_id]),
+                      `Cancel turn for ${agentName(col.agent_id)}`,
+                      "fanout-card-cancel",
+                    )}
+                  {/if}
                   {#if state === "queued"}
                     <span class="text-status-processing" data-testid="fanout-queued">queued…</span>
-                  {/if}
-                  {#if isLive(state)}
-                    <button
-                      type="button"
-                      class="text-muted hover:text-status-failed ml-auto text-[10px] normal-case"
-                      data-testid="fanout-card-cancel"
-                      aria-label={`Cancel ${agentName(col.agent_id)}`}
-                      onclick={() => cancelSend(block.send_id, [col.agent_id])}>Cancel</button
-                    >
                   {/if}
                 </div>
                 <div

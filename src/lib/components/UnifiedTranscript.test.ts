@@ -344,10 +344,35 @@ describe("UnifiedTranscript", () => {
     // waitFor for the DOM assertion.
     expect(state.transcripts[CLAUDE_AGENT.id]?.length).toBe(1);
     await waitFor(() => {
-      expect(screen.getByTestId("turn-streaming")).toBeInTheDocument();
+      expect(screen.getByTestId("turn")).toHaveTextContent("hello");
     });
+    expect(screen.queryByText("streaming…")).toBeNull();
     expect(screen.getByTestId("turn")).toHaveTextContent("hello");
     expect(screen.getByTestId("turn")).toHaveTextContent("world");
+  });
+
+  it("shows a live cancel control for a streaming standalone turn", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "agent-1",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:00Z",
+        status: "streaming",
+        items: [{ item_kind: "text", kind: "text", text: "working" }],
+      },
+    ];
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+
+    await fireEvent.click(screen.getByTestId("turn-live-control"));
+    expect(invokeMock).toHaveBeenCalledWith(
+      "cancel_turn",
+      expect.objectContaining({ agentId: CLAUDE_AGENT.id }),
+    );
   });
 
   it("renders failed turn with error message", async () => {
@@ -474,7 +499,7 @@ describe("UnifiedTranscript — fan-out groups", () => {
     expect(columns[1]).toHaveAttribute("data-state", "queued");
   });
 
-  it("offers cancel-send while any turn is live and invokes the send-scoped command", async () => {
+  it("offers per-recipient cancel controls only for live columns", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     await state.registerAgent(CODEX_AGENT);
@@ -484,18 +509,18 @@ describe("UnifiedTranscript — fan-out groups", () => {
     const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT, CODEX_AGENT] } });
 
-    await fireEvent.click(screen.getByTestId("fanout-cancel-send"));
+    const cancelControls = screen.getAllByTestId("fanout-card-cancel");
+    expect(cancelControls).toHaveLength(2);
+    await fireEvent.click(cancelControls[1]!);
     expect(invokeMock).toHaveBeenCalledWith(
       "cancel_send",
       expect.objectContaining({ sendId: SEND_1 }),
     );
     const call = invokeMock.mock.calls.find(([c]) => c === "cancel_send");
-    expect((call?.[1] as { recipients: string[] }).recipients.sort()).toEqual(
-      [CLAUDE_AGENT.id, CODEX_AGENT.id].sort(),
-    );
+    expect((call?.[1] as { recipients: string[] }).recipients).toEqual([CODEX_AGENT.id]);
   });
 
-  it("hides cancel-send once every recipient has settled", async () => {
+  it("hides per-recipient cancel controls once every recipient has settled", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     await state.registerAgent(CODEX_AGENT);
@@ -504,7 +529,7 @@ describe("UnifiedTranscript — fan-out groups", () => {
     const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT, CODEX_AGENT] } });
 
-    expect(screen.queryByTestId("fanout-cancel-send")).toBeNull();
+    expect(screen.queryByTestId("fanout-card-cancel")).toBeNull();
   });
 
   it("renders a single-recipient send as a normal row, not a fan-out group", async () => {

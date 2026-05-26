@@ -234,6 +234,53 @@ describe("ComposeBar", () => {
     expect((state.transcripts[AGENT_B.id] ?? []).length).toBe(1);
   });
 
+  it("turns the empty-draft send button into cancel for the latest live send", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    invokeMock.mockResolvedValue("msg-x");
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { agents: [AGENT_A, AGENT_B] } });
+
+    await fireEvent.click(chip(AGENT_B.id));
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "status?" } });
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("compose-send")).toHaveAttribute("aria-label", "Cancel send");
+    });
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    const cancelCall = invokeMock.mock.calls.find(([cmd]) => cmd === "cancel_send");
+    expect(cancelCall?.[1]).toMatchObject({
+      recipients: expect.arrayContaining([AGENT_A.id, AGENT_B.id]),
+    });
+  });
+
+  it("uses Mod+Enter to cancel when the empty-draft send button is in stop mode", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    invokeMock.mockResolvedValue("msg-1");
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { agents: [AGENT_A] } });
+
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "first" } });
+    await fireEvent.click(screen.getByTestId("compose-send"));
+    await waitFor(() => {
+      expect(screen.getByTestId("compose-send")).toHaveAttribute("aria-label", "Cancel send");
+    });
+    await fireEvent.keyDown(textarea, { key: "Enter", metaKey: true });
+
+    const sendCalls = invokeMock.mock.calls.filter(([cmd]) => cmd === "send_message");
+    const cancelCall = invokeMock.mock.calls.find(([cmd]) => cmd === "cancel_send");
+    expect(sendCalls).toHaveLength(1);
+    expect(cancelCall?.[1]).toMatchObject({ recipients: [AGENT_A.id] });
+  });
+
   it("send-while-busy is un-gated: Send stays enabled while a recipient is processing", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
@@ -255,6 +302,7 @@ describe("ComposeBar", () => {
 
     await fireEvent.input(textarea, { target: { value: "second" } });
     expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(false);
+    expect(screen.getByTestId("compose-send")).toHaveAttribute("aria-label", "Send");
   });
 
   it("a per-recipient IPC failure fails only that recipient and surfaces the error", async () => {

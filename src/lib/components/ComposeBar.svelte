@@ -1,9 +1,11 @@
 <script lang="ts">
   import {
+    cancelSend,
     dispatchUserTurn,
     failSendStart,
     recordSendAccepted,
     runtimes,
+    transcripts,
     ui,
   } from "$lib/state/index.svelte";
   import * as api from "$lib/api";
@@ -19,6 +21,9 @@
   let prompt = $state<string>("");
   let sendError = $state<string | null>(null);
   let composeEl = $state<HTMLDivElement | undefined>(undefined);
+  // The composer stop button intentionally tracks the latest compose action
+  // only; earlier live sends stay cancellable from their transcript controls.
+  let latestSend = $state<{ sendId: string; agentIds: AgentId[] } | null>(null);
 
   /// Recipient set — every agent is shown as a toggle chip (click to add/drop);
   /// `@name` is the keyboard path to the same toggle. Sticky across sends
@@ -146,6 +151,29 @@
       }),
   );
 
+  function sendIsLive(agentId: AgentId, sendId: string): boolean {
+    const pending = runtimes[agentId]?.pending_sends ?? [];
+    if (pending.some((p) => p.send_id === sendId)) return true;
+    // IPC failures prune pending state via failSendStart, so failed recipients
+    // naturally fall out of latestLiveAgentIds without extra bookkeeping here.
+    return (transcripts[agentId] ?? []).some(
+      (turn) => turn.role === "agent" && turn.send_id === sendId && turn.status === "streaming",
+    );
+  }
+
+  const latestLiveAgentIds = $derived.by(() => {
+    const send = latestSend;
+    return send === null
+      ? []
+      : send.agentIds.filter((agentId) => sendIsLive(agentId, send.sendId));
+  });
+  // A non-empty draft means the primary action is "send/queue this prompt";
+  // cancelling live work remains available from the transcript controls.
+  const showStop = $derived(
+    latestSend !== null && latestLiveAgentIds.length > 0 && prompt.trim() === "",
+  );
+  const primaryDisabled = $derived(showStop ? false : sendDisabled);
+
   function toggleRecipient(id: AgentId): void {
     selectedIds = selectedIds.includes(id)
       ? selectedIds.filter((x) => x !== id)
@@ -199,8 +227,17 @@
     // listener above, so it works whether the textarea or a chip has focus.
     if (event.key === "Enter" && event.metaKey) {
       event.preventDefault();
-      void handleSubmit();
+      handlePrimaryAction();
     }
+  }
+
+  function handlePrimaryAction(): void {
+    if (showStop && latestSend !== null) {
+      cancelSend(latestSend.sendId, latestLiveAgentIds);
+      latestSend = null;
+      return;
+    }
+    handleSubmit();
   }
 
   function handleSubmit(): void {
@@ -212,6 +249,7 @@
     // sharing it (the backend groups, and cancel-send is scoped to it).
     const sendId = crypto.randomUUID();
     const targets = [...selectedAgents];
+    latestSend = { sendId, agentIds: targets.map((agent) => agent.id) };
     for (const agent of targets) {
       const userTurnId = crypto.randomUUID();
       dispatchUserTurn(agent.id, userTurnId, submittedText, sendId);
@@ -274,7 +312,7 @@
               <button
                 {...props}
                 type="button"
-                class="text-muted hover:text-fg ml-0.5 flex h-4 w-4 items-center justify-center"
+                class="text-muted hover:text-fg ml-0.5 flex h-5 w-5 items-center justify-center"
                 data-testid="recipient-clear"
                 aria-label="Clear recipients"
                 onclick={() => (selectedIds = [])}
@@ -285,7 +323,7 @@
                   stroke="currentColor"
                   stroke-width="2"
                   stroke-linecap="round"
-                  class="h-3.5 w-3.5"
+                  class="h-4 w-4"
                   aria-hidden="true"
                 >
                   <circle cx="12" cy="12" r="9" />
@@ -370,34 +408,42 @@
         onkeydown={handleKey}
         class="min-h-16 border-0 bg-transparent p-1 shadow-none focus-visible:ring-0"
       />
-      <Tooltip label="Send" shortcut={shortcut("mod", "enter")}>
+      <Tooltip label={showStop ? "Cancel send" : "Send"} shortcut={shortcut("mod", "enter")}>
         {#snippet trigger(props)}
           <button
             {...props}
             type="button"
             data-testid="compose-send"
-            onclick={handleSubmit}
-            disabled={sendDisabled}
-            aria-label="Send"
+            onclick={handlePrimaryAction}
+            disabled={primaryDisabled}
+            aria-label={showStop ? "Cancel send" : "Send"}
             class={cn(
               "flex h-8 w-8 shrink-0 items-center justify-center rounded-full transition-colors",
-              sendDisabled
-                ? "bg-border text-muted/50 cursor-not-allowed"
-                : "bg-primary text-primary-fg hover:bg-primary/90",
+              showStop
+                ? "bg-border text-muted hover:bg-status-failed hover:text-primary-fg"
+                : sendDisabled
+                  ? "bg-border text-muted/50 cursor-not-allowed"
+                  : "bg-primary text-primary-fg hover:bg-primary/90",
             )}
           >
-            <svg
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="2.25"
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              class="h-4 w-4"
-              aria-hidden="true"
-            >
-              <path d="M12 19V5M5 12l7-7 7 7" />
-            </svg>
+            {#if showStop}
+              <svg viewBox="0 0 24 24" fill="currentColor" class="h-5 w-5" aria-hidden="true">
+                <rect x="5" y="5" width="14" height="14" rx="2.25" />
+              </svg>
+            {:else}
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2.25"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                class="h-4 w-4"
+                aria-hidden="true"
+              >
+                <path d="M12 19V5M5 12l7-7 7 7" />
+              </svg>
+            {/if}
           </button>
         {/snippet}
       </Tooltip>

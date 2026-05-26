@@ -133,6 +133,10 @@ export async function cancelSend(sendId: SendId, recipients: AgentId[]): Promise
   await invoke("cancel_send", { sendId, recipients });
 }
 
+export async function cancelTurn(agentId: AgentId): Promise<void> {
+  await invoke("cancel_turn", { agentId });
+}
+
 export async function loadTranscript(agentId: AgentId): Promise<LoadedTranscript> {
   return await invoke<LoadedTranscript>("load_transcript", { agentId });
 }

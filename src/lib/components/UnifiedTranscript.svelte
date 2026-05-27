@@ -215,9 +215,9 @@
 
 {#snippet turnStatusLabel(status: AgentTurn["status"])}
   {#if status === "failed"}
-    <span class="text-status-failed">failed</span>
+    <span class="bg-status-failed-soft text-status-failed inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium">failed</span>
   {:else if status === "cancelled"}
-    <span class="text-muted">cancelled</span>
+    <span class="bg-status-cancelled-soft text-status-cancelled inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium">cancelled</span>
   {/if}
 {/snippet}
 
@@ -244,8 +244,8 @@
   </button>
 {/snippet}
 
-{#snippet messageMeta(at: string, copyable: string, label: string)}
-  <div class="mt-1 flex items-center gap-2 opacity-0 group-hover:opacity-100" data-testid="message-meta">
+{#snippet messageMeta(at: string, copyable: string, label: string, mt = "mt-1")}
+  <div class={`${mt} flex items-center gap-2 opacity-0 group-hover:opacity-100`} data-testid="message-meta">
     {#if at}
       <time class="text-muted text-xs" datetime={at} title={at} data-testid="message-time"
         >{formatTime(at)}</time
@@ -258,8 +258,8 @@
 {/snippet}
 
 {#snippet userMessage(row: Extract<UnifiedRow, { kind: "user" }>)}
-  <div class="group -mx-3 min-w-0 flex-1" data-testid="turn" data-role="user">
-    <div class="bg-panel/45 space-y-1.5 rounded-md px-3 py-2">
+  <div class="group min-w-0 flex-1" data-testid="turn" data-role="user">
+    <div class="bg-panel/45 -mx-3 space-y-1.5 rounded-md px-3 py-2">
       <div class="flex items-center gap-2 text-xs font-semibold tracking-wide uppercase">
         <span class="text-fg" data-testid="turn-author">User</span>
       </div>
@@ -272,19 +272,27 @@
 {/snippet}
 
 {#snippet outcomeRow(row: Extract<UnifiedRow, { kind: "outcome" }>)}
-  <div
-    class="flex items-center gap-2 border-l pl-3 text-xs"
-    style:border-left-color={agentBorderColor(row.agent_id)}
-    data-testid="turn-outcome"
-    data-status={row.status}
-  >
-    <span class="text-fg font-semibold">{agentName(row.agent_id)}</span>
-    {#if row.status === "cancelled"}
-      <span class="text-muted" data-testid="outcome-cancelled">cancelled</span>
-    {:else}
-      <span class="text-status-failed" data-testid="outcome-failed">failed</span>
-    {/if}
-    {#if row.reason}<span class="text-muted">— {row.reason}</span>{/if}
+  {@const harness = agentById[row.agent_id]?.harness}
+  <div class="group space-y-1.5" data-testid="turn-outcome" data-role="agent" data-status={row.status}>
+    <div class="flex items-center gap-2 text-xs font-semibold tracking-wide uppercase">
+      <span class="text-fg" data-testid="turn-agent-name">{agentName(row.agent_id)}</span>
+      {#if harness}<HarnessIcon {harness} testid="turn-harness-icon" />{:else}<Badge>?</Badge>{/if}
+    </div>
+    <div class="border-l pl-3" style:border-left-color={agentBorderColor(row.agent_id)}>
+      {#if row.status === "cancelled"}
+        <span
+          class="bg-status-cancelled-soft text-status-cancelled inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium"
+          data-testid="outcome-cancelled"
+        >cancelled</span>
+      {:else}
+        <span
+          class="bg-status-failed-soft text-status-failed inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium"
+          data-testid="outcome-failed"
+        >failed</span>
+        {#if row.reason}<span class="text-muted text-xs"> — {row.reason}</span>{/if}
+      {/if}
+    </div>
+    {@render messageMeta(row.at, "", "", "mt-2.5")}
   </div>
 {/snippet}
 
@@ -411,15 +419,11 @@
                       {@render turnBody(r.turn)}
                     {:else}
                       {#if r.status === "cancelled"}
-                        <span class="text-muted text-xs" data-testid="outcome-cancelled"
-                          >cancelled</span
-                        >
+                        <span class="bg-status-cancelled-soft text-status-cancelled inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium" data-testid="outcome-cancelled">cancelled</span>
                       {:else}
-                        <span class="text-status-failed text-xs" data-testid="outcome-failed"
-                          >failed</span
-                        >
+                        <span class="bg-status-failed-soft text-status-failed inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium" data-testid="outcome-failed">failed</span>
                       {/if}
-                      {#if r.reason}<span class="text-muted text-xs">— {r.reason}</span>{/if}
+                      {#if r.status !== "cancelled" && r.reason}<span class="text-muted text-xs"> — {r.reason}</span>{/if}
                     {/if}
                   {/each}
                 </div>

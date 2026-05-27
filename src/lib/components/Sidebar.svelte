@@ -128,11 +128,6 @@
           >
             {statusLabel(runtime?.run_status)}
           </div>
-          {#if runtime?.last_error}
-            <div class="text-status-failed mt-1 text-xs" data-testid="agent-last-error">
-              {runtime.last_error.message}
-            </div>
-          {/if}
           {#if runtime?.hydration_error}
             <div class="text-status-failed mt-1 text-xs" data-testid="agent-hydration-error">
               history failed to load: {runtime.hydration_error}

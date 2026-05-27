@@ -606,3 +606,225 @@ describe("UnifiedTranscript — fan-out groups", () => {
     expect(screen.getAllByTestId("turn")).toHaveLength(2);
   });
 });
+
+describe("UnifiedTranscript — markdown rendering", () => {
+  it("renders agent text as markdown with tool calls interleaved between segments", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "agent-md",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:00Z",
+        status: "complete",
+        items: [
+          { item_kind: "text", kind: "text", text: "Running **before** the tool" },
+          {
+            item_kind: "tool",
+            tool_use_id: "tool-1",
+            kind: "builtin",
+            name: "Bash",
+            input: { command: "echo hi" },
+            output: "hi\n",
+            is_error: false,
+            started_at: "2026-05-16T00:00:01Z",
+            completed_at: "2026-05-16T00:00:02Z",
+          },
+          { item_kind: "text", kind: "text", text: "Done with `code` after" },
+        ],
+      },
+    ];
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+
+    const turn = screen.getByTestId("turn");
+    // Both text segments are formatted (not raw markdown).
+    expect(turn.querySelector("strong")).toHaveTextContent("before");
+    expect(turn.querySelector("code")).toHaveTextContent("code");
+    // The tool box still renders *between* the two markdown segments — assert the
+    // DOM order is [markdown, tool, markdown].
+    const sequence = Array.from(
+      turn.querySelectorAll(".markdown-body, [data-testid='turn-tool']"),
+    ).map((el) => (el.getAttribute("data-testid") === "turn-tool" ? "tool" : "md"));
+    expect(sequence).toEqual(["md", "tool", "md"]);
+  });
+
+  it("renders a user message as markdown", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "user-md",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:00Z",
+        text: "# Heading\n\nwith **bold**",
+      },
+    ];
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+
+    const turn = screen.getByTestId("turn");
+    expect(turn.querySelector("h1")).toHaveTextContent("Heading");
+    expect(turn.querySelector("strong")).toHaveTextContent("bold");
+  });
+
+  it("renders markdown in each fan-out column", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "u-a",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: SEND_1,
+        started_at: "2026-05-16T00:00:00Z",
+        text: "fan out",
+      },
+      {
+        role: "agent",
+        turn_id: "a-a",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: SEND_1,
+        started_at: "2026-05-16T00:00:01Z",
+        status: "complete",
+        items: [{ item_kind: "text", kind: "text", text: "**alice**" }],
+      },
+    ];
+    state.transcripts[CODEX_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "u-b",
+        agent_id: CODEX_AGENT.id,
+        send_id: SEND_1,
+        started_at: "2026-05-16T00:00:00Z",
+        text: "fan out",
+      },
+      {
+        role: "agent",
+        turn_id: "a-b",
+        agent_id: CODEX_AGENT.id,
+        send_id: SEND_1,
+        started_at: "2026-05-16T00:00:02Z",
+        status: "complete",
+        items: [{ item_kind: "text", kind: "text", text: "**bob**" }],
+      },
+    ];
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT, CODEX_AGENT] } });
+
+    const columns = screen.getAllByTestId("fanout-column");
+    expect(columns[0]!.querySelector("strong")).toHaveTextContent("alice");
+    expect(columns[1]!.querySelector("strong")).toHaveTextContent("bob");
+  });
+
+  it("renders streaming markdown without throwing on an intermediate partial fence", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "turn_start",
+      turn_id: "turn-1",
+      message_id: "msg-1",
+      started_at: "2026-05-16T00:00:00Z",
+    });
+    // Unclosed fence — marked renders a partial code block; must not throw.
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "content_chunk",
+      turn_id: "turn-1",
+      kind: "text",
+      text: "```rust\nlet x =",
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId("turn").querySelector("pre")).not.toBeNull();
+    });
+    // Closing chunk completes the block.
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "content_chunk",
+      turn_id: "turn-1",
+      kind: "text",
+      text: " 1;\n```",
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId("turn")).toHaveTextContent("let x = 1;");
+    });
+  });
+
+  it("keeps the view pinned to the bottom as streaming text grows", async () => {
+    // jsdom does no layout (scrollHeight/clientHeight are 0), so stub the
+    // dimensions and assert the wiring: a content_chunk into an existing turn
+    // grows item.text.length → scrollSignal changes → the pin effect re-assigns
+    // scrollTop to the bottom. This guards the streaming-growth → re-pin chain;
+    // the real height-jump-after-paint behavior is verified manually.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+
+    const container = screen.getByTestId("unified-transcript");
+    Object.defineProperty(container, "scrollHeight", { configurable: true, value: 1000 });
+    Object.defineProperty(container, "clientHeight", { configurable: true, value: 500 });
+
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "turn_start",
+      turn_id: "turn-1",
+      message_id: "msg-1",
+      started_at: "2026-05-16T00:00:00Z",
+    });
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "content_chunk",
+      turn_id: "turn-1",
+      kind: "text",
+      text: "hello",
+    });
+    // Growing the same turn's text (not adding a row) exercises the
+    // item.text.length term of scrollSignal specifically.
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "content_chunk",
+      turn_id: "turn-1",
+      kind: "text",
+      text: " world, more streaming content arrives",
+    });
+
+    await waitFor(() => {
+      expect(container.scrollTop).toBe(1000);
+    });
+  });
+
+  it("intercepts a link click, routes it to open_external_url, and prevents navigation", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "agent-link",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:00Z",
+        status: "complete",
+        items: [{ item_kind: "text", kind: "text", text: "see [site](https://example.com)" }],
+      },
+    ];
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+
+    const link = screen.getByTestId("turn").querySelector("a");
+    if (!link) throw new Error("expected a rendered link");
+    invokeMock.mockClear();
+
+    const notCancelled = await fireEvent.click(link);
+
+    // Routed to the backend opener (which validates the scheme), not the webview.
+    expect(invokeMock).toHaveBeenCalledWith("open_external_url", { url: "https://example.com" });
+    expect(notCancelled).toBe(false);
+  });
+});

@@ -6,6 +6,7 @@
   import { HARNESS_COLOR } from "$lib/harnessDisplay";
   import Badge from "$lib/components/ui/Badge.svelte";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
+  import Markdown from "$lib/components/ui/Markdown.svelte";
 
   type AgentTurn = Extract<Turn, { role: "agent" }>;
   type NonUserRow = Exclude<UnifiedRow, { kind: "user" }>;
@@ -140,7 +141,7 @@
   {/if}
   {#each turn.items as item, i (i)}
     {#if item.item_kind === "text"}
-      <div class="text-fg text-sm leading-6 whitespace-pre-wrap">{item.text}</div>
+      <Markdown text={item.text} />
     {:else}
       <div
         class="border-border/80 bg-panel/80 rounded-md border p-2 text-xs"
@@ -212,7 +213,7 @@
       <span class="text-fg" data-testid="turn-author">User</span>
     </div>
     <div class="border-border border-l pl-3">
-      <div class="text-fg text-sm leading-6 whitespace-pre-wrap">{row.text}</div>
+      <Markdown text={row.text} />
     </div>
   </div>
 {/snippet}

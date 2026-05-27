@@ -178,7 +178,7 @@
 
 {#snippet turnBody(turn: AgentTurn)}
   {#if turn.status === "streaming" && turn.items.length === 0}
-    <div class="text-muted text-xs italic" data-testid="turn-processing">processing…</div>
+    <span class="bg-status-processing-soft text-status-processing inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium" data-testid="turn-processing">processing</span>
   {/if}
   {#each turn.items as item, i (i)}
     {#if item.item_kind === "text"}
@@ -308,7 +308,9 @@
         `Cancel queued send for ${agentName(agentId)}`,
         "turn-live-control",
       )}
-      <span class="text-status-processing" data-testid="turn-queued">queued…</span>
+    </div>
+    <div class="border-l pl-3" style:border-left-color={agentBorderColor(agentId)}>
+      <span class="bg-status-processing-soft text-status-processing inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium" data-testid="turn-queued">queued</span>
     </div>
   </div>
 {/snippet}

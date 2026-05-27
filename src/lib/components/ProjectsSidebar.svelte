@@ -127,7 +127,7 @@
               <Badge class="ml-auto" testid="project-unavailable">unavailable</Badge>
             {/if}
           </div>
-          <div class="text-muted flex w-full items-center gap-1 text-[11px] leading-4">
+          <div class="text-muted flex w-full items-center gap-1 text-xs leading-4">
             <span class="truncate" title={project.directory}>{basename(project.directory)}</span>
             <span>·</span>
             <span class="shrink-0">{relativeTime(project.last_activity)}</span>

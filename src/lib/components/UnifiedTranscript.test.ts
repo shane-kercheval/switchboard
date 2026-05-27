@@ -18,6 +18,11 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: (cmd: string, args?: Record<string, unknown>) => invokeMock(cmd, args),
 }));
 
+const copyTextMock = vi.fn(async (_t: string): Promise<void> => undefined);
+vi.mock("$lib/native", () => ({
+  copyText: (t: string) => copyTextMock(t),
+}));
+
 async function loadState() {
   return await import("$lib/state/index.svelte");
 }
@@ -826,5 +831,128 @@ describe("UnifiedTranscript — markdown rendering", () => {
     // Routed to the backend opener (which validates the scheme), not the webview.
     expect(invokeMock).toHaveBeenCalledWith("open_external_url", { url: "https://example.com" });
     expect(notCancelled).toBe(false);
+  });
+});
+
+describe("UnifiedTranscript — per-message copy", () => {
+  it("copies a user message's text", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "user-1",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:00Z",
+        text: "please do the thing",
+      },
+    ];
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+    copyTextMock.mockClear();
+
+    const turn = screen.getByTestId("turn");
+    const copy = turn.querySelector('[data-testid="message-copy"]');
+    if (!copy) throw new Error("expected a copy button on the user message");
+    await fireEvent.click(copy);
+
+    expect(copyTextMock).toHaveBeenCalledWith("please do the thing");
+  });
+
+  it("copies an agent message's prose, excluding tool calls", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "agent-1",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:00Z",
+        status: "complete",
+        items: [
+          { item_kind: "text", kind: "text", text: "Here is **step one**" },
+          {
+            item_kind: "tool",
+            tool_use_id: "tool-1",
+            kind: "builtin",
+            name: "Bash",
+            input: { command: "echo hi" },
+            output: "hi\n",
+            is_error: false,
+            started_at: "2026-05-16T00:00:01Z",
+            completed_at: "2026-05-16T00:00:02Z",
+          },
+          { item_kind: "text", kind: "text", text: "and step two." },
+        ],
+      },
+    ];
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+    copyTextMock.mockClear();
+
+    const turn = screen.getByTestId("turn");
+    const copy = turn.querySelector('[data-testid="message-copy"]');
+    if (!copy) throw new Error("expected a copy button on the agent message");
+    await fireEvent.click(copy);
+
+    // Prose segments joined; tool output ("hi") is omitted.
+    expect(copyTextMock).toHaveBeenCalledWith("Here is **step one**\n\nand step two.");
+  });
+
+  it("shows a timestamp (titled with the ISO start) on each message", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "agent-1",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T08:30:00Z",
+        status: "complete",
+        items: [{ item_kind: "text", kind: "text", text: "done" }],
+      },
+    ];
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+
+    const time = screen.getByTestId("turn").querySelector('[data-testid="message-time"]');
+    if (!time) throw new Error("expected a timestamp on the message");
+    expect(time).toHaveAttribute("title", "2026-05-16T08:30:00Z");
+    expect(time.textContent?.trim()).not.toBe("");
+  });
+
+  it("shows no copy button on a tool-only agent turn", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "agent-1",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:00Z",
+        status: "complete",
+        items: [
+          {
+            item_kind: "tool",
+            tool_use_id: "tool-1",
+            kind: "builtin",
+            name: "read_file",
+            input: { file_path: "x" },
+            output: "",
+            is_error: false,
+            started_at: "2026-05-16T00:00:01Z",
+            completed_at: "2026-05-16T00:00:02Z",
+          },
+        ],
+      },
+    ];
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+
+    expect(screen.getByTestId("turn").querySelector('[data-testid="message-copy"]')).toBeNull();
   });
 });

@@ -293,7 +293,7 @@
                 {...props}
                 type="button"
                 class={cn(
-                  "focus-visible:ring-accent inline-flex items-center gap-1 rounded-full border py-0.5 pr-2 pl-1.5 transition-colors focus-visible:ring-2 focus-visible:outline-none",
+                  "focus-visible:ring-accent inline-flex items-center gap-1.5 rounded-full border py-1 pr-2.5 pl-2 text-sm transition-colors focus-visible:ring-2 focus-visible:outline-none",
                   selected
                     ? "bg-accent-soft text-fg border-transparent"
                     : "border-border bg-panel text-muted hover:text-fg",
@@ -303,7 +303,7 @@
                 aria-pressed={selected}
                 onclick={() => toggleRecipient(agent.id)}
               >
-                <HarnessIcon harness={agent.harness} size="sm" class="h-3.5 w-3.5" />
+                <HarnessIcon harness={agent.harness} size="sm" class="h-4 w-4" />
                 {agent.name}
               </button>
             {/snippet}
@@ -315,7 +315,7 @@
               <button
                 {...props}
                 type="button"
-                class="text-muted hover:text-fg ml-0.5 flex h-5 w-5 items-center justify-center"
+                class="text-muted hover:text-fg ml-0.5 flex h-6 w-6 items-center justify-center"
                 data-testid="recipient-clear"
                 aria-label="Clear recipients"
                 onclick={() => (selectedIds = [])}
@@ -324,9 +324,9 @@
                   viewBox="0 0 24 24"
                   fill="none"
                   stroke="currentColor"
-                  stroke-width="2"
+                  stroke-width="1.75"
                   stroke-linecap="round"
-                  class="h-4 w-4"
+                  class="h-5 w-5"
                   aria-hidden="true"
                 >
                   <circle cx="12" cy="12" r="9" />
@@ -341,14 +341,14 @@
     <div class="relative flex items-end gap-2">
       {#if menuOpen && menuItems.length > 0}
         <div
-          class="border-border bg-raised absolute bottom-full left-0 z-10 mb-1 max-h-48 w-56 overflow-y-auto rounded-lg border p-1 shadow-[0_10px_28px_rgba(0,0,0,0.12)]"
+          class="border-border bg-raised absolute bottom-full left-0 z-10 mb-1 max-h-64 w-64 overflow-y-auto rounded-lg border p-1.5 shadow-[0_10px_28px_rgba(0,0,0,0.12)]"
           data-testid="recipient-menu"
           role="listbox"
         >
           {#each menuItems as item, i (item.key)}
             <button
               type="button"
-              class={"flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs " +
+              class={"flex w-full items-center gap-2.5 rounded-md px-3 py-2 text-left text-sm " +
                 (i === highlighted ? "bg-panel" : "")}
               data-testid={`recipient-option-${item.key}`}
               role="option"
@@ -370,7 +370,7 @@
                   <path d="m8.5 12 2.5 2.5 4.5-5" />
                 </svg>
                 <span class="text-fg">All agents</span>
-                <span class="text-muted ml-auto font-mono text-xs">
+                <span class="text-muted ml-auto font-mono text-[13px]">
                   {shortcut("mod", "shift", "A")}
                 </span>
               {:else if item.kind === "clear"}
@@ -387,13 +387,13 @@
                   <path d="m5.6 5.6 12.8 12.8" />
                 </svg>
                 <span class="text-fg">Clear</span>
-                <span class="text-muted ml-auto font-mono text-xs">{shortcut("esc")}</span>
+                <span class="text-muted ml-auto font-mono text-[13px]">{shortcut("esc")}</span>
               {:else}
                 {@const agentIndex = agents.findIndex((a) => a.id === item.agent.id)}
                 <HarnessIcon harness={item.agent.harness} size="sm" class="h-4 w-4" />
                 <span class="text-fg">{item.agent.name}</span>
                 {#if agentIndex >= 0 && agentIndex < 9}
-                  <span class="text-muted ml-auto font-mono text-xs">
+                  <span class="text-muted ml-auto font-mono text-[13px]">
                     {shortcut("mod", String(agentIndex + 1))}
                   </span>
                 {/if}

@@ -76,6 +76,10 @@
      (not the white `--raised`). Its own token because no neutral surface sits
      in this gap. */
   --code-bg: #f8f8f9;
+
+  /* Transcript scroll area — lighter than `--surface` so the reading area
+     feels brighter than the surrounding chrome. */
+  --transcript-bg: #fefefe;
 }
 
 .dark {
@@ -118,6 +122,9 @@
 
   /* Lighter than the dark `--panel` so the block reads as a raised code surface. */
   --code-bg: #1f1f23;
+
+  /* Marginally lighter than the dark `--surface` for the reading area. */
+  --transcript-bg: #111114;
 }
 
 /* `inline` so the generated utilities reference the CSS variables by name
@@ -125,6 +132,7 @@
    `.dark`-scoped override re-theme `bg-surface` et al. with no rebuild. */
 @theme inline {
   --color-surface: var(--surface);
+  --color-transcript: var(--transcript-bg);
   --color-panel: var(--panel);
   --color-raised: var(--raised);
   --color-border: var(--border);
@@ -338,7 +346,7 @@ body {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 0.25rem 0.625rem;
+    padding: 0.25rem 0.25rem 0.25rem 0.625rem;
     background-color: var(--code-bg);
   }
   .md-code-lang {
@@ -359,18 +367,27 @@ body {
     color: var(--muted);
     background: transparent;
     border: 0;
-    border-radius: 0.25rem;
-    padding: 0.2rem;
+    border-radius: 9999px;
+    width: 1.75rem;
+    height: 1.75rem;
+    padding: 0;
     cursor: pointer;
-    transition: color 0.12s ease;
+    opacity: 0;
+  }
+  /* Visibility is gated purely on hovering the code block — instant, no fade,
+     and NOT tied to `data-copied` (which lingers ~1s after a click and would
+     otherwise keep the button visible after the pointer has left). The green
+     checkmark still swaps in while hovering. */
+  .md-code-block:hover .md-code-copy {
+    opacity: 1;
   }
   .md-code-copy:hover {
     color: var(--fg);
     background-color: var(--border);
   }
   .md-code-copy svg {
-    width: 1rem;
-    height: 1rem;
+    width: 1.0625rem;
+    height: 1.0625rem;
   }
   .md-check-icon {
     display: none;

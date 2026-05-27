@@ -7,6 +7,7 @@
   import Badge from "$lib/components/ui/Badge.svelte";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
   import Markdown from "$lib/components/ui/Markdown.svelte";
+  import CopyButton from "$lib/components/ui/CopyButton.svelte";
 
   type AgentTurn = Extract<Turn, { role: "agent" }>;
   type NonUserRow = Exclude<UnifiedRow, { kind: "user" }>;
@@ -72,6 +73,46 @@
   function agentBorderColor(agentId: string): string {
     const harness = agentById[agentId]?.harness;
     return harness ? HARNESS_COLOR[harness] : "var(--border)";
+  }
+
+  /// The copyable prose of an agent turn: its text segments joined, with tool
+  /// calls omitted (people copy the response, not the tool I/O). A turn that is
+  /// only tool calls (or still empty) yields "", which suppresses the button.
+  function agentTurnText(turn: AgentTurn): string {
+    return turn.items
+      .filter((i) => i.item_kind === "text")
+      .map((i) => i.text)
+      .join("\n\n")
+      .trim();
+  }
+
+  /// A fan-out column's copyable prose: the joined text of its agent turns.
+  function columnText(colRows: NonUserRow[]): string {
+    return colRows
+      .filter((r) => r.kind === "agent")
+      .map((r) => agentTurnText(r.turn))
+      .filter((t) => t.length > 0)
+      .join("\n\n");
+  }
+
+  /// A fan-out column's timestamp: its latest agent turn's start, or "" (queued).
+  function columnAt(colRows: NonUserRow[]): string {
+    for (let i = colRows.length - 1; i >= 0; i--) {
+      const r = colRows[i]!;
+      if (r.kind === "agent") return r.turn.started_at;
+    }
+    return "";
+  }
+
+  function formatTime(iso: string): string {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return "";
+    return d.toLocaleString(undefined, {
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+    });
   }
 
   /// A fan-out column's state, derived from its rows: the response turn's status
@@ -160,7 +201,7 @@
         {#if item.output !== undefined && item.output !== ""}
           <pre
             class={cn(
-              "mt-1 max-h-40 overflow-y-auto font-mono text-[11px] whitespace-pre-wrap",
+              "mt-1 max-h-40 overflow-y-auto font-mono text-xs whitespace-pre-wrap",
               item.is_error ? "text-status-failed" : "text-muted",
             )}>{item.output}</pre>
         {/if}
@@ -203,18 +244,30 @@
   </button>
 {/snippet}
 
+{#snippet messageMeta(at: string, copyable: string, label: string)}
+  <div class="mt-1 flex items-center gap-2 opacity-0 group-hover:opacity-100" data-testid="message-meta">
+    {#if at}
+      <time class="text-muted text-xs" datetime={at} title={at} data-testid="message-time"
+        >{formatTime(at)}</time
+      >
+    {/if}
+    {#if copyable}
+      <CopyButton text={copyable} {label} testid="message-copy" />
+    {/if}
+  </div>
+{/snippet}
+
 {#snippet userMessage(row: Extract<UnifiedRow, { kind: "user" }>)}
-  <div
-    class="bg-panel/45 -mx-3 min-w-0 flex-1 space-y-1.5 rounded-md px-3 py-2"
-    data-testid="turn"
-    data-role="user"
-  >
-    <div class="flex items-center gap-2 text-[11px] font-semibold tracking-wide uppercase">
-      <span class="text-fg" data-testid="turn-author">User</span>
+  <div class="group -mx-3 min-w-0 flex-1" data-testid="turn" data-role="user">
+    <div class="bg-panel/45 space-y-1.5 rounded-md px-3 py-2">
+      <div class="flex items-center gap-2 text-xs font-semibold tracking-wide uppercase">
+        <span class="text-fg" data-testid="turn-author">User</span>
+      </div>
+      <div class="border-border border-l pl-3">
+        <Markdown text={row.text} />
+      </div>
     </div>
-    <div class="border-border border-l pl-3">
-      <Markdown text={row.text} />
-    </div>
+    {@render messageMeta(row.at, row.text, "Copy message")}
   </div>
 {/snippet}
 
@@ -237,7 +290,7 @@
 
 {#snippet queuedRow(agentId: string, sendId: string)}
   <div class="space-y-1.5" data-testid="turn" data-role="agent">
-    <div class="flex items-center gap-2 text-[11px] font-semibold tracking-wide uppercase">
+    <div class="flex items-center gap-2 text-xs font-semibold tracking-wide uppercase">
       <span class="text-fg" data-testid="turn-agent-name">{agentName(agentId)}</span>
       {#if agentById[agentId]?.harness}
         <HarnessIcon harness={agentById[agentId]!.harness} testid="turn-harness-icon" />
@@ -254,8 +307,9 @@
 
 {#snippet agentRow(turn: AgentTurn)}
   {@const harness = agentById[turn.agent_id]?.harness}
-  <div class="space-y-1.5" data-testid="turn" data-role="agent">
-    <div class="flex items-center gap-2 text-[11px] font-semibold tracking-wide uppercase">
+  {@const copyable = agentTurnText(turn)}
+  <div class="group space-y-1.5" data-testid="turn" data-role="agent">
+    <div class="flex items-center gap-2 text-xs font-semibold tracking-wide uppercase">
       <span class="text-fg" data-testid="turn-agent-name">{agentName(turn.agent_id)}</span>
       {#if harness}<HarnessIcon {harness} testid="turn-harness-icon" />{:else}<Badge>?</Badge>{/if}
       {#if turn.status === "streaming" && turn.send_id !== undefined}
@@ -274,6 +328,7 @@
       {@render turnStatusLabel(turn.status)}
       {@render turnBody(turn)}
     </div>
+    {@render messageMeta(turn.started_at, copyable, "Copy message")}
   </div>
 {/snippet}
 
@@ -281,7 +336,7 @@
   bind:this={container}
   onscroll={onScroll}
   data-testid="unified-transcript"
-  class="flex-1 overflow-y-auto px-8 py-4"
+  class="bg-transcript flex-1 overflow-y-auto px-8 py-4"
 >
   {#if loadStatus === "loading"}
     <p class="text-muted mb-3 text-xs italic" data-testid="transcript-loading">Loading history…</p>
@@ -295,7 +350,7 @@
     <p class="text-muted text-sm">No messages yet. Type a prompt below.</p>
   {/if}
 
-  <div class="space-y-7">
+  <div class="space-y-8">
     {#each blocks as block (block.kind === "fanout" ? block.key : block.row.key)}
       {#if block.kind === "row"}
         {#if block.row.kind === "user"}
@@ -321,14 +376,15 @@
             {#each block.columns as col (col.agent_id)}
               {@const state = columnState(col.rows)}
               {@const harness = agentById[col.agent_id]?.harness}
+              {@const colCopyable = columnText(col.rows)}
               <div
-                class="space-y-1.5"
+                class="group space-y-1.5"
                 data-testid="fanout-column"
                 data-agent-id={col.agent_id}
                 data-state={state}
               >
                 <div
-                  class="flex items-center gap-2 text-[11px] font-semibold tracking-wide uppercase"
+                  class="flex items-center gap-2 text-xs font-semibold tracking-wide uppercase"
                 >
                   <span class="text-fg" data-testid="turn-agent-name"
                     >{agentName(col.agent_id)}</span
@@ -367,6 +423,11 @@
                     {/if}
                   {/each}
                 </div>
+                {@render messageMeta(
+                  columnAt(col.rows),
+                  colCopyable,
+                  `Copy ${agentName(col.agent_id)}'s message`,
+                )}
               </div>
             {/each}
           </div>

@@ -123,7 +123,7 @@
             </div>
           </div>
           <div
-            class={cn("mt-0.5 text-[11px] leading-4", statusClass(runtime?.run_status))}
+            class={cn("mt-0.5 text-xs leading-4", statusClass(runtime?.run_status))}
             data-testid="agent-run-status"
           >
             {statusLabel(runtime?.run_status)}
@@ -154,7 +154,7 @@
           {/if}
           {#if runtime?.meta}
             <div
-              class="text-muted mt-1.5 space-y-0.5 text-[11px] leading-4"
+              class="text-muted mt-1.5 space-y-0.5 text-xs leading-4"
               data-testid="agent-meta"
             >
               <div class="truncate" title={runtime.meta.model}>
@@ -180,7 +180,7 @@
           {/if}
           {#if util !== undefined}
             <div class="mt-1.5" data-testid="agent-context-bar">
-              <div class="text-muted mb-0.5 text-[10px]">
+              <div class="text-muted mb-0.5 text-[11px]">
                 context after last turn: {(util * 100).toFixed(0)}%
               </div>
               <div class="bg-border/80 h-1 w-full overflow-hidden rounded">

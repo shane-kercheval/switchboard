@@ -275,6 +275,109 @@ describe("UnifiedTranscript", () => {
     expect(tool.querySelector("pre")).toBeNull();
   });
 
+  it("collapses completed tool output by default and hides the internal builtin label", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "agent-tool",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:00Z",
+        status: "complete",
+        items: [
+          {
+            item_kind: "tool",
+            tool_use_id: "tool-1",
+            kind: "builtin",
+            name: "Bash",
+            input: { command: "echo hi" },
+            output: "hi\n",
+            is_error: false,
+            started_at: "2026-05-16T00:00:01Z",
+            completed_at: "2026-05-16T00:00:02Z",
+          },
+        ],
+      },
+    ];
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+
+    const tool = screen.getByTestId("turn-tool");
+    expect(tool).not.toHaveAttribute("open");
+    expect(tool.querySelector("summary")).toHaveTextContent("Tool");
+    expect(tool).not.toHaveTextContent("builtin");
+    // Success shows the quiet muted check, not the running/error indicators.
+    expect(tool.querySelector('[data-testid="tool-done"]')).not.toBeNull();
+    expect(tool.querySelector('[data-testid="tool-error"]')).toBeNull();
+  });
+
+  it("keeps completed tool errors collapsed while showing error in the header", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "agent-tool-error",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:00Z",
+        status: "complete",
+        items: [
+          {
+            item_kind: "tool",
+            tool_use_id: "tool-error",
+            kind: "builtin",
+            name: "Read",
+            input: { file_path: "missing.txt" },
+            output: "File does not exist",
+            is_error: true,
+            started_at: "2026-05-16T00:00:01Z",
+            completed_at: "2026-05-16T00:00:02Z",
+          },
+        ],
+      },
+    ];
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+
+    const tool = screen.getByTestId("turn-tool");
+    expect(tool).not.toHaveAttribute("open");
+    expect(tool.querySelector('[data-testid="tool-error"]')).not.toBeNull();
+  });
+
+  it("expands running tool calls by default", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "agent-running-tool",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:00Z",
+        status: "streaming",
+        items: [
+          {
+            item_kind: "tool",
+            tool_use_id: "tool-running",
+            kind: "builtin",
+            name: "Bash",
+            input: { command: "sleep 1" },
+            started_at: "2026-05-16T00:00:01Z",
+          },
+        ],
+      },
+    ];
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+
+    const tool = screen.getByTestId("turn-tool");
+    expect(tool).toHaveAttribute("open");
+    expect(tool.querySelector('[data-testid="tool-running"]')).not.toBeNull();
+  });
+
   it("shows processing… indicator for Codex turns with empty items array (streaming)", async () => {
     const state = await loadState();
     await state.registerAgent(CODEX_AGENT);

@@ -20,6 +20,7 @@
   import SidebarToggleButton from "$lib/components/ui/SidebarToggleButton.svelte";
   import PlusIcon from "$lib/components/ui/PlusIcon.svelte";
   import StopIcon from "$lib/components/ui/StopIcon.svelte";
+  import Spinner from "$lib/components/ui/Spinner.svelte";
   import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
   import { windowDragRegion } from "$lib/windowDrag";
 
@@ -167,10 +168,7 @@
                 data-testid="project-cancel"
                 onclick={() => cancelAllForProject(project.id)}
               >
-                <span
-                  class="border-muted/30 border-t-muted block h-5 w-5 animate-spin rounded-full border-2 group-hover:hidden group-focus-visible:hidden"
-                  aria-hidden="true"
-                ></span>
+                <Spinner class="h-5 w-5 group-hover:hidden group-focus-visible:hidden" />
                 <StopIcon class="hidden h-5 w-5 group-hover:block group-focus-visible:block" />
               </button>
             </div>

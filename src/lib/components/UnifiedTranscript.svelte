@@ -2,7 +2,6 @@
   import type { AgentRecord, ConversationItem } from "$lib/types";
   import { cancelSend, runtimes, transcripts, type Turn } from "$lib/state/index.svelte";
   import { buildUnifiedRows, groupRenderBlocks, type UnifiedRow } from "$lib/state/unified";
-  import { cn } from "$lib/utils";
   import { HARNESS_COLOR } from "$lib/harnessDisplay";
   import Badge from "$lib/components/ui/Badge.svelte";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
@@ -10,6 +9,8 @@
   import CopyButton from "$lib/components/ui/CopyButton.svelte";
   import StatusChip from "$lib/components/ui/StatusChip.svelte";
   import StopIcon from "$lib/components/ui/StopIcon.svelte";
+  import Spinner from "$lib/components/ui/Spinner.svelte";
+  import ToolCallWidget from "$lib/components/ToolCallWidget.svelte";
 
   type AgentTurn = Extract<Turn, { role: "agent" }>;
   type NonUserRow = Exclude<UnifiedRow, { kind: "user" }>;
@@ -186,28 +187,7 @@
     {#if item.item_kind === "text"}
       <Markdown text={item.text} />
     {:else}
-      <div
-        class="border-border/80 bg-panel/80 rounded-md border p-2 text-xs"
-        data-testid="turn-tool"
-        data-tool-use-id={item.tool_use_id}
-      >
-        <div class="text-fg flex items-center gap-1.5 font-semibold">
-          <Badge>{item.kind}</Badge>
-          <span class="font-mono">{item.name}</span>
-          {#if item.completed_at === undefined}
-            <span class="text-status-processing ml-auto italic">running…</span>
-          {:else if item.is_error}
-            <span class="text-status-failed ml-auto">error</span>
-          {/if}
-        </div>
-        {#if item.output !== undefined && item.output !== ""}
-          <pre
-            class={cn(
-              "mt-1 max-h-40 overflow-y-auto font-mono text-xs whitespace-pre-wrap",
-              item.is_error ? "text-status-failed" : "text-muted",
-            )}>{item.output}</pre>
-        {/if}
-      </div>
+      <ToolCallWidget tool={item} />
     {/if}
   {/each}
   {#if turn.status === "failed" && turn.error}
@@ -226,22 +206,23 @@
 {#snippet liveTurnControl(onclick: () => void, label: string, testid: string)}
   <button
     type="button"
-    class="group text-muted hover:bg-status-failed-soft/70 hover:text-status-failed focus-visible:ring-accent focus-visible:bg-status-failed-soft/70 focus-visible:text-status-failed inline-flex h-6 w-6 items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none"
+    class="group/live-control text-muted hover:bg-status-failed-soft/70 hover:text-status-failed focus-visible:ring-accent focus-visible:bg-status-failed-soft/70 focus-visible:text-status-failed inline-flex h-6 w-6 items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none"
     data-testid={testid}
     aria-label={label}
     {onclick}
   >
-    <span
-      class="border-muted/30 border-t-muted block h-5 w-5 animate-spin rounded-full border-2 group-hover:hidden group-focus-visible:hidden"
-      aria-hidden="true"
-    ></span>
-    <StopIcon class="hidden h-5 w-5 group-hover:block group-focus-visible:block" />
+    <Spinner
+      class="h-5 w-5 group-hover/live-control:hidden group-focus-visible/live-control:hidden"
+    />
+    <StopIcon
+      class="hidden h-5 w-5 group-hover/live-control:block group-focus-visible/live-control:block"
+    />
   </button>
 {/snippet}
 
 {#snippet messageMeta(at: string, copyable: string, label: string, mt = "mt-1")}
   <div
-    class={`${mt} flex items-center gap-2 opacity-0 group-focus-within:opacity-100 group-hover:opacity-100`}
+    class={`${mt} flex items-center justify-end gap-2 opacity-0 group-focus-within:opacity-100 group-hover:opacity-100`}
     data-testid="message-meta"
   >
     {#if at}

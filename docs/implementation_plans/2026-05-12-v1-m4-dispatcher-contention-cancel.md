@@ -72,6 +72,7 @@ Backend hardening + new mechanism first, then the UI that sits on top of it. The
 - **M4.7 — Multi-recipient compose + fan-out.** Multi-select recipients; N independent dispatches; queueing UX for busy recipients.
 - **M4.8 — Per-agent actions: cancel, stop, open + resume session.** Solo-turn cancel in the transcript; sidebar kebab with stop-agent (cancel + clear queue, new `CancelAgent` command), open session file, and copy a TUI-resume command (all four harnesses; copy-only, with collision warning).
 - **M4.9 — Harness quota / usage-limit surfacing.** Distinct `FailureKind` + recognizable UI for "out of credits / usage limit" (vs generic harness error). **⚠️ DRAFT — not yet human-reviewed** (added from the 2026-05-25 Codex probe + a "v1, not v2" decision); see the section for the per-harness research prerequisite.
+- **M4.10 — Thinking/reasoning block rendering.** Visually distinct treatment for `ContentKind::Thinking` items in the transcript; Gemini live-stream `[Thought: true]` probe + optional parser fix. **⚠️ DRAFT — not yet human-reviewed.**
 
 **Dependency notes:** M4.1 is foundational for all. M4.2 must precede M4.3 (contract before adapters) and M4.4 (queue keys off the turn lifecycle and idle signal) and M4.8 (the UI action calls the command). M4.7 depends on M4.4. M4.6 has no hard dependency on the cancellation work and could move earlier if convenient, but is sequenced after the backend hardening so the switcher is built against final state shapes.
 
@@ -584,6 +585,84 @@ The capture (above) splits M4.9 into **two distinct surfaces**, because the harn
 - The frontend renders the failure kind distinctly (transcript + sidebar), verified by a component test; if `AuthFailure` rendering had to be built, it is covered too.
 - Dispatcher / `commands.rs` contain zero harness-specific quota branches (abstraction held).
 - The "open product question" in `codex-cli-observed.md` is updated to "resolved → implemented in M4.9."
+
+---
+
+## M4.10 — Thinking/reasoning block rendering
+
+> **⚠️ DRAFT — not yet human-reviewed.** Added 2026-05-26 from observed-in-app research confirming that `ContentKind::Thinking` items are already emitted and stored correctly but rendered identically to answer text.
+
+### Goal & Outcome
+
+Model reasoning steps (Antigravity's `thinking` field, Gemini's `thoughts[]` array) are already parsed and stored in turn state as `ContentKind::Thinking` items — distinct from `ContentKind::Text` answer items in the reducer. But `UnifiedTranscript.svelte` renders both through the same unstyled `<div>`, so reasoning and answer are visually indistinguishable. This milestone adds the missing visual distinction.
+
+Outcomes:
+- Thinking blocks render with a visually subordinate treatment (dimmed/muted, labeled so the user knows it's reasoning, collapsible for long chains) — clearly distinct from the answer that follows. The reasoning prose inside is Markdown-formatted via the shared `<Markdown>` primitive (introduced by the Markdown-rendering plan, which lands first); only the surrounding container is new here.
+- Answer text (`ContentKind::Text`) is visually unchanged.
+- Antigravity turns and Gemini hydrated turns both benefit automatically with no backend change — only the renderer changes.
+- The `[Thought: true]` literal that Gemini CLI embeds in some live-stream content turns is investigated and either reclassified as `ContentKind::Thinking` in the parser or confirmed as intentional model output (probe result decides; either outcome is recorded).
+- The stale `events.rs` doc comment on `ContentKind::Thinking` ("Reserved; not currently emitted") is corrected.
+
+### Background: what the research found (2026-05-26)
+
+Read before implementing — this is not recoverable from the codebase alone:
+
+- **`ContentKind::Thinking` is already emitted** by two paths: Antigravity's live transcript-tail parser (`antigravity/parser.rs`) emits it from the `thinking` field of `PLANNER_RESPONSE` records; Gemini's session-file hydrator (`gemini/session_file.rs`) emits it from the `thoughts[{subject, description}]` array on each gemini record. Both are currently live.
+- **The reducer already handles it correctly** (`reducers.ts`): adjacent `content_chunk` events of the same `kind` are coalesced, but a `thinking` item is never coalesced into a `text` item — they stay as separate entries in `turn.items`.
+- **The renderer does not** (`UnifiedTranscript.svelte` `turnBody` snippet, `{#if item.item_kind === "text"}` branch): both `kind: "text"` and `kind: "thinking"` fall through the same `<div class="text-fg text-sm leading-6 whitespace-pre-wrap">`.
+- **`[Thought: true]`** is a literal string the Gemini CLI embeds in the `content` field of some `message` stream-json events (observed in-app; not reproduced in the prior stream-json research probe because a different model config was used). It is NOT a structured event. It appears as `ContentKind::Text` in the live stream — the parser has no special handling for it.
+- **Gemini live stream never emits thinking as a separate event** in the documented probe config (`thoughts:[]` in headless mode, per `gemini-cli-observed.md §"CONFIRMED: thoughts appear opportunistically in the session file, never in the stream"`). The `[Thought: true]` case is a newer/different model configuration that was not part of that probe.
+- **The `events.rs` comment** on `ContentKind::Thinking` reads "Reserved; not currently emitted." This is now wrong.
+- **Claude**: the Claude adapter was not checked for extended-thinking block support in this research pass. Check it early in implementation (see outline).
+
+### Implementation Outline
+
+**Step 1 — Gemini live-stream probe (prerequisite; do before any parser change).**
+
+Run `gemini -p "<short prompt>" --output-format stream-json` against the model config that produced the `[Thought: true]` output (the same project the user observed it in), capture the raw stream-json, and inspect it. Two possible outcomes:
+
+- **`[Thought: true]` appears as a literal prefix in a `message` event's `content` field** → add a detection pass in the Gemini live-stream parser (`gemini/parser.rs`): when a `message` event's content starts with `[Thought: true]`, strip the prefix and emit the remaining text as `ContentChunk { kind: Thinking }` instead of `ContentKind::Text`. Record the exact format (prefix string, whether it spans a single event or multiple) in `gemini-cli-observed.md`.
+- **`[Thought: true]` is regular model output that the model authored as text** → leave it as `ContentKind::Text`; record that finding in `gemini-cli-observed.md`. No parser change.
+- **It's a separate event type in a newer stream-json schema** → handle that event type as `ContentKind::Thinking` in the parser; record the new event shape.
+
+If the probe is not runnable (quota, auth issue), record that and proceed without the parser change — the frontend fix is independent.
+
+**Step 2 — Check Claude extended thinking (read, don't add).**
+
+Read `crates/harness/src/claude_code/parser.rs` (or wherever the Claude stream-json `content_block_start` / `content_block_delta` events are handled). Claude's stream-json format has a `type: "thinking"` content block type for extended thinking. Check whether the Claude parser currently emits `ContentChunk { kind: Thinking }` for these. Two outcomes:
+- Already emitted → the frontend fix in Step 3 covers Claude automatically. Note this in the DoD.
+- Not emitted → do NOT add it speculatively. Record it as a known gap; it is follow-up work, not M4.10 scope.
+
+**Step 3 — Frontend: render `kind: "thinking"` distinctly (the main work).**
+
+> **Prerequisite — Markdown rendering lands first.** The Markdown plan
+> (`docs/implementation_plans/2026-05-26-markdown-rendering.md`) ships before this
+> milestone and converts the `{#if item.item_kind === "text"}` branch to render
+> through a content-agnostic `<Markdown>` primitive (covering both `text` and
+> `thinking` items, formatted identically for now). **This step builds on that,
+> not on the raw-text renderer.** Reuse `<Markdown>` for the reasoning body —
+> wrap it, do not replace it.
+
+In `UnifiedTranscript.svelte`'s `turnBody` snippet, the `{#if item.item_kind === "text"}` branch renders all text items through `<Markdown>` (after the Markdown plan). Add a sub-branch on `item.kind`:
+
+- `kind === "text"` → unchanged (answer prose through `<Markdown>`).
+- `kind === "thinking"` → visually subordinate treatment **wrapping the same `<Markdown>` body**. The exact styling is the implementing agent's call against the design-system tokens in `docs/ui-conventions.md`, but the intent is: muted/dimmed, a small labeled header (e.g. "Thinking" or a collapse toggle), and collapsible for long blocks. A `<details>`/`<summary>` element is a natural fit but any approach consistent with the existing component patterns is fine. The reasoning prose inside still renders as Markdown — only the container changes. The key constraint: it must be visually distinct enough that a user can clearly tell where reasoning ends and the answer begins.
+
+No changes to `types.ts`, `reducers.ts`, `events.rs` enum variants, or any Rust backend are needed for this step.
+
+**Step 4 — Correct stale doc comment.**
+
+In `crates/harness/src/events.rs`, update the `ContentKind::Thinking` doc comment from "Reserved; not currently emitted" to reflect current reality: both Antigravity and Gemini already emit it, and the comment should describe what it means, not its historical reservation status.
+
+### Definition of Done
+
+- **Gemini probe result recorded** in `gemini-cli-observed.md` (even if the result is "leave as text — it's model output") — the probe outcome must be documented regardless of whether it triggers a parser change.
+- **Claude check result recorded** — either "Claude already emits `ContentKind::Thinking`, frontend fix covers it" or "Claude does not currently emit it; gap noted for follow-up."
+- **Frontend rendering**: thinking items render with visually distinct treatment; answer text is unchanged. Component test: construct a turn with a `thinking` item followed by a `text` item and assert (a) both render, (b) they carry distinct `data-testid` attributes or CSS class selectors so thinking and answer can be told apart in tests, (c) the thinking item does not bleed into the answer container.
+- **Gemini parser change (only if probe warrants)**: unit test asserting a `[Thought: true]`-prefixed `message` event produces `ContentChunk { kind: Thinking }` with the prefix stripped; a normal `message` event produces `ContentChunk { kind: Text }` unchanged.
+- **`events.rs` doc comment corrected.**
+- **Manual verification**: open an Antigravity project with thinking turns and a Gemini project with session-file thoughts in `make dev` — confirm reasoning blocks are visually distinct from answer text in both. If Claude extended thinking is already emitted, verify it too.
+- **Known limitation to record if applicable**: if the Gemini probe was not runnable, state that `[Thought: true]` handling is deferred and why; if Claude extended-thinking emission is absent, state the gap explicitly in a code comment at the Claude parser's content-block handling site.
 
 ---
 

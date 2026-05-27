@@ -93,6 +93,7 @@
   /// agents; Enter / click adds the highlighted one and strips the token. This
   /// is the keyboard route to selecting recipients without touching the mouse.
   let menuOpen = $state(false);
+  let menuEl = $state<HTMLDivElement | undefined>(undefined);
   let menuQuery = $state("");
   let highlighted = $state(0);
   const AT_TOKEN = /(^|\s)@([\w-]*)$/;
@@ -197,6 +198,16 @@
     prompt = prompt.replace(AT_TOKEN, "$1");
     menuOpen = false;
   }
+
+  $effect(() => {
+    if (!menuOpen) return;
+    function onPointerDown(e: PointerEvent): void {
+      if (menuEl?.contains(e.target as Node)) return;
+      menuOpen = false;
+    }
+    document.addEventListener("pointerdown", onPointerDown);
+    return () => document.removeEventListener("pointerdown", onPointerDown);
+  });
 
   function onInput(): void {
     const m = AT_TOKEN.exec(prompt);
@@ -344,6 +355,7 @@
           class="border-border bg-raised absolute bottom-full left-0 z-10 mb-1 max-h-64 w-64 overflow-y-auto rounded-lg border p-1.5 shadow-[0_10px_28px_rgba(0,0,0,0.12)]"
           data-testid="recipient-menu"
           role="listbox"
+          bind:this={menuEl}
         >
           {#each menuItems as item, i (item.key)}
             <button

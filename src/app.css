@@ -79,7 +79,7 @@
 
   /* Transcript scroll area — lighter than `--surface` so the reading area
      feels brighter than the surrounding chrome. */
-  --transcript-bg: #fefefe;
+  --transcript-bg: #ffffff;
 }
 
 .dark {

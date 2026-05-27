@@ -293,7 +293,7 @@
                 {...props}
                 type="button"
                 class={cn(
-                  "focus-visible:ring-accent inline-flex items-center gap-1.5 rounded-full border py-1 pr-2.5 pl-2 text-sm transition-colors focus-visible:ring-2 focus-visible:outline-none",
+                  "focus-visible:ring-accent inline-flex items-center gap-1 rounded-full border py-0.5 pr-2 pl-1.5 text-sm transition-colors focus-visible:ring-2 focus-visible:outline-none",
                   selected
                     ? "bg-accent-soft text-fg border-transparent"
                     : "border-border bg-panel text-muted hover:text-fg",
@@ -303,7 +303,7 @@
                 aria-pressed={selected}
                 onclick={() => toggleRecipient(agent.id)}
               >
-                <HarnessIcon harness={agent.harness} size="sm" class="h-4 w-4" />
+                <HarnessIcon harness={agent.harness} size="sm" class="h-3.5 w-3.5" />
                 {agent.name}
               </button>
             {/snippet}
@@ -430,7 +430,7 @@
             class={cn(
               "flex h-8 w-8 shrink-0 items-center justify-center rounded-full transition-colors",
               showStop
-                ? "bg-border text-muted hover:bg-status-failed hover:text-primary-fg"
+                ? "bg-border text-muted hover:bg-status-failed-soft/70 hover:text-status-failed"
                 : sendDisabled
                   ? "bg-border text-muted/50 cursor-not-allowed"
                   : "bg-primary text-primary-fg hover:bg-primary/90",
@@ -438,7 +438,7 @@
           >
             {#if showStop}
               <svg viewBox="0 0 24 24" fill="currentColor" class="h-5 w-5" aria-hidden="true">
-                <rect x="5" y="5" width="14" height="14" rx="2.25" />
+                <rect x="7" y="7" width="10" height="10" rx="2" />
               </svg>
             {:else}
               <svg

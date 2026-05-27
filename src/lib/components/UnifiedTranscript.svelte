@@ -224,7 +224,7 @@
 {#snippet liveTurnControl(onclick: () => void, label: string, testid: string)}
   <button
     type="button"
-    class="group text-muted hover:bg-status-failed-soft hover:text-status-failed focus-visible:ring-accent focus-visible:bg-status-failed-soft focus-visible:text-status-failed inline-flex h-6 w-6 items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none"
+    class="group text-muted hover:bg-status-failed-soft/70 hover:text-status-failed focus-visible:ring-accent focus-visible:bg-status-failed-soft/70 focus-visible:text-status-failed inline-flex h-6 w-6 items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none"
     data-testid={testid}
     aria-label={label}
     {onclick}
@@ -239,7 +239,7 @@
       class="hidden h-5 w-5 group-hover:block group-focus-visible:block"
       aria-hidden="true"
     >
-      <rect x="5" y="5" width="14" height="14" rx="2.25" />
+      <rect x="7" y="7" width="10" height="10" rx="2" />
     </svg>
   </button>
 {/snippet}

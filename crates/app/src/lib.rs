@@ -30,7 +30,7 @@ use crate::commands::{
     list_agents_impl, list_projects_impl, list_workspace_directories_impl,
     load_project_conversation_impl, load_transcript_impl, open_project_impl, parse_uuid,
     pick_directory_impl, remove_directory_impl, remove_queued_message_impl, send_message_impl,
-    set_active_project_impl,
+    set_active_project_impl, validate_external_url,
 };
 use crate::state::AppState;
 
@@ -309,6 +309,21 @@ async fn open_session_file(state: State<'_, AppState>, agent_id: String) -> Resu
 }
 
 #[tauri::command]
+async fn open_external_url(url: String) -> Result<(), String> {
+    validate_external_url(&url)?;
+    let status = tokio::process::Command::new("open")
+        .arg(&url)
+        .status()
+        .await
+        .map_err(|e| e.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("`open` failed for {url} (exit {status})"))
+    }
+}
+
+#[tauri::command]
 async fn load_project_conversation(
     state: State<'_, AppState>,
     project_id: String,
@@ -465,6 +480,7 @@ pub fn run() {
             cancel_send,
             agent_session_info,
             open_session_file,
+            open_external_url,
             load_transcript,
             load_project_conversation,
         ])

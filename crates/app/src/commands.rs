@@ -1427,6 +1427,23 @@ pub fn agent_session_info_impl(
 /// POSIX single-quote a string for safe interpolation into a shell command:
 /// wrap in single quotes, and replace any embedded single quote with the
 /// `'\''` close-reopen idiom. Used only to render a copy-ready resume command.
+/// Gate which URLs the `open_external_url` command will hand to the OS opener.
+/// Markdown links are agent/user-controlled text, so only well-formed `http`/
+/// `https` URLs with a host are forwarded; `file:`, `javascript:`, `data:`,
+/// relative, and scheme-only/hostless inputs are refused, so a hallucinated
+/// `file://…` link can't open an arbitrary local file when clicked. Parsing
+/// (rather than a scheme-prefix check) is what rejects malformed "web" URLs like
+/// `https:` or `http:foo` that have no real host.
+pub fn validate_external_url(url: &str) -> Result<(), String> {
+    let parsed = url::Url::parse(url).map_err(|e| format!("not a valid URL ({e}): {url}"))?;
+    let has_host = parsed.host_str().is_some_and(|h| !h.is_empty());
+    if matches!(parsed.scheme(), "http" | "https") && has_host {
+        Ok(())
+    } else {
+        Err(format!("refusing to open non-web URL: {url}"))
+    }
+}
+
 fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
@@ -4168,6 +4185,33 @@ mod tests {
         assert_eq!(shell_quote_if_needed("a b;rm -rf /"), "'a b;rm -rf /'");
         assert_eq!(shell_quote_if_needed("x'y"), "'x'\\''y'");
         assert_eq!(shell_quote_if_needed(""), "''");
+    }
+
+    #[test]
+    fn validate_external_url_allows_only_web_urls_with_a_host() {
+        assert!(validate_external_url("http://example.com").is_ok());
+        assert!(validate_external_url("https://example.com/a?b=c#d").is_ok());
+        // Scheme/host casing is normalized by the parser.
+        assert!(validate_external_url("HTTPS://Example.com").is_ok());
+        // Odd-but-hostful inputs normalize to a real host (harmless — they route
+        // to the browser, not a file opener), so they're accepted.
+        assert!(validate_external_url("http:foo").is_ok());
+        assert!(validate_external_url("https:/example.com").is_ok());
+        assert!(validate_external_url("https:////example.com").is_ok());
+
+        // Non-web schemes that could open local files or execute are refused.
+        assert!(validate_external_url("file:///etc/passwd").is_err());
+        assert!(validate_external_url("javascript:alert(1)").is_err());
+        assert!(validate_external_url("data:text/html,<script>").is_err());
+        assert!(validate_external_url("vscode://open").is_err());
+        // Well-formed scheme but no host — refused.
+        assert!(validate_external_url("https:").is_err());
+        assert!(validate_external_url("http://").is_err());
+        // Relative / scheme-less and malformed inputs are refused.
+        assert!(validate_external_url("/local/path").is_err());
+        assert!(validate_external_url("example.com").is_err());
+        assert!(validate_external_url("a b:c").is_err());
+        assert!(validate_external_url("").is_err());
     }
 
     #[tokio::test]

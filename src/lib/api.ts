@@ -159,6 +159,13 @@ export async function openSessionFile(agentId: AgentId): Promise<void> {
   await invoke("open_session_file", { agentId });
 }
 
+/// Open an external URL in the OS default browser. The backend validates the
+/// scheme (http/https only) before opening, so a non-web link from transcript
+/// content is rejected rather than handed to the OS opener.
+export async function openExternalUrl(url: string): Promise<void> {
+  await invoke("open_external_url", { url });
+}
+
 export async function loadTranscript(agentId: AgentId): Promise<LoadedTranscript> {
   return await invoke<LoadedTranscript>("load_transcript", { agentId });
 }

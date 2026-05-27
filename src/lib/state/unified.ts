@@ -105,7 +105,6 @@ export function buildUnifiedRows(turns: Turn[], overlay: ConversationItem[]): Un
   // accumulate group metadata first (a plain scratch map), then build each user
   // row exactly once.
   type UserGroup = { send_id?: string; agent_ids: AgentId[]; text: string; at: string };
-  // eslint-disable-next-line svelte/prefer-svelte-reactivity
   const groups = new Map<string, UserGroup>();
   const groupOrder: string[] = [];
   for (const turn of turns) {
@@ -191,7 +190,6 @@ export function buildUnifiedRows(turns: Turn[], overlay: ConversationItem[]): Un
   // fall back to their own `at`. Within one anchor: kind rank (user < agent <
   // outcome), then own `at`; `Array.prototype.sort` is stable so ties hold
   // insertion order.
-  // eslint-disable-next-line svelte/prefer-svelte-reactivity
   const sendAnchor = new Map<string, string>();
   for (const row of rows) {
     if (row.kind === "user" && row.send_id !== undefined) {
@@ -236,24 +234,20 @@ function rowAgentId(row: NonUserRow): AgentId {
 export function groupRenderBlocks(rows: UnifiedRow[], agentOrder: AgentId[] = []): RenderBlock[] {
   // Canonical column ordering: an agent's index in the roster. Recipients not
   // in the roster (shouldn't happen, but stay defensive) sort to the end.
-  // eslint-disable-next-line svelte/prefer-svelte-reactivity
   const orderIndex = new Map<AgentId, number>();
   agentOrder.forEach((id, i) => orderIndex.set(id, i));
   const rankOf = (id: AgentId): number => orderIndex.get(id) ?? Number.MAX_SAFE_INTEGER;
   // Pass 1: identify fan-out sends (a user row to >1 recipient) and bucket
   // every agent/outcome row of those sends by recipient.
-  // eslint-disable-next-line svelte/prefer-svelte-reactivity
   const fanoutUsers = new Map<string, Extract<UnifiedRow, { kind: "user" }>>();
   for (const row of rows) {
     if (row.kind === "user" && row.send_id !== undefined && row.agent_ids.length > 1) {
       fanoutUsers.set(row.send_id, row);
     }
   }
-  // eslint-disable-next-line svelte/prefer-svelte-reactivity
   const colsBySend = new Map<string, Map<AgentId, NonUserRow[]>>();
   for (const row of rows) {
     if (row.kind === "user" || row.send_id === undefined || !fanoutUsers.has(row.send_id)) continue;
-    // eslint-disable-next-line svelte/prefer-svelte-reactivity
     const perAgent = colsBySend.get(row.send_id) ?? new Map<AgentId, NonUserRow[]>();
     const agentId = rowAgentId(row);
     const col = perAgent.get(agentId) ?? [];

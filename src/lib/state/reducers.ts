@@ -100,6 +100,27 @@ export function transcriptReducer(
       ];
     }
 
+    case "message_failed": {
+      // A send failed before any turn started (adapter failed to launch, or the
+      // journal write failed). Render a failed agent turn under its prompt so
+      // the failure surfaces in the transcript — the same place post-start
+      // failures and the post-reload journal marker appear. `sendId` is resolved
+      // by the caller from the pending entry (the same lookup `turn_start` uses,
+      // including the pre-receipt front-fallback). A failure whose entry was
+      // already consumed by a `turn_start` is post-start (the live turn renders
+      // it) and arrives here with `sendId` undefined — a no-op, so there is no
+      // double-render. Idempotent on the derived `turn_id`.
+      if (sendId === undefined) return turns;
+      return appendFailedTurnImpl(
+        turns,
+        agentId,
+        `failed-${input.message_id}`,
+        receivedAt,
+        input.error,
+        sendId,
+      );
+    }
+
     case "content_chunk": {
       const existing = findTurn(turns, input.turn_id);
       if (existing === undefined || existing.role !== "agent") return turns;
@@ -543,6 +564,37 @@ function appendUserTurnImpl(
   ];
 }
 
+/// Append a synthetic `failed` agent turn for a send that failed *before* any
+/// `turn_start` arrived (adapter failed to launch, journal write failed, or the
+/// `send_message` IPC rejected). Mirrors the pre-start `message_cancelled` row:
+/// empty items, terminal status, attributed to its send. Idempotent on
+/// `turnId`. Post-start failures are NOT routed here — they update the existing
+/// streaming turn via `turn_end`, so there is no double-render.
+function appendFailedTurnImpl(
+  turns: Turn[],
+  agentId: AgentId,
+  turnId: TurnId,
+  startedAt: string,
+  error: string,
+  sendId?: SendId,
+): Turn[] {
+  if (findTurn(turns, turnId) !== undefined) return turns;
+  return [
+    ...turns,
+    {
+      role: "agent",
+      turn_id: turnId,
+      agent_id: agentId,
+      send_id: sendId,
+      started_at: startedAt,
+      status: "failed",
+      items: [],
+      error,
+      error_kind: "adapter_failure",
+    },
+  ];
+}
+
 /// Internal helper namespace. The underscore prefix signals "not for
 /// production callers" — both the state module (`index.svelte.ts`) and
 /// the reducer tests import from here. Production callers go through
@@ -551,6 +603,7 @@ function appendUserTurnImpl(
 /// transition on top of this raw helper.
 export const _internal = {
   appendUserTurn: appendUserTurnImpl,
+  appendFailedTurn: appendFailedTurnImpl,
 };
 
 // Re-export NormalizedEvent for downstream convenience.

@@ -345,7 +345,9 @@ export function recordSendAccepted(
 /// `last_error`. Flips `run_status` back to `"idle"` only if this was the
 /// *starting* send; a queued send failing while another turn is `processing`
 /// must not stomp the live turn. The optimistic user turn stays in the
-/// transcript (the user did submit it; the failure is a separate surface).
+/// transcript (the user did submit it) and a failed agent turn is appended
+/// beneath it, so the failure surfaces in the transcript rather than only in
+/// runtime `last_error`.
 export function failSendStart(
   agentId: AgentId,
   userTurnId: TurnId,
@@ -363,12 +365,29 @@ export function failSendStart(
   // Entry already gone ⇒ TurnStart raced ahead and consumed it; the backend is
   // genuinely processing this send. No-op (don't stomp the live turn).
   if (pending === undefined || idx < 0) return;
+  const entry = pending[idx];
   const remaining = [...pending.slice(0, idx), ...pending.slice(idx + 1)];
   const pending_sends = remaining.length === 0 ? undefined : remaining;
   runtimes[agentId] =
     runtime.run_status === "starting"
       ? { ...runtime, run_status: "idle", last_error: error, pending_sends }
       : { ...runtime, last_error: error, pending_sends };
+  // Surface the failure in the transcript (the same place post-start failures
+  // and the post-reload journal marker render it) rather than only in runtime
+  // state. The optimistic user turn already sits above it; this adds the failed
+  // response beneath. Keyed on `user_turn_id` (the IPC-reject path has no
+  // backend `message_id`), so it can't collide with a `message_failed` event's
+  // `failed-${message_id}` row.
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity
+  const at = new Date().toISOString();
+  transcripts[agentId] = _internal.appendFailedTurn(
+    transcripts[agentId] ?? [],
+    agentId,
+    `failed-${userTurnId}`,
+    at,
+    error?.message ?? "send failed before the turn started",
+    entry?.send_id,
+  );
 }
 
 /// Cancel a whole send across `agentIds` (the group cancel-send control, or a
@@ -512,7 +531,18 @@ function handleEvent(agentId: AgentId, event: NormalizedEvent): void {
     event.type === "message_cancelled"
       ? priorRuntime.pending_sends?.find((p) => p.message_id === event.message_id)?.send_id
       : undefined;
-  const sendId = startEntry?.send_id ?? cancelledSendId;
+  // For a `message_failed` event, resolve the failed send via the same
+  // `pendingEntryFor` lookup `turn_start` uses (and that `runtimeReducer`
+  // mirrors via `pickPendingIndex`): exact message_id, else the front entry
+  // during the pre-receipt race (message_failed beating the IPC receipt). This
+  // keeps the transcript row and the runtime pruning on the *same* entry. A
+  // post-start failure finds no entry (turn_start consumed it) → no row, so the
+  // live turn still owns the outcome and there is no double-render.
+  const failedSendId =
+    event.type === "message_failed"
+      ? pendingEntryFor(priorRuntime, event.message_id)?.send_id
+      : undefined;
+  const sendId = startEntry?.send_id ?? cancelledSendId ?? failedSendId;
   transcripts[agentId] = transcriptReducer(priorTurns, event, agentId, receivedAt, sendId);
   runtimes[agentId] = runtimeReducer(priorRuntime, event);
   manageHeartbeat(agentId, event);

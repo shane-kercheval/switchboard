@@ -17,11 +17,9 @@ vi.mock("$lib/api", () => ({
   },
 }));
 
-const copyTextMock = vi.fn();
+const copyTextMock = vi.fn<(t: string) => Promise<void>>();
 vi.mock("$lib/native", () => ({
-  copyText: async (t: string) => {
-    copyTextMock(t);
-  },
+  copyText: (t: string) => copyTextMock(t),
 }));
 
 const AGENT: AgentRecord = {
@@ -42,6 +40,7 @@ beforeEach(() => {
   agentSessionInfoMock.mockReset();
   openSessionFileMock.mockReset();
   copyTextMock.mockReset();
+  copyTextMock.mockResolvedValue(undefined);
 });
 
 describe("AgentActionsMenu", () => {
@@ -115,5 +114,32 @@ describe("AgentActionsMenu", () => {
     expect(copyTextMock).toHaveBeenCalledWith(
       "cd '/proj' && claude --resume abc --dangerously-skip-permissions",
     );
+    // Confirmation appears only after the clipboard write resolves.
+    await waitFor(() =>
+      expect(screen.getByTestId("resume-copy")).toHaveAttribute("aria-label", "Copied"),
+    );
+  });
+
+  it("does not confirm the copy when the clipboard write fails", async () => {
+    copyTextMock.mockRejectedValueOnce(new Error("nope"));
+    agentSessionInfoMock.mockResolvedValue({
+      session_file: "/sessions/alice.jsonl",
+      resume_command: "cd '/proj' && claude --resume abc --dangerously-skip-permissions",
+    });
+    const Component = await loadComponent();
+    render(Component, { props: { agent: AGENT, active: true } });
+
+    await fireEvent.click(screen.getByTestId("agent-actions-trigger"));
+    await waitFor(() =>
+      expect(screen.getByTestId("agent-action-resume")).not.toHaveAttribute("data-disabled"),
+    );
+    await fireEvent.click(screen.getByTestId("agent-action-resume"));
+    await waitFor(() => expect(screen.getByTestId("resume-panel")).toBeInTheDocument());
+
+    await fireEvent.click(screen.getByTestId("resume-copy"));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(screen.getByTestId("resume-copy")).toHaveAttribute("aria-label", "Copy command");
   });
 });

@@ -58,10 +58,17 @@
   $effect(() => () => clearTimeout(copiedTimer));
   function copyResumeCommand(): void {
     if (info?.resume_command === null || info?.resume_command === undefined) return;
-    void copyText(info.resume_command);
-    copied = true;
-    clearTimeout(copiedTimer);
-    copiedTimer = setTimeout(() => (copied = false), 1000);
+    // Confirm only after the clipboard write resolves — an optimistic flip would
+    // show "Copied" even when the write rejected.
+    void copyText(info.resume_command)
+      .then(() => {
+        copied = true;
+        clearTimeout(copiedTimer);
+        copiedTimer = setTimeout(() => (copied = false), 1000);
+      })
+      .catch((err: unknown) => {
+        console.error("[switchboard] copy resume command failed", err);
+      });
   }
 </script>
 

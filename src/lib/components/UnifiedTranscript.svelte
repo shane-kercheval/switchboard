@@ -8,6 +8,8 @@
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
   import Markdown from "$lib/components/ui/Markdown.svelte";
   import CopyButton from "$lib/components/ui/CopyButton.svelte";
+  import StatusChip from "$lib/components/ui/StatusChip.svelte";
+  import StopIcon from "$lib/components/ui/StopIcon.svelte";
 
   type AgentTurn = Extract<Turn, { role: "agent" }>;
   type NonUserRow = Exclude<UnifiedRow, { kind: "user" }>;
@@ -178,7 +180,7 @@
 
 {#snippet turnBody(turn: AgentTurn)}
   {#if turn.status === "streaming" && turn.items.length === 0}
-    <span class="bg-status-processing-soft text-status-processing inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium" data-testid="turn-processing">processing</span>
+    <StatusChip status="processing" testid="turn-processing" />
   {/if}
   {#each turn.items as item, i (i)}
     {#if item.item_kind === "text"}
@@ -215,9 +217,9 @@
 
 {#snippet turnStatusLabel(status: AgentTurn["status"])}
   {#if status === "failed"}
-    <span class="bg-status-failed-soft text-status-failed inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium">failed</span>
+    <StatusChip status="failed" />
   {:else if status === "cancelled"}
-    <span class="bg-status-cancelled-soft text-status-cancelled inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium">cancelled</span>
+    <StatusChip status="cancelled" />
   {/if}
 {/snippet}
 
@@ -233,19 +235,15 @@
       class="border-muted/30 border-t-muted block h-5 w-5 animate-spin rounded-full border-2 group-hover:hidden group-focus-visible:hidden"
       aria-hidden="true"
     ></span>
-    <svg
-      viewBox="0 0 24 24"
-      fill="currentColor"
-      class="hidden h-5 w-5 group-hover:block group-focus-visible:block"
-      aria-hidden="true"
-    >
-      <rect x="7" y="7" width="10" height="10" rx="2" />
-    </svg>
+    <StopIcon class="hidden h-5 w-5 group-hover:block group-focus-visible:block" />
   </button>
 {/snippet}
 
 {#snippet messageMeta(at: string, copyable: string, label: string, mt = "mt-1")}
-  <div class={`${mt} flex items-center gap-2 opacity-0 group-hover:opacity-100`} data-testid="message-meta">
+  <div
+    class={`${mt} flex items-center gap-2 opacity-0 group-focus-within:opacity-100 group-hover:opacity-100`}
+    data-testid="message-meta"
+  >
     {#if at}
       <time class="text-muted text-xs" datetime={at} title={at} data-testid="message-time"
         >{formatTime(at)}</time
@@ -273,22 +271,21 @@
 
 {#snippet outcomeRow(row: Extract<UnifiedRow, { kind: "outcome" }>)}
   {@const harness = agentById[row.agent_id]?.harness}
-  <div class="group space-y-1.5" data-testid="turn-outcome" data-role="agent" data-status={row.status}>
+  <div
+    class="group space-y-1.5"
+    data-testid="turn-outcome"
+    data-role="agent"
+    data-status={row.status}
+  >
     <div class="flex items-center gap-2 text-xs font-semibold tracking-wide uppercase">
       <span class="text-fg" data-testid="turn-agent-name">{agentName(row.agent_id)}</span>
       {#if harness}<HarnessIcon {harness} testid="turn-harness-icon" />{:else}<Badge>?</Badge>{/if}
     </div>
     <div class="border-l pl-3" style:border-left-color={agentBorderColor(row.agent_id)}>
       {#if row.status === "cancelled"}
-        <span
-          class="bg-status-cancelled-soft text-status-cancelled inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium"
-          data-testid="outcome-cancelled"
-        >cancelled</span>
+        <StatusChip status="cancelled" testid="outcome-cancelled" />
       {:else}
-        <span
-          class="bg-status-failed-soft text-status-failed inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium"
-          data-testid="outcome-failed"
-        >failed</span>
+        <StatusChip status="failed" testid="outcome-failed" />
         {#if row.reason}<span class="text-muted text-xs"> — {row.reason}</span>{/if}
       {/if}
     </div>
@@ -310,7 +307,7 @@
       )}
     </div>
     <div class="border-l pl-3" style:border-left-color={agentBorderColor(agentId)}>
-      <span class="bg-status-processing-soft text-status-processing inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium" data-testid="turn-queued">queued</span>
+      <StatusChip status="queued" testid="turn-queued" />
     </div>
   </div>
 {/snippet}
@@ -390,12 +387,11 @@
               <div
                 class="group space-y-1.5"
                 data-testid="fanout-column"
+                data-role="agent"
                 data-agent-id={col.agent_id}
                 data-state={state}
               >
-                <div
-                  class="flex items-center gap-2 text-xs font-semibold tracking-wide uppercase"
-                >
+                <div class="flex items-center gap-2 text-xs font-semibold tracking-wide uppercase">
                   <span class="text-fg" data-testid="turn-agent-name"
                     >{agentName(col.agent_id)}</span
                   >
@@ -419,13 +415,11 @@
                     {#if r.kind === "agent"}
                       {@render turnStatusLabel(r.turn.status)}
                       {@render turnBody(r.turn)}
+                    {:else if r.status === "cancelled"}
+                      <StatusChip status="cancelled" testid="outcome-cancelled" />
                     {:else}
-                      {#if r.status === "cancelled"}
-                        <span class="bg-status-cancelled-soft text-status-cancelled inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium" data-testid="outcome-cancelled">cancelled</span>
-                      {:else}
-                        <span class="bg-status-failed-soft text-status-failed inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium" data-testid="outcome-failed">failed</span>
-                      {/if}
-                      {#if r.status !== "cancelled" && r.reason}<span class="text-muted text-xs"> — {r.reason}</span>{/if}
+                      <StatusChip status="failed" testid="outcome-failed" />
+                      {#if r.reason}<span class="text-muted text-xs"> — {r.reason}</span>{/if}
                     {/if}
                   {/each}
                 </div>

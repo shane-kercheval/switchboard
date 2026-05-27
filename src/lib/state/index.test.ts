@@ -448,14 +448,39 @@ describe("failSendStart", () => {
     });
   });
 
-  it("preserves the optimistic user turn (user did submit; failure is separate)", async () => {
+  it("keeps the optimistic user turn and appends a failed agent turn beneath it", async () => {
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));
     state.dispatchUserTurn(AGENT_A, "user-1", "hello", "s1", "2026-05-16T00:00:00Z");
     state.failSendStart(AGENT_A, "user-1", { message: "boom", kind: "adapter_failure" });
     const turns = state.transcripts[AGENT_A] ?? [];
-    expect(turns).toHaveLength(1);
+    expect(turns).toHaveLength(2);
     expect(turns[0]?.role).toBe("user");
+    const failed = turns[1];
+    if (failed?.role !== "agent") throw new Error("expected a failed agent turn");
+    expect(failed.status).toBe("failed");
+    expect(failed.error).toBe("boom");
+    expect(failed.send_id).toBe("s1");
+  });
+
+  it("does not append a failed agent turn when it no-ops (TurnStart raced ahead)", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    state.dispatchUserTurn(AGENT_A, "user-1", "hello", "s1", "2026-05-16T00:00:00Z");
+    state.recordSendAccepted(AGENT_A, "user-1", MESSAGE_1);
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_start",
+      turn_id: TURN_1,
+      message_id: MESSAGE_1,
+      started_at: "2026-05-16T00:00:00Z",
+    });
+
+    state.failSendStart(AGENT_A, "user-1", { message: "ignored", kind: "adapter_failure" });
+
+    // Entry already consumed by turn_start → no synthetic failed turn; only the
+    // user turn and the live (streaming) agent turn exist.
+    const turns = state.transcripts[AGENT_A] ?? [];
+    expect(turns.filter((t) => t.role === "agent" && t.status === "failed")).toHaveLength(0);
   });
 
   it("is a no-op while processing (TurnStart raced ahead)", async () => {
@@ -499,6 +524,84 @@ describe("failSendStart", () => {
       expect.objectContaining({ agent_id: AGENT_A }),
     );
     errSpy.mockRestore();
+  });
+});
+
+describe("message_failed event → transcript", () => {
+  it("renders a failed agent turn for a pre-start failure (entry still pending)", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    state.dispatchUserTurn(AGENT_A, "user-1", "hello", "send-1", "2026-05-16T00:00:00Z");
+    state.recordSendAccepted(AGENT_A, "user-1", MESSAGE_1);
+
+    fireTo(`agent:${AGENT_A}`, {
+      type: "message_failed",
+      message_id: MESSAGE_1,
+      agent_id: AGENT_A,
+      error: "adapter failed to launch",
+      at: "2026-05-16T00:00:01Z",
+    });
+
+    const turns = state.transcripts[AGENT_A] ?? [];
+    const failed = turns.find((t) => t.role === "agent" && t.status === "failed");
+    if (failed?.role !== "agent") throw new Error("expected a failed agent turn");
+    expect(failed.error).toBe("adapter failed to launch");
+    expect(failed.send_id).toBe("send-1");
+  });
+
+  it("renders the row in the pre-receipt race (message_failed beats recordSendAccepted)", async () => {
+    // The send is dispatched but its `send_message` IPC receipt hasn't landed,
+    // so the pending entry has no message_id yet. A backend message_failed must
+    // still surface — pendingEntryFor's front-fallback resolves it (mirroring
+    // the runtime reducer's pickPendingIndex), so the transcript and runtime
+    // stay on the same entry.
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    state.dispatchUserTurn(AGENT_A, "user-1", "hello", "send-1", "2026-05-16T00:00:00Z");
+
+    fireTo(`agent:${AGENT_A}`, {
+      type: "message_failed",
+      message_id: MESSAGE_1,
+      agent_id: AGENT_A,
+      error: "adapter failed to launch",
+      at: "2026-05-16T00:00:01Z",
+    });
+
+    const failed = (state.transcripts[AGENT_A] ?? []).find(
+      (t) => t.role === "agent" && t.status === "failed",
+    );
+    if (failed?.role !== "agent") throw new Error("expected a failed agent turn");
+    expect(failed.error).toBe("adapter failed to launch");
+    expect(failed.send_id).toBe("send-1");
+    // Runtime pruned the same entry.
+    expect(state.runtimes[AGENT_A]?.pending_sends).toBeUndefined();
+  });
+
+  it("does not double-render when the failure is post-start (turn already streaming)", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    state.dispatchUserTurn(AGENT_A, "user-1", "hello", "send-1", "2026-05-16T00:00:00Z");
+    state.recordSendAccepted(AGENT_A, "user-1", MESSAGE_1);
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_start",
+      turn_id: TURN_1,
+      message_id: MESSAGE_1,
+      started_at: "2026-05-16T00:00:01Z",
+    });
+
+    // Out-of-protocol message_failed after the turn started: the entry is gone,
+    // so it resolves no send_id and appends nothing — the live turn owns the
+    // outcome (a failed turn_end would update it in place).
+    fireTo(`agent:${AGENT_A}`, {
+      type: "message_failed",
+      message_id: MESSAGE_1,
+      agent_id: AGENT_A,
+      error: "boom",
+      at: "2026-05-16T00:00:02Z",
+    });
+
+    const agentTurns = (state.transcripts[AGENT_A] ?? []).filter((t) => t.role === "agent");
+    expect(agentTurns).toHaveLength(1);
   });
 });
 
@@ -700,7 +803,11 @@ describe("pending-send pruning (fan-out / queue correctness)", () => {
       message_id: MESSAGE_1,
       started_at: "2026-05-16T00:00:02Z",
     });
-    const agentTurn = (state.transcripts[AGENT_A] ?? []).find((t) => t.role === "agent");
+    // The live (streaming) turn is the retry; a failed turn for send-A also sits
+    // in the transcript now, so target the streaming one explicitly.
+    const agentTurn = (state.transcripts[AGENT_A] ?? []).find(
+      (t) => t.role === "agent" && t.status === "streaming",
+    );
     expect(agentTurn?.role === "agent" ? agentTurn.send_id : null).toBe("send-B");
   });
 

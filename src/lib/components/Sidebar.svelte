@@ -148,7 +148,7 @@
           agent.harness === "codex" ? rateLimitPercent(runtime?.last_rate_limit) : undefined}
         {@const isCollapsed = collapsed[agent.id] ?? false}
         <div
-          class="bg-white/90 hover:bg-black/[0.04] rounded-md px-2.5 py-2 transition-colors"
+          class="bg-raised/90 hover:bg-border/40 rounded-md px-2.5 py-2 transition-colors"
           data-testid="sidebar-agent"
           data-agent-id={agent.id}
         >
@@ -204,10 +204,7 @@
               </div>
             {/if}
             {#if runtime?.meta}
-              <div
-                class="text-muted mt-1.5 space-y-0.5 text-xs leading-4"
-                data-testid="agent-meta"
-              >
+              <div class="text-muted mt-1.5 space-y-0.5 text-xs leading-4" data-testid="agent-meta">
                 <div class="truncate" title={runtime.meta.model}>
                   model: <span class="font-mono">{runtime.meta.model}</span>
                 </div>

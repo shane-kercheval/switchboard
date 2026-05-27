@@ -359,8 +359,13 @@ describe("ComposeBar", () => {
     });
     expect(state.runtimes[AGENT_B.id]?.run_status).toBe("idle");
     expect(state.runtimes[AGENT_A.id]?.run_status).toBe("starting");
+    // alice is still pending → just her user turn; bob's failure surfaces as a
+    // failed agent turn beneath his user turn.
     expect((state.transcripts[AGENT_A.id] ?? []).length).toBe(1);
-    expect((state.transcripts[AGENT_B.id] ?? []).length).toBe(1);
+    const bobTurns = state.transcripts[AGENT_B.id] ?? [];
+    expect(bobTurns.length).toBe(2);
+    const bobFailed = bobTurns[1];
+    expect(bobFailed?.role === "agent" ? bobFailed.status : null).toBe("failed");
   });
 
   it("clears the prompt on submit but keeps the recipients selected (sticky)", async () => {

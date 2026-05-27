@@ -8,9 +8,11 @@
     transcripts,
     ui,
   } from "$lib/state/index.svelte";
+  import { buildLiveSendsMap } from "$lib/state/liveSends";
   import * as api from "$lib/api";
   import type { AgentId, AgentRecord } from "$lib/types";
   import Textarea from "$lib/components/ui/Textarea.svelte";
+  import StopIcon from "$lib/components/ui/StopIcon.svelte";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import { cn } from "$lib/utils";
@@ -150,32 +152,11 @@
   );
 
   // Every live send across this project's agents, mapped to the agents it's
-  // live for — both still-queued sends (`pending_sends`) and currently-streaming
-  // turns. The composer stop cancels *all* of it, not just the most recent send,
-  // so one click halts everything the project's agents are running and have
-  // queued. (IPC failures prune `pending_sends` via failSendStart, so failed
-  // recipients drop out without extra bookkeeping.)
-  const liveSends = $derived.by(() => {
-    // eslint-disable-next-line svelte/prefer-svelte-reactivity
-    const bySend = new Map<string, AgentId[]>();
-    const add = (sendId: string, agentId: AgentId): void => {
-      const arr = bySend.get(sendId) ?? [];
-      if (!arr.includes(agentId)) arr.push(agentId);
-      bySend.set(sendId, arr);
-    };
-    for (const agent of agents) {
-      for (const p of runtimes[agent.id]?.pending_sends ?? []) {
-        // A cancel_requested entry is already being cancelled — not live work.
-        if (!p.cancel_requested) add(p.send_id, agent.id);
-      }
-      for (const turn of transcripts[agent.id] ?? []) {
-        if (turn.role === "agent" && turn.status === "streaming" && turn.send_id !== undefined) {
-          add(turn.send_id, agent.id);
-        }
-      }
-    }
-    return bySend;
-  });
+  // live for. The composer stop cancels *all* of it, not just the most recent
+  // send, so one click halts everything the project's agents are running and
+  // have queued. (IPC failures prune `pending_sends` via failSendStart, so
+  // failed recipients drop out without extra bookkeeping.)
+  const liveSends = $derived(buildLiveSendsMap(agents, runtimes, transcripts));
   // A non-empty draft means the primary action is "send/queue this prompt".
   const showStop = $derived(liveSends.size > 0 && prompt.trim() === "");
   const primaryDisabled = $derived(showStop ? false : sendDisabled);
@@ -449,9 +430,7 @@
             )}
           >
             {#if showStop}
-              <svg viewBox="0 0 24 24" fill="currentColor" class="h-5 w-5" aria-hidden="true">
-                <rect x="7" y="7" width="10" height="10" rx="2" />
-              </svg>
+              <StopIcon />
             {:else}
               <svg
                 viewBox="0 0 24 24"

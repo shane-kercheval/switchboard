@@ -8,7 +8,8 @@
     workspace,
   } from "$lib/state/workspace.svelte";
   import { cancelSend, runtimes, transcripts } from "$lib/state/index.svelte";
-  import type { AgentId } from "$lib/types";
+  import { buildLiveSendsMap } from "$lib/state/liveSends";
+  import type { AgentId, SendId } from "$lib/types";
   import { basename, cn, relativeTime } from "$lib/utils";
   import SidebarPanel from "$lib/components/ui/SidebarPanel.svelte";
   import SidebarSection from "$lib/components/ui/SidebarSection.svelte";
@@ -18,6 +19,7 @@
   import SettingsButton from "$lib/components/ui/SettingsButton.svelte";
   import SidebarToggleButton from "$lib/components/ui/SidebarToggleButton.svelte";
   import PlusIcon from "$lib/components/ui/PlusIcon.svelte";
+  import StopIcon from "$lib/components/ui/StopIcon.svelte";
   import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
   import { windowDragRegion } from "$lib/windowDrag";
 
@@ -37,28 +39,10 @@
     settingsOpen?: boolean;
   } = $props();
 
-  /// All non-cancelled live sends across a project's agents: pending (not
-  /// cancel_requested) + currently-streaming turns. Mirrors the `liveSends`
-  /// derived in ComposeBar but scoped to one project.
-  function liveProjectSends(projectId: string): Map<string, AgentId[]> {
-    const roster = agentsByProject[projectId] ?? [];
-    const bySend = new Map<string, AgentId[]>();
-    const add = (sendId: string, agentId: AgentId): void => {
-      const arr = bySend.get(sendId) ?? [];
-      if (!arr.includes(agentId)) arr.push(agentId);
-      bySend.set(sendId, arr);
-    };
-    for (const agent of roster) {
-      for (const p of runtimes[agent.id]?.pending_sends ?? []) {
-        if (!p.cancel_requested) add(p.send_id, agent.id);
-      }
-      for (const turn of transcripts[agent.id] ?? []) {
-        if (turn.role === "agent" && turn.status === "streaming" && turn.send_id !== undefined) {
-          add(turn.send_id, agent.id);
-        }
-      }
-    }
-    return bySend;
+  /// Live sends across one project's agents (the shared selector scoped to this
+  /// project's roster).
+  function liveProjectSends(projectId: string): Map<SendId, AgentId[]> {
+    return buildLiveSendsMap(agentsByProject[projectId] ?? [], runtimes, transcripts);
   }
 
   function cancelAllForProject(projectId: string): void {
@@ -144,7 +128,7 @@
         {@const completed = !busy && project.id in completedProjectIds}
         <div
           class={cn(
-            "flex w-full items-center rounded-md transition-colors hover:bg-raised/70",
+            "hover:bg-raised/70 flex w-full items-center rounded-md transition-colors",
             project.id === selection.activeProjectId && "bg-raised hover:bg-raised",
           )}
           data-testid="project-row"
@@ -187,14 +171,7 @@
                   class="border-muted/30 border-t-muted block h-5 w-5 animate-spin rounded-full border-2 group-hover:hidden group-focus-visible:hidden"
                   aria-hidden="true"
                 ></span>
-                <svg
-                  viewBox="0 0 24 24"
-                  fill="currentColor"
-                  class="hidden h-5 w-5 group-hover:block group-focus-visible:block"
-                  aria-hidden="true"
-                >
-                  <rect x="7" y="7" width="10" height="10" rx="2" />
-                </svg>
+                <StopIcon class="hidden h-5 w-5 group-hover:block group-focus-visible:block" />
               </button>
             </div>
           {:else if completed}

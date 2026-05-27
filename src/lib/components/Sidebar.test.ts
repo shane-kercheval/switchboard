@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
-import { render, screen, waitFor } from "@testing-library/svelte";
+import { render, screen, fireEvent, waitFor } from "@testing-library/svelte";
 import type { AgentRecord, NormalizedEvent } from "$lib/types";
 
 vi.mock("@tauri-apps/api/event", () => ({
@@ -63,35 +63,72 @@ describe("Sidebar", () => {
     expect(screen.getByText(/no agents/i)).toBeInTheDocument();
   });
 
-  it("shows 'processing' when run_status is starting or processing", async () => {
+  // Run-status and last_error are no longer surfaced in the right sidebar:
+  // mid-turn activity shows as a per-project spinner in the projects sidebar,
+  // and failures render in the transcript as a failed agent turn (covered in
+  // the reducer + UnifiedTranscript suites). The sidebar's job here is the
+  // collapsible per-agent detail card.
+
+  it("collapses an agent's detail card when its header is toggled", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
-    // Drive run_status by dispatching a user turn.
-    state.dispatchUserTurn(CLAUDE_AGENT.id, "user-1", "hi", "s1", "2026-05-16T00:00:00Z");
-    expect(state.runtimes[CLAUDE_AGENT.id]?.run_status).toBe("starting");
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "turn-1",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:00Z",
+        ended_at: "2026-05-16T00:00:01Z",
+        status: "complete",
+        items: [],
+        usage: { input_tokens: 100, output_tokens: 20, total_cost_usd: 0.01 },
+      },
+    ];
 
     const Sidebar = (await import("./Sidebar.svelte")).default;
     render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
 
-    expect(screen.getByTestId("agent-run-status")).toHaveTextContent("processing");
+    // Expanded by default → details (cost) are visible.
+    expect(screen.getByTestId("agent-cost")).toBeInTheDocument();
+
+    const header = screen.getByTestId("agent-name").closest("button");
+    if (!header) throw new Error("expected the agent name to sit in a toggle button");
+    expect(header).toHaveAttribute("aria-expanded", "true");
+
+    await fireEvent.click(header);
+
+    expect(header).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByTestId("agent-cost")).toBeNull();
   });
 
-  it("surfaces last_error from a failed turn", async () => {
+  it("collapse-all hides every agent's details; toggling again restores them", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
-    state.dispatchUserTurn(CLAUDE_AGENT.id, "user-1", "hi", "s1", "2026-05-16T00:00:00Z");
-    state.failSendStart(CLAUDE_AGENT.id, "user-1", {
-      message: "could not connect",
-      kind: "adapter_failure",
-    });
+    await state.registerAgent(CODEX_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "turn-1",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:00Z",
+        ended_at: "2026-05-16T00:00:01Z",
+        status: "complete",
+        items: [],
+        usage: { input_tokens: 100, output_tokens: 20, total_cost_usd: 0.01 },
+      },
+    ];
 
     const Sidebar = (await import("./Sidebar.svelte")).default;
-    render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+    render(Sidebar, { props: { agents: [CLAUDE_AGENT, CODEX_AGENT] } });
 
-    expect(screen.getByTestId("agent-last-error")).toHaveTextContent("could not connect");
-    // After failSendStart the agent is sendable again (idle) — error
-    // surfaces in the sidebar but doesn't gate Send.
-    expect(screen.getByTestId("agent-run-status")).toHaveTextContent("idle");
+    expect(screen.getByTestId("agent-cost")).toBeInTheDocument();
+
+    const toggleAll = screen.getByTestId("sidebar-toggle-all");
+    await fireEvent.click(toggleAll);
+    expect(screen.queryByTestId("agent-cost")).toBeNull();
+
+    await fireEvent.click(toggleAll);
+    expect(screen.getByTestId("agent-cost")).toBeInTheDocument();
   });
 
   it("displays Claude session-total cost (null-safe sum)", async () => {

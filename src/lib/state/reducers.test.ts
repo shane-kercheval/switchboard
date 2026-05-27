@@ -313,6 +313,48 @@ describe("transcriptReducer", () => {
     });
   });
 
+  describe("message_failed", () => {
+    it("appends a failed agent turn carrying the error, stamped with the resolved send_id", () => {
+      const turns = transcriptReducer(
+        [],
+        {
+          type: "message_failed",
+          message_id: MESSAGE_1,
+          agent_id: AGENT_A,
+          error: "adapter failed to launch",
+          at: RECEIVED_AT,
+        },
+        AGENT_A,
+        RECEIVED_AT,
+        "send-1",
+      );
+      expect(turns).toHaveLength(1);
+      const t = turns[0];
+      if (t?.role !== "agent") throw new Error("unreachable");
+      expect(t.status).toBe("failed");
+      expect(t.error).toBe("adapter failed to launch");
+      expect(t.error_kind).toBe("adapter_failure");
+      expect(t.send_id).toBe("send-1");
+    });
+
+    it("is a no-op when no send_id resolves (post-start failure renders on the live turn)", () => {
+      const turns = transcriptReducer(
+        [],
+        {
+          type: "message_failed",
+          message_id: MESSAGE_1,
+          agent_id: AGENT_A,
+          error: "boom",
+          at: RECEIVED_AT,
+        },
+        AGENT_A,
+        RECEIVED_AT,
+        undefined,
+      );
+      expect(turns).toEqual([]);
+    });
+  });
+
   describe("turn_end", () => {
     it("transitions a streaming turn to complete + records usage", () => {
       let turns = reduce([], turnStart(TURN_1));
@@ -960,6 +1002,34 @@ describe("_internal.appendUserTurn", () => {
     expect(next).not.toBe(prev);
     expect(next).toHaveLength(2);
     expect(next[0]).toBe(prev[0]); // first element same reference
+  });
+});
+
+describe("_internal.appendFailedTurn", () => {
+  it("synthesizes a failed agent turn carrying the error + send_id", () => {
+    const turns = _internal.appendFailedTurn(
+      [],
+      AGENT_A,
+      "failed-user-1",
+      "2026-05-16T00:00:00Z",
+      "send failed before the turn started",
+      "send-1",
+    );
+    expect(turns).toHaveLength(1);
+    const t = turns[0];
+    if (t?.role !== "agent") throw new Error("unreachable");
+    expect(t.status).toBe("failed");
+    expect(t.error).toBe("send failed before the turn started");
+    expect(t.error_kind).toBe("adapter_failure");
+    expect(t.send_id).toBe("send-1");
+    expect(t.items).toEqual([]);
+  });
+
+  it("is idempotent on turn_id (no duplicate row on a re-fire)", () => {
+    const first = _internal.appendFailedTurn([], AGENT_A, "failed-x", RECEIVED_AT, "boom");
+    const second = _internal.appendFailedTurn(first, AGENT_A, "failed-x", RECEIVED_AT, "boom");
+    expect(second).toBe(first);
+    expect(second).toHaveLength(1);
   });
 });
 

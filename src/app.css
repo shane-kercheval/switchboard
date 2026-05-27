@@ -80,6 +80,17 @@
   /* Transcript scroll area — lighter than `--surface` so the reading area
      feels brighter than the surrounding chrome. */
   --transcript-bg: #ffffff;
+
+  /* Code-block surface per message role: agent messages sit on the transcript
+     bg, user messages on a panel/45 card that's nearly `--code-bg`, so each
+     needs its own contrast step to read as a distinct surface. */
+  --code-bg-agent: #f3f3f5;
+  --code-bg-user: #ebebee;
+  /* Copy-button hover/active fill. `--code-copy-hover` equals `--surface`
+     today but is named separately so the two can diverge. The `-user` variant
+     is lighter to sit on the darker user-message code surface. */
+  --code-copy-hover: #fafafa;
+  --code-copy-hover-user: #f6f6f8;
 }
 
 .dark {
@@ -125,6 +136,13 @@
 
   /* Marginally lighter than the dark `--surface` for the reading area. */
   --transcript-bg: #111114;
+
+  /* Both roles share one dark code surface; the light-mode contrast step isn't
+     needed against the dark message backgrounds. */
+  --code-bg-agent: #232326;
+  --code-bg-user: #232326;
+  --code-copy-hover: #3f3f46;
+  --code-copy-hover-user: #3f3f46;
 }
 
 /* `inline` so the generated utilities reference the CSS variables by name
@@ -379,12 +397,13 @@ body {
      and NOT tied to `data-copied` (which lingers ~1s after a click and would
      otherwise keep the button visible after the pointer has left). The green
      checkmark still swaps in while hovering. */
-  .md-code-block:hover .md-code-copy {
+  .md-code-block:hover .md-code-copy,
+  .md-code-copy:focus-visible {
     opacity: 1;
   }
   .md-code-copy:hover:not([data-copied="true"]) {
     color: var(--fg);
-    background-color: #fafafa;
+    background-color: var(--code-copy-hover);
   }
   .md-code-copy svg {
     width: 1.0625rem;
@@ -395,7 +414,7 @@ body {
   }
   .md-code-copy[data-copied="true"] {
     color: var(--accent);
-    background-color: #fafafa;
+    background-color: var(--code-copy-hover);
     opacity: 1;
   }
   .md-code-copy[data-copied="true"] .md-copy-icon {
@@ -476,37 +495,19 @@ body {
   }
 }
 
-/* Agent messages sit on the transcript bg; a hair darker than --code-bg
-   adds just enough contrast to read as a distinct surface. */
+/* Per-message-role code surfaces. The role tokens carry their own light/dark
+   mappings, so these rules don't need `.dark` variants. */
 [data-role="agent"] .md-code-block,
 [data-role="agent"] .md-code-header {
-  background-color: #f3f3f5;
+  background-color: var(--code-bg-agent);
 }
 
-.dark [data-role="agent"] .md-code-block,
-.dark [data-role="agent"] .md-code-header {
-  background-color: #232326;
-}
-
-/* User messages sit on a panel/45 card that's nearly the same gray as
-   --code-bg, so code blocks need a noticeably darker surface. */
 [data-role="user"] .md-code-block,
 [data-role="user"] .md-code-header {
-  background-color: #ebebee;
+  background-color: var(--code-bg-user);
 }
 
 [data-role="user"] .md-code-copy:hover:not([data-copied="true"]),
 [data-role="user"] .md-code-copy[data-copied="true"] {
-  background-color: #f6f6f8;
+  background-color: var(--code-copy-hover-user);
 }
-
-
-.dark [data-role="user"] .md-code-block,
-.dark [data-role="user"] .md-code-header {
-  background-color: #232326;
-}
-
-.dark .md-code-copy:hover:not([data-copied="true"]) {
-  background-color: #3f3f46;
-}
-

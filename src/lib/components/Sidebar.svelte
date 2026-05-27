@@ -27,16 +27,6 @@
   /// rendering; when absent, the button isn't shown.
   let { agents, onAddAgent }: { agents: AgentRecord[]; onAddAgent?: () => void } = $props();
 
-  function statusLabel(status: "idle" | "starting" | "processing" | undefined): string {
-    if (status === "starting" || status === "processing") return "processing";
-    return "idle";
-  }
-
-  function statusClass(status: "idle" | "starting" | "processing" | undefined): string {
-    if (status === "starting" || status === "processing") return "text-status-processing";
-    return "text-muted";
-  }
-
   /// Claude session-total cost — null-safe sum across the agent's completed
   /// turns. Codex turns have `total_cost_usd: null` so the `?? 0` is
   /// load-bearing (without it, the result is `NaN`). Codex agents typically
@@ -79,112 +69,179 @@
     const pct = (primary as { used_percent?: unknown }).used_percent;
     return typeof pct === "number" ? pct : undefined;
   }
+
+  /// Per-agent collapsed state. Default expanded; ephemeral (resets on reload).
+  let collapsed = $state<Record<string, boolean>>({});
+
+  function toggleCollapsed(agentId: AgentId): void {
+    collapsed[agentId] = !collapsed[agentId];
+  }
+
+  const allExpanded = $derived(agents.every((a) => !(collapsed[a.id] ?? false)));
+
+  function toggleAll(): void {
+    if (allExpanded) {
+      for (const a of agents) collapsed[a.id] = true;
+    } else {
+      for (const a of agents) delete collapsed[a.id];
+    }
+  }
 </script>
 
 <SidebarPanel side="right" width="w-60" testid="sidebar">
   <SidebarSection title="Agents">
     {#snippet action()}
-      {#if onAddAgent}
-        <button
-          type="button"
-          class={ICON_BUTTON_CLASS}
-          title="Add agent"
-          aria-label="Add agent"
-          data-testid="sidebar-add-agent"
-          onclick={onAddAgent}
-        >
-          <PlusIcon />
-        </button>
-      {/if}
+      <div class="flex items-center gap-0.5">
+        {#if agents.length > 0}
+          <button
+            type="button"
+            class={ICON_BUTTON_CLASS}
+            aria-label={allExpanded ? "Collapse all agents" : "Expand all agents"}
+            title={allExpanded ? "Collapse all" : "Expand all"}
+            data-testid="sidebar-toggle-all"
+            onclick={toggleAll}
+          >
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.5"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              class="h-[18px] w-[18px]"
+              aria-hidden="true"
+            >
+              {#if allExpanded}
+                <path d="m17 11-5-5-5 5" />
+                <path d="m17 18-5-5-5 5" />
+              {:else}
+                <path d="m7 6 5 5 5-5" />
+                <path d="m7 13 5 5 5-5" />
+              {/if}
+            </svg>
+          </button>
+        {/if}
+        {#if onAddAgent}
+          <button
+            type="button"
+            class={ICON_BUTTON_CLASS}
+            title="Add agent"
+            aria-label="Add agent"
+            data-testid="sidebar-add-agent"
+            onclick={onAddAgent}
+          >
+            <PlusIcon />
+          </button>
+        {/if}
+      </div>
     {/snippet}
 
     {#if agents.length === 0}
       <p class="text-muted px-3 py-3 text-xs">No agents in this project yet.</p>
     {/if}
-    <div class="flex flex-col gap-1 px-2 pb-2">
+    <div class="flex flex-col gap-1.5 px-2 pb-2">
       {#each agents as agent (agent.id)}
         {@const runtime = runtimes[agent.id]}
         {@const cost = sessionTotalCost(agent.id)}
         {@const util = contextUtilization(agent.id)}
         {@const rateLimit =
           agent.harness === "codex" ? rateLimitPercent(runtime?.last_rate_limit) : undefined}
+        {@const isCollapsed = collapsed[agent.id] ?? false}
         <div
-          class="hover:bg-raised/60 rounded-md px-2.5 py-2 transition-colors"
+          class="bg-white/90 hover:bg-black/[0.04] rounded-md px-2.5 py-2 transition-colors"
           data-testid="sidebar-agent"
           data-agent-id={agent.id}
         >
           <div class="flex items-center justify-between gap-2">
-            <span class="text-fg truncate text-[13px] font-semibold" data-testid="agent-name">
-              {agent.name}
-            </span>
+            <button
+              type="button"
+              class="flex min-w-0 flex-1 items-center gap-1.5 text-left"
+              aria-expanded={!isCollapsed}
+              onclick={() => toggleCollapsed(agent.id)}
+            >
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.5"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                class={cn(
+                  "text-muted h-3 w-3 shrink-0 transition-transform",
+                  isCollapsed && "-rotate-90",
+                )}
+                aria-hidden="true"
+              >
+                <path d="m6 9 6 6 6-6" />
+              </svg>
+              <span class="text-fg truncate text-[13px] font-semibold" data-testid="agent-name">
+                {agent.name}
+              </span>
+            </button>
             <div class="flex shrink-0 items-center gap-1">
               <HarnessIcon harness={agent.harness} size="md" testid="agent-harness-icon" />
               <AgentActionsMenu {agent} active={isActive(agent.id)} />
             </div>
           </div>
-          <div
-            class={cn("mt-0.5 text-xs leading-4", statusClass(runtime?.run_status))}
-            data-testid="agent-run-status"
-          >
-            {statusLabel(runtime?.run_status)}
-          </div>
-          {#if runtime?.hydration_error}
-            <div class="text-status-failed mt-1 text-xs" data-testid="agent-hydration-error">
-              history failed to load: {runtime.hydration_error}
-            </div>
-          {/if}
-          {#if runtime?.parse_warnings && runtime.parse_warnings.length > 0}
-            <div
-              class="text-warning mt-1 text-xs"
-              data-testid="agent-parse-warnings"
-              title={runtime.parse_warnings
-                .map((w) => `line ${w.line_number}: ${w.reason}`)
-                .join("\n")}
-            >
-              ⚠ {runtime.parse_warnings.length} transcript warning{runtime.parse_warnings.length ===
-              1
-                ? ""
-                : "s"}
-            </div>
-          {/if}
-          {#if runtime?.meta}
-            <div
-              class="text-muted mt-1.5 space-y-0.5 text-xs leading-4"
-              data-testid="agent-meta"
-            >
-              <div class="truncate" title={runtime.meta.model}>
-                model: <span class="font-mono">{runtime.meta.model}</span>
+          {#if !isCollapsed}
+            {#if runtime?.hydration_error}
+              <div class="text-status-failed mt-1 text-xs" data-testid="agent-hydration-error">
+                history failed to load: {runtime.hydration_error}
               </div>
-              {#if runtime.meta.mcp_servers.length > 0}
-                <div>mcp: {runtime.meta.mcp_servers.length}</div>
-              {/if}
-              {#if runtime.meta.skills.length > 0}
-                <div>skills: {runtime.meta.skills.length}</div>
-              {/if}
-            </div>
-          {/if}
-          {#if agent.harness === "claude_code" && cost > 0}
-            <div class="text-fg mt-1.5 text-xs" data-testid="agent-cost">
-              ${cost.toFixed(4)}
-            </div>
-          {/if}
-          {#if rateLimit !== undefined}
-            <div class="text-fg mt-1.5 text-xs" data-testid="agent-rate-limit">
-              quota used: {rateLimit.toFixed(0)}%
-            </div>
-          {/if}
-          {#if util !== undefined}
-            <div class="mt-1.5" data-testid="agent-context-bar">
-              <div class="text-muted mb-0.5 text-[11px]">
-                context after last turn: {(util * 100).toFixed(0)}%
+            {/if}
+            {#if runtime?.parse_warnings && runtime.parse_warnings.length > 0}
+              <div
+                class="text-warning mt-1 text-xs"
+                data-testid="agent-parse-warnings"
+                title={runtime.parse_warnings
+                  .map((w) => `line ${w.line_number}: ${w.reason}`)
+                  .join("\n")}
+              >
+                ⚠ {runtime.parse_warnings.length} transcript warning{runtime.parse_warnings
+                  .length === 1
+                  ? ""
+                  : "s"}
               </div>
-              <div class="bg-border/80 h-1 w-full overflow-hidden rounded">
-                <div
-                  class="bg-fg h-full"
-                  style:width="{Math.min(util * 100, 100).toFixed(1)}%"
-                ></div>
+            {/if}
+            {#if runtime?.meta}
+              <div
+                class="text-muted mt-1.5 space-y-0.5 text-xs leading-4"
+                data-testid="agent-meta"
+              >
+                <div class="truncate" title={runtime.meta.model}>
+                  model: <span class="font-mono">{runtime.meta.model}</span>
+                </div>
+                {#if runtime.meta.mcp_servers.length > 0}
+                  <div>mcp: {runtime.meta.mcp_servers.length}</div>
+                {/if}
+                {#if runtime.meta.skills.length > 0}
+                  <div>skills: {runtime.meta.skills.length}</div>
+                {/if}
               </div>
-            </div>
+            {/if}
+            {#if agent.harness === "claude_code" && cost > 0}
+              <div class="text-fg mt-1.5 text-xs" data-testid="agent-cost">
+                ${cost.toFixed(4)}
+              </div>
+            {/if}
+            {#if rateLimit !== undefined}
+              <div class="text-fg mt-1.5 text-xs" data-testid="agent-rate-limit">
+                quota used: {rateLimit.toFixed(0)}%
+              </div>
+            {/if}
+            {#if util !== undefined}
+              <div class="mt-1.5" data-testid="agent-context-bar">
+                <div class="text-muted mb-0.5 text-[11px]">
+                  context after last turn: {(util * 100).toFixed(0)}%
+                </div>
+                <div class="bg-border/80 h-1 w-full overflow-hidden rounded">
+                  <div
+                    class="bg-fg h-full"
+                    style:width="{Math.min(util * 100, 100).toFixed(1)}%"
+                  ></div>
+                </div>
+              </div>
+            {/if}
           {/if}
         </div>
       {/each}

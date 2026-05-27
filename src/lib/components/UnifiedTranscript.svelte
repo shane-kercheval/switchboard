@@ -350,7 +350,7 @@
     <p class="text-muted text-sm">No messages yet. Type a prompt below.</p>
   {/if}
 
-  <div class="space-y-8">
+  <div class="space-y-5">
     {#each blocks as block (block.kind === "fanout" ? block.key : block.row.key)}
       {#if block.kind === "row"}
         {#if block.row.kind === "user"}

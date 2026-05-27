@@ -276,6 +276,8 @@ body {
     margin-left: -1rem;
   }
   input[type="checkbox"] {
+    width: 1em;
+    height: 1em;
     margin: 0 0.4em 0 0;
     vertical-align: middle;
   }
@@ -325,12 +327,11 @@ body {
   }
   th,
   td {
-    border: 1px solid var(--border);
-    padding: 0.3rem 0.6rem;
+    padding: 0.35rem 1rem 0.35rem 0;
     text-align: left;
+    border-bottom: 1px solid var(--border);
   }
   th {
-    background-color: var(--panel);
     font-weight: 600;
   }
 

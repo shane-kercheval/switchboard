@@ -1150,6 +1150,16 @@ pub fn cancel_send_impl(state: &AppState, send_id: SendId, recipients: &[AgentId
         .cancel_send(send_id, recipients, CancelSource::User);
 }
 
+/// Stop an agent entirely (sidebar "Stop agent"): cancel its in-flight turn and
+/// drop its whole queued backlog, leaving the agent loaded and idle. Idempotent
+/// — `NothingToCancel` when the agent has no actor. The running turn's
+/// `Cancelled` terminal + return-to-idle flow back over the event channel; the
+/// dropped queued items are discarded silently (never journaled), so the
+/// frontend's optimistic `stopAgent` cleanup is what resolves their cards.
+pub fn cancel_agent_impl(state: &AppState, agent_id: AgentId) -> CancelOutcome {
+    state.dispatcher.cancel_agent(agent_id, CancelSource::User)
+}
+
 /// Cancel every in-flight turn for `agents`, await their drains, then release
 /// `project_ids`' instance locks — strictly in that order, so a project lock
 /// is never released while one of its agents' turns is still live (which would
@@ -1294,6 +1304,147 @@ fn load_agent_transcript(
             )?)
         }
         _ => Err(AppError::UnsupportedHarness),
+    }
+}
+
+/// Per-agent session actions surfaced in the sidebar: the path of the harness
+/// session file to open, and the interactive command to resume the session in a
+/// terminal. Both are `None` until the agent has a resolvable session — `Open`
+/// needs the file to exist on disk; `Resume` needs the agent to have dispatched
+/// at least once (for Claude/Gemini that coincides with the file existing; for
+/// Codex/Antigravity the id lives in a sidecar that's written post-dispatch, so
+/// resume can be offered even if the local transcript file is absent).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
+pub struct AgentSessionInfo {
+    /// Absolute path of the harness session file, present only if it exists.
+    pub session_file: Option<String>,
+    /// Full copy-ready resume command (`cd '<dir>' && <harness> …`), present
+    /// only if the session can be resumed.
+    pub resume_command: Option<String>,
+}
+
+/// Resolve the per-agent session actions ([`AgentSessionInfo`]). Mirrors
+/// [`load_agent_transcript`]'s per-harness session-id resolution (Claude/Gemini
+/// from `AgentRecord.session_id`; Codex/Antigravity from their sidecars — corrupt
+/// sidecars fail loud, never-dispatched is the legitimate empty case). `home_dir`
+/// is injected for testability; the Tauri shim reads `$HOME`.
+pub fn agent_session_info_impl(
+    state: &AppState,
+    agent_id: AgentId,
+    home_dir: &Path,
+) -> Result<AgentSessionInfo, AppError> {
+    let (project, agent) = lookup_agent(state, agent_id)?;
+    let directory = project.directory.clone();
+
+    // (session file if it exists, resume identifier if the agent can be resumed)
+    let (session_file, resume_ref): (Option<PathBuf>, Option<String>) = match agent.harness {
+        HarnessKind::ClaudeCode => match agent.session_id {
+            Some(sid) => {
+                let path =
+                    switchboard_harness::claude_session_file_path(home_dir, &directory, &sid);
+                let file = path.exists().then_some(path);
+                let resume = file.as_ref().map(|_| sid.to_string());
+                (file, resume)
+            }
+            None => (None, None),
+        },
+        HarnessKind::Gemini => match agent.session_id {
+            Some(sid) => {
+                let mut candidates =
+                    switchboard_harness::gemini_session_file_candidates(home_dir, &directory, &sid);
+                candidates.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+                let file = candidates.pop();
+                let resume = file.as_ref().map(|_| sid.to_string());
+                (file, resume)
+            }
+            None => (None, None),
+        },
+        HarnessKind::Codex => {
+            let sidecar_path =
+                switchboard_harness::codex::sidecar::sidecar_path(&directory, project.id, agent.id);
+            let latest = switchboard_harness::codex::sidecar::read_latest(&sidecar_path).map_err(
+                |source| AppError::HydrationBlockedByCorruption {
+                    path: sidecar_path.clone(),
+                    source: Box::new(source),
+                },
+            )?;
+            match latest {
+                Some(record) => {
+                    let file = switchboard_harness::codex::session_file::locate_session_file(
+                        home_dir,
+                        record.session_partition_date,
+                        &record.session_id,
+                    );
+                    (file, Some(record.session_id))
+                }
+                None => (None, None),
+            }
+        }
+        HarnessKind::Antigravity => {
+            let sidecar_path = switchboard_harness::antigravity::sidecar::sidecar_path(
+                &directory, project.id, agent.id,
+            );
+            let latest = switchboard_harness::antigravity::sidecar::read_latest(&sidecar_path)
+                .map_err(|source| AppError::HydrationBlockedByCorruption {
+                    path: sidecar_path.clone(),
+                    source: Box::new(source),
+                })?;
+            match latest {
+                Some(record) => {
+                    let path = switchboard_harness::antigravity::paths::transcript_path(
+                        home_dir,
+                        record.conversation_id,
+                    );
+                    let file = path.exists().then_some(path);
+                    (file, Some(record.conversation_id.to_string()))
+                }
+                None => (None, None),
+            }
+        }
+        _ => return Err(AppError::UnsupportedHarness),
+    };
+
+    let resume_command = resume_ref
+        .and_then(|r| switchboard_harness::interactive_resume_command(agent.harness, &r))
+        .map(|tokens| {
+            let args = tokens
+                .iter()
+                .map(|t| shell_quote_if_needed(t))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!(
+                "cd {} && {args}",
+                shell_single_quote(&directory.to_string_lossy())
+            )
+        });
+
+    Ok(AgentSessionInfo {
+        session_file: session_file.map(|p| p.to_string_lossy().into_owned()),
+        resume_command,
+    })
+}
+
+/// POSIX single-quote a string for safe interpolation into a shell command:
+/// wrap in single quotes, and replace any embedded single quote with the
+/// `'\''` close-reopen idiom. Used only to render a copy-ready resume command.
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Quote a resume-command token only when it contains anything outside a
+/// shell-safe charset. The fixed program/flag tokens pass through unquoted (so
+/// the copied command stays readable), while a session id sourced from a
+/// malformed/edited sidecar that smuggles in shell metacharacters is
+/// single-quoted, keeping the copy-only command well-formed.
+fn shell_quote_if_needed(token: &str) -> String {
+    let safe = !token.is_empty()
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/' | b'='));
+    if safe {
+        token.to_owned()
+    } else {
+        shell_single_quote(token)
     }
 }
 
@@ -3975,6 +4126,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_session_info_for_claude_with_file_offers_open_and_resume() {
+        let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        let session_id = Uuid::now_v7();
+        stage_claude_session_file(tmp_home.path(), tmp_workdir.path(), &session_id);
+        let record = attach_agent_impl(
+            &state,
+            "x",
+            HarnessKind::ClaudeCode,
+            &session_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap();
+
+        let info = agent_session_info_impl(&state, record.id, tmp_home.path()).unwrap();
+        assert!(
+            info.session_file.is_some(),
+            "an existing session file is openable"
+        );
+        let cmd = info.resume_command.expect("resume command offered");
+        assert!(
+            cmd.starts_with("cd '"),
+            "command cds into the project dir: {cmd}"
+        );
+        assert!(cmd.contains("claude --resume"), "got: {cmd}");
+        assert!(cmd.contains(&session_id.to_string()), "got: {cmd}");
+        assert!(cmd.contains("--dangerously-skip-permissions"), "got: {cmd}");
+    }
+
+    #[test]
+    fn shell_quote_if_needed_passes_safe_tokens_and_quotes_metacharacters() {
+        // Fixed program/flag tokens and UUID-ish ids stay readable.
+        assert_eq!(shell_quote_if_needed("claude"), "claude");
+        assert_eq!(shell_quote_if_needed("--resume"), "--resume");
+        assert_eq!(
+            shell_quote_if_needed("019e62e6-ae07-77a1-9a0c-47a6e1628531"),
+            "019e62e6-ae07-77a1-9a0c-47a6e1628531"
+        );
+        // A session ref from a malformed/edited sidecar with shell metacharacters
+        // is single-quoted so the copy-only command stays well-formed.
+        assert_eq!(shell_quote_if_needed("a b;rm -rf /"), "'a b;rm -rf /'");
+        assert_eq!(shell_quote_if_needed("x'y"), "'x'\\''y'");
+        assert_eq!(shell_quote_if_needed(""), "''");
+    }
+
+    #[tokio::test]
+    async fn agent_session_info_quotes_a_metacharacter_session_id() {
+        // End-to-end: a Codex sidecar session id with shell metacharacters is
+        // single-quoted in the rendered resume command.
+        let (tmp_workdir, tmp_home, state, proj) = fresh_state_with_active_project("alpha").await;
+        let agent = create_agent_impl(&state, "codex_evil", HarnessKind::Codex).unwrap();
+        let canonical_workdir = tmp_workdir.path().canonicalize().unwrap();
+        let sidecar = switchboard_harness::codex::sidecar::sidecar_path(
+            &canonical_workdir,
+            proj.id,
+            agent.id,
+        );
+        std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+        switchboard_harness::codex::sidecar::append_record(
+            &sidecar,
+            &switchboard_harness::codex::sidecar::SessionLinkRecord {
+                session_id: "a;rm -rf".to_owned(),
+                session_partition_date: chrono::NaiveDate::from_ymd_opt(2026, 5, 25).unwrap(),
+                started_at: chrono::Utc::now(),
+            },
+        )
+        .unwrap();
+
+        let info = agent_session_info_impl(&state, agent.id, tmp_home.path()).unwrap();
+        let cmd = info.resume_command.expect("resume offered");
+        assert!(
+            cmd.contains("'a;rm -rf'"),
+            "metacharacter id is quoted: {cmd}"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_session_info_for_never_dispatched_agent_is_empty() {
+        let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
+        // Codex agent with no sidecar (never dispatched) → nothing to open/resume.
+        let record = create_agent_impl(&state, "codex_one", HarnessKind::Codex).unwrap();
+        let info = agent_session_info_impl(&state, record.id, tmp_home.path()).unwrap();
+        assert_eq!(info, AgentSessionInfo::default());
+    }
+
+    #[tokio::test]
+    async fn agent_session_info_for_codex_resolves_resume_id_from_sidecar() {
+        // Codex carries `session_id: None` on the record; the resume id lives in
+        // the sidecar (written post-dispatch). Resume is offered from it even
+        // when the local session file isn't present.
+        let (tmp_workdir, tmp_home, state, proj) = fresh_state_with_active_project("alpha").await;
+        let agent = create_agent_impl(&state, "codex_two", HarnessKind::Codex).unwrap();
+        let canonical_workdir = tmp_workdir.path().canonicalize().unwrap();
+        let sidecar = switchboard_harness::codex::sidecar::sidecar_path(
+            &canonical_workdir,
+            proj.id,
+            agent.id,
+        );
+        std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+        switchboard_harness::codex::sidecar::append_record(
+            &sidecar,
+            &switchboard_harness::codex::sidecar::SessionLinkRecord {
+                session_id: "sess-xyz".to_owned(),
+                session_partition_date: chrono::NaiveDate::from_ymd_opt(2026, 5, 25).unwrap(),
+                started_at: chrono::Utc::now(),
+            },
+        )
+        .unwrap();
+
+        let info = agent_session_info_impl(&state, agent.id, tmp_home.path()).unwrap();
+        assert!(
+            info.session_file.is_none(),
+            "no transcript file staged on disk"
+        );
+        let cmd = info.resume_command.expect("resume offered from sidecar id");
+        assert!(cmd.contains("codex resume sess-xyz"), "got: {cmd}");
+    }
+
+    #[tokio::test]
     async fn load_transcript_for_codex_agent_without_sidecar_returns_meta_only_empty() {
         let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
         // Create a Codex agent the normal way (no sidecar — no first dispatch).
@@ -4841,6 +5110,51 @@ mod tests {
         // Never dispatched → nothing to cancel.
         assert_eq!(
             cancel_turn_impl(&state, agent.id),
+            CancelOutcome::NothingToCancel
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_agent_stops_in_flight_turn() {
+        // App-level routing for "stop agent"; the cancel-running + clear-backlog
+        // + actor-survives semantics are covered in the dispatcher crate. Here we
+        // assert the impl drives a live turn to a cancelled terminal + idle.
+        let (tmp, state, emitter) =
+            fresh_state_with_scenario(switchboard_harness::MockScenario::AwaitCancellation);
+        let (agent, _project_id) = project_with_agent(&state, &tmp).await;
+
+        send_msg(&state, agent.id, "long task").await.unwrap();
+        within(
+            &emitter,
+            "turn_start",
+            emitter.wait_for_type("turn_start", 1),
+        )
+        .await;
+
+        assert_eq!(
+            cancel_agent_impl(&state, agent.id),
+            CancelOutcome::Requested
+        );
+
+        within(
+            &emitter,
+            "agent_idle",
+            emitter.wait_for_type("agent_idle", 1),
+        )
+        .await;
+        let channel = format!("agent:{}", agent.id);
+        let cancelled = emitter.snapshot().into_iter().any(|(name, v)| {
+            name == channel && v["type"] == "turn_end" && v["outcome"]["status"] == "cancelled"
+        });
+        assert!(cancelled, "cancel_agent synthesizes a cancelled terminal");
+    }
+
+    #[tokio::test]
+    async fn cancel_agent_on_idle_agent_is_a_no_op() {
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        let (agent, _project_id) = project_with_agent(&state, &tmp).await;
+        assert_eq!(
+            cancel_agent_impl(&state, agent.id),
             CancelOutcome::NothingToCancel
         );
     }

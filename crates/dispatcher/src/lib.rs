@@ -146,6 +146,14 @@ enum Command {
         send_id: SendId,
         source: CancelSource,
     },
+    /// Stop the whole agent: fire the running turn's cancel token (if any) **and**
+    /// clear the entire backlog, **without** shutting the actor down — the agent
+    /// stays loaded and idle, ready for new work. Out-of-band, no reply; the
+    /// running turn's effect surfaces as its synthesized `Cancelled` terminal, and
+    /// the dropped queued items are discarded silently (never journaled, so the
+    /// frontend's optimistic cleanup is the only place they need resolving — same
+    /// as `CancelSend`'s queued drop, just unscoped).
+    CancelAgent { source: CancelSource },
     /// Close the actor: reject further work, clear the backlog, cancel any
     /// running turn, drain it, then signal `reply` and exit.
     Shutdown {
@@ -482,6 +490,21 @@ impl Dispatcher {
         }
     }
 
+    /// Stop an agent: cancel its in-flight turn (if any) **and** drop its entire
+    /// queued backlog, leaving the actor alive and idle. Fire-and-forget — the
+    /// running turn's effect arrives as its synthesized `Cancelled` terminal, and
+    /// dropped queued items are discarded silently (never journaled). `NothingToCancel`
+    /// only when the agent has no actor.
+    pub fn cancel_agent(&self, agent_id: AgentId, source: CancelSource) -> CancelOutcome {
+        let agents = lock(&self.agents);
+        match agents.get(&agent_id) {
+            Some(AgentSlot::Active(tx)) if tx.send(Command::CancelAgent { source }).is_ok() => {
+                CancelOutcome::Requested
+            }
+            _ => CancelOutcome::NothingToCancel,
+        }
+    }
+
     /// Remove a not-yet-dispatched queued message by id, returning its payload
     /// so the UI can restore the composer text. **Race-safe** (the actor is the
     /// single authority): if the id is no longer enqueued — already
@@ -590,7 +613,9 @@ async fn agent_actor(
         let Some(cmd) = commands.recv().await else {
             break 'main;
         };
-        if let IdleAfter::Shutdown(reply) = apply_idle_command(cmd, agent_id, &mut backlog) {
+        if let IdleAfter::Shutdown(reply) =
+            apply_idle_command(cmd, agent_id, &mut backlog, idle_emitter.as_ref(), &channel)
+        {
             abandon_backlog(&mut backlog, idle_emitter.as_ref(), &channel, agent_id);
             let _ = reply.send(());
             break 'main;
@@ -629,9 +654,13 @@ async fn agent_actor(
             }
             match commands.try_recv() {
                 Ok(cmd) => {
-                    if let IdleAfter::Shutdown(reply) =
-                        apply_idle_command(cmd, agent_id, &mut backlog)
-                    {
+                    if let IdleAfter::Shutdown(reply) = apply_idle_command(
+                        cmd,
+                        agent_id,
+                        &mut backlog,
+                        idle_emitter.as_ref(),
+                        &channel,
+                    ) {
                         abandon_backlog(&mut backlog, idle_emitter.as_ref(), &channel, agent_id);
                         let _ = reply.send(());
                         break 'main;
@@ -689,6 +718,8 @@ fn apply_idle_command(
     cmd: Command,
     agent_id: AgentId,
     backlog: &mut VecDeque<WorkItem>,
+    emitter: &dyn EventEmitter,
+    channel: &str,
 ) -> IdleAfter {
     match cmd {
         Command::Enqueue {
@@ -711,9 +742,16 @@ fn apply_idle_command(
         }
         // No turn live ⇒ cancel is a no-op.
         Command::Cancel(_) => IdleAfter::Continue,
-        // No turn live ⇒ only this send's *queued* items can exist; drop them.
+        // No turn live ⇒ only this send's *queued* items can exist; drop them
+        // and emit MessageCancelled for each.
         Command::CancelSend { send_id, source: _ } => {
-            backlog.retain(|m| m.send_id != send_id);
+            drop_queued_send(backlog, send_id, emitter, channel, agent_id);
+            IdleAfter::Continue
+        }
+        // No turn live ⇒ drop the whole backlog (the actor stays alive),
+        // emitting MessageCancelled for each dropped send.
+        Command::CancelAgent { source: _ } => {
+            drop_all_queued(backlog, emitter, channel, agent_id);
             IdleAfter::Continue
         }
         // The caller (`agent_actor`) abandons the backlog (emitting
@@ -927,7 +965,18 @@ async fn drain_turn(
                             cancel_source.get_or_insert(source);
                             token.cancel();
                         }
-                        backlog.retain(|m| m.send_id != send_id);
+                        drop_queued_send(backlog, send_id, emitter.as_ref(), channel, agent_id);
+                    }
+                    Some(Command::CancelAgent { source }) => {
+                        // Stop the agent: cancel the running turn (post-terminal
+                        // cancel no-ops via the token-presence guard) and drop the
+                        // whole backlog. Unlike Shutdown, the actor keeps running —
+                        // it drains this turn to its terminal then parks idle.
+                        if !terminal_seen {
+                            cancel_source.get_or_insert(source);
+                            token.cancel();
+                        }
+                        drop_all_queued(backlog, emitter.as_ref(), channel, agent_id);
                     }
                     Some(Command::Shutdown { source, reply }) => {
                         // Cancel the running turn and keep draining to its
@@ -1071,6 +1120,57 @@ fn emit_message_failed(
         },
         agent_id,
     );
+}
+
+fn emit_message_cancelled(
+    emitter: &dyn EventEmitter,
+    channel: &str,
+    message_id: MessageId,
+    agent_id: AgentId,
+) {
+    emit_event(
+        emitter,
+        channel,
+        &NormalizedEvent::MessageCancelled {
+            message_id,
+            agent_id,
+            at: Utc::now(),
+        },
+        agent_id,
+    );
+}
+
+/// Drop the queued backlog items of `send_id`, emitting `MessageCancelled` for
+/// each — the authoritative signal that a not-yet-started send is gone, so the
+/// frontend renders its cancellation instead of optimistically guessing.
+fn drop_queued_send(
+    backlog: &mut VecDeque<WorkItem>,
+    send_id: SendId,
+    emitter: &dyn EventEmitter,
+    channel: &str,
+    agent_id: AgentId,
+) {
+    backlog.retain(|m| {
+        if m.send_id == send_id {
+            emit_message_cancelled(emitter, channel, m.message_id, agent_id);
+            false
+        } else {
+            true
+        }
+    });
+}
+
+/// Drop *all* queued backlog items (the `CancelAgent` "stop agent" path),
+/// emitting `MessageCancelled` for each.
+fn drop_all_queued(
+    backlog: &mut VecDeque<WorkItem>,
+    emitter: &dyn EventEmitter,
+    channel: &str,
+    agent_id: AgentId,
+) {
+    for item in backlog.drain(..) {
+        emit_message_cancelled(emitter, channel, item.message_id, agent_id);
+    }
 }
 
 /// Recover from `Mutex` poisoning. The only holders are short O(1) map edits

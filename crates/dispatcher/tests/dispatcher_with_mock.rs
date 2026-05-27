@@ -2307,3 +2307,100 @@ async fn cancel_send_for_a_completed_send_is_a_noop() {
         "cancel_send on a fully-completed send produces no cancelled terminal"
     );
 }
+
+#[tokio::test]
+async fn cancel_agent_cancels_in_flight_clears_backlog_and_stays_alive() {
+    // "Stop agent": one in-flight turn + one queued behind it. cancel_agent
+    // cancels the running turn AND drops the queued item (so it never
+    // dispatches), but the actor survives — a later send dispatches normally.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let agent = agent_record();
+    let emitter = Arc::new(RecordingEmitter::new());
+    // Turn 1 parks until cancelled; turn 2 (the queued one) would Stream if it
+    // ever dispatched — its ABSENCE proves the backlog was cleared. Turn 3 (the
+    // later send) streams to prove the actor is still alive.
+    let factory = TestFactory::sequence(
+        [MockScenario::AwaitCancellation, MockScenario::Streaming],
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+    );
+
+    // Turn 1 in-flight.
+    dispatcher
+        .send_message(
+            agent.id,
+            "first",
+            Uuid::now_v7(),
+            factory as Arc<dyn DispatchContextFactory>,
+            OnBusy::Enqueue,
+        )
+        .await;
+    within(
+        &emitter,
+        "turn 1 start",
+        emitter.wait_for_type("turn_start", 1),
+    )
+    .await;
+    // Turn 2 queued behind it (distinct send).
+    dispatcher
+        .send_message(
+            agent.id,
+            "queued",
+            Uuid::now_v7(),
+            TestFactory::new(
+                MockScenario::Streaming,
+                agent.clone(),
+                Arc::clone(&emitter),
+                noop_journal(),
+            ) as Arc<dyn DispatchContextFactory>,
+            OnBusy::Enqueue,
+        )
+        .await;
+
+    dispatcher.cancel_agent(agent.id, CancelSource::User);
+
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+    assert_eq!(
+        cancelled_sources(&emitter),
+        vec!["user"],
+        "the in-flight turn is cancelled by cancel_agent"
+    );
+    assert_eq!(
+        count_type(&emitter.snapshot(), "turn_start"),
+        1,
+        "the queued turn was dropped and never dispatched"
+    );
+    assert_eq!(
+        count_type(&emitter.snapshot(), "message_cancelled"),
+        1,
+        "the dropped queued send emits MessageCancelled so the UI renders it (not the running turn, which gets a Cancelled terminal)"
+    );
+
+    // The actor is still alive: a fresh send dispatches normally.
+    dispatcher
+        .send_message(
+            agent.id,
+            "after stop",
+            Uuid::now_v7(),
+            TestFactory::new(
+                MockScenario::Streaming,
+                agent.clone(),
+                Arc::clone(&emitter),
+                noop_journal(),
+            ) as Arc<dyn DispatchContextFactory>,
+            OnBusy::Enqueue,
+        )
+        .await;
+    within(
+        &emitter,
+        "post-stop turn start",
+        emitter.wait_for_type("turn_start", 2),
+    )
+    .await;
+}

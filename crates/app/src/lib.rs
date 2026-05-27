@@ -22,11 +22,12 @@ use tauri::{Emitter, Manager, State};
 
 use crate::commands::ProjectConversation;
 use crate::commands::{
-    DirectoryInfo, ProjectListing, WorkspaceDirectories, attach_agent_impl, cancel_send_impl,
-    cancel_turn_impl, check_antigravity_auth_impl, check_antigravity_binary_impl,
-    check_claude_binary_impl, check_codex_auth_impl, check_codex_binary_impl,
-    check_gemini_auth_impl, check_gemini_binary_impl, create_agent_impl, create_project_impl,
-    init_directory_impl, list_agents_impl, list_projects_impl, list_workspace_directories_impl,
+    AgentSessionInfo, DirectoryInfo, ProjectListing, WorkspaceDirectories, agent_session_info_impl,
+    attach_agent_impl, cancel_agent_impl, cancel_send_impl, cancel_turn_impl,
+    check_antigravity_auth_impl, check_antigravity_binary_impl, check_claude_binary_impl,
+    check_codex_auth_impl, check_codex_binary_impl, check_gemini_auth_impl,
+    check_gemini_binary_impl, create_agent_impl, create_project_impl, init_directory_impl,
+    list_agents_impl, list_projects_impl, list_workspace_directories_impl,
     load_project_conversation_impl, load_transcript_impl, open_project_impl, parse_uuid,
     pick_directory_impl, remove_directory_impl, remove_queued_message_impl, send_message_impl,
     set_active_project_impl,
@@ -228,6 +229,17 @@ async fn cancel_turn(state: State<'_, AppState>, agent_id: String) -> Result<(),
 }
 
 #[tauri::command]
+async fn cancel_agent(state: State<'_, AppState>, agent_id: String) -> Result<(), String> {
+    let id = parse_uuid(&agent_id).map_err(|e| e.to_string())?;
+    // Idempotent "stop agent": cancels the in-flight turn + clears the backlog.
+    // The synthesized `Cancelled` terminal flows back over the event channel and
+    // the dropped queued items are resolved by the frontend's optimistic
+    // cleanup, so the command just acks.
+    cancel_agent_impl(state.inner(), id);
+    Ok(())
+}
+
+#[tauri::command]
 async fn cancel_send(
     state: State<'_, AppState>,
     send_id: String,
@@ -256,6 +268,44 @@ async fn load_transcript(
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
     load_transcript_impl(state.inner(), id, &home).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn agent_session_info(
+    state: State<'_, AppState>,
+    agent_id: String,
+) -> Result<AgentSessionInfo, String> {
+    let id = parse_uuid(&agent_id).map_err(|e| e.to_string())?;
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    agent_session_info_impl(state.inner(), id, &home).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn open_session_file(state: State<'_, AppState>, agent_id: String) -> Result<(), String> {
+    let id = parse_uuid(&agent_id).map_err(|e| e.to_string())?;
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    let info = agent_session_info_impl(state.inner(), id, &home).map_err(|e| e.to_string())?;
+    let Some(path) = info.session_file else {
+        return Err("this agent has no session file yet".to_owned());
+    };
+    // `.jsonl` has no default macOS app handler, so a plain open fails
+    // (kLSApplicationNotFoundErr). `open -t` forces the default *text* editor.
+    // macOS-specific, which is fine — Switchboard is macOS-only in v1.
+    let status = tokio::process::Command::new("open")
+        .arg("-t")
+        .arg(&path)
+        .status()
+        .await
+        .map_err(|e| e.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("`open -t` failed for {path} (exit {status})"))
+    }
 }
 
 #[tauri::command]
@@ -356,6 +406,7 @@ pub fn run() {
             }
         }))
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .setup(move |app| {
             let emitter: Arc<dyn EventEmitter> = Arc::new(AppHandleEmitter {
                 app: app.handle().clone(),
@@ -410,7 +461,10 @@ pub fn run() {
             send_message,
             remove_queued_message,
             cancel_turn,
+            cancel_agent,
             cancel_send,
+            agent_session_info,
+            open_session_file,
             load_transcript,
             load_project_conversation,
         ])

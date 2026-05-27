@@ -179,13 +179,33 @@ export function buildUnifiedRows(turns: Turn[], overlay: ConversationItem[]): Un
     // (routed to per-agent state); ignore to avoid double-rendering.
   }
 
-  // ISO-8601 timestamps sort lexicographically; tie-break by kind rank so a
-  // user message precedes its own turn's content/markers at an equal instant.
-  // `Array.prototype.sort` is stable (ES2019+), so same-(at,rank) rows keep
+  // Order by **send**, not raw timestamp: each row is anchored to the time of
+  // its send's user message (`sendAnchor`), so a send's response renders
+  // directly under its prompt even when it ran much later. This matters for a
+  // *queued* single-recipient send — live, all three user messages are stamped
+  // near submit time (t1<t2<t3) while a queued send's response only starts after
+  // the earlier turn finishes, so its own timestamp is *later than the next
+  // prompt*. A raw-timestamp sort would float that response below the later
+  // prompt (detached from its own); anchoring keeps it adjacent. Rows whose
+  // send has no user message (pre-journal history with no recoverable send_id)
+  // fall back to their own `at`. Within one anchor: kind rank (user < agent <
+  // outcome), then own `at`; `Array.prototype.sort` is stable so ties hold
   // insertion order.
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity
+  const sendAnchor = new Map<string, string>();
+  for (const row of rows) {
+    if (row.kind === "user" && row.send_id !== undefined) {
+      const prior = sendAnchor.get(row.send_id);
+      if (prior === undefined || row.at < prior) sendAnchor.set(row.send_id, row.at);
+    }
+  }
+  const anchorOf = (row: UnifiedRow): string =>
+    (row.send_id !== undefined ? sendAnchor.get(row.send_id) : undefined) ?? row.at;
   rows.sort((a, b) => {
-    const t = a.at.localeCompare(b.at);
-    return t !== 0 ? t : a.rank - b.rank;
+    const t = anchorOf(a).localeCompare(anchorOf(b));
+    if (t !== 0) return t;
+    if (a.rank !== b.rank) return a.rank - b.rank;
+    return a.at.localeCompare(b.at);
   });
   return rows;
 }

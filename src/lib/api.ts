@@ -137,6 +137,28 @@ export async function cancelTurn(agentId: AgentId): Promise<void> {
   await invoke("cancel_turn", { agentId });
 }
 
+export async function cancelAgent(agentId: AgentId): Promise<void> {
+  await invoke("cancel_agent", { agentId });
+}
+
+/// Per-agent session actions: the openable session-file path and a copy-ready
+/// terminal resume command. Each field is null until the agent has a resolvable
+/// session.
+export interface AgentSessionInfo {
+  session_file: string | null;
+  resume_command: string | null;
+}
+
+export async function agentSessionInfo(agentId: AgentId): Promise<AgentSessionInfo> {
+  return await invoke<AgentSessionInfo>("agent_session_info", { agentId });
+}
+
+/// Open the agent's harness session file in the OS default app (backend-resolved
+/// path, opened Rust-side). Rejects if the agent has no session file yet.
+export async function openSessionFile(agentId: AgentId): Promise<void> {
+  await invoke("open_session_file", { agentId });
+}
+
 export async function loadTranscript(agentId: AgentId): Promise<LoadedTranscript> {
   return await invoke<LoadedTranscript>("load_transcript", { agentId });
 }

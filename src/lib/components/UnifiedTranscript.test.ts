@@ -351,7 +351,55 @@ describe("UnifiedTranscript", () => {
     expect(screen.getByTestId("turn")).toHaveTextContent("world");
   });
 
-  it("shows a live cancel control for a streaming standalone turn", async () => {
+  it("shows a live cancel control for a streaming standalone turn (send-scoped)", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "agent-1",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: "send-1",
+        started_at: "2026-05-16T00:00:00Z",
+        status: "streaming",
+        items: [{ item_kind: "text", kind: "text", text: "working" }],
+      },
+    ];
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+
+    // Cancel is send-scoped (TOCTOU-safe), not turn-scoped: it targets the
+    // turn's send_id, so a turn that completes mid-click can't be mis-cancelled.
+    await fireEvent.click(screen.getByTestId("turn-live-control"));
+    expect(invokeMock).toHaveBeenCalledWith(
+      "cancel_send",
+      expect.objectContaining({ sendId: "send-1", recipients: [CLAUDE_AGENT.id] }),
+    );
+  });
+
+  it("shows a queued… indicator + cancel for a queued single-recipient send", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    // A dispatched-but-not-started send: optimistic user turn + pending entry,
+    // backend-accepted (message_id recorded) but no turn_start yet (queued
+    // behind some other work).
+    state.dispatchUserTurn(CLAUDE_AGENT.id, "user-1", "later", "send-q", "2026-05-16T00:00:00Z");
+    state.recordSendAccepted(CLAUDE_AGENT.id, "user-1", "msg-q");
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+
+    expect(screen.getByTestId("turn-queued")).toBeInTheDocument();
+    // The cancel control targets the queued send (send-scoped).
+    await fireEvent.click(screen.getByTestId("turn-live-control"));
+    expect(invokeMock).toHaveBeenCalledWith(
+      "cancel_send",
+      expect.objectContaining({ sendId: "send-q", recipients: [CLAUDE_AGENT.id] }),
+    );
+  });
+
+  it("hides the live cancel control for a streaming turn with no send_id", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     state.transcripts[CLAUDE_AGENT.id] = [
@@ -368,11 +416,7 @@ describe("UnifiedTranscript", () => {
     const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
 
-    await fireEvent.click(screen.getByTestId("turn-live-control"));
-    expect(invokeMock).toHaveBeenCalledWith(
-      "cancel_turn",
-      expect.objectContaining({ agentId: CLAUDE_AGENT.id }),
-    );
+    expect(screen.queryByTestId("turn-live-control")).toBeNull();
   });
 
   it("renders failed turn with error message", async () => {

@@ -112,7 +112,12 @@ export type NormalizedEvent =
   // adapter failed to launch pre-`turn_start`). Keyed by `message_id` — there
   // is no live turn. Carries no prompt; the frontend still holds the
   // optimistically-rendered text and marks that bubble failed.
-  | { type: "message_failed"; message_id: MessageId; agent_id: AgentId; error: string; at: string };
+  | { type: "message_failed"; message_id: MessageId; agent_id: AgentId; error: string; at: string }
+  // A queued send was cancelled before it started (its backlog item was dropped
+  // by cancel_send / cancel_agent). Keyed by `message_id`, no `turn_id`. The
+  // authoritative signal that a not-yet-started send is gone — the frontend
+  // renders its cancelled row from this rather than optimistically guessing.
+  | { type: "message_cancelled"; message_id: MessageId; agent_id: AgentId; at: string };
 
 // Synthetic reducer input — fired by the state module's heartbeat timer
 // when no per-turn activity has been observed for HEARTBEAT_TIMEOUT_MS

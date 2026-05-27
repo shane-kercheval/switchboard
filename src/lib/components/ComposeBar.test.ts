@@ -259,6 +259,40 @@ describe("ComposeBar", () => {
     });
   });
 
+  it("the empty-draft stop cancels ALL live sends, not just the latest", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    invokeMock.mockResolvedValue("msg-x");
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { agents: [AGENT_A, AGENT_B] } });
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+
+    // Send #1 to alice (default selected).
+    await fireEvent.input(textarea, { target: { value: "to alice" } });
+    await fireEvent.click(screen.getByTestId("compose-send"));
+    // Send #2 to bob only (toggle alice off, bob on).
+    await fireEvent.click(chip(AGENT_A.id));
+    await fireEvent.click(chip(AGENT_B.id));
+    await fireEvent.input(textarea, { target: { value: "to bob" } });
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    // Two distinct sends are now live → the stop affordance covers all of them.
+    await waitFor(() => {
+      expect(screen.getByTestId("compose-send")).toHaveAttribute("aria-label", "Cancel all sends");
+    });
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    const cancelCalls = invokeMock.mock.calls.filter(([cmd]) => cmd === "cancel_send");
+    const cancelledSendIds = new Set(cancelCalls.map((c) => (c[1] as { sendId: string }).sendId));
+    expect(cancelledSendIds.size).toBe(2); // both sends cancelled, not just the last
+    const cancelledRecipients = cancelCalls.flatMap(
+      (c) => (c[1] as { recipients: string[] }).recipients,
+    );
+    expect(cancelledRecipients).toEqual(expect.arrayContaining([AGENT_A.id, AGENT_B.id]));
+  });
+
   it("uses Mod+Enter to cancel when the empty-draft send button is in stop mode", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);

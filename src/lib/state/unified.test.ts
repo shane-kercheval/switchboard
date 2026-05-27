@@ -114,6 +114,29 @@ describe("buildUnifiedRows", () => {
     ]);
   });
 
+  it("anchors a queued send's response under its own prompt, not by run-time", () => {
+    // Two sequential single-recipient sends: prompts stamped near submit
+    // (00, 01), but send-2 is queued so its response only runs at 20 — after
+    // BOTH prompts. A raw-timestamp sort would float both responses to the
+    // bottom (detached from their prompts); send-anchored ordering keeps each
+    // response under its own prompt.
+    const rows = buildUnifiedRows(
+      [
+        userTurn(TURN_1, AGENT_A, "2026-05-16T00:00:00Z", "first", "send-1"),
+        userTurn("u2", AGENT_A, "2026-05-16T00:00:01Z", "second", "send-2"),
+        agentTurn("a1", AGENT_A, "2026-05-16T00:00:10Z", "send-1"),
+        agentTurn("a2", AGENT_A, "2026-05-16T00:00:20Z", "send-2"),
+      ],
+      [],
+    );
+    expect(rows.map((r) => (r.kind === "user" ? `u:${r.text}` : `a:${r.send_id ?? "?"}`))).toEqual([
+      "u:first",
+      "a:send-1",
+      "u:second",
+      "a:send-2",
+    ]);
+  });
+
   it("ignores an agent_turn item that strays into the overlay (no double-render)", () => {
     const overlay: ConversationItem[] = [
       {

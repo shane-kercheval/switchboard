@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { AgentRecord, ConversationItem } from "$lib/types";
-  import { cancelSend, cancelTurn, transcripts, type Turn } from "$lib/state/index.svelte";
+  import { cancelSend, runtimes, transcripts, type Turn } from "$lib/state/index.svelte";
   import { buildUnifiedRows, groupRenderBlocks, type UnifiedRow } from "$lib/state/unified";
   import { cn } from "$lib/utils";
   import { HARNESS_COLOR } from "$lib/harnessDisplay";
@@ -47,6 +47,22 @@
       agents.map((a) => a.id),
     ),
   );
+
+  /// Send ids that are queued (dispatched, not yet started) across the project's
+  /// agents — the per-agent `pending_sends` minus any being cancelled. A
+  /// single-recipient queued send has a user message but no agent turn yet
+  /// (turn_start removes the pending entry), so we render a "queued…" affordance
+  /// under it — the single-send equivalent of a fan-out column's queued state.
+  const queuedSendIds = $derived.by(() => {
+    // eslint-disable-next-line svelte/prefer-svelte-reactivity
+    const set = new Set<string>();
+    for (const agent of agents) {
+      for (const p of runtimes[agent.id]?.pending_sends ?? []) {
+        if (!p.cancel_requested) set.add(p.send_id);
+      }
+    }
+    return set;
+  });
 
   function agentName(agentId: string): string {
     return agentById[agentId]?.name ?? "unknown";
@@ -169,7 +185,7 @@
     class="group text-muted hover:bg-status-failed-soft hover:text-status-failed focus-visible:ring-accent focus-visible:bg-status-failed-soft focus-visible:text-status-failed inline-flex h-6 w-6 items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none"
     data-testid={testid}
     aria-label={label}
-    onclick={onclick}
+    {onclick}
   >
     <span
       class="border-muted/30 border-t-muted block h-5 w-5 animate-spin rounded-full border-2 group-hover:hidden group-focus-visible:hidden"
@@ -188,7 +204,7 @@
 
 {#snippet userMessage(row: Extract<UnifiedRow, { kind: "user" }>)}
   <div
-    class="-mx-3 min-w-0 flex-1 space-y-1.5 rounded-md bg-panel/45 px-3 py-2"
+    class="bg-panel/45 -mx-3 min-w-0 flex-1 space-y-1.5 rounded-md px-3 py-2"
     data-testid="turn"
     data-role="user"
   >
@@ -218,15 +234,33 @@
   </div>
 {/snippet}
 
+{#snippet queuedRow(agentId: string, sendId: string)}
+  <div class="space-y-1.5" data-testid="turn" data-role="agent">
+    <div class="flex items-center gap-2 text-[11px] font-semibold tracking-wide uppercase">
+      <span class="text-fg" data-testid="turn-agent-name">{agentName(agentId)}</span>
+      {#if agentById[agentId]?.harness}
+        <HarnessIcon harness={agentById[agentId]!.harness} testid="turn-harness-icon" />
+      {/if}
+      {@render liveTurnControl(
+        () => cancelSend(sendId, [agentId]),
+        `Cancel queued send for ${agentName(agentId)}`,
+        "turn-live-control",
+      )}
+      <span class="text-status-processing" data-testid="turn-queued">queued…</span>
+    </div>
+  </div>
+{/snippet}
+
 {#snippet agentRow(turn: AgentTurn)}
   {@const harness = agentById[turn.agent_id]?.harness}
   <div class="space-y-1.5" data-testid="turn" data-role="agent">
     <div class="flex items-center gap-2 text-[11px] font-semibold tracking-wide uppercase">
       <span class="text-fg" data-testid="turn-agent-name">{agentName(turn.agent_id)}</span>
       {#if harness}<HarnessIcon {harness} testid="turn-harness-icon" />{:else}<Badge>?</Badge>{/if}
-      {#if turn.status === "streaming"}
+      {#if turn.status === "streaming" && turn.send_id !== undefined}
+        {@const sendId = turn.send_id}
         {@render liveTurnControl(
-          () => cancelTurn(turn.agent_id),
+          () => cancelSend(sendId, [turn.agent_id]),
           `Cancel turn for ${agentName(turn.agent_id)}`,
           "turn-live-control",
         )}
@@ -265,6 +299,9 @@
       {#if block.kind === "row"}
         {#if block.row.kind === "user"}
           {@render userMessage(block.row)}
+          {#if block.row.send_id !== undefined && block.row.agent_ids.length === 1 && queuedSendIds.has(block.row.send_id)}
+            {@render queuedRow(block.row.agent_ids[0]!, block.row.send_id)}
+          {/if}
         {:else if block.row.kind === "outcome"}
           {@render outcomeRow(block.row)}
         {:else}

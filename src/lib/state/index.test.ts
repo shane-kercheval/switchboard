@@ -502,6 +502,184 @@ describe("failSendStart", () => {
   });
 });
 
+const cancelledSendIds = (
+  state: Awaited<ReturnType<typeof loadState>>,
+  agentId: string,
+): string[] =>
+  (state.transcripts[agentId] ?? [])
+    .filter((t) => t.role === "agent" && t.status === "cancelled")
+    .map((t) => (t.role === "agent" ? (t.send_id ?? "?") : "?"));
+
+describe("stopAgent", () => {
+  it("fires cancel_agent; backend message_cancelled events prune queued + render cancelled", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    // Two queued sends, both backend-accepted (message_id recorded).
+    state.dispatchUserTurn(AGENT_A, "user-1", "first", "send-1", "2026-05-16T00:00:00Z");
+    state.dispatchUserTurn(AGENT_A, "user-2", "second", "send-2", "2026-05-16T00:00:01Z");
+    state.recordSendAccepted(AGENT_A, "user-1", "msg-1");
+    state.recordSendAccepted(AGENT_A, "user-2", "msg-2");
+    invokeMock.mockClear();
+
+    state.stopAgent(AGENT_A);
+    expect(invokeMock).toHaveBeenCalledWith("cancel_agent", { agentId: AGENT_A });
+
+    // The backend drops both queued sends and emits a message_cancelled per send;
+    // those events (not optimistic synthesis) prune pending + render cancelled.
+    fireTo(`agent:${AGENT_A}`, {
+      type: "message_cancelled",
+      message_id: "msg-1",
+      agent_id: AGENT_A,
+      at: "2026-05-16T00:00:02Z",
+    });
+    fireTo(`agent:${AGENT_A}`, {
+      type: "message_cancelled",
+      message_id: "msg-2",
+      agent_id: AGENT_A,
+      at: "2026-05-16T00:00:02Z",
+    });
+
+    expect(state.runtimes[AGENT_A]?.pending_sends).toBeUndefined();
+    expect(cancelledSendIds(state, AGENT_A)).toEqual(["send-1", "send-2"]);
+  });
+
+  it("queued send cancelled via event; running turn via its own terminal (no duplicate)", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    // send-1 running (turn_start popped its pending entry).
+    state.dispatchUserTurn(AGENT_A, "user-1", "running", "send-1", "2026-05-16T00:00:00Z");
+    state.recordSendAccepted(AGENT_A, "user-1", MESSAGE_1);
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_start",
+      turn_id: TURN_1,
+      message_id: MESSAGE_1,
+      started_at: "2026-05-16T00:00:00Z",
+    });
+    // send-2 queued behind it, accepted.
+    state.dispatchUserTurn(AGENT_A, "user-2", "queued", "send-2", "2026-05-16T00:00:01Z");
+    state.recordSendAccepted(AGENT_A, "user-2", "msg-2");
+    invokeMock.mockClear();
+
+    state.stopAgent(AGENT_A);
+    expect(invokeMock).toHaveBeenCalledWith("cancel_agent", { agentId: AGENT_A });
+
+    // Queued send-2: dropped → message_cancelled. Running send-1: Cancelled terminal.
+    fireTo(`agent:${AGENT_A}`, {
+      type: "message_cancelled",
+      message_id: "msg-2",
+      agent_id: AGENT_A,
+      at: "2026-05-16T00:00:02Z",
+    });
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_end",
+      turn_id: TURN_1,
+      outcome: { status: "cancelled", source: "user" },
+      ended_at: "2026-05-16T00:00:02Z",
+    });
+
+    // Exactly one cancelled row per send — no duplicate/detached row.
+    expect(cancelledSendIds(state, AGENT_A).sort()).toEqual(["send-1", "send-2"]);
+  });
+
+  it("defers the cancel for a send not yet backend-accepted, firing it on accept", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    // Dispatched but no message_id yet (send_message IPC still in flight).
+    state.dispatchUserTurn(AGENT_A, "user-1", "racing", "send-1", "2026-05-16T00:00:00Z");
+    invokeMock.mockClear();
+
+    state.stopAgent(AGENT_A);
+
+    // Deferred: entry flagged, no send-scoped cancel yet (firing now would race
+    // the send IPC), and nothing rendered cancelled.
+    expect(state.runtimes[AGENT_A]?.pending_sends?.[0]?.cancel_requested).toBe(true);
+    expect(invokeMock.mock.calls.some(([c]) => c === "cancel_send")).toBe(false);
+    expect(cancelledSendIds(state, AGENT_A)).toEqual([]);
+
+    // Once accepted, the deferred cancel fires; the backend's message_cancelled
+    // then prunes + renders.
+    state.recordSendAccepted(AGENT_A, "user-1", MESSAGE_1);
+    expect(invokeMock).toHaveBeenCalledWith(
+      "cancel_send",
+      expect.objectContaining({ sendId: "send-1", recipients: [AGENT_A] }),
+    );
+    fireTo(`agent:${AGENT_A}`, {
+      type: "message_cancelled",
+      message_id: MESSAGE_1,
+      agent_id: AGENT_A,
+      at: "2026-05-16T00:00:02Z",
+    });
+    expect(state.runtimes[AGENT_A]?.pending_sends).toBeUndefined();
+    expect(cancelledSendIds(state, AGENT_A)).toEqual(["send-1"]);
+  });
+});
+
+describe("cancelSend pre-accept race", () => {
+  it("defers the backend cancel until the send is accepted", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    state.dispatchUserTurn(AGENT_A, "user-1", "racing", "send-1", "2026-05-16T00:00:00Z");
+    invokeMock.mockClear();
+
+    state.cancelSend("send-1", [AGENT_A]);
+    // No backend cancel yet (would race the send IPC); entry flagged instead.
+    expect(invokeMock.mock.calls.some(([c]) => c === "cancel_send")).toBe(false);
+    expect(state.runtimes[AGENT_A]?.pending_sends?.[0]?.cancel_requested).toBe(true);
+
+    state.recordSendAccepted(AGENT_A, "user-1", MESSAGE_1);
+    expect(invokeMock).toHaveBeenCalledWith(
+      "cancel_send",
+      expect.objectContaining({ sendId: "send-1", recipients: [AGENT_A] }),
+    );
+  });
+
+  it("fires the deferred cancel if the turn starts before acceptance is recorded", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    state.dispatchUserTurn(AGENT_A, "user-1", "racing", "send-1", "2026-05-16T00:00:00Z");
+    state.cancelSend("send-1", [AGENT_A]);
+    invokeMock.mockClear();
+
+    // The turn started anyway (backend accepted + dispatched before the cancel
+    // landed). turn_start consumes the flagged entry → fire the cancel now.
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_start",
+      turn_id: TURN_1,
+      message_id: MESSAGE_1,
+      started_at: "2026-05-16T00:00:00Z",
+    });
+    expect(invokeMock).toHaveBeenCalledWith(
+      "cancel_send",
+      expect.objectContaining({ sendId: "send-1", recipients: [AGENT_A] }),
+    );
+  });
+
+  it("fires cancel immediately once accepted; the message_cancelled event renders it", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    state.dispatchUserTurn(AGENT_A, "user-1", "queued", "send-1", "2026-05-16T00:00:00Z");
+    state.recordSendAccepted(AGENT_A, "user-1", MESSAGE_1);
+    invokeMock.mockClear();
+
+    state.cancelSend("send-1", [AGENT_A]);
+    // Accepted → backend has it → cancel fires now (no optimistic synthesis).
+    expect(invokeMock).toHaveBeenCalledWith(
+      "cancel_send",
+      expect.objectContaining({ sendId: "send-1", recipients: [AGENT_A] }),
+    );
+    expect(cancelledSendIds(state, AGENT_A)).toEqual([]); // nothing rendered until the event
+
+    fireTo(`agent:${AGENT_A}`, {
+      type: "message_cancelled",
+      message_id: MESSAGE_1,
+      agent_id: AGENT_A,
+      at: "2026-05-16T00:00:02Z",
+    });
+    expect(state.runtimes[AGENT_A]?.pending_sends).toBeUndefined();
+    expect(cancelledSendIds(state, AGENT_A)).toEqual(["send-1"]);
+  });
+});
+
 describe("pending-send pruning (fan-out / queue correctness)", () => {
   it("prunes a failed send's entry so the next send's response isn't mis-stamped", async () => {
     // Regression: a send that fails before turn_start must not leave a stale

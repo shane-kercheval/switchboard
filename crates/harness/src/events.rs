@@ -198,6 +198,20 @@ pub enum NormalizedEvent {
         error: String,
         at: DateTime<Utc>,
     },
+    /// A **queued** send was cancelled before it started (its backlog item was
+    /// dropped by a `cancel_send` / `cancel_agent` while it was still waiting,
+    /// so it never produced a `TurnStart`). Keyed by `message_id` — there is no
+    /// `turn_id`. The dispatcher's authoritative signal that a not-yet-started
+    /// send is gone, so the frontend renders its cancellation from this event
+    /// rather than guessing (a *running* turn's cancellation still arrives as a
+    /// `TurnEnd { Cancelled }`). Like `MessageFailed`, this is a non-turn,
+    /// message-keyed event and carries no durable journal record (a
+    /// queued-but-unstarted send is live-UI-only).
+    MessageCancelled {
+        message_id: MessageId,
+        agent_id: AgentId,
+        at: DateTime<Utc>,
+    },
     /// Emitted by the dispatcher as the **last event on the per-agent
     /// channel** for a dispatch — immediately before `AgentIdleGuard`
     /// drops.

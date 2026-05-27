@@ -77,6 +77,29 @@ export function transcriptReducer(
       ];
     }
 
+    case "message_cancelled": {
+      // A *queued* send was dropped before it started (backend-authoritative —
+      // see `NormalizedEvent::MessageCancelled`). Render a cancelled agent turn
+      // under its prompt. `sendId` is resolved by the caller from the pending
+      // entry (by `message_id`); without it there is nothing to attribute, so
+      // this is a stray and a no-op. Idempotent on the derived `turn_id`.
+      if (sendId === undefined) return turns;
+      const turn_id = `cancelled-${input.message_id}`;
+      if (findTurn(turns, turn_id) !== undefined) return turns;
+      return [
+        ...turns,
+        {
+          role: "agent",
+          turn_id,
+          agent_id: agentId,
+          send_id: sendId,
+          started_at: receivedAt,
+          status: "cancelled",
+          items: [],
+        },
+      ];
+    }
+
     case "content_chunk": {
       const existing = findTurn(turns, input.turn_id);
       if (existing === undefined || existing.role !== "agent") return turns;
@@ -319,6 +342,20 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
       return runtime.run_status === "starting"
         ? { ...runtime, run_status: "idle", pending_sends, last_error }
         : { ...runtime, pending_sends, last_error };
+    }
+
+    case "message_cancelled": {
+      // A queued send was dropped before starting. Prune its pending entry
+      // (exact `message_id` match — no front-fallback; the backend always
+      // carries the real id). Cancellation is not an error, so no `last_error`.
+      // Flip to idle only if this was the *starting* send (nothing is running);
+      // a queued send cancelled while another turn runs leaves run_status alone.
+      const idx = runtime.pending_sends?.findIndex((p) => p.message_id === input.message_id) ?? -1;
+      if (idx < 0) return runtime;
+      const pending_sends = removePending(runtime.pending_sends, idx);
+      return runtime.run_status === "starting"
+        ? { ...runtime, run_status: "idle", pending_sends }
+        : { ...runtime, pending_sends };
     }
 
     case "turn_end":

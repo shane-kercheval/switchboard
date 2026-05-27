@@ -1,7 +1,7 @@
 # Research: Antigravity CLI (`agy`) for Switchboard
 
-**Captured:** 2026-05-19
-**Tool version:** `agy --version` reports `1.0.0` (CLI). `agy changelog` lists only `1.0.0: Initial release of the Antigravity CLI.` Build channel: stable.
+**Captured:** 2026-05-19 (initial); updated 2026-05-26 (1.0.2 probe).
+**Tool version:** `agy --version` reports `1.0.0` (CLI) at initial capture. Auto-updated to **`1.0.2`** by 2026-05-26; `agy changelog` for 1.0.1/1.0.2 lists OAuth/onboarding/sandbox/skills changes — no print-mode or transcript-format entries — but observed behavior includes additive transcript changes (see §"1.0.2 additive changes" below). Build channel: stable.
 **Status:** Hands-on probing against the installed binary at `/Users/shanekercheval/.local/bin/agy`, authenticated as `shane.kercheval@gmail.com` via macOS Keychain (silent auth — no `agy login` command was invoked during this probe; auth had been established previously through the Antigravity IDE app).
 
 **Companion to:** [`gemini-cli-observed.md`](gemini-cli-observed.md), [`claude-code-cli-observed.md`](claude-code-cli-observed.md), [`codex-cli-observed.md`](codex-cli-observed.md). Antigravity is being evaluated as the headless replacement for Gemini CLI on free / Google AI Pro / Ultra tiers (announced cutover: 2026-06-18).
@@ -166,9 +166,15 @@ Layout observed after a series of headless probes:
 │   └── <conversation-uuid>.pb              # primary conversation log — encrypted .pb
 ├── brain/
 │   └── <conversation-uuid>/
-│       └── .system_generated/
-│           └── logs/
-│               └── transcript.jsonl        # plaintext JSONL transcript (load-bearing)
+│       ├── .system_generated/
+│       │   └── logs/
+│       │       ├── transcript.jsonl        # plaintext JSONL transcript (load-bearing)
+│       │       └── transcript_full.jsonl   # same records, raw JSON tool args (1.0.2+)
+│       ├── messages/                       # server-side notification files (1.0.2+)
+│       │   ├── <uuid>.json                 # server messages (restart notices, etc.)
+│       │   ├── cursor.json                 # message-read cursor
+│       │   └── read.json                   # read-receipts
+│       └── .agents/                        # subagent definitions (if any subagents run)
 └── scratch/                                # ephemeral working dir
 ```
 
@@ -255,6 +261,16 @@ Record schema:
 **No assistant-message streaming records.** Unlike Gemini's per-chunk `{role:"assistant", delta:true}` events, the transcript file records the **completed** `PLANNER_RESPONSE` only. The text dripping seen on stdout is a server-side rendering effect (`text_drip.go`) — the on-disk record is whole.
 
 **A tool-calling `PLANNER_RESPONSE` carries narration in `thinking`, not `content`.** Across every captured transcript (the `b7456aa7` / `bdf1687e` probes and the `tool-use` fixture), a `PLANNER_RESPONSE` that has `tool_calls` puts the model's reasoning in `thinking` and leaves `content` empty; the user-facing answer always arrives as a *separate* later `PLANNER_RESPONSE` with `content` and no `tool_calls`. Switchboard's adapter relies on this: it emits answer text only for that terminal (no-tool-calls) record (`is_terminal_answer`), so a tool-calling record's empty `content` drops nothing. If a future `agy` release ever attaches displayable `content` to a tool-calling record, that text would be dropped and this assumption needs revisiting.
+
+**`SYSTEM_MESSAGE` records on resume (1.0.2+).** Resume turns (any turn after the first in a conversation) now have a `SYSTEM_MESSAGE` record injected by the server between `USER_INPUT` and `PLANNER_RESPONSE`. Observed shape (probed 2026-05-26):
+
+```jsonl
+{"step_index":N,"source":"SYSTEM","type":"SYSTEM_MESSAGE","status":"DONE","created_at":"...","content":"[Notice] All your subagents and background tasks have been stopped due to server restart. If you want a subagent to continue working, it needs to be revived by sending it a new message. If resuming work, please check on status and restart as needed."}
+```
+
+So a resume turn's step sequence is `USER_INPUT` → `CONVERSATION_HISTORY` → `SYSTEM_MESSAGE` (zero or more) → `PLANNER_RESPONSE`. The adapter's parser (`record_to_live_events`) already handles this correctly: `SYSTEM_MESSAGE` records have `source = "SYSTEM"` and `type = "SYSTEM_MESSAGE"` — they pass neither `is_planner_response()` nor `is_tool_result()` and are silently skipped, so no parser change is needed. The `SYSTEM_MESSAGE` content is currently not surfaced to the user.
+
+**`transcript_full.jsonl` (1.0.2+).** Written alongside `transcript.jsonl` in the same `.system_generated/logs/` directory. Contains the same step records but with raw JSON values in `tool_calls[].args` rather than the stringified-JSON values in `transcript.jsonl` (where each arg value is a JSON string containing a JSON literal). The adapter reads `transcript.jsonl`; `transcript_full.jsonl` is available if richer structured tool-call arg rendering is ever wanted (a one-line `paths.rs` change to switch targets).
 
 **Resume creates a new conversation if the UUID is unknown.** Tested: `agy --conversation 00000000-0000-0000-0000-000000000000 -p "hi"` printed `Warning: conversation "00000000-0000-0000-0000-000000000000" not found.` to stderr and exited 0 with a fresh-conversation reply. No error / non-zero exit code. **Adapters cannot rely on exit code to detect missing-conversation.**
 
@@ -388,10 +404,33 @@ mid-turn produces a `Cancelled` outcome with the agent returning to idle.
 | Empty prompt `agy -p ""` | (none) | `Error: empty prompt. Usage: agy --print "your prompt here"` | 0 |
 | Unknown `--conversation <uuid>` | Fresh-conversation greeting (`Hello! I'm Antigravity, ...`) | `Warning: conversation "..." not found.` | 0 |
 | Timeout (5-min default exceeded) | `Error: timed out waiting for response` | (none) | 0 |
+| **Quota exhausted (`RESOURCE_EXHAUSTED`)** | **(none)** | **(none)** | **0** |
 | Unauthenticated (not probed; would require revoking Keychain entry) | unclear | unclear | unclear |
 | Network failure (not probed) | unclear | unclear | unclear |
 
 **Notable**: `agy` exits 0 on virtually every error condition surveyed. Failure detection by exit code is unreliable. The adapter must parse stdout for `^Error:` or `^Warning:` lines and check transcript-file completeness.
+
+### Quota exhaustion (`RESOURCE_EXHAUSTED`) — captured 2026-05-26, agy 1.0.2
+
+When Google Cloud individual quota is exhausted, `agy -p` exits 0 with **empty stdout and empty stderr** and writes **no new records to `transcript.jsonl`**. This makes it the most invisible error condition: exit code, stdout, and transcript are all indistinguishable from a successful-but-answer-less turn.
+
+The error is visible only in the per-invocation CLI log file:
+
+```
+~/.gemini/antigravity-cli/log/cli-<YYYYMMDD>_<HHMMSS>.log
+```
+
+Representative log line (sourced from `http_helpers.go`):
+
+```
+http_helpers.go:178] rpc error: code = ResourceExhausted desc = RESOURCE_EXHAUSTED: 429 ... individual quota exhausted ...
+```
+
+The substring `RESOURCE_EXHAUSTED` appears in the line (case-insensitive match is safe). The log file is created at invocation start and its `mtime` is updated as the process runs, so it can be correlated to a specific dispatch by selecting the file with `mtime >= spawn_time`.
+
+**Adapter detection strategy:** after the turn exits, if `saw_terminal_answer` is false, scan the log directory for the file with the most-recent `mtime >= spawn_time`; search for `RESOURCE_EXHAUSTED` (case-insensitive). This scan is best-effort — if the log dir is unreadable or no matching file exists, the adapter falls back to its generic failure messages. A successful turn (with a `PLANNER_RESPONSE` record confirmed) skips the scan entirely.
+
+**Classification:** this is a hard failure — the turn produced no answer. Classify as `FailureKind::UsageLimit` (M4.9 Surface A), preserving a user-readable message: "Antigravity quota exhausted — Google Cloud individual quota reached."
 
 ## Comparison to Gemini CLI
 
@@ -449,6 +488,20 @@ The FIFO tool-pairing in `record_to_live_events` (`pending_tool_ids.pop_front()`
 ### Aside confirmed during this probe: `agy -p` blocks indefinitely on an open stdin
 
 `agy -p <prompt>` with stdin left attached (no EOF) **hangs forever** — it never creates a `brain/<uuid>` dir, never emits, never exits (observed on both a trivial `ack` prompt and the subagent prompt; not quota-related). Redirecting `< /dev/null` makes it complete normally (exit 0, brain dir created). Unlike Gemini (which warns "no stdin data received in 3s, proceeding"), `agy` has **no stdin timeout**. This is why Switchboard's adapter spawning with `Stdio::null()` is **load-bearing, not hygiene** — without it the harness would hang every turn. (Also a reminder for manual probing: always run `agy -p … < /dev/null`.)
+
+## agy 1.0.2 additive changes — summary (probed 2026-05-26)
+
+`agy` auto-updated from 1.0.0 to 1.0.2. The following changes were observed; **none break the existing Switchboard adapter**:
+
+| Change | Where | Adapter impact |
+|---|---|---|
+| `SYSTEM_MESSAGE` records injected on resume turns | `transcript.jsonl` | None — parser skips records that are neither `PLANNER_RESPONSE` nor tool results |
+| `transcript_full.jsonl` written alongside `transcript.jsonl` | `.system_generated/logs/` | None — adapter reads `transcript.jsonl` only; full file is additive |
+| `messages/` directory with server notification JSONs, `cursor.json`, `read.json` | `brain/<uuid>/messages/` | None — not a transcript source; server restart notices appear here, not in `transcript.jsonl` |
+
+The `RESOURCE_EXHAUSTED` quota error (exit 0, empty stdout/stderr, error only in CLI log) is also new in practice under 1.0.2 — though this is a server-side quota condition, not a format change. See §"Quota exhaustion" above for the observed shape and §"Known limitations" for the adapter's detection approach.
+
+**Root-cause note (corrects `docs/implementation_plans/2026-05-26-bug-antigravity-1-0-2.md`):** the bug report hypothesized that 1.0.2 changed transcript-writing behavior. Probing disproved this: the `090da703` conversation (created under 1.0.2 by live tests on 2026-05-23) has a properly-structured `transcript.jsonl` with `USER_INPUT → PLANNER_RESPONSE` for a fresh turn and `USER_INPUT → SYSTEM_MESSAGE → PLANNER_RESPONSE` for a resume turn. Every turn failure on 2026-05-26 was `RESOURCE_EXHAUSTED` quota exhaustion, not a path or format change.
 
 ## Pending verification / unclear after probing
 

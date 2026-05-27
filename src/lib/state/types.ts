@@ -124,6 +124,14 @@ export type PendingSend = {
   send_id: SendId;
   user_turn_id: TurnId;
   message_id?: MessageId;
+  /// Set when the user cancelled/stopped this send *before* the backend
+  /// accepted it (no `message_id` yet). Firing the backend cancel then would
+  /// race the in-flight `send_message` IPC and could miss, letting the send run
+  /// anyway. Instead the entry is flagged and the cancel is deferred to whenever
+  /// the send is confirmed — `recordSendAccepted` (queued → drop) or `turn_start`
+  /// (already running → cancel the live turn). Such an entry is no longer "live"
+  /// work (excluded from the composer's stop affordance).
+  cancel_requested?: boolean;
 };
 
 /// Per-agent operational state.

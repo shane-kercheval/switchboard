@@ -6,7 +6,21 @@
   import SidebarSection from "$lib/components/ui/SidebarSection.svelte";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
   import PlusIcon from "$lib/components/ui/PlusIcon.svelte";
+  import AgentActionsMenu from "$lib/components/AgentActionsMenu.svelte";
   import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
+
+  /// An agent is "active" — currently driving work — when its turn is in-flight
+  /// (run_status) or it still has queued sends. Gates the "Stop agent" action and
+  /// the resume panel's stronger collision warning.
+  function isActive(agentId: AgentId): boolean {
+    const rt = runtimes[agentId];
+    if (rt === undefined) return false;
+    return (
+      rt.run_status === "starting" ||
+      rt.run_status === "processing" ||
+      (rt.pending_sends ?? []).length > 0
+    );
+  }
 
   /// `onAddAgent` is the "+ Add agent" entry point in the sidebar header.
   /// Optional so existing callers + tests that don't pass it continue
@@ -103,7 +117,10 @@
             <span class="text-fg truncate text-[13px] font-semibold" data-testid="agent-name">
               {agent.name}
             </span>
-            <HarnessIcon harness={agent.harness} size="md" testid="agent-harness-icon" />
+            <div class="flex shrink-0 items-center gap-1">
+              <HarnessIcon harness={agent.harness} size="md" testid="agent-harness-icon" />
+              <AgentActionsMenu {agent} active={isActive(agent.id)} />
+            </div>
           </div>
           <div
             class={cn("mt-0.5 text-[11px] leading-4", statusClass(runtime?.run_status))}

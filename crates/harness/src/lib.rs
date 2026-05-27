@@ -22,6 +22,7 @@ pub mod events;
 pub mod gemini;
 pub mod mock;
 mod parser;
+pub mod resume;
 pub mod subprocess;
 pub mod transcript;
 
@@ -43,6 +44,7 @@ pub use gemini::session_file::{
     gemini_session_file_candidates, id_prefix as gemini_session_id_prefix, load_gemini_transcript,
 };
 pub use mock::{MockHarnessAdapter, MockScenario};
+pub use resume::interactive_resume_command;
 pub use transcript::{
     LoadTranscriptError, LoadedTranscript, ParseWarning, SessionMetaInfo, Turn, TurnItem,
     TurnStatus,

@@ -21,9 +21,6 @@
   let prompt = $state<string>("");
   let sendError = $state<string | null>(null);
   let composeEl = $state<HTMLDivElement | undefined>(undefined);
-  // The composer stop button intentionally tracks the latest compose action
-  // only; earlier live sends stay cancellable from their transcript controls.
-  let latestSend = $state<{ sendId: string; agentIds: AgentId[] } | null>(null);
 
   /// Recipient set — every agent is shown as a toggle chip (click to add/drop);
   /// `@name` is the keyboard path to the same toggle. Sticky across sends
@@ -151,27 +148,35 @@
       }),
   );
 
-  function sendIsLive(agentId: AgentId, sendId: string): boolean {
-    const pending = runtimes[agentId]?.pending_sends ?? [];
-    if (pending.some((p) => p.send_id === sendId)) return true;
-    // IPC failures prune pending state via failSendStart, so failed recipients
-    // naturally fall out of latestLiveAgentIds without extra bookkeeping here.
-    return (transcripts[agentId] ?? []).some(
-      (turn) => turn.role === "agent" && turn.send_id === sendId && turn.status === "streaming",
-    );
-  }
-
-  const latestLiveAgentIds = $derived.by(() => {
-    const send = latestSend;
-    return send === null
-      ? []
-      : send.agentIds.filter((agentId) => sendIsLive(agentId, send.sendId));
+  // Every live send across this project's agents, mapped to the agents it's
+  // live for — both still-queued sends (`pending_sends`) and currently-streaming
+  // turns. The composer stop cancels *all* of it, not just the most recent send,
+  // so one click halts everything the project's agents are running and have
+  // queued. (IPC failures prune `pending_sends` via failSendStart, so failed
+  // recipients drop out without extra bookkeeping.)
+  const liveSends = $derived.by(() => {
+    // eslint-disable-next-line svelte/prefer-svelte-reactivity
+    const bySend = new Map<string, AgentId[]>();
+    const add = (sendId: string, agentId: AgentId): void => {
+      const arr = bySend.get(sendId) ?? [];
+      if (!arr.includes(agentId)) arr.push(agentId);
+      bySend.set(sendId, arr);
+    };
+    for (const agent of agents) {
+      for (const p of runtimes[agent.id]?.pending_sends ?? []) {
+        // A cancel_requested entry is already being cancelled — not live work.
+        if (!p.cancel_requested) add(p.send_id, agent.id);
+      }
+      for (const turn of transcripts[agent.id] ?? []) {
+        if (turn.role === "agent" && turn.status === "streaming" && turn.send_id !== undefined) {
+          add(turn.send_id, agent.id);
+        }
+      }
+    }
+    return bySend;
   });
-  // A non-empty draft means the primary action is "send/queue this prompt";
-  // cancelling live work remains available from the transcript controls.
-  const showStop = $derived(
-    latestSend !== null && latestLiveAgentIds.length > 0 && prompt.trim() === "",
-  );
+  // A non-empty draft means the primary action is "send/queue this prompt".
+  const showStop = $derived(liveSends.size > 0 && prompt.trim() === "");
   const primaryDisabled = $derived(showStop ? false : sendDisabled);
 
   function toggleRecipient(id: AgentId): void {
@@ -232,9 +237,8 @@
   }
 
   function handlePrimaryAction(): void {
-    if (showStop && latestSend !== null) {
-      cancelSend(latestSend.sendId, latestLiveAgentIds);
-      latestSend = null;
+    if (showStop) {
+      for (const [sendId, agentIds] of liveSends) cancelSend(sendId, agentIds);
       return;
     }
     handleSubmit();
@@ -249,7 +253,6 @@
     // sharing it (the backend groups, and cancel-send is scoped to it).
     const sendId = crypto.randomUUID();
     const targets = [...selectedAgents];
-    latestSend = { sendId, agentIds: targets.map((agent) => agent.id) };
     for (const agent of targets) {
       const userTurnId = crypto.randomUUID();
       dispatchUserTurn(agent.id, userTurnId, submittedText, sendId);
@@ -408,7 +411,10 @@
         onkeydown={handleKey}
         class="min-h-16 border-0 bg-transparent p-1 shadow-none focus-visible:ring-0"
       />
-      <Tooltip label={showStop ? "Cancel send" : "Send"} shortcut={shortcut("mod", "enter")}>
+      <Tooltip
+        label={showStop ? (liveSends.size > 1 ? "Cancel all sends" : "Cancel send") : "Send"}
+        shortcut={shortcut("mod", "enter")}
+      >
         {#snippet trigger(props)}
           <button
             {...props}
@@ -416,7 +422,11 @@
             data-testid="compose-send"
             onclick={handlePrimaryAction}
             disabled={primaryDisabled}
-            aria-label={showStop ? "Cancel send" : "Send"}
+            aria-label={showStop
+              ? liveSends.size > 1
+                ? "Cancel all sends"
+                : "Cancel send"
+              : "Send"}
             class={cn(
               "flex h-8 w-8 shrink-0 items-center justify-center rounded-full transition-colors",
               showStop

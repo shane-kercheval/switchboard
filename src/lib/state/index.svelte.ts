@@ -33,7 +33,12 @@
 // IPC error.
 
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { cancelSend as apiCancelSend, cancelTurn as apiCancelTurn, loadTranscript } from "$lib/api";
+import {
+  cancelAgent as apiCancelAgent,
+  cancelSend as apiCancelSend,
+  cancelTurn as apiCancelTurn,
+  loadTranscript,
+} from "$lib/api";
 import type {
   AgentId,
   AgentRecord,
@@ -46,7 +51,7 @@ import type {
 } from "$lib/types";
 import { HEARTBEAT_TIMEOUT_MS } from "$lib/types";
 import { _internal, freshRuntime, runtimeReducer, transcriptReducer } from "./reducers";
-import type { AgentRuntime, RuntimeMap, ToolCall, TranscriptMap, Turn } from "./types";
+import type { AgentRuntime, PendingSend, RuntimeMap, ToolCall, TranscriptMap, Turn } from "./types";
 
 /// Per-agent turn lists, keyed by `agent_id`. The unified-view renderer
 /// merges across all agents at render time:
@@ -319,9 +324,18 @@ export function recordSendAccepted(
   const idx = pending.findIndex((p) => p.user_turn_id === userTurnId);
   const entry = idx >= 0 ? pending[idx] : undefined;
   if (entry === undefined) return;
+  // Record the receipt either way (the entry must carry `message_id` so a later
+  // `message_cancelled` / `turn_start` can match it).
   const next = [...pending];
   next[idx] = { ...entry, message_id: messageId };
   runtimes[agentId] = { ...runtime, pending_sends: next };
+  if (entry.cancel_requested) {
+    // The user cancelled before the backend accepted this send; now that it's
+    // accepted, fire the deferred send-scoped cancel. The backend reports the
+    // outcome (a `message_cancelled` event if still queued, a `Cancelled`
+    // terminal if it had started) — no optimistic synthesis here.
+    void apiCancelSend(entry.send_id, [agentId]);
+  }
 }
 
 /// Mark a send-start failure: the compose-bar called `dispatchUserTurn`, then
@@ -358,41 +372,60 @@ export function failSendStart(
 }
 
 /// Cancel a whole send across `agentIds` (the group cancel-send control, or a
-/// single-element list for one recipient's Cancel). Delegates to the
-/// send-scoped backend command, which cancels each recipient's in-flight turn
-/// (→ a `Cancelled` `turn_end` flows back and the agent turn renders cancelled)
-/// and drops still-queued items. A *queued* item is dropped silently — no
-/// event — so for those recipients we prune the pending entry and synthesize a
-/// cancelled agent turn here, otherwise the optimistic "queued" card would
-/// spin forever. Running turns need no optimistic handling (the backend's
-/// terminal arrives).
+/// single-element list for one recipient's Cancel). Fire-and-forget: the
+/// backend cancels each recipient's in-flight turn (→ a `Cancelled` `turn_end`)
+/// or drops its still-queued item (→ a `message_cancelled` event); the
+/// transcript renders cancellation from whichever event arrives. No optimistic
+/// synthesis — that guessing is what created the start-race.
+///
+/// The one exception is a recipient whose entry isn't backend-accepted yet (no
+/// `message_id`): firing now races the in-flight `send_message` IPC and could
+/// miss, so we defer (`cancel_requested`) and `recordSendAccepted` fires it once
+/// the send is confirmed.
 export function cancelSend(sendId: SendId, agentIds: AgentId[]): void {
+  const fireNow: AgentId[] = [];
   for (const agentId of agentIds) {
     const rt = runtimes[agentId];
-    const pending = rt?.pending_sends;
-    if (rt === undefined || pending === undefined) continue;
-    const remaining = pending.filter((p) => p.send_id !== sendId);
-    if (remaining.length === pending.length) continue; // no queued item for this send here
-    runtimes[agentId] = { ...rt, pending_sends: remaining.length > 0 ? remaining : undefined };
-    transcripts[agentId] = [
-      ...(transcripts[agentId] ?? []),
-      {
-        role: "agent",
-        turn_id: crypto.randomUUID(),
-        agent_id: agentId,
-        send_id: sendId,
-        // eslint-disable-next-line svelte/prefer-svelte-reactivity
-        started_at: new Date().toISOString(),
-        status: "cancelled",
-        items: [],
-      },
-    ];
+    if (rt === undefined) continue;
+    const pending = rt.pending_sends;
+    const entry = pending?.find((p) => p.send_id === sendId);
+    if (entry !== undefined && entry.message_id === undefined) {
+      runtimes[agentId] = {
+        ...rt,
+        pending_sends: pending!.map((p) =>
+          p.send_id === sendId ? { ...p, cancel_requested: true } : p,
+        ),
+      };
+      continue;
+    }
+    fireNow.push(agentId);
   }
-  void apiCancelSend(sendId, agentIds);
+  if (fireNow.length > 0) void apiCancelSend(sendId, fireNow);
 }
 
 export function cancelTurn(agentId: AgentId): void {
   void apiCancelTurn(agentId);
+}
+
+/// Stop an agent (sidebar "Stop agent"): cancel its in-flight turn and clear its
+/// entire queued backlog. Fire-and-forget: `cancel_agent` cancels the running
+/// turn (→ `Cancelled` terminal) and drops each accepted queued send (→ a
+/// `message_cancelled` event per send); the transcript renders from those
+/// events. A not-yet-accepted send (no `message_id`) can't be cancelled
+/// backend-side yet, so it's flagged `cancel_requested` and `recordSendAccepted`
+/// fires its cancel once confirmed.
+export function stopAgent(agentId: AgentId): void {
+  const rt = runtimes[agentId];
+  const pending = rt?.pending_sends;
+  if (rt !== undefined && pending !== undefined) {
+    runtimes[agentId] = {
+      ...rt,
+      pending_sends: pending.map((p) =>
+        p.message_id === undefined ? { ...p, cancel_requested: true } : p,
+      ),
+    };
+  }
+  void apiCancelAgent(agentId);
 }
 
 /// Mark an agent as already-hydrated so the per-agent `hydrateAgent` path
@@ -429,18 +462,18 @@ export function unregisterAgents(agentIds: AgentId[]): void {
 
 // --- internal ---
 
-/// The `send_id` of the pending entry a `turn_start { message_id }` belongs to:
-/// the entry matching `messageId`, else the front (covers the race where the
-/// IPC receipt hasn't been recorded yet). Mirrors `reducers.ts::pickPendingIndex`
-/// so the transcript stamp and the runtime removal pick the same entry.
-function pendingSendIdFor(runtime: AgentRuntime, messageId: MessageId): SendId | undefined {
+/// The pending entry a `turn_start { message_id }` belongs to: the entry
+/// matching `messageId`, else the front (covers the race where the IPC receipt
+/// hasn't been recorded yet). Mirrors `reducers.ts::pickPendingIndex` so the
+/// transcript stamp and the runtime removal pick the same entry.
+function pendingEntryFor(runtime: AgentRuntime, messageId: MessageId): PendingSend | undefined {
   const pending = runtime.pending_sends;
   const front = pending?.[0];
   if (front === undefined) return undefined;
   const byMsg = pending?.find((p) => p.message_id === messageId);
-  if (byMsg !== undefined) return byMsg.send_id;
+  if (byMsg !== undefined) return byMsg;
   // Front-fallback only during the pre-receipt race (mirrors pickPendingIndex).
-  return front.message_id === undefined ? front.send_id : undefined;
+  return front.message_id === undefined ? front : undefined;
 }
 
 function handleEvent(agentId: AgentId, event: NormalizedEvent): void {
@@ -471,11 +504,26 @@ function handleEvent(agentId: AgentId, event: NormalizedEvent): void {
   // message_id, else the front — the backend runs turns in dispatch order) and
   // pass its send_id so the new agent turn is stamped; `runtimeReducer` removes
   // the same entry in lockstep.
-  const sendId =
-    event.type === "turn_start" ? pendingSendIdFor(priorRuntime, event.message_id) : undefined;
+  const startEntry =
+    event.type === "turn_start" ? pendingEntryFor(priorRuntime, event.message_id) : undefined;
+  // For a `message_cancelled` event, resolve the send_id of the dropped queued
+  // entry (exact message_id match) so the reducer can render its cancelled row.
+  const cancelledSendId =
+    event.type === "message_cancelled"
+      ? priorRuntime.pending_sends?.find((p) => p.message_id === event.message_id)?.send_id
+      : undefined;
+  const sendId = startEntry?.send_id ?? cancelledSendId;
   transcripts[agentId] = transcriptReducer(priorTurns, event, agentId, receivedAt, sendId);
   runtimes[agentId] = runtimeReducer(priorRuntime, event);
   manageHeartbeat(agentId, event);
+
+  // Deferred cancel: if this turn started for a send the user cancelled before
+  // the backend accepted it, the turn ran anyway — fire the send-scoped cancel
+  // now (the live turn's `Cancelled` terminal will follow). The real turn is
+  // already rendered, so there is nothing to synthesize.
+  if (startEntry?.cancel_requested) {
+    void apiCancelSend(startEntry.send_id, [agentId]);
+  }
 }
 
 function manageHeartbeat(agentId: AgentId, event: NormalizedEvent): void {

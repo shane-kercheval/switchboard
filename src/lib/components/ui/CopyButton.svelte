@@ -34,7 +34,7 @@
   type="button"
   class={cn(
     "flex h-7 w-7 items-center justify-center rounded-full border border-transparent transition-colors",
-    copied ? "text-accent bg-border/60" : "text-muted hover:text-fg hover:bg-border/60",
+    copied ? "text-accent bg-panel" : "text-muted hover:text-fg hover:bg-border/60",
     className,
   )}
   data-testid={testid}

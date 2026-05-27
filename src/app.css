@@ -381,9 +381,9 @@ body {
   .md-code-block:hover .md-code-copy {
     opacity: 1;
   }
-  .md-code-copy:hover {
+  .md-code-copy:hover:not([data-copied="true"]) {
     color: var(--fg);
-    background-color: var(--border);
+    background-color: #fafafa;
   }
   .md-code-copy svg {
     width: 1.0625rem;
@@ -394,7 +394,8 @@ body {
   }
   .md-code-copy[data-copied="true"] {
     color: var(--accent);
-    background-color: var(--border);
+    background-color: #fafafa;
+    opacity: 1;
   }
   .md-code-copy[data-copied="true"] .md-copy-icon {
     display: none;
@@ -473,3 +474,38 @@ body {
     font-style: italic;
   }
 }
+
+/* Agent messages sit on the transcript bg; a hair darker than --code-bg
+   adds just enough contrast to read as a distinct surface. */
+[data-role="agent"] .md-code-block,
+[data-role="agent"] .md-code-header {
+  background-color: #f3f3f5;
+}
+
+.dark [data-role="agent"] .md-code-block,
+.dark [data-role="agent"] .md-code-header {
+  background-color: #232326;
+}
+
+/* User messages sit on a panel/45 card that's nearly the same gray as
+   --code-bg, so code blocks need a noticeably darker surface. */
+[data-role="user"] .md-code-block,
+[data-role="user"] .md-code-header {
+  background-color: #ebebee;
+}
+
+[data-role="user"] .md-code-copy:hover:not([data-copied="true"]),
+[data-role="user"] .md-code-copy[data-copied="true"] {
+  background-color: #f6f6f8;
+}
+
+
+.dark [data-role="user"] .md-code-block,
+.dark [data-role="user"] .md-code-header {
+  background-color: #232326;
+}
+
+.dark .md-code-copy:hover:not([data-copied="true"]) {
+  background-color: #3f3f46;
+}
+

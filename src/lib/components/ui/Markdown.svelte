@@ -46,11 +46,11 @@
           // optimistically would lie if the write rejected (stale paste).
           void copyText(code.textContent ?? "")
             .then(() => {
-              copyBtn.textContent = "Copied";
+              copyBtn.setAttribute("data-copied", "true");
               clearTimeout(copyTimers.get(copyBtn));
               copyTimers.set(
                 copyBtn,
-                setTimeout(() => (copyBtn.textContent = "Copy"), 1000),
+                setTimeout(() => copyBtn.removeAttribute("data-copied"), 1000),
               );
             })
             .catch((err: unknown) => {

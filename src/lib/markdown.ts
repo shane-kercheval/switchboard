@@ -69,7 +69,10 @@ marked.use({
         `<div class="md-code-block">` +
         `<div class="md-code-header">` +
         `<span class="md-code-lang">${label}</span>` +
-        `<button type="button" class="md-code-copy" aria-label="Copy code">Copy</button>` +
+        `<button type="button" class="md-code-copy" aria-label="Copy code">` +
+        `<svg class="md-copy-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="8" width="12" height="12" rx="2"></rect><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"></path></svg>` +
+        `<svg class="md-check-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"></path></svg>` +
+        `</button>` +
         `</div>` +
         `<pre${langClass}><code${langClass}>${highlighted}</code></pre>` +
         `</div>`

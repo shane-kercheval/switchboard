@@ -69,7 +69,7 @@
   bind:open={menuOpen}
   triggerLabel={`Actions for ${agent.name}`}
   triggerTestid="agent-actions-trigger"
-  triggerClass="text-muted hover:text-fg hover:bg-raised flex h-6 w-6 items-center justify-center rounded-md transition-colors"
+  triggerClass="text-muted hover:text-fg hover:bg-border flex h-6 w-6 items-center justify-center rounded-md transition-colors"
   contentTestid="agent-actions-menu"
 >
   {#snippet trigger()}
@@ -115,7 +115,7 @@
     <p class="text-muted text-xs">
       Run this in your terminal to resume this session interactively.
     </p>
-    <div class="flex items-start gap-2">
+    <div class="flex items-stretch gap-2">
       <code
         class="bg-panel text-fg min-w-0 flex-1 overflow-x-auto rounded-md px-2.5 py-2 font-mono text-xs whitespace-pre"
         data-testid="resume-command">{info?.resume_command ?? ""}</code
@@ -123,7 +123,7 @@
       <button
         type="button"
         class={cn(
-          "border-border bg-panel hover:bg-raised flex h-8 w-8 shrink-0 items-center justify-center rounded-md border transition-colors",
+          "border-border bg-panel hover:bg-raised flex w-8 shrink-0 items-center justify-center rounded-md border transition-colors",
           copied ? "text-accent" : "text-muted hover:text-fg",
         )}
         data-testid="resume-copy"
@@ -151,7 +151,7 @@
             stroke-width="2"
             stroke-linecap="round"
             stroke-linejoin="round"
-            class="h-3.5 w-3.5"
+            class="h-4 w-4"
             aria-hidden="true"
           >
             <rect x="8" y="8" width="12" height="12" rx="2" />

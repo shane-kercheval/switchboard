@@ -39,8 +39,9 @@ describe("Markdown copy button", () => {
     expect(copied).toContain("<tag> & 'quote'");
     expect(copied).not.toContain("&lt;");
     expect(copied).not.toContain("<span");
-    // Confirmation appears only after the clipboard write resolves.
-    await waitFor(() => expect(button.textContent).toBe("Copied"));
+    // Confirmation (icon swap via data-copied) appears only after the clipboard
+    // write resolves.
+    await waitFor(() => expect(button).toHaveAttribute("data-copied", "true"));
   });
 
   it("does not show 'Copied' when the clipboard write fails", async () => {
@@ -54,7 +55,7 @@ describe("Markdown copy button", () => {
     await Promise.resolve();
 
     expect(copyTextMock).toHaveBeenCalledTimes(1);
-    expect(button.textContent).toBe("Copy");
+    expect(button).not.toHaveAttribute("data-copied");
   });
 
   it("resets each block's button independently (no shared timer)", async () => {
@@ -69,21 +70,21 @@ describe("Markdown copy button", () => {
 
       await fireEvent.click(a);
       await vi.advanceTimersByTimeAsync(0);
-      expect(a.textContent).toBe("Copied");
+      expect(a).toHaveAttribute("data-copied", "true");
 
       // Click B partway through A's reset window.
       await vi.advanceTimersByTimeAsync(400);
       await fireEvent.click(b);
       await vi.advanceTimersByTimeAsync(0);
-      expect(b.textContent).toBe("Copied");
+      expect(b).toHaveAttribute("data-copied", "true");
 
       // A's own timer must still fire — it isn't cancelled by B's click.
       await vi.advanceTimersByTimeAsync(700);
-      expect(a.textContent).toBe("Copy");
-      expect(b.textContent).toBe("Copied");
+      expect(a).not.toHaveAttribute("data-copied");
+      expect(b).toHaveAttribute("data-copied", "true");
 
       await vi.advanceTimersByTimeAsync(400);
-      expect(b.textContent).toBe("Copy");
+      expect(b).not.toHaveAttribute("data-copied");
     } finally {
       vi.useRealTimers();
     }

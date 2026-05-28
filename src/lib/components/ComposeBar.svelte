@@ -192,7 +192,7 @@
 
   function onInput(): void {
     const m = AT_TOKEN.exec(prompt);
-    if (m) {
+    if (m && agents.length > 1) {
       menuQuery = m[2] ?? "";
       highlighted = 0;
       menuOpen = true;

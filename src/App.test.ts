@@ -69,14 +69,15 @@ function freshBackend(): Backend {
   };
 }
 
+// Only binary probes are called from App startup. The `check_*_auth`
+// Tauri commands exist in the backend for the getting-started surface
+// (no-project state) to consume; the working UI does not proactively
+// probe auth — failures surface reactively in the transcript.
 const PROBES = [
   "check_claude_binary",
   "check_codex_binary",
-  "check_codex_auth",
   "check_gemini_binary",
-  "check_gemini_auth",
   "check_antigravity_binary",
-  "check_antigravity_auth",
 ];
 
 function summaryFor(id: string): ProjectSummary {
@@ -274,31 +275,22 @@ describe("App", () => {
     expect(screen.queryByTestId("banner-binary_missing-codex")).not.toBeInTheDocument();
   });
 
-  it("renders a Codex auth-missing banner when only the Codex auth probe fails", async () => {
-    backend.probeFailures.add("check_codex_auth");
+  it("does not call any check_*_auth probe at startup (auth is reactive-only)", async () => {
+    // Reactive-auth posture: a logged-out harness is discovered on send,
+    // not by a startup probe. The backend commands still exist (retained
+    // for the getting-started surface), but App.svelte no longer invokes
+    // them — invoking would silently bring back the proactive surface
+    // we removed.
     await mountApp();
-    await waitFor(() =>
-      expect(screen.getByTestId("banner-auth_missing-codex")).toBeInTheDocument(),
+    // Settle one tick so any errant onMount call would have landed.
+    await waitFor(() => expect(screen.getByTestId("welcome-new-project")).toBeInTheDocument());
+    const authCalls = invokeMock.mock.calls.filter(
+      ([c]) =>
+        c === "check_codex_auth" || c === "check_gemini_auth" || c === "check_antigravity_auth",
     );
-  });
-
-  it("renders a Gemini auth-missing banner when only the Gemini auth probe fails", async () => {
-    backend.probeFailures.add("check_gemini_auth");
-    await mountApp();
-    await waitFor(() =>
-      expect(screen.getByTestId("banner-auth_missing-gemini")).toBeInTheDocument(),
-    );
-    expect(screen.queryByTestId("banner-auth_missing-codex")).not.toBeInTheDocument();
-  });
-
-  it("suppresses a harness's auth banner when its binary is also missing", async () => {
-    backend.probeFailures.add("check_codex_binary");
-    backend.probeFailures.add("check_codex_auth");
-    await mountApp();
-    await waitFor(() =>
-      expect(screen.getByTestId("banner-binary_missing-codex")).toBeInTheDocument(),
-    );
-    expect(screen.queryByTestId("banner-auth_missing-codex")).not.toBeInTheDocument();
+    expect(authCalls).toHaveLength(0);
+    // And no banner anywhere — the no-banner posture is the whole point.
+    expect(screen.queryByTestId(/^banner-auth_missing-/)).not.toBeInTheDocument();
   });
 
   it("renders two binary banners simultaneously when two binaries are missing", async () => {
@@ -633,6 +625,61 @@ describe("App", () => {
     );
     await fireEvent.input(textarea, { target: { value: "again" } });
     await waitFor(() => expect(screen.getByTestId("compose-send")).not.toBeDisabled());
+  });
+
+  it("E2E reactive auth: AuthFailure turn renders the authored message in the transcript (no banner)", async () => {
+    // Reactive-auth surface: with no proactive auth banner or picker gate,
+    // a logged-out harness must still be discoverable — by sending. The
+    // adapter authors the AuthFailure message, and the transcript renders
+    // any failed turn's error text verbatim. This test exercises the full
+    // path (compose → send → turn_start → turn_end(AuthFailure)) and
+    // asserts the user sees the authored copy where they actually look
+    // (the transcript), not a banner.
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant", harness: "codex" })],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "hi" } });
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    const turnId = "99999999-9999-7000-8000-999999999999";
+    const channel = "agent:ag-1";
+    fireTo(channel, {
+      type: "turn_start",
+      turn_id: turnId,
+      message_id: backend.sendMessageId,
+      started_at: "2026-05-20T00:00:00Z",
+    });
+    fireTo(channel, {
+      type: "turn_end",
+      turn_id: turnId,
+      outcome: {
+        status: "failed",
+        kind: "auth_failure",
+        message: "Codex authentication required — run `codex login`",
+      },
+      ended_at: "2026-05-20T00:00:01Z",
+      usage: null,
+    });
+    fireTo(channel, { type: "agent_idle", agent_id: "ag-1" });
+
+    // The authored message lands in the transcript — same path any failed
+    // turn takes (the absence of a per-kind render is intentional).
+    await waitFor(() =>
+      expect(screen.getByTestId("unified-transcript")).toHaveTextContent(
+        "Codex authentication required — run `codex login`",
+      ),
+    );
+    // And the auth-banner posture is preserved: nothing in the banner stack.
+    expect(screen.queryByTestId(/^banner-auth_missing-/)).not.toBeInTheDocument();
   });
 
   // --- directory removal lifecycle (store-level: the `removeDirectory` +

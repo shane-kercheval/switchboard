@@ -36,56 +36,39 @@
   import { bannerCopy, bannerTestid } from "$lib/harnessAvailability";
   import { basename } from "$lib/utils";
 
-  // --- Per-harness availability probes (unchanged from the single-directory
-  // model; see the flat-field rationale below). ---
+  // Per-harness binary-presence probes. Auth is deliberately not tracked
+  // in this surface — a logged-out harness is discovered reactively when
+  // the user sends, and the failed turn carries an authored actionable
+  // message in the transcript. The backend `check_*_auth` Tauri commands
+  // exist for the getting-started surface (no-project state) to consume,
+  // not the working UI.
   let claudeBinary = $state<BinaryState>("checking");
   let codexBinary = $state<BinaryState>("checking");
-  let codexAuth = $state<"available" | "missing" | "checking">("checking");
   let geminiBinary = $state<BinaryState>("checking");
-  let geminiAuth = $state<"available" | "missing" | "checking">("checking");
   let antigravityBinary = $state<BinaryState>("checking");
-  let antigravityAuth = $state<"available" | "missing" | "checking">("checking");
 
   const claudeAvailability = $derived<HarnessAvailability>({
     harness: "claude_code",
     binary: claudeBinary,
-    auth: "unsupported",
   });
   const codexAvailability = $derived<HarnessAvailability>({
     harness: "codex",
     binary: codexBinary,
-    auth: codexAuth,
   });
   const geminiAvailability = $derived<HarnessAvailability>({
     harness: "gemini",
     binary: geminiBinary,
-    auth: geminiAuth,
   });
   const antigravityAvailability = $derived<HarnessAvailability>({
     harness: "antigravity",
     binary: antigravityBinary,
-    auth: antigravityAuth,
   });
 
-  const banners = $derived.by((): HarnessBanner[] => {
-    const result: HarnessBanner[] = [];
-    for (const a of [
-      claudeAvailability,
-      codexAvailability,
-      geminiAvailability,
-      antigravityAvailability,
-    ]) {
-      if (a.binary === "missing") {
-        result.push({ kind: "binary_missing", harness: a.harness });
-      } else if (
-        a.auth === "missing" &&
-        (a.harness === "codex" || a.harness === "gemini" || a.harness === "antigravity")
-      ) {
-        result.push({ kind: "auth_missing", harness: a.harness });
-      }
-    }
-    return result;
-  });
+  const banners = $derived.by((): HarnessBanner[] =>
+    [claudeAvailability, codexAvailability, geminiAvailability, antigravityAvailability]
+      .filter((a) => a.binary === "missing")
+      .map((a) => ({ kind: "binary_missing" as const, harness: a.harness })),
+  );
 
   let dirError = $state<string | null>(null);
   let projectsSidebarOpen = $state<boolean>(true);
@@ -146,9 +129,11 @@
     }
   }
 
-  // Startup: kick off the harness probes (each writes its own slice as it
-  // resolves — no barrier) and eagerly load the workspace registry (directory
-  // list + flat project list). Per-project rosters/hydration stay lazy.
+  // Startup: kick off the per-harness binary probes (each writes its own slice
+  // as it resolves — no barrier) and eagerly load the workspace registry
+  // (directory list + flat project list). Per-project rosters/hydration stay
+  // lazy. Auth probes intentionally not called here — see `claudeBinary` /
+  // `codexBinary` / etc. comment above.
   onMount(() => {
     api.checkClaudeBinary().then(
       () => (claudeBinary = "available"),
@@ -158,25 +143,13 @@
       () => (codexBinary = "available"),
       () => (codexBinary = "missing"),
     );
-    api.checkCodexAuth().then(
-      () => (codexAuth = "available"),
-      () => (codexAuth = "missing"),
-    );
     api.checkGeminiBinary().then(
       () => (geminiBinary = "available"),
       () => (geminiBinary = "missing"),
     );
-    api.checkGeminiAuth().then(
-      () => (geminiAuth = "available"),
-      () => (geminiAuth = "missing"),
-    );
     api.checkAntigravityBinary().then(
       () => (antigravityBinary = "available"),
       () => (antigravityBinary = "missing"),
-    );
-    api.checkAntigravityAuth().then(
-      () => (antigravityAuth = "available"),
-      () => (antigravityAuth = "missing"),
     );
     void loadWorkspace().catch((err) => {
       dirError = err instanceof Error ? err.message : String(err);

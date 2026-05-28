@@ -5,51 +5,13 @@ import CreateAgentForm from "./CreateAgentForm.svelte";
 import type { AgentFormSubmit } from "./CreateAgentForm.types";
 import type { HarnessAvailability } from "$lib/types";
 
-const CLAUDE_AVAILABLE: HarnessAvailability = {
-  harness: "claude_code",
-  binary: "available",
-  auth: "unsupported",
-};
-const CLAUDE_BINARY_MISSING: HarnessAvailability = {
-  harness: "claude_code",
-  binary: "missing",
-  auth: "unsupported",
-};
-const CODEX_AVAILABLE: HarnessAvailability = {
-  harness: "codex",
-  binary: "available",
-  auth: "available",
-};
-const CODEX_BINARY_MISSING: HarnessAvailability = {
-  harness: "codex",
-  binary: "missing",
-  auth: "missing",
-};
-const CODEX_AUTH_MISSING: HarnessAvailability = {
-  harness: "codex",
-  binary: "available",
-  auth: "missing",
-};
-const CLAUDE_CHECKING: HarnessAvailability = {
-  harness: "claude_code",
-  binary: "checking",
-  auth: "unsupported",
-};
-const CODEX_CHECKING: HarnessAvailability = {
-  harness: "codex",
-  binary: "checking",
-  auth: "checking",
-};
-const GEMINI_AVAILABLE: HarnessAvailability = {
-  harness: "gemini",
-  binary: "available",
-  auth: "available",
-};
-const GEMINI_AUTH_MISSING: HarnessAvailability = {
-  harness: "gemini",
-  binary: "available",
-  auth: "missing",
-};
+const CLAUDE_AVAILABLE: HarnessAvailability = { harness: "claude_code", binary: "available" };
+const CLAUDE_BINARY_MISSING: HarnessAvailability = { harness: "claude_code", binary: "missing" };
+const CODEX_AVAILABLE: HarnessAvailability = { harness: "codex", binary: "available" };
+const CODEX_BINARY_MISSING: HarnessAvailability = { harness: "codex", binary: "missing" };
+const CLAUDE_CHECKING: HarnessAvailability = { harness: "claude_code", binary: "checking" };
+const CODEX_CHECKING: HarnessAvailability = { harness: "codex", binary: "checking" };
+const GEMINI_AVAILABLE: HarnessAvailability = { harness: "gemini", binary: "available" };
 
 const VALID_UUID = "019e2c5f-aaaa-7000-8000-000000000001";
 
@@ -169,21 +131,6 @@ describe("CreateAgentForm", () => {
     } satisfies AgentFormSubmit);
   });
 
-  it("Gemini auth missing: Gemini control disabled; tooltip mentions interactive sign-in", async () => {
-    const onSubmit = vi.fn();
-    render(CreateAgentForm, {
-      props: {
-        onSubmit,
-        claudeAvailability: CLAUDE_AVAILABLE,
-        codexAvailability: CODEX_AVAILABLE,
-        geminiAvailability: GEMINI_AUTH_MISSING,
-      },
-    });
-    const geminiControl = screen.getByTestId("harness-gemini") as HTMLInputElement;
-    expect(geminiControl.disabled).toBe(true);
-    expect(geminiControl.closest("label")?.getAttribute("title")).toContain("gemini`");
-  });
-
   it("all three harnesses available: Gemini control enabled by default", () => {
     const onSubmit = vi.fn();
     render(CreateAgentForm, {
@@ -245,20 +192,6 @@ describe("CreateAgentForm", () => {
       name: "assistant",
       harness: "claude_code",
     } satisfies AgentFormSubmit);
-  });
-
-  it("Codex auth missing (binary available): Codex control disabled; tooltip mentions codex login", async () => {
-    const onSubmit = vi.fn();
-    render(CreateAgentForm, {
-      props: {
-        onSubmit,
-        claudeAvailability: CLAUDE_AVAILABLE,
-        codexAvailability: CODEX_AUTH_MISSING,
-      },
-    });
-    const codexControl = screen.getByTestId("harness-codex") as HTMLInputElement;
-    expect(codexControl.disabled).toBe(true);
-    expect(codexControl.closest("label")?.getAttribute("title")).toContain("codex login");
   });
 
   it("Claude binary missing: Claude control disabled, Codex remains selectable", async () => {

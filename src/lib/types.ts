@@ -212,80 +212,39 @@ export type ReducerInput = NormalizedEvent | HeartbeatTimeout | Hydrate;
 // pre-generated at registration time.
 export type HarnessKind = "claude_code" | "codex" | "gemini" | "antigravity";
 
-/// Result of the startup-time per-harness probes. `binary` is the
-/// `which`-on-PATH check; `auth` is the best-effort subscription-auth
-/// detection (Codex only — Claude's auth lives in the macOS keychain with
-/// no reliable file signal, deferred to a future release).
-///
-/// **Discriminated union, not a flat record.** The v1 invariant "auth
-/// detection is Codex-only; Claude's auth is always `unsupported`" is
-/// encoded structurally in the type: the Claude variant's `auth` is
-/// the literal `"unsupported"`, the Codex variant's covers the real
-/// probe states. Consumers narrow on `harness` before accessing `auth`,
-/// and `a.auth === "missing"` is only type-checkable for the Codex
-/// variant. This eliminates the runtime-guard-with-defensive-arm
-/// pattern that a flat record forces on every consumer.
-///
-/// A future harness with file-detectable auth adds a new variant
-/// rather than widening Claude's auth field — the compiler then forces
-/// every consumer (banner copy, form gating) to acknowledge the new
-/// case explicitly.
-///
-/// **State semantics** (per the Codex variant; Claude has only
-/// `unsupported`):
-/// - `"checking"`: probe in flight; the initial value at mount. Form
+/// State of the `which`-on-PATH binary probe for a single harness.
+/// - `"checking"`: probe in flight (the initial value at mount). Form
 ///   gating treats this as not-selectable (silent disable — no scary
 ///   "Checking…" copy) so a user racing the probe can't submit before
-///   we know.
+///   the result lands. Fail-closed by type, not by polite hope.
 /// - `"available"`: probe completed positively.
 /// - `"missing"`: probe completed negatively. Banner copy is actionable
-///   (install link / `codex login`).
-/// - `"unsupported"`: only on the Claude variant.
-///
-/// Replacing the original optimistic-"available" default with `"checking"`
-/// makes the pre-probe semantics structural rather than convention-based:
-/// fail-closed by type, not by polite hope.
+///   (install link).
 export type BinaryState = "available" | "missing" | "checking";
 
-export type HarnessAvailability =
-  | {
-      harness: "claude_code";
-      binary: BinaryState;
-      auth: "unsupported";
-    }
-  | {
-      harness: "codex";
-      binary: BinaryState;
-      auth: "available" | "missing" | "checking";
-    }
-  | {
-      harness: "gemini";
-      binary: BinaryState;
-      auth: "available" | "missing" | "checking";
-    }
-  | {
-      harness: "antigravity";
-      binary: BinaryState;
-      auth: "available" | "missing" | "checking";
-    };
-
-/// Structured banner shape. The App.svelte banner-stack ordering rule:
-/// binary-missing banners first; for any harness whose binary is missing,
-/// the auth banner is suppressed (auth is irrelevant if the CLI isn't
-/// installed).
+/// Frontend availability surface. Tracks binary presence only — auth is
+/// **not** a frontend concern in v1: a logged-out harness is discovered
+/// reactively when the user sends, surfaced as an `AuthFailure` turn in
+/// the transcript (with an authored actionable message per adapter). No
+/// proactive banner, no picker gate on auth grounds.
 ///
-/// **v1 invariant encoded in the type**: `auth_missing` is restricted to
-/// harnesses with detectable auth — Codex's `~/.codex/auth.json`,
-/// Gemini's `~/.gemini/settings.json`, and Antigravity's macOS Keychain
-/// entry (service `gemini`, account `antigravity`). Claude's auth is
-/// `"unsupported"` (keychain-based on macOS with no reliable probe yet —
-/// see `HarnessAvailability` docstring). A future Claude auth probe must
-/// add a new banner variant or extend the `harness` literal explicitly;
-/// the closed set prevents accidental auth-banner copy from leaking onto
-/// Claude rows.
-export type HarnessBanner =
-  | { kind: "binary_missing"; harness: HarnessKind }
-  | { kind: "auth_missing"; harness: "codex" | "gemini" | "antigravity" };
+/// The backend `check_*_auth` Tauri commands exist for the getting-started
+/// surface (no-project state) to consume; nothing in the working UI calls
+/// them.
+export type HarnessAvailability = {
+  harness: HarnessKind;
+  binary: BinaryState;
+};
+
+/// Structured banner shape. The only banner variant is the
+/// binary-missing case — a missing CLI is a real install problem the
+/// user needs to act on before sends will work at all. Auth has no
+/// banner: a logged-out harness is surfaced reactively in the transcript
+/// when the user sends.
+export type HarnessBanner = {
+  kind: "binary_missing";
+  harness: HarnessKind;
+};
 
 export type AgentRecord = {
   id: AgentId;

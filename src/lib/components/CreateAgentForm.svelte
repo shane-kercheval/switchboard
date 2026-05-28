@@ -18,10 +18,10 @@
     onCancel?: () => void;
     /// Optional per-harness availability. When provided, gates the radio
     /// buttons (and the submit button if the currently-selected harness
-    /// is unavailable). Tooltip copy matches the banner copy in
-    /// `App.svelte` verbatim so the user sees the same gap stated in
-    /// both places. Defaults to "both harnesses available" so tests
-    /// that don't care about gating render unchanged.
+    /// is unavailable) on binary-presence only. Tooltip copy matches the
+    /// banner copy in `App.svelte` verbatim so the user sees the same
+    /// gap stated in both places. Defaults to "all harnesses available"
+    /// so tests that don't care about gating render unchanged.
     claudeAvailability?: HarnessAvailability;
     codexAvailability?: HarnessAvailability;
     geminiAvailability?: HarnessAvailability;
@@ -33,10 +33,10 @@
     error = null,
     onSubmit,
     onCancel,
-    claudeAvailability = { harness: "claude_code", binary: "available", auth: "unsupported" },
-    codexAvailability = { harness: "codex", binary: "available", auth: "available" },
-    geminiAvailability = { harness: "gemini", binary: "available", auth: "available" },
-    antigravityAvailability = { harness: "antigravity", binary: "available", auth: "available" },
+    claudeAvailability = { harness: "claude_code", binary: "available" },
+    codexAvailability = { harness: "codex", binary: "available" },
+    geminiAvailability = { harness: "gemini", binary: "available" },
+    antigravityAvailability = { harness: "antigravity", binary: "available" },
   }: Props = $props();
   let name = $state<string>("assistant");
   let harness = $state<HarnessKind>("claude_code");

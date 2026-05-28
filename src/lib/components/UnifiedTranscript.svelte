@@ -238,7 +238,7 @@
 
 {#snippet userMessage(row: Extract<UnifiedRow, { kind: "user" }>)}
   <div class="group min-w-0 flex-1" data-testid="turn" data-role="user">
-    <div class="bg-blue-100/20 -mx-3 rounded-md px-3 py-2">
+    <div class="-mx-3 rounded-md bg-blue-100/20 px-3 py-2">
       <Markdown text={row.text} />
     </div>
     {@render messageMeta(row.at, row.text, "Copy message")}

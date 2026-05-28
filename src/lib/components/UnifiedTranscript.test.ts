@@ -169,7 +169,11 @@ describe("UnifiedTranscript", () => {
     expect(turns[1]).toHaveAttribute("data-role", "agent");
   });
 
-  it("labels the user's own turn as 'User' (recipients are shown by the responses)", async () => {
+  it("renders the user's own turn distinctly from agent turns (role attribution, no explicit label)", async () => {
+    // The user message renders as just the prompt text — no "User" label —
+    // because authorship is implicit (it's the only non-agent role).
+    // Recipient agents are still labeled by name on their response turns.
+    // Outer container carries data-role="user" for styling / queries.
     const state = await loadState();
     await state.registerAgent(CODEX_AGENT);
     state.transcripts[CODEX_AGENT.id] = [
@@ -185,7 +189,9 @@ describe("UnifiedTranscript", () => {
     const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CODEX_AGENT] } });
 
-    expect(screen.getByTestId("turn-author")).toHaveTextContent("User");
+    const turn = screen.getByTestId("turn");
+    expect(turn).toHaveAttribute("data-role", "user");
+    expect(turn).toHaveTextContent("test");
   });
 
   it("renders interleaved text/tool/text items in order", async () => {
@@ -623,10 +629,13 @@ describe("UnifiedTranscript — fan-out groups", () => {
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT, CODEX_AGENT] } });
 
     expect(screen.getByTestId("fanout-group")).toBeInTheDocument();
-    // The user's message renders once, labeled "User" (recipients are the columns).
-    const authors = screen.getAllByTestId("turn-author");
-    expect(authors).toHaveLength(1);
-    expect(authors[0]).toHaveTextContent("User");
+    // The user's message renders once at the group head — exactly one
+    // user-role turn in the group. The "User" label is gone by design
+    // (the user-role is implicit); recipients are conveyed by columns.
+    const userTurns = screen
+      .getAllByTestId("turn")
+      .filter((el) => el.getAttribute("data-role") === "user");
+    expect(userTurns).toHaveLength(1);
     // One column per recipient, in recipient order, each with its response.
     const columns = screen.getAllByTestId("fanout-column");
     expect(columns).toHaveLength(2);

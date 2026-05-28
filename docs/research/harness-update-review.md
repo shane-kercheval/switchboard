@@ -42,6 +42,7 @@ For each changelog item, ask "does it touch one of these contracts?" Most items 
 - **Turn-completion & error detection** — the terminal signal (`result` / `turn.completed`+`turn.failed` / `result.status` / transcript terminal record) and the error discriminants (`is_error`, `turn.failed`, status:error). Did the shape change?
 - **Exit-code semantics** — especially the "exits 0 on SIGTERM / on error" cases the cancel path and outcome classification rely on.
 - **Session-file layout & fields** — path/naming and the specific fields we read (rate limits, context window, model, usage/tokens, thinking). Map against `session_file.rs`.
+- **Session-file record ordering invariants** — does the parser assume strict time-ordering of records, or does it tolerate out-of-order writes? Claude 2.1.150+ writes some `tool_result` records before their matching `tool_use` (within the same turn); our Claude parser tolerates this via a deferred-results queue. If a future Claude version delays a `tool_use` across a *turn boundary* the queue's per-session scope would no longer be safe. Re-verify after Claude updates by running `live_claude_tool_results_bind_after_restart` against a multi-tool prompt (`make test-live-claude`).
 - **Auth-failure shape** — the strings/fields our detector matches.
 - **Failure / quota message shapes** — substrings we classify on. (We prefer passing harness messages **verbatim**, which is drift-resilient; flag any place we substring-match.)
 - **Resume command** — the interactive TUI-resume invocation we generate/copy (M4.8).

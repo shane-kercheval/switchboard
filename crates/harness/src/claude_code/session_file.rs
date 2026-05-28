@@ -107,9 +107,7 @@ pub fn load_claude_transcript(
             Err(e) => state.warn(line_number, format!("malformed JSON: {e}")),
         }
     }
-    let warnings = state.warnings.clone();
     let mut transcript = state.finalize();
-    transcript.warnings = warnings;
     transcript.meta = Some(merge_meta_with_loaders(
         transcript.meta.take(),
         load_mcp_servers(home_dir, cwd),
@@ -151,6 +149,20 @@ struct ReconstructionState {
     current_agent: Option<AgentTurnBuilder>,
     first_model: Option<String>,
     warnings: Vec<ParseWarning>,
+    /// `tool_result` records whose matching `tool_use` hasn't been seen
+    /// yet. Claude Code 2.1.150 was observed to write `tool_result`
+    /// records to disk *before* their matching `tool_use` (within the
+    /// same turn; ~1s gap; observed in session
+    /// `22300f1b-3efe-4dbc-a4a0-7c1c954d1da2.jsonl` lines 1406/1408 and
+    /// 1607/1609). `handle_assistant` drains matches when the
+    /// corresponding `tool_use` arrives.
+    ///
+    /// Effectively per-turn lifetime: flushed as warnings on every new
+    /// user prompt (`handle_user` string branch) and on `finalize`.
+    /// A deferred entry never crosses a turn boundary — even if a same
+    /// `tool_use_id` appears in a later turn, the stale entry has been
+    /// flushed by then and won't silently bind to the new turn's tool.
+    pending_tool_results: Vec<DeferredToolResult>,
 }
 
 struct AgentTurnBuilder {
@@ -162,6 +174,14 @@ struct AgentTurnBuilder {
     usage: Option<TurnUsage>,
 }
 
+struct DeferredToolResult {
+    tool_use_id: String,
+    output: String,
+    is_error: bool,
+    completed_at: Option<DateTime<Utc>>,
+    line_number: usize,
+}
+
 impl ReconstructionState {
     fn new(agent_id: AgentId) -> Self {
         Self {
@@ -170,6 +190,7 @@ impl ReconstructionState {
             current_agent: None,
             first_model: None,
             warnings: Vec::new(),
+            pending_tool_results: Vec::new(),
         }
     }
 
@@ -197,14 +218,34 @@ impl ReconstructionState {
         }
     }
 
+    /// Drain `pending_tool_results` into warnings. Called at each turn
+    /// boundary (a new user prompt) and at `finalize` — deferred
+    /// `tool_result` entries must not survive across the turn they
+    /// belong to, or a same-id `tool_use` in a later turn would silently
+    /// bind the stale output and corrupt the reconstructed transcript.
+    fn flush_deferred_as_warnings(&mut self) {
+        for deferred in std::mem::take(&mut self.pending_tool_results) {
+            self.warnings.push(ParseWarning {
+                line_number: deferred.line_number,
+                reason: format!(
+                    "tool_result for {} never matched a tool_use",
+                    deferred.tool_use_id
+                ),
+            });
+        }
+    }
+
     fn handle_user(&mut self, line_number: usize, record: &Value) {
         let message = record.get("message");
         let content = message.and_then(|m| m.get("content"));
         match content {
             Some(Value::String(text)) => {
-                // Fresh user prompt — close any open agent turn, then open a
-                // new User turn.
+                // Fresh user prompt — close any open agent turn, flush any
+                // unmatched deferred tool_results (they belonged to the
+                // turn that just ended; they must not carry into the new
+                // turn), then open a new User turn.
                 self.close_current_agent(TurnStatus::Complete);
+                self.flush_deferred_as_warnings();
                 let started_at = parse_timestamp(record).unwrap_or_else(Utc::now);
                 self.turns.push(Turn::User {
                     turn_id: Uuid::now_v7(),
@@ -285,15 +326,30 @@ impl ReconstructionState {
                     };
                     let name = block.get("name").and_then(Value::as_str).unwrap_or("");
                     let input = block.get("input").cloned().unwrap_or(Value::Null);
+
+                    // Late-bind: if a tool_result for this id arrived
+                    // earlier (Claude can write tool_result before tool_use
+                    // — see ReconstructionState::pending_tool_results),
+                    // pull it from the deferred queue and apply it now.
+                    let deferred = self
+                        .pending_tool_results
+                        .iter()
+                        .position(|d| d.tool_use_id == id)
+                        .map(|pos| self.pending_tool_results.swap_remove(pos));
+                    let (output, is_error, completed_at) = match deferred {
+                        Some(d) => (Some(d.output), Some(d.is_error), d.completed_at),
+                        None => (None, None, None),
+                    };
+
                     builder.items.push(TurnItem::Tool {
                         tool_use_id: id.to_owned(),
                         kind: classify_claude_tool_kind(name),
                         name: name.to_owned(),
                         input,
-                        output: None,
-                        is_error: None,
+                        output,
+                        is_error,
                         started_at: timestamp,
-                        completed_at: None,
+                        completed_at,
                     });
                 }
                 _ => {
@@ -319,38 +375,38 @@ impl ReconstructionState {
             .unwrap_or(false);
         let output = extract_tool_result_text(block.get("content"));
 
-        let Some(builder) = self.current_agent.as_mut() else {
-            self.warnings.push(ParseWarning {
-                line_number,
-                reason: format!("tool_result for {tool_use_id} has no open agent turn"),
-            });
-            return;
-        };
-
-        let mut matched = false;
-        for item in &mut builder.items {
-            if let TurnItem::Tool {
-                tool_use_id: id,
-                output: out,
-                is_error: err,
-                completed_at: cat,
-                ..
-            } = item
-                && id == tool_use_id
-            {
-                *out = Some(output.clone());
-                *err = Some(is_error);
-                *cat = completed_at;
-                matched = true;
-                break;
+        // Happy path: matching tool_use already in the current builder.
+        if let Some(builder) = self.current_agent.as_mut() {
+            for item in &mut builder.items {
+                if let TurnItem::Tool {
+                    tool_use_id: id,
+                    output: out,
+                    is_error: err,
+                    completed_at: cat,
+                    ..
+                } = item
+                    && id == tool_use_id
+                {
+                    *out = Some(output);
+                    *err = Some(is_error);
+                    *cat = completed_at;
+                    return;
+                }
             }
         }
-        if !matched {
-            self.warnings.push(ParseWarning {
-                line_number,
-                reason: format!("tool_result for {tool_use_id} did not match any open tool"),
-            });
-        }
+
+        // No matching tool_use yet — either no current agent turn at all
+        // (the tool_result preceded any assistant record) or the builder
+        // exists but hasn't seen this id (the matching tool_use is later
+        // in the file). Defer; `handle_assistant` will bind it when the
+        // tool_use arrives, or `finalize` will warn if it never does.
+        self.pending_tool_results.push(DeferredToolResult {
+            tool_use_id: tool_use_id.to_owned(),
+            output,
+            is_error,
+            completed_at,
+            line_number,
+        });
     }
 
     fn close_current_agent(&mut self, status: TurnStatus) {
@@ -381,7 +437,14 @@ impl ReconstructionState {
         // `Failed` when the marker is missing. See `crates/harness/src/
         // codex/session_file.rs::CodexReconstruction::finalize` for the
         // other side of the asymmetry.
+        //
+        // Ordering: close the current agent *before* flushing deferred
+        // tool_results. Binding happens in `handle_assistant`, not in
+        // `close_current_agent`, so by this point any remaining deferreds
+        // are genuinely unmatched (the matching `tool_use` never appeared
+        // in the final turn's records).
         self.close_current_agent(TurnStatus::Complete);
+        self.flush_deferred_as_warnings();
         let meta = self.first_model.map(|model| SessionMetaInfo {
             model,
             harness_version: String::new(),
@@ -393,7 +456,7 @@ impl ReconstructionState {
             turns: self.turns,
             meta,
             last_rate_limit: None,
-            warnings: vec![],
+            warnings: self.warnings,
         }
     }
 }
@@ -645,6 +708,274 @@ mod tests {
             }
             _ => panic!("expected Tool item"),
         }
+    }
+
+    // --- Out-of-order tool_use / tool_result binding (M2 of the parser
+    // fidelity plan: Claude 2.1.150 was observed to write tool_result
+    // records to disk before their matching tool_use, ~1s gap, in session
+    // `22300f1b-3efe-4dbc-a4a0-7c1c954d1da2.jsonl` lines 1406/1408 and
+    // 1607/1609). Tests assert on the returned LoadedTranscript — the path
+    // production goes through — not on intermediate state. ---
+
+    fn user_tool_result(tool_use_id: &str, output: &str, timestamp: &str) -> Value {
+        json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": output,
+                    "is_error": false
+                }]
+            },
+            "timestamp": timestamp
+        })
+    }
+
+    fn assistant_tool_use(tool_use_id: &str, name: &str, input: &Value, timestamp: &str) -> Value {
+        json!({
+            "type": "assistant",
+            "message": {
+                "model": "claude-sonnet-4-6",
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": tool_use_id,
+                    "name": name,
+                    "input": input
+                }],
+                "usage": { "input_tokens": 1, "output_tokens": 1 }
+            },
+            "timestamp": timestamp
+        })
+    }
+
+    /// The bug: Claude 2.1.150 can write a `tool_result` before its matching
+    /// `tool_use` in the session file. Pre-M2, the parser dropped the
+    /// `tool_result`'s output silently and emitted a "did not match any
+    /// open tool" warning. After M2, the deferred queue binds at
+    /// `tool_use` time and no warning surfaces.
+    #[test]
+    fn out_of_order_tool_result_before_tool_use_binds_via_deferred_queue() {
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let session_id = Uuid::now_v7();
+        let agent_id = Uuid::now_v7();
+        // Order on disk: user prompt → first assistant record (text) →
+        // user/tool_result for toolu_x (before the tool_use exists) →
+        // assistant/tool_use toolu_x (binds the deferred result).
+        let content = jsonl(&[
+            user_record("Run ls", "2026-05-14T04:43:15Z"),
+            assistant_text_record("running bash", "claude-sonnet-4-6", "2026-05-14T04:43:16Z"),
+            user_tool_result("toolu_x", "ls-output", "2026-05-14T04:43:17Z"),
+            assistant_tool_use(
+                "toolu_x",
+                "Bash",
+                &json!({ "command": "ls" }),
+                "2026-05-14T04:43:18Z",
+            ),
+        ]);
+        stage_session_file(home.path(), cwd.path(), session_id, &content);
+
+        let result = load_claude_transcript(home.path(), cwd.path(), session_id, agent_id).unwrap();
+        assert!(
+            result.warnings.is_empty(),
+            "out-of-order binding must not warn; got {:?}",
+            result.warnings,
+        );
+        let Turn::Agent { items, .. } = &result.turns[1] else {
+            panic!("expected Agent turn");
+        };
+        let tool = items
+            .iter()
+            .find(|i| matches!(i, TurnItem::Tool { tool_use_id, .. } if tool_use_id == "toolu_x"))
+            .expect("Bash TurnItem must exist");
+        match tool {
+            TurnItem::Tool {
+                output,
+                is_error,
+                completed_at,
+                ..
+            } => {
+                assert_eq!(output.as_deref(), Some("ls-output"));
+                assert_eq!(*is_error, Some(false));
+                assert!(completed_at.is_some());
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Case-(a) regression guard: `tool_result` arrives before ANY
+    /// assistant record for the turn (no `current_agent` yet). The
+    /// builder-scoped queue that this milestone replaced would have
+    /// missed this case — the warning path "no open agent turn" would
+    /// have fired and the output dropped. With the queue on
+    /// `ReconstructionState`, the deferred entry survives until
+    /// `handle_assistant` creates the builder and binds the match.
+    #[test]
+    fn tool_result_before_any_assistant_record_binds_when_assistant_arrives() {
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let session_id = Uuid::now_v7();
+        let agent_id = Uuid::now_v7();
+        let content = jsonl(&[
+            user_record("Run ls", "2026-05-14T04:43:15Z"),
+            // tool_result arrives before any assistant record — no
+            // current_agent at this point.
+            user_tool_result("toolu_x", "ls-output", "2026-05-14T04:43:16Z"),
+            // First assistant record creates the builder; tool_use binds
+            // the deferred result.
+            assistant_tool_use(
+                "toolu_x",
+                "Bash",
+                &json!({ "command": "ls" }),
+                "2026-05-14T04:43:17Z",
+            ),
+        ]);
+        stage_session_file(home.path(), cwd.path(), session_id, &content);
+
+        let result = load_claude_transcript(home.path(), cwd.path(), session_id, agent_id).unwrap();
+        assert!(
+            result.warnings.is_empty(),
+            "pre-builder deferred binding must not warn; got {:?}",
+            result.warnings,
+        );
+        let Turn::Agent { items, .. } = &result.turns[1] else {
+            panic!("expected Agent turn after user turn");
+        };
+        match items.iter().find_map(|i| match i {
+            TurnItem::Tool {
+                tool_use_id,
+                output,
+                ..
+            } if tool_use_id == "toolu_x" => Some(output.as_deref()),
+            _ => None,
+        }) {
+            Some(Some("ls-output")) => {}
+            other => panic!("expected toolu_x to be bound with 'ls-output', got {other:?}"),
+        }
+    }
+
+    /// Genuine miss: a `tool_result` whose `tool_use_id` never appears.
+    /// Surfaces as exactly one warning on the **returned transcript** —
+    /// guards both the unmatched-detection contract and the
+    /// finalize-warning-attachment fix (without that attachment, this
+    /// warning would be silently dropped).
+    #[test]
+    fn unmatched_tool_result_surfaces_as_warning_on_returned_transcript() {
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let session_id = Uuid::now_v7();
+        let agent_id = Uuid::now_v7();
+        let content = jsonl(&[
+            user_record("Run ls", "2026-05-14T04:43:15Z"),
+            assistant_text_record("answering", "claude-sonnet-4-6", "2026-05-14T04:43:16Z"),
+            user_tool_result("toolu_ORPHAN", "stray", "2026-05-14T04:43:17Z"),
+        ]);
+        stage_session_file(home.path(), cwd.path(), session_id, &content);
+
+        let result = load_claude_transcript(home.path(), cwd.path(), session_id, agent_id).unwrap();
+        assert_eq!(
+            result.warnings.len(),
+            1,
+            "expected one warning for the unmatched tool_result; got {:?}",
+            result.warnings,
+        );
+        assert!(
+            result.warnings[0].reason.contains("toolu_ORPHAN"),
+            "warning must name the orphan id; got {:?}",
+            result.warnings[0].reason,
+        );
+        assert!(
+            result.warnings[0]
+                .reason
+                .contains("never matched a tool_use"),
+            "warning must use the unified post-M2 wording; got {:?}",
+            result.warnings[0].reason,
+        );
+        // No phantom TurnItem::Tool is created — the orphan result
+        // doesn't surface as an empty-output Tool item.
+        let Turn::Agent { items, .. } = &result.turns[1] else {
+            panic!("expected Agent turn");
+        };
+        assert!(
+            !items.iter().any(
+                |i| matches!(i, TurnItem::Tool { tool_use_id, .. } if tool_use_id == "toolu_ORPHAN")
+            ),
+            "orphan tool_result must not produce a phantom Tool item",
+        );
+    }
+
+    /// Cross-turn binding guard: an orphan `tool_result` in turn A must
+    /// not silently bind to a same-id `tool_use` in turn B. Pre-fix the
+    /// deferred queue's per-session lifetime would have carried the
+    /// orphan across the turn boundary and attached the stale output to
+    /// turn B's tool — exactly the silent corruption the warning surface
+    /// is meant to catch. Post-fix the queue flushes as a warning at
+    /// every new user prompt.
+    #[test]
+    fn orphan_tool_result_does_not_bind_across_turn_boundary() {
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let session_id = Uuid::now_v7();
+        let agent_id = Uuid::now_v7();
+        let content = jsonl(&[
+            // Turn A: user prompt + assistant text + orphan tool_result
+            // (no matching tool_use anywhere in turn A).
+            user_record("first prompt", "2026-05-14T04:43:15Z"),
+            assistant_text_record("answering", "claude-sonnet-4-6", "2026-05-14T04:43:16Z"),
+            user_tool_result("toolu_x", "stale-output", "2026-05-14T04:43:17Z"),
+            // Turn B: user prompt re-using the same tool_use_id. The
+            // orphan from turn A must have been flushed at the boundary,
+            // so turn B's tool_use binds with no output.
+            user_record("second prompt", "2026-05-14T04:43:18Z"),
+            assistant_tool_use(
+                "toolu_x",
+                "Bash",
+                &json!({ "command": "ls" }),
+                "2026-05-14T04:43:19Z",
+            ),
+        ]);
+        stage_session_file(home.path(), cwd.path(), session_id, &content);
+
+        let result = load_claude_transcript(home.path(), cwd.path(), session_id, agent_id).unwrap();
+        assert_eq!(
+            result.warnings.len(),
+            1,
+            "turn-A orphan must surface as exactly one warning; got {:?}",
+            result.warnings,
+        );
+        assert!(
+            result.warnings[0].reason.contains("toolu_x"),
+            "warning must name the orphan id; got {:?}",
+            result.warnings[0].reason,
+        );
+
+        // Turn B's tool_use must NOT have bound the stale output. Find
+        // turn B's Agent turn and assert its toolu_x has output: None.
+        let turn_b_agent = result
+            .turns
+            .iter()
+            .filter_map(|t| match t {
+                Turn::Agent { items, .. } => Some(items),
+                _ => None,
+            })
+            .next_back()
+            .expect("expected an Agent turn from turn B");
+        let bound = turn_b_agent.iter().find_map(|i| match i {
+            TurnItem::Tool {
+                tool_use_id,
+                output,
+                ..
+            } if tool_use_id == "toolu_x" => Some(output.as_deref()),
+            _ => None,
+        });
+        assert_eq!(
+            bound,
+            Some(None),
+            "turn B's toolu_x must have output=None; the orphan from turn A must not bind across the boundary",
+        );
     }
 
     /// Disk-side regression guard for the subagent rendering contract.

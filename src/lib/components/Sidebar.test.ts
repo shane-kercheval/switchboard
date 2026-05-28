@@ -238,6 +238,95 @@ describe("Sidebar", () => {
   });
 });
 
+/// Transcript-warnings indicator. The indicator persists for the
+/// lifetime of a project session — it's the project's drift detector
+/// for upstream CLI parser changes (see `harness-update-review.md`).
+/// What changed in M3: native `title=` → themed `Tooltip` with rows;
+/// 10-row cap with "+N more" footer for long tails.
+describe("Sidebar agent-parse-warnings tooltip", () => {
+  beforeEach(() => {
+    // bits-ui Tooltip has a 500ms delayDuration; fake timers let
+    // hover-driven content appear immediately in test time.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("shows the indicator with the count and uses Tooltip (not native title)", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    const runtime = state.runtimes[CLAUDE_AGENT.id];
+    if (runtime === undefined) throw new Error("unreachable");
+    state.runtimes[CLAUDE_AGENT.id] = {
+      ...runtime,
+      parse_warnings: [
+        { line_number: 17, reason: "tool_result for toolu_a never matched a tool_use" },
+        { line_number: 42, reason: "tool_result for toolu_b never matched a tool_use" },
+      ],
+    };
+
+    const Sidebar = (await import("./Sidebar.svelte")).default;
+    render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+
+    const indicator = screen.getByTestId("agent-parse-warnings");
+    expect(indicator).toHaveTextContent("⚠ 2 transcript warnings");
+    // Native `title=` is gone — the themed Tooltip replaces it.
+    expect(indicator).not.toHaveAttribute("title");
+    // Keyboard-reachable: the trigger is a <div> (no click action implied),
+    // so it needs an explicit tabindex to receive focus. Without this,
+    // keyboard-only users couldn't open the tooltip to read the warnings.
+    // The Tooltip.test.ts focus test exercises the primitive with a
+    // <button> harness, which is intrinsically focusable; this pins the
+    // production-shape contract.
+    expect(indicator).toHaveAttribute("tabindex", "0");
+
+    await fireEvent.pointerEnter(indicator);
+    await vi.advanceTimersByTimeAsync(500);
+    await waitFor(() => screen.getByTestId("agent-parse-warnings-list"));
+
+    const rows = screen.getAllByTestId("agent-parse-warnings-row");
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toHaveTextContent("line 17:");
+    expect(rows[0]).toHaveTextContent("tool_result for toolu_a never matched a tool_use");
+    expect(rows[1]).toHaveTextContent("line 42:");
+    expect(rows[1]).toHaveTextContent("tool_result for toolu_b never matched a tool_use");
+    // No overflow row when under the cap.
+    expect(screen.queryByTestId("agent-parse-warnings-overflow")).not.toBeInTheDocument();
+  });
+
+  it("caps at 10 rows and renders an overflow footer for the remainder", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    const runtime = state.runtimes[CLAUDE_AGENT.id];
+    if (runtime === undefined) throw new Error("unreachable");
+    state.runtimes[CLAUDE_AGENT.id] = {
+      ...runtime,
+      parse_warnings: Array.from({ length: 12 }, (_, i) => ({
+        line_number: i + 1,
+        reason: `warning ${i + 1}`,
+      })),
+    };
+
+    const Sidebar = (await import("./Sidebar.svelte")).default;
+    render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+
+    // Indicator reflects the full count (not the cap).
+    expect(screen.getByTestId("agent-parse-warnings")).toHaveTextContent(
+      "⚠ 12 transcript warnings",
+    );
+
+    await fireEvent.pointerEnter(screen.getByTestId("agent-parse-warnings"));
+    await vi.advanceTimersByTimeAsync(500);
+    await waitFor(() => screen.getByTestId("agent-parse-warnings-list"));
+
+    expect(screen.getAllByTestId("agent-parse-warnings-row")).toHaveLength(10);
+    const overflow = screen.getByTestId("agent-parse-warnings-overflow");
+    expect(overflow).toHaveTextContent("+ 2 more");
+  });
+});
+
 // agent-scoped events not crashing the component — direct-listener
 // integration covered by index.test.ts already.
 describe("Sidebar agent-scoped event tolerance", () => {

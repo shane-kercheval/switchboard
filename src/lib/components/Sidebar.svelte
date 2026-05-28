@@ -7,7 +7,13 @@
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
   import PlusIcon from "$lib/components/ui/PlusIcon.svelte";
   import AgentActionsMenu from "$lib/components/AgentActionsMenu.svelte";
+  import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
+
+  /// Cap the per-tooltip warning rows so a session with a long tail
+  /// (50+) doesn't render a wall of text. Anything beyond is summarized
+  /// as "+ N more"; the underlying `parse_warnings` array is untouched.
+  const WARNING_ROW_CAP = 10;
 
   /// An agent is "active" — currently driving work — when its turn is in-flight
   /// (run_status) or it still has queued sends. Gates the "Stop agent" action and
@@ -190,18 +196,45 @@
               </div>
             {/if}
             {#if runtime?.parse_warnings && runtime.parse_warnings.length > 0}
-              <div
-                class="text-warning mt-1 text-xs"
-                data-testid="agent-parse-warnings"
-                title={runtime.parse_warnings
-                  .map((w) => `line ${w.line_number}: ${w.reason}`)
-                  .join("\n")}
-              >
-                ⚠ {runtime.parse_warnings.length} transcript warning{runtime.parse_warnings
-                  .length === 1
-                  ? ""
-                  : "s"}
-              </div>
+              {@const warnings = runtime.parse_warnings}
+              {@const visible = warnings.slice(0, WARNING_ROW_CAP)}
+              {@const extra = warnings.length - visible.length}
+              <Tooltip side="right">
+                {#snippet trigger(props)}
+                  <!-- tabindex=0: the indicator is purely hover/focus-driven
+                       (no click). bits-ui Trigger spreads handler props but
+                       doesn't make a <div> focusable on its own, so without
+                       this keyboard-only users couldn't reach the warning
+                       detail. Not promoted to <button> because a button
+                       implies a click action that doesn't exist. -->
+                  <div
+                    {...props}
+                    tabindex="0"
+                    class="text-warning mt-1 cursor-default text-xs"
+                    data-testid="agent-parse-warnings"
+                  >
+                    ⚠ {warnings.length} transcript warning{warnings.length === 1 ? "" : "s"}
+                  </div>
+                {/snippet}
+                <ul class="max-w-md space-y-1 text-[13px]" data-testid="agent-parse-warnings-list">
+                  {#each visible as warning (warning.line_number + ":" + warning.reason)}
+                    <li class="flex gap-2" data-testid="agent-parse-warnings-row">
+                      <span class="text-primary-fg/70 shrink-0 font-mono"
+                        >line {warning.line_number}:</span
+                      >
+                      <span>{warning.reason}</span>
+                    </li>
+                  {/each}
+                  {#if extra > 0}
+                    <li
+                      class="text-primary-fg/70 pt-0.5 text-xs"
+                      data-testid="agent-parse-warnings-overflow"
+                    >
+                      + {extra} more
+                    </li>
+                  {/if}
+                </ul>
+              </Tooltip>
             {/if}
             {#if runtime?.meta}
               <div class="text-muted mt-1.5 space-y-0.5 text-xs leading-4" data-testid="agent-meta">

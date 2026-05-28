@@ -11,11 +11,10 @@
     type AgentSessionInfo,
   } from "$lib/api";
   import { stopAgent } from "$lib/state/index.svelte";
-  import { copyText } from "$lib/native";
   import DropdownMenu from "$lib/components/ui/DropdownMenu.svelte";
   import DropdownMenuItem from "$lib/components/ui/DropdownMenuItem.svelte";
   import Dialog from "$lib/components/ui/Dialog.svelte";
-  import { cn } from "$lib/utils";
+  import CopyButton from "$lib/components/ui/CopyButton.svelte";
 
   /// `active` = the agent is currently driving work (in-flight or queued). Gates
   /// "Stop agent" and switches the resume panel to its stronger collision warning.
@@ -25,7 +24,6 @@
   let resumeOpen = $state(false);
   let info = $state<AgentSessionInfo | null>(null);
   let loadError = $state<string | null>(null);
-  let copied = $state(false);
 
   // Resolve session actions each time the menu opens (a session can become
   // available after the first dispatch). A *failure* (e.g. a corrupt sidecar,
@@ -53,30 +51,13 @@
       console.error("[switchboard] open session file failed", err);
     });
   }
-
-  let copiedTimer: ReturnType<typeof setTimeout> | undefined;
-  $effect(() => () => clearTimeout(copiedTimer));
-  function copyResumeCommand(): void {
-    if (info?.resume_command === null || info?.resume_command === undefined) return;
-    // Confirm only after the clipboard write resolves — an optimistic flip would
-    // show "Copied" even when the write rejected.
-    void copyText(info.resume_command)
-      .then(() => {
-        copied = true;
-        clearTimeout(copiedTimer);
-        copiedTimer = setTimeout(() => (copied = false), 1000);
-      })
-      .catch((err: unknown) => {
-        console.error("[switchboard] copy resume command failed", err);
-      });
-  }
 </script>
 
 <DropdownMenu
   bind:open={menuOpen}
   triggerLabel={`Actions for ${agent.name}`}
   triggerTestid="agent-actions-trigger"
-  triggerClass="text-muted hover:text-fg hover:bg-border flex h-6 w-6 items-center justify-center rounded-md transition-colors"
+  triggerClass="text-muted hover:text-fg hover:bg-raised flex h-6 w-6 items-center justify-center rounded-full transition-colors"
   contentTestid="agent-actions-menu"
 >
   {#snippet trigger()}
@@ -94,10 +75,7 @@
     Stop agent
   </DropdownMenuItem>
   <DropdownMenuItem
-    onSelect={() => {
-      copied = false;
-      resumeOpen = true;
-    }}
+    onSelect={() => (resumeOpen = true)}
     disabled={!info?.resume_command}
     data-testid="agent-action-resume"
   >
@@ -122,50 +100,17 @@
     <p class="text-muted text-xs">
       Run this in your terminal to resume this session interactively.
     </p>
-    <div class="flex items-stretch gap-2">
+    <div class="flex items-center gap-2">
       <code
         class="bg-panel text-fg min-w-0 flex-1 overflow-x-auto rounded-md px-2.5 py-2 font-mono text-xs whitespace-pre"
         data-testid="resume-command">{info?.resume_command ?? ""}</code
       >
-      <button
-        type="button"
-        class={cn(
-          "border-border bg-panel hover:bg-raised flex w-8 shrink-0 items-center justify-center rounded-md border transition-colors",
-          copied ? "text-accent" : "text-muted hover:text-fg",
-        )}
-        data-testid="resume-copy"
-        aria-label={copied ? "Copied" : "Copy command"}
-        onclick={copyResumeCommand}
-      >
-        {#if copied}
-          <svg
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="2.5"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            class="h-4 w-4"
-            aria-hidden="true"
-          >
-            <path d="M20 6 9 17l-5-5" />
-          </svg>
-        {:else}
-          <svg
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="2"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            class="h-4 w-4"
-            aria-hidden="true"
-          >
-            <rect x="8" y="8" width="12" height="12" rx="2" />
-            <path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2" />
-          </svg>
-        {/if}
-      </button>
+      <CopyButton
+        text={info?.resume_command ?? ""}
+        label="Copy command"
+        testid="resume-copy"
+        class="shrink-0"
+      />
     </div>
     {#if active}
       <p class="text-status-failed text-xs" data-testid="resume-warning-active">

@@ -101,19 +101,26 @@ Outcomes:
 
 The two records pair correctly (`parentUuid` chain confirms it), and the `tool_use`'s timestamp predates the `tool_result`'s by 11ms — so the file is not strictly time-ordered.
 
-**The fix — late binding via a deferred-results queue.** Add a `Vec<DeferredToolResult>` to the per-agent turn builder; when `handle_tool_result` can't find an open tool, push the `(tool_use_id, output, is_error, completed_at, line_number)` into the queue instead of warning. Then in `handle_tool_use` (where a new `TurnItem::Tool` is appended), check the queue for any matching `tool_use_id` and immediately bind the deferred result. On `close_current_agent` (turn finalization), any entries still in the queue **become warnings** — these are the genuinely unmatched cases worth surfacing.
+**The fix — late binding via a deferred-results queue on `ReconstructionState`.** Add `pending_tool_results: Vec<DeferredToolResult>` to `ReconstructionState` (**not** to `AgentTurnBuilder` — the builder doesn't exist between turns, so a tool_result arriving before its turn's first assistant record would otherwise fall through to the "no open agent turn" warning path and lose the output). Each entry carries `(tool_use_id, output, is_error, completed_at, line_number)`.
 
-This preserves the warning surface for real drift while eliminating the false positive for the out-of-order pattern. The queue is per-turn (cleared on close), bounded by the turn's tool count, and adds no measurable cost.
+Both failure paths in today's `handle_tool_result` (`session_file.rs:307-353`) — the `current_agent.is_none()` case at `:322-327` ("no open agent turn") *and* the `!matched` case at `:348-353` ("did not match any open tool") — push to the queue instead of warning. The case distinction disappears: both are "we haven't seen the matching `tool_use` yet."
 
-**Scope discipline.** Claude session-file parser only. The stream parser is unaffected (live events arrive strictly in time order — the disk re-ordering is a write-side artifact, not a stream-side one). Codex/Gemini/Antigravity session-file parsers untouched unless verification turns up the same pattern (live tests M2's DoD includes a check).
+Binding happens in `handle_assistant`'s `tool_use` block branch (`:278-298`): after appending a `TurnItem::Tool`, drain any `pending_tool_results` entries whose `tool_use_id` matches the just-appended item and apply their `output`/`is_error`/`completed_at`. (Same equality check as today's match loop, inverted: queue is the source, the new builder item is the destination.)
 
-**Honest limitation to record in a code comment** at the queue site: "Claude Code 2.1.150 can write `tool_result` records before their matching `tool_use` on disk (observed ~1s gap). The deferred queue tolerates this within a single turn. If a future Claude version delays a `tool_use` *across* a turn boundary, we'd warn on close — at which point the queue's per-turn lifetime needs re-examining."
+**Restructure the loader/finalize flow so finalize-time warnings survive.** Today `load_claude_transcript` (`session_file.rs:110-112`) does `let warnings = state.warnings.clone(); let mut transcript = state.finalize(); transcript.warnings = warnings;` — `finalize` consumes `state`, so any warnings pushed inside `finalize` or `close_current_agent` are silently dropped. Change `finalize` to attach `state.warnings` to the returned transcript before returning, and drop the caller-side clone+assign. At the end of `finalize` (after the last `close_current_agent`), iterate remaining `pending_tool_results` entries and push a `ParseWarning` for each (`"tool_result for {id} never matched a tool_use"`) — these are the genuinely unmatched cases, now correctly surfaced to the caller.
+
+This preserves the warning surface for real drift while eliminating the false positive for the out-of-order pattern. The queue is per-session (`ReconstructionState` lifetime), bounded by the file's tool count, and adds no measurable cost.
+
+**Scope discipline.** Claude session-file parser only. The stream parser is unaffected (live events arrive strictly in time order — the disk re-ordering is a write-side artifact, not a stream-side one). Codex/Gemini/Antigravity session-file parsers untouched unless verification turns up the same pattern (M2's DoD live test catches the Claude case).
+
+**Honest limitation to record in a code comment** at the queue site: "Claude Code 2.1.150 can write `tool_result` records before their matching `tool_use` on disk (observed ~1s gap). The deferred queue tolerates arbitrary ordering within a session file; unmatched entries surface as warnings only at finalize."
 
 ### Definition of Done
 
-- **Fixture tests:**
-  - A session-file fixture with an out-of-order `tool_result → tool_use` pair → rehydrated `TurnItem::Tool` carries the full `output` and `is_error`, and **no** `ParseWarning` is produced.
-  - A session-file fixture with a `tool_result` whose `tool_use_id` never appears in the turn → **one** `ParseWarning` produced at turn close (regression guard: genuine misses still surface).
+- **Fixture tests** (assert on the **returned `LoadedTranscript`**, not on intermediate `state.warnings` — the loader path is what production goes through, and the finalize-warning attachment is part of what's being fixed):
+  - A session-file fixture with an out-of-order `tool_result → tool_use` pair (same turn, builder exists) → rehydrated `TurnItem::Tool` carries the full `output` and `is_error`, and **no** `ParseWarning` on the returned transcript.
+  - A session-file fixture where the `tool_result` arrives **before any assistant record exists for the turn** (no `current_agent` at queue time, then `handle_assistant` creates the builder and the matching `tool_use` arrives) → same result: bound output, zero warnings. This is the case-(a) regression guard — the lifecycle case the builder-scoped queue would have missed.
+  - A session-file fixture with a `tool_result` whose `tool_use_id` never appears anywhere → exactly **one** `ParseWarning` **on the returned transcript** (regression guard for both genuine drift and the finalize-warning-drop bug being fixed in the same milestone).
   - The order-preserved case (tool_use before tool_result, today's healthy pattern) continues to bind directly without queueing — no behavioral change.
   - Capture the fixture from the affected session file (lines around 1400-1410 of session `22300f1b-…`); record file path + line numbers in the fixture's header comment so a future engineer can re-derive.
 - **Live test** (`#[ignore]`-gated, named `live_claude_tool_results_bind_after_restart`, run via `make test-live-claude`):
@@ -144,14 +151,27 @@ The warning **count and label stay**; only the hover surface changes. The surfac
 
 **Site.** `src/lib/components/Sidebar.svelte:192-205`. Replace the `title={runtime.parse_warnings.map(...).join("\n")}` pattern with a `Tooltip` from `src/lib/components/ui/Tooltip.svelte`. The trigger is the existing `⚠ {N} transcript warning(s)` text; the content is a small `<ul>` (or styled `<div>` stack), one row per warning with `line_number` rendered in `font-mono` and `reason` in default text.
 
-**Reuse the existing semantic tokens** (`text-warning`, `text-xs`, `font-mono`) — no new tokens, no new shared component. If `Tooltip` doesn't support multiline list content out of the box, the addition is a small `contentClass` slot or rendering children — judgment call at implementation time, but prefer extending the primitive over hand-rolling at the call site.
+**Extend `Tooltip.svelte` with a backwards-compatible `children` slot.** Today the primitive only accepts `label: string` (`Tooltip.svelte:10-19`) and renders `<div class="text-[13px] font-medium">{label}</div>` (`:37`). All four existing callers (`SettingsButton`, `ComposeBar` ×3, `SidebarToggleButton`) pass `label` as a string. To support the warning-row list, change `label: string` → `label?: string`, add `children?: Snippet` to `Props`, and replace the content `<div>` with:
+
+```svelte
+{#if children}
+  {@render children()}
+{:else if label}
+  <div class="text-[13px] font-medium">{label}</div>
+{/if}
+```
+
+Existing callers continue to work unchanged (label mode). The warning-list use site passes its `<ul>` as the default slot (`children` mode). `shortcut` remains meaningful only in `label` mode — document this with a one-line comment on the prop (slot mode owns its own layout).
+
+**Reuse the existing semantic tokens** (`text-warning`, `text-xs`, `font-mono`) — no new tokens, no new shared component.
 
 **Keep responsive sizing reasonable** — a transcript with 50 warnings shouldn't render a 1000px-tall tooltip. Cap visible rows at ~10 with a "+ N more" footer if exceeded (warnings beyond the cap remain in the data; just not rendered to avoid a wall of text).
 
 ### Definition of Done
 
-- **Component test:** mock a runtime with two `parse_warnings` → the rendered DOM contains a `Tooltip` (not a `title` attribute) keyed to the warning indicator; the tooltip's content includes both `line_number` + `reason` strings rendered as separate elements.
+- **Component test:** mock a runtime with two `parse_warnings` → the rendered DOM contains a `Tooltip` (not a `title` attribute) keyed to the warning indicator; the tooltip's content includes both `line_number` + `reason` strings rendered as separate elements (children-slot mode).
 - **Component test:** mock a runtime with 12 warnings → tooltip shows 10 rows + a "+ 2 more" footer (or the chosen cap behavior).
+- **Regression check (Tooltip primitive):** confirm an existing label-only caller (e.g. `SettingsButton` or one of the `ComposeBar` tooltips) still renders the `<div class="text-[13px] font-medium">{label}</div>` content — prefer extending an existing component test for one of these callers over adding a separate primitive-level test, to avoid test sprawl.
 - **Manual verification:** in `make dev`, open a project whose Claude session triggers the warning (e.g. the one in the user's screenshot); confirm the tooltip is themed, readable, and lists warnings cleanly.
 - **No behavioral regression:** the `agent-parse-warnings` testid still exists; the warning count still renders identically; tooltip activation still works on hover for mouse users (a11y for keyboard users is a `Tooltip` primitive concern — inherit whatever it provides).
 

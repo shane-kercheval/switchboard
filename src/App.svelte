@@ -106,9 +106,18 @@
     if (isEditableShortcutTarget(event.target)) return;
 
     const command = event.metaKey || event.ctrlKey;
-    if (!command || event.altKey) return;
+    if (!command) return;
 
     const key = event.key.toLowerCase();
+    if (event.altKey) {
+      if (event.code === "KeyB") {
+        event.preventDefault();
+        projectsSidebarOpen = !projectsSidebarOpen;
+        agentsSidebarOpen = !agentsSidebarOpen;
+      }
+      return;
+    }
+
     if (key === "," && !event.shiftKey) {
       event.preventDefault();
       toggleSettings();

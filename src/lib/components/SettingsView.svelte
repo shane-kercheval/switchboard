@@ -14,6 +14,7 @@
   const shortcuts = [
     { action: "Toggle projects sidebar", keys: ["⌘", "B"] },
     { action: "Toggle agents sidebar", keys: ["⌘", "⇧", "B"] },
+    { action: "Toggle both sidebars", keys: ["⌘", "⌥", "B"] },
     { action: "Toggle settings", keys: ["⌘", ","] },
   ];
 </script>

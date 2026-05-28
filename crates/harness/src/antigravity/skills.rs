@@ -7,7 +7,7 @@
 //! a same-named skill stay distinct.
 //!
 //! **User scope only.** Workspace-scoped plugins are plausible but unverified
-//! (see `docs/research/antigravity-cli-observed.md`), so the `cwd` parameter is
+//! (see `docs/research/archive/antigravity-cli-observed.md`), so the `cwd` parameter is
 //! reserved for a future workspace scope and not scanned today.
 //!
 //! Kept separate from `gemini/skills.rs` rather than shared: Gemini's skills

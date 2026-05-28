@@ -87,6 +87,8 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             .current_dir(cwd)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            // Null stdin: we never write to it, and an open stdin can stall a
+            // harness on an interactive read or a pipe-full deadlock.
             .stdin(Stdio::null())
             // Belt-and-suspenders teardown: `kill_on_drop` fires only when
             // `child` is dropped, which happens if the producer task itself is
@@ -470,7 +472,7 @@ mod tests {
         // All cases below are empirically verified against `claude` itself
         // by running it in each cwd shape and inspecting where it created
         // its session-storage directory under `~/.claude/projects/`. See
-        // `docs/research/claude-code-cli-observed.md` for the probe.
+        // `docs/research/archive/claude-code-cli-observed.md` for the probe.
 
         // Switchboard's actual on-disk layout: `.switchboard/` dot-prefixed
         // component must produce `--switchboard` (double dash).

@@ -1,5 +1,7 @@
 # Research: Codex CLI hands-on observations
 
+> **Captured-in-time provenance.** For current behavior + how Switchboard handles it, see the canonical [`harness-behavior.md`](../harness-behavior.md); this doc holds the raw probes behind it and may drift from the code.
+
 **Captured:** 2026-05-09
 **Tool version:** codex-cli 0.128.0
 **Companion to:** [codex-noninteractive.md](codex-noninteractive.md) (the docs-derived note). This file captures what we actually observed by exercising the CLI.

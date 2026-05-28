@@ -1,5 +1,7 @@
 # Research: Gemini CLI for Switchboard
 
+> **Captured-in-time provenance.** For current behavior + how Switchboard handles it, see the canonical [`harness-behavior.md`](../harness-behavior.md); this doc holds the raw probes behind it and may drift from the code.
+
 **Captured:** 2026-05-13
 **Tool version:** gemini-cli v0.42.0 (stable; weekly stable / preview / nightly release channels)
 **Status:** **Docs-derived only.** This document was assembled from Google's official Gemini CLI docs, the open-source repo, and Google's pricing pages. Hands-on probing (fixture capture, stream-event verification, SIGTERM behaviour, session-file inspection) is **pending** and lands in M3 implementation alongside fixture capture for the Gemini adapter. Anything labeled "verify in M3" below is a known unknown.
@@ -578,7 +580,11 @@ The resume probe (asking Gemini to recall a prior message) produced a session-fi
 
 These remain unverified and should be confirmed during M3.2:
 
-1. **Auth-failure shape.** Requires breaking the user's auth (risky during M3.1); deferred. Expected to surface in `result.status:"error"` with a recognizable `error.message` — verify when implementing the auth-failure stream pattern.
+1. **Auth-failure shape — PARTIALLY CAPTURED (2026-05-27, logged-out probe).** When **no auth method is configured** (the user logged out, clearing `~/.gemini/settings.json`'s auth selection), `gemini -p "…" --output-format stream-json < /dev/null` does **not** reach the API — it fails at startup and prints to stderr:
+   ```
+   Please set an Auth method in your /Users/<user>/.gemini/settings.json or specify one of the following environment variables before running: GEMINI_API_KEY, GOOGLE_GENAI_USE_VERTEXAI, GOOGLE_GENAI_USE_GCA
+   ```
+   **Exit code 41. No stream-json emitted at all** (it fails before the first event). **Gap this reveals:** our `is_gemini_auth_failure_message` keys on `"401 Unauthorized"` in a `result.status:"error"` event — but this *no-auth-configured* shape produces no stream event and never contains "401", so it currently classifies as a generic `AdapterFailure` (non-zero exit, no terminal event), **not** `AuthFailure`. The "401 Unauthorized" path remains the *expired/invalid-token-mid-call* shape (still unobserved on Gemini — would need a stale-but-present token, not a clean logout). So Gemini has (at least) two distinct auth-ish failures: **no-auth-configured** (exit 41 + stderr "Please set an Auth method", no stream) and **bad-token** (presumed `result.status:"error"` 401, unobserved). Detection should cover the captured exit-41/stderr shape, not only the 401 substring.
 2. **`--list-sessions` output format.** Useful for a future attach-existing-session UX; not v1 critical.
 3. **Multi-chunk streaming under genuinely long replies.** The SIGTERM probe surfaced ~100 `message` records with `delta:true`, confirming streaming works at scale. Further verification not needed.
 4. **MCP tool events from a real MCP server.** Switchboard does not maintain its own MCP infrastructure; once a user has a real MCP server wired into Gemini, M3.2's MCP-tool path can be verified live. For v1 we project `mcp_*`-prefixed tools through the existing `ToolKind::Mcp` path; fixture-cover with inline JSON if M3.5 needs it.

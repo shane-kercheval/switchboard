@@ -136,6 +136,8 @@ impl HarnessAdapter for CodexAdapter {
             .current_dir(cwd)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            // Null stdin: we never write to it, and an open stdin can stall a
+            // harness on an interactive read or a pipe-full deadlock.
             .stdin(Stdio::null())
             .kill_on_drop(true);
         #[cfg(unix)]
@@ -198,7 +200,7 @@ fn resolve_home_dir(override_path: Option<&Path>) -> PathBuf {
 
 /// Build the args for `codex exec [resume <id>]`. Flag set verified against
 /// codex-cli 0.130.0; see the module-level docstring and
-/// `docs/research/codex-cli-observed.md` for the `-C`-on-resume rejection
+/// `docs/research/archive/codex-cli-observed.md` for the `-C`-on-resume rejection
 /// finding.
 fn build_args(prompt: &str, prior: Option<&SessionLinkRecord>) -> Vec<String> {
     if let Some(record) = prior {

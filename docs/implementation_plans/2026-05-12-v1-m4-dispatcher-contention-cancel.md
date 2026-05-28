@@ -519,7 +519,7 @@ The resume-command tokens come from the **same adapter-owned session-artifact re
 
 ## M4.9 — Harness quota / usage-limit surfacing
 
-> **⚠️ DRAFT — not yet human-reviewed.** This sub-milestone was drafted by an AI agent from a probe finding (the Codex out-of-credits capture, 2026-05-25) and a maintainer "do this in v1, not v2" decision. The scope, the `FailureKind` approach, the sequencing, and the per-harness research plan have **not** been reviewed or approved by a human. Treat it as a proposal pending review, not settled scope — unlike the other M4 sub-milestones above.
+> **🛑 SUPERSEDED — extracted and rewritten.** This draft was reviewed (2026-05-27) and replaced by its own plan: [`2026-05-27-harness-failure-metadata-surfacing.md`](2026-05-27-harness-failure-metadata-surfacing.md). The review rejected this draft's framing (distinct `FailureKind` + bespoke quota UI) in favor of "render failures accurately, like any other failure" and a per-harness failure/metadata audit ([`docs/research/harness-behavior.md`](../research/harness-behavior.md)). **Everything below this line is the obsolete draft — do not implement it; follow the extracted plan.**
 
 ### Goal & Outcome
 

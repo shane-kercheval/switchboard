@@ -1,5 +1,7 @@
 # Research: Antigravity CLI (`agy`) for Switchboard
 
+> **Captured-in-time provenance.** For current behavior + how Switchboard handles it, see the canonical [`harness-behavior.md`](../harness-behavior.md); this doc holds the raw probes behind it and may drift from the code.
+
 **Captured:** 2026-05-19 (initial); updated 2026-05-26 (1.0.2 probe).
 **Tool version:** `agy --version` reports `1.0.0` (CLI) at initial capture. Auto-updated to **`1.0.2`** by 2026-05-26; `agy changelog` for 1.0.1/1.0.2 lists OAuth/onboarding/sandbox/skills changes — no print-mode or transcript-format entries — but observed behavior includes additive transcript changes (see §"1.0.2 additive changes" below). Build channel: stable.
 **Status:** Hands-on probing against the installed binary at `/Users/shanekercheval/.local/bin/agy`, authenticated as `shane.kercheval@gmail.com` via macOS Keychain (silent auth — no `agy login` command was invoked during this probe; auth had been established previously through the Antigravity IDE app).
@@ -405,10 +407,24 @@ mid-turn produces a `Cancelled` outcome with the agent returning to idle.
 | Unknown `--conversation <uuid>` | Fresh-conversation greeting (`Hello! I'm Antigravity, ...`) | `Warning: conversation "..." not found.` | 0 |
 | Timeout (5-min default exceeded) | `Error: timed out waiting for response` | (none) | 0 |
 | **Quota exhausted (`RESOURCE_EXHAUSTED`)** | **(none)** | **(none)** | **0** |
-| Unauthenticated (not probed; would require revoking Keychain entry) | unclear | unclear | unclear |
+| **Unauthenticated (CAPTURED 2026-05-27, logged-out probe)** | **interactive-OAuth prompt then `Error: authentication timed out.`** | (none) | **0** |
 | Network failure (not probed) | unclear | unclear | unclear |
 
 **Notable**: `agy` exits 0 on virtually every error condition surveyed. Failure detection by exit code is unreliable. The adapter must parse stdout for `^Error:` or `^Warning:` lines and check transcript-file completeness.
+
+### Unauthenticated shape — CAPTURED (2026-05-27, logged-out probe)
+
+After signing out of the Antigravity desktop app (revoking the Keychain entry), `agy -p "…" < /dev/null` does **not** silently fail — it falls back to an **interactive OAuth flow on stdout**:
+
+```
+Authentication required. Please visit the URL to log in:
+  https://accounts.google.com/o/oauth2/auth?...&redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback&...
+Waiting for authentication (timeout 30s)...
+Or, paste the authorization code here and press Enter:
+Error: authentication timed out.
+```
+
+Exit code **0** (consistent with every other `agy` error). It **blocks ~30s** on the OAuth wait before timing out. This confirms the behavior system-design §9 anticipated ("a stale token triggers an interactive-OAuth fallback the adapter detects on stdout and force-kills"). **The adapter already handles this correctly** — `antigravity/parser.rs::is_auth_failure_line` matches `Authentication required` (and `authentication timed out`, and the init-time `not logged into Antigravity` breadcrumb); its doc comment notes it was written from a real logged-out capture. So this row was the research doc lagging the code, not a code gap. (Still worth confirming the producer force-kills on the match rather than waiting out the 30s OAuth timeout — that path is exercised by the live test, not a fixture.)
 
 ### Quota exhaustion (`RESOURCE_EXHAUSTED`) — captured 2026-05-26, agy 1.0.2
 

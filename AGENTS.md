@@ -72,10 +72,6 @@ After either command, commit both the manifest change and the lockfile diff in o
 - `thiserror` for typed errors at module boundaries.
 - No `unwrap` / `expect` outside `main` or test code; bubble via `Result`.
 - `#[non_exhaustive]` on enums that cross IPC or evolve between milestones — adding a new variant should not be a breaking change for consumers.
-- Subprocess gotchas (load-bearing for adapter code):
-  - Use `tokio::io::BufReader`, not `std::io::BufReader`, for async pipes. `tokio::process::ChildStdout` doesn't implement `std::io::Read`.
-  - Use `Stdio::null()` for stdin we never write to. Prevents pipe-full deadlocks and stalls on harnesses that try to read interactively (see `docs/research/codex-cli-observed.md`).
-  - Spawn the harness in its own process group on Unix (`Command::process_group(0)`). Lets cancellation reach the whole subprocess tree with one `killpg`, and makes the convention uniform across Claude Code (single process) and Codex (Node parent + Rust child).
 
 ### TypeScript / Svelte
 
@@ -140,10 +136,8 @@ Project-wide rules that apply across all milestones. Milestone-specific mechanic
 - `docs/system-design.md` — canonical design (the "what and why").
 - `docs/ui-conventions.md` — frontend styling + component conventions (token model, `ui/` primitives, theming).
 - `docs/implementation_plans/` — per-milestone plans and the v1 roadmap. Read the active milestone plan before changing scope; it's the ground truth for what to build.
-- `docs/research/` — harness ground-truth notes (one per harness):
-  - `claude-code-cli-observed.md`, `claude-code-headless.md` — Claude Code CLI behavior.
-  - `codex-cli-observed.md`, `codex-noninteractive.md` — Codex CLI behavior.
-  - `gemini-cli-observed.md` — Gemini CLI behavior.
-  - `antigravity-cli-observed.md` — Antigravity CLI (`agy`) behavior (Google's Gemini-CLI replacement for free / Pro / Ultra tiers).
+- `docs/research/` — harness ground-truth notes:
+  - `harness-behavior.md` — **the single source of truth for harness behavior**: how each harness behaves in the scenarios we care about (failures, auth, quota, metadata), how our adapter/frontend handles it, and the gap register. Start here.
+  - `harness-update-review.md` — playbook for reviewing a harness CLI version bump for impact on Switchboard (what to read, the dependency surface to check, how to record findings).
   - `same-session-parallel-invocation.md` — why we enforce session-id uniqueness at the app layer.
-  - `archive/` — captured-in-time research that informed earlier milestones and is no longer maintained. See `docs/system-design.md` §9 for the living cross-harness comparison.
+  - `archive/` — frozen, no-longer-maintained provenance, including the per-harness `*-cli-observed.md` probes (raw strings, exit codes, fixtures) that `harness-behavior.md` distills from. Cite for evidence; trust `harness-behavior.md` for current behavior. `docs/system-design.md` §9 is the design-level capability matrix; `harness-behavior.md` is its operational companion.

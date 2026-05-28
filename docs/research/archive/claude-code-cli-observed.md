@@ -1,5 +1,7 @@
 # Research: Claude Code CLI hands-on observations
 
+> **Captured-in-time provenance.** For current behavior + how Switchboard handles it, see the canonical [`harness-behavior.md`](../harness-behavior.md); this doc holds the raw probes behind it and may drift from the code.
+
 **Captured:** 2026-05-09
 **Tool version:** Claude Code 2.1.138
 **Companion to:** [claude-code-headless.md](claude-code-headless.md) (the docs-derived note). This file captures what we actually observed by exercising the CLI.

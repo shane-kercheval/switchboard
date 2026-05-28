@@ -1904,7 +1904,7 @@ pub fn check_antigravity_binary_impl(state: &AppState) -> Result<(), AppError> {
 /// Gemini Keychain service to match the `~/.gemini/` directory namespace
 /// theme. Source: `security dump-keychain` on an authed dev machine
 /// showed `svce="gemini" acct="antigravity"`. Documented in
-/// `docs/research/antigravity-cli-observed.md` line 99.
+/// `docs/research/archive/antigravity-cli-observed.md` line 99.
 const ANTIGRAVITY_KEYCHAIN_SERVICE: &str = "gemini";
 const ANTIGRAVITY_KEYCHAIN_ACCOUNT: &str = "antigravity";
 

@@ -30,7 +30,7 @@
 //!   tools even on success; the real content lives in the session file.
 //!   The adapter still emits a `ToolCompleted` event (lifecycle is the
 //!   live contract); transcript hydration on project reopen fills in the
-//!   real output. See `docs/research/gemini-cli-observed.md` §"`read_file`
+//!   real output. See `docs/research/archive/gemini-cli-observed.md` §"`read_file`
 //!   stream gap" for the architectural rationale.
 //! - **Lazy `harness_version` fetch.** The constructor stays cheap and
 //!   non-failing (matches Claude / Codex). `gemini --version` is invoked
@@ -170,6 +170,8 @@ impl HarnessAdapter for GeminiAdapter {
             .current_dir(cwd)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            // Null stdin: we never write to it, and an open stdin can stall a
+            // harness on an interactive read or a pipe-full deadlock.
             .stdin(Stdio::null())
             .kill_on_drop(true);
         #[cfg(unix)]
@@ -292,7 +294,7 @@ async fn run_producer(
     // Set on any error path that ends the producer loop with the subprocess
     // still potentially running. Mirrors Codex's pattern; load-bearing for
     // Gemini specifically because Gemini ignores bare-PID SIGTERM and
-    // requires process-group signaling (see docs/research/gemini-cli-observed.md,
+    // requires process-group signaling (see docs/research/archive/gemini-cli-observed.md,
     // "SIGTERM behaviour" findings). Without the explicit kill, a Gemini
     // process that keeps writing after we stop draining stdout would block
     // on a full pipe and `child.wait()` would hang indefinitely, delaying

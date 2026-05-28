@@ -68,7 +68,7 @@ pub fn parse_line(line: &str, turn_id: TurnId, state: &mut CodexParserState) -> 
     // via the wildcard arm. `event_msg` carries Codex's session-file-bound
     // `token_count` payload, which the post-terminal enrichment owns
     // (rate_limits is session-file-only — see
-    // `docs/research/codex-cli-observed.md`).
+    // `docs/research/archive/codex-cli-observed.md`).
     match value.get("type").and_then(Value::as_str) {
         Some("thread.started") => parse_thread_started(&value, state),
         Some("item.started") => parse_item_started(&value, turn_id),
@@ -363,7 +363,7 @@ pub fn unwrap_error_message(raw: &str) -> String {
 /// Codex auth-failure detection — pattern-matches the unwrapped error
 /// message against the documented 401 signature. A successful API call
 /// cannot return 401, so the substring is a sufficient discriminant (per
-/// `docs/research/codex-cli-observed.md`).
+/// `docs/research/archive/codex-cli-observed.md`).
 pub fn is_codex_auth_failure(message: &str) -> bool {
     message.contains("401 Unauthorized")
 }

@@ -40,7 +40,7 @@
 //!   bounding the hang. (The browser tab cannot be prevented; documented as
 //!   a known limitation.)
 //!
-//! Ground-truth reference: `docs/research/antigravity-cli-observed.md`.
+//! Ground-truth reference: `docs/research/archive/antigravity-cli-observed.md`.
 
 pub mod config;
 pub mod parser;
@@ -214,6 +214,9 @@ impl HarnessAdapter for AntigravityAdapter {
             .current_dir(cwd)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            // Null stdin is load-bearing here, not hygiene: `agy -p` has no stdin
+            // timeout and hangs forever on an open stdin (see
+            // docs/research/archive/antigravity-cli-observed.md).
             .stdin(Stdio::null())
             .kill_on_drop(true);
         // When a home override is set (tests), pass it to the child as `HOME`
@@ -996,7 +999,7 @@ fn classify_outcome(
     if sig.saw_stdout_content {
         return TurnOutcome::Failed {
             kind: FailureKind::AdapterFailure,
-            message: "Antigravity produced output but Switchboard could not read the answer from the conversation transcript — the .system_generated/ transcript path may have changed (see docs/research/antigravity-cli-observed.md); retry".to_owned(),
+            message: "Antigravity produced output but Switchboard could not read the answer from the conversation transcript — the .system_generated/ transcript path may have changed (see docs/research/archive/antigravity-cli-observed.md); retry".to_owned(),
         };
     }
     let tail = crate::subprocess::format_stderr_tail(stderr_tail);

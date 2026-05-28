@@ -385,3 +385,192 @@ async fn live_codex_emits_tool_started_and_tool_completed_for_shell_command() {
         "expected TurnEnd(Completed); got: {terminal:?}"
     );
 }
+
+/// Collect every `tool_use` id the subagent emitted into its sidecar(s) for
+/// a given session id. Returns an empty `Vec` if no sidecar directory was
+/// created (no delegation happened) or no `tool_use` blocks were recorded.
+///
+/// Used for two assertions in the live test:
+/// - **Drift guard** (`.len() >= 1`): confirms the run exercised the bug
+///   path. A subagent that answers without using any tools wouldn't have
+///   leaked anything in either a bug-fixed *or* bug-present parser, so
+///   the rest of the test would pass spuriously.
+/// - **Cross-check**: none of these ids may appear in any parent-stream
+///   `ToolStarted` / `ToolCompleted`. If one did, that's a leaked
+///   subagent-internal call — the exact M1 bug.
+///
+/// We glob `~/.claude/projects/*/<session-id>/subagents/*.jsonl` rather
+/// than reconstructing the encoded-cwd path because session ids are
+/// globally unique and the glob sidesteps any cwd canonicalization quirks
+/// (e.g. `/tmp` → `/private/tmp` on macOS).
+fn collect_subagent_tool_use_ids(session_id: uuid::Uuid) -> Vec<String> {
+    let home = std::env::var_os("HOME").expect("HOME must be set for live tests");
+    let projects_dir = std::path::PathBuf::from(home)
+        .join(".claude")
+        .join("projects");
+    let session_dir_name = session_id.to_string();
+    let mut ids = Vec::new();
+    let Ok(projects) = std::fs::read_dir(&projects_dir) else {
+        return ids;
+    };
+    for project in projects.flatten() {
+        let subagents = project.path().join(&session_dir_name).join("subagents");
+        let Ok(entries) = std::fs::read_dir(&subagents) else {
+            continue;
+        };
+        for sidecar in entries.flatten() {
+            let Ok(content) = std::fs::read_to_string(sidecar.path()) else {
+                continue;
+            };
+            for line in content.lines() {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                let Some(blocks) = v
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(serde_json::Value::as_array)
+                else {
+                    continue;
+                };
+                for block in blocks {
+                    if block.get("type").and_then(serde_json::Value::as_str) == Some("tool_use")
+                        && let Some(id) = block.get("id").and_then(serde_json::Value::as_str)
+                    {
+                        ids.push(id.to_owned());
+                    }
+                }
+            }
+        }
+    }
+    ids
+}
+
+/// Probes the `parent_tool_use_id` short-circuit in `parser.rs`: when a
+/// Claude turn delegates via the `Agent` tool, the parent stream carries
+/// subagent-internal `tool_use` / `tool_result` records tagged with
+/// `parent_tool_use_id = <Agent tool_use id>`. Those must be suppressed at
+/// the parent turn level so the live transcript collapses to one
+/// `ToolStarted{Agent}` + one matching `ToolCompleted` for the delegation
+/// — matching what the rehydrated session-file view shows.
+///
+/// **Assertions are deliberately split.** Claude may legitimately invoke
+/// preliminary tools (e.g. `TodoWrite`) at the parent level before
+/// delegating; counting all `ToolStarted`s would falsely fail on those
+/// runs. But naively allow-listing by name (e.g. "exactly one `Agent`
+/// start") would let a *bug-leaked* `Bash` slip through unnoticed, because
+/// the leaked call's name is `Bash`, not `Agent`. The check therefore
+/// pairs two assertions:
+///
+/// 1. Exactly one parent-turn `ToolStarted` with `name == "Agent"` plus
+///    its matching `ToolCompleted` — that's the delegation contract.
+/// 2. No parent-stream `ToolStarted` / `ToolCompleted` carries a
+///    `tool_use_id` that appears in any subagent sidecar — that's the
+///    bug-detection contract, grounded in real subagent-emitted ids.
+#[tokio::test]
+#[ignore = "requires claude installed — run with: make test-live"]
+async fn live_claude_subagent_collapses_to_parent_tool_call() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let adapter = ClaudeCodeAdapter::new();
+    let agent = claude_agent();
+    let session_id = agent
+        .session_id
+        .expect("Claude agents pre-mint a session id");
+    let turn_id = Uuid::now_v7();
+    let stream = adapter
+        .dispatch(
+            &agent,
+            tmp.path(),
+            "Use the Agent tool to launch exactly one general-purpose subagent whose \
+             instruction is: run the bash command 'echo hello-from-subagent' and report \
+             its exact output. After it returns, reply with the single word done.",
+            turn_id,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed with real claude");
+    let events: Vec<AdapterEvent> = stream.collect().await;
+
+    // Drift guard: passing the assertions below would be vacuous if Claude
+    // delegated but the subagent answered without using any internal tools
+    // — no tagged tool records would have existed for a bug-present parser
+    // to leak. Confirm the subagent sidecar holds at least one tool_use.
+    let subagent_tool_use_ids = collect_subagent_tool_use_ids(session_id);
+    assert!(
+        !subagent_tool_use_ids.is_empty(),
+        "subagent didn't run any internal tools (sidecar tool_use count = 0); \
+         this run didn't exercise the bug path. The prompt asked for a bash command — Claude may \
+         have answered without delegating, or the subagent decided to answer without using its \
+         tools. Adjust the prompt to be more explicit, or re-run.",
+    );
+
+    // (1) Exactly one parent-turn ToolStarted with name == "Agent", plus
+    // its matching ToolCompleted. Tolerates incidental parent-level tools
+    // (TodoWrite etc.) — we don't constrain the total count.
+    let agent_starts: Vec<&AdapterEvent> = events
+        .iter()
+        .filter(|e| matches!(e, AdapterEvent::ToolStarted { name, .. } if name == "Agent"))
+        .collect();
+    assert_eq!(
+        agent_starts.len(),
+        1,
+        "expected exactly one ToolStarted with name=\"Agent\" (the delegation); got {}. Events: {:?}",
+        agent_starts.len(),
+        events,
+    );
+    let AdapterEvent::ToolStarted {
+        tool_use_id: agent_call_id,
+        ..
+    } = agent_starts[0]
+    else {
+        unreachable!();
+    };
+    let agent_completed = events.iter().find(|e| {
+        matches!(
+            e,
+            AdapterEvent::ToolCompleted { tool_use_id, .. } if tool_use_id == agent_call_id
+        )
+    });
+    assert!(
+        agent_completed.is_some(),
+        "Agent ToolStarted ({agent_call_id}) had no matching ToolCompleted. Events: {events:?}",
+    );
+
+    // (2) No parent-stream ToolStarted/ToolCompleted may carry a tool_use_id
+    // that was emitted inside a subagent. A match here is the M1 bug —
+    // a subagent-internal call leaking into the parent turn.
+    let leaked: Vec<(&str, &str)> = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::ToolStarted { tool_use_id, .. } => subagent_tool_use_ids
+                .iter()
+                .find(|sid| sid.as_str() == tool_use_id)
+                .map(|sid| ("ToolStarted", sid.as_str())),
+            AdapterEvent::ToolCompleted { tool_use_id, .. } => subagent_tool_use_ids
+                .iter()
+                .find(|sid| sid.as_str() == tool_use_id)
+                .map(|sid| ("ToolCompleted", sid.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "subagent-internal tool_use_id(s) leaked into the parent stream — the M1 bug. \
+         Leaked: {leaked:?}. Subagent ids: {subagent_tool_use_ids:?}. Events: {events:?}",
+    );
+
+    let terminal = events
+        .iter()
+        .find(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+        .expect("must observe a terminal TurnEnd");
+    assert!(
+        matches!(
+            terminal,
+            AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        ),
+        "expected TurnEnd(Completed); got: {terminal:?}"
+    );
+}

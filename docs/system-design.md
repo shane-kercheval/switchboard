@@ -792,7 +792,7 @@ For harness commands Switchboard does not need to coordinate, the design *intent
 
 The interactive Claude Code, Codex, Gemini, and Antigravity TUIs are not used. Switchboard renders the output itself. This means rendering tool calls, diffs, todo lists, and thinking blocks is Switchboard's responsibility.
 
-What is **preserved** because the harness still runs in default mode: hooks fire, MCP servers connect and tools work, auto-invoked skills trigger normally, sub-agents (Claude Code's `Task` tool) spawn as expected, auto-compaction runs when context climbs.
+What is **preserved** because the harness still runs in default mode: hooks fire, MCP servers connect and tools work, auto-invoked skills trigger normally, sub-agents (Claude Code's `Agent` tool, Gemini's `invoke_agent`, Antigravity's `invoke_subagent`) spawn as expected, auto-compaction runs when context climbs. Cross-harness, a sub-agent invocation surfaces in Switchboard as **a single tool call from the parent's view** (one `ToolStarted` + one `ToolCompleted` for the delegation tool itself); the sub-agent's internal tool calls are not separately rendered. See [`docs/research/harness-behavior.md`](research/harness-behavior.md) §6 for the operational evidence.
 
 What is **lost** in headless mode:
 

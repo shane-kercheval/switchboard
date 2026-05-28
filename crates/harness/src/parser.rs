@@ -74,6 +74,40 @@ pub fn parse_line(
         Err(e) => return ParseOutcome::Error(e.to_string()),
     };
 
+    // Suppress subagent-internal events at the parent stream level.
+    //
+    // When Claude's `Agent` tool delegates to a subagent, the parent's stream
+    // carries every subagent event tagged with `parent_tool_use_id = <Agent
+    // tool_use id>`. The parent's own events (including the `Agent` call and
+    // its aggregate `tool_result`) carry `null` or absent. Without this
+    // short-circuit, subagent-internal `tool_use` / `tool_result` blocks
+    // emit `ToolStarted` / `ToolCompleted` at the parent's `turn_id` and the
+    // live transcript mis-attributes the subagent's work to the parent —
+    // diverging from the rehydrated view (Claude already collapses on disk:
+    // the main session file holds only the parent's `Agent` call + aggregate
+    // result; subagent internals live in `<session-id>/subagents/agent-<id>.jsonl`).
+    //
+    // Conservative rule: skip on *any* non-null `parent_tool_use_id`,
+    // regardless of record type. Probed against Claude 2.1.153: the field is
+    // absent on `result` / `system` / `rate_limit_event`, always null on
+    // `stream_event`, and only ever non-null on `assistant` / `user`
+    // envelopes that originate from inside a subagent. The conservative rule
+    // is therefore safe for every observed record shape and forward-compatible
+    // with any new tagged shape (the third — a `user` envelope with text
+    // content relaying the subagent's task instruction — was first observed
+    // here, not in the original 2026-05-24 probes).
+    //
+    // From the parent's view, a delegation is a single tool call. Matches
+    // Gemini's `invoke_agent` (already opaque) and Antigravity's
+    // `invoke_subagent` (separate brain conversation we don't tail).
+    if value
+        .get("parent_tool_use_id")
+        .and_then(Value::as_str)
+        .is_some()
+    {
+        return ParseOutcome::Skip;
+    }
+
     match value.get("type").and_then(Value::as_str) {
         Some("stream_event") => parse_stream_event(&value, turn_id, state),
         Some("result") => parse_result(&value, turn_id, state),
@@ -1069,6 +1103,141 @@ mod tests {
             other => panic!("expected TurnEnd(Failed{{AuthFailure}}), got {other:?}"),
         }
     }
+
+    // --- Subagent rendering: `parent_tool_use_id` short-circuit ---
+
+    /// Replays a captured delegation fixture through `parse_line`. The fixture
+    /// is the synthetic shape of a Claude 2.1.153 stream during a delegating
+    /// turn (probed 2026-05-27; redacted for inclusion):
+    ///
+    /// 1. parent's `Agent` `tool_use`           (`parent_tool_use_id`=null) → `ToolStarted{Agent}`
+    /// 2. parent-tagged user envelope w/ text   (`parent_tool_use_id`=non-null) → SUPPRESSED
+    /// 3. parent-tagged assistant w/ `Bash`     (`parent_tool_use_id`=non-null) → SUPPRESSED
+    /// 4. parent-tagged user w/ `tool_result`   (`parent_tool_use_id`=non-null) → SUPPRESSED
+    /// 5. parent's aggregate `tool_result`      (`parent_tool_use_id`=null) → `ToolCompleted{Agent}`
+    /// 6. terminal `result`                     (`parent_tool_use_id` absent) → `TurnEnd{Completed}`
+    ///
+    /// Asserts the parent's view collapses to exactly one tool-call pair plus
+    /// a terminal — matching what the rehydrated session-file view shows
+    /// (Claude collapses subagent internals into a separate sidecar file on
+    /// disk, so the stream parser must do the same in memory).
+    #[test]
+    fn subagent_delegation_fixture_collapses_to_parent_tool_call_pair() {
+        let fixture = include_str!("../tests/fixtures/claude/subagent-delegation.jsonl");
+        let mut state = ParserState::default();
+        let turn_id = tid();
+        let agent_id = aid();
+        let mut events: Vec<AdapterEvent> = Vec::new();
+        for line in fixture.lines().filter(|l| !l.trim().is_empty()) {
+            match parse_line(line, turn_id, agent_id, &mut state) {
+                ParseOutcome::Event(ev) => events.push(ev),
+                ParseOutcome::Events(evs) => events.extend(evs),
+                ParseOutcome::Skip => {}
+                ParseOutcome::Error(e) => panic!("unexpected parse error: {e}"),
+            }
+        }
+
+        // Exactly one ToolStarted, naming the parent's `Agent` call.
+        let tool_starteds: Vec<&AdapterEvent> = events
+            .iter()
+            .filter(|e| matches!(e, AdapterEvent::ToolStarted { .. }))
+            .collect();
+        assert_eq!(
+            tool_starteds.len(),
+            1,
+            "expected exactly one ToolStarted (parent's Agent call); got {tool_starteds:#?}",
+        );
+        match tool_starteds[0] {
+            AdapterEvent::ToolStarted {
+                tool_use_id, name, ..
+            } => {
+                assert_eq!(tool_use_id, "toolu_PARENT_AGENT_CALL");
+                assert_eq!(name, "Agent");
+            }
+            other => panic!("expected ToolStarted, got {other:?}"),
+        }
+
+        // Exactly one ToolCompleted, paired to the parent's Agent call.
+        let tool_completeds: Vec<&AdapterEvent> = events
+            .iter()
+            .filter(|e| matches!(e, AdapterEvent::ToolCompleted { .. }))
+            .collect();
+        assert_eq!(
+            tool_completeds.len(),
+            1,
+            "expected exactly one ToolCompleted (parent's aggregate result); got {tool_completeds:#?}",
+        );
+        match tool_completeds[0] {
+            AdapterEvent::ToolCompleted { tool_use_id, .. } => {
+                assert_eq!(tool_use_id, "toolu_PARENT_AGENT_CALL");
+            }
+            other => panic!("expected ToolCompleted, got {other:?}"),
+        }
+
+        // Zero events from subagent-tagged records. If the subagent's Bash
+        // tool_use or tool_result had leaked, this fails — that's the bug.
+        let subagent_tool_events: Vec<&AdapterEvent> = events
+            .iter()
+            .filter(|e| match e {
+                AdapterEvent::ToolStarted { tool_use_id, .. }
+                | AdapterEvent::ToolCompleted { tool_use_id, .. } => {
+                    tool_use_id == "toolu_SUBAGENT_BASH_CALL"
+                }
+                _ => false,
+            })
+            .collect();
+        assert!(
+            subagent_tool_events.is_empty(),
+            "subagent-internal tool events must not be attributed to the parent turn; got {subagent_tool_events:#?}",
+        );
+
+        // Exactly one terminal TurnEnd.
+        let turn_ends: Vec<&AdapterEvent> = events
+            .iter()
+            .filter(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+            .collect();
+        assert_eq!(turn_ends.len(), 1, "expected exactly one TurnEnd");
+    }
+
+    /// Direct unit-level coverage of the short-circuit rule. The fixture
+    /// asserts the overall collapse; this asserts each path the rule cares
+    /// about, including the conservative-by-default behavior for record
+    /// types that could theoretically grow a `parent_tool_use_id` field
+    /// later but don't carry one today.
+    #[test]
+    fn parent_tagged_records_skip_regardless_of_inner_type() {
+        // assistant + tool_use, parent-tagged → Skip (the live mis-attribution case).
+        let line = r#"{"type":"assistant","parent_tool_use_id":"toolu_PARENT","message":{"content":[{"type":"tool_use","id":"toolu_INNER","name":"Bash","input":{}}]}}"#;
+        assert!(matches!(parse_one(line, tid()), ParseOutcome::Skip));
+
+        // user + tool_result, parent-tagged → Skip.
+        let line = r#"{"type":"user","parent_tool_use_id":"toolu_PARENT","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_INNER","content":"hi","is_error":false}]}}"#;
+        assert!(matches!(parse_one(line, tid()), ParseOutcome::Skip));
+
+        // user + text, parent-tagged (the third shape the original probe missed) → Skip.
+        let line = r#"{"type":"user","parent_tool_use_id":"toolu_PARENT","message":{"role":"user","content":[{"type":"text","text":"task instruction"}]}}"#;
+        assert!(matches!(parse_one(line, tid()), ParseOutcome::Skip));
+    }
+
+    #[test]
+    fn null_or_absent_parent_tool_use_id_does_not_skip() {
+        // Explicit null → process normally (matches the parent's own
+        // events, which include parent_tool_use_id: null on every record).
+        let line = r#"{"type":"assistant","parent_tool_use_id":null,"message":{"content":[{"type":"tool_use","id":"toolu_AGENT","name":"Agent","input":{}}]}}"#;
+        assert!(matches!(
+            parse_one(line, tid()),
+            ParseOutcome::Event(AdapterEvent::ToolStarted { .. })
+        ));
+
+        // Absent entirely (e.g. `result` events) → process normally.
+        let line = r#"{"type":"result","is_error":false,"result":"done"}"#;
+        assert!(matches!(
+            parse_one(line, tid()),
+            ParseOutcome::Event(AdapterEvent::TurnEnd { .. })
+        ));
+    }
+
+    // --- Auth-failure regressions guarded by the suppression rule ---
 
     /// Guards the per-dispatch `ParserState`-freshness invariant: a fresh
     /// `ParserState` between dispatches means a prior turn's auth failure

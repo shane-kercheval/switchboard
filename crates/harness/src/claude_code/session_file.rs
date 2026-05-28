@@ -647,6 +647,102 @@ mod tests {
         }
     }
 
+    /// Disk-side regression guard for the subagent rendering contract.
+    ///
+    /// Claude's main session file collapses every delegation to (parent's
+    /// `Agent` `tool_use` + aggregate `tool_result`); subagent internals
+    /// live in `<session-id>/subagents/agent-<id>.jsonl`, which Switchboard
+    /// does not read. Verified at scale 2026-05-27: zero non-null
+    /// `parent_tool_use_id` values across 317 historical main session files
+    /// (see `harness-behavior.md` §6).
+    ///
+    /// If Claude ever inlines subagent records into the main session file,
+    /// this test breaks loudly — at which point the session-file parser
+    /// would need its own `parent_tool_use_id` filter to keep the
+    /// rehydrated view aligned with the stream parser (which collapses
+    /// in-memory; see `parser.rs` `parse_line` short-circuit).
+    #[test]
+    fn delegation_session_file_renders_as_single_parent_tool_call() {
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let session_id = Uuid::now_v7();
+        let agent_id = Uuid::now_v7();
+        let assistant_agent_call = json!({
+            "type": "assistant",
+            "message": {
+                "model": "claude-sonnet-4-6",
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_PARENT_AGENT_CALL",
+                    "name": "Agent",
+                    "input": {
+                        "description": "<redacted>",
+                        "prompt": "<redacted>",
+                        "subagent_type": "general-purpose"
+                    }
+                }],
+                "usage": { "input_tokens": 1, "output_tokens": 1 }
+            },
+            "parent_tool_use_id": null,
+            "timestamp": "2026-05-27T21:00:00Z"
+        });
+        let aggregate_tool_result = json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_PARENT_AGENT_CALL",
+                    "content": "<redacted: subagent's aggregate report>",
+                    "is_error": false
+                }]
+            },
+            "parent_tool_use_id": null,
+            "timestamp": "2026-05-27T21:00:05Z"
+        });
+        let content = jsonl(&[
+            user_record("delegate to a subagent", "2026-05-27T20:59:55Z"),
+            assistant_agent_call,
+            aggregate_tool_result,
+        ]);
+        stage_session_file(home.path(), cwd.path(), session_id, &content);
+
+        let result = load_claude_transcript(home.path(), cwd.path(), session_id, agent_id).unwrap();
+        assert_eq!(result.turns.len(), 2);
+        assert!(
+            result.warnings.is_empty(),
+            "delegation should hydrate cleanly with no warnings; got {:?}",
+            result.warnings
+        );
+        let Turn::Agent { items, .. } = &result.turns[1] else {
+            panic!("expected Agent turn");
+        };
+        assert_eq!(
+            items.len(),
+            1,
+            "expected exactly one tool call (the parent's Agent call); got {items:#?}",
+        );
+        match &items[0] {
+            TurnItem::Tool {
+                tool_use_id,
+                name,
+                output,
+                is_error,
+                ..
+            } => {
+                assert_eq!(tool_use_id, "toolu_PARENT_AGENT_CALL");
+                assert_eq!(name, "Agent");
+                assert_eq!(
+                    output.as_deref(),
+                    Some("<redacted: subagent's aggregate report>")
+                );
+                assert_eq!(*is_error, Some(false));
+            }
+            other => panic!("expected Tool item, got {other:?}"),
+        }
+    }
+
     #[test]
     fn mcp_tool_use_classifies_as_mcp_kind() {
         let home = TempDir::new().unwrap();

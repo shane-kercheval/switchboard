@@ -85,6 +85,33 @@ All four synthesize `AdapterFailure` for malformed JSON, stdout read errors, and
 
 **Sidebar absent-field convention (cross-cutting gap):** every metadata cell is `{#if}`-gated and **simply omitted** when its value is missing/zero — no `—`, no "n/a". So the UI **cannot distinguish** "this harness never reports cost" (permanent — e.g. Antigravity) from "no turn has run yet" (transient — e.g. a fresh Claude agent). MCP/skills show bare **counts**, no names/status.
 
+### 3.1 Event ⟂ on-disk parity (what survives restart)
+
+For metadata-flavored fields, where a datum lives determines whether Switchboard can re-show it after the app restarts. The TUI never has this question — it doesn't restart mid-session — so any field Switchboard loses on restart is a **TUI-parity gap**. Four classes:
+
+| Class | Meaning | Restart behavior |
+|---|---|---|
+| **A. Full parity** | Stream + harness session file agree | ✅ Survives — re-read from session file |
+| **B. Disk-canonical (we enrich)** | Stream lacks it; session file has it; we re-read at turn-end | ✅ Survives — same source on rehydrate |
+| **C. Stream-only, in-memory** | Lives in events; no on-disk equivalent; held in `Runtime` per agent | ❌ **Lost** until next event |
+| **D. Absent everywhere** | Not in stream, not on disk, not in any harness file | — Impossible — TUI parity ceiling (workaround at best) |
+
+| Field | Claude | Codex | Gemini | Antigravity |
+|---|---|---|---|---|
+| Assistant text / tool calls / per-turn final usage | A | A | A (B for read-tool output) | (file is the only source — A by construction) |
+| `rate_limit` snapshot | **C** | B (session file) | — (none emitted) | D (CLI log only) |
+| Overage flag (`isUsingOverage`) | **C** | n/a | n/a | n/a |
+| Context window | A (`modelUsage`) | B (session file) | D | D |
+| Model | A | B | A | D-ish (fragile `USER_SETTINGS_CHANGE` scrape, empty on resume) |
+| MCP servers — live connection status | **C** (`system/init`) | D (config-only) | D (config-only) | D (config-only) |
+| Tools registry | A (`system/init`) | D | A | D |
+
+**The C cells are the actual restart gaps.** Today: **Claude `rate_limit_event` (used %, `isUsingOverage`, reset times)** and **Claude `system/init.mcp_servers[].status`**. Closing the app and reopening drops them until the next interaction, so the agent bar shows less than the TUI would. (Mid-stream token deltas across all four are also class-C but have no UI surface today, so the loss is theoretical.)
+
+**Class B is *not* a gap** — we already re-read the session file at turn-end (Codex rate-limits, Codex model/context, Gemini tool output) and on project open, so the data is durable. The latency cost (one extra file read) is the trade.
+
+**Class D is what no implementation can fix without external data** — e.g. Gemini does not emit a context window anywhere; Antigravity emits no token usage to disk. Document these as TUI parity ceilings; workarounds (hardcoded model→context maps) are case-by-case decisions.
+
 ---
 
 ## 4. Gap register (actionable)
@@ -110,6 +137,10 @@ Grouped by theme; this is the candidate scope for the failure/metadata-surfacing
 
 **Wire model:**
 - **G12 — no `FailureKind::UsageLimit`.** Per the "render like any failure" decision, quota can stay `HarnessError` with an accurate message — so a new variant is likely **unnecessary**. Confirm before adding one.
+
+**Restart continuity (TUI parity):**
+- **G13 — Claude class-C metadata lost on restart.** `rate_limit_event` payload (used %, `isUsingOverage`, `overageResetsAt`, `resetsAt`) lives only in `Runtime.last_rate_limit` in memory. On app restart the agent bar shows no quota / overage state until the next event arrives. Fix: per-agent metadata sidecar that captures the latest snapshot (write on event, read on project open). Without this, any UI surface added for G7 would vanish-then-reappear across restarts — *worse* UX than no surface. See §3.1 for the parity class definition.
+- **G14 — Claude MCP live-status lost on restart.** `system/init.mcp_servers[].status` is class-C. Config-loader fallback gives us the *registry* (servers exist) without status (up/down). Not in immediate plan scope; a stale "this server was up 3 days ago" indicator may be worse than no indicator — needs a UX decision before persisting.
 
 ---
 

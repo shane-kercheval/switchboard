@@ -327,9 +327,10 @@ body {
     font-family: var(--font-mono);
     font-size: 0.85em;
     font-weight: 400;
+    color: var(--syntax-constant);
     background-color: var(--panel);
     border-radius: 0.25rem;
-    padding: 0.1em 0.3em;
+    padding: 0.15em 0.45em;
   }
 
   /* `display: block` makes the table its own horizontal scroll container, so a

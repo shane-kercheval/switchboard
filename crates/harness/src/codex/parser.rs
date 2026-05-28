@@ -314,11 +314,17 @@ fn parse_turn_failed(obj: &Value, turn_id: TurnId, state: &mut CodexParserState)
     } else {
         raw_message.to_owned()
     };
-    let message = unwrap_error_message(&message_source);
-    let kind = if is_codex_auth_failure(&message) {
-        FailureKind::AuthFailure
+    let raw = unwrap_error_message(&message_source);
+    let (kind, message) = if is_codex_auth_failure(&raw) {
+        // Author the auth message instead of surfacing raw "401 Unauthorized" —
+        // the user sees one consistent actionable line. Reactive-auth posture:
+        // never advises "reload Switchboard."
+        (FailureKind::AuthFailure, CODEX_AUTH_MESSAGE.to_owned())
     } else {
-        FailureKind::HarnessError
+        // Non-auth `HarnessError` text (quota, model errors, etc.) reaches the
+        // user verbatim — that text is the actionable content (Codex's quota
+        // message carries reset time + upgrade links).
+        (FailureKind::HarnessError, raw)
     };
     ParseOutcome::Event(AdapterEvent::TurnEnd {
         turn_id,
@@ -327,6 +333,12 @@ fn parse_turn_failed(obj: &Value, turn_id: TurnId, state: &mut CodexParserState)
         usage: None,
     })
 }
+
+/// Authored auth-failure message for Codex. Replaces the raw
+/// `"401 Unauthorized"` / similar text the stream carries so the user sees
+/// uniform actionable copy across harnesses. Reactive-auth posture — never
+/// advises "reload Switchboard."
+pub const CODEX_AUTH_MESSAGE: &str = "Codex authentication required — run `codex login`";
 
 fn parse_error_event(obj: &Value, state: &mut CodexParserState) -> ParseOutcome {
     if let Some(message) = obj.get("message").and_then(Value::as_str) {
@@ -505,10 +517,13 @@ mod tests {
                     },
                 ..
             } => {
-                assert!(
-                    message.contains("401 Unauthorized"),
-                    "auth-failure message preserves 401 signal: {message}"
-                );
+                // Authored message replaces the raw "401 Unauthorized" line.
+                // The user sees one consistent actionable Codex auth message,
+                // not the raw HTTP status detail.
+                assert_eq!(message, CODEX_AUTH_MESSAGE);
+                assert!(message.contains("Codex authentication required"));
+                assert!(message.contains("codex login"));
+                assert!(!message.contains("reload Switchboard"));
             }
             other => panic!("expected TurnEnd(Failed{{AuthFailure}}), got {other:?}"),
         }
@@ -763,10 +778,10 @@ mod tests {
                     },
                 ..
             }) => {
-                assert!(
-                    message.contains("401 Unauthorized"),
-                    "fallback must surface buffered 401: {message}"
-                );
+                // Same assertion as the canonical-message path: the buffered
+                // 401 signal is what flips classification to AuthFailure, and
+                // the surfaced text is the authored message, not the raw 401.
+                assert_eq!(message, CODEX_AUTH_MESSAGE);
             }
             other => panic!("expected TurnEnd(AuthFailure), got {other:?}"),
         }

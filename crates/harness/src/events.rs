@@ -351,11 +351,17 @@ pub enum FailureKind {
     /// Adapter synthesized this: subprocess died, parser hit malformed JSON, or
     /// stdout EOF arrived without a terminal `result` event. Typically transient.
     AdapterFailure,
-    /// Subscription / tier auth is missing or expired. Detected via stream-event
-    /// patterns: Claude's `assistant.error == "authentication_failed"` (state-flag
-    /// pattern consumed in `parse_result`) or Codex's `turn.failed.error.message`
-    /// containing `"401 Unauthorized"`. Frontend renders a "subscription auth
-    /// required" banner rather than a generic error.
+    /// Subscription / tier auth is missing or expired. Detected per-adapter
+    /// from stream signals (Claude: `assistant.error == "authentication_failed"`;
+    /// Codex: `turn.failed.error.message` containing `"401 Unauthorized"`;
+    /// Gemini: 401 in `result.status:"error"`, exit 41 + "Please set an Auth
+    /// method", or exit 42 + 401; Antigravity: `Authentication required` /
+    /// `authentication timed out` on stdout). Each adapter authors a uniform
+    /// actionable message naming the harness + recovery command — the user
+    /// sees one consistent failure line in the transcript regardless of which
+    /// harness's auth surface fired. There is no proactive auth banner;
+    /// reactive auth means "discovered on send, fixed by signing in, then
+    /// sending again."
     AuthFailure,
 }
 
@@ -532,7 +538,7 @@ mod tests {
             turn_id: fresh_turn_id(),
             outcome: TurnOutcome::Failed {
                 kind: FailureKind::AuthFailure,
-                message: "Not logged in · Please run /login".to_owned(),
+                message: "Claude authentication required — run `claude login`".to_owned(),
             },
             ended_at: fresh_time(),
             usage: None,
@@ -542,7 +548,7 @@ mod tests {
         assert_eq!(value["outcome"]["kind"], "auth_failure");
         assert_eq!(
             value["outcome"]["message"],
-            "Not logged in · Please run /login"
+            "Claude authentication required — run `claude login`"
         );
         let parsed: NormalizedEvent = serde_json::from_value(value).unwrap();
         assert_eq!(parsed, event);

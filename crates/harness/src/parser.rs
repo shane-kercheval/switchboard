@@ -7,6 +7,14 @@ use crate::events::{
     TurnUsage,
 };
 
+/// Authored auth-failure message for Claude. Replaces Claude's
+/// `"Not logged in · Please run /login"` (which refers to the
+/// interactive-session slash command, not the CLI command users would
+/// typically run from a terminal). The authored copy names the CLI
+/// recovery (`claude login`) and matches the cross-harness format.
+/// Reactive-auth posture — never advises "reload Switchboard."
+pub const CLAUDE_AUTH_MESSAGE: &str = "Claude authentication required — run `claude login`";
+
 #[derive(Debug)]
 pub enum ParseOutcome {
     /// One adapter event was produced. The common case.
@@ -43,15 +51,13 @@ pub struct ParserState {
     /// separator is prepended onto that chunk's text).
     pending_separator: bool,
     /// Auth-failure stash: `Some(message)` means an `assistant` envelope with
-    /// `"error": "authentication_failed"` was observed earlier in this turn;
-    /// the message is the displayable text extracted from the assistant
-    /// event. `parse_result` consumes via `.take()` and refines the terminal
-    /// `TurnEnd` from `HarnessError` to `AuthFailure`. This is the
-    /// state-flag pattern that keeps the "exactly one terminal event per
-    /// turn" contract intact — `parse_result` remains the sole emitter.
-    /// `None` discriminates "not seen" from "seen with no displayable text"
-    /// (which sets `Some(String::new())` and lets the render layer supply
-    /// default copy).
+    /// `"error": "authentication_failed"` was observed earlier in this turn.
+    /// The stashed message is the authored Switchboard auth string
+    /// (`CLAUDE_AUTH_MESSAGE`), not the harness's raw text — authoring
+    /// happens at stash time. `parse_result` consumes via `.take()` and
+    /// refines the terminal `TurnEnd` from `HarnessError` to `AuthFailure`.
+    /// State-flag pattern: `parse_result` remains the sole `TurnEnd` emitter,
+    /// preserving the exactly-one-terminal-event invariant.
     pending_auth_failure: Option<String>,
 }
 
@@ -367,32 +373,13 @@ fn parse_mcp_server_status(v: &Value) -> Option<McpServerStatus> {
 /// `HarnessError` to `AuthFailure`.
 fn parse_assistant_envelope(obj: &Value, turn_id: TurnId, state: &mut ParserState) -> ParseOutcome {
     if obj.get("error").and_then(Value::as_str) == Some("authentication_failed") {
-        // Extract displayable text: first text content block in `message.content`,
-        // fall back to the raw error-field value. Empty extraction is preserved
-        // as `Some(String::new())` — the `Some` discriminates "seen" from "not
-        // seen"; the empty string is the parser's signal that no displayable
-        // message was available, and the render layer supplies default copy.
-        // No hardcoded UI strings in the parser.
-        let message = obj
-            .get("message")
-            .and_then(|m| m.get("content"))
-            .and_then(Value::as_array)
-            .and_then(|content| {
-                content.iter().find_map(|block| {
-                    if block.get("type").and_then(Value::as_str) == Some("text") {
-                        block.get("text").and_then(Value::as_str).map(str::to_owned)
-                    } else {
-                        None
-                    }
-                })
-            })
-            .unwrap_or_else(|| {
-                obj.get("error")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_owned()
-            });
-        state.pending_auth_failure = Some(message);
+        // Stash the authored Switchboard auth message rather than Claude's
+        // own `Please run /login` (which is the interactive-session slash
+        // command, not the CLI command). Authoring keeps the user-facing
+        // copy consistent across all four harnesses' auth surfaces and
+        // names the right recovery (the `claude login` CLI command).
+        // Reactive-auth posture — never advises "reload Switchboard."
+        state.pending_auth_failure = Some(CLAUDE_AUTH_MESSAGE.to_owned());
         // Fall through to tool_use extraction — an auth-failed assistant
         // envelope from claude is unlikely to carry tool_use blocks (the
         // synthesized response is plain text), but bypassing extraction
@@ -1098,7 +1085,13 @@ mod tests {
                     },
                 ..
             } => {
-                assert_eq!(message, "Not logged in · Please run /login");
+                // Authored message replaces Claude's own `Please run /login`
+                // (an interactive-session slash command). The user sees the
+                // CLI recovery command and the harness name.
+                assert_eq!(message, CLAUDE_AUTH_MESSAGE);
+                assert!(message.contains("Claude authentication required"));
+                assert!(message.contains("claude login"));
+                assert!(!message.contains("reload Switchboard"));
             }
             other => panic!("expected TurnEnd(Failed{{AuthFailure}}), got {other:?}"),
         }

@@ -273,7 +273,11 @@ async fn auth_failure_inline_fixture_emits_auth_failure_kind() {
             ..
         } => {
             assert_eq!(*kind, FailureKind::AuthFailure);
-            assert!(message.contains("401 Unauthorized"));
+            // Authored Gemini auth message — raw "401 Unauthorized" replaced
+            // with uniform actionable text. End-to-end through the adapter.
+            assert!(message.contains("Gemini authentication required"));
+            assert!(message.contains("gemini"));
+            assert!(!message.contains("reload Switchboard"));
         }
         other => panic!("expected Failed(AuthFailure), got {other:?}"),
     }

@@ -76,6 +76,14 @@ use sidecar::{SessionLinkRecord, append_record, read_latest, sidecar_path};
 /// binary probe agree on the name.
 pub const BINARY_NAME: &str = "agy";
 
+/// Authored auth-failure message for Antigravity. Reactive-auth posture:
+/// the recovery is "sign in, then send again" — never "reload Switchboard"
+/// (there's no proactive state to refresh). Used by every Antigravity auth
+/// path (stdout fast-fail, `Error: authentication timed out`, etc.) so all
+/// surfaces show the same actionable text.
+const ANTIGRAVITY_AUTH_MESSAGE: &str =
+    "Antigravity authentication required — sign in via the Antigravity desktop app";
+
 /// Control-file names for the `fake_agy` test fixture binary, read from the
 /// dispatch cwd. Defined in the library (not the bin) so the fixture binary
 /// and the integration tests share one source of truth and can't drift.
@@ -206,7 +214,8 @@ impl HarnessAdapter for AntigravityAdapter {
             read_latest(&sidecar_file).map_err(|e| DispatchError::PreStreamRead(e.to_string()))?;
         let resume_id = prior.as_ref().map(|r| r.conversation_id);
 
-        let args = build_args(prompt, resume_id);
+        let log_file_path = build_log_file_path(turn_id);
+        let args = build_args(prompt, resume_id, &log_file_path);
 
         let mut command = tokio::process::Command::new(&binary);
         command
@@ -258,6 +267,7 @@ impl HarnessAdapter for AntigravityAdapter {
             mcp_servers,
             skills,
             prompt: prompt.to_owned(),
+            log_file_path,
             cancel_token: options.cancel_token,
         }));
 
@@ -297,14 +307,27 @@ fn fetch_version(binary: &Path) -> String {
 /// so per-tool approval prompts (which would block a headless dispatch)
 /// must be auto-approved. Resume passes the captured UUID via
 /// `--conversation`; first turn omits it and lets `agy` mint a new one.
-fn build_args(prompt: &str, resume_id: Option<Uuid>) -> Vec<String> {
+///
+/// `log_file` isolates this dispatch's CLI log so the no-answer-branch
+/// outcome scan reads only this turn's failures — never another concurrent
+/// `agy`'s log (which the default-dir-by-mtime approach would misattribute).
+fn build_args(prompt: &str, resume_id: Option<Uuid>, log_file: &Path) -> Vec<String> {
     let mut args = vec!["-p".to_owned(), prompt.to_owned()];
     if let Some(uuid) = resume_id {
         args.push("--conversation".to_owned());
         args.push(uuid.to_string());
     }
     args.push("--dangerously-skip-permissions".to_owned());
+    args.push("--log-file".to_owned());
+    args.push(log_file.to_string_lossy().into_owned());
     args
+}
+
+/// Per-dispatch CLI log path under the system temp dir. `turn_id` is unique
+/// per dispatch so concurrent agents can't collide; missing/unreadable later
+/// degrades to the generic fallback (best-effort scan).
+fn build_log_file_path(turn_id: TurnId) -> PathBuf {
+    std::env::temp_dir().join(format!("switchboard-agy-{turn_id}.log"))
 }
 
 /// Arguments to [`run_producer`]. A struct rather than a long parameter list
@@ -330,6 +353,12 @@ struct ProducerCtx {
     /// prompt), so concurrent same-cwd dispatches can't bind each other's
     /// conversation.
     prompt: String,
+    /// Per-dispatch CLI log path. Passed to `agy` via `--log-file` so this
+    /// turn's log is isolated; scanned on the no-answer branch for the
+    /// underlying RPC error (the only place quota / network failures appear —
+    /// `agy` exits 0 with empty stdout/stderr on them). Cleaned up best-effort
+    /// after the scan.
+    log_file_path: PathBuf,
     /// Fired by the dispatcher to cancel the turn. Watched as an arm of the
     /// producer's existing `select!`.
     cancel_token: CancellationToken,
@@ -356,6 +385,7 @@ async fn run_producer(ctx: ProducerCtx) {
         mcp_servers,
         skills,
         prompt,
+        log_file_path,
         cancel_token,
     } = ctx;
 
@@ -518,6 +548,7 @@ async fn run_producer(ctx: ProducerCtx) {
         // holds stderr open.
         crate::subprocess::terminate_then_kill(&mut child).await;
         let _ = stderr_task.await;
+        let _ = std::fs::remove_file(&log_file_path);
         return;
     }
 
@@ -616,6 +647,17 @@ async fn run_producer(ctx: ProducerCtx) {
         }
     }
 
+    // Scan the per-dispatch CLI log only when the turn produced no answer —
+    // a successful turn has nothing in the log we'd want to surface. Best-
+    // effort: an unreadable / missing log falls back to the generic message.
+    let log_error = if saw_terminal_answer {
+        None
+    } else {
+        scan_agy_log_for_error(&log_file_path)
+    };
+    // Per-dispatch log cleanup. Best-effort — leaving a few KB temp file
+    // around isn't load-bearing, but normal operation shouldn't leak.
+    let _ = std::fs::remove_file(&log_file_path);
     let outcome = classify_outcome(
         &OutcomeSignals {
             auth_failed,
@@ -624,6 +666,7 @@ async fn run_producer(ctx: ProducerCtx) {
             unresumable,
             saw_terminal_answer,
             saw_stdout_content,
+            log_error,
         },
         &stdout_buf,
         &stderr_tail,
@@ -876,8 +919,8 @@ fn extract_model_from_record(rec: &TranscriptRecord) -> Option<String> {
 }
 
 /// Post-exit signals fed to [`classify_outcome`]. Bundled into a struct so
-/// the classifier stays a 3-arg pure function (testable without spawning
-/// `agy`).
+/// the classifier stays a small-arity pure function (testable without
+/// spawning `agy`).
 // Five independent booleans, each a distinct terminal condition the producer
 // observed. Modeling them as two-variant enums or a state machine would
 // obscure rather than clarify — they're orthogonal flags, not states.
@@ -889,6 +932,11 @@ struct OutcomeSignals {
     unresumable: bool,
     saw_terminal_answer: bool,
     saw_stdout_content: bool,
+    /// Human-readable message derived from scanning this dispatch's CLI log
+    /// for an `rpc error: code = …` line when no transcript terminal answer
+    /// was produced. `None` when the scan was skipped (success), the file
+    /// was unreadable, or no matching line was found.
+    log_error: Option<String>,
 }
 
 /// True if a line reports the resume target conversation was not found
@@ -914,15 +962,110 @@ fn conversation_not_found(stdout_lines: &[String], stderr_tail: &Mutex<VecDeque<
         .is_ok_and(|buf| buf.iter().any(|l| is_conversation_not_found(l)))
 }
 
+/// Scan a per-dispatch `agy` CLI log for the first `rpc error: code = …`
+/// line and return a human-readable message, or `None` if the file is
+/// missing/unreadable or contains no matching line.
+///
+/// Why this exists: `agy` exits 0 with empty stdout/stderr on
+/// `RESOURCE_EXHAUSTED` (quota) and similar RPC failures — the *only* place
+/// the underlying cause appears is the per-invocation CLI log. Per-dispatch
+/// log isolation (we pass `--log-file <our-path>`) means a positive match
+/// always belongs to *this* turn, never a concurrent `agy`.
+///
+/// Known limitation: a deliberate display-only surface. The log line for
+/// `RESOURCE_EXHAUSTED` actually includes a `Resets in 143h34m25s` suffix
+/// (verified against captured logs); we carry that text through as part of
+/// the displayed message but do **not** parse it into structured retry
+/// metadata or schedule any auto-retry — those are explicit non-goals (see
+/// the failure-message plan's "Out of scope" section).
+fn scan_agy_log_for_error(path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+        let Some(idx) = find_rpc_error_marker(line) else {
+            continue;
+        };
+        // Trim `agy`'s leading log preamble (timestamp + goroutine + file:line)
+        // so the displayed message is the RPC text, not a Go log header.
+        let detail = line[idx..].trim_start();
+        return Some(rpc_error_to_message(detail));
+    }
+    None
+}
+
+/// Find the byte index of the `rpc error: code = ` marker (case-insensitive)
+/// in a log line, or `None` if absent.
+fn find_rpc_error_marker(line: &str) -> Option<usize> {
+    const MARKER: &str = "rpc error: code = ";
+    // MARKER is already lowercase; only the input needs normalization.
+    line.to_ascii_lowercase().find(MARKER)
+}
+
+/// Map an RPC error detail line into a user-facing failure message.
+///
+/// Known codes get an authored prefix; the log's own descriptive tail is
+/// appended verbatim because for `RESOURCE_EXHAUSTED` it carries the
+/// `Resets in <duration>` info that the user wants — but as plain text
+/// only, never parsed into a retry schedule. Unknown codes pass through as
+/// `Antigravity error: <line>` so a never-seen-before RPC failure still
+/// surfaces a meaningful root cause instead of "agy exited without
+/// producing an answer".
+fn rpc_error_to_message(detail: &str) -> String {
+    // `agy` has been observed emitting both `ResourceExhausted` (camel-case;
+    // recent CLI logs) and `RESOURCE_EXHAUSTED` (screaming-snake; older
+    // captures). Normalize for matching.
+    let lower = detail.to_ascii_lowercase().replace('_', "");
+    if lower.contains("resourceexhausted") {
+        let tail = extract_rpc_descriptive_tail(detail);
+        let mut msg =
+            "Antigravity quota exhausted — Google Cloud individual quota reached.".to_owned();
+        if !tail.is_empty() {
+            msg.push(' ');
+            msg.push_str(&tail);
+        }
+        return msg;
+    }
+    format!("Antigravity error: {detail}")
+}
+
+/// Strip the `rpc error: code = <CODE> desc = ` prefix and the duplicated
+/// trailing repetition `agy` logs (`"<msg>: <msg>"`), keeping only the
+/// human-readable descriptive sentence. Falls back to the raw detail when
+/// the shape doesn't match — the caller doesn't depend on the strip
+/// succeeding, just on getting a reasonable string back.
+fn extract_rpc_descriptive_tail(detail: &str) -> String {
+    let after_desc = detail
+        .split_once("desc = ")
+        .map_or(detail, |(_, rest)| rest);
+    let trimmed = after_desc.trim().trim_end_matches('.').trim();
+    // `agy` logs `"<msg>: <msg>"` — same sentence repeated on either side of
+    // the colon. The first half retains its mid-string trailing period
+    // (`"…25s.: …25s"`), the second doesn't — so equality must compare on
+    // the period-stripped form, then return either half (they're
+    // semantically identical) trimmed to the user-facing shape.
+    let halved = match trimmed.split_once(": ") {
+        Some((first, second))
+            if first.trim_end_matches('.').trim() == second.trim_end_matches('.').trim() =>
+        {
+            second.trim_end_matches('.').trim()
+        }
+        _ => trimmed,
+    };
+    halved.to_owned()
+}
+
 /// Build the terminal `TurnOutcome` from the post-exit signals. Pure so the
 /// classification logic is unit-tested without spawning `agy`.
 ///
 /// Precedence: auth fast-fail → ambiguous capture → sidecar write failure →
-/// stdout `Error:` line → unresumable-with-a-streamed-reply (required recapture
-/// failed) → **transcript terminal answer → Completed** → output-but-no-answer
-/// (adapter failure) → no output (adapter failure). A concrete `Error:` line
-/// wins over the generic unresumable classification. `agy` exits 0 universally,
-/// so neither the exit code nor a transcript `status` drives this.
+/// stdout `Error:` line → log-derived RPC error → unresumable-with-a-streamed-reply
+/// (required recapture failed) → **transcript terminal answer → Completed** →
+/// output-but-no-answer (adapter failure) → no output (adapter failure). A
+/// concrete stdout `Error:` line wins over a log-derived RPC error (more direct
+/// signal); the log-derived RPC error wins over the diagnostic
+/// "transcript-path-may-have-changed" branch (the RPC error is the real root
+/// cause). `agy` exits 0 universally, so neither the exit code nor a transcript
+/// `status` drives this.
 ///
 /// **Completed requires a transcript-derived terminal answer** (`saw_terminal_answer`).
 /// stdout is no longer the displayed answer — `agy` replays the whole
@@ -948,7 +1091,7 @@ fn classify_outcome(
     if sig.auth_failed {
         return TurnOutcome::Failed {
             kind: FailureKind::AuthFailure,
-            message: "Antigravity authentication required — sign in via the Antigravity desktop app and reload Switchboard".to_owned(),
+            message: ANTIGRAVITY_AUTH_MESSAGE.to_owned(),
         };
     }
     if sig.ambiguous_capture {
@@ -968,14 +1111,25 @@ fn classify_outcome(
     // timed out and so never created a conversation dir should surface the
     // timeout, not "conversation could not be located."
     if let Some(error) = first_error_line(stdout_lines) {
-        let kind = if is_auth_failure_line(&error) {
-            FailureKind::AuthFailure
+        let (kind, message) = if is_auth_failure_line(&error) {
+            (
+                FailureKind::AuthFailure,
+                ANTIGRAVITY_AUTH_MESSAGE.to_owned(),
+            )
         } else {
-            FailureKind::HarnessError
+            (FailureKind::HarnessError, error)
         };
+        return TurnOutcome::Failed { kind, message };
+    }
+    // Log-derived RPC error: the only place `RESOURCE_EXHAUSTED` / network
+    // failures surface (stdout/stderr stay empty and `agy` exits 0). Wins
+    // over the diagnostic "transcript-path-may-have-changed" branches below
+    // because it names the real root cause; loses to a stdout `Error:` line
+    // above because that's a more direct user-visible signal.
+    if let Some(log_message) = sig.log_error.as_deref() {
         return TurnOutcome::Failed {
-            kind,
-            message: error,
+            kind: FailureKind::HarnessError,
+            message: log_message.to_owned(),
         };
     }
     // Unresumable only matters when a reply actually streamed: a required
@@ -1036,19 +1190,34 @@ mod tests {
 
     #[test]
     fn build_args_first_turn_omits_conversation() {
-        let args = build_args("hello", None);
+        let log = PathBuf::from("/tmp/x.log");
+        let args = build_args("hello", None, &log);
         assert_eq!(args[0], "-p");
         assert_eq!(args[1], "hello");
         assert!(!args.contains(&"--conversation".to_owned()));
         assert!(args.contains(&"--dangerously-skip-permissions".to_owned()));
+        let idx = args.iter().position(|a| a == "--log-file").unwrap();
+        assert_eq!(args[idx + 1], "/tmp/x.log");
     }
 
     #[test]
     fn build_args_resume_passes_conversation_uuid() {
         let uuid = Uuid::new_v4();
-        let args = build_args("hi", Some(uuid));
+        let log = PathBuf::from("/tmp/y.log");
+        let args = build_args("hi", Some(uuid), &log);
         let idx = args.iter().position(|a| a == "--conversation").unwrap();
         assert_eq!(args[idx + 1], uuid.to_string());
+    }
+
+    #[test]
+    fn build_log_file_path_is_unique_per_turn() {
+        let a = build_log_file_path(Uuid::now_v7());
+        let b = build_log_file_path(Uuid::now_v7());
+        assert_ne!(a, b, "different turn ids must yield different log paths");
+        assert!(
+            a.starts_with(std::env::temp_dir()),
+            "log path lives under temp dir"
+        );
     }
 
     #[tokio::test]
@@ -1266,6 +1435,7 @@ mod tests {
             unresumable: false,
             saw_terminal_answer: true,
             saw_stdout_content: true,
+            log_error: None,
         }
     }
 
@@ -1275,13 +1445,26 @@ mod tests {
             auth_failed: true,
             ..ok_signals()
         };
-        assert!(matches!(
-            classify_outcome(&sig, &[], &empty_tail()),
+        match classify_outcome(&sig, &[], &empty_tail()) {
             TurnOutcome::Failed {
                 kind: FailureKind::AuthFailure,
-                ..
+                message,
+            } => {
+                assert!(
+                    message.contains("Antigravity authentication required"),
+                    "names the harness: {message}"
+                );
+                assert!(
+                    message.contains("Antigravity desktop app"),
+                    "names the fix: {message}"
+                );
+                assert!(
+                    !message.contains("reload Switchboard"),
+                    "must not advise reload (reactive auth): {message}"
+                );
             }
-        ));
+            other => panic!("expected AuthFailure, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1405,13 +1588,144 @@ mod tests {
     fn classify_outcome_auth_error_line_is_auth_failure() {
         let lines = vec!["Error: authentication timed out.".to_owned()];
         let sig = ok_signals();
-        assert!(matches!(
-            classify_outcome(&sig, &lines, &empty_tail()),
+        match classify_outcome(&sig, &lines, &empty_tail()) {
             TurnOutcome::Failed {
                 kind: FailureKind::AuthFailure,
-                ..
+                message,
+            } => {
+                // Even when the raw stdout `Error:` line is the trigger, the
+                // authored message wins so the user gets uniform actionable
+                // text.
+                assert!(message.contains("Antigravity desktop app"));
+                assert!(!message.contains("reload Switchboard"));
             }
-        ));
+            other => panic!("expected AuthFailure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_outcome_log_error_surfaces_as_harness_error() {
+        // RESOURCE_EXHAUSTED log line scanned by the producer reaches
+        // classify_outcome via OutcomeSignals.log_error.
+        let sig = OutcomeSignals {
+            saw_terminal_answer: false,
+            saw_stdout_content: false,
+            log_error: Some("Antigravity quota exhausted — Google Cloud individual quota reached. Resets in 143h34m25s.".to_owned()),
+            ..ok_signals()
+        };
+        match classify_outcome(&sig, &[], &empty_tail()) {
+            TurnOutcome::Failed {
+                kind: FailureKind::HarnessError,
+                message,
+            } => {
+                assert!(message.contains("quota exhausted"));
+                assert!(message.contains("Resets in"));
+            }
+            other => panic!("expected HarnessError from log_error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_outcome_log_error_wins_over_unresumable() {
+        // A real RPC failure is the root cause; the diagnostic
+        // "transcript path may have changed" branch must not mask it.
+        let sig = OutcomeSignals {
+            saw_terminal_answer: false,
+            saw_stdout_content: true,
+            unresumable: true,
+            log_error: Some("Antigravity quota exhausted.".to_owned()),
+            ..ok_signals()
+        };
+        match classify_outcome(&sig, &[], &empty_tail()) {
+            TurnOutcome::Failed {
+                kind: FailureKind::HarnessError,
+                message,
+            } => assert!(message.contains("quota exhausted")),
+            other => panic!("expected HarnessError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_outcome_stdout_error_wins_over_log_error() {
+        // A stdout `Error:` line is more direct (the user-visible signal `agy`
+        // itself printed); it should win over a log-derived RPC message.
+        let sig = OutcomeSignals {
+            saw_terminal_answer: false,
+            saw_stdout_content: true,
+            log_error: Some("rpc error noise".to_owned()),
+            ..ok_signals()
+        };
+        let stdout = vec!["Error: timed out waiting for response".to_owned()];
+        match classify_outcome(&sig, &stdout, &empty_tail()) {
+            TurnOutcome::Failed {
+                kind: FailureKind::HarnessError,
+                message,
+            } => assert!(message.contains("timed out")),
+            other => panic!("expected stdout-derived HarnessError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scan_agy_log_resource_exhausted_returns_authored_message_with_log_tail() {
+        let tmp = TempDir::new().unwrap();
+        let log = tmp.path().join("agy.log");
+        std::fs::write(
+            &log,
+            "E0526 13:59:05.636054  1754 log.go:398] agent executor error: rpc error: code = ResourceExhausted desc = Individual quota reached. Contact your administrator to enable overages. Resets in 143h34m25s.: Individual quota reached. Contact your administrator to enable overages. Resets in 143h34m25s.\n",
+        )
+        .unwrap();
+        let msg = scan_agy_log_for_error(&log).expect("log scan must find the error");
+        assert!(
+            msg.starts_with("Antigravity quota exhausted"),
+            "authored prefix: {msg}"
+        );
+        assert!(
+            msg.contains("Resets in 143h34m25s"),
+            "carries the reset-time tail from the log line: {msg}"
+        );
+        assert!(
+            !msg.contains("rpc error: code"),
+            "Go log preamble stripped: {msg}"
+        );
+        // The `agy` log doubles the descriptive sentence on either side of a
+        // `: ` separator. The dedup must collapse it so the user sees one
+        // copy, not a run-on.
+        assert_eq!(
+            msg.matches("Individual quota reached").count(),
+            1,
+            "duplicate descriptive sentence must be collapsed: {msg}"
+        );
+    }
+
+    #[test]
+    fn scan_agy_log_unknown_code_passes_through_as_authored_prefix() {
+        let tmp = TempDir::new().unwrap();
+        let log = tmp.path().join("agy.log");
+        std::fs::write(
+            &log,
+            "E0526 13:59:05.636054  1754 log.go:398] rpc error: code = Internal desc = backend exploded\n",
+        )
+        .unwrap();
+        let msg = scan_agy_log_for_error(&log).expect("scan must surface unknown codes");
+        assert!(
+            msg.starts_with("Antigravity error: "),
+            "unknown code passes through with authored prefix: {msg}"
+        );
+        assert!(msg.contains("Internal"), "carries the code: {msg}");
+    }
+
+    #[test]
+    fn scan_agy_log_missing_file_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        assert!(scan_agy_log_for_error(&tmp.path().join("absent.log")).is_none());
+    }
+
+    #[test]
+    fn scan_agy_log_no_rpc_error_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let log = tmp.path().join("agy.log");
+        std::fs::write(&log, "I0526 13:59:05.636054 log.go:398] normal startup\n").unwrap();
+        assert!(scan_agy_log_for_error(&log).is_none());
     }
 
     #[test]

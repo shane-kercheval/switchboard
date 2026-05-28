@@ -695,3 +695,158 @@ async fn cancel_terminates_and_emits_no_terminal() {
         "adapter must emit no terminal event on cancel; got: {events:?}"
     );
 }
+
+/// End-to-end quota path: with the per-dispatch `--log-file` carrying a
+/// `RESOURCE_EXHAUSTED` line, the no-answer branch surfaces an authored
+/// `HarnessError` quota message instead of the generic "agy exited without
+/// producing an answer" fallback. Closes G1 (`docs/research/harness-behavior.md`).
+#[tokio::test]
+async fn quota_log_line_surfaces_as_harness_error_quota_message() {
+    let home = tempfile::TempDir::new().unwrap();
+    let cwd = tempfile::TempDir::new().unwrap();
+    let adapter = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home.path());
+    let agent = agy_agent();
+
+    write_script(
+        cwd.path(),
+        &json!({
+            "conversation_uuid": Uuid::new_v4().to_string(),
+            "create_brain_dir": false,
+            "stdout": [],
+            "exit_code": 0,
+            "log_file_content": "E0526 13:59:05.636054  1754 log.go:398] agent executor error: rpc error: code = ResourceExhausted desc = Individual quota reached. Contact your administrator to enable overages. Resets in 143h34m25s.: Individual quota reached. Contact your administrator to enable overages. Resets in 143h34m25s.\n",
+        }),
+    );
+
+    let events = dispatch(&adapter, &agent, cwd.path(), "hi").await;
+    match outcome(&events) {
+        TurnOutcome::Failed {
+            kind: FailureKind::HarnessError,
+            message,
+        } => {
+            assert!(
+                message.contains("quota exhausted"),
+                "authored quota prefix: {message}"
+            );
+            assert!(
+                message.contains("Resets in 143h34m25s"),
+                "reset-time tail carried through: {message}"
+            );
+            assert_eq!(
+                message.matches("Individual quota reached").count(),
+                1,
+                "agy doubles the descriptive sentence; dedup must surface one copy: {message}"
+            );
+            assert!(
+                !message.contains("without producing an answer"),
+                "must not fall through to the generic no-answer message: {message}"
+            );
+        }
+        other => panic!("expected HarnessError quota message, got {other:?}"),
+    }
+}
+
+/// Two concurrent dispatches each scan their own `--log-file` — no
+/// cross-attribution. The closed-the-misattribution-hole reason for
+/// per-dispatch log isolation (vs. an mtime-windowed default-dir scan)
+/// only matters under concurrency, so prove it directly.
+#[tokio::test]
+async fn concurrent_quota_dispatches_read_their_own_logs() {
+    let home_a = tempfile::TempDir::new().unwrap();
+    let home_b = tempfile::TempDir::new().unwrap();
+    let cwd_a = tempfile::TempDir::new().unwrap();
+    let cwd_b = tempfile::TempDir::new().unwrap();
+    let adapter_a = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home_a.path());
+    let adapter_b = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home_b.path());
+    let agent_a = agy_agent();
+    let agent_b = agy_agent();
+
+    // Agent A: quota failure. Agent B: a different RPC failure (unknown code,
+    // passes through as authored "Antigravity error: …").
+    write_script(
+        cwd_a.path(),
+        &json!({
+            "conversation_uuid": Uuid::new_v4().to_string(),
+            "create_brain_dir": false,
+            "stdout": [],
+            "exit_code": 0,
+            "log_file_content": "E0526 13:59:05 log.go:398] rpc error: code = ResourceExhausted desc = quota reached\n",
+        }),
+    );
+    write_script(
+        cwd_b.path(),
+        &json!({
+            "conversation_uuid": Uuid::new_v4().to_string(),
+            "create_brain_dir": false,
+            "stdout": [],
+            "exit_code": 0,
+            "log_file_content": "E0526 13:59:05 log.go:398] rpc error: code = Internal desc = backend exploded\n",
+        }),
+    );
+
+    let (events_a, events_b) = tokio::join!(
+        dispatch(&adapter_a, &agent_a, cwd_a.path(), "a"),
+        dispatch(&adapter_b, &agent_b, cwd_b.path(), "b"),
+    );
+
+    match outcome(&events_a) {
+        TurnOutcome::Failed {
+            kind: FailureKind::HarnessError,
+            message,
+        } => assert!(
+            message.contains("quota exhausted"),
+            "A must see its own quota error, not B's Internal: {message}"
+        ),
+        other => panic!("A: expected quota HarnessError, got {other:?}"),
+    }
+    match outcome(&events_b) {
+        TurnOutcome::Failed {
+            kind: FailureKind::HarnessError,
+            message,
+        } => {
+            assert!(
+                message.contains("Antigravity error: ") && message.contains("Internal"),
+                "B must see its own Internal error, not A's quota: {message}"
+            );
+            assert!(
+                !message.contains("quota exhausted"),
+                "B's message must not contain A's quota text: {message}"
+            );
+        }
+        other => panic!("B: expected Internal HarnessError, got {other:?}"),
+    }
+}
+
+/// Successful turn: the per-dispatch log is left untouched by the producer's
+/// scan (only the no-answer branch reads it). Even if the log file is
+/// staged with a quota line, a transcript terminal answer takes precedence
+/// and the turn completes.
+#[tokio::test]
+async fn successful_turn_does_not_scan_or_misclassify_from_log() {
+    let home = tempfile::TempDir::new().unwrap();
+    let cwd = tempfile::TempDir::new().unwrap();
+    let adapter = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home.path());
+    let agent = agy_agent();
+    let uuid = Uuid::new_v4();
+
+    write_script(
+        cwd.path(),
+        &json!({
+            "conversation_uuid": uuid.to_string(),
+            "records": [
+                {"json": user_record("hi", "2026-05-19T19:00:00Z"), "delay_ms": 0},
+                {"json": terminal_record("2026-05-19T19:00:01Z", "ack"), "delay_ms": 0},
+            ],
+            "stdout": [drip("ack", 0)],
+            "exit_code": 0,
+            "log_file_content": "E0526 13:59:05 log.go:398] rpc error: code = ResourceExhausted desc = should never be surfaced\n",
+        }),
+    );
+
+    let events = dispatch(&adapter, &agent, cwd.path(), "hi").await;
+    assert!(
+        matches!(outcome(&events), TurnOutcome::Completed),
+        "successful turn must complete; log scan must not run: {:?}",
+        outcome(&events)
+    );
+}

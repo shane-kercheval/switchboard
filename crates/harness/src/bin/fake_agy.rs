@@ -29,6 +29,11 @@
 //!   "records": [ {"json": "<raw transcript.jsonl line>", "delay_ms": 0} ],
 //!   "stdout": [ {"text": "<answer line>", "delay_ms": 0} ],
 //!   "exit_code": 0,
+//!   "log_file_content": "<text>",    // optional: when set AND the adapter passed
+//!                                    //   --log-file <path>, write the text to that
+//!                                    //   path. Stages content for the no-answer
+//!                                    //   branch's log scan (e.g. a RESOURCE_EXHAUSTED
+//!                                    //   line) without needing the real `agy` CLI.
 //!   "hang": false                    // true → after writing records/stdout, sleep
 //!                                    //   indefinitely instead of exiting, so a
 //!                                    //   cancellation test can fire the token while
@@ -63,6 +68,13 @@ struct Script {
     stdout: Vec<Drip>,
     #[serde(default)]
     exit_code: i32,
+    /// Stage content for the per-dispatch CLI log scan. When non-empty and
+    /// the adapter passed `--log-file <path>`, write this text there so the
+    /// adapter's no-answer-branch scan reads it. Letting the test express
+    /// the entire failure shape (e.g. a `RESOURCE_EXHAUSTED` line) through
+    /// the same wiring the production adapter uses.
+    #[serde(default)]
+    log_file_content: String,
     /// When true, park indefinitely after writing records/stdout (never exit
     /// on our own), so a cancellation test can fire the token mid-turn. Stays
     /// killable (a sleeping process dies on SIGTERM/SIGKILL).
@@ -82,6 +94,15 @@ struct Drip {
 
 fn default_true() -> bool {
     true
+}
+
+/// Return the value of `--flag <value>` from argv, or `None` if absent or
+/// trailing without a value.
+fn arg_value(args: &[String], flag: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
 }
 
 fn main() {
@@ -109,6 +130,16 @@ fn main() {
         .open(FAKE_AGY_INVOCATIONS_FILE)
     {
         let _ = writeln!(f, "{}", args[1..].join(" "));
+    }
+
+    // Stage the per-dispatch CLI log: write the script's `log_file_content`
+    // to whatever path the adapter passed via `--log-file`. Lets a test
+    // stage a `RESOURCE_EXHAUSTED` line that the adapter's no-answer scan
+    // will read through the same wiring as the real `agy` CLI.
+    if !script.log_file_content.is_empty()
+        && let Some(log_path) = arg_value(&args, "--log-file")
+    {
+        let _ = std::fs::write(&log_path, &script.log_file_content);
     }
 
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| {

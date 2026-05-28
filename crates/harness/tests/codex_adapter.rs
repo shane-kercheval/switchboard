@@ -189,7 +189,12 @@ async fn auth_failure_fixture_yields_auth_failure_terminal() {
             ..
         } => {
             assert_eq!(*kind, FailureKind::AuthFailure);
-            assert!(message.contains("401 Unauthorized"));
+            // Authored Codex auth message — raw "401 Unauthorized" replaced
+            // with uniform actionable text. End-to-end through the adapter
+            // (not just the parser).
+            assert!(message.contains("Codex authentication required"));
+            assert!(message.contains("codex login"));
+            assert!(!message.contains("reload Switchboard"));
         }
         other => panic!("expected TurnEnd(AuthFailure), got {other:?}"),
     }

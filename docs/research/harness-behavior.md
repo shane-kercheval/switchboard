@@ -34,14 +34,16 @@ Each turn ends in exactly one terminal outcome: `Completed` · `Failed { kind, m
 
 ### 1.3 Auth failure
 
-| Harness | Observed shape (reactive, per-turn) | Classified | Proactive startup probe → project banner |
-|---|---|---|---|
-| Claude | `assistant` envelope top-level `"error":"authentication_failed"` + "Not logged in · Please run /login" | `AuthFailure` ✅ (classified) | **❌ none** — Claude is hardcoded `auth:"unsupported"` (`App.svelte`); no pre-flight, no banner. Discovered only by sending a turn. |
-| Codex | stream `turn.failed.error.message` contains `"401 Unauthorized"` | `AuthFailure` ✅ | ✅ `check_codex_auth_impl` (file-presence of `~/.codex/auth.json`; has a documented stale-file false-positive) |
-| Gemini | **bad token:** presumed `result.status:"error"` "401" — **never observed**. **logged-out:** exit **41** + stderr "Please set an Auth method…", **no stream** | bad-token→`AuthFailure` (guessed substrings); **logged-out→`AdapterFailure` ❌** (exit 41≠42; substring set misses it) | ✅ `check_gemini_auth_impl` (reads `settings.json` `security.auth.selectedType`) |
-| Antigravity | stdout `Authentication required…` → (force-killed before the 30s OAuth wait) → `Error: authentication timed out.`, exit 0 | `AuthFailure` ✅ (`is_auth_failure_line`; break+`terminate_then_kill` bounds it) | ✅ `check_antigravity_auth_impl` (keychain `security find-generic-password -s gemini -a antigravity`) |
+| Harness | Observed shape (reactive, per-turn) | Classified | Surfaced message | Proactive startup probe → project banner |
+|---|---|---|---|---|
+| Claude | `assistant` envelope top-level `"error":"authentication_failed"` (Claude's own text is `"Not logged in · Please run /login"`) | `AuthFailure` ✅ | Authored: `"Claude authentication required — run `claude login`"` (Claude's `/login` is the in-app slash command; the authored copy names the CLI command) | **❌ none** — Claude is hardcoded `auth:"unsupported"` (`App.svelte`); no pre-flight, no banner. Discovered only by sending a turn. |
+| Codex | stream `turn.failed.error.message` contains `"401 Unauthorized"` | `AuthFailure` ✅ | Authored: `"Codex authentication required — run `codex login`"` (raw 401 text replaced) | ✅ `check_codex_auth_impl` (file-presence of `~/.codex/auth.json`; has a documented stale-file false-positive) |
+| Gemini | **bad token:** presumed `result.status:"error"` "401" — **never observed**. **logged-out:** exit **41** + stderr "Please set an Auth method…", **no stream**. **bad-token (alt):** exit **42** + 401 on stderr | All three → `AuthFailure` ✅ | Authored (uniform across all three shapes): `"Gemini authentication required — run `gemini` interactively to sign in"` | ✅ `check_gemini_auth_impl` (reads `settings.json` `security.auth.selectedType`) |
+| Antigravity | stdout `Authentication required…` → (force-killed before the 30s OAuth wait) → `Error: authentication timed out.`, exit 0 | `AuthFailure` ✅ (`is_auth_failure_line`; break+`terminate_then_kill` bounds it) | Authored: `"Antigravity authentication required — sign in via the Antigravity desktop app"` | ✅ `check_antigravity_auth_impl` (keychain `security find-generic-password -s gemini -a antigravity`) |
 
-**Two disjoint auth surfaces** (cross-cutting): (a) a **startup probe** → a project-level red banner "X not authenticated — … reload Switchboard" (Codex/Gemini/Antigravity only; **reload-gated** — runs once in `onMount`, signing in mid-session doesn't clear it); (b) a **reactive per-turn `AuthFailure`** → renders as a *generic* red error in the transcript (see §2). They never interact.
+**Uniform authored auth messages (cross-cutting).** Every adapter authors its `AuthFailure` message — naming the harness and the recovery command — instead of surfacing the raw harness text (`"401 Unauthorized"`, `"Please set an Auth method"`, `"Not logged in · Please run /login"`). The user sees one consistent actionable line regardless of which harness's auth surface fired. **None mention "reload Switchboard"** — reactive-auth posture: discover on send, sign in, send again. Constants: `CLAUDE_AUTH_MESSAGE` / `CODEX_AUTH_MESSAGE` / `GEMINI_AUTH_MESSAGE` (`parser.rs` / `codex/parser.rs` / `gemini/parser.rs`); `ANTIGRAVITY_AUTH_MESSAGE` (`antigravity/mod.rs`).
+
+**Two disjoint auth surfaces** (cross-cutting, retained for context): (a) a **startup probe** → a project-level red banner "X not authenticated — … reload Switchboard" (Codex/Gemini/Antigravity only; **reload-gated** — runs once in `onMount`, signing in mid-session doesn't clear it); (b) a **reactive per-turn `AuthFailure`** → renders as a *generic* red error in the transcript (see §2). They never interact. The banner goes away in the next milestone (reactive-only auth).
 
 ### 1.4 Quota / usage-limit
 
@@ -49,7 +51,7 @@ Each turn ends in exactly one terminal outcome: `Completed` · `Failed { kind, m
 |---|---|---|---|
 | Codex | `turn.failed.error.message` = "You've hit your usage limit … try again at 1:00 PM" (exit 1) | `HarnessError`, **verbatim message preserved** (reset time + upgrade link reach the user) | ✅ accurate message; just not *distinguished* from other harness errors |
 | Claude | **turn SUCCEEDS** (overage served). Only signal: `rate_limit_event` `isUsingOverage:true` (+ `status:"rejected"`, `resetsAt`, `overageResetsAt`) | captured verbatim into `last_rate_limit` | ❌ **displayed nowhere** — no "spending usage credits" indication |
-| Antigravity | `RESOURCE_EXHAUSTED` **only in the per-invocation CLI log** `~/.gemini/antigravity-cli/log/cli-*.log`; stdout/stderr/transcript all empty, exit 0 | **❌ misclassified** → falls through to generic `AdapterFailure` "agy exited without producing an answer" (`mod.rs:~1004`). No log scan exists. | ❌ the user's exact confusing case — a hard quota wall looks like a transient crash |
+| Antigravity | `rpc error: code = ResourceExhausted desc = Individual quota reached. … Resets in <duration>` on the per-dispatch CLI log; stdout/stderr/transcript all empty, exit 0 | ✅ `HarnessError` with authored prefix + the log line's `Resets in …` tail. The adapter passes `--log-file <per-dispatch-temp>` so the scan reads only *this* turn's log (no cross-attribution under concurrent dispatch). Unknown `rpc error: code = <CODE>` lines pass through as `"Antigravity error: <line>"`. | Display-only: we surface "quota exhausted" + the reset duration the log carries, but never parse it into structured retry metadata or schedule a retry. |
 | Gemini | free-tier exhaustion observed to **retry-and-complete**, not hard-fail | nothing to classify | record as "stalls, no hard wall" (no action) |
 
 ### 1.5 Cancellation
@@ -58,7 +60,7 @@ Uniform and correct across all four: token-driven (`select!`), adapter kills its
 
 ### 1.6 Adapter / parse failure
 
-All four synthesize `AdapterFailure` for malformed JSON, stdout read errors, and EOF-without-terminal (with the stderr tail appended); the frontend `heartbeat_timeout` path also synthesizes one. ✅ This is the catch-all that Gemini-logged-out (1.3) and Antigravity-quota (1.4) **wrongly** land in.
+All four synthesize `AdapterFailure` for malformed JSON, stdout read errors, and EOF-without-terminal (with the stderr tail appended); the frontend `heartbeat_timeout` path also synthesizes one. ✅ Gemini-logged-out and Antigravity-quota used to mis-land here; both now route to their correct `AuthFailure` / `HarnessError` classifications with authored messages (see G1/G2 in §4 — closed).
 
 ---
 
@@ -119,8 +121,8 @@ For metadata-flavored fields, where a datum lives determines whether Switchboard
 Grouped by theme; this is the candidate scope for the failure/metadata-surfacing milestone.
 
 **Failure accuracy:**
-- **G1 — Antigravity quota misclassified** as generic `AdapterFailure` "agy exited without producing an answer". Fix: on the no-answer branch, scan the invocation CLI log for the error line (`RESOURCE_EXHAUSTED`, and ideally any `rpc error: code = …`) and surface an accurate message. Best-effort (undocumented Go log; falls back to generic on miss).
-- **G2 — Gemini logged-out misclassified** as `AdapterFailure` (exit 41 + "Please set an Auth method", no stream). Fix: recognize the exit-41/stderr shape as `AuthFailure` (the "401" path stays for bad-token, still unobserved).
+- ✅ **G1 — Antigravity quota misclassified.** **Closed.** Per-dispatch `--log-file` isolation + a `rpc error: code = …` scan on the no-answer branch yields `HarnessError` with an authored "quota exhausted" prefix and the log line's `Resets in <duration>` tail. Unknown codes pass through as `"Antigravity error: <line>"`. Fixture-driven concurrent-isolation test asserts no cross-attribution. See `antigravity/mod.rs::scan_agy_log_for_error`.
+- ✅ **G2 — Gemini logged-out misclassified.** **Closed.** `synthesize_terminal_failure` now recognizes exit 41 + "Please set an Auth method" as `AuthFailure`; the existing exit-42 401 path also rewrites to the same authored `AuthFailure` message. All three Gemini auth surfaces (in-stream 401, exit-41, exit-42) emit the same authored copy. See `gemini/mod.rs::synthesize_terminal_failure`.
 
 **Failure rendering (cross-cutting):**
 - **G3 — `error_kind` is never rendered.** Decide a consistent treatment (per decision: *not* a bespoke per-kind UI — quota/auth render like any failure, just with the accurate message). The lever is the message + possibly a single shared affordance, not N renders. Note this also subsumes the unbuilt "AuthFailure banner."

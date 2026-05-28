@@ -238,13 +238,8 @@
 
 {#snippet userMessage(row: Extract<UnifiedRow, { kind: "user" }>)}
   <div class="group min-w-0 flex-1" data-testid="turn" data-role="user">
-    <div class="bg-panel/45 -mx-3 space-y-1.5 rounded-md px-3 py-2">
-      <div class="flex items-center gap-2 text-xs font-semibold tracking-wide uppercase">
-        <span class="text-fg" data-testid="turn-author">User</span>
-      </div>
-      <div class="border-border border-l pl-3">
-        <Markdown text={row.text} />
-      </div>
+    <div class="bg-blue-100/20 -mx-3 rounded-md px-3 py-2">
+      <Markdown text={row.text} />
     </div>
     {@render messageMeta(row.at, row.text, "Copy message")}
   </div>
@@ -262,7 +257,7 @@
       <span class="text-fg" data-testid="turn-agent-name">{agentName(row.agent_id)}</span>
       {#if harness}<HarnessIcon {harness} testid="turn-harness-icon" />{:else}<Badge>?</Badge>{/if}
     </div>
-    <div class="border-l pl-3" style:border-left-color={agentBorderColor(row.agent_id)}>
+    <div class="border-l-[0.5px] pl-3" style:border-left-color={agentBorderColor(row.agent_id)}>
       {#if row.status === "cancelled"}
         <StatusChip status="cancelled" testid="outcome-cancelled" />
       {:else}
@@ -287,7 +282,7 @@
         "turn-live-control",
       )}
     </div>
-    <div class="border-l pl-3" style:border-left-color={agentBorderColor(agentId)}>
+    <div class="border-l-[0.5px] pl-3" style:border-left-color={agentBorderColor(agentId)}>
       <StatusChip status="queued" testid="turn-queued" />
     </div>
   </div>
@@ -310,7 +305,7 @@
       {/if}
     </div>
     <div
-      class="space-y-1.5 border-l pl-3"
+      class="space-y-1.5 border-l-[0.5px] pl-3"
       style:border-left-color={agentBorderColor(turn.agent_id)}
     >
       {@render turnStatusLabel(turn.status)}
@@ -389,7 +384,7 @@
                   {/if}
                 </div>
                 <div
-                  class="space-y-1.5 border-l pl-3"
+                  class="space-y-1.5 border-l-[0.5px] pl-3"
                   style:border-left-color={agentBorderColor(col.agent_id)}
                 >
                   {#each col.rows as r (r.key)}

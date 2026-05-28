@@ -464,21 +464,27 @@
   {/if}
 
   <Dialog bind:open={newProjectOpen} title="New project" onClose={() => (newProjectOpen = false)}>
-    <div class="space-y-3" data-testid="new-project-form">
-      <div class="space-y-1">
+    <div class="space-y-4" data-testid="new-project-form">
+      <div class="space-y-1.5">
         <span class="text-muted block text-xs">Folder</span>
-        <div class="flex items-center gap-2">
-          <Button data-testid="new-project-choose-folder" onclick={chooseNewProjectFolder}>
-            Choose folder…
-          </Button>
-          {#if newProjectFolder}
-            <span class="text-muted truncate font-mono text-xs" title={newProjectFolder}>
-              {newProjectFolder}
-            </span>
-          {/if}
-        </div>
+        <Button
+          variant="secondary"
+          size="sm"
+          data-testid="new-project-choose-folder"
+          onclick={chooseNewProjectFolder}
+        >
+          Choose folder…
+        </Button>
+        {#if newProjectFolder}
+          <p
+            class="text-muted bg-panel truncate rounded px-2 py-1.5 font-mono text-xs"
+            title={newProjectFolder}
+          >
+            {newProjectFolder}
+          </p>
+        {/if}
       </div>
-      <div class="space-y-1">
+      <div class="space-y-1.5">
         <label for="new-project-name" class="text-muted block text-xs">Name</label>
         <Input
           id="new-project-name"

@@ -15,6 +15,8 @@ The concrete gaps this closes (from the audit's gap register): G1 (Antigravity q
 ## Required reading (before implementing)
 
 - [`docs/research/harness-behavior.md`](../research/harness-behavior.md) — the canonical matrix; the gap register (G1–G14) is the scope source, and **§3.1 (event ⟂ on-disk parity)** is the substrate for Milestone 3. **Read first.**
+
+> **Out of scope here, tracked separately:** Claude session-file / stream parser fidelity (subagent attribution, out-of-order `tool_use`/`tool_result` writes, warning-surface UX) is covered by [`2026-05-27-claude-session-file-parser-fidelity.md`](2026-05-27-claude-session-file-parser-fidelity.md). The "N transcript warnings" surface that fires on those bugs is *unrelated* to this plan's failure/metadata work — don't try to address it here.
 - [`docs/system-design.md`](../system-design.md) §7 "Failure handling" (failures = harness/template/orchestration errors; the transcript is the surface) and §9 (harness adapter pattern; keep the dispatcher harness-agnostic).
 - The captured shapes behind the cells you'll touch (archived provenance): `docs/research/archive/antigravity-cli-observed.md` §"Quota exhaustion (RESOURCE_EXHAUSTED)" + §"Unauthenticated shape"; `docs/research/archive/gemini-cli-observed.md` §"Pending items #1" (logged-out exit-41 capture); `docs/research/archive/claude-code-cli-observed.md` §`rate_limit_event` overage shape; `docs/research/archive/codex-cli-observed.md` §"usage-limit error shape".
 - [`docs/ui-conventions.md`](../ui-conventions.md) — for the Sidebar metadata work (semantic tokens, `ui/` primitives).

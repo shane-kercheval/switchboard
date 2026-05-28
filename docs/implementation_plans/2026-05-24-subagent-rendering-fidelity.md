@@ -1,6 +1,6 @@
 # Follow-up: subagent rendering fidelity (`parent_tool_use_id`)
 
-**Status:** open follow-up work item. **Sequencing:** pick up *after* M4.6 lands — it is an isolated parser/adapter change, orthogonal to the workspace/switcher reshape, and should not gate that cluster. **Owner on pickup:** an agent that will read the code but was not in the investigation conversation — this doc carries the decisions and the ground-truth evidence so they're recoverable.
+**Status: SUPERSEDED 2026-05-27** by [`2026-05-27-claude-session-file-parser-fidelity.md`](2026-05-27-claude-session-file-parser-fidelity.md), which consolidates this subagent-attribution fix with a sibling Claude session-file parser bug (out-of-order `tool_use` / `tool_result` records, observed on Claude 2.1.150) and a warning-surface UX cleanup. **Implementing agent: work from the consolidated plan, not this one.** This doc is preserved unedited for investigation provenance — the probe shapes, cross-harness verification (2026-05-24), and reasoning behind the v1 collapse decision live here.
 
 ## Problem
 

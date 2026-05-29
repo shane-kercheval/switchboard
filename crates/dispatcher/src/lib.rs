@@ -51,7 +51,7 @@ use futures::StreamExt;
 use switchboard_core::{AgentId, AgentRecord, SendId};
 use switchboard_harness::{
     AdapterEvent, CancelSource, DispatchOptions, EventStream, FailureKind, HarnessAdapter,
-    MessageId, NormalizedEvent, TurnId, TurnOutcome,
+    MessageId, NormalizedEvent, RateLimitSource, TurnId, TurnOutcome,
 };
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -303,6 +303,35 @@ pub trait ConversationJournal: Send + Sync {
     );
 }
 
+/// Sink for **stream-only** (class-C) metadata that has no harness-side
+/// on-disk equivalent, so Switchboard persists it to survive an app restart.
+/// Parallel to [`ConversationJournal`]: the dispatcher owns *when* a snapshot
+/// is recorded (on a `RateLimitEvent` whose `source` is `StreamOnly`); the
+/// app-side impl owns *where* (the per-agent metadata sidecar).
+///
+/// **Best-effort, not load-bearing.** Returns `()`; the implementation logs
+/// and swallows write errors. The cache is a UX improvement (restart
+/// continuity), not a correctness dependency — a failed write degrades to
+/// "the agent bar is empty until the next event," exactly the pre-cache
+/// behavior, never a failed turn.
+pub trait MetadataCache: Send + Sync {
+    /// Persist the latest rate-limit snapshot for `agent_id`. Last-write-wins.
+    fn record_rate_limit(
+        &self,
+        agent_id: AgentId,
+        info: serde_json::Value,
+        captured_at: DateTime<Utc>,
+    );
+}
+
+/// No-op metadata cache for tests and any caller that doesn't persist
+/// stream-only metadata (e.g. the live end-to-end harness).
+pub struct NoopMetadataCache;
+
+impl MetadataCache for NoopMetadataCache {
+    fn record_rate_limit(&self, _: AgentId, _: serde_json::Value, _: DateTime<Utc>) {}
+}
+
 /// No-op journal for tests and any caller that doesn't persist the user side.
 pub struct NoopJournal;
 
@@ -339,6 +368,7 @@ pub struct DispatchContext {
     pub emitter: Arc<dyn EventEmitter>,
     pub options: DispatchOptions,
     pub journal: Arc<dyn ConversationJournal>,
+    pub metadata: Arc<dyn MetadataCache>,
 }
 
 /// Builds a [`DispatchContext`] for an agent's next turn. Injected by the app
@@ -792,6 +822,7 @@ async fn run_turn(
         emitter,
         mut options,
         journal,
+        metadata,
     } = factory.build(item.send_id);
     let turn_id: TurnId = Uuid::now_v7();
     let started_at = Utc::now();
@@ -861,6 +892,7 @@ async fn run_turn(
         started_at,
         &emitter,
         &journal,
+        &metadata,
         &token,
         stream,
         commands,
@@ -883,6 +915,7 @@ async fn drain_turn(
     started_at: DateTime<Utc>,
     emitter: &Arc<dyn EventEmitter>,
     journal: &Arc<dyn ConversationJournal>,
+    metadata: &Arc<dyn MetadataCache>,
     token: &CancellationToken,
     mut stream: EventStream,
     commands: &mut mpsc::UnboundedReceiver<Command>,
@@ -912,6 +945,17 @@ async fn drain_turn(
                     if !matches!(outcome, TurnOutcome::Completed) {
                         journal.record_outcome(turn_id, agent_id, outcome, started_at, *ended_at);
                     }
+                }
+                // Persist stream-only (class-C) rate-limit snapshots so they
+                // survive an app restart. The gate is on the event's `source`,
+                // not the harness — keeping the dispatcher harness-agnostic.
+                // Session-file-backed payloads (Codex) are already durable on
+                // disk and are not re-persisted. Best-effort: the cache logs
+                // and swallows write errors, so this never blocks the turn.
+                if let AdapterEvent::RateLimitEvent { agent_id: a, info, source } = &event
+                    && *source == RateLimitSource::StreamOnly
+                {
+                    metadata.record_rate_limit(*a, info.clone(), Utc::now());
                 }
                 let normalized: NormalizedEvent = event.into();
                 emit_event(emitter.as_ref(), channel, &normalized, agent_id);

@@ -52,6 +52,30 @@ pub struct McpServerStatus {
     pub status: String,
 }
 
+/// Where a `RateLimitEvent`'s payload is durable — the dispatcher's gate for
+/// whether to persist it to the per-agent metadata sidecar.
+///
+/// This is an **internal adapter→dispatcher** discriminator: it rides on
+/// [`AdapterEvent::RateLimitEvent`] but is deliberately dropped at the
+/// [`NormalizedEvent`] boundary (the frontend doesn't need it). Keeping the
+/// persistence rule in the type system — rather than a `match harness {…}` in
+/// the dispatcher — is what lets the dispatcher stay harness-agnostic while
+/// still persisting only the class-C (stream-only) payloads.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum RateLimitSource {
+    /// Lives only on the live stream; no session-file equivalent (class C, per
+    /// `docs/research/harness-behavior.md` §3.1). Claude's `rate_limit_event`.
+    /// The dispatcher persists these to the metadata sidecar so they survive
+    /// restart.
+    StreamOnly,
+    /// Already persisted by the harness in its own session file (class B); the
+    /// harness file is canonical and durable, so Switchboard does **not**
+    /// re-persist it. Codex's session-file-enriched rate-limit.
+    SessionFileBacked,
+}
+
 /// Per-turn usage and cost. Carried on `TurnEnd.usage`.
 ///
 /// `total_cost_usd` is Claude Code only (subscription auth has no dollar
@@ -115,6 +139,10 @@ pub enum AdapterEvent {
     RateLimitEvent {
         agent_id: AgentId,
         info: serde_json::Value,
+        /// Where this payload is durable — gates Switchboard-side persistence.
+        /// Not carried to the frontend (dropped in the `NormalizedEvent`
+        /// conversion below).
+        source: RateLimitSource,
     },
     SessionMeta {
         agent_id: AgentId,
@@ -279,7 +307,9 @@ impl From<AdapterEvent> for NormalizedEvent {
                 ended_at,
                 usage,
             },
-            AdapterEvent::RateLimitEvent { agent_id, info } => {
+            // `source` is intentionally dropped — it's an internal persistence
+            // discriminator the frontend doesn't need (see `RateLimitSource`).
+            AdapterEvent::RateLimitEvent { agent_id, info, .. } => {
                 NormalizedEvent::RateLimitEvent { agent_id, info }
             }
             AdapterEvent::SessionMeta {
@@ -764,17 +794,25 @@ mod tests {
     }
 
     #[test]
-    fn adapter_event_lifts_to_normalized_rate_limit_event() {
+    fn adapter_event_lifts_to_normalized_rate_limit_event_dropping_source() {
         let agent_id = fresh_agent_id();
         let adapter = AdapterEvent::RateLimitEvent {
             agent_id,
             info: json!({"x": 1}),
+            source: RateLimitSource::StreamOnly,
         };
+        // The `source` discriminator is internal — it must not survive the
+        // conversion to the wire-format event (the frontend never sees it).
         let normalized = NormalizedEvent::from(adapter);
         assert!(matches!(
             normalized,
             NormalizedEvent::RateLimitEvent { agent_id: a, .. } if a == agent_id
         ));
+        let value = serde_json::to_value(&normalized).unwrap();
+        assert!(
+            value.get("source").is_none(),
+            "source must not appear on the wire: {value}"
+        );
     }
 
     #[test]

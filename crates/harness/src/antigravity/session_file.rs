@@ -360,6 +360,7 @@ impl Reconstruction {
                 skills: vec![],
             }),
             last_rate_limit: None,
+            last_rate_limit_as_of: None,
             warnings: self.warnings,
         }
     }

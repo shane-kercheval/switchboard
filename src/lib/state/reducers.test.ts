@@ -908,29 +908,59 @@ describe("runtimeReducer", () => {
     expect(r.meta?.model).toBe("live-model");
   });
 
-  it("hydrate fills last_rate_limit when currently empty", () => {
+  it("hydrate fills last_rate_limit + its as_of when currently empty", () => {
     const r = runtimeReducer(fresh(), {
       type: "hydrate",
       agent_id: AGENT_A,
       turns: [],
       last_rate_limit: { primary: { used_percent: 10.0 } },
+      last_rate_limit_as_of: "2026-05-27T18:42:11Z",
     });
     expect(r.last_rate_limit).toEqual({ primary: { used_percent: 10.0 } });
+    // The capture time rides along with the value it qualifies.
+    expect(r.last_rate_limit_as_of).toBe("2026-05-27T18:42:11Z");
   });
 
-  it("live rate_limit_event always overwrites a previously hydrated value", () => {
+  it("live rate_limit_event after a stale hydrate clears as_of to null (stale → live)", () => {
+    // Hydrate restores a stale on-disk snapshot with its capture time.
     let r = runtimeReducer(fresh(), {
       type: "hydrate",
       agent_id: AGENT_A,
       turns: [],
       last_rate_limit: { primary: { used_percent: 10.0 } },
+      last_rate_limit_as_of: "2026-05-27T18:42:11Z",
     });
+    expect(r.last_rate_limit_as_of).toBe("2026-05-27T18:42:11Z");
+    // A live event overwrites the value and must drop the staleness qualifier
+    // — the in-memory value is now live, not an aged on-disk snapshot.
     r = runtimeReducer(r, {
       type: "rate_limit_event",
       agent_id: AGENT_A,
       info: { primary: { used_percent: 99.0 } },
     });
     expect(r.last_rate_limit).toEqual({ primary: { used_percent: 99.0 } });
+    expect(r.last_rate_limit_as_of).toBeNull();
+  });
+
+  it("hydrate after a fresh live event leaves the live value + null as_of in place", () => {
+    // Live event sets the value and clears as_of.
+    let r = runtimeReducer(fresh(), {
+      type: "rate_limit_event",
+      agent_id: AGENT_A,
+      info: { primary: { used_percent: 99.0 } },
+    });
+    expect(r.last_rate_limit_as_of).toBeNull();
+    // A late hydrate carrying a stale snapshot must NOT override the live
+    // value, and must not reintroduce a stale `as_of` (fill-if-empty).
+    r = runtimeReducer(r, {
+      type: "hydrate",
+      agent_id: AGENT_A,
+      turns: [],
+      last_rate_limit: { primary: { used_percent: 10.0 } },
+      last_rate_limit_as_of: "2026-05-27T18:42:11Z",
+    });
+    expect(r.last_rate_limit).toEqual({ primary: { used_percent: 99.0 } });
+    expect(r.last_rate_limit_as_of).toBeNull();
   });
 
   it("hydrate sets hydration_status=complete even with no payload", () => {

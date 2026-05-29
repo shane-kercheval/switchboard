@@ -539,11 +539,15 @@ async fn emit_terminal_with_enrichment(
         usage: enriched_usage,
     });
 
-    // Step 4: emit RateLimitEvent if rate-limit info was found.
+    // Step 4: emit RateLimitEvent if rate-limit info was found. Codex's
+    // rate-limit is read from its own session file at turn-end (class B) —
+    // already durable on disk, so it's marked `SessionFileBacked` and the
+    // dispatcher does NOT re-persist it to the metadata sidecar.
     if let Some(rate_limits) = enrichment.rate_limits.clone() {
         let _ = tx.send(AdapterEvent::RateLimitEvent {
             agent_id,
             info: rate_limits,
+            source: crate::events::RateLimitSource::SessionFileBacked,
         });
     }
 

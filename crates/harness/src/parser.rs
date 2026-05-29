@@ -514,7 +514,14 @@ fn stringify_tool_result_content(content: Option<&Value>) -> String {
 
 fn parse_rate_limit_event(obj: &Value, agent_id: AgentId) -> ParseOutcome {
     let info = obj.get("rate_limit_info").cloned().unwrap_or(Value::Null);
-    ParseOutcome::Event(AdapterEvent::RateLimitEvent { agent_id, info })
+    // Claude's rate-limit payload lives only on the live stream — no
+    // session-file equivalent (class C). Mark it `StreamOnly` so the
+    // dispatcher persists it to the metadata sidecar for restart continuity.
+    ParseOutcome::Event(AdapterEvent::RateLimitEvent {
+        agent_id,
+        info,
+        source: crate::events::RateLimitSource::StreamOnly,
+    })
 }
 
 #[cfg(test)]
@@ -862,16 +869,19 @@ mod tests {
     }
 
     #[test]
-    fn rate_limit_event_yields_rate_limit_event() {
+    fn rate_limit_event_yields_rate_limit_event_marked_stream_only() {
         let agent_id = aid();
         let line = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1778701800}}"#;
         match parse_one_with_agent(line, tid(), agent_id) {
             ParseOutcome::Event(AdapterEvent::RateLimitEvent {
                 agent_id: aid_out,
                 info,
+                source,
             }) => {
                 assert_eq!(aid_out, agent_id);
                 assert_eq!(info["status"], "allowed");
+                // Claude rate-limit is stream-only (class C) → must be persisted.
+                assert_eq!(source, crate::events::RateLimitSource::StreamOnly);
             }
             _ => panic!("expected RateLimitEvent"),
         }

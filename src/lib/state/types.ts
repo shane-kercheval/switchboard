@@ -233,10 +233,17 @@ export type AgentRuntime = {
   /// agent's session file. Undefined on agents whose first dispatch
   /// hasn't happened yet.
   meta?: AgentMeta;
-  /// Most-recent Codex `RateLimitEvent.info` payload. Opaque — the
-  /// renderer reads `primary.used_percent` for the sidebar quota signal.
-  /// Undefined for Claude agents (Claude doesn't emit rate-limit events).
+  /// Most-recent `RateLimitEvent.info` payload. Opaque — the renderer reads
+  /// `primary.used_percent` (Codex) or `isUsingOverage` (Claude). Populated
+  /// by live events or by hydration from the metadata sidecar.
   last_rate_limit?: unknown;
+  /// Capture time of `last_rate_limit` when it came from the metadata
+  /// sidecar on hydration (a stream-only/class-C value restored across
+  /// restart). ISO-8601 string. `null` once a live `rate_limit_event`
+  /// overwrites the in-memory value (it's no longer an on-disk snapshot)
+  /// and for class-B sources. Drives the UI "as of …" staleness qualifier:
+  /// the staleness check is `as_of != null && age(as_of) > threshold`.
+  last_rate_limit_as_of?: string | null;
   /// Disk-rehydration lifecycle. Newly-created agents start at
   /// `"complete"` (nothing to hydrate); registered/attached agents pass
   /// through `"pending"` → `"loading"` → `"complete"`. Compose-bar Send

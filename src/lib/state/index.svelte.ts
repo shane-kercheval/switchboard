@@ -173,6 +173,7 @@ export function applyAgentHydrate(
     turns: Hydrate["turns"];
     meta?: Hydrate["meta"];
     last_rate_limit?: Hydrate["last_rate_limit"];
+    last_rate_limit_as_of?: Hydrate["last_rate_limit_as_of"];
     warnings?: Hydrate["warnings"];
   },
 ): void {
@@ -182,6 +183,7 @@ export function applyAgentHydrate(
     turns: loaded.turns,
     meta: loaded.meta ?? null,
     last_rate_limit: loaded.last_rate_limit ?? null,
+    last_rate_limit_as_of: loaded.last_rate_limit_as_of ?? null,
     warnings: loaded.warnings,
   };
   const priorTurns = transcripts[agentId] ?? [];

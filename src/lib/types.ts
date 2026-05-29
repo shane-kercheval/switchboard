@@ -138,6 +138,12 @@ export type LoadedTranscript = {
   turns: LoadedTurn[];
   meta?: SessionMetaInfo | null;
   last_rate_limit?: unknown;
+  /// Capture time of `last_rate_limit` when restored from the per-agent
+  /// metadata sidecar (a stream-only/class-C value, e.g. Claude's overage
+  /// signal, that would otherwise be lost on restart). ISO-8601 string.
+  /// `null` for live values and for class-B (already-durable) sources;
+  /// drives the UI "as of …" staleness qualifier.
+  last_rate_limit_as_of?: string | null;
   warnings: ParseWarning[];
 };
 
@@ -197,6 +203,10 @@ export type Hydrate = {
   turns: LoadedTurn[];
   meta?: SessionMetaInfo | null;
   last_rate_limit?: unknown;
+  /// Capture time of `last_rate_limit` from the metadata sidecar (see
+  /// `LoadedTranscript.last_rate_limit_as_of`). `null` when the value is
+  /// live or class-B.
+  last_rate_limit_as_of?: string | null;
   warnings?: ParseWarning[];
 };
 
@@ -339,6 +349,10 @@ export type AgentConversationMeta = {
   agent_id: AgentId;
   meta?: SessionMetaInfo | null;
   last_rate_limit?: unknown;
+  /// Capture time of `last_rate_limit` from the metadata sidecar (ISO-8601);
+  /// `null`/absent for live or class-B sources. See
+  /// `LoadedTranscript.last_rate_limit_as_of`.
+  last_rate_limit_as_of?: string | null;
   warnings: ParseWarning[];
   load_error?: string | null;
 };

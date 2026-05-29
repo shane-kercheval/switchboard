@@ -8,6 +8,7 @@ mod dispatch_context;
 mod emitter;
 mod error;
 mod journal;
+mod metadata;
 mod state;
 mod workspace;
 

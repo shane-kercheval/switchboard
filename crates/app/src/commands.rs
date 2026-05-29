@@ -1094,6 +1094,7 @@ pub async fn send_message_impl(
         agent.clone(),
         project.directory.clone(),
         project.journal_path(),
+        project.id,
         adapter,
         Arc::clone(&state.emitter),
         Arc::clone(&state.needs_session_meta),
@@ -1221,6 +1222,55 @@ pub fn load_transcript_impl(
 /// Switchboard-owned sidecars are fail-loud
 /// ([`AppError::HydrationBlockedByCorruption`]).
 fn load_agent_transcript(
+    project: &Project,
+    agent: &AgentRecord,
+    home_dir: &Path,
+) -> Result<switchboard_harness::LoadedTranscript, AppError> {
+    let mut transcript = load_agent_transcript_raw(project, agent, home_dir)?;
+    // Overlay the per-agent metadata sidecar (stream-only / class-C metadata
+    // that the harness session file doesn't carry, so it would otherwise be
+    // lost on restart). Done here — the one chokepoint both hydration paths
+    // funnel through — rather than in the per-harness loaders, which have no
+    // `project_id` and don't know the sidecar layout. Best-effort: a
+    // missing/corrupt sidecar reads as absent and the overlay is a no-op.
+    let sidecar_path = switchboard_harness::meta_sidecar::meta_sidecar_path(
+        &project.directory,
+        project.id,
+        agent.id,
+    );
+    apply_meta_sidecar_overlay(
+        &mut transcript,
+        switchboard_harness::meta_sidecar::read(&sidecar_path),
+    );
+    Ok(transcript)
+}
+
+/// Overlay a metadata sidecar's snapshot onto a freshly-loaded transcript.
+///
+/// **Fill-if-empty**: the sidecar fills `last_rate_limit` (+ its
+/// `last_rate_limit_as_of` capture time) *only* when the loader left
+/// `last_rate_limit` unset. A loader-provided value is a class-B source
+/// (e.g. Codex's session-file rate-limit) that's already durable and
+/// authoritative — it wins, and carries no `as_of` qualifier because it
+/// isn't a stale snapshot. Mirrors the frontend reducer's hydrate fill-if-
+/// empty semantics. A `None` sidecar (missing/corrupt) is a no-op.
+fn apply_meta_sidecar_overlay(
+    transcript: &mut switchboard_harness::LoadedTranscript,
+    sidecar: Option<switchboard_harness::meta_sidecar::MetaSidecar>,
+) {
+    if transcript.last_rate_limit.is_some() {
+        return;
+    }
+    if let Some(snapshot) = sidecar.and_then(|m| m.rate_limit) {
+        transcript.last_rate_limit = Some(snapshot.payload);
+        transcript.last_rate_limit_as_of = Some(snapshot.captured_at);
+    }
+}
+
+/// The per-harness session-file load, without the metadata-sidecar overlay.
+/// Split out so [`load_agent_transcript`] can apply the overlay at a single
+/// chokepoint covering both hydration paths.
+fn load_agent_transcript_raw(
     project: &Project,
     agent: &AgentRecord,
     home_dir: &Path,
@@ -1564,6 +1614,10 @@ pub struct AgentConversationMeta {
     pub agent_id: AgentId,
     pub meta: Option<switchboard_harness::SessionMetaInfo>,
     pub last_rate_limit: Option<serde_json::Value>,
+    /// Capture time of `last_rate_limit` when restored from the metadata
+    /// sidecar (stream-only/class-C value); drives the UI staleness
+    /// qualifier. `None` for live values and for class-B (durable) sources.
+    pub last_rate_limit_as_of: Option<chrono::DateTime<chrono::Utc>>,
     pub warnings: Vec<switchboard_harness::ParseWarning>,
     pub load_error: Option<String>,
 }
@@ -1746,6 +1800,7 @@ fn merge_project_conversation(
             agent_id,
             meta: transcript.meta,
             last_rate_limit: transcript.last_rate_limit,
+            last_rate_limit_as_of: transcript.last_rate_limit_as_of,
             warnings: transcript.warnings,
             load_error,
         });
@@ -4140,6 +4195,110 @@ mod tests {
         let result = load_transcript_impl(&state, record.id, tmp_home.path()).unwrap();
         assert!(result.turns.is_empty());
         assert!(result.warnings.is_empty());
+        // No metadata sidecar staged → both rate-limit fields stay None.
+        assert!(result.last_rate_limit.is_none());
+        assert!(result.last_rate_limit_as_of.is_none());
+    }
+
+    #[test]
+    fn overlay_fills_rate_limit_when_loader_left_it_empty() {
+        // Claude-shape: the loader produces no rate_limit (class C); the
+        // sidecar fills it and stamps the capture time.
+        let mut transcript = switchboard_harness::LoadedTranscript::default();
+        let captured = chrono::DateTime::parse_from_rfc3339("2026-05-27T18:42:11Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let sidecar = switchboard_harness::meta_sidecar::MetaSidecar {
+            schema_version: 1,
+            rate_limit: Some(switchboard_harness::meta_sidecar::RateLimitSnapshot {
+                payload: serde_json::json!({"isUsingOverage": true}),
+                captured_at: captured,
+            }),
+        };
+        apply_meta_sidecar_overlay(&mut transcript, Some(sidecar));
+        assert_eq!(
+            transcript.last_rate_limit,
+            Some(serde_json::json!({"isUsingOverage": true}))
+        );
+        assert_eq!(transcript.last_rate_limit_as_of, Some(captured));
+    }
+
+    #[test]
+    fn overlay_does_not_override_loader_provided_rate_limit() {
+        // Codex-shape (class B): the loader already populated last_rate_limit
+        // from the session file (durable, authoritative). A stray sidecar
+        // must NOT override it, and no `as_of` qualifier is added — the
+        // session value isn't a stale snapshot.
+        let mut transcript = switchboard_harness::LoadedTranscript {
+            last_rate_limit: Some(serde_json::json!({"primary": {"used_percent": 10.0}})),
+            ..Default::default()
+        };
+        let sidecar = switchboard_harness::meta_sidecar::MetaSidecar {
+            schema_version: 1,
+            rate_limit: Some(switchboard_harness::meta_sidecar::RateLimitSnapshot {
+                payload: serde_json::json!({"should": "not win"}),
+                captured_at: chrono::Utc::now(),
+            }),
+        };
+        apply_meta_sidecar_overlay(&mut transcript, Some(sidecar));
+        assert_eq!(
+            transcript.last_rate_limit,
+            Some(serde_json::json!({"primary": {"used_percent": 10.0}})),
+            "class-B session-file value must win over the sidecar"
+        );
+        assert!(
+            transcript.last_rate_limit_as_of.is_none(),
+            "a durable class-B value carries no staleness qualifier"
+        );
+    }
+
+    #[test]
+    fn overlay_missing_sidecar_is_a_noop() {
+        let mut transcript = switchboard_harness::LoadedTranscript::default();
+        apply_meta_sidecar_overlay(&mut transcript, None);
+        assert!(transcript.last_rate_limit.is_none());
+        assert!(transcript.last_rate_limit_as_of.is_none());
+    }
+
+    #[tokio::test]
+    async fn load_transcript_overlays_metadata_sidecar_for_claude_agent() {
+        // End-to-end wiring: a Claude agent with a staged metadata sidecar
+        // surfaces the persisted rate-limit + its capture time through the
+        // real load path (proves the sidecar-path resolution + overlay are
+        // wired into load_agent_transcript, not just the pure helper).
+        let (tmp_workdir, tmp_home, state, proj) = fresh_state_with_active_project("alpha").await;
+        let session_id = Uuid::now_v7();
+        stage_claude_session_file(tmp_home.path(), tmp_workdir.path(), &session_id);
+        let record = attach_agent_impl(
+            &state,
+            "x",
+            HarnessKind::ClaudeCode,
+            &session_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap();
+
+        let captured = chrono::DateTime::parse_from_rfc3339("2026-05-27T18:42:11Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let sidecar_path = switchboard_harness::meta_sidecar::meta_sidecar_path(
+            tmp_workdir.path(),
+            proj.id,
+            record.id,
+        );
+        switchboard_harness::meta_sidecar::write_rate_limit(
+            &sidecar_path,
+            serde_json::json!({"isUsingOverage": true, "resetsAt": 1_778_701_800u64}),
+            captured,
+        )
+        .unwrap();
+
+        let result = load_transcript_impl(&state, record.id, tmp_home.path()).unwrap();
+        assert_eq!(
+            result.last_rate_limit,
+            Some(serde_json::json!({"isUsingOverage": true, "resetsAt": 1_778_701_800u64}))
+        );
+        assert_eq!(result.last_rate_limit_as_of, Some(captured));
     }
 
     #[tokio::test]
@@ -6093,6 +6252,7 @@ mod tests {
             turns,
             meta: None,
             last_rate_limit: None,
+            last_rate_limit_as_of: None,
             warnings: Vec::new(),
         }
     }
@@ -6668,12 +6828,14 @@ mod tests {
             turns: Vec::new(),
             meta: None,
             last_rate_limit: None,
+            last_rate_limit_as_of: None,
             warnings: vec![warn("a busted")],
         };
         let b_t = LoadedTranscript {
             turns: Vec::new(),
             meta: None,
             last_rate_limit: None,
+            last_rate_limit_as_of: None,
             warnings: vec![warn("b busted")],
         };
 

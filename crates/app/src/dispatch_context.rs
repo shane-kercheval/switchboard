@@ -15,20 +15,25 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use switchboard_core::{AgentId, AgentRecord, SendId};
+use switchboard_core::{AgentId, AgentRecord, ProjectId, SendId};
 use switchboard_dispatcher::{
-    ConversationJournal, DispatchContext, DispatchContextFactory, EventEmitter,
+    ConversationJournal, DispatchContext, DispatchContextFactory, EventEmitter, MetadataCache,
 };
 use switchboard_harness::{DispatchOptions, HarnessAdapter};
 
 use crate::emitter::SessionMetaObservingEmitter;
 use crate::journal::ProjectJournal;
+use crate::metadata::ProjectMetadataCache;
 use crate::state::lock;
 
 pub struct ProjectDispatchContextFactory {
     agent: AgentRecord,
     cwd: PathBuf,
     journal_path: PathBuf,
+    /// The project id, paired with `cwd` (the project's owning directory) to
+    /// resolve the per-agent metadata-sidecar path
+    /// `<cwd>/.switchboard/projects/<project_id>/sessions/<agent-id>.meta.json`.
+    project_id: ProjectId,
     adapter: Arc<dyn HarnessAdapter>,
     base_emitter: Arc<dyn EventEmitter>,
     needs_session_meta: Arc<Mutex<HashSet<AgentId>>>,
@@ -39,6 +44,7 @@ impl ProjectDispatchContextFactory {
         agent: AgentRecord,
         cwd: PathBuf,
         journal_path: PathBuf,
+        project_id: ProjectId,
         adapter: Arc<dyn HarnessAdapter>,
         base_emitter: Arc<dyn EventEmitter>,
         needs_session_meta: Arc<Mutex<HashSet<AgentId>>>,
@@ -47,6 +53,7 @@ impl ProjectDispatchContextFactory {
             agent,
             cwd,
             journal_path,
+            project_id,
             adapter,
             base_emitter,
             needs_session_meta,
@@ -73,6 +80,13 @@ impl DispatchContextFactory for ProjectDispatchContextFactory {
         ));
         let journal: Arc<dyn ConversationJournal> =
             Arc::new(ProjectJournal::new(self.journal_path.clone(), send_id));
+        let sidecar_path = switchboard_harness::meta_sidecar::meta_sidecar_path(
+            &self.cwd,
+            self.project_id,
+            agent_id,
+        );
+        let metadata: Arc<dyn MetadataCache> =
+            Arc::new(ProjectMetadataCache::new(agent_id, sidecar_path));
         DispatchContext {
             adapter: Arc::clone(&self.adapter),
             cwd: self.cwd.clone(),
@@ -80,6 +94,7 @@ impl DispatchContextFactory for ProjectDispatchContextFactory {
             emitter,
             options,
             journal,
+            metadata,
         }
     }
 

@@ -456,6 +456,7 @@ impl ReconstructionState {
             turns: self.turns,
             meta,
             last_rate_limit: None,
+            last_rate_limit_as_of: None,
             warnings: self.warnings,
         }
     }

@@ -20,6 +20,7 @@ pub mod claude_code;
 pub mod codex;
 pub mod events;
 pub mod gemini;
+pub mod meta_sidecar;
 pub mod mock;
 mod parser;
 pub mod resume;
@@ -36,7 +37,7 @@ pub use codex::session_file::{
 };
 pub use events::{
     AdapterEvent, CancelSource, ContentKind, FailureKind, McpServerStatus, MessageId,
-    NormalizedEvent, ToolKind, TurnId, TurnOutcome, TurnUsage,
+    NormalizedEvent, RateLimitSource, ToolKind, TurnId, TurnOutcome, TurnUsage,
 };
 pub use gemini::GeminiAdapter;
 pub use gemini::session_file::{

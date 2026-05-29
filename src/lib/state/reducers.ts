@@ -452,7 +452,11 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
       };
 
     case "rate_limit_event":
-      return { ...runtime, last_rate_limit: input.info };
+      // A live event overwrites the in-memory value; the `as_of` qualifier
+      // (the on-disk snapshot's age) is meaningless once live data lands, so
+      // clear it to null — never stamp `now`, which would spuriously age an
+      // actively-streaming session past the staleness threshold.
+      return { ...runtime, last_rate_limit: input.info, last_rate_limit_as_of: null };
 
     case "hydrate": {
       // **Fill-if-empty for scalars.** Live `session_meta` and
@@ -476,7 +480,12 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
         };
       }
       if (next.last_rate_limit === undefined && input.last_rate_limit != null) {
+        // Fill `last_rate_limit` and its `as_of` together — they're one unit.
+        // Only when the runtime had no value: if a live event already
+        // populated it (and cleared `as_of` to null), this no-ops and the
+        // live value + its null `as_of` stay in place.
         next.last_rate_limit = input.last_rate_limit;
+        next.last_rate_limit_as_of = input.last_rate_limit_as_of ?? null;
       }
       if (input.warnings !== undefined && input.warnings.length > 0) {
         next.parse_warnings = input.warnings;

@@ -88,6 +88,18 @@ pub struct LoadedTranscript {
     pub turns: Vec<Turn>,
     pub meta: Option<SessionMetaInfo>,
     pub last_rate_limit: Option<serde_json::Value>,
+    /// Capture time of `last_rate_limit` when it was restored from the
+    /// per-agent metadata sidecar (a stream-only/class-C value that would
+    /// otherwise be lost on restart). Drives the UI's "as of …" staleness
+    /// qualifier so a rehydrated snapshot isn't shown as live.
+    ///
+    /// **Always `None` from the per-harness loaders** — they have no
+    /// `project_id` and don't read the metadata sidecar. It is populated only
+    /// by the app-layer overlay (`load_agent_transcript`) after the load.
+    /// Raw harness-crate consumers must not rely on this field being set; a
+    /// class-B value (e.g. Codex's session-file rate-limit) carries `None`
+    /// here because it's already durable and needs no staleness qualifier.
+    pub last_rate_limit_as_of: Option<DateTime<Utc>>,
     pub warnings: Vec<ParseWarning>,
 }
 

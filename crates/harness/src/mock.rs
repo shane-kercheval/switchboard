@@ -76,6 +76,13 @@ pub enum MockScenario {
     /// `crates/harness/src/codex/mod.rs`; this scenario stands in without
     /// requiring a subprocess.
     CodexPostTerminalEnrichment,
+
+    /// Emits `ContentChunk → TurnEnd(Completed) → RateLimitEvent` with the
+    /// given [`RateLimitSource`]. The vehicle for the dispatcher's
+    /// metadata-persistence durability-gate test: run once with `StreamOnly`
+    /// (must persist) and once with `SessionFileBacked` (must not), asserting
+    /// the injected `MetadataCache`.
+    RateLimitWithSource(crate::events::RateLimitSource),
 }
 
 /// A `HarnessAdapter` that produces canned events without spawning any subprocess.
@@ -228,6 +235,8 @@ impl HarnessAdapter for MockHarnessAdapter {
                     let _ = tx.send(AdapterEvent::RateLimitEvent {
                         agent_id,
                         info: serde_json::json!({"primary": {"used_percent": 50.0}}),
+                        // Codex-shaped enrichment → session-file-backed.
+                        source: crate::events::RateLimitSource::SessionFileBacked,
                     });
                     // A real terminal that lost the race with cancellation —
                     // the dispatcher must drop this in favor of Cancelled.
@@ -255,6 +264,8 @@ impl HarnessAdapter for MockHarnessAdapter {
                     let _ = tx.send(AdapterEvent::RateLimitEvent {
                         agent_id,
                         info: serde_json::json!({"primary": {"used_percent": 12.5}}),
+                        // Codex-shaped enrichment → session-file-backed.
+                        source: crate::events::RateLimitSource::SessionFileBacked,
                     });
                     let _ = tx.send(AdapterEvent::SessionMeta {
                         agent_id,
@@ -267,6 +278,26 @@ impl HarnessAdapter for MockHarnessAdapter {
                         }],
                         skills: vec![],
                         raw: serde_json::Value::Null,
+                    });
+                });
+            }
+            MockScenario::RateLimitWithSource(source) => {
+                tokio::spawn(async move {
+                    let _ = tx.send(AdapterEvent::ContentChunk {
+                        turn_id,
+                        kind: ContentKind::Text,
+                        text: "ack".to_owned(),
+                    });
+                    let _ = tx.send(AdapterEvent::TurnEnd {
+                        turn_id,
+                        outcome: TurnOutcome::Completed,
+                        ended_at: Utc::now(),
+                        usage: None,
+                    });
+                    let _ = tx.send(AdapterEvent::RateLimitEvent {
+                        agent_id,
+                        info: serde_json::json!({"primary": {"used_percent": 42.0}}),
+                        source,
                     });
                 });
             }

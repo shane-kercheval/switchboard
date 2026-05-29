@@ -317,6 +317,7 @@ fn ambiguous_session_warning() -> LoadedTranscript {
         turns: Vec::new(),
         meta: None,
         last_rate_limit: None,
+        last_rate_limit_as_of: None,
         warnings: vec![ParseWarning {
             line_number: 0,
             reason:
@@ -558,6 +559,7 @@ impl GeminiReconstruction {
             turns: self.turns,
             meta,
             last_rate_limit: None,
+            last_rate_limit_as_of: None,
             warnings: self.warnings,
         }
     }

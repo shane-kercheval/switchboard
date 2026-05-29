@@ -920,6 +920,7 @@ impl CodexReconstruction {
             turns: self.turns,
             meta: None,
             last_rate_limit: None,
+            last_rate_limit_as_of: None,
             warnings: self.warnings,
         }
     }

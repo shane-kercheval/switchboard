@@ -22,11 +22,12 @@ use chrono::{DateTime, Utc};
 use switchboard_core::{AgentId, AgentRecord, HarnessKind, SendId};
 use switchboard_dispatcher::{
     CancelOutcome, ConversationJournal, DispatchContext, DispatchContextFactory, Dispatcher,
-    EventEmitter, JournalError, NoopJournal, NotQueued, OnBusy, RecordingEmitter, SendOutcome,
+    EventEmitter, JournalError, MetadataCache, NoopJournal, NoopMetadataCache, NotQueued, OnBusy,
+    RecordingEmitter, SendOutcome,
 };
 use switchboard_harness::{
     CancelSource, DispatchOptions, HarnessAdapter, MessageId, MockHarnessAdapter, MockScenario,
-    TurnId, TurnOutcome,
+    RateLimitSource, TurnId, TurnOutcome,
 };
 use uuid::Uuid;
 
@@ -72,6 +73,7 @@ struct TestFactory {
     agent: AgentRecord,
     emitter: Arc<dyn EventEmitter>,
     journal: Arc<dyn ConversationJournal>,
+    metadata: Arc<dyn MetadataCache>,
 }
 
 impl TestFactory {
@@ -94,6 +96,25 @@ impl TestFactory {
         emitter: Arc<RecordingEmitter>,
         journal: Arc<dyn ConversationJournal>,
     ) -> Arc<Self> {
+        Self::sequence_with_metadata(
+            scenarios,
+            agent,
+            emitter,
+            journal,
+            Arc::new(NoopMetadataCache),
+        )
+    }
+
+    /// As [`Self::sequence`], but with an injected [`MetadataCache`] so the
+    /// metadata-persistence durability-gate test can capture what the
+    /// dispatcher records (or doesn't) per `RateLimitSource`.
+    fn sequence_with_metadata(
+        scenarios: impl IntoIterator<Item = MockScenario>,
+        agent: AgentRecord,
+        emitter: Arc<RecordingEmitter>,
+        journal: Arc<dyn ConversationJournal>,
+        metadata: Arc<dyn MetadataCache>,
+    ) -> Arc<Self> {
         let queue: std::collections::VecDeque<Arc<dyn HarnessAdapter>> = scenarios
             .into_iter()
             .map(|s| Arc::new(MockHarnessAdapter::with_scenario(s)) as Arc<dyn HarnessAdapter>)
@@ -105,6 +126,7 @@ impl TestFactory {
             agent,
             emitter: emitter as Arc<dyn EventEmitter>,
             journal,
+            metadata,
         })
     }
 }
@@ -126,6 +148,7 @@ impl DispatchContextFactory for TestFactory {
             emitter: Arc::clone(&self.emitter),
             options: DispatchOptions::default(),
             journal: Arc::clone(&self.journal),
+            metadata: Arc::clone(&self.metadata),
         }
     }
 
@@ -168,6 +191,28 @@ impl ConversationJournal for RecordingJournal {
             .lock()
             .unwrap()
             .push((turn_id, outcome.clone()));
+    }
+}
+
+/// Captures metadata-cache calls so the durability-gate test can assert the
+/// dispatcher persists `StreamOnly` rate-limit payloads and skips
+/// `SessionFileBacked` ones, with a roughly-now `captured_at`.
+#[derive(Default)]
+struct RecordingMetadataCache {
+    calls: Mutex<Vec<(AgentId, serde_json::Value, DateTime<Utc>)>>,
+}
+
+impl MetadataCache for RecordingMetadataCache {
+    fn record_rate_limit(
+        &self,
+        agent_id: AgentId,
+        info: serde_json::Value,
+        captured_at: DateTime<Utc>,
+    ) {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((agent_id, info, captured_at));
     }
 }
 
@@ -717,6 +762,96 @@ async fn agent_idle_is_last_after_codex_post_terminal_enrichment_sequence() {
         last_idx,
         type_sequence.len() - 1,
         "AgentIdle must be strictly the final event — no trailing events allowed"
+    );
+}
+
+#[tokio::test]
+async fn stream_only_rate_limit_is_persisted_to_metadata_cache() {
+    // Durability gate: a RateLimitEvent whose source is StreamOnly (class-C,
+    // no on-disk equivalent — Claude) must be recorded to the metadata cache
+    // so it survives restart.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let metadata = Arc::new(RecordingMetadataCache::default());
+    let before = Utc::now();
+    let factory = TestFactory::sequence_with_metadata(
+        [MockScenario::RateLimitWithSource(
+            RateLimitSource::StreamOnly,
+        )],
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+        Arc::clone(&metadata) as Arc<dyn MetadataCache>,
+    );
+
+    dispatcher
+        .send_message(agent.id, "hello", Uuid::now_v7(), factory, OnBusy::Enqueue)
+        .await;
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+    let after = Utc::now();
+
+    let calls = metadata.calls.lock().unwrap();
+    assert_eq!(
+        calls.len(),
+        1,
+        "StreamOnly rate-limit must be persisted exactly once"
+    );
+    let (recorded_agent, payload, captured_at) = &calls[0];
+    assert_eq!(*recorded_agent, agent.id);
+    assert_eq!(payload["primary"]["used_percent"], 42.0);
+    assert!(
+        *captured_at >= before && *captured_at <= after,
+        "captured_at must be stamped at record time (roughly now)"
+    );
+}
+
+#[tokio::test]
+async fn session_file_backed_rate_limit_is_not_persisted() {
+    // Durability gate, negative case: a SessionFileBacked rate-limit (class-B,
+    // already durable in the harness's own session file — Codex) must NOT be
+    // re-persisted to the metadata cache.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let metadata = Arc::new(RecordingMetadataCache::default());
+    let factory = TestFactory::sequence_with_metadata(
+        [MockScenario::RateLimitWithSource(
+            RateLimitSource::SessionFileBacked,
+        )],
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+        Arc::clone(&metadata) as Arc<dyn MetadataCache>,
+    );
+
+    dispatcher
+        .send_message(agent.id, "hello", Uuid::now_v7(), factory, OnBusy::Enqueue)
+        .await;
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+
+    // The wire event still reaches the frontend (the reducer overwrites the
+    // live value); only Switchboard-side *persistence* is gated.
+    assert!(
+        emitter
+            .snapshot()
+            .iter()
+            .any(|(_, v)| event_type(v) == "rate_limit_event"),
+        "the rate_limit_event must still be emitted on the wire"
+    );
+    assert!(
+        metadata.calls.lock().unwrap().is_empty(),
+        "SessionFileBacked rate-limit must NOT be persisted (harness file is canonical)"
     );
 }
 

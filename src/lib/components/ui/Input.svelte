@@ -12,7 +12,7 @@
 <input
   bind:value
   class={cn(
-    "border-border bg-raised h-9 w-full rounded-md border px-2.5 text-sm",
+    "border-border bg-raised h-9 w-full rounded-full border px-2.5 text-sm",
     "text-fg placeholder:text-muted",
     "focus-visible:ring-accent focus-visible:ring-2 focus-visible:outline-none",
     "disabled:bg-panel disabled:cursor-not-allowed disabled:opacity-50",

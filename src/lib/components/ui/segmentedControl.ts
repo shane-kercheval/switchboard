@@ -7,12 +7,12 @@
 
 /// The control's outer wrapper. Add the layout (`inline-grid grid-cols-3`,
 /// `grid grid-cols-4`, `flex`, …) alongside this.
-export const SEGMENTED_CONTAINER_CLASS = "border-border bg-panel/70 gap-1 rounded-md border p-0.5";
+export const SEGMENTED_CONTAINER_CLASS = "border-border bg-panel/70 gap-1 rounded-full border p-0.5";
 
 /// A single segment. Height/typography are fixed here (the standard `h-7`);
 /// add centering (`flex items-center justify-center`) or `flex-1`, plus the
 /// active/inactive color classes below.
-export const SEGMENTED_ITEM_CLASS = "h-7 rounded px-2 text-xs font-medium transition-colors";
+export const SEGMENTED_ITEM_CLASS = "h-7 rounded-full px-2 text-xs font-medium transition-colors";
 
 /// The selected segment.
 export const SEGMENTED_ITEM_ACTIVE_CLASS = "bg-primary text-primary-fg";

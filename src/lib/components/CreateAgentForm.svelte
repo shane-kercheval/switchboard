@@ -45,7 +45,18 @@
     geminiAvailability = { harness: "gemini", binary: "available" },
     antigravityAvailability = { harness: "antigravity", binary: "available" },
   }: Props = $props();
-  let name = $state<string>("assistant");
+  const HARNESS_LABELS: Record<HarnessKind, string> = {
+    claude_code: "Claude Code",
+    codex: "Codex",
+    gemini: "Gemini",
+    antigravity: "Antigravity",
+  };
+
+  function harnessDefaultName(kind: HarnessKind): string {
+    return HARNESS_LABELS[kind].toLowerCase().replace(/\s+/g, "-");
+  }
+
+  let name = $state<string>(harnessDefaultName("claude_code"));
   let harness = $state<HarnessKind>("claude_code");
   let mode = $state<"create" | "attach">("create");
   let existingSessionId = $state<string>("");
@@ -115,6 +126,13 @@
   /// to create and back. Done in the explicit click handlers rather than a
   /// `$effect` so the reset stays adjacent to the trigger and there's no
   /// hidden reactive dependency.
+  function selectHarness(kind: HarnessKind): void {
+    if (name === harnessDefaultName(harness)) {
+      name = harnessDefaultName(kind);
+    }
+    harness = kind;
+  }
+
   function selectMode(next: "create" | "attach"): void {
     if (next === mode) return;
     mode = next;
@@ -198,7 +216,7 @@
           class="sr-only"
           checked={harness === "claude_code"}
           disabled={busy || !claudeSelectable}
-          onchange={() => (harness = "claude_code")}
+          onchange={() => selectHarness("claude_code")}
           data-testid="harness-claude"
         />
         Claude Code
@@ -217,7 +235,7 @@
           class="sr-only"
           checked={harness === "codex"}
           disabled={busy || !codexSelectable}
-          onchange={() => (harness = "codex")}
+          onchange={() => selectHarness("codex")}
           data-testid="harness-codex"
         />
         Codex
@@ -236,7 +254,7 @@
           class="sr-only"
           checked={harness === "gemini"}
           disabled={busy || !geminiSelectable}
-          onchange={() => (harness = "gemini")}
+          onchange={() => selectHarness("gemini")}
           data-testid="harness-gemini"
         />
         Gemini
@@ -255,7 +273,7 @@
           class="sr-only"
           checked={harness === "antigravity"}
           disabled={busy || !antigravitySelectable}
-          onchange={() => (harness = "antigravity")}
+          onchange={() => selectHarness("antigravity")}
           data-testid="harness-antigravity"
         />
         Antigravity

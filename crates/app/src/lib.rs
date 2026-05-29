@@ -23,15 +23,16 @@ use tauri::{Emitter, Manager, State};
 
 use crate::commands::ProjectConversation;
 use crate::commands::{
-    AgentSessionInfo, DirectoryInfo, ProjectListing, WorkspaceDirectories, agent_session_info_impl,
-    attach_agent_impl, cancel_agent_impl, cancel_send_impl, cancel_turn_impl,
-    check_antigravity_auth_impl, check_antigravity_binary_impl, check_claude_binary_impl,
-    check_codex_auth_impl, check_codex_binary_impl, check_gemini_auth_impl,
-    check_gemini_binary_impl, create_agent_impl, create_project_impl, init_directory_impl,
-    list_agents_impl, list_projects_impl, list_workspace_directories_impl,
-    load_project_conversation_impl, load_transcript_impl, open_project_impl, parse_uuid,
-    pick_directory_impl, remove_directory_impl, remove_queued_message_impl, send_message_impl,
-    set_active_project_impl, validate_external_url,
+    AgentSessionInfo, DirectoryInfo, HarnessInstallStatus, ProjectListing, WorkspaceDirectories,
+    agent_session_info_impl, attach_agent_impl, cancel_agent_impl, cancel_send_impl,
+    cancel_turn_impl, check_antigravity_auth_impl, check_antigravity_binary_impl,
+    check_claude_auth_impl, check_claude_binary_impl, check_codex_auth_impl,
+    check_codex_binary_impl, check_gemini_auth_impl, check_gemini_binary_impl, create_agent_impl,
+    create_project_impl, get_harness_install_status_impl, init_directory_impl, list_agents_impl,
+    list_projects_impl, list_workspace_directories_impl, load_project_conversation_impl,
+    load_transcript_impl, open_project_impl, parse_uuid, pick_directory_impl,
+    remove_directory_impl, remove_queued_message_impl, send_message_impl, set_active_project_impl,
+    validate_external_url,
 };
 use crate::state::AppState;
 
@@ -78,6 +79,20 @@ async fn check_antigravity_auth() -> Result<(), String> {
     // No `$HOME` forwarding: Antigravity's auth lives in the macOS
     // Keychain, not under `$HOME`. See the impl docstring.
     check_antigravity_auth_impl().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn check_claude_auth() -> Result<(), String> {
+    // No `$HOME` forwarding: Claude's auth lives in the macOS Keychain.
+    check_claude_auth_impl().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_harness_install_status(
+    state: State<'_, AppState>,
+    harness: HarnessKind,
+) -> Result<HarnessInstallStatus, String> {
+    Ok(get_harness_install_status_impl(state.inner(), harness))
 }
 
 #[tauri::command]
@@ -463,6 +478,8 @@ pub fn run() {
             check_gemini_auth,
             check_antigravity_binary,
             check_antigravity_auth,
+            check_claude_auth,
+            get_harness_install_status,
             pick_directory,
             init_directory,
             remove_directory,

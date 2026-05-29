@@ -11,9 +11,9 @@ use crate::events::{
 /// `"Not logged in · Please run /login"` (which refers to the
 /// interactive-session slash command, not the CLI command users would
 /// typically run from a terminal). The authored copy names the CLI
-/// recovery (`claude login`) and matches the cross-harness format.
+/// recovery (`claude auth login`) and matches the cross-harness format.
 /// Reactive-auth posture — never advises "reload Switchboard."
-pub const CLAUDE_AUTH_MESSAGE: &str = "Claude authentication required — run `claude login`";
+pub const CLAUDE_AUTH_MESSAGE: &str = "Claude authentication required — run `claude auth login`";
 
 #[derive(Debug)]
 pub enum ParseOutcome {
@@ -377,7 +377,7 @@ fn parse_assistant_envelope(obj: &Value, turn_id: TurnId, state: &mut ParserStat
         // own `Please run /login` (which is the interactive-session slash
         // command, not the CLI command). Authoring keeps the user-facing
         // copy consistent across all four harnesses' auth surfaces and
-        // names the right recovery (the `claude login` CLI command).
+        // names the right recovery (the `claude auth login` CLI command).
         // Reactive-auth posture — never advises "reload Switchboard."
         state.pending_auth_failure = Some(CLAUDE_AUTH_MESSAGE.to_owned());
         // Fall through to tool_use extraction — an auth-failed assistant
@@ -1100,7 +1100,7 @@ mod tests {
                 // CLI recovery command and the harness name.
                 assert_eq!(message, CLAUDE_AUTH_MESSAGE);
                 assert!(message.contains("Claude authentication required"));
-                assert!(message.contains("claude login"));
+                assert!(message.contains("claude auth login"));
                 assert!(!message.contains("reload Switchboard"));
             }
             other => panic!("expected TurnEnd(Failed{{AuthFailure}}), got {other:?}"),

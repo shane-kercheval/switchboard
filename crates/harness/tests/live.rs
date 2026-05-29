@@ -670,7 +670,7 @@ fn live_antigravity_agent() -> AgentRecord {
 }
 
 #[tokio::test]
-#[ignore = "requires agy authed via Antigravity desktop app — run with: make test-live"]
+#[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
 async fn live_antigravity_basic_turn_completes() {
     // cwd is a tempdir so the sidecar lands in a clean location. Note: `agy`
     // also writes a `.antigravitycli/` dir into cwd as a side effect — fine
@@ -765,7 +765,7 @@ async fn live_antigravity_basic_turn_completes() {
 }
 
 #[tokio::test]
-#[ignore = "requires agy authed via Antigravity desktop app — run with: make test-live"]
+#[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
 async fn live_antigravity_adversarial_prompt_still_completes() {
     // Guards the load-bearing assumption that `agy` echoes the dispatched
     // prompt verbatim into the transcript's `<USER_REQUEST>` body. Capture
@@ -829,7 +829,7 @@ async fn live_antigravity_adversarial_prompt_still_completes() {
 }
 
 #[tokio::test]
-#[ignore = "requires agy authed via Antigravity desktop app — run with: make test-live"]
+#[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
 async fn live_antigravity_resume_reuses_session() {
     // Memorize-then-recall: proof that `--conversation <uuid>` (driven by the
     // sidecar-captured UUID) restores the prior turn's server-side context.

@@ -29,28 +29,28 @@ describe("bannerCopy", () => {
   it("Claude binary_missing surfaces install link", () => {
     const banner: HarnessBanner = { kind: "binary_missing", harness: "claude_code" };
     expect(bannerCopy(banner)).toBe(
-      "Claude Code not found on PATH. Install from https://claude.com/code",
+      "Claude Code not found on PATH. Install from https://code.claude.com/docs/en/quickstart",
     );
   });
 
   it("Codex binary_missing surfaces install link", () => {
     const banner: HarnessBanner = { kind: "binary_missing", harness: "codex" };
     expect(bannerCopy(banner)).toBe(
-      "Codex not found on PATH. Install from https://github.com/openai/codex",
+      "Codex not found on PATH. Install from https://developers.openai.com/codex/cli",
     );
   });
 
   it("Gemini binary_missing surfaces install link", () => {
     const banner: HarnessBanner = { kind: "binary_missing", harness: "gemini" };
     expect(bannerCopy(banner)).toBe(
-      "Gemini CLI not found on PATH. Install from https://github.com/google-gemini/gemini-cli",
+      "Gemini CLI not found on PATH. Install from https://geminicli.com/docs/get-started/installation/",
     );
   });
 
   it("Antigravity binary_missing surfaces install link", () => {
     const banner: HarnessBanner = { kind: "binary_missing", harness: "antigravity" };
     expect(bannerCopy(banner)).toBe(
-      "Antigravity CLI (agy) not found on PATH. Install from https://antigravity.google/download",
+      "Antigravity CLI (agy) not found on PATH. Install from https://antigravity.google/docs/cli-install",
     );
   });
 });

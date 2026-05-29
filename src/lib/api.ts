@@ -6,6 +6,7 @@ import type {
   AgentId,
   AgentRecord,
   DirectoryInfo,
+  HarnessInstallStatus,
   HarnessKind,
   LoadedTranscript,
   MessageId,
@@ -50,6 +51,19 @@ export async function checkAntigravityBinary(): Promise<void> {
 /// See `checkCodexAuth` — same retention rationale.
 export async function checkAntigravityAuth(): Promise<void> {
   await invoke<null>("check_antigravity_auth");
+}
+
+/// Claude auth probe (macOS Keychain presence heuristic). Like the others,
+/// consumed only by the getting-started surface — not the working UI.
+export async function checkClaudeAuth(): Promise<void> {
+  await invoke<null>("check_claude_auth");
+}
+
+/// Install status (present-on-PATH + best-effort version) for the
+/// getting-started panel. Never throws on a missing binary — that's
+/// reported as `{ installed: false, version: null }`.
+export async function getHarnessInstallStatus(harness: HarnessKind): Promise<HarnessInstallStatus> {
+  return await invoke<HarnessInstallStatus>("get_harness_install_status", { harness });
 }
 
 export async function pickDirectory(path: string): Promise<DirectoryInfo> {

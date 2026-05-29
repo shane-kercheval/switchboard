@@ -256,6 +256,14 @@ export type HarnessBanner = {
   harness: HarnessKind;
 };
 
+/// Install status of a harness CLI for the getting-started surface.
+/// Mirrors the Rust `HarnessInstallStatus`. A missing binary is
+/// `installed: false` with `version: null` — data, not an error.
+export type HarnessInstallStatus = {
+  installed: boolean;
+  version: string | null;
+};
+
 export type AgentRecord = {
   id: AgentId;
   project_id: ProjectId;

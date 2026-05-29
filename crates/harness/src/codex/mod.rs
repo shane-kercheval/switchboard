@@ -27,7 +27,7 @@ pub mod skills;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -59,6 +59,10 @@ pub struct CodexAdapter {
     /// dispatch time (mirrors `claude_code::session_file_exists`'s
     /// pattern).
     home_dir_override: Option<PathBuf>,
+    /// Lazily-resolved `codex --version`, cached for the lifetime of the
+    /// adapter. Empty string caches a failed/absent probe (version is
+    /// display-only). Mirrors the Gemini/Antigravity pattern.
+    cached_version: OnceLock<String>,
 }
 
 impl CodexAdapter {
@@ -69,6 +73,7 @@ impl CodexAdapter {
         Self {
             codex_binary_path: PathBuf::from("codex"),
             home_dir_override: None,
+            cached_version: OnceLock::new(),
         }
     }
 
@@ -77,6 +82,7 @@ impl CodexAdapter {
         Self {
             codex_binary_path: path.into(),
             home_dir_override: None,
+            cached_version: OnceLock::new(),
         }
     }
 
@@ -91,6 +97,7 @@ impl CodexAdapter {
         Self {
             codex_binary_path: binary_path.into(),
             home_dir_override: Some(home_dir.into()),
+            cached_version: OnceLock::new(),
         }
     }
 }
@@ -107,6 +114,13 @@ impl HarnessAdapter for CodexAdapter {
         which::which(&self.codex_binary_path)
             .map(|_| ())
             .map_err(|_| DispatchError::BinaryNotFound)
+    }
+
+    fn version(&self) -> Option<String> {
+        let raw = self.cached_version.get_or_init(|| {
+            crate::subprocess::fetch_version(&self.codex_binary_path).unwrap_or_default()
+        });
+        crate::subprocess::parse_cli_version(raw)
     }
 
     async fn dispatch(

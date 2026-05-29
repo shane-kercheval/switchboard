@@ -11,15 +11,31 @@
 /// is binary presence — a missing CLI is a real install problem that
 /// must be surfaced before any send can succeed.
 
-import type { HarnessAvailability, HarnessBanner } from "./types";
+import type { HarnessAvailability, HarnessBanner, HarnessKind } from "./types";
+import { HARNESS_SETUP_URL } from "./harnessDisplay";
 
-const BINARY_COPY: Record<HarnessAvailability["harness"], string> = {
-  claude_code: "Claude Code not found on PATH. Install from https://claude.com/code",
-  codex: "Codex not found on PATH. Install from https://github.com/openai/codex",
-  gemini: "Gemini CLI not found on PATH. Install from https://github.com/google-gemini/gemini-cli",
-  antigravity:
-    "Antigravity CLI (agy) not found on PATH. Install from https://antigravity.google/download",
+/// CLI name as it appears in the binary-missing message (distinct from the
+/// short `HARNESS_LABEL`: "Claude Code", not "Claude"; "Antigravity CLI
+/// (agy)", which names the actual binary the user can't find).
+const BINARY_PROSE_NAME: Record<HarnessKind, string> = {
+  claude_code: "Claude Code",
+  codex: "Codex",
+  gemini: "Gemini CLI",
+  antigravity: "Antigravity CLI (agy)",
 };
+
+/// Built from the one install-URL source so the URL isn't duplicated
+/// between this copy and the getting-started panel.
+const BINARY_COPY: Record<HarnessKind, string> = {
+  claude_code: binaryMissingCopy("claude_code"),
+  codex: binaryMissingCopy("codex"),
+  gemini: binaryMissingCopy("gemini"),
+  antigravity: binaryMissingCopy("antigravity"),
+};
+
+function binaryMissingCopy(harness: HarnessKind): string {
+  return `${BINARY_PROSE_NAME[harness]} not found on PATH. Install from ${HARNESS_SETUP_URL[harness]}`;
+}
 
 /// The user-facing string for a given banner.
 export function bannerCopy(banner: HarnessBanner): string {

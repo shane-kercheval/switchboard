@@ -4,6 +4,13 @@
   import { harnessUnavailableReason, isHarnessSelectable } from "$lib/harnessAvailability";
   import Button from "$lib/components/ui/Button.svelte";
   import Input from "$lib/components/ui/Input.svelte";
+  import { cn } from "$lib/utils";
+  import {
+    SEGMENTED_CONTAINER_CLASS,
+    SEGMENTED_ITEM_CLASS,
+    SEGMENTED_ITEM_ACTIVE_CLASS,
+    SEGMENTED_ITEM_INACTIVE_CLASS,
+  } from "$lib/components/ui/segmentedControl";
 
   type Props = {
     busy?: boolean;
@@ -120,9 +127,9 @@
   // pill). Selection is driven off `harness`, gating off `selectable`.
   function harnessOptionClass(kind: HarnessKind, selectable: boolean): string {
     const selected = harness === kind;
-    if (selected) return "bg-primary text-primary-fg";
+    if (selected) return SEGMENTED_ITEM_ACTIVE_CLASS;
     if (!selectable) return "text-muted cursor-not-allowed opacity-60";
-    return "text-muted hover:bg-raised";
+    return SEGMENTED_ITEM_INACTIVE_CLASS;
   }
 </script>
 
@@ -137,16 +144,14 @@
   error → action row) is identical across both layouts.
 -->
 {#snippet formBody()}
-  <div
-    class="border-border bg-panel/70 flex gap-1 rounded-md border p-0.5"
-    role="tablist"
-    data-testid="mode-toggle"
-  >
+  <div class={cn(SEGMENTED_CONTAINER_CLASS, "flex")} role="tablist" data-testid="mode-toggle">
     <button
       type="button"
-      class="h-8 flex-1 rounded px-2 text-xs font-medium transition-colors {mode === 'create'
-        ? 'bg-primary text-primary-fg'
-        : 'text-muted hover:bg-raised'}"
+      class={cn(
+        SEGMENTED_ITEM_CLASS,
+        "flex-1",
+        mode === "create" ? SEGMENTED_ITEM_ACTIVE_CLASS : SEGMENTED_ITEM_INACTIVE_CLASS,
+      )}
       role="tab"
       aria-selected={mode === "create"}
       data-testid="mode-create"
@@ -157,9 +162,11 @@
     </button>
     <button
       type="button"
-      class="h-8 flex-1 rounded px-2 text-xs font-medium transition-colors {mode === 'attach'
-        ? 'bg-primary text-primary-fg'
-        : 'text-muted hover:bg-raised'}"
+      class={cn(
+        SEGMENTED_ITEM_CLASS,
+        "flex-1",
+        mode === "attach" ? SEGMENTED_ITEM_ACTIVE_CLASS : SEGMENTED_ITEM_INACTIVE_CLASS,
+      )}
       role="tab"
       aria-selected={mode === "attach"}
       data-testid="mode-attach"
@@ -171,17 +178,14 @@
   </div>
 
   <fieldset class="space-y-1.5" disabled={busy}>
-    <legend class="text-muted text-xs">Harness</legend>
+    <legend class="text-muted text-xs">Tool</legend>
     <!-- Native radios (real arrow-key + screen-reader semantics, grouped/labeled
          by the fieldset+legend) styled as a segmented control: the input is
          visually hidden and the label is the pill; `has-[:focus-visible]` lights
          the pill when the radio is keyboard-focused. -->
-    <div
-      class="border-border bg-panel/70 grid grid-cols-4 gap-1 rounded-md border p-0.5"
-      data-testid="harness-picker"
-    >
+    <div class={cn(SEGMENTED_CONTAINER_CLASS, "grid grid-cols-4")} data-testid="harness-picker">
       <label
-        class="has-[:focus-visible]:ring-accent flex h-8 items-center justify-center rounded px-2 text-xs font-medium transition-colors has-[:focus-visible]:ring-2 {harnessOptionClass(
+        class="{SEGMENTED_ITEM_CLASS} has-[:focus-visible]:ring-accent flex items-center justify-center has-[:focus-visible]:ring-2 {harnessOptionClass(
           'claude_code',
           claudeSelectable,
         )}"
@@ -200,7 +204,7 @@
         Claude Code
       </label>
       <label
-        class="has-[:focus-visible]:ring-accent flex h-8 items-center justify-center rounded px-2 text-xs font-medium transition-colors has-[:focus-visible]:ring-2 {harnessOptionClass(
+        class="{SEGMENTED_ITEM_CLASS} has-[:focus-visible]:ring-accent flex items-center justify-center has-[:focus-visible]:ring-2 {harnessOptionClass(
           'codex',
           codexSelectable,
         )}"
@@ -219,7 +223,7 @@
         Codex
       </label>
       <label
-        class="has-[:focus-visible]:ring-accent flex h-8 items-center justify-center rounded px-2 text-xs font-medium transition-colors has-[:focus-visible]:ring-2 {harnessOptionClass(
+        class="{SEGMENTED_ITEM_CLASS} has-[:focus-visible]:ring-accent flex items-center justify-center has-[:focus-visible]:ring-2 {harnessOptionClass(
           'gemini',
           geminiSelectable,
         )}"
@@ -238,7 +242,7 @@
         Gemini
       </label>
       <label
-        class="has-[:focus-visible]:ring-accent flex h-8 items-center justify-center rounded px-2 text-xs font-medium transition-colors has-[:focus-visible]:ring-2 {harnessOptionClass(
+        class="{SEGMENTED_ITEM_CLASS} has-[:focus-visible]:ring-accent flex items-center justify-center has-[:focus-visible]:ring-2 {harnessOptionClass(
           'antigravity',
           antigravitySelectable,
         )}"

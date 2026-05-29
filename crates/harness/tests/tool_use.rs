@@ -267,7 +267,7 @@ fn antigravity_agent() -> AgentRecord {
 }
 
 #[tokio::test]
-#[ignore = "requires agy authed via Antigravity desktop app — run with: make test-live"]
+#[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
 async fn live_antigravity_emits_tool_started_and_tool_completed_for_file_read() {
     // Antigravity's tool lifecycle AND answer text both come from tailing
     // `transcript.jsonl` (stdout replays the whole conversation on resume, so

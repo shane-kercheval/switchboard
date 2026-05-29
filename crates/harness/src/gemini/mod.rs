@@ -122,7 +122,9 @@ impl GeminiAdapter {
     /// downstream consumers (the field is display-only).
     fn resolve_version(&self) -> String {
         self.cached_version
-            .get_or_init(|| fetch_version(&self.gemini_binary_path))
+            .get_or_init(|| {
+                crate::subprocess::fetch_version(&self.gemini_binary_path).unwrap_or_default()
+            })
             .clone()
     }
 }
@@ -139,6 +141,10 @@ impl HarnessAdapter for GeminiAdapter {
         which::which(&self.gemini_binary_path)
             .map(|_| ())
             .map_err(|_| DispatchError::BinaryNotFound)
+    }
+
+    fn version(&self) -> Option<String> {
+        crate::subprocess::parse_cli_version(&self.resolve_version())
     }
 
     async fn dispatch(
@@ -217,24 +223,6 @@ fn resolve_home_dir(override_path: Option<&Path>) -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_default()
-}
-
-fn fetch_version(binary: &Path) -> String {
-    let Ok(resolved) = crate::subprocess::resolve_binary(binary) else {
-        return String::new();
-    };
-    let output = std::process::Command::new(&resolved)
-        .arg("--version")
-        .output();
-    match output {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_owned(),
-        _ => String::new(),
-    }
 }
 
 /// Build the `gemini` invocation. Order matches the captured fixture shape

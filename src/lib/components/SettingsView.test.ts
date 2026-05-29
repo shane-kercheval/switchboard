@@ -1,12 +1,22 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
-import { fireEvent, render, screen } from "@testing-library/svelte";
+import { fireEvent, render, screen, waitFor } from "@testing-library/svelte";
 import { tick } from "svelte";
 import SettingsView from "./SettingsView.svelte";
 import { theme } from "$lib/theme.svelte";
 
+// SettingsView embeds HarnessStatusList, which probes install/auth on mount.
+const invokeMock = vi.fn(async (cmd: string, _args?: Record<string, unknown>) => {
+  if (cmd === "get_harness_install_status") return { installed: true, version: "1.0.0" };
+  return null; // auth probes resolve = authenticated
+});
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: (cmd: string, args?: Record<string, unknown>) => invokeMock(cmd, args),
+}));
+
 beforeEach(() => {
   theme.set("system");
+  invokeMock.mockClear();
 });
 
 afterEach(() => {
@@ -19,6 +29,18 @@ describe("SettingsView", () => {
     render(SettingsView, { props: { onClose } });
     await fireEvent.click(screen.getByTestId("settings-close"));
     expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it("renders a Supported CLIs section with the harness status list", async () => {
+    render(SettingsView, { props: { onClose: vi.fn() } });
+    expect(screen.getByText("Supported CLIs")).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByTestId("harness-status")).toBeInTheDocument());
+    // The shared list probed install status for each harness.
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("get_harness_install_status", {
+        harness: "claude_code",
+      }),
+    );
   });
 
   it("theme picker has role=radiogroup and each option has role=radio", () => {

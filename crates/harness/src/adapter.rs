@@ -116,4 +116,10 @@ pub trait HarnessAdapter: Send + Sync {
     /// is ready to dispatch. In-process adapters (e.g., the mock) return
     /// `Ok(())` unconditionally.
     fn probe(&self) -> Result<(), DispatchError>;
+
+    /// Best-effort installed-CLI version (first line of `<binary> --version`),
+    /// for the getting-started surface. `None` when the binary can't be
+    /// invoked or reports nothing. Display-only — never load-bearing.
+    /// In-process adapters (the mock) return `None`.
+    fn version(&self) -> Option<String>;
 }

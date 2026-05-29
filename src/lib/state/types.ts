@@ -73,7 +73,7 @@ export type Turn =
       usage?: TurnUsage;
       /// Populated when status = "failed". Preserved so retry UX can distinguish
       /// recoverable from non-recoverable failures (HarnessError → suggest retry;
-      /// AdapterFailure → suggest "report bug"; AuthFailure → "run claude login").
+      /// AdapterFailure → suggest "report bug"; AuthFailure → "run claude auth login").
       error?: string;
       error_kind?: FailureKind;
     };

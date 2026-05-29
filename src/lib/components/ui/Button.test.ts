@@ -8,16 +8,20 @@ function label(text: string) {
 }
 
 describe("Button", () => {
-  it("renders children and defaults to the primary (token) variant", () => {
+  it("renders children and defaults to the primary (accent) variant", () => {
     render(Button, { props: { children: label("Go") } });
     const btn = screen.getByRole("button", { name: "Go" });
-    expect(btn).toHaveClass("bg-primary");
-    expect(btn).toHaveClass("text-primary-fg");
+    expect(btn).toHaveClass("bg-accent");
+    expect(btn).toHaveClass("text-accent-fg");
+    // Pill shape (matches the app's circular icon language).
+    expect(btn).toHaveClass("rounded-full");
   });
 
-  it("applies the secondary variant", () => {
+  it("applies the secondary variant as an outline", () => {
     render(Button, { props: { variant: "secondary", children: label("Cancel") } });
-    expect(screen.getByRole("button")).toHaveClass("bg-raised");
+    const btn = screen.getByRole("button");
+    expect(btn).toHaveClass("border");
+    expect(btn).toHaveClass("bg-transparent");
   });
 
   it("applies the destructive (danger) variant", () => {

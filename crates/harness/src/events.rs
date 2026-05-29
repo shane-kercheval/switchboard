@@ -568,7 +568,7 @@ mod tests {
             turn_id: fresh_turn_id(),
             outcome: TurnOutcome::Failed {
                 kind: FailureKind::AuthFailure,
-                message: "Claude authentication required — run `claude login`".to_owned(),
+                message: "Claude authentication required — run `claude auth login`".to_owned(),
             },
             ended_at: fresh_time(),
             usage: None,
@@ -578,7 +578,7 @@ mod tests {
         assert_eq!(value["outcome"]["kind"], "auth_failure");
         assert_eq!(
             value["outcome"]["message"],
-            "Claude authentication required — run `claude login`"
+            "Claude authentication required — run `claude auth login`"
         );
         let parsed: NormalizedEvent = serde_json::from_value(value).unwrap();
         assert_eq!(parsed, event);

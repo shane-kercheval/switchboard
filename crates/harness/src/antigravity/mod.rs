@@ -82,7 +82,7 @@ pub const BINARY_NAME: &str = "agy";
 /// path (stdout fast-fail, `Error: authentication timed out`, etc.) so all
 /// surfaces show the same actionable text.
 const ANTIGRAVITY_AUTH_MESSAGE: &str =
-    "Antigravity authentication required — sign in via the Antigravity desktop app";
+    "Antigravity authentication required — run `agy` to authenticate";
 
 /// Control-file names for the `fake_agy` test fixture binary, read from the
 /// dispatch cwd. Defined in the library (not the bin) so the fixture binary
@@ -161,7 +161,7 @@ impl AntigravityAdapter {
 
     fn resolve_version(&self) -> String {
         self.cached_version
-            .get_or_init(|| fetch_version(&self.binary_path))
+            .get_or_init(|| crate::subprocess::fetch_version(&self.binary_path).unwrap_or_default())
             .clone()
     }
 }
@@ -176,6 +176,10 @@ impl Default for AntigravityAdapter {
 impl HarnessAdapter for AntigravityAdapter {
     fn probe(&self) -> Result<(), DispatchError> {
         probe_binary_by_name(&self.binary_path.to_string_lossy())
+    }
+
+    fn version(&self) -> Option<String> {
+        crate::subprocess::parse_cli_version(&self.resolve_version())
     }
 
     async fn dispatch(
@@ -282,24 +286,6 @@ fn resolve_home_dir(override_path: Option<&Path>) -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_default()
-}
-
-fn fetch_version(binary: &Path) -> String {
-    let Ok(resolved) = crate::subprocess::resolve_binary(binary) else {
-        return String::new();
-    };
-    let output = std::process::Command::new(&resolved)
-        .arg("--version")
-        .output();
-    match output {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_owned(),
-        _ => String::new(),
-    }
 }
 
 /// Build the `agy` invocation. `--dangerously-skip-permissions` mirrors
@@ -1454,10 +1440,7 @@ mod tests {
                     message.contains("Antigravity authentication required"),
                     "names the harness: {message}"
                 );
-                assert!(
-                    message.contains("Antigravity desktop app"),
-                    "names the fix: {message}"
-                );
+                assert!(message.contains("run `agy`"), "names the fix: {message}");
                 assert!(
                     !message.contains("reload Switchboard"),
                     "must not advise reload (reactive auth): {message}"
@@ -1596,7 +1579,7 @@ mod tests {
                 // Even when the raw stdout `Error:` line is the trigger, the
                 // authored message wins so the user gets uniform actionable
                 // text.
-                assert!(message.contains("Antigravity desktop app"));
+                assert!(message.contains("run `agy`"));
                 assert!(!message.contains("reload Switchboard"));
             }
             other => panic!("expected AuthFailure, got {other:?}"),

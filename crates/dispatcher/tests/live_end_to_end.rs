@@ -519,7 +519,7 @@ async fn live_codex_full_stack_emits_turn_start_then_content_then_turn_end() {
 }
 
 #[tokio::test]
-#[ignore = "requires agy authed via Antigravity desktop app — run with: make test-live"]
+#[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
 async fn live_antigravity_full_stack_two_turns_resume_through_dispatcher() {
     // The full backend slice for Antigravity, exercising the capture→resume
     // path through the dispatcher: turn 1 captures the server-assigned UUID into
@@ -713,7 +713,7 @@ async fn live_gemini_cancel_terminates_and_synthesizes_cancelled() {
 }
 
 #[tokio::test]
-#[ignore = "requires agy authed via Antigravity desktop app — run with: make test-live"]
+#[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
 async fn live_antigravity_cancel_terminates_and_synthesizes_cancelled() {
     live_cancel_case(
         HarnessKind::Antigravity,

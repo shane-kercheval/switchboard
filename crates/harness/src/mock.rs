@@ -113,6 +113,10 @@ impl HarnessAdapter for MockHarnessAdapter {
         Ok(())
     }
 
+    fn version(&self) -> Option<String> {
+        None
+    }
+
     // One arm per `MockScenario`; the body is a flat match where each arm
     // spawns a small canned producer. It reads top-to-bottom as a catalog of
     // scenarios — splitting it into per-scenario helpers would scatter that

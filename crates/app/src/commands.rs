@@ -2015,6 +2015,47 @@ fn interpret_antigravity_keychain_probe(
     }
 }
 
+/// macOS Keychain service Claude Code stores its OAuth credentials under
+/// when logged in. Confirmed via `security dump-keychain` on an authed dev
+/// machine: a generic-password item with `svce="Claude Code-credentials"`.
+const CLAUDE_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
+
+/// Best-effort Claude Code subscription-auth detection (macOS only). Looks
+/// up the Keychain service the CLI stores its OAuth token under; presence
+/// means "logged in at some point," not a validity guarantee — the
+/// authoritative test is a successful send. Mirrors
+/// [`check_antigravity_auth_impl`]: `Ok(false)` (no entry) and `Err(_)`
+/// (couldn't run `security` — non-macOS host, missing tool) both surface as
+/// auth-missing.
+///
+/// Queried by service name only (no `-a` account filter): the heuristic only
+/// needs "does any Claude credential item exist," and the account value isn't
+/// stable enough to pin. A Linux build would instead check
+/// `~/.claude/.credentials.json` — out of v1 scope (macOS-only).
+pub fn check_claude_auth_impl() -> Result<(), AppError> {
+    let probe_result = std::process::Command::new("security")
+        .args(["find-generic-password", "-s", CLAUDE_KEYCHAIN_SERVICE])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success());
+    interpret_claude_keychain_probe(&probe_result)
+}
+
+/// Pure interpretation of the Claude Keychain probe's exit status. Factored
+/// out so unit tests pin all branches without invoking the real `security`
+/// CLI (which would couple the test to the dev machine's login state).
+fn interpret_claude_keychain_probe(probe_result: &std::io::Result<bool>) -> Result<(), AppError> {
+    let auth_err = || AppError::AuthNotConfigured {
+        harness: HarnessKind::ClaudeCode,
+        expected_path: format!("macOS Keychain (service: {CLAUDE_KEYCHAIN_SERVICE})"),
+    };
+    match probe_result {
+        Ok(true) => Ok(()),
+        Ok(false) | Err(_) => Err(auth_err()),
+    }
+}
+
 /// Best-effort Codex subscription-auth detection. Returns `Ok(())` if the
 /// auth file is present at the default location (`<home>/.codex/auth.json`),
 /// `Err(AppError::AuthNotConfigured)` otherwise.
@@ -2025,9 +2066,9 @@ fn interpret_antigravity_keychain_probe(
 ///   `auth.json` from a prior login; we report "authenticated" but a real
 ///   dispatch may surface an `AuthFailure`. The banner's actionable copy
 ///   ("run `codex login`") is still correct guidance under that case.
-/// - **No Claude equivalent.** Claude Code on macOS stores OAuth tokens in
-///   the keychain; there's no on-disk file we can reliably probe. The plan
-///   explicitly defers robust Claude auth detection to v2.
+/// - **Claude uses a Keychain presence heuristic.** Claude Code on macOS
+///   stores OAuth tokens in the Keychain (no reliable on-disk file); see
+///   [`check_claude_auth_impl`] for the equivalent best-effort probe.
 ///
 /// `home_dir` is a parameter (not derived from `$HOME` inside) for the
 /// same testability reason as `attach_agent_impl` — the Tauri shim reads
@@ -2079,6 +2120,50 @@ pub fn check_gemini_auth_impl(home_dir: &Path) -> Result<(), AppError> {
     } else {
         Err(auth_err())
     }
+}
+
+/// Install status of a harness CLI, for the getting-started surface.
+/// A missing binary is `installed: false` with no version — *data*, not an
+/// error path (unlike `check_*_binary`, which gates agent creation and so
+/// returns `Result<(), _>`).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct HarnessInstallStatus {
+    pub installed: bool,
+    pub version: Option<String>,
+}
+
+/// Derive install status from an adapter: present-on-PATH plus its
+/// best-effort `--version`. Version is only read when the binary is present
+/// (a missing binary has no version to report). Free of harness identity —
+/// works for any adapter, which keeps it trivially unit-testable.
+fn install_status_for(adapter: &dyn HarnessAdapter) -> HarnessInstallStatus {
+    let installed = adapter.probe().is_ok();
+    HarnessInstallStatus {
+        installed,
+        version: if installed { adapter.version() } else { None },
+    }
+}
+
+/// Install status for a given harness. The `match harness` here is adapter
+/// *routing* (the same pattern as `send_message_impl`), not failure
+/// classification — it selects which CLI to inspect.
+pub fn get_harness_install_status_impl(
+    state: &AppState,
+    harness: HarnessKind,
+) -> HarnessInstallStatus {
+    let adapter: &dyn HarnessAdapter = match harness {
+        HarnessKind::ClaudeCode => state.claude_adapter.as_ref(),
+        HarnessKind::Codex => state.codex_adapter.as_ref(),
+        HarnessKind::Gemini => state.gemini_adapter.as_ref(),
+        HarnessKind::Antigravity => state.antigravity_adapter.as_ref(),
+        _ => {
+            return HarnessInstallStatus {
+                installed: false,
+                version: None,
+            };
+        }
+    };
+    install_status_for(adapter)
 }
 
 /// Find a not-yet-loaded project's owning directory by searching every loaded
@@ -2792,13 +2877,127 @@ mod tests {
     /// fails on the developer's machine before silent miscategorization
     /// ships.
     #[test]
-    #[ignore = "requires agy authed via Antigravity desktop app — run with: make test-live"]
+    #[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
     fn live_antigravity_check_auth_finds_real_keychain_entry() {
         check_antigravity_auth_impl().expect(
             "Antigravity Keychain entry must live at service=gemini account=antigravity on a \
              logged-in machine; if this fails, Antigravity may have changed its keychain \
              naming or removed Keychain-based auth entirely",
         );
+    }
+
+    #[test]
+    fn interpret_claude_keychain_probe_ok_true_returns_ok() {
+        assert!(interpret_claude_keychain_probe(&Ok(true)).is_ok());
+    }
+
+    #[test]
+    fn interpret_claude_keychain_probe_ok_false_returns_auth_not_configured() {
+        let err = interpret_claude_keychain_probe(&Ok(false)).unwrap_err();
+        match err {
+            AppError::AuthNotConfigured {
+                harness,
+                expected_path,
+            } => {
+                assert_eq!(harness, HarnessKind::ClaudeCode);
+                assert!(
+                    expected_path.contains("Keychain"),
+                    "expected_path should reference Keychain: {expected_path}"
+                );
+                assert!(
+                    expected_path.contains("Claude Code-credentials"),
+                    "expected_path should pin the service name: {expected_path}"
+                );
+            }
+            other => panic!("expected AuthNotConfigured, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interpret_claude_keychain_probe_io_error_returns_auth_not_configured() {
+        // Simulates `security` missing (non-macOS host). Auth reports missing,
+        // which is correct: the heuristic is macOS-only in v1.
+        let probe_result = Err::<bool, _>(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "security missing",
+        ));
+        let err = interpret_claude_keychain_probe(&probe_result).unwrap_err();
+        assert!(matches!(err, AppError::AuthNotConfigured { .. }));
+    }
+
+    /// Drift-detection live test: if Claude Code moves its credentials out of
+    /// the macOS Keychain or renames the service, this fails on a logged-in
+    /// machine before the presence heuristic silently starts reporting ✗.
+    #[test]
+    #[ignore = "requires claude auth login — run with: make test-live"]
+    fn live_claude_check_auth_finds_real_keychain_entry() {
+        check_claude_auth_impl().expect(
+            "Claude Keychain entry must live at service=\"Claude Code-credentials\" on a \
+             logged-in machine; if this fails, `claude auth login` may have changed its keychain \
+             naming or moved off Keychain auth",
+        );
+    }
+
+    #[test]
+    fn install_status_for_mock_reports_installed_without_version() {
+        // Mock adapter probes Ok and reports no version — the "installed but
+        // version unknown" composition.
+        let status = install_status_for(&MockHarnessAdapter::new());
+        assert_eq!(
+            status,
+            HarnessInstallStatus {
+                installed: true,
+                version: None,
+            }
+        );
+    }
+
+    #[test]
+    fn install_status_for_missing_binary_reports_not_installed() {
+        let adapter = ClaudeCodeAdapter::with_binary_path("/nonexistent/claude-xyz123");
+        let status = install_status_for(&adapter);
+        assert_eq!(
+            status,
+            HarnessInstallStatus {
+                installed: false,
+                version: None,
+            }
+        );
+    }
+
+    #[test]
+    fn install_status_for_present_binary_reports_version() {
+        // `cargo` is guaranteed present wherever `cargo test` runs and supports
+        // `--version`; it stands in for a real harness CLI to exercise the
+        // installed-and-versioned branch deterministically without a login.
+        let adapter = ClaudeCodeAdapter::with_binary_path("cargo");
+        let status = install_status_for(&adapter);
+        assert!(status.installed);
+        // `cargo --version` prints "cargo 1.xx.y"; we surface just the parsed
+        // number, not the binary name.
+        let version = status
+            .version
+            .expect("cargo --version should report a number");
+        assert!(
+            version.starts_with(|c: char| c.is_ascii_digit()) && version.contains('.'),
+            "version should be a dotted number, not the raw line: {version}"
+        );
+    }
+
+    #[test]
+    fn get_harness_install_status_routes_per_harness() {
+        // Claude pointed at a missing binary; the others mocked (installed).
+        let claude: Arc<dyn HarnessAdapter> = Arc::new(ClaudeCodeAdapter::with_binary_path(
+            "/nonexistent/claude-xyz123",
+        ));
+        let codex: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let gemini: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let antigravity: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let emitter = Arc::new(RecordingEmitter::new());
+        let state = AppState::new(claude, codex, gemini, antigravity, emitter);
+
+        assert!(!get_harness_install_status_impl(&state, HarnessKind::ClaudeCode).installed);
+        assert!(get_harness_install_status_impl(&state, HarnessKind::Codex).installed);
     }
 
     /// Drift-detection live test: if `agy` is renamed or moved off PATH,
@@ -2896,6 +3095,10 @@ mod tests {
     impl HarnessAdapter for TaggedMockAdapter {
         fn probe(&self) -> Result<(), switchboard_harness::DispatchError> {
             Ok(())
+        }
+
+        fn version(&self) -> Option<String> {
+            None
         }
 
         async fn dispatch(
@@ -3164,6 +3367,9 @@ mod tests {
             fn probe(&self) -> Result<(), switchboard_harness::DispatchError> {
                 Ok(())
             }
+            fn version(&self) -> Option<String> {
+                None
+            }
             async fn dispatch(
                 &self,
                 _agent: &AgentRecord,
@@ -3263,6 +3469,9 @@ mod tests {
         impl HarnessAdapter for ProgrammableAdapter {
             fn probe(&self) -> Result<(), switchboard_harness::DispatchError> {
                 Ok(())
+            }
+            fn version(&self) -> Option<String> {
+                None
             }
             async fn dispatch(
                 &self,

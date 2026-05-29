@@ -31,8 +31,15 @@
     loadWorkspace,
     projects,
     selection,
+    workspace,
   } from "$lib/state/workspace.svelte";
-  import type { AgentRecord, BinaryState, HarnessAvailability, HarnessBanner } from "$lib/types";
+  import type {
+    AgentRecord,
+    BinaryState,
+    HarnessAvailability,
+    HarnessBanner,
+    ProjectListing,
+  } from "$lib/types";
   import { bannerCopy, bannerTestid } from "$lib/harnessAvailability";
   import { basename } from "$lib/utils";
 
@@ -177,6 +184,14 @@
   const activeProject = $derived(
     projects.list.find((p) => p.id === selection.activeProjectId) ?? null,
   );
+  // The projects sidebar is a project picker — with no projects there's
+  // nothing to pick, so it (and its re-open toggle) hide entirely; the
+  // welcome screen carries the New/Add affordances and Settings moves to the
+  // title bar. Exception: a workspace-persistability warning lives in the
+  // sidebar, so keep it visible when that needs surfacing even with no
+  // projects.
+  const projectsSidebarHasContent = $derived(projects.list.length > 0 || !workspace.persistable);
+  const projectsSidebarVisible = $derived(projectsSidebarOpen && projectsSidebarHasContent);
 
   function retryActivation(): void {
     if (selection.activeProjectId !== null) void activateProject(selection.activeProjectId);
@@ -190,16 +205,39 @@
     return typeof result === "string" ? result : null;
   }
 
-  // Add existing: point at a folder; every Switchboard project already in it
-  // flows into the flat list.
-  async function handleAddExisting(): Promise<void> {
-    dirError = null;
+  // Add existing: a dialog first explains *what* to select (the working
+  // directory, not the `.switchboard/` folder), then reports what was found so
+  // a no-match doesn't look like a silent success.
+  let addExistingOpen = $state<boolean>(false);
+  let addExistingFolder = $state<string | null>(null);
+  // `null` until a folder has been chosen; then the projects discovered in it
+  // (empty array = none found).
+  let addExistingFound = $state<ProjectListing[] | null>(null);
+  let addExistingBusy = $state<boolean>(false);
+  let addExistingError = $state<string | null>(null);
+
+  function openAddExisting(): void {
+    addExistingFolder = null;
+    addExistingFound = null;
+    addExistingError = null;
+    addExistingOpen = true;
+  }
+
+  async function chooseAddExistingFolder(): Promise<void> {
     const folder = await pickFolder();
     if (folder === null) return;
+    addExistingError = null;
+    addExistingBusy = true;
     try {
       await addDirectory(folder);
+      // `addDirectory` refreshes the workspace; surface what now lives in the
+      // chosen folder straight from the flat list (same source as the sidebar).
+      addExistingFolder = folder;
+      addExistingFound = projects.list.filter((p) => p.directory === folder);
     } catch (err) {
-      dirError = err instanceof Error ? err.message : String(err);
+      addExistingError = err instanceof Error ? err.message : String(err);
+    } finally {
+      addExistingBusy = false;
     }
   }
 
@@ -304,10 +342,10 @@
 <main class="bg-surface text-fg flex h-full flex-col">
   <AppShell centerTestid="workspace-main">
     {#snippet left()}
-      {#if projectsSidebarOpen}
+      {#if projectsSidebarVisible}
         <ProjectsSidebar
           onNewProject={openNewProject}
-          onAddExisting={handleAddExisting}
+          onAddExisting={openAddExisting}
           onOpenSettings={toggleSettings}
           onProjectSelect={() => (settingsOpen = false)}
           onToggleSidebar={() => (projectsSidebarOpen = false)}
@@ -331,13 +369,16 @@
         sync if that position changes.
       -->
       <div
-        class="border-border/80 bg-raised flex h-11 shrink-0 items-center gap-2 border-b pr-3 {projectsSidebarOpen
+        class="border-border/80 bg-raised flex h-11 shrink-0 items-center gap-2 border-b pr-3 {projectsSidebarVisible
           ? 'pl-4'
           : 'pl-20'}"
         data-tauri-drag-region
         use:windowDragRegion
       >
-        {#if !projectsSidebarOpen}
+        <!-- Title-bar Settings + re-open toggle appear only when the sidebar
+             has content but is collapsed. In the no-project state there's no
+             sidebar at all, so neither shows — the welcome screen stays clean. -->
+        {#if projectsSidebarHasContent && !projectsSidebarOpen}
           <SettingsButton
             pressed={settingsOpen}
             testid="settings-button"
@@ -386,11 +427,15 @@
         {#if settingsOpen}
           <SettingsView onClose={closeSettings} />
         {:else if selection.activeProjectId === null}
-          {#if projects.list.length === 0}
-            <WelcomeScreen onNewProject={openNewProject} onAddExisting={handleAddExisting} />
-          {:else}
-            <EmptyState title="Select a project." />
-          {/if}
+          <!-- Every no-project state shows the same orientation surface
+               (what Switchboard is, the project/agent explainer, the CTAs, and
+               the harness panel). When projects already exist they remain in
+               the sidebar list as the selection affordance. -->
+          <div class="flex h-full flex-col items-center overflow-y-auto px-8 pt-6 pb-8">
+            <div class="w-full max-w-2xl pb-6">
+              <WelcomeScreen onNewProject={openNewProject} onAddExisting={openAddExisting} />
+            </div>
+          </div>
         {:else if selection.activationError !== null}
           <EmptyState
             testid="activation-error"
@@ -399,7 +444,12 @@
             description={selection.activationError}
           >
             {#snippet action()}
-              <Button variant="secondary" data-testid="activation-retry" onclick={retryActivation}>
+              <Button
+                variant="secondary"
+                size="sm"
+                data-testid="activation-retry"
+                onclick={retryActivation}
+              >
                 Retry
               </Button>
             {/snippet}
@@ -484,11 +534,79 @@
       {/if}
       <div class="flex justify-end">
         <Button
+          size="sm"
           data-testid="new-project-submit"
           disabled={!newProjectValid || newProjectBusy}
           onclick={submitNewProject}
         >
           Create
+        </Button>
+      </div>
+    </div>
+  </Dialog>
+
+  <Dialog
+    bind:open={addExistingOpen}
+    title="Add an existing project"
+    onClose={() => (addExistingOpen = false)}
+  >
+    <div class="space-y-4" data-testid="add-existing-form">
+      <p class="text-muted text-sm leading-relaxed">
+        Choose a folder you've already used with Switchboard — your repo or working directory (the
+        one that contains a
+        <code class="bg-panel text-fg rounded px-1 font-mono text-xs">.switchboard/</code>
+        folder), not the
+        <code class="bg-panel text-fg rounded px-1 font-mono text-xs">.switchboard/</code> folder itself.
+        Switchboard looks there for projects you've created before.
+      </p>
+
+      <Button
+        variant="secondary"
+        size="sm"
+        data-testid="add-existing-choose-folder"
+        disabled={addExistingBusy}
+        onclick={chooseAddExistingFolder}
+      >
+        Choose folder…
+      </Button>
+
+      {#if addExistingError}
+        <p class="text-status-failed text-xs" data-testid="add-existing-error">
+          {addExistingError}
+        </p>
+      {:else if addExistingFound !== null}
+        {#if addExistingFound.length > 0}
+          <div class="space-y-1.5" data-testid="add-existing-found">
+            <p class="text-fg text-sm">
+              Found {addExistingFound.length}
+              {addExistingFound.length === 1 ? "project" : "projects"} — added to your list.
+            </p>
+            <ul class="text-muted space-y-0.5 text-xs">
+              {#each addExistingFound as found (found.id)}
+                <li class="truncate">{found.name}</li>
+              {/each}
+            </ul>
+          </div>
+        {:else}
+          <p class="text-warning text-xs leading-relaxed" data-testid="add-existing-none">
+            No Switchboard projects found in
+            <span class="font-mono" title={addExistingFolder}>{addExistingFolder}</span>. Make sure
+            you picked the working directory that contains a
+            <code class="bg-panel text-fg rounded px-1 font-mono">.switchboard/</code>
+            folder — or start a new project there with “New project”.
+          </p>
+        {/if}
+      {/if}
+
+      <div class="flex justify-end">
+        <Button
+          variant="secondary"
+          size="sm"
+          data-testid="add-existing-done"
+          disabled={addExistingBusy || (addExistingFound === null && addExistingError === null)}
+          onclick={() => (addExistingOpen = false)}
+        >
+          Done
         </Button>
       </div>
     </div>

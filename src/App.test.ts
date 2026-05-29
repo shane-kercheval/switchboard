@@ -166,6 +166,17 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
     }
     case "send_message":
       return backend.sendMessageId;
+    // The getting-started panel (no-project state) probes auth + install
+    // status. Honor probeFailures so a "logged out" / "not installed" case
+    // can be simulated; default to authed + installed.
+    case "check_claude_auth":
+    case "check_codex_auth":
+    case "check_gemini_auth":
+    case "check_antigravity_auth":
+      if (backend.probeFailures.has(cmd)) throw new Error(`auth failed: ${cmd}`);
+      return null;
+    case "get_harness_install_status":
+      return { installed: true, version: "1.0.0" };
     default:
       throw new Error(`unexpected invoke call: ${cmd}`);
   }
@@ -261,8 +272,10 @@ describe("App", () => {
     expect(screen.getByText("Switchboard")).toBeInTheDocument();
     expect(screen.getByTestId("welcome-new-project")).toBeInTheDocument();
     expect(screen.getByTestId("welcome-add-existing")).toBeInTheDocument();
-    // The flat project sidebar is always present (no separate welcome phase).
-    expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument();
+    // With no projects the picker sidebar has nothing to show, so it (and its
+    // re-open toggle) hide; the welcome screen carries the New/Add affordances.
+    expect(screen.queryByTestId("projects-sidebar")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("projects-sidebar-toggle")).not.toBeInTheDocument();
     await waitFor(() => expect(screen.queryByTestId(/^banner-/)).not.toBeInTheDocument());
   });
 
@@ -275,21 +288,26 @@ describe("App", () => {
     expect(screen.queryByTestId("banner-binary_missing-codex")).not.toBeInTheDocument();
   });
 
-  it("does not call any check_*_auth probe at startup (auth is reactive-only)", async () => {
-    // Reactive-auth posture: a logged-out harness is discovered on send,
-    // not by a startup probe. The backend commands still exist (retained
-    // for the getting-started surface), but App.svelte no longer invokes
-    // them — invoking would silently bring back the proactive surface
-    // we removed.
+  it("probes auth in the no-project getting-started surface, but renders no auth banner", async () => {
+    // Auth status is proactive in exactly one place — the no-project
+    // getting-started panel — and reactive everywhere else. So the panel
+    // *does* probe auth here (that's its job), but the removed mid-work
+    // surface must stay gone: no auth banner.
     await mountApp();
-    // Settle one tick so any errant onMount call would have landed.
-    await waitFor(() => expect(screen.getByTestId("welcome-new-project")).toBeInTheDocument());
-    const authCalls = invokeMock.mock.calls.filter(
-      ([c]) =>
-        c === "check_codex_auth" || c === "check_gemini_auth" || c === "check_antigravity_auth",
-    );
-    expect(authCalls).toHaveLength(0);
-    // And no banner anywhere — the no-banner posture is the whole point.
+    await waitFor(() => expect(screen.getByTestId("getting-started")).toBeInTheDocument());
+    // The panel probes auth asynchronously (install → auth per harness); wait
+    // for at least one auth probe to fire rather than checking synchronously.
+    await waitFor(() => {
+      const authCalls = invokeMock.mock.calls.filter(
+        ([c]) =>
+          c === "check_claude_auth" ||
+          c === "check_codex_auth" ||
+          c === "check_gemini_auth" ||
+          c === "check_antigravity_auth",
+      );
+      expect(authCalls.length).toBeGreaterThan(0);
+    });
+    // The mid-work auth banner stays removed — that posture is the point.
     expect(screen.queryByTestId(/^banner-auth_missing-/)).not.toBeInTheDocument();
   });
 
@@ -305,9 +323,20 @@ describe("App", () => {
 
   // --- adding projects ---
 
-  it("add existing project: pointing at a folder brings its existing projects into the flat list", async () => {
-    // The folder already has a Switchboard project on disk; adding it surfaces
-    // that project in the list (the directory is invisible plumbing).
+  it("add existing: opens an explanatory dialog before picking a folder (no immediate OS picker)", async () => {
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("welcome-add-existing")).toBeInTheDocument());
+
+    await fireEvent.click(screen.getByTestId("welcome-add-existing"));
+    // The dialog explains what to select first; the OS folder picker has not
+    // been opened yet (it opens on "Choose folder…").
+    await waitFor(() => expect(screen.getByTestId("add-existing-form")).toBeInTheDocument());
+    expect(openDialogMock).not.toHaveBeenCalled();
+    // Done is disabled until a folder has been chosen.
+    expect(screen.getByTestId("add-existing-done")).toBeDisabled();
+  });
+
+  it("add existing: choosing a folder with projects reports what was found and adds them to the list", async () => {
     backend.projects.push(listing({ id: "p-x", directory: DIR_A, name: "existing-proj" }));
     backend.rosters.set("p-x", []);
     openDialogMock.mockResolvedValueOnce(DIR_A);
@@ -315,12 +344,31 @@ describe("App", () => {
     await waitFor(() => expect(screen.getByTestId("welcome-add-existing")).toBeInTheDocument());
 
     await fireEvent.click(screen.getByTestId("welcome-add-existing"));
-    await waitFor(() => expect(screen.getByText("existing-proj")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("add-existing-choose-folder"));
+
+    // Found feedback names the project, and it surfaces in the flat list.
+    await waitFor(() => expect(screen.getByTestId("add-existing-found")).toBeInTheDocument());
+    expect(screen.getByTestId("add-existing-found")).toHaveTextContent("existing-proj");
+    // Done enables once a folder has been chosen.
+    expect(screen.getByTestId("add-existing-done")).toBeEnabled();
     expect(
       invokeMock.mock.calls.some(([c, a]) => c === "init_directory" && a?.path === DIR_A),
     ).toBe(true);
-    // No directory rows anywhere — folders are not a managed object.
-    expect(screen.queryByTestId("directory-row")).not.toBeInTheDocument();
+    // It also surfaces in the flat list (the sidebar now has a project to show).
+    expect(screen.getByTestId("project-row")).toBeInTheDocument();
+  });
+
+  it("add existing: a folder with no projects shows a 'none found' warning, not silent success", async () => {
+    // DIR_A has no projects on disk.
+    openDialogMock.mockResolvedValueOnce(DIR_A);
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("welcome-add-existing")).toBeInTheDocument());
+
+    await fireEvent.click(screen.getByTestId("welcome-add-existing"));
+    await fireEvent.click(screen.getByTestId("add-existing-choose-folder"));
+
+    await waitFor(() => expect(screen.getByTestId("add-existing-none")).toBeInTheDocument());
+    expect(screen.queryByTestId("add-existing-found")).not.toBeInTheDocument();
   });
 
   it("new project: choosing a folder + name creates the project and activates it", async () => {
@@ -348,8 +396,9 @@ describe("App", () => {
     backend.dirs.set(DIR_A, { available: true });
     await mountApp();
     await waitFor(() => expect(screen.getByTestId("not-persistable-banner")).toBeInTheDocument());
-    // The workspace shell renders (sidebar present), not a bare welcome with no warning.
-    expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument();
+    // The distinguishing signal is the banner above the welcome surface — not a
+    // bare welcome with no warning. (With no projects the picker sidebar hides.)
+    expect(screen.getByText("Switchboard")).toBeInTheDocument();
   });
 
   // --- workspace: project list + lazy activation ---

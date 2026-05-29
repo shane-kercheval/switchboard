@@ -7,7 +7,7 @@ pub use session_file::load_claude_transcript;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -29,6 +29,10 @@ use crate::parser::{self, ParseOutcome, ParserState};
 /// only the binary changes.
 pub struct ClaudeCodeAdapter {
     claude_binary_path: PathBuf,
+    /// Lazily-resolved `claude --version`, cached for the lifetime of the
+    /// adapter. Empty string caches a failed/absent probe (version is
+    /// display-only). Mirrors the Gemini/Antigravity pattern.
+    cached_version: OnceLock<String>,
 }
 
 impl ClaudeCodeAdapter {
@@ -36,6 +40,7 @@ impl ClaudeCodeAdapter {
     pub fn new() -> Self {
         Self {
             claude_binary_path: PathBuf::from("claude"),
+            cached_version: OnceLock::new(),
         }
     }
 
@@ -43,6 +48,7 @@ impl ClaudeCodeAdapter {
     pub fn with_binary_path(path: impl Into<PathBuf>) -> Self {
         Self {
             claude_binary_path: path.into(),
+            cached_version: OnceLock::new(),
         }
     }
 }
@@ -63,6 +69,13 @@ impl HarnessAdapter for ClaudeCodeAdapter {
         which::which(&self.claude_binary_path)
             .map(|_| ())
             .map_err(|_| DispatchError::BinaryNotFound)
+    }
+
+    fn version(&self) -> Option<String> {
+        let raw = self.cached_version.get_or_init(|| {
+            crate::subprocess::fetch_version(&self.claude_binary_path).unwrap_or_default()
+        });
+        crate::subprocess::parse_cli_version(raw)
     }
 
     async fn dispatch(

@@ -21,7 +21,7 @@ real harnesses".
 ## How to run
 
 One-time: install and authenticate each harness with subscription credentials
-(no API keys) — `claude login`, `codex login`, an interactive `gemini`
+(no API keys) — `claude auth login`, `codex login`, an interactive `gemini`
 sign-in, and the Antigravity desktop-app sign-in for `agy`.
 
 ```sh

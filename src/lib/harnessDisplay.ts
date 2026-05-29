@@ -29,3 +29,25 @@ export const HARNESS_COLOR: Record<HarnessKind, string> = {
   gemini: "#17b967",
   antigravity: "#3187fe",
 };
+
+/// Official setup/install docs for each harness CLI. The single source for
+/// these URLs: the getting-started panel links to them, and
+/// `harnessAvailability`'s binary-missing copy is built from them — so a
+/// moved docs page is a one-line change here, not a hunt across the frontend.
+export const HARNESS_SETUP_URL: Record<HarnessKind, string> = {
+  claude_code: "https://code.claude.com/docs/en/quickstart",
+  codex: "https://developers.openai.com/codex/cli",
+  gemini: "https://geminicli.com/docs/get-started/installation/",
+  antigravity: "https://antigravity.google/docs/cli-install",
+};
+
+/// How the user authenticates each harness, shown in the auth column of the
+/// getting-started panel when a harness is installed but not signed in. These
+/// are *hints* — the authoritative test is a successful send; auth is
+/// otherwise discovered reactively.
+export const HARNESS_LOGIN_HINT: Record<HarnessKind, string> = {
+  claude_code: "run `claude auth login` to authenticate",
+  codex: "run `codex login` to authenticate",
+  gemini: "run `gemini` to authenticate",
+  antigravity: "run `agy` to authenticate",
+};

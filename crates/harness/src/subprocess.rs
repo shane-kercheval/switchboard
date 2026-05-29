@@ -54,6 +54,53 @@ pub fn resolve_binary(path: &Path) -> Result<PathBuf, DispatchError> {
     which::which(path).map_err(|_| DispatchError::BinaryNotFound)
 }
 
+/// Extract just the version number from a `--version` line, since CLIs pad it
+/// differently: `claude` prints `2.1.156 (Claude Code)`, `codex` prints
+/// `codex-cli 0.134.0`, others print a bare `0.44.0`. Returns the first
+/// whitespace-separated token that looks like a dotted version (optionally
+/// `v`-prefixed, which is stripped), or `None` if the line has none — callers
+/// then show "Installed" without a number rather than echoing the binary name.
+#[must_use]
+pub fn parse_cli_version(line: &str) -> Option<String> {
+    line.split_whitespace()
+        .map(|tok| tok.strip_prefix('v').unwrap_or(tok))
+        .find(|tok| {
+            let mut segments = tok.split('.');
+            let major_numeric = segments
+                .next()
+                .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()));
+            // Require at least `<digits>.<digit>…` so "codex-cli" (no dot) and
+            // "(Claude" are rejected but "2.1.156" / "0.44.0" match.
+            let minor_starts_numeric = segments
+                .next()
+                .is_some_and(|s| s.bytes().next().is_some_and(|b| b.is_ascii_digit()));
+            major_numeric && minor_starts_numeric
+        })
+        .map(str::to_owned)
+}
+
+/// Best-effort version string for a harness CLI: the first line of
+/// `<binary> --version`, trimmed. Returns `None` when the binary can't be
+/// resolved/invoked or reports nothing — the value is display-only, never
+/// load-bearing, so any failure collapses to "unknown" rather than an error.
+pub fn fetch_version(binary: &Path) -> Option<String> {
+    let resolved = resolve_binary(binary).ok()?;
+    let output = std::process::Command::new(&resolved)
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let line = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_owned();
+    (!line.is_empty()).then_some(line)
+}
+
 /// Drain a child's stderr stream into a bounded tail buffer.
 ///
 /// Each line is also emitted at `tracing::debug!` with the harness name as
@@ -247,5 +294,49 @@ mod tests {
             resolve_binary(path),
             Err(DispatchError::BinaryNotFound)
         ));
+    }
+
+    #[test]
+    fn fetch_version_returns_first_line_for_present_binary() {
+        // `cargo` is guaranteed present wherever `cargo test` runs and
+        // supports `--version`; it stands in for a harness CLI to prove the
+        // first-line extraction without depending on a real harness install.
+        let version = fetch_version(std::path::Path::new("cargo"))
+            .expect("cargo --version should report a line");
+        assert!(
+            version.contains("cargo"),
+            "unexpected version line: {version}"
+        );
+        assert!(!version.contains('\n'), "should be a single trimmed line");
+    }
+
+    #[test]
+    fn fetch_version_none_for_missing_binary() {
+        assert_eq!(
+            fetch_version(std::path::Path::new("definitely-not-a-real-binary-xyz123")),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_cli_version_extracts_number_from_real_formats() {
+        // Captured live: each harness pads its --version differently.
+        assert_eq!(
+            parse_cli_version("2.1.156 (Claude Code)").as_deref(),
+            Some("2.1.156")
+        );
+        assert_eq!(
+            parse_cli_version("codex-cli 0.134.0").as_deref(),
+            Some("0.134.0")
+        );
+        assert_eq!(parse_cli_version("0.44.0").as_deref(), Some("0.44.0"));
+        assert_eq!(parse_cli_version("1.0.3").as_deref(), Some("1.0.3"));
+    }
+
+    #[test]
+    fn parse_cli_version_strips_leading_v_and_handles_no_version() {
+        assert_eq!(parse_cli_version("v1.2.3").as_deref(), Some("1.2.3"));
+        assert_eq!(parse_cli_version(""), None);
+        assert_eq!(parse_cli_version("no version here"), None);
     }
 }

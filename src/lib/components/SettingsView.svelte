@@ -2,6 +2,13 @@
   import { theme, type ThemeMode } from "$lib/theme.svelte";
   import { cn } from "$lib/utils";
   import { ICON_BUTTON_CLASS, ICON_SIZE } from "$lib/components/ui/iconButton";
+  import {
+    SEGMENTED_CONTAINER_CLASS,
+    SEGMENTED_ITEM_CLASS,
+    SEGMENTED_ITEM_ACTIVE_CLASS,
+    SEGMENTED_ITEM_INACTIVE_CLASS,
+  } from "$lib/components/ui/segmentedControl";
+  import HarnessStatusList from "$lib/components/HarnessStatusList.svelte";
 
   let { onClose }: { onClose: () => void } = $props();
 
@@ -52,7 +59,7 @@
       </div>
 
       <div
-        class="border-border bg-panel inline-grid h-9 grid-cols-3 rounded-md border p-0.5"
+        class={cn(SEGMENTED_CONTAINER_CLASS, "inline-grid grid-cols-3")}
         role="radiogroup"
         aria-label="Theme"
       >
@@ -61,8 +68,11 @@
             type="button"
             role="radio"
             class={cn(
-              "text-muted hover:text-fg rounded-[5px] px-4 text-sm font-medium transition-colors",
-              theme.mode === option.mode && "bg-primary text-primary-fg hover:text-primary-fg",
+              SEGMENTED_ITEM_CLASS,
+              "flex items-center justify-center",
+              theme.mode === option.mode
+                ? SEGMENTED_ITEM_ACTIVE_CLASS
+                : SEGMENTED_ITEM_INACTIVE_CLASS,
             )}
             aria-checked={theme.mode === option.mode}
             onclick={() => theme.set(option.mode)}
@@ -92,6 +102,16 @@
           </div>
         {/each}
       </div>
+    </section>
+
+    <section class="space-y-3">
+      <div>
+        <h2 class="text-fg text-sm font-semibold">Supported CLIs</h2>
+        <p class="text-muted mt-1 text-sm leading-relaxed">
+          The AI coding CLIs Switchboard runs. Install and sign in to the ones you want to use.
+        </p>
+      </div>
+      <HarnessStatusList />
     </section>
   </div>
 </div>

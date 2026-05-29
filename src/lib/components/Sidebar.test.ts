@@ -238,6 +238,307 @@ describe("Sidebar", () => {
   });
 });
 
+/// A unix-epoch-seconds timestamp `deltaSeconds` from now — payloads use
+/// real-now-relative resets so the "is this window still in the future?" gate
+/// is exercised deterministically (a fixed epoch would drift past `now` and
+/// flip the test's meaning over time).
+function epochFromNow(deltaSeconds: number): number {
+  return Math.floor(Date.now() / 1000) + deltaSeconds;
+}
+
+/// An ISO string `ms` before now — for the snapshot-age (`as_of`) tooltip line.
+function agoIso(ms: number): string {
+  return new Date(Date.now() - ms).toISOString();
+}
+
+async function renderClaudeWithRateLimit(info: unknown, asOf: string | null): Promise<void> {
+  const state = await loadState();
+  await state.registerAgent(CLAUDE_AGENT);
+  const runtime = state.runtimes[CLAUDE_AGENT.id];
+  if (runtime === undefined) throw new Error("unreachable");
+  state.runtimes[CLAUDE_AGENT.id] = {
+    ...runtime,
+    last_rate_limit: info,
+    last_rate_limit_as_of: asOf,
+  };
+  const Sidebar = (await import("./Sidebar.svelte")).default;
+  render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+}
+
+/// Claude rate-limit surface — two independent signals (the always-present
+/// primary window + the overage escalation), each gated on its own reset being
+/// in the future (reset-passed → clean-hide). Exact clock/date text isn't
+/// asserted (jsdom locale/timezone dependent) — only the stable label/copy and
+/// presence/absence per the gating rules.
+describe("Sidebar Claude rate-limit surface", () => {
+  it("shows the primary window independent of overage (normal-quota turn)", async () => {
+    // No isUsingOverage — the 5-hour window must still surface (the bug we're
+    // fixing: the window used to be gated on overage).
+    await renderClaudeWithRateLimit(
+      { status: "allowed", rateLimitType: "five_hour", resetsAt: epochFromNow(4 * 3600) },
+      null,
+    );
+    const window = screen.getByTestId("agent-rate-window");
+    expect(window).toHaveTextContent("5-hour limit resets");
+    // Not overaging → no amber escalation.
+    expect(screen.queryByTestId("agent-overage")).toBeNull();
+  });
+
+  it("derives the window label from rateLimitType (unknown → generic)", async () => {
+    await renderClaudeWithRateLimit(
+      { status: "allowed", rateLimitType: "weekly", resetsAt: epochFromNow(4 * 3600) },
+      null,
+    );
+    // Unknown type falls back to the generic label, never a hardcoded "5-hour".
+    const window = screen.getByTestId("agent-rate-window");
+    expect(window).toHaveTextContent("rate limit resets");
+    expect(window).not.toHaveTextContent("5-hour");
+  });
+
+  it("hides the primary window once its reset is in the past (reset-passed)", async () => {
+    // A past reset is known-stale (the window has cycled, we lack the new
+    // reset) — showing a past 'resets at' would be wrong, so it clean-hides.
+    await renderClaudeWithRateLimit(
+      { status: "allowed", rateLimitType: "five_hour", resetsAt: epochFromNow(-3600) },
+      null,
+    );
+    expect(screen.queryByTestId("agent-rate-window")).toBeNull();
+    expect(screen.queryByTestId("agent-rate-limit-claude")).toBeNull();
+  });
+
+  it("shows the amber overage escalation when overaging with a future overage window", async () => {
+    await renderClaudeWithRateLimit(
+      {
+        status: "rejected",
+        rateLimitType: "five_hour",
+        resetsAt: epochFromNow(4 * 3600),
+        isUsingOverage: true,
+        overageResetsAt: epochFromNow(6 * 86400),
+      },
+      null,
+    );
+    // Both signals present: neutral window + amber escalation.
+    expect(screen.getByTestId("agent-rate-window")).toHaveTextContent("5-hour limit resets");
+    const overage = screen.getByTestId("agent-overage");
+    expect(overage).toHaveTextContent("using credits");
+    expect(overage).toHaveClass("text-warning");
+  });
+
+  it("drops the overage escalation once the overage window has passed", async () => {
+    // isUsingOverage true, but the overage window elapsed → the credit window
+    // has cycled, so the escalation is stale and hidden. The still-future
+    // primary window stays.
+    await renderClaudeWithRateLimit(
+      {
+        status: "rejected",
+        rateLimitType: "five_hour",
+        resetsAt: epochFromNow(4 * 3600),
+        isUsingOverage: true,
+        overageResetsAt: epochFromNow(-3600),
+      },
+      null,
+    );
+    expect(screen.getByTestId("agent-rate-window")).toBeInTheDocument();
+    expect(screen.queryByTestId("agent-overage")).toBeNull();
+  });
+
+  it("overage flag with no overage window still shows (can't prove it stale)", async () => {
+    await renderClaudeWithRateLimit(
+      { isUsingOverage: true, resetsAt: epochFromNow(4 * 3600), rateLimitType: "five_hour" },
+      null,
+    );
+    expect(screen.getByTestId("agent-overage")).toHaveTextContent("using credits");
+  });
+
+  it("renders nothing when there is no usable rate-limit signal", async () => {
+    // Everything elapsed / absent → the whole cell clean-hides.
+    await renderClaudeWithRateLimit({ status: "allowed", resetsAt: epochFromNow(-3600) }, null);
+    expect(screen.queryByTestId("agent-rate-limit-claude")).toBeNull();
+    expect(screen.queryByTestId("agent-rate-window")).toBeNull();
+    expect(screen.queryByTestId("agent-overage")).toBeNull();
+  });
+
+  it("Codex agent never shows the Claude rate-limit cells (Claude-gated)", async () => {
+    const state = await loadState();
+    await state.registerAgent(CODEX_AGENT);
+    const runtime = state.runtimes[CODEX_AGENT.id];
+    if (runtime === undefined) throw new Error("unreachable");
+    state.runtimes[CODEX_AGENT.id] = {
+      ...runtime,
+      last_rate_limit: {
+        rateLimitType: "five_hour",
+        resetsAt: epochFromNow(4 * 3600),
+        isUsingOverage: true,
+        overageResetsAt: epochFromNow(6 * 86400),
+      },
+    };
+    const Sidebar = (await import("./Sidebar.svelte")).default;
+    render(Sidebar, { props: { agents: [CODEX_AGENT] } });
+    expect(screen.queryByTestId("agent-rate-window")).toBeNull();
+    expect(screen.queryByTestId("agent-overage")).toBeNull();
+  });
+});
+
+/// Rate-limit tooltip content — always present when the cell shows, carrying
+/// full reset dates (a window can be days out, beyond the inline clock) plus
+/// both windows and the snapshot age when rehydrated. Mirrors the
+/// parse-warnings tooltip test's fake-timer + pointerEnter pattern.
+describe("Sidebar Claude rate-limit tooltip", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("surfaces the window + overage windows on hover; no snapshot line when live", async () => {
+    await renderClaudeWithRateLimit(
+      {
+        status: "rejected",
+        rateLimitType: "five_hour",
+        resetsAt: epochFromNow(4 * 3600),
+        isUsingOverage: true,
+        overageResetsAt: epochFromNow(6 * 86400),
+      },
+      null,
+    );
+    await fireEvent.pointerEnter(screen.getByTestId("agent-rate-limit-claude"));
+    await vi.advanceTimersByTimeAsync(500);
+    const detail = await waitFor(() => screen.getByTestId("agent-rate-detail"));
+    expect(detail).toHaveTextContent("5-hour limit resets");
+    // The overage window — dropped before M4, now surfaced here.
+    expect(detail).toHaveTextContent("overage window resets");
+    // Live snapshot (as_of null) → no snapshot-age line.
+    expect(screen.queryByTestId("agent-rate-snapshot")).toBeNull();
+  });
+
+  it("adds a snapshot-age + refresh line on hover when rehydrated (as_of set)", async () => {
+    await renderClaudeWithRateLimit(
+      { status: "allowed", rateLimitType: "five_hour", resetsAt: epochFromNow(4 * 3600) },
+      agoIso(3 * 60 * 60 * 1000),
+    );
+    await fireEvent.pointerEnter(screen.getByTestId("agent-rate-limit-claude"));
+    await vi.advanceTimersByTimeAsync(500);
+    await waitFor(() => screen.getByTestId("agent-rate-detail"));
+    const snapshot = screen.getByTestId("agent-rate-snapshot");
+    expect(snapshot).toHaveTextContent(/snapshot from .* ago/i);
+    expect(snapshot).toHaveTextContent(/refresh/i);
+  });
+});
+
+async function renderCodexWithRateLimit(info: unknown): Promise<void> {
+  const state = await loadState();
+  await state.registerAgent(CODEX_AGENT);
+  const runtime = state.runtimes[CODEX_AGENT.id];
+  if (runtime === undefined) throw new Error("unreachable");
+  state.runtimes[CODEX_AGENT.id] = { ...runtime, last_rate_limit: info };
+  const Sidebar = (await import("./Sidebar.svelte")).default;
+  render(Sidebar, { props: { agents: [CODEX_AGENT] } });
+}
+
+/// Codex rate-limit windows — both independent windows (primary ~5-hour +
+/// secondary weekly) surfaced as gauge lines, each labeled from its
+/// `window_minutes` and gated reset-passed. The reset times (incl. the weekly
+/// window, days out) live in the tooltip. Class B (session-file-backed), so no
+/// snapshot-age line. Closes G8 (secondary window + reset times were dropped).
+describe("Sidebar Codex rate-limit windows", () => {
+  it("renders both windows with duration-derived labels", async () => {
+    await renderCodexWithRateLimit({
+      primary: { used_percent: 42.0, window_minutes: 300, resets_at: epochFromNow(2 * 3600) },
+      secondary: { used_percent: 7.0, window_minutes: 10080, resets_at: epochFromNow(5 * 86400) },
+    });
+    const cell = screen.getByTestId("agent-rate-limit");
+    // window_minutes → human label, not "primary/secondary".
+    expect(cell).toHaveTextContent("5-hour used: 42%");
+    expect(cell).toHaveTextContent("weekly used: 7%");
+  });
+
+  it("bare used_percent (no window_minutes) keeps the legacy 'quota used' copy", async () => {
+    // Backward-compatible fallback: a minimal payload still reads cleanly.
+    await renderCodexWithRateLimit({ primary: { used_percent: 42.5 } });
+    expect(screen.getByTestId("agent-rate-limit")).toHaveTextContent("quota used: 43%");
+  });
+
+  it("hides a window whose reset has passed (reset-passed), keeps the live one", async () => {
+    await renderCodexWithRateLimit({
+      primary: { used_percent: 42.0, window_minutes: 300, resets_at: epochFromNow(-3600) },
+      secondary: { used_percent: 7.0, window_minutes: 10080, resets_at: epochFromNow(5 * 86400) },
+    });
+    const cell = screen.getByTestId("agent-rate-limit");
+    expect(cell).not.toHaveTextContent("5-hour");
+    expect(cell).toHaveTextContent("weekly used: 7%");
+  });
+
+  it("surfaces reset times in the tooltip, not the inline gauge", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      await renderCodexWithRateLimit({
+        primary: { used_percent: 42.0, window_minutes: 300, resets_at: epochFromNow(2 * 3600) },
+        secondary: { used_percent: 7.0, window_minutes: 10080, resets_at: epochFromNow(5 * 86400) },
+      });
+      await fireEvent.pointerEnter(screen.getByTestId("agent-rate-limit"));
+      await vi.advanceTimersByTimeAsync(500);
+      const detail = await waitFor(() => screen.getByTestId("agent-rate-limit-detail"));
+      expect(detail).toHaveTextContent(/5-hour: 42% used · resets/);
+      expect(detail).toHaveTextContent(/weekly: 7% used · resets/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("Claude agent never shows the Codex gauge cell (Codex-gated)", async () => {
+    await renderClaudeWithRateLimit(
+      { primary: { used_percent: 42.0, window_minutes: 300, resets_at: epochFromNow(2 * 3600) } },
+      null,
+    );
+    // Claude reads its own shape (isUsingOverage/resetsAt), not Codex's
+    // primary.used_percent — so the Codex gauge cell must not appear.
+    expect(screen.queryByTestId("agent-rate-limit")).toBeNull();
+  });
+});
+
+/// Clean-hide convention (G10): a metadata cell a harness can't report must
+/// render *nothing* — no empty label, no blank bar, no placeholder. These pin
+/// the capable-absence cases so a future "show — / n/a" regression fails here.
+describe("Sidebar clean-hide for absent metadata", () => {
+  it("Codex agent renders no cost cell (subscription model — no dollar figure)", async () => {
+    const state = await loadState();
+    await state.registerAgent(CODEX_AGENT);
+    // A completed Codex turn with usage but total_cost_usd null.
+    state.transcripts[CODEX_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "turn-1",
+        agent_id: CODEX_AGENT.id,
+        started_at: "2026-05-16T00:00:00Z",
+        ended_at: "2026-05-16T00:00:01Z",
+        status: "complete",
+        items: [],
+        usage: { input_tokens: 100, output_tokens: 20, total_cost_usd: null },
+      },
+    ];
+    const Sidebar = (await import("./Sidebar.svelte")).default;
+    render(Sidebar, { props: { agents: [CODEX_AGENT] } });
+    expect(screen.queryByTestId("agent-cost")).toBeNull();
+  });
+
+  it("agent with no metadata renders no cost / quota / rate-limit / context cells", async () => {
+    // A freshly-registered agent (no turns, no rate-limit, no meta) — every
+    // value-gated cell must be absent, not blank.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    const Sidebar = (await import("./Sidebar.svelte")).default;
+    render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+    expect(screen.queryByTestId("agent-cost")).toBeNull();
+    expect(screen.queryByTestId("agent-rate-limit")).toBeNull();
+    expect(screen.queryByTestId("agent-rate-limit-claude")).toBeNull();
+    expect(screen.queryByTestId("agent-rate-window")).toBeNull();
+    expect(screen.queryByTestId("agent-overage")).toBeNull();
+    expect(screen.queryByTestId("agent-context-bar")).toBeNull();
+    expect(screen.queryByTestId("agent-meta")).toBeNull();
+  });
+});
+
 /// Transcript-warnings indicator. The indicator persists for the
 /// lifetime of a project session — it's the project's drift detector
 /// for upstream CLI parser changes (see `harness-update-review.md`).

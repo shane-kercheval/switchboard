@@ -11,7 +11,7 @@ use futures::StreamExt;
 use switchboard_core::{AgentRecord, HarnessKind};
 use switchboard_harness::{
     AdapterEvent, AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, DispatchOptions,
-    GeminiAdapter, HarnessAdapter, TurnOutcome,
+    GeminiAdapter, HarnessAdapter, RateLimitSource, TurnOutcome,
 };
 use uuid::Uuid;
 
@@ -118,6 +118,42 @@ async fn live_claude_basic_turn_completes() {
         }
         _ => panic!("expected TurnEnd with Some(usage), got: {terminal:?}"),
     }
+
+    // Rate-limit drift detection (M3/M4 contract). Claude emits a
+    // `rate_limit_event` on every normal turn; our parser lifts it to a
+    // `StreamOnly` `RateLimitEvent` (persisted to the metadata sidecar for
+    // restart continuity) whose `info` carries the fields the Sidebar's
+    // rate-limit window line reads: `resetsAt` (epoch seconds) and
+    // `rateLimitType` (the window-label source). A fixture-based test keeps
+    // passing if Anthropic renames or drops these; this catches it live.
+    // (We can't assert `isUsingOverage` — that appears only once the 5-hour
+    // window is exhausted, which a tiny live prompt won't trigger.)
+    let rate_limit = events
+        .iter()
+        .find(|e| matches!(e, AdapterEvent::RateLimitEvent { .. }))
+        .expect("Claude must emit a rate_limit_event on a normal turn");
+    match rate_limit {
+        AdapterEvent::RateLimitEvent { info, source, .. } => {
+            assert_eq!(
+                *source,
+                RateLimitSource::StreamOnly,
+                "Claude rate-limit has no session-file equivalent → must be StreamOnly (persisted)"
+            );
+            assert!(
+                info.get("resetsAt")
+                    .and_then(serde_json::Value::as_i64)
+                    .is_some(),
+                "rate_limit_info.resetsAt must be an epoch number (Sidebar window reset reads it): {info}"
+            );
+            assert!(
+                info.get("rateLimitType")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some(),
+                "rate_limit_info.rateLimitType must be a string (Sidebar window label derives from it): {info}"
+            );
+        }
+        _ => unreachable!(),
+    }
 }
 
 #[tokio::test]
@@ -216,6 +252,10 @@ fn live_codex_agent() -> AgentRecord {
 
 #[tokio::test]
 #[ignore = "requires codex installed — run with: make test-live"]
+// One cohesive end-to-end assertion sequence (completion + enrichment ordering
+// + rate-limit/SessionMeta shape + sidecar); splitting it across helpers would
+// scatter a single turn's drift-detection checks for no real gain.
+#[allow(clippy::too_many_lines)]
 async fn live_codex_basic_turn_completes() {
     // Use a tempdir as cwd so the sidecar is written to a clean location
     // (avoids leaving state under the repo).
@@ -295,6 +335,50 @@ async fn live_codex_basic_turn_completes() {
         terminal_idx < rate_limit_idx && rate_limit_idx < session_meta_idx,
         "enrichment events must arrive after TurnEnd in order: TurnEnd → RateLimitEvent → SessionMeta"
     );
+
+    // Rate-limit payload-shape drift detection (M4 contract). The ordering
+    // check above proves the event fires; this proves its `info` still carries
+    // the fields the Sidebar's Codex windows read: `primary.used_percent` (the
+    // gauge — relied on since the original single cell), plus `window_minutes`
+    // (the window-label source) and `resets_at` (the tooltip reset time).
+    // SessionFileBacked — Codex's own session file is canonical, so we don't
+    // re-persist it. `secondary` is intentionally not asserted (a fresh
+    // account may not have a weekly window yet; the Sidebar shows it only when
+    // present).
+    match &events[rate_limit_idx] {
+        AdapterEvent::RateLimitEvent { info, source, .. } => {
+            assert_eq!(
+                *source,
+                RateLimitSource::SessionFileBacked,
+                "Codex rate-limit is read from its session file (class B) → not re-persisted"
+            );
+            let primary = info
+                .get("primary")
+                .expect("rate_limits.primary must be present: {info}");
+            assert!(
+                primary
+                    .get("used_percent")
+                    .and_then(serde_json::Value::as_f64)
+                    .is_some(),
+                "primary.used_percent must be a number (Sidebar gauge reads it): {info}"
+            );
+            assert!(
+                primary
+                    .get("window_minutes")
+                    .and_then(serde_json::Value::as_i64)
+                    .is_some(),
+                "primary.window_minutes must be present (Sidebar window label derives from it): {info}"
+            );
+            assert!(
+                primary
+                    .get("resets_at")
+                    .and_then(serde_json::Value::as_i64)
+                    .is_some(),
+                "primary.resets_at must be present (Sidebar tooltip reset time reads it): {info}"
+            );
+        }
+        _ => unreachable!(),
+    }
 
     // SessionMeta shape: structural-only checks. mcp_servers / skills lists
     // are developer-environment-dependent (we don't pin a particular ~/.codex

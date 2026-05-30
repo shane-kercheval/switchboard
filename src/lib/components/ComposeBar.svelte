@@ -279,6 +279,7 @@
           <Tooltip
             label={selected ? `Drop ${agent.name}` : `Add ${agent.name}`}
             shortcut={i < 9 ? shortcut("mod", String(i + 1)) : undefined}
+            delayDuration={1000}
           >
             {#snippet trigger(props)}
               <button
@@ -288,7 +289,7 @@
                   "focus-visible:ring-accent inline-flex items-center gap-1 rounded-full border py-0.5 pr-2 pl-1.5 text-sm transition-colors focus-visible:ring-2 focus-visible:outline-none",
                   selected
                     ? "bg-accent-soft text-fg border-transparent"
-                    : "border-border bg-panel text-muted hover:text-fg",
+                    : "border-border bg-panel text-muted hover:bg-raised hover:text-fg",
                 )}
                 data-testid={`recipient-chip-${agent.id}`}
                 data-selected={selected}
@@ -338,6 +339,7 @@
           role="listbox"
           bind:this={menuEl}
         >
+          <div class="text-muted px-2.5 py-1 text-[11px] font-medium uppercase tracking-wide select-none">Send to</div>
           {#each menuItems as item, i (item.key)}
             <button
               type="button"

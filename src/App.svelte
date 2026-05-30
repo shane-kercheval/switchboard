@@ -25,6 +25,7 @@
   import EmptyState from "$lib/components/ui/EmptyState.svelte";
   import SettingsButton from "$lib/components/ui/SettingsButton.svelte";
   import SidebarToggleButton from "$lib/components/ui/SidebarToggleButton.svelte";
+  import DevIndicator from "$lib/components/ui/DevIndicator.svelte";
   import { windowDragRegion } from "$lib/windowDrag";
   import { hydrateAgent, registerAgent } from "$lib/state/index.svelte";
   import {
@@ -570,6 +571,11 @@
         data-tauri-drag-region
         use:windowDragRegion
       >
+        <!-- Dev-only build indicator, pinned to the far left of the header so
+             it's visible in every state — including the no-project welcome,
+             where there is no sidebar to host it. Renders nothing in
+             production builds (self-gated on import.meta.env.DEV). -->
+        <DevIndicator />
         <!-- Title-bar Settings + re-open toggle appear only when the sidebar
              has content but is collapsed. In the no-project state there's no
              sidebar at all, so neither shows — the welcome screen stays clean. -->

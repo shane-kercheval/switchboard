@@ -6,8 +6,22 @@ LIVE_PKGS := -p switchboard-harness -p switchboard-dispatcher -p switchboard-app
 install:
 	pnpm install --frozen-lockfile
 
+DEFAULT_DEV_PORT := 1420
+DEV_PORT ?= $(DEFAULT_DEV_PORT)
+
+# Per-instance global config dir, keyed on DEV_PORT (the same value that keeps
+# the Vite/Tauri dev servers from colliding). The default port resolves to the
+# bare `switchboard-dev` — identical to the in-binary fallback a non-`make dev`
+# launch (`cargo run`, IDE run button) uses — so alternating launch methods
+# doesn't silently swap dev registries. Only additional instances on other
+# ports get a `-<port>` suffix, so two simultaneous dev builds don't share one
+# `workspace.yaml`. Read only by debug builds (see `workspace_config_path` in
+# crates/app/src/lib.rs). macOS path; v1 is macOS-only.
+DEV_SUFFIX := $(if $(filter-out $(DEFAULT_DEV_PORT),$(DEV_PORT)),-$(DEV_PORT))
+DEV_CONFIG_DIR := $(HOME)/Library/Application Support/switchboard-dev$(DEV_SUFFIX)
+
 dev:
-	pnpm tauri dev
+	SWITCHBOARD_CONFIG_DIR="$(DEV_CONFIG_DIR)" VITE_DEV_PORT=$(DEV_PORT) VITE_GIT_BRANCH=$(shell git branch --show-current) TAURI_CONFIG='{"build":{"devUrl":"http://localhost:$(DEV_PORT)"}}' pnpm tauri dev
 
 # Release build of the macOS .app bundle (the only artifact that carries the
 # bundled icon). `--bundles app` skips the .dmg packaging step. Output:

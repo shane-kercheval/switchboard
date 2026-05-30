@@ -19,7 +19,7 @@ export default defineConfig({
   },
   clearScreen: false,
   server: {
-    port: 1420,
+    port: Number(process.env.VITE_DEV_PORT) || 1420,
     strictPort: true,
     host: host || false,
     hmr: host

@@ -50,6 +50,7 @@ describe("buildUnifiedRows", () => {
     const overlay: ConversationItem[] = [
       {
         kind: "user_message",
+        id: SEND_1,
         send_id: SEND_1,
         agent_ids: [AGENT_A, AGENT_B],
         text: "fan out",
@@ -62,6 +63,31 @@ describe("buildUnifiedRows", () => {
     expect(row.text).toBe("fan out");
   });
 
+  it("renders an imported user message (send_id null) as a standalone, ungrouped row", () => {
+    // The backend surfaces a pre-journaling/imported prompt with `send_id: null`,
+    // keyed by `id` (the harness turn_id). It must key off `id` (not send_id),
+    // coerce null→undefined so the grouping/anchor `=== undefined` guards hold,
+    // and never be pulled into a fan-out.
+    const overlay: ConversationItem[] = [
+      {
+        kind: "user_message",
+        id: "imported-turn-1",
+        send_id: null,
+        agent_ids: [AGENT_A],
+        text: "imported prompt",
+        at: "2026-05-16T00:00:00Z",
+      },
+    ];
+    const rows = buildUnifiedRows([], overlay);
+    expect(rows).toHaveLength(1);
+    const row = rows[0] as Extract<UnifiedRow, { kind: "user" }>;
+    expect(row.key).toBe("u:imported-turn-1");
+    expect(row.send_id).toBeUndefined();
+    const blocks = groupRenderBlocks(rows);
+    expect(blocks.filter((b) => b.kind === "fanout")).toHaveLength(0);
+    expect(blocks.map((b) => (b.kind === "row" ? b.row.kind : "fanout"))).toEqual(["user"]);
+  });
+
   it("prunes a removed agent from a historical fan-out's recipient set", () => {
     // A removed agent (AGENT_B) lingers in the journal overlay's recipient set;
     // filtering against the live roster keeps the message but drops the orphan
@@ -69,6 +95,7 @@ describe("buildUnifiedRows", () => {
     const overlay: ConversationItem[] = [
       {
         kind: "user_message",
+        id: SEND_1,
         send_id: SEND_1,
         agent_ids: [AGENT_A, AGENT_B],
         text: "fan out",
@@ -85,6 +112,7 @@ describe("buildUnifiedRows", () => {
     const overlay: ConversationItem[] = [
       {
         kind: "user_message",
+        id: SEND_1,
         send_id: SEND_1,
         agent_ids: [AGENT_B],
         text: "gone",
@@ -124,7 +152,7 @@ describe("buildUnifiedRows", () => {
         reason: "boom",
         at,
       },
-      { kind: "user_message", send_id: SEND_1, agent_ids: [AGENT_A], text: "go", at },
+      { kind: "user_message", id: SEND_1, send_id: SEND_1, agent_ids: [AGENT_A], text: "go", at },
     ];
     const rows = buildUnifiedRows([], overlay);
     expect(rows.map((r) => r.kind)).toEqual(["user", "outcome"]);
@@ -133,7 +161,7 @@ describe("buildUnifiedRows", () => {
   it("sorts a user message before an agent turn at an identical timestamp", () => {
     const at = "2026-05-16T00:00:00Z";
     const overlay: ConversationItem[] = [
-      { kind: "user_message", send_id: SEND_1, agent_ids: [AGENT_A], text: "go", at },
+      { kind: "user_message", id: SEND_1, send_id: SEND_1, agent_ids: [AGENT_A], text: "go", at },
     ];
     const rows = buildUnifiedRows([agentTurn(TURN_1, AGENT_A, at)], overlay);
     expect(rows.map((r) => r.kind)).toEqual(["user", "agent"]);
@@ -143,6 +171,7 @@ describe("buildUnifiedRows", () => {
     const overlay: ConversationItem[] = [
       {
         kind: "user_message",
+        id: SEND_1,
         send_id: SEND_1,
         agent_ids: [AGENT_A],
         text: "first",
@@ -289,6 +318,7 @@ describe("groupRenderBlocks", () => {
       [
         {
           kind: "user_message",
+          id: SEND_1,
           send_id: SEND_1,
           agent_ids: [AGENT_A, AGENT_B],
           text: "fan out",
@@ -339,6 +369,7 @@ describe("groupRenderBlocks", () => {
       [
         {
           kind: "user_message",
+          id: SEND_1,
           send_id: SEND_1,
           agent_ids: [AGENT_B, AGENT_A],
           text: "fan out",

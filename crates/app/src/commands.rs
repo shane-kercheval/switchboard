@@ -1654,19 +1654,32 @@ pub struct ProjectConversation {
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ConversationItem {
-    /// The user's side of a send, sourced from the journal. A fan-out renders
-    /// once (grouped by `send_id`); `agent_ids` are the group's recipients in
-    /// first-seen order. `text` is the prompt (identical across the group);
-    /// `at` is the earliest `at` in the group.
+    /// The user's side of the conversation, from one of two sources:
+    /// - A **dispatched send** from the journal (the common case): `send_id` is
+    ///   `Some` and groups a fan-out (the message renders once across its N
+    ///   recipients).
+    /// - An **imported prompt** read from a harness session file when it predates
+    ///   journaling (an attached session's history that the journal never saw):
+    ///   `send_id` is `None` and there is a single recipient.
+    ///
+    /// `id` is the stable render identity in both cases — the journal `send_id`
+    /// for a dispatched send, the harness `turn_id` for an imported prompt. It
+    /// keys the rendered row and is never a join key to a `Send` (so grouping
+    /// must key off `send_id`, not `id`). `agent_ids` are the recipients in
+    /// first-seen order; `text` is the prompt (identical across a fan-out); `at`
+    /// is the earliest `at` in the group.
     UserMessage {
-        send_id: SendId,
+        id: Uuid,
+        send_id: Option<SendId>,
         agent_ids: Vec<AgentId>,
         text: String,
         at: chrono::DateTime<chrono::Utc>,
     },
     /// One agent's completed (or harness-failed) turn content, sourced from the
-    /// harness session file. Harness user-role turns are dropped — the journal
-    /// is the canonical record of the user's words.
+    /// harness session file. A harness user-role turn is dropped when the journal
+    /// already holds that prompt (a dispatched send is canonical there); a prompt
+    /// that predates journaling has no `Send`, so it is surfaced as an imported
+    /// `UserMessage` rather than lost.
     ///
     /// `send_id` is recovered by joining this turn's `turn_id` against the
     /// journal's `Send` records (which persist `send_id` + `turn_id` at
@@ -1817,7 +1830,8 @@ fn merge_project_conversation(
     }
     for (send_id, agent_ids, text, at) in user_messages {
         items.push(ConversationItem::UserMessage {
-            send_id,
+            id: send_id,
+            send_id: Some(send_id),
             agent_ids,
             text,
             at,
@@ -1837,71 +1851,127 @@ fn merge_project_conversation(
         sends_by_agent.insert(agent_id, kept);
     }
 
-    // Agent turns ← each agent's harness transcript, keeping only `Turn::Agent`
-    // (drop `Turn::User`). Warnings and any load error are agent-scoped: attach
-    // them to this transcript's `AgentConversationMeta` so the unified view can
-    // attribute them (one bad agent never blanks the project).
+    // Agent content ← each agent's harness transcript. Warnings and any load
+    // error are agent-scoped: attach them to this transcript's
+    // `AgentConversationMeta` so the unified view can attribute them (one bad
+    // agent never blanks the project).
     let mut agents: Vec<AgentConversationMeta> = Vec::new();
     for (agent_id, transcript, load_error) in agent_transcripts {
-        // This agent's Agent-role turns, in order.
-        type HarnessTurn = (
-            switchboard_harness::TurnId,
-            AgentId,
-            chrono::DateTime<chrono::Utc>,
-            Option<chrono::DateTime<chrono::Utc>>,
-            switchboard_harness::TurnStatus,
-            Vec<switchboard_harness::TurnItem>,
-            Option<switchboard_harness::TurnUsage>,
-        );
-        let agent_turns: Vec<HarnessTurn> = transcript
-            .turns
-            .into_iter()
-            .filter_map(|t| match t {
+        let turns = transcript.turns;
+        // Correlate harness turns to journaled sends by ORDER (the journal's
+        // turn_id is the dispatcher's, unrelated to the harness file's).
+        //
+        // Agent turns end-align: extra agent turns at the FRONT are pre-journaling
+        // history (older than the first journaled send — typically an attached
+        // session predating Switchboard) and get no send_id (rendered un-grouped);
+        // the most-recent ones pair with completed sends. Extra completed sends at
+        // the BACK are in-flight (a send whose turn has no harness content yet) and
+        // are dropped here rather than mislabeling a completed turn.
+        //
+        // User turns are classified by their REPLY, not by a suffix count — so a
+        // non-journaled prompt that lands *after* journaled history (e.g. the user
+        // ran the CLI directly in the same dir between Switchboard sessions) is
+        // still handled. The journal renders a UserMessage for every `Send`
+        // (regardless of outcome), so a harness user turn is "journaled" (drop it,
+        // the journal owns it) exactly when it corresponds to a send:
+        //   - A user turn WITH a following reply is journaled iff that reply is
+        //     journaled (`agent_seen >= turn_offset`).
+        //   - A *dangling* user turn (no reply — a failed/cancelled send, an
+        //     in-flight one, or an imported prompt with no reply yet) is journaled
+        //     while sends that produced no completed agent turn remain to account
+        //     for it (`dangling_journaled` of them = non-completed + in-flight);
+        //     beyond that it's imported and rendered.
+        // This needs 1:1 prompt/reply alternation in the file (true for Claude and
+        // Codex — tool results fold into the agent turn). Two edges remain, BOTH
+        // confined to the already-discouraged pattern of running the bare CLI on a
+        // session Switchboard is also driving (the resume-in-terminal panel warns
+        // this corrupts the session file), and both pinned by characterization
+        // tests so the behavior stays a conscious decision:
+        //   - A send cancelled *before* the harness recorded its prompt has no
+        //     harness user turn, so `dangling_journaled` overcounts by one and can
+        //     drop a co-occurring imported dangling prompt.
+        //   - Dangling turns are classified front-to-back (the first
+        //     `dangling_journaled` are treated as journaled). If an *imported*
+        //     dangling prompt precedes a *journaled* one (e.g. a bare-CLI prompt,
+        //     then an in-flight Switchboard send), the imported prompt is dropped
+        //     and the journaled one duplicated. Order alone can't disambiguate
+        //     interleaved dangling sources — a timestamp join could, but would be
+        //     inconsistent with the order-based agent-side correlation above.
+        // Both mirror the order assumptions the agent-side end-alignment already
+        // makes.
+        let agent_turn_count = turns
+            .iter()
+            .filter(|t| matches!(t, switchboard_harness::Turn::Agent { .. }))
+            .count();
+        let completed = sends_by_agent.get(&agent_id).map_or(&[][..], Vec::as_slice);
+        let non_completed_count = non_completed
+            .get(&agent_id)
+            .map_or(0, std::collections::HashSet::len);
+        let pairs = agent_turn_count.min(completed.len());
+        let turn_offset = agent_turn_count - pairs;
+        let dangling_journaled = (completed.len() + non_completed_count).saturating_sub(pairs);
+        let mut agent_seen = 0usize;
+        let mut dangling_seen = 0usize;
+        for turn in turns {
+            match turn {
                 switchboard_harness::Turn::Agent {
                     turn_id,
-                    agent_id,
+                    agent_id: a_id,
                     started_at,
                     ended_at,
                     status,
-                    items,
+                    items: t_items,
                     usage,
-                } => Some((
-                    turn_id, agent_id, started_at, ended_at, status, items, usage,
-                )),
-                _ => None,
-            })
-            .collect();
-        // Correlate turns to completed sends by order, accounting for an
-        // asymmetry between the two lists' unpaired extras:
-        //   - Extra *turns* sit at the FRONT — pre-journaling session history,
-        //     older than the first journaled send. End-align turns so the most
-        //     recent ones pair with sends; the leading unpaired turns get no
-        //     send_id and render un-grouped.
-        //   - Extra *sends* sit at the BACK — an in-flight send whose turn has
-        //     started but not yet produced harness content. Front-align sends
-        //     (`send_offset = 0`) so the trailing in-flight send is dropped
-        //     rather than mislabeling a completed turn.
-        let completed = sends_by_agent.get(&agent_id).map_or(&[][..], Vec::as_slice);
-        let pairs = agent_turns.len().min(completed.len());
-        let turn_offset = agent_turns.len() - pairs;
-        for (j, (turn_id, a_id, started_at, ended_at, status, t_items, usage)) in
-            agent_turns.into_iter().enumerate()
-        {
-            let send_id = if j >= turn_offset {
-                completed.get(j - turn_offset).copied()
-            } else {
-                None
-            };
-            items.push(ConversationItem::AgentTurn {
-                turn_id,
-                agent_id: a_id,
-                send_id,
-                started_at,
-                ended_at,
-                status,
-                items: t_items,
-                usage,
-            });
+                } => {
+                    let send_id = if agent_seen >= turn_offset {
+                        completed.get(agent_seen - turn_offset).copied()
+                    } else {
+                        None
+                    };
+                    items.push(ConversationItem::AgentTurn {
+                        turn_id,
+                        agent_id: a_id,
+                        send_id,
+                        started_at,
+                        ended_at,
+                        status,
+                        items: t_items,
+                        usage,
+                    });
+                    agent_seen += 1;
+                }
+                switchboard_harness::Turn::User {
+                    turn_id,
+                    agent_id: a_id,
+                    started_at,
+                    text,
+                } => {
+                    let imported = if agent_seen < agent_turn_count {
+                        // A reply follows (the agent turn at index `agent_seen`):
+                        // imported iff that reply is pre-journaling.
+                        agent_seen < turn_offset
+                    } else {
+                        // Dangling (no reply): journaled while non-completed /
+                        // in-flight sends remain to account for it; otherwise it's
+                        // an imported prompt with no reply yet.
+                        let journaled = dangling_seen < dangling_journaled;
+                        dangling_seen += 1;
+                        !journaled
+                    };
+                    if imported {
+                        // Un-grouped (single recipient, `send_id` None), keyed by
+                        // the harness turn_id — the prompt lives only here.
+                        items.push(ConversationItem::UserMessage {
+                            id: turn_id,
+                            send_id: None,
+                            agent_ids: vec![a_id],
+                            text,
+                            at: started_at,
+                        });
+                    }
+                }
+                _ => {}
+            }
         }
         agents.push(AgentConversationMeta {
             agent_id,
@@ -6821,6 +6891,432 @@ mod tests {
     }
 
     #[test]
+    fn merge_renders_pre_journaling_user_prompts_from_harness() {
+        // Attaching an existing session: its history (user prompt + agent reply)
+        // predates journaling, so the journal has no Send for it — the prompt lives
+        // only in the harness file. A later turn is dispatched through Switchboard
+        // (journaled). The pre-journaling prompt must survive restart (rendered from
+        // the harness user turn); the journaled turn's prompt still comes from the
+        // journal, and the harness user-role copy of it is NOT duplicated.
+        let agent = Uuid::now_v7();
+        let send_id = Uuid::now_v7();
+        let journal = vec![send_record(send_id, Uuid::now_v7(), agent, "new prompt", 2)];
+        let transcript = transcript_of(vec![
+            user_turn(Uuid::now_v7(), agent, "old prompt", 0),
+            agent_turn(Uuid::now_v7(), agent, "old reply", 1),
+            user_turn(Uuid::now_v7(), agent, "new prompt", 2),
+            agent_turn(Uuid::now_v7(), agent, "new reply", 3),
+        ]);
+
+        let merged = merge_project_conversation(journal, vec![(agent, transcript, None)]);
+
+        let user_texts: Vec<&str> = merged
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                ConversationItem::UserMessage { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            user_texts,
+            vec!["old prompt", "new prompt"],
+            "pre-journaling prompt survives from the harness file; the journaled \
+             prompt appears once (its harness user-role copy is not duplicated)"
+        );
+
+        let send_at = |t: i64| {
+            merged.items.iter().find_map(|i| match i {
+                ConversationItem::AgentTurn {
+                    started_at,
+                    send_id,
+                    ..
+                } if *started_at == at(t) => Some(*send_id),
+                _ => None,
+            })
+        };
+        assert_eq!(
+            send_at(1),
+            Some(None),
+            "pre-journaling agent turn un-grouped"
+        );
+        assert_eq!(
+            send_at(3),
+            Some(Some(send_id)),
+            "journaled agent turn keeps its send_id"
+        );
+    }
+
+    #[test]
+    fn merge_pure_attach_with_empty_journal_renders_all_harness_prompts() {
+        // The literal reported bug: attach an existing session and restart WITHOUT
+        // ever dispatching through Switchboard. The journal is empty, so every turn
+        // is pre-journaling — both user prompts must render from the harness file
+        // (not just the assistant replies), each agent turn un-grouped.
+        let agent = Uuid::now_v7();
+        let transcript = transcript_of(vec![
+            user_turn(Uuid::now_v7(), agent, "first prompt", 0),
+            agent_turn(Uuid::now_v7(), agent, "first reply", 1),
+            user_turn(Uuid::now_v7(), agent, "second prompt", 2),
+            agent_turn(Uuid::now_v7(), agent, "second reply", 3),
+        ]);
+
+        let merged = merge_project_conversation(vec![], vec![(agent, transcript, None)]);
+
+        let user_texts: Vec<&str> = merged
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                ConversationItem::UserMessage { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            user_texts,
+            vec!["first prompt", "second prompt"],
+            "both imported prompts survive when nothing was journaled"
+        );
+        let all_ungrouped = merged.items.iter().all(|i| {
+            !matches!(
+                i,
+                ConversationItem::AgentTurn {
+                    send_id: Some(_),
+                    ..
+                }
+            )
+        });
+        assert!(
+            all_ungrouped,
+            "no journal sends → every agent turn un-grouped"
+        );
+    }
+
+    #[test]
+    fn merge_imported_claude_session_keeps_prompts_through_real_parser() {
+        // End-to-end through the real Claude parser (not hand-built Turns): an
+        // imported turn that includes a tool call, plus one turn dispatched through
+        // Switchboard. Proves the load-bearing assumption holds against real parser
+        // output — the tool_result (a user-role array record) folds into the agent
+        // turn rather than opening a spurious user turn, so genuine prompts stay 1:1
+        // with agent turns, the imported prompt renders once, and the journaled
+        // prompt is not duplicated.
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let canonical_cwd = cwd.path().canonicalize().unwrap();
+        let session_id = Uuid::now_v7();
+        let agent = Uuid::now_v7();
+
+        let lines = [
+            serde_json::json!({"type":"user","message":{"role":"user","content":"fix the build"},"timestamp":"2026-05-14T04:43:15Z"}),
+            serde_json::json!({"type":"assistant","message":{"model":"claude-sonnet-4-6","role":"assistant","content":[{"type":"text","text":"looking"},{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"make build"}}],"usage":{"input_tokens":1,"output_tokens":2}},"timestamp":"2026-05-14T04:43:16Z"}),
+            serde_json::json!({"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok","is_error":false}]},"timestamp":"2026-05-14T04:43:17Z"}),
+            serde_json::json!({"type":"assistant","message":{"model":"claude-sonnet-4-6","role":"assistant","content":[{"type":"text","text":"fixed"}]},"timestamp":"2026-05-14T04:43:18Z"}),
+            serde_json::json!({"type":"user","message":{"role":"user","content":"now add tests"},"timestamp":"2026-05-14T04:43:20Z"}),
+            serde_json::json!({"type":"assistant","message":{"model":"claude-sonnet-4-6","role":"assistant","content":[{"type":"text","text":"added"}]},"timestamp":"2026-05-14T04:43:21Z"}),
+        ];
+        let content = lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let target =
+            switchboard_harness::claude_session_file_path(home.path(), &canonical_cwd, &session_id);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, content).unwrap();
+
+        let transcript = switchboard_harness::load_claude_transcript(
+            home.path(),
+            &canonical_cwd,
+            session_id,
+            agent,
+        )
+        .unwrap();
+
+        // The journaled send carries a real 2026 timestamp so it sorts between the
+        // imported turn and the journaled reply (the `at()` epoch helper would sort
+        // a 2023 instant ahead of the 2026 parsed turns).
+        let send_id = Uuid::now_v7();
+        let journal = vec![JournalRecord::Send {
+            send_id,
+            turn_id: Uuid::now_v7(),
+            agent_id: agent,
+            prompt: "now add tests".to_owned(),
+            at: "2026-05-14T04:43:19Z".parse().unwrap(),
+        }];
+
+        let merged = merge_project_conversation(journal, vec![(agent, transcript, None)]);
+
+        let user_texts: Vec<&str> = merged
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                ConversationItem::UserMessage { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            user_texts,
+            vec!["fix the build", "now add tests"],
+            "imported prompt (with a tool call in its turn) survives; journaled prompt not doubled"
+        );
+
+        let agent_sends: Vec<Option<SendId>> = merged
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                ConversationItem::AgentTurn { send_id, .. } => Some(*send_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            agent_sends.len(),
+            2,
+            "two agent turns (tool result folded in)"
+        );
+        assert!(
+            agent_sends.contains(&None),
+            "imported agent turn un-grouped"
+        );
+        assert!(
+            agent_sends.contains(&Some(send_id)),
+            "journaled agent turn grouped"
+        );
+    }
+
+    #[test]
+    fn merge_trailing_unanswered_imported_prompt_survives() {
+        // An attached session that ends on a prompt with no reply yet (the CLI was
+        // interrupted, or it was attached mid-turn). Empty journal → the trailing
+        // prompt is pre-journaling and must render. Classifying user turns by
+        // user-turn count (not by pairing each to a following agent turn) is what
+        // keeps a trailing prompt that has no agent turn after it.
+        let agent = Uuid::now_v7();
+        let transcript = transcript_of(vec![
+            user_turn(Uuid::now_v7(), agent, "answered", 0),
+            agent_turn(Uuid::now_v7(), agent, "reply", 1),
+            user_turn(Uuid::now_v7(), agent, "dangling", 2),
+        ]);
+
+        let merged = merge_project_conversation(vec![], vec![(agent, transcript, None)]);
+
+        let user_texts: Vec<&str> = merged
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                ConversationItem::UserMessage { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            user_texts,
+            vec!["answered", "dangling"],
+            "the trailing un-answered imported prompt is not dropped"
+        );
+    }
+
+    #[test]
+    fn merge_trailing_in_flight_prompt_comes_from_journal_not_duplicated() {
+        // Same harness shape as the dangling case (trailing user turn, no reply),
+        // but this prompt WAS dispatched through Switchboard and is in-flight
+        // (`Send`, no `Outcome`, no agent turn yet). It must render once, from the
+        // journal `Send`; the harness user-role copy is dropped so it isn't doubled.
+        let agent = Uuid::now_v7();
+        let s1 = Uuid::now_v7();
+        let s2 = Uuid::now_v7();
+        let journal = vec![
+            send_record(s1, Uuid::now_v7(), agent, "answered", 0),
+            send_record(s2, Uuid::now_v7(), agent, "in flight", 2),
+        ];
+        let transcript = transcript_of(vec![
+            user_turn(Uuid::now_v7(), agent, "answered", 0),
+            agent_turn(Uuid::now_v7(), agent, "reply", 1),
+            user_turn(Uuid::now_v7(), agent, "in flight", 2),
+        ]);
+
+        let merged = merge_project_conversation(journal, vec![(agent, transcript, None)]);
+
+        let user_texts: Vec<&str> = merged
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                ConversationItem::UserMessage { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            user_texts,
+            vec!["answered", "in flight"],
+            "in-flight prompt rendered once (from the journal), harness copy dropped"
+        );
+    }
+
+    #[test]
+    fn merge_external_prompt_after_journaled_history_not_duplicated_or_dropped() {
+        // A prompt dispatched through Switchboard (journaled, completed), then a
+        // prompt run via the CLI directly in the same dir (no Send, no reply yet).
+        // The journaled prompt must render ONCE (from the journal; harness copy
+        // dropped) and the external dangling prompt must render (imported). A
+        // suffix-count classification gets this wrong — it renders the journaled
+        // prompt as imported (a duplicate of the journal's) and drops the external
+        // one. Classifying by reply (the journaled prompt's reply is journaled; the
+        // external prompt has no reply and no send to account for it) is correct.
+        let agent = Uuid::now_v7();
+        let s1 = Uuid::now_v7();
+        let journal = vec![send_record(s1, Uuid::now_v7(), agent, "answered", 0)];
+        let transcript = transcript_of(vec![
+            user_turn(Uuid::now_v7(), agent, "answered", 0),
+            agent_turn(Uuid::now_v7(), agent, "reply", 1),
+            user_turn(Uuid::now_v7(), agent, "external", 2),
+        ]);
+
+        let merged = merge_project_conversation(journal, vec![(agent, transcript, None)]);
+
+        let user_msgs: Vec<(&str, Option<SendId>)> = merged
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                ConversationItem::UserMessage { text, send_id, .. } => {
+                    Some((text.as_str(), *send_id))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            user_msgs,
+            vec![("answered", Some(s1)), ("external", None)],
+            "journaled prompt once (grouped); external prompt kept (un-grouped)"
+        );
+    }
+
+    #[test]
+    fn merge_failed_send_does_not_duplicate_its_harness_prompt() {
+        // A dispatched send that failed: the journal holds the Send (prompt) + a
+        // failed Outcome, and the harness recorded the user turn but no agent reply.
+        // The prompt must render ONCE — from the journal Send — not also from the
+        // harness copy. The user-side count therefore has to include non-completed
+        // sends (the journal renders a UserMessage for every Send), not only
+        // completed ones.
+        let agent = Uuid::now_v7();
+        let s1 = Uuid::now_v7();
+        let t1 = Uuid::now_v7();
+        let journal = vec![
+            send_record(s1, t1, agent, "do it", 0),
+            outcome_record(
+                s1,
+                t1,
+                agent,
+                serde_json::json!({"status": "failed", "kind": "harness_error", "message": "boom"}),
+                0,
+            ),
+        ];
+        let transcript = transcript_of(vec![user_turn(Uuid::now_v7(), agent, "do it", 0)]);
+
+        let merged = merge_project_conversation(journal, vec![(agent, transcript, None)]);
+
+        let user_count = merged
+            .items
+            .iter()
+            .filter(|i| matches!(i, ConversationItem::UserMessage { text, .. } if text == "do it"))
+            .count();
+        assert_eq!(
+            user_count, 1,
+            "failed send's prompt renders once (journal), not duplicated by the harness copy"
+        );
+        assert!(
+            merged.items.iter().any(|i| matches!(
+                i,
+                ConversationItem::Outcome {
+                    status: OutcomeStatus::Failed,
+                    ..
+                }
+            )),
+            "the failed marker renders"
+        );
+    }
+
+    #[test]
+    fn merge_imported_dangling_before_journaled_dangling_is_misclassified() {
+        // CHARACTERIZATION of a documented limitation (not desired behavior): when
+        // an imported dangling prompt (bare CLI, no Send) precedes a journaled
+        // dangling one (an in-flight Switchboard send) in the file, the front-to-
+        // back dangling classification mis-assigns them. Order alone can't tell
+        // which dangling turn owns the in-flight send; this only arises under the
+        // discouraged "drive the same session from the bare CLI and Switchboard"
+        // pattern. Pinned so a future fix (or regression) changes it consciously.
+        //
+        // CORRECT behavior would be: "external" rendered once (imported), "later"
+        // rendered once (from the journal Send). What actually happens: "external"
+        // is dropped and "later" is duplicated.
+        let agent = Uuid::now_v7();
+        let s1 = Uuid::now_v7();
+        let journal = vec![send_record(s1, Uuid::now_v7(), agent, "later", 2)];
+        let transcript = transcript_of(vec![
+            user_turn(Uuid::now_v7(), agent, "external", 0),
+            user_turn(Uuid::now_v7(), agent, "later", 2),
+        ]);
+
+        let merged = merge_project_conversation(journal, vec![(agent, transcript, None)]);
+
+        let count = |t: &str| {
+            merged
+                .items
+                .iter()
+                .filter(|i| matches!(i, ConversationItem::UserMessage { text, .. } if text == t))
+                .count()
+        };
+        assert_eq!(
+            count("external"),
+            0,
+            "documented limitation: imported prompt dropped"
+        );
+        assert_eq!(
+            count("later"),
+            2,
+            "documented limitation: journaled prompt duplicated"
+        );
+    }
+
+    #[test]
+    fn merge_cancel_before_harness_flush_overcounts_and_drops_imported() {
+        // CHARACTERIZATION of the second documented limitation: a send cancelled
+        // before the harness recorded its prompt leaves no harness user turn, but
+        // it still counts toward `dangling_journaled`, so a co-occurring imported
+        // dangling prompt is absorbed (dropped). Pinned, not endorsed.
+        //
+        // CORRECT behavior would be: "imported" rendered once. What happens: it is
+        // dropped (the phantom slot for the never-recorded cancelled prompt eats
+        // it); only the journal's own "cancelled" prompt + marker render.
+        let agent = Uuid::now_v7();
+        let s1 = Uuid::now_v7();
+        let t1 = Uuid::now_v7();
+        let journal = vec![
+            send_record(s1, t1, agent, "cancelled", 0),
+            outcome_record(
+                s1,
+                t1,
+                agent,
+                serde_json::json!({"status": "cancelled", "source": "user"}),
+                0,
+            ),
+        ];
+        let transcript = transcript_of(vec![user_turn(Uuid::now_v7(), agent, "imported", 1)]);
+
+        let merged = merge_project_conversation(journal, vec![(agent, transcript, None)]);
+
+        let imported_count = merged
+            .items
+            .iter()
+            .filter(
+                |i| matches!(i, ConversationItem::UserMessage { text, .. } if text == "imported"),
+            )
+            .count();
+        assert_eq!(
+            imported_count, 0,
+            "documented limitation: the imported prompt is absorbed by the phantom cancelled slot"
+        );
+    }
+
+    #[test]
     fn merge_in_flight_send_does_not_mislabel_completed_turns() {
         // Regression: viewing a project while an agent is mid-response. The agent
         // has two COMPLETED turns (each answering an earlier send) plus a third
@@ -7107,19 +7603,35 @@ mod tests {
     }
 
     #[test]
-    fn merge_drops_harness_user_role_turns() {
-        // A harness user-role turn never surfaces as a UserMessage — those come
-        // only from the journal.
+    fn merge_lone_unjournaled_harness_user_turn_renders_as_imported() {
+        // A harness user-role turn with no journal `Send` (pure pre-journaling —
+        // an attached session never dispatched through Switchboard) surfaces as an
+        // imported UserMessage: un-grouped, `send_id` None, keyed by the harness
+        // turn_id. (A *journaled* turn's harness user copy is still dropped — see
+        // `merge_single_completed_turn_drops_harness_user_role`. Dropping these
+        // unconditionally, as before, lost the user's side of imported history.)
         let agent = Uuid::now_v7();
         let turn_id = Uuid::now_v7();
         let transcript = transcript_of(vec![user_turn(turn_id, agent, "from harness", 0)]);
 
         let merged = merge_project_conversation(Vec::new(), vec![(agent, transcript, None)]);
 
-        assert!(
-            merged.items.is_empty(),
-            "harness user-role turns produce no rendered items"
-        );
+        assert_eq!(merged.items.len(), 1, "the imported prompt renders");
+        match &merged.items[0] {
+            ConversationItem::UserMessage {
+                id,
+                send_id,
+                agent_ids,
+                text,
+                ..
+            } => {
+                assert_eq!(text, "from harness");
+                assert_eq!(*send_id, None, "imported prompt has no journal send_id");
+                assert_eq!(*id, turn_id, "keyed by the harness turn_id");
+                assert_eq!(agent_ids, &vec![agent]);
+            }
+            other => panic!("expected an imported UserMessage, got {other:?}"),
+        }
     }
 
     #[test]

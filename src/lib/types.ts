@@ -320,7 +320,12 @@ export type OutcomeStatus = "cancelled" | "failed";
 export type ConversationItem =
   | {
       kind: "user_message";
-      send_id: string;
+      // Stable render identity: the journal `send_id` for a dispatched send, the
+      // harness `turn_id` for an imported prompt. Keys the row; not a join key.
+      id: string;
+      // Grouping key for a fan-out. Null for an imported prompt that predates
+      // journaling (an attached session's history) — it has no journal Send.
+      send_id?: string | null;
       agent_ids: AgentId[];
       text: string;
       at: string;

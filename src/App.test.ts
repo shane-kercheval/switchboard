@@ -796,6 +796,7 @@ describe("App", () => {
       items: [
         {
           kind: "user_message",
+          id: "s-1",
           send_id: "s-1",
           agent_ids: ["ag-1"],
           text: "do the thing",
@@ -814,6 +815,7 @@ describe("App", () => {
         // A failed send and a cancelled send, each at its own send's instant.
         {
           kind: "user_message",
+          id: "s-2",
           send_id: "s-2",
           agent_ids: ["ag-1"],
           text: "second ask",
@@ -830,6 +832,7 @@ describe("App", () => {
         },
         {
           kind: "user_message",
+          id: "s-3",
           send_id: "s-3",
           agent_ids: ["ag-1"],
           text: "third ask",

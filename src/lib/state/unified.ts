@@ -169,8 +169,10 @@ export function buildUnifiedRows(
         kind: "user",
         at: item.at,
         rank: KIND_RANK.user,
-        key: `u:${item.send_id}`,
-        send_id: item.send_id,
+        // Key off `id` (always present); an imported prompt's `send_id` is null,
+        // which the anchor/grouping passes treat as "no send" via `=== undefined`.
+        key: `u:${item.id}`,
+        send_id: item.send_id ?? undefined,
         agent_ids: item.agent_ids,
         text: item.text,
         live: false,

@@ -1658,6 +1658,15 @@ not valid json
         let result =
             load_codex_transcript(home.path(), cwd.path(), session_id, Some(date), agent_id)
                 .unwrap();
+        // A function_call + function_call_output folds into the agent turn — it
+        // does NOT open a spurious user turn (tool results are `response_item`s,
+        // not `user_message`s). The conversation merge's order-correlation of
+        // imported prompts relies on this 1:1 user/agent alternation, so pin it.
+        assert_eq!(
+            result.turns.len(),
+            2,
+            "tool call folds into the agent turn; no extra user turn"
+        );
         let Turn::Agent { items, .. } = &result.turns[1] else {
             panic!("expected Agent turn");
         };

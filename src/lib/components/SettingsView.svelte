@@ -59,7 +59,7 @@
       </div>
 
       <div
-        class={cn(SEGMENTED_CONTAINER_CLASS, "inline-grid grid-cols-3 w-56")}
+        class={cn(SEGMENTED_CONTAINER_CLASS, "inline-grid w-56 grid-cols-3")}
         role="radiogroup"
         aria-label="Theme"
       >

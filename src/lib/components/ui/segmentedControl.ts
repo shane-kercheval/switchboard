@@ -7,7 +7,8 @@
 
 /// The control's outer wrapper. Add the layout (`inline-grid grid-cols-3`,
 /// `grid grid-cols-4`, `flex`, …) alongside this.
-export const SEGMENTED_CONTAINER_CLASS = "border-border bg-panel/70 gap-1 rounded-full border p-0.5";
+export const SEGMENTED_CONTAINER_CLASS =
+  "border-border bg-panel/70 gap-1 rounded-full border p-0.5";
 
 /// A single segment. Height/typography are fixed here (the standard `h-7`);
 /// add centering (`flex items-center justify-center`) or `flex-1`, plus the

@@ -498,8 +498,8 @@
   <Dialog bind:open={newProjectOpen} title="New project" onClose={() => (newProjectOpen = false)}>
     <div class="space-y-4" data-testid="new-project-form">
       <p class="text-muted text-sm leading-relaxed">
-        Choose the folder you want to work in — typically your repo or working directory. Switchboard
-        will initialize it as a new project there.
+        Choose the folder you want to work in — typically your repo or working directory.
+        Switchboard will initialize it as a new project there.
       </p>
       <div class="space-y-1.5">
         <span class="text-muted block text-xs">Folder</span>

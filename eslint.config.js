@@ -6,7 +6,7 @@ import svelteConfig from "./svelte.config.js";
 
 export default ts.config(
   {
-    ignores: ["dist/", "target/", "node_modules/", "crates/", ".github/", "docs/"],
+    ignores: ["dist/", "target/", "node_modules/", "crates/", ".github/", "docs/", ".claude/"],
   },
   js.configs.recommended,
   ...ts.configs.recommended,

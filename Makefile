@@ -1,4 +1,4 @@
-.PHONY: dev build test lint fmt check clean install test-live test-live-claude test-live-codex test-live-gemini test-live-antigravity
+.PHONY: dev build open run install-app deploy test lint fmt check clean install test-live test-live-claude test-live-codex test-live-gemini test-live-antigravity
 
 # Crates that carry live (`#[ignore]`-gated) harness tests.
 LIVE_PKGS := -p switchboard-harness -p switchboard-dispatcher -p switchboard-app
@@ -28,6 +28,20 @@ dev:
 # target/release/bundle/macos/Switchboard.app
 build:
 	pnpm tauri build --bundles app
+
+open:
+	open target/release/bundle/macos/Switchboard.app
+
+run: build open
+
+# Remove any prior bundle first so stale files from an older build don't
+# linger inside the installed .app (a plain `cp` merges into the existing one).
+install-app:
+	rm -rf /Applications/Switchboard.app
+	cp -R target/release/bundle/macos/Switchboard.app /Applications/
+
+deploy: build install-app
+	open /Applications/Switchboard.app
 
 test:
 	cargo test --workspace --all-features --locked

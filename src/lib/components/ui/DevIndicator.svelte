@@ -16,6 +16,7 @@
            so keyboard users couldn't otherwise reach the build detail. Not a
            <button> because a button implies a click action that doesn't exist
            (matches the warning indicator in Sidebar.svelte). -->
+      <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
       <div
         {...props}
         tabindex="0"

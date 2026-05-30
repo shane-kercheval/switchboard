@@ -117,9 +117,7 @@ const FINAL_DRAIN_ATTEMPTS: u32 = 6;
 /// Used by [`AntigravityAdapter::probe`]; factored out so the negative-path
 /// test can pass a synthetic name.
 fn probe_binary_by_name(name: &str) -> Result<(), DispatchError> {
-    which::which(name)
-        .map(|_| ())
-        .map_err(|_| DispatchError::BinaryNotFound)
+    crate::subprocess::probe_binary(std::path::Path::new(name))
 }
 
 /// Adapter for Antigravity (`agy -p`). See the module docstring for the
@@ -234,6 +232,7 @@ impl HarnessAdapter for AntigravityAdapter {
             // docs/research/archive/antigravity-cli-observed.md).
             .stdin(Stdio::null())
             .kill_on_drop(true);
+        crate::subprocess::apply_path_env(&mut command);
         // When a home override is set (tests), pass it to the child as `HOME`
         // so the conversation directory the child writes
         // (`$HOME/.gemini/antigravity-cli/brain/<uuid>/`) and the directory the

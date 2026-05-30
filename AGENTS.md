@@ -34,7 +34,7 @@ For each crate's internal mechanics, read the source (the `*_impl` functions are
 All via `make`:
 
 - `make install` — `pnpm install --frozen-lockfile` (one-time / after lockfile changes).
-- `make dev` — runs the Tauri dev shell.
+- `make dev` — runs the Tauri dev shell. Pass `DEV_PORT=<port>` (default 1420) to run a second instance side by side — e.g. two worktrees, or comparing a change against `main`. Each port gets its own isolated dev config, so concurrent instances don't clobber each other's project list. The default port shares one config with a bare `cargo run`; `docs/implementation_plans/2026-05-30-macos-release-distribution.md` (M1) has the isolation rules.
 - `make test` — runs all Rust + frontend tests.
 - `make lint` — runs clippy, eslint, svelte-check.
 - `make fmt` — formats Rust + frontend.

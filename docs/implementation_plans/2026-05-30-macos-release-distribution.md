@@ -16,15 +16,30 @@ Ship a distributable Switchboard build that macOS users — developers already u
 
 ## Milestone 1 — Dev/prod global config isolation
 
+**Status: implemented** (landed alongside the multi-worktree dev support, since that change is what made the isolation load-bearing). Implemented form differs from the original outline below — see "As implemented."
+
 ### Goal & Outcome
 
 Dev builds and the installed production app use separate global config paths, so a developer's `workspace.yaml` (the project/directory list) cannot bleed into or overwrite the production one and vice versa.
 
-- `make dev` (a debug build) resolves global state to `~/Library/Application Support/switchboard-dev/`.
+- `make dev` (a debug build) resolves global state to `~/Library/Application Support/switchboard-dev-<port>/`.
 - The installed app (a release build) resolves global state to `~/Library/Application Support/switchboard/`.
 - The separation is automatic — no env var to remember, no manual setup.
 
-### Implementation Outline
+### As implemented
+
+The outline below proposed a one-line build-profile switch on the `ProjectDirs::from` app name. The shipped version goes one step further to also isolate **two simultaneous dev instances** from each other (different worktrees running `make dev` on different ports), which the multi-worktree dev support makes a real scenario — without it, two dev builds share one `switchboard-dev/workspace.yaml` and last-writer-wins silently drops project-list edits.
+
+- `crates/app/src/lib.rs` extracts a `workspace_config_path()` free function with two `#[cfg]` arms:
+  - **Release** (`not(debug_assertions)`) — always `ProjectDirs::from("", "", "switchboard")`. No env var is consulted, so nothing can relocate the installed app's data.
+  - **Debug** — honors a `SWITCHBOARD_CONFIG_DIR` path override if set; otherwise falls back to `ProjectDirs::from("", "", "switchboard-dev")`.
+- `make dev` sets `SWITCHBOARD_CONFIG_DIR`, keyed on `DEV_PORT` (the same value that already keeps the Vite/Tauri dev servers from colliding). The **default** port resolves to the bare `~/Library/Application Support/switchboard-dev` — identical to the in-binary fallback above, so a `make dev` and a bare `cargo run`/IDE launch share one dev registry instead of silently diverging. Only **additional** instances on other ports get a `-<port>` suffix (e.g. `switchboard-dev-1421`), so two simultaneous dev builds get fully isolated global state.
+
+`DEV_PORT` was chosen as the discriminator over the git branch because a branch name contains `/`, changes under `git checkout` mid-session, and isn't already a per-instance key — whereas the port is stable for the life of the `make dev` process and is already the uniqueness key for the dev servers. The debug arm of `workspace_config_path` is split into a pure `debug_workspace_config_path(override_dir)` helper so the override mapping is unit-tested without mutating process-global env (`std::env::set_var` is `unsafe` under edition 2024).
+
+Per-project `.switchboard/` directories are unaffected — they're local to each working directory, not global, and don't need isolation.
+
+### Original implementation outline (superseded by "As implemented")
 
 The only change is in `crates/app/src/lib.rs` at the `ProjectDirs::from` call (line ~474), where `"switchboard"` is passed as the application name:
 
@@ -45,14 +60,12 @@ if let Some(dirs) = directories::ProjectDirs::from("", "", app_name) {
 
 `debug_assertions` is enabled for `cargo build` (debug) and `tauri dev`, and disabled for `cargo build --release` and `pnpm tauri build`. This maps exactly to the desired split: dev shell → `-dev` path, installed app → production path.
 
-Per-project `.switchboard/` directories are unaffected — they're local to each working directory, not global, and don't need isolation.
-
 ### Definition of Done
 
-- Running `make dev`, opening the app, and adding a directory writes `workspace.yaml` to `~/Library/Application Support/switchboard-dev/`, not `switchboard/`.
+- Running `make dev`, opening the app, and adding a directory writes `workspace.yaml` to `~/Library/Application Support/switchboard-dev/`, not `switchboard/`. Running a second instance with `make dev DEV_PORT=1421` writes to `switchboard-dev-1421/` — the two do not share state.
 - A release build (`make release-build`) reads from `~/Library/Application Support/switchboard/`.
 - `make check` green.
-- No unit test needed — the path selection has no logic to test; the manual verification above is the proof.
+- `debug_workspace_config_path` carries unit tests for the override and fallback branches.
 
 ---
 

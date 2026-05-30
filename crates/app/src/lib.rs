@@ -431,6 +431,45 @@ fn build_adapters() -> (
     }
 }
 
+/// Resolve the path to the user-global `workspace.yaml` (the cross-directory
+/// project list). `None` only when no home directory is resolvable, in which
+/// case workspace persistence is disabled.
+///
+/// Release builds always resolve the OS config dir for `switchboard`, so the
+/// installed app's list lives at one fixed, predictable location no env var can
+/// move.
+///
+/// Debug builds resolve a separate dev registry so dev runs never read or
+/// overwrite the installed app's list. `SWITCHBOARD_CONFIG_DIR` (set per port by
+/// `make dev`) overrides the location outright; without it the fallback is a
+/// shared `switchboard-dev`. The override is debug-only by construction — it
+/// cannot relocate the installed app's data.
+#[cfg(not(debug_assertions))]
+fn workspace_config_path() -> Option<std::path::PathBuf> {
+    directories::ProjectDirs::from("", "", "switchboard")
+        .map(|dirs| dirs.config_dir().join("workspace.yaml"))
+}
+
+#[cfg(debug_assertions)]
+fn workspace_config_path() -> Option<std::path::PathBuf> {
+    debug_workspace_config_path(std::env::var_os("SWITCHBOARD_CONFIG_DIR"))
+}
+
+/// Pure decision behind the debug arm of [`workspace_config_path`], split out so
+/// the override mapping is testable without mutating process-global env (which
+/// is `unsafe` and racy under edition 2024). An explicit override is used
+/// verbatim; otherwise the shared `switchboard-dev` registry is the fallback.
+#[cfg(debug_assertions)]
+fn debug_workspace_config_path(
+    override_dir: Option<std::ffi::OsString>,
+) -> Option<std::path::PathBuf> {
+    if let Some(dir) = override_dir {
+        return Some(std::path::PathBuf::from(dir).join("workspace.yaml"));
+    }
+    directories::ProjectDirs::from("", "", "switchboard-dev")
+        .map(|dirs| dirs.config_dir().join("workspace.yaml"))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let _ = tracing_subscriber::fmt()
@@ -442,18 +481,25 @@ pub fn run() {
 
     let (claude_adapter, codex_adapter, gemini_adapter, antigravity_adapter) = build_adapters();
 
-    tauri::Builder::default()
-        // Must be the first plugin registered. A second launch of the app
-        // hands its argv/cwd to the already-running instance via this callback
-        // (instead of starting a rival process); we surface the existing window
-        // rather than spawn a duplicate. Single-instance keeps one
-        // `workspace.yaml` writer, so there is no cross-process clobber.
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.unminimize();
-                let _ = window.set_focus();
-            }
-        }))
+    // In release builds, enforce single-instance: a second launch focuses the
+    // existing window instead of spawning a rival process, keeping one
+    // `workspace.yaml` writer and no cross-process clobber. Disabled in debug so
+    // multiple dev instances (two worktrees, or `make dev` on two ports) can run
+    // at once. Their isolation is launcher-provided, not structural: `make dev`
+    // sets `SWITCHBOARD_CONFIG_DIR` per port so each resolves its own config dir
+    // (see `workspace_config_path`). A debug build launched without it (bare
+    // `cargo run`, IDE run button) falls back to the shared `switchboard-dev`
+    // registry, so two such instances can last-writer-wins each other — accepted,
+    // since it's atomic-write dev convenience state, never the installed app's data.
+    let builder = tauri::Builder::default();
+    #[cfg(not(debug_assertions))]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.unminimize();
+            let _ = window.set_focus();
+        }
+    }));
+    builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .setup(move |app| {
@@ -471,8 +517,7 @@ pub fn run() {
             // directory is resolvable (exotic host), skip workspace persistence
             // entirely — the registry stays empty and `persist_workspace` is a
             // no-op, which is safe since the registry is convenience state.
-            let state = if let Some(dirs) = directories::ProjectDirs::from("", "", "switchboard") {
-                let path = dirs.config_dir().join("workspace.yaml");
+            let state = if let Some(path) = workspace_config_path() {
                 state.with_workspace(path)
             } else {
                 tracing::warn!(
@@ -524,4 +569,29 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+// Gated on `debug_assertions` because `debug_workspace_config_path` exists only
+// in debug builds; `cargo test --release` turns those off and the symbol away.
+#[cfg(all(test, debug_assertions))]
+mod tests {
+    use super::debug_workspace_config_path;
+    use std::path::PathBuf;
+
+    #[test]
+    fn override_dir_is_used_verbatim_with_workspace_yaml_appended() {
+        let path = debug_workspace_config_path(Some("/tmp/switchboard-test".into()))
+            .expect("an explicit override always yields a path");
+        assert_eq!(path, PathBuf::from("/tmp/switchboard-test/workspace.yaml"));
+    }
+
+    #[test]
+    fn no_override_falls_back_to_switchboard_dev() {
+        // Routes through `ProjectDirs`, which is `None` only on a host with no
+        // resolvable home (not a dev machine or normal CI). Skip rather than
+        // unwrap so an exotic host degrades quietly instead of panicking.
+        if let Some(path) = debug_workspace_config_path(None) {
+            assert!(path.ends_with("switchboard-dev/workspace.yaml"));
+        }
+    }
 }

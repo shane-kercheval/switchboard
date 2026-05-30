@@ -308,7 +308,7 @@
               <button
                 {...props}
                 type="button"
-                class="text-muted hover:text-fg hover:bg-raised ml-0.5 flex h-6 w-6 items-center justify-center rounded-full transition-colors"
+                class="text-muted hover:text-fg hover:bg-panel ml-0.5 flex h-[26px] w-[26px] items-center justify-center rounded-full transition-colors"
                 data-testid="recipient-clear"
                 aria-label="Clear recipients"
                 onclick={() => (selectedIds = [])}

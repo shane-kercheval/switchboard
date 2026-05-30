@@ -264,7 +264,7 @@ async function mountApp() {
 // DIR_A unless `folder` overrides it.
 async function createNewProjectViaDialog(name: string, folder: string = DIR_A): Promise<void> {
   openDialogMock.mockResolvedValueOnce(folder);
-  await fireEvent.click(screen.getByTestId("welcome-new-project"));
+  await fireEvent.click(screen.getByTestId("welcome-add-project"));
   await waitFor(() => expect(screen.getByTestId("new-project-form")).toBeInTheDocument());
   await fireEvent.click(screen.getByTestId("new-project-choose-folder"));
   const nameInput = screen.getByTestId("new-project-name") as HTMLInputElement;
@@ -300,13 +300,12 @@ describe("App", () => {
 
   // --- harness availability banners (workspace empty → welcome) ---
 
-  it("renders the welcome state (New / Add existing) with no banners when probes succeed and no projects exist", async () => {
+  it("renders the welcome state (Add project) with no banners when probes succeed and no projects exist", async () => {
     await mountApp();
     expect(screen.getByText("Switchboard")).toBeInTheDocument();
-    expect(screen.getByTestId("welcome-new-project")).toBeInTheDocument();
-    expect(screen.getByTestId("welcome-add-existing")).toBeInTheDocument();
+    expect(screen.getByTestId("welcome-add-project")).toBeInTheDocument();
     // With no projects the picker sidebar has nothing to show, so it (and its
-    // re-open toggle) hide; the welcome screen carries the New/Add affordances.
+    // re-open toggle) hide; the welcome screen carries the Add project affordance.
     expect(screen.queryByTestId("projects-sidebar")).not.toBeInTheDocument();
     expect(screen.queryByTestId("projects-sidebar-toggle")).not.toBeInTheDocument();
     await waitFor(() => expect(screen.queryByTestId(/^banner-/)).not.toBeInTheDocument());
@@ -358,9 +357,11 @@ describe("App", () => {
 
   it("add existing: opens an explanatory dialog before picking a folder (no immediate OS picker)", async () => {
     await mountApp();
-    await waitFor(() => expect(screen.getByTestId("welcome-add-existing")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByTestId("welcome-add-project")).toBeInTheDocument());
 
-    await fireEvent.click(screen.getByTestId("welcome-add-existing"));
+    await fireEvent.click(screen.getByTestId("welcome-add-project"));
+    await waitFor(() => expect(screen.getByTestId("project-dialog")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("project-dialog-mode-existing"));
     // The dialog explains what to select first; the OS folder picker has not
     // been opened yet (it opens on "Choose folder…").
     await waitFor(() => expect(screen.getByTestId("add-existing-form")).toBeInTheDocument());
@@ -374,9 +375,12 @@ describe("App", () => {
     backend.rosters.set("p-x", []);
     openDialogMock.mockResolvedValueOnce(DIR_A);
     await mountApp();
-    await waitFor(() => expect(screen.getByTestId("welcome-add-existing")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByTestId("welcome-add-project")).toBeInTheDocument());
 
-    await fireEvent.click(screen.getByTestId("welcome-add-existing"));
+    await fireEvent.click(screen.getByTestId("welcome-add-project"));
+    await waitFor(() => expect(screen.getByTestId("project-dialog")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("project-dialog-mode-existing"));
+    await waitFor(() => expect(screen.getByTestId("add-existing-form")).toBeInTheDocument());
     await fireEvent.click(screen.getByTestId("add-existing-choose-folder"));
 
     // Found feedback names the project, and it surfaces in the flat list.
@@ -395,9 +399,12 @@ describe("App", () => {
     // DIR_A has no projects on disk.
     openDialogMock.mockResolvedValueOnce(DIR_A);
     await mountApp();
-    await waitFor(() => expect(screen.getByTestId("welcome-add-existing")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByTestId("welcome-add-project")).toBeInTheDocument());
 
-    await fireEvent.click(screen.getByTestId("welcome-add-existing"));
+    await fireEvent.click(screen.getByTestId("welcome-add-project"));
+    await waitFor(() => expect(screen.getByTestId("project-dialog")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("project-dialog-mode-existing"));
+    await waitFor(() => expect(screen.getByTestId("add-existing-form")).toBeInTheDocument());
     await fireEvent.click(screen.getByTestId("add-existing-choose-folder"));
 
     await waitFor(() => expect(screen.getByTestId("add-existing-none")).toBeInTheDocument());
@@ -406,7 +413,7 @@ describe("App", () => {
 
   it("new project: choosing a folder + name creates the project, activates it, and auto-seeds an agent per installed harness", async () => {
     await mountApp();
-    await waitFor(() => expect(screen.getByTestId("welcome-new-project")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByTestId("welcome-add-project")).toBeInTheDocument());
 
     await createNewProjectViaDialog("brand-new");
 
@@ -433,7 +440,7 @@ describe("App", () => {
     backend.notInstalled.add("gemini");
     backend.notInstalled.add("antigravity");
     await mountApp();
-    await waitFor(() => expect(screen.getByTestId("welcome-new-project")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByTestId("welcome-add-project")).toBeInTheDocument());
 
     await createNewProjectViaDialog("brand-new");
 
@@ -447,7 +454,7 @@ describe("App", () => {
   it("new project: with no harnesses installed, creates no agents and shows the first-agent prompt", async () => {
     for (const h of ALL_HARNESSES) backend.notInstalled.add(h);
     await mountApp();
-    await waitFor(() => expect(screen.getByTestId("welcome-new-project")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByTestId("welcome-add-project")).toBeInTheDocument());
 
     await createNewProjectViaDialog("brand-new");
 
@@ -463,7 +470,7 @@ describe("App", () => {
     let release: () => void = () => {};
     backend.installGate = new Promise<void>((r) => (release = r));
     await mountApp();
-    await waitFor(() => expect(screen.getByTestId("welcome-new-project")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByTestId("welcome-add-project")).toBeInTheDocument());
 
     await createNewProjectViaDialog("brand-new");
     // Project is created/activated, but auto-create is parked on the gated probe.
@@ -477,7 +484,7 @@ describe("App", () => {
   it("new project: a failed agent create surfaces a dismissible banner and the rest still seed", async () => {
     backend.createAgentFailFor.add("codex");
     await mountApp();
-    await waitFor(() => expect(screen.getByTestId("welcome-new-project")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByTestId("welcome-add-project")).toBeInTheDocument());
 
     await createNewProjectViaDialog("brand-new");
 
@@ -513,7 +520,7 @@ describe("App", () => {
     let release: () => void = () => {};
     backend.installGate = new Promise<void>((r) => (release = r));
     await mountApp();
-    await waitFor(() => expect(screen.getByTestId("welcome-new-project")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByTestId("welcome-add-project")).toBeInTheDocument());
 
     await createNewProjectViaDialog("brand-new");
 
@@ -535,7 +542,7 @@ describe("App", () => {
     let release: () => void = () => {};
     backend.createAgentGate = new Promise<void>((r) => (release = r));
     await mountApp();
-    await waitFor(() => expect(screen.getByTestId("welcome-new-project")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByTestId("welcome-add-project")).toBeInTheDocument());
 
     await createNewProjectViaDialog("brand-new");
     // First create issued and parked → activation is done, id captured.
@@ -555,7 +562,7 @@ describe("App", () => {
     backend.createAgentFailFor.add("codex");
     seedProject({ projectId: "p-other", directory: DIR_B, name: "other", agents: [] });
     await mountApp();
-    await waitFor(() => expect(screen.getByTestId("welcome-new-project")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByTestId("welcome-add-project")).toBeInTheDocument());
 
     await createNewProjectViaDialog("brand-new");
     await screen.findByTestId("banner-agent-create-failed-codex");

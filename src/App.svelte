@@ -15,6 +15,12 @@
   import Dialog from "$lib/components/ui/Dialog.svelte";
   import Input from "$lib/components/ui/Input.svelte";
   import Button from "$lib/components/ui/Button.svelte";
+  import {
+    SEGMENTED_CONTAINER_CLASS,
+    SEGMENTED_ITEM_CLASS,
+    SEGMENTED_ITEM_ACTIVE_CLASS,
+    SEGMENTED_ITEM_INACTIVE_CLASS,
+  } from "$lib/components/ui/segmentedControl";
   import AppShell from "$lib/components/ui/AppShell.svelte";
   import EmptyState from "$lib/components/ui/EmptyState.svelte";
   import SettingsButton from "$lib/components/ui/SettingsButton.svelte";
@@ -45,7 +51,7 @@
   import { bannerCopy, bannerTestid } from "$lib/harnessAvailability";
   import { ALL_HARNESSES, HARNESS_LABEL } from "$lib/harnessDisplay";
   import { harnessAvailability, refreshHarnessAvailability } from "$lib/harnessAvailability.svelte";
-  import { basename } from "$lib/utils";
+  import { basename, cn } from "$lib/utils";
 
   // One availability map keyed by harness, derived from the shared
   // `harnessAvailability` store (one probe also feeding the Supported-CLIs
@@ -178,10 +184,17 @@
     return typeof result === "string" ? result : null;
   }
 
-  // Add existing: a dialog first explains *what* to select (the working
-  // directory, not the `.switchboard/` folder), then reports what was found so
-  // a no-match doesn't look like a silent success.
-  let addExistingOpen = $state<boolean>(false);
+  // Combined "Add project" dialog — toggle between new and existing modes.
+  let projectDialogOpen = $state<boolean>(false);
+  let projectDialogMode = $state<"new" | "existing">("new");
+
+  // New-project sub-state
+  let newProjectFolder = $state<string | null>(null);
+  let newProjectName = $state<string>("");
+  let newProjectBusy = $state<boolean>(false);
+  let newProjectError = $state<string | null>(null);
+
+  // Add-existing sub-state
   let addExistingFolder = $state<string | null>(null);
   // `null` until a folder has been chosen; then the projects discovered in it
   // (empty array = none found).
@@ -189,11 +202,71 @@
   let addExistingBusy = $state<boolean>(false);
   let addExistingError = $state<string | null>(null);
 
-  function openAddExisting(): void {
+  function openProjectDialog(): void {
+    projectDialogMode = "new";
+    newProjectFolder = null;
+    newProjectName = "";
+    newProjectError = null;
     addExistingFolder = null;
     addExistingFound = null;
     addExistingError = null;
-    addExistingOpen = true;
+    projectDialogOpen = true;
+  }
+
+  function switchProjectDialogMode(next: "new" | "existing"): void {
+    if (next === projectDialogMode) return;
+    projectDialogMode = next;
+    // Reset the outgoing mode's state so stale results don't linger.
+    if (next === "new") {
+      addExistingFolder = null;
+      addExistingFound = null;
+      addExistingError = null;
+    } else {
+      newProjectFolder = null;
+      newProjectName = "";
+      newProjectError = null;
+    }
+  }
+
+  const projectTabNewClass = $derived(
+    cn(
+      SEGMENTED_ITEM_CLASS,
+      "flex-1",
+      projectDialogMode === "new" ? SEGMENTED_ITEM_ACTIVE_CLASS : SEGMENTED_ITEM_INACTIVE_CLASS,
+    ),
+  );
+  const projectTabExistingClass = $derived(
+    cn(
+      SEGMENTED_ITEM_CLASS,
+      "flex-1",
+      projectDialogMode === "existing"
+        ? SEGMENTED_ITEM_ACTIVE_CLASS
+        : SEGMENTED_ITEM_INACTIVE_CLASS,
+    ),
+  );
+
+  async function chooseNewProjectFolder(): Promise<void> {
+    const folder = await pickFolder();
+    if (folder === null) return;
+    newProjectFolder = folder;
+    if (newProjectName.trim() === "") newProjectName = basename(folder);
+  }
+
+  const newProjectValid = $derived(newProjectFolder !== null && newProjectName.trim() !== "");
+
+  async function submitNewProject(): Promise<void> {
+    if (!newProjectValid || newProjectFolder === null) return;
+    newProjectError = null;
+    newProjectBusy = true;
+    try {
+      await createProjectAndActivate(newProjectName.trim(), newProjectFolder);
+      projectDialogOpen = false;
+      settingsOpen = false;
+    } catch (err) {
+      newProjectError = err instanceof Error ? err.message : String(err);
+    } finally {
+      newProjectBusy = false;
+    }
   }
 
   async function chooseAddExistingFolder(): Promise<void> {
@@ -211,44 +284,6 @@
       addExistingError = err instanceof Error ? err.message : String(err);
     } finally {
       addExistingBusy = false;
-    }
-  }
-
-  // New project: a small modal collects the target folder + a name.
-  let newProjectOpen = $state<boolean>(false);
-  let newProjectFolder = $state<string | null>(null);
-  let newProjectName = $state<string>("");
-  let newProjectBusy = $state<boolean>(false);
-  let newProjectError = $state<string | null>(null);
-
-  function openNewProject(): void {
-    newProjectFolder = null;
-    newProjectName = "";
-    newProjectError = null;
-    newProjectOpen = true;
-  }
-
-  async function chooseNewProjectFolder(): Promise<void> {
-    const folder = await pickFolder();
-    if (folder === null) return;
-    newProjectFolder = folder;
-    if (newProjectName.trim() === "") newProjectName = basename(folder);
-  }
-
-  const newProjectValid = $derived(newProjectFolder !== null && newProjectName.trim() !== "");
-
-  async function submitNewProject(): Promise<void> {
-    if (!newProjectValid || newProjectFolder === null) return;
-    newProjectError = null;
-    newProjectBusy = true;
-    try {
-      await createProjectAndActivate(newProjectName.trim(), newProjectFolder);
-      newProjectOpen = false;
-      settingsOpen = false;
-    } catch (err) {
-      newProjectError = err instanceof Error ? err.message : String(err);
-    } finally {
-      newProjectBusy = false;
     }
   }
 
@@ -312,13 +347,152 @@
   }
 </script>
 
+{#snippet projectDialogBody()}
+  <div class="space-y-4" data-testid="project-dialog">
+    <div class={cn(SEGMENTED_CONTAINER_CLASS, "flex")} role="tablist">
+      <button
+        type="button"
+        class={projectTabNewClass}
+        role="tab"
+        aria-selected={projectDialogMode === "new"}
+        data-testid="project-dialog-mode-new"
+        onclick={() => switchProjectDialogMode("new")}
+        disabled={newProjectBusy || addExistingBusy}
+      >
+        New project
+      </button>
+      <button
+        type="button"
+        class={projectTabExistingClass}
+        role="tab"
+        aria-selected={projectDialogMode === "existing"}
+        data-testid="project-dialog-mode-existing"
+        onclick={() => switchProjectDialogMode("existing")}
+        disabled={newProjectBusy || addExistingBusy}
+      >
+        Add existing
+      </button>
+    </div>
+
+    {#if projectDialogMode === "new"}
+      <div class="space-y-4" data-testid="new-project-form">
+        <p class="text-muted text-sm leading-relaxed">
+          Choose the folder you want to work in — typically your repo or working directory.
+          Switchboard will initialize it as a new project there.
+        </p>
+        <div class="space-y-1.5">
+          <span class="text-muted block text-xs">Folder</span>
+          <Button
+            variant="secondary"
+            size="sm"
+            data-testid="new-project-choose-folder"
+            onclick={chooseNewProjectFolder}
+          >
+            Choose folder…
+          </Button>
+          {#if newProjectFolder}
+            <p
+              class="text-muted bg-panel truncate rounded px-2 py-1.5 font-mono text-xs"
+              title={newProjectFolder}
+            >
+              {newProjectFolder}
+            </p>
+          {/if}
+        </div>
+        <div class="space-y-1.5">
+          <label for="new-project-name" class="text-muted block text-xs">Name</label>
+          <Input
+            id="new-project-name"
+            data-testid="new-project-name"
+            placeholder="project name"
+            bind:value={newProjectName}
+            disabled={newProjectBusy}
+            onkeydown={(e: KeyboardEvent) => {
+              if (e.key === "Enter") void submitNewProject();
+            }}
+          />
+        </div>
+        {#if newProjectError}
+          <p class="text-status-failed text-xs" data-testid="new-project-error">
+            {newProjectError}
+          </p>
+        {/if}
+        <div class="flex justify-end">
+          <Button
+            size="sm"
+            data-testid="new-project-submit"
+            disabled={!newProjectValid || newProjectBusy}
+            onclick={submitNewProject}
+          >
+            Create
+          </Button>
+        </div>
+      </div>
+    {:else}
+      <div class="space-y-4" data-testid="add-existing-form">
+        <p class="text-muted text-sm leading-relaxed">
+          Choose a folder you've already used with Switchboard — your repo or working directory (the
+          one that contains a
+          <code class="bg-panel text-fg rounded px-1 font-mono text-xs">.switchboard/</code>
+          folder). Switchboard looks there for projects you've created before.
+        </p>
+        <Button
+          variant="secondary"
+          size="sm"
+          data-testid="add-existing-choose-folder"
+          disabled={addExistingBusy}
+          onclick={chooseAddExistingFolder}
+        >
+          Choose folder…
+        </Button>
+        {#if addExistingError}
+          <p class="text-status-failed text-xs" data-testid="add-existing-error">
+            {addExistingError}
+          </p>
+        {:else if addExistingFound !== null}
+          {#if addExistingFound.length > 0}
+            <div class="space-y-1.5" data-testid="add-existing-found">
+              <p class="text-fg text-sm">
+                Found {addExistingFound.length}
+                {addExistingFound.length === 1 ? "project" : "projects"} — added to your list.
+              </p>
+              <ul class="text-muted space-y-0.5 text-xs">
+                {#each addExistingFound as found (found.id)}
+                  <li class="truncate">{found.name}</li>
+                {/each}
+              </ul>
+            </div>
+          {:else}
+            <p class="text-warning text-xs leading-relaxed" data-testid="add-existing-none">
+              No Switchboard projects found in
+              <span class="font-mono" title={addExistingFolder ?? ""}>{addExistingFolder}</span>.
+              Make sure you picked the working directory that contains a
+              <code class="bg-panel text-fg rounded px-1 font-mono">.switchboard/</code>
+              folder — or switch to "New project" to create one there.
+            </p>
+          {/if}
+        {/if}
+        <div class="flex justify-end">
+          <Button
+            size="sm"
+            data-testid="add-existing-done"
+            disabled={addExistingBusy || (addExistingFound === null && addExistingError === null)}
+            onclick={() => (projectDialogOpen = false)}
+          >
+            Done
+          </Button>
+        </div>
+      </div>
+    {/if}
+  </div>
+{/snippet}
+
 <main class="bg-surface text-fg flex h-full flex-col">
   <AppShell centerTestid="workspace-main">
     {#snippet left()}
       {#if projectsSidebarVisible}
         <ProjectsSidebar
-          onNewProject={openNewProject}
-          onAddExisting={openAddExisting}
+          onAddProject={openProjectDialog}
           onOpenSettings={toggleSettings}
           onProjectSelect={() => (settingsOpen = false)}
           onToggleSidebar={() => (projectsSidebarOpen = false)}
@@ -414,7 +588,7 @@
                the sidebar list as the selection affordance. -->
           <div class="flex h-full flex-col items-center overflow-y-auto px-8 pt-6 pb-8">
             <div class="w-full max-w-2xl pb-6">
-              <WelcomeScreen onNewProject={openNewProject} onAddExisting={openAddExisting} />
+              <WelcomeScreen onAddProject={openProjectDialog} />
             </div>
           </div>
         {:else if selection.activationError !== null}
@@ -475,128 +649,12 @@
   {/if}
 
   <Dialog
-    bind:open={newProjectOpen}
-    title="New project"
-    dismissible={!newProjectBusy}
-    onClose={() => (newProjectOpen = false)}
+    bind:open={projectDialogOpen}
+    title="Add project"
+    dismissible={!newProjectBusy && !addExistingBusy}
+    onClose={() => (projectDialogOpen = false)}
   >
-    <div class="space-y-4" data-testid="new-project-form">
-      <p class="text-muted text-sm leading-relaxed">
-        Choose the folder you want to work in — typically your repo or working directory.
-        Switchboard will initialize it as a new project there.
-      </p>
-      <div class="space-y-1.5">
-        <span class="text-muted block text-xs">Folder</span>
-        <Button
-          variant="secondary"
-          size="sm"
-          data-testid="new-project-choose-folder"
-          onclick={chooseNewProjectFolder}
-        >
-          Choose folder…
-        </Button>
-        {#if newProjectFolder}
-          <p
-            class="text-muted bg-panel truncate rounded px-2 py-1.5 font-mono text-xs"
-            title={newProjectFolder}
-          >
-            {newProjectFolder}
-          </p>
-        {/if}
-      </div>
-      <div class="space-y-1.5">
-        <label for="new-project-name" class="text-muted block text-xs">Name</label>
-        <Input
-          id="new-project-name"
-          data-testid="new-project-name"
-          placeholder="project name"
-          bind:value={newProjectName}
-          disabled={newProjectBusy}
-          onkeydown={(e: KeyboardEvent) => {
-            if (e.key === "Enter") void submitNewProject();
-          }}
-        />
-      </div>
-      {#if newProjectError}
-        <p class="text-status-failed text-xs" data-testid="new-project-error">{newProjectError}</p>
-      {/if}
-      <div class="flex justify-end">
-        <Button
-          size="sm"
-          data-testid="new-project-submit"
-          disabled={!newProjectValid || newProjectBusy}
-          onclick={submitNewProject}
-        >
-          Create
-        </Button>
-      </div>
-    </div>
-  </Dialog>
-
-  <Dialog
-    bind:open={addExistingOpen}
-    title="Add an existing project"
-    onClose={() => (addExistingOpen = false)}
-  >
-    <div class="space-y-4" data-testid="add-existing-form">
-      <p class="text-muted text-sm leading-relaxed">
-        Choose a folder you've already used with Switchboard — your repo or working directory (the
-        one that contains a
-        <code class="bg-panel text-fg rounded px-1 font-mono text-xs">.switchboard/</code>
-        folder), not the
-        <code class="bg-panel text-fg rounded px-1 font-mono text-xs">.switchboard/</code> folder itself.
-        Switchboard looks there for projects you've created before.
-      </p>
-
-      <Button
-        variant="secondary"
-        size="sm"
-        data-testid="add-existing-choose-folder"
-        disabled={addExistingBusy}
-        onclick={chooseAddExistingFolder}
-      >
-        Choose folder…
-      </Button>
-
-      {#if addExistingError}
-        <p class="text-status-failed text-xs" data-testid="add-existing-error">
-          {addExistingError}
-        </p>
-      {:else if addExistingFound !== null}
-        {#if addExistingFound.length > 0}
-          <div class="space-y-1.5" data-testid="add-existing-found">
-            <p class="text-fg text-sm">
-              Found {addExistingFound.length}
-              {addExistingFound.length === 1 ? "project" : "projects"} — added to your list.
-            </p>
-            <ul class="text-muted space-y-0.5 text-xs">
-              {#each addExistingFound as found (found.id)}
-                <li class="truncate">{found.name}</li>
-              {/each}
-            </ul>
-          </div>
-        {:else}
-          <p class="text-warning text-xs leading-relaxed" data-testid="add-existing-none">
-            No Switchboard projects found in
-            <span class="font-mono" title={addExistingFolder}>{addExistingFolder}</span>. Make sure
-            you picked the working directory that contains a
-            <code class="bg-panel text-fg rounded px-1 font-mono">.switchboard/</code>
-            folder — or start a new project there with “New project”.
-          </p>
-        {/if}
-      {/if}
-
-      <div class="flex justify-end">
-        <Button
-          size="sm"
-          data-testid="add-existing-done"
-          disabled={addExistingBusy || (addExistingFound === null && addExistingError === null)}
-          onclick={() => (addExistingOpen = false)}
-        >
-          Done
-        </Button>
-      </div>
-    </div>
+    {@render projectDialogBody()}
   </Dialog>
 
   <AddAgentModal

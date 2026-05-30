@@ -179,6 +179,16 @@
     </button>
   </div>
 
+  <p class="text-muted text-xs leading-relaxed">
+    {#if mode === "create"}
+      Starts a fresh session with no prior history. The CLI creates a new conversation in your
+      project directory.
+    {:else}
+      Connects to an existing session by its UUID, picking up the conversation where it left off.
+      Use this to bring a session the harness already has on disk into Switchboard.
+    {/if}
+  </p>
+
   <fieldset class="space-y-1.5" disabled={busy}>
     <legend class="text-muted text-xs">Tool</legend>
     <!-- Native radios (real arrow-key + screen-reader semantics, grouped/labeled

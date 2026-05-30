@@ -13,8 +13,6 @@
   import { basename, cn, relativeTime } from "$lib/utils";
   import SidebarPanel from "$lib/components/ui/SidebarPanel.svelte";
   import SidebarSection from "$lib/components/ui/SidebarSection.svelte";
-  import DropdownMenu from "$lib/components/ui/DropdownMenu.svelte";
-  import DropdownMenuItem from "$lib/components/ui/DropdownMenuItem.svelte";
   import Badge from "$lib/components/ui/Badge.svelte";
   import SettingsButton from "$lib/components/ui/SettingsButton.svelte";
   import SidebarToggleButton from "$lib/components/ui/SidebarToggleButton.svelte";
@@ -25,15 +23,13 @@
   import { windowDragRegion } from "$lib/windowDrag";
 
   let {
-    onNewProject,
-    onAddExisting,
+    onAddProject,
     onOpenSettings,
     onProjectSelect,
     onToggleSidebar,
     settingsOpen = false,
   }: {
-    onNewProject: () => void;
-    onAddExisting: () => void;
+    onAddProject: () => void;
     onOpenSettings: () => void;
     onProjectSelect: () => void;
     onToggleSidebar: () => void;
@@ -101,22 +97,15 @@
 
   <SidebarSection title="Projects">
     {#snippet action()}
-      <DropdownMenu
-        triggerTestid="add-project"
-        triggerLabel="Add a project"
-        triggerClass={ICON_BUTTON_CLASS}
-        contentTestid="add-project-menu"
+      <button
+        type="button"
+        class={ICON_BUTTON_CLASS}
+        aria-label="Add a project"
+        data-testid="add-project"
+        onclick={onAddProject}
       >
-        {#snippet trigger()}
-          <PlusIcon />
-        {/snippet}
-        <DropdownMenuItem onSelect={onNewProject} data-testid="menu-new-project">
-          New project
-        </DropdownMenuItem>
-        <DropdownMenuItem onSelect={onAddExisting} data-testid="menu-add-existing">
-          Add existing project
-        </DropdownMenuItem>
-      </DropdownMenu>
+        <PlusIcon />
+      </button>
     {/snippet}
 
     {#if projects.list.length === 0}

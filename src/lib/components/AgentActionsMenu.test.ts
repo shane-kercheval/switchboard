@@ -8,6 +8,11 @@ vi.mock("$lib/state/index.svelte", () => ({
   stopAgent: (id: string) => stopAgentMock(id),
 }));
 
+const removeAgentMock = vi.fn<(id: string) => Promise<void>>();
+vi.mock("$lib/state/workspace.svelte", () => ({
+  removeAgent: (id: string) => removeAgentMock(id),
+}));
+
 const agentSessionInfoMock = vi.fn();
 const openSessionFileMock = vi.fn();
 vi.mock("$lib/api", () => ({
@@ -37,6 +42,8 @@ async function loadComponent() {
 
 beforeEach(() => {
   stopAgentMock.mockReset();
+  removeAgentMock.mockReset();
+  removeAgentMock.mockResolvedValue(undefined);
   agentSessionInfoMock.mockReset();
   openSessionFileMock.mockReset();
   copyTextMock.mockReset();
@@ -118,6 +125,83 @@ describe("AgentActionsMenu", () => {
     await waitFor(() =>
       expect(screen.getByTestId("resume-copy")).toHaveAttribute("aria-label", "Copied"),
     );
+  });
+
+  it("disables Remove while the agent is active and explains why", async () => {
+    agentSessionInfoMock.mockResolvedValue({ session_file: null, resume_command: null });
+    const Component = await loadComponent();
+    render(Component, { props: { agent: AGENT, active: true } });
+
+    await fireEvent.click(screen.getByTestId("agent-actions-trigger"));
+    const remove = await screen.findByTestId("agent-action-remove");
+    expect(remove).toHaveAttribute("data-disabled");
+    expect(remove).toHaveAttribute("title", "Stop the agent before removing it");
+  });
+
+  it("first Remove click swaps the menu to a focused confirm view, still open", async () => {
+    agentSessionInfoMock.mockResolvedValue({ session_file: null, resume_command: null });
+    const Component = await loadComponent();
+    render(Component, { props: { agent: AGENT, active: false } });
+
+    await fireEvent.click(screen.getByTestId("agent-actions-trigger"));
+    await fireEvent.click(await screen.findByTestId("agent-action-remove"));
+
+    // The menu stays open but its contents are replaced by the confirm view —
+    // the live actions are gone, the prompt + Confirm/Cancel are shown, and the
+    // backend hasn't been touched yet.
+    expect(screen.getByTestId("agent-actions-menu")).toBeInTheDocument();
+    expect(screen.getByTestId("agent-remove-prompt")).toBeInTheDocument();
+    expect(screen.getByTestId("agent-remove-confirm")).toBeInTheDocument();
+    expect(screen.getByTestId("agent-remove-cancel")).toBeInTheDocument();
+    expect(screen.queryByTestId("agent-action-stop")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("agent-action-remove")).not.toBeInTheDocument();
+    expect(removeAgentMock).not.toHaveBeenCalled();
+  });
+
+  it("confirming removal calls removeAgent and closes the menu", async () => {
+    agentSessionInfoMock.mockResolvedValue({ session_file: null, resume_command: null });
+    const Component = await loadComponent();
+    render(Component, { props: { agent: AGENT, active: false } });
+
+    await fireEvent.click(screen.getByTestId("agent-actions-trigger"));
+    await fireEvent.click(await screen.findByTestId("agent-action-remove"));
+    await fireEvent.click(screen.getByTestId("agent-remove-confirm"));
+
+    expect(removeAgentMock).toHaveBeenCalledWith(AGENT.id);
+    // Menu closes on success — its content unmounts.
+    await waitFor(() => expect(screen.queryByTestId("agent-actions-menu")).not.toBeInTheDocument());
+  });
+
+  it("cancelling removal reverts the row without calling removeAgent", async () => {
+    agentSessionInfoMock.mockResolvedValue({ session_file: null, resume_command: null });
+    const Component = await loadComponent();
+    render(Component, { props: { agent: AGENT, active: false } });
+
+    await fireEvent.click(screen.getByTestId("agent-actions-trigger"));
+    await fireEvent.click(await screen.findByTestId("agent-action-remove"));
+    await fireEvent.click(screen.getByTestId("agent-remove-cancel"));
+
+    expect(removeAgentMock).not.toHaveBeenCalled();
+    // Back to the idle Remove item, menu still open.
+    expect(await screen.findByTestId("agent-action-remove")).toBeInTheDocument();
+    expect(screen.queryByTestId("agent-remove-confirm")).not.toBeInTheDocument();
+  });
+
+  it("surfaces a removal error and keeps the agent", async () => {
+    agentSessionInfoMock.mockResolvedValue({ session_file: null, resume_command: null });
+    removeAgentMock.mockRejectedValueOnce(new Error("registry locked"));
+    const Component = await loadComponent();
+    render(Component, { props: { agent: AGENT, active: false } });
+
+    await fireEvent.click(screen.getByTestId("agent-actions-trigger"));
+    await fireEvent.click(await screen.findByTestId("agent-action-remove"));
+    await fireEvent.click(screen.getByTestId("agent-remove-confirm"));
+
+    expect(removeAgentMock).toHaveBeenCalledWith(AGENT.id);
+    const err = await screen.findByTestId("agent-remove-error");
+    expect(err).toHaveTextContent("registry locked");
+    // Menu stays open and reverts to the idle Remove item — the agent is kept.
+    expect(screen.getByTestId("agent-action-remove")).toBeInTheDocument();
   });
 
   it("does not confirm the copy when the clipboard write fails", async () => {

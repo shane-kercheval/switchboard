@@ -2,8 +2,7 @@
   import Button from "$lib/components/ui/Button.svelte";
   import GettingStarted from "$lib/components/GettingStarted.svelte";
 
-  let { onNewProject, onAddExisting }: { onNewProject: () => void; onAddExisting: () => void } =
-    $props();
+  let { onAddProject }: { onAddProject: () => void } = $props();
 </script>
 
 <div class="flex w-full flex-col gap-8">
@@ -29,15 +28,8 @@
       </p>
     </div>
     <div class="flex gap-2">
-      <Button size="sm" data-testid="welcome-new-project" onclick={onNewProject}>New project</Button
-      >
-      <Button
-        variant="secondary"
-        size="sm"
-        data-testid="welcome-add-existing"
-        onclick={onAddExisting}
-      >
-        Add existing
+      <Button size="sm" data-testid="welcome-add-project" onclick={onAddProject}>
+        Add project
       </Button>
     </div>
   </section>

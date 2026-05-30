@@ -62,6 +62,53 @@ describe("buildUnifiedRows", () => {
     expect(row.text).toBe("fan out");
   });
 
+  it("prunes a removed agent from a historical fan-out's recipient set", () => {
+    // A removed agent (AGENT_B) lingers in the journal overlay's recipient set;
+    // filtering against the live roster keeps the message but drops the orphan
+    // column that would otherwise render "unknown / queued".
+    const overlay: ConversationItem[] = [
+      {
+        kind: "user_message",
+        send_id: SEND_1,
+        agent_ids: [AGENT_A, AGENT_B],
+        text: "fan out",
+        at: "2026-05-16T00:00:00Z",
+      },
+    ];
+    const rows = buildUnifiedRows([], overlay, new Set([AGENT_A]));
+    expect(rows).toHaveLength(1);
+    const row = rows[0] as Extract<UnifiedRow, { kind: "user" }>;
+    expect(row.agent_ids).toEqual([AGENT_A]);
+  });
+
+  it("drops a user message whose only recipient was removed", () => {
+    const overlay: ConversationItem[] = [
+      {
+        kind: "user_message",
+        send_id: SEND_1,
+        agent_ids: [AGENT_B],
+        text: "gone",
+        at: "2026-05-16T00:00:00Z",
+      },
+    ];
+    expect(buildUnifiedRows([], overlay, new Set([AGENT_A]))).toHaveLength(0);
+  });
+
+  it("drops an outcome marker for a removed agent", () => {
+    const overlay: ConversationItem[] = [
+      {
+        kind: "outcome",
+        send_id: SEND_1,
+        turn_id: TURN_1,
+        agent_id: AGENT_B,
+        status: "failed",
+        reason: "boom",
+        at: "2026-05-16T00:00:00Z",
+      },
+    ];
+    expect(buildUnifiedRows([], overlay, new Set([AGENT_A]))).toHaveLength(0);
+  });
+
   it("sorts a user message before its outcome marker at an identical timestamp", () => {
     // Real data: a failed-to-start / cancelled turn has Send.at ==
     // Outcome.at, so a timestamp-only sort would float the marker above its

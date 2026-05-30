@@ -46,8 +46,7 @@ function agent(id: string, projectId: string): AgentRecord {
 }
 
 const noopProps = {
-  onNewProject: () => {},
-  onAddExisting: () => {},
+  onAddProject: () => {},
   onOpenSettings: () => {},
   onProjectSelect: () => {},
   onToggleSidebar: () => {},

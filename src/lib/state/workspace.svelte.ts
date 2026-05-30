@@ -223,6 +223,25 @@ async function seedAgentsForInstalledHarnesses(): Promise<void> {
   }
 }
 
+/// Remove an agent everywhere. The backend tears down its actor (cancelling any
+/// in-flight turn), drops its registry record, and deletes Switchboard's
+/// per-agent sidecars; on success we drop it from whichever project roster holds
+/// it and unregister its live per-agent state (event listener, transcript,
+/// runtime). The agent is located across all rosters rather than assumed to be
+/// in the active project, mirroring the backend's agent-id → own-project
+/// resolution. A dangling recipient preselect needs no cleanup — `ComposeBar`
+/// filters its selection against the live roster. Errors propagate to the caller
+/// (the menu surfaces them and keeps the agent).
+export async function removeAgent(agentId: AgentId): Promise<void> {
+  await api.removeAgent(agentId);
+  for (const [projectId, agents] of Object.entries(agentsByProject)) {
+    if (agents.some((a) => a.id === agentId)) {
+      agentsByProject[projectId] = agents.filter((a) => a.id !== agentId);
+    }
+  }
+  unregisterAgents([agentId]);
+}
+
 /// Dismiss the auto-create failure banner for one harness.
 export function dismissAgentCreationFailure(harness: HarnessKind): void {
   const idx = agentCreationFailures.findIndex((f) => f.harness === harness);

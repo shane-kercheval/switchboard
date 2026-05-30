@@ -11,6 +11,7 @@
     type AgentSessionInfo,
   } from "$lib/api";
   import { stopAgent } from "$lib/state/index.svelte";
+  import { removeAgent } from "$lib/state/workspace.svelte";
   import DropdownMenu from "$lib/components/ui/DropdownMenu.svelte";
   import DropdownMenuItem from "$lib/components/ui/DropdownMenuItem.svelte";
   import Dialog from "$lib/components/ui/Dialog.svelte";
@@ -25,13 +26,26 @@
   let info = $state<AgentSessionInfo | null>(null);
   let loadError = $state<string | null>(null);
 
+  // Inline-confirm state for "Remove agent" — no dialog. The first click swaps
+  // the menu's contents to a focused confirm view while keeping it open (the
+  // Remove item sets `closeOnSelect={false}`); `removing` guards against a
+  // double-confirm while the backend teardown is in flight.
+  let confirmingRemove = $state(false);
+  let removing = $state(false);
+  let removeError = $state<string | null>(null);
+
   // Resolve session actions each time the menu opens (a session can become
   // available after the first dispatch). A *failure* (e.g. a corrupt sidecar,
   // which the command surfaces loudly) is kept distinct from a clean
   // "no session yet" so the menu can say so rather than silently greying out.
+  // Reopening also resets the remove affordance to its idle state.
   $effect(() => {
-    if (!menuOpen) return;
+    if (!menuOpen) {
+      confirmingRemove = false;
+      return;
+    }
     loadError = null;
+    removeError = null;
     void agentSessionInfo(agent.id)
       .then((next) => {
         info = next;
@@ -51,6 +65,33 @@
       console.error("[switchboard] open session file failed", err);
     });
   }
+
+  function startRemove(): void {
+    removeError = null;
+    confirmingRemove = true;
+  }
+
+  function cancelRemove(): void {
+    confirmingRemove = false;
+  }
+
+  // Confirm: tear the agent down. On success the sidebar card unmounts as the
+  // roster updates, so we just close the menu; on failure we revert to the
+  // normal item and surface the error, keeping the agent.
+  async function confirmRemove(): Promise<void> {
+    removing = true;
+    removeError = null;
+    try {
+      await removeAgent(agent.id);
+      confirmingRemove = false;
+      menuOpen = false;
+    } catch (err) {
+      removeError = err instanceof Error ? err.message : String(err);
+      confirmingRemove = false;
+    } finally {
+      removing = false;
+    }
+  }
 </script>
 
 <DropdownMenu
@@ -67,31 +108,72 @@
       <circle cx="12" cy="19" r="1.6" />
     </svg>
   {/snippet}
-  <DropdownMenuItem
-    onSelect={() => stopAgent(agent.id)}
-    disabled={!active}
-    data-testid="agent-action-stop"
-  >
-    Stop agent
-  </DropdownMenuItem>
-  <DropdownMenuItem
-    onSelect={() => (resumeOpen = true)}
-    disabled={!info?.resume_command}
-    data-testid="agent-action-resume"
-  >
-    Resume in terminal…
-  </DropdownMenuItem>
-  <DropdownMenuItem
-    onSelect={openSessionFile}
-    disabled={!info?.session_file}
-    data-testid="agent-action-open-session"
-  >
-    Open session file
-  </DropdownMenuItem>
-  {#if loadError !== null}
-    <div class="text-status-failed px-2.5 py-1.5 text-xs" data-testid="agent-actions-error">
-      Couldn't read session state: {loadError}
+  {#if confirmingRemove}
+    <!-- Removal swaps the whole menu to a focused confirm view at the same
+         location — the live actions above are irrelevant mid-confirm. -->
+    <div class="px-2.5 pt-1.5 pb-1" data-testid="agent-remove-prompt">
+      <p class="text-fg text-xs">Remove “{agent.name}” from this project?</p>
+      <p class="text-warning mt-0.5 text-xs" data-testid="agent-remove-warning">
+        Its responses will be removed from the conversation.
+      </p>
     </div>
+    <DropdownMenuItem
+      onSelect={confirmRemove}
+      closeOnSelect={false}
+      disabled={removing}
+      class="text-status-failed"
+      data-testid="agent-remove-confirm"
+    >
+      Remove agent
+    </DropdownMenuItem>
+    <DropdownMenuItem
+      onSelect={cancelRemove}
+      closeOnSelect={false}
+      data-testid="agent-remove-cancel"
+    >
+      Cancel
+    </DropdownMenuItem>
+  {:else}
+    <DropdownMenuItem
+      onSelect={() => stopAgent(agent.id)}
+      disabled={!active}
+      data-testid="agent-action-stop"
+    >
+      Stop agent
+    </DropdownMenuItem>
+    <DropdownMenuItem
+      onSelect={() => (resumeOpen = true)}
+      disabled={!info?.resume_command}
+      data-testid="agent-action-resume"
+    >
+      Resume in terminal…
+    </DropdownMenuItem>
+    <DropdownMenuItem
+      onSelect={openSessionFile}
+      disabled={!info?.session_file}
+      data-testid="agent-action-open-session"
+    >
+      Open session file
+    </DropdownMenuItem>
+    <DropdownMenuItem
+      onSelect={startRemove}
+      closeOnSelect={false}
+      disabled={active}
+      title={active ? "Stop the agent before removing it" : undefined}
+      data-testid="agent-action-remove"
+    >
+      Remove agent
+    </DropdownMenuItem>
+    {#if loadError !== null}
+      <div class="text-status-failed px-2.5 py-1.5 text-xs" data-testid="agent-actions-error">
+        Couldn't read session state: {loadError}
+      </div>
+    {/if}
+    {#if removeError !== null}
+      <div class="text-status-failed px-2.5 py-1.5 text-xs" data-testid="agent-remove-error">
+        Couldn't remove agent: {removeError}
+      </div>
+    {/if}
   {/if}
 </DropdownMenu>
 

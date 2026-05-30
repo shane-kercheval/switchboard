@@ -41,7 +41,10 @@
       const slice = transcripts[agent.id] ?? [];
       for (const turn of slice) turns.push(turn);
     }
-    return buildUnifiedRows(turns, overlay);
+    // Filter to the live roster so a removed agent leaves no orphan column
+    // (the journal overlay retains its original recipient set).
+    const knownAgentIds = new Set(agents.map((a) => a.id));
+    return buildUnifiedRows(turns, overlay, knownAgentIds);
   });
 
   /// Group the flat rows into render blocks: standalone rows, plus one block per

@@ -92,7 +92,21 @@ const KIND_RANK = { user: 0, agent: 1, outcome: 2 } as const;
 /// store routes `agent_turn` items into per-agent state); any stray
 /// `agent_turn` in the overlay is ignored defensively to avoid double-rendering
 /// agent content.
-export function buildUnifiedRows(turns: Turn[], overlay: ConversationItem[]): UnifiedRow[] {
+///
+/// `knownAgentIds`, when provided, is the live roster: rows are filtered to it
+/// so a **removed agent** leaves no orphan in the transcript. This matters
+/// because the journal overlay's `user_message.agent_ids` carries the *original*
+/// recipient set (and survives on the backend across reload), so a removed
+/// agent would otherwise render a phantom fan-out column — "unknown" (gone from
+/// the roster) stuck "queued" (its per-agent content was deleted). Pruning a
+/// fan-out recipient set down to one agent collapses it back to a plain
+/// single-recipient send; a user message left with no surviving recipients is
+/// dropped entirely. Omit `knownAgentIds` to disable filtering.
+export function buildUnifiedRows(
+  turns: Turn[],
+  overlay: ConversationItem[],
+  knownAgentIds?: ReadonlySet<AgentId>,
+): UnifiedRow[] {
   const rows: UnifiedRow[] = [];
 
   // Live user turns of one fan-out share a `send_id` (one per recipient), so
@@ -178,6 +192,25 @@ export function buildUnifiedRows(turns: Turn[], overlay: ConversationItem[]): Un
     // (routed to per-agent state); ignore to avoid double-rendering.
   }
 
+  // Drop rows that belong to agents no longer in the roster (a removed agent),
+  // pruning fan-out recipient sets and discarding messages left with no
+  // surviving recipient. Live `turns` are already roster-scoped (the caller only
+  // flattens roster agents), so this matters for the journal overlay, whose
+  // `agent_ids` retains the original recipient set.
+  const visibleRows: UnifiedRow[] = [];
+  for (const row of rows) {
+    if (knownAgentIds === undefined) {
+      visibleRows.push(row);
+    } else if (row.kind === "user") {
+      const agent_ids = row.agent_ids.filter((id) => knownAgentIds.has(id));
+      if (agent_ids.length > 0) visibleRows.push({ ...row, agent_ids });
+    } else if (row.kind === "outcome") {
+      if (knownAgentIds.has(row.agent_id)) visibleRows.push(row);
+    } else if (knownAgentIds.has(row.turn.agent_id)) {
+      visibleRows.push(row);
+    }
+  }
+
   // Order by **send**, not raw timestamp: each row is anchored to the time of
   // its send's user message (`sendAnchor`), so a send's response renders
   // directly under its prompt even when it ran much later. This matters for a
@@ -191,7 +224,7 @@ export function buildUnifiedRows(turns: Turn[], overlay: ConversationItem[]): Un
   // outcome), then own `at`; `Array.prototype.sort` is stable so ties hold
   // insertion order.
   const sendAnchor = new Map<string, string>();
-  for (const row of rows) {
+  for (const row of visibleRows) {
     if (row.kind === "user" && row.send_id !== undefined) {
       const prior = sendAnchor.get(row.send_id);
       if (prior === undefined || row.at < prior) sendAnchor.set(row.send_id, row.at);
@@ -199,13 +232,13 @@ export function buildUnifiedRows(turns: Turn[], overlay: ConversationItem[]): Un
   }
   const anchorOf = (row: UnifiedRow): string =>
     (row.send_id !== undefined ? sendAnchor.get(row.send_id) : undefined) ?? row.at;
-  rows.sort((a, b) => {
+  visibleRows.sort((a, b) => {
     const t = anchorOf(a).localeCompare(anchorOf(b));
     if (t !== 0) return t;
     if (a.rank !== b.rank) return a.rank - b.rank;
     return a.at.localeCompare(b.at);
   });
-  return rows;
+  return visibleRows;
 }
 
 /// Group a flat row list into render blocks, collapsing each fan-out (a user

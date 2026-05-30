@@ -339,7 +339,11 @@
           role="listbox"
           bind:this={menuEl}
         >
-          <div class="text-muted px-2.5 py-1 text-[11px] font-medium uppercase tracking-wide select-none">Send to</div>
+          <div
+            class="text-muted px-2.5 py-1 text-[11px] font-medium tracking-wide uppercase select-none"
+          >
+            Send to
+          </div>
           {#each menuItems as item, i (item.key)}
             <button
               type="button"

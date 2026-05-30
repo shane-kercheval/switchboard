@@ -22,11 +22,8 @@
   /// `onRename` puts the sidebar card into its inline rename editor — the menu
   /// owns the trigger, the card owns the edit state (an `<input>` can't live in
   /// the card's collapse-toggle button), so this is a callback, not local state.
-  let {
-    agent,
-    active,
-    onRename,
-  }: { agent: AgentRecord; active: boolean; onRename?: () => void } = $props();
+  let { agent, active, onRename }: { agent: AgentRecord; active: boolean; onRename?: () => void } =
+    $props();
 
   let menuOpen = $state(false);
   let resumeOpen = $state(false);

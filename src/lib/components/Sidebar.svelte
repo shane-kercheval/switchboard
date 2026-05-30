@@ -393,7 +393,10 @@
               />
               <button
                 type="button"
-                class={cn(ICON_BUTTON_CLASS, "shrink-0 disabled:cursor-not-allowed disabled:opacity-50")}
+                class={cn(
+                  ICON_BUTTON_CLASS,
+                  "shrink-0 disabled:cursor-not-allowed disabled:opacity-50",
+                )}
                 disabled={!canSave}
                 aria-label="Save name"
                 title="Save"

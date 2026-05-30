@@ -1,7 +1,9 @@
 # Research: Antigravity CLI (`agy`) for Switchboard
 
-**Captured:** 2026-05-19
-**Tool version:** `agy --version` reports `1.0.0` (CLI). `agy changelog` lists only `1.0.0: Initial release of the Antigravity CLI.` Build channel: stable.
+> **Captured-in-time provenance.** For current behavior + how Switchboard handles it, see the canonical [`harness-behavior.md`](../harness-behavior.md); this doc holds the raw probes behind it and may drift from the code.
+
+**Captured:** 2026-05-19 (initial); updated 2026-05-26 (1.0.2 probe).
+**Tool version:** `agy --version` reports `1.0.0` (CLI) at initial capture. Auto-updated to **`1.0.2`** by 2026-05-26; `agy changelog` for 1.0.1/1.0.2 lists OAuth/onboarding/sandbox/skills changes — no print-mode or transcript-format entries — but observed behavior includes additive transcript changes (see §"1.0.2 additive changes" below). Build channel: stable.
 **Status:** Hands-on probing against the installed binary at `/Users/shanekercheval/.local/bin/agy`, authenticated as `shane.kercheval@gmail.com` via macOS Keychain (silent auth — no `agy login` command was invoked during this probe; auth had been established previously through the Antigravity IDE app).
 
 **Companion to:** [`gemini-cli-observed.md`](gemini-cli-observed.md), [`claude-code-cli-observed.md`](claude-code-cli-observed.md), [`codex-cli-observed.md`](codex-cli-observed.md). Antigravity is being evaluated as the headless replacement for Gemini CLI on free / Google AI Pro / Ultra tiers (announced cutover: 2026-06-18).
@@ -166,9 +168,15 @@ Layout observed after a series of headless probes:
 │   └── <conversation-uuid>.pb              # primary conversation log — encrypted .pb
 ├── brain/
 │   └── <conversation-uuid>/
-│       └── .system_generated/
-│           └── logs/
-│               └── transcript.jsonl        # plaintext JSONL transcript (load-bearing)
+│       ├── .system_generated/
+│       │   └── logs/
+│       │       ├── transcript.jsonl        # plaintext JSONL transcript (load-bearing)
+│       │       └── transcript_full.jsonl   # same records, raw JSON tool args (1.0.2+)
+│       ├── messages/                       # server-side notification files (1.0.2+)
+│       │   ├── <uuid>.json                 # server messages (restart notices, etc.)
+│       │   ├── cursor.json                 # message-read cursor
+│       │   └── read.json                   # read-receipts
+│       └── .agents/                        # subagent definitions (if any subagents run)
 └── scratch/                                # ephemeral working dir
 ```
 
@@ -255,6 +263,16 @@ Record schema:
 **No assistant-message streaming records.** Unlike Gemini's per-chunk `{role:"assistant", delta:true}` events, the transcript file records the **completed** `PLANNER_RESPONSE` only. The text dripping seen on stdout is a server-side rendering effect (`text_drip.go`) — the on-disk record is whole.
 
 **A tool-calling `PLANNER_RESPONSE` carries narration in `thinking`, not `content`.** Across every captured transcript (the `b7456aa7` / `bdf1687e` probes and the `tool-use` fixture), a `PLANNER_RESPONSE` that has `tool_calls` puts the model's reasoning in `thinking` and leaves `content` empty; the user-facing answer always arrives as a *separate* later `PLANNER_RESPONSE` with `content` and no `tool_calls`. Switchboard's adapter relies on this: it emits answer text only for that terminal (no-tool-calls) record (`is_terminal_answer`), so a tool-calling record's empty `content` drops nothing. If a future `agy` release ever attaches displayable `content` to a tool-calling record, that text would be dropped and this assumption needs revisiting.
+
+**`SYSTEM_MESSAGE` records on resume (1.0.2+).** Resume turns (any turn after the first in a conversation) now have a `SYSTEM_MESSAGE` record injected by the server between `USER_INPUT` and `PLANNER_RESPONSE`. Observed shape (probed 2026-05-26):
+
+```jsonl
+{"step_index":N,"source":"SYSTEM","type":"SYSTEM_MESSAGE","status":"DONE","created_at":"...","content":"[Notice] All your subagents and background tasks have been stopped due to server restart. If you want a subagent to continue working, it needs to be revived by sending it a new message. If resuming work, please check on status and restart as needed."}
+```
+
+So a resume turn's step sequence is `USER_INPUT` → `CONVERSATION_HISTORY` → `SYSTEM_MESSAGE` (zero or more) → `PLANNER_RESPONSE`. The adapter's parser (`record_to_live_events`) already handles this correctly: `SYSTEM_MESSAGE` records have `source = "SYSTEM"` and `type = "SYSTEM_MESSAGE"` — they pass neither `is_planner_response()` nor `is_tool_result()` and are silently skipped, so no parser change is needed. The `SYSTEM_MESSAGE` content is currently not surfaced to the user.
+
+**`transcript_full.jsonl` (1.0.2+).** Written alongside `transcript.jsonl` in the same `.system_generated/logs/` directory. Contains the same step records but with raw JSON values in `tool_calls[].args` rather than the stringified-JSON values in `transcript.jsonl` (where each arg value is a JSON string containing a JSON literal). The adapter reads `transcript.jsonl`; `transcript_full.jsonl` is available if richer structured tool-call arg rendering is ever wanted (a one-line `paths.rs` change to switch targets).
 
 **Resume creates a new conversation if the UUID is unknown.** Tested: `agy --conversation 00000000-0000-0000-0000-000000000000 -p "hi"` printed `Warning: conversation "00000000-0000-0000-0000-000000000000" not found.` to stderr and exited 0 with a fresh-conversation reply. No error / non-zero exit code. **Adapters cannot rely on exit code to detect missing-conversation.**
 
@@ -370,6 +388,17 @@ Tested: `agy -p "Count from 1 to 100 slowly"` backgrounded, then `kill -TERM <pi
 - **Switchboard's existing `Command::process_group(0)` + `killpg` pattern is unnecessary here** — `agy` does not fork persistent children. But it remains correct (a no-op for `agy` is fine).
 - **Exit code 0 on cancellation matches Gemini.** The adapter cannot distinguish "completed turn" from "cancelled mid-turn" by exit code alone — it must check for a `PLANNER_RESPONSE` terminal record in the transcript file (or whatever terminal-step heuristic applies — given the JSONL has no explicit "turn complete" record, this is non-trivial).
 
+**M4.3 wiring.** Cancellation is now token-driven: the producer's existing
+`select!` (transcript-tail tick) gains a `CancellationToken` arm; on cancel it
+kills via `terminate_then_kill` (SIGTERM → ~2s grace → SIGKILL on the process
+group) and ends the stream without a terminal event — the dispatcher
+synthesizes `TurnEnd { Cancelled }` from the fired token, so the
+exit-0/no-terminal-record problem above is irrelevant on the cancel path (the
+adapter never tries to infer the outcome). **Verified end-to-end (2026-05-23):**
+`live_antigravity_cancel_terminates_and_synthesizes_cancelled` (run via
+`make test-live` / `make test-live-antigravity`) passes — firing the token
+mid-turn produces a `Cancelled` outcome with the agent returning to idle.
+
 ## Error paths
 
 | Probe | Stdout | Stderr | Exit |
@@ -377,10 +406,47 @@ Tested: `agy -p "Count from 1 to 100 slowly"` backgrounded, then `kill -TERM <pi
 | Empty prompt `agy -p ""` | (none) | `Error: empty prompt. Usage: agy --print "your prompt here"` | 0 |
 | Unknown `--conversation <uuid>` | Fresh-conversation greeting (`Hello! I'm Antigravity, ...`) | `Warning: conversation "..." not found.` | 0 |
 | Timeout (5-min default exceeded) | `Error: timed out waiting for response` | (none) | 0 |
-| Unauthenticated (not probed; would require revoking Keychain entry) | unclear | unclear | unclear |
+| **Quota exhausted (`RESOURCE_EXHAUSTED`)** | **(none)** | **(none)** | **0** |
+| **Unauthenticated (CAPTURED 2026-05-27, logged-out probe)** | **interactive-OAuth prompt then `Error: authentication timed out.`** | (none) | **0** |
 | Network failure (not probed) | unclear | unclear | unclear |
 
 **Notable**: `agy` exits 0 on virtually every error condition surveyed. Failure detection by exit code is unreliable. The adapter must parse stdout for `^Error:` or `^Warning:` lines and check transcript-file completeness.
+
+### Unauthenticated shape — CAPTURED (2026-05-27, logged-out probe)
+
+After signing out of the Antigravity desktop app (revoking the Keychain entry), `agy -p "…" < /dev/null` does **not** silently fail — it falls back to an **interactive OAuth flow on stdout**:
+
+```
+Authentication required. Please visit the URL to log in:
+  https://accounts.google.com/o/oauth2/auth?...&redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback&...
+Waiting for authentication (timeout 30s)...
+Or, paste the authorization code here and press Enter:
+Error: authentication timed out.
+```
+
+Exit code **0** (consistent with every other `agy` error). It **blocks ~30s** on the OAuth wait before timing out. This confirms the behavior system-design §9 anticipated ("a stale token triggers an interactive-OAuth fallback the adapter detects on stdout and force-kills"). **The adapter already handles this correctly** — `antigravity/parser.rs::is_auth_failure_line` matches `Authentication required` (and `authentication timed out`, and the init-time `not logged into Antigravity` breadcrumb); its doc comment notes it was written from a real logged-out capture. So this row was the research doc lagging the code, not a code gap. (Still worth confirming the producer force-kills on the match rather than waiting out the 30s OAuth timeout — that path is exercised by the live test, not a fixture.)
+
+### Quota exhaustion (`RESOURCE_EXHAUSTED`) — captured 2026-05-26, agy 1.0.2
+
+When Google Cloud individual quota is exhausted, `agy -p` exits 0 with **empty stdout and empty stderr** and writes **no new records to `transcript.jsonl`**. This makes it the most invisible error condition: exit code, stdout, and transcript are all indistinguishable from a successful-but-answer-less turn.
+
+The error is visible only in the per-invocation CLI log file:
+
+```
+~/.gemini/antigravity-cli/log/cli-<YYYYMMDD>_<HHMMSS>.log
+```
+
+Representative log line (sourced from `http_helpers.go`):
+
+```
+http_helpers.go:178] rpc error: code = ResourceExhausted desc = RESOURCE_EXHAUSTED: 429 ... individual quota exhausted ...
+```
+
+The substring `RESOURCE_EXHAUSTED` appears in the line (case-insensitive match is safe). The log file is created at invocation start and its `mtime` is updated as the process runs, so it can be correlated to a specific dispatch by selecting the file with `mtime >= spawn_time`.
+
+**Adapter detection strategy:** after the turn exits, if `saw_terminal_answer` is false, scan the log directory for the file with the most-recent `mtime >= spawn_time`; search for `RESOURCE_EXHAUSTED` (case-insensitive). This scan is best-effort — if the log dir is unreadable or no matching file exists, the adapter falls back to its generic failure messages. A successful turn (with a `PLANNER_RESPONSE` record confirmed) skips the scan entirely.
+
+**Classification:** this is a hard failure — the turn produced no answer. Classify as `FailureKind::UsageLimit` (M4.9 Surface A), preserving a user-readable message: "Antigravity quota exhausted — Google Cloud individual quota reached."
 
 ## Comparison to Gemini CLI
 
@@ -411,6 +477,47 @@ For each contract Switchboard's Gemini adapter relies on, here is the Antigravit
 | Server-side vs local | Hybrid — model on server, but stream-JSON gives full event visibility locally; session file is fully replayable | Server-side state is authoritative; local transcript is a log of received events; no token data offline | **Different** (more server-dependent) |
 | Concurrent-dispatch safety | UUID-v7 first-8-char filename collision risk (use UUID v4) | No filename collision risk — full-UUID directories | **Same** (no concern here) |
 | `.gitignore` impact in cwd | None — Gemini doesn't write into the user's cwd | `<cwd>/.antigravitycli/<project-uuid>.json` symlink IS written on first invocation | **Different** (new gitignore consideration) |
+
+## Subagent (`invoke_subagent`) representation — separate conversation, no mis-attribution (2026-05-24, agy 1.0.2)
+
+Probed whether a subagent's *internal* tool calls leak into the parent conversation's transcript (the Antigravity analogue of [Claude's mis-attribution gap](claude-code-cli-observed.md) — see [`../implementation_plans/2026-05-24-subagent-rendering-fidelity.md`](../implementation_plans/2026-05-24-subagent-rendering-fidelity.md)). Prompt: "Use a subagent to run the shell command `echo hello-from-subagent` and report its output." **Answer: no leak — Antigravity isolates the subagent more strongly than either Claude or Gemini.**
+
+**A subagent runs as its own `brain/<uuid>` conversation.** The single dispatch produced **two** new brain dirs: the parent (carries `.agents/agents/command_runner/agent.json` — the subagent it defined — plus a `messages/` dir) and a **wholly separate** conversation for the subagent's own execution. The subagent's `run_command` (`echo hello-from-subagent`) is recorded only in the *subagent's* conversation, which Switchboard **never tails** (Switchboard only knows the parent's UUID; it didn't spawn the subagent and has no sidecar for it).
+
+**The parent transcript surfaces the delegation as ordinary tool calls, not the subagent's internals.** Parent `transcript.jsonl` record sequence:
+
+```
+USER_INPUT
+PLANNER_RESPONSE  tool_calls=[define_subagent]
+GENERIC           (MODEL-sourced → is_tool_result → completes define_subagent)
+PLANNER_RESPONSE  tool_calls=[invoke_subagent]   args carry the subagent's prompt + role
+INVOKE_SUBAGENT   (MODEL-sourced → is_tool_result → completes invoke_subagent)
+PLANNER_RESPONSE  (terminal answer text)
+```
+
+So our parser (`antigravity/parser.rs`, `record_to_live_events`) emits, for the parent turn: `ToolStarted{define_subagent}`→`ToolCompleted`, `ToolStarted{invoke_subagent}`→`ToolCompleted`, then the answer `ContentChunk` + `TurnEnd`. The subagent's `run_command` appears **nowhere** in what Switchboard reads. **No parser change needed** — this is already the "a delegation is one (here, two) tool call(s) from the parent's view" shape.
+
+The FIFO tool-pairing in `record_to_live_events` (`pending_tool_ids.pop_front()`) pairs correctly here because the calls are **sequential** — each tool-result record lands before the next tool call (`define_subagent`→`GENERIC`, then `invoke_subagent`→`INVOKE_SUBAGENT`). (A record carrying *multiple concurrent* `tool_calls` followed by interleaved results could expose a FIFO mis-pair, but that shape wasn't produced by the subagent flow and is a separate general concern, not a subagent gap.)
+
+**Net cross-harness:** the subagent mis-attribution gap is **Claude-only**. Gemini (`invoke_agent`) is opaque; Antigravity (`invoke_subagent`) runs the subagent in a separate conversation. Both already match the target shape the Claude fix aims for.
+
+### Aside confirmed during this probe: `agy -p` blocks indefinitely on an open stdin
+
+`agy -p <prompt>` with stdin left attached (no EOF) **hangs forever** — it never creates a `brain/<uuid>` dir, never emits, never exits (observed on both a trivial `ack` prompt and the subagent prompt; not quota-related). Redirecting `< /dev/null` makes it complete normally (exit 0, brain dir created). Unlike Gemini (which warns "no stdin data received in 3s, proceeding"), `agy` has **no stdin timeout**. This is why Switchboard's adapter spawning with `Stdio::null()` is **load-bearing, not hygiene** — without it the harness would hang every turn. (Also a reminder for manual probing: always run `agy -p … < /dev/null`.)
+
+## agy 1.0.2 additive changes — summary (probed 2026-05-26)
+
+`agy` auto-updated from 1.0.0 to 1.0.2. The following changes were observed; **none break the existing Switchboard adapter**:
+
+| Change | Where | Adapter impact |
+|---|---|---|
+| `SYSTEM_MESSAGE` records injected on resume turns | `transcript.jsonl` | None — parser skips records that are neither `PLANNER_RESPONSE` nor tool results |
+| `transcript_full.jsonl` written alongside `transcript.jsonl` | `.system_generated/logs/` | None — adapter reads `transcript.jsonl` only; full file is additive |
+| `messages/` directory with server notification JSONs, `cursor.json`, `read.json` | `brain/<uuid>/messages/` | None — not a transcript source; server restart notices appear here, not in `transcript.jsonl` |
+
+The `RESOURCE_EXHAUSTED` quota error (exit 0, empty stdout/stderr, error only in CLI log) is also new in practice under 1.0.2 — though this is a server-side quota condition, not a format change. See §"Quota exhaustion" above for the observed shape and §"Known limitations" for the adapter's detection approach.
+
+**Root-cause note (corrects `docs/implementation_plans/2026-05-26-bug-antigravity-1-0-2.md`):** the bug report hypothesized that 1.0.2 changed transcript-writing behavior. Probing disproved this: the `090da703` conversation (created under 1.0.2 by live tests on 2026-05-23) has a properly-structured `transcript.jsonl` with `USER_INPUT → PLANNER_RESPONSE` for a fresh turn and `USER_INPUT → SYSTEM_MESSAGE → PLANNER_RESPONSE` for a resume turn. Every turn failure on 2026-05-26 was `RESOURCE_EXHAUSTED` quota exhaustion, not a path or format change.
 
 ## Pending verification / unclear after probing
 

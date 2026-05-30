@@ -4,8 +4,14 @@ use std::pin::Pin;
 use async_trait::async_trait;
 use futures::Stream;
 use switchboard_core::AgentRecord;
+use tokio_util::sync::CancellationToken;
 
 use crate::events::{AdapterEvent, TurnId};
+
+// `CancellationToken` is carried on `DispatchOptions` (below) rather than as a
+// `dispatch` parameter — extending the options struct is backwards-compatible
+// with every call site, while a new trait parameter would ripple to all of
+// them (the same rationale the struct's own doc gives for existing fields).
 
 /// A stream of `AdapterEvent`s emitted by a running harness turn.
 pub type EventStream = Pin<Box<dyn Stream<Item = AdapterEvent> + Send>>;
@@ -63,6 +69,19 @@ pub struct DispatchOptions {
     /// ignore this field — Claude emits `SessionMeta` from its
     /// `system/init` stream event on every dispatch regardless.
     pub is_first_dispatch_after_attach: bool,
+
+    /// Fired by the dispatcher to request cancellation of this turn. The
+    /// adapter watches it (via `select!`) and, on cancel, does only the
+    /// harness-specific teardown — kill the subprocess group — then **ends
+    /// its stream without emitting a terminal event**. The dispatcher
+    /// synthesizes the `TurnEnd { Cancelled }` from the token, stamping the
+    /// cancel *source* it recorded (a binary token can't carry intent, and
+    /// only the dispatcher knows why it fired). The dispatcher always
+    /// overwrites this with the turn's token before calling `dispatch`; the
+    /// `Default` (a fresh, never-fired token) is just a harmless placeholder
+    /// for direct callers. The real subprocess kill lands in M4.3; until then
+    /// the four real adapters ignore the token and the mock honors it.
+    pub cancel_token: CancellationToken,
 }
 
 /// Implemented by each harness (`ClaudeCode`, Codex, ...). Returns a stream of
@@ -79,9 +98,10 @@ pub trait HarnessAdapter: Send + Sync {
     /// files via its Read/Glob/Bash tools), **not** the per-project
     /// metadata directory inside `.switchboard/projects/<uuid>/`.
     ///
-    /// `options` carries caller-side conditions (see [`DispatchOptions`]).
-    /// Normal sends pass `DispatchOptions::default()`; the
-    /// attach-existing-session flow sets `is_first_dispatch_after_attach`.
+    /// `options` carries caller-side conditions (see [`DispatchOptions`]),
+    /// including `options.cancel_token`, which the dispatcher fires to request
+    /// cancellation of this turn. Normal sends pass `DispatchOptions::default()`;
+    /// the attach-existing-session flow sets `is_first_dispatch_after_attach`.
     async fn dispatch(
         &self,
         agent: &AgentRecord,
@@ -96,4 +116,10 @@ pub trait HarnessAdapter: Send + Sync {
     /// is ready to dispatch. In-process adapters (e.g., the mock) return
     /// `Ok(())` unconditionally.
     fn probe(&self) -> Result<(), DispatchError>;
+
+    /// Best-effort installed-CLI version (first line of `<binary> --version`),
+    /// for the getting-started surface. `None` when the binary can't be
+    /// invoked or reports nothing. Display-only — never load-bearing.
+    /// In-process adapters (the mock) return `None`.
+    fn version(&self) -> Option<String>;
 }

@@ -4,8 +4,7 @@
 use std::path::PathBuf;
 
 use switchboard_core::{AgentId, CoreError, HarnessKind, ProjectId};
-use switchboard_dispatcher::DispatcherError;
-use switchboard_harness::DispatchError;
+use switchboard_harness::{DispatchError, MessageId};
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -13,25 +12,63 @@ pub enum AppError {
     #[error(transparent)]
     Core(#[from] CoreError),
 
-    #[error(transparent)]
-    Dispatcher(#[from] DispatcherError),
+    /// The agent was busy and the caller requested fail-fast (workflow §7).
+    /// Not reachable on the compose-bar `Enqueue` path (which queues); kept for
+    /// the future workflow-step dispatch path.
+    #[error("agent is busy")]
+    AgentBusy,
+
+    /// `remove_queued_message` targeted an id that is no longer enqueued —
+    /// already dequeued/started, already removed, or never existed. The
+    /// frontend uses this to avoid fake-restoring composer text for a message
+    /// that is already running.
+    #[error("queued message {0} not found (already started or removed)")]
+    QueuedMessageNotFound(MessageId),
 
     /// Pre-dispatch harness check failed (e.g., binary not on PATH).
-    /// Distinct from `Dispatcher` because the call site is the adapter's
-    /// `probe()` method — not dispatcher business — and the frontend gates
-    /// behaviour on it (`check_claude_binary` banner) independently of any
-    /// dispatch attempt.
+    /// Distinct because the call site is the adapter's `probe()` method, and
+    /// the frontend gates behaviour on it (`check_claude_binary` banner)
+    /// independently of any dispatch attempt.
     #[error("harness probe failed: {0}")]
     Probe(DispatchError),
 
     #[error("no working directory has been initialised — call init_directory first")]
     NoDirectory,
 
+    /// Persisting the user-global workspace registry (`workspace.yaml`) failed.
+    /// The registry is convenience state (the cross-directory project list and
+    /// its cached snapshot), so callers treat this as best-effort and log
+    /// rather than abort — but `save` still surfaces it for the rare caller
+    /// that wants to react.
+    #[error("failed to persist workspace registry at {path}: {source}")]
+    WorkspacePersist {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error("no active project — call set_active_project first")]
     NoActiveProject,
 
     #[error("project {0} is not loaded")]
     ProjectNotLoaded(ProjectId),
+
+    /// The project's `instance.lock` is held by another Switchboard process.
+    /// Inter-process guard (M4.1): one Switchboard process per project. The
+    /// frontend surfaces this as "This project is already open in another
+    /// Switchboard window."
+    #[error("project {0} is already open in another Switchboard process")]
+    ProjectLocked(ProjectId),
+
+    /// Failed to open or `flock` a project's `instance.lock` for a reason
+    /// other than contention (e.g. the metadata directory is unwritable).
+    /// Distinct from `ProjectLocked`, which means "another process holds it."
+    #[error("failed to acquire instance lock for project {project_id}: {source}")]
+    ProjectLockIo {
+        project_id: ProjectId,
+        #[source]
+        source: std::io::Error,
+    },
 
     #[error("agent {0} not found in any loaded project")]
     AgentNotFound(AgentId),

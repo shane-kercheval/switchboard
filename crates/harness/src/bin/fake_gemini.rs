@@ -16,6 +16,9 @@
 //!   `// pgid_to:<path>` — write the child's own process-group id (decimal
 //!     ASCII, single line) to the given path before streaming. Tests use
 //!     this to assert the adapter put us in our own process group.
+//!   `// hang` — flush lines emitted so far, then sleep indefinitely (never
+//!     exit on our own), leaving the adapter's read parked so a cancellation
+//!     test can fire the token. Stays killable (dies on SIGTERM/SIGKILL).
 
 use std::io::{self, BufRead, Read, Write};
 use std::process;
@@ -76,6 +79,13 @@ fn main() {
                 let _ = path;
             }
             continue;
+        }
+
+        if line.trim() == "// hang" {
+            out.flush().ok();
+            loop {
+                std::thread::park();
+            }
         }
 
         if line.trim().is_empty() {

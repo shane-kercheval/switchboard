@@ -6,9 +6,9 @@
 //! adapter has. Keeping them in one module means a fix to (say) the UTF-8
 //! boundary handling in [`format_stderr_tail`] lands once, not once per
 //! adapter; and the `killpg`-vs-plain-`kill` distinction (load-bearing for
-//! Codex's two-process tree — see [`kill_subprocess_group`]) is implemented
+//! Codex's two-process tree) is implemented
 //! in a single place that any new harness adapter calls without having to
-//! re-derive the correct behavior.
+//! re-derive the correct behavior — see [`terminate_then_kill`].
 //!
 //! **What is NOT here.** `synthesize_truncation_turn_end` stays
 //! adapter-local — Claude and Codex construct different diagnostic messages
@@ -19,12 +19,20 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::io::AsyncBufReadExt;
 
 use crate::adapter::DispatchError;
 use crate::events::TurnId;
 use switchboard_core::AgentId;
+
+/// How long to wait for a process group to exit after SIGTERM before
+/// escalating to SIGKILL. A ceiling, not a fixed wait — a well-behaved
+/// harness exits on SIGTERM in milliseconds, so this is only paid by a
+/// SIGTERM-deaf (or slow-to-flush) process. Kept generous enough for Codex's
+/// Node-parent-plus-Rust-child tree to flush its session file.
+pub const TERMINATE_GRACE: Duration = Duration::from_secs(2);
 
 /// Maximum number of stderr lines retained in the per-dispatch tail buffer.
 /// Tail-only (FIFO drop of older lines) — we only need the last few lines
@@ -44,6 +52,53 @@ pub fn resolve_binary(path: &Path) -> Result<PathBuf, DispatchError> {
         return Ok(path.to_owned());
     }
     which::which(path).map_err(|_| DispatchError::BinaryNotFound)
+}
+
+/// Extract just the version number from a `--version` line, since CLIs pad it
+/// differently: `claude` prints `2.1.156 (Claude Code)`, `codex` prints
+/// `codex-cli 0.134.0`, others print a bare `0.44.0`. Returns the first
+/// whitespace-separated token that looks like a dotted version (optionally
+/// `v`-prefixed, which is stripped), or `None` if the line has none — callers
+/// then show "Installed" without a number rather than echoing the binary name.
+#[must_use]
+pub fn parse_cli_version(line: &str) -> Option<String> {
+    line.split_whitespace()
+        .map(|tok| tok.strip_prefix('v').unwrap_or(tok))
+        .find(|tok| {
+            let mut segments = tok.split('.');
+            let major_numeric = segments
+                .next()
+                .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()));
+            // Require at least `<digits>.<digit>…` so "codex-cli" (no dot) and
+            // "(Claude" are rejected but "2.1.156" / "0.44.0" match.
+            let minor_starts_numeric = segments
+                .next()
+                .is_some_and(|s| s.bytes().next().is_some_and(|b| b.is_ascii_digit()));
+            major_numeric && minor_starts_numeric
+        })
+        .map(str::to_owned)
+}
+
+/// Best-effort version string for a harness CLI: the first line of
+/// `<binary> --version`, trimmed. Returns `None` when the binary can't be
+/// resolved/invoked or reports nothing — the value is display-only, never
+/// load-bearing, so any failure collapses to "unknown" rather than an error.
+pub fn fetch_version(binary: &Path) -> Option<String> {
+    let resolved = resolve_binary(binary).ok()?;
+    let output = std::process::Command::new(&resolved)
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let line = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_owned();
+    (!line.is_empty()).then_some(line)
 }
 
 /// Drain a child's stderr stream into a bounded tail buffer.
@@ -112,50 +167,68 @@ pub fn format_stderr_tail(tail: &Mutex<VecDeque<String>>) -> String {
     }
 }
 
-/// Force-kill a harness subprocess and any descendants it spawned.
+/// Terminate a harness subprocess and **the whole process group** it leads:
+/// SIGTERM the group, give the parent up to [`TERMINATE_GRACE`] to flush and
+/// exit, then SIGKILL the group unconditionally to sweep any survivor. Reaps
+/// the direct child (so callers must not `wait()` again, or must tolerate an
+/// already-reaped result).
 ///
-/// **Why not just `child.kill()`.** `tokio::process::Child::kill` is
-/// `libc::kill(pid, SIGKILL)` — it signals only the spawned PID. For
-/// harnesses with a two-process tree (Codex's Node parent + Rust child),
-/// killing only the parent leaves the child holding the write end of
-/// stdout/stderr pipes; the adapter's stderr-drain task then blocks
-/// forever waiting on an EOF that never arrives. The fix is to signal the
-/// whole process group with `killpg`.
+/// **Why the group, not just the PID.** `tokio::process::Child::kill` signals
+/// only the spawned PID. For a two-process tree (Codex's Node parent + Rust
+/// child), killing only the parent leaves the child holding the write end of
+/// the stdout/stderr pipes; a drain task then blocks forever on an EOF that
+/// never arrives. `process_group(0)` at spawn (used by every adapter here)
+/// makes the spawned child its own process-group leader (`pgid == pid`), so
+/// passing its PID to `killpg` signals every process in the group.
 ///
-/// `process_group(0)` at spawn (used by all harness adapters in this
-/// crate) makes the spawned child its own process-group leader, so
-/// `pgid == pid`. Passing the child's PID to `killpg` causes the kernel
-/// to signal every process in that group.
+/// **Why the final SIGKILL is unconditional.** Waiting on the direct child
+/// only tells us the *parent* exited — not that the *group* is empty. A
+/// descendant that ignores SIGTERM and outlives the parent (still holding our
+/// pipes) would otherwise be missed, and the adapter's stderr drain would hang
+/// forever. So after the parent's grace window we always `killpg(SIGKILL)`:
+/// when the group already exited it's a harmless `ESRCH` no-op; when a survivor
+/// remains it's what actually tears it down. We do **not** `wait` the survivor
+/// — it's a grandchild, reparented to (and reaped by) init once the parent
+/// died; we only reap our direct child.
 ///
-/// `child.wait()` later in the producer still reaps the parent, so no
-/// zombie. Cleanly cross-platform: non-unix falls back to plain
-/// `child.kill()` (no process-group concept).
+/// **Why SIGTERM-first.** A graceful signal lets the harness flush and leave
+/// its session file in a resumable state — load-bearing for both cancellation
+/// (the user stopped a healthy turn) and the adapter error paths (a parse /
+/// stream-read error means *we* stopped reading, not that the harness is
+/// unhealthy; it may be mid-write to its session file). The grace is a ceiling
+/// for the parent: a process that exits promptly on SIGTERM adds no latency.
 ///
-/// **Adapters that don't use this**: not every harness needs force-kill on
-/// every error path. Claude Code is single-process and exits cleanly on
-/// stdin EOF; its parser-error and stdout-read-error paths break the
-/// producer loop without calling this helper, and stderr drains naturally
-/// when the child exits. Codex calls this helper on its synthesized
-/// failure paths because the two-process tree means natural shutdown
-/// isn't guaranteed.
-// `clippy::unused_async` fires on unix because that branch has no
-// `.await`; the non-unix branch does (`child.kill().await`). Keep the
-// function async so the signature is uniform across platforms.
-#[cfg_attr(unix, allow(clippy::unused_async))]
-pub async fn kill_subprocess_group(child: &mut tokio::process::Child) {
+/// Cross-platform: non-unix has no process-group concept, so it falls back to
+/// `child.kill()` (SIGKILL-equivalent).
+pub async fn terminate_then_kill(child: &mut tokio::process::Child) {
     #[cfg(unix)]
     {
-        if let Some(pid) = child.id() {
-            let _ = nix::sys::signal::killpg(
-                nix::unistd::Pid::from_raw(pid.cast_signed()),
-                nix::sys::signal::Signal::SIGKILL,
-            );
-        }
+        let Some(pid) = child.id() else {
+            // No PID → already exited/reaped; nothing to signal.
+            let _ = child.wait().await;
+            return;
+        };
+        let group = nix::unistd::Pid::from_raw(pid.cast_signed());
+        killpg_signal(group, nix::sys::signal::Signal::SIGTERM);
+        // Give the parent the grace window to flush + exit on SIGTERM. We
+        // ignore the result: whether it exited or timed out, the unconditional
+        // group SIGKILL below is what guarantees teardown (see doc).
+        let _ = tokio::time::timeout(TERMINATE_GRACE, child.wait()).await;
+        killpg_signal(group, nix::sys::signal::Signal::SIGKILL);
+        let _ = child.wait().await;
     }
     #[cfg(not(unix))]
     {
         let _ = child.kill().await;
     }
+}
+
+/// Signal a process group, ignoring `ESRCH` ("no such process" — the group
+/// already exited between the caller's check and this signal, which is a
+/// no-op success, not a failure).
+#[cfg(unix)]
+fn killpg_signal(pgid: nix::unistd::Pid, signal: nix::sys::signal::Signal) {
+    let _ = nix::sys::signal::killpg(pgid, signal);
 }
 
 #[cfg(test)]
@@ -221,5 +294,49 @@ mod tests {
             resolve_binary(path),
             Err(DispatchError::BinaryNotFound)
         ));
+    }
+
+    #[test]
+    fn fetch_version_returns_first_line_for_present_binary() {
+        // `cargo` is guaranteed present wherever `cargo test` runs and
+        // supports `--version`; it stands in for a harness CLI to prove the
+        // first-line extraction without depending on a real harness install.
+        let version = fetch_version(std::path::Path::new("cargo"))
+            .expect("cargo --version should report a line");
+        assert!(
+            version.contains("cargo"),
+            "unexpected version line: {version}"
+        );
+        assert!(!version.contains('\n'), "should be a single trimmed line");
+    }
+
+    #[test]
+    fn fetch_version_none_for_missing_binary() {
+        assert_eq!(
+            fetch_version(std::path::Path::new("definitely-not-a-real-binary-xyz123")),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_cli_version_extracts_number_from_real_formats() {
+        // Captured live: each harness pads its --version differently.
+        assert_eq!(
+            parse_cli_version("2.1.156 (Claude Code)").as_deref(),
+            Some("2.1.156")
+        );
+        assert_eq!(
+            parse_cli_version("codex-cli 0.134.0").as_deref(),
+            Some("0.134.0")
+        );
+        assert_eq!(parse_cli_version("0.44.0").as_deref(), Some("0.44.0"));
+        assert_eq!(parse_cli_version("1.0.3").as_deref(), Some("1.0.3"));
+    }
+
+    #[test]
+    fn parse_cli_version_strips_leading_v_and_handles_no_version() {
+        assert_eq!(parse_cli_version("v1.2.3").as_deref(), Some("1.2.3"));
+        assert_eq!(parse_cli_version(""), None);
+        assert_eq!(parse_cli_version("no version here"), None);
     }
 }

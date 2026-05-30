@@ -4,6 +4,21 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Switchboard</title>
+    <!-- Pre-paint theme bootstrap: set the `.dark` class before any CSS paints
+         so dark-mode users don't see a light flash on cold start. Mirrors the
+         resolution in src/lib/theme.svelte.ts (which takes over as the live
+         controller after mount); the small duplication is the conventional
+         cost of running before the app module loads. Keep "switchboard-theme"
+         in sync with STORAGE_KEY. -->
+    <script>
+      try {
+        var m = localStorage.getItem("switchboard-theme");
+        var dark =
+          m === "dark" ||
+          ((m === "system" || !m) && matchMedia("(prefers-color-scheme: dark)").matches);
+        if (dark) document.documentElement.classList.add("dark");
+      } catch (e) {}
+    </script>
   </head>
   <body>
     <div id="app"></div>

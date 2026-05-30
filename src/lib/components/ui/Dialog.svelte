@@ -16,6 +16,8 @@
   /// happens; today the single composite is enough.
   import type { Snippet } from "svelte";
   import { Dialog as BitsDialog } from "bits-ui";
+  import { cn } from "$lib/utils";
+  import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
 
   type Props = {
     /// Two-way bound open state — caller controls the modal's visibility.
@@ -30,9 +32,22 @@
     /// Optional override for the content max-width. Defaults to `max-w-md`
     /// which matches the standalone CreateAgentForm layout.
     contentClass?: string;
+    /// When false, the modal can't be dismissed (escape, click-outside, or the
+    /// header ✕ are all suppressed). Used to keep a modal up while an
+    /// irreversible action it kicked off is mid-flight — e.g. the New Project
+    /// dialog during agent auto-seeding, so the user can't navigate away into a
+    /// partially-created project. Defaults to true (normal dismissible modal).
+    dismissible?: boolean;
   };
 
-  let { open = $bindable(), title, children, onClose, contentClass }: Props = $props();
+  let {
+    open = $bindable(),
+    title,
+    children,
+    onClose,
+    contentClass,
+    dismissible = true,
+  }: Props = $props();
 
   function handleOpenChange(next: boolean): void {
     open = next;
@@ -45,17 +60,43 @@
     <BitsDialog.Overlay class="fixed inset-0 z-40 bg-black/40" data-testid="dialog-overlay" />
     <BitsDialog.Content
       class={[
-        "fixed top-1/2 left-1/2 z-50 w-full -translate-x-1/2 -translate-y-1/2 rounded-md border border-neutral-200 bg-white shadow-lg",
+        "border-border/90 bg-raised fixed top-1/2 left-1/2 z-50 w-[calc(100vw-2rem)] -translate-x-1/2 -translate-y-1/2 rounded-lg border shadow-[0_18px_60px_rgba(0,0,0,0.22)]",
         contentClass ?? "max-w-md",
       ].join(" ")}
       data-testid="dialog-content"
+      onEscapeKeydown={(e) => {
+        if (!dismissible) e.preventDefault();
+      }}
+      onInteractOutside={(e) => {
+        if (!dismissible) e.preventDefault();
+      }}
     >
-      <BitsDialog.Title
-        class="border-b border-neutral-200 px-4 py-3 text-sm font-semibold text-neutral-900"
-        data-testid="dialog-title"
-      >
-        {title}
-      </BitsDialog.Title>
+      <div class="border-border/80 flex items-center justify-between gap-3 border-b px-4 py-3">
+        <BitsDialog.Title class="text-fg text-sm font-semibold" data-testid="dialog-title">
+          {title}
+        </BitsDialog.Title>
+        {#if dismissible}
+          <BitsDialog.Close
+            class={cn(ICON_BUTTON_CLASS, "hover:bg-panel")}
+            aria-label="Close dialog"
+            data-testid="dialog-close"
+          >
+            <svg
+              width="16"
+              height="16"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M18 6 6 18M6 6l12 12" />
+            </svg>
+          </BitsDialog.Close>
+        {/if}
+      </div>
       <div class="p-4">
         {@render children()}
       </div>

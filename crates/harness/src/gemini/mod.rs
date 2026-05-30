@@ -30,7 +30,7 @@
 //!   tools even on success; the real content lives in the session file.
 //!   The adapter still emits a `ToolCompleted` event (lifecycle is the
 //!   live contract); transcript hydration on project reopen fills in the
-//!   real output. See `docs/research/gemini-cli-observed.md` §"`read_file`
+//!   real output. See `docs/research/archive/gemini-cli-observed.md` §"`read_file`
 //!   stream gap" for the architectural rationale.
 //! - **Lazy `harness_version` fetch.** The constructor stays cheap and
 //!   non-failing (matches Claude / Codex). `gemini --version` is invoked
@@ -61,11 +61,15 @@ use chrono::Utc;
 use switchboard_core::{AgentId, AgentRecord};
 use tokio::io::AsyncBufReadExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_util::sync::CancellationToken;
 
 use crate::adapter::{DispatchError, EventStream, HarnessAdapter};
 use crate::events::{AdapterEvent, FailureKind, TurnId, TurnOutcome};
 
-use parser::{GeminiParserState, is_gemini_auth_failure_message, parse_line};
+use parser::{
+    GEMINI_AUTH_MESSAGE, GeminiParserState, is_gemini_auth_failure_message,
+    is_gemini_logged_out_message, parse_line,
+};
 
 /// Stderr lines emitted by Gemini that carry no diagnostic value. The
 /// exit-42 handler filters them before classifying the remaining lines.
@@ -118,7 +122,9 @@ impl GeminiAdapter {
     /// downstream consumers (the field is display-only).
     fn resolve_version(&self) -> String {
         self.cached_version
-            .get_or_init(|| fetch_version(&self.gemini_binary_path))
+            .get_or_init(|| {
+                crate::subprocess::fetch_version(&self.gemini_binary_path).unwrap_or_default()
+            })
             .clone()
     }
 }
@@ -137,13 +143,17 @@ impl HarnessAdapter for GeminiAdapter {
             .map_err(|_| DispatchError::BinaryNotFound)
     }
 
+    fn version(&self) -> Option<String> {
+        crate::subprocess::parse_cli_version(&self.resolve_version())
+    }
+
     async fn dispatch(
         &self,
         agent: &AgentRecord,
         cwd: &Path,
         prompt: &str,
         turn_id: TurnId,
-        _options: crate::DispatchOptions,
+        options: crate::DispatchOptions,
     ) -> Result<EventStream, DispatchError> {
         if prompt.trim().is_empty() {
             return Err(DispatchError::InvalidPrompt(
@@ -169,6 +179,8 @@ impl HarnessAdapter for GeminiAdapter {
             .current_dir(cwd)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            // Null stdin: we never write to it, and an open stdin can stall a
+            // harness on an interactive read or a pipe-full deadlock.
             .stdin(Stdio::null())
             .kill_on_drop(true);
         #[cfg(unix)]
@@ -197,6 +209,7 @@ impl HarnessAdapter for GeminiAdapter {
             harness_version,
             mcp_servers,
             skills_list,
+            options.cancel_token,
         ));
 
         Ok(Box::pin(UnboundedReceiverStream::new(rx)))
@@ -210,24 +223,6 @@ fn resolve_home_dir(override_path: Option<&Path>) -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_default()
-}
-
-fn fetch_version(binary: &Path) -> String {
-    let Ok(resolved) = crate::subprocess::resolve_binary(binary) else {
-        return String::new();
-    };
-    let output = std::process::Command::new(&resolved)
-        .arg("--version")
-        .output();
-    match output {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_owned(),
-        _ => String::new(),
-    }
 }
 
 /// Build the `gemini` invocation. Order matches the captured fixture shape
@@ -266,6 +261,7 @@ async fn run_producer(
     harness_version: String,
     mcp_servers: Vec<crate::events::McpServerStatus>,
     skills_list: Vec<String>,
+    cancel_token: CancellationToken,
 ) {
     let stderr_tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::with_capacity(
         crate::subprocess::STDERR_TAIL_CAPACITY,
@@ -280,11 +276,16 @@ async fn run_producer(
 
     let mut terminal_seen = false;
     let mut terminal_was_completed = false;
+    // Set when cancellation fires: kill the group and end the stream with NO
+    // terminal event (the dispatcher synthesizes `Cancelled`). Distinct from
+    // `force_kill_child`, which is an error path that still emits a `Failed`
+    // terminal.
+    let mut cancelled = false;
     let mut state = GeminiParserState::default();
     // Set on any error path that ends the producer loop with the subprocess
     // still potentially running. Mirrors Codex's pattern; load-bearing for
     // Gemini specifically because Gemini ignores bare-PID SIGTERM and
-    // requires process-group signaling (see docs/research/gemini-cli-observed.md,
+    // requires process-group signaling (see docs/research/archive/gemini-cli-observed.md,
     // "SIGTERM behaviour" findings). Without the explicit kill, a Gemini
     // process that keeps writing after we stop draining stdout would block
     // on a full pipe and `child.wait()` would hang indefinitely, delaying
@@ -294,7 +295,16 @@ async fn run_producer(
     let mut lines = tokio::io::BufReader::new(stdout).lines();
 
     loop {
-        match lines.next_line().await {
+        // `select!` over the read AND the cancellation token so a parked read
+        // (Gemini buffering its whole response) still notices a cancel.
+        let line = tokio::select! {
+            line = lines.next_line() => line,
+            () = cancel_token.cancelled() => {
+                cancelled = true;
+                break;
+            }
+        };
+        match line {
             Ok(Some(line)) => {
                 let outcome = parse_line(&line, turn_id, agent_id, &mut state);
                 let events = match outcome {
@@ -372,8 +382,17 @@ async fn run_producer(
         }
     }
 
+    if cancelled {
+        // Cancellation path: kill the group and end the stream with NO
+        // terminal event (the dispatcher synthesizes `Cancelled`). Kill before
+        // awaiting the stderr drain — a parked subprocess holds stderr open.
+        crate::subprocess::terminate_then_kill(&mut child).await;
+        let _ = stderr_task.await;
+        return;
+    }
+
     if force_kill_child {
-        crate::subprocess::kill_subprocess_group(&mut child).await;
+        crate::subprocess::terminate_then_kill(&mut child).await;
     }
 
     let _ = stderr_task.await;
@@ -433,34 +452,59 @@ fn inject_session_meta_fields(
 }
 
 /// Synthesize the terminal `TurnEnd(Failed)` event for the no-terminal-seen
-/// EOF case. Exit 42 with a recognizable stderr line → `AuthFailure` if
-/// the message matches the shared auth-substring set, else `AdapterFailure`
-/// (exit-42 is input rejection — not the model's fault, so `HarnessError`
-/// would be wrong). Everything else falls through to `AdapterFailure` with
-/// the stderr tail attached.
+/// EOF case. Two recognized auth shapes both yield the same authored
+/// `AuthFailure` message:
+///
+/// - **Exit 42 + `401 Unauthorized` (or similar) on stderr** — expired-token /
+///   bad-credential mid-call. Still unobserved live on Gemini but kept for
+///   coverage; the auth-substring set is loose.
+/// - **Exit 41 + `Please set an Auth method` on stderr** — clean-logout shape
+///   captured 2026-05-27. Without this, the turn falls through to
+///   `AdapterFailure` ("gemini exited without terminal result event") which
+///   buries the actual reason.
+///
+/// A non-auth exit-42 (e.g. invalid session id) stays `AdapterFailure` with
+/// the raw stderr — exit-42 means input rejection, not a model fault, so
+/// `HarnessError` would be wrong. Everything else falls through to a generic
+/// `AdapterFailure` with the stderr tail attached.
 fn synthesize_terminal_failure(
     turn_id: TurnId,
     stderr_tail: &Mutex<VecDeque<String>>,
     exit_code: Option<i32>,
 ) -> AdapterEvent {
-    if exit_code == Some(42) {
-        let actionable = extract_actionable_stderr(stderr_tail);
-        if !actionable.is_empty() {
-            let kind = if is_gemini_auth_failure_message(&actionable) {
-                FailureKind::AuthFailure
-            } else {
-                FailureKind::AdapterFailure
-            };
-            return AdapterEvent::TurnEnd {
-                turn_id,
-                outcome: TurnOutcome::Failed {
-                    kind,
-                    message: actionable,
-                },
-                ended_at: Utc::now(),
-                usage: None,
-            };
-        }
+    let actionable = extract_actionable_stderr(stderr_tail);
+    // Auth detection is gated per exit code: exit 42 is Gemini's input-rejection
+    // exit (the 401-on-stderr bad-token shape lives here); exit 41 is the
+    // clean-logout exit. Any other non-zero exit with an "authentication" word
+    // in stderr stays AdapterFailure with the raw text — without this gate, a
+    // crash that mentions auth in diagnostic text would falsely surface as
+    // "Gemini authentication required" and bury the real cause.
+    let auth_detected = match exit_code {
+        Some(42) => is_gemini_auth_failure_message(&actionable),
+        Some(41) => is_gemini_logged_out_message(&actionable),
+        _ => false,
+    };
+    if !actionable.is_empty() && auth_detected {
+        return AdapterEvent::TurnEnd {
+            turn_id,
+            outcome: TurnOutcome::Failed {
+                kind: FailureKind::AuthFailure,
+                message: GEMINI_AUTH_MESSAGE.to_owned(),
+            },
+            ended_at: Utc::now(),
+            usage: None,
+        };
+    }
+    if exit_code == Some(42) && !actionable.is_empty() {
+        return AdapterEvent::TurnEnd {
+            turn_id,
+            outcome: TurnOutcome::Failed {
+                kind: FailureKind::AdapterFailure,
+                message: actionable,
+            },
+            ended_at: Utc::now(),
+            usage: None,
+        };
     }
     let tail = crate::subprocess::format_stderr_tail(stderr_tail);
     let message = if tail.is_empty() {
@@ -642,10 +686,102 @@ mod tests {
         let event = synthesize_terminal_failure(Uuid::now_v7(), &tail, Some(42));
         match event {
             AdapterEvent::TurnEnd { outcome, .. } => {
-                let TurnOutcome::Failed { kind, .. } = outcome else {
+                let TurnOutcome::Failed { kind, message } = outcome else {
                     panic!("expected Failed");
                 };
                 assert_eq!(kind, FailureKind::AuthFailure);
+                // Authored message — not the raw "401 Unauthorized" line.
+                assert_eq!(message, GEMINI_AUTH_MESSAGE);
+                assert!(!message.contains("reload Switchboard"));
+            }
+            other => panic!("expected TurnEnd, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn synthesize_terminal_failure_classifies_exit41_logged_out_as_auth_failure() {
+        // Clean-logout shape captured 2026-05-27: exit 41 + "Please set an
+        // Auth method" on stderr. Without recognition this would land in
+        // AdapterFailure and bury the real cause.
+        let tail = tail_with(&[
+            "Please set an Auth method in your settings, then try again. Try running `gemini --help`",
+        ]);
+        let event = synthesize_terminal_failure(Uuid::now_v7(), &tail, Some(41));
+        match event {
+            AdapterEvent::TurnEnd { outcome, .. } => {
+                let TurnOutcome::Failed { kind, message } = outcome else {
+                    panic!("expected Failed");
+                };
+                assert_eq!(kind, FailureKind::AuthFailure);
+                assert_eq!(message, GEMINI_AUTH_MESSAGE);
+            }
+            other => panic!("expected TurnEnd, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn synthesize_terminal_failure_unrelated_exit_is_adapter_failure_with_tail() {
+        // An unrelated non-zero exit (e.g. 5) must not be misclassified as
+        // auth just because exit 41/42 has special-cases.
+        let tail = tail_with(&["something else went wrong"]);
+        let event = synthesize_terminal_failure(Uuid::now_v7(), &tail, Some(5));
+        match event {
+            AdapterEvent::TurnEnd { outcome, .. } => {
+                let TurnOutcome::Failed { kind, message } = outcome else {
+                    panic!("expected Failed");
+                };
+                assert_eq!(kind, FailureKind::AdapterFailure);
+                assert!(message.contains("something else"));
+            }
+            other => panic!("expected TurnEnd, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn synthesize_terminal_failure_unrelated_exit_with_auth_word_in_stderr_stays_adapter_failure() {
+        // Regression guard: the auth-substring check ("authentication" etc.)
+        // is broad enough that an unrelated crash whose stderr mentions
+        // authentication in diagnostic text used to be misclassified as
+        // AuthFailure once the exit-code gate was relaxed. Exit code MUST
+        // gate auth detection — exit 5 with "authentication" in stderr stays
+        // AdapterFailure with the raw text preserved.
+        let tail = tail_with(&["Error during authentication retry handshake"]);
+        let event = synthesize_terminal_failure(Uuid::now_v7(), &tail, Some(5));
+        match event {
+            AdapterEvent::TurnEnd { outcome, .. } => {
+                let TurnOutcome::Failed { kind, message } = outcome else {
+                    panic!("expected Failed");
+                };
+                assert_eq!(kind, FailureKind::AdapterFailure);
+                assert!(
+                    message.contains("authentication retry"),
+                    "raw stderr must surface, not authored auth copy: {message}"
+                );
+                assert!(
+                    !message.contains("Gemini authentication required"),
+                    "unrelated exit must not yield authored auth message: {message}"
+                );
+            }
+            other => panic!("expected TurnEnd, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn synthesize_terminal_failure_exit0_with_auth_word_in_stderr_stays_adapter_failure() {
+        // Same guard as above for exit 0 (Gemini exits 0 on SIGTERM among
+        // other things — auth detection must not leak into those paths).
+        let tail = tail_with(&["[INFO] authentication subsystem ready"]);
+        let event = synthesize_terminal_failure(Uuid::now_v7(), &tail, Some(0));
+        match event {
+            AdapterEvent::TurnEnd { outcome, .. } => {
+                let TurnOutcome::Failed { kind, message } = outcome else {
+                    panic!("expected Failed");
+                };
+                assert_eq!(kind, FailureKind::AdapterFailure);
+                assert!(
+                    !message.contains("Gemini authentication required"),
+                    "exit 0 must not yield authored auth message: {message}"
+                );
             }
             other => panic!("expected TurnEnd, got {other:?}"),
         }

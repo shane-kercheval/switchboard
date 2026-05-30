@@ -4,9 +4,13 @@
 //! is the Tauri wiring layer.
 
 mod commands;
+mod dispatch_context;
 mod emitter;
 mod error;
+mod journal;
+mod metadata;
 mod state;
+mod workspace;
 
 use std::sync::Arc;
 
@@ -17,12 +21,18 @@ use switchboard_harness::{
 };
 use tauri::{Emitter, Manager, State};
 
+use crate::commands::ProjectConversation;
 use crate::commands::{
-    DirectoryInfo, attach_agent_impl, check_antigravity_auth_impl, check_antigravity_binary_impl,
-    check_claude_binary_impl, check_codex_auth_impl, check_codex_binary_impl,
-    check_gemini_auth_impl, check_gemini_binary_impl, create_agent_impl, create_project_impl,
-    init_directory_impl, list_agents_impl, list_projects_impl, load_transcript_impl,
-    open_project_impl, parse_uuid, pick_directory_impl, send_message_impl, set_active_project_impl,
+    AgentSessionInfo, DirectoryInfo, HarnessInstallStatus, ProjectListing, WorkspaceDirectories,
+    agent_session_info_impl, attach_agent_impl, cancel_agent_impl, cancel_send_impl,
+    cancel_turn_impl, check_antigravity_auth_impl, check_antigravity_binary_impl,
+    check_claude_auth_impl, check_claude_binary_impl, check_codex_auth_impl,
+    check_codex_binary_impl, check_gemini_auth_impl, check_gemini_binary_impl, create_agent_impl,
+    create_project_impl, get_harness_install_status_impl, init_directory_impl, list_agents_impl,
+    list_projects_impl, list_workspace_directories_impl, load_project_conversation_impl,
+    load_transcript_impl, open_project_impl, parse_uuid, pick_directory_impl, remove_agent_impl,
+    remove_directory_impl, remove_queued_message_impl, rename_agent_impl, send_message_impl,
+    set_active_project_impl, validate_external_url,
 };
 use crate::state::AppState;
 
@@ -72,6 +82,20 @@ async fn check_antigravity_auth() -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn check_claude_auth() -> Result<(), String> {
+    // No `$HOME` forwarding: Claude's auth lives in the macOS Keychain.
+    check_claude_auth_impl().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_harness_install_status(
+    state: State<'_, AppState>,
+    harness: HarnessKind,
+) -> Result<HarnessInstallStatus, String> {
+    Ok(get_harness_install_status_impl(state.inner(), harness))
+}
+
+#[tauri::command]
 async fn pick_directory(path: String) -> Result<DirectoryInfo, String> {
     pick_directory_impl(&path).await.map_err(|e| e.to_string())
 }
@@ -84,16 +108,31 @@ async fn init_directory(state: State<'_, AppState>, path: String) -> Result<Dire
 }
 
 #[tauri::command]
-async fn list_projects(state: State<'_, AppState>) -> Result<Vec<ProjectSummary>, String> {
+async fn remove_directory(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    remove_directory_impl(state.inner(), &path)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn list_projects(state: State<'_, AppState>) -> Result<Vec<ProjectListing>, String> {
     list_projects_impl(state.inner()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn list_workspace_directories(
+    state: State<'_, AppState>,
+) -> Result<WorkspaceDirectories, String> {
+    Ok(list_workspace_directories_impl(state.inner()))
 }
 
 #[tauri::command]
 async fn create_project(
     state: State<'_, AppState>,
     name: String,
+    directory: String,
 ) -> Result<ProjectSummary, String> {
-    create_project_impl(state.inner(), &name).map_err(|e| e.to_string())
+    create_project_impl(state.inner(), &name, &directory).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -118,6 +157,24 @@ async fn create_agent(
     harness: HarnessKind,
 ) -> Result<AgentRecord, String> {
     create_agent_impl(state.inner(), &name, harness).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn remove_agent(state: State<'_, AppState>, agent_id: String) -> Result<(), String> {
+    let id = parse_uuid(&agent_id).map_err(|e| e.to_string())?;
+    remove_agent_impl(state.inner(), id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn rename_agent(
+    state: State<'_, AppState>,
+    agent_id: String,
+    new_name: String,
+) -> Result<AgentRecord, String> {
+    let id = parse_uuid(&agent_id).map_err(|e| e.to_string())?;
+    rename_agent_impl(state.inner(), id, &new_name).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -151,16 +208,88 @@ async fn send_message(
     state: State<'_, AppState>,
     agent_id: String,
     prompt: String,
+    send_id: String,
 ) -> Result<String, String> {
     let id = parse_uuid(&agent_id).map_err(|e| e.to_string())?;
-    // Returns as soon as TurnStart has been emitted; the JoinHandle drops
-    // here and the drain task detaches, continuing in the background. The
-    // load-bearing ordering invariant (TurnId returned synchronously,
-    // TurnStart already on the wire) is preserved.
-    let handle = send_message_impl(state.inner(), id, &prompt)
+    // The frontend mints one `send_id` per Send and passes it on every
+    // per-recipient call, so a fan-out's turns share it (hydration groups the
+    // user's message once).
+    let sid = parse_uuid(&send_id).map_err(|e| e.to_string())?;
+    // Returns the minted `message_id` immediately (the send is accepted, not
+    // necessarily started). The turn's `turn_id` and lifecycle flow over the
+    // per-agent event channel; the correlated `TurnStart` carries this
+    // `message_id`, and a pre-`TurnStart` failure surfaces as `MessageFailed`.
+    let message_id = send_message_impl(state.inner(), id, &prompt, sid)
         .await
         .map_err(|e| e.to_string())?;
-    Ok(handle.turn_id.to_string())
+    Ok(message_id.to_string())
+}
+
+#[tauri::command]
+async fn remove_queued_message(
+    state: State<'_, AppState>,
+    agent_id: String,
+    message_id: String,
+) -> Result<RemovedQueued, String> {
+    let aid = parse_uuid(&agent_id).map_err(|e| e.to_string())?;
+    let mid = parse_uuid(&message_id).map_err(|e| e.to_string())?;
+    let removed = remove_queued_message_impl(state.inner(), aid, mid)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(RemovedQueued {
+        agent_id: removed.agent_id.to_string(),
+        send_id: removed.send_id.to_string(),
+        prompt: removed.prompt,
+    })
+}
+
+/// Wire result of `remove_queued_message` — the removed message's payload, so
+/// the compose bar can restore the text the user had queued.
+#[derive(serde::Serialize)]
+struct RemovedQueued {
+    agent_id: String,
+    send_id: String,
+    prompt: String,
+}
+
+#[tauri::command]
+async fn cancel_turn(state: State<'_, AppState>, agent_id: String) -> Result<(), String> {
+    let id = parse_uuid(&agent_id).map_err(|e| e.to_string())?;
+    // Idempotent stop — the dispatcher no-ops if there's nothing to cancel.
+    // The synthesized `Cancelled` terminal + return-to-idle flow back to the
+    // frontend over the per-agent event channel, so the command just acks.
+    cancel_turn_impl(state.inner(), id);
+    Ok(())
+}
+
+#[tauri::command]
+async fn cancel_agent(state: State<'_, AppState>, agent_id: String) -> Result<(), String> {
+    let id = parse_uuid(&agent_id).map_err(|e| e.to_string())?;
+    // Idempotent "stop agent": cancels the in-flight turn + clears the backlog.
+    // The synthesized `Cancelled` terminal flows back over the event channel and
+    // the dropped queued items are resolved by the frontend's optimistic
+    // cleanup, so the command just acks.
+    cancel_agent_impl(state.inner(), id);
+    Ok(())
+}
+
+#[tauri::command]
+async fn cancel_send(
+    state: State<'_, AppState>,
+    send_id: String,
+    recipients: Vec<String>,
+) -> Result<(), String> {
+    let sid = parse_uuid(&send_id).map_err(|e| e.to_string())?;
+    let agent_ids = recipients
+        .iter()
+        .map(|r| parse_uuid(r))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    // Send-scoped, idempotent stop — each recipient's actor decides whether its
+    // current turn belongs to this send; the synthesized `Cancelled` terminals
+    // flow back over the per-agent event channels, so the command just acks.
+    cancel_send_impl(state.inner(), sid, &agent_ids);
+    Ok(())
 }
 
 #[tauri::command]
@@ -173,6 +302,73 @@ async fn load_transcript(
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
     load_transcript_impl(state.inner(), id, &home).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn agent_session_info(
+    state: State<'_, AppState>,
+    agent_id: String,
+) -> Result<AgentSessionInfo, String> {
+    let id = parse_uuid(&agent_id).map_err(|e| e.to_string())?;
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    agent_session_info_impl(state.inner(), id, &home).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn open_session_file(state: State<'_, AppState>, agent_id: String) -> Result<(), String> {
+    let id = parse_uuid(&agent_id).map_err(|e| e.to_string())?;
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    let info = agent_session_info_impl(state.inner(), id, &home).map_err(|e| e.to_string())?;
+    let Some(path) = info.session_file else {
+        return Err("this agent has no session file yet".to_owned());
+    };
+    // `.jsonl` has no default macOS app handler, so a plain open fails
+    // (kLSApplicationNotFoundErr). `open -t` forces the default *text* editor.
+    // macOS-specific, which is fine — Switchboard is macOS-only in v1.
+    let status = tokio::process::Command::new("open")
+        .arg("-t")
+        .arg(&path)
+        .status()
+        .await
+        .map_err(|e| e.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("`open -t` failed for {path} (exit {status})"))
+    }
+}
+
+#[tauri::command]
+async fn open_external_url(url: String) -> Result<(), String> {
+    validate_external_url(&url)?;
+    let status = tokio::process::Command::new("open")
+        .arg(&url)
+        .status()
+        .await
+        .map_err(|e| e.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("`open` failed for {url} (exit {status})"))
+    }
+}
+
+#[tauri::command]
+async fn load_project_conversation(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<ProjectConversation, String> {
+    let id = parse_uuid(&project_id).map_err(|e| e.to_string())?;
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    load_project_conversation_impl(state.inner(), id, &home)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Bridges the dispatcher's `EventEmitter` abstraction onto Tauri's
@@ -247,18 +443,49 @@ pub fn run() {
     let (claude_adapter, codex_adapter, gemini_adapter, antigravity_adapter) = build_adapters();
 
     tauri::Builder::default()
+        // Must be the first plugin registered. A second launch of the app
+        // hands its argv/cwd to the already-running instance via this callback
+        // (instead of starting a rival process); we surface the existing window
+        // rather than spawn a duplicate. Single-instance keeps one
+        // `workspace.yaml` writer, so there is no cross-process clobber.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .setup(move |app| {
             let emitter: Arc<dyn EventEmitter> = Arc::new(AppHandleEmitter {
                 app: app.handle().clone(),
             });
-            app.manage(AppState::new(
+            let state = AppState::new(
                 Arc::clone(&claude_adapter),
                 Arc::clone(&codex_adapter),
                 Arc::clone(&gemini_adapter),
                 Arc::clone(&antigravity_adapter),
                 emitter,
-            ));
+            );
+            // Resolve the user-global `workspace.yaml` location. If no home
+            // directory is resolvable (exotic host), skip workspace persistence
+            // entirely — the registry stays empty and `persist_workspace` is a
+            // no-op, which is safe since the registry is convenience state.
+            let state = if let Some(dirs) = directories::ProjectDirs::from("", "", "switchboard") {
+                let path = dirs.config_dir().join("workspace.yaml");
+                state.with_workspace(path)
+            } else {
+                tracing::warn!(
+                    "no home directory resolved — workspace registry persistence disabled"
+                );
+                state
+            };
+            // Cold start: open a `Directory` handle for every workspace entry so
+            // restored directories report `available: true` and participate in
+            // the cross-harness session-id collision scan. Unopenable
+            // directories (unmounted/moved) are skipped and stay unavailable.
+            crate::state::eager_load_directories(&state);
+            app.manage(state);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -269,17 +496,31 @@ pub fn run() {
             check_gemini_auth,
             check_antigravity_binary,
             check_antigravity_auth,
+            check_claude_auth,
+            get_harness_install_status,
             pick_directory,
             init_directory,
+            remove_directory,
             list_projects,
+            list_workspace_directories,
             create_project,
             open_project,
             set_active_project,
             create_agent,
+            remove_agent,
+            rename_agent,
             attach_agent,
             list_agents,
             send_message,
+            remove_queued_message,
+            cancel_turn,
+            cancel_agent,
+            cancel_send,
+            agent_session_info,
+            open_session_file,
+            open_external_url,
             load_transcript,
+            load_project_conversation,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

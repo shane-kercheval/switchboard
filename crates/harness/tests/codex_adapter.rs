@@ -12,6 +12,13 @@ use switchboard_harness::{
 };
 use uuid::Uuid;
 
+#[cfg(unix)]
+use nix::unistd::{Pid, getpgid};
+#[cfg(unix)]
+use std::time::Duration;
+#[cfg(unix)]
+use tokio_util::sync::CancellationToken;
+
 const FAKE_CODEX: &str = env!("CARGO_BIN_EXE_fake_codex");
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/codex");
 
@@ -182,7 +189,12 @@ async fn auth_failure_fixture_yields_auth_failure_terminal() {
             ..
         } => {
             assert_eq!(*kind, FailureKind::AuthFailure);
-            assert!(message.contains("401 Unauthorized"));
+            // Authored Codex auth message — raw "401 Unauthorized" replaced
+            // with uniform actionable text. End-to-end through the adapter
+            // (not just the parser).
+            assert!(message.contains("Codex authentication required"));
+            assert!(message.contains("codex login"));
+            assert!(!message.contains("reload Switchboard"));
         }
         other => panic!("expected TurnEnd(AuthFailure), got {other:?}"),
     }
@@ -986,6 +998,7 @@ async fn attach_flow_first_dispatch_forces_session_meta_despite_sidecar_present(
 
     let options = DispatchOptions {
         is_first_dispatch_after_attach: true,
+        ..Default::default()
     };
     let events = dispatch_with_home_and_options(
         &agent,
@@ -1149,4 +1162,139 @@ command = "p"
         session_meta.iter().all(|s| s.status == "configured"),
         "all entries report status='configured'"
     );
+}
+
+/// Poll until `path` holds a parseable pgid; bounded so a spawn failure panics.
+#[cfg(unix)]
+async fn wait_for_pgid(path: &Path) -> Pid {
+    for _ in 0..200 {
+        if let Ok(s) = std::fs::read_to_string(path)
+            && let Ok(n) = s.trim().parse::<i32>()
+        {
+            return Pid::from_raw(n);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("fake_codex never wrote its pgid at {}", path.display());
+}
+
+/// Poll until the process group's leader is gone (`getpgid` → `ESRCH`).
+#[cfg(unix)]
+async fn assert_group_reaped(leader: Pid) {
+    for _ in 0..200 {
+        if getpgid(Some(leader)).is_err() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("process group {leader} still alive after cancel");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancel_kills_whole_group_and_emits_no_terminal() {
+    // Codex is the load-bearing cancel case: it exits 0 on SIGTERM, emits no
+    // terminal event, and runs a two-process tree. The fixture spawns a child
+    // that holds the stderr pipe open, then `// hang`s. On cancel the adapter
+    // must `killpg` the WHOLE group (not just the parent) — otherwise the
+    // spawned child keeps stderr open and the stderr-drain `.await` hangs,
+    // tripping this test's timeout. And the adapter must emit no terminal
+    // (the dispatcher synthesizes `Cancelled`).
+    let cwd = tempfile::TempDir::new().unwrap();
+    let home = tempfile::TempDir::new().unwrap();
+    let pgid_path = cwd.path().join("child.pgid");
+    let fixture_path = cwd.path().join("cancel-fixture.jsonl");
+    let body = format!(
+        "// pgid_to:{}\n// spawn_child_holding_stderr\n// hang\n",
+        pgid_path.display()
+    );
+    std::fs::write(&fixture_path, body).unwrap();
+
+    let adapter = CodexAdapter::with_binary_and_home(FAKE_CODEX, home.path());
+    let token = CancellationToken::new();
+    let options = DispatchOptions {
+        cancel_token: token.clone(),
+        ..Default::default()
+    };
+    let stream = adapter
+        .dispatch(
+            &codex_agent(),
+            cwd.path(),
+            fixture_path.to_str().unwrap(),
+            Uuid::now_v7(),
+            options,
+        )
+        .await
+        .expect("dispatch should succeed");
+
+    let leader = wait_for_pgid(&pgid_path).await;
+    token.cancel();
+
+    let events: Vec<AdapterEvent> = tokio::time::timeout(Duration::from_secs(15), stream.collect())
+        .await
+        .expect("stream must end promptly after cancel (no stderr-pipe hang), not time out");
+
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::TurnEnd { .. })),
+        "adapter must emit no terminal event on cancel; got: {events:?}"
+    );
+    assert_group_reaped(leader).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancel_sweeps_sigterm_immune_descendant() {
+    // Regression guard for `terminate_then_kill`'s unconditional final group
+    // SIGKILL. The spawned child IGNORES SIGTERM and holds the inherited stderr
+    // pipe, while fake_codex (the parent) dies on SIGTERM. If the helper only
+    // waited on the parent (conditional SIGKILL), the immune child would keep
+    // stderr open and the adapter's stderr drain would block forever — this
+    // test's timeout would trip. With the final group SIGKILL, the child is
+    // reaped and the stream ends.
+    let cwd = tempfile::TempDir::new().unwrap();
+    let home = tempfile::TempDir::new().unwrap();
+    let pgid_path = cwd.path().join("child.pgid");
+    let fixture_path = cwd.path().join("immune-fixture.jsonl");
+    let body = format!(
+        "// pgid_to:{}\n// spawn_sigterm_immune_child_holding_stderr\n// hang\n",
+        pgid_path.display()
+    );
+    std::fs::write(&fixture_path, body).unwrap();
+
+    let adapter = CodexAdapter::with_binary_and_home(FAKE_CODEX, home.path());
+    let token = CancellationToken::new();
+    let options = DispatchOptions {
+        cancel_token: token.clone(),
+        ..Default::default()
+    };
+    let stream = adapter
+        .dispatch(
+            &codex_agent(),
+            cwd.path(),
+            fixture_path.to_str().unwrap(),
+            Uuid::now_v7(),
+            options,
+        )
+        .await
+        .expect("dispatch should succeed");
+
+    let leader = wait_for_pgid(&pgid_path).await;
+    token.cancel();
+
+    let events: Vec<AdapterEvent> = tokio::time::timeout(Duration::from_secs(15), stream.collect())
+        .await
+        .expect(
+            "stream must end after cancel — the SIGTERM-immune descendant must be SIGKILLed by \
+             the final group sweep, not left holding stderr",
+        );
+
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::TurnEnd { .. })),
+        "adapter must emit no terminal event on cancel; got: {events:?}"
+    );
+    assert_group_reaped(leader).await;
 }

@@ -251,6 +251,44 @@ async fn unresumable_when_no_conversation_dir_appears() {
     }
 }
 
+/// Resilience: if `agy`'s CLI log ever stops naming the conversation (the
+/// Google-internal log line moves on a version bump), capture must degrade to
+/// the brain-dir prompt-correlation fallback rather than fail every turn.
+/// `suppress_conversation_log` omits the id lines while still creating the
+/// brain dir, so only the fallback can bind the UUID.
+#[tokio::test]
+async fn capture_falls_back_to_brain_dir_when_log_omits_the_id() {
+    let home = tempfile::TempDir::new().unwrap();
+    let cwd = tempfile::TempDir::new().unwrap();
+    let adapter = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home.path());
+    let agent = agy_agent();
+    let uuid = Uuid::new_v4();
+
+    write_script(
+        cwd.path(),
+        &json!({
+            "conversation_uuid": uuid.to_string(),
+            "suppress_conversation_log": true,
+            "records": [
+                {"json": user_record("fallback please", "2026-05-19T19:00:00Z"), "delay_ms": 0},
+                {"json": terminal_record("2026-05-19T19:00:01Z", "ok"), "delay_ms": 0},
+            ],
+            "stdout": [drip("ok", 0)],
+            "exit_code": 0,
+        }),
+    );
+
+    let events = dispatch(&adapter, &agent, cwd.path(), "fallback please").await;
+    assert!(
+        matches!(outcome(&events), TurnOutcome::Completed),
+        "fallback prompt-correlation should still bind the conversation"
+    );
+    let latest = read_latest(&sidecar_path(cwd.path(), agent.project_id, agent.id))
+        .unwrap()
+        .expect("sidecar persisted via the fallback path");
+    assert_eq!(latest.conversation_id, uuid);
+}
+
 /// The load-bearing case. A resume whose `--conversation <stale>` expired
 /// server-side: `agy` warns and forks a fresh conversation. The adapter must
 /// (a) heal the sidecar to the new UUID, (b) surface the forked turn's tool
@@ -520,8 +558,15 @@ async fn auth_failure_line_on_stdout_emits_auth_failure() {
         &json!({
             "conversation_uuid": Uuid::new_v4().to_string(),
             "create_brain_dir": false,
+            // `hang` (park after dripping, never self-exit) models real `agy`
+            // blocking ~30s on interactive OAuth, so the adapter's stdout
+            // auth-detection deterministically force-kills it. A clean self-exit
+            // (`exit_code: 0`) instead manufactures a race: on a loaded CI box the
+            // process-exit can beat detection, yielding AdapterFailure ("no
+            // answer") rather than AuthFailure. The detection path under test is
+            // unchanged — this just stops the fake from exiting out from under it.
             "stdout": [drip("Authentication required. Please visit the URL to log in:", 0)],
-            "exit_code": 0,
+            "hang": true,
         }),
     );
 
@@ -636,5 +681,221 @@ async fn hydration_none_conversation_still_surfaces_registries() {
     assert!(
         meta.skills
             .contains(&"chrome-devtools-plugin/troubleshooting".to_owned())
+    );
+}
+
+#[tokio::test]
+async fn cancel_terminates_and_emits_no_terminal() {
+    // Antigravity already uses `select!` to tail the transcript on a tick;
+    // cancellation is one more arm. The script `hang`s after writing its
+    // records, so the turn is still in flight when we fire the token. On
+    // cancel the adapter kills the process and ends the stream with NO
+    // terminal event (the dispatcher synthesizes `Cancelled`). The
+    // timeout-wrapped collect proves the kill actually tore the process down
+    // (a failed kill would leave the producer's drain awaiting forever).
+    use tokio_util::sync::CancellationToken;
+
+    let home = tempfile::TempDir::new().unwrap();
+    let cwd = tempfile::TempDir::new().unwrap();
+    let adapter = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home.path());
+    let agent = agy_agent();
+    let uuid = Uuid::new_v4();
+
+    write_script(
+        cwd.path(),
+        &json!({
+            "conversation_uuid": uuid.to_string(),
+            "records": [
+                {"json": user_record("long running", "2026-05-19T19:00:00Z"), "delay_ms": 0},
+            ],
+            "stdout": [],
+            "hang": true,
+        }),
+    );
+
+    let token = CancellationToken::new();
+    let options = DispatchOptions {
+        cancel_token: token.clone(),
+        ..Default::default()
+    };
+    let stream = adapter
+        .dispatch(&agent, cwd.path(), "long running", Uuid::now_v7(), options)
+        .await
+        .expect("dispatch should succeed");
+
+    // Let the adapter spawn `agy`, capture the UUID, and settle into its poll
+    // loop, then cancel mid-turn. `hang: true` keeps the turn in flight.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    token.cancel();
+
+    let events: Vec<AdapterEvent> =
+        tokio::time::timeout(std::time::Duration::from_secs(15), stream.collect())
+            .await
+            .expect("stream must end promptly after cancel, not hang");
+
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::TurnEnd { .. })),
+        "adapter must emit no terminal event on cancel; got: {events:?}"
+    );
+}
+
+/// End-to-end quota path: with the per-dispatch `--log-file` carrying a
+/// `RESOURCE_EXHAUSTED` line, the no-answer branch surfaces an authored
+/// `HarnessError` quota message instead of the generic "agy exited without
+/// producing an answer" fallback. Closes G1 (`docs/research/harness-behavior.md`).
+#[tokio::test]
+async fn quota_log_line_surfaces_as_harness_error_quota_message() {
+    let home = tempfile::TempDir::new().unwrap();
+    let cwd = tempfile::TempDir::new().unwrap();
+    let adapter = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home.path());
+    let agent = agy_agent();
+
+    write_script(
+        cwd.path(),
+        &json!({
+            "conversation_uuid": Uuid::new_v4().to_string(),
+            "create_brain_dir": false,
+            "stdout": [],
+            "exit_code": 0,
+            "log_file_content": "E0526 13:59:05.636054  1754 log.go:398] agent executor error: rpc error: code = ResourceExhausted desc = Individual quota reached. Contact your administrator to enable overages. Resets in 143h34m25s.: Individual quota reached. Contact your administrator to enable overages. Resets in 143h34m25s.\n",
+        }),
+    );
+
+    let events = dispatch(&adapter, &agent, cwd.path(), "hi").await;
+    match outcome(&events) {
+        TurnOutcome::Failed {
+            kind: FailureKind::HarnessError,
+            message,
+        } => {
+            assert!(
+                message.contains("quota exhausted"),
+                "authored quota prefix: {message}"
+            );
+            assert!(
+                message.contains("Resets in 143h34m25s"),
+                "reset-time tail carried through: {message}"
+            );
+            assert_eq!(
+                message.matches("Individual quota reached").count(),
+                1,
+                "agy doubles the descriptive sentence; dedup must surface one copy: {message}"
+            );
+            assert!(
+                !message.contains("without producing an answer"),
+                "must not fall through to the generic no-answer message: {message}"
+            );
+        }
+        other => panic!("expected HarnessError quota message, got {other:?}"),
+    }
+}
+
+/// Two concurrent dispatches each scan their own `--log-file` — no
+/// cross-attribution. The closed-the-misattribution-hole reason for
+/// per-dispatch log isolation (vs. an mtime-windowed default-dir scan)
+/// only matters under concurrency, so prove it directly.
+#[tokio::test]
+async fn concurrent_quota_dispatches_read_their_own_logs() {
+    let home_a = tempfile::TempDir::new().unwrap();
+    let home_b = tempfile::TempDir::new().unwrap();
+    let cwd_a = tempfile::TempDir::new().unwrap();
+    let cwd_b = tempfile::TempDir::new().unwrap();
+    let adapter_a = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home_a.path());
+    let adapter_b = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home_b.path());
+    let agent_a = agy_agent();
+    let agent_b = agy_agent();
+
+    // Agent A: quota failure. Agent B: a different RPC failure (unknown code,
+    // passes through as authored "Antigravity error: …").
+    write_script(
+        cwd_a.path(),
+        &json!({
+            "conversation_uuid": Uuid::new_v4().to_string(),
+            "create_brain_dir": false,
+            "stdout": [],
+            "exit_code": 0,
+            "log_file_content": "E0526 13:59:05 log.go:398] rpc error: code = ResourceExhausted desc = quota reached\n",
+        }),
+    );
+    write_script(
+        cwd_b.path(),
+        &json!({
+            "conversation_uuid": Uuid::new_v4().to_string(),
+            "create_brain_dir": false,
+            "stdout": [],
+            "exit_code": 0,
+            "log_file_content": "E0526 13:59:05 log.go:398] rpc error: code = Internal desc = backend exploded\n",
+        }),
+    );
+
+    let (events_a, events_b) = tokio::join!(
+        dispatch(&adapter_a, &agent_a, cwd_a.path(), "a"),
+        dispatch(&adapter_b, &agent_b, cwd_b.path(), "b"),
+    );
+
+    match outcome(&events_a) {
+        TurnOutcome::Failed {
+            kind: FailureKind::HarnessError,
+            message,
+        } => assert!(
+            message.contains("quota exhausted"),
+            "A must see its own quota error, not B's Internal: {message}"
+        ),
+        other => panic!("A: expected quota HarnessError, got {other:?}"),
+    }
+    match outcome(&events_b) {
+        TurnOutcome::Failed {
+            kind: FailureKind::HarnessError,
+            message,
+        } => {
+            assert!(
+                message.contains("Antigravity error: ") && message.contains("backend exploded"),
+                "B must see its own error's descriptive tail, not A's quota: {message}"
+            );
+            assert!(
+                !message.contains("rpc error: code = "),
+                "Go RPC boilerplate is stripped from the unknown-code message: {message}"
+            );
+            assert!(
+                !message.contains("quota exhausted"),
+                "B's message must not contain A's quota text: {message}"
+            );
+        }
+        other => panic!("B: expected Internal HarnessError, got {other:?}"),
+    }
+}
+
+/// Successful turn: the per-dispatch log is left untouched by the producer's
+/// scan (only the no-answer branch reads it). Even if the log file is
+/// staged with a quota line, a transcript terminal answer takes precedence
+/// and the turn completes.
+#[tokio::test]
+async fn successful_turn_does_not_scan_or_misclassify_from_log() {
+    let home = tempfile::TempDir::new().unwrap();
+    let cwd = tempfile::TempDir::new().unwrap();
+    let adapter = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home.path());
+    let agent = agy_agent();
+    let uuid = Uuid::new_v4();
+
+    write_script(
+        cwd.path(),
+        &json!({
+            "conversation_uuid": uuid.to_string(),
+            "records": [
+                {"json": user_record("hi", "2026-05-19T19:00:00Z"), "delay_ms": 0},
+                {"json": terminal_record("2026-05-19T19:00:01Z", "ack"), "delay_ms": 0},
+            ],
+            "stdout": [drip("ack", 0)],
+            "exit_code": 0,
+            "log_file_content": "E0526 13:59:05 log.go:398] rpc error: code = ResourceExhausted desc = should never be surfaced\n",
+        }),
+    );
+
+    let events = dispatch(&adapter, &agent, cwd.path(), "hi").await;
+    assert!(
+        matches!(outcome(&events), TurnOutcome::Completed),
+        "successful turn must complete; log scan must not run: {:?}",
+        outcome(&events)
     );
 }

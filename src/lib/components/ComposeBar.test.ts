@@ -46,6 +46,8 @@ function fireTo(channel: string, event: NormalizedEvent): void {
   cb({ payload: event });
 }
 
+const chip = (id: string) => screen.getByTestId(`recipient-chip-${id}`);
+
 beforeEach(() => {
   listeners.clear();
   invokeMock.mockReset();
@@ -57,240 +59,244 @@ afterEach(async () => {
 });
 
 describe("ComposeBar", () => {
-  it("Send is disabled until the chosen recipient is idle and prompt is non-empty", async () => {
+  it("hides the recipient field for a single agent but still sends to it", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
+    invokeMock.mockResolvedValueOnce("msg-1");
 
     const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { agents: [AGENT_A] } });
 
-    // Empty prompt → disabled even though agent is idle.
+    expect(screen.queryByTestId("recipient-field")).toBeNull();
     expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(true);
 
     const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
     await fireEvent.input(textarea, { target: { value: "hi" } });
-
-    // Idle + non-empty prompt → enabled.
     expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(false);
-  });
-
-  it("Send disables while run_status is starting (closes pre-TurnStart race)", async () => {
-    const state = await loadState();
-    await state.registerAgent(AGENT_A);
-    // Outstanding IPC: invoke is pending until we resolve manually.
-    let resolveInvoke: (v: string) => void = () => {};
-    invokeMock.mockImplementationOnce(
-      () =>
-        new Promise((resolve) => {
-          resolveInvoke = resolve as (v: string) => void;
-        }),
-    );
-
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
-    render(ComposeBar, { props: { agents: [AGENT_A] } });
-
-    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
-    await fireEvent.input(textarea, { target: { value: "hello" } });
-    await fireEvent.click(screen.getByTestId("compose-send"));
-
-    // Now run_status === "starting" (synchronous after dispatchUserTurn).
-    await waitFor(() => {
-      expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(true);
-    });
-    expect(state.runtimes[AGENT_A.id]?.run_status).toBe("starting");
-
-    // Settle the IPC.
-    resolveInvoke("turn-1");
-  });
-
-  it("IPC failure calls failSendStart, restoring sendability and surfacing error", async () => {
-    const state = await loadState();
-    await state.registerAgent(AGENT_A);
-    invokeMock.mockRejectedValueOnce(new Error("backend exploded"));
-
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
-    render(ComposeBar, { props: { agents: [AGENT_A] } });
-
-    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
-    await fireEvent.input(textarea, { target: { value: "hello" } });
-    await fireEvent.click(screen.getByTestId("compose-send"));
-
-    // Send-error visible.
-    await waitFor(() => {
-      expect(screen.getByTestId("compose-send-error")).toHaveTextContent("backend exploded");
-    });
-    // Runtime restored: idle + last_error set.
-    expect(state.runtimes[AGENT_A.id]?.run_status).toBe("idle");
-    expect(state.runtimes[AGENT_A.id]?.last_error?.message).toBe("backend exploded");
-  });
-
-  it("preserves textarea text on send failure so the user can retry without retyping", async () => {
-    const state = await loadState();
-    await state.registerAgent(AGENT_A);
-    invokeMock.mockRejectedValueOnce(new Error("network down"));
-
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
-    render(ComposeBar, { props: { agents: [AGENT_A] } });
-
-    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
-    await fireEvent.input(textarea, { target: { value: "important prompt" } });
     await fireEvent.click(screen.getByTestId("compose-send"));
 
     await waitFor(() => {
-      expect(screen.getByTestId("compose-send-error")).toBeInTheDocument();
+      const calls = invokeMock.mock.calls.filter(([c]) => c === "send_message");
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.[1]).toMatchObject({ agentId: AGENT_A.id, prompt: "hi" });
+      expect(typeof (calls[0]?.[1] as { sendId?: unknown }).sendId).toBe("string");
     });
-    // Textarea still has the original text — retry doesn't require retyping.
-    expect(textarea.value).toBe("important prompt");
-    // Send is enabled again (idle + non-empty prompt).
-    expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(false);
   });
 
-  it("clears textarea on send success when prompt is unchanged", async () => {
-    // Happy-path: user submits, IPC succeeds without the user typing
-    // anything new during the await, textarea clears for the next
-    // message.
+  it("shows a toggle chip per agent; the first is selected by default", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
-    invokeMock.mockResolvedValueOnce("turn-1");
+    await state.registerAgent(AGENT_B);
 
     const ComposeBar = (await import("./ComposeBar.svelte")).default;
-    render(ComposeBar, { props: { agents: [AGENT_A] } });
+    render(ComposeBar, { props: { agents: [AGENT_A, AGENT_B] } });
+
+    expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "true");
+    expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "false");
+  });
+
+  it("toggles a recipient on and off by clicking its chip", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { agents: [AGENT_A, AGENT_B] } });
+
+    await fireEvent.click(chip(AGENT_B.id));
+    expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "true");
+    // Toggle alice off; bob stays on.
+    await fireEvent.click(chip(AGENT_A.id));
+    expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "false");
+    expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "true");
+  });
+
+  it("@-quick-add: typing @bob opens the menu, selects via keyboard, strips the token", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { agents: [AGENT_A, AGENT_B] } });
 
     const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
-    await fireEvent.input(textarea, { target: { value: "hello" } });
+    await fireEvent.input(textarea, { target: { value: "ping @bo" } });
+    // bob is offered (alice is already selected); Enter picks the highlighted.
+    await screen.findByTestId(`recipient-option-${AGENT_B.id}`);
+    await fireEvent.keyDown(textarea, { key: "Enter" });
+
+    expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "true");
+    // The "@bo" token is stripped; the text typed before it (with its space) stays.
+    expect(textarea.value).toBe("ping ");
+  });
+
+  it("a bare @ offers All / Clear actions that bulk-select and deselect", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { agents: [AGENT_A, AGENT_B] } });
+
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "@" } });
+
+    // All → every agent selected.
+    await fireEvent.click(await screen.findByTestId("recipient-option-all"));
+    expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "true");
+    expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "true");
+    expect(textarea.value).toBe(""); // the @ token is stripped
+
+    // Clear → none selected.
+    await fireEvent.input(textarea, { target: { value: "@" } });
+    await fireEvent.click(await screen.findByTestId("recipient-option-clear"));
+    expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "false");
+    expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "false");
+  });
+
+  it("hides All when everyone is selected and Clear when no one is", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { agents: [AGENT_A, AGENT_B] } });
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+
+    // Select everyone (alice is default; add bob) → All has nothing to do.
+    await fireEvent.keyDown(document.body, { key: "2", metaKey: true });
+    await fireEvent.input(textarea, { target: { value: "@" } });
+    expect(await screen.findByTestId("recipient-option-clear")).toBeInTheDocument();
+    expect(screen.queryByTestId("recipient-option-all")).toBeNull();
+
+    // Clear everyone → Clear has nothing to do.
+    await fireEvent.click(screen.getByTestId("recipient-option-clear"));
+    await fireEvent.input(textarea, { target: { value: "@" } });
+    expect(await screen.findByTestId("recipient-option-all")).toBeInTheDocument();
+    expect(screen.queryByTestId("recipient-option-clear")).toBeNull();
+  });
+
+  it("Mod+N toggles the Nth agent (sidebar order)", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { agents: [AGENT_A, AGENT_B] } });
+    // alice (index 0) selected by default; bob not.
+    expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "false");
+
+    // Mod+2 toggles the second agent on; Mod+1 toggles the first off.
+    await fireEvent.keyDown(document.body, { key: "2", metaKey: true });
+    expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "true");
+    await fireEvent.keyDown(document.body, { key: "1", metaKey: true });
+    expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "false");
+  });
+
+  it("Mod+Shift+A selects every agent", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { agents: [AGENT_A, AGENT_B] } });
+
+    await fireEvent.keyDown(document.body, { key: "a", metaKey: true, shiftKey: true });
+    expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "true");
+    expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "true");
+  });
+
+  it("fans one message out to all selected recipients sharing one send_id", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    invokeMock.mockResolvedValue("msg-x");
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { agents: [AGENT_A, AGENT_B] } });
+
+    await fireEvent.click(chip(AGENT_B.id)); // select both
+
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "status?" } });
     await fireEvent.click(screen.getByTestId("compose-send"));
 
-    // Wait for the post-await success branch to clear the prompt.
     await waitFor(() => {
-      expect(textarea.value).toBe("");
+      const calls = invokeMock.mock.calls.filter(([c]) => c === "send_message");
+      expect(calls).toHaveLength(2);
     });
-    // User turn is in the transcript; runtime is "starting" (TurnStart
-    // hasn't arrived yet — the listener events are separate).
+    const calls = invokeMock.mock.calls.filter(([c]) => c === "send_message");
+    const agentIds = calls.map((c) => (c[1] as { agentId: string }).agentId).sort();
+    expect(agentIds).toEqual([AGENT_A.id, AGENT_B.id].sort());
+    const sendIds = new Set(calls.map((c) => (c[1] as { sendId: string }).sendId));
+    expect(sendIds.size).toBe(1);
     expect((state.transcripts[AGENT_A.id] ?? []).length).toBe(1);
-  });
-
-  it("preserves new typing on send success when prompt has changed mid-await", async () => {
-    // Capture-and-compare pattern: if `prompt.trim() === submittedText`
-    // after the await, clear; otherwise preserve the user's new typing.
-    // This protects against the rare race where the user types new text
-    // during the IPC window and the send succeeds.
-    await loadState().then((s) => s.registerAgent(AGENT_A));
-    let resolveInvoke: (v: string) => void = () => {};
-    invokeMock.mockImplementationOnce(
-      () =>
-        new Promise((resolve) => {
-          resolveInvoke = resolve as (v: string) => void;
-        }),
-    );
-
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
-    render(ComposeBar, { props: { agents: [AGENT_A] } });
-
-    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
-    await fireEvent.input(textarea, { target: { value: "first message" } });
-    await fireEvent.click(screen.getByTestId("compose-send"));
-
-    // While the send is in flight, user types something new.
-    await fireEvent.input(textarea, { target: { value: "second draft" } });
-
-    // Send succeeds. Wait for the post-IPC microtask flush; the
-    // capture-and-compare branch sees `prompt !== submittedText` and
-    // leaves the new typing intact.
-    resolveInvoke("turn-1");
-    await waitFor(() => {
-      expect(textarea.value).toBe("second draft");
-    });
-  });
-
-  it("optimistic user turn appears immediately on click, before IPC reply", async () => {
-    const state = await loadState();
-    await state.registerAgent(AGENT_A);
-    let resolveInvoke: (v: string) => void = () => {};
-    invokeMock.mockImplementationOnce(
-      () =>
-        new Promise((resolve) => {
-          resolveInvoke = resolve as (v: string) => void;
-        }),
-    );
-
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
-    render(ComposeBar, { props: { agents: [AGENT_A] } });
-
-    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
-    await fireEvent.input(textarea, { target: { value: "hi there" } });
-    await fireEvent.click(screen.getByTestId("compose-send"));
-
-    // User turn appended synchronously — visible before the IPC settles.
-    const turns = state.transcripts[AGENT_A.id] ?? [];
-    expect(turns).toHaveLength(1);
-    expect(turns[0]?.role).toBe("user");
-    if (turns[0]?.role !== "user") throw new Error("unreachable");
-    expect(turns[0]?.text).toBe("hi there");
-
-    resolveInvoke("turn-1");
-  });
-
-  it("hides recipient picker when only one agent is loaded", async () => {
-    const state = await loadState();
-    await state.registerAgent(AGENT_A);
-
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
-    render(ComposeBar, { props: { agents: [AGENT_A] } });
-
-    expect(screen.queryByTestId("recipient-picker")).toBeNull();
-  });
-
-  it("shows recipient picker with all agents when more than one is loaded", async () => {
-    const state = await loadState();
-    await state.registerAgent(AGENT_A);
-    await state.registerAgent(AGENT_B);
-
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
-    render(ComposeBar, { props: { agents: [AGENT_A, AGENT_B] } });
-
-    const picker = screen.getByTestId("recipient-picker") as HTMLSelectElement;
-    const optionValues = Array.from(picker.options).map((o) => o.value);
-    expect(optionValues).toEqual([AGENT_A.id, AGENT_B.id]);
-  });
-
-  it("sends to the picker-selected agent (not the default first)", async () => {
-    const state = await loadState();
-    await state.registerAgent(AGENT_A);
-    await state.registerAgent(AGENT_B);
-    invokeMock.mockResolvedValueOnce("turn-1");
-
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
-    render(ComposeBar, { props: { agents: [AGENT_A, AGENT_B] } });
-
-    const picker = screen.getByTestId("recipient-picker") as HTMLSelectElement;
-    await fireEvent.change(picker, { target: { value: AGENT_B.id } });
-
-    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
-    await fireEvent.input(textarea, { target: { value: "hi bob" } });
-    await fireEvent.click(screen.getByTestId("compose-send"));
-
-    // sendMessage called with agent_id = AGENT_B.
-    await waitFor(() => {
-      expect(invokeMock).toHaveBeenCalledWith(
-        "send_message",
-        expect.objectContaining({ agentId: AGENT_B.id }),
-      );
-    });
-    // User turn appended to B's transcript, not A's.
     expect((state.transcripts[AGENT_B.id] ?? []).length).toBe(1);
-    expect((state.transcripts[AGENT_A.id] ?? []).length).toBe(0);
   });
 
-  it("a second click during 'starting' is rejected by the gate (no double-send)", async () => {
+  it("turns the empty-draft send button into cancel for the latest live send", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
-    let resolveInvoke: (v: string) => void = () => {};
-    invokeMock.mockImplementationOnce(
-      () =>
-        new Promise((resolve) => {
-          resolveInvoke = resolve as (v: string) => void;
-        }),
+    await state.registerAgent(AGENT_B);
+    invokeMock.mockResolvedValue("msg-x");
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { agents: [AGENT_A, AGENT_B] } });
+
+    await fireEvent.click(chip(AGENT_B.id));
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "status?" } });
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("compose-send")).toHaveAttribute("aria-label", "Cancel send");
+    });
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    const cancelCall = invokeMock.mock.calls.find(([cmd]) => cmd === "cancel_send");
+    expect(cancelCall?.[1]).toMatchObject({
+      recipients: expect.arrayContaining([AGENT_A.id, AGENT_B.id]),
+    });
+  });
+
+  it("the empty-draft stop cancels ALL live sends, not just the latest", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    invokeMock.mockResolvedValue("msg-x");
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { agents: [AGENT_A, AGENT_B] } });
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+
+    // Send #1 to alice (default selected).
+    await fireEvent.input(textarea, { target: { value: "to alice" } });
+    await fireEvent.click(screen.getByTestId("compose-send"));
+    // Send #2 to bob only (toggle alice off, bob on).
+    await fireEvent.click(chip(AGENT_A.id));
+    await fireEvent.click(chip(AGENT_B.id));
+    await fireEvent.input(textarea, { target: { value: "to bob" } });
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    // Two distinct sends are now live → the stop affordance covers all of them.
+    await waitFor(() => {
+      expect(screen.getByTestId("compose-send")).toHaveAttribute("aria-label", "Cancel all sends");
+    });
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    const cancelCalls = invokeMock.mock.calls.filter(([cmd]) => cmd === "cancel_send");
+    const cancelledSendIds = new Set(cancelCalls.map((c) => (c[1] as { sendId: string }).sendId));
+    expect(cancelledSendIds.size).toBe(2); // both sends cancelled, not just the last
+    const cancelledRecipients = cancelCalls.flatMap(
+      (c) => (c[1] as { recipients: string[] }).recipients,
     );
+    expect(cancelledRecipients).toEqual(expect.arrayContaining([AGENT_A.id, AGENT_B.id]));
+  });
+
+  it("uses Mod+Enter to cancel when the empty-draft send button is in stop mode", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    invokeMock.mockResolvedValue("msg-1");
 
     const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { agents: [AGENT_A] } });
@@ -298,51 +304,124 @@ describe("ComposeBar", () => {
     const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
     await fireEvent.input(textarea, { target: { value: "first" } });
     await fireEvent.click(screen.getByTestId("compose-send"));
+    await waitFor(() => {
+      expect(screen.getByTestId("compose-send")).toHaveAttribute("aria-label", "Cancel send");
+    });
+    await fireEvent.keyDown(textarea, { key: "Enter", metaKey: true });
 
-    await fireEvent.input(textarea, { target: { value: "second" } });
-    await fireEvent.click(screen.getByTestId("compose-send"));
-
-    expect(invokeMock).toHaveBeenCalledTimes(1);
-    // Only ONE user turn appended.
-    expect((state.transcripts[AGENT_A.id] ?? []).length).toBe(1);
-
-    resolveInvoke("turn-1");
+    const sendCalls = invokeMock.mock.calls.filter(([cmd]) => cmd === "send_message");
+    const cancelCall = invokeMock.mock.calls.find(([cmd]) => cmd === "cancel_send");
+    expect(sendCalls).toHaveLength(1);
+    expect(cancelCall?.[1]).toMatchObject({ recipients: [AGENT_A.id] });
   });
 
-  it("Send re-enables after TurnStart → AgentIdle sequence completes", async () => {
+  it("send-while-busy is un-gated: Send stays enabled while a recipient is processing", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
-    invokeMock.mockResolvedValueOnce("turn-1");
+    invokeMock.mockResolvedValue("msg-1");
 
     const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { agents: [AGENT_A] } });
 
     const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
-    await fireEvent.input(textarea, { target: { value: "hi" } });
+    await fireEvent.input(textarea, { target: { value: "first" } });
     await fireEvent.click(screen.getByTestId("compose-send"));
-
-    await waitFor(() => {
-      expect(state.runtimes[AGENT_A.id]?.run_status).toBe("starting");
-    });
     fireTo(`agent:${AGENT_A.id}`, {
       type: "turn_start",
       turn_id: "turn-1",
+      message_id: "msg-1",
       started_at: "2026-05-16T00:00:00Z",
     });
-    expect(state.runtimes[AGENT_A.id]?.run_status).toBe("processing");
-    fireTo(`agent:${AGENT_A.id}`, {
-      type: "turn_end",
-      turn_id: "turn-1",
-      outcome: { status: "completed" },
-      ended_at: "2026-05-16T00:00:01Z",
-    });
-    // turn_end does NOT flip back to idle — AgentIdle does.
-    expect(state.runtimes[AGENT_A.id]?.run_status).toBe("processing");
-    fireTo(`agent:${AGENT_A.id}`, { type: "agent_idle", agent_id: AGENT_A.id });
-    expect(state.runtimes[AGENT_A.id]?.run_status).toBe("idle");
+    await waitFor(() => expect(state.runtimes[AGENT_A.id]?.run_status).toBe("processing"));
 
-    // Send is back to enabled after entering a fresh prompt.
-    await fireEvent.input(textarea, { target: { value: "again" } });
+    await fireEvent.input(textarea, { target: { value: "second" } });
     expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(false);
+    expect(screen.getByTestId("compose-send")).toHaveAttribute("aria-label", "Send");
+  });
+
+  it("a per-recipient IPC failure fails only that recipient and surfaces the error", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    // Dispatch order is selection order: alice (default) then bob.
+    invokeMock.mockResolvedValueOnce("msg-a").mockRejectedValueOnce(new Error("bob exploded"));
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { agents: [AGENT_A, AGENT_B] } });
+    await fireEvent.click(chip(AGENT_B.id));
+
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "go" } });
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("compose-send-error")).toHaveTextContent("bob exploded");
+    });
+    expect(state.runtimes[AGENT_B.id]?.run_status).toBe("idle");
+    expect(state.runtimes[AGENT_A.id]?.run_status).toBe("starting");
+    // alice is still pending → just her user turn; bob's failure surfaces as a
+    // failed agent turn beneath his user turn.
+    expect((state.transcripts[AGENT_A.id] ?? []).length).toBe(1);
+    const bobTurns = state.transcripts[AGENT_B.id] ?? [];
+    expect(bobTurns.length).toBe(2);
+    const bobFailed = bobTurns[1];
+    expect(bobFailed?.role === "agent" ? bobFailed.status : null).toBe("failed");
+  });
+
+  it("clears the prompt on submit but keeps the recipients selected (sticky)", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    invokeMock.mockResolvedValue("msg-1");
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { agents: [AGENT_A, AGENT_B] } });
+
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "hi" } });
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    await waitFor(() => expect(textarea.value).toBe(""));
+    expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "true");
+  });
+
+  it("Clear and Escape (with composer focus) both deselect all recipients", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { agents: [AGENT_A, AGENT_B] } });
+    expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "true");
+
+    await fireEvent.click(screen.getByTestId("recipient-clear"));
+    expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "false");
+
+    // Re-select, then clear via Escape while the composer holds focus.
+    await fireEvent.click(chip(AGENT_A.id));
+    expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "true");
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    textarea.focus();
+    await fireEvent.keyDown(window, { key: "Escape" });
+    expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "false");
+  });
+
+  it("Escape is a no-op when focus is outside the composer", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { agents: [AGENT_A, AGENT_B] } });
+    expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "true");
+
+    // Focus an element outside the compose surface; Escape must not clear the
+    // recipients (Escape is overloaded across the app and only owns the
+    // composer's selection while the composer has focus).
+    const outside = document.createElement("button");
+    document.body.appendChild(outside);
+    outside.focus();
+    await fireEvent.keyDown(window, { key: "Escape" });
+    expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "true");
+    outside.remove();
   });
 });

@@ -6,6 +6,14 @@ use uuid::Uuid;
 /// UUID v7 turn identifier — consistent with `AgentId` and `ProjectId`.
 pub type TurnId = Uuid;
 
+/// UUID v7 identifier minted by the dispatcher for every accepted send (idle or
+/// queued), returned synchronously to the caller. A turn later started for that
+/// message carries the same `message_id` on its `TurnStart`, letting the
+/// frontend correlate "the message I sent/queued" with "the turn now running."
+/// A message that fails before any turn starts is reported via
+/// [`NormalizedEvent::MessageFailed`] keyed by this id.
+pub type MessageId = Uuid;
+
 /// Tells the reducer / UI which content rendering applies to a chunk.
 ///
 /// `Thinking` is reserved but not currently emitted — keeping the variant
@@ -42,6 +50,30 @@ pub enum ToolKind {
 pub struct McpServerStatus {
     pub name: String,
     pub status: String,
+}
+
+/// Where a `RateLimitEvent`'s payload is durable — the dispatcher's gate for
+/// whether to persist it to the per-agent metadata sidecar.
+///
+/// This is an **internal adapter→dispatcher** discriminator: it rides on
+/// [`AdapterEvent::RateLimitEvent`] but is deliberately dropped at the
+/// [`NormalizedEvent`] boundary (the frontend doesn't need it). Keeping the
+/// persistence rule in the type system — rather than a `match harness {…}` in
+/// the dispatcher — is what lets the dispatcher stay harness-agnostic while
+/// still persisting only the class-C (stream-only) payloads.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum RateLimitSource {
+    /// Lives only on the live stream; no session-file equivalent (class C, per
+    /// `docs/research/harness-behavior.md` §3.1). Claude's `rate_limit_event`.
+    /// The dispatcher persists these to the metadata sidecar so they survive
+    /// restart.
+    StreamOnly,
+    /// Already persisted by the harness in its own session file (class B); the
+    /// harness file is canonical and durable, so Switchboard does **not**
+    /// re-persist it. Codex's session-file-enriched rate-limit.
+    SessionFileBacked,
 }
 
 /// Per-turn usage and cost. Carried on `TurnEnd.usage`.
@@ -107,6 +139,10 @@ pub enum AdapterEvent {
     RateLimitEvent {
         agent_id: AgentId,
         info: serde_json::Value,
+        /// Where this payload is durable — gates Switchboard-side persistence.
+        /// Not carried to the frontend (dropped in the `NormalizedEvent`
+        /// conversion below).
+        source: RateLimitSource,
     },
     SessionMeta {
         agent_id: AgentId,
@@ -133,6 +169,10 @@ pub enum AdapterEvent {
 pub enum NormalizedEvent {
     TurnStart {
         turn_id: TurnId,
+        /// Correlates this turn to the accepted send (idle or dequeued) that
+        /// produced it — see [`MessageId`]. The frontend flips its optimistic
+        /// message bubble (keyed by `message_id`) from queued/sending to running.
+        message_id: MessageId,
         started_at: DateTime<Utc>,
     },
     ContentChunk {
@@ -171,6 +211,34 @@ pub enum NormalizedEvent {
         mcp_servers: Vec<McpServerStatus>,
         skills: Vec<String>,
         raw: serde_json::Value,
+    },
+    /// A send **failed before any turn started**: either the journal write of
+    /// the user's send failed (no durable record, no outcome marker), or the
+    /// adapter failed to launch before `TurnStart` (the send was journaled and
+    /// a `Failed` outcome marker references the minted turn, but no turn went
+    /// live on the wire). Keyed by `message_id` (there is no live `turn_id`);
+    /// carries no prompt — the frontend still holds the optimistically-rendered
+    /// text and just marks that bubble failed. The async analogue of the
+    /// pre-actor synchronous fail-closed `Err`.
+    MessageFailed {
+        message_id: MessageId,
+        agent_id: AgentId,
+        error: String,
+        at: DateTime<Utc>,
+    },
+    /// A **queued** send was cancelled before it started (its backlog item was
+    /// dropped by a `cancel_send` / `cancel_agent` while it was still waiting,
+    /// so it never produced a `TurnStart`). Keyed by `message_id` — there is no
+    /// `turn_id`. The dispatcher's authoritative signal that a not-yet-started
+    /// send is gone, so the frontend renders its cancellation from this event
+    /// rather than guessing (a *running* turn's cancellation still arrives as a
+    /// `TurnEnd { Cancelled }`). Like `MessageFailed`, this is a non-turn,
+    /// message-keyed event and carries no durable journal record (a
+    /// queued-but-unstarted send is live-UI-only).
+    MessageCancelled {
+        message_id: MessageId,
+        agent_id: AgentId,
+        at: DateTime<Utc>,
     },
     /// Emitted by the dispatcher as the **last event on the per-agent
     /// channel** for a dispatch — immediately before `AgentIdleGuard`
@@ -239,7 +307,9 @@ impl From<AdapterEvent> for NormalizedEvent {
                 ended_at,
                 usage,
             },
-            AdapterEvent::RateLimitEvent { agent_id, info } => {
+            // `source` is intentionally dropped — it's an internal persistence
+            // discriminator the frontend doesn't need (see `RateLimitSource`).
+            AdapterEvent::RateLimitEvent { agent_id, info, .. } => {
                 NormalizedEvent::RateLimitEvent { agent_id, info }
             }
             AdapterEvent::SessionMeta {
@@ -267,12 +337,37 @@ impl From<AdapterEvent> for NormalizedEvent {
 /// for retry policy: `HarnessError` (model/API issue) vs `AdapterFailure`
 /// (subprocess crash, parse error, infrastructure) have different retry
 /// semantics.
+///
+/// `Cancelled` is distinct from `Failed` because cancellation is
+/// **intent-bearing, not an error** — the user (or a workflow, or shutdown)
+/// deliberately stopped the turn, and the frontend renders it differently
+/// from a harness failure. The cancelled terminal is **dispatcher-stamped,
+/// not adapter-emitted**: a binary cancellation token can't carry intent, and
+/// the dispatcher is the only layer that knows *why* it fired the token, so it
+/// synthesizes this variant with the `source` it recorded. `source` also lets
+/// M6 (workflow cancel) and M8 (shutdown) reuse the same mechanism.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "status", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum TurnOutcome {
     Completed,
     Failed { kind: FailureKind, message: String },
+    Cancelled { source: CancelSource },
+}
+
+/// Who initiated a cancellation. Carried on `TurnOutcome::Cancelled` so the
+/// UI (and persisted journal) can distinguish a user pressing stop from a
+/// workflow aborting a step or the app shutting down.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum CancelSource {
+    /// The user cancelled an in-flight turn (compose-bar / context-menu stop).
+    User,
+    /// A workflow aborted the turn (M6).
+    Workflow,
+    /// App shutdown or working-directory removal drained the turn.
+    Shutdown,
 }
 
 /// Discriminates the cause of a failed turn for retry-policy decisions.
@@ -286,11 +381,17 @@ pub enum FailureKind {
     /// Adapter synthesized this: subprocess died, parser hit malformed JSON, or
     /// stdout EOF arrived without a terminal `result` event. Typically transient.
     AdapterFailure,
-    /// Subscription / tier auth is missing or expired. Detected via stream-event
-    /// patterns: Claude's `assistant.error == "authentication_failed"` (state-flag
-    /// pattern consumed in `parse_result`) or Codex's `turn.failed.error.message`
-    /// containing `"401 Unauthorized"`. Frontend renders a "subscription auth
-    /// required" banner rather than a generic error.
+    /// Subscription / tier auth is missing or expired. Detected per-adapter
+    /// from stream signals (Claude: `assistant.error == "authentication_failed"`;
+    /// Codex: `turn.failed.error.message` containing `"401 Unauthorized"`;
+    /// Gemini: 401 in `result.status:"error"`, exit 41 + "Please set an Auth
+    /// method", or exit 42 + 401; Antigravity: `Authentication required` /
+    /// `authentication timed out` on stdout). Each adapter authors a uniform
+    /// actionable message naming the harness + recovery command — the user
+    /// sees one consistent failure line in the transcript regardless of which
+    /// harness's auth surface fired. There is no proactive auth banner;
+    /// reactive auth means "discovered on send, fixed by signing in, then
+    /// sending again."
     AuthFailure,
 }
 
@@ -314,14 +415,37 @@ mod tests {
     #[test]
     fn turn_start_wire_shape() {
         let turn_id = fresh_turn_id();
+        let message_id = Uuid::now_v7();
         let started_at = fresh_time();
         let event = NormalizedEvent::TurnStart {
             turn_id,
+            message_id,
             started_at,
         };
         let value = serde_json::to_value(&event).unwrap();
         assert_eq!(value["type"], "turn_start");
         assert_eq!(value["turn_id"], turn_id.to_string());
+        assert_eq!(value["message_id"], message_id.to_string());
+        let parsed: NormalizedEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, event);
+    }
+
+    #[test]
+    fn message_failed_wire_shape() {
+        let message_id = Uuid::now_v7();
+        let agent_id = Uuid::now_v7();
+        let at = fresh_time();
+        let event = NormalizedEvent::MessageFailed {
+            message_id,
+            agent_id,
+            error: "journal write failed".to_owned(),
+            at,
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["type"], "message_failed");
+        assert_eq!(value["message_id"], message_id.to_string());
+        assert_eq!(value["agent_id"], agent_id.to_string());
+        assert_eq!(value["error"], "journal write failed");
         let parsed: NormalizedEvent = serde_json::from_value(value).unwrap();
         assert_eq!(parsed, event);
     }
@@ -418,12 +542,33 @@ mod tests {
     }
 
     #[test]
+    fn turn_end_cancelled_wire_shape() {
+        for (source, tag) in [
+            (CancelSource::User, "user"),
+            (CancelSource::Workflow, "workflow"),
+            (CancelSource::Shutdown, "shutdown"),
+        ] {
+            let event = NormalizedEvent::TurnEnd {
+                turn_id: fresh_turn_id(),
+                outcome: TurnOutcome::Cancelled { source },
+                ended_at: fresh_time(),
+                usage: None,
+            };
+            let value = serde_json::to_value(&event).unwrap();
+            assert_eq!(value["outcome"]["status"], "cancelled");
+            assert_eq!(value["outcome"]["source"], tag);
+            let parsed: NormalizedEvent = serde_json::from_value(value).unwrap();
+            assert_eq!(parsed, event);
+        }
+    }
+
+    #[test]
     fn auth_failure_kind_wire_shape() {
         let event = NormalizedEvent::TurnEnd {
             turn_id: fresh_turn_id(),
             outcome: TurnOutcome::Failed {
                 kind: FailureKind::AuthFailure,
-                message: "Not logged in · Please run /login".to_owned(),
+                message: "Claude authentication required — run `claude auth login`".to_owned(),
             },
             ended_at: fresh_time(),
             usage: None,
@@ -433,7 +578,7 @@ mod tests {
         assert_eq!(value["outcome"]["kind"], "auth_failure");
         assert_eq!(
             value["outcome"]["message"],
-            "Not logged in · Please run /login"
+            "Claude authentication required — run `claude auth login`"
         );
         let parsed: NormalizedEvent = serde_json::from_value(value).unwrap();
         assert_eq!(parsed, event);
@@ -649,17 +794,25 @@ mod tests {
     }
 
     #[test]
-    fn adapter_event_lifts_to_normalized_rate_limit_event() {
+    fn adapter_event_lifts_to_normalized_rate_limit_event_dropping_source() {
         let agent_id = fresh_agent_id();
         let adapter = AdapterEvent::RateLimitEvent {
             agent_id,
             info: json!({"x": 1}),
+            source: RateLimitSource::StreamOnly,
         };
+        // The `source` discriminator is internal — it must not survive the
+        // conversion to the wire-format event (the frontend never sees it).
         let normalized = NormalizedEvent::from(adapter);
         assert!(matches!(
             normalized,
             NormalizedEvent::RateLimitEvent { agent_id: a, .. } if a == agent_id
         ));
+        let value = serde_json::to_value(&normalized).unwrap();
+        assert!(
+            value.get("source").is_none(),
+            "source must not appear on the wire: {value}"
+        );
     }
 
     #[test]

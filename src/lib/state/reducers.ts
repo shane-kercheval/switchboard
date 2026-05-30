@@ -37,17 +37,23 @@ import type {
   FailureKind,
   LoadedTurn,
   LoadedTurnItem,
+  MessageId,
   NormalizedEvent,
   ReducerInput,
+  SendId,
   TurnId,
 } from "$lib/types";
-import type { AgentRuntime, ToolCall, Turn, TurnItem } from "./types";
+import type { AgentRuntime, PendingSend, ToolCall, Turn, TurnItem } from "./types";
 
 export function transcriptReducer(
   turns: Turn[],
   input: ReducerInput,
   agentId: AgentId,
   receivedAt: string,
+  // The send this turn belongs to, supplied by the caller for `turn_start`
+  // (popped from the agent's pending-send FIFO). Stamped onto the new agent
+  // turn so a fan-out's live responses group like its historical ones.
+  sendId?: SendId,
 ): Turn[] {
   switch (input.type) {
     case "turn_start": {
@@ -63,11 +69,56 @@ export function transcriptReducer(
           role: "agent",
           turn_id: input.turn_id,
           agent_id: agentId,
+          send_id: sendId,
           started_at: input.started_at,
           status: "streaming",
           items: [],
         },
       ];
+    }
+
+    case "message_cancelled": {
+      // A *queued* send was dropped before it started (backend-authoritative —
+      // see `NormalizedEvent::MessageCancelled`). Render a cancelled agent turn
+      // under its prompt. `sendId` is resolved by the caller from the pending
+      // entry (by `message_id`); without it there is nothing to attribute, so
+      // this is a stray and a no-op. Idempotent on the derived `turn_id`.
+      if (sendId === undefined) return turns;
+      const turn_id = `cancelled-${input.message_id}`;
+      if (findTurn(turns, turn_id) !== undefined) return turns;
+      return [
+        ...turns,
+        {
+          role: "agent",
+          turn_id,
+          agent_id: agentId,
+          send_id: sendId,
+          started_at: receivedAt,
+          status: "cancelled",
+          items: [],
+        },
+      ];
+    }
+
+    case "message_failed": {
+      // A send failed before any turn started (adapter failed to launch, or the
+      // journal write failed). Render a failed agent turn under its prompt so
+      // the failure surfaces in the transcript — the same place post-start
+      // failures and the post-reload journal marker appear. `sendId` is resolved
+      // by the caller from the pending entry (the same lookup `turn_start` uses,
+      // including the pre-receipt front-fallback). A failure whose entry was
+      // already consumed by a `turn_start` is post-start (the live turn renders
+      // it) and arrives here with `sendId` undefined — a no-op, so there is no
+      // double-render. Idempotent on the derived `turn_id`.
+      if (sendId === undefined) return turns;
+      return appendFailedTurnImpl(
+        turns,
+        agentId,
+        `failed-${input.message_id}`,
+        receivedAt,
+        input.error,
+        sendId,
+      );
     }
 
     case "content_chunk": {
@@ -170,6 +221,14 @@ export function transcriptReducer(
           usage: input.usage ?? undefined,
         });
       }
+      if (input.outcome.status === "cancelled") {
+        return updateTurn(turns, input.turn_id, {
+          ...existing,
+          status: "cancelled",
+          ended_at: input.ended_at,
+          usage: input.usage ?? undefined,
+        });
+      }
       return updateTurn(turns, input.turn_id, {
         ...existing,
         status: "failed",
@@ -230,6 +289,7 @@ function loadedTurnToTurn(t: LoadedTurn): Turn {
     role: "agent",
     turn_id: t.turn_id,
     agent_id: t.agent_id,
+    send_id: t.send_id ?? undefined,
     started_at: t.started_at,
     ended_at: t.ended_at ?? undefined,
     status: t.status,
@@ -259,7 +319,9 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
   switch (input.type) {
     case "turn_start":
       // Backend-confirmed dispatch: `starting → processing`. The
-      // user-clicked Send transition (`idle → starting`) is driven by
+      // correlated `message_id` matches the `pending_message_id` recorded
+      // when `send_message` resolved; we adopt the real `turn_id` here.
+      // The user-clicked Send transition (`idle → starting`) is driven by
       // the `dispatchUserTurn` state-module action — caller-driven,
       // outside the reducer. The reducer handles only the backend
       // event side of the state machine. See `AgentRuntime.run_status`
@@ -268,14 +330,54 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
       // Sets unconditionally (not guarded on prior state): a regression
       // that emitted `TurnStart` while the runtime was `idle` should
       // still land on `processing` rather than silently dropping the
-      // event. `last_error` is cleared so a successful new dispatch
-      // doesn't surface stale failure state.
+      // event. `last_error` and `pending_message_id` are cleared so a
+      // successful new dispatch doesn't surface stale state.
       return {
         ...runtime,
         run_status: "processing",
         in_flight_turn_id: input.turn_id,
         last_error: undefined,
+        // Consume the pending-send entry this turn belongs to (by message_id,
+        // else the front — see `pickPendingIndex`).
+        pending_sends: removePending(
+          runtime.pending_sends,
+          pickPendingIndex(runtime.pending_sends, input.message_id),
+        ),
       };
+
+    case "message_failed": {
+      // A send failed before any turn started (journal write failed, or the
+      // adapter failed to launch pre-`TurnStart`). Prune its pending entry (by
+      // message_id, else front) and surface the error. A truly stray event
+      // (no pending sends) is ignored.
+      const idx = pickPendingIndex(runtime.pending_sends, input.message_id);
+      if (idx < 0) return runtime;
+      const pending_sends = removePending(runtime.pending_sends, idx);
+      const last_error: { message: string; kind: FailureKind } = {
+        message: input.error,
+        kind: "adapter_failure",
+      };
+      // Flip to idle only if this was the *starting* send. A queued send that
+      // fails pre-start (the agent is `processing` another turn) must not stomp
+      // the live turn — `AgentIdle` settles run_status when the backlog drains.
+      return runtime.run_status === "starting"
+        ? { ...runtime, run_status: "idle", pending_sends, last_error }
+        : { ...runtime, pending_sends, last_error };
+    }
+
+    case "message_cancelled": {
+      // A queued send was dropped before starting. Prune its pending entry
+      // (exact `message_id` match — no front-fallback; the backend always
+      // carries the real id). Cancellation is not an error, so no `last_error`.
+      // Flip to idle only if this was the *starting* send (nothing is running);
+      // a queued send cancelled while another turn runs leaves run_status alone.
+      const idx = runtime.pending_sends?.findIndex((p) => p.message_id === input.message_id) ?? -1;
+      if (idx < 0) return runtime;
+      const pending_sends = removePending(runtime.pending_sends, idx);
+      return runtime.run_status === "starting"
+        ? { ...runtime, run_status: "idle", pending_sends }
+        : { ...runtime, pending_sends };
+    }
 
     case "turn_end":
       // **Do NOT flip run_status to "idle" here.** The dispatcher holds
@@ -283,7 +385,10 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
       // on the per-agent channel (Codex). `AgentIdle` is the signal for
       // "dispatcher will accept a new send." This is the load-bearing
       // distinction that makes the compose-bar gate correct for Codex.
-      if (input.outcome.status === "completed") {
+      // Completed and cancelled are not errors — leave runtime untouched
+      // (AgentIdle clears in_flight_turn_id). Only a real failure surfaces
+      // last_error.
+      if (input.outcome.status === "completed" || input.outcome.status === "cancelled") {
         return runtime;
       }
       return {
@@ -347,7 +452,11 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
       };
 
     case "rate_limit_event":
-      return { ...runtime, last_rate_limit: input.info };
+      // A live event overwrites the in-memory value; the `as_of` qualifier
+      // (the on-disk snapshot's age) is meaningless once live data lands, so
+      // clear it to null — never stamp `now`, which would spuriously age an
+      // actively-streaming session past the staleness threshold.
+      return { ...runtime, last_rate_limit: input.info, last_rate_limit_as_of: null };
 
     case "hydrate": {
       // **Fill-if-empty for scalars.** Live `session_meta` and
@@ -371,7 +480,12 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
         };
       }
       if (next.last_rate_limit === undefined && input.last_rate_limit != null) {
+        // Fill `last_rate_limit` and its `as_of` together — they're one unit.
+        // Only when the runtime had no value: if a live event already
+        // populated it (and cleared `as_of` to null), this no-ops and the
+        // live value + its null `as_of` stay in place.
         next.last_rate_limit = input.last_rate_limit;
+        next.last_rate_limit_as_of = input.last_rate_limit_as_of ?? null;
       }
       if (input.warnings !== undefined && input.warnings.length > 0) {
         next.parse_warnings = input.warnings;
@@ -400,6 +514,33 @@ function findTurn(turns: Turn[], turnId: TurnId): Turn | undefined {
   return turns.find((t) => t.turn_id === turnId);
 }
 
+/// The pending-send entry a backend event refers to: the one whose receipt
+/// matches `messageId`, else the front (covers the race where `turn_start` /
+/// `message_failed` beats the `send_message` IPC receipt, so the entry has no
+/// `message_id` yet — the backend runs turns in dispatch order, so the front is
+/// the next to start). `-1` when there are no pending sends (a stray event).
+function pickPendingIndex(pending: PendingSend[] | undefined, messageId: MessageId): number {
+  if (pending === undefined || pending.length === 0) return -1;
+  const byMsg = pending.findIndex((p) => p.message_id === messageId);
+  if (byMsg >= 0) return byMsg;
+  // No receipt match. Fall back to the front *only* if it hasn't recorded its
+  // receipt yet — the race where the event beat `recordSendAccepted`. If the
+  // front already has a (different) receipt, this event doesn't correlate to
+  // any pending send: it's stray/stale, so don't consume anything.
+  return pending[0]?.message_id === undefined ? 0 : -1;
+}
+
+/// Remove `index` from the pending list, returning `undefined` (not `[]`) when
+/// it empties so a fresh runtime and a fully-drained one compare equal.
+function removePending(
+  pending: PendingSend[] | undefined,
+  index: number,
+): PendingSend[] | undefined {
+  if (pending === undefined || index < 0 || index >= pending.length) return pending;
+  const next = [...pending.slice(0, index), ...pending.slice(index + 1)];
+  return next.length === 0 ? undefined : next;
+}
+
 function updateTurn(turns: Turn[], turnId: TurnId, next: Turn): Turn[] {
   return turns.map((t) => (t.turn_id === turnId ? next : t));
 }
@@ -417,6 +558,7 @@ function appendUserTurnImpl(
   turnId: TurnId,
   text: string,
   startedAt: string,
+  sendId?: SendId,
 ): Turn[] {
   return [
     ...turns,
@@ -424,8 +566,40 @@ function appendUserTurnImpl(
       role: "user",
       turn_id: turnId,
       agent_id: agentId,
+      send_id: sendId,
       started_at: startedAt,
       text,
+    },
+  ];
+}
+
+/// Append a synthetic `failed` agent turn for a send that failed *before* any
+/// `turn_start` arrived (adapter failed to launch, journal write failed, or the
+/// `send_message` IPC rejected). Mirrors the pre-start `message_cancelled` row:
+/// empty items, terminal status, attributed to its send. Idempotent on
+/// `turnId`. Post-start failures are NOT routed here — they update the existing
+/// streaming turn via `turn_end`, so there is no double-render.
+function appendFailedTurnImpl(
+  turns: Turn[],
+  agentId: AgentId,
+  turnId: TurnId,
+  startedAt: string,
+  error: string,
+  sendId?: SendId,
+): Turn[] {
+  if (findTurn(turns, turnId) !== undefined) return turns;
+  return [
+    ...turns,
+    {
+      role: "agent",
+      turn_id: turnId,
+      agent_id: agentId,
+      send_id: sendId,
+      started_at: startedAt,
+      status: "failed",
+      items: [],
+      error,
+      error_kind: "adapter_failure",
     },
   ];
 }
@@ -438,6 +612,7 @@ function appendUserTurnImpl(
 /// transition on top of this raw helper.
 export const _internal = {
   appendUserTurn: appendUserTurnImpl,
+  appendFailedTurn: appendFailedTurnImpl,
 };
 
 // Re-export NormalizedEvent for downstream convenience.

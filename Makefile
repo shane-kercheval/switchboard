@@ -1,4 +1,4 @@
-.PHONY: dev test lint fmt check clean install test-live test-live-claude test-live-codex test-live-gemini test-live-antigravity
+.PHONY: dev build test lint fmt check clean install test-live test-live-claude test-live-codex test-live-gemini test-live-antigravity
 
 # Crates that carry live (`#[ignore]`-gated) harness tests.
 LIVE_PKGS := -p switchboard-harness -p switchboard-dispatcher -p switchboard-app
@@ -8,6 +8,12 @@ install:
 
 dev:
 	pnpm tauri dev
+
+# Release build of the macOS .app bundle (the only artifact that carries the
+# bundled icon). `--bundles app` skips the .dmg packaging step. Output:
+# target/release/bundle/macos/Switchboard.app
+build:
+	pnpm tauri build --bundles app
 
 test:
 	cargo test --workspace --all-features --locked

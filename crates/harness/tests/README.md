@@ -21,7 +21,7 @@ real harnesses".
 ## How to run
 
 One-time: install and authenticate each harness with subscription credentials
-(no API keys) — `claude login`, `codex login`, an interactive `gemini`
+(no API keys) — `claude auth login`, `codex login`, an interactive `gemini`
 sign-in, and the Antigravity desktop-app sign-in for `agy`.
 
 ```sh
@@ -85,7 +85,7 @@ from a test name):
   tailed from `transcript.jsonl`, and a turn is `Completed` only when a terminal
   answer is read from it. Its tool-use live test therefore doubles as the guard
   that an agentic (tool-using) turn still yields a readable terminal answer. See
-  `docs/research/antigravity-cli-observed.md`.
+  `docs/research/harness-behavior.md` (raw probe: `docs/research/archive/antigravity-cli-observed.md`).
 
 ## What's intentionally NOT covered live
 

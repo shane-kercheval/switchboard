@@ -30,23 +30,111 @@
 //!   coupling of the dispatcher to one harness's behavior surfaces in the
 //!   other tests.
 //!
+//! Turn/chain completion is awaited deterministically off the event stream
+//! (`RecordingEmitter::wait_for_type("agent_idle", n)`) under a timeout —
+//! there is no per-send join handle in the actor model.
+//!
 //! Run with: `make test-live`. Gated behind `#[ignore]` because each test
 //! costs real credits and requires the corresponding CLI installed and
 //! authenticated.
 
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
-use switchboard_core::{Directory, HarnessKind};
-use switchboard_dispatcher::{Dispatcher, EventEmitter, RecordingEmitter};
+use switchboard_core::{AgentRecord, Directory, HarnessKind, SendId};
+use switchboard_dispatcher::{
+    ConversationJournal, DispatchContext, DispatchContextFactory, Dispatcher, EventEmitter,
+    NoopJournal, NoopMetadataCache, OnBusy, RecordingEmitter, SendOutcome,
+};
 use switchboard_harness::{
-    AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, DispatchOptions, GeminiAdapter,
-    HarnessAdapter,
+    AntigravityAdapter, CancelSource, ClaudeCodeAdapter, CodexAdapter, DispatchOptions,
+    GeminiAdapter, HarnessAdapter,
 };
 use tempfile::TempDir;
+use uuid::Uuid;
+
+/// Generous deadline for a real-CLI turn (spawn + model latency). A logic bug
+/// surfaces as a bounded timeout with the recorded events, not a hang.
+#[allow(
+    clippy::duration_suboptimal_units,
+    reason = "from_mins is unstable on the pinned toolchain"
+)]
+const LIVE_WAIT: Duration = Duration::from_secs(60);
+
+/// The capturing factory the live tests build: it freezes the real adapter,
+/// agent record, emitter, and (no-op) journal, handing the actor a fresh
+/// `DispatchContext` per turn — the app-side factory's contract, against a
+/// real harness adapter.
+struct LiveFactory {
+    adapter: Arc<dyn HarnessAdapter>,
+    cwd: PathBuf,
+    agent: AgentRecord,
+    emitter: Arc<dyn EventEmitter>,
+}
+
+impl LiveFactory {
+    fn new(
+        adapter: Arc<dyn HarnessAdapter>,
+        cwd: PathBuf,
+        agent: AgentRecord,
+        emitter: Arc<RecordingEmitter>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            adapter,
+            cwd,
+            agent,
+            emitter: emitter as Arc<dyn EventEmitter>,
+        })
+    }
+}
+
+impl DispatchContextFactory for LiveFactory {
+    fn build(&self, _send_id: SendId) -> DispatchContext {
+        DispatchContext {
+            adapter: Arc::clone(&self.adapter),
+            cwd: self.cwd.clone(),
+            agent: self.agent.clone(),
+            emitter: Arc::clone(&self.emitter),
+            options: DispatchOptions::default(),
+            journal: noop_journal(),
+            metadata: Arc::new(NoopMetadataCache),
+        }
+    }
+
+    fn idle_emitter(&self) -> Arc<dyn EventEmitter> {
+        Arc::clone(&self.emitter)
+    }
+}
+
+/// Live tests assert on real-harness stream behavior, not journaling.
+fn noop_journal() -> Arc<dyn ConversationJournal> {
+    Arc::new(NoopJournal)
+}
+
+/// Block until `count` `agent_idle` events have been recorded, under the live
+/// timeout — the actor-model replacement for `handle.join.await`.
+async fn wait_for_idles(emitter: &Arc<RecordingEmitter>, count: usize) {
+    tokio::time::timeout(LIVE_WAIT, emitter.wait_for_type("agent_idle", count))
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "timed out waiting for {count} agent_idle event(s); events: {:?}",
+                emitter.snapshot()
+            )
+        });
+}
+
+/// Unwrap an `Accepted` send (the Enqueue path never returns `Busy`).
+fn expect_accepted(outcome: SendOutcome, label: &str) {
+    assert!(
+        matches!(outcome, SendOutcome::Accepted(_)),
+        "{label} must be accepted; got {outcome:?}"
+    );
+}
 
 /// Extracts the `outcome.status` strings from every `turn_end` event the
-/// emitter saw on the given channel, in arrival order. Tests assert against
-/// this rather than rummaging through the event list each time.
+/// emitter saw on the given channel, in arrival order.
 fn turn_end_statuses(emitter: &Arc<RecordingEmitter>, channel: &str) -> Vec<String> {
     emitter
         .snapshot()
@@ -66,17 +154,61 @@ fn agent_text(emitter: &Arc<RecordingEmitter>, channel: &str) -> String {
         .collect()
 }
 
+/// The wire-`type` sequence on a channel, in arrival order.
+fn kind_sequence(emitter: &Arc<RecordingEmitter>, channel: &str) -> Vec<String> {
+    emitter
+        .snapshot()
+        .into_iter()
+        .filter(|(name, _)| name == channel)
+        .map(|(_, payload)| payload["type"].as_str().unwrap_or("").to_owned())
+        .collect()
+}
+
+/// The shared event-ordering contract every harness must satisfy:
+/// `turn_start` first, `agent_idle` last, exactly one `turn_end`, exactly one
+/// `agent_idle`, `turn_end` before `agent_idle`, and at least one
+/// `content_chunk`.
+fn assert_ordering_contract(kinds: &[String]) {
+    assert_eq!(
+        kinds.first().map(String::as_str),
+        Some("turn_start"),
+        "first event on the channel must be turn_start; got: {kinds:?}"
+    );
+    assert_eq!(
+        kinds.last().map(String::as_str),
+        Some("agent_idle"),
+        "last event must be agent_idle; got: {kinds:?}"
+    );
+    assert_eq!(
+        kinds.iter().filter(|k| *k == "turn_end").count(),
+        1,
+        "must be exactly one terminal event per turn; got: {kinds:?}"
+    );
+    assert_eq!(
+        kinds.iter().filter(|k| *k == "agent_idle").count(),
+        1,
+        "exactly one agent_idle per dispatch; got: {kinds:?}"
+    );
+    let turn_end_idx = kinds.iter().position(|k| k == "turn_end").unwrap();
+    let agent_idle_idx = kinds.iter().position(|k| k == "agent_idle").unwrap();
+    assert!(
+        turn_end_idx < agent_idle_idx,
+        "turn_end must precede agent_idle; got: {kinds:?}"
+    );
+    assert!(
+        kinds.iter().any(|k| k == "content_chunk"),
+        "at least one content_chunk expected for a real completion; got: {kinds:?}"
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires claude installed and authenticated — run with: make test-live"]
 async fn live_claude_full_stack_two_consecutive_turns_succeed() {
-    // Reproduces the full backend vertical slice. Creates a working
-    // directory, initializes the .switchboard/ layout, registers a project +
-    // agent exactly like the app does, then dispatches two turns. The
-    // second turn is the load-bearing assertion — the first turn creates
-    // the session file, and the second turn must find it and switch from
-    // `--session-id` to `--resume`. A path-encoding bug in the session-file
-    // lookup would surface here as the second turn failing with "Session
-    // ID … is already in use".
+    // Reproduces the full backend vertical slice. Two turns: the second is the
+    // load-bearing assertion — the first creates the session file, and the
+    // second must find it and switch from `--session-id` to `--resume`. A
+    // path-encoding bug surfaces as the second turn failing with "Session ID …
+    // is already in use". The two turns chain through the actor's FIFO backlog.
     let tmp = TempDir::new().expect("tempdir");
     let directory = Directory::at(tmp.path()).expect("Directory::at");
     directory.init().expect("init .switchboard/");
@@ -95,37 +227,45 @@ async fn live_claude_full_stack_two_consecutive_turns_succeed() {
     let adapter: Arc<dyn HarnessAdapter> = Arc::new(ClaudeCodeAdapter::new());
     let emitter = Arc::new(RecordingEmitter::new());
     let channel = format!("agent:{}", agent.id);
+    let factory = LiveFactory::new(
+        adapter,
+        project.directory.clone(),
+        agent.clone(),
+        Arc::clone(&emitter),
+    );
 
     // Turn 1: adapter passes --session-id (session file doesn't exist yet).
-    let handle1 = dispatcher
-        .send_message(
-            &agent,
-            &project.directory,
-            "Reply with exactly the word: ack",
-            adapter.as_ref(),
-            Arc::clone(&emitter) as Arc<dyn EventEmitter>,
-            DispatchOptions::default(),
-        )
-        .await
-        .expect("first send_message");
-    handle1.join.await.expect("drain joined");
+    expect_accepted(
+        dispatcher
+            .send_message(
+                agent.id,
+                "Reply with exactly the word: ack",
+                Uuid::now_v7(),
+                Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
+                OnBusy::Enqueue,
+            )
+            .await,
+        "first send",
+    );
+    // Wait for turn 1 to fully settle before sending turn 2, so the adapter's
+    // session-file lookup on turn 2 sees the file turn 1 wrote.
+    wait_for_idles(&emitter, 1).await;
 
     // Turn 2: the regression catch. Adapter must detect the session file
-    // created by turn 1 and pass --resume (not --session-id). Pre-fix, this
-    // failed with "Session ID is already in use" because the path-encoding
-    // mismatch made the session file appear missing.
-    let handle2 = dispatcher
-        .send_message(
-            &agent,
-            &project.directory,
-            "And again, exactly: ack",
-            adapter.as_ref(),
-            Arc::clone(&emitter) as Arc<dyn EventEmitter>,
-            DispatchOptions::default(),
-        )
-        .await
-        .expect("second send_message");
-    handle2.join.await.expect("second drain joined");
+    // created by turn 1 and pass --resume (not --session-id).
+    expect_accepted(
+        dispatcher
+            .send_message(
+                agent.id,
+                "And again, exactly: ack",
+                Uuid::now_v7(),
+                factory,
+                OnBusy::Enqueue,
+            )
+            .await,
+        "second send",
+    );
+    wait_for_idles(&emitter, 2).await;
 
     let statuses = turn_end_statuses(&emitter, &channel);
     assert_eq!(
@@ -139,13 +279,6 @@ async fn live_claude_full_stack_two_consecutive_turns_succeed() {
 #[tokio::test]
 #[ignore = "requires claude installed and authenticated — run with: make test-live"]
 async fn live_claude_full_stack_emits_turn_start_then_content_then_turn_end() {
-    // Confirms the event-order contract end-to-end through the dispatcher.
-    // The reducer relies on `turn_start` arriving before any `content_chunk`
-    // and exactly one `turn_end` per turn; if the dispatcher's ordering
-    // (acquire guard → generate TurnId → dispatch → emit TurnStart → spawn
-    // drain) ever regressed, the frontend reducer would silently start
-    // dropping events. This test fails fast in that case without needing a
-    // running app.
     let tmp = TempDir::new().expect("tempdir");
     let directory = Directory::at(tmp.path()).expect("Directory::at");
     directory.init().expect("init");
@@ -158,108 +291,74 @@ async fn live_claude_full_stack_emits_turn_start_then_content_then_turn_end() {
     let adapter: Arc<dyn HarnessAdapter> = Arc::new(ClaudeCodeAdapter::new());
     let emitter = Arc::new(RecordingEmitter::new());
     let channel = format!("agent:{}", agent.id);
+    let factory = LiveFactory::new(
+        adapter,
+        project.directory.clone(),
+        agent.clone(),
+        Arc::clone(&emitter),
+    );
 
-    let handle = dispatcher
-        .send_message(
-            &agent,
-            &project.directory,
-            "Reply with exactly: hi",
-            adapter.as_ref(),
-            Arc::clone(&emitter) as Arc<dyn EventEmitter>,
-            DispatchOptions::default(),
-        )
-        .await
-        .expect("send_message");
-    handle.join.await.expect("drain joined");
+    expect_accepted(
+        dispatcher
+            .send_message(
+                agent.id,
+                "Reply with exactly: hi",
+                Uuid::now_v7(),
+                factory,
+                OnBusy::Enqueue,
+            )
+            .await,
+        "send",
+    );
+    wait_for_idles(&emitter, 1).await;
 
-    let kinds: Vec<String> = emitter
-        .snapshot()
-        .into_iter()
-        .filter(|(name, _)| name == &channel)
-        .map(|(_, payload)| payload["type"].as_str().unwrap_or("").to_owned())
-        .collect();
-
-    assert_eq!(
-        kinds.first().map(String::as_str),
-        Some("turn_start"),
-        "first event on the channel must be turn_start; got: {kinds:?}"
-    );
-    // AGENTS.md stream contract: `AgentIdle` is the last event on the
-    // per-agent channel for a dispatch, AFTER `TurnEnd` and any
-    // post-terminal agent-scoped events. This was originally a
-    // `turn_end`-is-last assertion (pre-AgentIdle); updated to track the
-    // current contract.
-    assert_eq!(
-        kinds.last().map(String::as_str),
-        Some("agent_idle"),
-        "last event must be agent_idle; got: {kinds:?}"
-    );
-    assert_eq!(
-        kinds.iter().filter(|k| *k == "turn_end").count(),
-        1,
-        "must be exactly one terminal event per turn; got: {kinds:?}"
-    );
-    assert_eq!(
-        kinds.iter().filter(|k| *k == "agent_idle").count(),
-        1,
-        "exactly one agent_idle per dispatch; got: {kinds:?}"
-    );
-    // turn_end must precede agent_idle.
-    let turn_end_idx = kinds.iter().position(|k| k == "turn_end").unwrap();
-    let agent_idle_idx = kinds.iter().position(|k| k == "agent_idle").unwrap();
-    assert!(
-        turn_end_idx < agent_idle_idx,
-        "turn_end must precede agent_idle; got: {kinds:?}"
-    );
-    assert!(
-        kinds.iter().any(|k| k == "content_chunk"),
-        "at least one content_chunk expected for a real-claude completion; got: {kinds:?}"
-    );
+    assert_ordering_contract(&kind_sequence(&emitter, &channel));
 }
 
 #[tokio::test]
 #[ignore = "requires claude installed and authenticated — run with: make test-live"]
 async fn live_claude_full_stack_paths_with_dot_components_resolve_correctly() {
     // Direct regression test for the path-encoding bug. The user's bound
-    // working directory can contain dots (hidden directories, dotted
-    // usernames, etc.). The path-encoding rule must apply the same way at
-    // any path position, otherwise the second-turn `--resume` lookup fails.
+    // working directory can contain dots; the encoding rule must apply the same
+    // way at any path position, otherwise the second-turn `--resume` lookup
+    // fails.
     let tmp = TempDir::new().expect("tempdir");
-    // Build a working directory with a dot-prefixed component to exercise
-    // the encoding rule. The actual user-bound dir is typed by the user
-    // and can take any shape; we simulate one of the trickier cases here.
     let working_dir = tmp.path().join(".config").join("my.app");
     std::fs::create_dir_all(&working_dir).expect("create working dir");
     let directory = Directory::at(&working_dir).expect("Directory::at");
     directory.init().expect("init");
     let project = directory.create_project("dot-path-test").expect("project");
-
     let agent = project
         .register_agent("assistant", HarnessKind::ClaudeCode)
         .expect("agent");
+
     let dispatcher = Arc::new(Dispatcher::new());
     let adapter: Arc<dyn HarnessAdapter> = Arc::new(ClaudeCodeAdapter::new());
     let emitter = Arc::new(RecordingEmitter::new());
     let channel = format!("agent:{}", agent.id);
+    let factory = LiveFactory::new(
+        adapter,
+        project.directory.clone(),
+        agent.clone(),
+        Arc::clone(&emitter),
+    );
 
-    // Send two consecutive turns. The session-id encoding bug surfaces as a
-    // failure on the second.
+    // Two consecutive turns, each awaited to idle before the next so the resume
+    // lookup on turn 2 sees turn 1's session file.
     for (i, prompt) in ["Say 1", "Say 2"].iter().enumerate() {
-        let handle = dispatcher
-            .send_message(
-                &agent,
-                &project.directory,
-                prompt,
-                adapter.as_ref(),
-                Arc::clone(&emitter) as Arc<dyn EventEmitter>,
-                DispatchOptions::default(),
-            )
-            .await
-            .unwrap_or_else(|e| panic!("send_message #{} failed: {e:?}", i + 1));
-        handle
-            .join
-            .await
-            .unwrap_or_else(|e| panic!("drain join #{} failed: {e:?}", i + 1));
+        expect_accepted(
+            dispatcher
+                .send_message(
+                    agent.id,
+                    prompt,
+                    Uuid::now_v7(),
+                    Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
+                    OnBusy::Enqueue,
+                )
+                .await,
+            "send",
+        );
+        wait_for_idles(&emitter, i + 1).await;
     }
 
     let statuses = turn_end_statuses(&emitter, &channel);
@@ -276,21 +375,9 @@ async fn live_claude_full_stack_paths_with_dot_components_resolve_correctly() {
 #[tokio::test]
 #[ignore = "requires claude installed and authenticated — run with: make test-live"]
 async fn live_claude_full_stack_sees_files_in_cwd() {
-    // Regression test for the cwd-routing rule: claude must be spawned in
-    // the user's bound working directory, NOT in
-    // `<dir>/.switchboard/projects/<uuid>/` (the Switchboard-internal
-    // metadata directory). The observable symptom of a regression here is
-    // that claude can't see the user's repo files via its Read/Glob/Bash
-    // tools — the core use case (orchestrate claude on the user's code)
-    // would be broken.
-    //
-    // This test: write a known-content file into the working directory,
-    // dispatch a turn asking claude to read it, assert the streamed
-    // response references the content. Pre-fix, claude's Read tool would
-    // fail or return nothing (the file isn't in `.switchboard/projects/<uuid>/`).
+    // Regression test for the cwd-routing rule: claude must be spawned in the
+    // user's bound working directory, NOT in `<dir>/.switchboard/projects/<uuid>/`.
     let tmp = TempDir::new().expect("tempdir");
-    // A token unlikely to appear in any other context, so its presence in
-    // the response is strong evidence claude read the file.
     let token = "SWITCHBOARD_LIVE_TEST_TOKEN_F8A23E";
     std::fs::write(tmp.path().join("MARKER.txt"), token).expect("write marker");
 
@@ -305,19 +392,26 @@ async fn live_claude_full_stack_sees_files_in_cwd() {
     let adapter: Arc<dyn HarnessAdapter> = Arc::new(ClaudeCodeAdapter::new());
     let emitter = Arc::new(RecordingEmitter::new());
     let channel = format!("agent:{}", agent.id);
+    let factory = LiveFactory::new(
+        adapter,
+        project.directory.clone(),
+        agent.clone(),
+        Arc::clone(&emitter),
+    );
 
-    let handle = dispatcher
-        .send_message(
-            &agent,
-            &project.directory,
-            "Read the file MARKER.txt in the current directory and tell me what string it contains. Reply with just the string, nothing else.",
-            adapter.as_ref(),
-            Arc::clone(&emitter) as Arc<dyn EventEmitter>,
-            DispatchOptions::default(),
-        )
-        .await
-        .expect("send_message");
-    handle.join.await.expect("drain joined");
+    expect_accepted(
+        dispatcher
+            .send_message(
+                agent.id,
+                "Read the file MARKER.txt in the current directory and tell me what string it contains. Reply with just the string, nothing else.",
+                Uuid::now_v7(),
+                factory,
+                OnBusy::Enqueue,
+            )
+            .await,
+        "send",
+    );
+    wait_for_idles(&emitter, 1).await;
 
     let text = agent_text(&emitter, &channel);
     assert!(
@@ -330,17 +424,6 @@ async fn live_claude_full_stack_sees_files_in_cwd() {
 #[tokio::test]
 #[ignore = "requires gemini installed and authenticated — run with: make test-live"]
 async fn live_gemini_full_stack_emits_turn_start_then_content_then_turn_end() {
-    // The canonical empirical assertion of M3's headline claim: the
-    // dispatcher abstraction is genuinely harness-neutral. Same
-    // event-ordering contract (turn_start → content_chunk → turn_end →
-    // agent_idle) must hold through the dispatcher for Gemini exactly
-    // as it does for Claude — proved through the real `gemini`
-    // subprocess code path, not just through adapter-layer fixtures.
-    //
-    // `Project::register_agent` mints UUID v4 for Gemini because session
-    // filenames use the first 8 hex chars of the session UUID and v7s
-    // minted in the same millisecond share that prefix. No special
-    // test-side handling needed; the production path honors this.
     let tmp = TempDir::new().expect("tempdir");
     let directory = Directory::at(tmp.path()).expect("Directory::at");
     directory.init().expect("init");
@@ -359,58 +442,28 @@ async fn live_gemini_full_stack_emits_turn_start_then_content_then_turn_end() {
     let adapter: Arc<dyn HarnessAdapter> = Arc::new(GeminiAdapter::new());
     let emitter = Arc::new(RecordingEmitter::new());
     let channel = format!("agent:{}", agent.id);
-
-    let handle = dispatcher
-        .send_message(
-            &agent,
-            &project.directory,
-            "Reply with exactly: hi",
-            adapter.as_ref(),
-            Arc::clone(&emitter) as Arc<dyn EventEmitter>,
-            DispatchOptions::default(),
-        )
-        .await
-        .expect("send_message");
-    handle.join.await.expect("drain joined");
-
-    let kinds: Vec<String> = emitter
-        .snapshot()
-        .into_iter()
-        .filter(|(name, _)| name == &channel)
-        .map(|(_, payload)| payload["type"].as_str().unwrap_or("").to_owned())
-        .collect();
-
-    assert_eq!(
-        kinds.first().map(String::as_str),
-        Some("turn_start"),
-        "first event on the channel must be turn_start; got: {kinds:?}"
-    );
-    assert_eq!(
-        kinds.last().map(String::as_str),
-        Some("agent_idle"),
-        "last event must be agent_idle; got: {kinds:?}"
-    );
-    assert_eq!(
-        kinds.iter().filter(|k| *k == "turn_end").count(),
-        1,
-        "must be exactly one terminal event per turn; got: {kinds:?}"
-    );
-    assert_eq!(
-        kinds.iter().filter(|k| *k == "agent_idle").count(),
-        1,
-        "exactly one agent_idle per dispatch; got: {kinds:?}"
-    );
-    let turn_end_idx = kinds.iter().position(|k| k == "turn_end").unwrap();
-    let agent_idle_idx = kinds.iter().position(|k| k == "agent_idle").unwrap();
-    assert!(
-        turn_end_idx < agent_idle_idx,
-        "turn_end must precede agent_idle; got: {kinds:?}"
-    );
-    assert!(
-        kinds.iter().any(|k| k == "content_chunk"),
-        "at least one content_chunk expected for a real-gemini completion; got: {kinds:?}"
+    let factory = LiveFactory::new(
+        adapter,
+        project.directory.clone(),
+        agent.clone(),
+        Arc::clone(&emitter),
     );
 
+    expect_accepted(
+        dispatcher
+            .send_message(
+                agent.id,
+                "Reply with exactly: hi",
+                Uuid::now_v7(),
+                factory,
+                OnBusy::Enqueue,
+            )
+            .await,
+        "send",
+    );
+    wait_for_idles(&emitter, 1).await;
+
+    assert_ordering_contract(&kind_sequence(&emitter, &channel));
     let statuses = turn_end_statuses(&emitter, &channel);
     assert_eq!(statuses, vec!["completed".to_owned()]);
 }
@@ -418,18 +471,9 @@ async fn live_gemini_full_stack_emits_turn_start_then_content_then_turn_end() {
 #[tokio::test]
 #[ignore = "requires codex installed and authenticated — run with: make test-live"]
 async fn live_codex_full_stack_emits_turn_start_then_content_then_turn_end() {
-    // Symmetric coverage with the Claude and Gemini dispatcher-layer
-    // tests. The dispatcher's per-turn machinery (TurnId generation,
-    // AgentIdleGuard, EventEmitter forwarding, per-agent state tracking)
-    // must remain harness-agnostic; this test proves the same
-    // `turn_start → content_chunk → turn_end → agent_idle` ordering
-    // contract through a real `codex` subprocess. A regression coupling
-    // any dispatcher path to Claude- or Gemini-specific behavior fails
-    // here.
-    //
-    // Codex agents register with `session_id = None` (the per-agent
-    // sidecar is the system-of-record); the dispatcher must not depend
-    // on `agent.session_id.is_some()` to function.
+    // Codex agents register with `session_id = None` (the per-agent sidecar is
+    // the system-of-record); the dispatcher must not depend on
+    // `agent.session_id.is_some()` to function.
     let tmp = TempDir::new().expect("tempdir");
     let directory = Directory::at(tmp.path()).expect("Directory::at");
     directory.init().expect("init");
@@ -448,73 +492,39 @@ async fn live_codex_full_stack_emits_turn_start_then_content_then_turn_end() {
     let adapter: Arc<dyn HarnessAdapter> = Arc::new(CodexAdapter::new());
     let emitter = Arc::new(RecordingEmitter::new());
     let channel = format!("agent:{}", agent.id);
-
-    let handle = dispatcher
-        .send_message(
-            &agent,
-            &project.directory,
-            "Reply with exactly: hi",
-            adapter.as_ref(),
-            Arc::clone(&emitter) as Arc<dyn EventEmitter>,
-            DispatchOptions::default(),
-        )
-        .await
-        .expect("send_message");
-    handle.join.await.expect("drain joined");
-
-    let kinds: Vec<String> = emitter
-        .snapshot()
-        .into_iter()
-        .filter(|(name, _)| name == &channel)
-        .map(|(_, payload)| payload["type"].as_str().unwrap_or("").to_owned())
-        .collect();
-
-    assert_eq!(
-        kinds.first().map(String::as_str),
-        Some("turn_start"),
-        "first event on the channel must be turn_start; got: {kinds:?}"
-    );
-    assert_eq!(
-        kinds.last().map(String::as_str),
-        Some("agent_idle"),
-        "last event must be agent_idle; got: {kinds:?}"
-    );
-    assert_eq!(
-        kinds.iter().filter(|k| *k == "turn_end").count(),
-        1,
-        "must be exactly one terminal event per turn; got: {kinds:?}"
-    );
-    assert_eq!(
-        kinds.iter().filter(|k| *k == "agent_idle").count(),
-        1,
-        "exactly one agent_idle per dispatch; got: {kinds:?}"
-    );
-    let turn_end_idx = kinds.iter().position(|k| k == "turn_end").unwrap();
-    let agent_idle_idx = kinds.iter().position(|k| k == "agent_idle").unwrap();
-    assert!(
-        turn_end_idx < agent_idle_idx,
-        "turn_end must precede agent_idle; got: {kinds:?}"
-    );
-    assert!(
-        kinds.iter().any(|k| k == "content_chunk"),
-        "at least one content_chunk expected for a real-codex completion; got: {kinds:?}"
+    let factory = LiveFactory::new(
+        adapter,
+        project.directory.clone(),
+        agent.clone(),
+        Arc::clone(&emitter),
     );
 
+    expect_accepted(
+        dispatcher
+            .send_message(
+                agent.id,
+                "Reply with exactly: hi",
+                Uuid::now_v7(),
+                factory,
+                OnBusy::Enqueue,
+            )
+            .await,
+        "send",
+    );
+    wait_for_idles(&emitter, 1).await;
+
+    assert_ordering_contract(&kind_sequence(&emitter, &channel));
     let statuses = turn_end_statuses(&emitter, &channel);
     assert_eq!(statuses, vec!["completed".to_owned()]);
 }
 
 #[tokio::test]
-#[ignore = "requires agy authed via Antigravity desktop app — run with: make test-live"]
+#[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
 async fn live_antigravity_full_stack_two_turns_resume_through_dispatcher() {
-    // The full backend slice for Antigravity, exercising the load-bearing
-    // capture→resume path through the dispatcher (not just the adapter):
-    // turn 1 spawns a fresh conversation and the adapter captures the
-    // server-assigned UUID into the per-agent sidecar; turn 2 must read that
-    // sidecar and resume via `--conversation <uuid>`. Antigravity agents carry
-    // `session_id: None` (server-assigned, sidecar-carried), unlike Claude/
-    // Gemini. Also asserts the harness-neutral event-ordering contract holds
-    // through the real `agy` subprocess.
+    // The full backend slice for Antigravity, exercising the capture→resume
+    // path through the dispatcher: turn 1 captures the server-assigned UUID into
+    // the per-agent sidecar; turn 2 must read that sidecar and resume via
+    // `--conversation <uuid>`.
     let tmp = TempDir::new().expect("tempdir");
     let directory = Directory::at(tmp.path()).expect("Directory::at");
     directory.init().expect("init");
@@ -533,27 +543,29 @@ async fn live_antigravity_full_stack_two_turns_resume_through_dispatcher() {
     let adapter: Arc<dyn HarnessAdapter> = Arc::new(AntigravityAdapter::new());
     let emitter = Arc::new(RecordingEmitter::new());
     let channel = format!("agent:{}", agent.id);
+    let factory = LiveFactory::new(
+        adapter,
+        project.directory.clone(),
+        agent.clone(),
+        Arc::clone(&emitter),
+    );
 
-    let handle1 = dispatcher
-        .send_message(
-            &agent,
-            &project.directory,
-            "Reply with exactly the word: ack",
-            adapter.as_ref(),
-            Arc::clone(&emitter) as Arc<dyn EventEmitter>,
-            DispatchOptions::default(),
-        )
-        .await
-        .expect("first send_message");
-    handle1.join.await.expect("first drain joined");
+    expect_accepted(
+        dispatcher
+            .send_message(
+                agent.id,
+                "Reply with exactly the word: ack",
+                Uuid::now_v7(),
+                Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
+                OnBusy::Enqueue,
+            )
+            .await,
+        "first send",
+    );
+    wait_for_idles(&emitter, 1).await;
 
     // Event-ordering contract on turn 1.
-    let kinds: Vec<String> = emitter
-        .snapshot()
-        .into_iter()
-        .filter(|(name, _)| name == &channel)
-        .map(|(_, payload)| payload["type"].as_str().unwrap_or("").to_owned())
-        .collect();
+    let kinds = kind_sequence(&emitter, &channel);
     assert_eq!(
         kinds.first().map(String::as_str),
         Some("turn_start"),
@@ -565,20 +577,20 @@ async fn live_antigravity_full_stack_two_turns_resume_through_dispatcher() {
         "last event must be agent_idle; got: {kinds:?}"
     );
 
-    // Turn 2: the resume regression catch. The adapter must read the sidecar
-    // written by turn 1 and pass `--conversation <uuid>`.
-    let handle2 = dispatcher
-        .send_message(
-            &agent,
-            &project.directory,
-            "And again, exactly: ack",
-            adapter.as_ref(),
-            Arc::clone(&emitter) as Arc<dyn EventEmitter>,
-            DispatchOptions::default(),
-        )
-        .await
-        .expect("second send_message");
-    handle2.join.await.expect("second drain joined");
+    // Turn 2: the resume regression catch.
+    expect_accepted(
+        dispatcher
+            .send_message(
+                agent.id,
+                "And again, exactly: ack",
+                Uuid::now_v7(),
+                factory,
+                OnBusy::Enqueue,
+            )
+            .await,
+        "second send",
+    );
+    wait_for_idles(&emitter, 2).await;
 
     let statuses = turn_end_statuses(&emitter, &channel);
     assert_eq!(
@@ -586,4 +598,126 @@ async fn live_antigravity_full_stack_two_turns_resume_through_dispatcher() {
         vec!["completed".to_owned(), "completed".to_owned()],
         "both turns must complete (turn 2 resumes via the captured UUID); got: {statuses:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Live cancellation tests (M4.3). Each dispatches a turn through the real CLI,
+// fires the cancellation token while it is in flight, and asserts the
+// dispatcher synthesizes a `Cancelled` terminal and the agent returns to idle
+// (reaches agent_idle) and is re-promptable.
+// ---------------------------------------------------------------------------
+
+/// The `outcome.source` of the single `turn_end` on the channel, if cancelled.
+fn cancelled_source(emitter: &Arc<RecordingEmitter>, channel: &str) -> Option<String> {
+    emitter
+        .snapshot()
+        .into_iter()
+        .filter(|(name, payload)| name == channel && payload["type"] == "turn_end")
+        .find_map(|(_, payload)| {
+            if payload["outcome"]["status"] == "cancelled" {
+                payload["outcome"]["source"].as_str().map(str::to_owned)
+            } else {
+                None
+            }
+        })
+}
+
+async fn live_cancel_case(harness: HarnessKind, adapter: Arc<dyn HarnessAdapter>) {
+    let tmp = TempDir::new().expect("tempdir");
+    let directory = Directory::at(tmp.path()).expect("Directory::at");
+    directory.init().expect("init .switchboard/");
+    let project = directory
+        .create_project("cancel-test")
+        .expect("create_project");
+    let agent = project
+        .register_agent("assistant", harness)
+        .expect("register_agent");
+
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let channel = format!("agent:{}", agent.id);
+    let factory = LiveFactory::new(
+        adapter,
+        project.directory.clone(),
+        agent.clone(),
+        Arc::clone(&emitter),
+    );
+
+    expect_accepted(
+        dispatcher
+            .send_message(
+                agent.id,
+                "Count slowly to one hundred, one number per line.",
+                Uuid::now_v7(),
+                factory,
+                OnBusy::Enqueue,
+            )
+            .await,
+        "send",
+    );
+
+    // Wait until the turn is actually live, then fire the token. The adapter
+    // must kill the subprocess group and end the stream, and the dispatcher
+    // must synthesize `Cancelled { User }`.
+    tokio::time::timeout(LIVE_WAIT, emitter.wait_for_type("turn_start", 1))
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "turn never started within the timeout; events: {:?}",
+                emitter.snapshot()
+            )
+        });
+    dispatcher.cancel(agent.id, CancelSource::User);
+
+    // The agent drains to idle within the timeout; a CLI that ignored the
+    // cancel path surfaces as a clear failure with the events.
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "turn did not drain within 30s of cancel — cancellation may have hung; events: {:?}",
+            emitter.snapshot()
+        )
+    });
+
+    assert_eq!(
+        cancelled_source(&emitter, &channel).as_deref(),
+        Some("user"),
+        "expected a cancelled terminal stamped `user`; events: {:?}",
+        emitter.snapshot()
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires claude installed and authenticated — run with: make test-live"]
+async fn live_claude_cancel_terminates_and_synthesizes_cancelled() {
+    live_cancel_case(HarnessKind::ClaudeCode, Arc::new(ClaudeCodeAdapter::new())).await;
+}
+
+#[tokio::test]
+#[ignore = "requires codex installed and authenticated — run with: make test-live"]
+async fn live_codex_cancel_terminates_and_synthesizes_cancelled() {
+    // Codex is the load-bearing case: it exits 0 on SIGTERM and emits no
+    // terminal event, so only the dispatcher's token-driven synthesis produces
+    // `Cancelled` here.
+    live_cancel_case(HarnessKind::Codex, Arc::new(CodexAdapter::new())).await;
+}
+
+#[tokio::test]
+#[ignore = "requires gemini installed and authenticated — run with: make test-live"]
+async fn live_gemini_cancel_terminates_and_synthesizes_cancelled() {
+    live_cancel_case(HarnessKind::Gemini, Arc::new(GeminiAdapter::new())).await;
+}
+
+#[tokio::test]
+#[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
+async fn live_antigravity_cancel_terminates_and_synthesizes_cancelled() {
+    live_cancel_case(
+        HarnessKind::Antigravity,
+        Arc::new(AntigravityAdapter::new()),
+    )
+    .await;
 }

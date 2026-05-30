@@ -1,9 +1,18 @@
 <script lang="ts">
-  import type { HarnessAvailability, HarnessKind } from "$lib/types";
+  import type { AgentRecord, HarnessAvailability, HarnessKind } from "$lib/types";
   import type { AgentFormSubmit } from "./CreateAgentForm.types";
   import { harnessUnavailableReason, isHarnessSelectable } from "$lib/harnessAvailability";
+  import { ALL_HARNESSES, HARNESS_DEFAULT_AGENT_NAME, HARNESS_LABEL } from "$lib/harnessDisplay";
+  import { normalizeAgentName, validateAgentName } from "$lib/agentName";
   import Button from "$lib/components/ui/Button.svelte";
   import Input from "$lib/components/ui/Input.svelte";
+  import { cn } from "$lib/utils";
+  import {
+    SEGMENTED_CONTAINER_CLASS,
+    SEGMENTED_ITEM_CLASS,
+    SEGMENTED_ITEM_ACTIVE_CLASS,
+    SEGMENTED_ITEM_INACTIVE_CLASS,
+  } from "$lib/components/ui/segmentedControl";
 
   type Props = {
     busy?: boolean;
@@ -16,16 +25,16 @@
     /// "standalone phase" (the no-agent first-time flow), which keeps the
     /// existing page-fill card layout.
     onCancel?: () => void;
-    /// Optional per-harness availability. When provided, gates the radio
-    /// buttons (and the submit button if the currently-selected harness
-    /// is unavailable). Tooltip copy matches the banner copy in
-    /// `App.svelte` verbatim so the user sees the same gap stated in
-    /// both places. Defaults to "both harnesses available" so tests
-    /// that don't care about gating render unchanged.
-    claudeAvailability?: HarnessAvailability;
-    codexAvailability?: HarnessAvailability;
-    geminiAvailability?: HarnessAvailability;
-    antigravityAvailability?: HarnessAvailability;
+    /// Existing agents in the active project, for the live name-uniqueness
+    /// check. Defaults to empty (the no-agent first-time flow has none, and
+    /// tests that don't exercise uniqueness render unchanged).
+    roster?: AgentRecord[];
+    /// Per-harness availability, gating the picker (and the submit button when
+    /// the selected harness is unavailable) on binary presence. A missing entry
+    /// defaults to "available" — so tests that don't exercise gating can pass
+    /// `{}` (or omit it) and render unchanged. Keyed by `HarnessKind` so it
+    /// scales with the harness set rather than four named props.
+    availability?: Partial<Record<HarnessKind, HarnessAvailability>>;
   };
 
   let {
@@ -33,51 +42,34 @@
     error = null,
     onSubmit,
     onCancel,
-    claudeAvailability = { harness: "claude_code", binary: "available", auth: "unsupported" },
-    codexAvailability = { harness: "codex", binary: "available", auth: "available" },
-    geminiAvailability = { harness: "gemini", binary: "available", auth: "available" },
-    antigravityAvailability = { harness: "antigravity", binary: "available", auth: "available" },
+    roster = [],
+    availability = {},
   }: Props = $props();
-  let name = $state<string>("assistant");
+  let name = $state<string>(HARNESS_DEFAULT_AGENT_NAME["claude_code"]);
   let harness = $state<HarnessKind>("claude_code");
   let mode = $state<"create" | "attach">("create");
   let existingSessionId = $state<string>("");
 
-  /// Gate state per harness. Two predicates from `harnessAvailability`:
-  /// - `isHarnessSelectable` — false for `"checking"` / `"missing"`;
-  ///   gates radio `disabled` and the parent's submit button.
-  /// - `harnessUnavailableReason` — message text for *real* missing
-  ///   states; returns null for `"checking"` so the inline gating
-  ///   message doesn't show during the brief probe window.
-  ///
-  /// The two predicates intentionally disagree on `"checking"`: the
-  /// user is blocked, but no scary "Checking…" copy renders.
-  const claudeSelectable = $derived(isHarnessSelectable(claudeAvailability));
-  const codexSelectable = $derived(isHarnessSelectable(codexAvailability));
-  const geminiSelectable = $derived(isHarnessSelectable(geminiAvailability));
-  const antigravitySelectable = $derived(isHarnessSelectable(antigravityAvailability));
-  const claudeReason = $derived(harnessUnavailableReason(claudeAvailability));
-  const codexReason = $derived(harnessUnavailableReason(codexAvailability));
-  const geminiReason = $derived(harnessUnavailableReason(geminiAvailability));
-  const antigravityReason = $derived(harnessUnavailableReason(antigravityAvailability));
-  const selectedSelectable = $derived(
-    harness === "claude_code"
-      ? claudeSelectable
-      : harness === "codex"
-        ? codexSelectable
-        : harness === "gemini"
-          ? geminiSelectable
-          : antigravitySelectable,
-  );
-  const selectedReason = $derived(
-    harness === "claude_code"
-      ? claudeReason
-      : harness === "codex"
-        ? codexReason
-        : harness === "gemini"
-          ? geminiReason
-          : antigravityReason,
-  );
+  /// Per-harness gate, looked up by kind (no per-harness branches). Missing
+  /// availability defaults to "available". Two predicates from
+  /// `harnessAvailability`:
+  /// - `isHarnessSelectable` — false for `"checking"` / `"missing"`; gates the
+  ///   radio `disabled` and the parent's submit button.
+  /// - `harnessUnavailableReason` — message text for *real* missing states;
+  ///   null for `"checking"` so no scary "Checking…" copy shows during the probe
+  ///   window. (The two intentionally disagree on `"checking"`: blocked, but
+  ///   silent.)
+  function availabilityFor(kind: HarnessKind): HarnessAvailability {
+    return availability[kind] ?? { harness: kind, binary: "available" };
+  }
+  function selectable(kind: HarnessKind): boolean {
+    return isHarnessSelectable(availabilityFor(kind));
+  }
+  function reason(kind: HarnessKind): string | null {
+    return harnessUnavailableReason(availabilityFor(kind));
+  }
+  const selectedSelectable = $derived(selectable(harness));
+  const selectedReason = $derived(reason(harness));
 
   /// UUID shape check (any version — Codex and Claude use v4 / v7
   /// respectively; the backend re-validates). This is a UX gate so the user
@@ -87,10 +79,20 @@
 
   const sessionIdValid = $derived(mode !== "attach" || UUID_PATTERN.test(existingSessionId.trim()));
 
-  const canSubmit = $derived(!busy && name.trim() !== "" && sessionIdValid && selectedSelectable);
+  /// Live name validation against the format rules and the roster (shared with
+  /// the backend's authoritative check via `$lib/agentName`). `nameError` is
+  /// the visible message: suppressed for the `empty` reason so an empty field
+  /// disables submit without nagging the user mid-edit — mirrors how the
+  /// attach session-id hint only appears once the user has typed.
+  const nameValidation = $derived(validateAgentName(name, roster));
+  const nameError = $derived(
+    nameValidation.ok || nameValidation.reason === "empty" ? null : nameValidation.message,
+  );
+
+  const canSubmit = $derived(!busy && nameValidation.ok && sessionIdValid && selectedSelectable);
 
   function handleSubmit(): void {
-    const trimmedName = name.trim();
+    const trimmedName = normalizeAgentName(name);
     if (mode === "create") {
       onSubmit({ mode: "create", name: trimmedName, harness });
     } else {
@@ -108,12 +110,28 @@
   /// to create and back. Done in the explicit click handlers rather than a
   /// `$effect` so the reset stays adjacent to the trigger and there's no
   /// hidden reactive dependency.
+  function selectHarness(kind: HarnessKind): void {
+    if (name === HARNESS_DEFAULT_AGENT_NAME[harness]) {
+      name = HARNESS_DEFAULT_AGENT_NAME[kind];
+    }
+    harness = kind;
+  }
+
   function selectMode(next: "create" | "attach"): void {
     if (next === mode) return;
     mode = next;
     if (next === "create") {
       existingSessionId = "";
     }
+  }
+
+  // Visual classes for a harness option (a native radio styled as a segmented
+  // pill). Selection is driven off `harness`, gating off `selectable`.
+  function harnessOptionClass(kind: HarnessKind, selectable: boolean): string {
+    const selected = harness === kind;
+    if (selected) return SEGMENTED_ITEM_ACTIVE_CLASS;
+    if (!selectable) return "text-muted cursor-not-allowed opacity-60";
+    return SEGMENTED_ITEM_INACTIVE_CLASS;
   }
 </script>
 
@@ -128,16 +146,14 @@
   error → action row) is identical across both layouts.
 -->
 {#snippet formBody()}
-  <div
-    class="flex gap-2 rounded-md border border-neutral-200 bg-white p-1"
-    role="tablist"
-    data-testid="mode-toggle"
-  >
+  <div class={cn(SEGMENTED_CONTAINER_CLASS, "flex")} role="tablist" data-testid="mode-toggle">
     <button
       type="button"
-      class="flex-1 rounded px-2 py-1 text-xs font-medium {mode === 'create'
-        ? 'bg-neutral-900 text-white'
-        : 'text-neutral-700 hover:bg-neutral-100'}"
+      class={cn(
+        SEGMENTED_ITEM_CLASS,
+        "flex-1",
+        mode === "create" ? SEGMENTED_ITEM_ACTIVE_CLASS : SEGMENTED_ITEM_INACTIVE_CLASS,
+      )}
       role="tab"
       aria-selected={mode === "create"}
       data-testid="mode-create"
@@ -148,9 +164,11 @@
     </button>
     <button
       type="button"
-      class="flex-1 rounded px-2 py-1 text-xs font-medium {mode === 'attach'
-        ? 'bg-neutral-900 text-white'
-        : 'text-neutral-700 hover:bg-neutral-100'}"
+      class={cn(
+        SEGMENTED_ITEM_CLASS,
+        "flex-1",
+        mode === "attach" ? SEGMENTED_ITEM_ACTIVE_CLASS : SEGMENTED_ITEM_INACTIVE_CLASS,
+      )}
       role="tab"
       aria-selected={mode === "attach"}
       data-testid="mode-attach"
@@ -161,101 +179,94 @@
     </button>
   </div>
 
-  <fieldset class="space-y-1" disabled={busy}>
-    <legend class="text-xs text-neutral-600">Harness</legend>
-    <div class="flex gap-3 text-sm" data-testid="harness-picker">
-      <label
-        class="flex items-center gap-1.5 {claudeSelectable
-          ? ''
-          : 'cursor-not-allowed text-neutral-400'}"
-        title={claudeReason ?? ""}
-      >
-        <input
-          type="radio"
-          name="harness"
-          value="claude_code"
-          checked={harness === "claude_code"}
-          disabled={!claudeSelectable}
-          onchange={() => (harness = "claude_code")}
-          data-testid="harness-claude"
-        />
-        Claude Code
-      </label>
-      <label
-        class="flex items-center gap-1.5 {codexSelectable
-          ? ''
-          : 'cursor-not-allowed text-neutral-400'}"
-        title={codexReason ?? ""}
-      >
-        <input
-          type="radio"
-          name="harness"
-          value="codex"
-          checked={harness === "codex"}
-          disabled={!codexSelectable}
-          onchange={() => (harness = "codex")}
-          data-testid="harness-codex"
-        />
-        Codex
-      </label>
-      <label
-        class="flex items-center gap-1.5 {geminiSelectable
-          ? ''
-          : 'cursor-not-allowed text-neutral-400'}"
-        title={geminiReason ?? ""}
-      >
-        <input
-          type="radio"
-          name="harness"
-          value="gemini"
-          checked={harness === "gemini"}
-          disabled={!geminiSelectable}
-          onchange={() => (harness = "gemini")}
-          data-testid="harness-gemini"
-        />
-        Gemini
-      </label>
-      <label
-        class="flex items-center gap-1.5 {antigravitySelectable
-          ? ''
-          : 'cursor-not-allowed text-neutral-400'}"
-        title={antigravityReason ?? ""}
-      >
-        <input
-          type="radio"
-          name="harness"
-          value="antigravity"
-          checked={harness === "antigravity"}
-          disabled={!antigravitySelectable}
-          onchange={() => (harness = "antigravity")}
-          data-testid="harness-antigravity"
-        />
-        Antigravity
-      </label>
+  <p class="text-muted text-xs leading-relaxed">
+    {#if mode === "create"}
+      Starts a fresh session with no prior history. The CLI creates a new conversation in your
+      project directory.
+    {:else}
+      Connects to an existing session by its UUID, picking up the conversation where it left off.
+      Use this to bring a session the CLI already has on disk into Switchboard.
+    {/if}
+  </p>
+
+  <fieldset class="space-y-1.5" disabled={busy}>
+    <legend class="text-muted text-xs">Tool</legend>
+    <!-- Native radios (real arrow-key + screen-reader semantics, grouped/labeled
+         by the fieldset+legend) styled as a segmented control: the input is
+         visually hidden and the label is the pill; `has-[:focus-visible]` lights
+         the pill when the radio is keyboard-focused. -->
+    <!-- One pill per harness, looped over `ALL_HARNESSES` (no hardcoded set or
+         fixed column count) so a new harness picks up the picker automatically.
+         Columns are inline-styled because Tailwind can't generate a dynamic
+         `grid-cols-N`. -->
+    <div
+      class={cn(SEGMENTED_CONTAINER_CLASS, "grid")}
+      style="grid-template-columns: repeat({ALL_HARNESSES.length}, minmax(0, 1fr));"
+      data-testid="harness-picker"
+    >
+      {#each ALL_HARNESSES as kind (kind)}
+        <label
+          class="{SEGMENTED_ITEM_CLASS} has-[:focus-visible]:ring-accent flex items-center justify-center has-[:focus-visible]:ring-2 {harnessOptionClass(
+            kind,
+            selectable(kind),
+          )}"
+          title={reason(kind) ?? ""}
+        >
+          <input
+            type="radio"
+            name="harness"
+            value={kind}
+            class="sr-only"
+            checked={harness === kind}
+            disabled={busy || !selectable(kind)}
+            onchange={() => selectHarness(kind)}
+            data-testid={`harness-${kind}`}
+          />
+          {HARNESS_LABEL[kind]}
+        </label>
+      {/each}
     </div>
     {#if selectedReason}
-      <p class="text-xs text-red-700" data-testid="harness-unavailable">
+      <p class="text-status-failed text-xs" data-testid="harness-unavailable">
         {selectedReason}
       </p>
     {/if}
   </fieldset>
 
   <label class="block space-y-1">
-    <span class="text-xs text-neutral-600">Agent name</span>
-    <Input bind:value={name} disabled={busy} data-testid="agent-name" />
+    <span class="text-muted text-xs">Agent name</span>
+    <Input
+      bind:value={name}
+      disabled={busy}
+      data-testid="agent-name"
+      class={cn("h-8 px-2", nameError && "border-status-failed")}
+      aria-invalid={!nameValidation.ok}
+      aria-describedby={nameError ? "agent-name-error" : undefined}
+      title={nameError ?? undefined}
+    />
+    {#if nameError}
+      <span
+        id="agent-name-error"
+        class="text-status-failed block text-xs"
+        data-testid="agent-name-error"
+      >
+        {nameError}
+      </span>
+    {/if}
   </label>
 
   {#if mode === "attach"}
     <label class="block space-y-1">
-      <span class="text-xs text-neutral-600"> Existing session UUID </span>
+      <span class="text-muted text-xs"> Existing session UUID </span>
       <Input
         bind:value={existingSessionId}
         disabled={busy}
         placeholder="00000000-0000-0000-0000-000000000000"
         data-testid="attach-session-id"
+        class="h-8 px-2"
       />
       {#if existingSessionId.trim() !== "" && !sessionIdValid}
-        <span class="block text-xs text-red-700" data-testid="attach-session-id-error">
+        <span class="text-status-failed block text-xs" data-testid="attach-session-id-error">
           Must be a UUID (8-4-4-4-12 hex characters).
         </span>
       {/if}
@@ -263,12 +274,14 @@
   {/if}
 
   {#if error}
-    <p class="text-xs text-red-700" data-testid="error">{error}</p>
+    <p class="text-status-failed text-xs" data-testid="error">{error}</p>
   {/if}
   <div class="flex justify-end gap-2">
     {#if onCancel}
       <Button
         variant="secondary"
+        size="sm"
+        class="w-28"
         data-testid="cancel-create-agent"
         disabled={busy}
         onclick={onCancel}
@@ -276,7 +289,13 @@
         Cancel
       </Button>
     {/if}
-    <Button data-testid="confirm-create-agent" disabled={!canSubmit} onclick={handleSubmit}>
+    <Button
+      size="sm"
+      class="w-28"
+      data-testid="confirm-create-agent"
+      disabled={!canSubmit}
+      onclick={handleSubmit}
+    >
       {#if busy}
         {mode === "create" ? "Creating…" : "Attaching…"}
       {:else}
@@ -288,16 +307,16 @@
 
 {#if onCancel}
   <!-- Embedded: bare form, modal supplies its own title/centering. -->
-  <div class="space-y-4" data-testid="create-agent-form-embedded">
+  <div class="space-y-3.5" data-testid="create-agent-form-embedded">
     {@render formBody()}
   </div>
 {:else}
   <!-- Standalone: page-fill centered card + heading. -->
   <div class="flex h-full flex-col items-center justify-center gap-6 p-8">
-    <div class="w-full max-w-md space-y-4 rounded-md border border-neutral-200 bg-neutral-50 p-6">
+    <div class="border-border bg-raised w-full max-w-md space-y-4 rounded-md border p-5">
       <div class="space-y-1">
-        <h2 class="text-lg font-semibold text-neutral-900">Create an agent</h2>
-        <p class="text-sm text-neutral-600">Agents live inside the active project.</p>
+        <h2 class="text-fg text-lg font-semibold">Create an agent</h2>
+        <p class="text-muted text-sm">Agents live inside the active project.</p>
       </div>
       {@render formBody()}
     </div>

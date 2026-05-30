@@ -27,6 +27,9 @@ pub enum CoreError {
     #[error("project not found: {0}")]
     ProjectNotFound(uuid::Uuid),
 
+    #[error("agent not found: {0}")]
+    AgentNotFound(uuid::Uuid),
+
     #[error("unsupported config version at {path}: found {found}, expected {expected}")]
     UnsupportedConfigVersion {
         path: PathBuf,

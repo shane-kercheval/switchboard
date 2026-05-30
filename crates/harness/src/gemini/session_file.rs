@@ -209,6 +209,11 @@ pub fn load_gemini_transcript(
     // user-record was parsed last). Audit the failure mode if the
     // resume-creates-stub-file pattern ever changes; if it does, capture
     // a fixture and add user-record dedup keyed on the on-disk record id.
+    // Consequence downstream: an attached Gemini session whose imported
+    // history hit this duplicate path would render that prompt twice in the
+    // unified transcript (the conversation merge surfaces pre-journaling user
+    // turns verbatim). Cosmetic, not data loss; fixed here (dedup) rather than
+    // in the merge if it ever materializes.
     //
     // Ambiguity in any single candidate aborts the whole merge — even
     // when prior candidates were clean. The clean files' content is
@@ -317,6 +322,7 @@ fn ambiguous_session_warning() -> LoadedTranscript {
         turns: Vec::new(),
         meta: None,
         last_rate_limit: None,
+        last_rate_limit_as_of: None,
         warnings: vec![ParseWarning {
             line_number: 0,
             reason:
@@ -558,6 +564,7 @@ impl GeminiReconstruction {
             turns: self.turns,
             meta,
             last_rate_limit: None,
+            last_rate_limit_as_of: None,
             warnings: self.warnings,
         }
     }

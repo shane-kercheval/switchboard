@@ -27,13 +27,14 @@ pub mod skills;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use chrono::Utc;
 use switchboard_core::{AgentId, AgentRecord};
 use tokio::io::AsyncBufReadExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_util::sync::CancellationToken;
 
 use crate::adapter::{DispatchError, EventStream, HarnessAdapter};
 use crate::events::{AdapterEvent, FailureKind, TurnId, TurnOutcome, TurnUsage};
@@ -58,6 +59,10 @@ pub struct CodexAdapter {
     /// dispatch time (mirrors `claude_code::session_file_exists`'s
     /// pattern).
     home_dir_override: Option<PathBuf>,
+    /// Lazily-resolved `codex --version`, cached for the lifetime of the
+    /// adapter. Empty string caches a failed/absent probe (version is
+    /// display-only). Mirrors the Gemini/Antigravity pattern.
+    cached_version: OnceLock<String>,
 }
 
 impl CodexAdapter {
@@ -68,6 +73,7 @@ impl CodexAdapter {
         Self {
             codex_binary_path: PathBuf::from("codex"),
             home_dir_override: None,
+            cached_version: OnceLock::new(),
         }
     }
 
@@ -76,6 +82,7 @@ impl CodexAdapter {
         Self {
             codex_binary_path: path.into(),
             home_dir_override: None,
+            cached_version: OnceLock::new(),
         }
     }
 
@@ -90,6 +97,7 @@ impl CodexAdapter {
         Self {
             codex_binary_path: binary_path.into(),
             home_dir_override: Some(home_dir.into()),
+            cached_version: OnceLock::new(),
         }
     }
 }
@@ -106,6 +114,13 @@ impl HarnessAdapter for CodexAdapter {
         which::which(&self.codex_binary_path)
             .map(|_| ())
             .map_err(|_| DispatchError::BinaryNotFound)
+    }
+
+    fn version(&self) -> Option<String> {
+        let raw = self.cached_version.get_or_init(|| {
+            crate::subprocess::fetch_version(&self.codex_binary_path).unwrap_or_default()
+        });
+        crate::subprocess::parse_cli_version(raw)
     }
 
     async fn dispatch(
@@ -135,6 +150,8 @@ impl HarnessAdapter for CodexAdapter {
             .current_dir(cwd)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            // Null stdin: we never write to it, and an open stdin can stall a
+            // harness on an interactive read or a pipe-full deadlock.
             .stdin(Stdio::null())
             .kill_on_drop(true);
         #[cfg(unix)]
@@ -174,6 +191,7 @@ impl HarnessAdapter for CodexAdapter {
             home_dir,
             cwd.to_owned(),
             force_session_meta,
+            options.cancel_token,
         ));
 
         Ok(Box::pin(UnboundedReceiverStream::new(rx)))
@@ -196,7 +214,7 @@ fn resolve_home_dir(override_path: Option<&Path>) -> PathBuf {
 
 /// Build the args for `codex exec [resume <id>]`. Flag set verified against
 /// codex-cli 0.130.0; see the module-level docstring and
-/// `docs/research/codex-cli-observed.md` for the `-C`-on-resume rejection
+/// `docs/research/archive/codex-cli-observed.md` for the `-C`-on-resume rejection
 /// finding.
 fn build_args(prompt: &str, prior: Option<&SessionLinkRecord>) -> Vec<String> {
     if let Some(record) = prior {
@@ -248,6 +266,7 @@ async fn run_producer(
     home_dir: PathBuf,
     cwd: PathBuf,
     force_session_meta: bool,
+    cancel_token: CancellationToken,
 ) {
     let stderr_tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::with_capacity(
         crate::subprocess::STDERR_TAIL_CAPACITY,
@@ -262,6 +281,12 @@ async fn run_producer(
 
     let mut terminal_seen = false;
     let mut terminal_was_completed = false;
+    // Set when cancellation fires: kill the group and end the stream with NO
+    // terminal event. Codex is the load-bearing case for token-driven (not
+    // exit-code/terminal-event-driven) cancellation — it exits 0 on SIGTERM
+    // and emits no terminal event, so only the dispatcher's synthesized
+    // `Cancelled` (from the fired token) is authoritative.
+    let mut cancelled = false;
     let mut state = CodexParserState::default();
     // Once we've written the sidecar for this dispatch, ignore any
     // subsequent thread.started events (defensive — Codex emits one per
@@ -277,7 +302,16 @@ async fn run_producer(
     let mut lines = tokio::io::BufReader::new(stdout).lines();
 
     'lines: loop {
-        match lines.next_line().await {
+        // `select!` over the read AND the cancellation token so a parked read
+        // still notices a cancel. Codex's two-process tree dies via `killpg`.
+        let line = tokio::select! {
+            line = lines.next_line() => line,
+            () = cancel_token.cancelled() => {
+                cancelled = true;
+                break 'lines;
+            }
+        };
+        match line {
             Ok(Some(line)) => {
                 let outcome = parse_line(&line, turn_id, &mut state);
 
@@ -392,8 +426,19 @@ async fn run_producer(
         }
     }
 
+    if cancelled {
+        // Cancellation path: kill the (two-process) group and end the stream
+        // with NO terminal event — the dispatcher synthesizes `Cancelled`.
+        // Kill before awaiting the stderr drain (a parked subprocess holds
+        // stderr open) and skip the truncation synthesis + exit reconciliation
+        // (Codex exits 0 on SIGTERM, so neither would be meaningful here).
+        crate::subprocess::terminate_then_kill(&mut child).await;
+        let _ = stderr_task.await;
+        return;
+    }
+
     if force_kill_child {
-        crate::subprocess::kill_subprocess_group(&mut child).await;
+        crate::subprocess::terminate_then_kill(&mut child).await;
     }
 
     let _ = stderr_task.await;
@@ -508,11 +553,15 @@ async fn emit_terminal_with_enrichment(
         usage: enriched_usage,
     });
 
-    // Step 4: emit RateLimitEvent if rate-limit info was found.
+    // Step 4: emit RateLimitEvent if rate-limit info was found. Codex's
+    // rate-limit is read from its own session file at turn-end (class B) —
+    // already durable on disk, so it's marked `SessionFileBacked` and the
+    // dispatcher does NOT re-persist it to the metadata sidecar.
     if let Some(rate_limits) = enrichment.rate_limits.clone() {
         let _ = tx.send(AdapterEvent::RateLimitEvent {
             agent_id,
             info: rate_limits,
+            source: crate::events::RateLimitSource::SessionFileBacked,
         });
     }
 

@@ -33,6 +33,14 @@ There is also a quieter benefit: because Switchboard resolves prompts itself and
 - Cross-session persistent agent memory. Possibly a future addition; not in scope for v1.
 - A hosted / SaaS service. Switchboard runs locally on your machine. A future hosted service may exist for cross-machine sync of workflows and prompts; that is not v1.
 
+## Harness support and limitations
+
+Switchboard drives each agent through its own CLI, so it inherits that CLI's capabilities — and a few per-harness limitations are worth knowing up front:
+
+- **Model selection.** Claude Code, Codex, and Gemini let Switchboard choose the model per agent. **Antigravity does not** — its CLI exposes no model option, so Antigravity agents run on whatever model you've selected inside Antigravity itself, and Switchboard can't change it per agent.
+- **Codex models depend on your plan.** When you sign in to Codex with a ChatGPT subscription, only the models your plan includes are available; choosing one your plan doesn't cover fails the turn with Codex's own error.
+- **Antigravity and hidden folders.** Antigravity can't work in a project whose path contains a hidden (dot-prefixed) folder — for example anything under `~/.config/…`. The agent still runs but can't see your files. Keep projects under normal paths like `~/repos/…`.
+
 ## Status
 
 Early development. Design is being captured in [`docs/system-design.md`](./docs/system-design.md).

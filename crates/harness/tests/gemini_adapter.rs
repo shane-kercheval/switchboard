@@ -9,6 +9,12 @@ use uuid::Uuid;
 
 #[cfg(unix)]
 use nix::unistd::{Pid, getpgid};
+#[cfg(unix)]
+use std::path::Path;
+#[cfg(unix)]
+use std::time::Duration;
+#[cfg(unix)]
+use tokio_util::sync::CancellationToken;
 
 const FAKE_GEMINI: &str = env!("CARGO_BIN_EXE_fake_gemini");
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/gemini");
@@ -267,7 +273,11 @@ async fn auth_failure_inline_fixture_emits_auth_failure_kind() {
             ..
         } => {
             assert_eq!(*kind, FailureKind::AuthFailure);
-            assert!(message.contains("401 Unauthorized"));
+            // Authored Gemini auth message — raw "401 Unauthorized" replaced
+            // with uniform actionable text. End-to-end through the adapter.
+            assert!(message.contains("Gemini authentication required"));
+            assert!(message.contains("gemini"));
+            assert!(!message.contains("reload Switchboard"));
         }
         other => panic!("expected Failed(AuthFailure), got {other:?}"),
     }
@@ -510,4 +520,82 @@ async fn session_meta_carries_loaded_mcp_servers_and_skills() {
         }
         _ => unreachable!(),
     }
+}
+
+/// Poll until `path` holds a parseable pgid; bounded so a spawn failure panics.
+#[cfg(unix)]
+async fn wait_for_pgid(path: &Path) -> Pid {
+    for _ in 0..200 {
+        if let Ok(s) = std::fs::read_to_string(path)
+            && let Ok(n) = s.trim().parse::<i32>()
+        {
+            return Pid::from_raw(n);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("fake_gemini never wrote its pgid at {}", path.display());
+}
+
+/// Poll until the process group's leader is gone (`getpgid` → `ESRCH`).
+#[cfg(unix)]
+async fn assert_group_reaped(leader: Pid) {
+    for _ in 0..200 {
+        if getpgid(Some(leader)).is_err() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("process group {leader} still alive after cancel");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancel_mid_stream_kills_group_and_emits_no_terminal() {
+    // Gemini buffers; its producer `select!`s the read against the token so a
+    // parked read still notices cancel. On cancel: kill the group, end the
+    // stream with NO terminal event (the dispatcher synthesizes `Cancelled`).
+    let tempdir = TempDir::new().unwrap();
+    let pgid_path = tempdir.path().join("child.pgid");
+    let fixture_path = tempdir.path().join("cancel-fixture.jsonl");
+
+    let init = std::fs::read_to_string(fixture("happy-path.stream"))
+        .expect("read fixture")
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .expect("a line")
+        .to_owned();
+    let body = format!("// pgid_to:{}\n{init}\n// hang\n", pgid_path.display());
+    std::fs::write(&fixture_path, body).unwrap();
+
+    let (adapter, _home) = adapter();
+    let cwd = TempDir::new().unwrap();
+    let token = CancellationToken::new();
+    let options = DispatchOptions {
+        cancel_token: token.clone(),
+        ..Default::default()
+    };
+    let stream = adapter
+        .dispatch(
+            &gemini_agent(),
+            cwd.path(),
+            fixture_path.to_str().unwrap(),
+            Uuid::now_v7(),
+            options,
+        )
+        .await
+        .expect("dispatch should succeed");
+
+    let leader = wait_for_pgid(&pgid_path).await;
+    token.cancel();
+
+    let events: Vec<AdapterEvent> = tokio::time::timeout(Duration::from_secs(15), stream.collect())
+        .await
+        .expect("stream must end promptly after cancel, not hang");
+
+    assert_eq!(
+        count_terminals(&events),
+        0,
+        "adapter must emit no terminal event on cancel; got: {events:?}"
+    );
+    assert_group_reaped(leader).await;
 }

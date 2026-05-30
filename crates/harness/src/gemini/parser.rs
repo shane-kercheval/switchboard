@@ -41,6 +41,27 @@ pub const GEMINI_INTERNAL_TOOL_NAMES: &[&str] = &["update_topic"];
 const AUTH_FAILURE_SUBSTRINGS: &[&str] =
     &["401 unauthorized", "permission_denied", "authentication"];
 
+/// Authored auth-failure message for Gemini. Both auth surfaces (in-stream
+/// `result.status:"error"` with a 401, exit-42 401-on-stderr, and the new
+/// exit-41 "Please set an Auth method" shape) emit this so the user sees
+/// uniform actionable text. Reactive-auth posture — never advises
+/// "reload Switchboard."
+pub const GEMINI_AUTH_MESSAGE: &str =
+    "Gemini authentication required — run `gemini` interactively to sign in";
+
+/// Substring that identifies Gemini's clean-logout shape on stderr
+/// (captured 2026-05-27: exit 41 with stderr "Please set an Auth method
+/// in your settings…", no stream-json). Case-insensitive match on the
+/// exact captured shape — a bare "auth method" substring would falsely
+/// match unrelated diagnostic text ("unsupported auth method",
+/// "invalid auth method specified"); expand only with new observed shapes.
+#[must_use]
+pub fn is_gemini_logged_out_message(message: &str) -> bool {
+    message
+        .to_ascii_lowercase()
+        .contains("please set an auth method")
+}
+
 #[derive(Debug, Default)]
 pub struct GeminiParserState {
     /// `tool_use_id`s that the adapter filtered from `ToolStarted` emission
@@ -205,10 +226,19 @@ fn parse_result(obj: &Value, turn_id: TurnId) -> ParseOutcome {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_owned();
-        let kind = if is_gemini_auth_failure_message(&message) {
-            FailureKind::AuthFailure
+        // Deliberate scope: only `is_gemini_auth_failure_message` is checked
+        // here, not `is_gemini_logged_out_message`. The exit-41 logged-out
+        // shape is an EOF/stderr-only surface (no stream events emitted), so
+        // a stream `result:error` never carries the "Please set an Auth
+        // method" text in practice. Revisit if a future Gemini adds a
+        // `result.status:"error"` stream variant for logout.
+        let (kind, message) = if is_gemini_auth_failure_message(&message) {
+            // Author across all auth surfaces (stream, exit-41, exit-42) so the
+            // user sees one consistent actionable message — not the raw
+            // "401 Unauthorized" / etc. that vary by failure shape.
+            (FailureKind::AuthFailure, GEMINI_AUTH_MESSAGE.to_owned())
         } else {
-            FailureKind::HarnessError
+            (FailureKind::HarnessError, message)
         };
         TurnOutcome::Failed { kind, message }
     };
@@ -477,10 +507,32 @@ mod tests {
                     panic!("expected Failed");
                 };
                 assert_eq!(kind, FailureKind::AuthFailure);
-                assert!(message.contains("401 Unauthorized"));
+                // Authored message replaces the raw stream text — the user
+                // sees one consistent Gemini auth message across surfaces.
+                assert_eq!(message, GEMINI_AUTH_MESSAGE);
+                assert!(message.contains("Gemini authentication required"));
+                assert!(!message.contains("reload Switchboard"));
             }
             other => panic!("expected TurnEnd, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn is_logged_out_recognizes_only_the_captured_shape() {
+        // Positive: the exact captured exit-41 shape.
+        assert!(is_gemini_logged_out_message(
+            "Please set an Auth method in your settings."
+        ));
+        // Negative: unrelated diagnostics that mention "auth method" but are
+        // NOT logged-out states. The substring guard was tightened so these
+        // don't falsely route to the authored auth-failure message.
+        assert!(!is_gemini_logged_out_message("auth method missing"));
+        assert!(!is_gemini_logged_out_message("unsupported auth method"));
+        assert!(!is_gemini_logged_out_message(
+            "invalid auth method specified"
+        ));
+        assert!(!is_gemini_logged_out_message("401 Unauthorized"));
+        assert!(!is_gemini_logged_out_message(""));
     }
 
     #[test]

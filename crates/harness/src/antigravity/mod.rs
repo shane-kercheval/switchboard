@@ -14,10 +14,17 @@
 //!   condition (success, empty prompt, unknown conversation, timeout,
 //!   auth failure), so the exit code is useless for outcome detection;
 //!   stdout text is the failure signal.
-//! - **Server-assigned conversation UUID.** The UUID is minted server-side
-//!   and discovered post-spawn by watching for a new
-//!   `~/.gemini/antigravity-cli/brain/<uuid>/` directory, then persisted to
-//!   the per-agent sidecar (see [`sidecar`]) for resume / hydration.
+//! - **Server-assigned conversation UUID.** The UUID is minted server-side.
+//!   `agy` records it in *this dispatch's* private `--log-file` (a line like
+//!   `… server.go:755] Created conversation <uuid>`), which is the primary,
+//!   deterministic capture source: read straight from our own log, it is the
+//!   conversation this exact invocation used — available in ~seconds
+//!   regardless of cold-start latency, and never cross-attributed from a
+//!   concurrent or background `agy` (each writes its own log). It is then
+//!   persisted to the per-agent sidecar (see [`sidecar`]) for resume /
+//!   hydration. A filesystem fallback (watch `brain/<uuid>/` for a dir whose
+//!   transcript echoes the prompt) covers the case where that Google-internal
+//!   log line ever moves — see [`capture_conversation_id`].
 //! - **Transcript-sourced content; stdout is a control channel.** All
 //!   displayed content — assistant text, `thinking`, and tool lifecycle
 //!   (`ToolStarted` / `ToolCompleted`) — comes from tailing the conversation's
@@ -40,7 +47,7 @@
 //!   bounding the hang. (The browser tab cannot be prevented; documented as
 //!   a known limitation.)
 //!
-//! Ground-truth reference: `docs/research/antigravity-cli-observed.md`.
+//! Ground-truth reference: `docs/research/archive/antigravity-cli-observed.md`.
 
 pub mod config;
 pub mod parser;
@@ -60,6 +67,7 @@ use chrono::Utc;
 use switchboard_core::{AgentId, AgentRecord};
 use tokio::io::AsyncBufReadExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::adapter::{DispatchError, DispatchOptions, EventStream, HarnessAdapter};
@@ -75,6 +83,14 @@ use sidecar::{SessionLinkRecord, append_record, read_latest, sidecar_path};
 /// binary probe agree on the name.
 pub const BINARY_NAME: &str = "agy";
 
+/// Authored auth-failure message for Antigravity. Reactive-auth posture:
+/// the recovery is "sign in, then send again" — never "reload Switchboard"
+/// (there's no proactive state to refresh). Used by every Antigravity auth
+/// path (stdout fast-fail, `Error: authentication timed out`, etc.) so all
+/// surfaces show the same actionable text.
+const ANTIGRAVITY_AUTH_MESSAGE: &str =
+    "Antigravity authentication required — run `agy` to authenticate";
+
 /// Control-file names for the `fake_agy` test fixture binary, read from the
 /// dispatch cwd. Defined in the library (not the bin) so the fixture binary
 /// and the integration tests share one source of truth and can't drift.
@@ -85,13 +101,8 @@ pub const FAKE_AGY_SCRIPT_FILE: &str = ".fake_agy.json";
 /// `--conversation <healed-uuid>` on the post-fork resume).
 pub const FAKE_AGY_INVOCATIONS_FILE: &str = ".fake_agy.invocations";
 
-/// Poll interval for UUID-directory discovery and transcript tailing.
+/// Poll interval for log-file UUID discovery and transcript tailing.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
-
-/// How long to wait for the conversation directory to appear before giving
-/// up. Matches the user-visible "agent starting" pause we tolerate
-/// elsewhere; an early child exit short-circuits this.
-const UUID_CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Post-exit drain attempts for the terminal answer. The in-loop poll already
 /// catches the common case (the answer record lands before `agy` exits); this
@@ -152,7 +163,7 @@ impl AntigravityAdapter {
 
     fn resolve_version(&self) -> String {
         self.cached_version
-            .get_or_init(|| fetch_version(&self.binary_path))
+            .get_or_init(|| crate::subprocess::fetch_version(&self.binary_path).unwrap_or_default())
             .clone()
     }
 }
@@ -169,13 +180,17 @@ impl HarnessAdapter for AntigravityAdapter {
         probe_binary_by_name(&self.binary_path.to_string_lossy())
     }
 
+    fn version(&self) -> Option<String> {
+        crate::subprocess::parse_cli_version(&self.resolve_version())
+    }
+
     async fn dispatch(
         &self,
         agent: &AgentRecord,
         cwd: &Path,
         prompt: &str,
         turn_id: TurnId,
-        _options: DispatchOptions,
+        options: DispatchOptions,
     ) -> Result<EventStream, DispatchError> {
         if prompt.trim().is_empty() {
             // `agy -p ""` exits 0 with "Error: empty prompt" — pre-validate
@@ -205,7 +220,8 @@ impl HarnessAdapter for AntigravityAdapter {
             read_latest(&sidecar_file).map_err(|e| DispatchError::PreStreamRead(e.to_string()))?;
         let resume_id = prior.as_ref().map(|r| r.conversation_id);
 
-        let args = build_args(prompt, resume_id);
+        let log_file_path = build_log_file_path(turn_id);
+        let args = build_args(prompt, cwd, resume_id, &log_file_path);
 
         let mut command = tokio::process::Command::new(&binary);
         command
@@ -213,6 +229,9 @@ impl HarnessAdapter for AntigravityAdapter {
             .current_dir(cwd)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            // Null stdin is load-bearing here, not hygiene: `agy -p` has no stdin
+            // timeout and hangs forever on an open stdin (see
+            // docs/research/archive/antigravity-cli-observed.md).
             .stdin(Stdio::null())
             .kill_on_drop(true);
         // When a home override is set (tests), pass it to the child as `HOME`
@@ -254,6 +273,8 @@ impl HarnessAdapter for AntigravityAdapter {
             mcp_servers,
             skills,
             prompt: prompt.to_owned(),
+            log_file_path,
+            cancel_token: options.cancel_token,
         }));
 
         Ok(Box::pin(UnboundedReceiverStream::new(rx)))
@@ -269,37 +290,46 @@ fn resolve_home_dir(override_path: Option<&Path>) -> PathBuf {
         .unwrap_or_default()
 }
 
-fn fetch_version(binary: &Path) -> String {
-    let Ok(resolved) = crate::subprocess::resolve_binary(binary) else {
-        return String::new();
-    };
-    let output = std::process::Command::new(&resolved)
-        .arg("--version")
-        .output();
-    match output {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_owned(),
-        _ => String::new(),
-    }
-}
-
-/// Build the `agy` invocation. `--dangerously-skip-permissions` mirrors
-/// Gemini's `--yolo`: Switchboard's bound cwd is the user's own workspace,
-/// so per-tool approval prompts (which would block a headless dispatch)
-/// must be auto-approved. Resume passes the captured UUID via
+/// Build the `agy` invocation.
+///
+/// `--add-dir <cwd>` establishes the **workspace** so the model's file and
+/// command tools operate in the project directory. This is load-bearing and
+/// non-obvious: setting the child's `current_dir(cwd)` alone is *not* enough —
+/// without `--add-dir`, `agy` reports "no active workspace set" and runs tools
+/// against `$HOME` (verified live: a file written into the dispatch cwd is
+/// invisible to the model, and `run_command` executes with `Cwd=$HOME`). Passed
+/// on every dispatch (`agy` is one-shot, so the workspace must be re-established
+/// each turn). `agy` also discovers a `.gemini/config/projects/<id>.json` from
+/// the cwd regardless, but that "project" is distinct from the active workspace
+/// the tools use — only `--add-dir` sets the latter.
+///
+/// `--dangerously-skip-permissions` mirrors Gemini's `--yolo`: the bound cwd is
+/// the user's own workspace, so per-tool approval prompts (which would block a
+/// headless dispatch) must be auto-approved. Resume passes the captured UUID via
 /// `--conversation`; first turn omits it and lets `agy` mint a new one.
-fn build_args(prompt: &str, resume_id: Option<Uuid>) -> Vec<String> {
+///
+/// `log_file` isolates this dispatch's CLI log so the no-answer-branch outcome
+/// scan (and the conversation-id capture) read only this turn's output — never
+/// another concurrent `agy`'s log.
+fn build_args(prompt: &str, cwd: &Path, resume_id: Option<Uuid>, log_file: &Path) -> Vec<String> {
     let mut args = vec!["-p".to_owned(), prompt.to_owned()];
+    args.push("--add-dir".to_owned());
+    args.push(cwd.to_string_lossy().into_owned());
     if let Some(uuid) = resume_id {
         args.push("--conversation".to_owned());
         args.push(uuid.to_string());
     }
     args.push("--dangerously-skip-permissions".to_owned());
+    args.push("--log-file".to_owned());
+    args.push(log_file.to_string_lossy().into_owned());
     args
+}
+
+/// Per-dispatch CLI log path under the system temp dir. `turn_id` is unique
+/// per dispatch so concurrent agents can't collide; missing/unreadable later
+/// degrades to the generic fallback (best-effort scan).
+fn build_log_file_path(turn_id: TurnId) -> PathBuf {
+    std::env::temp_dir().join(format!("switchboard-agy-{turn_id}.log"))
 }
 
 /// Arguments to [`run_producer`]. A struct rather than a long parameter list
@@ -325,6 +355,15 @@ struct ProducerCtx {
     /// prompt), so concurrent same-cwd dispatches can't bind each other's
     /// conversation.
     prompt: String,
+    /// Per-dispatch CLI log path. Passed to `agy` via `--log-file` so this
+    /// turn's log is isolated; scanned on the no-answer branch for the
+    /// underlying RPC error (the only place quota / network failures appear —
+    /// `agy` exits 0 with empty stdout/stderr on them). Cleaned up best-effort
+    /// after the scan.
+    log_file_path: PathBuf,
+    /// Fired by the dispatcher to cancel the turn. Watched as an arm of the
+    /// producer's existing `select!`.
+    cancel_token: CancellationToken,
 }
 
 /// Drive a single Antigravity turn to completion, emitting normalized
@@ -348,6 +387,8 @@ async fn run_producer(ctx: ProducerCtx) {
         mcp_servers,
         skills,
         prompt,
+        log_file_path,
+        cancel_token,
     } = ctx;
 
     let stderr_tail: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::with_capacity(
@@ -396,8 +437,12 @@ async fn run_producer(ctx: ProducerCtx) {
     // must fail loudly rather than silently complete on the stdout answer.
     let mut unresumable = false;
     let mut stdout_eof = false;
+    // Set when cancellation fires: kill the group and end the stream with NO
+    // terminal event (the dispatcher synthesizes `Cancelled`). Unlike the
+    // stdout-draining adapters, Antigravity already uses `select!` to tail the
+    // transcript on a tick — cancellation is just one more arm.
+    let mut cancelled = false;
     let mut exit_status: Option<std::process::ExitStatus> = None;
-    let capture_deadline = spawn_time + UUID_CAPTURE_TIMEOUT;
 
     let mut poll = tokio::time::interval(POLL_INTERVAL);
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -436,7 +481,7 @@ async fn run_producer(ctx: ProducerCtx) {
             }
             _ = poll.tick() => {
                 if conversation_id.is_none() {
-                    match correlate_conversation_dir(&home_dir, spawn_time, &prompt) {
+                    match capture_conversation_id(&log_file_path, &home_dir, spawn_time, &prompt) {
                         CaptureOutcome::Bound(uuid) => {
                             conversation_id = Some(uuid);
                             transcript_path = Some(paths::transcript_path(&home_dir, uuid));
@@ -469,6 +514,13 @@ async fn run_producer(ctx: ProducerCtx) {
                     exit_status = Some(status);
                 }
             }
+            () = cancel_token.cancelled() => {
+                // Cancellation: break the loop and let the post-loop
+                // `if cancelled` handler kill the group and end the stream with
+                // NO terminal event (the dispatcher synthesizes `Cancelled`).
+                cancelled = true;
+                break;
+            }
         }
 
         // Abort paths: stop immediately and force-kill below.
@@ -480,20 +532,44 @@ async fn run_producer(ctx: ProducerCtx) {
         if stdout_eof && exit_status.is_some() {
             break;
         }
-        // First-turn UUID never appeared and the process is gone / timed out:
-        // nothing more will be written. Stop waiting.
-        if conversation_id.is_none()
-            && (exit_status.is_some() || SystemTime::now() >= capture_deadline)
-        {
+        // First-turn UUID never appeared and the child has exited (one-shot
+        // turn done, log + transcript flushed) — nothing more will be written,
+        // so stop. **No wall-clock capture deadline**: the conversation id is
+        // read from `agy`'s own log file, which lands in ~seconds independent of
+        // server-response latency, so there is no slow-cold-start to race, and
+        // the terminator is process exit (a real event) plus cancellation — the
+        // *same* terminators the Claude/Codex/Gemini producers use; none of them
+        // has a capture/run timeout and the dispatcher has no turn deadline, so
+        // removing this one aligns Antigravity with that pattern (it was the odd
+        // one out, and the old 5s deadline actively false-failed healthy ~10s
+        // cold starts). The residual gap — an `agy` that spawns, emits nothing,
+        // and never exits pins the turn until manual cancel — is systemic across
+        // all adapters, not introduced here; an automatic backstop for a
+        // zero-output wedge, if ever wanted, belongs in the dispatcher for every
+        // adapter, not as an Antigravity-only timeout that would reintroduce the
+        // cold-start false-fail.
+        if conversation_id.is_none() && exit_status.is_some() {
             break;
         }
     }
 
+    if cancelled {
+        // Cancellation path: kill the group and end the stream with NO
+        // terminal event (the dispatcher synthesizes `Cancelled`). Skip the
+        // post-exit recapture / `classify_outcome` / `TurnEnd` / `SessionMeta`
+        // below. Kill before awaiting the stderr drain — a parked subprocess
+        // holds stderr open.
+        crate::subprocess::terminate_then_kill(&mut child).await;
+        let _ = stderr_task.await;
+        let _ = std::fs::remove_file(&log_file_path);
+        return;
+    }
+
     // Force-kill if we broke out while the child may still be running (auth
     // fast-fail, or capture timeout with the process hung on OAuth).
+    // `terminate_then_kill` reaps the child itself, so no trailing `wait`.
     if exit_status.is_none() {
-        crate::subprocess::kill_subprocess_group(&mut child).await;
-        let _ = child.wait().await;
+        crate::subprocess::terminate_then_kill(&mut child).await;
     }
     // Drain stderr before scanning it for the resume-not-found signal below.
     let _ = stderr_task.await;
@@ -519,7 +595,7 @@ async fn run_producer(ctx: ProducerCtx) {
     // still completed (a real answer streamed), so it is not failed.
     let resume_forked = is_resume && conversation_not_found(&stdout_buf, &stderr_tail);
     if conversation_id.is_none() || resume_forked {
-        match correlate_conversation_dir(&home_dir, spawn_time, &prompt) {
+        match capture_conversation_id(&log_file_path, &home_dir, spawn_time, &prompt) {
             CaptureOutcome::Bound(uuid) => {
                 if resume_forked {
                     tracing::warn!(
@@ -541,17 +617,18 @@ async fn run_producer(ctx: ProducerCtx) {
             CaptureOutcome::Ambiguous => ambiguous_capture = true,
             CaptureOutcome::NotYet => {
                 // Recapture was required (first turn never bound, or a resume
-                // forked) but no conversation directory matched this dispatch
-                // — most likely the `.system_generated/` transcript path
-                // changed, or agy didn't echo the prompt verbatim. The agent
-                // can't be made resumable; fail loud rather than silently
-                // complete on the stdout answer (which would leave it amnesiac
-                // every turn).
+                // forked) but neither the log file nor the brain-dir fallback
+                // yielded this dispatch's conversation id — most likely the
+                // `Created conversation <uuid>` log line moved *and* the
+                // `.system_generated/` transcript path changed (or `agy` didn't
+                // echo the prompt verbatim). The agent can't be made resumable;
+                // fail loud rather than silently complete on the stdout answer
+                // (which would leave it amnesiac every turn).
                 unresumable = true;
                 tracing::warn!(
                     %turn_id, agent_id = %agent_id, resume_forked,
-                    "antigravity: produced output but could not locate the conversation \
-                     directory; the agent cannot be resumed"
+                    "antigravity: produced output but could not identify the conversation \
+                     (no id in the CLI log, no matching brain dir); the agent cannot be resumed"
                 );
             }
         }
@@ -584,6 +661,17 @@ async fn run_producer(ctx: ProducerCtx) {
         }
     }
 
+    // Scan the per-dispatch CLI log only when the turn produced no answer —
+    // a successful turn has nothing in the log we'd want to surface. Best-
+    // effort: an unreadable / missing log falls back to the generic message.
+    let log_error = if saw_terminal_answer {
+        None
+    } else {
+        scan_agy_log_for_error(&log_file_path)
+    };
+    // Per-dispatch log cleanup. Best-effort — leaving a few KB temp file
+    // around isn't load-bearing, but normal operation shouldn't leak.
+    let _ = std::fs::remove_file(&log_file_path);
     let outcome = classify_outcome(
         &OutcomeSignals {
             auth_failed,
@@ -592,6 +680,7 @@ async fn run_producer(ctx: ProducerCtx) {
             unresumable,
             saw_terminal_answer,
             saw_stdout_content,
+            log_error,
         },
         &stdout_buf,
         &stderr_tail,
@@ -666,15 +755,84 @@ fn persist_sidecar(sidecar_file: &Path, uuid: Uuid) -> Result<(), sidecar::Sidec
 /// directory.
 #[derive(Debug)]
 enum CaptureOutcome {
-    /// No candidate transcript yet contains this dispatch's prompt — keep
-    /// polling (the dir/transcript may not be written yet).
+    /// The conversation id isn't readable yet — neither in the CLI log nor (in
+    /// the fallback) a matching brain dir. Keep polling; the child may not have
+    /// logged it yet.
     NotYet,
-    /// Exactly one in-window conversation echoes this dispatch's prompt.
+    /// The conversation id for this dispatch (from the log, or unambiguously
+    /// from the brain-dir fallback).
     Bound(Uuid),
-    /// Two or more in-window conversations echo this prompt (e.g. identical
-    /// concurrent prompts in the same cwd). Binding either would risk
-    /// attaching to the wrong conversation, so fail loud instead of guessing.
+    /// **Fallback path only.** Two or more in-window conversations echo this
+    /// prompt (e.g. identical concurrent prompts in the same cwd). Binding
+    /// either would risk attaching to the wrong conversation, so fail loud
+    /// instead of guessing. The primary log-file path can't produce this — the
+    /// id is read from this dispatch's own private log.
     Ambiguous,
+}
+
+/// Capture this dispatch's server-assigned conversation id.
+///
+/// **Primary: read it from `agy`'s own log file.** `agy` mints the
+/// conversation server-side and logs the id to the `--log-file` we passed
+/// (unique per dispatch). Reading it from *our* log is deterministic, lands in
+/// ~seconds regardless of server-response/cold-start latency, and is immune to
+/// cross-attribution: a concurrent or background `agy` writes its *own* log,
+/// never ours, so there is no shared-resource race and no "two identical
+/// prompts" ambiguity. This replaced a filesystem race that watched the shared
+/// `brain/` dir and matched the prompt — which both raced the (slow, ~10s on a
+/// cold start) transcript write and could collide on identical concurrent
+/// prompts.
+///
+/// **Fallback: the prompt-correlation watch.** If the log yields nothing — the
+/// `Created conversation <uuid>` line is a Google-internal debug string that
+/// could move on a CLI bump — degrade to [`correlate_conversation_dir`] so
+/// turns keep working (with the older concurrency caveat) instead of
+/// hard-failing every turn. A CLI bump that moves the log line is caught by the
+/// live test before users see it.
+fn capture_conversation_id(
+    log_path: &Path,
+    home_dir: &Path,
+    since: SystemTime,
+    prompt: &str,
+) -> CaptureOutcome {
+    if let Some(uuid) = conversation_id_from_log(log_path) {
+        return CaptureOutcome::Bound(uuid);
+    }
+    correlate_conversation_dir(home_dir, since, prompt)
+}
+
+/// The conversation id `agy` recorded in this dispatch's private CLI log.
+///
+/// `agy` logs the id it uses, e.g. (real `agy` 1.0.3, glog format):
+/// - `… server.go:755] Created conversation <uuid>` — a freshly minted one
+/// - `… printmode.go:130] Print mode: conversation=<uuid>, sending message` —
+///   the one the message is actually sent to (first turn, resume, or the new
+///   id after a fork-and-heal).
+///
+/// We key on either marker and return the **last** id seen, so a fork's fresh
+/// conversation (logged after the stale resume id) wins. Matching is anchored
+/// to the marker text — `conversationID="…"` (the unused "starting" line) does
+/// not contain `conversation=` and so never false-matches.
+fn conversation_id_from_log(log_path: &Path) -> Option<Uuid> {
+    let content = std::fs::read_to_string(log_path).ok()?;
+    let mut found: Option<Uuid> = None;
+    for line in content.lines() {
+        for marker in ["Created conversation ", "conversation="] {
+            if let Some((_, rest)) = line.split_once(marker)
+                && let Some(uuid) = uuid_prefix(rest)
+            {
+                found = Some(uuid);
+            }
+        }
+    }
+    found
+}
+
+/// Parse a UUID from the start of `s` — the 36-char canonical form, however it
+/// is delimited afterward (`,`, space, `"`, end-of-line).
+fn uuid_prefix(s: &str) -> Option<Uuid> {
+    let token: String = s.chars().take(36).collect();
+    Uuid::parse_str(&token).ok()
 }
 
 /// Correlate this dispatch to its server-assigned conversation by matching
@@ -844,8 +1002,8 @@ fn extract_model_from_record(rec: &TranscriptRecord) -> Option<String> {
 }
 
 /// Post-exit signals fed to [`classify_outcome`]. Bundled into a struct so
-/// the classifier stays a 3-arg pure function (testable without spawning
-/// `agy`).
+/// the classifier stays a small-arity pure function (testable without
+/// spawning `agy`).
 // Five independent booleans, each a distinct terminal condition the producer
 // observed. Modeling them as two-variant enums or a state machine would
 // obscure rather than clarify — they're orthogonal flags, not states.
@@ -857,6 +1015,11 @@ struct OutcomeSignals {
     unresumable: bool,
     saw_terminal_answer: bool,
     saw_stdout_content: bool,
+    /// Human-readable message derived from scanning this dispatch's CLI log
+    /// for an `rpc error: code = …` line when no transcript terminal answer
+    /// was produced. `None` when the scan was skipped (success), the file
+    /// was unreadable, or no matching line was found.
+    log_error: Option<String>,
 }
 
 /// True if a line reports the resume target conversation was not found
@@ -882,15 +1045,118 @@ fn conversation_not_found(stdout_lines: &[String], stderr_tail: &Mutex<VecDeque<
         .is_ok_and(|buf| buf.iter().any(|l| is_conversation_not_found(l)))
 }
 
+/// Scan a per-dispatch `agy` CLI log for the first `rpc error: code = …`
+/// line and return a human-readable message, or `None` if the file is
+/// missing/unreadable or contains no matching line.
+///
+/// Why this exists: `agy` exits 0 with empty stdout/stderr on
+/// `RESOURCE_EXHAUSTED` (quota) and similar RPC failures — the *only* place
+/// the underlying cause appears is the per-invocation CLI log. Per-dispatch
+/// log isolation (we pass `--log-file <our-path>`) means a positive match
+/// always belongs to *this* turn, never a concurrent `agy`.
+///
+/// Known limitation: a deliberate display-only surface. The log line for
+/// `RESOURCE_EXHAUSTED` actually includes a `Resets in 143h34m25s` suffix
+/// (verified against captured logs); we carry that text through as part of
+/// the displayed message but do **not** parse it into structured retry
+/// metadata or schedule any auto-retry — those are explicit non-goals (see
+/// the failure-message plan's "Out of scope" section).
+fn scan_agy_log_for_error(path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+        let Some(idx) = find_rpc_error_marker(line) else {
+            continue;
+        };
+        // Trim `agy`'s leading log preamble (timestamp + goroutine + file:line)
+        // so the displayed message is the RPC text, not a Go log header.
+        let detail = line[idx..].trim_start();
+        return Some(rpc_error_to_message(detail));
+    }
+    None
+}
+
+/// Find the byte index of the `rpc error: code = ` marker (case-insensitive)
+/// in a log line, or `None` if absent.
+fn find_rpc_error_marker(line: &str) -> Option<usize> {
+    const MARKER: &str = "rpc error: code = ";
+    // MARKER is already lowercase; only the input needs normalization.
+    line.to_ascii_lowercase().find(MARKER)
+}
+
+/// Map an RPC error detail line into a user-facing failure message.
+///
+/// Known codes get an authored prefix; the log's own descriptive tail is
+/// appended verbatim because for `RESOURCE_EXHAUSTED` it carries the
+/// `Resets in <duration>` info that the user wants — but as plain text
+/// only, never parsed into a retry schedule. Unknown codes pass through as
+/// `Antigravity error: <line>` so a never-seen-before RPC failure still
+/// surfaces a meaningful root cause instead of "agy exited without
+/// producing an answer".
+fn rpc_error_to_message(detail: &str) -> String {
+    // `agy` has been observed emitting both `ResourceExhausted` (camel-case;
+    // recent CLI logs) and `RESOURCE_EXHAUSTED` (screaming-snake; older
+    // captures). Normalize for matching.
+    let lower = detail.to_ascii_lowercase().replace('_', "");
+    if lower.contains("resourceexhausted") {
+        let tail = extract_rpc_descriptive_tail(detail);
+        let mut msg =
+            "Antigravity quota exhausted — Google Cloud individual quota reached.".to_owned();
+        if !tail.is_empty() {
+            msg.push(' ');
+            msg.push_str(&tail);
+        }
+        return msg;
+    }
+    // Unknown/never-observed code: strip the `rpc error: code = … desc = `
+    // gRPC plumbing the same way the quota branch does, so the user sees the
+    // descriptive tail rather than Go boilerplate. (No `desc = ` → the tail
+    // helper returns the line unchanged, which is acceptable for a code we
+    // haven't yet authored a message for.)
+    format!(
+        "Antigravity error: {}",
+        extract_rpc_descriptive_tail(detail)
+    )
+}
+
+/// Strip the `rpc error: code = <CODE> desc = ` prefix and the duplicated
+/// trailing repetition `agy` logs (`"<msg>: <msg>"`), keeping only the
+/// human-readable descriptive sentence. Falls back to the raw detail when
+/// the shape doesn't match — the caller doesn't depend on the strip
+/// succeeding, just on getting a reasonable string back.
+fn extract_rpc_descriptive_tail(detail: &str) -> String {
+    let after_desc = detail
+        .split_once("desc = ")
+        .map_or(detail, |(_, rest)| rest);
+    let trimmed = after_desc.trim().trim_end_matches('.').trim();
+    // `agy` logs `"<msg>: <msg>"` — same sentence repeated on either side of
+    // the colon. The first half retains its mid-string trailing period
+    // (`"…25s.: …25s"`), the second doesn't — so equality must compare on
+    // the period-stripped form, then return either half (they're
+    // semantically identical) trimmed to the user-facing shape.
+    let halved = match trimmed.split_once(": ") {
+        Some((first, second))
+            if first.trim_end_matches('.').trim() == second.trim_end_matches('.').trim() =>
+        {
+            second.trim_end_matches('.').trim()
+        }
+        _ => trimmed,
+    };
+    halved.to_owned()
+}
+
 /// Build the terminal `TurnOutcome` from the post-exit signals. Pure so the
 /// classification logic is unit-tested without spawning `agy`.
 ///
 /// Precedence: auth fast-fail → ambiguous capture → sidecar write failure →
-/// stdout `Error:` line → unresumable-with-a-streamed-reply (required recapture
-/// failed) → **transcript terminal answer → Completed** → output-but-no-answer
-/// (adapter failure) → no output (adapter failure). A concrete `Error:` line
-/// wins over the generic unresumable classification. `agy` exits 0 universally,
-/// so neither the exit code nor a transcript `status` drives this.
+/// stdout `Error:` line → log-derived RPC error → unresumable-with-a-streamed-reply
+/// (required recapture failed) → **transcript terminal answer → Completed** →
+/// output-but-no-answer (adapter failure) → no output (adapter failure). A
+/// concrete stdout `Error:` line wins over a log-derived RPC error (more direct
+/// signal); the log-derived RPC error wins over the diagnostic
+/// "transcript-path-may-have-changed" branch (the RPC error is the real root
+/// cause). `agy` exits 0 universally, so neither the exit code nor a transcript
+/// `status` drives this.
 ///
 /// **Completed requires a transcript-derived terminal answer** (`saw_terminal_answer`).
 /// stdout is no longer the displayed answer — `agy` replays the whole
@@ -916,7 +1182,7 @@ fn classify_outcome(
     if sig.auth_failed {
         return TurnOutcome::Failed {
             kind: FailureKind::AuthFailure,
-            message: "Antigravity authentication required — sign in via the Antigravity desktop app and reload Switchboard".to_owned(),
+            message: ANTIGRAVITY_AUTH_MESSAGE.to_owned(),
         };
     }
     if sig.ambiguous_capture {
@@ -936,14 +1202,25 @@ fn classify_outcome(
     // timed out and so never created a conversation dir should surface the
     // timeout, not "conversation could not be located."
     if let Some(error) = first_error_line(stdout_lines) {
-        let kind = if is_auth_failure_line(&error) {
-            FailureKind::AuthFailure
+        let (kind, message) = if is_auth_failure_line(&error) {
+            (
+                FailureKind::AuthFailure,
+                ANTIGRAVITY_AUTH_MESSAGE.to_owned(),
+            )
         } else {
-            FailureKind::HarnessError
+            (FailureKind::HarnessError, error)
         };
+        return TurnOutcome::Failed { kind, message };
+    }
+    // Log-derived RPC error: the only place `RESOURCE_EXHAUSTED` / network
+    // failures surface (stdout/stderr stay empty and `agy` exits 0). Wins
+    // over the diagnostic "transcript-path-may-have-changed" branches below
+    // because it names the real root cause; loses to a stdout `Error:` line
+    // above because that's a more direct user-visible signal.
+    if let Some(log_message) = sig.log_error.as_deref() {
         return TurnOutcome::Failed {
-            kind,
-            message: error,
+            kind: FailureKind::HarnessError,
+            message: log_message.to_owned(),
         };
     }
     // Unresumable only matters when a reply actually streamed: a required
@@ -967,7 +1244,7 @@ fn classify_outcome(
     if sig.saw_stdout_content {
         return TurnOutcome::Failed {
             kind: FailureKind::AdapterFailure,
-            message: "Antigravity produced output but Switchboard could not read the answer from the conversation transcript — the .system_generated/ transcript path may have changed (see docs/research/antigravity-cli-observed.md); retry".to_owned(),
+            message: "Antigravity produced output but Switchboard could not read the answer from the conversation transcript — the .system_generated/ transcript path may have changed (see docs/research/archive/antigravity-cli-observed.md); retry".to_owned(),
         };
     }
     let tail = crate::subprocess::format_stderr_tail(stderr_tail);
@@ -1004,27 +1281,57 @@ mod tests {
 
     #[test]
     fn build_args_first_turn_omits_conversation() {
-        let args = build_args("hello", None);
+        let log = PathBuf::from("/tmp/x.log");
+        let args = build_args("hello", Path::new("/work/proj"), None, &log);
         assert_eq!(args[0], "-p");
         assert_eq!(args[1], "hello");
         assert!(!args.contains(&"--conversation".to_owned()));
         assert!(args.contains(&"--dangerously-skip-permissions".to_owned()));
+        let idx = args.iter().position(|a| a == "--log-file").unwrap();
+        assert_eq!(args[idx + 1], "/tmp/x.log");
+    }
+
+    #[test]
+    fn build_args_establishes_the_workspace_via_add_dir() {
+        // `--add-dir <cwd>` is load-bearing: without it `agy` runs the model's
+        // file/command tools against $HOME, not the project dir.
+        let log = PathBuf::from("/tmp/x.log");
+        let args = build_args("hello", Path::new("/work/proj"), None, &log);
+        let idx = args
+            .iter()
+            .position(|a| a == "--add-dir")
+            .expect("must pass --add-dir");
+        assert_eq!(args[idx + 1], "/work/proj");
     }
 
     #[test]
     fn build_args_resume_passes_conversation_uuid() {
         let uuid = Uuid::new_v4();
-        let args = build_args("hi", Some(uuid));
+        let log = PathBuf::from("/tmp/y.log");
+        let args = build_args("hi", Path::new("/work/proj"), Some(uuid), &log);
         let idx = args.iter().position(|a| a == "--conversation").unwrap();
         assert_eq!(args[idx + 1], uuid.to_string());
+        // Workspace is re-established on resume too (agy is one-shot).
+        assert!(args.contains(&"--add-dir".to_owned()));
+    }
+
+    #[test]
+    fn build_log_file_path_is_unique_per_turn() {
+        let a = build_log_file_path(Uuid::new_v4());
+        let b = build_log_file_path(Uuid::new_v4());
+        assert_ne!(a, b, "different turn ids must yield different log paths");
+        assert!(
+            a.starts_with(std::env::temp_dir()),
+            "log path lives under temp dir"
+        );
     }
 
     #[tokio::test]
     async fn dispatch_rejects_empty_prompt_before_spawn() {
         let adapter = AntigravityAdapter::with_binary_path("/nonexistent");
         let agent = AgentRecord {
-            id: Uuid::now_v7(),
-            project_id: Uuid::now_v7(),
+            id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
             name: "a".to_owned(),
             harness: switchboard_core::HarnessKind::Antigravity,
             session_id: None,
@@ -1036,7 +1343,7 @@ mod tests {
                 &agent,
                 cwd.path(),
                 "   ",
-                Uuid::now_v7(),
+                Uuid::new_v4(),
                 DispatchOptions::default(),
             )
             .await;
@@ -1110,6 +1417,136 @@ mod tests {
             correlate_conversation_dir(home.path(), since, "summarize"),
             CaptureOutcome::NotYet
         ));
+    }
+
+    /// Write a realistic `agy` CLI log naming the conversation it created.
+    fn write_log(path: &Path, uuid: Uuid) {
+        std::fs::write(
+            path,
+            format!(
+                "I0529 server.go:734] Conversation using project ID: proj\n\
+                 I0529 server.go:755] Created conversation {uuid}\n\
+                 I0529 printmode.go:130] Print mode: conversation={uuid}, sending message\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn conversation_id_read_from_log_is_the_logged_uuid() {
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("agy.log");
+        let uuid = Uuid::new_v4();
+        write_log(&log, uuid);
+        assert_eq!(conversation_id_from_log(&log), Some(uuid));
+    }
+
+    #[test]
+    fn conversation_id_from_log_ignores_the_empty_starting_line() {
+        // The first-turn "starting" line carries `conversationID=""` (note the
+        // `ID=`, not `conversation=`) — it must not be mistaken for an id.
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("agy.log");
+        let uuid = Uuid::new_v4();
+        std::fs::write(
+            &log,
+            format!(
+                "I0529 printmode.go:71] Print mode: starting (promptLength=22, conversationID=\"\")\n\
+                 I0529 server.go:755] Created conversation {uuid}\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(conversation_id_from_log(&log), Some(uuid));
+    }
+
+    #[test]
+    fn conversation_id_from_log_returns_last_so_a_fork_wins() {
+        // A fork logs the stale resume id, then mints + logs a fresh one; the
+        // fresh (last) id must win so we heal to the conversation that actually
+        // carries this turn's answer.
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("agy.log");
+        let stale = Uuid::new_v4();
+        let fresh = Uuid::new_v4();
+        std::fs::write(
+            &log,
+            format!(
+                "I0529 printmode.go:130] Print mode: conversation={stale}, sending message\n\
+                 I0529 server.go] Warning: conversation \"{stale}\" not found.\n\
+                 I0529 server.go:755] Created conversation {fresh}\n\
+                 I0529 printmode.go:130] Print mode: conversation={fresh}, sending message\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(conversation_id_from_log(&log), Some(fresh));
+    }
+
+    #[test]
+    fn conversation_id_from_log_ignores_a_half_written_final_line() {
+        // The producer reads the log *while* `agy` is writing it (every poll
+        // tick). A partially-flushed final id line yields fewer than 36 chars,
+        // so `uuid_prefix` fails to parse and we return None and keep polling —
+        // never binding a truncated-but-wrong id. Pins the "safe to read
+        // mid-write" property the polling design relies on.
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("agy.log");
+        // No trailing newline; the uuid is cut short mid-flush.
+        std::fs::write(
+            &log,
+            "I0529 server.go:755] Created conversation 7b1024a8-f1df-",
+        )
+        .unwrap();
+        assert_eq!(conversation_id_from_log(&log), None);
+    }
+
+    #[test]
+    fn conversation_id_from_log_none_when_absent_or_unreadable() {
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("agy.log");
+        std::fs::write(&log, "I0529 server.go] nothing relevant here\n").unwrap();
+        assert_eq!(conversation_id_from_log(&log), None);
+        // Missing file → None (not an error).
+        assert_eq!(
+            conversation_id_from_log(&dir.path().join("missing.log")),
+            None
+        );
+    }
+
+    #[test]
+    fn capture_prefers_the_log_and_is_immune_to_a_same_prompt_sibling() {
+        // The log names *our* conversation directly. Even with a sibling
+        // conversation echoing the identical prompt on disk (which would make
+        // the brain-dir fallback `Ambiguous`), capture binds our logged id with
+        // no ambiguity — the concurrency-safety the log path buys.
+        let dir = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let log = dir.path().join("agy.log");
+        let mine = Uuid::new_v4();
+        write_log(&log, mine);
+        let since = SystemTime::now() - Duration::from_secs(1);
+        stage_conversation(home.path(), Uuid::new_v4(), "identical prompt");
+        stage_conversation(home.path(), mine, "identical prompt");
+        match capture_conversation_id(&log, home.path(), since, "identical prompt") {
+            CaptureOutcome::Bound(uuid) => assert_eq!(uuid, mine),
+            other => panic!("expected Bound(mine) from the log, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn capture_falls_back_to_brain_dir_when_the_log_has_no_id() {
+        // If the log line ever moves (no id parseable), capture degrades to the
+        // prompt-correlation watch rather than hard-failing.
+        let dir = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let log = dir.path().join("agy.log");
+        std::fs::write(&log, "I0529 some.go] format changed, no id here\n").unwrap();
+        let mine = Uuid::new_v4();
+        let since = SystemTime::now() - Duration::from_secs(1);
+        stage_conversation(home.path(), mine, "remember mango");
+        match capture_conversation_id(&log, home.path(), since, "remember mango") {
+            CaptureOutcome::Bound(uuid) => assert_eq!(uuid, mine),
+            other => panic!("expected fallback Bound(mine), got {other:?}"),
+        }
     }
 
     #[test]
@@ -1234,6 +1671,7 @@ mod tests {
             unresumable: false,
             saw_terminal_answer: true,
             saw_stdout_content: true,
+            log_error: None,
         }
     }
 
@@ -1243,13 +1681,23 @@ mod tests {
             auth_failed: true,
             ..ok_signals()
         };
-        assert!(matches!(
-            classify_outcome(&sig, &[], &empty_tail()),
+        match classify_outcome(&sig, &[], &empty_tail()) {
             TurnOutcome::Failed {
                 kind: FailureKind::AuthFailure,
-                ..
+                message,
+            } => {
+                assert!(
+                    message.contains("Antigravity authentication required"),
+                    "names the harness: {message}"
+                );
+                assert!(message.contains("run `agy`"), "names the fix: {message}");
+                assert!(
+                    !message.contains("reload Switchboard"),
+                    "must not advise reload (reactive auth): {message}"
+                );
             }
-        ));
+            other => panic!("expected AuthFailure, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1373,13 +1821,151 @@ mod tests {
     fn classify_outcome_auth_error_line_is_auth_failure() {
         let lines = vec!["Error: authentication timed out.".to_owned()];
         let sig = ok_signals();
-        assert!(matches!(
-            classify_outcome(&sig, &lines, &empty_tail()),
+        match classify_outcome(&sig, &lines, &empty_tail()) {
             TurnOutcome::Failed {
                 kind: FailureKind::AuthFailure,
-                ..
+                message,
+            } => {
+                // Even when the raw stdout `Error:` line is the trigger, the
+                // authored message wins so the user gets uniform actionable
+                // text.
+                assert!(message.contains("run `agy`"));
+                assert!(!message.contains("reload Switchboard"));
             }
-        ));
+            other => panic!("expected AuthFailure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_outcome_log_error_surfaces_as_harness_error() {
+        // RESOURCE_EXHAUSTED log line scanned by the producer reaches
+        // classify_outcome via OutcomeSignals.log_error.
+        let sig = OutcomeSignals {
+            saw_terminal_answer: false,
+            saw_stdout_content: false,
+            log_error: Some("Antigravity quota exhausted — Google Cloud individual quota reached. Resets in 143h34m25s.".to_owned()),
+            ..ok_signals()
+        };
+        match classify_outcome(&sig, &[], &empty_tail()) {
+            TurnOutcome::Failed {
+                kind: FailureKind::HarnessError,
+                message,
+            } => {
+                assert!(message.contains("quota exhausted"));
+                assert!(message.contains("Resets in"));
+            }
+            other => panic!("expected HarnessError from log_error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_outcome_log_error_wins_over_unresumable() {
+        // A real RPC failure is the root cause; the diagnostic
+        // "transcript path may have changed" branch must not mask it.
+        let sig = OutcomeSignals {
+            saw_terminal_answer: false,
+            saw_stdout_content: true,
+            unresumable: true,
+            log_error: Some("Antigravity quota exhausted.".to_owned()),
+            ..ok_signals()
+        };
+        match classify_outcome(&sig, &[], &empty_tail()) {
+            TurnOutcome::Failed {
+                kind: FailureKind::HarnessError,
+                message,
+            } => assert!(message.contains("quota exhausted")),
+            other => panic!("expected HarnessError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_outcome_stdout_error_wins_over_log_error() {
+        // A stdout `Error:` line is more direct (the user-visible signal `agy`
+        // itself printed); it should win over a log-derived RPC message.
+        let sig = OutcomeSignals {
+            saw_terminal_answer: false,
+            saw_stdout_content: true,
+            log_error: Some("rpc error noise".to_owned()),
+            ..ok_signals()
+        };
+        let stdout = vec!["Error: timed out waiting for response".to_owned()];
+        match classify_outcome(&sig, &stdout, &empty_tail()) {
+            TurnOutcome::Failed {
+                kind: FailureKind::HarnessError,
+                message,
+            } => assert!(message.contains("timed out")),
+            other => panic!("expected stdout-derived HarnessError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scan_agy_log_resource_exhausted_returns_authored_message_with_log_tail() {
+        let tmp = TempDir::new().unwrap();
+        let log = tmp.path().join("agy.log");
+        std::fs::write(
+            &log,
+            "E0526 13:59:05.636054  1754 log.go:398] agent executor error: rpc error: code = ResourceExhausted desc = Individual quota reached. Contact your administrator to enable overages. Resets in 143h34m25s.: Individual quota reached. Contact your administrator to enable overages. Resets in 143h34m25s.\n",
+        )
+        .unwrap();
+        let msg = scan_agy_log_for_error(&log).expect("log scan must find the error");
+        assert!(
+            msg.starts_with("Antigravity quota exhausted"),
+            "authored prefix: {msg}"
+        );
+        assert!(
+            msg.contains("Resets in 143h34m25s"),
+            "carries the reset-time tail from the log line: {msg}"
+        );
+        assert!(
+            !msg.contains("rpc error: code"),
+            "Go log preamble stripped: {msg}"
+        );
+        // The `agy` log doubles the descriptive sentence on either side of a
+        // `: ` separator. The dedup must collapse it so the user sees one
+        // copy, not a run-on.
+        assert_eq!(
+            msg.matches("Individual quota reached").count(),
+            1,
+            "duplicate descriptive sentence must be collapsed: {msg}"
+        );
+    }
+
+    #[test]
+    fn scan_agy_log_unknown_code_passes_through_as_authored_prefix() {
+        let tmp = TempDir::new().unwrap();
+        let log = tmp.path().join("agy.log");
+        std::fs::write(
+            &log,
+            "E0526 13:59:05.636054  1754 log.go:398] rpc error: code = Internal desc = backend exploded\n",
+        )
+        .unwrap();
+        let msg = scan_agy_log_for_error(&log).expect("scan must surface unknown codes");
+        assert!(
+            msg.starts_with("Antigravity error: "),
+            "unknown code passes through with authored prefix: {msg}"
+        );
+        assert!(
+            msg.contains("backend exploded"),
+            "carries the descriptive tail: {msg}"
+        );
+        assert!(
+            !msg.contains("rpc error: code = "),
+            "Go RPC boilerplate is stripped: {msg}"
+        );
+    }
+
+    #[test]
+    fn scan_agy_log_missing_file_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        assert!(scan_agy_log_for_error(&tmp.path().join("absent.log")).is_none());
+    }
+
+    #[test]
+    fn scan_agy_log_no_rpc_error_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let log = tmp.path().join("agy.log");
+        std::fs::write(&log, "I0526 13:59:05.636054 log.go:398] normal startup\n").unwrap();
+        assert!(scan_agy_log_for_error(&log).is_none());
     }
 
     #[test]

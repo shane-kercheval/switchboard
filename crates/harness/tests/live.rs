@@ -11,7 +11,7 @@ use futures::StreamExt;
 use switchboard_core::{AgentRecord, HarnessKind};
 use switchboard_harness::{
     AdapterEvent, AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, DispatchOptions,
-    GeminiAdapter, HarnessAdapter, TurnOutcome,
+    GeminiAdapter, HarnessAdapter, RateLimitSource, TurnOutcome,
 };
 use uuid::Uuid;
 
@@ -118,6 +118,42 @@ async fn live_claude_basic_turn_completes() {
         }
         _ => panic!("expected TurnEnd with Some(usage), got: {terminal:?}"),
     }
+
+    // Rate-limit drift detection (M3/M4 contract). Claude emits a
+    // `rate_limit_event` on every normal turn; our parser lifts it to a
+    // `StreamOnly` `RateLimitEvent` (persisted to the metadata sidecar for
+    // restart continuity) whose `info` carries the fields the Sidebar's
+    // rate-limit window line reads: `resetsAt` (epoch seconds) and
+    // `rateLimitType` (the window-label source). A fixture-based test keeps
+    // passing if Anthropic renames or drops these; this catches it live.
+    // (We can't assert `isUsingOverage` — that appears only once the 5-hour
+    // window is exhausted, which a tiny live prompt won't trigger.)
+    let rate_limit = events
+        .iter()
+        .find(|e| matches!(e, AdapterEvent::RateLimitEvent { .. }))
+        .expect("Claude must emit a rate_limit_event on a normal turn");
+    match rate_limit {
+        AdapterEvent::RateLimitEvent { info, source, .. } => {
+            assert_eq!(
+                *source,
+                RateLimitSource::StreamOnly,
+                "Claude rate-limit has no session-file equivalent → must be StreamOnly (persisted)"
+            );
+            assert!(
+                info.get("resetsAt")
+                    .and_then(serde_json::Value::as_i64)
+                    .is_some(),
+                "rate_limit_info.resetsAt must be an epoch number (Sidebar window reset reads it): {info}"
+            );
+            assert!(
+                info.get("rateLimitType")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some(),
+                "rate_limit_info.rateLimitType must be a string (Sidebar window label derives from it): {info}"
+            );
+        }
+        _ => unreachable!(),
+    }
 }
 
 #[tokio::test]
@@ -216,6 +252,10 @@ fn live_codex_agent() -> AgentRecord {
 
 #[tokio::test]
 #[ignore = "requires codex installed — run with: make test-live"]
+// One cohesive end-to-end assertion sequence (completion + enrichment ordering
+// + rate-limit/SessionMeta shape + sidecar); splitting it across helpers would
+// scatter a single turn's drift-detection checks for no real gain.
+#[allow(clippy::too_many_lines)]
 async fn live_codex_basic_turn_completes() {
     // Use a tempdir as cwd so the sidecar is written to a clean location
     // (avoids leaving state under the repo).
@@ -295,6 +335,50 @@ async fn live_codex_basic_turn_completes() {
         terminal_idx < rate_limit_idx && rate_limit_idx < session_meta_idx,
         "enrichment events must arrive after TurnEnd in order: TurnEnd → RateLimitEvent → SessionMeta"
     );
+
+    // Rate-limit payload-shape drift detection (M4 contract). The ordering
+    // check above proves the event fires; this proves its `info` still carries
+    // the fields the Sidebar's Codex windows read: `primary.used_percent` (the
+    // gauge — relied on since the original single cell), plus `window_minutes`
+    // (the window-label source) and `resets_at` (the tooltip reset time).
+    // SessionFileBacked — Codex's own session file is canonical, so we don't
+    // re-persist it. `secondary` is intentionally not asserted (a fresh
+    // account may not have a weekly window yet; the Sidebar shows it only when
+    // present).
+    match &events[rate_limit_idx] {
+        AdapterEvent::RateLimitEvent { info, source, .. } => {
+            assert_eq!(
+                *source,
+                RateLimitSource::SessionFileBacked,
+                "Codex rate-limit is read from its session file (class B) → not re-persisted"
+            );
+            let primary = info
+                .get("primary")
+                .expect("rate_limits.primary must be present: {info}");
+            assert!(
+                primary
+                    .get("used_percent")
+                    .and_then(serde_json::Value::as_f64)
+                    .is_some(),
+                "primary.used_percent must be a number (Sidebar gauge reads it): {info}"
+            );
+            assert!(
+                primary
+                    .get("window_minutes")
+                    .and_then(serde_json::Value::as_i64)
+                    .is_some(),
+                "primary.window_minutes must be present (Sidebar window label derives from it): {info}"
+            );
+            assert!(
+                primary
+                    .get("resets_at")
+                    .and_then(serde_json::Value::as_i64)
+                    .is_some(),
+                "primary.resets_at must be present (Sidebar tooltip reset time reads it): {info}"
+            );
+        }
+        _ => unreachable!(),
+    }
 
     // SessionMeta shape: structural-only checks. mcp_servers / skills lists
     // are developer-environment-dependent (we don't pin a particular ~/.codex
@@ -586,7 +670,7 @@ fn live_antigravity_agent() -> AgentRecord {
 }
 
 #[tokio::test]
-#[ignore = "requires agy authed via Antigravity desktop app — run with: make test-live"]
+#[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
 async fn live_antigravity_basic_turn_completes() {
     // cwd is a tempdir so the sidecar lands in a clean location. Note: `agy`
     // also writes a `.antigravitycli/` dir into cwd as a side effect — fine
@@ -681,17 +765,67 @@ async fn live_antigravity_basic_turn_completes() {
 }
 
 #[tokio::test]
-#[ignore = "requires agy authed via Antigravity desktop app — run with: make test-live"]
+#[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
+async fn live_antigravity_cli_log_names_the_conversation() {
+    // The adapter's PRIMARY conversation-id capture reads `agy`'s own
+    // `--log-file` (a `Created conversation <uuid>` line) — deterministic and
+    // concurrency-safe, unlike the prompt-correlation fallback. That log line is
+    // a Google-internal debug string, so a CLI bump could move it; if it did,
+    // the adapter would silently fall back and the other live tests would still
+    // pass, masking the drift. This test guards the log contract directly: run
+    // real `agy` exactly as the adapter does and assert its `--log-file` still
+    // names the conversation in the form `conversation_id_from_log` parses.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let log = tmp.path().join("agy.log");
+    let status = tokio::process::Command::new("agy")
+        .args([
+            "-p",
+            "Reply with the single word 'ack' and nothing else.",
+            "--dangerously-skip-permissions",
+            "--log-file",
+        ])
+        .arg(&log)
+        .current_dir(tmp.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .expect("agy should spawn");
+    assert!(status.success(), "agy exited non-zero: {status:?}");
+
+    let content = std::fs::read_to_string(&log).expect("agy should write the --log-file");
+    let names_conversation = content.lines().any(|line| {
+        ["Created conversation ", "conversation="]
+            .iter()
+            .any(|marker| {
+                line.split_once(marker)
+                    .map(|(_, rest)| rest.chars().take(36).collect::<String>())
+                    .and_then(|token| Uuid::parse_str(&token).ok())
+                    .is_some()
+            })
+    });
+    assert!(
+        names_conversation,
+        "agy --log-file no longer names the conversation in a parseable form; the adapter's \
+         primary capture (antigravity::conversation_id_from_log) needs updating. Log:\n{content}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
 async fn live_antigravity_adversarial_prompt_still_completes() {
-    // Guards the load-bearing assumption that `agy` echoes the dispatched
-    // prompt verbatim into the transcript's `<USER_REQUEST>` body. Capture
-    // correlates on exact prompt match and a miss is now fatal (unresumable
-    // → failed turn), so if `agy` reformats a non-trivial prompt (reindents
-    // multi-line, escapes quotes, mangles unicode), correlation would miss
-    // and this turn would FAIL. A `Completed` outcome proves the prompt was
-    // echoed verbatim and the exact-match gate is sound for realistic
-    // prompts. If this test fails, loosen `transcript_echoes_prompt` to a
-    // whitespace-normalized comparison (see its docstring).
+    // Guards the *fallback* capture's load-bearing assumption that `agy` echoes
+    // the dispatched prompt verbatim into the transcript's `<USER_REQUEST>`
+    // body. Primary capture now reads the conversation id from the CLI log, so
+    // this dispatch binds via the log (not correlation); but the
+    // prompt-correlation fallback still runs if that log line ever moves, and a
+    // fallback miss is fatal (unresumable → failed turn). This sends the gnarly
+    // multi-line/quoted/unicode shapes most likely to be reformatted and asserts
+    // the real CLI both completes and echoes them verbatim — so the fallback's
+    // exact-match gate stays sound. If this fails, loosen
+    // `transcript_echoes_prompt` to a whitespace-normalized comparison (see its
+    // docstring).
     let tmp = tempfile::TempDir::new().unwrap();
     let adapter = AntigravityAdapter::new();
     let agent = live_antigravity_agent();
@@ -745,7 +879,7 @@ async fn live_antigravity_adversarial_prompt_still_completes() {
 }
 
 #[tokio::test]
-#[ignore = "requires agy authed via Antigravity desktop app — run with: make test-live"]
+#[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
 async fn live_antigravity_resume_reuses_session() {
     // Memorize-then-recall: proof that `--conversation <uuid>` (driven by the
     // sidecar-captured UUID) restores the prior turn's server-side context.

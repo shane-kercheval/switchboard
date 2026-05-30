@@ -186,6 +186,116 @@ async fn live_claude_transcript_load_hydrates_tool_items() {
     );
 }
 
+/// End-to-end drift detection for the deferred-tool-result queue
+/// (`session_file.rs::ReconstructionState::pending_tool_results`).
+///
+/// Claude 2.1.150 was observed to write `tool_result` records to the
+/// session file *before* their matching `tool_use` (within the same
+/// turn, ~1s gap; the canonical case was session
+/// `22300f1b-3efe-4dbc-a4a0-7c1c954d1da2.jsonl` lines 1406/1408 and
+/// 1607/1609). Pre-M2 the parser dropped the result's output silently
+/// and emitted a "did not match any open tool" warning; on rehydration
+/// the affected tool calls rendered with empty content.
+///
+/// Multi-tool prompt makes the out-of-order pattern more likely to
+/// manifest in any given run (the originally-observed sessions all had
+/// long tool-call sequences). The assertion is the TUI-parity invariant:
+/// every hydrated `TurnItem::Tool` carries non-empty output, no warnings.
+/// If the parser stops binding properly on a future Claude version, this
+/// test fails — same drift-detection role the live tool-use tests play.
+#[tokio::test]
+#[ignore = "requires claude installed — run with: make test-live"]
+async fn live_claude_tool_results_bind_after_restart() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    // Stage three small files; the prompt asks Claude to read all of
+    // them, which forces a sequence of Read tool calls.
+    std::fs::write(tmp.path().join("ALPHA.txt"), "first-file-contents").expect("write ALPHA");
+    std::fs::write(tmp.path().join("BETA.txt"), "second-file-contents").expect("write BETA");
+    std::fs::write(tmp.path().join("GAMMA.txt"), "third-file-contents").expect("write GAMMA");
+
+    let adapter = ClaudeCodeAdapter::new();
+    let agent = AgentRecord {
+        id: Uuid::now_v7(),
+        project_id: Uuid::now_v7(),
+        name: "transcript-claude-tool-bind".to_owned(),
+        harness: HarnessKind::ClaudeCode,
+        session_id: Some(Uuid::now_v7()),
+        created_at: chrono::Utc::now(),
+    };
+    let turn_id = Uuid::now_v7();
+    let stream = adapter
+        .dispatch(
+            &agent,
+            tmp.path(),
+            "Read each of ALPHA.txt, BETA.txt, and GAMMA.txt in the current directory \
+             using your Read tool, one at a time. Reply with the single word done after \
+             you have read all three.",
+            turn_id,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed with real claude");
+    // Drain to flush the subprocess before reading the session file.
+    let _events: Vec<AdapterEvent> = stream.collect().await;
+
+    let transcript = switchboard_harness::load_claude_transcript(
+        &real_home(),
+        tmp.path(),
+        agent.session_id.unwrap(),
+        agent.id,
+    )
+    .expect("load_claude_transcript must succeed");
+
+    assert!(
+        transcript.warnings.is_empty(),
+        "rehydrating a multi-tool Claude turn must not emit parse warnings \
+         (out-of-order tool_use/tool_result writes should be bound via the \
+         deferred queue); got: {:?}",
+        transcript.warnings,
+    );
+
+    let agent_turn = transcript
+        .turns
+        .iter()
+        .find(|t| matches!(t, Turn::Agent { .. }))
+        .expect("hydrated transcript must contain a Turn::Agent");
+    let Turn::Agent { items, .. } = agent_turn else {
+        unreachable!();
+    };
+
+    // Pin the test to the three staged file contents specifically, rather
+    // than constraining every tool item in the turn. Two reasons:
+    //   1. Claude may emit incidental parent-level tools (e.g.,
+    //      `TodoWrite`) whose output is legitimately empty — asserting
+    //      "every tool has non-empty output" would false-fail there with
+    //      a misleading "deferred-queue regressed" diagnosis.
+    //   2. The invariant we actually care about is "the Reads we asked
+    //      for happened and their content bound" — a stronger,
+    //      contents-pinned check.
+    for expected in [
+        "first-file-contents",
+        "second-file-contents",
+        "third-file-contents",
+    ] {
+        let found = items.iter().any(|i| {
+            matches!(
+                i,
+                TurnItem::Tool {
+                    output: Some(out),
+                    is_error: Some(false),
+                    ..
+                } if out.contains(expected)
+            )
+        });
+        assert!(
+            found,
+            "expected a non-error TurnItem::Tool whose output contains {expected:?} — \
+             either out-of-order writes regressed the deferred-queue fix, or Claude's \
+             session-file shape changed. Items: {items:?}",
+        );
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires codex installed — run with: make test-live"]
 async fn live_codex_transcript_load_via_sidecar_round_trips() {

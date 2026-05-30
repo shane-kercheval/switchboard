@@ -72,10 +72,6 @@ After either command, commit both the manifest change and the lockfile diff in o
 - `thiserror` for typed errors at module boundaries.
 - No `unwrap` / `expect` outside `main` or test code; bubble via `Result`.
 - `#[non_exhaustive]` on enums that cross IPC or evolve between milestones — adding a new variant should not be a breaking change for consumers.
-- Subprocess gotchas (load-bearing for adapter code):
-  - Use `tokio::io::BufReader`, not `std::io::BufReader`, for async pipes. `tokio::process::ChildStdout` doesn't implement `std::io::Read`.
-  - Use `Stdio::null()` for stdin we never write to. Prevents pipe-full deadlocks and stalls on harnesses that try to read interactively (see `docs/research/codex-cli-observed.md`).
-  - Spawn the harness in its own process group on Unix (`Command::process_group(0)`). Lets cancellation reach the whole subprocess tree with one `killpg`, and makes the convention uniform across Claude Code (single process) and Codex (Node parent + Rust child).
 
 ### TypeScript / Svelte
 
@@ -83,6 +79,7 @@ After either command, commit both the manifest change and the lockfile diff in o
 - Svelte 5 runes (`$state`, `$derived`, `$effect`).
 - Wire-format types match Rust `#[serde(tag = "type", rename_all = "snake_case")]` — TS uses discriminated unions with snake_case keys. New variants land additively (`#[non_exhaustive]` on the Rust side; reducer default branches on the TS side that degrade gracefully on unknown discriminants).
 - `DateTime<Utc>` serializes as ISO-8601 string; consumers convert at the boundary if they need `Date` objects.
+- **Styling & components: see `docs/ui-conventions.md`.** Reach for a `src/lib/components/ui/` primitive before hand-rolling; a component that needs a color names a semantic token (`bg-surface`, `text-status-failed`), never a raw palette hue. That doc is the source of truth for the token model, the primitive set, and theming.
 
 ### Both languages
 
@@ -129,18 +126,19 @@ Adapter correctness depends on behavior we don't control: harness event vocabula
 Project-wide rules that apply across all milestones. Milestone-specific mechanics (dispatcher internals, exact wire shapes, lock orders, file paths) live in the milestone plan that introduced them and in the relevant crate's source — not here.
 
 - **Project = unit of work.** A project hosts N equally first-class agents. UI is one unified transcript stream with per-agent attribution, plus a per-agent overview sidebar. **No singleton "active" or "focused" agent at the model level** — all agents in a loaded project are equally live.
-- **Transcript source-of-truth = harness session files.** Switchboard does not maintain its own persistent transcript store. On project open, Switchboard reads `~/.claude/projects/.../*.jsonl` (Claude Code) and `~/.codex/sessions/YYYY/MM/DD/rollout-*-*.jsonl` (Codex), parses both into a normalized `Turn` shape, and merges chronologically.
+- **Vocabulary: send vs. turn.** A _send_ is one dispatch action (one compose-bar submit, or later one workflow step) targeting 1..N recipients; each recipient's request→response cycle is a _turn_, so a multi-recipient send creates N independent turns. Use this vocabulary in code, comments, and tests. Canonical definition: system-design §7 "Sends and turns."
+- **Conversation source-of-truth is split (see system-design §3).** Harness session files own **agent-produced content** (responses, tool calls) — on project open Switchboard reads them (`~/.claude/projects/.../*.jsonl`, `~/.codex/sessions/.../rollout-*.jsonl`, etc.), parses into a normalized `Turn` shape, and merges chronologically. Switchboard owns the **user's side** — a per-project append-only conversation journal (`journal.jsonl`) of user _sends_ (written at turn-start; a `send_id` groups a fan-out so the user's message renders once) and _outcome markers_ for every non-completed turn (failed or cancelled — no content). It does **not** store agent content itself. The two partition: harness files supply _completed_-turn content, the journal supplies _non-completed_-turn outcomes (no correlation/dedup). Durable history begins at turn-start, so queued-but-unstarted messages are live-UI-only.
 - **Harness registries (MCP servers, skills) are harness-owned, like transcripts.** They come from each harness's config files and skills directories (see system-design §9 for per-harness sources and the per-harness research docs in `docs/research/` for file shapes). Switchboard reads them as inputs; it does not maintain its own copies. Loader failures degrade to empty lists with a warning — these registries are display-only, not load-bearing for dispatch.
-- **Filesystem layout.** All Switchboard state lives at `<directory>/.switchboard/` — directly under the user's working directory, not in `~/.switchboard/`. `config.yaml`, `workflows/`, and `prompts/` are intended to be git-tracked; everything else is runtime data the user should `.gitignore` themselves. See system-design §3 for the full layout.
+- **Filesystem layout.** Per-directory Switchboard state lives at `<directory>/.switchboard/` — directly under the user's working directory, not in `~/.switchboard/`. `config.yaml`, `workflows/`, and `prompts/` are intended to be git-tracked; everything else is runtime data the user should `.gitignore` themselves. User-global state lives in the OS-conventional config dir resolved via the `directories` crate (illustrative `~/.config/switchboard/` on Linux; `~/Library/Application Support/switchboard/` on macOS): personal `config.yaml`/`prompts/`, plus `workspace.yaml` — the app-managed set of working directories the user works across, the source for the flat cross-directory project list. See system-design §3 for the full layout.
 
 ## Authoritative docs
 
 - `docs/system-design.md` — canonical design (the "what and why").
+- `docs/ui-conventions.md` — frontend styling + component conventions (token model, `ui/` primitives, theming).
 - `docs/implementation_plans/` — per-milestone plans and the v1 roadmap. Read the active milestone plan before changing scope; it's the ground truth for what to build.
-- `docs/research/` — harness ground-truth notes (one per harness):
-  - `claude-code-cli-observed.md`, `claude-code-headless.md` — Claude Code CLI behavior.
-  - `codex-cli-observed.md`, `codex-noninteractive.md` — Codex CLI behavior.
-  - `gemini-cli-observed.md` — Gemini CLI behavior.
-  - `antigravity-cli-observed.md` — Antigravity CLI (`agy`) behavior (Google's Gemini-CLI replacement for free / Pro / Ultra tiers).
+- `docs/research/` — harness ground-truth notes:
+  - `harness-behavior.md` — **the single source of truth for harness behavior**: how each harness behaves in the scenarios we care about (failures, auth, quota, metadata), how our adapter/frontend handles it, and the gap register. Start here.
+  - `harness-update-review.md` — playbook for reviewing a harness CLI version bump for impact on Switchboard (what to read, the dependency surface to check, how to record findings).
   - `same-session-parallel-invocation.md` — why we enforce session-id uniqueness at the app layer.
-  - `archive/` — captured-in-time research that informed earlier milestones and is no longer maintained. See `docs/system-design.md` §9 for the living cross-harness comparison.
+  - `archive/` — frozen, no-longer-maintained provenance, including the per-harness `*-cli-observed.md` probes (raw strings, exit codes, fixtures) that `harness-behavior.md` distills from. Cite for evidence; trust `harness-behavior.md` for current behavior. `docs/system-design.md` §9 is the design-level capability matrix; `harness-behavior.md` is its operational companion.
+- `README.md` → "Harness support and limitations" — the **user-facing** register of harness behaviors and limitations. Add an entry when a harness constraint is something a _user_ would hit and want explained in product terms: a capability one harness lacks (a model that can't be selected), an environment that won't work (a path that breaks an agent), a choice gated outside Switchboard (plan-limited models). Keep each to one or two plain-language lines; lead with the user-visible symptom, not the mechanism. This is **not** where adapter internals, wire shapes, exit codes, or gap-register detail go — those stay in `docs/research/harness-behavior.md`. Rule of thumb: if a user would file it as "why doesn't X work," it belongs in the README; if only a developer cares how we detect or handle it, it belongs in the research doc.

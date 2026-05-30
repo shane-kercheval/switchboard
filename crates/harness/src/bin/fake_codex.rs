@@ -32,6 +32,15 @@
 //!     group; with plain `kill` on the parent PID, the forked child would
 //!     keep the stderr pipe open and the adapter's stderr-drain task would
 //!     hang on EOF that never arrives.
+//!   `// spawn_sigterm_immune_child_holding_stderr` (unix only) — like the
+//!     above, but the child ignores SIGTERM and dies only on SIGKILL. Models
+//!     the case where the parent exits on SIGTERM but a descendant survives it
+//!     holding the stderr pipe — exercising `terminate_then_kill`'s
+//!     unconditional final group SIGKILL (without which the stderr drain hangs).
+//!   `// hang` — flush lines emitted so far, then sleep indefinitely (never
+//!     exit on our own), leaving the adapter's read parked so a cancellation
+//!     test can fire the token. Combine with `// spawn_child_holding_stderr`
+//!     to verify `killpg` reaps the whole tree on cancel. Stays killable.
 //!
 //! A fixed "`fake_codex`: done" line is always written to stderr so tests can
 //! verify the stderr drain path handles output without deadlocking.
@@ -111,6 +120,29 @@ fn main() {
             continue;
         }
 
+        if line.trim() == "// spawn_sigterm_immune_child_holding_stderr" {
+            #[cfg(unix)]
+            {
+                // Like `spawn_child_holding_stderr`, but the child **ignores
+                // SIGTERM** (`trap "" TERM`) and only dies on SIGKILL. This is
+                // the case `terminate_then_kill` must handle: when the parent
+                // (fake_codex) exits on SIGTERM but a descendant survives it
+                // while holding the inherited stderr pipe, waiting on the
+                // parent alone is not enough — the helper's unconditional final
+                // `killpg(SIGKILL)` is what reaps this child. Without that
+                // sweep, the adapter's stderr drain blocks forever.
+                let _ = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg("trap '' TERM; while :; do sleep 1; done")
+                    .spawn();
+            }
+            #[cfg(not(unix))]
+            {
+                // No-op on non-unix; process groups aren't a thing.
+            }
+            continue;
+        }
+
         if let Some(path) = line.strip_prefix("// pgid_to:") {
             #[cfg(unix)]
             {
@@ -124,6 +156,17 @@ fn main() {
                 let _ = path;
             }
             continue;
+        }
+
+        if line.trim() == "// hang" {
+            // Park indefinitely with stdout open so the adapter's read stays
+            // blocked — the cancellation test fires the token, and the
+            // adapter's `killpg` must tear us down (plus any `// spawn_child…`
+            // process in our group). Stays killable.
+            out.flush().ok();
+            loop {
+                std::thread::park();
+            }
         }
 
         if line.trim().is_empty() {

@@ -1,6 +1,7 @@
 use std::fs::create_dir_all;
 use std::path::{Path, PathBuf};
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, Result};
@@ -9,7 +10,8 @@ use crate::name::{canonicalize_for_uniqueness, validate_name};
 use crate::project::{self, Project, ProjectId, ProjectSummary};
 
 use crate::paths::{
-    CONFIG_FILE, PROJECTS_DIR, PROJECTS_INDEX, PROMPTS_DIR, SWITCHBOARD_DIR, WORKFLOWS_DIR,
+    CONFIG_FILE, JOURNAL_FILE, PROJECTS_DIR, PROJECTS_INDEX, PROMPTS_DIR, SWITCHBOARD_DIR,
+    WORKFLOWS_DIR,
 };
 
 const DIRECTORY_CONFIG_VERSION: u32 = 1;
@@ -90,11 +92,15 @@ impl Directory {
     /// # Atomicity
     ///
     /// The project directory is created first, then the summary is appended to
-    /// `projects.jsonl`. If the append fails, the freshly-created project
-    /// directory is removed so `list_projects` and `open_project` remain
-    /// consistent with the index. The original append error stays primary; a
-    /// rollback failure (rare) is logged but does not replace the primary
-    /// error.
+    /// `projects.jsonl`. If the append fails we **do not** delete the project
+    /// directory: the append is the commit step, and (because `append_jsonl`
+    /// fsyncs *after* writing) an append error does not prove the line is
+    /// absent — it may already be on disk. Deleting the directory after a
+    /// possible commit is exactly what would leave a dangling index entry
+    /// pointing at a missing project. So on append failure we keep the
+    /// directory and surface the error. The worst case is a benign orphan
+    /// directory: it has no `projects.jsonl` entry, so `list_projects` never
+    /// surfaces it and its UUID is unreachable; a retry mints a fresh UUID.
     ///
     /// # Concurrency
     ///
@@ -119,12 +125,9 @@ impl Directory {
 
         let projects_dir = self.projects_dir();
         let (summary, project) = project::create_on_disk(&self.path, &projects_dir, name)?;
-        if let Err(append_err) = append_jsonl(&self.projects_index_path(), &summary) {
-            if let Err(rollback_err) = std::fs::remove_dir_all(&project.root) {
-                log_rollback_failure_to_stderr(&project.root, &rollback_err);
-            }
-            return Err(append_err);
-        }
+        // No destructive rollback on append failure — see "Atomicity" above.
+        // The directory stays; an orphan (no index entry) is benign.
+        append_jsonl(&self.projects_index_path(), &summary)?;
         Ok(project)
     }
 
@@ -143,6 +146,29 @@ impl Directory {
             .ok_or(CoreError::ProjectNotFound(id))?;
         let root = self.projects_dir().join(summary.id.to_string());
         project::load(&self.path, summary.id, root)
+    }
+
+    /// Best-effort "last activity" timestamp for a project, used to order the
+    /// cross-directory project list by recency. Returns the later of the
+    /// project's conversation-journal modification time and `fallback`
+    /// (typically the project's `created_at`).
+    ///
+    /// The journal (`journal.jsonl`) is appended on every user send and every
+    /// non-completed-turn outcome, so its mtime is a cheap recency proxy that
+    /// needs no transcript parse — `O(1)` per project, safe to call for every
+    /// project at startup. It reflects *send* time, not the eventual response
+    /// time, for a completed turn; that's close enough for ordering. A missing
+    /// or unreadable journal (never-dispatched project) yields `fallback`.
+    pub fn project_last_activity(&self, id: ProjectId, fallback: DateTime<Utc>) -> DateTime<Utc> {
+        let journal = self.projects_dir().join(id.to_string()).join(JOURNAL_FILE);
+        let mtime = std::fs::metadata(&journal)
+            .and_then(|m| m.modified())
+            .ok()
+            .map(DateTime::<Utc>::from);
+        match mtime {
+            Some(t) if t > fallback => t,
+            _ => fallback,
+        }
     }
 
     /// Reads the directory-level config. Errors with `UnsupportedConfigVersion`
@@ -186,18 +212,6 @@ impl Directory {
             ))
         }
     }
-}
-
-// `crates/core` deliberately stays free of a `tracing` dep — it's the
-// persistence layer, kept lean and Tauri-free. Rollback failures go to
-// stderr so they aren't completely silent in dev. Surfacing this as a
-// structured `CoreError` variant so the app layer can `tracing::warn!` it
-// with full context is future work.
-fn log_rollback_failure_to_stderr(path: &Path, err: &std::io::Error) {
-    eprintln!(
-        "switchboard-core: failed to roll back project directory {} after index append failure: {err}",
-        path.display(),
-    );
 }
 
 #[cfg(test)]
@@ -270,6 +284,45 @@ mod tests {
     }
 
     #[test]
+    fn project_last_activity_without_journal_returns_fallback() {
+        let tmp = TempDir::new().unwrap();
+        let directory = Directory::at(tmp.path()).unwrap();
+        directory.init().unwrap();
+        let project = directory.create_project("alpha").unwrap();
+
+        // No dispatch has happened, so there is no journal file — the recency
+        // key falls back to the supplied timestamp (the project's created_at).
+        let fallback = DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            directory.project_last_activity(project.id, fallback),
+            fallback
+        );
+    }
+
+    #[test]
+    fn project_last_activity_uses_journal_mtime_when_newer() {
+        let tmp = TempDir::new().unwrap();
+        let directory = Directory::at(tmp.path()).unwrap();
+        directory.init().unwrap();
+        let project = directory.create_project("alpha").unwrap();
+        // Touch the journal so it exists with a current mtime.
+        std::fs::write(project.journal_path(), b"{}\n").unwrap();
+
+        // A fallback far in the past must lose to the just-written journal's
+        // mtime; a fallback far in the future must win (journal isn't newer).
+        let past = DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let future = DateTime::parse_from_rfc3339("2999-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(directory.project_last_activity(project.id, past) > past);
+        assert_eq!(directory.project_last_activity(project.id, future), future);
+    }
+
+    #[test]
     fn create_project_without_init_fails() {
         let tmp = TempDir::new().unwrap();
         let directory = Directory::at(tmp.path()).unwrap();
@@ -325,18 +378,24 @@ mod tests {
         }
     }
 
+    // Unix-only: drives the commit-step failure via file permission bits
+    // (the crate's durability hardening is itself `cfg(unix)`).
+    #[cfg(unix)]
     #[test]
-    fn create_project_rolls_back_directory_when_index_append_fails() {
+    fn create_project_keeps_directory_and_stays_index_consistent_when_index_append_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
         let tmp = TempDir::new().unwrap();
         let directory = Directory::at(tmp.path()).unwrap();
         directory.init().unwrap();
-        // Make projects.jsonl unwritable by replacing it with a read-only directory
-        // of the same name — the append call's open() will fail.
+        // Exercise the *commit-step* failure: make projects.jsonl readable
+        // (so the uniqueness pre-check `list_projects` succeeds and the
+        // project dir does get created) but unwritable (so the subsequent
+        // append fails). Replacing it with a directory — the prior approach —
+        // instead failed the pre-check before any dir was created, so it never
+        // tested the rollback path at all.
         let index = directory.projects_index_path();
-        std::fs::remove_file(&index).unwrap();
-        std::fs::create_dir(&index).unwrap();
-
-        let projects_dir_before = std::fs::read_dir(directory.projects_dir()).unwrap().count();
+        std::fs::set_permissions(&index, std::fs::Permissions::from_mode(0o444)).unwrap();
 
         let err = directory.create_project("alpha").unwrap_err();
         assert!(
@@ -344,11 +403,25 @@ mod tests {
             "expected Io error, got {err:?}"
         );
 
-        // Rollback must have removed the freshly-created project root.
-        let projects_dir_after = std::fs::read_dir(directory.projects_dir()).unwrap().count();
+        // No destructive rollback: the created project directory is kept (the
+        // append is the commit step; deleting after a possible commit is what
+        // would leave a dangling index entry).
+        let orphans = std::fs::read_dir(directory.projects_dir()).unwrap().count();
         assert_eq!(
-            projects_dir_before, projects_dir_after,
-            "project directory not rolled back after index append failure"
+            orphans, 1,
+            "the created project directory must be kept, not rolled back"
         );
+
+        // The orphan has no index entry, so it never surfaces; once the index
+        // is writable again, list_projects ignores the orphan and a retry
+        // succeeds with a fresh UUID.
+        std::fs::set_permissions(&index, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            directory.list_projects().unwrap().is_empty(),
+            "orphan directory (no index entry) must not surface in list_projects"
+        );
+        let project = directory.create_project("alpha").unwrap();
+        assert_eq!(project.config.name, "alpha");
+        assert_eq!(directory.list_projects().unwrap().len(), 1);
     }
 }

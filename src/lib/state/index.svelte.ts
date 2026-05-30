@@ -33,18 +33,25 @@
 // IPC error.
 
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { loadTranscript } from "$lib/api";
+import {
+  cancelAgent as apiCancelAgent,
+  cancelSend as apiCancelSend,
+  cancelTurn as apiCancelTurn,
+  loadTranscript,
+} from "$lib/api";
 import type {
   AgentId,
   AgentRecord,
   FailureKind,
   Hydrate,
+  MessageId,
   NormalizedEvent,
+  SendId,
   TurnId,
 } from "$lib/types";
 import { HEARTBEAT_TIMEOUT_MS } from "$lib/types";
 import { _internal, freshRuntime, runtimeReducer, transcriptReducer } from "./reducers";
-import type { AgentRuntime, RuntimeMap, ToolCall, TranscriptMap, Turn } from "./types";
+import type { AgentRuntime, PendingSend, RuntimeMap, ToolCall, TranscriptMap, Turn } from "./types";
 
 /// Per-agent turn lists, keyed by `agent_id`. The unified-view renderer
 /// merges across all agents at render time:
@@ -142,26 +149,48 @@ export async function hydrateAgent(agentId: AgentId): Promise<void> {
   runtimes[agentId] = { ...current, hydration_status: "loading" };
   try {
     const loaded = await loadTranscript(agentId);
-    const hydrate: Hydrate = {
-      type: "hydrate",
-      agent_id: agentId,
-      turns: loaded.turns,
-      meta: loaded.meta ?? null,
-      last_rate_limit: loaded.last_rate_limit ?? null,
-      warnings: loaded.warnings,
-    };
-    const priorTurns = transcripts[agentId] ?? [];
-    transcripts[agentId] = transcriptReducer(priorTurns, hydrate, agentId, "");
-    const priorRuntime = runtimes[agentId];
-    if (priorRuntime !== undefined) {
-      runtimes[agentId] = runtimeReducer(priorRuntime, hydrate);
-    }
+    applyAgentHydrate(agentId, loaded);
   } catch (e) {
     console.warn("[switchboard] hydrateAgent failed", { agent_id: agentId, error: e });
     const after = runtimes[agentId];
     if (after !== undefined) {
       runtimes[agentId] = { ...after, hydration_status: "failed" };
     }
+  }
+}
+
+/// Apply a resolved hydration payload to an agent's transcript + runtime via
+/// the non-destructive `hydrate` reducer path (live in-flight turns win over
+/// disk; the runtime reducer flips `hydration_status` to `"complete"` and fills
+/// meta/rate-limit only where absent). Shared by the per-agent `hydrateAgent`
+/// path and the project-scoped hydration in the workspace store, which feeds
+/// agent-turn content regrouped from `load_project_conversation`. The caller
+/// owns idempotency (the per-agent `hydrationAttempted` set / the per-project
+/// hydration guard) — this helper only applies.
+export function applyAgentHydrate(
+  agentId: AgentId,
+  loaded: {
+    turns: Hydrate["turns"];
+    meta?: Hydrate["meta"];
+    last_rate_limit?: Hydrate["last_rate_limit"];
+    last_rate_limit_as_of?: Hydrate["last_rate_limit_as_of"];
+    warnings?: Hydrate["warnings"];
+  },
+): void {
+  const hydrate: Hydrate = {
+    type: "hydrate",
+    agent_id: agentId,
+    turns: loaded.turns,
+    meta: loaded.meta ?? null,
+    last_rate_limit: loaded.last_rate_limit ?? null,
+    last_rate_limit_as_of: loaded.last_rate_limit_as_of ?? null,
+    warnings: loaded.warnings,
+  };
+  const priorTurns = transcripts[agentId] ?? [];
+  transcripts[agentId] = transcriptReducer(priorTurns, hydrate, agentId, "");
+  const priorRuntime = runtimes[agentId];
+  if (priorRuntime !== undefined) {
+    runtimes[agentId] = runtimeReducer(priorRuntime, hydrate);
   }
 }
 
@@ -237,6 +266,7 @@ export function dispatchUserTurn(
   agentId: AgentId,
   userTurnId: TurnId,
   text: string,
+  sendId: SendId,
   // Timestamp generation, not reactive state.
   // eslint-disable-next-line svelte/prefer-svelte-reactivity
   startedAt: string = new Date().toISOString(),
@@ -248,36 +278,81 @@ export function dispatchUserTurn(
     });
     return;
   }
-  if (runtime.run_status !== "idle") {
-    console.error("[switchboard] dispatchUserTurn called while agent not idle", {
-      agent_id: agentId,
-      run_status: runtime.run_status,
-    });
-    return;
-  }
   const existing = transcripts[agentId] ?? [];
-  transcripts[agentId] = _internal.appendUserTurn(existing, agentId, userTurnId, text, startedAt);
-  runtimes[agentId] = {
-    ...runtime,
-    run_status: "starting",
-    last_error: undefined,
-  };
+  transcripts[agentId] = _internal.appendUserTurn(
+    existing,
+    agentId,
+    userTurnId,
+    text,
+    startedAt,
+    sendId,
+  );
+  // Append a pending-send entry regardless of whether the agent is idle or
+  // busy — send-while-busy is un-gated (the backend queues), so a second send
+  // just lines up behind the running turn. The entry (keyed by user_turn_id,
+  // receipt filled later) is what stamps each response's `send_id` and lets a
+  // failure prune the right send.
+  const pending = [...(runtime.pending_sends ?? []), { send_id: sendId, user_turn_id: userTurnId }];
+  // Only an idle agent transitions to "starting" (the run_status machine
+  // governs the single running turn); a send to a busy agent leaves its
+  // run_status alone — its turn waits in the backend queue and surfaces when
+  // its `turn_start` arrives.
+  runtimes[agentId] =
+    runtime.run_status === "idle"
+      ? { ...runtime, run_status: "starting", last_error: undefined, pending_sends: pending }
+      : { ...runtime, pending_sends: pending };
   ui.lastRecipientId = agentId;
 }
 
-/// Mark a send-start failure: the compose-bar called `dispatchUserTurn`,
-/// then invoked the `send_message` Tauri IPC which rejected before the
-/// backend's `TurnStart` could arrive. Restores `run_status` to `"idle"`
-/// (re-enabling Send for retry) and surfaces `last_error` for the sidebar.
-///
-/// **Guarded transition**: only flips `"starting" → "idle"`. If
-/// `TurnStart` raced ahead and the agent is already `"processing"`, this
-/// is a no-op — the backend is genuinely processing the turn and the
-/// frontend's "send failed" intuition was wrong. The optimistic user
-/// turn stays in the transcript regardless (the user did submit it; the
-/// failure is a separate surface).
+/// Record the accepted-send receipt (`message_id`) onto this send's pending
+/// entry (matched by `user_turn_id`). Called by the compose-bar after
+/// `send_message` resolves; the receipt lets the correlated `turn_start` /
+/// `message_failed` event find the right entry. A no-op if the entry is already
+/// gone (its `turn_start` / failure raced the IPC reply and consumed it).
+export function recordSendAccepted(
+  agentId: AgentId,
+  userTurnId: TurnId,
+  messageId: MessageId,
+): void {
+  const runtime = runtimes[agentId];
+  if (runtime === undefined) {
+    console.error("[switchboard] recordSendAccepted called for unregistered agent", {
+      agent_id: agentId,
+    });
+    return;
+  }
+  const pending = runtime.pending_sends;
+  if (pending === undefined) return;
+  const idx = pending.findIndex((p) => p.user_turn_id === userTurnId);
+  const entry = idx >= 0 ? pending[idx] : undefined;
+  if (entry === undefined) return;
+  // Record the receipt either way (the entry must carry `message_id` so a later
+  // `message_cancelled` / `turn_start` can match it).
+  const next = [...pending];
+  next[idx] = { ...entry, message_id: messageId };
+  runtimes[agentId] = { ...runtime, pending_sends: next };
+  if (entry.cancel_requested) {
+    // The user cancelled before the backend accepted this send; now that it's
+    // accepted, fire the deferred send-scoped cancel. The backend reports the
+    // outcome (a `message_cancelled` event if still queued, a `Cancelled`
+    // terminal if it had started) — no optimistic synthesis here.
+    void apiCancelSend(entry.send_id, [agentId]);
+  }
+}
+
+/// Mark a send-start failure: the compose-bar called `dispatchUserTurn`, then
+/// invoked the `send_message` Tauri IPC which rejected before the backend's
+/// `TurnStart` arrived. Prunes this send's pending entry (by `user_turn_id`,
+/// wherever it sits — a queued send's entry is not at the front) and surfaces
+/// `last_error`. Flips `run_status` back to `"idle"` only if this was the
+/// *starting* send; a queued send failing while another turn is `processing`
+/// must not stomp the live turn. The optimistic user turn stays in the
+/// transcript (the user did submit it) and a failed agent turn is appended
+/// beneath it, so the failure surfaces in the transcript rather than only in
+/// runtime `last_error`.
 export function failSendStart(
   agentId: AgentId,
+  userTurnId: TurnId,
   error?: { message: string; kind: FailureKind },
 ): void {
   const runtime = runtimes[agentId];
@@ -287,20 +362,140 @@ export function failSendStart(
     });
     return;
   }
-  if (runtime.run_status !== "starting") {
-    // No-op — TurnStart raced ahead, or the agent is otherwise not in
-    // the starting state. The frontend's "send failed" intuition was
-    // wrong; the backend is actually processing.
-    return;
+  const pending = runtime.pending_sends;
+  const idx = pending?.findIndex((p) => p.user_turn_id === userTurnId) ?? -1;
+  // Entry already gone ⇒ TurnStart raced ahead and consumed it; the backend is
+  // genuinely processing this send. No-op (don't stomp the live turn).
+  if (pending === undefined || idx < 0) return;
+  const entry = pending[idx];
+  const remaining = [...pending.slice(0, idx), ...pending.slice(idx + 1)];
+  const pending_sends = remaining.length === 0 ? undefined : remaining;
+  runtimes[agentId] =
+    runtime.run_status === "starting"
+      ? { ...runtime, run_status: "idle", last_error: error, pending_sends }
+      : { ...runtime, last_error: error, pending_sends };
+  // Surface the failure in the transcript (the same place post-start failures
+  // and the post-reload journal marker render it) rather than only in runtime
+  // state. The optimistic user turn already sits above it; this adds the failed
+  // response beneath. Keyed on `user_turn_id` (the IPC-reject path has no
+  // backend `message_id`), so it can't collide with a `message_failed` event's
+  // `failed-${message_id}` row.
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity
+  const at = new Date().toISOString();
+  transcripts[agentId] = _internal.appendFailedTurn(
+    transcripts[agentId] ?? [],
+    agentId,
+    `failed-${userTurnId}`,
+    at,
+    error?.message ?? "send failed before the turn started",
+    entry?.send_id,
+  );
+}
+
+/// Cancel a whole send across `agentIds` (the group cancel-send control, or a
+/// single-element list for one recipient's Cancel). Fire-and-forget: the
+/// backend cancels each recipient's in-flight turn (→ a `Cancelled` `turn_end`)
+/// or drops its still-queued item (→ a `message_cancelled` event); the
+/// transcript renders cancellation from whichever event arrives. No optimistic
+/// synthesis — that guessing is what created the start-race.
+///
+/// The one exception is a recipient whose entry isn't backend-accepted yet (no
+/// `message_id`): firing now races the in-flight `send_message` IPC and could
+/// miss, so we defer (`cancel_requested`) and `recordSendAccepted` fires it once
+/// the send is confirmed.
+export function cancelSend(sendId: SendId, agentIds: AgentId[]): void {
+  const fireNow: AgentId[] = [];
+  for (const agentId of agentIds) {
+    const rt = runtimes[agentId];
+    if (rt === undefined) continue;
+    const pending = rt.pending_sends;
+    const entry = pending?.find((p) => p.send_id === sendId);
+    if (entry !== undefined && entry.message_id === undefined) {
+      runtimes[agentId] = {
+        ...rt,
+        pending_sends: pending!.map((p) =>
+          p.send_id === sendId ? { ...p, cancel_requested: true } : p,
+        ),
+      };
+      continue;
+    }
+    fireNow.push(agentId);
   }
-  runtimes[agentId] = {
-    ...runtime,
-    run_status: "idle",
-    last_error: error,
-  };
+  if (fireNow.length > 0) void apiCancelSend(sendId, fireNow);
+}
+
+export function cancelTurn(agentId: AgentId): void {
+  void apiCancelTurn(agentId);
+}
+
+/// Stop an agent (sidebar "Stop agent"): cancel its in-flight turn and clear its
+/// entire queued backlog. Fire-and-forget: `cancel_agent` cancels the running
+/// turn (→ `Cancelled` terminal) and drops each accepted queued send (→ a
+/// `message_cancelled` event per send); the transcript renders from those
+/// events. A not-yet-accepted send (no `message_id`) can't be cancelled
+/// backend-side yet, so it's flagged `cancel_requested` and `recordSendAccepted`
+/// fires its cancel once confirmed.
+export function stopAgent(agentId: AgentId): void {
+  const rt = runtimes[agentId];
+  const pending = rt?.pending_sends;
+  if (rt !== undefined && pending !== undefined) {
+    runtimes[agentId] = {
+      ...rt,
+      pending_sends: pending.map((p) =>
+        p.message_id === undefined ? { ...p, cancel_requested: true } : p,
+      ),
+    };
+  }
+  void apiCancelAgent(agentId);
+}
+
+/// Mark an agent as already-hydrated so the per-agent `hydrateAgent` path
+/// won't re-parse it. Used by the project-scoped hydration in the workspace
+/// store, which hydrates roster agents through `applyAgentHydrate` directly:
+/// without this, a later `hydrateAgent` call on the same agent would re-parse
+/// its session file and duplicate its turns (the reducer dedups by `turn_id`,
+/// but parsers mint fresh ids each parse). Keeps the "hydrate an agent at most
+/// once per session" invariant holding regardless of which path runs first.
+export function markHydrationAttempted(agentId: AgentId): void {
+  hydrationAttempted.add(agentId);
+}
+
+/// Tear down per-agent state for the given agents: unsubscribe their event
+/// channels, cancel heartbeats, and drop their transcript/runtime/guard
+/// entries. Called when a directory is removed (the frontend lifecycle teardown
+/// matching the backend drain) so a remove-then-re-add of the same project ids
+/// — ids are persisted on disk and survive removal — starts clean rather than
+/// reusing stale listeners, transcripts, or hydration guards.
+export function unregisterAgents(agentIds: AgentId[]): void {
+  for (const agentId of agentIds) {
+    const unlisten = listenerRegistry.get(agentId);
+    if (unlisten !== undefined) {
+      unlisten();
+      listenerRegistry.delete(agentId);
+    }
+    pendingRegistrations.delete(agentId);
+    hydrationAttempted.delete(agentId);
+    clearHeartbeat(agentId);
+    delete transcripts[agentId];
+    delete runtimes[agentId];
+  }
 }
 
 // --- internal ---
+
+/// The pending entry a `turn_start { message_id }` belongs to: the entry
+/// matching `messageId`, else the front (covers the race where the IPC receipt
+/// hasn't been recorded yet). Mirrors `reducers.ts::pickPendingIndex` so the
+/// transcript stamp and the runtime removal pick the same entry.
+function pendingEntryFor(runtime: AgentRuntime, messageId: MessageId): PendingSend | undefined {
+  const pending = runtime.pending_sends;
+  const front = pending?.[0];
+  if (front === undefined) return undefined;
+  const byMsg = pending?.find((p) => p.message_id === messageId);
+  if (byMsg !== undefined) return byMsg;
+  // Front-fallback only during the pre-receipt race (mirrors pickPendingIndex).
+  return front.message_id === undefined ? front : undefined;
+}
 
 function handleEvent(agentId: AgentId, event: NormalizedEvent): void {
   // Check runtime BEFORE applying any reducer. If runtime is missing,
@@ -326,9 +521,41 @@ function handleEvent(agentId: AgentId, event: NormalizedEvent): void {
   const receivedAt = new Date().toISOString();
 
   const priorTurns = transcripts[agentId] ?? [];
-  transcripts[agentId] = transcriptReducer(priorTurns, event, agentId, receivedAt);
+  // On turn_start, find the pending-send entry this turn belongs to (by
+  // message_id, else the front — the backend runs turns in dispatch order) and
+  // pass its send_id so the new agent turn is stamped; `runtimeReducer` removes
+  // the same entry in lockstep.
+  const startEntry =
+    event.type === "turn_start" ? pendingEntryFor(priorRuntime, event.message_id) : undefined;
+  // For a `message_cancelled` event, resolve the send_id of the dropped queued
+  // entry (exact message_id match) so the reducer can render its cancelled row.
+  const cancelledSendId =
+    event.type === "message_cancelled"
+      ? priorRuntime.pending_sends?.find((p) => p.message_id === event.message_id)?.send_id
+      : undefined;
+  // For a `message_failed` event, resolve the failed send via the same
+  // `pendingEntryFor` lookup `turn_start` uses (and that `runtimeReducer`
+  // mirrors via `pickPendingIndex`): exact message_id, else the front entry
+  // during the pre-receipt race (message_failed beating the IPC receipt). This
+  // keeps the transcript row and the runtime pruning on the *same* entry. A
+  // post-start failure finds no entry (turn_start consumed it) → no row, so the
+  // live turn still owns the outcome and there is no double-render.
+  const failedSendId =
+    event.type === "message_failed"
+      ? pendingEntryFor(priorRuntime, event.message_id)?.send_id
+      : undefined;
+  const sendId = startEntry?.send_id ?? cancelledSendId ?? failedSendId;
+  transcripts[agentId] = transcriptReducer(priorTurns, event, agentId, receivedAt, sendId);
   runtimes[agentId] = runtimeReducer(priorRuntime, event);
   manageHeartbeat(agentId, event);
+
+  // Deferred cancel: if this turn started for a send the user cancelled before
+  // the backend accepted it, the turn ran anyway — fire the send-scoped cancel
+  // now (the live turn's `Cancelled` terminal will follow). The real turn is
+  // already rendered, so there is nothing to synthesize.
+  if (startEntry?.cancel_requested) {
+    void apiCancelSend(startEntry.send_id, [agentId]);
+  }
 }
 
 function manageHeartbeat(agentId: AgentId, event: NormalizedEvent): void {

@@ -15,7 +15,7 @@
 //!   record — the conversation UUID lives in the directory name, and the
 //!   turn terminates when the `agy` process exits.
 //!
-//! See `docs/research/antigravity-cli-observed.md` for the ground-truth
+//! See `docs/research/archive/antigravity-cli-observed.md` for the ground-truth
 //! shapes these types mirror.
 
 use std::collections::VecDeque;

@@ -17,6 +17,8 @@ Source: [Run Claude Code programmatically — Claude Code Docs](https://code.cla
 
 This means skills, hooks, plugins, MCP servers, auto-memory, and CLAUDE.md all load by default in headless mode. **Auto-invoked skills work normally** — the model discovers them at session start (via the YAML frontmatter description) and decides whether to load the full SKILL.md body mid-turn, exactly as in an interactive session.
 
+**Subagents (the `Agent` tool) also work** — the model delegates to built-in or `.claude/agents/*.md` subagents mid-turn just as interactively. But "work" here means *execute*; how subagent activity is *represented* on the stream vs. on disk is a separate, load-bearing concern — Switchboard currently **mis-attributes** a subagent's internal tool calls to the parent turn (the stream tags them with `parent_tool_use_id`, which our parser ignores), and the live view diverges from the rehydrated one. Ground truth in [`claude-code-cli-observed.md` §"Subagent (`Agent` tool) representation"](claude-code-cli-observed.md); the fix is tracked in [`2026-05-24-subagent-rendering-fidelity.md`](../../implementation_plans/2026-05-24-subagent-rendering-fidelity.md). (And note: when `--bare` becomes the `-p` default, subagent loading must be preserved with `--agents` — see below.)
+
 ### `--bare` mode skips auto-discovery
 
 > Add `--bare` to reduce startup time by skipping auto-discovery of hooks, skills, plugins, MCP servers, auto memory, and CLAUDE.md.

@@ -1,8 +1,191 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 
+/* Dark mode is class-driven (`.dark` on <html>), set by the theme store in
+   src/lib/theme.svelte.ts — not the bare `prefers-color-scheme` media query —
+   so a manual light/dark/system override can win over the OS preference. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* ─── Semantic token model ───────────────────────────────────────────────
+   Components reference these semantic roles, never raw palette hues. Light
+   and dark are two mappings of the SAME names; adding dark mode anywhere is
+   "use the token." Groups:
+     - neutral surfaces (layered: surface → panel → raised → border → text)
+     - primary (monochrome high-contrast action/selection)
+     - accent (teal — focus rings, links, selected emphasis; narrow use)
+     - destructive / warning action+caution surfaces
+     - status (run state) — strong foreground + soft background, so a status
+       chip/dot is `bg-status-{state}-soft text-status-{state}`.
+   Harness identity is conveyed by `HarnessIcon` (brand artwork) and the
+   `HARNESS_COLOR` map (transcript attribution), not by color tokens. */
 :root {
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  /* neutral surfaces */
+  --surface: #fafafa;
+  --panel: #f4f4f5;
+  --raised: #ffffff;
+  --border: #e4e4e7;
+  --fg: #18181b;
+  --muted: #71717a;
+
+  /* monochrome primary */
+  --primary: #18181b;
+  --primary-fg: #fafafa;
+
+  /* green accent — focus rings, links, and selected-state emphasis (e.g. the
+     compose recipient chips). `-soft` is the light tint used for a selected
+     chip's fill, with `--accent` as its readable foreground. */
+  --accent: #15803d;
+  --accent-fg: #ffffff;
+  --accent-soft: #dcfce7;
+
+  /* destructive action surface — a solid fill (distinct from the soft
+     status-failed chip) so a destructive button carries primary-level weight.
+     fg must clear contrast on the fill in both themes. */
+  --destructive: #dc2626;
+  --destructive-fg: #ffffff;
+
+  /* caution / warning — its own role, distinct from run-status "processing"
+     so re-tuning run state can't silently drag warnings along (name a role,
+     not a hue). Same amber as processing today; decoupled for the future. */
+  --warning: #b45309;
+  --warning-soft: #fef3c7;
+
+  /* run status — strong foreground + soft background */
+  --status-idle: #71717a;
+  --status-idle-soft: #f4f4f5;
+  --status-processing: #b45309;
+  --status-processing-soft: #fef3c7;
+  --status-failed: #b91c1c;
+  --status-failed-soft: #fee2e2;
+  --status-cancelled: #71717a;
+  --status-cancelled-soft: #f4f4f5;
+
+  /* syntax highlighting — the one place the model carries colors beyond the
+     neutral/accent/status roles, because legible code needs several
+     distinguishable hues. Named by syntactic role, not by hue, and mapped to
+     Prism token classes in `.markdown-body` below. Values are a restrained,
+     GitHub-derived palette tuned for contrast on the code-block surface. */
+  --syntax-comment: #6e7781;
+  --syntax-keyword: #cf222e;
+  --syntax-string: #0a3069;
+  --syntax-function: #8250df;
+  --syntax-constant: #0550ae;
+  --syntax-tag: #116329;
+
+  /* Code-block surface — a hair lighter than `--panel`, still clearly gray
+     (not the white `--raised`). Its own token because no neutral surface sits
+     in this gap. */
+  --code-bg: #f8f8f9;
+
+  /* Transcript scroll area — lighter than `--surface` so the reading area
+     feels brighter than the surrounding chrome. */
+  --transcript-bg: #ffffff;
+
+  /* Code-block surface per message role: agent messages sit on the transcript
+     bg, user messages on a panel/45 card that's nearly `--code-bg`, so each
+     needs its own contrast step to read as a distinct surface. */
+  --code-bg-agent: #f3f3f5;
+  --code-bg-user: #ebebee;
+  /* Copy-button hover/active fill. `--code-copy-hover` equals `--surface`
+     today but is named separately so the two can diverge. The `-user` variant
+     is lighter to sit on the darker user-message code surface. */
+  --code-copy-hover: #fafafa;
+  --code-copy-hover-user: #f6f6f8;
+}
+
+.dark {
+  --surface: #09090b;
+  --panel: #18181b;
+  --raised: #27272a;
+  --border: #27272a;
+  --fg: #fafafa;
+  --muted: #a1a1aa;
+
+  --primary: #fafafa;
+  --primary-fg: #18181b;
+
+  --accent: #4ade80;
+  --accent-fg: #052e16;
+  --accent-soft: #14532d;
+
+  /* deeper, less-glary red on a dark surface; white text clears contrast */
+  --destructive: #b91c1c;
+  --destructive-fg: #fafafa;
+
+  --warning: #fbbf24;
+  --warning-soft: #422006;
+
+  --status-idle: #a1a1aa;
+  --status-idle-soft: #27272a;
+  --status-processing: #fbbf24;
+  --status-processing-soft: #422006;
+  --status-failed: #f87171;
+  --status-failed-soft: #450a0a;
+  --status-cancelled: #a1a1aa;
+  --status-cancelled-soft: #27272a;
+
+  --syntax-comment: #8b949e;
+  --syntax-keyword: #ff7b72;
+  --syntax-string: #a5d6ff;
+  --syntax-function: #d2a8ff;
+  --syntax-constant: #79c0ff;
+  --syntax-tag: #7ee787;
+
+  /* Lighter than the dark `--panel` so the block reads as a raised code surface. */
+  --code-bg: #1f1f23;
+
+  /* Marginally lighter than the dark `--surface` for the reading area. */
+  --transcript-bg: #111114;
+
+  /* Both roles share one dark code surface; the light-mode contrast step isn't
+     needed against the dark message backgrounds. */
+  --code-bg-agent: #232326;
+  --code-bg-user: #232326;
+  --code-copy-hover: #3f3f46;
+  --code-copy-hover-user: #3f3f46;
+}
+
+/* `inline` so the generated utilities reference the CSS variables by name
+   rather than copying their values at build time — that is what lets a
+   `.dark`-scoped override re-theme `bg-surface` et al. with no rebuild. */
+@theme inline {
+  --color-surface: var(--surface);
+  --color-transcript: var(--transcript-bg);
+  --color-panel: var(--panel);
+  --color-raised: var(--raised);
+  --color-border: var(--border);
+  --color-fg: var(--fg);
+  --color-muted: var(--muted);
+
+  --color-primary: var(--primary);
+  --color-primary-fg: var(--primary-fg);
+
+  --color-accent: var(--accent);
+  --color-accent-fg: var(--accent-fg);
+  --color-accent-soft: var(--accent-soft);
+
+  --color-destructive: var(--destructive);
+  --color-destructive-fg: var(--destructive-fg);
+
+  --color-warning: var(--warning);
+  --color-warning-soft: var(--warning-soft);
+
+  --color-status-idle: var(--status-idle);
+  --color-status-idle-soft: var(--status-idle-soft);
+  --color-status-processing: var(--status-processing);
+  --color-status-processing-soft: var(--status-processing-soft);
+  --color-status-failed: var(--status-failed);
+  --color-status-failed-soft: var(--status-failed-soft);
+  --color-status-cancelled: var(--status-cancelled);
+  --color-status-cancelled-soft: var(--status-cancelled-soft);
+
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-mono:
+    ui-monospace, "SF Mono", SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+}
+
+:root {
+  font-family: var(--font-sans);
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
@@ -13,4 +196,319 @@ body,
 #app {
   height: 100%;
   margin: 0;
+}
+
+body {
+  background-color: var(--surface);
+  color: var(--fg);
+}
+
+/* Window dragging is driven by the `windowDragRegion` action (and Tauri's
+   `data-tauri-drag-region` handler) calling `startDragging()`, NOT by CSS:
+   `-webkit-app-region`/`app-region` is a Chromium feature and is inert in
+   macOS WKWebView. Only the cursor/selection hints below actually apply; the
+   "don't drag from interactive elements" exclusions live in that action's
+   `closest(...)` check + the `[data-tauri-no-drag]` marker. */
+[data-tauri-drag-region] {
+  cursor: default;
+  user-select: none;
+}
+
+/* Rendered Markdown (see `Markdown.svelte`). Scoped under `.markdown-body` so
+   these element selectors can't leak into the rest of the app, and built from
+   semantic tokens only (plus the `--syntax-*` group) so light/dark flip with no
+   JS recolor. Density matches the transcript body (`text-sm`/`leading-6`). */
+.markdown-body {
+  font-size: 0.875rem;
+  line-height: 1.5rem;
+  color: var(--fg);
+  overflow-wrap: break-word;
+
+  > :first-child {
+    margin-top: 0;
+  }
+  > :last-child {
+    margin-bottom: 0;
+  }
+
+  p {
+    margin: 0 0 0.5rem;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6 {
+    color: var(--fg);
+    font-weight: 600;
+    line-height: 1.3;
+    margin: 1rem 0 0.5rem;
+  }
+  h1 {
+    font-size: 1.375rem;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 0.25rem;
+  }
+  h2 {
+    font-size: 1.15rem;
+  }
+  h3 {
+    font-size: 1.0625rem;
+  }
+  h4 {
+    font-size: 0.9375rem;
+  }
+  /* h5/h6 are rarely emitted; differentiate by color, not another size step. */
+  h5,
+  h6 {
+    font-size: 0.875rem;
+    color: var(--muted);
+  }
+
+  ul,
+  ol {
+    margin: 0 0 0.5rem;
+    padding-left: 1.5rem;
+  }
+  ul {
+    list-style: disc;
+  }
+  ol {
+    list-style: decimal;
+  }
+  li {
+    margin: 0.125rem 0;
+  }
+  li > ul,
+  li > ol {
+    margin: 0.125rem 0;
+  }
+
+  /* GFM task list: drop the list marker (the checkbox is the marker) and align
+     the box with the text baseline. Without this, items show both a bullet and
+     a checkbox. */
+  li:has(> input[type="checkbox"]) {
+    list-style: none;
+    margin-left: -1rem;
+  }
+  input[type="checkbox"] {
+    width: 1em;
+    height: 1em;
+    margin: 0 0.4em 0 0;
+    vertical-align: middle;
+  }
+
+  blockquote {
+    margin: 0.5rem 0;
+    padding: 0 0 0 0.75rem;
+    border-left: 3px solid var(--accent);
+    color: var(--muted);
+  }
+
+  a {
+    color: var(--accent);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    cursor: pointer;
+  }
+
+  hr {
+    border: 0;
+    border-top: 1px solid var(--border);
+    margin: 1rem 0;
+  }
+
+  /* Inline code — a subtle tint, no border. Borders turn a sentence with several
+     inline-code spans into a row of boxes; a quiet background reads as emphasis
+     without the visual noise. (Fenced blocks reset this in `pre code` below.) */
+  code {
+    font-family: var(--font-mono);
+    font-size: 0.85em;
+    font-weight: 400;
+    color: var(--syntax-constant);
+    background-color: var(--panel);
+    border-radius: 0.25rem;
+    padding: 0.15em 0.45em;
+  }
+
+  /* `display: block` makes the table its own horizontal scroll container, so a
+     wide table (many columns, or a cell with a long unbreakable token) scrolls
+     within its bounds instead of stretching the transcript / fan-out column. */
+  table {
+    display: block;
+    max-width: 100%;
+    overflow-x: auto;
+    border-collapse: collapse;
+    margin: 0.5rem 0;
+    font-size: 0.85em;
+  }
+  th,
+  td {
+    padding: 0.35rem 1rem 0.35rem 0;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+  }
+  th {
+    font-weight: 600;
+  }
+
+  /* Fenced code block — a bordered panel matching the transcript's tool-call
+     boxes (bg-panel / border-border / rounded-md). */
+  .md-code-block {
+    margin: 0.5rem 0;
+    border-radius: 0.375rem;
+    background-color: var(--code-bg);
+    overflow: hidden;
+  }
+  .md-code-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.25rem 0.25rem 0.25rem 0.625rem;
+    background-color: var(--code-bg);
+  }
+  .md-code-lang {
+    font-family: var(--font-mono);
+    font-size: 0.6875rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+    user-select: none;
+  }
+  /* Ghost icon button: a quiet copy glyph that swaps to a green checkmark on
+     success (matching the resume-dialog copy affordance), via the `data-copied`
+     attribute the delegated handler toggles. */
+  .md-code-copy {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--muted);
+    background: transparent;
+    border: 0;
+    border-radius: 9999px;
+    width: 1.75rem;
+    height: 1.75rem;
+    padding: 0;
+    cursor: pointer;
+    opacity: 0;
+  }
+  /* Visibility is gated purely on hovering the code block — instant, no fade,
+     and NOT tied to `data-copied` (which lingers ~1s after a click and would
+     otherwise keep the button visible after the pointer has left). The green
+     checkmark still swaps in while hovering. */
+  .md-code-block:hover .md-code-copy,
+  .md-code-copy:focus-visible {
+    opacity: 1;
+  }
+  .md-code-copy:hover:not([data-copied="true"]) {
+    color: var(--fg);
+    background-color: var(--code-copy-hover);
+  }
+  .md-code-copy svg {
+    width: 1.0625rem;
+    height: 1.0625rem;
+  }
+  .md-check-icon {
+    display: none;
+  }
+  .md-code-copy[data-copied="true"] {
+    color: var(--accent);
+    background-color: var(--code-copy-hover);
+    opacity: 1;
+  }
+  .md-code-copy[data-copied="true"] .md-copy-icon {
+    display: none;
+  }
+  .md-code-copy[data-copied="true"] .md-check-icon {
+    display: inline;
+  }
+
+  pre {
+    margin: 0;
+    padding: 0.5rem 0.75rem;
+    overflow-x: auto;
+  }
+  /* Reset the inline-code chip styling inside fenced blocks. */
+  pre code {
+    background: none;
+    border: 0;
+    border-radius: 0;
+    padding: 0;
+    font-size: 0.75rem;
+    line-height: 1.25rem;
+    color: var(--fg);
+  }
+
+  /* Prism token classes → semantic syntax roles. Same class names in both
+     themes; the `--syntax-*` values carry the light/dark difference. */
+  .token.comment,
+  .token.prolog,
+  .token.doctype,
+  .token.cdata {
+    color: var(--syntax-comment);
+    font-style: italic;
+  }
+  .token.punctuation,
+  .token.operator,
+  .token.entity {
+    color: var(--muted);
+  }
+  .token.keyword,
+  .token.atrule,
+  .token.rule,
+  .token.important,
+  .token.deleted {
+    color: var(--syntax-keyword);
+  }
+  .token.string,
+  .token.char,
+  .token.attr-value,
+  .token.regex,
+  .token.url {
+    color: var(--syntax-string);
+  }
+  .token.function,
+  .token.class-name {
+    color: var(--syntax-function);
+  }
+  .token.number,
+  .token.boolean,
+  .token.constant,
+  .token.symbol {
+    color: var(--syntax-constant);
+  }
+  .token.tag,
+  .token.attr-name,
+  .token.property,
+  .token.selector,
+  .token.builtin,
+  .token.namespace,
+  .token.inserted {
+    color: var(--syntax-tag);
+  }
+  .token.bold {
+    font-weight: 600;
+  }
+  .token.italic {
+    font-style: italic;
+  }
+}
+
+/* Per-message-role code surfaces. The role tokens carry their own light/dark
+   mappings, so these rules don't need `.dark` variants. */
+[data-role="agent"] .md-code-block,
+[data-role="agent"] .md-code-header {
+  background-color: var(--code-bg-agent);
+}
+
+[data-role="user"] .md-code-block,
+[data-role="user"] .md-code-header {
+  background-color: var(--code-bg-user);
+}
+
+[data-role="user"] .md-code-copy:hover:not([data-copied="true"]),
+[data-role="user"] .md-code-copy[data-copied="true"] {
+  background-color: var(--code-copy-hover-user);
 }

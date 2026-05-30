@@ -7,14 +7,20 @@ const AGENT_A = "00000000-0000-7000-8000-000000000aaa";
 const AGENT_B = "00000000-0000-7000-8000-000000000bbb";
 const TURN_1 = "00000000-0000-7000-8000-000000000001";
 const TURN_2 = "00000000-0000-7000-8000-000000000002";
+const MESSAGE_1 = "00000000-0000-7000-8000-0000000000f1";
+const MESSAGE_2 = "00000000-0000-7000-8000-0000000000f2";
 
 // Fixed timestamp used as `receivedAt` across all transcriptReducer
 // invocations in tests. Pinning a constant makes tool-event ordering and
 // timestamp assertions deterministic.
 const RECEIVED_AT = "2026-05-16T00:00:00Z";
 
-function turnStart(turnId: string, startedAt = "2026-05-16T00:00:00Z"): NormalizedEvent {
-  return { type: "turn_start", turn_id: turnId, started_at: startedAt };
+function turnStart(
+  turnId: string,
+  messageId = MESSAGE_1,
+  startedAt = "2026-05-16T00:00:00Z",
+): NormalizedEvent {
+  return { type: "turn_start", turn_id: turnId, message_id: messageId, started_at: startedAt };
 }
 
 function contentChunk(turnId: string, text: string): NormalizedEvent {
@@ -278,6 +284,77 @@ describe("transcriptReducer", () => {
     });
   });
 
+  describe("message_cancelled", () => {
+    it("appends a cancelled agent turn stamped with the resolved send_id", () => {
+      const turns = transcriptReducer(
+        [],
+        { type: "message_cancelled", message_id: MESSAGE_1, agent_id: AGENT_A, at: RECEIVED_AT },
+        AGENT_A,
+        RECEIVED_AT,
+        "send-1",
+      );
+      expect(turns).toHaveLength(1);
+      const t = turns[0];
+      expect(t?.role).toBe("agent");
+      if (t?.role !== "agent") throw new Error("unreachable");
+      expect(t.status).toBe("cancelled");
+      expect(t.send_id).toBe("send-1");
+    });
+
+    it("is a no-op when no send_id resolves (stray event)", () => {
+      const turns = transcriptReducer(
+        [],
+        { type: "message_cancelled", message_id: MESSAGE_1, agent_id: AGENT_A, at: RECEIVED_AT },
+        AGENT_A,
+        RECEIVED_AT,
+        undefined,
+      );
+      expect(turns).toEqual([]);
+    });
+  });
+
+  describe("message_failed", () => {
+    it("appends a failed agent turn carrying the error, stamped with the resolved send_id", () => {
+      const turns = transcriptReducer(
+        [],
+        {
+          type: "message_failed",
+          message_id: MESSAGE_1,
+          agent_id: AGENT_A,
+          error: "adapter failed to launch",
+          at: RECEIVED_AT,
+        },
+        AGENT_A,
+        RECEIVED_AT,
+        "send-1",
+      );
+      expect(turns).toHaveLength(1);
+      const t = turns[0];
+      if (t?.role !== "agent") throw new Error("unreachable");
+      expect(t.status).toBe("failed");
+      expect(t.error).toBe("adapter failed to launch");
+      expect(t.error_kind).toBe("adapter_failure");
+      expect(t.send_id).toBe("send-1");
+    });
+
+    it("is a no-op when no send_id resolves (post-start failure renders on the live turn)", () => {
+      const turns = transcriptReducer(
+        [],
+        {
+          type: "message_failed",
+          message_id: MESSAGE_1,
+          agent_id: AGENT_A,
+          error: "boom",
+          at: RECEIVED_AT,
+        },
+        AGENT_A,
+        RECEIVED_AT,
+        undefined,
+      );
+      expect(turns).toEqual([]);
+    });
+  });
+
   describe("turn_end", () => {
     it("transitions a streaming turn to complete + records usage", () => {
       let turns = reduce([], turnStart(TURN_1));
@@ -320,6 +397,23 @@ describe("transcriptReducer", () => {
       if (turn?.role !== "agent") throw new Error("unreachable");
       expect(turn.status).toBe("complete");
       expect(turn.error).toBeUndefined();
+    });
+
+    it("transitions to cancelled (distinct from failed, no error fields)", () => {
+      let turns = reduce([], turnStart(TURN_1));
+      const ev: NormalizedEvent = {
+        type: "turn_end",
+        turn_id: TURN_1,
+        outcome: { status: "cancelled", source: "user" },
+        ended_at: "2026-05-16T00:00:05Z",
+      };
+      turns = reduce(turns, ev);
+      const turn = turns[0];
+      if (turn?.role !== "agent") throw new Error("unreachable");
+      expect(turn.status).toBe("cancelled");
+      expect(turn.ended_at).toBe("2026-05-16T00:00:05Z");
+      expect(turn.error).toBeUndefined();
+      expect(turn.error_kind).toBeUndefined();
     });
   });
 
@@ -524,14 +618,22 @@ describe("runtimeReducer", () => {
     expect(r.last_error).toBeUndefined();
   });
 
-  it("turn_start → processing + sets in_flight_turn_id + clears last_error", () => {
+  it("turn_start → processing + sets in_flight_turn_id + clears last_error + consumes the pending send", () => {
+    // Correlates the optimistic "starting" send (its pending entry) to its real
+    // turn_id; the entry is consumed once the turn starts.
     const r = runtimeReducer(
-      { ...fresh(), last_error: { message: "old", kind: "harness_error" } },
-      turnStart(TURN_1),
+      {
+        ...fresh(),
+        run_status: "starting",
+        pending_sends: [{ send_id: "send-1", user_turn_id: "user-1", message_id: MESSAGE_1 }],
+        last_error: { message: "old", kind: "harness_error" },
+      },
+      turnStart(TURN_1, MESSAGE_1),
     );
     expect(r.run_status).toBe("processing");
     expect(r.in_flight_turn_id).toBe(TURN_1);
     expect(r.last_error).toBeUndefined();
+    expect(r.pending_sends).toBeUndefined();
   });
 
   it("turn_end (completed) does NOT flip run_status to idle (waits for AgentIdle)", () => {
@@ -581,6 +683,110 @@ describe("runtimeReducer", () => {
     const idle = fresh();
     const r = runtimeReducer(idle, { type: "agent_idle", agent_id: AGENT_A });
     expect(r).toBe(idle);
+  });
+
+  it("message_failed while starting → idle + records adapter_failure (event-driven failSendStart)", () => {
+    // Pre-turn failure for the optimistic send: the dispatcher accepted it
+    // (minted MESSAGE_1) but failed before any turn_start. Mirrors the
+    // failSendStart action, but triggered by the event.
+    const starting: AgentRuntime = {
+      ...fresh(),
+      run_status: "starting",
+      pending_sends: [{ send_id: "send-1", user_turn_id: "user-1", message_id: MESSAGE_1 }],
+    };
+    const r = runtimeReducer(starting, {
+      type: "message_failed",
+      message_id: MESSAGE_1,
+      agent_id: AGENT_A,
+      error: "journal write failed",
+      at: "2026-05-16T00:00:00Z",
+    });
+    expect(r.run_status).toBe("idle");
+    expect(r.pending_sends).toBeUndefined();
+    expect(r.last_error).toEqual({ message: "journal write failed", kind: "adapter_failure" });
+  });
+
+  it("message_failed for a different message_id is a no-op (correlation guard)", () => {
+    // The pending send already recorded receipt MESSAGE_1, so a message_failed
+    // for MESSAGE_2 correlates to nothing (not the front, since the front isn't
+    // pre-receipt) — it must not consume the live pending send.
+    const starting: AgentRuntime = {
+      ...fresh(),
+      run_status: "starting",
+      pending_sends: [{ send_id: "send-1", user_turn_id: "user-1", message_id: MESSAGE_1 }],
+    };
+    const r = runtimeReducer(starting, {
+      type: "message_failed",
+      message_id: MESSAGE_2,
+      agent_id: AGENT_A,
+      error: "stale",
+      at: "2026-05-16T00:00:00Z",
+    });
+    expect(r).toBe(starting); // no-op: same reference
+  });
+
+  it("message_cancelled while starting → idle, prunes pending, no error (cancel ≠ failure)", () => {
+    const starting: AgentRuntime = {
+      ...fresh(),
+      run_status: "starting",
+      pending_sends: [{ send_id: "send-1", user_turn_id: "user-1", message_id: MESSAGE_1 }],
+    };
+    const r = runtimeReducer(starting, {
+      type: "message_cancelled",
+      message_id: MESSAGE_1,
+      agent_id: AGENT_A,
+      at: "2026-05-16T00:00:00Z",
+    });
+    expect(r.run_status).toBe("idle");
+    expect(r.pending_sends).toBeUndefined();
+    expect(r.last_error).toBeUndefined();
+  });
+
+  it("message_cancelled for a queued send while processing leaves run_status, prunes the entry", () => {
+    const processing: AgentRuntime = {
+      ...fresh(),
+      run_status: "processing",
+      pending_sends: [{ send_id: "send-2", user_turn_id: "user-2", message_id: MESSAGE_2 }],
+    };
+    const r = runtimeReducer(processing, {
+      type: "message_cancelled",
+      message_id: MESSAGE_2,
+      agent_id: AGENT_A,
+      at: "2026-05-16T00:00:00Z",
+    });
+    expect(r.run_status).toBe("processing");
+    expect(r.pending_sends).toBeUndefined();
+  });
+
+  it("message_cancelled for an unknown message_id is a no-op", () => {
+    const starting: AgentRuntime = {
+      ...fresh(),
+      run_status: "starting",
+      pending_sends: [{ send_id: "send-1", user_turn_id: "user-1", message_id: MESSAGE_1 }],
+    };
+    const r = runtimeReducer(starting, {
+      type: "message_cancelled",
+      message_id: MESSAGE_2,
+      agent_id: AGENT_A,
+      at: "2026-05-16T00:00:00Z",
+    });
+    expect(r).toBe(starting);
+  });
+
+  it("message_failed while processing is a no-op (turn already started; must not stomp)", () => {
+    // turn_start raced ahead of the (out-of-protocol) message_failed; the
+    // turn is live and the failure intuition is wrong.
+    let r = runtimeReducer({ ...fresh(), run_status: "starting" }, turnStart(TURN_1, MESSAGE_1));
+    expect(r.run_status).toBe("processing");
+    r = runtimeReducer(r, {
+      type: "message_failed",
+      message_id: MESSAGE_1,
+      agent_id: AGENT_A,
+      error: "ignored",
+      at: "2026-05-16T00:00:00Z",
+    });
+    expect(r.run_status).toBe("processing");
+    expect(r.last_error).toBeUndefined();
   });
 
   it("heartbeat_timeout records adapter_failure + clears in_flight_turn_id", () => {
@@ -702,29 +908,59 @@ describe("runtimeReducer", () => {
     expect(r.meta?.model).toBe("live-model");
   });
 
-  it("hydrate fills last_rate_limit when currently empty", () => {
+  it("hydrate fills last_rate_limit + its as_of when currently empty", () => {
     const r = runtimeReducer(fresh(), {
       type: "hydrate",
       agent_id: AGENT_A,
       turns: [],
       last_rate_limit: { primary: { used_percent: 10.0 } },
+      last_rate_limit_as_of: "2026-05-27T18:42:11Z",
     });
     expect(r.last_rate_limit).toEqual({ primary: { used_percent: 10.0 } });
+    // The capture time rides along with the value it qualifies.
+    expect(r.last_rate_limit_as_of).toBe("2026-05-27T18:42:11Z");
   });
 
-  it("live rate_limit_event always overwrites a previously hydrated value", () => {
+  it("live rate_limit_event after a stale hydrate clears as_of to null (stale → live)", () => {
+    // Hydrate restores a stale on-disk snapshot with its capture time.
     let r = runtimeReducer(fresh(), {
       type: "hydrate",
       agent_id: AGENT_A,
       turns: [],
       last_rate_limit: { primary: { used_percent: 10.0 } },
+      last_rate_limit_as_of: "2026-05-27T18:42:11Z",
     });
+    expect(r.last_rate_limit_as_of).toBe("2026-05-27T18:42:11Z");
+    // A live event overwrites the value and must drop the staleness qualifier
+    // — the in-memory value is now live, not an aged on-disk snapshot.
     r = runtimeReducer(r, {
       type: "rate_limit_event",
       agent_id: AGENT_A,
       info: { primary: { used_percent: 99.0 } },
     });
     expect(r.last_rate_limit).toEqual({ primary: { used_percent: 99.0 } });
+    expect(r.last_rate_limit_as_of).toBeNull();
+  });
+
+  it("hydrate after a fresh live event leaves the live value + null as_of in place", () => {
+    // Live event sets the value and clears as_of.
+    let r = runtimeReducer(fresh(), {
+      type: "rate_limit_event",
+      agent_id: AGENT_A,
+      info: { primary: { used_percent: 99.0 } },
+    });
+    expect(r.last_rate_limit_as_of).toBeNull();
+    // A late hydrate carrying a stale snapshot must NOT override the live
+    // value, and must not reintroduce a stale `as_of` (fill-if-empty).
+    r = runtimeReducer(r, {
+      type: "hydrate",
+      agent_id: AGENT_A,
+      turns: [],
+      last_rate_limit: { primary: { used_percent: 10.0 } },
+      last_rate_limit_as_of: "2026-05-27T18:42:11Z",
+    });
+    expect(r.last_rate_limit).toEqual({ primary: { used_percent: 99.0 } });
+    expect(r.last_rate_limit_as_of).toBeNull();
   });
 
   it("hydrate sets hydration_status=complete even with no payload", () => {
@@ -796,6 +1032,34 @@ describe("_internal.appendUserTurn", () => {
     expect(next).not.toBe(prev);
     expect(next).toHaveLength(2);
     expect(next[0]).toBe(prev[0]); // first element same reference
+  });
+});
+
+describe("_internal.appendFailedTurn", () => {
+  it("synthesizes a failed agent turn carrying the error + send_id", () => {
+    const turns = _internal.appendFailedTurn(
+      [],
+      AGENT_A,
+      "failed-user-1",
+      "2026-05-16T00:00:00Z",
+      "send failed before the turn started",
+      "send-1",
+    );
+    expect(turns).toHaveLength(1);
+    const t = turns[0];
+    if (t?.role !== "agent") throw new Error("unreachable");
+    expect(t.status).toBe("failed");
+    expect(t.error).toBe("send failed before the turn started");
+    expect(t.error_kind).toBe("adapter_failure");
+    expect(t.send_id).toBe("send-1");
+    expect(t.items).toEqual([]);
+  });
+
+  it("is idempotent on turn_id (no duplicate row on a re-fire)", () => {
+    const first = _internal.appendFailedTurn([], AGENT_A, "failed-x", RECEIVED_AT, "boom");
+    const second = _internal.appendFailedTurn(first, AGENT_A, "failed-x", RECEIVED_AT, "boom");
+    expect(second).toBe(first);
+    expect(second).toHaveLength(1);
   });
 });
 

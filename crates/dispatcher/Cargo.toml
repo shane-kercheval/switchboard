@@ -22,6 +22,7 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
+tokio-util = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

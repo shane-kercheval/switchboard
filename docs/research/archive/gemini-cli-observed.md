@@ -1,5 +1,7 @@
 # Research: Gemini CLI for Switchboard
 
+> **Captured-in-time provenance.** For current behavior + how Switchboard handles it, see the canonical [`harness-behavior.md`](../harness-behavior.md); this doc holds the raw probes behind it and may drift from the code.
+
 **Captured:** 2026-05-13
 **Tool version:** gemini-cli v0.42.0 (stable; weekly stable / preview / nightly release channels)
 **Status:** **Docs-derived only.** This document was assembled from Google's official Gemini CLI docs, the open-source repo, and Google's pricing pages. Hands-on probing (fixture capture, stream-event verification, SIGTERM behaviour, session-file inspection) is **pending** and lands in M3 implementation alongside fixture capture for the Gemini adapter. Anything labeled "verify in M3" below is a known unknown.
@@ -527,6 +529,23 @@ Probe used Python's `subprocess.Popen(start_new_session=True)` (equivalent to Sw
 
 **Bonus finding**: Gemini's `invoke_agent` builtin tool can dispatch internal sub-agents that take a long time to complete (~47s for a "count to 100" sub-agent). For Switchboard's M4 per-turn timeout work, this means a single Gemini "turn" can legitimately exceed 60s of wall clock even on a simple-looking prompt. Generous defaults required.
 
+### CONFIRMED: `invoke_agent` subagents are OPAQUE in the stream — no mis-attribution (2026-05-24, gemini 0.42.0)
+
+Follow-up to the bonus finding above, probing a **tool-using** subagent (the earlier note used a "count to 100" subagent that ran no tools). Prompt dispatched a `generalist` subagent instructed to run `echo hello-from-subagent` and report; invocation `gemini -p … --output-format stream-json --yolo --skip-trust`. Stream:
+
+```
+tool_use     tool_name=update_topic     (Gemini's planning/UI tool — unrelated)
+tool_use     tool_name=invoke_agent     parameters={prompt, agent_name:"generalist"}
+tool_result  tool_id=update_topic…      status=success
+tool_result  tool_id=invoke_agent…      status=success            (no `output` field)
+message      role=assistant             "done"
+result
+```
+
+**The subagent's internal `run_shell_command` does NOT appear as a stream tool event** — there is no nested/parent-tagged tool call, and `run_shell_command`/`run_command` appear nowhere in the stream. The subagent runs fully opaquely: the stream shows only the `invoke_agent` `tool_use`/`tool_result` pair, and the parent agent's final `message`. (The subagent's reported output didn't even surface in a top-level message here — the assistant just said "done".)
+
+**Implication:** Gemini does **not** have Claude's subagent mis-attribution gap (see [`claude-code-cli-observed.md` §"Subagent (`Agent` tool) representation"](claude-code-cli-observed.md) and [`../implementation_plans/2026-05-24-subagent-rendering-fidelity.md`](../implementation_plans/2026-05-24-subagent-rendering-fidelity.md)). Our adapter maps `invoke_agent` → one `ToolStarted`/`ToolCompleted` pair and the subagent internals never reach the parser. **No Gemini parser change needed** — `invoke_agent`-as-one-tool-call is already the target shape the Claude fix aims for. (Caveat: the probe hit free-tier quota — 3 "exhausted your capacity" retries — but still completed with valid structure; quota affected timing, not the event shapes.)
+
 ### CRITICAL — NEW: concurrent dispatches in the same cwd can corrupt the on-disk session file if session-id prefixes collide
 
 **This is the most important M3 finding** and a real abstraction-load-bearing surprise. Two concurrent `gemini -p` invocations from the same cwd with session IDs that happen to share their first 8 hex characters write to the **same** session file (`session-<startTime>-<prefix>.jsonl`), interleaving each other's records.
@@ -561,7 +580,11 @@ The resume probe (asking Gemini to recall a prior message) produced a session-fi
 
 These remain unverified and should be confirmed during M3.2:
 
-1. **Auth-failure shape.** Requires breaking the user's auth (risky during M3.1); deferred. Expected to surface in `result.status:"error"` with a recognizable `error.message` — verify when implementing the auth-failure stream pattern.
+1. **Auth-failure shape — PARTIALLY CAPTURED (2026-05-27, logged-out probe).** When **no auth method is configured** (the user logged out, clearing `~/.gemini/settings.json`'s auth selection), `gemini -p "…" --output-format stream-json < /dev/null` does **not** reach the API — it fails at startup and prints to stderr:
+   ```
+   Please set an Auth method in your /Users/<user>/.gemini/settings.json or specify one of the following environment variables before running: GEMINI_API_KEY, GOOGLE_GENAI_USE_VERTEXAI, GOOGLE_GENAI_USE_GCA
+   ```
+   **Exit code 41. No stream-json emitted at all** (it fails before the first event). **Gap this reveals:** our `is_gemini_auth_failure_message` keys on `"401 Unauthorized"` in a `result.status:"error"` event — but this *no-auth-configured* shape produces no stream event and never contains "401", so it currently classifies as a generic `AdapterFailure` (non-zero exit, no terminal event), **not** `AuthFailure`. The "401 Unauthorized" path remains the *expired/invalid-token-mid-call* shape (still unobserved on Gemini — would need a stale-but-present token, not a clean logout). So Gemini has (at least) two distinct auth-ish failures: **no-auth-configured** (exit 41 + stderr "Please set an Auth method", no stream) and **bad-token** (presumed `result.status:"error"` 401, unobserved). Detection should cover the captured exit-41/stderr shape, not only the 401 substring.
 2. **`--list-sessions` output format.** Useful for a future attach-existing-session UX; not v1 critical.
 3. **Multi-chunk streaming under genuinely long replies.** The SIGTERM probe surfaced ~100 `message` records with `delta:true`, confirming streaming works at scale. Further verification not needed.
 4. **MCP tool events from a real MCP server.** Switchboard does not maintain its own MCP infrastructure; once a user has a real MCP server wired into Gemini, M3.2's MCP-tool path can be verified live. For v1 we project `mcp_*`-prefixed tools through the existing `ToolKind::Mcp` path; fixture-cover with inline JSON if M3.5 needs it.
@@ -606,3 +629,19 @@ These remain unverified and should be confirmed during M3.2:
 - `interleaved-collision.session.jsonl` — two-session interleave demonstrating the prefix-collision hazard.
 
 API budget used: ~7 small turns + 2 zero-API probes (workspace-trust rejection, empty-prompt rejection). Roughly 1% of the 1,000-req/day free OAuth tier. Comfortable headroom remains for M3.2 implementation probes.
+
+## Cancellation / SIGTERM (M4.3) — wired and verified end-to-end
+
+M4.3 wires token-driven cancellation: the adapter's producer `select!`s the
+stdout read against the turn's `CancellationToken`; on cancel it kills the
+subprocess **process group** via `terminate_then_kill` (SIGTERM → ~2s grace →
+SIGKILL — `crates/harness/src/subprocess.rs`) and ends the stream without a
+terminal event (the dispatcher synthesizes `TurnEnd { Cancelled }`).
+
+This composes with the already-confirmed SIGTERM behaviour above
+("process-group kill is clean; exit code is 0"): a process-group SIGTERM tears
+`gemini` down within milliseconds, so the grace window is rarely reached.
+
+**Verified end-to-end (2026-05-23):** `live_gemini_cancel_terminates_and_synthesizes_cancelled`
+(run via `make test-live` / `make test-live-gemini`) passes — firing the token
+mid-turn produces a `Cancelled` outcome with the agent returning to idle.

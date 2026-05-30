@@ -9,7 +9,7 @@
 //! (`<cwd>/.gemini/config/mcp_config.json` or similar) is plausible but
 //! unverified, so workspace scope is not loaded — the `cwd` parameter is
 //! reserved for it. See the "Known limitations" section of
-//! `docs/research/antigravity-cli-observed.md`.
+//! `docs/research/archive/antigravity-cli-observed.md`.
 //!
 //! Kept separate from `gemini/config.rs` rather than factored into a shared
 //! module: Antigravity and Gemini currently share the JSON shape but not the

@@ -10,6 +10,10 @@ use uuid::Uuid;
 
 #[cfg(unix)]
 use nix::unistd::{Pid, getpgid};
+#[cfg(unix)]
+use std::time::Duration;
+#[cfg(unix)]
+use tokio_util::sync::CancellationToken;
 
 const FAKE_CLAUDE: &str = env!("CARGO_BIN_EXE_fake_claude");
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/claude");
@@ -492,5 +496,113 @@ async fn stderr_drain_no_deadlock() {
         events
             .iter()
             .any(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+    );
+}
+
+/// Poll until `path` holds a parseable pgid (the fake wrote it on spawn),
+/// returning that pid. Bounded so a spawn failure surfaces as a panic, not a
+/// hang.
+#[cfg(unix)]
+async fn wait_for_pgid(path: &Path) -> Pid {
+    for _ in 0..200 {
+        if let Ok(s) = std::fs::read_to_string(path)
+            && let Ok(n) = s.trim().parse::<i32>()
+        {
+            return Pid::from_raw(n);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("fake_claude never wrote its pgid at {}", path.display());
+}
+
+/// Poll until the process group's leader is gone (`getpgid` → `ESRCH`),
+/// proving the adapter's `killpg` reaped the whole tree. Bounded.
+#[cfg(unix)]
+async fn assert_group_reaped(leader: Pid) {
+    for _ in 0..200 {
+        if getpgid(Some(leader)).is_err() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("process group {leader} still alive after cancel");
+}
+
+/// Build a fixture (in `tempdir`) that writes its pgid, optionally emits the
+/// first real stream line, then `// hang`s (parked read). Dispatch it with a
+/// fresh token, wait for the child to spawn, fire the token, and return the
+/// events the adapter emitted before the stream closed.
+#[cfg(unix)]
+async fn dispatch_then_cancel(emit_a_line: bool) -> Vec<AdapterEvent> {
+    let tempdir = tempfile::TempDir::new().expect("tempdir");
+    let pgid_path = tempdir.path().join("child.pgid");
+    let fixture_path = tempdir.path().join("cancel-fixture.jsonl");
+
+    let mut body = format!("// pgid_to:{}\n", pgid_path.display());
+    if emit_a_line {
+        let base = std::fs::read_to_string(fixture("text-only")).expect("read fixture");
+        let first = base.lines().find(|l| !l.trim().is_empty()).expect("a line");
+        body.push_str(first);
+        body.push('\n');
+    }
+    body.push_str("// hang\n");
+    std::fs::write(&fixture_path, body).expect("write cancel fixture");
+
+    let agent = fake_agent();
+    let token = CancellationToken::new();
+    let options = DispatchOptions {
+        cancel_token: token.clone(),
+        ..Default::default()
+    };
+    let stream = adapter()
+        .dispatch(
+            &agent,
+            Path::new("/tmp"),
+            fixture_path.to_str().expect("utf-8 path"),
+            Uuid::now_v7(),
+            options,
+        )
+        .await
+        .expect("dispatch should succeed");
+
+    // Cancel only once the child is live and parked.
+    let leader = wait_for_pgid(&pgid_path).await;
+    token.cancel();
+
+    let events: Vec<AdapterEvent> = tokio::time::timeout(Duration::from_secs(15), stream.collect())
+        .await
+        .expect("stream must end promptly after cancel, not hang");
+
+    assert_group_reaped(leader).await;
+    events
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancel_mid_stream_kills_group_and_emits_no_terminal() {
+    // The adapter's contract on cancel: kill the process group and end the
+    // stream with NO terminal event of any kind (the dispatcher synthesizes
+    // `Cancelled`). Anything terminal here would be the adapter violating its
+    // own contract.
+    let events = dispatch_then_cancel(/* emit_a_line */ true).await;
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::TurnEnd { .. })),
+        "adapter must emit no terminal event on cancel; got: {events:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancel_pre_first_output_kills_group_and_emits_no_terminal() {
+    // Cancellation before the harness produced any output: the read is parked,
+    // and `select!` must still observe the token. No events at all, group reaped.
+    let events = dispatch_then_cancel(/* emit_a_line */ false).await;
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::TurnEnd { .. })),
+        "adapter must emit no terminal event on pre-output cancel; got: {events:?}"
     );
 }

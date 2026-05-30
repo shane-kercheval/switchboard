@@ -2,7 +2,7 @@
 //!
 //! After each turn's terminal stream event (`turn.completed` / `turn.failed`),
 //! the Codex adapter reads the session file to fill in metadata the stream
-//! omits. Per `docs/research/codex-cli-observed.md`, the session file is
+//! omits. Per `docs/research/archive/codex-cli-observed.md`, the session file is
 //! the **only** source for:
 //! - `event_msg/task_started.payload.model_context_window` →
 //!   `TurnEnd.usage.context_window` (per-turn).
@@ -33,7 +33,7 @@
 //! original-partition file even on cross-day resumes; the stored date is
 //! authoritative across local-date boundaries. **Never recompute the date
 //! from any wall-clock function at enrichment time** — always read from
-//! the sidecar. See `docs/research/codex-cli-observed.md` for the
+//! the sidecar. See `docs/research/archive/codex-cli-observed.md` for the
 //! verification evidence and the fallback path if Codex ever changes
 //! partition behavior.
 //!
@@ -65,7 +65,7 @@ use super::config::load_mcp_servers;
 use super::skills::load_skills;
 
 /// Per-attempt backoff between session-file read tries. Codex writes the
-/// session file synchronously per `docs/research/codex-cli-observed.md`; by
+/// session file synchronously per `docs/research/archive/codex-cli-observed.md`; by
 /// the time the terminal stream event arrives, the file should already be
 /// on disk. The first attempt fires **immediately** — the backoff applies
 /// only between failed attempts, so a typical turn pays zero latency. Two
@@ -920,6 +920,7 @@ impl CodexReconstruction {
             turns: self.turns,
             meta: None,
             last_rate_limit: None,
+            last_rate_limit_as_of: None,
             warnings: self.warnings,
         }
     }
@@ -1657,6 +1658,15 @@ not valid json
         let result =
             load_codex_transcript(home.path(), cwd.path(), session_id, Some(date), agent_id)
                 .unwrap();
+        // A function_call + function_call_output folds into the agent turn — it
+        // does NOT open a spurious user turn (tool results are `response_item`s,
+        // not `user_message`s). The conversation merge's order-correlation of
+        // imported prompts relies on this 1:1 user/agent alternation, so pin it.
+        assert_eq!(
+            result.turns.len(),
+            2,
+            "tool call folds into the agent turn; no extra user turn"
+        );
         let Turn::Agent { items, .. } = &result.turns[1] else {
             panic!("expected Agent turn");
         };

@@ -1,10 +1,29 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
-import { render, screen, waitFor } from "@testing-library/svelte";
+import { render, screen, fireEvent, waitFor } from "@testing-library/svelte";
 import type { AgentRecord, NormalizedEvent } from "$lib/types";
 
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(async () => vi.fn()),
+}));
+
+// The inline rename editor commits through the workspace state's `renameAgent`;
+// AgentActionsMenu (rendered per card) imports `removeAgent` from the same
+// module, so the mock provides both. `$lib/state/index.svelte` (the real module
+// the other suites drive) does not import either, so these mocks are orthogonal.
+const renameAgentMock = vi.fn<(id: string, name: string) => Promise<void>>();
+const removeAgentMock = vi.fn<(id: string) => Promise<void>>();
+vi.mock("$lib/state/workspace.svelte", () => ({
+  renameAgent: (id: string, name: string) => renameAgentMock(id, name),
+  removeAgent: (id: string) => removeAgentMock(id),
+}));
+
+// Opening the actions menu resolves session info; stub it so the "Rename via
+// menu" path doesn't reach the real Tauri `invoke`.
+const agentSessionInfoMock = vi.fn();
+vi.mock("$lib/api", () => ({
+  agentSessionInfo: (id: string) => agentSessionInfoMock(id),
+  openSessionFile: vi.fn(),
 }));
 
 async function loadState() {
@@ -30,6 +49,9 @@ const CODEX_AGENT: AgentRecord = {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  renameAgentMock.mockResolvedValue(undefined);
+  removeAgentMock.mockResolvedValue(undefined);
+  agentSessionInfoMock.mockResolvedValue({ session_file: null, resume_command: null });
 });
 
 afterEach(async () => {
@@ -38,7 +60,7 @@ afterEach(async () => {
 });
 
 describe("Sidebar", () => {
-  it("renders one row per agent with name and harness badge", async () => {
+  it("renders one row per agent with name and harness icon", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     await state.registerAgent(CODEX_AGENT);
@@ -51,9 +73,9 @@ describe("Sidebar", () => {
     expect(rows[0]).toHaveAttribute("data-agent-id", CLAUDE_AGENT.id);
     expect(rows[1]).toHaveAttribute("data-agent-id", CODEX_AGENT.id);
 
-    const badges = screen.getAllByTestId("agent-harness-badge");
-    expect(badges[0]).toHaveTextContent("Claude");
-    expect(badges[1]).toHaveTextContent("Codex");
+    const icons = screen.getAllByTestId("agent-harness-icon");
+    expect(icons[0]).toHaveAttribute("alt", "Claude");
+    expect(icons[1]).toHaveAttribute("alt", "Codex");
   });
 
   it("renders empty-state message when no agents", async () => {
@@ -63,35 +85,72 @@ describe("Sidebar", () => {
     expect(screen.getByText(/no agents/i)).toBeInTheDocument();
   });
 
-  it("shows 'processing' when run_status is starting or processing", async () => {
+  // Run-status and last_error are no longer surfaced in the right sidebar:
+  // mid-turn activity shows as a per-project spinner in the projects sidebar,
+  // and failures render in the transcript as a failed agent turn (covered in
+  // the reducer + UnifiedTranscript suites). The sidebar's job here is the
+  // collapsible per-agent detail card.
+
+  it("collapses an agent's detail card when its header is toggled", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
-    // Drive run_status by dispatching a user turn.
-    state.dispatchUserTurn(CLAUDE_AGENT.id, "user-1", "hi", "2026-05-16T00:00:00Z");
-    expect(state.runtimes[CLAUDE_AGENT.id]?.run_status).toBe("starting");
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "turn-1",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:00Z",
+        ended_at: "2026-05-16T00:00:01Z",
+        status: "complete",
+        items: [],
+        usage: { input_tokens: 100, output_tokens: 20, total_cost_usd: 0.01 },
+      },
+    ];
 
     const Sidebar = (await import("./Sidebar.svelte")).default;
     render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
 
-    expect(screen.getByTestId("agent-run-status")).toHaveTextContent("processing");
+    // Expanded by default → details (cost) are visible.
+    expect(screen.getByTestId("agent-cost")).toBeInTheDocument();
+
+    const header = screen.getByTestId("agent-name").closest("button");
+    if (!header) throw new Error("expected the agent name to sit in a toggle button");
+    expect(header).toHaveAttribute("aria-expanded", "true");
+
+    await fireEvent.click(header);
+
+    expect(header).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByTestId("agent-cost")).toBeNull();
   });
 
-  it("surfaces last_error from a failed turn", async () => {
+  it("collapse-all hides every agent's details; toggling again restores them", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
-    state.dispatchUserTurn(CLAUDE_AGENT.id, "user-1", "hi", "2026-05-16T00:00:00Z");
-    state.failSendStart(CLAUDE_AGENT.id, {
-      message: "could not connect",
-      kind: "adapter_failure",
-    });
+    await state.registerAgent(CODEX_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "turn-1",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:00Z",
+        ended_at: "2026-05-16T00:00:01Z",
+        status: "complete",
+        items: [],
+        usage: { input_tokens: 100, output_tokens: 20, total_cost_usd: 0.01 },
+      },
+    ];
 
     const Sidebar = (await import("./Sidebar.svelte")).default;
-    render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+    render(Sidebar, { props: { agents: [CLAUDE_AGENT, CODEX_AGENT] } });
 
-    expect(screen.getByTestId("agent-last-error")).toHaveTextContent("could not connect");
-    // After failSendStart the agent is sendable again (idle) — error
-    // surfaces in the sidebar but doesn't gate Send.
-    expect(screen.getByTestId("agent-run-status")).toHaveTextContent("idle");
+    expect(screen.getByTestId("agent-cost")).toBeInTheDocument();
+
+    const toggleAll = screen.getByTestId("sidebar-toggle-all");
+    await fireEvent.click(toggleAll);
+    expect(screen.queryByTestId("agent-cost")).toBeNull();
+
+    await fireEvent.click(toggleAll);
+    expect(screen.getByTestId("agent-cost")).toBeInTheDocument();
   });
 
   it("displays Claude session-total cost (null-safe sum)", async () => {
@@ -201,6 +260,396 @@ describe("Sidebar", () => {
   });
 });
 
+/// A unix-epoch-seconds timestamp `deltaSeconds` from now — payloads use
+/// real-now-relative resets so the "is this window still in the future?" gate
+/// is exercised deterministically (a fixed epoch would drift past `now` and
+/// flip the test's meaning over time).
+function epochFromNow(deltaSeconds: number): number {
+  return Math.floor(Date.now() / 1000) + deltaSeconds;
+}
+
+/// An ISO string `ms` before now — for the snapshot-age (`as_of`) tooltip line.
+function agoIso(ms: number): string {
+  return new Date(Date.now() - ms).toISOString();
+}
+
+async function renderClaudeWithRateLimit(info: unknown, asOf: string | null): Promise<void> {
+  const state = await loadState();
+  await state.registerAgent(CLAUDE_AGENT);
+  const runtime = state.runtimes[CLAUDE_AGENT.id];
+  if (runtime === undefined) throw new Error("unreachable");
+  state.runtimes[CLAUDE_AGENT.id] = {
+    ...runtime,
+    last_rate_limit: info,
+    last_rate_limit_as_of: asOf,
+  };
+  const Sidebar = (await import("./Sidebar.svelte")).default;
+  render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+}
+
+/// Claude rate-limit surface — two independent signals (the always-present
+/// primary window + the overage escalation), each gated on its own reset being
+/// in the future (reset-passed → clean-hide). Exact clock/date text isn't
+/// asserted (jsdom locale/timezone dependent) — only the stable label/copy and
+/// presence/absence per the gating rules.
+describe("Sidebar Claude rate-limit surface", () => {
+  it("shows the primary window independent of overage (normal-quota turn)", async () => {
+    // No isUsingOverage — the 5-hour window must still surface (the bug we're
+    // fixing: the window used to be gated on overage).
+    await renderClaudeWithRateLimit(
+      { status: "allowed", rateLimitType: "five_hour", resetsAt: epochFromNow(4 * 3600) },
+      null,
+    );
+    const window = screen.getByTestId("agent-rate-window");
+    expect(window).toHaveTextContent("5-hour limit resets");
+    // Not overaging → no amber escalation.
+    expect(screen.queryByTestId("agent-overage")).toBeNull();
+  });
+
+  it("derives the window label from rateLimitType (unknown → generic)", async () => {
+    await renderClaudeWithRateLimit(
+      { status: "allowed", rateLimitType: "weekly", resetsAt: epochFromNow(4 * 3600) },
+      null,
+    );
+    // Unknown type falls back to the generic label, never a hardcoded "5-hour".
+    const window = screen.getByTestId("agent-rate-window");
+    expect(window).toHaveTextContent("rate limit resets");
+    expect(window).not.toHaveTextContent("5-hour");
+  });
+
+  it("hides the primary window once its reset is in the past (reset-passed)", async () => {
+    // A past reset is known-stale (the window has cycled, we lack the new
+    // reset) — showing a past 'resets at' would be wrong, so it clean-hides.
+    await renderClaudeWithRateLimit(
+      { status: "allowed", rateLimitType: "five_hour", resetsAt: epochFromNow(-3600) },
+      null,
+    );
+    expect(screen.queryByTestId("agent-rate-window")).toBeNull();
+    expect(screen.queryByTestId("agent-rate-limit-claude")).toBeNull();
+  });
+
+  it("shows the amber overage escalation when overaging with a future overage window", async () => {
+    await renderClaudeWithRateLimit(
+      {
+        status: "rejected",
+        rateLimitType: "five_hour",
+        resetsAt: epochFromNow(4 * 3600),
+        isUsingOverage: true,
+        overageResetsAt: epochFromNow(6 * 86400),
+      },
+      null,
+    );
+    // Both signals present: neutral window + amber escalation.
+    expect(screen.getByTestId("agent-rate-window")).toHaveTextContent("5-hour limit resets");
+    const overage = screen.getByTestId("agent-overage");
+    expect(overage).toHaveTextContent("using credits");
+    expect(overage).toHaveClass("text-warning");
+  });
+
+  it("drops the overage escalation once the overage window has passed", async () => {
+    // isUsingOverage true, but the overage window elapsed → the credit window
+    // has cycled, so the escalation is stale and hidden. The still-future
+    // primary window stays.
+    await renderClaudeWithRateLimit(
+      {
+        status: "rejected",
+        rateLimitType: "five_hour",
+        resetsAt: epochFromNow(4 * 3600),
+        isUsingOverage: true,
+        overageResetsAt: epochFromNow(-3600),
+      },
+      null,
+    );
+    expect(screen.getByTestId("agent-rate-window")).toBeInTheDocument();
+    expect(screen.queryByTestId("agent-overage")).toBeNull();
+  });
+
+  it("overage flag with no overage window still shows (can't prove it stale)", async () => {
+    await renderClaudeWithRateLimit(
+      { isUsingOverage: true, resetsAt: epochFromNow(4 * 3600), rateLimitType: "five_hour" },
+      null,
+    );
+    expect(screen.getByTestId("agent-overage")).toHaveTextContent("using credits");
+  });
+
+  it("renders nothing when there is no usable rate-limit signal", async () => {
+    // Everything elapsed / absent → the whole cell clean-hides.
+    await renderClaudeWithRateLimit({ status: "allowed", resetsAt: epochFromNow(-3600) }, null);
+    expect(screen.queryByTestId("agent-rate-limit-claude")).toBeNull();
+    expect(screen.queryByTestId("agent-rate-window")).toBeNull();
+    expect(screen.queryByTestId("agent-overage")).toBeNull();
+  });
+
+  it("Codex agent never shows the Claude rate-limit cells (Claude-gated)", async () => {
+    const state = await loadState();
+    await state.registerAgent(CODEX_AGENT);
+    const runtime = state.runtimes[CODEX_AGENT.id];
+    if (runtime === undefined) throw new Error("unreachable");
+    state.runtimes[CODEX_AGENT.id] = {
+      ...runtime,
+      last_rate_limit: {
+        rateLimitType: "five_hour",
+        resetsAt: epochFromNow(4 * 3600),
+        isUsingOverage: true,
+        overageResetsAt: epochFromNow(6 * 86400),
+      },
+    };
+    const Sidebar = (await import("./Sidebar.svelte")).default;
+    render(Sidebar, { props: { agents: [CODEX_AGENT] } });
+    expect(screen.queryByTestId("agent-rate-window")).toBeNull();
+    expect(screen.queryByTestId("agent-overage")).toBeNull();
+  });
+});
+
+/// Rate-limit tooltip content — always present when the cell shows, carrying
+/// full reset dates (a window can be days out, beyond the inline clock) plus
+/// both windows and the snapshot age when rehydrated. Mirrors the
+/// parse-warnings tooltip test's fake-timer + pointerEnter pattern.
+describe("Sidebar Claude rate-limit tooltip", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("surfaces the window + overage windows on hover; no snapshot line when live", async () => {
+    await renderClaudeWithRateLimit(
+      {
+        status: "rejected",
+        rateLimitType: "five_hour",
+        resetsAt: epochFromNow(4 * 3600),
+        isUsingOverage: true,
+        overageResetsAt: epochFromNow(6 * 86400),
+      },
+      null,
+    );
+    await fireEvent.pointerEnter(screen.getByTestId("agent-rate-limit-claude"));
+    await vi.advanceTimersByTimeAsync(500);
+    const detail = await waitFor(() => screen.getByTestId("agent-rate-detail"));
+    expect(detail).toHaveTextContent("5-hour limit resets");
+    // The overage window — dropped before M4, now surfaced here.
+    expect(detail).toHaveTextContent("overage window resets");
+    // Live snapshot (as_of null) → no snapshot-age line.
+    expect(screen.queryByTestId("agent-rate-snapshot")).toBeNull();
+  });
+
+  it("adds a snapshot-age + refresh line on hover when rehydrated (as_of set)", async () => {
+    await renderClaudeWithRateLimit(
+      { status: "allowed", rateLimitType: "five_hour", resetsAt: epochFromNow(4 * 3600) },
+      agoIso(3 * 60 * 60 * 1000),
+    );
+    await fireEvent.pointerEnter(screen.getByTestId("agent-rate-limit-claude"));
+    await vi.advanceTimersByTimeAsync(500);
+    await waitFor(() => screen.getByTestId("agent-rate-detail"));
+    const snapshot = screen.getByTestId("agent-rate-snapshot");
+    expect(snapshot).toHaveTextContent(/snapshot from .* ago/i);
+    expect(snapshot).toHaveTextContent(/refresh/i);
+  });
+});
+
+async function renderCodexWithRateLimit(info: unknown): Promise<void> {
+  const state = await loadState();
+  await state.registerAgent(CODEX_AGENT);
+  const runtime = state.runtimes[CODEX_AGENT.id];
+  if (runtime === undefined) throw new Error("unreachable");
+  state.runtimes[CODEX_AGENT.id] = { ...runtime, last_rate_limit: info };
+  const Sidebar = (await import("./Sidebar.svelte")).default;
+  render(Sidebar, { props: { agents: [CODEX_AGENT] } });
+}
+
+/// Codex rate-limit windows — both independent windows (primary ~5-hour +
+/// secondary weekly) surfaced as gauge lines, each labeled from its
+/// `window_minutes` and gated reset-passed. The reset times (incl. the weekly
+/// window, days out) live in the tooltip. Class B (session-file-backed), so no
+/// snapshot-age line. Closes G8 (secondary window + reset times were dropped).
+describe("Sidebar Codex rate-limit windows", () => {
+  it("renders both windows with duration-derived labels", async () => {
+    await renderCodexWithRateLimit({
+      primary: { used_percent: 42.0, window_minutes: 300, resets_at: epochFromNow(2 * 3600) },
+      secondary: { used_percent: 7.0, window_minutes: 10080, resets_at: epochFromNow(5 * 86400) },
+    });
+    const cell = screen.getByTestId("agent-rate-limit");
+    // window_minutes → human label, not "primary/secondary".
+    expect(cell).toHaveTextContent("5-hour used: 42%");
+    expect(cell).toHaveTextContent("weekly used: 7%");
+  });
+
+  it("bare used_percent (no window_minutes) keeps the legacy 'quota used' copy", async () => {
+    // Backward-compatible fallback: a minimal payload still reads cleanly.
+    await renderCodexWithRateLimit({ primary: { used_percent: 42.5 } });
+    expect(screen.getByTestId("agent-rate-limit")).toHaveTextContent("quota used: 43%");
+  });
+
+  it("hides a window whose reset has passed (reset-passed), keeps the live one", async () => {
+    await renderCodexWithRateLimit({
+      primary: { used_percent: 42.0, window_minutes: 300, resets_at: epochFromNow(-3600) },
+      secondary: { used_percent: 7.0, window_minutes: 10080, resets_at: epochFromNow(5 * 86400) },
+    });
+    const cell = screen.getByTestId("agent-rate-limit");
+    expect(cell).not.toHaveTextContent("5-hour");
+    expect(cell).toHaveTextContent("weekly used: 7%");
+  });
+
+  it("surfaces reset times in the tooltip, not the inline gauge", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      await renderCodexWithRateLimit({
+        primary: { used_percent: 42.0, window_minutes: 300, resets_at: epochFromNow(2 * 3600) },
+        secondary: { used_percent: 7.0, window_minutes: 10080, resets_at: epochFromNow(5 * 86400) },
+      });
+      await fireEvent.pointerEnter(screen.getByTestId("agent-rate-limit"));
+      await vi.advanceTimersByTimeAsync(500);
+      const detail = await waitFor(() => screen.getByTestId("agent-rate-limit-detail"));
+      expect(detail).toHaveTextContent(/5-hour: 42% used · resets/);
+      expect(detail).toHaveTextContent(/weekly: 7% used · resets/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("Claude agent never shows the Codex gauge cell (Codex-gated)", async () => {
+    await renderClaudeWithRateLimit(
+      { primary: { used_percent: 42.0, window_minutes: 300, resets_at: epochFromNow(2 * 3600) } },
+      null,
+    );
+    // Claude reads its own shape (isUsingOverage/resetsAt), not Codex's
+    // primary.used_percent — so the Codex gauge cell must not appear.
+    expect(screen.queryByTestId("agent-rate-limit")).toBeNull();
+  });
+});
+
+/// Clean-hide convention (G10): a metadata cell a harness can't report must
+/// render *nothing* — no empty label, no blank bar, no placeholder. These pin
+/// the capable-absence cases so a future "show — / n/a" regression fails here.
+describe("Sidebar clean-hide for absent metadata", () => {
+  it("Codex agent renders no cost cell (subscription model — no dollar figure)", async () => {
+    const state = await loadState();
+    await state.registerAgent(CODEX_AGENT);
+    // A completed Codex turn with usage but total_cost_usd null.
+    state.transcripts[CODEX_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "turn-1",
+        agent_id: CODEX_AGENT.id,
+        started_at: "2026-05-16T00:00:00Z",
+        ended_at: "2026-05-16T00:00:01Z",
+        status: "complete",
+        items: [],
+        usage: { input_tokens: 100, output_tokens: 20, total_cost_usd: null },
+      },
+    ];
+    const Sidebar = (await import("./Sidebar.svelte")).default;
+    render(Sidebar, { props: { agents: [CODEX_AGENT] } });
+    expect(screen.queryByTestId("agent-cost")).toBeNull();
+  });
+
+  it("agent with no metadata renders no cost / quota / rate-limit / context cells", async () => {
+    // A freshly-registered agent (no turns, no rate-limit, no meta) — every
+    // value-gated cell must be absent, not blank.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    const Sidebar = (await import("./Sidebar.svelte")).default;
+    render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+    expect(screen.queryByTestId("agent-cost")).toBeNull();
+    expect(screen.queryByTestId("agent-rate-limit")).toBeNull();
+    expect(screen.queryByTestId("agent-rate-limit-claude")).toBeNull();
+    expect(screen.queryByTestId("agent-rate-window")).toBeNull();
+    expect(screen.queryByTestId("agent-overage")).toBeNull();
+    expect(screen.queryByTestId("agent-context-bar")).toBeNull();
+    expect(screen.queryByTestId("agent-meta")).toBeNull();
+  });
+});
+
+/// Transcript-warnings indicator. The indicator persists for the
+/// lifetime of a project session — it's the project's drift detector
+/// for upstream CLI parser changes (see `harness-update-review.md`).
+/// What changed in M3: native `title=` → themed `Tooltip` with rows;
+/// 10-row cap with "+N more" footer for long tails.
+describe("Sidebar agent-parse-warnings tooltip", () => {
+  beforeEach(() => {
+    // bits-ui Tooltip has a 500ms delayDuration; fake timers let
+    // hover-driven content appear immediately in test time.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("shows the indicator with the count and uses Tooltip (not native title)", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    const runtime = state.runtimes[CLAUDE_AGENT.id];
+    if (runtime === undefined) throw new Error("unreachable");
+    state.runtimes[CLAUDE_AGENT.id] = {
+      ...runtime,
+      parse_warnings: [
+        { line_number: 17, reason: "tool_result for toolu_a never matched a tool_use" },
+        { line_number: 42, reason: "tool_result for toolu_b never matched a tool_use" },
+      ],
+    };
+
+    const Sidebar = (await import("./Sidebar.svelte")).default;
+    render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+
+    const indicator = screen.getByTestId("agent-parse-warnings");
+    expect(indicator).toHaveTextContent("⚠ 2 transcript warnings");
+    // Native `title=` is gone — the themed Tooltip replaces it.
+    expect(indicator).not.toHaveAttribute("title");
+    // Keyboard-reachable: the trigger is a <div> (no click action implied),
+    // so it needs an explicit tabindex to receive focus. Without this,
+    // keyboard-only users couldn't open the tooltip to read the warnings.
+    // The Tooltip.test.ts focus test exercises the primitive with a
+    // <button> harness, which is intrinsically focusable; this pins the
+    // production-shape contract.
+    expect(indicator).toHaveAttribute("tabindex", "0");
+
+    await fireEvent.pointerEnter(indicator);
+    await vi.advanceTimersByTimeAsync(500);
+    await waitFor(() => screen.getByTestId("agent-parse-warnings-list"));
+
+    const rows = screen.getAllByTestId("agent-parse-warnings-row");
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toHaveTextContent("line 17:");
+    expect(rows[0]).toHaveTextContent("tool_result for toolu_a never matched a tool_use");
+    expect(rows[1]).toHaveTextContent("line 42:");
+    expect(rows[1]).toHaveTextContent("tool_result for toolu_b never matched a tool_use");
+    // No overflow row when under the cap.
+    expect(screen.queryByTestId("agent-parse-warnings-overflow")).not.toBeInTheDocument();
+  });
+
+  it("caps at 10 rows and renders an overflow footer for the remainder", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    const runtime = state.runtimes[CLAUDE_AGENT.id];
+    if (runtime === undefined) throw new Error("unreachable");
+    state.runtimes[CLAUDE_AGENT.id] = {
+      ...runtime,
+      parse_warnings: Array.from({ length: 12 }, (_, i) => ({
+        line_number: i + 1,
+        reason: `warning ${i + 1}`,
+      })),
+    };
+
+    const Sidebar = (await import("./Sidebar.svelte")).default;
+    render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+
+    // Indicator reflects the full count (not the cap).
+    expect(screen.getByTestId("agent-parse-warnings")).toHaveTextContent(
+      "⚠ 12 transcript warnings",
+    );
+
+    await fireEvent.pointerEnter(screen.getByTestId("agent-parse-warnings"));
+    await vi.advanceTimersByTimeAsync(500);
+    await waitFor(() => screen.getByTestId("agent-parse-warnings-list"));
+
+    expect(screen.getAllByTestId("agent-parse-warnings-row")).toHaveLength(10);
+    const overflow = screen.getByTestId("agent-parse-warnings-overflow");
+    expect(overflow).toHaveTextContent("+ 2 more");
+  });
+});
+
 // agent-scoped events not crashing the component — direct-listener
 // integration covered by index.test.ts already.
 describe("Sidebar agent-scoped event tolerance", () => {
@@ -240,5 +689,183 @@ describe("Sidebar agent-scoped event tolerance", () => {
     await waitFor(() => {
       expect(screen.getByTestId("agent-meta")).toHaveTextContent("claude-sonnet-4-6");
     });
+  });
+});
+
+/// Inline rename editor (M7). The card's name swaps to an <input> with live
+/// validation; Enter / the save icon commit, Escape / blur cancel (never
+/// persist on blur). The menu's "Rename" item and a double-click on the name
+/// row are the two entry points. Commits route through the mocked workspace
+/// `renameAgent`; the backend stays authoritative, the frontend check is UX.
+describe("Sidebar inline rename", () => {
+  async function enterEditViaDoubleClick(agent: AgentRecord): Promise<HTMLInputElement> {
+    const state = await loadState();
+    await state.registerAgent(agent);
+    const Sidebar = (await import("./Sidebar.svelte")).default;
+    render(Sidebar, { props: { agents: [agent] } });
+    const toggle = screen.getByTestId("agent-name").closest("button");
+    if (!toggle) throw new Error("expected the agent name to sit in a toggle button");
+    await fireEvent.dblClick(toggle);
+    return (await screen.findByTestId("agent-rename-input")) as HTMLInputElement;
+  }
+
+  it("double-click on the name row enters edit mode seeded with the current name", async () => {
+    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    expect(input).toHaveValue("alice");
+    // The name span / toggle button is gone while editing.
+    expect(screen.queryByTestId("agent-name")).toBeNull();
+  });
+
+  it("the input is not nested inside the collapse toggle (no nested interactive)", async () => {
+    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    expect(input.closest("button")).toBeNull();
+  });
+
+  it("the menu's Rename item enters edit mode", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    const Sidebar = (await import("./Sidebar.svelte")).default;
+    render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+
+    await fireEvent.click(screen.getByTestId("agent-actions-trigger"));
+    await fireEvent.click(await screen.findByTestId("agent-action-rename"));
+
+    const input = (await screen.findByTestId("agent-rename-input")) as HTMLInputElement;
+    expect(input).toHaveValue("alice");
+  });
+
+  it("Enter commits the new name via renameAgent and exits edit mode", async () => {
+    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    await fireEvent.input(input, { target: { value: "alice2" } });
+    await fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(renameAgentMock).toHaveBeenCalledWith(CLAUDE_AGENT.id, "alice2");
+    await waitFor(() => expect(screen.queryByTestId("agent-rename-input")).toBeNull());
+  });
+
+  it("the save icon commits the new name via renameAgent", async () => {
+    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    await fireEvent.input(input, { target: { value: "alice2" } });
+
+    const save = screen.getByTestId("agent-rename-save");
+    // mousedown-preventDefault keeps focus so the click commits before any
+    // blur-cancel; the click does the actual commit.
+    await fireEvent.mouseDown(save);
+    await fireEvent.click(save);
+
+    expect(renameAgentMock).toHaveBeenCalledWith(CLAUDE_AGENT.id, "alice2");
+    await waitFor(() => expect(screen.queryByTestId("agent-rename-input")).toBeNull());
+  });
+
+  it("trims the draft before submitting (validated value equals submitted value)", async () => {
+    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    await fireEvent.input(input, { target: { value: "  alice2  " } });
+    await fireEvent.keyDown(input, { key: "Enter" });
+    expect(renameAgentMock).toHaveBeenCalledWith(CLAUDE_AGENT.id, "alice2");
+  });
+
+  it("Escape reverts without calling renameAgent", async () => {
+    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    await fireEvent.input(input, { target: { value: "alice2" } });
+    await fireEvent.keyDown(input, { key: "Escape" });
+
+    expect(renameAgentMock).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.queryByTestId("agent-rename-input")).toBeNull());
+    expect(screen.getByTestId("agent-name")).toHaveTextContent("alice");
+  });
+
+  it("blur (click-away) reverts without calling renameAgent — never persists on blur", async () => {
+    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    await fireEvent.input(input, { target: { value: "alice2" } });
+    await fireEvent.blur(input);
+
+    expect(renameAgentMock).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.queryByTestId("agent-rename-input")).toBeNull());
+    expect(screen.getByTestId("agent-name")).toHaveTextContent("alice");
+  });
+
+  it("renaming to the agent's own name (case variant) is allowed — exclude-self", async () => {
+    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    // "Alice" canonicalizes to "alice" (the agent's own); exclude-self means it
+    // is not a duplicate, and it differs verbatim, so it commits.
+    await fireEvent.input(input, { target: { value: "Alice" } });
+    expect(screen.getByTestId("agent-rename-save")).not.toBeDisabled();
+    await fireEvent.keyDown(input, { key: "Enter" });
+    expect(renameAgentMock).toHaveBeenCalledWith(CLAUDE_AGENT.id, "Alice");
+  });
+
+  it("an unchanged name skips the backend round-trip and just exits", async () => {
+    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    await fireEvent.keyDown(input, { key: "Enter" });
+    expect(renameAgentMock).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.queryByTestId("agent-rename-input")).toBeNull());
+  });
+
+  it("a duplicate of another agent disables save and blocks commit", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    const Sidebar = (await import("./Sidebar.svelte")).default;
+    render(Sidebar, { props: { agents: [CLAUDE_AGENT, CODEX_AGENT] } });
+
+    const [firstName] = screen.getAllByTestId("agent-name");
+    const toggle = firstName?.closest("button");
+    if (!toggle) throw new Error("expected a toggle button");
+    await fireEvent.dblClick(toggle);
+    const input = (await screen.findByTestId("agent-rename-input")) as HTMLInputElement;
+
+    await fireEvent.input(input, { target: { value: "bob" } });
+    const save = screen.getByTestId("agent-rename-save");
+    expect(save).toBeDisabled();
+    // The live message rides the input's title tooltip in the cramped card.
+    expect(input).toHaveAttribute("title", "An agent named 'bob' already exists");
+    expect(input).toHaveAttribute("aria-invalid", "true");
+
+    // Enter is a no-op while invalid; the agent stays in edit mode.
+    await fireEvent.keyDown(input, { key: "Enter" });
+    expect(renameAgentMock).not.toHaveBeenCalled();
+    expect(screen.getByTestId("agent-rename-input")).toBeInTheDocument();
+  });
+
+  it("an emptied field disables save without showing a nag message", async () => {
+    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    await fireEvent.input(input, { target: { value: "" } });
+    expect(screen.getByTestId("agent-rename-save")).toBeDisabled();
+    // `empty` is suppressed — no scary message mid-edit (aria-invalid still set).
+    expect(input).not.toHaveAttribute("title");
+    expect(input).toHaveAttribute("aria-invalid", "true");
+  });
+
+  it("double-Enter while a rename is in flight commits only once", async () => {
+    // Defer the resolution so the second Enter lands mid-flight (renaming=true),
+    // exercising the re-entry guard the save button already enforces.
+    let resolve: (() => void) | undefined;
+    renameAgentMock.mockImplementationOnce(
+      () =>
+        new Promise<void>((r) => {
+          resolve = () => r();
+        }),
+    );
+
+    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    await fireEvent.input(input, { target: { value: "alice2" } });
+    await fireEvent.keyDown(input, { key: "Enter" });
+    await fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(renameAgentMock).toHaveBeenCalledTimes(1);
+    resolve?.();
+    await waitFor(() => expect(screen.queryByTestId("agent-rename-input")).toBeNull());
+  });
+
+  it("a backend rejection keeps edit mode and surfaces the error", async () => {
+    renameAgentMock.mockRejectedValueOnce(new Error("registry locked"));
+    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    await fireEvent.input(input, { target: { value: "alice2" } });
+    await fireEvent.keyDown(input, { key: "Enter" });
+
+    const err = await screen.findByTestId("agent-rename-error");
+    expect(err).toHaveTextContent("registry locked");
+    // Still editing — the agent is kept on the field for a retry.
+    expect(screen.getByTestId("agent-rename-input")).toBeInTheDocument();
   });
 });

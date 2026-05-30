@@ -42,6 +42,31 @@ pub enum MockScenario {
     /// from `send_message`, never a half-stream).
     DispatchFails,
 
+    /// Emits one `ContentChunk` then a terminal `TurnEnd { Failed }`
+    /// (`AdapterFailure`). Used to exercise the dispatcher's handling of an
+    /// adapter-emitted *failed* terminal — including journaling the failed
+    /// outcome and clearing the cancellation token — which the other
+    /// scenarios (completed / cancelled) don't cover.
+    Fails,
+
+    /// Emits one `ContentChunk`, then **awaits the cancellation token** and,
+    /// once fired, ends the stream **without** a terminal event — mirroring a
+    /// real adapter's cancel path (kill the subprocess, drop the stream, let
+    /// the dispatcher synthesize `TurnEnd { Cancelled }`). The deterministic
+    /// vehicle for the dispatcher's cancellation tests: the producer parks
+    /// until the test fires the token, so there is no timing race.
+    AwaitCancellation,
+
+    /// Emits one `ContentChunk`, **awaits the cancellation token**, then emits
+    /// a *second* `ContentChunk` and a real `TurnEnd { Completed }`, and ends —
+    /// simulating a harness whose buffered output and result event lost the
+    /// race with cancellation. Exercises two invariants: (1) the cancellation
+    /// *latch* drops the late real terminal so the synthesized `Cancelled`
+    /// wins, and (2) buffered content the agent already produced is still
+    /// emitted (partial output stays visible past a cancel, per system-design
+    /// §7) — only the terminal is suppressed, not the content.
+    TerminalAfterCancel,
+
     /// Emits a Codex-shaped post-terminal enrichment sequence:
     /// `ContentChunk → TurnEnd(Completed) → RateLimitEvent → SessionMeta`.
     /// Used in the dispatcher's `agent_idle_is_last_after_codex_post_terminal_enrichment_sequence`
@@ -51,6 +76,13 @@ pub enum MockScenario {
     /// `crates/harness/src/codex/mod.rs`; this scenario stands in without
     /// requiring a subprocess.
     CodexPostTerminalEnrichment,
+
+    /// Emits `ContentChunk → TurnEnd(Completed) → RateLimitEvent` with the
+    /// given [`RateLimitSource`]. The vehicle for the dispatcher's
+    /// metadata-persistence durability-gate test: run once with `StreamOnly`
+    /// (must persist) and once with `SessionFileBacked` (must not), asserting
+    /// the injected `MetadataCache`.
+    RateLimitWithSource(crate::events::RateLimitSource),
 }
 
 /// A `HarnessAdapter` that produces canned events without spawning any subprocess.
@@ -81,13 +113,22 @@ impl HarnessAdapter for MockHarnessAdapter {
         Ok(())
     }
 
+    fn version(&self) -> Option<String> {
+        None
+    }
+
+    // One arm per `MockScenario`; the body is a flat match where each arm
+    // spawns a small canned producer. It reads top-to-bottom as a catalog of
+    // scenarios — splitting it into per-scenario helpers would scatter that
+    // catalog for no real gain — so the length lint is allowed here.
+    #[allow(clippy::too_many_lines)]
     async fn dispatch(
         &self,
         agent: &AgentRecord,
         _cwd: &Path,
         prompt: &str,
         turn_id: TurnId,
-        _options: crate::DispatchOptions,
+        options: crate::DispatchOptions,
     ) -> Result<EventStream, DispatchError> {
         if matches!(self.scenario, MockScenario::DispatchFails) {
             return Err(DispatchError::BinaryNotFound);
@@ -145,6 +186,72 @@ impl HarnessAdapter for MockHarnessAdapter {
                     // Drop tx without emitting TurnEnd — stream closes silently.
                 });
             }
+            MockScenario::Fails => {
+                tokio::spawn(async move {
+                    let _ = tx.send(AdapterEvent::ContentChunk {
+                        turn_id,
+                        kind: ContentKind::Text,
+                        text: "partial-before-failure".to_owned(),
+                    });
+                    let _ = tx.send(AdapterEvent::TurnEnd {
+                        turn_id,
+                        outcome: TurnOutcome::Failed {
+                            kind: crate::events::FailureKind::AdapterFailure,
+                            message: "mock failure".to_owned(),
+                        },
+                        ended_at: Utc::now(),
+                        usage: None,
+                    });
+                });
+            }
+            MockScenario::AwaitCancellation => {
+                let cancel_token = options.cancel_token.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send(AdapterEvent::ContentChunk {
+                        turn_id,
+                        kind: ContentKind::Text,
+                        text: "partial-before-cancel".to_owned(),
+                    });
+                    // Park until cancelled, then end the stream with no
+                    // terminal event — the dispatcher synthesizes Cancelled.
+                    cancel_token.cancelled().await;
+                });
+            }
+            MockScenario::TerminalAfterCancel => {
+                let cancel_token = options.cancel_token.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send(AdapterEvent::ContentChunk {
+                        turn_id,
+                        kind: ContentKind::Text,
+                        text: "before-cancel".to_owned(),
+                    });
+                    cancel_token.cancelled().await;
+                    // Buffered content the agent produced before the kill — it
+                    // should still be emitted (partial output stays visible).
+                    let _ = tx.send(AdapterEvent::ContentChunk {
+                        turn_id,
+                        kind: ContentKind::Text,
+                        text: "after-cancel".to_owned(),
+                    });
+                    // Agent-scoped enrichment buffered behind the cancel — it
+                    // reflects real agent state and is forwarded as-is (only the
+                    // terminal is the dispatcher's to synthesize).
+                    let _ = tx.send(AdapterEvent::RateLimitEvent {
+                        agent_id,
+                        info: serde_json::json!({"primary": {"used_percent": 50.0}}),
+                        // Codex-shaped enrichment → session-file-backed.
+                        source: crate::events::RateLimitSource::SessionFileBacked,
+                    });
+                    // A real terminal that lost the race with cancellation —
+                    // the dispatcher must drop this in favor of Cancelled.
+                    let _ = tx.send(AdapterEvent::TurnEnd {
+                        turn_id,
+                        outcome: TurnOutcome::Completed,
+                        ended_at: Utc::now(),
+                        usage: None,
+                    });
+                });
+            }
             MockScenario::CodexPostTerminalEnrichment => {
                 tokio::spawn(async move {
                     let _ = tx.send(AdapterEvent::ContentChunk {
@@ -161,6 +268,8 @@ impl HarnessAdapter for MockHarnessAdapter {
                     let _ = tx.send(AdapterEvent::RateLimitEvent {
                         agent_id,
                         info: serde_json::json!({"primary": {"used_percent": 12.5}}),
+                        // Codex-shaped enrichment → session-file-backed.
+                        source: crate::events::RateLimitSource::SessionFileBacked,
                     });
                     let _ = tx.send(AdapterEvent::SessionMeta {
                         agent_id,
@@ -173,6 +282,26 @@ impl HarnessAdapter for MockHarnessAdapter {
                         }],
                         skills: vec![],
                         raw: serde_json::Value::Null,
+                    });
+                });
+            }
+            MockScenario::RateLimitWithSource(source) => {
+                tokio::spawn(async move {
+                    let _ = tx.send(AdapterEvent::ContentChunk {
+                        turn_id,
+                        kind: ContentKind::Text,
+                        text: "ack".to_owned(),
+                    });
+                    let _ = tx.send(AdapterEvent::TurnEnd {
+                        turn_id,
+                        outcome: TurnOutcome::Completed,
+                        ended_at: Utc::now(),
+                        usage: None,
+                    });
+                    let _ = tx.send(AdapterEvent::RateLimitEvent {
+                        agent_id,
+                        info: serde_json::json!({"primary": {"used_percent": 42.0}}),
+                        source,
                     });
                 });
             }

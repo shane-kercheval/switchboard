@@ -12,10 +12,13 @@ export type FailureKind = "harness_error" | "adapter_failure" | "auth_failure";
 // `assistant.error == "authentication_failed"` and Codex's
 // `turn.failed.error` containing `"401 Unauthorized"`.
 
+// Who initiated a cancellation. Carried on the `cancelled` outcome.
+export type CancelSource = "user" | "workflow" | "shutdown";
+
 export type TurnOutcome =
   | { status: "completed" }
-  | { status: "failed"; kind: FailureKind; message: string };
-// Future: | { status: "cancelled"; source: CancelSource } — added when per-turn cancel lands.
+  | { status: "failed"; kind: FailureKind; message: string }
+  | { status: "cancelled"; source: CancelSource };
 
 // ContentChunk.kind discriminates rendering. `thinking` is reserved in the
 // wire format but not currently emitted — future reasoning UI can land
@@ -43,8 +46,21 @@ export type TurnUsage = {
   total_cost_usd?: number | null;
 };
 
+// Identifier minted by the dispatcher for every accepted send (idle or
+// queued), returned synchronously from `send_message`. The turn later started
+// for that message carries the same `message_id` on its `turn_start`, so the
+// optimistic user bubble (keyed by `message_id`) can flip to running. A send
+// that fails before any turn starts surfaces as `message_failed`.
+export type MessageId = string;
+
+// Identifier the frontend mints once per Send action and passes on every
+// per-recipient `send_message` call, so a fan-out's turns share it (the
+// backend groups the user's message once by `send_id`, and `cancel_send` is
+// scoped to it).
+export type SendId = string;
+
 export type NormalizedEvent =
-  | { type: "turn_start"; turn_id: TurnId; started_at: string }
+  | { type: "turn_start"; turn_id: TurnId; message_id: MessageId; started_at: string }
   | { type: "content_chunk"; turn_id: TurnId; kind: ContentKind; text: string }
   | {
       type: "tool_started";
@@ -91,7 +107,17 @@ export type NormalizedEvent =
   // sole event that flips `run_status` from `processing` back to `idle`
   // (the only path out of `processing` — see `AgentRuntime.run_status`
   // docstring in `src/lib/state/types.ts` for the full state machine).
-  | { type: "agent_idle"; agent_id: AgentId };
+  | { type: "agent_idle"; agent_id: AgentId }
+  // A send failed before any turn started (journal write failed, or the
+  // adapter failed to launch pre-`turn_start`). Keyed by `message_id` — there
+  // is no live turn. Carries no prompt; the frontend still holds the
+  // optimistically-rendered text and marks that bubble failed.
+  | { type: "message_failed"; message_id: MessageId; agent_id: AgentId; error: string; at: string }
+  // A queued send was cancelled before it started (its backlog item was dropped
+  // by cancel_send / cancel_agent). Keyed by `message_id`, no `turn_id`. The
+  // authoritative signal that a not-yet-started send is gone — the frontend
+  // renders its cancelled row from this rather than optimistically guessing.
+  | { type: "message_cancelled"; message_id: MessageId; agent_id: AgentId; at: string };
 
 // Synthetic reducer input — fired by the state module's heartbeat timer
 // when no per-turn activity has been observed for HEARTBEAT_TIMEOUT_MS
@@ -112,6 +138,12 @@ export type LoadedTranscript = {
   turns: LoadedTurn[];
   meta?: SessionMetaInfo | null;
   last_rate_limit?: unknown;
+  /// Capture time of `last_rate_limit` when restored from the per-agent
+  /// metadata sidecar (a stream-only/class-C value, e.g. Claude's overage
+  /// signal, that would otherwise be lost on restart). ISO-8601 string.
+  /// `null` for live values and for class-B (already-durable) sources;
+  /// drives the UI "as of …" staleness qualifier.
+  last_rate_limit_as_of?: string | null;
   warnings: ParseWarning[];
 };
 
@@ -134,6 +166,7 @@ export type LoadedTurn =
       role: "agent";
       turn_id: TurnId;
       agent_id: AgentId;
+      send_id?: SendId | null;
       started_at: string;
       ended_at?: string | null;
       status: "streaming" | "complete" | "failed";
@@ -170,6 +203,10 @@ export type Hydrate = {
   turns: LoadedTurn[];
   meta?: SessionMetaInfo | null;
   last_rate_limit?: unknown;
+  /// Capture time of `last_rate_limit` from the metadata sidecar (see
+  /// `LoadedTranscript.last_rate_limit_as_of`). `null` when the value is
+  /// live or class-B.
+  last_rate_limit_as_of?: string | null;
   warnings?: ParseWarning[];
 };
 
@@ -185,80 +222,47 @@ export type ReducerInput = NormalizedEvent | HeartbeatTimeout | Hydrate;
 // pre-generated at registration time.
 export type HarnessKind = "claude_code" | "codex" | "gemini" | "antigravity";
 
-/// Result of the startup-time per-harness probes. `binary` is the
-/// `which`-on-PATH check; `auth` is the best-effort subscription-auth
-/// detection (Codex only — Claude's auth lives in the macOS keychain with
-/// no reliable file signal, deferred to a future release).
-///
-/// **Discriminated union, not a flat record.** The v1 invariant "auth
-/// detection is Codex-only; Claude's auth is always `unsupported`" is
-/// encoded structurally in the type: the Claude variant's `auth` is
-/// the literal `"unsupported"`, the Codex variant's covers the real
-/// probe states. Consumers narrow on `harness` before accessing `auth`,
-/// and `a.auth === "missing"` is only type-checkable for the Codex
-/// variant. This eliminates the runtime-guard-with-defensive-arm
-/// pattern that a flat record forces on every consumer.
-///
-/// A future harness with file-detectable auth adds a new variant
-/// rather than widening Claude's auth field — the compiler then forces
-/// every consumer (banner copy, form gating) to acknowledge the new
-/// case explicitly.
-///
-/// **State semantics** (per the Codex variant; Claude has only
-/// `unsupported`):
-/// - `"checking"`: probe in flight; the initial value at mount. Form
+/// State of the `which`-on-PATH binary probe for a single harness.
+/// - `"checking"`: probe in flight (the initial value at mount). Form
 ///   gating treats this as not-selectable (silent disable — no scary
 ///   "Checking…" copy) so a user racing the probe can't submit before
-///   we know.
+///   the result lands. Fail-closed by type, not by polite hope.
 /// - `"available"`: probe completed positively.
 /// - `"missing"`: probe completed negatively. Banner copy is actionable
-///   (install link / `codex login`).
-/// - `"unsupported"`: only on the Claude variant.
-///
-/// Replacing the original optimistic-"available" default with `"checking"`
-/// makes the pre-probe semantics structural rather than convention-based:
-/// fail-closed by type, not by polite hope.
+///   (install link).
 export type BinaryState = "available" | "missing" | "checking";
 
-export type HarnessAvailability =
-  | {
-      harness: "claude_code";
-      binary: BinaryState;
-      auth: "unsupported";
-    }
-  | {
-      harness: "codex";
-      binary: BinaryState;
-      auth: "available" | "missing" | "checking";
-    }
-  | {
-      harness: "gemini";
-      binary: BinaryState;
-      auth: "available" | "missing" | "checking";
-    }
-  | {
-      harness: "antigravity";
-      binary: BinaryState;
-      auth: "available" | "missing" | "checking";
-    };
-
-/// Structured banner shape. The App.svelte banner-stack ordering rule:
-/// binary-missing banners first; for any harness whose binary is missing,
-/// the auth banner is suppressed (auth is irrelevant if the CLI isn't
-/// installed).
+/// Frontend availability surface. Tracks binary presence only — auth is
+/// **not** a frontend concern in v1: a logged-out harness is discovered
+/// reactively when the user sends, surfaced as an `AuthFailure` turn in
+/// the transcript (with an authored actionable message per adapter). No
+/// proactive banner, no picker gate on auth grounds.
 ///
-/// **v1 invariant encoded in the type**: `auth_missing` is restricted to
-/// harnesses with detectable auth — Codex's `~/.codex/auth.json`,
-/// Gemini's `~/.gemini/settings.json`, and Antigravity's macOS Keychain
-/// entry (service `gemini`, account `antigravity`). Claude's auth is
-/// `"unsupported"` (keychain-based on macOS with no reliable probe yet —
-/// see `HarnessAvailability` docstring). A future Claude auth probe must
-/// add a new banner variant or extend the `harness` literal explicitly;
-/// the closed set prevents accidental auth-banner copy from leaking onto
-/// Claude rows.
-export type HarnessBanner =
-  | { kind: "binary_missing"; harness: HarnessKind }
-  | { kind: "auth_missing"; harness: "codex" | "gemini" | "antigravity" };
+/// The backend `check_*_auth` Tauri commands exist for the getting-started
+/// surface (no-project state) to consume; nothing in the working UI calls
+/// them.
+export type HarnessAvailability = {
+  harness: HarnessKind;
+  binary: BinaryState;
+};
+
+/// Structured banner shape. The only banner variant is the
+/// binary-missing case — a missing CLI is a real install problem the
+/// user needs to act on before sends will work at all. Auth has no
+/// banner: a logged-out harness is surfaced reactively in the transcript
+/// when the user sends.
+export type HarnessBanner = {
+  kind: "binary_missing";
+  harness: HarnessKind;
+};
+
+/// Install status of a harness CLI for the getting-started surface.
+/// Mirrors the Rust `HarnessInstallStatus`. A missing binary is
+/// `installed: false` with `version: null` — data, not an error.
+export type HarnessInstallStatus = {
+  installed: boolean;
+  version: string | null;
+};
 
 export type AgentRecord = {
   id: AgentId;
@@ -273,6 +277,102 @@ export type ProjectSummary = {
   id: ProjectId;
   name: string;
   created_at: string;
+};
+
+// Mirror of Rust `ProjectListing` (`crates/app/src/commands.rs`) — one row of
+// the flat cross-directory project list. `directory` is the owning directory's
+// path (label + spawn cwd); `available` is whether that directory is currently
+// loaded/readable; `last_activity` is the recency-ordering key (journal mtime
+// or `created_at`).
+export type ProjectListing = {
+  id: ProjectId;
+  name: string;
+  created_at: string;
+  directory: string;
+  available: boolean;
+  last_activity: string;
+};
+
+// Mirror of Rust `WorkspaceDirectoryInfo` / `WorkspaceDirectories`. The
+// switcher renders directory rows independent of projects (so empty directories
+// appear), and `persistable === false` means an existing `workspace.yaml`
+// couldn't be read this session — surfaced distinctly from a fresh install so a
+// transient read error doesn't lure the user into re-adding directories that
+// then silently fail to save.
+export type WorkspaceDirectoryInfo = {
+  path: string;
+  available: boolean;
+};
+
+export type WorkspaceDirectories = {
+  directories: WorkspaceDirectoryInfo[];
+  persistable: boolean;
+};
+
+// Mirror of Rust `ProjectConversation` / `ConversationItem` / `OutcomeStatus` /
+// `AgentConversationMeta` (`crates/app/src/commands.rs`). The post-restart
+// unified history: the three `ConversationItem` kinds are disjoint sources
+// (user messages ← journal, agent content ← harness files, outcome markers ←
+// journal), so there is no cross-source dedup. Items arrive pre-sorted by
+// timestamp (user message before its content/markers at equal instants).
+export type OutcomeStatus = "cancelled" | "failed";
+
+export type ConversationItem =
+  | {
+      kind: "user_message";
+      // Stable render identity: the journal `send_id` for a dispatched send, the
+      // harness `turn_id` for an imported prompt. Keys the row; not a join key.
+      id: string;
+      // Grouping key for a fan-out. Null for an imported prompt that predates
+      // journaling (an attached session's history) — it has no journal Send.
+      send_id?: string | null;
+      agent_ids: AgentId[];
+      text: string;
+      at: string;
+    }
+  | {
+      kind: "agent_turn";
+      turn_id: TurnId;
+      agent_id: AgentId;
+      // Recovered by joining this turn's `turn_id` against the journal's Send
+      // records, so a historical fan-out's responses group by `send_id` exactly
+      // like live ones. Null when no Send matched (pre-journal / failed write).
+      send_id?: SendId | null;
+      started_at: string;
+      ended_at?: string | null;
+      status: "streaming" | "complete" | "failed";
+      items: LoadedTurnItem[];
+      usage?: TurnUsage | null;
+    }
+  | {
+      kind: "outcome";
+      turn_id: TurnId;
+      send_id: string;
+      agent_id: AgentId;
+      status: OutcomeStatus;
+      reason?: string | null;
+      at: string;
+    };
+
+// Per-agent metadata carried alongside the merged items. `warnings` and
+// `load_error` are agent-scoped: one agent's transcript failing to load leaves
+// its `load_error` set (and turns absent) while the rest of the project still
+// renders.
+export type AgentConversationMeta = {
+  agent_id: AgentId;
+  meta?: SessionMetaInfo | null;
+  last_rate_limit?: unknown;
+  /// Capture time of `last_rate_limit` from the metadata sidecar (ISO-8601);
+  /// `null`/absent for live or class-B sources. See
+  /// `LoadedTranscript.last_rate_limit_as_of`.
+  last_rate_limit_as_of?: string | null;
+  warnings: ParseWarning[];
+  load_error?: string | null;
+};
+
+export type ProjectConversation = {
+  items: ConversationItem[];
+  agents: AgentConversationMeta[];
 };
 
 export type DirectoryInfo = {

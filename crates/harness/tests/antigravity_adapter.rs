@@ -251,6 +251,44 @@ async fn unresumable_when_no_conversation_dir_appears() {
     }
 }
 
+/// Resilience: if `agy`'s CLI log ever stops naming the conversation (the
+/// Google-internal log line moves on a version bump), capture must degrade to
+/// the brain-dir prompt-correlation fallback rather than fail every turn.
+/// `suppress_conversation_log` omits the id lines while still creating the
+/// brain dir, so only the fallback can bind the UUID.
+#[tokio::test]
+async fn capture_falls_back_to_brain_dir_when_log_omits_the_id() {
+    let home = tempfile::TempDir::new().unwrap();
+    let cwd = tempfile::TempDir::new().unwrap();
+    let adapter = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home.path());
+    let agent = agy_agent();
+    let uuid = Uuid::new_v4();
+
+    write_script(
+        cwd.path(),
+        &json!({
+            "conversation_uuid": uuid.to_string(),
+            "suppress_conversation_log": true,
+            "records": [
+                {"json": user_record("fallback please", "2026-05-19T19:00:00Z"), "delay_ms": 0},
+                {"json": terminal_record("2026-05-19T19:00:01Z", "ok"), "delay_ms": 0},
+            ],
+            "stdout": [drip("ok", 0)],
+            "exit_code": 0,
+        }),
+    );
+
+    let events = dispatch(&adapter, &agent, cwd.path(), "fallback please").await;
+    assert!(
+        matches!(outcome(&events), TurnOutcome::Completed),
+        "fallback prompt-correlation should still bind the conversation"
+    );
+    let latest = read_latest(&sidecar_path(cwd.path(), agent.project_id, agent.id))
+        .unwrap()
+        .expect("sidecar persisted via the fallback path");
+    assert_eq!(latest.conversation_id, uuid);
+}
+
 /// The load-bearing case. A resume whose `--conversation <stale>` expired
 /// server-side: `agy` warns and forks a fresh conversation. The adapter must
 /// (a) heal the sidecar to the new UUID, (b) surface the forked turn's tool
@@ -805,8 +843,12 @@ async fn concurrent_quota_dispatches_read_their_own_logs() {
             message,
         } => {
             assert!(
-                message.contains("Antigravity error: ") && message.contains("Internal"),
-                "B must see its own Internal error, not A's quota: {message}"
+                message.contains("Antigravity error: ") && message.contains("backend exploded"),
+                "B must see its own error's descriptive tail, not A's quota: {message}"
+            );
+            assert!(
+                !message.contains("rpc error: code = "),
+                "Go RPC boilerplate is stripped from the unknown-code message: {message}"
             );
             assert!(
                 !message.contains("quota exhausted"),

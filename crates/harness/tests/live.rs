@@ -766,16 +766,66 @@ async fn live_antigravity_basic_turn_completes() {
 
 #[tokio::test]
 #[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
+async fn live_antigravity_cli_log_names_the_conversation() {
+    // The adapter's PRIMARY conversation-id capture reads `agy`'s own
+    // `--log-file` (a `Created conversation <uuid>` line) — deterministic and
+    // concurrency-safe, unlike the prompt-correlation fallback. That log line is
+    // a Google-internal debug string, so a CLI bump could move it; if it did,
+    // the adapter would silently fall back and the other live tests would still
+    // pass, masking the drift. This test guards the log contract directly: run
+    // real `agy` exactly as the adapter does and assert its `--log-file` still
+    // names the conversation in the form `conversation_id_from_log` parses.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let log = tmp.path().join("agy.log");
+    let status = tokio::process::Command::new("agy")
+        .args([
+            "-p",
+            "Reply with the single word 'ack' and nothing else.",
+            "--dangerously-skip-permissions",
+            "--log-file",
+        ])
+        .arg(&log)
+        .current_dir(tmp.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .expect("agy should spawn");
+    assert!(status.success(), "agy exited non-zero: {status:?}");
+
+    let content = std::fs::read_to_string(&log).expect("agy should write the --log-file");
+    let names_conversation = content.lines().any(|line| {
+        ["Created conversation ", "conversation="]
+            .iter()
+            .any(|marker| {
+                line.split_once(marker)
+                    .map(|(_, rest)| rest.chars().take(36).collect::<String>())
+                    .and_then(|token| Uuid::parse_str(&token).ok())
+                    .is_some()
+            })
+    });
+    assert!(
+        names_conversation,
+        "agy --log-file no longer names the conversation in a parseable form; the adapter's \
+         primary capture (antigravity::conversation_id_from_log) needs updating. Log:\n{content}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
 async fn live_antigravity_adversarial_prompt_still_completes() {
-    // Guards the load-bearing assumption that `agy` echoes the dispatched
-    // prompt verbatim into the transcript's `<USER_REQUEST>` body. Capture
-    // correlates on exact prompt match and a miss is now fatal (unresumable
-    // → failed turn), so if `agy` reformats a non-trivial prompt (reindents
-    // multi-line, escapes quotes, mangles unicode), correlation would miss
-    // and this turn would FAIL. A `Completed` outcome proves the prompt was
-    // echoed verbatim and the exact-match gate is sound for realistic
-    // prompts. If this test fails, loosen `transcript_echoes_prompt` to a
-    // whitespace-normalized comparison (see its docstring).
+    // Guards the *fallback* capture's load-bearing assumption that `agy` echoes
+    // the dispatched prompt verbatim into the transcript's `<USER_REQUEST>`
+    // body. Primary capture now reads the conversation id from the CLI log, so
+    // this dispatch binds via the log (not correlation); but the
+    // prompt-correlation fallback still runs if that log line ever moves, and a
+    // fallback miss is fatal (unresumable → failed turn). This sends the gnarly
+    // multi-line/quoted/unicode shapes most likely to be reformatted and asserts
+    // the real CLI both completes and echoes them verbatim — so the fallback's
+    // exact-match gate stays sound. If this fails, loosen
+    // `transcript_echoes_prompt` to a whitespace-normalized comparison (see its
+    // docstring).
     let tmp = tempfile::TempDir::new().unwrap();
     let adapter = AntigravityAdapter::new();
     let agent = live_antigravity_agent();

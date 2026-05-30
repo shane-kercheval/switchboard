@@ -29,11 +29,13 @@
 //!   "records": [ {"json": "<raw transcript.jsonl line>", "delay_ms": 0} ],
 //!   "stdout": [ {"text": "<answer line>", "delay_ms": 0} ],
 //!   "exit_code": 0,
-//!   "log_file_content": "<text>",    // optional: when set AND the adapter passed
-//!                                    //   --log-file <path>, write the text to that
-//!                                    //   path. Stages content for the no-answer
-//!                                    //   branch's log scan (e.g. a RESOURCE_EXHAUSTED
-//!                                    //   line) without needing the real `agy` CLI.
+//!   "log_file_content": "<text>",    // optional: appended to the --log-file after
+//!                                    //   the conversation-id lines. Stages content
+//!                                    //   for the no-answer branch's log scan (e.g. a
+//!                                    //   RESOURCE_EXHAUSTED line) without the real CLI.
+//!   "suppress_conversation_log": false, // omit the `Created conversation <uuid>` log
+//!                                    //   lines even when a brain dir is created, so a
+//!                                    //   test exercises the brain-dir correlation fallback.
 //!   "hang": false                    // true → after writing records/stdout, sleep
 //!                                    //   indefinitely instead of exiting, so a
 //!                                    //   cancellation test can fire the token while
@@ -41,10 +43,20 @@
 //! }
 //! ```
 //!
+//! ## CLI log (`--log-file`)
+//!
+//! Real `agy` records the server-assigned conversation id in its `--log-file`,
+//! and the adapter reads it back as its **primary** capture signal. So when a
+//! brain dir is created, `fake_agy` writes realistic `Created conversation
+//! <uuid>` + `Print mode: conversation=<uuid>, sending message` lines to that
+//! path by default (suppressible via `suppress_conversation_log`), then appends
+//! `log_file_content`.
+//!
 //! Records are appended (not truncated) so a resume continues the same
 //! `transcript.jsonl`, matching real Antigravity's single-file-per-conversation
 //! behavior.
 
+use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::thread::sleep;
@@ -75,6 +87,12 @@ struct Script {
     /// the same wiring the production adapter uses.
     #[serde(default)]
     log_file_content: String,
+    /// Omit the `Created conversation <uuid>` log lines even when a brain dir
+    /// is created, so a test can exercise the adapter's brain-dir
+    /// prompt-correlation fallback (the path used only if the real CLI's log
+    /// line ever moves).
+    #[serde(default)]
+    suppress_conversation_log: bool,
     /// When true, park indefinitely after writing records/stdout (never exit
     /// on our own), so a cancellation test can fire the token mid-turn. Stays
     /// killable (a sleeping process dies on SIGTERM/SIGKILL).
@@ -132,14 +150,27 @@ fn main() {
         let _ = writeln!(f, "{}", args[1..].join(" "));
     }
 
-    // Stage the per-dispatch CLI log: write the script's `log_file_content`
-    // to whatever path the adapter passed via `--log-file`. Lets a test
-    // stage a `RESOURCE_EXHAUSTED` line that the adapter's no-answer scan
-    // will read through the same wiring as the real `agy` CLI.
-    if !script.log_file_content.is_empty()
-        && let Some(log_path) = arg_value(&args, "--log-file")
-    {
-        let _ = std::fs::write(&log_path, &script.log_file_content);
+    // Stage this dispatch's CLI log at the `--log-file` path. Real `agy`
+    // records the conversation id here and the adapter reads it back as its
+    // primary capture signal, so emit realistic id lines by default when a
+    // conversation is created. The adapter only reads them on first-turn
+    // capture / fork recapture (a normal resume ignores the log), so emitting
+    // them unconditionally is harmless. `log_file_content` (e.g. a staged
+    // RESOURCE_EXHAUSTED line) is appended for the no-answer-branch scan.
+    if let Some(log_path) = arg_value(&args, "--log-file") {
+        let mut log = String::new();
+        if script.create_brain_dir && !script.suppress_conversation_log {
+            let uuid = &script.conversation_uuid;
+            let _ = writeln!(log, "server.go:755] Created conversation {uuid}");
+            let _ = writeln!(
+                log,
+                "printmode.go:130] Print mode: conversation={uuid}, sending message"
+            );
+        }
+        log.push_str(&script.log_file_content);
+        if !log.is_empty() {
+            let _ = std::fs::write(&log_path, &log);
+        }
     }
 
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| {

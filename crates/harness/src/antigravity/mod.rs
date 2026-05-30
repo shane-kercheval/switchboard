@@ -14,10 +14,17 @@
 //!   condition (success, empty prompt, unknown conversation, timeout,
 //!   auth failure), so the exit code is useless for outcome detection;
 //!   stdout text is the failure signal.
-//! - **Server-assigned conversation UUID.** The UUID is minted server-side
-//!   and discovered post-spawn by watching for a new
-//!   `~/.gemini/antigravity-cli/brain/<uuid>/` directory, then persisted to
-//!   the per-agent sidecar (see [`sidecar`]) for resume / hydration.
+//! - **Server-assigned conversation UUID.** The UUID is minted server-side.
+//!   `agy` records it in *this dispatch's* private `--log-file` (a line like
+//!   `… server.go:755] Created conversation <uuid>`), which is the primary,
+//!   deterministic capture source: read straight from our own log, it is the
+//!   conversation this exact invocation used — available in ~seconds
+//!   regardless of cold-start latency, and never cross-attributed from a
+//!   concurrent or background `agy` (each writes its own log). It is then
+//!   persisted to the per-agent sidecar (see [`sidecar`]) for resume /
+//!   hydration. A filesystem fallback (watch `brain/<uuid>/` for a dir whose
+//!   transcript echoes the prompt) covers the case where that Google-internal
+//!   log line ever moves — see [`capture_conversation_id`].
 //! - **Transcript-sourced content; stdout is a control channel.** All
 //!   displayed content — assistant text, `thinking`, and tool lifecycle
 //!   (`ToolStarted` / `ToolCompleted`) — comes from tailing the conversation's
@@ -94,13 +101,8 @@ pub const FAKE_AGY_SCRIPT_FILE: &str = ".fake_agy.json";
 /// `--conversation <healed-uuid>` on the post-fork resume).
 pub const FAKE_AGY_INVOCATIONS_FILE: &str = ".fake_agy.invocations";
 
-/// Poll interval for UUID-directory discovery and transcript tailing.
+/// Poll interval for log-file UUID discovery and transcript tailing.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
-
-/// How long to wait for the conversation directory to appear before giving
-/// up. Matches the user-visible "agent starting" pause we tolerate
-/// elsewhere; an early child exit short-circuits this.
-const UUID_CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Post-exit drain attempts for the terminal answer. The in-loop poll already
 /// catches the common case (the answer record lands before `agy` exits); this
@@ -427,7 +429,6 @@ async fn run_producer(ctx: ProducerCtx) {
     // transcript on a tick — cancellation is just one more arm.
     let mut cancelled = false;
     let mut exit_status: Option<std::process::ExitStatus> = None;
-    let capture_deadline = spawn_time + UUID_CAPTURE_TIMEOUT;
 
     let mut poll = tokio::time::interval(POLL_INTERVAL);
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -466,7 +467,7 @@ async fn run_producer(ctx: ProducerCtx) {
             }
             _ = poll.tick() => {
                 if conversation_id.is_none() {
-                    match correlate_conversation_dir(&home_dir, spawn_time, &prompt) {
+                    match capture_conversation_id(&log_file_path, &home_dir, spawn_time, &prompt) {
                         CaptureOutcome::Bound(uuid) => {
                             conversation_id = Some(uuid);
                             transcript_path = Some(paths::transcript_path(&home_dir, uuid));
@@ -517,11 +518,23 @@ async fn run_producer(ctx: ProducerCtx) {
         if stdout_eof && exit_status.is_some() {
             break;
         }
-        // First-turn UUID never appeared and the process is gone / timed out:
-        // nothing more will be written. Stop waiting.
-        if conversation_id.is_none()
-            && (exit_status.is_some() || SystemTime::now() >= capture_deadline)
-        {
+        // First-turn UUID never appeared and the child has exited (one-shot
+        // turn done, log + transcript flushed) — nothing more will be written,
+        // so stop. **No wall-clock capture deadline**: the conversation id is
+        // read from `agy`'s own log file, which lands in ~seconds independent of
+        // server-response latency, so there is no slow-cold-start to race, and
+        // the terminator is process exit (a real event) plus cancellation — the
+        // *same* terminators the Claude/Codex/Gemini producers use; none of them
+        // has a capture/run timeout and the dispatcher has no turn deadline, so
+        // removing this one aligns Antigravity with that pattern (it was the odd
+        // one out, and the old 5s deadline actively false-failed healthy ~10s
+        // cold starts). The residual gap — an `agy` that spawns, emits nothing,
+        // and never exits pins the turn until manual cancel — is systemic across
+        // all adapters, not introduced here; an automatic backstop for a
+        // zero-output wedge, if ever wanted, belongs in the dispatcher for every
+        // adapter, not as an Antigravity-only timeout that would reintroduce the
+        // cold-start false-fail.
+        if conversation_id.is_none() && exit_status.is_some() {
             break;
         }
     }
@@ -568,7 +581,7 @@ async fn run_producer(ctx: ProducerCtx) {
     // still completed (a real answer streamed), so it is not failed.
     let resume_forked = is_resume && conversation_not_found(&stdout_buf, &stderr_tail);
     if conversation_id.is_none() || resume_forked {
-        match correlate_conversation_dir(&home_dir, spawn_time, &prompt) {
+        match capture_conversation_id(&log_file_path, &home_dir, spawn_time, &prompt) {
             CaptureOutcome::Bound(uuid) => {
                 if resume_forked {
                     tracing::warn!(
@@ -590,17 +603,18 @@ async fn run_producer(ctx: ProducerCtx) {
             CaptureOutcome::Ambiguous => ambiguous_capture = true,
             CaptureOutcome::NotYet => {
                 // Recapture was required (first turn never bound, or a resume
-                // forked) but no conversation directory matched this dispatch
-                // — most likely the `.system_generated/` transcript path
-                // changed, or agy didn't echo the prompt verbatim. The agent
-                // can't be made resumable; fail loud rather than silently
-                // complete on the stdout answer (which would leave it amnesiac
-                // every turn).
+                // forked) but neither the log file nor the brain-dir fallback
+                // yielded this dispatch's conversation id — most likely the
+                // `Created conversation <uuid>` log line moved *and* the
+                // `.system_generated/` transcript path changed (or `agy` didn't
+                // echo the prompt verbatim). The agent can't be made resumable;
+                // fail loud rather than silently complete on the stdout answer
+                // (which would leave it amnesiac every turn).
                 unresumable = true;
                 tracing::warn!(
                     %turn_id, agent_id = %agent_id, resume_forked,
-                    "antigravity: produced output but could not locate the conversation \
-                     directory; the agent cannot be resumed"
+                    "antigravity: produced output but could not identify the conversation \
+                     (no id in the CLI log, no matching brain dir); the agent cannot be resumed"
                 );
             }
         }
@@ -727,15 +741,84 @@ fn persist_sidecar(sidecar_file: &Path, uuid: Uuid) -> Result<(), sidecar::Sidec
 /// directory.
 #[derive(Debug)]
 enum CaptureOutcome {
-    /// No candidate transcript yet contains this dispatch's prompt — keep
-    /// polling (the dir/transcript may not be written yet).
+    /// The conversation id isn't readable yet — neither in the CLI log nor (in
+    /// the fallback) a matching brain dir. Keep polling; the child may not have
+    /// logged it yet.
     NotYet,
-    /// Exactly one in-window conversation echoes this dispatch's prompt.
+    /// The conversation id for this dispatch (from the log, or unambiguously
+    /// from the brain-dir fallback).
     Bound(Uuid),
-    /// Two or more in-window conversations echo this prompt (e.g. identical
-    /// concurrent prompts in the same cwd). Binding either would risk
-    /// attaching to the wrong conversation, so fail loud instead of guessing.
+    /// **Fallback path only.** Two or more in-window conversations echo this
+    /// prompt (e.g. identical concurrent prompts in the same cwd). Binding
+    /// either would risk attaching to the wrong conversation, so fail loud
+    /// instead of guessing. The primary log-file path can't produce this — the
+    /// id is read from this dispatch's own private log.
     Ambiguous,
+}
+
+/// Capture this dispatch's server-assigned conversation id.
+///
+/// **Primary: read it from `agy`'s own log file.** `agy` mints the
+/// conversation server-side and logs the id to the `--log-file` we passed
+/// (unique per dispatch). Reading it from *our* log is deterministic, lands in
+/// ~seconds regardless of server-response/cold-start latency, and is immune to
+/// cross-attribution: a concurrent or background `agy` writes its *own* log,
+/// never ours, so there is no shared-resource race and no "two identical
+/// prompts" ambiguity. This replaced a filesystem race that watched the shared
+/// `brain/` dir and matched the prompt — which both raced the (slow, ~10s on a
+/// cold start) transcript write and could collide on identical concurrent
+/// prompts.
+///
+/// **Fallback: the prompt-correlation watch.** If the log yields nothing — the
+/// `Created conversation <uuid>` line is a Google-internal debug string that
+/// could move on a CLI bump — degrade to [`correlate_conversation_dir`] so
+/// turns keep working (with the older concurrency caveat) instead of
+/// hard-failing every turn. A CLI bump that moves the log line is caught by the
+/// live test before users see it.
+fn capture_conversation_id(
+    log_path: &Path,
+    home_dir: &Path,
+    since: SystemTime,
+    prompt: &str,
+) -> CaptureOutcome {
+    if let Some(uuid) = conversation_id_from_log(log_path) {
+        return CaptureOutcome::Bound(uuid);
+    }
+    correlate_conversation_dir(home_dir, since, prompt)
+}
+
+/// The conversation id `agy` recorded in this dispatch's private CLI log.
+///
+/// `agy` logs the id it uses, e.g. (real `agy` 1.0.3, glog format):
+/// - `… server.go:755] Created conversation <uuid>` — a freshly minted one
+/// - `… printmode.go:130] Print mode: conversation=<uuid>, sending message` —
+///   the one the message is actually sent to (first turn, resume, or the new
+///   id after a fork-and-heal).
+///
+/// We key on either marker and return the **last** id seen, so a fork's fresh
+/// conversation (logged after the stale resume id) wins. Matching is anchored
+/// to the marker text — `conversationID="…"` (the unused "starting" line) does
+/// not contain `conversation=` and so never false-matches.
+fn conversation_id_from_log(log_path: &Path) -> Option<Uuid> {
+    let content = std::fs::read_to_string(log_path).ok()?;
+    let mut found: Option<Uuid> = None;
+    for line in content.lines() {
+        for marker in ["Created conversation ", "conversation="] {
+            if let Some((_, rest)) = line.split_once(marker)
+                && let Some(uuid) = uuid_prefix(rest)
+            {
+                found = Some(uuid);
+            }
+        }
+    }
+    found
+}
+
+/// Parse a UUID from the start of `s` — the 36-char canonical form, however it
+/// is delimited afterward (`,`, space, `"`, end-of-line).
+fn uuid_prefix(s: &str) -> Option<Uuid> {
+    let token: String = s.chars().take(36).collect();
+    Uuid::parse_str(&token).ok()
 }
 
 /// Correlate this dispatch to its server-assigned conversation by matching
@@ -1011,7 +1094,15 @@ fn rpc_error_to_message(detail: &str) -> String {
         }
         return msg;
     }
-    format!("Antigravity error: {detail}")
+    // Unknown/never-observed code: strip the `rpc error: code = … desc = `
+    // gRPC plumbing the same way the quota branch does, so the user sees the
+    // descriptive tail rather than Go boilerplate. (No `desc = ` → the tail
+    // helper returns the line unchanged, which is acceptable for a code we
+    // haven't yet authored a message for.)
+    format!(
+        "Antigravity error: {}",
+        extract_rpc_descriptive_tail(detail)
+    )
 }
 
 /// Strip the `rpc error: code = <CODE> desc = ` prefix and the duplicated
@@ -1197,8 +1288,8 @@ mod tests {
 
     #[test]
     fn build_log_file_path_is_unique_per_turn() {
-        let a = build_log_file_path(Uuid::now_v7());
-        let b = build_log_file_path(Uuid::now_v7());
+        let a = build_log_file_path(Uuid::new_v4());
+        let b = build_log_file_path(Uuid::new_v4());
         assert_ne!(a, b, "different turn ids must yield different log paths");
         assert!(
             a.starts_with(std::env::temp_dir()),
@@ -1210,8 +1301,8 @@ mod tests {
     async fn dispatch_rejects_empty_prompt_before_spawn() {
         let adapter = AntigravityAdapter::with_binary_path("/nonexistent");
         let agent = AgentRecord {
-            id: Uuid::now_v7(),
-            project_id: Uuid::now_v7(),
+            id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
             name: "a".to_owned(),
             harness: switchboard_core::HarnessKind::Antigravity,
             session_id: None,
@@ -1223,7 +1314,7 @@ mod tests {
                 &agent,
                 cwd.path(),
                 "   ",
-                Uuid::now_v7(),
+                Uuid::new_v4(),
                 DispatchOptions::default(),
             )
             .await;
@@ -1297,6 +1388,136 @@ mod tests {
             correlate_conversation_dir(home.path(), since, "summarize"),
             CaptureOutcome::NotYet
         ));
+    }
+
+    /// Write a realistic `agy` CLI log naming the conversation it created.
+    fn write_log(path: &Path, uuid: Uuid) {
+        std::fs::write(
+            path,
+            format!(
+                "I0529 server.go:734] Conversation using project ID: proj\n\
+                 I0529 server.go:755] Created conversation {uuid}\n\
+                 I0529 printmode.go:130] Print mode: conversation={uuid}, sending message\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn conversation_id_read_from_log_is_the_logged_uuid() {
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("agy.log");
+        let uuid = Uuid::new_v4();
+        write_log(&log, uuid);
+        assert_eq!(conversation_id_from_log(&log), Some(uuid));
+    }
+
+    #[test]
+    fn conversation_id_from_log_ignores_the_empty_starting_line() {
+        // The first-turn "starting" line carries `conversationID=""` (note the
+        // `ID=`, not `conversation=`) — it must not be mistaken for an id.
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("agy.log");
+        let uuid = Uuid::new_v4();
+        std::fs::write(
+            &log,
+            format!(
+                "I0529 printmode.go:71] Print mode: starting (promptLength=22, conversationID=\"\")\n\
+                 I0529 server.go:755] Created conversation {uuid}\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(conversation_id_from_log(&log), Some(uuid));
+    }
+
+    #[test]
+    fn conversation_id_from_log_returns_last_so_a_fork_wins() {
+        // A fork logs the stale resume id, then mints + logs a fresh one; the
+        // fresh (last) id must win so we heal to the conversation that actually
+        // carries this turn's answer.
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("agy.log");
+        let stale = Uuid::new_v4();
+        let fresh = Uuid::new_v4();
+        std::fs::write(
+            &log,
+            format!(
+                "I0529 printmode.go:130] Print mode: conversation={stale}, sending message\n\
+                 I0529 server.go] Warning: conversation \"{stale}\" not found.\n\
+                 I0529 server.go:755] Created conversation {fresh}\n\
+                 I0529 printmode.go:130] Print mode: conversation={fresh}, sending message\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(conversation_id_from_log(&log), Some(fresh));
+    }
+
+    #[test]
+    fn conversation_id_from_log_ignores_a_half_written_final_line() {
+        // The producer reads the log *while* `agy` is writing it (every poll
+        // tick). A partially-flushed final id line yields fewer than 36 chars,
+        // so `uuid_prefix` fails to parse and we return None and keep polling —
+        // never binding a truncated-but-wrong id. Pins the "safe to read
+        // mid-write" property the polling design relies on.
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("agy.log");
+        // No trailing newline; the uuid is cut short mid-flush.
+        std::fs::write(
+            &log,
+            "I0529 server.go:755] Created conversation 7b1024a8-f1df-",
+        )
+        .unwrap();
+        assert_eq!(conversation_id_from_log(&log), None);
+    }
+
+    #[test]
+    fn conversation_id_from_log_none_when_absent_or_unreadable() {
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("agy.log");
+        std::fs::write(&log, "I0529 server.go] nothing relevant here\n").unwrap();
+        assert_eq!(conversation_id_from_log(&log), None);
+        // Missing file → None (not an error).
+        assert_eq!(
+            conversation_id_from_log(&dir.path().join("missing.log")),
+            None
+        );
+    }
+
+    #[test]
+    fn capture_prefers_the_log_and_is_immune_to_a_same_prompt_sibling() {
+        // The log names *our* conversation directly. Even with a sibling
+        // conversation echoing the identical prompt on disk (which would make
+        // the brain-dir fallback `Ambiguous`), capture binds our logged id with
+        // no ambiguity — the concurrency-safety the log path buys.
+        let dir = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let log = dir.path().join("agy.log");
+        let mine = Uuid::new_v4();
+        write_log(&log, mine);
+        let since = SystemTime::now() - Duration::from_secs(1);
+        stage_conversation(home.path(), Uuid::new_v4(), "identical prompt");
+        stage_conversation(home.path(), mine, "identical prompt");
+        match capture_conversation_id(&log, home.path(), since, "identical prompt") {
+            CaptureOutcome::Bound(uuid) => assert_eq!(uuid, mine),
+            other => panic!("expected Bound(mine) from the log, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn capture_falls_back_to_brain_dir_when_the_log_has_no_id() {
+        // If the log line ever moves (no id parseable), capture degrades to the
+        // prompt-correlation watch rather than hard-failing.
+        let dir = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let log = dir.path().join("agy.log");
+        std::fs::write(&log, "I0529 some.go] format changed, no id here\n").unwrap();
+        let mine = Uuid::new_v4();
+        let since = SystemTime::now() - Duration::from_secs(1);
+        stage_conversation(home.path(), mine, "remember mango");
+        match capture_conversation_id(&log, home.path(), since, "remember mango") {
+            CaptureOutcome::Bound(uuid) => assert_eq!(uuid, mine),
+            other => panic!("expected fallback Bound(mine), got {other:?}"),
+        }
     }
 
     #[test]
@@ -1694,7 +1915,14 @@ mod tests {
             msg.starts_with("Antigravity error: "),
             "unknown code passes through with authored prefix: {msg}"
         );
-        assert!(msg.contains("Internal"), "carries the code: {msg}");
+        assert!(
+            msg.contains("backend exploded"),
+            "carries the descriptive tail: {msg}"
+        );
+        assert!(
+            !msg.contains("rpc error: code = "),
+            "Go RPC boilerplate is stripped: {msg}"
+        );
     }
 
     #[test]

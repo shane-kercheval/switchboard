@@ -2,7 +2,7 @@
 
 **Status:** proposed · **Created:** 2026-05-30
 
-Ship a distributable Switchboard build that macOS users — developers already using Claude Code, Codex, or Gemini — can install with a single Homebrew command. The plan has three milestones: consolidate version management (eliminating a three-file sync problem), automate builds via a GitHub Release CI workflow, and create a Homebrew tap so `brew install --cask` works with zero Gatekeeper friction.
+Ship a distributable Switchboard build that macOS users — developers already using Claude Code, Codex, or Gemini — can install with a single Homebrew command. The plan has four milestones: isolate dev and production config paths, consolidate version management (eliminating a three-file sync problem), automate builds via a GitHub Release CI workflow, and create a Homebrew tap so `brew install --cask` works with zero Gatekeeper friction.
 
 **Scope decisions:**
 
@@ -14,7 +14,49 @@ Ship a distributable Switchboard build that macOS users — developers already u
 
 ---
 
-## Milestone 1 — Version management and local release build
+## Milestone 1 — Dev/prod global config isolation
+
+### Goal & Outcome
+
+Dev builds and the installed production app use separate global config paths, so a developer's `workspace.yaml` (the project/directory list) cannot bleed into or overwrite the production one and vice versa.
+
+- `make dev` (a debug build) resolves global state to `~/Library/Application Support/switchboard-dev/`.
+- The installed app (a release build) resolves global state to `~/Library/Application Support/switchboard/`.
+- The separation is automatic — no env var to remember, no manual setup.
+
+### Implementation Outline
+
+The only change is in `crates/app/src/lib.rs` at the `ProjectDirs::from` call (line ~474), where `"switchboard"` is passed as the application name:
+
+```rust
+if let Some(dirs) = directories::ProjectDirs::from("", "", "switchboard") {
+```
+
+The `directories` crate derives the OS config path from this name (`~/Library/Application Support/<name>/` on macOS). Change it to select the name based on the build profile:
+
+```rust
+#[cfg(debug_assertions)]
+let app_name = "switchboard-dev";
+#[cfg(not(debug_assertions))]
+let app_name = "switchboard";
+
+if let Some(dirs) = directories::ProjectDirs::from("", "", app_name) {
+```
+
+`debug_assertions` is enabled for `cargo build` (debug) and `tauri dev`, and disabled for `cargo build --release` and `pnpm tauri build`. This maps exactly to the desired split: dev shell → `-dev` path, installed app → production path.
+
+Per-project `.switchboard/` directories are unaffected — they're local to each working directory, not global, and don't need isolation.
+
+### Definition of Done
+
+- Running `make dev`, opening the app, and adding a directory writes `workspace.yaml` to `~/Library/Application Support/switchboard-dev/`, not `switchboard/`.
+- A release build (`make release-build`) reads from `~/Library/Application Support/switchboard/`.
+- `make check` green.
+- No unit test needed — the path selection has no logic to test; the manual verification above is the proof.
+
+---
+
+## Milestone 2 — Version management and local release build
 
 ### Goal & Outcome
 
@@ -73,7 +115,7 @@ Step 6 (Homebrew tap update) is added in M3.
 
 ---
 
-## Milestone 2 — GitHub Release CI workflow
+## Milestone 3 — GitHub Release CI workflow
 
 ### Goal & Outcome
 
@@ -115,7 +157,7 @@ Pushing a `v*` tag automatically builds the universal `.dmg` and publishes it as
 
 ---
 
-## Milestone 3 — Homebrew tap and README
+## Milestone 4 — Homebrew tap and README
 
 ### Goal & Outcome
 

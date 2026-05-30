@@ -333,7 +333,7 @@
     <div class="relative flex items-end gap-2">
       {#if menuOpen && menuItems.length > 0}
         <div
-          class="border-border bg-raised absolute bottom-full left-0 z-10 mb-1 max-h-64 w-64 overflow-y-auto rounded-lg border p-1.5 shadow-[0_10px_28px_rgba(0,0,0,0.12)]"
+          class="border-border/90 bg-raised absolute bottom-full left-0 z-10 mb-1 max-h-64 w-64 overflow-y-auto rounded-lg border p-1 text-[13px] shadow-[0_10px_28px_rgba(0,0,0,0.10)]"
           data-testid="recipient-menu"
           role="listbox"
           bind:this={menuEl}
@@ -341,8 +341,8 @@
           {#each menuItems as item, i (item.key)}
             <button
               type="button"
-              class={"hover:bg-panel flex w-full items-center gap-2.5 rounded-md px-3 py-1.5 text-left text-sm " +
-                (i === highlighted ? "bg-panel" : "")}
+              class={"hover:bg-panel/80 flex w-full cursor-pointer items-center gap-2.5 rounded-md px-2.5 py-1.5 text-left leading-5 outline-none select-none " +
+                (i === highlighted ? "bg-panel/80" : "")}
               data-testid={`recipient-option-${item.key}`}
               role="option"
               aria-selected={i === highlighted}

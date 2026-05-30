@@ -497,7 +497,7 @@ describe("App", () => {
     });
     const createCalls = invokeMock.mock.calls.filter(([c]) => c === "create_agent");
     expect(createCalls).toHaveLength(1);
-    expect(createCalls[0]?.[1]).toEqual({ name: "assistant", harness: "claude_code" });
+    expect(createCalls[0]?.[1]).toEqual({ name: "claude-code", harness: "claude_code" });
   });
 
   it("add agent via the sidebar modal registers a listener and appends to the roster", async () => {

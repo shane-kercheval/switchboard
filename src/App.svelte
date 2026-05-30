@@ -462,6 +462,7 @@
               busy={firstAgentBusy}
               error={firstAgentError}
               onSubmit={handleCreateFirstAgent}
+              roster={activeAgents}
               {claudeAvailability}
               {codexAvailability}
               {geminiAvailability}
@@ -619,6 +620,7 @@
     bind:open={addAgentOpen}
     busy={addAgentBusy}
     error={addAgentError}
+    roster={activeAgents}
     {claudeAvailability}
     {codexAvailability}
     {geminiAvailability}

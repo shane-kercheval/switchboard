@@ -3,7 +3,18 @@ import "@testing-library/jest-dom/vitest";
 import { fireEvent, render, screen } from "@testing-library/svelte";
 import CreateAgentForm from "./CreateAgentForm.svelte";
 import type { AgentFormSubmit } from "./CreateAgentForm.types";
-import type { HarnessAvailability } from "$lib/types";
+import type { AgentRecord, HarnessAvailability } from "$lib/types";
+
+function rosterAgent(name: string): AgentRecord {
+  return {
+    id: `id-${name}`,
+    project_id: "p1",
+    name,
+    harness: "claude_code",
+    session_id: null,
+    created_at: "2026-05-29T00:00:00Z",
+  };
+}
 
 const CLAUDE_AVAILABLE: HarnessAvailability = { harness: "claude_code", binary: "available" };
 const CLAUDE_BINARY_MISSING: HarnessAvailability = { harness: "claude_code", binary: "missing" };
@@ -29,7 +40,7 @@ describe("CreateAgentForm", () => {
     await fireEvent.click(screen.getByTestId("confirm-create-agent"));
     expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
       mode: "create",
-      name: "assistant",
+      name: "claude-code",
       harness: "claude_code",
     } satisfies AgentFormSubmit);
   });
@@ -40,7 +51,7 @@ describe("CreateAgentForm", () => {
     await fireEvent.click(screen.getByTestId("confirm-create-agent"));
     expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
       mode: "create",
-      name: "assistant",
+      name: "codex",
       harness: "codex",
     } satisfies AgentFormSubmit);
   });
@@ -54,7 +65,7 @@ describe("CreateAgentForm", () => {
     await fireEvent.click(screen.getByTestId("confirm-create-agent"));
     expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
       mode: "attach",
-      name: "assistant",
+      name: "claude-code",
       harness: "claude_code",
       existingSessionId: VALID_UUID,
     } satisfies AgentFormSubmit);
@@ -111,7 +122,7 @@ describe("CreateAgentForm", () => {
     await fireEvent.click(screen.getByTestId("confirm-create-agent"));
     expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
       mode: "create",
-      name: "assistant",
+      name: "gemini",
       harness: "gemini",
     } satisfies AgentFormSubmit);
   });
@@ -125,7 +136,7 @@ describe("CreateAgentForm", () => {
     await fireEvent.click(screen.getByTestId("confirm-create-agent"));
     expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
       mode: "attach",
-      name: "assistant",
+      name: "gemini",
       harness: "gemini",
       existingSessionId: VALID_UUID,
     } satisfies AgentFormSubmit);
@@ -154,7 +165,7 @@ describe("CreateAgentForm", () => {
     await fireEvent.click(screen.getByTestId("confirm-create-agent"));
     expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
       mode: "attach",
-      name: "assistant",
+      name: "codex",
       harness: "codex",
       existingSessionId: VALID_UUID,
     } satisfies AgentFormSubmit);
@@ -189,7 +200,7 @@ describe("CreateAgentForm", () => {
     await fireEvent.click(screen.getByTestId("confirm-create-agent"));
     expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
       mode: "create",
-      name: "assistant",
+      name: "claude-code",
       harness: "claude_code",
     } satisfies AgentFormSubmit);
   });
@@ -274,5 +285,109 @@ describe("CreateAgentForm", () => {
     const sessionInputAgain = screen.getByTestId("attach-session-id") as HTMLInputElement;
     expect(sessionInputAgain.value).toBe("");
     expect(screen.queryByTestId("attach-session-id-error")).not.toBeInTheDocument();
+  });
+
+  it("duplicate name disables Create and shows the validation message", async () => {
+    const onSubmit = vi.fn();
+    render(CreateAgentForm, { props: { onSubmit, roster: [rosterAgent("codex")] } });
+    const nameInput = screen.getByTestId("agent-name") as HTMLInputElement;
+    await fireEvent.input(nameInput, { target: { value: "codex" } });
+    expect(screen.getByTestId("agent-name-error")).toHaveTextContent("already exists");
+    expect((screen.getByTestId("confirm-create-agent") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("duplicate detection is canonicalized (hyphen/case-insensitive)", async () => {
+    const onSubmit = vi.fn();
+    render(CreateAgentForm, { props: { onSubmit, roster: [rosterAgent("claude-code")] } });
+    const nameInput = screen.getByTestId("agent-name") as HTMLInputElement;
+    await fireEvent.input(nameInput, { target: { value: "Claude_Code" } });
+    expect(screen.getByTestId("agent-name-error")).toBeInTheDocument();
+    expect((screen.getByTestId("confirm-create-agent") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("fixing a duplicate name re-enables Create and clears the message", async () => {
+    const onSubmit = vi.fn();
+    render(CreateAgentForm, { props: { onSubmit, roster: [rosterAgent("codex")] } });
+    const nameInput = screen.getByTestId("agent-name") as HTMLInputElement;
+    await fireEvent.input(nameInput, { target: { value: "codex" } });
+    expect((screen.getByTestId("confirm-create-agent") as HTMLButtonElement).disabled).toBe(true);
+    await fireEvent.input(nameInput, { target: { value: "codex-2" } });
+    expect(screen.queryByTestId("agent-name-error")).not.toBeInTheDocument();
+    expect((screen.getByTestId("confirm-create-agent") as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("invalid characters disable Create and show the message", async () => {
+    const onSubmit = vi.fn();
+    render(CreateAgentForm, { props: { onSubmit } });
+    const nameInput = screen.getByTestId("agent-name") as HTMLInputElement;
+    await fireEvent.input(nameInput, { target: { value: "bad name" } });
+    expect(screen.getByTestId("agent-name-error")).toHaveTextContent("letters, numbers");
+    expect((screen.getByTestId("confirm-create-agent") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("empty name disables Create without showing an error message (no mid-edit nag)", async () => {
+    const onSubmit = vi.fn();
+    render(CreateAgentForm, { props: { onSubmit } });
+    const nameInput = screen.getByTestId("agent-name") as HTMLInputElement;
+    await fireEvent.input(nameInput, { target: { value: "" } });
+    expect(screen.queryByTestId("agent-name-error")).not.toBeInTheDocument();
+    expect((screen.getByTestId("confirm-create-agent") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("flags the default name on open when it already collides with the roster", () => {
+    // Realistic add-another-agent case: an auto-created "claude-code" already
+    // exists, so the form opens with its default name already flagged.
+    const onSubmit = vi.fn();
+    render(CreateAgentForm, { props: { onSubmit, roster: [rosterAgent("claude-code")] } });
+    expect(screen.getByTestId("agent-name-error")).toHaveTextContent("already exists");
+    expect((screen.getByTestId("confirm-create-agent") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("submits the normalized (trimmed) name", async () => {
+    const onSubmit = vi.fn();
+    render(CreateAgentForm, { props: { onSubmit } });
+    const nameInput = screen.getByTestId("agent-name") as HTMLInputElement;
+    await fireEvent.input(nameInput, { target: { value: "  my-agent  " } });
+    await fireEvent.click(screen.getByTestId("confirm-create-agent"));
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
+      mode: "create",
+      name: "my-agent",
+      harness: "claude_code",
+    } satisfies AgentFormSubmit);
+  });
+
+  it("attach mode: a valid UUID with a duplicate name keeps submit disabled (both gates apply)", async () => {
+    const onSubmit = vi.fn();
+    render(CreateAgentForm, { props: { onSubmit, roster: [rosterAgent("codex")] } });
+    await fireEvent.click(screen.getByTestId("mode-attach"));
+    const sessionInput = screen.getByTestId("attach-session-id") as HTMLInputElement;
+    await fireEvent.input(sessionInput, { target: { value: VALID_UUID } });
+    const nameInput = screen.getByTestId("agent-name") as HTMLInputElement;
+    await fireEvent.input(nameInput, { target: { value: "codex" } });
+    // UUID is valid, so the only remaining gate is the duplicate name.
+    expect(screen.queryByTestId("attach-session-id-error")).not.toBeInTheDocument();
+    expect(screen.getByTestId("agent-name-error")).toBeInTheDocument();
+    expect((screen.getByTestId("confirm-create-agent") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("aria-invalid tracks validity (incl. empty); aria-describedby links the message only when shown", async () => {
+    const onSubmit = vi.fn();
+    render(CreateAgentForm, { props: { onSubmit, roster: [rosterAgent("codex")] } });
+    const nameInput = screen.getByTestId("agent-name") as HTMLInputElement;
+    // Default "claude-code" is valid: not invalid, no description.
+    expect(nameInput.getAttribute("aria-invalid")).toBe("false");
+    expect(nameInput.getAttribute("aria-describedby")).toBeNull();
+
+    // Empty: invalid for assistive tech, but no visible message/border (no nag).
+    await fireEvent.input(nameInput, { target: { value: "" } });
+    expect(nameInput.getAttribute("aria-invalid")).toBe("true");
+    expect(screen.queryByTestId("agent-name-error")).not.toBeInTheDocument();
+    expect(nameInput.getAttribute("aria-describedby")).toBeNull();
+
+    // Duplicate: invalid and the message is linked.
+    await fireEvent.input(nameInput, { target: { value: "codex" } });
+    expect(nameInput.getAttribute("aria-invalid")).toBe("true");
+    expect(nameInput.getAttribute("aria-describedby")).toBe("agent-name-error");
+    expect(screen.getByTestId("agent-name-error")).toBeInTheDocument();
   });
 });

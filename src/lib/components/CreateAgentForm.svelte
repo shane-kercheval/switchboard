@@ -1,7 +1,8 @@
 <script lang="ts">
-  import type { HarnessAvailability, HarnessKind } from "$lib/types";
+  import type { AgentRecord, HarnessAvailability, HarnessKind } from "$lib/types";
   import type { AgentFormSubmit } from "./CreateAgentForm.types";
   import { harnessUnavailableReason, isHarnessSelectable } from "$lib/harnessAvailability";
+  import { normalizeAgentName, validateAgentName } from "$lib/agentName";
   import Button from "$lib/components/ui/Button.svelte";
   import Input from "$lib/components/ui/Input.svelte";
   import { cn } from "$lib/utils";
@@ -23,6 +24,10 @@
     /// "standalone phase" (the no-agent first-time flow), which keeps the
     /// existing page-fill card layout.
     onCancel?: () => void;
+    /// Existing agents in the active project, for the live name-uniqueness
+    /// check. Defaults to empty (the no-agent first-time flow has none, and
+    /// tests that don't exercise uniqueness render unchanged).
+    roster?: AgentRecord[];
     /// Optional per-harness availability. When provided, gates the radio
     /// buttons (and the submit button if the currently-selected harness
     /// is unavailable) on binary-presence only. Tooltip copy matches the
@@ -40,6 +45,7 @@
     error = null,
     onSubmit,
     onCancel,
+    roster = [],
     claudeAvailability = { harness: "claude_code", binary: "available" },
     codexAvailability = { harness: "codex", binary: "available" },
     geminiAvailability = { harness: "gemini", binary: "available" },
@@ -105,10 +111,20 @@
 
   const sessionIdValid = $derived(mode !== "attach" || UUID_PATTERN.test(existingSessionId.trim()));
 
-  const canSubmit = $derived(!busy && name.trim() !== "" && sessionIdValid && selectedSelectable);
+  /// Live name validation against the format rules and the roster (shared with
+  /// the backend's authoritative check via `$lib/agentName`). `nameError` is
+  /// the visible message: suppressed for the `empty` reason so an empty field
+  /// disables submit without nagging the user mid-edit — mirrors how the
+  /// attach session-id hint only appears once the user has typed.
+  const nameValidation = $derived(validateAgentName(name, roster));
+  const nameError = $derived(
+    nameValidation.ok || nameValidation.reason === "empty" ? null : nameValidation.message,
+  );
+
+  const canSubmit = $derived(!busy && nameValidation.ok && sessionIdValid && selectedSelectable);
 
   function handleSubmit(): void {
-    const trimmedName = name.trim();
+    const trimmedName = normalizeAgentName(name);
     if (mode === "create") {
       onSubmit({ mode: "create", name: trimmedName, harness });
     } else {
@@ -288,7 +304,24 @@
 
   <label class="block space-y-1">
     <span class="text-muted text-xs">Agent name</span>
-    <Input bind:value={name} disabled={busy} data-testid="agent-name" class="h-8 px-2" />
+    <Input
+      bind:value={name}
+      disabled={busy}
+      data-testid="agent-name"
+      class={cn("h-8 px-2", nameError && "border-status-failed")}
+      aria-invalid={!nameValidation.ok}
+      aria-describedby={nameError ? "agent-name-error" : undefined}
+      title={nameError ?? undefined}
+    />
+    {#if nameError}
+      <span
+        id="agent-name-error"
+        class="text-status-failed block text-xs"
+        data-testid="agent-name-error"
+      >
+        {nameError}
+      </span>
+    {/if}
   </label>
 
   {#if mode === "attach"}

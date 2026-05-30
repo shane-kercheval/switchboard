@@ -11,7 +11,7 @@
   /// dismiss path (ESC, overlay click, Cancel button, the form's own
   /// onCancel) collapses to the same handler.
   import type { AgentFormSubmit } from "./CreateAgentForm.types";
-  import type { HarnessAvailability } from "$lib/types";
+  import type { AgentRecord, HarnessAvailability } from "$lib/types";
   import CreateAgentForm from "./CreateAgentForm.svelte";
   import Dialog from "./ui/Dialog.svelte";
 
@@ -22,6 +22,7 @@
     error?: string | null;
     onSubmit: (submission: AgentFormSubmit) => void;
     onCancel: () => void;
+    roster?: AgentRecord[];
     claudeAvailability?: HarnessAvailability;
     codexAvailability?: HarnessAvailability;
     geminiAvailability?: HarnessAvailability;
@@ -34,6 +35,7 @@
     error = null,
     onSubmit,
     onCancel,
+    roster,
     claudeAvailability,
     codexAvailability,
     geminiAvailability,
@@ -47,6 +49,7 @@
     {error}
     {onSubmit}
     {onCancel}
+    {roster}
     {claudeAvailability}
     {codexAvailability}
     {geminiAvailability}

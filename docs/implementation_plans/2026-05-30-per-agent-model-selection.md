@@ -2,48 +2,60 @@
 
 **Status:** proposed · **Created:** 2026-05-30
 
-Let each agent run on a user-chosen model. The model is picked when the agent is created, and — for harnesses that support it — changed later from the agent's actions menu. Antigravity is the exception: its CLI exposes no model control, so the picker is disabled at creation and the change-model action is absent.
+Let each agent run on a user-chosen model. The model is picked when the agent is created, changed later (for harnesses that support it) from the agent's actions menu, shown as the agent's current intent in the sidebar, and recorded **per turn** in the transcript so a mid-conversation switch is visible in history. Antigravity is the exception: its CLI exposes no model control, so the picker is disabled at creation, the change-model action is absent, and its per-turn model is best-effort (often blank).
 
 ## Background — read before implementing
 
-This plan is the product of an empirical probe of all four harness CLIs. **Read `docs/research/harness-behavior.md` §3.3 ("Model selection — can we set the model on a turn?") first** — it is the ground truth for the per-harness behavior this plan encodes, and the decisions below depend on it. The essentials:
+This plan is the product of an empirical probe of all four harness CLIs. **Read `docs/research/harness-behavior.md` §3.3 ("Model selection — can we set the model on a turn?") first** — it is the ground truth for the per-harness behavior this plan encodes. The essentials:
 
 - **Claude** (`--model <alias|id>`), **Codex** (`-m/--model <id>`), **Gemini** (`-m/--model <id>`) all accept a model on every invocation, including resume. Verify exact flag spelling against each CLI's `--help` before wiring it.
-- **Model is per-invocation, not configured once.** Claude happens to be session-sticky (a resumed session keeps its last model), but Gemini reverts to its default without the flag and Codex re-derives per turn. The uniform rule — decided — is **send the flag on every dispatch when a model is set**, so we never depend on per-harness stickiness. One code path, no special cases.
-- **Codex models are gated by the user's plan**, not by us. The CLI forwards any `-m` value; the API rejects out-of-plan ones with a 400. We do not enumerate or validate model values (see "reactive validation" below).
-- **Antigravity has no per-call model control and we will not build one.** Its only model lever is a global, harness-owned config file we've decided never to touch. Antigravity agents run on whatever model was last selected inside Antigravity itself. In our UI, model selection is simply unavailable for this harness.
+- **Model is per-invocation, not configured once.** Claude is session-sticky, Gemini reverts to its default without the flag, Codex re-derives per turn. The uniform rule — decided — is **send the flag on every dispatch when a model is set**, so we never depend on per-harness stickiness. One code path.
+- **Codex models are gated by the user's plan**, not by us. The CLI forwards any `-m` value; the API rejects out-of-plan ones with a 400. We do not enumerate or validate model values (see "reactive validation").
+- **Antigravity has no per-call model control and we will not build one.** Its only model lever is a global, harness-owned config file we've decided never to touch; its agents run on whatever model was last selected inside Antigravity itself. For **display**, though, Antigravity reaches per-turn parity: it writes a `USER_SETTINGS_CHANGE` "from X to Y" sentence on the turn where the model changes (verified 2026-05-30 — turn 1 `None → Gemini 3.1 Pro`, then a resume after a settings change wrote `Gemini 3.1 Pro → Claude Sonnet 4.6`). Unchanged turns carry no sentence, so the per-turn model is reconstructed by **carrying the last announced model forward** until the next change. So Antigravity is the one harness where the user can't *select* the model here, but its per-turn *history* is still accurate.
+
+### Two model concepts — keep them distinct
+
+This is the central design idea; everything else follows from it.
+
+1. **Selected model (intent)** — the model the *user chose* for the agent. Lives on `AgentRecord.model` (`Option<String>`). Shown in the **sidebar / agent card**. Updates the instant the user changes it — immediate confirmation, no turn required.
+2. **Per-turn model (history)** — the model that *actually produced* a given turn, as the harness reported it. Lives on each **`Turn`** and renders in the **transcript footer**, next to the existing per-message timestamp, on **every** turn. Preserves history: a conversation can read sonnet → sonnet → opus → opus across a switch.
+
+The two surfaces never compete: the sidebar answers "what will the next turn use," the transcript answers "what did each past turn use." This split is *why* there is no "show both models on the card" reconciliation — the card shows only intent.
 
 ### Decisions locked for this plan
 
-1. **Input mechanism: hybrid.** A per-harness dropdown of suggested models **plus** a free-text "custom…" escape hatch. Suggestions are a convenience for the common case; free-text covers plan-specific or newly-released models we haven't catalogued.
-2. **Validation: reactive.** We do **not** validate model strings. A bad/out-of-plan model surfaces as a normal failed turn carrying the harness's own message — identical posture to auth (discover on send, fix, re-send). The only structural check is the harness-capability one (an Antigravity agent can never carry a model).
-3. **Unset = harness default.** No model chosen → store `None` → pass **no** model flag → the harness uses its own default (today's behavior). The "send every turn" rule only applies when a model is set.
-4. **Codex stale-model display is fixed here** (Milestone 4): the sidebar must read the model from the **latest** turn, not the first, or a changed Codex model would display stale.
-5. **Change-model lives in the per-agent actions menu** and takes effect on the **next send** — never mutating an in-flight turn. The item is absent for Antigravity.
+1. **Input mechanism: hybrid.** A per-harness dropdown of suggested models **plus** a free-text "custom…" escape hatch. Suggestions are convenience; free-text is the real contract (Codex models are plan-dependent and can't be enumerated).
+2. **Validation: reactive.** We do **not** validate model strings. A bad/out-of-plan model surfaces as a normal failed turn carrying the harness's own message — same posture as auth. The only structural check is the harness-capability one (an Antigravity agent can never carry a model). One input state *is* guarded as a footgun, not a validation: an empty/whitespace custom entry must never persist as `Some("")` (it would dispatch `--model ""` and fail every turn) — normalize it to "no model" at the form boundary.
+3. **Unset = harness default.** No model chosen → `None` → pass **no** flag → harness uses its own default. "Send every turn" applies only when a model is set.
+4. **Per-turn model, every turn.** The transcript records and displays the model for every turn. For Claude/Codex/Gemini it comes straight from each turn's harness data; for Antigravity it's reconstructed by carry-forward (last announced model wins). Blank only when genuinely unknown (e.g. an attached Antigravity conversation truncated before its first model announcement). This subsumes the earlier idea of picking one "representative" model for the agent — there is no representative model, only per-turn models plus the user's selected intent.
+5. **Change-model lives in the per-agent actions menu**, takes effect on the **next send** (never mutating an in-flight turn), and is absent for Antigravity.
 
 ### Shared conventions established early (reuse, don't reinvent)
 
-- **`HarnessKind::supports_model_selection()`** (Milestone 1, `crates/core`) is the single backend source of truth for "can this harness take a model." The frontend mirrors it with one capability map (Milestone 5). Every gate — command validation, form picker, card action — derives from one of these two, never an ad-hoc `if harness == antigravity`.
-- **"Send the flag every turn when `model` is `Some`, omit when `None`"** (Milestone 2) is the dispatch rule all model-capable adapters follow identically.
-- **One model-picker component** (Milestone 5) is built once and reused by both the create form and the change-model editor (Milestone 6).
+- **`HarnessKind::supports_model_selection()`** (M1, `crates/core`) is the single backend truth for "can this harness take a model." The frontend mirrors it with one capability map (M5). Every gate — command validation, form picker, card action — derives from one of these two, never an ad-hoc `if harness == antigravity`.
+- **"Send the flag every turn when `model` is `Some`, omit when `None`"** (M2) is the dispatch rule all model-capable adapters follow identically.
+- **Selected model is `Option<String>` end to end** (`AgentRecord.model`, the `set_agent_model` command, the `setAgentModel` api, the picker's value). Empty/cleared is `None`/`undefined`, never `""` — normalized at the form boundary, not via a wire sentinel.
+- **Per-turn model is a dedicated field on `Turn`** (M4), distinct from the agent-scoped `SessionMeta`. One model-picker component (M5) is built once and reused by the change-model editor (M6).
 
 ---
 
-## Milestone 1 — Core: `model` field + capability helper
+## Milestone 1 — Core: `model` field, capability helper, registration threading
 
 ### Goal & Outcome
 Give the persisted agent a place to hold its chosen model, and establish the one backend fact the rest of the plan gates on.
 
-- An `AgentRecord` can carry an optional model string; agents created before this change load with no model (backward-compatible).
-- The codebase has a single authoritative answer to "does harness X support model selection," used everywhere a gate is needed.
+- An `AgentRecord` carries an optional selected model; agents created before this change load with no model (backward-compatible).
+- The codebase has a single authoritative answer to "does harness X support model selection."
+- The model can be set at registration in one step, through every creation path (not created-then-mutated).
 
 ### Implementation Outline
-- Add `model: Option<String>` to `AgentRecord` (`crates/core/src/agent.rs`). Optional so existing on-disk records deserialize as `None` with no migration. Serde handles the JSONL round-trip; confirm the existing round-trip test exercises the new field.
-- Thread the model through `Project::register_agent` (and any sibling constructor used by attach) so a record can be created with a model in one step rather than created-then-mutated.
-- Add `pub fn supports_model_selection(self) -> bool` to `HarnessKind` (`crates/core/src/harness.rs`): `Antigravity => false`, all others `true`. Write it as an exhaustive match (no `_` arm) so a future harness variant forces a deliberate decision here. The rationale (Antigravity has no per-call model control — see harness-behavior §3.3) must live in a doc comment on this method, not just this plan.
+- Add `pub model: Option<String>` to `AgentRecord` (`crates/core/src/agent.rs`). **No `#[serde(default)]`** — `Option<T>` already deserializes a missing field as `None`, and the sibling `session_id: Option<Uuid>` in this same struct carries no such attribute; match it (serialize `null` when `None`). Backward-compat is real but automatic; the DoD test below is the proof, not the attribute.
+- Thread `model: Option<String>` through **all** registration entry points in `crates/core/src/project.rs` — there are five public ones plus the private inner, and an implementer who updates only `register_agent` would silently drop the model on every *attach* path: `register_agent` (86), `register_attached_claude_agent` (117), `register_attached_codex_agent_with_id` (152), `register_attached_gemini_agent` (166), `register_attached_antigravity_agent_with_id` (186), and `register_agent_inner_with_id` (203). The Antigravity attach variant always receives `None` (the capability invariant — it may assert this rather than accept arbitrary input).
+- Add `pub fn supports_model_selection(self) -> bool` to `HarnessKind` (`crates/core/src/harness.rs`): `Antigravity => false`, all others `true`, as an exhaustive match (no `_` arm) so a future harness forces a deliberate decision. Put the rationale (Antigravity has no per-call model control — harness-behavior §3.3) in a doc comment on the method.
 
 ### Definition of Done
-- Round-trip test covers a record with `Some(model)` and one with `None`, and a record serialized *without* the field still deserializes (the backward-compat case).
+- Round-trip test covers `Some(model)` and `None`; **and a JSON object lacking the `model` key deserializes to `None`** (the backward-compat safeguard — this is the test that de-risks the upgrade path).
+- One attach-with-model test (a model-capable harness) proving the model lands at registration, not via a follow-up call.
 - Unit test asserts `supports_model_selection()` per variant.
 - `make check` green.
 
@@ -52,21 +64,21 @@ Give the persisted agent a place to hold its chosen model, and establish the one
 ## Milestone 2 — Adapters: pass the model on every dispatch
 
 ### Goal & Outcome
-When an agent has a chosen model, every turn it runs — first or resumed — uses that model; when it doesn't, behavior is unchanged.
+When an agent has a selected model, every turn it runs — first or resumed — uses that model; otherwise behavior is unchanged.
 
-- Claude, Codex, and Gemini agents dispatch with their chosen model applied on first turn and on every resume.
-- An agent with no chosen model dispatches exactly as today (no flag).
-- Antigravity ignores the field entirely (no flag, no behavior change).
+- Claude, Codex, and Gemini agents dispatch with their selected model on first turn and every resume.
+- An agent with no selected model dispatches exactly as today (no flag).
+- Antigravity ignores the field entirely.
 
 ### Implementation Outline
-- **Refactor `build_args` for Codex and Antigravity to receive `&AgentRecord`.** Claude and Gemini already do. The adapter `dispatch` methods all already hold the `&AgentRecord`, so this is a signature/threading change at the call sites — load-bearing only in that the model isn't reachable without it.
-- For **Claude / Codex / Gemini**: when `agent.model` is `Some`, append the model flag with its value; when `None`, append nothing. Apply it on **both** the first-turn and resume arg paths (these adapters build args differently per path — the flag goes on both). Confirm exact flag spelling per CLI `--help` (`--model` for Claude/Gemini; `-m`/`--model` for Codex, valid on `exec` and `exec resume`).
-- For **Antigravity**: take the `&AgentRecord` for signature uniformity but do **not** add any flag. Leave a one-line comment stating why (no per-call model control — harness-behavior §3.3), so a future reader doesn't "helpfully" add one.
-- Do not validate the model value here; an invalid value is the harness's to reject (it surfaces through the existing failure path).
+- **Refactor `build_args` for Codex and Antigravity to receive `&AgentRecord`.** Claude and Gemini already do; the `dispatch` methods all hold the `&AgentRecord`, so this is a signature/threading change at the call sites.
+- For **Claude / Codex / Gemini**: when `agent.model` is `Some`, append the model flag with its value; when `None`, append nothing. Apply on **both** the first-turn and resume arg paths (these adapters build args differently per path — the flag goes on both). Confirm exact flag spelling per CLI `--help` (`--model` for Claude/Gemini; `-m`/`--model` for Codex, valid on `exec` and `exec resume`).
+- For **Antigravity**: take `&AgentRecord` for signature uniformity but add no flag; leave a one-line comment stating why (no per-call model control — §3.3).
+- No value validation here — an invalid model is the harness's to reject via the existing failure path.
 
 ### Definition of Done
-- Unit tests on each `build_args`: model present → flag+value emitted on first-turn and resume paths; model absent → no flag. Antigravity: never emits a model flag regardless of the field.
-- **Live tests** (one per model-capable harness, named `live_<harness>_…` per the live-test convention) that dispatch with a chosen model and confirm the harness honors it — assert against the model the harness reports back (Claude/Gemini `init.model`; Codex `turn_context.model`). Keep prompts tiny per cost discipline. These are the regression guard if a CLI renames the flag.
+- Unit tests on each `build_args`: model present → flag+value on first-turn and resume paths; absent → no flag; Antigravity never emits a model flag.
+- **Live tests** (one per model-capable harness, named `live_<harness>_…`) dispatching with a chosen model and asserting the harness honors it (Claude/Gemini `init.model`; Codex `turn_context.model`). Tiny prompts per cost discipline. These guard against a CLI renaming the flag.
 - `make check` green; `make test-live` covers the new live tests.
 
 ---
@@ -74,85 +86,104 @@ When an agent has a chosen model, every turn it runs — first or resumed — us
 ## Milestone 3 — Backend: create / attach with a model, and change it later
 
 ### Goal & Outcome
-The model chosen in the UI reaches the persisted record, and a later change persists and takes effect on the next send.
+The selected model reaches the persisted record, and a later change persists and takes effect on the next send.
 
 - Creating or attaching an agent can specify a model; the record stores it.
-- A new command changes an existing agent's model and re-persists it.
-- A model can never be attached to a harness that doesn't support one (structural invariant enforced server-side, not just hidden in the UI).
+- A new command changes (or clears) an existing agent's model and re-persists it.
+- A model can never attach to a harness that doesn't support one (enforced server-side, independent of the UI).
 
 ### Implementation Outline
-- Extend `create_agent_impl` and `attach_agent_impl` (`crates/app/src/commands.rs`) to accept `model: Option<String>`, and update their `#[tauri::command]` wrappers.
-- Add `set_agent_model_impl` (+ wrapper): look up the agent, update `AgentRecord.model`, re-persist via the same registry-write path the other mutating commands use (follow `rename_agent_impl`'s structure), return the updated record. No effect on any in-flight turn — the new model applies on the next dispatch because Milestone 2 reads the field fresh each time.
-- **Capability check, all three entry points:** if `model.is_some()` and `!agent.harness.supports_model_selection()`, reject with a typed `AppError`. This is the *only* validation — model **strings** are not checked (reactive posture). The check keeps an Antigravity record from ever carrying a dead model value.
-- No model-string normalization, no allow-list lookup. Pass the user's string through verbatim.
+- Extend `create_agent_impl` and `attach_agent_impl` (`crates/app/src/commands.rs`) to accept `model: Option<String>`, and update the `#[tauri::command]` wrappers.
+- **Capability check runs first.** In `attach_agent_impl` the rejection `model.is_some() && !harness.supports_model_selection()` must be the first thing after project/active resolution — **before** the per-harness session lookup and sidecar writes (the attach flow writes sidecars before committing the registry record; a check placed inside the harness match would orphan a sidecar on rejection). Same check on the create path.
+- Add `set_agent_model_impl` (+ wrapper) taking `model: Option<String>` (so clearing back to the harness default is expressible — a non-optional `String` could not say "clear"): look up the agent, set `AgentRecord.model`, re-persist via the same registry-write path the other mutating commands use (mirror `rename_agent_impl`), return the updated record. No effect on any in-flight turn — the new model applies on the next dispatch because M2 reads the field fresh each time. Reject for an unsupported harness.
+- No model-string normalization or allow-list here; the user's string passes through verbatim. (The `Some("")` footgun is handled at the form boundary in M5, not here.)
 
 ### Definition of Done
-- Tests on the free functions: create/attach with a model stores it; `set_agent_model` updates and persists (reload proves durability); setting a model on an Antigravity agent (any of the three paths) returns the capability error; setting `None`/clearing is allowed for all harnesses.
+- Tests on the free functions: create/attach with a model stores it; `set_agent_model` updates and persists (reload proves durability); **clearing persists `None`**; setting a model on an Antigravity agent (all three paths) returns the capability error **and leaves no orphan sidecar**; the attach rejection happens before any sidecar write.
 - `make check` green.
 
 ---
 
-## Milestone 4 — Codex: display the current model, not the first
+## Milestone 4 — Per-turn model on the transcript
 
 ### Goal & Outcome
-After a Codex agent's model is changed mid-conversation, the sidebar shows the model it's actually running now.
+Every turn records the model that produced it, for all harnesses, on both the live stream and on reopen — so the transcript can show a faithful per-turn history of which model ran.
 
-- The model surfaced for a Codex agent reflects its most recent turn, not its first.
+- Each completed turn carries the model the harness reported for that turn.
+- A mid-conversation model switch is reflected turn-by-turn (e.g. sonnet, sonnet, opus, opus).
+- Antigravity turns carry a model when available and `None` otherwise (accepted limitation), without breaking anything.
 
 ### Implementation Outline
-Small, self-contained, and independent of Milestones 1–3 (it concerns *reading back* the model, not setting it). In `crates/harness/src/codex/session_file.rs`, the enrichment uses a set-once gate (`model_set`, "first-turn_context wins") so the first `turn_context.payload.model` becomes `SessionMeta.model`. Codex writes a fresh `turn_context.model` **per turn** (verified — harness-behavior §3.3), so switch this to **last-wins**: let each `turn_context` overwrite, leaving the final one as the session-level model. Update the now-incorrect doc comments in this file (the lines stating "first one in file" / "first-turn model is authoritative") to describe last-wins and *why* (per-turn overrides mean the latest turn is the live model).
+This replaces the earlier "Codex latest-model" milestone: per-turn attachment makes "which model represents the agent" a non-question — every turn carries its own.
+
+- **Add a dedicated `model: Option<String>` to the `Turn` wire shape** (`crates/harness/src/transcript.rs`, and the TS `LoadedTurn`/`Turn` in `src/lib/types.ts`). Keep it **separate from** the agent-scoped `SessionMeta.model`: `SessionMeta` is emitted as a standalone, non-turn-anchored event (events.rs:108) and carries agent-level registry data; the per-turn model is a property of the turn itself. Do not overload `Turn.meta` for it.
+- **Populate per turn, per harness, on both paths** (live parse and session-file hydration):
+  - **Claude** — the per-turn model is on each turn's assistant record / `init` (`claude-sonnet-4-6` etc.); attach it to that turn.
+  - **Codex** — each turn's `turn_context.payload.model` (the per-turn value M-historically read first-wins for `SessionMeta`); attach each to its own turn. The old set-once `model_set` gate in `codex/session_file.rs` is removed in favor of per-turn attachment.
+  - **Gemini** — `init.model` per invocation; attach to that turn.
+  - **Antigravity** — **carry-forward.** Each turn carries a `USER_SETTINGS_CHANGE` "from X to Y" sentence only when the model *changed* on that turn (verified: the change is announced on the resume turn where it takes effect). So maintain a running "current model": on a turn whose records contain a settings-change, set it to the announced "to" value; otherwise inherit the prior turn's value; stamp every turn with the running value. On **hydrate**, walk turns chronologically and carry forward from the start of the transcript; **live**, hold the running value in the adapter's per-agent state across turns (the existing "empty-model-keeps-prior" rule is this pattern — extend it to stamp the turn). Leave `None` only before any model has ever been announced (e.g. an attached conversation truncated before its first announcement). The fragile string-scrape itself is unchanged; what's new is attaching its result per-turn with carry-forward.
+- **Live path correlation:** for Claude/Codex/Gemini the model arrives as an agent-scoped `SessionMeta` event with no turn anchor. To land it on the right turn live, associate the most-recent model with the turn being finalized (at `TurnEnd`/turn close in the state reducer or dispatcher). Transmit this explicitly so the implementer doesn't assume the model is already turn-anchored — it is not. (Antigravity's carry-forward state, above, is the analogous mechanism for that harness.)
+- **`SessionMeta.model` consumer audit.** After M6 the sidebar no longer displays `SessionMeta.model` (it shows `AgentRecord.model`). Check whether any consumer of `SessionMeta.model` remains; if none, remove the field for a clean architecture; if a harness's per-turn population reuses it as an intermediate, keep it only as that. Record the decision in the milestone notes.
 
 ### Definition of Done
-- Unit test: a session file with two `turn_context` records carrying different models yields the **second** model in the enrichment / `SessionMeta`. (Add or extend a fixture; the existing first-wins test, if any, is updated to assert last-wins — this is an intended behavior change, not a regression to preserve.)
+- Per-harness unit/fixture tests: a session file with two turns on **different** models yields two turns whose `model` differ (Codex is the canonical case — extend/convert the former first-wins test to assert per-turn values, an intended behavior change). Claude and Gemini equivalents.
+- An Antigravity carry-forward test: a transcript where turn 1 announces a model and turns 2–3 don't → all three carry that model; a later change-sentence flips the subsequent turns to the new model; a transcript with no announcement at all hydrates with `model: None` and does not error.
+- Live tests assert the per-turn model arrives on the live stream for the three model-capable harnesses (can extend the M2 live tests rather than add new ones).
 - `make check` green.
+
+> Note: Codex `turn_context` is written at turn **start**, not on success (verified — a failed model turn still wrote its `turn_context`). So a failed/interrupted turn correctly carries the model it attempted; no special-casing needed.
 
 ---
 
 ## Milestone 5 — Frontend: model picker in the create-agent form
 
 ### Goal & Outcome
-A user choosing a harness when creating an agent can also choose its model, with sensible suggestions and a free-text fallback — except for Antigravity, where the control explains why it's unavailable.
+A user creating (or attaching) an agent can choose its model, with suggestions and a free-text fallback — except for Antigravity, where the control explains why it's unavailable.
 
-- The create/attach form offers a hybrid model picker (suggested values + custom free-text) for Claude/Codex/Gemini.
-- Selecting Antigravity disables the picker and shows a short note that model selection happens inside Antigravity itself; no model is submitted.
-- The chosen model reaches the backend create/attach call.
+- The form offers a hybrid model picker (suggestions + custom free-text) for Claude/Codex/Gemini.
+- Selecting Antigravity disables the picker with a short note that model selection happens inside Antigravity itself; no model is submitted.
+- The chosen model reaches the backend create/attach call; an empty/whitespace custom entry submits no model (never `""`).
 
 ### Implementation Outline
-- Add a frontend capability map to `src/lib/harnessDisplay.ts` mirroring `supports_model_selection()` (exhaustive `Record<HarnessKind, …>`, matching the existing maps in that file). This is the UI's gate.
-- Add a **single reusable model-picker component** (hybrid: a dropdown of suggested models for the selected harness + a "custom…" option revealing a free-text input). Build it here so Milestone 6 reuses it rather than duplicating. Its value is `string | undefined` where `undefined`/empty means "no model → harness default."
-- Add a per-harness suggested-model list (a frontend constant). Seed it minimally and treat it as a maintained convenience, **not** an authoritative or validated set — free-text is the real contract (Codex especially, since valid models are plan-dependent). Starting suggestions: Claude `opus` / `sonnet` / `haiku` (stable aliases); Gemini `gemini-2.5-pro` / `gemini-2.5-flash` (+ `auto` default); Codex `gpt-5.5`. Confirm current aliases against each CLI `--help` / harness-behavior before finalizing, and add a comment that the list is convenience-only and may drift.
-- Wire the picker into `CreateAgentForm.svelte` after the harness selector. When the selected harness is not model-capable, render the picker disabled with the explanatory note and ensure the submit payload omits the model. Thread `model?: string` through `createAgent` / `attachAgent` in `api.ts` and the form's submit types.
+- Add a frontend capability map to `src/lib/harnessDisplay.ts` mirroring `supports_model_selection()` (exhaustive `Record<HarnessKind, …>`, matching the existing maps). This is the UI's gate.
+- Build a **single reusable model-picker component** (hybrid: dropdown of suggested models for the selected harness + a "custom…" option revealing a free-text input). Its value is `string | undefined`, where `undefined`/empty/whitespace means "no model → harness default." Normalize empty → `undefined` **inside this component (the form boundary)**, so the `Some("")` footgun can never cross the IPC boundary. Built here so M6 reuses it.
+- Add a per-harness suggested-model list (frontend constant), seeded minimally and treated as a maintained convenience — **not** authoritative or validated. Starting suggestions: Claude `opus` / `sonnet` / `haiku`; Gemini `gemini-2.5-pro` / `gemini-2.5-flash` (+ `auto`); Codex `gpt-5.5`. Confirm current aliases against each CLI `--help` / harness-behavior before finalizing; comment that the list is convenience-only and may drift.
+- Wire the picker into `CreateAgentForm.svelte` after the harness selector; when the selected harness is not model-capable, render it disabled with the note and omit the model from submit. Thread `model?: string` through `createAgent` / `attachAgent` in `api.ts` and the form's submit types.
 
 ### Definition of Done
-- Component tests (per the project's component-test guidance — mock `invoke`): selecting a suggested model and a custom model each produce the right `model` in the create payload; switching to Antigravity disables the picker and submits no model; leaving the picker untouched submits no model. Reuse-readiness: the picker is a standalone component, not inlined in the form.
+- Component tests (mock `invoke`): a suggested model and a custom model each produce the right `model` in the create payload; switching to Antigravity disables the picker and submits no model; an untouched picker submits no model; **an empty/whitespace custom entry submits no model, not `""`**.
+- The picker is a standalone component (reuse-ready for M6), not inlined.
 - `make check` green.
 
 ---
 
-## Milestone 6 — Frontend: change a model from the agent's actions menu
+## Milestone 6 — Frontend: change the model, and surface intent vs. history
 
 ### Goal & Outcome
-For a model-capable agent, the user can change its model after creation; the change persists and applies to the next send.
+For a model-capable agent the user can change its model after creation; the sidebar shows the selected model (immediate), and the transcript shows the per-turn model (history).
 
-- The per-agent actions menu offers "Change model" for Claude/Codex/Gemini agents and omits it for Antigravity.
-- Choosing a new model calls the backend, updates the record, and the agent card reflects the change.
+- The per-agent actions menu offers "Change model" for Claude/Codex/Gemini and omits it for Antigravity.
+- Choosing/clearing a model calls the backend, updates the record, and the **sidebar reflects the selected model immediately** — before any turn runs.
+- The **transcript footer shows each turn's model** next to its timestamp, on every turn.
 
 ### Implementation Outline
-- Add a "Change model" item to `AgentActionsMenu.svelte`, gated on the frontend capability map (absent for Antigravity). It opens an editor that reuses the Milestone 5 picker, pre-filled with the agent's current model.
-- On submit, call a new `setAgentModel` api function → `set_agent_model` command → updated `AgentRecord` flows back into frontend state; the card re-renders.
-- **Selected vs. reported model in the card:** the card's existing model line shows the model the harness *reported running* (`runtime.meta.model`). Keep that as the primary display. The newly *selected* model is the editable setting (`AgentRecord.model`); surface it as the pre-turn fallback (before any turn has produced a reported model) so a freshly-set model is visible immediately, and let the reported model take over once a turn runs. Do not conflate the two — reported is what ran, selected is intent. (For Antigravity there is only a reported model, read-only, unchanged by this plan.)
-- Note in a comment that the change applies on the next send (the dispatch path reads the field fresh each turn — Milestone 2), so no in-flight handling is needed.
+- Add a "Change model" item to `AgentActionsMenu.svelte`, gated on the frontend capability map (absent for Antigravity). It opens an editor reusing the M5 picker, pre-filled with the agent's current model; submit calls a new `setAgentModel(agentId, model?: string)` api → `set_agent_model` command → updated `AgentRecord` flows back into state.
+- **Sidebar shows the selected model.** Change the sidebar model line (`Sidebar.svelte`, currently reading `runtime.meta.model`) to read `AgentRecord.model`. This is intent, so it updates the moment the change lands — the immediate confirmation that resolves the old "did my change take?" gap. When no model is selected (`None`), clean-hide per the sidebar's existing absent-field convention.
+- **Transcript footer shows the per-turn model.** In the per-message footer that already renders the timestamp (`UnifiedTranscript.svelte`'s `messageMeta`), render `Turn.model` for every agent turn; omit only when `None` (rare — an Antigravity conversation truncated before its first announcement). Keep it subtle (muted, small) consistent with the timestamp styling.
+- Comment that a model change applies on the next send (dispatch reads the field fresh each turn — M2), so no in-flight handling is needed.
 
 ### Definition of Done
-- Component tests: the action is present for a model-capable agent and absent for Antigravity; submitting a new model invokes `set_agent_model` with the right args and the card reflects the returned record; the editor pre-fills the current model.
+- Component tests: the action is present for a model-capable agent, absent for Antigravity; submitting a new model invokes `set_agent_model` with the right args; **the sidebar reflects the selected model on an agent that has already run a turn** (the real post-turn state — not a fresh agent), proving intent shows immediately; clearing the model hides the sidebar line.
+- Transcript test: an agent turn renders its `model` in the footer; a turn with `model: None` renders no model.
+- **Docs:** update `docs/research/harness-behavior.md` §3.3 status note (per-agent model selection ships; Antigravity per-turn model is best-effort/blank) and the README "Harness support and limitations" model bullet; update `docs/system-design.md` §9 if model selection belongs in the capability matrix.
 - `make check` green.
-- **Docs:** update `docs/research/harness-behavior.md` §3.3 status note and, if warranted, the README "Harness support and limitations" model bullet, to reflect that per-agent model selection now ships (with Antigravity's exception intact). `docs/system-design.md` §9 capability matrix updated if model selection belongs there.
 
 ---
 
 ## Out of scope (explicitly)
 
 - Enumerating or validating model values, or detecting plan-gated Codex models — reactive failure is the design.
-- Any mechanism to set Antigravity's model (global harness-owned config is off-limits; per-`HOME`/config-dir isolation was considered and declined — harness-behavior §3.3).
+- Any mechanism to set Antigravity's model (global harness-owned config is off-limits; per-`HOME`/config-dir isolation was considered and declined — §3.3). Antigravity model selection is read-only here; its per-turn *display* is handled via carry-forward (M4) and is not a limitation.
 - Changing a model mid-turn / interrupting an in-flight turn to re-model it.
 - A global or project-level default model — selection is strictly per-agent.
+- "Show both models on the agent card" reconciliation — obviated by the sidebar-intent / transcript-history split.

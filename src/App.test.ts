@@ -63,6 +63,7 @@ type Backend = {
   loadConvoCalls: string[];
   failOpenFor: Set<string>;
   failConvoFor: Set<string>;
+  failPickFor: Set<string>;
 };
 let backend: Backend;
 let agentSeq = 0;
@@ -85,6 +86,7 @@ function freshBackend(): Backend {
     loadConvoCalls: [],
     failOpenFor: new Set(),
     failConvoFor: new Set(),
+    failPickFor: new Set(),
   };
 }
 
@@ -105,6 +107,19 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
       // Only projects in registered directories surface (matches the real
       // backend: the workspace registry gates which projects are listed).
       return backend.projects.filter((p) => backend.dirs.has(p.directory));
+    case "pick_directory": {
+      // Read-only probe: discovers projects on disk for the chosen folder
+      // WITHOUT registering it (no mutation of `backend.dirs`). Mirrors the real
+      // `pick_directory_impl` the preview step calls before "Add" commits.
+      const path = args?.path as string;
+      if (backend.failPickFor.has(path)) throw new Error("incompatible .switchboard/ version");
+      const found = backend.projects.filter((p) => p.directory === path);
+      return {
+        path,
+        has_switchboard: found.length > 0,
+        projects: found.map((p) => ({ id: p.id, name: p.name, created_at: p.created_at })),
+      };
+    }
     case "init_directory": {
       const path = args?.path as string;
       backend.dirs.set(path, { available: true });
@@ -366,11 +381,11 @@ describe("App", () => {
     // been opened yet (it opens on "Choose folder…").
     await waitFor(() => expect(screen.getByTestId("add-existing-form")).toBeInTheDocument());
     expect(openDialogMock).not.toHaveBeenCalled();
-    // Done is disabled until a folder has been chosen.
-    expect(screen.getByTestId("add-existing-done")).toBeDisabled();
+    // Add is disabled until a folder with projects has been previewed.
+    expect(screen.getByTestId("add-existing-add")).toBeDisabled();
   });
 
-  it("add existing: choosing a folder with projects reports what was found and adds them to the list", async () => {
+  it("add existing: choosing a folder previews the projects but does NOT add them until Add is pressed", async () => {
     backend.projects.push(listing({ id: "p-x", directory: DIR_A, name: "existing-proj" }));
     backend.rosters.set("p-x", []);
     openDialogMock.mockResolvedValueOnce(DIR_A);
@@ -383,19 +398,29 @@ describe("App", () => {
     await waitFor(() => expect(screen.getByTestId("add-existing-form")).toBeInTheDocument());
     await fireEvent.click(screen.getByTestId("add-existing-choose-folder"));
 
-    // Found feedback names the project, and it surfaces in the flat list.
+    // The preview names the project and enables Add — but the read-only probe
+    // ran, not a commit: the directory is unregistered and nothing is in the
+    // flat list yet.
     await waitFor(() => expect(screen.getByTestId("add-existing-found")).toBeInTheDocument());
     expect(screen.getByTestId("add-existing-found")).toHaveTextContent("existing-proj");
-    // Done enables once a folder has been chosen.
-    expect(screen.getByTestId("add-existing-done")).toBeEnabled();
-    expect(
-      invokeMock.mock.calls.some(([c, a]) => c === "init_directory" && a?.path === DIR_A),
-    ).toBe(true);
-    // It also surfaces in the flat list (the sidebar now has a project to show).
+    expect(screen.getByTestId("add-existing-add")).toBeEnabled();
+    expect(invokeMock.mock.calls.some(([c]) => c === "pick_directory")).toBe(true);
+    expect(invokeMock.mock.calls.some(([c]) => c === "init_directory")).toBe(false);
+    expect(screen.queryByTestId("project-row")).not.toBeInTheDocument();
+
+    // Pressing Add commits: init_directory registers the folder, the dialog
+    // closes, and the project surfaces in the flat list.
+    await fireEvent.click(screen.getByTestId("add-existing-add"));
+    await waitFor(() =>
+      expect(
+        invokeMock.mock.calls.some(([c, a]) => c === "init_directory" && a?.path === DIR_A),
+      ).toBe(true),
+    );
+    await waitFor(() => expect(screen.queryByTestId("project-dialog")).not.toBeInTheDocument());
     expect(screen.getByTestId("project-row")).toBeInTheDocument();
   });
 
-  it("add existing: a folder with no projects shows a 'none found' warning, not silent success", async () => {
+  it("add existing: a folder with no projects shows a 'none found' warning, leaves Add disabled, and adds nothing", async () => {
     // DIR_A has no projects on disk.
     openDialogMock.mockResolvedValueOnce(DIR_A);
     await mountApp();
@@ -409,6 +434,56 @@ describe("App", () => {
 
     await waitFor(() => expect(screen.getByTestId("add-existing-none")).toBeInTheDocument());
     expect(screen.queryByTestId("add-existing-found")).not.toBeInTheDocument();
+    // Nothing to add → Add stays disabled and the empty folder is never
+    // registered (no accidental `.switchboard/` init).
+    expect(screen.getByTestId("add-existing-add")).toBeDisabled();
+    expect(invokeMock.mock.calls.some(([c]) => c === "init_directory")).toBe(false);
+  });
+
+  it("add existing: a failed probe surfaces the error, disables Add, and registers nothing", async () => {
+    // e.g. an incompatible `.switchboard/` version — the read-only probe rejects.
+    backend.failPickFor.add(DIR_A);
+    openDialogMock.mockResolvedValueOnce(DIR_A);
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("welcome-add-project")).toBeInTheDocument());
+
+    await fireEvent.click(screen.getByTestId("welcome-add-project"));
+    await waitFor(() => expect(screen.getByTestId("project-dialog")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("project-dialog-mode-existing"));
+    await waitFor(() => expect(screen.getByTestId("add-existing-form")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("add-existing-choose-folder"));
+
+    await waitFor(() => expect(screen.getByTestId("add-existing-error")).toBeInTheDocument());
+    expect(screen.queryByTestId("add-existing-found")).not.toBeInTheDocument();
+    expect(screen.getByTestId("add-existing-add")).toBeDisabled();
+    expect(invokeMock.mock.calls.some(([c]) => c === "init_directory")).toBe(false);
+  });
+
+  it("add existing: a probe failure on a re-pick clears the prior preview (Add can't strand on the old folder)", async () => {
+    // First pick (DIR_A) previews a project; second pick (DIR_B) fails the probe.
+    backend.projects.push(listing({ id: "p-x", directory: DIR_A, name: "existing-proj" }));
+    backend.rosters.set("p-x", []);
+    backend.failPickFor.add(DIR_B);
+    openDialogMock.mockResolvedValueOnce(DIR_A).mockResolvedValueOnce(DIR_B);
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("welcome-add-project")).toBeInTheDocument());
+
+    await fireEvent.click(screen.getByTestId("welcome-add-project"));
+    await waitFor(() => expect(screen.getByTestId("project-dialog")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("project-dialog-mode-existing"));
+    await waitFor(() => expect(screen.getByTestId("add-existing-form")).toBeInTheDocument());
+
+    await fireEvent.click(screen.getByTestId("add-existing-choose-folder"));
+    await waitFor(() => expect(screen.getByTestId("add-existing-found")).toBeInTheDocument());
+    expect(screen.getByTestId("add-existing-add")).toBeEnabled();
+
+    // Re-pick a folder whose probe fails → the stale preview is gone and Add is
+    // disabled, so it can't silently commit the first folder.
+    await fireEvent.click(screen.getByTestId("add-existing-choose-folder"));
+    await waitFor(() => expect(screen.getByTestId("add-existing-error")).toBeInTheDocument());
+    expect(screen.queryByTestId("add-existing-found")).not.toBeInTheDocument();
+    expect(screen.getByTestId("add-existing-add")).toBeDisabled();
+    expect(invokeMock.mock.calls.some(([c]) => c === "init_directory")).toBe(false);
   });
 
   it("new project: choosing a folder + name creates the project, activates it, and auto-seeds an agent per installed harness", async () => {

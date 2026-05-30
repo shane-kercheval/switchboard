@@ -46,7 +46,7 @@
     HarnessAvailability,
     HarnessBanner,
     HarnessKind,
-    ProjectListing,
+    ProjectSummary,
   } from "$lib/types";
   import { bannerCopy, bannerTestid } from "$lib/harnessAvailability";
   import { ALL_HARNESSES, HARNESS_LABEL } from "$lib/harnessDisplay";
@@ -197,8 +197,9 @@
   // Add-existing sub-state
   let addExistingFolder = $state<string | null>(null);
   // `null` until a folder has been chosen; then the projects discovered in it
-  // (empty array = none found).
-  let addExistingFound = $state<ProjectListing[] | null>(null);
+  // (empty array = none found). This is a *preview* read via the read-only
+  // `pick_directory` probe — nothing is registered until "Add" commits.
+  let addExistingFound = $state<ProjectSummary[] | null>(null);
   let addExistingBusy = $state<boolean>(false);
   let addExistingError = $state<string | null>(null);
 
@@ -269,17 +270,42 @@
     }
   }
 
+  // Pick a folder and *preview* the projects it holds via the read-only
+  // `pick_directory` probe — nothing is registered or written to disk yet. The
+  // commit happens in `confirmAddExisting` when the user presses "Add".
   async function chooseAddExistingFolder(): Promise<void> {
     const folder = await pickFolder();
     if (folder === null) return;
+    // Discard any prior preview up front, so a failed probe leaves a clean
+    // "nothing to add" state (Add disabled) rather than stranding the button on
+    // the previously-picked folder.
+    addExistingError = null;
+    addExistingFolder = null;
+    addExistingFound = null;
+    addExistingBusy = true;
+    try {
+      const info = await api.pickDirectory(folder);
+      // Use the canonical path the probe resolved, so "Add" commits the same
+      // directory identity the backend keys on.
+      addExistingFolder = info.path;
+      addExistingFound = info.projects;
+    } catch (err) {
+      addExistingError = err instanceof Error ? err.message : String(err);
+    } finally {
+      addExistingBusy = false;
+    }
+  }
+
+  // Commit the previewed folder: register it in the workspace (its projects join
+  // the flat list) and close the dialog. Only reachable once the preview holds
+  // at least one project.
+  async function confirmAddExisting(): Promise<void> {
+    if (addExistingFolder === null) return;
     addExistingError = null;
     addExistingBusy = true;
     try {
-      await addDirectory(folder);
-      // `addDirectory` refreshes the workspace; surface what now lives in the
-      // chosen folder straight from the flat list (same source as the sidebar).
-      addExistingFolder = folder;
-      addExistingFound = projects.list.filter((p) => p.directory === folder);
+      await addDirectory(addExistingFolder);
+      projectDialogOpen = false;
     } catch (err) {
       addExistingError = err instanceof Error ? err.message : String(err);
     } finally {
@@ -417,9 +443,20 @@
             {newProjectError}
           </p>
         {/if}
-        <div class="flex justify-end">
+        <div class="flex justify-end gap-2">
+          <Button
+            variant="secondary"
+            size="sm"
+            class="w-24"
+            data-testid="new-project-cancel"
+            disabled={newProjectBusy}
+            onclick={() => (projectDialogOpen = false)}
+          >
+            Cancel
+          </Button>
           <Button
             size="sm"
+            class="w-24"
             data-testid="new-project-submit"
             disabled={!newProjectValid || newProjectBusy}
             onclick={submitNewProject}
@@ -454,7 +491,7 @@
             <div class="space-y-1.5" data-testid="add-existing-found">
               <p class="text-fg text-sm">
                 Found {addExistingFound.length}
-                {addExistingFound.length === 1 ? "project" : "projects"} — added to your list.
+                {addExistingFound.length === 1 ? "project" : "projects"} — these will be added:
               </p>
               <ul class="text-muted space-y-0.5 text-xs">
                 {#each addExistingFound as found (found.id)}
@@ -472,14 +509,25 @@
             </p>
           {/if}
         {/if}
-        <div class="flex justify-end">
+        <div class="flex justify-end gap-2">
           <Button
+            variant="secondary"
             size="sm"
-            data-testid="add-existing-done"
-            disabled={addExistingBusy || (addExistingFound === null && addExistingError === null)}
+            class="w-24"
+            data-testid="add-existing-cancel"
+            disabled={addExistingBusy}
             onclick={() => (projectDialogOpen = false)}
           >
-            Done
+            Cancel
+          </Button>
+          <Button
+            size="sm"
+            class="w-24"
+            data-testid="add-existing-add"
+            disabled={addExistingBusy || addExistingFound === null || addExistingFound.length === 0}
+            onclick={confirmAddExisting}
+          >
+            {addExistingBusy ? "Adding…" : "Add"}
           </Button>
         </div>
       </div>

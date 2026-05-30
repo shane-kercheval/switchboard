@@ -78,7 +78,7 @@ When an agent has a selected model, every turn it runs — first or resumed — 
 
 ### Definition of Done
 - Unit tests on each `build_args`: model present → flag+value on first-turn and resume paths; absent → no flag; Antigravity never emits a model flag.
-- **Live tests** (one per model-capable harness, named `live_<harness>_…`) dispatching with a chosen model and asserting the harness honors it (Claude/Gemini `init.model`; Codex `turn_context.model`). Tiny prompts per cost discipline. These guard against a CLI renaming the flag.
+- **Live tests** (one per model-capable harness, named `live_<harness>_…`): construct the **real adapter**, `dispatch` with an `AgentRecord` carrying a chosen model, and assert the chosen model surfaces in the adapter's emitted `AdapterEvent` (`SessionMeta`/per-turn model) — driven through our code, **not** a bare CLI probe, so the test covers both the real CLI honoring the flag *and* our `build_args` passing it. Tiny prompts per cost discipline.
 - `make check` green; `make test-live` covers the new live tests.
 
 ---
@@ -128,8 +128,20 @@ This replaces the earlier "Codex latest-model" milestone: per-turn attachment ma
 ### Definition of Done
 - Per-harness unit/fixture tests: a session file with two turns on **different** models yields two turns whose `model` differ (Codex is the canonical case — extend/convert the former first-wins test to assert per-turn values, an intended behavior change). Claude and Gemini equivalents.
 - An Antigravity carry-forward test: a transcript where turn 1 announces a model and turns 2–3 don't → all three carry that model; a later change-sentence flips the subsequent turns to the new model; a transcript with no announcement at all hydrates with `model: None` and does not error.
-- Live tests assert the per-turn model arrives on the live stream for the three model-capable harnesses (can extend the M2 live tests rather than add new ones).
-- `make check` green.
+- **Live tests — the upstream-contract guard (required).** Per-turn model attribution and Antigravity carry-forward read harness output that can drift across CLI versions, so this milestone *must* land live coverage of the actual switching behavior, not just single-dispatch honoring. **Every live test here is adapter-driven:** construct the real adapter (`ClaudeCodeAdapter::new()` etc.), call `dispatch` through our production path, and assert on the **per-turn `model` in the emitted `AdapterEvent`s** — never grep the raw CLI output. That is what makes the test catch *both* upstream drift (the CLI stops emitting the contract) *and* our own regressions (`build_args` drops the flag, the parser stops extracting the model, carry-forward miscomputes) in one shot.
+  - **Model switch (Claude, Gemini)** — `live_<harness>_model_changes_across_turns`: dispatch turn 1 with an `AgentRecord` model A, resume with model B, assert each turn's per-turn `model` in our events reflects the switch (A then B). Two valid models exist for both (verified: Claude `sonnet`/`opus`, Gemini `gemini-2.5-flash`/`-pro`).
+  - **Codex** — plan-gating usually leaves only one valid model on a given account (only `gpt-5.5` accepted on the probe account), so its live test asserts the chosen model is honored and recorded **per turn** for a single model; document that a true A→B switch isn't reliably testable without a multi-model plan.
+  - **Antigravity carry-forward** — `live_antigravity_model_change_announced_on_resume`: dispatch turn 1 through `AntigravityAdapter` (recording the dev's current settings model X), change `~/.gemini/antigravity-cli/settings.json`'s `model` to a different value Y, resume, and assert that **our adapter's emitted per-turn model** is X for turn 1 and Y for turn 2 (proving the `USER_SETTINGS_CHANGE … from X to Y` contract *and* our carry-forward both hold). This is the canary for Antigravity silently dropping the change-announcement on a CLI bump.
+
+    **Config-mutation safety protocol (this test edits the real `settings.json`; isolated-`HOME` was tested and rejected — agy re-prompts for OAuth under a fresh HOME, so the dev's authenticated `~/.gemini` is the only workable home):**
+    1. **Byte-for-byte backup** of `settings.json` to a **stable, well-known path** (not a random temp name) — restore the user's exact original bytes (their other keys/formatting), never a parsed-and-reserialized copy.
+    2. **Self-heal at test start:** if the backup file already exists, a prior run was interrupted — restore `settings.json` from it *first* (the backup always holds the pristine original), and **fail loudly with the recovery path printed** so the interrupted run is visible, not silently swallowed.
+    3. **`Drop`/scope guard** restores from backup then **deletes** it on exit — this covers normal completion *and* assertion-panic (Rust unwinds on panic, running `Drop`). Backup-absent ⇒ clean state; backup-present ⇒ recovery pending.
+    4. **Known gap, mitigated:** `SIGKILL` / `Ctrl-C` (SIGINT) / crash / `panic=abort` bypass `Drop`, so a hard-killed run leaves `settings.json` clobbered — but step 2 repairs it on the next run, and the pristine value survives in the backup file until a clean restore deletes it. No signal handler (fragile in the test harness); the self-heal is the mitigation.
+    5. Mark the test **serial** (the file is global — it must not interleave with other agy live tests).
+
+    Document this protocol in the test itself (a module/test doc-comment), including the rationale that mutating harness config *in a test* does not violate the production rule that the app never writes harness config — it is the only way to exercise the real contract.
+- `make check` green; `make test-live` (and `make test-live-<harness>`) cover the new live tests.
 
 > Note: Codex `turn_context` is written at turn **start**, not on success (verified — a failed model turn still wrote its `turn_context`). So a failed/interrupted turn correctly carries the model it attempted; no special-casing needed.
 

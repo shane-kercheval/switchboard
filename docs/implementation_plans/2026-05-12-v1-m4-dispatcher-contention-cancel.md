@@ -594,15 +594,16 @@ The capture (above) splits M4.9 into **two distinct surfaces**, because the harn
 
 ### Goal & Outcome
 
-Model reasoning steps (Antigravity's `thinking` field, Gemini's `thoughts[]` array) are already parsed and stored in turn state as `ContentKind::Thinking` items — distinct from `ContentKind::Text` answer items in the reducer. But `UnifiedTranscript.svelte` renders both through the same unstyled `<div>`, so reasoning and answer are visually indistinguishable. This milestone adds the missing visual distinction.
+`ContentKind::Thinking` items render through the same unstyled `<div>` as answer text in `UnifiedTranscript.svelte`, so reasoning and answer are visually indistinguishable. This milestone adds a distinct, subordinate reasoning treatment. **Scope was reshaped by the 2026-05-29 probes** (harness-behavior §3.2/§7): of the four harnesses, only **Antigravity** actually gives us live reasoning *text*, so it is the sole beneficiary today — Claude redacts the text, Codex encrypts it, and Gemini emits it only to disk (never live). The renderer is built for Antigravity and is forward-compatible: if Claude's redaction lifts, it picks Claude up for free.
 
 Outcomes:
-- Thinking blocks render with a visually subordinate treatment (dimmed/muted, labeled so the user knows it's reasoning, collapsible for long chains) — clearly distinct from the answer that follows. The reasoning prose inside is Markdown-formatted via the shared `<Markdown>` primitive (introduced by the Markdown-rendering plan, which lands first); only the surrounding container is new here.
+- A new **`ThinkingWidget`** renders `kind: "thinking"` items subordinate to the answer — reusing the existing `ToolCallWidget` disclosure pattern (`<details>`/`<summary>`, same width/styling), **collapsed-always** with a truncated reasoning preview in the header (no harness delta-streams reasoning to us — it arrives as whole blocks, so there is nothing to "watch build"); "Thinking" label; body through the shared `<Markdown>` primitive (which the Markdown-rendering plan lands first).
 - Answer text (`ContentKind::Text`) is visually unchanged.
-- Antigravity turns and Gemini hydrated turns both benefit automatically with no backend change — only the renderer changes.
-- The `[Thought: true]` literal that Gemini CLI embeds in some live-stream content turns is investigated and either reclassified as `ContentKind::Thinking` in the parser or confirmed as intentional model output (probe result decides; either outcome is recorded).
+- **Antigravity** reasoning (live + reopened) renders distinctly — the one harness served.
+- **Gemini's hydrate-only `Thinking` emission is removed** (`gemini/session_file.rs` + its test): it never streams (re-confirmed @ 0.44.0), so reopened-only reasoning is stale UX. Small backend change. The `[Thought: true]` live literal stays an open capture (§5/§7.2) — not reproduced under the default config; parse it only if a later probe proves it's a live reasoning marker.
+- **Claude / Codex** surface nothing — recorded as unavailable (redacted) / impossible (encrypted) in §3.2/§7; no code.
 - The stale `events.rs` doc comment on `ContentKind::Thinking` ("Reserved; not currently emitted") is corrected.
-- **The per-harness reasoning reality is recorded in `docs/research/harness-behavior.md` §3.2** (the canonical operational surface, created after this milestone was drafted) — covering all four harnesses, not the two the renderer touches. The frozen `archive/*-cli-observed.md` probes are cited as evidence, not edited.
+- The per-harness reasoning reality is recorded in `docs/research/harness-behavior.md` §3.2/§7 (the canonical operational surface, created after this milestone was drafted). The frozen `archive/*-cli-observed.md` probes are cited as evidence, not edited.
 
 ### Background: what the research found (2026-05-26)
 
@@ -619,15 +620,9 @@ Read before implementing — this is not recoverable from the codebase alone:
 
 ### Implementation Outline
 
-**Step 1 — Gemini live-stream probe (prerequisite; do before any parser change).**
+**Step 1 — Gemini: probe done; remove the hydrate emission.**
 
-Run `gemini -p "<short prompt>" --output-format stream-json` against the model config that produced the `[Thought: true]` output (the same project the user observed it in), capture the raw stream-json, and inspect it. Two possible outcomes:
-
-- **`[Thought: true]` appears as a literal prefix in a `message` event's `content` field** → add a detection pass in the Gemini live-stream parser (`gemini/parser.rs`): when a `message` event's content starts with `[Thought: true]`, strip the prefix and emit the remaining text as `ContentChunk { kind: Thinking }` instead of `ContentKind::Text`. Record the exact format (prefix string, whether it spans a single event or multiple) in `gemini-cli-observed.md`.
-- **`[Thought: true]` is regular model output that the model authored as text** → leave it as `ContentKind::Text`; record that finding in `gemini-cli-observed.md`. No parser change.
-- **It's a separate event type in a newer stream-json schema** → handle that event type as `ContentKind::Thinking` in the parser; record the new event shape.
-
-If the probe is not runnable (quota, auth issue), record that and proceed without the parser change — the frontend fix is independent.
+The live-stream probe is resolved (2026-05-29 @ 0.44.0, model `auto`): the stream carries **no** thoughts; the session file does — confirming Gemini reasoning is disk-only. Per the disk-only-is-stale-UX decision, **remove the `ContentKind::Thinking` emission from `gemini/session_file.rs`** (and its `parse_surfaces_thoughts_as_thinking_items` test) so reopened Gemini turns no longer show after-the-fact reasoning. Do **not** add live-stream parsing. The `[Thought: true]` literal was **not** reproduced under the default config; log it as an open capture (§5/§7.2) — if a future probe shows it is a live reasoning marker, add `gemini/parser.rs` detection then (strip prefix → `ContentChunk { kind: Thinking }`), out of scope here.
 
 **Step 2 — Claude: already probed; record as unavailable, do not wire.**
 
@@ -646,25 +641,29 @@ Resolved by the 2026-05-29 probe (Background + harness-behavior §7): Claude's r
 In `UnifiedTranscript.svelte`'s `turnBody` snippet, the `{#if item.item_kind === "text"}` branch renders all text items through `<Markdown>` (after the Markdown plan). Add a sub-branch on `item.kind`:
 
 - `kind === "text"` → unchanged (answer prose through `<Markdown>`).
-- `kind === "thinking"` → visually subordinate treatment **wrapping the same `<Markdown>` body**. The exact styling is the implementing agent's call against the design-system tokens in `docs/ui-conventions.md`, but the intent is: muted/dimmed, a small labeled header (e.g. "Thinking" or a collapse toggle), and collapsible for long blocks. A `<details>`/`<summary>` element is a natural fit but any approach consistent with the existing component patterns is fine. The reasoning prose inside still renders as Markdown — only the container changes. The key constraint: it must be visually distinct enough that a user can clearly tell where reasoning ends and the answer begins.
+- `kind === "thinking"` → a new **`ThinkingWidget.svelte`**, modeled on `ToolCallWidget.svelte`:
+  - Same `<details>`/`<summary>` disclosure, same `max-w-[600px]` + muted container styling.
+  - **Collapsed by default and stays collapsed** — do *not* reuse ToolCallWidget's open-while-running behavior. Reasoning reaches us as a whole block (no harness delta-streams it), so there is nothing to watch build, and auto-opening would flash for whole-block emitters.
+  - **Header (`<summary>`)**: a "Thinking" label where the tool name sits, a truncated single-line preview of the reasoning text (`min-w-0 truncate`), and a chevron — a glimpse without expanding.
+  - **Body**: the full reasoning through the shared `<Markdown>` primitive (prose — not the `<pre>` ToolCallWidget uses for command output).
+  - Key constraint: visually distinct enough that the user can tell where reasoning ends and the answer begins.
 
-No changes to `types.ts`, `reducers.ts`, `events.rs` enum variants, or any Rust backend are needed for this step.
+No changes to `types.ts`, `reducers.ts`, or `events.rs` enum variants are needed for the frontend. The only backend change in this milestone is the Gemini emission removal (Step 1).
 
 **Step 4 — Correct stale doc comment.**
 
-In `crates/harness/src/events.rs`, update the `ContentKind::Thinking` doc comment from "Reserved; not currently emitted" to reflect current reality: both Antigravity and Gemini already emit it, and the comment should describe what it means, not its historical reservation status.
+In `crates/harness/src/events.rs`, replace the `ContentKind::Thinking` doc comment ("Reserved; not currently emitted"). Describe what the variant means and the current reality: **Antigravity** emits it (live transcript tail); Gemini's disk-only emission was removed (Step 1); Claude's is server-redacted and Codex's encrypted (both unavailable). Keep it short — point to harness-behavior §3.2 for detail rather than duplicating it.
 
 ### Definition of Done
 
 - **`harness-behavior.md §3.2` is the system of record for findings.** The reasoning section is seeded with the current per-harness reality (all four harnesses); update it with the probe/recapture outcomes below. The frozen `archive/*-cli-observed.md` files are cited as evidence, **not** edited — earlier drafts of this DoD routed findings into `gemini-cli-observed.md`, which is now archived/frozen.
-- **Gemini probe result recorded** in §3.2 + §5 (even if the result is "leave as text — it's model output") — the probe outcome must be documented regardless of whether it triggers a parser change.
-- **Claude recorded** in §3.2/§7 as **unavailable** — reasoning text server-redacted (probed @ 2.1.157; `showThinkingSummaries` tested-failed); tracked upstream regression with a re-probe-on-bump trigger. No code change. The #63147 resume-wedge is logged in §7 as a separate reliability item to verify.
-- **Codex recorded** in §3.2 — reasoning is encrypted/unrecoverable (class-D ceiling); no code change, no probe. (Seeded already; just confirm it stays accurate.)
-- **Frontend rendering**: thinking items render with visually distinct treatment; answer text is unchanged. Component test: construct a turn with a `thinking` item followed by a `text` item and assert (a) both render, (b) they carry distinct `data-testid` attributes or CSS class selectors so thinking and answer can be told apart in tests, (c) the thinking item does not bleed into the answer container.
-- **Gemini parser change (only if probe warrants)**: unit test asserting a `[Thought: true]`-prefixed `message` event produces `ContentChunk { kind: Thinking }` with the prefix stripped; a normal `message` event produces `ContentChunk { kind: Text }` unchanged.
-- **`events.rs` doc comment corrected.**
-- **Manual verification**: open an Antigravity project with thinking turns and a Gemini project with session-file thoughts in `make dev` — confirm reasoning blocks are visually distinct from answer text in both. (Claude and Codex surface no reasoning by design — see §3.2 — so there is nothing to verify visually for them.)
-- **Known limitation to record if applicable**: if the Gemini probe was not runnable, state in §3.2/§5 that `[Thought: true]` handling is deferred and why; the Claude drop is recorded as a code comment at both content-block handling sites (`parser.rs`, `claude_code/session_file.rs`).
+- **Gemini emission removed.** §3.2/§5 reflect the disk-only probe result; `gemini/session_file.rs` no longer emits `ContentKind::Thinking`, and its `parse_surfaces_thoughts_as_thinking_items` test is removed/replaced with one asserting thoughts are **not** surfaced. A reopened Gemini turn shows no reasoning block. No live-stream parser change — `[Thought: true]` stays `Text`, logged as an open capture (§5/§7.2).
+- **Claude recorded** in §3.2/§7 as **unavailable** — reasoning text server-redacted (probed @ 2.1.157; `showThinkingSummaries` tested-failed); tracked upstream regression with a re-probe-on-bump trigger. No code change. The #63147 resume-wedge is logged in §7 (verified not-exposed @ 2.1.157, both normal and cancel→resume paths).
+- **Codex recorded** in §3.2 — reasoning is encrypted/unrecoverable (class-D ceiling); no code change, no probe. (Seeded already; confirm it stays accurate.)
+- **Frontend rendering**: a `ThinkingWidget` renders thinking items **collapsed by default** with a header preview, distinct from the answer. Component test: a turn with a `thinking` item followed by a `text` item asserts (a) both render, (b) distinct `data-testid`s so thinking vs answer are distinguishable, (c) thinking does not bleed into the answer container, (d) the widget is collapsed by default.
+- **`events.rs` doc comment corrected** (per Step 4).
+- **Manual verification**: open an Antigravity project with thinking turns in `make dev` — confirm reasoning renders as a distinct collapsed widget, separate from the answer; expanding shows the Markdown body. Confirm a reopened Gemini project shows **no** reasoning block (emission removed). Claude/Codex surface nothing by design (§3.2).
+- **Open capture logged**: `[Thought: true]` handling is deferred in §5/§7.2 with the reason (not reproduced under the default config).
 
 ---
 

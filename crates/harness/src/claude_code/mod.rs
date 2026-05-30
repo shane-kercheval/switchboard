@@ -62,13 +62,7 @@ impl Default for ClaudeCodeAdapter {
 #[async_trait]
 impl HarnessAdapter for ClaudeCodeAdapter {
     fn probe(&self) -> Result<(), DispatchError> {
-        // `which::which` handles both absolute paths (checks existence +
-        // executable bit) and relative names (PATH lookup), so it's a
-        // stricter check than `resolve_binary` for symmetry with the error
-        // we'd otherwise only learn about at spawn time.
-        which::which(&self.claude_binary_path)
-            .map(|_| ())
-            .map_err(|_| DispatchError::BinaryNotFound)
+        crate::subprocess::probe_binary(&self.claude_binary_path)
     }
 
     fn version(&self) -> Option<String> {
@@ -110,6 +104,7 @@ impl HarnessAdapter for ClaudeCodeAdapter {
             // the whole process group; `kill_on_drop` just covers the
             // producer-task-teardown edge.
             .kill_on_drop(true);
+        crate::subprocess::apply_path_env(&mut command);
         // Own process group so `killpg` (in the cancel path) tears down the
         // entire subprocess tree, not just the spawned PID.
         #[cfg(unix)]

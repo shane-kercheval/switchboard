@@ -486,6 +486,7 @@
                        this keyboard-only users couldn't reach the warning
                        detail. Not promoted to <button> because a button
                        implies a click action that doesn't exist. -->
+                  <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
                   <div
                     {...props}
                     tabindex="0"
@@ -548,6 +549,7 @@
                   <!-- tabindex=0 so keyboard users can open the tooltip; a <div>
                        (no click action) isn't focusable on its own. Mirrors the
                        parse-warnings indicator. -->
+                  <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
                   <div
                     {...props}
                     tabindex="0"
@@ -598,6 +600,7 @@
                    snapshot-age qualifier, unlike Claude's stream-only payload. -->
               <Tooltip side="right">
                 {#snippet trigger(props)}
+                  <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
                   <div
                     {...props}
                     tabindex="0"

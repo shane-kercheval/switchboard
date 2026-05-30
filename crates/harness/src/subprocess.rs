@@ -18,7 +18,7 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use tokio::io::AsyncBufReadExt;
@@ -43,15 +43,105 @@ pub const STDERR_TAIL_CAPACITY: usize = 16;
 /// UI. Truncation happens on char boundaries (see [`format_stderr_tail`]).
 pub const STDERR_MESSAGE_MAX_LEN: usize = 800;
 
+/// Sentinel bracketing the PATH value we ask the login shell to print, so we
+/// can recover it even when shell startup emits its own banner/MOTD output
+/// around our command.
+#[cfg(target_os = "macos")]
+const PATH_SENTINEL: &str = "__SWITCHBOARD_PATH__";
+
+/// Extract the PATH value bracketed by [`PATH_SENTINEL`] from login-shell
+/// output. Returns `None` if the markers are absent or bracket an empty value.
+#[cfg(target_os = "macos")]
+fn parse_sentinel_path(output: &str) -> Option<String> {
+    let start = output.find(PATH_SENTINEL)? + PATH_SENTINEL.len();
+    let rest = &output[start..];
+    let end = rest.find(PATH_SENTINEL)?;
+    let path = rest[..end].trim();
+    (!path.is_empty()).then(|| path.to_owned())
+}
+
+/// Run the user's login shell once to print its PATH between two sentinels.
+/// `-ilc` sources both login (`.zprofile`) and interactive (`.zshrc`) startup
+/// files — where nvm/asdf/pyenv and `~/.local/bin` typically extend PATH — so
+/// the result matches what the user sees in a terminal. `$SHELL` falls back to
+/// zsh (the macOS default). `printf` avoids a trailing newline inside the
+/// sentinels.
+#[cfg(target_os = "macos")]
+fn run_login_shell_path() -> Option<String> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_owned());
+    let script = format!("printf '%s%s%s' '{PATH_SENTINEL}' \"$PATH\" '{PATH_SENTINEL}'");
+    let output = std::process::Command::new(shell)
+        .args(["-ilc", &script])
+        .output()
+        .ok()?;
+    parse_sentinel_path(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Capture the login-shell PATH, bounded by a timeout so a misbehaving startup
+/// file (one that blocks on input) can't stall app launch. The shell runs on a
+/// detached thread; if it doesn't answer within the window we give up and the
+/// caller falls back to the process PATH.
+#[cfg(target_os = "macos")]
+fn capture_login_shell_path() -> Option<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(run_login_shell_path());
+    });
+    rx.recv_timeout(Duration::from_secs(5)).ok().flatten()
+}
+
+/// The PATH used to locate and run harness CLIs: the user's login-shell PATH,
+/// captured once and cached. A GUI launch (Spotlight/Launchpad) inherits only a
+/// minimal PATH that omits nvm, `~/.local/bin`, Homebrew, etc.; this recovers
+/// the full terminal PATH. Falls back to the process PATH if the shell capture
+/// fails — correct for a terminal launch, safe degradation for a GUI launch.
+#[cfg(target_os = "macos")]
+fn resolved_path() -> &'static str {
+    static CACHE: OnceLock<String> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        capture_login_shell_path().unwrap_or_else(|| std::env::var("PATH").unwrap_or_default())
+    })
+}
+
+/// Set the resolved PATH on a harness subprocess so the spawned CLI — and the
+/// tools *it* shells out to (git, node, ripgrep, an `env`-shebang interpreter,
+/// …) — resolve the same way they would in the user's terminal. Without this, a
+/// GUI-launched app hands the child its minimal PATH and those lookups fail even
+/// when the harness binary itself was found. No-op off macOS, where the
+/// inherited PATH is already correct.
+pub fn apply_path_env(command: &mut tokio::process::Command) {
+    #[cfg(target_os = "macos")]
+    command.env("PATH", resolved_path());
+    #[cfg(not(target_os = "macos"))]
+    let _ = command;
+}
+
 /// Resolve a harness binary path to an absolute path. Absolute paths are
 /// trusted as-is (spawn will return `NotFound` if the binary is missing and
-/// the caller maps that to `BinaryNotFound`). Relative names go through
-/// `which` for PATH lookup.
+/// the caller maps that to `BinaryNotFound`). Relative names go through `which`,
+/// searching the resolved login-shell PATH on macOS so a GUI launch finds the
+/// same binary the terminal would.
 pub fn resolve_binary(path: &Path) -> Result<PathBuf, DispatchError> {
     if path.is_absolute() {
         return Ok(path.to_owned());
     }
-    which::which(path).map_err(|_| DispatchError::BinaryNotFound)
+    #[cfg(target_os = "macos")]
+    let found = which::which_in(path, Some(resolved_path()), std::path::Path::new("."));
+    #[cfg(not(target_os = "macos"))]
+    let found = which::which(path);
+    found.map_err(|_| DispatchError::BinaryNotFound)
+}
+
+/// Check whether a harness binary is present and executable. Absolute paths are
+/// checked directly; relative names search `which` over the resolved
+/// login-shell PATH on macOS so a GUI launch probes the same locations the
+/// terminal would.
+pub fn probe_binary(path: &Path) -> Result<(), DispatchError> {
+    #[cfg(target_os = "macos")]
+    let found = which::which_in(path, Some(resolved_path()), std::path::Path::new("."));
+    #[cfg(not(target_os = "macos"))]
+    let found = which::which(path);
+    found.map(|_| ()).map_err(|_| DispatchError::BinaryNotFound)
 }
 
 /// Extract just the version number from a `--version` line, since CLIs pad it
@@ -85,10 +175,13 @@ pub fn parse_cli_version(line: &str) -> Option<String> {
 /// load-bearing, so any failure collapses to "unknown" rather than an error.
 pub fn fetch_version(binary: &Path) -> Option<String> {
     let resolved = resolve_binary(binary).ok()?;
-    let output = std::process::Command::new(&resolved)
-        .arg("--version")
-        .output()
-        .ok()?;
+    let mut command = std::process::Command::new(&resolved);
+    // Same PATH augmentation as a dispatched turn: a `--version` that shells
+    // out (or is an env-shebang script) must resolve its interpreter/tools the
+    // way a real turn would, so the displayed version matches what runs.
+    #[cfg(target_os = "macos")]
+    command.env("PATH", resolved_path());
+    let output = command.arg("--version").output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -278,6 +371,35 @@ mod tests {
         assert!(result.chars().count() < 850);
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_sentinel_path_extracts_value_between_markers() {
+        let out = format!("{PATH_SENTINEL}/usr/bin:/bin{PATH_SENTINEL}");
+        assert_eq!(parse_sentinel_path(&out).as_deref(), Some("/usr/bin:/bin"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_sentinel_path_ignores_surrounding_banner_noise() {
+        // A login shell may print MOTD/banner lines around our printf; the
+        // sentinels let us recover the value regardless.
+        let out = format!("Welcome to zsh\nbanner line\n{PATH_SENTINEL}/a:/b:/c{PATH_SENTINEL}\n");
+        assert_eq!(parse_sentinel_path(&out).as_deref(), Some("/a:/b:/c"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_sentinel_path_none_when_missing_or_empty() {
+        assert_eq!(parse_sentinel_path("no markers here"), None);
+        // Both markers present but bracketing nothing → None.
+        assert_eq!(
+            parse_sentinel_path(&format!("{PATH_SENTINEL}{PATH_SENTINEL}")),
+            None
+        );
+        // Only the opening marker → can't bracket a value → None.
+        assert_eq!(parse_sentinel_path(&format!("{PATH_SENTINEL}/a:/b")), None);
+    }
+
     #[test]
     fn resolve_binary_returns_absolute_path_verbatim() {
         // Absolute path → trusted as-is, no PATH lookup. Even nonexistent
@@ -294,6 +416,35 @@ mod tests {
             resolve_binary(path),
             Err(DispatchError::BinaryNotFound)
         ));
+    }
+
+    #[test]
+    fn probe_binary_is_stricter_than_resolve_for_absolute_paths() {
+        // Intentional divergence: `resolve_binary` trusts an absolute path
+        // verbatim (failure deferred to spawn), but `probe_binary` actually
+        // checks existence + exec bit, so a missing absolute path fails at
+        // probe time. This test locks that contract so a future refactor can't
+        // silently collapse the two.
+        let path = std::path::Path::new("/nonexistent/absolute/binary");
+        assert!(resolve_binary(path).is_ok());
+        assert!(matches!(
+            probe_binary(path),
+            Err(DispatchError::BinaryNotFound)
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn apply_path_env_sets_resolved_path_on_child() {
+        // The behavior the fix exists for: a spawned harness subprocess must
+        // see the resolved (login-shell) PATH, not the parent's minimal GUI
+        // PATH. Run a child that prints its inherited PATH and assert it equals
+        // what we resolved.
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-c", "printf %s \"$PATH\""]);
+        apply_path_env(&mut command);
+        let output = command.output().await.expect("sh should run");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), resolved_path());
     }
 
     #[test]

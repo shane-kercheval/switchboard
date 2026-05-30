@@ -111,9 +111,7 @@ impl Default for CodexAdapter {
 #[async_trait]
 impl HarnessAdapter for CodexAdapter {
     fn probe(&self) -> Result<(), DispatchError> {
-        which::which(&self.codex_binary_path)
-            .map(|_| ())
-            .map_err(|_| DispatchError::BinaryNotFound)
+        crate::subprocess::probe_binary(&self.codex_binary_path)
     }
 
     fn version(&self) -> Option<String> {
@@ -154,6 +152,7 @@ impl HarnessAdapter for CodexAdapter {
             // harness on an interactive read or a pipe-full deadlock.
             .stdin(Stdio::null())
             .kill_on_drop(true);
+        crate::subprocess::apply_path_env(&mut command);
         #[cfg(unix)]
         command.process_group(0);
         let mut child = command.spawn().map_err(|e| {

@@ -30,9 +30,9 @@ use crate::commands::{
     check_codex_binary_impl, check_gemini_auth_impl, check_gemini_binary_impl, create_agent_impl,
     create_project_impl, get_harness_install_status_impl, init_directory_impl, list_agents_impl,
     list_projects_impl, list_workspace_directories_impl, load_project_conversation_impl,
-    load_transcript_impl, open_project_impl, parse_uuid, pick_directory_impl,
-    remove_directory_impl, remove_queued_message_impl, send_message_impl, set_active_project_impl,
-    validate_external_url,
+    load_transcript_impl, open_project_impl, parse_uuid, pick_directory_impl, remove_agent_impl,
+    remove_directory_impl, remove_queued_message_impl, rename_agent_impl, send_message_impl,
+    set_active_project_impl, validate_external_url,
 };
 use crate::state::AppState;
 
@@ -157,6 +157,24 @@ async fn create_agent(
     harness: HarnessKind,
 ) -> Result<AgentRecord, String> {
     create_agent_impl(state.inner(), &name, harness).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn remove_agent(state: State<'_, AppState>, agent_id: String) -> Result<(), String> {
+    let id = parse_uuid(&agent_id).map_err(|e| e.to_string())?;
+    remove_agent_impl(state.inner(), id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn rename_agent(
+    state: State<'_, AppState>,
+    agent_id: String,
+    new_name: String,
+) -> Result<AgentRecord, String> {
+    let id = parse_uuid(&agent_id).map_err(|e| e.to_string())?;
+    rename_agent_impl(state.inner(), id, &new_name).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -489,6 +507,8 @@ pub fn run() {
             open_project,
             set_active_project,
             create_agent,
+            remove_agent,
+            rename_agent,
             attach_agent,
             list_agents,
             send_message,

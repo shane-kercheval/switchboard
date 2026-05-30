@@ -533,6 +533,111 @@ pub fn create_agent_impl(
     Ok(record)
 }
 
+/// Remove an agent: tear down its actor, then delete its registry record and
+/// Switchboard sidecars. Resolves the agent's *own* project from its id (never
+/// the active project), so it's free of the active-project coupling.
+///
+/// **Two phases by necessity.** `shutdown_agent` is async and the registry
+/// mutation runs under the synchronous `registry_write` guard, which can't be
+/// held across an `.await` (the guard isn't `Send`).
+///
+/// **Active agents are torn down, not rejected.** If a turn is in flight,
+/// `shutdown_agent` cancels it (surfaced as a `Cancelled` terminal, same as
+/// "Stop"), drains the harness subprocess, and drops the slot — the UI gates
+/// Remove on the active state; the backend just makes teardown robust whatever
+/// the state. This inherits `shutdown_agent`'s drain latency: a slow subprocess
+/// wind-down blocks the command for that duration (same path as remove-directory
+/// and quit).
+///
+/// **Not atomic across the two phases.** Phase (a) is irreversible (it cancels
+/// any in-flight turn), but phase (b)'s registry write can fail (disk I/O). On
+/// that path the turn was already cancelled yet the record remains — so a failed
+/// remove can still have cancelled work; "remove errored" does not mean "nothing
+/// happened." It self-heals functionally (the next send re-spawns the actor),
+/// and registry-write failure is rare, so this is accepted rather than made
+/// transactional across an async cancel + a sync write.
+pub async fn remove_agent_impl(state: &AppState, agent_id: AgentId) -> Result<(), AppError> {
+    // Resolve the agent's *own* project from its id (never the active project),
+    // before the irreversible phase (a) so a non-existent agent fails fast —
+    // nothing is torn down before we know the agent exists.
+    let (project, agent) = lookup_agent(state, agent_id)?;
+
+    // Phase (a) — no lock held.
+    state
+        .dispatcher
+        .shutdown_agent(agent_id, CancelSource::Shutdown)
+        .await;
+
+    // No lock spans (a)→(b), so a concurrent `send_message` to this id can
+    // re-spawn an `Active` actor via `ensure_actor` between the teardown and the
+    // registry removal — leaving an idle orphan actor after phase (b) deletes the
+    // record. Tolerated: it's UI-gated (you can't send to an agent you're
+    // removing), self-limiting (the orphan is idle), and reaped on restart.
+    // Phase (b) — fully synchronous under `registry_write`, no `.await`.
+    let _write = lock(&state.registry_write);
+    project.remove_agent(agent_id)?;
+    delete_agent_sidecars(&project, agent_id, agent.harness);
+    lock(&state.agents_by_id).remove(&agent_id);
+    Ok(())
+}
+
+/// Best-effort deletion of an agent's Switchboard sidecars. A missing file is
+/// fine; a failed delete is logged and tolerated — the registry removal is the
+/// authoritative effect. Harness-native session files (`~/.claude/…`,
+/// `~/.codex/…`, …) are deliberately left untouched.
+fn delete_agent_sidecars(project: &Project, agent_id: AgentId, harness: HarnessKind) {
+    let dir = project.directory.as_path();
+    let pid = project.id;
+    // The meta sidecar is harness-agnostic (a Switchboard-owned stream-metadata
+    // cache keyed on `AgentId`), so it's present-or-absent for any agent.
+    let mut paths = vec![switchboard_harness::meta_sidecar::meta_sidecar_path(
+        dir, pid, agent_id,
+    )];
+    // The session-link sidecar exists only for harnesses whose session id is
+    // *server-assigned* (Codex, Antigravity); Claude/Gemini carry a
+    // caller-controlled id in the registry record and write none. Matched on the
+    // agent's own harness so we don't probe paths that can't exist.
+    //
+    // `HarnessKind` is `#[non_exhaustive]`, so this cross-crate match needs a
+    // `_` arm and can't be compile-checked for a future variant: a new
+    // *server-assigned* harness MUST add an arm here (and at its dispatch-time
+    // sidecar-write site), or its link sidecars orphan on remove.
+    match harness {
+        HarnessKind::Codex => paths.push(switchboard_harness::codex::sidecar::sidecar_path(
+            dir, pid, agent_id,
+        )),
+        HarnessKind::Antigravity => paths.push(
+            switchboard_harness::antigravity::sidecar::sidecar_path(dir, pid, agent_id),
+        ),
+        _ => {}
+    }
+    for path in paths {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "failed to delete agent sidecar");
+            }
+        }
+    }
+}
+
+/// Rename an agent's registry record (and its in-memory mirror). Synchronous
+/// under `registry_write` — no actor interaction. Format and uniqueness are
+/// re-validated in core; the frontend pre-checks, but the backend stays
+/// authoritative, so a collision or invalid name surfaces as the matching error.
+pub fn rename_agent_impl(
+    state: &AppState,
+    agent_id: AgentId,
+    new_name: &str,
+) -> Result<AgentRecord, AppError> {
+    let _write = lock(&state.registry_write);
+    let (project, _) = lookup_agent(state, agent_id)?;
+    let updated = project.rename_agent(agent_id, new_name)?;
+    lock(&state.agents_by_id).insert(agent_id, updated.clone());
+    Ok(updated)
+}
+
 /// Attach an existing harness session (Claude Code, Codex, Gemini, or
 /// Antigravity) as a new Switchboard agent in the active project.
 ///
@@ -5513,6 +5618,143 @@ mod tests {
             name == channel && v["type"] == "turn_end" && v["outcome"]["status"] == "cancelled"
         });
         assert!(cancelled, "cancel synthesizes a cancelled terminal");
+    }
+
+    // --- remove_agent / rename_agent (M5) ---
+    // Fixture-level only — no live test: these commands don't change how we talk
+    // to a real CLI, just registry/sidecar/in-memory state.
+
+    fn meta_sidecar(tmp: &TempDir, project_id: ProjectId, agent_id: AgentId) -> PathBuf {
+        switchboard_harness::meta_sidecar::meta_sidecar_path(tmp.path(), project_id, agent_id)
+    }
+
+    fn write_dummy(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"{}").unwrap();
+    }
+
+    #[tokio::test]
+    async fn remove_agent_drops_record_and_cache_entry() {
+        let (tmp, state, _) = fresh_state_with_mock();
+        let (agent, project_id) = project_with_agent(&state, &tmp).await;
+        let project = lock(&state.projects).get(&project_id).cloned().unwrap();
+        assert_eq!(project.list_agents().unwrap().len(), 1);
+
+        remove_agent_impl(&state, agent.id).await.unwrap();
+
+        assert!(project.list_agents().unwrap().is_empty());
+        assert!(!lock(&state.agents_by_id).contains_key(&agent.id));
+    }
+
+    #[tokio::test]
+    async fn remove_agent_deletes_present_sidecar_and_tolerates_absent() {
+        let (tmp, state, _) = fresh_state_with_mock();
+        let (agent, project_id) = project_with_agent(&state, &tmp).await;
+        // Only the meta sidecar exists; the codex/antigravity ones don't —
+        // removal must delete the present one and not fail on the absent ones.
+        let sidecar = meta_sidecar(&tmp, project_id, agent.id);
+        write_dummy(&sidecar);
+
+        remove_agent_impl(&state, agent.id).await.unwrap();
+
+        assert!(!sidecar.exists(), "the agent's meta sidecar is deleted");
+    }
+
+    #[tokio::test]
+    async fn remove_agent_leaves_other_agents_sidecar_intact() {
+        // Scope guard: removal touches only this agent's sidecars. A sibling
+        // agent's sidecar (and, by construction — we only ever target the three
+        // `.switchboard/.../sessions/<id>.*` paths — any harness-native file)
+        // is untouched.
+        let (tmp, state, _) = fresh_state_with_mock();
+        let (a, project_id) = project_with_agent(&state, &tmp).await;
+        let b = create_agent_impl(&state, "second", HarnessKind::ClaudeCode).unwrap();
+        let sidecar_a = meta_sidecar(&tmp, project_id, a.id);
+        let sidecar_b = meta_sidecar(&tmp, project_id, b.id);
+        write_dummy(&sidecar_a);
+        write_dummy(&sidecar_b);
+
+        remove_agent_impl(&state, a.id).await.unwrap();
+
+        assert!(!sidecar_a.exists());
+        assert!(sidecar_b.exists(), "sibling agent's sidecar untouched");
+    }
+
+    #[tokio::test]
+    async fn remove_agent_nonexistent_errors() {
+        let (_tmp, state, _) = fresh_state_with_mock();
+        let err = remove_agent_impl(&state, Uuid::now_v7()).await.unwrap_err();
+        assert!(matches!(err, AppError::AgentNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn remove_agent_with_in_flight_turn_cancels_then_removes() {
+        let (tmp, state, emitter) =
+            fresh_state_with_scenario(switchboard_harness::MockScenario::AwaitCancellation);
+        let (agent, project_id) = project_with_agent(&state, &tmp).await;
+        send_msg(&state, agent.id, "long task").await.unwrap();
+        within(
+            &emitter,
+            "turn_start",
+            emitter.wait_for_type("turn_start", 1),
+        )
+        .await;
+
+        // Phase (a) cancels the live turn + tears down; phase (b) deletes.
+        remove_agent_impl(&state, agent.id).await.unwrap();
+
+        let project = lock(&state.projects).get(&project_id).cloned().unwrap();
+        assert!(project.list_agents().unwrap().is_empty());
+        assert!(!lock(&state.agents_by_id).contains_key(&agent.id));
+        let channel = format!("agent:{}", agent.id);
+        let cancelled = emitter.snapshot().into_iter().any(|(name, v)| {
+            name == channel && v["type"] == "turn_end" && v["outcome"]["status"] == "cancelled"
+        });
+        assert!(
+            cancelled,
+            "the in-flight turn is cancelled, not silently dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_agent_updates_record_and_cache() {
+        let (tmp, state, _) = fresh_state_with_mock();
+        let (agent, project_id) = project_with_agent(&state, &tmp).await;
+
+        let updated = rename_agent_impl(&state, agent.id, "renamed").unwrap();
+        assert_eq!(updated.name, "renamed");
+        assert_eq!(updated.id, agent.id);
+
+        let project = lock(&state.projects).get(&project_id).cloned().unwrap();
+        assert_eq!(project.list_agents().unwrap()[0].name, "renamed");
+        assert_eq!(
+            lock(&state.agents_by_id).get(&agent.id).unwrap().name,
+            "renamed"
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_agent_rejects_duplicate_name() {
+        let (tmp, state, _) = fresh_state_with_mock();
+        let (a, _pid) = project_with_agent(&state, &tmp).await;
+        create_agent_impl(&state, "second", HarnessKind::ClaudeCode).unwrap();
+        let err = rename_agent_impl(&state, a.id, "SECOND").unwrap_err();
+        assert!(matches!(
+            err,
+            AppError::Core(CoreError::DuplicateAgentName { .. })
+        ));
+        // The reject path leaves the cache untouched.
+        assert_eq!(
+            lock(&state.agents_by_id).get(&a.id).unwrap().name,
+            "assistant"
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_agent_nonexistent_errors() {
+        let (_tmp, state, _) = fresh_state_with_mock();
+        let err = rename_agent_impl(&state, Uuid::now_v7(), "x").unwrap_err();
+        assert!(matches!(err, AppError::AgentNotFound(_)));
     }
 
     #[tokio::test]

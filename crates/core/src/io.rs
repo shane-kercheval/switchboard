@@ -100,6 +100,64 @@ pub(crate) fn read_jsonl<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
     Ok(out)
 }
 
+/// Atomically rewrite a JSONL file with exactly `values`, replacing any
+/// existing content: serialize all, write `<path>.tmp` in the same directory,
+/// `rename` over the target.
+///
+/// **Why rewrite, not append.** The registry is otherwise an append-only log
+/// (`append_jsonl`), but removing or renaming an agent edits a record in place,
+/// which can't be expressed as an append without a compaction/tombstone story
+/// we're not building. The agent count is tiny, so a full rewrite is cheap and
+/// keeps the read path a simple `read_jsonl`. Adds still go through
+/// `append_jsonl`; this is only for the in-place edits.
+///
+/// **Durability matches `append_jsonl`** (the registry's add path), so the two
+/// halves of the same source-of-truth fail the same way: `sync_data` the tmp
+/// before the rename (else a power loss after the rename reaches disk but the
+/// data didn't leaves an empty/partial registry — every agent lost), and fsync
+/// the parent directory after the rename (a rename is a directory-entry change,
+/// not durable until the dir is synced — else the rewrite can silently revert on
+/// power loss). Unlike `append_jsonl`'s create-only dir fsync, a
+/// rewrite-over-existing *always* changes the entry, so the dir fsync is
+/// unconditional. Unix-only (no portable Windows equivalent), matching
+/// `append_jsonl`. This is a rare path (remove/rename), not the hot append, so
+/// the extra syncs cost nothing meaningful.
+pub(crate) fn write_jsonl<T: Serialize>(path: &Path, values: &[T]) -> Result<()> {
+    let mut buf = String::new();
+    for value in values {
+        let line = serde_json::to_string(value).map_err(|source| CoreError::Serialize {
+            path: path.to_owned(),
+            source,
+        })?;
+        buf.push_str(&line);
+        buf.push('\n');
+    }
+    let tmp = tmp_path(path);
+    {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)
+            .map_err(|e| CoreError::io(&tmp, e))?;
+        file.write_all(buf.as_bytes())
+            .map_err(|e| CoreError::io(&tmp, e))?;
+        file.flush().map_err(|e| CoreError::io(&tmp, e))?;
+        file.sync_data().map_err(|e| CoreError::io(&tmp, e))?;
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(CoreError::io(path, e));
+    }
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| CoreError::io(parent, e))?;
+    }
+    Ok(())
+}
+
 pub fn read_yaml<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let bytes = std::fs::read(path).map_err(|e| CoreError::io(path, e))?;
     serde_norway::from_slice(&bytes).map_err(|source| CoreError::CorruptYaml {
@@ -112,6 +170,14 @@ pub fn read_yaml<T: DeserializeOwned>(path: &Path) -> Result<T> {
 /// directory* as the target, then `rename` over the target. Same-filesystem
 /// rename is atomic on POSIX/Windows; a cross-filesystem temp dir would
 /// degrade to copy+delete and defeat the purpose, so we stay adjacent.
+///
+/// **Known durability gap (tracked follow-up).** Unlike `write_jsonl` /
+/// `append_jsonl`, this does *not* `sync_data` the tmp before rename nor fsync
+/// the parent dir after — so a power loss can leave a partial/stale file. Lower
+/// frequency than the registry, but it persists `workspace.yaml` (the user's
+/// whole cross-directory project list) and `config.yaml`, so the gap isn't
+/// trivial. Hardening it the way `write_jsonl` does is a deliberate follow-up,
+/// out of the milestone that added `write_jsonl`.
 pub fn write_yaml<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let yaml = serde_norway::to_string(value).map_err(|source| CoreError::CorruptYaml {
         path: path.to_owned(),

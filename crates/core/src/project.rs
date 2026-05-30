@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::agent::AgentRecord;
 use crate::error::{CoreError, Result};
 use crate::harness::HarnessKind;
-use crate::io::{append_jsonl, read_jsonl, read_yaml, write_yaml};
+use crate::io::{append_jsonl, read_jsonl, read_yaml, write_jsonl, write_yaml};
 use crate::name::{canonicalize_for_uniqueness, validate_name};
 use crate::paths::{CONFIG_FILE, JOURNAL_FILE, REGISTRY_FILE};
 
@@ -208,15 +208,7 @@ impl Project {
         agent_id: Uuid,
     ) -> Result<AgentRecord> {
         validate_name(name)?;
-        let canonical = canonicalize_for_uniqueness(name);
-        for existing in self.list_agents()? {
-            if canonicalize_for_uniqueness(&existing.name) == canonical {
-                return Err(CoreError::DuplicateAgentName {
-                    name: name.to_owned(),
-                    existing: existing.name,
-                });
-            }
-        }
+        check_name_unique(&self.list_agents()?, name, None)?;
 
         let record = AgentRecord {
             id: agent_id,
@@ -234,6 +226,68 @@ impl Project {
     pub fn list_agents(&self) -> Result<Vec<AgentRecord>> {
         read_jsonl(&self.registry_path)
     }
+
+    /// Remove an agent from the registry by id, rewriting `registry.jsonl`
+    /// without the record. Returns whether a record was actually removed, so a
+    /// stale or double remove is detectable rather than a silent no-op. Touches
+    /// only the registry — the caller owns sidecar cleanup and any actor
+    /// teardown.
+    pub fn remove_agent(&self, agent_id: crate::agent::AgentId) -> Result<bool> {
+        let mut agents = self.list_agents()?;
+        let before = agents.len();
+        agents.retain(|a| a.id != agent_id);
+        if agents.len() == before {
+            return Ok(false);
+        }
+        write_jsonl(&self.registry_path, &agents)?;
+        Ok(true)
+    }
+
+    /// Rename an agent in the registry. Validates the new name's format and its
+    /// canonicalized uniqueness against the *other* agents (self excluded, so
+    /// re-saving the same name — or a case/hyphen variant — is allowed), then
+    /// rewrites `registry.jsonl`. Returns the updated record.
+    pub fn rename_agent(
+        &self,
+        agent_id: crate::agent::AgentId,
+        new_name: &str,
+    ) -> Result<AgentRecord> {
+        validate_name(new_name)?;
+        let mut agents = self.list_agents()?;
+        let idx = agents
+            .iter()
+            .position(|a| a.id == agent_id)
+            .ok_or(CoreError::AgentNotFound(agent_id))?;
+        check_name_unique(&agents, new_name, Some(agent_id))?;
+        new_name.clone_into(&mut agents[idx].name);
+        let updated = agents[idx].clone();
+        write_jsonl(&self.registry_path, &agents)?;
+        Ok(updated)
+    }
+}
+
+/// Canonicalized-uniqueness check shared by register (`exclude` = `None`) and
+/// rename (`exclude` = the renamed agent's id, so it doesn't collide with
+/// itself). Per system-design §4, names collide case-insensitively and with
+/// hyphens treated as underscores.
+fn check_name_unique(
+    agents: &[AgentRecord],
+    name: &str,
+    exclude: Option<crate::agent::AgentId>,
+) -> Result<()> {
+    let canonical = canonicalize_for_uniqueness(name);
+    for existing in agents {
+        if Some(existing.id) == exclude {
+            continue;
+        }
+        if canonicalize_for_uniqueness(&existing.name) == canonical {
+            return Err(CoreError::DuplicateAgentName {
+                name: name.to_owned(),
+                existing: existing.name.clone(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Load a `Project` from disk. Reads the per-project config.yaml; the caller has
@@ -406,6 +460,97 @@ mod tests {
                 "{collision:?} should collide with 'agent-a'"
             );
         }
+    }
+
+    #[test]
+    fn remove_agent_drops_target_and_keeps_others() {
+        let (_tmp, project) = fresh_project();
+        let a = project
+            .register_agent("alpha", HarnessKind::ClaudeCode)
+            .unwrap();
+        let b = project.register_agent("beta", HarnessKind::Codex).unwrap();
+        assert!(project.remove_agent(a.id).unwrap());
+        assert_eq!(project.list_agents().unwrap(), vec![b]);
+    }
+
+    #[test]
+    fn remove_agent_nonexistent_reports_not_removed() {
+        let (_tmp, project) = fresh_project();
+        project
+            .register_agent("alpha", HarnessKind::ClaudeCode)
+            .unwrap();
+        assert!(!project.remove_agent(Uuid::now_v7()).unwrap());
+        assert_eq!(project.list_agents().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn removed_name_is_reusable() {
+        // Uniqueness is checked against the live registry, so freeing a name by
+        // removal lets it be registered again.
+        let (_tmp, project) = fresh_project();
+        let a = project
+            .register_agent("alpha", HarnessKind::ClaudeCode)
+            .unwrap();
+        project.remove_agent(a.id).unwrap();
+        project
+            .register_agent("alpha", HarnessKind::Codex)
+            .expect("name freed by removal");
+    }
+
+    #[test]
+    fn rename_agent_changes_name_and_persists() {
+        let (_tmp, project) = fresh_project();
+        let a = project
+            .register_agent("alpha", HarnessKind::ClaudeCode)
+            .unwrap();
+        let updated = project.rename_agent(a.id, "renamed").unwrap();
+        assert_eq!(updated.name, "renamed");
+        assert_eq!(updated.id, a.id);
+        let listed = project.list_agents().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "renamed");
+    }
+
+    #[test]
+    fn rename_agent_to_own_name_variant_succeeds() {
+        // Self is excluded from the uniqueness check, so a case/hyphen variant
+        // of the agent's own name is allowed.
+        let (_tmp, project) = fresh_project();
+        let a = project
+            .register_agent("agent-a", HarnessKind::ClaudeCode)
+            .unwrap();
+        let updated = project.rename_agent(a.id, "Agent_A").unwrap();
+        assert_eq!(updated.name, "Agent_A");
+    }
+
+    #[test]
+    fn rename_agent_rejects_canonical_collision_with_another() {
+        let (_tmp, project) = fresh_project();
+        let a = project
+            .register_agent("alpha", HarnessKind::ClaudeCode)
+            .unwrap();
+        project.register_agent("beta", HarnessKind::Codex).unwrap();
+        let err = project.rename_agent(a.id, "BETA").unwrap_err();
+        assert!(matches!(err, CoreError::DuplicateAgentName { .. }));
+        // The reject path leaves the registry untouched.
+        assert_eq!(project.list_agents().unwrap()[0].name, "alpha");
+    }
+
+    #[test]
+    fn rename_agent_rejects_invalid_name() {
+        let (_tmp, project) = fresh_project();
+        let a = project
+            .register_agent("alpha", HarnessKind::ClaudeCode)
+            .unwrap();
+        let err = project.rename_agent(a.id, "bad name").unwrap_err();
+        assert!(matches!(err, CoreError::InvalidName { .. }));
+    }
+
+    #[test]
+    fn rename_agent_nonexistent_returns_not_found() {
+        let (_tmp, project) = fresh_project();
+        let err = project.rename_agent(Uuid::now_v7(), "x").unwrap_err();
+        assert!(matches!(err, CoreError::AgentNotFound(_)));
     }
 
     #[test]

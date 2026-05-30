@@ -103,6 +103,19 @@ export async function createAgent(name: string, harness: HarnessKind): Promise<A
   return await invoke<AgentRecord>("create_agent", { name, harness });
 }
 
+/// Remove an agent: tears down its actor (cancelling any in-flight turn) and
+/// deletes its registry record + Switchboard sidecars. Harness-native session
+/// files are left intact.
+export async function removeAgent(agentId: AgentId): Promise<void> {
+  await invoke("remove_agent", { agentId });
+}
+
+/// Rename an agent. The backend re-validates format + uniqueness and returns the
+/// updated record (or rejects with a collision/invalid-name error).
+export async function renameAgent(agentId: AgentId, newName: string): Promise<AgentRecord> {
+  return await invoke<AgentRecord>("rename_agent", { agentId, newName });
+}
+
 export async function attachAgent(
   name: string,
   harness: HarnessKind,

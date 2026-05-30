@@ -137,25 +137,39 @@ The "Add an agent" form validates the name as the user types, using M1, instead 
 
 ### Goal & Outcome
 
-A single reactive source of truth for which harness binaries are installed, fetched once at startup and refreshed at natural moments, so consumers don't each re-probe.
+A single reactive source of truth for which harness binaries are installed (and their version), fetched once at startup and refreshed at natural moments, so no surface re-probes independently. **Full-consolidation scope** (chosen over a narrower refactor): every install/version consumer reads this store, so they agree by construction.
 
-- On app load, availability for all four harnesses is fetched and held in reactive state.
-- The existing blank-state surface and the create form read from this store.
-- The store is refreshed when the user is likely to have changed their install set (at minimum: when the settings panel opens, which already lists harness status).
+- On app load, install status for all four harnesses is fetched and held in reactive state.
+- Every surface that needs "is harness X installed / what version" reads the store: the binary-missing banner stack, the create-form gating, the Settings + blank-state "Supported CLIs" list, and (M4) auto-create.
+- The store is refreshed when the user is likely to have changed their install set (at minimum: when the settings panel opens).
+
+### Context: the two pre-existing mechanisms this replaces
+
+Before this milestone there are **two** backend availability commands and **three** frontend consumers, which is exactly the duplication this store removes:
+
+- `check_*_binary` (probe-only → `Result<()>`): `App.svelte` runs four of these into `BinaryState` (`checking`→`available`/`missing`), feeding **both** the binary-missing banner stack **and** the `CreateAgentForm`/`AddAgentModal` gating props.
+- `get_harness_install_status` (probe **+ version** → `{installed, version}`): called directly by `HarnessStatusList.svelte` (rendered in **Settings** and the **blank-state** `GettingStarted` surface), which **interleaves auth probes** alongside.
+
+`get_harness_install_status` is a superset of `check_*_binary` (adds version), so the store wraps it and serves all install consumers.
 
 ### Implementation Outline
 
-- Add a reactive store (colocate with `workspace.svelte.ts` state or a small dedicated `harnessAvailability.svelte.ts` — implementing agent's call). It holds the per-harness availability and a method to refresh it by calling the existing `get_harness_install_status` for each harness.
-- **No new backend command.** This is purely a frontend caching layer over the existing per-harness command. The backend probe stays on-demand and cheap (a PATH lookup); we're caching its result in the UI, not changing detection.
-- Populate at startup (wherever the workspace is first loaded). Refresh on settings-open. Keep it simple — no polling/timer unless a concrete need appears (it didn't in discussion; don't add speculatively).
-- Refactor the current consumers (blank state, `CreateAgentForm` availability props) to read from the store. This is the "establish once, reuse" point for convention #3 — after this milestone, ad-hoc `get_harness_install_status` calls in the UI should be gone (or justified).
+- Add a dedicated `harnessAvailability.svelte.ts` store module (alongside the existing pure `harnessAvailability.ts` helpers, which stay). It holds `HarnessInstallStatus | null` per harness (**`null` = not yet probed = "checking"**, so the create form's existing fail-closed-while-checking behavior is preserved exactly) and a `refresh()` that calls `get_harness_install_status` for each harness.
+- Derive `HarnessAvailability` (`binary`: `null`→`checking`, `installed`→`available`, else `missing`) from the store for the banner + gating path; expose the `installed` boolean for M4 and `version` for the status list.
+- **No new backend command.** Purely a frontend caching layer over the existing per-harness command; detection is unchanged.
+- Populate at startup, refresh on settings-open. No polling.
+- **Full consolidation — all install/version consumers read the store:**
+  - `App.svelte`: derive banners + `CreateAgentForm` gating props from the store; **remove the four `check_*_binary` probes** in `onMount`. The now-unused `check*Binary` **frontend wrappers** in `api.ts` are deleted. Leave the backend `check_*_binary` commands (tested, cheap; removing them is out of scope).
+  - `HarnessStatusList.svelte`: read `installed`/`version` from the store instead of its own `getHarnessInstallStatus` fetch. **Keep its local auth probe** — auth is deliberately reactive in v1 and not part of this store (this store is install/availability only, never an auth store). Install and auth are genuinely different axes with different lifecycles; sourcing them separately is correct, not a wart.
+- **Behavior note:** `App.svelte` startup moves from `check_*_binary` (probe-only) to `get_harness_install_status` (probe + version) — one extra `version()` call per harness, negligible (same CLI spawn), and version is then available everywhere.
 
-Rationale to preserve: the store exists so **auto-create (M4) has availability already in hand at project-creation time without a round-trip**, and so multiple surfaces agree on one answer. Note this in a comment.
+Rationale to preserve in a module comment: the store exists so **auto-create (M4) has availability in hand at project-creation time without a round-trip**, and so **one place answers "is this harness installed," with every surface agreeing by construction**.
 
 ### Definition of Done
 
-- Tests for the store's refresh logic with `invoke` mocked: it populates all four entries; a harness reporting not-installed is reflected; refresh updates a previously-cached value.
-- Existing blank-state / create-form behavior unchanged (their tests still pass, adjusted only for the new data source).
+- Store unit tests with `invoke` mocked: populates all four entries; not-installed reflected; `refresh()` updates a previously-cached value; pre-probe state derives to `checking` (fail-closed).
+- The derived `HarnessAvailability` mapping is tested (`null`→`checking`, installed→`available`, missing→`missing`).
+- `CreateAgentForm` / banner / `HarnessStatusList` behavior unchanged from the user's perspective (existing tests pass, adjusted only for the new data source). `HarnessStatusList`'s auth column still works off its local probe.
 
 ---
 
@@ -173,6 +187,7 @@ Creating a new project automatically creates one agent per installed harness; op
 
 - Hook into `createProjectAndActivate` in `workspace.svelte.ts` (the function the New Project dialog calls). **Only this path** auto-creates — `activateProject` for existing projects must remain untouched, which is what guarantees the "new projects only" boundary.
 - Sequence: after the project is created and activated, read the M3 availability store, and for each installed harness call the existing `create_agent` command with the harness-derived name. Then reload the roster **once** (not once per agent).
+  - **Await a fresh availability probe before reading `installed()` (race guard, mandatory):** the M3 store's startup probe is fired un-awaited, and `harnessAvailability.installed()` returns `[]` until it resolves. If the user reaches project creation inside that startup window, reading `installed()` directly would silently yield zero agents. So auto-create must `await refreshHarnessAvailability()` (idempotent + cheap — a few PATH lookups, already done by the time the create round-trip completes in the common case) **then** read `installed()`, guaranteeing a definitive answer regardless of startup timing.
   - **Ordering is load-bearing:** activation must precede the auto-creates, because `create_agent_impl` writes to the *active* project (it reads `state.active_project_id`). That means `activateProject`'s own roster fetch (`api.listAgents` → `agentsByProject[projectId]`) ran on an empty project, so it will not reflect the new agents.
   - **Roster reload mechanism (do not guess):** after the auto-create loop, call `api.listAgents(projectId)` and assign the result into `agentsByProject[projectId]` — mirror the existing fetch in `activateProject` (`workspace.svelte.ts` ~lines 192–193). Do **not** rely on `loadWorkspace()` for this — that refreshes the project/directory list, not the per-project agent roster, and will leave the new agents invisible until a later activation.
   - Naming: reuse the same slug rule already added to `CreateAgentForm` (`harnessDefaultName`) — letters lowercased, spaces→hyphens. Extract it to a shared spot if both call sites need it (M2/the form and M4); don't duplicate the label→slug map. These names are distinct under the backend's canonicalization, so no self-collision.
@@ -182,6 +197,7 @@ Creating a new project automatically creates one agent per installed harness; op
 ### Definition of Done
 
 - Tests (frontend, `invoke` mocked): creating a project with 2 of 4 harnesses available creates exactly those 2 agents with the expected names and reloads the roster once; with 0 available creates none and still lands in the project; activating an *existing* project creates nothing.
+- **Race-guard test:** simulate the availability probe still *pending* at project-creation time (a `get_harness_install_status` mock that defers resolution rather than resolving synchronously) and assert auto-create still sees the right harnesses — i.e. the `await refreshHarnessAvailability()` actually closes the window. Confirm the mock genuinely defers, or the test passes without exercising the race.
 - A test asserting the new-project path and the existing-project activation path diverge (the latter never calls `create_agent`).
 - Manual: create a project with multiple harnesses installed; confirm the roster and names; confirm reopening an existing project adds nothing.
 

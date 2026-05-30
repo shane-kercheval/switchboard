@@ -1,6 +1,7 @@
 <script lang="ts">
   import * as api from "$lib/api";
-  import type { HarnessInstallStatus, HarnessKind } from "$lib/types";
+  import type { HarnessKind } from "$lib/types";
+  import { harnessAvailability, refreshHarnessAvailability } from "$lib/harnessAvailability.svelte";
   import { HARNESS_SETUP_URL, HARNESS_LABEL, HARNESS_LOGIN_HINT } from "$lib/harnessDisplay";
   import HarnessIcon from "./ui/HarnessIcon.svelte";
 
@@ -17,17 +18,14 @@
 
   const HARNESSES: HarnessKind[] = ["claude_code", "codex", "gemini", "antigravity"];
 
-  type Row = {
-    /// `null` while the probe is in flight.
-    install: HarnessInstallStatus | null;
-    authed: boolean | null;
-  };
-
-  let rows = $state<Record<HarnessKind, Row>>({
-    claude_code: { install: null, authed: null },
-    codex: { install: null, authed: null },
-    gemini: { install: null, authed: null },
-    antigravity: { install: null, authed: null },
+  // Install/version come from the shared `harnessAvailability` store (read in
+  // the template). Only auth is local: it's deliberately not in the store
+  // (v1 keeps auth reactive) and is a best-effort display hint here.
+  let authed = $state<Record<HarnessKind, boolean | null>>({
+    claude_code: null,
+    codex: null,
+    gemini: null,
+    antigravity: null,
   });
 
   const AUTH_PROBE: Record<HarnessKind, () => Promise<void>> = {
@@ -37,24 +35,20 @@
     antigravity: api.checkAntigravityAuth,
   };
 
-  async function probe(harness: HarnessKind): Promise<void> {
-    try {
-      rows[harness].install = await api.getHarnessInstallStatus(harness);
-    } catch {
-      rows[harness].install = { installed: false, version: null };
-    }
+  async function probeAuth(harness: HarnessKind): Promise<void> {
     try {
       await AUTH_PROBE[harness]();
-      rows[harness].authed = true;
+      authed[harness] = true;
     } catch {
       // A rejected probe means "not authenticated" (or the probe couldn't
       // run) — a hint, never a hard error. The send path is authoritative.
-      rows[harness].authed = false;
+      authed[harness] = false;
     }
   }
 
   function refresh(): void {
-    for (const harness of HARNESSES) void probe(harness);
+    void refreshHarnessAvailability();
+    for (const harness of HARNESSES) void probeAuth(harness);
   }
 
   // Probe on mount and whenever the window regains visibility — installing a
@@ -79,9 +73,9 @@
   class="border-border divide-border/60 flex flex-col divide-y rounded-lg border"
 >
   {#each HARNESSES as harness (harness)}
-    {@const row = rows[harness]}
-    {@const installing = row.install === null}
-    {@const installed = row.install?.installed === true}
+    {@const install = harnessAvailability.status(harness)}
+    {@const installing = install === null}
+    {@const installed = install?.installed === true}
     <li
       data-testid={`harness-row-${harness}`}
       class="grid grid-cols-[1.5rem_5.5rem_minmax(0,1fr)_minmax(0,1.2fr)] items-center gap-x-3 px-3 py-2.5"
@@ -95,8 +89,8 @@
           <span class="text-muted">Checking…</span>
         {:else if installed}
           <span class="text-fg">Installed</span>
-          {#if row.install?.version != null}
-            <span class="text-muted">v{row.install.version}</span>
+          {#if install?.version != null}
+            <span class="text-muted">v{install.version}</span>
           {/if}
         {:else}
           <span class="inline-flex items-center gap-2">
@@ -129,9 +123,9 @@
       <span class="text-xs" data-testid={`harness-auth-${harness}`}>
         {#if installing || !installed}
           <!-- nothing: still checking, or install is the blocking step -->
-        {:else if row.authed === null}
+        {:else if authed[harness] === null}
           <span class="text-muted">Checking…</span>
-        {:else if row.authed}
+        {:else if authed[harness]}
           <span class="text-fg">Authenticated</span>
         {:else}
           <span class="text-warning">{HARNESS_LOGIN_HINT[harness]}</span>

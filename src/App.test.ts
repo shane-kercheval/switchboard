@@ -43,6 +43,9 @@ type Backend = {
   conversations: Map<string, ProjectConversation>;
   activeProjectId: string | null;
   probeFailures: Set<string>;
+  // Harnesses `get_harness_install_status` should report as not-installed
+  // (keyed by HarnessKind). Drives the binary-missing banner tests.
+  notInstalled: Set<string>;
   agentQueue: AgentRecord[];
   sendMessageId: string;
   loadConvoCalls: string[];
@@ -61,6 +64,7 @@ function freshBackend(): Backend {
     conversations: new Map(),
     activeProjectId: null,
     probeFailures: new Set(),
+    notInstalled: new Set(),
     agentQueue: [],
     sendMessageId: "77777777-7777-7000-8000-777777777777",
     loadConvoCalls: [],
@@ -69,17 +73,6 @@ function freshBackend(): Backend {
   };
 }
 
-// Only binary probes are called from App startup. The `check_*_auth`
-// Tauri commands exist in the backend for the getting-started surface
-// (no-project state) to consume; the working UI does not proactively
-// probe auth — failures surface reactively in the transcript.
-const PROBES = [
-  "check_claude_binary",
-  "check_codex_binary",
-  "check_gemini_binary",
-  "check_antigravity_binary",
-];
-
 function summaryFor(id: string): ProjectSummary {
   const row = backend.projects.find((p) => p.id === id);
   if (row === undefined) throw new Error(`open of unknown project ${id}`);
@@ -87,10 +80,6 @@ function summaryFor(id: string): ProjectSummary {
 }
 
 const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Promise<unknown> => {
-  if (PROBES.includes(cmd)) {
-    if (backend.probeFailures.has(cmd)) throw new Error(`probe failed: ${cmd}`);
-    return null;
-  }
   switch (cmd) {
     case "list_workspace_directories":
       return {
@@ -175,8 +164,10 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
     case "check_antigravity_auth":
       if (backend.probeFailures.has(cmd)) throw new Error(`auth failed: ${cmd}`);
       return null;
-    case "get_harness_install_status":
-      return { installed: true, version: "1.0.0" };
+    case "get_harness_install_status": {
+      const installed = !backend.notInstalled.has(args?.harness as string);
+      return { installed, version: installed ? "1.0.0" : null };
+    }
     default:
       throw new Error(`unexpected invoke call: ${cmd}`);
   }
@@ -263,6 +254,8 @@ describe("App", () => {
     idx._testing.reset();
     const ws = await import("$lib/state/workspace.svelte");
     ws._testing.reset();
+    const ha = await import("$lib/harnessAvailability.svelte");
+    ha._testing.reset();
   });
 
   // --- harness availability banners (workspace empty → welcome) ---
@@ -280,7 +273,7 @@ describe("App", () => {
   });
 
   it("renders a Claude binary-missing banner when only the Claude probe fails", async () => {
-    backend.probeFailures.add("check_claude_binary");
+    backend.notInstalled.add("claude_code");
     await mountApp();
     await waitFor(() =>
       expect(screen.getByTestId("banner-binary_missing-claude_code")).toBeInTheDocument(),
@@ -312,8 +305,8 @@ describe("App", () => {
   });
 
   it("renders two binary banners simultaneously when two binaries are missing", async () => {
-    backend.probeFailures.add("check_claude_binary");
-    backend.probeFailures.add("check_codex_binary");
+    backend.notInstalled.add("claude_code");
+    backend.notInstalled.add("codex");
     await mountApp();
     await waitFor(() => {
       expect(screen.getByTestId("banner-binary_missing-claude_code")).toBeInTheDocument();

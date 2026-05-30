@@ -4,6 +4,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/svelte";
 import { tick } from "svelte";
 import SettingsView from "./SettingsView.svelte";
 import { theme } from "$lib/theme.svelte";
+import { _testing as availabilityTesting } from "$lib/harnessAvailability.svelte";
 
 // SettingsView embeds HarnessStatusList, which probes install/auth on mount.
 const invokeMock = vi.fn(async (cmd: string, _args?: Record<string, unknown>) => {
@@ -17,6 +18,9 @@ vi.mock("@tauri-apps/api/core", () => ({
 beforeEach(() => {
   theme.set("system");
   invokeMock.mockClear();
+  // The embedded HarnessStatusList reads the shared singleton store; reset it
+  // so probed values don't leak across tests.
+  availabilityTesting.reset();
 });
 
 afterEach(() => {

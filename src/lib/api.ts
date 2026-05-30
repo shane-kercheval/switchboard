@@ -18,34 +18,21 @@ import type {
   WorkspaceDirectories,
 } from "./types";
 
-export async function checkClaudeBinary(): Promise<void> {
-  await invoke<null>("check_claude_binary");
-}
-
-export async function checkCodexBinary(): Promise<void> {
-  await invoke<null>("check_codex_binary");
-}
-
 /// Auth probes exist for the getting-started surface (no-project state)
 /// to show ✓/✗ per harness. The working UI does **not** call these —
 /// reactive-auth posture means a logged-out harness is discovered on
 /// send, surfaced as an `AuthFailure` turn in the transcript, not by a
-/// startup probe.
+/// startup probe. Binary presence is no longer probed via dedicated
+/// `check_*_binary` commands here — it comes from the shared
+/// `harnessAvailability` store (`get_harness_install_status`), which also
+/// carries the version.
 export async function checkCodexAuth(): Promise<void> {
   await invoke<null>("check_codex_auth");
-}
-
-export async function checkGeminiBinary(): Promise<void> {
-  await invoke<null>("check_gemini_binary");
 }
 
 /// See `checkCodexAuth` — same retention rationale.
 export async function checkGeminiAuth(): Promise<void> {
   await invoke<null>("check_gemini_auth");
-}
-
-export async function checkAntigravityBinary(): Promise<void> {
-  await invoke<null>("check_antigravity_binary");
 }
 
 /// See `checkCodexAuth` — same retention rationale.

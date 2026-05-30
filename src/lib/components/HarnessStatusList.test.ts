@@ -4,6 +4,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/svelte";
 import HarnessStatusList from "./HarnessStatusList.svelte";
 import type { HarnessKind } from "$lib/types";
 import { HARNESS_SETUP_URL } from "$lib/harnessDisplay";
+import { _testing as availabilityTesting } from "$lib/harnessAvailability.svelte";
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
@@ -50,6 +51,9 @@ function setup(over?: Partial<Record<HarnessKind, Partial<HarnessState>>>): void
 
 beforeEach(() => {
   invokeMock.mockReset();
+  // The component reads install/version from the shared singleton store; reset
+  // it so a prior test's probed values don't leak into this one's initial frame.
+  availabilityTesting.reset();
 });
 
 afterEach(() => {

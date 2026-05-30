@@ -33,43 +33,20 @@
     selection,
     workspace,
   } from "$lib/state/workspace.svelte";
-  import type {
-    AgentRecord,
-    BinaryState,
-    HarnessAvailability,
-    HarnessBanner,
-    ProjectListing,
-  } from "$lib/types";
+  import type { AgentRecord, HarnessBanner, ProjectListing } from "$lib/types";
   import { bannerCopy, bannerTestid } from "$lib/harnessAvailability";
+  import { harnessAvailability, refreshHarnessAvailability } from "$lib/harnessAvailability.svelte";
   import { basename } from "$lib/utils";
 
-  // Per-harness binary-presence probes. Auth is deliberately not tracked
-  // in this surface — a logged-out harness is discovered reactively when
-  // the user sends, and the failed turn carries an authored actionable
-  // message in the transcript. The backend `check_*_auth` Tauri commands
-  // exist for the getting-started surface (no-project state) to consume,
-  // not the working UI.
-  let claudeBinary = $state<BinaryState>("checking");
-  let codexBinary = $state<BinaryState>("checking");
-  let geminiBinary = $state<BinaryState>("checking");
-  let antigravityBinary = $state<BinaryState>("checking");
-
-  const claudeAvailability = $derived<HarnessAvailability>({
-    harness: "claude_code",
-    binary: claudeBinary,
-  });
-  const codexAvailability = $derived<HarnessAvailability>({
-    harness: "codex",
-    binary: codexBinary,
-  });
-  const geminiAvailability = $derived<HarnessAvailability>({
-    harness: "gemini",
-    binary: geminiBinary,
-  });
-  const antigravityAvailability = $derived<HarnessAvailability>({
-    harness: "antigravity",
-    binary: antigravityBinary,
-  });
+  // Per-harness binary presence comes from the shared `harnessAvailability`
+  // store (one probe shared with the banner stack, the create-form gating, and
+  // the Supported-CLIs list). Auth is deliberately not tracked here — a
+  // logged-out harness is discovered reactively when the user sends, and the
+  // failed turn carries an authored actionable message in the transcript.
+  const claudeAvailability = $derived(harnessAvailability.availability("claude_code"));
+  const codexAvailability = $derived(harnessAvailability.availability("codex"));
+  const geminiAvailability = $derived(harnessAvailability.availability("gemini"));
+  const antigravityAvailability = $derived(harnessAvailability.availability("antigravity"));
 
   const banners = $derived.by((): HarnessBanner[] =>
     [claudeAvailability, codexAvailability, geminiAvailability, antigravityAvailability]
@@ -136,28 +113,13 @@
     }
   }
 
-  // Startup: kick off the per-harness binary probes (each writes its own slice
-  // as it resolves — no barrier) and eagerly load the workspace registry
+  // Startup: kick off the harness install probe (the store writes each slice as
+  // it resolves — no barrier) and eagerly load the workspace registry
   // (directory list + flat project list). Per-project rosters/hydration stay
-  // lazy. Auth probes intentionally not called here — see `claudeBinary` /
-  // `codexBinary` / etc. comment above.
+  // lazy. Auth probes intentionally not called here — see the
+  // `harnessAvailability` comment above.
   onMount(() => {
-    api.checkClaudeBinary().then(
-      () => (claudeBinary = "available"),
-      () => (claudeBinary = "missing"),
-    );
-    api.checkCodexBinary().then(
-      () => (codexBinary = "available"),
-      () => (codexBinary = "missing"),
-    );
-    api.checkGeminiBinary().then(
-      () => (geminiBinary = "available"),
-      () => (geminiBinary = "missing"),
-    );
-    api.checkAntigravityBinary().then(
-      () => (antigravityBinary = "available"),
-      () => (antigravityBinary = "missing"),
-    );
+    void refreshHarnessAvailability();
     void loadWorkspace().catch((err) => {
       dirError = err instanceof Error ? err.message : String(err);
     });

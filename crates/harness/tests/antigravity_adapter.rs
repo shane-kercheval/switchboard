@@ -558,8 +558,15 @@ async fn auth_failure_line_on_stdout_emits_auth_failure() {
         &json!({
             "conversation_uuid": Uuid::new_v4().to_string(),
             "create_brain_dir": false,
+            // `hang` (park after dripping, never self-exit) models real `agy`
+            // blocking ~30s on interactive OAuth, so the adapter's stdout
+            // auth-detection deterministically force-kills it. A clean self-exit
+            // (`exit_code: 0`) instead manufactures a race: on a loaded CI box the
+            // process-exit can beat detection, yielding AdapterFailure ("no
+            // answer") rather than AuthFailure. The detection path under test is
+            // unchanged — this just stops the fake from exiting out from under it.
             "stdout": [drip("Authentication required. Please visit the URL to log in:", 0)],
-            "exit_code": 0,
+            "hang": true,
         }),
     );
 

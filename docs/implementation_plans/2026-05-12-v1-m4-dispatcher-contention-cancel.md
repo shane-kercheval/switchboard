@@ -602,6 +602,7 @@ Outcomes:
 - Antigravity turns and Gemini hydrated turns both benefit automatically with no backend change — only the renderer changes.
 - The `[Thought: true]` literal that Gemini CLI embeds in some live-stream content turns is investigated and either reclassified as `ContentKind::Thinking` in the parser or confirmed as intentional model output (probe result decides; either outcome is recorded).
 - The stale `events.rs` doc comment on `ContentKind::Thinking` ("Reserved; not currently emitted") is corrected.
+- **The per-harness reasoning reality is recorded in `docs/research/harness-behavior.md` §3.2** (the canonical operational surface, created after this milestone was drafted) — covering all four harnesses, not the two the renderer touches. The frozen `archive/*-cli-observed.md` probes are cited as evidence, not edited.
 
 ### Background: what the research found (2026-05-26)
 
@@ -613,7 +614,8 @@ Read before implementing — this is not recoverable from the codebase alone:
 - **`[Thought: true]`** is a literal string the Gemini CLI embeds in the `content` field of some `message` stream-json events (observed in-app; not reproduced in the prior stream-json research probe because a different model config was used). It is NOT a structured event. It appears as `ContentKind::Text` in the live stream — the parser has no special handling for it.
 - **Gemini live stream never emits thinking as a separate event** in the documented probe config (`thoughts:[]` in headless mode, per `gemini-cli-observed.md §"CONFIRMED: thoughts appear opportunistically in the session file, never in the stream"`). The `[Thought: true]` case is a newer/different model configuration that was not part of that probe.
 - **The `events.rs` comment** on `ContentKind::Thinking` reads "Reserved; not currently emitted." This is now wrong.
-- **Claude**: the Claude adapter was not checked for extended-thinking block support in this research pass. Check it early in implementation (see outline).
+- **Claude**: the CLI emits a `thinking` content block, but the **reasoning text is redacted to empty (`thinking:""`, signature only)** in `-p`/programmatic mode — *probed 2026-05-29 @ 2.1.157* (`MAX_THINKING_TOKENS` forces a block; text `len=0` live + on disk; the model demonstrably reasoned). This is a **tracked upstream regression** (the `redact-thinking-2026-02-12` beta header; harness-behavior §7), **not** something our parser drops — there is no text to surface. The `showThinkingSummaries: true` workaround was tested in global settings and **does not work** at 2.1.157. So Claude is **unavailable** (like Codex, different mechanism), possibly temporary — re-probe on CLI bump, don't wire speculatively. **Separately, a reliability risk to verify (not M4.10 scope):** the same empty-but-signed blocks cause a permanent `400` on `--resume` (#63147, OPEN) — Switchboard resumes every Claude turn, so a multi-turn extended-thinking session could wedge; see §7 for the verify/mitigate path.
+- **Codex** (not in the original draft — added after the harness-behavior audit): Codex's `reasoning` is delivered as a `response_item` with **`encrypted_content`** (`codex-cli-observed.md §60/162`). We can see that reasoning *happened* but the content is encrypted and **unrecoverable** — a class-D TUI-parity ceiling, not unbuilt work. There is nothing to emit and nothing to probe; only the `reasoning_output_tokens` count surfaces. This milestone touches no Codex code; it only records the ceiling so Codex isn't mistaken for a TODO.
 
 ### Implementation Outline
 
@@ -627,11 +629,9 @@ Run `gemini -p "<short prompt>" --output-format stream-json` against the model c
 
 If the probe is not runnable (quota, auth issue), record that and proceed without the parser change — the frontend fix is independent.
 
-**Step 2 — Check Claude extended thinking (read, don't add).**
+**Step 2 — Claude: already probed; record as unavailable, do not wire.**
 
-Read `crates/harness/src/claude_code/parser.rs` (or wherever the Claude stream-json `content_block_start` / `content_block_delta` events are handled). Claude's stream-json format has a `type: "thinking"` content block type for extended thinking. Check whether the Claude parser currently emits `ContentChunk { kind: Thinking }` for these. Two outcomes:
-- Already emitted → the frontend fix in Step 3 covers Claude automatically. Note this in the DoD.
-- Not emitted → do NOT add it speculatively. Record it as a known gap; it is follow-up work, not M4.10 scope.
+Resolved by the 2026-05-29 probe (Background + harness-behavior §7): Claude's reasoning **text is server-redacted to empty** in `-p` mode, the `showThinkingSummaries` workaround is dead at 2.1.157, and the issues driving it are tracked upstream. There is **nothing to render** — do not add Claude `Thinking` emission. Record it in §3.2/§7 as an unavailable, possibly-temporary gap with a re-probe-on-bump trigger. The only Claude follow-up worth flagging is the **#63147 resume-wedge reliability risk** (verify whether Switchboard's `--resume` path hits the `400`); that is its own investigation, **not** part of this renderer milestone.
 
 **Step 3 — Frontend: render `kind: "thinking"` distinctly (the main work).**
 
@@ -656,13 +656,15 @@ In `crates/harness/src/events.rs`, update the `ContentKind::Thinking` doc commen
 
 ### Definition of Done
 
-- **Gemini probe result recorded** in `gemini-cli-observed.md` (even if the result is "leave as text — it's model output") — the probe outcome must be documented regardless of whether it triggers a parser change.
-- **Claude check result recorded** — either "Claude already emits `ContentKind::Thinking`, frontend fix covers it" or "Claude does not currently emit it; gap noted for follow-up."
+- **`harness-behavior.md §3.2` is the system of record for findings.** The reasoning section is seeded with the current per-harness reality (all four harnesses); update it with the probe/recapture outcomes below. The frozen `archive/*-cli-observed.md` files are cited as evidence, **not** edited — earlier drafts of this DoD routed findings into `gemini-cli-observed.md`, which is now archived/frozen.
+- **Gemini probe result recorded** in §3.2 + §5 (even if the result is "leave as text — it's model output") — the probe outcome must be documented regardless of whether it triggers a parser change.
+- **Claude recorded** in §3.2/§7 as **unavailable** — reasoning text server-redacted (probed @ 2.1.157; `showThinkingSummaries` tested-failed); tracked upstream regression with a re-probe-on-bump trigger. No code change. The #63147 resume-wedge is logged in §7 as a separate reliability item to verify.
+- **Codex recorded** in §3.2 — reasoning is encrypted/unrecoverable (class-D ceiling); no code change, no probe. (Seeded already; just confirm it stays accurate.)
 - **Frontend rendering**: thinking items render with visually distinct treatment; answer text is unchanged. Component test: construct a turn with a `thinking` item followed by a `text` item and assert (a) both render, (b) they carry distinct `data-testid` attributes or CSS class selectors so thinking and answer can be told apart in tests, (c) the thinking item does not bleed into the answer container.
 - **Gemini parser change (only if probe warrants)**: unit test asserting a `[Thought: true]`-prefixed `message` event produces `ContentChunk { kind: Thinking }` with the prefix stripped; a normal `message` event produces `ContentChunk { kind: Text }` unchanged.
 - **`events.rs` doc comment corrected.**
-- **Manual verification**: open an Antigravity project with thinking turns and a Gemini project with session-file thoughts in `make dev` — confirm reasoning blocks are visually distinct from answer text in both. If Claude extended thinking is already emitted, verify it too.
-- **Known limitation to record if applicable**: if the Gemini probe was not runnable, state that `[Thought: true]` handling is deferred and why; if Claude extended-thinking emission is absent, state the gap explicitly in a code comment at the Claude parser's content-block handling site.
+- **Manual verification**: open an Antigravity project with thinking turns and a Gemini project with session-file thoughts in `make dev` — confirm reasoning blocks are visually distinct from answer text in both. (Claude and Codex surface no reasoning by design — see §3.2 — so there is nothing to verify visually for them.)
+- **Known limitation to record if applicable**: if the Gemini probe was not runnable, state in §3.2/§5 that `[Thought: true]` handling is deferred and why; the Claude drop is recorded as a code comment at both content-block handling sites (`parser.rs`, `claude_code/session_file.rs`).
 
 ---
 

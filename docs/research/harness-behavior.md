@@ -114,6 +114,19 @@ For metadata-flavored fields, where a datum lives determines whether Switchboard
 
 **Class D is what no implementation can fix without external data** — e.g. Gemini does not emit a context window anywhere; Antigravity emits no token usage to disk. Document these as TUI parity ceilings; workarounds (hardcoded model→context maps) are case-by-case decisions.
 
+### 3.2 Reasoning / thinking content (exposed vs surfaced)
+
+Distinct from the `thoughts`/`reasoning` **token buckets** in the §3 table (those are counts) — this is the model's chain-of-thought **prose**, normalized to `ContentKind::Thinking` turn items (`crates/harness/src/events.rs`) so the frontend can render reasoning subordinate to the answer. Evidence cited from the frozen `archive/<harness>-cli-observed.md` probes.
+
+| Harness | On-disk / wire source | Availability | We emit `Thinking`? | Notes |
+|---|---|---|---|---|
+| **Antigravity** | `thinking` string on `PLANNER_RESPONSE` records (`transcript.jsonl`) | **Always present** when the model reasons — and the tool-calling record's narration lives in `thinking`, not `content` | ✅ **live + disk** — `antigravity/parser.rs` (live tail) and `antigravity/session_file.rs` (hydrate) | Best-grounded path; verified, tested (archive antigravity §256/265/470) |
+| **Gemini** | `thoughts:[{subject, description, timestamp}]` on `gemini` session records | **Opportunistic** (per-turn model decision); **disk-only — never in the live stream** (re-confirmed 2026-05-29 @ 0.44.0, model `auto`: stream carried no thoughts, the session file did) | ⚠️ currently emits **on hydrate** (`gemini/session_file.rs`); **M4.10 decision: remove** — reopened-only reasoning is stale UX (valuable at stream time, not hours later) | Open: the **`[Thought: true]`** live literal (different model config; not reproduced under `auto`) — see §5 |
+| **Claude** | `thinking` content block (`type:"thinking"`) — **text redacted to empty `""`, only a `signature`** | Reasoning *event* arrives (the block, plus `reasoning_output_tokens`), but the **text is server-stripped** in `-p`/programmatic mode | ❌ **nothing to surface** — the block carries no prose | **Tracked upstream regression (§7)** — *not* "we drop it": the CLI withholds the text. Probed 2026-05-29 @ 2.1.157 (`MAX_THINKING_TOKENS` forces a block; `--verbose`): `thinking_len=0` live + on disk. `showThinkingSummaries: true` in **global** settings tested → still empty (workaround dead for us). Server-flag-gated, so possibly temporary — re-probe on CLI bump |
+| **Codex** | `reasoning` `response_item` with **`encrypted_content`** | Reasoning *happened* is visible; the content is **encrypted** — unrecoverable | ❌ **impossible by design** — a class-D ceiling, not unbuilt work | Only the `reasoning_output_tokens` count surfaces; the prose can never be shown (archive codex §60/162) |
+
+**Surfacing (frontend).** A `Thinking` item renders with a visually subordinate treatment (muted, labeled, collapsible) distinct from the answer `Text` that follows; the reasoning prose inside still renders through the shared `<Markdown>` primitive. **Antigravity is the only harness that gives us live reasoning text**, so it is the one M4.10 actually serves. **Gemini** is disk-only (never streams — confirmed 2026-05-29 @ 0.44.0: stream had no thoughts, the session file did), so reopened-only reasoning is dropped rather than shown as stale (decision). **Claude** withholds the text (redaction regression, §7); **Codex** encrypts it. The widget is built for Antigravity and is forward-compatible: if Claude's redaction lifts, it picks Claude up for free.
+
 ---
 
 ## 4. Gap register (actionable)
@@ -148,6 +161,7 @@ Grouped by theme; this is the candidate scope for the failure/metadata-surfacing
 
 ## 5. Open captures / unverified
 
+- **Gemini `[Thought: true]` live-stream literal (§3.2)** — observed in-app inside a `message` stream-json event's `content`, under a newer/different model config than the original headless probe (which yielded `thoughts:[]` in the stream, never reasoning). Unknown whether it's a reasoning marker we should reclassify to `ContentKind::Thinking` (strip the prefix, emit the remainder) or plain model-authored text. Capture needs `gemini -p "<prompt>" --output-format stream-json` against that same config. Until captured, the live stream surfaces no Gemini reasoning and `[Thought: true]` falls through as `Text`.
 - **Gemini bad-token (401) auth shape** — never observed; our substring detector is a guess. Capture needs a *stale-but-present* token (a clean logout gives the exit-41 shape instead).
 - **Gemini hard quota wall** — none observed (it stalls/retries). Treated as "nothing to classify."
 - **Claude hard quota wall** (overage disabled/exhausted) — not yet hittable; only the soft `isUsingOverage` path is captured.
@@ -160,3 +174,29 @@ Grouped by theme; this is the candidate scope for the failure/metadata-surfacing
 - **Codex 0.134.0 (2026-05-26) changed the usage-limit copy** — "Display workspace usage limit error copy from response header" ([#24114](https://github.com/openai/codex/pull/24114)): the out-of-credits / usage-limit `turn.failed` message is now workspace-specific with distinct credit vs. spend-cap variants, sourced from the response header. The §1.4 Codex capture ("You've hit your usage limit … try again at 1:00 PM") is from 0.133.0 and may now read differently. **No code impact** — Switchboard classifies Codex quota as `HarnessError` and passes the message **verbatim**, so display is resilient to the copy change; recapture the exact 0.134.0 string only if substring detection is ever added.
 - Other 0.134.0 changes reviewed against our `codex exec --json` surface are **non-impacting**: `trace_id` added to `turn.started` (#23980) — we skip that event entirely; legacy `--profile`/profile-v1 removal (#24051/#24059) — we pass no `--profile` flag, though a user's legacy `[profiles]` config could surface as a harness error (user config, not our invocation); MCP `config.toml` additions (per-server env / OAuth, #23583/#24120) are additive.
 - **Rate-limit event contracts live-verified — claude 2.1.156 / codex 0.134.0 (2026-05-28).** The metadata surfaces M3/M4 depend on are now asserted in the live tests (run on these versions), not just fixtures: **Claude** emits a `rate_limit_event` on a *normal* turn (no overage needed) carrying `resetsAt` (epoch) + `rateLimitType` (`"five_hour"`), lifted to a `StreamOnly` `RateLimitEvent` (→ persisted to the metadata sidecar). **Codex** emits `token_count.rate_limits` with `primary.{used_percent, window_minutes, resets_at}`, marked `SessionFileBacked`. `live_claude_basic_turn_completes` / `live_codex_basic_turn_completes` assert these shapes so a future CLI rename/drop is caught live. **Not live-coverable (forcing required, fixture-only):** Claude overage (`isUsingOverage` — needs an exhausted window), Antigravity `RESOURCE_EXHAUSTED` quota, Gemini exit-41 logged-out, and all auth-failure shapes — these need a destructive/rare state to trigger, so they stay fixture-backed + recapture-on-bump per `harness-update-review.md`.
+
+---
+
+## 7. Tracked upstream harness issues
+
+Live upstream bugs we watch because they change what Switchboard can **show** or **do**. Re-check on each CLI bump (`harness-update-review.md`); update the State column from `gh issue view <n> --repo <repo>`. Status snapshot **2026-05-29**.
+
+### 7.1 Claude extended-thinking redaction & resume-wedge
+
+All one root cause: since **v2.1.69** Claude Code requests the `redact-thinking-2026-02-12` API beta, which **strips the text from `thinking` blocks** (empty `thinking:""`, `signature` retained). Decompiled gate (#31326): `showThinkingSummaries !== true && getFeatureFlag("tengu_quiet_hollow", …)` — the flag is **server-controlled and currently on**, so the redact header ships unless the user sets `showThinkingSummaries: true`. Two consequences: (a) reasoning text is invisible to any programmatic consumer (us), and (b) the signed-but-empty blocks, re-sent on `--resume`, get a permanent `400`.
+
+| Issue | What | State (2026-05-29) | Switchboard exposure |
+|---|---|---|---|
+| [#63147](https://github.com/anthropics/claude-code/issues/63147) | Resume of an extended-thinking session fails permanently with `400 "thinking blocks cannot be modified"` (empty-text-but-signed blocks re-sent) | **OPEN** — very active; confirmed 2.1.145–2.1.154, opus-4-7 **and** 4-8 | **Real risk, unverified.** We use `--resume` every subsequent Claude turn, and the dev's global `alwaysThinkingEnabled: true` generates thinking blocks each turn → a long interleaved-thinking+tools turn could wedge the session. 2.1.152 added a partial signature-stripping safety-net that does **not** cover all paths. **Action: verify** with a multi-turn resume live test; if exposed, consider setting `DISABLE_INTERLEAVED_THINKING=1` / `CLAUDE_CODE_DISABLE_THINKING=1` in the adapter's spawn env. |
+| [#31326](https://github.com/anthropics/claude-code/issues/31326) | Thinking text empty since v2.1.69 — signature only; root-cause decomp + `showThinkingSummaries` workaround | **CLOSED** (`NOT_PLANNED`, 2026-04-13) | Reasoning text **unavailable** to us → Claude surfaces no reasoning (§3.2). |
+| [#20127](https://github.com/anthropics/claude-code/issues/20127) | `--output-format stream-json` stopped emitting thinking blocks since v2.1.8 | **CLOSED** | Same root cause; our exact invocation. |
+| [#32810](https://github.com/anthropics/claude-code/issues/32810) | Thinking empty in session JSONL since 2.1.72 | **CLOSED** (`NOT_PLANNED`) | Affects the disk path we hydrate from. |
+| [#32997](https://github.com/anthropics/claude-code/issues/32997) | `tengu_quiet_hollow` redaction flag (filed as a safety concern) | **CLOSED** | Names the server flag driving the redaction. |
+
+**Workaround verdict (our test, 2026-05-29 @ 2.1.157).** `showThinkingSummaries: true` set in **global** `~/.claude/settings.json` + `--verbose` + a reliable agentic trigger → thinking blocks still `thinking_len=0`. It **worked for early reporters** (~2.1.69, March 2026) but **fails on 2.1.150+** (Slider-8 hit the bug with the setting on; Hillier98 "partial") and **fails for us**. The empty-thinking issues were closed `NOT_PLANNED` and maintainers signal the restriction is **intentional** ("defense against distillation"), so treat Claude reasoning text as **unavailable until proven otherwise**, and re-probe (not re-assume) on each bump.
+
+### 7.2 Gemini live-stream reasoning
+
+| Issue | What | State | Switchboard exposure |
+|---|---|---|---|
+| (no upstream issue) | `[Thought: true]` literal seen in a live `message` stream under a non-default model config; not reproduced under `auto` (2026-05-29 @ 0.44.0) | n/a | Open capture (§5). If it proves to be a live reasoning marker, parse → `Thinking`; else leave as text. Disk-only thoughts are being dropped regardless (§3.2). |

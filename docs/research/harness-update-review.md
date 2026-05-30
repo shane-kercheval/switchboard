@@ -8,7 +8,7 @@ The version each harness was last vetted against. **Update the relevant row at t
 
 | Harness | Last reviewed | Date | How / result |
 |---|---|---|---|
-| Codex | `0.134.0` | 2026-05-27 | changelog + code review — no impact (see `harness-behavior.md` §6) |
+| Codex | `0.135.0` | 2026-05-30 | changelog + code review — no impact (see `harness-behavior.md` §6) |
 | Claude Code | `2.1.153` | 2026-05-27 | subagent stream/disk probe (3 parent-tagged shapes, disk-side collapse verified — see `harness-behavior.md` §6); prior auth-failure/overage probes 2026-05-25 against 2.1.149 still current |
 | Gemini | `0.42.0` | 2026-05-27 | core probes from M3; logged-out auth shape captured 2026-05-27 |
 | Antigravity (`agy`) | `1.0.2` | 2026-05-26 | hands-on probes (transcript, quota, auth) |
@@ -66,7 +66,7 @@ Classify each relevant item: **breaking** (a contract we rely on changed) vs **a
 
 - **Report** the verdict (safe-to-update / breaking) with the specific impacted items and a recommendation.
 - **Update the "Last reviewed" table** at the top of this file (version, date, how/result).
-- **Record** in `docs/research/harness-behavior.md` — the single source of truth — typically a "Version notes" entry, and update any now-stale captured shape or cell. **Do not edit the archived `*-cli-observed.md` files** (frozen provenance).
+- **Record in `docs/research/harness-behavior.md` *only if the update actually impacts Switchboard*.** §6 "Version notes" is for things that change what Switchboard does or documents — a contract that changed, a captured shape/string now stale, a behavior we depend on that shifted. A **no-impact review gets NO §6 entry** — the "Last reviewed" table above is its complete record. Do not add "reviewed X, nothing relevant" commentary or per-update changelog summaries; that bloats the single-source-of-truth doc. Also update any now-stale captured shape or cell. **Do not edit the archived `*-cli-observed.md` files** (frozen provenance).
 - **If a contract genuinely changed**, the fix goes in the **adapter** (never a `match harness {…}` in the dispatcher or `commands.rs`).
 - **Run the live tests** for any adapter-touching change: `make test-live-<harness>` (claude / codex / gemini / antigravity). These spawn the real CLI and are the project's drift-detection mechanism — they need the developer's logged-in session and cost a little quota (see AGENTS.md "Live testing"). The fixture/`make test` path won't catch CLI drift.
 

@@ -1560,7 +1560,9 @@ pub fn agent_session_info_impl(
     };
 
     let resume_command = resume_ref
-        .and_then(|r| switchboard_harness::interactive_resume_command(agent.harness, &r))
+        .and_then(|r| {
+            switchboard_harness::interactive_resume_command(agent.harness, &r, &directory)
+        })
         .map(|tokens| {
             let args = tokens
                 .iter()

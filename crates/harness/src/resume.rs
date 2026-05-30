@@ -11,17 +11,26 @@
 //!
 //! Flag knowledge lives here (with the adapters), not in the app layer.
 
+use std::path::Path;
+
 use switchboard_core::HarnessKind;
 
 /// The interactive resume command for `harness`, as program + args, given the
-/// harness's session/conversation id (`session_ref`). `None` for a harness with
-/// no usable resume-by-id form.
+/// harness's session/conversation id (`session_ref`) and the agent's working
+/// directory (`cwd`). `None` for a harness with no usable resume-by-id form.
 ///
-/// The returned tokens are unquoted; the caller shell-quotes and may prepend a
-/// `cd` into the working directory (some harnesses resolve the session-file path
-/// from the cwd).
+/// The returned tokens are unquoted; the caller shell-quotes and prepends a `cd`
+/// into `cwd` (Claude/Codex/Gemini resolve the session file from the cwd, so the
+/// `cd` is all they need). **Antigravity additionally needs `--add-dir <cwd>`**:
+/// `cd` alone leaves it with "no active workspace," running file/command tools
+/// against `$HOME` — so the interactive command mirrors the headless dispatch's
+/// `--add-dir` (see `antigravity::build_args`).
 #[must_use]
-pub fn interactive_resume_command(harness: HarnessKind, session_ref: &str) -> Option<Vec<String>> {
+pub fn interactive_resume_command(
+    harness: HarnessKind,
+    session_ref: &str,
+    cwd: &Path,
+) -> Option<Vec<String>> {
     let id = session_ref.to_owned();
     let tokens = match harness {
         HarnessKind::ClaudeCode => vec![
@@ -46,6 +55,8 @@ pub fn interactive_resume_command(harness: HarnessKind, session_ref: &str) -> Op
             "agy".to_owned(),
             "--conversation".to_owned(),
             id,
+            "--add-dir".to_owned(),
+            cwd.to_string_lossy().into_owned(),
             "--dangerously-skip-permissions".to_owned(),
         ],
         _ => return None,
@@ -57,10 +68,12 @@ pub fn interactive_resume_command(harness: HarnessKind, session_ref: &str) -> Op
 mod tests {
     use super::*;
 
+    const CWD: &str = "/work/proj";
+
     #[test]
     fn claude_resume_uses_resume_flag_and_skip_permissions() {
         assert_eq!(
-            interactive_resume_command(HarnessKind::ClaudeCode, "abc"),
+            interactive_resume_command(HarnessKind::ClaudeCode, "abc", Path::new(CWD)),
             Some(vec![
                 "claude".to_owned(),
                 "--resume".to_owned(),
@@ -73,7 +86,7 @@ mod tests {
     #[test]
     fn codex_resume_uses_top_level_resume_subcommand() {
         assert_eq!(
-            interactive_resume_command(HarnessKind::Codex, "sid"),
+            interactive_resume_command(HarnessKind::Codex, "sid", Path::new(CWD)),
             Some(vec![
                 "codex".to_owned(),
                 "resume".to_owned(),
@@ -89,7 +102,7 @@ mod tests {
         // interactive resume takes `--resume <uuid>`, mirroring the adapter's
         // resume-turn args.
         assert_eq!(
-            interactive_resume_command(HarnessKind::Gemini, "uuid"),
+            interactive_resume_command(HarnessKind::Gemini, "uuid", Path::new(CWD)),
             Some(vec![
                 "gemini".to_owned(),
                 "--resume".to_owned(),
@@ -100,13 +113,17 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_resume_uses_conversation_flag() {
+    fn antigravity_resume_passes_conversation_and_add_dir() {
+        // `--add-dir <cwd>` establishes the workspace so the interactive resume
+        // runs tools in the project dir, not $HOME (mirrors the headless dispatch).
         assert_eq!(
-            interactive_resume_command(HarnessKind::Antigravity, "conv"),
+            interactive_resume_command(HarnessKind::Antigravity, "conv", Path::new(CWD)),
             Some(vec![
                 "agy".to_owned(),
                 "--conversation".to_owned(),
                 "conv".to_owned(),
+                "--add-dir".to_owned(),
+                CWD.to_owned(),
                 "--dangerously-skip-permissions".to_owned(),
             ])
         );

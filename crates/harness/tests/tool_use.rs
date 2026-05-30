@@ -278,7 +278,15 @@ async fn live_antigravity_emits_tool_started_and_tool_completed_for_file_read() 
     // assertion below also validates the agentic-turn case for the new outcome
     // rule: a tool-using turn must still produce a transcript terminal answer
     // (`saw_terminal_answer`), or `classify_outcome` would now fail it loud.
-    let tmp = tempfile::TempDir::new().expect("tempdir");
+    // Non-hidden tempdir prefix: `agy` refuses to add a *hidden* (dot-prefixed)
+    // directory as a workspace ("is hidden: ignore uri"), and `tempfile`'s
+    // default prefix is `.tmp`. A real project dir is never hidden, so this
+    // matches production; with a `.tmp`-prefixed dir `--add-dir` is silently
+    // dropped and the model runs tools against $HOME instead of the project.
+    let tmp = tempfile::Builder::new()
+        .prefix("agy-tool-test")
+        .tempdir()
+        .expect("tempdir");
     std::fs::write(tmp.path().join("MARKER.txt"), ANTIGRAVITY_TOKEN).expect("write marker");
 
     let adapter = AntigravityAdapter::new();

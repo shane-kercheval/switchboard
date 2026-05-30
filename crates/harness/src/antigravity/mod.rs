@@ -221,7 +221,7 @@ impl HarnessAdapter for AntigravityAdapter {
         let resume_id = prior.as_ref().map(|r| r.conversation_id);
 
         let log_file_path = build_log_file_path(turn_id);
-        let args = build_args(prompt, resume_id, &log_file_path);
+        let args = build_args(prompt, cwd, resume_id, &log_file_path);
 
         let mut command = tokio::process::Command::new(&binary);
         command
@@ -290,17 +290,31 @@ fn resolve_home_dir(override_path: Option<&Path>) -> PathBuf {
         .unwrap_or_default()
 }
 
-/// Build the `agy` invocation. `--dangerously-skip-permissions` mirrors
-/// Gemini's `--yolo`: Switchboard's bound cwd is the user's own workspace,
-/// so per-tool approval prompts (which would block a headless dispatch)
-/// must be auto-approved. Resume passes the captured UUID via
+/// Build the `agy` invocation.
+///
+/// `--add-dir <cwd>` establishes the **workspace** so the model's file and
+/// command tools operate in the project directory. This is load-bearing and
+/// non-obvious: setting the child's `current_dir(cwd)` alone is *not* enough —
+/// without `--add-dir`, `agy` reports "no active workspace set" and runs tools
+/// against `$HOME` (verified live: a file written into the dispatch cwd is
+/// invisible to the model, and `run_command` executes with `Cwd=$HOME`). Passed
+/// on every dispatch (`agy` is one-shot, so the workspace must be re-established
+/// each turn). `agy` also discovers a `.gemini/config/projects/<id>.json` from
+/// the cwd regardless, but that "project" is distinct from the active workspace
+/// the tools use — only `--add-dir` sets the latter.
+///
+/// `--dangerously-skip-permissions` mirrors Gemini's `--yolo`: the bound cwd is
+/// the user's own workspace, so per-tool approval prompts (which would block a
+/// headless dispatch) must be auto-approved. Resume passes the captured UUID via
 /// `--conversation`; first turn omits it and lets `agy` mint a new one.
 ///
-/// `log_file` isolates this dispatch's CLI log so the no-answer-branch
-/// outcome scan reads only this turn's failures — never another concurrent
-/// `agy`'s log (which the default-dir-by-mtime approach would misattribute).
-fn build_args(prompt: &str, resume_id: Option<Uuid>, log_file: &Path) -> Vec<String> {
+/// `log_file` isolates this dispatch's CLI log so the no-answer-branch outcome
+/// scan (and the conversation-id capture) read only this turn's output — never
+/// another concurrent `agy`'s log.
+fn build_args(prompt: &str, cwd: &Path, resume_id: Option<Uuid>, log_file: &Path) -> Vec<String> {
     let mut args = vec!["-p".to_owned(), prompt.to_owned()];
+    args.push("--add-dir".to_owned());
+    args.push(cwd.to_string_lossy().into_owned());
     if let Some(uuid) = resume_id {
         args.push("--conversation".to_owned());
         args.push(uuid.to_string());
@@ -1268,7 +1282,7 @@ mod tests {
     #[test]
     fn build_args_first_turn_omits_conversation() {
         let log = PathBuf::from("/tmp/x.log");
-        let args = build_args("hello", None, &log);
+        let args = build_args("hello", Path::new("/work/proj"), None, &log);
         assert_eq!(args[0], "-p");
         assert_eq!(args[1], "hello");
         assert!(!args.contains(&"--conversation".to_owned()));
@@ -1278,12 +1292,27 @@ mod tests {
     }
 
     #[test]
+    fn build_args_establishes_the_workspace_via_add_dir() {
+        // `--add-dir <cwd>` is load-bearing: without it `agy` runs the model's
+        // file/command tools against $HOME, not the project dir.
+        let log = PathBuf::from("/tmp/x.log");
+        let args = build_args("hello", Path::new("/work/proj"), None, &log);
+        let idx = args
+            .iter()
+            .position(|a| a == "--add-dir")
+            .expect("must pass --add-dir");
+        assert_eq!(args[idx + 1], "/work/proj");
+    }
+
+    #[test]
     fn build_args_resume_passes_conversation_uuid() {
         let uuid = Uuid::new_v4();
         let log = PathBuf::from("/tmp/y.log");
-        let args = build_args("hi", Some(uuid), &log);
+        let args = build_args("hi", Path::new("/work/proj"), Some(uuid), &log);
         let idx = args.iter().position(|a| a == "--conversation").unwrap();
         assert_eq!(args[idx + 1], uuid.to_string());
+        // Workspace is re-established on resume too (agy is one-shot).
+        assert!(args.contains(&"--add-dir".to_owned()));
     }
 
     #[test]

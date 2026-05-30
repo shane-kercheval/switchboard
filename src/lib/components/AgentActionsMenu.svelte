@@ -19,7 +19,14 @@
 
   /// `active` = the agent is currently driving work (in-flight or queued). Gates
   /// "Stop agent" and switches the resume panel to its stronger collision warning.
-  let { agent, active }: { agent: AgentRecord; active: boolean } = $props();
+  /// `onRename` puts the sidebar card into its inline rename editor — the menu
+  /// owns the trigger, the card owns the edit state (an `<input>` can't live in
+  /// the card's collapse-toggle button), so this is a callback, not local state.
+  let {
+    agent,
+    active,
+    onRename,
+  }: { agent: AgentRecord; active: boolean; onRename?: () => void } = $props();
 
   let menuOpen = $state(false);
   let resumeOpen = $state(false);
@@ -155,6 +162,11 @@
     >
       Open session file
     </DropdownMenuItem>
+    {#if onRename}
+      <DropdownMenuItem onSelect={onRename} data-testid="agent-action-rename">
+        Rename agent
+      </DropdownMenuItem>
+    {/if}
     <DropdownMenuItem
       onSelect={startRemove}
       closeOnSelect={false}

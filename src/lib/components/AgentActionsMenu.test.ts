@@ -204,6 +204,28 @@ describe("AgentActionsMenu", () => {
     expect(screen.getByTestId("agent-action-remove")).toBeInTheDocument();
   });
 
+  it("offers Rename only when onRename is given, and selecting it fires the callback", async () => {
+    agentSessionInfoMock.mockResolvedValue({ session_file: null, resume_command: null });
+    const Component = await loadComponent();
+    const onRename = vi.fn();
+    render(Component, { props: { agent: AGENT, active: false, onRename } });
+
+    await fireEvent.click(screen.getByTestId("agent-actions-trigger"));
+    const rename = await screen.findByTestId("agent-action-rename");
+    await fireEvent.click(rename);
+    expect(onRename).toHaveBeenCalledTimes(1);
+  });
+
+  it("omits Rename when no onRename callback is provided", async () => {
+    agentSessionInfoMock.mockResolvedValue({ session_file: null, resume_command: null });
+    const Component = await loadComponent();
+    render(Component, { props: { agent: AGENT, active: false } });
+
+    await fireEvent.click(screen.getByTestId("agent-actions-trigger"));
+    await screen.findByTestId("agent-action-remove");
+    expect(screen.queryByTestId("agent-action-rename")).not.toBeInTheDocument();
+  });
+
   it("does not confirm the copy when the clipboard write fails", async () => {
     copyTextMock.mockRejectedValueOnce(new Error("nope"));
     agentSessionInfoMock.mockResolvedValue({

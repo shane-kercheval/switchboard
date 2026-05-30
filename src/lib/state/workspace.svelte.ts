@@ -242,6 +242,23 @@ export async function removeAgent(agentId: AgentId): Promise<void> {
   unregisterAgents([agentId]);
 }
 
+/// Rename an agent. The backend re-validates format + uniqueness (the frontend
+/// pre-check is UX only) and returns the updated record, which replaces the old
+/// one in whichever project roster holds it — located across all rosters rather
+/// than assumed to be active, mirroring the backend's agent-id → own-project
+/// resolution and matching `removeAgent`. The agent's live per-agent state
+/// (`transcripts` / `runtimes`) is keyed by id and carries no name, so nothing
+/// else needs updating. Errors propagate to the caller (the inline editor
+/// surfaces them and stays in edit mode).
+export async function renameAgent(agentId: AgentId, newName: string): Promise<void> {
+  const updated = await api.renameAgent(agentId, newName);
+  for (const [projectId, agents] of Object.entries(agentsByProject)) {
+    if (agents.some((a) => a.id === agentId)) {
+      agentsByProject[projectId] = agents.map((a) => (a.id === agentId ? updated : a));
+    }
+  }
+}
+
 /// Dismiss the auto-create failure banner for one harness.
 export function dismissAgentCreationFailure(harness: HarnessKind): void {
   const idx = agentCreationFailures.findIndex((f) => f.harness === harness);

@@ -7,6 +7,25 @@ vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(async () => vi.fn()),
 }));
 
+// The inline rename editor commits through the workspace state's `renameAgent`;
+// AgentActionsMenu (rendered per card) imports `removeAgent` from the same
+// module, so the mock provides both. `$lib/state/index.svelte` (the real module
+// the other suites drive) does not import either, so these mocks are orthogonal.
+const renameAgentMock = vi.fn<(id: string, name: string) => Promise<void>>();
+const removeAgentMock = vi.fn<(id: string) => Promise<void>>();
+vi.mock("$lib/state/workspace.svelte", () => ({
+  renameAgent: (id: string, name: string) => renameAgentMock(id, name),
+  removeAgent: (id: string) => removeAgentMock(id),
+}));
+
+// Opening the actions menu resolves session info; stub it so the "Rename via
+// menu" path doesn't reach the real Tauri `invoke`.
+const agentSessionInfoMock = vi.fn();
+vi.mock("$lib/api", () => ({
+  agentSessionInfo: (id: string) => agentSessionInfoMock(id),
+  openSessionFile: vi.fn(),
+}));
+
 async function loadState() {
   return await import("$lib/state/index.svelte");
 }
@@ -30,6 +49,9 @@ const CODEX_AGENT: AgentRecord = {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  renameAgentMock.mockResolvedValue(undefined);
+  removeAgentMock.mockResolvedValue(undefined);
+  agentSessionInfoMock.mockResolvedValue({ session_file: null, resume_command: null });
 });
 
 afterEach(async () => {
@@ -667,5 +689,183 @@ describe("Sidebar agent-scoped event tolerance", () => {
     await waitFor(() => {
       expect(screen.getByTestId("agent-meta")).toHaveTextContent("claude-sonnet-4-6");
     });
+  });
+});
+
+/// Inline rename editor (M7). The card's name swaps to an <input> with live
+/// validation; Enter / the save icon commit, Escape / blur cancel (never
+/// persist on blur). The menu's "Rename" item and a double-click on the name
+/// row are the two entry points. Commits route through the mocked workspace
+/// `renameAgent`; the backend stays authoritative, the frontend check is UX.
+describe("Sidebar inline rename", () => {
+  async function enterEditViaDoubleClick(agent: AgentRecord): Promise<HTMLInputElement> {
+    const state = await loadState();
+    await state.registerAgent(agent);
+    const Sidebar = (await import("./Sidebar.svelte")).default;
+    render(Sidebar, { props: { agents: [agent] } });
+    const toggle = screen.getByTestId("agent-name").closest("button");
+    if (!toggle) throw new Error("expected the agent name to sit in a toggle button");
+    await fireEvent.dblClick(toggle);
+    return (await screen.findByTestId("agent-rename-input")) as HTMLInputElement;
+  }
+
+  it("double-click on the name row enters edit mode seeded with the current name", async () => {
+    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    expect(input).toHaveValue("alice");
+    // The name span / toggle button is gone while editing.
+    expect(screen.queryByTestId("agent-name")).toBeNull();
+  });
+
+  it("the input is not nested inside the collapse toggle (no nested interactive)", async () => {
+    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    expect(input.closest("button")).toBeNull();
+  });
+
+  it("the menu's Rename item enters edit mode", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    const Sidebar = (await import("./Sidebar.svelte")).default;
+    render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+
+    await fireEvent.click(screen.getByTestId("agent-actions-trigger"));
+    await fireEvent.click(await screen.findByTestId("agent-action-rename"));
+
+    const input = (await screen.findByTestId("agent-rename-input")) as HTMLInputElement;
+    expect(input).toHaveValue("alice");
+  });
+
+  it("Enter commits the new name via renameAgent and exits edit mode", async () => {
+    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    await fireEvent.input(input, { target: { value: "alice2" } });
+    await fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(renameAgentMock).toHaveBeenCalledWith(CLAUDE_AGENT.id, "alice2");
+    await waitFor(() => expect(screen.queryByTestId("agent-rename-input")).toBeNull());
+  });
+
+  it("the save icon commits the new name via renameAgent", async () => {
+    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    await fireEvent.input(input, { target: { value: "alice2" } });
+
+    const save = screen.getByTestId("agent-rename-save");
+    // mousedown-preventDefault keeps focus so the click commits before any
+    // blur-cancel; the click does the actual commit.
+    await fireEvent.mouseDown(save);
+    await fireEvent.click(save);
+
+    expect(renameAgentMock).toHaveBeenCalledWith(CLAUDE_AGENT.id, "alice2");
+    await waitFor(() => expect(screen.queryByTestId("agent-rename-input")).toBeNull());
+  });
+
+  it("trims the draft before submitting (validated value equals submitted value)", async () => {
+    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    await fireEvent.input(input, { target: { value: "  alice2  " } });
+    await fireEvent.keyDown(input, { key: "Enter" });
+    expect(renameAgentMock).toHaveBeenCalledWith(CLAUDE_AGENT.id, "alice2");
+  });
+
+  it("Escape reverts without calling renameAgent", async () => {
+    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    await fireEvent.input(input, { target: { value: "alice2" } });
+    await fireEvent.keyDown(input, { key: "Escape" });
+
+    expect(renameAgentMock).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.queryByTestId("agent-rename-input")).toBeNull());
+    expect(screen.getByTestId("agent-name")).toHaveTextContent("alice");
+  });
+
+  it("blur (click-away) reverts without calling renameAgent — never persists on blur", async () => {
+    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    await fireEvent.input(input, { target: { value: "alice2" } });
+    await fireEvent.blur(input);
+
+    expect(renameAgentMock).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.queryByTestId("agent-rename-input")).toBeNull());
+    expect(screen.getByTestId("agent-name")).toHaveTextContent("alice");
+  });
+
+  it("renaming to the agent's own name (case variant) is allowed — exclude-self", async () => {
+    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    // "Alice" canonicalizes to "alice" (the agent's own); exclude-self means it
+    // is not a duplicate, and it differs verbatim, so it commits.
+    await fireEvent.input(input, { target: { value: "Alice" } });
+    expect(screen.getByTestId("agent-rename-save")).not.toBeDisabled();
+    await fireEvent.keyDown(input, { key: "Enter" });
+    expect(renameAgentMock).toHaveBeenCalledWith(CLAUDE_AGENT.id, "Alice");
+  });
+
+  it("an unchanged name skips the backend round-trip and just exits", async () => {
+    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    await fireEvent.keyDown(input, { key: "Enter" });
+    expect(renameAgentMock).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.queryByTestId("agent-rename-input")).toBeNull());
+  });
+
+  it("a duplicate of another agent disables save and blocks commit", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    const Sidebar = (await import("./Sidebar.svelte")).default;
+    render(Sidebar, { props: { agents: [CLAUDE_AGENT, CODEX_AGENT] } });
+
+    const [firstName] = screen.getAllByTestId("agent-name");
+    const toggle = firstName?.closest("button");
+    if (!toggle) throw new Error("expected a toggle button");
+    await fireEvent.dblClick(toggle);
+    const input = (await screen.findByTestId("agent-rename-input")) as HTMLInputElement;
+
+    await fireEvent.input(input, { target: { value: "bob" } });
+    const save = screen.getByTestId("agent-rename-save");
+    expect(save).toBeDisabled();
+    // The live message rides the input's title tooltip in the cramped card.
+    expect(input).toHaveAttribute("title", "An agent named 'bob' already exists");
+    expect(input).toHaveAttribute("aria-invalid", "true");
+
+    // Enter is a no-op while invalid; the agent stays in edit mode.
+    await fireEvent.keyDown(input, { key: "Enter" });
+    expect(renameAgentMock).not.toHaveBeenCalled();
+    expect(screen.getByTestId("agent-rename-input")).toBeInTheDocument();
+  });
+
+  it("an emptied field disables save without showing a nag message", async () => {
+    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    await fireEvent.input(input, { target: { value: "" } });
+    expect(screen.getByTestId("agent-rename-save")).toBeDisabled();
+    // `empty` is suppressed — no scary message mid-edit (aria-invalid still set).
+    expect(input).not.toHaveAttribute("title");
+    expect(input).toHaveAttribute("aria-invalid", "true");
+  });
+
+  it("double-Enter while a rename is in flight commits only once", async () => {
+    // Defer the resolution so the second Enter lands mid-flight (renaming=true),
+    // exercising the re-entry guard the save button already enforces.
+    let resolve: (() => void) | undefined;
+    renameAgentMock.mockImplementationOnce(
+      () =>
+        new Promise<void>((r) => {
+          resolve = () => r();
+        }),
+    );
+
+    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    await fireEvent.input(input, { target: { value: "alice2" } });
+    await fireEvent.keyDown(input, { key: "Enter" });
+    await fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(renameAgentMock).toHaveBeenCalledTimes(1);
+    resolve?.();
+    await waitFor(() => expect(screen.queryByTestId("agent-rename-input")).toBeNull());
+  });
+
+  it("a backend rejection keeps edit mode and surfaces the error", async () => {
+    renameAgentMock.mockRejectedValueOnce(new Error("registry locked"));
+    const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
+    await fireEvent.input(input, { target: { value: "alice2" } });
+    await fireEvent.keyDown(input, { key: "Enter" });
+
+    const err = await screen.findByTestId("agent-rename-error");
+    expect(err).toHaveTextContent("registry locked");
+    // Still editing — the agent is kept on the field for a retry.
+    expect(screen.getByTestId("agent-rename-input")).toBeInTheDocument();
   });
 });

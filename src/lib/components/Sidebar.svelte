@@ -1,6 +1,8 @@
 <script lang="ts">
   import type { AgentRecord, AgentId } from "$lib/types";
   import { runtimes, transcripts } from "$lib/state/index.svelte";
+  import { renameAgent } from "$lib/state/workspace.svelte";
+  import { normalizeAgentName, validateAgentName, type NameValidation } from "$lib/agentName";
   import { cn, relativeTime } from "$lib/utils";
   import SidebarPanel from "$lib/components/ui/SidebarPanel.svelte";
   import SidebarSection from "$lib/components/ui/SidebarSection.svelte";
@@ -210,6 +212,87 @@
       for (const a of agents) delete collapsed[a.id];
     }
   }
+
+  /// Inline rename editor. Only one card edits at a time, so a single
+  /// `editingAgentId` + `draftName` suffices; `renameError` holds a backend
+  /// rejection (the live format/uniqueness check is `renameValidation`, the
+  /// frontend mirror of the backend rules — the backend stays authoritative).
+  let editingAgentId = $state<AgentId | null>(null);
+  let draftName = $state<string>("");
+  let renaming = $state<boolean>(false);
+  let renameError = $state<string | null>(null);
+
+  /// Validate the draft against the live roster, excluding the agent being
+  /// edited so re-saving its own (or a case/hyphen-variant) name isn't a false
+  /// duplicate. `renameMessage` suppresses the `empty` reason so an emptied
+  /// field disables save without nagging mid-edit (mirrors the create form).
+  const renameValidation = $derived<NameValidation>(
+    editingAgentId === null ? { ok: true } : validateAgentName(draftName, agents, editingAgentId),
+  );
+  const renameMessage = $derived(
+    renameValidation.ok || renameValidation.reason === "empty" ? null : renameValidation.message,
+  );
+  const canSave = $derived(renameValidation.ok && !renaming);
+
+  function startEdit(agent: AgentRecord): void {
+    editingAgentId = agent.id;
+    draftName = agent.name;
+    renameError = null;
+  }
+
+  function cancelEdit(): void {
+    editingAgentId = null;
+    renameError = null;
+  }
+
+  /// Commit the draft. An unchanged verbatim name skips the round-trip (a no-op
+  /// rename just exits edit mode). On success the roster updates and we leave
+  /// edit mode; on a backend rejection we stay in edit mode and surface it.
+  async function commitEdit(agent: AgentRecord): Promise<void> {
+    // Same gate the save button uses (`!canSave`), so the Enter path can't
+    // double-submit while a rename is already in flight. Preserves the
+    // unchanged-name skip: validation ok + not renaming → proceeds → the
+    // `next === agent.name` branch exits without a round-trip.
+    if (!canSave) return;
+    const next = normalizeAgentName(draftName);
+    if (next === agent.name) {
+      cancelEdit();
+      return;
+    }
+    renaming = true;
+    renameError = null;
+    try {
+      await renameAgent(agent.id, next);
+      editingAgentId = null;
+    } catch (err) {
+      renameError = err instanceof Error ? err.message : String(err);
+    } finally {
+      renaming = false;
+    }
+  }
+
+  function onRenameKeydown(event: KeyboardEvent, agent: AgentRecord): void {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      void commitEdit(agent);
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      cancelEdit();
+    }
+  }
+
+  /// Focus + select the edit field once it mounts. Deferred a frame so it wins
+  /// the dropdown menu's on-close focus restore (the "Rename" item closes the
+  /// menu, which returns focus to its trigger) — focusing synchronously would be
+  /// immediately stolen back, firing the input's blur-cancel. By the next frame
+  /// the menu teardown is done and the field takes focus cleanly. (Blur is the
+  /// cancel trigger, so the field must never be focused only to lose it.)
+  function focusSelect(node: HTMLInputElement): void {
+    requestAnimationFrame(() => {
+      node.focus();
+      node.select();
+    });
+  }
 </script>
 
 <SidebarPanel side="right" width="w-60" testid="sidebar">
@@ -286,36 +369,102 @@
           data-agent-id={agent.id}
         >
           <div class="flex items-center justify-between gap-2">
-            <button
-              type="button"
-              class="flex min-w-0 flex-1 items-center gap-1.5 text-left"
-              aria-expanded={!isCollapsed}
-              onclick={() => toggleCollapsed(agent.id)}
-            >
-              <svg
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="1.5"
-                stroke-linecap="round"
-                stroke-linejoin="round"
+            {#if editingAgentId === agent.id}
+              <!-- Edit mode swaps the whole left side: an <input> can't nest in
+                   the collapse-toggle <button>, and the harness icon becomes a
+                   save (check) button. Blur cancels (never persist on blur); the
+                   save button's mousedown-preventDefault keeps focus so its click
+                   commits before blur-cancel can fire. -->
+              <input
+                use:focusSelect
+                bind:value={draftName}
                 class={cn(
-                  "text-muted h-3 w-3 shrink-0 transition-transform",
-                  isCollapsed && "-rotate-90",
+                  "text-fg border-border bg-panel h-6 min-w-0 flex-1 rounded border px-1.5 text-[13px] font-semibold",
+                  "focus-visible:ring-accent focus-visible:ring-1 focus-visible:outline-none",
+                  renameMessage && "border-status-failed",
                 )}
-                aria-hidden="true"
+                aria-label="Agent name"
+                aria-invalid={!renameValidation.ok}
+                aria-describedby={renameError ? `agent-rename-error-${agent.id}` : undefined}
+                title={renameMessage ?? undefined}
+                data-testid="agent-rename-input"
+                onkeydown={(event) => onRenameKeydown(event, agent)}
+                onblur={cancelEdit}
+              />
+              <button
+                type="button"
+                class={cn(ICON_BUTTON_CLASS, "shrink-0 disabled:cursor-not-allowed disabled:opacity-50")}
+                disabled={!canSave}
+                aria-label="Save name"
+                title="Save"
+                data-testid="agent-rename-save"
+                onmousedown={(event) => event.preventDefault()}
+                onclick={() => void commitEdit(agent)}
               >
-                <path d="m6 9 6 6 6-6" />
-              </svg>
-              <span class="text-fg truncate text-[13px] font-semibold" data-testid="agent-name">
-                {agent.name}
-              </span>
-            </button>
-            <div class="flex shrink-0 items-center gap-1">
-              <HarnessIcon harness={agent.harness} size="md" testid="agent-harness-icon" />
-              <AgentActionsMenu {agent} active={isActive(agent.id)} />
-            </div>
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  class="h-4 w-4"
+                  aria-hidden="true"
+                >
+                  <path d="M20 6 9 17l-5-5" />
+                </svg>
+              </button>
+            {:else}
+              <!-- Double-click the name row to rename (the menu's "Rename" item
+                   is the other entry point); the handler is on the button — a
+                   real interactive element — so it's a11y-clean. Single-click
+                   still toggles collapse; a double-click toggles it twice (net
+                   no change) before edit mode opens. -->
+              <button
+                type="button"
+                class="flex min-w-0 flex-1 items-center gap-1.5 text-left"
+                aria-expanded={!isCollapsed}
+                onclick={() => toggleCollapsed(agent.id)}
+                ondblclick={() => startEdit(agent)}
+              >
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.5"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  class={cn(
+                    "text-muted h-3 w-3 shrink-0 transition-transform",
+                    isCollapsed && "-rotate-90",
+                  )}
+                  aria-hidden="true"
+                >
+                  <path d="m6 9 6 6 6-6" />
+                </svg>
+                <span class="text-fg truncate text-[13px] font-semibold" data-testid="agent-name">
+                  {agent.name}
+                </span>
+              </button>
+              <div class="flex shrink-0 items-center gap-1">
+                <HarnessIcon harness={agent.harness} size="md" testid="agent-harness-icon" />
+                <AgentActionsMenu
+                  {agent}
+                  active={isActive(agent.id)}
+                  onRename={() => startEdit(agent)}
+                />
+              </div>
+            {/if}
           </div>
+          {#if editingAgentId === agent.id && renameError}
+            <div
+              id={`agent-rename-error-${agent.id}`}
+              class="text-status-failed mt-1 text-xs"
+              data-testid="agent-rename-error"
+            >
+              {renameError}
+            </div>
+          {/if}
           {#if !isCollapsed}
             {#if runtime?.hydration_error}
               <div class="text-status-failed mt-1 text-xs" data-testid="agent-hydration-error">

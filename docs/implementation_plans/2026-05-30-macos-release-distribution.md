@@ -2,14 +2,14 @@
 
 **Status:** proposed · **Created:** 2026-05-30
 
-Ship a distributable Switchboard build that macOS users — developers already using Claude Code, Codex, or Gemini — can install with a single Homebrew command. The plan has four milestones: isolate dev and production config paths, consolidate version management (eliminating a three-file sync problem), automate builds via a GitHub Release CI workflow, and create a Homebrew tap so `brew install --cask` works with zero Gatekeeper friction.
+Ship a distributable Switchboard build that macOS users — developers already using Claude Code, Codex, or Gemini — can install with a single Homebrew command. The plan has five milestones: isolate dev and production config paths, consolidate version management (eliminating a three-file sync problem), automate builds via a GitHub Release CI workflow, add an in-app update notification, and create a Homebrew tap so `brew install --cask` works with zero Gatekeeper friction.
 
 **Scope decisions:**
 
 - **macOS only for v1** (stated project constraint). Tauri supports Linux and Windows, but CI and distribution are macOS-only here.
 - **Homebrew custom tap, not direct `.dmg` download or Mac App Store.** macOS Gatekeeper blocks unsigned apps downloaded from the internet and, since Sequoia (15), removed the right-click > Open bypass for unsigned apps — users must navigate to System Settings to approve. Homebrew automatically removes the quarantine attribute on install, so users get zero Gatekeeper friction with no Apple Developer ID signing ($99/year). The target audience (developers running AI coding CLIs) already has Homebrew.
 - **Universal binary (`universal-apple-darwin`).** One artifact covers both Apple Silicon and Intel Macs. Tauri supports this natively with `--target universal-apple-darwin`; the only cost is slightly longer CI build time.
-- **No auto-update for v1.** Tauri ships an updater plugin; defer until the app has an established release cadence.
+- **Notification-only update check, not Tauri's built-in updater.** Tauri's updater plugin downloads and installs updates itself, bypassing Homebrew and leaving the package manager out of sync. Instead: check the GitHub Releases API on startup, compare to the running version, and show a chip if a newer release exists — clicking it shows the `brew upgrade` command. No in-app download, no Homebrew conflict.
 - **No Apple Developer ID signing for v1.** Not needed — Homebrew quarantine removal provides equivalent UX for the developer audience. Revisit if distribution via direct download or to non-developer users becomes a goal.
 
 ---
@@ -157,7 +157,49 @@ Pushing a `v*` tag automatically builds the universal `.dmg` and publishes it as
 
 ---
 
-## Milestone 4 — Homebrew tap and README
+## Milestone 4 — In-app update notification
+
+### Goal & Outcome
+
+When a newer GitHub Release exists, a chip appears in the app header telling the user to run `brew upgrade --cask switchboard`. No in-app download, no Homebrew conflict.
+
+- On every launch, the app checks the GitHub Releases API for the latest version.
+- If the latest release is newer than the running version, a chip is shown in the header (e.g. *"v0.2.0 available"*).
+- Clicking the chip opens a small popover showing the upgrade command to run.
+- A failed check (no network, GitHub down, rate limit hit) is silent — the chip simply doesn't appear and the app launches normally.
+
+### Implementation Outline
+
+**New Tauri command: `check_for_update`.** Add to `crates/app/src/commands.rs` following the existing `*_impl` pattern. Returns `Option<String>` — `Some(version)` when a newer release is available, `None` when up to date or when the check fails for any reason. All failure modes (network error, parse error, timeout, non-200 response) return `None` via `?` — no error surface to the frontend.
+
+The command hits `https://api.github.com/repos/shane-kercheval/switchboard/releases/latest`, parses `tag_name` (e.g. `"v0.2.0"`), strips the leading `v`, and compares to `app.package_info().version` using semver ordering — not string equality — so a future rollback tag doesn't surface as "update available".
+
+Add `reqwest` with the `json` and `rustls-tls` features to `crates/app`'s dependencies (no OpenSSL dependency, consistent with macOS-first). Set a 5-second timeout on the client. GitHub's API requires a `User-Agent` header; use `"switchboard-app"`. The request comes from Rust, not the webview, so no CSP change is needed.
+
+The command is registered in `lib.rs` alongside the other commands.
+
+**Frontend: update chip.** Call `invoke('check_for_update')` in the app's top-level `onMount`. If it returns a version string, render a small chip in the header — consistent with the existing header component and design tokens in `docs/ui-conventions.md`. Clicking the chip opens a popover (use the existing `ui/` popover primitive) containing:
+
+```
+v{version} is available.
+Run: brew upgrade --cask switchboard
+```
+
+Include a copy-to-clipboard button on the command (the clipboard plugin is already wired up). The chip and popover are absent when `check_for_update` returns null.
+
+**Privacy note.** Add one line to `README.md` under a new "Privacy" section or inline in the Installation section: on launch, Switchboard checks GitHub's releases API to detect updates; this request is visible to GitHub as any other API call. One sentence is enough — the audience understands what an API call is.
+
+### Definition of Done
+
+- In a debug build pointing at a mock or real GitHub release with a higher version, the chip appears in the header.
+- With no network, the app launches normally with no chip and no error.
+- The copy button copies the `brew upgrade` command to the clipboard.
+- The chip is absent when already on the latest version.
+- `make check` green.
+
+---
+
+## Milestone 5 — Homebrew tap and README
 
 ### Goal & Outcome
 

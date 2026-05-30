@@ -289,7 +289,7 @@
                   "focus-visible:ring-accent inline-flex items-center gap-1 rounded-full border py-0.5 pr-2 pl-1.5 text-sm transition-colors focus-visible:ring-2 focus-visible:outline-none",
                   selected
                     ? "bg-accent-soft text-fg border-transparent"
-                    : "border-border bg-panel text-muted hover:bg-raised hover:text-fg",
+                    : "border-panel bg-panel text-muted hover:bg-raised hover:text-fg",
                 )}
                 data-testid={`recipient-chip-${agent.id}`}
                 data-selected={selected}

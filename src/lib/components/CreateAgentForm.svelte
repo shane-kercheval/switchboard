@@ -281,6 +281,7 @@
       <Button
         variant="secondary"
         size="sm"
+        class="w-28"
         data-testid="cancel-create-agent"
         disabled={busy}
         onclick={onCancel}
@@ -290,6 +291,7 @@
     {/if}
     <Button
       size="sm"
+      class="w-28"
       data-testid="confirm-create-agent"
       disabled={!canSubmit}
       onclick={handleSubmit}

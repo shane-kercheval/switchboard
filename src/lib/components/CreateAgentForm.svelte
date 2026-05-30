@@ -185,7 +185,7 @@
       project directory.
     {:else}
       Connects to an existing session by its UUID, picking up the conversation where it left off.
-      Use this to bring a session the harness already has on disk into Switchboard.
+      Use this to bring a session the CLI already has on disk into Switchboard.
     {/if}
   </p>
 
@@ -311,7 +311,7 @@
 {:else}
   <!-- Standalone: page-fill centered card + heading. -->
   <div class="flex h-full flex-col items-center justify-center gap-6 p-8">
-    <div class="border-border bg-panel w-full max-w-md space-y-4 rounded-md border p-5">
+    <div class="border-border bg-raised w-full max-w-md space-y-4 rounded-md border p-5">
       <div class="space-y-1">
         <h2 class="text-fg text-lg font-semibold">Create an agent</h2>
         <p class="text-muted text-sm">Agents live inside the active project.</p>

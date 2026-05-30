@@ -32,9 +32,22 @@
     /// Optional override for the content max-width. Defaults to `max-w-md`
     /// which matches the standalone CreateAgentForm layout.
     contentClass?: string;
+    /// When false, the modal can't be dismissed (escape, click-outside, or the
+    /// header ✕ are all suppressed). Used to keep a modal up while an
+    /// irreversible action it kicked off is mid-flight — e.g. the New Project
+    /// dialog during agent auto-seeding, so the user can't navigate away into a
+    /// partially-created project. Defaults to true (normal dismissible modal).
+    dismissible?: boolean;
   };
 
-  let { open = $bindable(), title, children, onClose, contentClass }: Props = $props();
+  let {
+    open = $bindable(),
+    title,
+    children,
+    onClose,
+    contentClass,
+    dismissible = true,
+  }: Props = $props();
 
   function handleOpenChange(next: boolean): void {
     open = next;
@@ -51,30 +64,38 @@
         contentClass ?? "max-w-md",
       ].join(" ")}
       data-testid="dialog-content"
+      onEscapeKeydown={(e) => {
+        if (!dismissible) e.preventDefault();
+      }}
+      onInteractOutside={(e) => {
+        if (!dismissible) e.preventDefault();
+      }}
     >
       <div class="border-border/80 flex items-center justify-between gap-3 border-b px-4 py-3">
         <BitsDialog.Title class="text-fg text-sm font-semibold" data-testid="dialog-title">
           {title}
         </BitsDialog.Title>
-        <BitsDialog.Close
-          class={cn(ICON_BUTTON_CLASS, "hover:bg-panel")}
-          aria-label="Close dialog"
-          data-testid="dialog-close"
-        >
-          <svg
-            width="16"
-            height="16"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="2"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            aria-hidden="true"
+        {#if dismissible}
+          <BitsDialog.Close
+            class={cn(ICON_BUTTON_CLASS, "hover:bg-panel")}
+            aria-label="Close dialog"
+            data-testid="dialog-close"
           >
-            <path d="M18 6 6 18M6 6l12 12" />
-          </svg>
-        </BitsDialog.Close>
+            <svg
+              width="16"
+              height="16"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M18 6 6 18M6 6l12 12" />
+            </svg>
+          </BitsDialog.Close>
+        {/if}
       </div>
       <div class="p-4">
         {@render children()}

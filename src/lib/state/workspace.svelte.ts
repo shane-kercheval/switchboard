@@ -31,11 +31,14 @@ import type {
   AgentId,
   AgentRecord,
   ConversationItem,
+  HarnessKind,
   LoadedTurn,
   ProjectId,
   ProjectListing,
   WorkspaceDirectoryInfo,
 } from "$lib/types";
+import { harnessAvailability, refreshHarnessAvailability } from "$lib/harnessAvailability.svelte";
+import { HARNESS_DEFAULT_AGENT_NAME } from "$lib/harnessDisplay";
 import {
   applyAgentHydrate,
   markHydrationAttempted,
@@ -80,6 +83,13 @@ export const selection = $state<{
 
 /// Per-project agent rosters, populated lazily on first activation.
 export const agentsByProject = $state<Record<ProjectId, AgentRecord[]>>({});
+
+/// Harnesses whose agent failed to auto-create on the just-created project,
+/// with the reason. Surfaced as a dismissible banner so a partial failure (the
+/// project opens, but one expected agent is missing) is visible rather than
+/// silent. Transient and event-scoped: cleared on every project (re)activation,
+/// repopulated only by `createProjectAndActivate`.
+export const agentCreationFailures = $state<{ harness: HarnessKind; error: string }[]>([]);
 
 /// Per-project hydrated conversation overlays, keyed by project id.
 export const conversations = $state<Record<ProjectId, ProjectConversationState>>({});
@@ -162,7 +172,61 @@ export async function createProjectAndActivate(name: string, directory: string):
   await api.initDirectory(directory);
   const summary = await api.createProject(name, directory);
   await loadWorkspace();
+  // Activation must complete first: `create_agent` targets the backend's active
+  // project, and `activateProject` issues `set_active_project`. It also clears
+  // `agentCreationFailures`, so the seeding below starts from a clean slate.
   await activateProject(summary.id);
+  await seedAgentsForInstalledHarnesses();
+}
+
+/// Auto-populate a freshly created project with one agent per installed harness.
+/// New projects only — called solely from `createProjectAndActivate`, never on
+/// activation of an existing project.
+///
+/// Awaits a fresh availability probe before reading `installed()`: the store's
+/// startup probe is fired un-awaited and reports `[]` until it resolves, so a
+/// project created inside that window would otherwise seed zero agents. The
+/// probe is idempotent and cheap, so awaiting it here closes the race.
+///
+/// Mirrors the canonical create path (`createAgent` → `registerAgent` →
+/// `addAgentToActiveProject`) per agent — a plain roster re-fetch would skip
+/// `registerAgent` and leave the agents without live transcript/dispatch state.
+/// Each create is independent: one failure is recorded in `agentCreationFailures`
+/// (surfaced as a dismissible banner) and never aborts the rest or the open.
+///
+/// **Targets a captured project, not live active state.** Both `create_agent`
+/// (backend active project) and `addAgentToActiveProject` (frontend
+/// `selection.activeProjectId`) bind to whatever is active *at call time*. If
+/// the user navigated to another project mid-seed, continuing would scatter
+/// agents into the wrong project — so we capture the id up front and bail if it
+/// changes. The new-project dialog also stays non-dismissible while this runs
+/// (belt). The durable fix is `create_agent`/`attach_agent` taking an explicit
+/// `project_id` instead of reading active state — out of scope here, but the
+/// same coupling affects M5's remove/rename.
+async function seedAgentsForInstalledHarnesses(): Promise<void> {
+  const projectId = selection.activeProjectId;
+  await refreshHarnessAvailability();
+  for (const harness of harnessAvailability.installed()) {
+    if (selection.activeProjectId !== projectId) break;
+    try {
+      const agent = await api.createAgent(HARNESS_DEFAULT_AGENT_NAME[harness], harness);
+      await registerAgent(agent);
+      addAgentToActiveProject(agent);
+    } catch (err) {
+      // Don't strand a banner on a project the user already left.
+      if (selection.activeProjectId !== projectId) break;
+      agentCreationFailures.push({
+        harness,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+}
+
+/// Dismiss the auto-create failure banner for one harness.
+export function dismissAgentCreationFailure(harness: HarnessKind): void {
+  const idx = agentCreationFailures.findIndex((f) => f.harness === harness);
+  if (idx !== -1) agentCreationFailures.splice(idx, 1);
 }
 
 /// Display the given project. The switch is immediate (responsive); the backend
@@ -176,6 +240,10 @@ export async function createProjectAndActivate(name: string, directory: string):
 export async function activateProject(projectId: ProjectId): Promise<void> {
   selection.activeProjectId = projectId;
   selection.activationError = null;
+  // Auto-create failures pertain to a just-created project; switching away (or
+  // re-activating) clears the banner. `createProjectAndActivate` seeds *after*
+  // this, so its failures survive.
+  agentCreationFailures.length = 0;
   try {
     await ensureProjectLoaded(projectId);
     await api.setActiveProject(projectId);
@@ -309,5 +377,6 @@ export const _testing = {
     hydrationStarted.clear();
     for (const key of Object.keys(agentsByProject)) delete agentsByProject[key];
     for (const key of Object.keys(conversations)) delete conversations[key];
+    agentCreationFailures.length = 0;
   },
 };

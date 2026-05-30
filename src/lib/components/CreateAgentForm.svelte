@@ -2,6 +2,7 @@
   import type { AgentRecord, HarnessAvailability, HarnessKind } from "$lib/types";
   import type { AgentFormSubmit } from "./CreateAgentForm.types";
   import { harnessUnavailableReason, isHarnessSelectable } from "$lib/harnessAvailability";
+  import { HARNESS_DEFAULT_AGENT_NAME } from "$lib/harnessDisplay";
   import { normalizeAgentName, validateAgentName } from "$lib/agentName";
   import Button from "$lib/components/ui/Button.svelte";
   import Input from "$lib/components/ui/Input.svelte";
@@ -51,18 +52,7 @@
     geminiAvailability = { harness: "gemini", binary: "available" },
     antigravityAvailability = { harness: "antigravity", binary: "available" },
   }: Props = $props();
-  const HARNESS_LABELS: Record<HarnessKind, string> = {
-    claude_code: "Claude Code",
-    codex: "Codex",
-    gemini: "Gemini",
-    antigravity: "Antigravity",
-  };
-
-  function harnessDefaultName(kind: HarnessKind): string {
-    return HARNESS_LABELS[kind].toLowerCase().replace(/\s+/g, "-");
-  }
-
-  let name = $state<string>(harnessDefaultName("claude_code"));
+  let name = $state<string>(HARNESS_DEFAULT_AGENT_NAME["claude_code"]);
   let harness = $state<HarnessKind>("claude_code");
   let mode = $state<"create" | "attach">("create");
   let existingSessionId = $state<string>("");
@@ -143,8 +133,8 @@
   /// `$effect` so the reset stays adjacent to the trigger and there's no
   /// hidden reactive dependency.
   function selectHarness(kind: HarnessKind): void {
-    if (name === harnessDefaultName(harness)) {
-      name = harnessDefaultName(kind);
+    if (name === HARNESS_DEFAULT_AGENT_NAME[harness]) {
+      name = HARNESS_DEFAULT_AGENT_NAME[kind];
     }
     harness = kind;
   }

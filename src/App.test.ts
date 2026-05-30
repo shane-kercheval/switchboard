@@ -46,6 +46,17 @@ type Backend = {
   // Harnesses `get_harness_install_status` should report as not-installed
   // (keyed by HarnessKind). Drives the binary-missing banner tests.
   notInstalled: Set<string>;
+  // Harnesses whose `create_agent` should reject (keyed by HarnessKind).
+  // Drives the partial-auto-create-failure test.
+  createAgentFailFor: Set<string>;
+  // When set, `get_harness_install_status` waits on this gate before
+  // resolving — lets a test hold the probe "pending" to exercise the
+  // auto-create race guard (await a fresh probe before reading installed()).
+  installGate: Promise<void> | null;
+  // When set, `create_agent` waits on this gate before resolving — lets a
+  // test park the seeding loop after its first create (call is recorded on
+  // invoke) to exercise the captured-project-id bail.
+  createAgentGate: Promise<void> | null;
   agentQueue: AgentRecord[];
   sendMessageId: string;
   loadConvoCalls: string[];
@@ -65,6 +76,9 @@ function freshBackend(): Backend {
     activeProjectId: null,
     probeFailures: new Set(),
     notInstalled: new Set(),
+    createAgentFailFor: new Set(),
+    installGate: null,
+    createAgentGate: null,
     agentQueue: [],
     sendMessageId: "77777777-7777-7000-8000-777777777777",
     loadConvoCalls: [],
@@ -131,6 +145,10 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
     }
     case "create_agent":
     case "attach_agent": {
+      if (cmd === "create_agent" && backend.createAgentGate) await backend.createAgentGate;
+      if (cmd === "create_agent" && backend.createAgentFailFor.has(args?.harness as string)) {
+        throw new Error(`disk full creating ${args?.harness as string}`);
+      }
       const agent =
         backend.agentQueue.shift() ??
         ({
@@ -165,6 +183,7 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
       if (backend.probeFailures.has(cmd)) throw new Error(`auth failed: ${cmd}`);
       return null;
     case "get_harness_install_status": {
+      if (backend.installGate) await backend.installGate;
       const installed = !backend.notInstalled.has(args?.harness as string);
       return { installed, version: installed ? "1.0.0" : null };
     }
@@ -237,6 +256,26 @@ function seedProject(opts: {
 async function mountApp() {
   const App = (await import("./App.svelte")).default;
   return render(App);
+}
+
+// Drives the new-project dialog flow (choose folder → name → submit). The
+// folder is resolved from the mocked native dialog; the project is created in
+// DIR_A unless `folder` overrides it.
+async function createNewProjectViaDialog(name: string, folder: string = DIR_A): Promise<void> {
+  openDialogMock.mockResolvedValueOnce(folder);
+  await fireEvent.click(screen.getByTestId("welcome-new-project"));
+  await waitFor(() => expect(screen.getByTestId("new-project-form")).toBeInTheDocument());
+  await fireEvent.click(screen.getByTestId("new-project-choose-folder"));
+  const nameInput = screen.getByTestId("new-project-name") as HTMLInputElement;
+  await fireEvent.input(nameInput, { target: { value: name } });
+  await fireEvent.click(screen.getByTestId("new-project-submit"));
+}
+
+// create_agent calls (name + harness pairs) in invocation order.
+function createAgentCalls(): { name: string; harness: string }[] {
+  return invokeMock.mock.calls
+    .filter(([c]) => c === "create_agent")
+    .map(([, a]) => a as { name: string; harness: string });
 }
 
 describe("App", () => {
@@ -364,24 +403,166 @@ describe("App", () => {
     expect(screen.queryByTestId("add-existing-found")).not.toBeInTheDocument();
   });
 
-  it("new project: choosing a folder + name creates the project and activates it", async () => {
-    openDialogMock.mockResolvedValueOnce(DIR_A);
+  it("new project: choosing a folder + name creates the project, activates it, and auto-seeds an agent per installed harness", async () => {
     await mountApp();
     await waitFor(() => expect(screen.getByTestId("welcome-new-project")).toBeInTheDocument());
 
-    await fireEvent.click(screen.getByTestId("welcome-new-project"));
-    await waitFor(() => expect(screen.getByTestId("new-project-form")).toBeInTheDocument());
-    await fireEvent.click(screen.getByTestId("new-project-choose-folder"));
-    const nameInput = screen.getByTestId("new-project-name") as HTMLInputElement;
-    await fireEvent.input(nameInput, { target: { value: "brand-new" } });
-    await fireEvent.click(screen.getByTestId("new-project-submit"));
+    await createNewProjectViaDialog("brand-new");
 
-    // Created in the chosen folder, then activated → its (empty) roster prompts
-    // for a first agent.
     await waitFor(() => expect(screen.getByText("brand-new")).toBeInTheDocument());
-    const createCalls = invokeMock.mock.calls.filter(([c]) => c === "create_project");
-    expect(createCalls).toHaveLength(1);
-    expect(createCalls[0]?.[1]).toEqual({ name: "brand-new", directory: DIR_A });
+    const createProjectCalls = invokeMock.mock.calls.filter(([c]) => c === "create_project");
+    expect(createProjectCalls).toHaveLength(1);
+    expect(createProjectCalls[0]?.[1]).toEqual({ name: "brand-new", directory: DIR_A });
+
+    // All four harnesses are installed by default → one agent each, named after
+    // the harness, in HARNESSES order.
+    await waitFor(() => expect(createAgentCalls()).toHaveLength(4));
+    expect(createAgentCalls()).toEqual([
+      { name: "claude-code", harness: "claude_code" },
+      { name: "codex", harness: "codex" },
+      { name: "gemini", harness: "gemini" },
+      { name: "antigravity", harness: "antigravity" },
+    ]);
+    // Auto-seeded → the roster is populated, not the empty first-agent prompt.
+    await waitFor(() => expect(screen.getAllByTestId("sidebar-agent")).toHaveLength(4));
+    expect(screen.queryByTestId("confirm-create-agent")).not.toBeInTheDocument();
+  });
+
+  it("new project: seeds agents only for installed harnesses", async () => {
+    backend.notInstalled.add("gemini");
+    backend.notInstalled.add("antigravity");
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("welcome-new-project")).toBeInTheDocument());
+
+    await createNewProjectViaDialog("brand-new");
+
+    await waitFor(() => expect(createAgentCalls()).toHaveLength(2));
+    expect(createAgentCalls()).toEqual([
+      { name: "claude-code", harness: "claude_code" },
+      { name: "codex", harness: "codex" },
+    ]);
+  });
+
+  it("new project: with no harnesses installed, creates no agents and shows the first-agent prompt", async () => {
+    for (const h of ["claude_code", "codex", "gemini", "antigravity"]) backend.notInstalled.add(h);
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("welcome-new-project")).toBeInTheDocument());
+
+    await createNewProjectViaDialog("brand-new");
+
+    // Lands in a usable (empty) project — the first-agent form, not an error.
+    await waitFor(() => expect(screen.getByTestId("confirm-create-agent")).toBeInTheDocument());
+    expect(createAgentCalls()).toHaveLength(0);
+  });
+
+  it("auto-create awaits a fresh probe — agents seed correctly even when the install probe is still pending at create time", async () => {
+    // Hold the install probe pending so the store reports nothing installed
+    // until released. The await in auto-create must close this window; without
+    // it, installed() would read [] and seed zero agents.
+    let release: () => void = () => {};
+    backend.installGate = new Promise<void>((r) => (release = r));
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("welcome-new-project")).toBeInTheDocument());
+
+    await createNewProjectViaDialog("brand-new");
+    // Project is created/activated, but auto-create is parked on the gated probe.
+    await waitFor(() => expect(screen.getByText("brand-new")).toBeInTheDocument());
+    expect(createAgentCalls()).toHaveLength(0);
+
+    release();
+    await waitFor(() => expect(createAgentCalls()).toHaveLength(4));
+  });
+
+  it("new project: a failed agent create surfaces a dismissible banner and the rest still seed", async () => {
+    backend.createAgentFailFor.add("codex");
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("welcome-new-project")).toBeInTheDocument());
+
+    await createNewProjectViaDialog("brand-new");
+
+    // The other three still created; the failure is surfaced, not silent.
+    await waitFor(() => expect(createAgentCalls()).toHaveLength(4));
+    const banner = await screen.findByTestId("banner-agent-create-failed-codex");
+    expect(banner).toHaveTextContent("Couldn't create the Codex agent");
+    expect(screen.getAllByTestId("sidebar-agent")).toHaveLength(3);
+
+    // Dismissible.
+    await fireEvent.click(screen.getByTestId("banner-agent-create-failed-codex-dismiss"));
+    expect(screen.queryByTestId("banner-agent-create-failed-codex")).not.toBeInTheDocument();
+  });
+
+  it("activating an existing project never auto-creates agents", async () => {
+    seedProject({
+      projectId: "p-existing",
+      directory: DIR_A,
+      name: "existing",
+      agents: [agent({ id: "ag-1", project_id: "p-existing", name: "assistant" })],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
+
+    await fireEvent.click(screen.getByText("existing"));
+    await waitFor(() => expect(screen.getByTestId("unified-transcript")).toBeInTheDocument());
+    expect(createAgentCalls()).toHaveLength(0);
+  });
+
+  it("the New Project dialog is non-dismissible while agents are seeding", async () => {
+    // Hold the install probe so seeding parks mid-flight and the dialog stays
+    // busy — the modal must not be dismissable into a half-created project.
+    let release: () => void = () => {};
+    backend.installGate = new Promise<void>((r) => (release = r));
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("welcome-new-project")).toBeInTheDocument());
+
+    await createNewProjectViaDialog("brand-new");
+
+    // Parked on the gated probe: dialog still up, and the ✕ is gone (the
+    // escape/outside paths are suppressed by the same `dismissible={false}`).
+    expect(screen.getByTestId("new-project-form")).toBeInTheDocument();
+    expect(screen.queryByTestId("dialog-close")).not.toBeInTheDocument();
+
+    release();
+    await waitFor(() => expect(screen.queryByTestId("new-project-form")).not.toBeInTheDocument());
+  });
+
+  it("seeding bails if the active project changes mid-flight (no agents scattered into the wrong project)", async () => {
+    // Defense-in-depth for the active-project coupling: park the seed loop on
+    // its first create (which proves activation completed and the id was
+    // captured), flip the active project, then release. The captured-id guard
+    // must stop the loop — only the single in-flight create lands (the
+    // documented TOCTOU sliver the dialog belt covers), not all four.
+    let release: () => void = () => {};
+    backend.createAgentGate = new Promise<void>((r) => (release = r));
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("welcome-new-project")).toBeInTheDocument());
+
+    await createNewProjectViaDialog("brand-new");
+    // First create issued and parked → activation is done, id captured.
+    await waitFor(() => expect(createAgentCalls()).toHaveLength(1));
+
+    // Active project changes out from under the parked seed.
+    const ws = await import("$lib/state/workspace.svelte");
+    ws.selection.activeProjectId = "some-other-project";
+
+    release();
+    await waitFor(() => expect(screen.queryByTestId("new-project-form")).not.toBeInTheDocument());
+    // Guard bailed after the in-flight create — three more were prevented.
+    expect(createAgentCalls()).toHaveLength(1);
+  });
+
+  it("switching projects clears the auto-create failure banner", async () => {
+    backend.createAgentFailFor.add("codex");
+    seedProject({ projectId: "p-other", directory: DIR_B, name: "other", agents: [] });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("welcome-new-project")).toBeInTheDocument());
+
+    await createNewProjectViaDialog("brand-new");
+    await screen.findByTestId("banner-agent-create-failed-codex");
+
+    await fireEvent.click(screen.getByText("other"));
+    await waitFor(() =>
+      expect(screen.queryByTestId("banner-agent-create-failed-codex")).not.toBeInTheDocument(),
+    );
   });
 
   it("surfaces the not-persistable state distinctly from a fresh install", async () => {

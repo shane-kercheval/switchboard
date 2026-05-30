@@ -51,3 +51,17 @@ export const HARNESS_LOGIN_HINT: Record<HarnessKind, string> = {
   gemini: "run `gemini` to authenticate",
   antigravity: "run `agy` to authenticate",
 };
+
+/// Default agent name for a harness — the pre-filled name in the create form
+/// and the name each auto-created agent gets on a new project. A **direct**
+/// slug map, deliberately not derived from a display label: these are
+/// persisted, canonicalized identifiers, and `HARNESS_LABEL` is the short
+/// display label (`"Claude"`) which would slug to the wrong name. All four are
+/// distinct under the backend's name canonicalization, so a new project's
+/// auto-created agents never self-collide.
+export const HARNESS_DEFAULT_AGENT_NAME: Record<HarnessKind, string> = {
+  claude_code: "claude-code",
+  codex: "codex",
+  gemini: "gemini",
+  antigravity: "antigravity",
+};

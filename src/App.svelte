@@ -25,9 +25,11 @@
     activateProject,
     addAgentToActiveProject,
     addDirectory,
+    agentCreationFailures,
     agentsByProject,
     conversations,
     createProjectAndActivate,
+    dismissAgentCreationFailure,
     loadWorkspace,
     projects,
     selection,
@@ -35,6 +37,7 @@
   } from "$lib/state/workspace.svelte";
   import type { AgentRecord, HarnessBanner, ProjectListing } from "$lib/types";
   import { bannerCopy, bannerTestid } from "$lib/harnessAvailability";
+  import { HARNESS_LABEL } from "$lib/harnessDisplay";
   import { harnessAvailability, refreshHarnessAvailability } from "$lib/harnessAvailability.svelte";
   import { basename } from "$lib/utils";
 
@@ -385,6 +388,14 @@
         <Banner message={bannerCopy(banner)} testid={bannerTestid(banner)} />
       {/each}
 
+      {#each agentCreationFailures as failure (failure.harness)}
+        <Banner
+          message={`Couldn't create the ${HARNESS_LABEL[failure.harness]} agent: ${failure.error}`}
+          testid={`banner-agent-create-failed-${failure.harness}`}
+          onDismiss={() => dismissAgentCreationFailure(failure.harness)}
+        />
+      {/each}
+
       <div class="flex min-h-0 flex-1 flex-col overflow-hidden">
         {#if settingsOpen}
           <SettingsView onClose={closeSettings} />
@@ -458,7 +469,12 @@
     </p>
   {/if}
 
-  <Dialog bind:open={newProjectOpen} title="New project" onClose={() => (newProjectOpen = false)}>
+  <Dialog
+    bind:open={newProjectOpen}
+    title="New project"
+    dismissible={!newProjectBusy}
+    onClose={() => (newProjectOpen = false)}
+  >
     <div class="space-y-4" data-testid="new-project-form">
       <p class="text-muted text-sm leading-relaxed">
         Choose the folder you want to work in — typically your repo or working directory.

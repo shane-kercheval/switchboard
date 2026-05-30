@@ -14,9 +14,8 @@
 /// sibling `harnessAvailability.ts`.
 
 import * as api from "./api";
+import { ALL_HARNESSES } from "./harnessDisplay";
 import type { BinaryState, HarnessAvailability, HarnessInstallStatus, HarnessKind } from "./types";
-
-const HARNESSES: HarnessKind[] = ["claude_code", "codex", "gemini", "antigravity"];
 
 /// `null` = not yet probed. Derives to `"checking"` so gating fails closed
 /// during the startup probe window (matches the prior per-harness `BinaryState`
@@ -52,7 +51,7 @@ export const harnessAvailability = {
   /// un-awaited startup probe having completed — otherwise it can race the
   /// startup window and silently see nothing installed.
   installed(): HarnessKind[] {
-    return HARNESSES.filter((harness) => status[harness]?.installed === true);
+    return ALL_HARNESSES.filter((harness) => status[harness]?.installed === true);
   },
 };
 
@@ -68,7 +67,7 @@ export const harnessAvailability = {
 /// and stable; if it ever becomes non-idempotent, revisit.
 export async function refreshHarnessAvailability(): Promise<void> {
   await Promise.all(
-    HARNESSES.map(async (harness) => {
+    ALL_HARNESSES.map(async (harness) => {
       try {
         status[harness] = await api.getHarnessInstallStatus(harness);
       } catch (err) {
@@ -82,6 +81,6 @@ export async function refreshHarnessAvailability(): Promise<void> {
 /// Test-only reset so suites don't leak probed state across cases.
 export const _testing = {
   reset(): void {
-    for (const harness of HARNESSES) status[harness] = null;
+    for (const harness of ALL_HARNESSES) status[harness] = null;
   },
 };

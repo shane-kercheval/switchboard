@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { HarnessKind } from "./types";
+import { ALL_HARNESSES } from "./harnessDisplay";
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
@@ -12,7 +13,7 @@ import {
   refreshHarnessAvailability,
 } from "./harnessAvailability.svelte";
 
-const ALL: HarnessKind[] = ["claude_code", "codex", "gemini", "antigravity"];
+const ALL = ALL_HARNESSES;
 
 afterEach(() => {
   _testing.reset();

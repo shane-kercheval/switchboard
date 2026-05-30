@@ -2,7 +2,12 @@
   import * as api from "$lib/api";
   import type { HarnessKind } from "$lib/types";
   import { harnessAvailability, refreshHarnessAvailability } from "$lib/harnessAvailability.svelte";
-  import { HARNESS_SETUP_URL, HARNESS_LABEL, HARNESS_LOGIN_HINT } from "$lib/harnessDisplay";
+  import {
+    ALL_HARNESSES,
+    HARNESS_SETUP_URL,
+    HARNESS_LABEL,
+    HARNESS_LOGIN_HINT,
+  } from "$lib/harnessDisplay";
   import HarnessIcon from "./ui/HarnessIcon.svelte";
 
   /// Per-harness install + auth status, shared by the no-project welcome
@@ -15,8 +20,6 @@
   /// fine. Version is shown without any "update available" detection (the CLIs
   /// self-update; a remote latest-version comparison is maintenance burden we
   /// don't take on). Claude's auth heuristic is macOS-only (Keychain presence).
-
-  const HARNESSES: HarnessKind[] = ["claude_code", "codex", "gemini", "antigravity"];
 
   // Install/version come from the shared `harnessAvailability` store (read in
   // the template). Only auth is local: it's deliberately not in the store
@@ -48,7 +51,7 @@
 
   function refresh(): void {
     void refreshHarnessAvailability();
-    for (const harness of HARNESSES) void probeAuth(harness);
+    for (const harness of ALL_HARNESSES) void probeAuth(harness);
   }
 
   // Probe on mount and whenever the window regains visibility — installing a
@@ -72,7 +75,7 @@
   data-testid="harness-status"
   class="border-border divide-border/60 flex flex-col divide-y rounded-lg border"
 >
-  {#each HARNESSES as harness (harness)}
+  {#each ALL_HARNESSES as harness (harness)}
     {@const install = harnessAvailability.status(harness)}
     {@const installing = install === null}
     {@const installed = install?.installed === true}

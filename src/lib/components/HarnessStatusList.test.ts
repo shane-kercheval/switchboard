@@ -3,7 +3,7 @@ import "@testing-library/jest-dom/vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/svelte";
 import HarnessStatusList from "./HarnessStatusList.svelte";
 import type { HarnessKind } from "$lib/types";
-import { HARNESS_SETUP_URL } from "$lib/harnessDisplay";
+import { ALL_HARNESSES, HARNESS_SETUP_URL } from "$lib/harnessDisplay";
 import { _testing as availabilityTesting } from "$lib/harnessAvailability.svelte";
 
 const invokeMock = vi.fn();
@@ -20,7 +20,7 @@ const AUTH_CMD: Record<string, HarnessKind> = {
   check_antigravity_auth: "antigravity",
 };
 
-const ALL: HarnessKind[] = ["claude_code", "codex", "gemini", "antigravity"];
+const ALL = ALL_HARNESSES;
 
 let state: Record<HarnessKind, HarnessState>;
 

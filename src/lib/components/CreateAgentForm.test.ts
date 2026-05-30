@@ -147,9 +147,11 @@ describe("CreateAgentForm", () => {
     render(CreateAgentForm, {
       props: {
         onSubmit,
-        claudeAvailability: CLAUDE_AVAILABLE,
-        codexAvailability: CODEX_AVAILABLE,
-        geminiAvailability: GEMINI_AVAILABLE,
+        availability: {
+          claude_code: CLAUDE_AVAILABLE,
+          codex: CODEX_AVAILABLE,
+          gemini: GEMINI_AVAILABLE,
+        },
       },
     });
     const geminiControl = screen.getByTestId("harness-gemini") as HTMLInputElement;
@@ -184,8 +186,7 @@ describe("CreateAgentForm", () => {
     render(CreateAgentForm, {
       props: {
         onSubmit,
-        claudeAvailability: CLAUDE_AVAILABLE,
-        codexAvailability: CODEX_BINARY_MISSING,
+        availability: { claude_code: CLAUDE_AVAILABLE, codex: CODEX_BINARY_MISSING },
       },
     });
     const codexControl = screen.getByTestId("harness-codex") as HTMLInputElement;
@@ -195,7 +196,7 @@ describe("CreateAgentForm", () => {
     );
 
     // Claude control still selectable + submit succeeds with Claude.
-    const claudeControl = screen.getByTestId("harness-claude") as HTMLInputElement;
+    const claudeControl = screen.getByTestId("harness-claude_code") as HTMLInputElement;
     expect(claudeControl.disabled).toBe(false);
     await fireEvent.click(screen.getByTestId("confirm-create-agent"));
     expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
@@ -210,11 +211,10 @@ describe("CreateAgentForm", () => {
     render(CreateAgentForm, {
       props: {
         onSubmit,
-        claudeAvailability: CLAUDE_BINARY_MISSING,
-        codexAvailability: CODEX_AVAILABLE,
+        availability: { claude_code: CLAUDE_BINARY_MISSING, codex: CODEX_AVAILABLE },
       },
     });
-    const claudeControl = screen.getByTestId("harness-claude") as HTMLInputElement;
+    const claudeControl = screen.getByTestId("harness-claude_code") as HTMLInputElement;
     expect(claudeControl.disabled).toBe(true);
     const codexControl = screen.getByTestId("harness-codex") as HTMLInputElement;
     expect(codexControl.disabled).toBe(false);
@@ -225,8 +225,7 @@ describe("CreateAgentForm", () => {
     render(CreateAgentForm, {
       props: {
         onSubmit,
-        claudeAvailability: CLAUDE_BINARY_MISSING,
-        codexAvailability: CODEX_AVAILABLE,
+        availability: { claude_code: CLAUDE_BINARY_MISSING, codex: CODEX_AVAILABLE },
       },
     });
     // Default selection is Claude (which is unavailable in this setup).
@@ -242,12 +241,11 @@ describe("CreateAgentForm", () => {
     render(CreateAgentForm, {
       props: {
         onSubmit,
-        claudeAvailability: CLAUDE_CHECKING,
-        codexAvailability: CODEX_CHECKING,
+        availability: { claude_code: CLAUDE_CHECKING, codex: CODEX_CHECKING },
       },
     });
     // Both controls are disabled — closes the pre-probe fail-open window.
-    expect((screen.getByTestId("harness-claude") as HTMLInputElement).disabled).toBe(true);
+    expect((screen.getByTestId("harness-claude_code") as HTMLInputElement).disabled).toBe(true);
     expect((screen.getByTestId("harness-codex") as HTMLInputElement).disabled).toBe(true);
     // Submit is gated alongside.
     const submit = screen.getByTestId("confirm-create-agent") as HTMLButtonElement;
@@ -262,12 +260,11 @@ describe("CreateAgentForm", () => {
     render(CreateAgentForm, {
       props: {
         onSubmit,
-        claudeAvailability: CLAUDE_AVAILABLE,
-        codexAvailability: CODEX_AVAILABLE,
+        availability: { claude_code: CLAUDE_AVAILABLE, codex: CODEX_AVAILABLE },
       },
     });
     expect(screen.queryByTestId("harness-unavailable")).not.toBeInTheDocument();
-    expect((screen.getByTestId("harness-claude") as HTMLInputElement).disabled).toBe(false);
+    expect((screen.getByTestId("harness-claude_code") as HTMLInputElement).disabled).toBe(false);
     expect((screen.getByTestId("harness-codex") as HTMLInputElement).disabled).toBe(false);
   });
 

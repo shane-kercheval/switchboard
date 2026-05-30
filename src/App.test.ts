@@ -8,6 +8,7 @@ import type {
   ProjectListing,
   ProjectSummary,
 } from "$lib/types";
+import { ALL_HARNESSES } from "$lib/harnessDisplay";
 
 // App.svelte tests focus on the workspace-level orchestration: eager registry
 // load, lazy per-project activation (roster + hydration), display-only project
@@ -444,7 +445,7 @@ describe("App", () => {
   });
 
   it("new project: with no harnesses installed, creates no agents and shows the first-agent prompt", async () => {
-    for (const h of ["claude_code", "codex", "gemini", "antigravity"]) backend.notInstalled.add(h);
+    for (const h of ALL_HARNESSES) backend.notInstalled.add(h);
     await mountApp();
     await waitFor(() => expect(screen.getByTestId("welcome-new-project")).toBeInTheDocument());
 

@@ -2,7 +2,7 @@
   import type { AgentRecord, HarnessAvailability, HarnessKind } from "$lib/types";
   import type { AgentFormSubmit } from "./CreateAgentForm.types";
   import { harnessUnavailableReason, isHarnessSelectable } from "$lib/harnessAvailability";
-  import { HARNESS_DEFAULT_AGENT_NAME } from "$lib/harnessDisplay";
+  import { ALL_HARNESSES, HARNESS_DEFAULT_AGENT_NAME, HARNESS_LABEL } from "$lib/harnessDisplay";
   import { normalizeAgentName, validateAgentName } from "$lib/agentName";
   import Button from "$lib/components/ui/Button.svelte";
   import Input from "$lib/components/ui/Input.svelte";
@@ -29,16 +29,12 @@
     /// check. Defaults to empty (the no-agent first-time flow has none, and
     /// tests that don't exercise uniqueness render unchanged).
     roster?: AgentRecord[];
-    /// Optional per-harness availability. When provided, gates the radio
-    /// buttons (and the submit button if the currently-selected harness
-    /// is unavailable) on binary-presence only. Tooltip copy matches the
-    /// banner copy in `App.svelte` verbatim so the user sees the same
-    /// gap stated in both places. Defaults to "all harnesses available"
-    /// so tests that don't care about gating render unchanged.
-    claudeAvailability?: HarnessAvailability;
-    codexAvailability?: HarnessAvailability;
-    geminiAvailability?: HarnessAvailability;
-    antigravityAvailability?: HarnessAvailability;
+    /// Per-harness availability, gating the picker (and the submit button when
+    /// the selected harness is unavailable) on binary presence. A missing entry
+    /// defaults to "available" — so tests that don't exercise gating can pass
+    /// `{}` (or omit it) and render unchanged. Keyed by `HarnessKind` so it
+    /// scales with the harness set rather than four named props.
+    availability?: Partial<Record<HarnessKind, HarnessAvailability>>;
   };
 
   let {
@@ -47,51 +43,33 @@
     onSubmit,
     onCancel,
     roster = [],
-    claudeAvailability = { harness: "claude_code", binary: "available" },
-    codexAvailability = { harness: "codex", binary: "available" },
-    geminiAvailability = { harness: "gemini", binary: "available" },
-    antigravityAvailability = { harness: "antigravity", binary: "available" },
+    availability = {},
   }: Props = $props();
   let name = $state<string>(HARNESS_DEFAULT_AGENT_NAME["claude_code"]);
   let harness = $state<HarnessKind>("claude_code");
   let mode = $state<"create" | "attach">("create");
   let existingSessionId = $state<string>("");
 
-  /// Gate state per harness. Two predicates from `harnessAvailability`:
-  /// - `isHarnessSelectable` — false for `"checking"` / `"missing"`;
-  ///   gates radio `disabled` and the parent's submit button.
-  /// - `harnessUnavailableReason` — message text for *real* missing
-  ///   states; returns null for `"checking"` so the inline gating
-  ///   message doesn't show during the brief probe window.
-  ///
-  /// The two predicates intentionally disagree on `"checking"`: the
-  /// user is blocked, but no scary "Checking…" copy renders.
-  const claudeSelectable = $derived(isHarnessSelectable(claudeAvailability));
-  const codexSelectable = $derived(isHarnessSelectable(codexAvailability));
-  const geminiSelectable = $derived(isHarnessSelectable(geminiAvailability));
-  const antigravitySelectable = $derived(isHarnessSelectable(antigravityAvailability));
-  const claudeReason = $derived(harnessUnavailableReason(claudeAvailability));
-  const codexReason = $derived(harnessUnavailableReason(codexAvailability));
-  const geminiReason = $derived(harnessUnavailableReason(geminiAvailability));
-  const antigravityReason = $derived(harnessUnavailableReason(antigravityAvailability));
-  const selectedSelectable = $derived(
-    harness === "claude_code"
-      ? claudeSelectable
-      : harness === "codex"
-        ? codexSelectable
-        : harness === "gemini"
-          ? geminiSelectable
-          : antigravitySelectable,
-  );
-  const selectedReason = $derived(
-    harness === "claude_code"
-      ? claudeReason
-      : harness === "codex"
-        ? codexReason
-        : harness === "gemini"
-          ? geminiReason
-          : antigravityReason,
-  );
+  /// Per-harness gate, looked up by kind (no per-harness branches). Missing
+  /// availability defaults to "available". Two predicates from
+  /// `harnessAvailability`:
+  /// - `isHarnessSelectable` — false for `"checking"` / `"missing"`; gates the
+  ///   radio `disabled` and the parent's submit button.
+  /// - `harnessUnavailableReason` — message text for *real* missing states;
+  ///   null for `"checking"` so no scary "Checking…" copy shows during the probe
+  ///   window. (The two intentionally disagree on `"checking"`: blocked, but
+  ///   silent.)
+  function availabilityFor(kind: HarnessKind): HarnessAvailability {
+    return availability[kind] ?? { harness: kind, binary: "available" };
+  }
+  function selectable(kind: HarnessKind): boolean {
+    return isHarnessSelectable(availabilityFor(kind));
+  }
+  function reason(kind: HarnessKind): string | null {
+    return harnessUnavailableReason(availabilityFor(kind));
+  }
+  const selectedSelectable = $derived(selectable(harness));
+  const selectedReason = $derived(reason(harness));
 
   /// UUID shape check (any version — Codex and Claude use v4 / v7
   /// respectively; the backend re-validates). This is a UX gate so the user
@@ -207,83 +185,36 @@
          by the fieldset+legend) styled as a segmented control: the input is
          visually hidden and the label is the pill; `has-[:focus-visible]` lights
          the pill when the radio is keyboard-focused. -->
-    <div class={cn(SEGMENTED_CONTAINER_CLASS, "grid grid-cols-4")} data-testid="harness-picker">
-      <label
-        class="{SEGMENTED_ITEM_CLASS} has-[:focus-visible]:ring-accent flex items-center justify-center has-[:focus-visible]:ring-2 {harnessOptionClass(
-          'claude_code',
-          claudeSelectable,
-        )}"
-        title={claudeReason ?? ""}
-      >
-        <input
-          type="radio"
-          name="harness"
-          value="claude_code"
-          class="sr-only"
-          checked={harness === "claude_code"}
-          disabled={busy || !claudeSelectable}
-          onchange={() => selectHarness("claude_code")}
-          data-testid="harness-claude"
-        />
-        Claude Code
-      </label>
-      <label
-        class="{SEGMENTED_ITEM_CLASS} has-[:focus-visible]:ring-accent flex items-center justify-center has-[:focus-visible]:ring-2 {harnessOptionClass(
-          'codex',
-          codexSelectable,
-        )}"
-        title={codexReason ?? ""}
-      >
-        <input
-          type="radio"
-          name="harness"
-          value="codex"
-          class="sr-only"
-          checked={harness === "codex"}
-          disabled={busy || !codexSelectable}
-          onchange={() => selectHarness("codex")}
-          data-testid="harness-codex"
-        />
-        Codex
-      </label>
-      <label
-        class="{SEGMENTED_ITEM_CLASS} has-[:focus-visible]:ring-accent flex items-center justify-center has-[:focus-visible]:ring-2 {harnessOptionClass(
-          'gemini',
-          geminiSelectable,
-        )}"
-        title={geminiReason ?? ""}
-      >
-        <input
-          type="radio"
-          name="harness"
-          value="gemini"
-          class="sr-only"
-          checked={harness === "gemini"}
-          disabled={busy || !geminiSelectable}
-          onchange={() => selectHarness("gemini")}
-          data-testid="harness-gemini"
-        />
-        Gemini
-      </label>
-      <label
-        class="{SEGMENTED_ITEM_CLASS} has-[:focus-visible]:ring-accent flex items-center justify-center has-[:focus-visible]:ring-2 {harnessOptionClass(
-          'antigravity',
-          antigravitySelectable,
-        )}"
-        title={antigravityReason ?? ""}
-      >
-        <input
-          type="radio"
-          name="harness"
-          value="antigravity"
-          class="sr-only"
-          checked={harness === "antigravity"}
-          disabled={busy || !antigravitySelectable}
-          onchange={() => selectHarness("antigravity")}
-          data-testid="harness-antigravity"
-        />
-        Antigravity
-      </label>
+    <!-- One pill per harness, looped over `ALL_HARNESSES` (no hardcoded set or
+         fixed column count) so a new harness picks up the picker automatically.
+         Columns are inline-styled because Tailwind can't generate a dynamic
+         `grid-cols-N`. -->
+    <div
+      class={cn(SEGMENTED_CONTAINER_CLASS, "grid")}
+      style="grid-template-columns: repeat({ALL_HARNESSES.length}, minmax(0, 1fr));"
+      data-testid="harness-picker"
+    >
+      {#each ALL_HARNESSES as kind (kind)}
+        <label
+          class="{SEGMENTED_ITEM_CLASS} has-[:focus-visible]:ring-accent flex items-center justify-center has-[:focus-visible]:ring-2 {harnessOptionClass(
+            kind,
+            selectable(kind),
+          )}"
+          title={reason(kind) ?? ""}
+        >
+          <input
+            type="radio"
+            name="harness"
+            value={kind}
+            class="sr-only"
+            checked={harness === kind}
+            disabled={busy || !selectable(kind)}
+            onchange={() => selectHarness(kind)}
+            data-testid={`harness-${kind}`}
+          />
+          {HARNESS_LABEL[kind]}
+        </label>
+      {/each}
     </div>
     {#if selectedReason}
       <p class="text-status-failed text-xs" data-testid="harness-unavailable">

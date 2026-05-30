@@ -35,24 +35,32 @@
     selection,
     workspace,
   } from "$lib/state/workspace.svelte";
-  import type { AgentRecord, HarnessBanner, ProjectListing } from "$lib/types";
+  import type {
+    AgentRecord,
+    HarnessAvailability,
+    HarnessBanner,
+    HarnessKind,
+    ProjectListing,
+  } from "$lib/types";
   import { bannerCopy, bannerTestid } from "$lib/harnessAvailability";
-  import { HARNESS_LABEL } from "$lib/harnessDisplay";
+  import { ALL_HARNESSES, HARNESS_LABEL } from "$lib/harnessDisplay";
   import { harnessAvailability, refreshHarnessAvailability } from "$lib/harnessAvailability.svelte";
   import { basename } from "$lib/utils";
 
-  // Per-harness binary presence comes from the shared `harnessAvailability`
-  // store (one probe shared with the banner stack, the create-form gating, and
-  // the Supported-CLIs list). Auth is deliberately not tracked here — a
-  // logged-out harness is discovered reactively when the user sends, and the
-  // failed turn carries an authored actionable message in the transcript.
-  const claudeAvailability = $derived(harnessAvailability.availability("claude_code"));
-  const codexAvailability = $derived(harnessAvailability.availability("codex"));
-  const geminiAvailability = $derived(harnessAvailability.availability("gemini"));
-  const antigravityAvailability = $derived(harnessAvailability.availability("antigravity"));
+  // One availability map keyed by harness, derived from the shared
+  // `harnessAvailability` store (one probe also feeding the Supported-CLIs
+  // list), so the banner stack and the create-form gating read the same source
+  // — and a new harness needs no per-harness wiring here, just its entry in
+  // `ALL_HARNESSES`. Auth is deliberately not tracked here: a logged-out harness
+  // is discovered reactively on send, surfaced as an actionable transcript turn.
+  const availability = $derived(
+    Object.fromEntries(
+      ALL_HARNESSES.map((h) => [h, harnessAvailability.availability(h)]),
+    ) as Record<HarnessKind, HarnessAvailability>,
+  );
 
   const banners = $derived.by((): HarnessBanner[] =>
-    [claudeAvailability, codexAvailability, geminiAvailability, antigravityAvailability]
+    ALL_HARNESSES.map((h) => availability[h])
       .filter((a) => a.binary === "missing")
       .map((a) => ({ kind: "binary_missing" as const, harness: a.harness })),
   );
@@ -436,10 +444,7 @@
               error={firstAgentError}
               onSubmit={handleCreateFirstAgent}
               roster={activeAgents}
-              {claudeAvailability}
-              {codexAvailability}
-              {geminiAvailability}
-              {antigravityAvailability}
+              {availability}
             />
           </div>
         {:else}
@@ -599,10 +604,7 @@
     busy={addAgentBusy}
     error={addAgentError}
     roster={activeAgents}
-    {claudeAvailability}
-    {codexAvailability}
-    {geminiAvailability}
-    {antigravityAvailability}
+    {availability}
     onSubmit={handleAddAgent}
     onCancel={handleAddAgentCancel}
   />

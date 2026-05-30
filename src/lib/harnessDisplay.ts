@@ -21,6 +21,18 @@ export const HARNESS_LABEL: Record<HarnessKind, string> = {
   antigravity: "Antigravity",
 };
 
+/// The canonical harness list + iteration order, derived from a type-checked
+/// `Record<HarnessKind, …>` rather than hand-written. A new `HarnessKind`
+/// variant can't be silently omitted: it must be added to `HARNESS_LABEL`
+/// (a missing key is a type error), after which it appears here and in every
+/// surface that iterates this list. **Always iterate this** instead of a literal
+/// `["claude_code", …]` array — a bare array is type-legal while incomplete and
+/// silently drops a harness from probes/banners/pickers. Insertion order
+/// (claude → codex → gemini → antigravity) is **load-bearing**: it governs
+/// auto-create sequencing (M4) and display order across banners, the picker, and
+/// the status list. Reorder only if the backend's `HARNESSES` constant changes.
+export const ALL_HARNESSES = Object.keys(HARNESS_LABEL) as HarnessKind[];
+
 /// Brand/icon-derived accent colors for transcript attribution and compact
 /// harness identity. Chosen from the actual icon artwork.
 export const HARNESS_COLOR: Record<HarnessKind, string> = {

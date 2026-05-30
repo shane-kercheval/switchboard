@@ -144,6 +144,19 @@ Distinct from the **Model** metadata row in §3 (which is what the harness *repo
 
 *Display, however, is recoverable per turn.* Antigravity announces the model in a `USER_SETTINGS_CHANGE` transcript sentence both on turn 1 (`from None to X`) and on any later turn where the model **changes** — verified 2026-05-30: a resume after editing `settings.json` wrote `from Gemini 3.1 Pro (High) to Claude Sonnet 4.6 (Thinking)`. Unchanged resumes emit no sentence, so the per-turn model is reconstructed by **carrying the last announced model forward**. This works **live** (the sentence rides the turn's own record, so it lands at turn-end; hold the running value in per-agent state) and **on reopen** (walk the transcript chronologically). So Antigravity's per-turn model *history* is accurate even though its model *selection* is not ours to drive.
 
+### 3.4 Reasoning effort — can we set the thinking level on a turn?
+
+A *separate* axis from model (§3.3), with a **different capability set**. Verified empirically 2026-05-30 (claude 2.1.158, codex 0.134.0, gemini 0.44.0, agy 1.0.3), supplemented by docs where no CLI surface exists.
+
+| Harness | Mechanism | Valid levels | Settable by us? | Per-turn readback |
+|---|---|---|---|---|
+| **Claude** | `--effort <level>` flag (also `CLAUDE_CODE_EFFORT_LEVEL` env) | `low, medium, high, xhigh, max` (enumerated via the arg-parse error on an invalid value) | ✅ per-call flag | unverified — `init` carries `model`, not obviously effort; if absent, display selected intent only |
+| **Codex** | `-c model_reasoning_effort=<level>` config override (**no `-e`/`--effort` flag** — a web claim to the contrary was verified false) | `none, minimal, low, medium, high, xhigh` (enumerated via the config-load error) | ✅ per-call `-c` | ✅ recorded **per turn** in `turn_context` next to `model` (B) |
+| **Gemini** | `thinkingConfig` (`thinkingBudget` for 2.5 / `thinkingLevel` for 3.x) in `settings.json` — **no CLI flag** (bundle grep confirms the keys; `--help` has none; open upstream FRs ask for one) | budget/level | ❌ config-only (harness-owned, off-limits) | — |
+| **Antigravity** | **baked into the model display name** (`(High)`/`(Medium)`/`(Low)`/`(Thinking)`) — no separate axis | per model variant | ❌ (and model itself isn't ours to set) | rides along *in* the model string (§3.3 carry-forward) |
+
+**Caveats.** Claude `max` is **session-only** and had a historical "flag ignored" bug ([#50099](https://github.com/anthropics/claude-code/issues/50099), v2.1.113) — re-probe on CLI bumps. Codex `none` is a *real* level (forces no extended reasoning) and is **not** the same as leaving effort unset (which passes no flag → harness default). Net: **effort is ours to drive only on Claude and Codex.** Gemini exposes a model flag but locks thinking behind config; Antigravity locks the model behind config but folds effort into the model name — mirror images, each with one axis we can't reach. Sources: Claude [model-config](https://code.claude.com/docs/en/model-config) / [effort](https://platform.claude.com/docs/en/build-with-claude/effort); Codex [reasoning-effort](https://codex.danielvaughan.com/2026/03/27/reasoning-effort-tuning/); Gemini [thinking config FR #25122](https://github.com/google-gemini/gemini-cli/issues/25122).
+
 ---
 
 ## 4. Gap register (actionable)

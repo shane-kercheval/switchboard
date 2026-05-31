@@ -135,8 +135,8 @@
 
   /// Elapsed silence for a quiet turn: the timer fired one full
   /// HEARTBEAT_TIMEOUT_MS after the last activity, so true silence is the time
-  /// since `quiet_since` plus that threshold. Starts at ~2m when the indicator
-  /// first appears and counts up.
+  /// since `quiet_since` plus that threshold. Starts at one HEARTBEAT_TIMEOUT_MS
+  /// when the indicator first appears and counts up.
   function quietElapsedMs(quietSince: string): number {
     return now - Date.parse(quietSince) + HEARTBEAT_TIMEOUT_MS;
   }

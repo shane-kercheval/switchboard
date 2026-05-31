@@ -131,8 +131,8 @@ export type NormalizedEvent =
 // no per-turn activity has been observed for HEARTBEAT_TIMEOUT_MS while a turn
 // is in flight. It does NOT fail the turn: a silent-but-alive turn still holds
 // the backend's busy-lock, so the frontend only surfaces the silence by
-// setting a transient `quiet` flag on the agent runtime (cleared on the next
-// activity event, or on turn end). Real stream death is failed by the backend.
+// setting a transient `quiet_since` timestamp on the agent runtime (cleared on
+// the next activity event, or on turn end). Real stream death is failed by the backend.
 //
 // Lives on the reducer-input union (not the wire-format `NormalizedEvent`)
 // because it's frontend-synthesized, not emitted by the dispatcher. The

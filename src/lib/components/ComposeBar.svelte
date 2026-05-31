@@ -436,7 +436,7 @@
             )}
           >
             {#if showStop}
-              <StopIcon />
+              <StopIcon class="size-6" />
             {:else}
               <svg
                 viewBox="0 0 24 24"

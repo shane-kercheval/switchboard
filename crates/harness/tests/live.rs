@@ -10,8 +10,8 @@ use std::path::Path;
 use futures::StreamExt;
 use switchboard_core::{AgentRecord, HarnessKind};
 use switchboard_harness::{
-    AdapterEvent, AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, DispatchOptions,
-    GeminiAdapter, HarnessAdapter, RateLimitSource, TurnOutcome,
+    AdapterEvent, AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, ContentKind,
+    DispatchOptions, GeminiAdapter, HarnessAdapter, RateLimitSource, TurnOutcome,
 };
 use uuid::Uuid;
 
@@ -154,6 +154,67 @@ async fn live_claude_basic_turn_completes() {
         }
         _ => unreachable!(),
     }
+}
+
+#[tokio::test]
+#[ignore = "requires claude installed — run with: make test-live"]
+async fn live_claude_thinking_emits_liveness() {
+    // Claude's thinking text is server-redacted to empty in `-p` mode, but the
+    // CLI still streams `thinking_delta`/`signature_delta` while the model
+    // reasons. The adapter must surface those as `Liveness` so the frontend
+    // heartbeat doesn't falsely fail a long thinking turn. If a CLI bump stops
+    // streaming during thinking, this test catches it (the fixture test proves
+    // the parser maps the delta; this proves the delta still arrives live).
+    let adapter = ClaudeCodeAdapter::new();
+    let agent = live_agent();
+    let turn_id = Uuid::now_v7();
+
+    let stream = adapter
+        .dispatch(
+            &agent,
+            Path::new("/tmp"),
+            "Think step by step and reason carefully before answering. ultrathink. \
+             Then reply with only the number 4 and nothing else.",
+            turn_id,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed with real claude");
+
+    let events: Vec<AdapterEvent> = stream.collect().await;
+
+    // A thinking block must produce a sign of life that re-arms the heartbeat:
+    // either `Liveness` (today, while thinking text is server-redacted to empty)
+    // or `ContentChunk { Thinking }` (if Claude ever stops redacting). Both are
+    // product-correct — assert the behavior, not which variant arrives, so a
+    // benign upstream un-redaction doesn't read as a regression.
+    let sign_of_life = events.iter().any(|e| {
+        matches!(e, AdapterEvent::Liveness { turn_id: t } if *t == turn_id)
+            || matches!(
+                e,
+                AdapterEvent::ContentChunk { turn_id: t, kind: ContentKind::Thinking, .. }
+                    if *t == turn_id
+            )
+    });
+    assert!(
+        sign_of_life,
+        "expected a thinking sign-of-life (Liveness or Thinking ContentChunk), got none; events: {events:?}"
+    );
+
+    let terminal = events
+        .iter()
+        .find(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+        .expect("should have a terminal TurnEnd");
+    assert!(
+        matches!(
+            terminal,
+            AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        ),
+        "expected TurnEnd(Completed), got: {terminal:?}"
+    );
 }
 
 #[tokio::test]

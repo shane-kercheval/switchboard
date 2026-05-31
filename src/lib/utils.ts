@@ -16,6 +16,18 @@ export function basename(path: string): string {
   return i >= 0 ? trimmed.slice(i + 1) : trimmed;
 }
 
+// Compact elapsed-duration label ("2m 03s" / "1h 04m"), used by the transcript
+// footer's "No response (…)" silence counter. Seconds-precision under an hour;
+// minute-precision past one hour. Negative/NaN inputs clamp to "0m 00s".
+export function formatDuration(ms: number): string {
+  const totalSec = Number.isFinite(ms) ? Math.max(0, Math.floor(ms / 1000)) : 0;
+  const h = Math.floor(totalSec / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const s = totalSec % 60;
+  const pad = (n: number): string => String(n).padStart(2, "0");
+  return h > 0 ? `${h}h ${pad(m)}m` : `${m}m ${pad(s)}s`;
+}
+
 // Compact "time since" label for the project list's last-activity column.
 // `now` is injectable so tests stay deterministic (no wall-clock dependency).
 // Falls back to a short locale date for anything older than ~4 weeks, and to

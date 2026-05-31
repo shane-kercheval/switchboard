@@ -239,21 +239,6 @@ export function transcriptReducer(
       });
     }
 
-    case "heartbeat_timeout": {
-      const existing = findTurn(turns, input.turn_id);
-      if (existing === undefined || existing.role !== "agent") return turns;
-      if (existing.status !== "streaming") return turns;
-      return updateTurn(turns, input.turn_id, {
-        ...existing,
-        status: "failed",
-        ended_at: input.at,
-        error: "no response from harness — retry?",
-        // Heartbeat timeouts are frontend-synthesized adapter failures —
-        // same retry semantics as a parser-emitted AdapterFailure.
-        error_kind: "adapter_failure",
-      });
-    }
-
     case "hydrate": {
       // Per-agent scope. Live in-flight turns take precedence: any turn_id
       // already in the slice is preserved verbatim. New (disk-derived) turns
@@ -266,10 +251,12 @@ export function transcriptReducer(
       return [...fromDisk, ...turns];
     }
 
-    // Agent-scoped events (rate_limit_event, session_meta, agent_idle) and
-    // any future-added wire-format variants don't modify transcripts. The
-    // wire-format enum is #[non_exhaustive] on the Rust side specifically
-    // to make this graceful-degradation legal.
+    // Agent-scoped events (rate_limit_event, session_meta, agent_idle),
+    // `liveness` (a content-free heartbeat — handled by the runtime, never a
+    // transcript item), `heartbeat_timeout` (sets the runtime `quiet_since`,
+    // not transcript state), and any future-added wire-format variants don't
+    // modify transcripts. The wire-format enum is #[non_exhaustive] on the
+    // Rust side specifically to make this graceful-degradation legal.
     default:
       return turns;
   }
@@ -337,6 +324,7 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
         run_status: "processing",
         in_flight_turn_id: input.turn_id,
         last_error: undefined,
+        quiet_since: undefined,
         // Consume the pending-send entry this turn belongs to (by message_id,
         // else the front — see `pickPendingIndex`).
         pending_sends: removePending(
@@ -389,10 +377,11 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
       // (AgentIdle clears in_flight_turn_id). Only a real failure surfaces
       // last_error.
       if (input.outcome.status === "completed" || input.outcome.status === "cancelled") {
-        return runtime;
+        return runtime.quiet_since !== undefined ? { ...runtime, quiet_since: undefined } : runtime;
       }
       return {
         ...runtime,
+        quiet_since: undefined,
         last_error: {
           message: input.outcome.message,
           kind: input.outcome.kind,
@@ -416,22 +405,33 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
         ...runtime,
         run_status: "idle",
         in_flight_turn_id: undefined,
+        quiet_since: undefined,
       };
 
     case "heartbeat_timeout":
-      // The transcript reducer marks the turn failed; runtime mirrors that
-      // by surfacing the error and clearing in_flight_turn_id. AgentIdle
-      // arrives later when the dispatcher's drain task notices the stream
-      // end — until then run_status stays "processing" (which is correct;
-      // the backend hasn't actually released the guard yet).
-      return {
-        ...runtime,
-        in_flight_turn_id: undefined,
-        last_error: {
-          message: "no response from harness — retry?",
-          kind: "adapter_failure" satisfies FailureKind,
-        },
-      };
+      // The turn has been silent but is still alive on the backend (it holds
+      // the busy-lock). Surface the silence by recording when it went quiet —
+      // do NOT fail it, do NOT clear `in_flight_turn_id`, do NOT set
+      // `last_error`. A frontend "failed" would be a lie and would not release
+      // the lock. `quiet_since` is cleared on the next activity for this turn
+      // (or on turn end). Scoped to the in-flight turn so a stale timer for a
+      // resolved turn can't paint a newer one.
+      if (input.turn_id !== runtime.in_flight_turn_id || runtime.quiet_since !== undefined) {
+        return runtime;
+      }
+      return { ...runtime, quiet_since: input.at };
+
+    case "content_chunk":
+    case "liveness":
+    case "tool_started":
+    case "tool_completed":
+      // Any sign of life clears the quiet marker for the turn the heartbeat is
+      // watching (the timer itself re-arms in `manageHeartbeat`). No-op when
+      // not quiet or when the event is for a different turn.
+      if (runtime.quiet_since === undefined || input.turn_id !== runtime.in_flight_turn_id) {
+        return runtime;
+      }
+      return { ...runtime, quiet_since: undefined };
 
     case "session_meta":
       return {

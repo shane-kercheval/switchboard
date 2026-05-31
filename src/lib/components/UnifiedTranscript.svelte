@@ -1,5 +1,7 @@
 <script lang="ts">
   import type { AgentRecord, ConversationItem } from "$lib/types";
+  import { HEARTBEAT_TIMEOUT_MS } from "$lib/types";
+  import { formatDuration } from "$lib/utils";
   import { cancelSend, runtimes, transcripts, type Turn } from "$lib/state/index.svelte";
   import { buildUnifiedRows, groupRenderBlocks, type UnifiedRow } from "$lib/state/unified";
   import { HARNESS_COLOR } from "$lib/harnessDisplay";
@@ -120,6 +122,25 @@
     });
   }
 
+  /// Ticking clock for the live "quiet" counter. Updated once per second while
+  /// the component is mounted; `now` is only read inside the quiet footer, so
+  /// when nothing is quiet these ticks trigger no re-render.
+  let now = $state(Date.now());
+  $effect(() => {
+    const id = setInterval(() => {
+      now = Date.now();
+    }, 1000);
+    return () => clearInterval(id);
+  });
+
+  /// Elapsed silence for a quiet turn: the timer fired one full
+  /// HEARTBEAT_TIMEOUT_MS after the last activity, so true silence is the time
+  /// since `quiet_since` plus that threshold. Starts at ~2m when the indicator
+  /// first appears and counts up.
+  function quietElapsedMs(quietSince: string): number {
+    return now - Date.parse(quietSince) + HEARTBEAT_TIMEOUT_MS;
+  }
+
   /// A fan-out column's state, derived from its rows: the response turn's status
   /// if present, else an outcome marker's status, else "queued" (dispatched, no
   /// turn yet). "streaming"/"queued" are *live* — they keep cancel-send active.
@@ -217,8 +238,30 @@
 {/snippet}
 
 {#snippet workingFooter(turn: AgentTurn)}
-  <div class="text-muted mt-2 flex items-center gap-2 text-xs" data-testid="turn-working">
-    <span class="animate-pulse">Working...</span>
+  {@const rt = runtimes[turn.agent_id]}
+  {@const quietSince =
+    rt?.quiet_since !== undefined && rt?.in_flight_turn_id === turn.turn_id
+      ? rt.quiet_since
+      : undefined}
+  <div
+    class="mt-2 flex items-center gap-2 text-xs {quietSince !== undefined
+      ? 'text-warning'
+      : 'text-muted'}"
+    data-testid="turn-working"
+    data-quiet={quietSince !== undefined}
+  >
+    <!-- Until the turn has been silent past HEARTBEAT_TIMEOUT_MS it just shows
+         "Working..." (no counter — the number would otherwise reset on every
+         event). Once quiet, it's still alive on the backend, so this is a soft
+         caution that counts up the silence — never a failure — and reverts to
+         "Working..." the moment activity resumes. -->
+    <span class="animate-pulse">
+      {#if quietSince !== undefined}
+        No response ({formatDuration(quietElapsedMs(quietSince))})...
+      {:else}
+        Working...
+      {/if}
+    </span>
     {#if turn.send_id !== undefined}
       {@const sendId = turn.send_id}
       {@render liveTurnControl(

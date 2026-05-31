@@ -1,8 +1,11 @@
-.PHONY: dev build open run install-app deploy test lint fmt check clean install test-live test-live-claude test-live-codex test-live-gemini test-live-antigravity
+.PHONY: dev build open run install-app uninstall-app deploy test lint fmt check clean install test-live test-live-claude test-live-codex test-live-gemini test-live-antigravity
 
 # Crates that carry live (`#[ignore]`-gated) harness tests.
 LIVE_PKGS := -p switchboard-harness -p switchboard-dispatcher -p switchboard-app
 
+# Fetch frontend (JS/TS) dependencies into node_modules. This installs the
+# project's *dependencies*, not the app — to install the built app into
+# /Applications, see `install-app` / `deploy`.
 install:
 	pnpm install --frozen-lockfile
 
@@ -34,11 +37,17 @@ open:
 
 run: build open
 
-# Remove any prior bundle first so stale files from an older build don't
-# linger inside the installed .app (a plain `cp` merges into the existing one).
+# Install the *built* app into /Applications (distinct from `install`, which
+# fetches dependencies). Copies an already-built bundle — run `build` first, or
+# use `deploy` for build + install + launch in one step. Remove any prior bundle
+# first so stale files from an older build don't linger inside the installed
+# .app (a plain `cp` merges into the existing one).
 install-app:
 	rm -rf /Applications/Switchboard.app
 	cp -R target/release/bundle/macos/Switchboard.app /Applications/
+
+uninstall-app:
+	rm -rf /Applications/Switchboard.app
 
 deploy: build install-app
 	open /Applications/Switchboard.app

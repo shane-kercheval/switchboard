@@ -45,9 +45,33 @@ Switchboard drives each agent through its own CLI, so it inherits that CLI's cap
 
 Early development. Design is being captured in [`docs/system-design.md`](./docs/system-design.md).
 
-Switchboard will ship as a single-binary desktop app (built with Tauri) — installable via Homebrew on macOS, `.deb`/`.rpm` on Linux, and a signed `.msi` installer on Windows once available.
+Switchboard is a Tauri desktop app, macOS only for v1. It's installable today by building from source (see [Install](#install)); a signed Homebrew release (`brew install --cask`) is planned so installs and updates become a single command.
 
-This is not yet usable software. Star or watch the repo if you want to follow along.
+Star or watch the repo if you want to follow along.
+
+## Install
+
+macOS only for v1. Until the signed Homebrew release is available, install by building from source. This is a one-time setup; afterwards `Switchboard.app` lives in `/Applications` like any other app, and updates are a single command.
+
+1. Install the prerequisites (Rust, Node, pnpm, Xcode Command Line Tools) — see [Local development](#local-development) below.
+2. Clone, install dependencies, then build and install into `/Applications`:
+
+   ```sh
+   git clone https://github.com/shane-kercheval/switchboard
+   cd switchboard
+   make install   # fetch frontend dependencies
+   make deploy    # build, install Switchboard.app to /Applications, and launch
+   ```
+
+3. Switchboard is now in `/Applications` — launch it any time from Spotlight or Launchpad.
+
+To update, pull the latest and rebuild:
+
+```sh
+git pull && make deploy
+```
+
+Because the app is built locally, it carries no quarantine attribute — it launches with no Gatekeeper warning, on first launch and on every update. (`make uninstall-app` removes it.) A signed Homebrew install is planned; this build-from-source path will remain as the zero-dependency, open-source option.
 
 ## Design and discussion
 

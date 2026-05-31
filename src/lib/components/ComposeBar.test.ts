@@ -23,9 +23,11 @@ async function loadState() {
   return await import("$lib/state/index.svelte");
 }
 
+const PROJECT_ID = "00000000-0000-7000-8000-0000000000ff";
+
 const AGENT_A: AgentRecord = {
   id: "00000000-0000-7000-8000-000000000aaa",
-  project_id: "00000000-0000-7000-8000-0000000000ff",
+  project_id: PROJECT_ID,
   name: "alice",
   harness: "claude_code",
   session_id: "00000000-0000-7000-8000-000000000001",
@@ -39,6 +41,10 @@ const AGENT_B: AgentRecord = {
   session_id: null,
   created_at: "2026-05-16T00:00:01Z",
 };
+
+async function loadComposeStore() {
+  return await import("$lib/state/composeStore");
+}
 
 function fireTo(channel: string, event: NormalizedEvent): void {
   const cb = listeners.get(channel);
@@ -56,6 +62,7 @@ beforeEach(() => {
 afterEach(async () => {
   const { _testing } = await loadState();
   _testing.reset();
+  (await loadComposeStore())._testing.reset();
 });
 
 describe("ComposeBar", () => {
@@ -65,7 +72,7 @@ describe("ComposeBar", () => {
     invokeMock.mockResolvedValueOnce("msg-1");
 
     const ComposeBar = (await import("./ComposeBar.svelte")).default;
-    render(ComposeBar, { props: { agents: [AGENT_A] } });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
 
     expect(screen.queryByTestId("recipient-field")).toBeNull();
     expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(true);
@@ -89,7 +96,7 @@ describe("ComposeBar", () => {
     await state.registerAgent(AGENT_B);
 
     const ComposeBar = (await import("./ComposeBar.svelte")).default;
-    render(ComposeBar, { props: { agents: [AGENT_A, AGENT_B] } });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
 
     expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "true");
     expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "false");
@@ -101,7 +108,7 @@ describe("ComposeBar", () => {
     await state.registerAgent(AGENT_B);
 
     const ComposeBar = (await import("./ComposeBar.svelte")).default;
-    render(ComposeBar, { props: { agents: [AGENT_A, AGENT_B] } });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
 
     await fireEvent.click(chip(AGENT_B.id));
     expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "true");
@@ -117,7 +124,7 @@ describe("ComposeBar", () => {
     await state.registerAgent(AGENT_B);
 
     const ComposeBar = (await import("./ComposeBar.svelte")).default;
-    render(ComposeBar, { props: { agents: [AGENT_A, AGENT_B] } });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
 
     const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
     await fireEvent.input(textarea, { target: { value: "ping @bo" } });
@@ -136,7 +143,7 @@ describe("ComposeBar", () => {
     await state.registerAgent(AGENT_B);
 
     const ComposeBar = (await import("./ComposeBar.svelte")).default;
-    render(ComposeBar, { props: { agents: [AGENT_A, AGENT_B] } });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
 
     const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
     await fireEvent.input(textarea, { target: { value: "@" } });
@@ -160,7 +167,7 @@ describe("ComposeBar", () => {
     await state.registerAgent(AGENT_B);
 
     const ComposeBar = (await import("./ComposeBar.svelte")).default;
-    render(ComposeBar, { props: { agents: [AGENT_A, AGENT_B] } });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
     const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
 
     // Select everyone (alice is default; add bob) → All has nothing to do.
@@ -182,7 +189,7 @@ describe("ComposeBar", () => {
     await state.registerAgent(AGENT_B);
 
     const ComposeBar = (await import("./ComposeBar.svelte")).default;
-    render(ComposeBar, { props: { agents: [AGENT_A, AGENT_B] } });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
     // alice (index 0) selected by default; bob not.
     expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "false");
 
@@ -199,7 +206,7 @@ describe("ComposeBar", () => {
     await state.registerAgent(AGENT_B);
 
     const ComposeBar = (await import("./ComposeBar.svelte")).default;
-    render(ComposeBar, { props: { agents: [AGENT_A, AGENT_B] } });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
 
     await fireEvent.keyDown(document.body, { key: "a", metaKey: true, shiftKey: true });
     expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "true");
@@ -213,7 +220,7 @@ describe("ComposeBar", () => {
     invokeMock.mockResolvedValue("msg-x");
 
     const ComposeBar = (await import("./ComposeBar.svelte")).default;
-    render(ComposeBar, { props: { agents: [AGENT_A, AGENT_B] } });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
 
     await fireEvent.click(chip(AGENT_B.id)); // select both
 
@@ -241,7 +248,7 @@ describe("ComposeBar", () => {
     invokeMock.mockResolvedValue("msg-x");
 
     const ComposeBar = (await import("./ComposeBar.svelte")).default;
-    render(ComposeBar, { props: { agents: [AGENT_A, AGENT_B] } });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
 
     await fireEvent.click(chip(AGENT_B.id));
     const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
@@ -266,7 +273,7 @@ describe("ComposeBar", () => {
     invokeMock.mockResolvedValue("msg-x");
 
     const ComposeBar = (await import("./ComposeBar.svelte")).default;
-    render(ComposeBar, { props: { agents: [AGENT_A, AGENT_B] } });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
     const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
 
     // Send #1 to alice (default selected).
@@ -299,7 +306,7 @@ describe("ComposeBar", () => {
     invokeMock.mockResolvedValue("msg-1");
 
     const ComposeBar = (await import("./ComposeBar.svelte")).default;
-    render(ComposeBar, { props: { agents: [AGENT_A] } });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
 
     const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
     await fireEvent.input(textarea, { target: { value: "first" } });
@@ -321,7 +328,7 @@ describe("ComposeBar", () => {
     invokeMock.mockResolvedValue("msg-1");
 
     const ComposeBar = (await import("./ComposeBar.svelte")).default;
-    render(ComposeBar, { props: { agents: [AGENT_A] } });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
 
     const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
     await fireEvent.input(textarea, { target: { value: "first" } });
@@ -347,7 +354,7 @@ describe("ComposeBar", () => {
     invokeMock.mockResolvedValueOnce("msg-a").mockRejectedValueOnce(new Error("bob exploded"));
 
     const ComposeBar = (await import("./ComposeBar.svelte")).default;
-    render(ComposeBar, { props: { agents: [AGENT_A, AGENT_B] } });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
     await fireEvent.click(chip(AGENT_B.id));
 
     const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
@@ -374,7 +381,7 @@ describe("ComposeBar", () => {
     invokeMock.mockResolvedValue("msg-1");
 
     const ComposeBar = (await import("./ComposeBar.svelte")).default;
-    render(ComposeBar, { props: { agents: [AGENT_A, AGENT_B] } });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
 
     const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
     await fireEvent.input(textarea, { target: { value: "hi" } });
@@ -390,7 +397,7 @@ describe("ComposeBar", () => {
     await state.registerAgent(AGENT_B);
 
     const ComposeBar = (await import("./ComposeBar.svelte")).default;
-    render(ComposeBar, { props: { agents: [AGENT_A, AGENT_B] } });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
     expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "true");
 
     await fireEvent.click(screen.getByTestId("recipient-clear"));
@@ -411,7 +418,7 @@ describe("ComposeBar", () => {
     await state.registerAgent(AGENT_B);
 
     const ComposeBar = (await import("./ComposeBar.svelte")).default;
-    render(ComposeBar, { props: { agents: [AGENT_A, AGENT_B] } });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
     expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "true");
 
     // Focus an element outside the compose surface; Escape must not clear the
@@ -423,5 +430,178 @@ describe("ComposeBar", () => {
     await fireEvent.keyDown(window, { key: "Escape" });
     expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "true");
     outside.remove();
+  });
+});
+
+describe("ComposeBar persistence", () => {
+  it("retains draft and recipient selection across a project-switch remount", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+
+    const first = render(ComposeBar, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] },
+    });
+    await fireEvent.input(screen.getByTestId("compose-textarea"), {
+      target: { value: "half-written" },
+    });
+    await fireEvent.click(chip(AGENT_B.id)); // alice (default) + bob
+    first.unmount();
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    expect((screen.getByTestId("compose-textarea") as HTMLTextAreaElement).value).toBe(
+      "half-written",
+    );
+    expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "true");
+    expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "true");
+  });
+
+  it("restores draft and selection persisted by a previous session (restart)", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    const store = await loadComposeStore();
+    store.setDraft(PROJECT_ID, "from last time");
+    store.setSelection(PROJECT_ID, [AGENT_B.id]);
+    store._testing.reloadFromStorage(); // drop in-memory copy; re-read localStorage
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    expect((screen.getByTestId("compose-textarea") as HTMLTextAreaElement).value).toBe(
+      "from last time",
+    );
+    expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "true");
+    expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "false");
+  });
+
+  it("clears the persisted draft on send so it can't reappear next time", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    invokeMock.mockResolvedValue("msg-1");
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "send me" } });
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    await waitFor(() => expect(textarea.value).toBe(""));
+    const store = await loadComposeStore();
+    expect(store.getCompose(PROJECT_ID).draft).toBe("");
+  });
+
+  it("persists a deliberate deselect-all and restores it as empty (not the default)", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+
+    const first = render(ComposeBar, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] },
+    });
+    await fireEvent.click(screen.getByTestId("recipient-clear"));
+    expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "false");
+    const store = await loadComposeStore();
+    expect(store.getCompose(PROJECT_ID).selectedIds).toEqual([]);
+    first.unmount();
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "false");
+    expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "false");
+  });
+
+  it("drops a saved recipient whose agent no longer exists on restore", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    const store = await loadComposeStore();
+    store.setSelection(PROJECT_ID, ["00000000-0000-7000-8000-00000000dead", AGENT_A.id]);
+    store._testing.reloadFromStorage();
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "true");
+    expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "false");
+    // The ghost id is pruned from the persisted set too (init re-persists).
+    expect(store.getCompose(PROJECT_ID).selectedIds).toEqual([AGENT_A.id]);
+  });
+
+  it("keeps drafts isolated per project", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    const OTHER_PROJECT = "00000000-0000-7000-8000-0000000000ee";
+
+    const first = render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await fireEvent.input(screen.getByTestId("compose-textarea"), {
+      target: { value: "project one's draft" },
+    });
+    first.unmount();
+
+    render(ComposeBar, { props: { projectId: OTHER_PROJECT, agents: [AGENT_A] } });
+    expect((screen.getByTestId("compose-textarea") as HTMLTextAreaElement).value).toBe("");
+  });
+
+  it("recovers a single-agent project from a saved selection whose agent is gone", async () => {
+    // Saved "send to bob" against a project that now has only alice: bob is
+    // filtered out, and a single-agent project shows no chips — so without the
+    // single-agent guard the composer would be unsendable with no recovery UI.
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    invokeMock.mockResolvedValue("msg-1");
+    const store = await loadComposeStore();
+    store.setSelection(PROJECT_ID, [AGENT_B.id]);
+    store._testing.reloadFromStorage();
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    expect(screen.queryByTestId("recipient-field")).toBeNull(); // no chips for one agent
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "hi" } });
+    expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(false);
+    await fireEvent.click(screen.getByTestId("compose-send"));
+    await waitFor(() => {
+      const calls = invokeMock.mock.calls.filter(([c]) => c === "send_message");
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.[1]).toMatchObject({ agentId: AGENT_A.id });
+    });
+  });
+
+  it("falls back to the default when a saved multi-agent selection is all stale", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    const store = await loadComposeStore();
+    store.setSelection(PROJECT_ID, [
+      "00000000-0000-7000-8000-00000000dea1",
+      "00000000-0000-7000-8000-00000000dea2",
+    ]);
+    store._testing.reloadFromStorage();
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    // All saved ids are gone → default to the first agent rather than empty.
+    expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "true");
+    expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "false");
+  });
+
+  it("a transient empty roster does not clobber the saved selection", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    const store = await loadComposeStore();
+
+    const { rerender } = render(ComposeBar, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] },
+    });
+    await fireEvent.click(chip(AGENT_B.id)); // persist alice + bob
+    expect(store.getCompose(PROJECT_ID).selectedIds).toEqual([AGENT_A.id, AGENT_B.id]);
+
+    await rerender({ projectId: PROJECT_ID, agents: [] });
+    // The roster-gated write must skip the empty roster, leaving the save intact.
+    expect(store.getCompose(PROJECT_ID).selectedIds).toEqual([AGENT_A.id, AGENT_B.id]);
   });
 });

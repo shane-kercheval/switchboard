@@ -1,5 +1,7 @@
 <script lang="ts">
   import type { AgentRecord, ConversationItem } from "$lib/types";
+  import { HEARTBEAT_TIMEOUT_MS } from "$lib/types";
+  import { formatDuration } from "$lib/utils";
   import { cancelSend, runtimes, transcripts, type Turn } from "$lib/state/index.svelte";
   import { buildUnifiedRows, groupRenderBlocks, type UnifiedRow } from "$lib/state/unified";
   import { HARNESS_COLOR } from "$lib/harnessDisplay";
@@ -9,7 +11,6 @@
   import CopyButton from "$lib/components/ui/CopyButton.svelte";
   import StatusChip from "$lib/components/ui/StatusChip.svelte";
   import StopIcon from "$lib/components/ui/StopIcon.svelte";
-  import Spinner from "$lib/components/ui/Spinner.svelte";
   import ToolCallWidget from "$lib/components/ToolCallWidget.svelte";
 
   type AgentTurn = Extract<Turn, { role: "agent" }>;
@@ -121,6 +122,25 @@
     });
   }
 
+  /// Ticking clock for the live "quiet" counter. Updated once per second while
+  /// the component is mounted; `now` is only read inside the quiet footer, so
+  /// when nothing is quiet these ticks trigger no re-render.
+  let now = $state(Date.now());
+  $effect(() => {
+    const id = setInterval(() => {
+      now = Date.now();
+    }, 1000);
+    return () => clearInterval(id);
+  });
+
+  /// Elapsed silence for a quiet turn: the timer fired one full
+  /// HEARTBEAT_TIMEOUT_MS after the last activity, so true silence is the time
+  /// since `quiet_since` plus that threshold. Starts at one HEARTBEAT_TIMEOUT_MS
+  /// when the indicator first appears and counts up.
+  function quietElapsedMs(quietSince: string): number {
+    return now - Date.parse(quietSince) + HEARTBEAT_TIMEOUT_MS;
+  }
+
   /// A fan-out column's state, derived from its rows: the response turn's status
   /// if present, else an outcome marker's status, else "queued" (dispatched, no
   /// turn yet). "streaming"/"queued" are *live* — they keep cancel-send active.
@@ -136,7 +156,6 @@
     }
     return "queued";
   }
-  const isLive = (s: ColumnState): boolean => s === "queued" || s === "streaming";
 
   // Auto-pin to bottom unless the user has scrolled up.
   let container = $state<HTMLDivElement | null>(null);
@@ -183,9 +202,6 @@
 </script>
 
 {#snippet turnBody(turn: AgentTurn)}
-  {#if turn.status === "streaming" && turn.items.length === 0}
-    <StatusChip status="processing" testid="turn-processing" />
-  {/if}
   {#each turn.items as item, i (i)}
     {#if item.item_kind === "text"}
       <Markdown text={item.text} />
@@ -195,6 +211,9 @@
   {/each}
   {#if turn.status === "failed" && turn.error}
     <div class="text-status-failed text-xs" data-testid="turn-error">{turn.error}</div>
+  {/if}
+  {#if turn.status === "streaming"}
+    {@render workingFooter(turn)}
   {/if}
 {/snippet}
 
@@ -209,18 +228,60 @@
 {#snippet liveTurnControl(onclick: () => void, label: string, testid: string)}
   <button
     type="button"
-    class="group/live-control text-muted hover:bg-status-failed-soft/70 hover:text-status-failed focus-visible:ring-accent focus-visible:bg-status-failed-soft/70 focus-visible:text-status-failed inline-flex h-6 w-6 items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none"
+    class="border-muted/40 text-muted hover:border-status-failed/60 hover:bg-status-failed-soft/70 hover:text-status-failed focus-visible:ring-accent focus-visible:border-status-failed/60 focus-visible:bg-status-failed-soft/70 focus-visible:text-status-failed inline-flex h-6 w-6 items-center justify-center rounded-full border-[0.5px] transition-colors focus-visible:ring-2 focus-visible:outline-none"
     data-testid={testid}
     aria-label={label}
     {onclick}
   >
-    <Spinner
-      class="h-5 w-5 group-hover/live-control:hidden group-focus-visible/live-control:hidden"
-    />
-    <StopIcon
-      class="hidden h-5 w-5 group-hover/live-control:block group-focus-visible/live-control:block"
-    />
+    <StopIcon class="size-5 -translate-x-[0.5px]" />
   </button>
+{/snippet}
+
+{#snippet workingFooter(turn: AgentTurn)}
+  {@const rt = runtimes[turn.agent_id]}
+  {@const quietSince =
+    rt?.quiet_since !== undefined && rt?.in_flight_turn_id === turn.turn_id
+      ? rt.quiet_since
+      : undefined}
+  <div
+    class="mt-2 flex items-center gap-2 text-xs {quietSince !== undefined
+      ? 'text-warning'
+      : 'text-muted'}"
+    data-testid="turn-working"
+    data-quiet={quietSince !== undefined}
+  >
+    <!-- Until the turn has been silent past HEARTBEAT_TIMEOUT_MS it just shows
+         "Working..." (no counter — the number would otherwise reset on every
+         event). Once quiet, it's still alive on the backend, so this is a soft
+         caution that counts up the silence — never a failure — and reverts to
+         "Working..." the moment activity resumes. -->
+    <span class="animate-pulse">
+      {#if quietSince !== undefined}
+        No response ({formatDuration(quietElapsedMs(quietSince))})...
+      {:else}
+        Working...
+      {/if}
+    </span>
+    {#if turn.send_id !== undefined}
+      {@const sendId = turn.send_id}
+      {@render liveTurnControl(
+        () => cancelSend(sendId, [turn.agent_id]),
+        `Cancel turn for ${agentName(turn.agent_id)}`,
+        "turn-live-control",
+      )}
+    {/if}
+  </div>
+{/snippet}
+
+{#snippet queuedFooter(agentId: string, sendId: string, labelTestid: string, controlTestid: string)}
+  <div class="text-muted mt-2 flex items-center gap-2 text-xs" data-testid={labelTestid}>
+    <span class="animate-pulse">Queued...</span>
+    {@render liveTurnControl(
+      () => cancelSend(sendId, [agentId]),
+      `Cancel queued send for ${agentName(agentId)}`,
+      controlTestid,
+    )}
+  </div>
 {/snippet}
 
 {#snippet messageMeta(at: string, copyable: string, label: string, mt = "mt-1")}
@@ -279,14 +340,9 @@
       {#if agentById[agentId]?.harness}
         <HarnessIcon harness={agentById[agentId]!.harness} testid="turn-harness-icon" />
       {/if}
-      {@render liveTurnControl(
-        () => cancelSend(sendId, [agentId]),
-        `Cancel queued send for ${agentName(agentId)}`,
-        "turn-live-control",
-      )}
     </div>
     <div class="border-l-[0.5px] pl-3" style:border-left-color={agentBorderColor(agentId)}>
-      <StatusChip status="queued" testid="turn-queued" />
+      {@render queuedFooter(agentId, sendId, "turn-queued", "turn-live-control")}
     </div>
   </div>
 {/snippet}
@@ -298,14 +354,6 @@
     <div class="flex items-center gap-2 text-xs font-semibold tracking-wide uppercase">
       <span class="text-fg" data-testid="turn-agent-name">{agentName(turn.agent_id)}</span>
       {#if harness}<HarnessIcon {harness} testid="turn-harness-icon" />{:else}<Badge>?</Badge>{/if}
-      {#if turn.status === "streaming" && turn.send_id !== undefined}
-        {@const sendId = turn.send_id}
-        {@render liveTurnControl(
-          () => cancelSend(sendId, [turn.agent_id]),
-          `Cancel turn for ${agentName(turn.agent_id)}`,
-          "turn-live-control",
-        )}
-      {/if}
     </div>
     <div
       class="space-y-1.5 border-l-[0.5px] pl-3"
@@ -375,21 +423,19 @@
                     >{agentName(col.agent_id)}</span
                   >
                   {#if harness}<HarnessIcon {harness} />{/if}
-                  {#if isLive(state)}
-                    {@render liveTurnControl(
-                      () => cancelSend(block.send_id, [col.agent_id]),
-                      `Cancel turn for ${agentName(col.agent_id)}`,
-                      "fanout-card-cancel",
-                    )}
-                  {/if}
-                  {#if state === "queued"}
-                    <span class="text-status-processing" data-testid="fanout-queued">queued…</span>
-                  {/if}
                 </div>
                 <div
                   class="space-y-1.5 border-l-[0.5px] pl-3"
                   style:border-left-color={agentBorderColor(col.agent_id)}
                 >
+                  {#if state === "queued"}
+                    {@render queuedFooter(
+                      col.agent_id,
+                      block.send_id,
+                      "fanout-queued",
+                      "fanout-card-cancel",
+                    )}
+                  {/if}
                   {#each col.rows as r (r.key)}
                     {#if r.kind === "agent"}
                       {@render turnStatusLabel(r.turn.status)}

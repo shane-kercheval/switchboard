@@ -1,5 +1,22 @@
 import { describe, it, expect } from "vitest";
-import { basename, relativeTime } from "./utils";
+import { basename, formatDuration, relativeTime } from "./utils";
+
+describe("formatDuration", () => {
+  it("formats minutes and seconds under an hour with padded seconds", () => {
+    expect(formatDuration(2 * 60_000 + 3_000)).toBe("2m 03s");
+    expect(formatDuration(45_000)).toBe("0m 45s");
+  });
+
+  it("formats hours and minutes past an hour with padded minutes", () => {
+    expect(formatDuration(60 * 60_000 + 4 * 60_000)).toBe("1h 04m");
+    expect(formatDuration(2 * 60 * 60_000 + 30 * 60_000)).toBe("2h 30m");
+  });
+
+  it("clamps negative and non-finite inputs to zero", () => {
+    expect(formatDuration(-5_000)).toBe("0m 00s");
+    expect(formatDuration(Number.NaN)).toBe("0m 00s");
+  });
+});
 
 describe("basename", () => {
   it("returns the last path component for an absolute path", () => {

@@ -6,40 +6,75 @@
     recordSendAccepted,
     runtimes,
     transcripts,
-    ui,
   } from "$lib/state/index.svelte";
   import { buildLiveSendsMap } from "$lib/state/liveSends";
+  import { getCompose, setDraft, setSelection } from "$lib/state/composeStore";
   import * as api from "$lib/api";
-  import type { AgentId, AgentRecord } from "$lib/types";
+  import type { AgentId, AgentRecord, ProjectId } from "$lib/types";
   import Textarea from "$lib/components/ui/Textarea.svelte";
   import StopIcon from "$lib/components/ui/StopIcon.svelte";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import { cn } from "$lib/utils";
   import { shortcut } from "$lib/platform";
+  import { untrack } from "svelte";
 
-  let { agents }: { agents: AgentRecord[] } = $props();
+  let { projectId, agents }: { projectId: ProjectId; agents: AgentRecord[] } = $props();
 
-  let prompt = $state<string>("");
+  // The compose bar is remounted per project (App.svelte's `{#key}`), and the
+  // parent only mounts it once the roster is loaded and non-empty — so the
+  // saved snapshot can be applied synchronously here, against a populated
+  // roster, with no first-render-empty window to guard against. `projectId` and
+  // the mount-time roster are constant for this component's life; `untrack`
+  // states that the initial read is deliberate, not a missed dependency.
+  const saved = untrack(() => getCompose(projectId));
+
+  let prompt = $state<string>(saved.draft);
   let sendError = $state<string | null>(null);
   let composeEl = $state<HTMLDivElement | undefined>(undefined);
 
   /// Recipient set — every agent is shown as a toggle chip (click to add/drop);
-  /// `@name` is the keyboard path to the same toggle. Sticky across sends
-  /// (defaults to the last recipient on first render).
-  let selectedIds = $state<AgentId[]>([]);
-  let initialized = false;
-  $effect(() => {
-    if (!initialized && agents.length > 0) {
-      const last = ui.lastRecipientId;
-      selectedIds = last !== null && agents.some((a) => a.id === last) ? [last] : [agents[0]!.id];
-      initialized = true;
+  /// `@name` is the keyboard path to the same toggle. Sticky across sends, and
+  /// persisted per project (across switches and restarts) via `composeStore`.
+  let selectedIds = $state<AgentId[]>(untrack(() => initialSelection(saved.selectedIds, agents)));
+
+  /// Resolve the recipient set for a fresh mount.
+  /// - A single-agent project shows no chips (nothing to choose), so the lone
+  ///   agent is always the recipient — a saved empty/stale selection must never
+  ///   leave it unsendable with no UI to recover.
+  /// - A deliberate deselect-all (saved `[]`) is honored.
+  /// - A saved selection whose agents were all removed falls back to the first
+  ///   agent rather than stranding the composer with no recipient.
+  function initialSelection(savedIds: AgentId[] | undefined, roster: AgentRecord[]): AgentId[] {
+    if (roster.length === 0) return [];
+    if (roster.length === 1) return [roster[0]!.id];
+    if (savedIds !== undefined) {
+      const valid = savedIds.filter((id) => roster.some((a) => a.id === id));
+      if (valid.length > 0 || savedIds.length === 0) return valid;
     }
-  });
-  // Drop any selected ids whose agent disappeared (project switch / removal).
+    return [roster[0]!.id];
+  }
+
+  // Drop any selected ids whose agent disappeared (agent removed at runtime).
   $effect(() => {
     const valid = selectedIds.filter((id) => agents.some((a) => a.id === id));
     if (valid.length !== selectedIds.length) selectedIds = valid;
+  });
+
+  // Persist draft + recipient selection per project (machine-local; see
+  // composeStore). Synchronous write-through — no debounce — so a send-clear
+  // can't be resurrected by a deferred write.
+  $effect(() => {
+    setDraft(projectId, prompt);
+  });
+  // The parent unmounts this bar the moment a project loses its last agent (it
+  // falls back to the roster-loading / first-agent screen), so an empty roster
+  // is the parent's job to gate. The `length === 0` skip is defense-in-depth:
+  // it guarantees a transient empty roster can never overwrite saved chips with
+  // `[]`, independent of any future change to the parent's gating.
+  $effect(() => {
+    if (agents.length === 0) return;
+    setSelection(projectId, selectedIds);
   });
 
   // Keyboard routes to the recipient chips, working even while typing (the
@@ -436,7 +471,7 @@
             )}
           >
             {#if showStop}
-              <StopIcon />
+              <StopIcon class="size-6" />
             {:else}
               <svg
                 viewBox="0 0 24 24"

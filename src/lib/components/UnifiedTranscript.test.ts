@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/svelte";
+import { tick } from "svelte";
 import type { AgentRecord, NormalizedEvent } from "$lib/types";
+import { HEARTBEAT_TIMEOUT_MS } from "$lib/types";
 
 const listeners = new Map<string, (e: { payload: NormalizedEvent }) => void>();
 vi.mock("@tauri-apps/api/event", () => ({
@@ -384,7 +386,7 @@ describe("UnifiedTranscript", () => {
     expect(tool.querySelector('[data-testid="tool-running"]')).not.toBeNull();
   });
 
-  it("shows processing… indicator for Codex turns with empty items array (streaming)", async () => {
+  it("shows a Working... footer for Codex turns with empty items array (streaming)", async () => {
     const state = await loadState();
     await state.registerAgent(CODEX_AGENT);
     state.transcripts[CODEX_AGENT.id] = [
@@ -401,10 +403,10 @@ describe("UnifiedTranscript", () => {
     const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CODEX_AGENT] } });
 
-    expect(screen.getByTestId("turn-processing")).toBeInTheDocument();
+    expect(screen.getByTestId("turn-working")).toHaveTextContent("Working...");
   });
 
-  it("hides processing… indicator once items arrive", async () => {
+  it("keeps the Working... footer at the bottom once items arrive", async () => {
     const state = await loadState();
     await state.registerAgent(CODEX_AGENT);
     state.transcripts[CODEX_AGENT.id] = [
@@ -421,8 +423,107 @@ describe("UnifiedTranscript", () => {
     const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CODEX_AGENT] } });
 
-    expect(screen.queryByTestId("turn-processing")).toBeNull();
     expect(screen.getByTestId("turn")).toHaveTextContent("ack");
+    expect(screen.getByTestId("turn-working")).toHaveTextContent("Working...");
+  });
+
+  it("shows the soft, counting-up 'No response' variant when the in-flight turn is quiet", async () => {
+    const state = await loadState();
+    await state.registerAgent(CODEX_AGENT);
+    state.transcripts[CODEX_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "agent-1",
+        agent_id: CODEX_AGENT.id,
+        started_at: "2026-05-16T00:00:00Z",
+        status: "streaming",
+        items: [],
+      },
+    ];
+    state.runtimes[CODEX_AGENT.id] = {
+      ...state.runtimes[CODEX_AGENT.id]!,
+      quiet_since: new Date().toISOString(),
+      in_flight_turn_id: "agent-1",
+    };
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, { props: { agents: [CODEX_AGENT] } });
+
+    const footer = screen.getByTestId("turn-working");
+    expect(footer).toHaveTextContent("No response");
+    expect(footer).not.toHaveTextContent("Working...");
+    expect(footer).toHaveAttribute("data-quiet", "true");
+  });
+
+  it("does NOT show quiet on a streaming turn that is not the in-flight turn", async () => {
+    const state = await loadState();
+    await state.registerAgent(CODEX_AGENT);
+    state.transcripts[CODEX_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "agent-1",
+        agent_id: CODEX_AGENT.id,
+        started_at: "2026-05-16T00:00:00Z",
+        status: "streaming",
+        items: [],
+      },
+    ];
+    // Agent is quiet, but the heartbeat is tracking a different turn — the
+    // footer for agent-1 must stay "Working...".
+    state.runtimes[CODEX_AGENT.id] = {
+      ...state.runtimes[CODEX_AGENT.id]!,
+      quiet_since: new Date().toISOString(),
+      in_flight_turn_id: "some-other-turn",
+    };
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, { props: { agents: [CODEX_AGENT] } });
+
+    const footer = screen.getByTestId("turn-working");
+    expect(footer).toHaveTextContent("Working...");
+    expect(footer).toHaveAttribute("data-quiet", "false");
+  });
+
+  it("flips Working… → No response → Working… across the live heartbeat timer", async () => {
+    // End-to-end reactive wiring: the timer fires through the real listener
+    // path, mutates runtime.quiet_since, and the footer re-renders — then
+    // activity clears it. This is the seam pure-reducer tests can't cover.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const state = await loadState();
+      await state.registerAgent(CODEX_AGENT);
+
+      const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+      render(UnifiedTranscript, { props: { agents: [CODEX_AGENT] } });
+
+      fireTo(`agent:${CODEX_AGENT.id}`, {
+        type: "turn_start",
+        turn_id: "agent-1",
+        message_id: "00000000-0000-7000-8000-0000000000e1",
+        started_at: "2026-05-16T00:00:00Z",
+      });
+      await tick();
+      expect(screen.getByTestId("turn-working")).toHaveTextContent("Working...");
+
+      // Past the silence threshold → the quiet counter appears.
+      vi.advanceTimersByTime(HEARTBEAT_TIMEOUT_MS + 1000);
+      await tick();
+      expect(screen.getByTestId("turn-working")).toHaveTextContent("No response");
+      expect(screen.getByTestId("turn-working")).toHaveAttribute("data-quiet", "true");
+
+      // Activity resumes → back to Working...
+      fireTo(`agent:${CODEX_AGENT.id}`, {
+        type: "content_chunk",
+        turn_id: "agent-1",
+        kind: "text",
+        text: "hi",
+      });
+      await tick();
+      expect(screen.getByTestId("turn-working")).toHaveTextContent("Working...");
+      expect(screen.getByTestId("turn-working")).toHaveAttribute("data-quiet", "false");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("live-streams an in-progress turn into the unified view", async () => {
@@ -463,6 +564,7 @@ describe("UnifiedTranscript", () => {
     expect(screen.queryByText("streaming…")).toBeNull();
     expect(screen.getByTestId("turn")).toHaveTextContent("hello");
     expect(screen.getByTestId("turn")).toHaveTextContent("world");
+    expect(screen.getByTestId("turn-working")).toHaveTextContent("Working...");
   });
 
   it("shows a live cancel control for a streaming standalone turn (send-scoped)", async () => {
@@ -504,7 +606,7 @@ describe("UnifiedTranscript", () => {
     const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
 
-    expect(screen.getByTestId("turn-queued")).toBeInTheDocument();
+    expect(screen.getByTestId("turn-queued")).toHaveTextContent("Queued...");
     // The cancel control targets the queued send (send-scoped).
     await fireEvent.click(screen.getByTestId("turn-live-control"));
     expect(invokeMock).toHaveBeenCalledWith(
@@ -655,7 +757,7 @@ describe("UnifiedTranscript — fan-out groups", () => {
     const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT, CODEX_AGENT] } });
 
-    expect(screen.getByTestId("fanout-queued")).toBeInTheDocument();
+    expect(screen.getByTestId("fanout-queued")).toHaveTextContent("Queued...");
     const columns = screen.getAllByTestId("fanout-column");
     expect(columns[1]).toHaveAttribute("data-state", "queued");
   });
@@ -670,15 +772,23 @@ describe("UnifiedTranscript — fan-out groups", () => {
     const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT, CODEX_AGENT] } });
 
-    const cancelControls = screen.getAllByTestId("fanout-card-cancel");
-    expect(cancelControls).toHaveLength(2);
-    await fireEvent.click(cancelControls[1]!);
+    const queuedCancel = screen.getByTestId("fanout-card-cancel");
+    const streamingCancel = screen.getByTestId("turn-live-control");
+    expect(screen.getByTestId("turn-working")).toHaveTextContent("Working...");
+    await fireEvent.click(queuedCancel);
     expect(invokeMock).toHaveBeenCalledWith(
       "cancel_send",
       expect.objectContaining({ sendId: SEND_1 }),
     );
     const call = invokeMock.mock.calls.find(([c]) => c === "cancel_send");
     expect((call?.[1] as { recipients: string[] }).recipients).toEqual([CODEX_AGENT.id]);
+
+    invokeMock.mockClear();
+    await fireEvent.click(streamingCancel);
+    expect(invokeMock).toHaveBeenCalledWith(
+      "cancel_send",
+      expect.objectContaining({ sendId: SEND_1, recipients: [CLAUDE_AGENT.id] }),
+    );
   });
 
   it("hides per-recipient cancel controls once every recipient has settled", async () => {

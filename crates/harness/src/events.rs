@@ -16,16 +16,24 @@ pub type MessageId = Uuid;
 
 /// Tells the reducer / UI which content rendering applies to a chunk.
 ///
-/// `Thinking` is reserved but not currently emitted — keeping the variant
-/// in the vocabulary now means future reasoning UI lands without a
-/// wire-format break.
+/// `Thinking` is emitted by adapters that surface reasoning text (e.g.
+/// Antigravity's planner records, Gemini session files). Claude's thinking text
+/// is server-redacted to empty in `-p` mode today, so the Claude adapter
+/// normally surfaces thinking only as a non-rendering [`AdapterEvent::Liveness`]
+/// signal — but if that redaction is lifted, its non-empty thinking flows
+/// through as `Thinking` content (see `parser.rs`). Note the frontend currently
+/// renders `Thinking` and `Text` identically (plain prose); distinct reasoning
+/// styling is follow-up work, so a redaction reversal would surface reasoning
+/// interleaved with the answer, not as a styled block. Per-harness reality lives
+/// in `docs/research/harness-behavior.md` §3.2.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ContentKind {
     /// User-facing assistant text.
     Text,
-    /// Model thinking blocks. Reserved; not currently emitted.
+    /// Model thinking/reasoning blocks (live reasoning text, where the harness
+    /// provides it).
     Thinking,
 }
 
@@ -117,6 +125,14 @@ pub enum AdapterEvent {
         kind: ContentKind,
         text: String,
     },
+    /// A content-free sign that the harness is still alive mid-turn. Emitted
+    /// when the stream carries activity that produces no renderable content —
+    /// e.g. Claude's `thinking_delta`/`signature_delta` (the thinking text is
+    /// server-redacted to empty, but the deltas still arrive periodically while
+    /// the model reasons). It re-arms the frontend liveness timer so a long
+    /// silent-but-thinking turn is not falsely declared dead. Never becomes a
+    /// transcript item.
+    Liveness { turn_id: TurnId },
     ToolStarted {
         turn_id: TurnId,
         tool_use_id: String,
@@ -180,6 +196,9 @@ pub enum NormalizedEvent {
         kind: ContentKind,
         text: String,
     },
+    /// Content-free liveness signal (see [`AdapterEvent::Liveness`]). The
+    /// frontend re-arms its per-turn heartbeat on this and renders nothing.
+    Liveness { turn_id: TurnId },
     ToolStarted {
         turn_id: TurnId,
         tool_use_id: String,
@@ -272,6 +291,7 @@ impl From<AdapterEvent> for NormalizedEvent {
                 kind,
                 text,
             },
+            AdapterEvent::Liveness { turn_id } => NormalizedEvent::Liveness { turn_id },
             AdapterEvent::ToolStarted {
                 turn_id,
                 tool_use_id,
@@ -716,6 +736,16 @@ mod tests {
                 text,
                 ..
             } if text == "hi"
+        ));
+    }
+
+    #[test]
+    fn adapter_event_lifts_to_normalized_liveness() {
+        let turn_id = fresh_turn_id();
+        let normalized = NormalizedEvent::from(AdapterEvent::Liveness { turn_id });
+        assert!(matches!(
+            normalized,
+            NormalizedEvent::Liveness { turn_id: t } if t == turn_id
         ));
     }
 

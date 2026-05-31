@@ -418,7 +418,7 @@ describe("transcriptReducer", () => {
   });
 
   describe("heartbeat_timeout", () => {
-    it("transitions a streaming turn to failed with adapter_failure kind", () => {
+    it("does NOT touch the transcript — a silent turn is not failed", () => {
       let turns = reduce([], turnStart(TURN_1));
       const ev: ReducerInput = {
         type: "heartbeat_timeout",
@@ -428,10 +428,11 @@ describe("transcriptReducer", () => {
       turns = reduce(turns, ev);
       const turn = turns[0];
       if (turn?.role !== "agent") throw new Error("unreachable");
-      expect(turn.status).toBe("failed");
-      expect(turn.error).toBe("no response from harness — retry?");
-      expect(turn.error_kind).toBe("adapter_failure");
-      expect(turn.ended_at).toBe("2026-05-16T00:01:00Z");
+      // The turn stays streaming; silence is surfaced via the runtime `quiet`
+      // flag (see runtimeReducer), not by failing the transcript turn.
+      expect(turn.status).toBe("streaming");
+      expect(turn.error).toBeUndefined();
+      expect(turn.ended_at).toBeUndefined();
     });
   });
 
@@ -789,18 +790,52 @@ describe("runtimeReducer", () => {
     expect(r.last_error).toBeUndefined();
   });
 
-  it("heartbeat_timeout records adapter_failure + clears in_flight_turn_id", () => {
+  it("heartbeat_timeout records quiet_since without failing or clearing in-flight turn", () => {
     let r = runtimeReducer(fresh(), turnStart(TURN_1));
     r = runtimeReducer(r, {
       type: "heartbeat_timeout",
       turn_id: TURN_1,
       at: "2026-05-16T00:01:00Z",
     });
-    expect(r.last_error?.kind).toBe("adapter_failure");
-    expect(r.in_flight_turn_id).toBeUndefined();
-    // run_status stays "processing" — the backend hasn't released the
-    // guard yet; AgentIdle arrives later when the drain task ends.
+    // quiet_since records when the silence was flagged (the event's `at`).
+    expect(r.quiet_since).toBe("2026-05-16T00:01:00Z");
+    // No failure: the turn is silent, not dead. in_flight_turn_id and
+    // run_status are untouched (the backend still holds the busy-lock).
+    expect(r.last_error).toBeUndefined();
+    expect(r.in_flight_turn_id).toBe(TURN_1);
     expect(r.run_status).toBe("processing");
+  });
+
+  it("heartbeat_timeout for a non-in-flight turn is a no-op", () => {
+    let r = runtimeReducer(fresh(), turnStart(TURN_1));
+    r = runtimeReducer(r, {
+      type: "heartbeat_timeout",
+      turn_id: TURN_2,
+      at: "2026-05-16T00:01:00Z",
+    });
+    // The mismatched timeout must not flag quiet (turn_start left it undefined).
+    expect(r.quiet_since).toBeUndefined();
+  });
+
+  it("activity clears quiet_since for the in-flight turn", () => {
+    let r = runtimeReducer(fresh(), turnStart(TURN_1));
+    r = runtimeReducer(r, { type: "heartbeat_timeout", turn_id: TURN_1, at: "t" });
+    expect(r.quiet_since).toBe("t");
+    r = runtimeReducer(r, { type: "liveness", turn_id: TURN_1 });
+    expect(r.quiet_since).toBeUndefined();
+  });
+
+  it("turn_end clears quiet_since", () => {
+    let r = runtimeReducer(fresh(), turnStart(TURN_1));
+    r = runtimeReducer(r, { type: "heartbeat_timeout", turn_id: TURN_1, at: "t" });
+    expect(r.quiet_since).toBe("t");
+    r = runtimeReducer(r, {
+      type: "turn_end",
+      turn_id: TURN_1,
+      outcome: { status: "completed" },
+      ended_at: "t2",
+    });
+    expect(r.quiet_since).toBeUndefined();
   });
 
   it("session_meta populates meta", () => {

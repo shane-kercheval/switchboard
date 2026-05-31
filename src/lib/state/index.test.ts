@@ -195,7 +195,7 @@ describe("per-agent isolation", () => {
 });
 
 describe("heartbeat orchestration", () => {
-  it("arms on turn_start, fires after HEARTBEAT_TIMEOUT_MS of silence, transitions turn to failed", async () => {
+  it("arms on turn_start, fires after HEARTBEAT_TIMEOUT_MS of silence, marks runtime quiet (not failed)", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));
@@ -210,12 +210,71 @@ describe("heartbeat orchestration", () => {
     // No activity — past the threshold, heartbeat fires.
     vi.advanceTimersByTime(HEARTBEAT_TIMEOUT_MS + 100);
 
+    // The turn is NOT failed — it's alive on the backend, just silent. The
+    // runtime carries a transient `quiet` flag instead.
     const turn = state.transcripts[AGENT_A]?.[0];
     if (turn?.role !== "agent") throw new Error("unreachable");
-    expect(turn.status).toBe("failed");
-    expect(turn.error).toBe("no response from harness — retry?");
-    expect(turn.error_kind).toBe("adapter_failure");
-    expect(state._testing.hasHeartbeat(AGENT_A)).toBe(false);
+    expect(turn.status).toBe("streaming");
+    expect(turn.error).toBeUndefined();
+    expect(state.runtimes[AGENT_A]?.quiet_since).toBeDefined();
+    // The watch is retained (entry kept, handle dropped) so the next activity
+    // can re-arm and clear quiet.
+    expect(state._testing.heartbeatTurnId(AGENT_A)).toBe(TURN_1);
+  });
+
+  it("re-arms on liveness (thinking keepalive) for the tracked turn", async () => {
+    // A long Claude thinking block emits only `liveness` (redacted thinking
+    // deltas); it must keep the turn alive the same way tool events do.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_start",
+      turn_id: TURN_1,
+      message_id: MESSAGE_1,
+      started_at: "2026-05-15T00:00:00Z",
+    });
+    vi.advanceTimersByTime(HEARTBEAT_TIMEOUT_MS - 100);
+    fireTo(`agent:${AGENT_A}`, { type: "liveness", turn_id: TURN_1 });
+    vi.advanceTimersByTime(HEARTBEAT_TIMEOUT_MS - 100);
+    fireTo(`agent:${AGENT_A}`, { type: "liveness", turn_id: TURN_1 });
+    vi.advanceTimersByTime(HEARTBEAT_TIMEOUT_MS - 100);
+    expect(state.runtimes[AGENT_A]?.quiet_since).toBeUndefined();
+  });
+
+  it("activity after quiet clears it and re-arms the timer", async () => {
+    // Regression for the latch: once the timer has fired and set quiet, the
+    // next activity must clear quiet AND re-arm, so a second silent stretch
+    // re-triggers quiet (rather than the indicator sticking forever).
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+    fireTo(`agent:${AGENT_A}`, {
+      type: "turn_start",
+      turn_id: TURN_1,
+      message_id: MESSAGE_1,
+      started_at: "2026-05-15T00:00:00Z",
+    });
+    vi.advanceTimersByTime(HEARTBEAT_TIMEOUT_MS + 100);
+    expect(state.runtimes[AGENT_A]?.quiet_since).toBeDefined();
+
+    // Activity resumes — quiet clears, timer re-arms.
+    fireTo(`agent:${AGENT_A}`, {
+      type: "content_chunk",
+      turn_id: TURN_1,
+      kind: "text",
+      text: "back",
+    });
+    expect(state.runtimes[AGENT_A]?.quiet_since).toBeUndefined();
+
+    // A second silent stretch re-triggers quiet.
+    vi.advanceTimersByTime(HEARTBEAT_TIMEOUT_MS + 100);
+    expect(state.runtimes[AGENT_A]?.quiet_since).toBeDefined();
+
+    // The turn was never failed throughout.
+    const turn = state.transcripts[AGENT_A]?.[0];
+    if (turn?.role !== "agent") throw new Error("unreachable");
+    expect(turn.status).toBe("streaming");
   });
 
   it("re-arms on content_chunk for the tracked turn", async () => {
@@ -327,11 +386,13 @@ describe("heartbeat orchestration", () => {
     });
     // Should still be tracking TURN_1.
     expect(state._testing.heartbeatTurnId(AGENT_A)).toBe(TURN_1);
-    // Past TURN_1's deadline.
+    // Past TURN_1's deadline — fires and marks quiet (the stale TURN_2 event
+    // did not re-arm), but never fails the turn.
     vi.advanceTimersByTime(200);
+    expect(state.runtimes[AGENT_A]?.quiet_since).toBeDefined();
     const turn = state.transcripts[AGENT_A]?.[0];
     if (turn?.role !== "agent") throw new Error("unreachable");
-    expect(turn.status).toBe("failed");
+    expect(turn.status).toBe("streaming");
   });
 });
 
@@ -372,24 +433,6 @@ describe("dispatchUserTurn", () => {
     expect(state.runtimes[AGENT_A]?.last_error).toBeUndefined();
   });
 
-  it("updates lastRecipientId for the picker preselect ergonomic", async () => {
-    const state = await loadState();
-    await state.registerAgent(agentRecord(AGENT_A));
-    await state.registerAgent(agentRecord(AGENT_B));
-    state.dispatchUserTurn(AGENT_B, "user-1", "hi", "s1", "2026-05-16T00:00:00Z");
-    expect(state.ui.lastRecipientId).toBe(AGENT_B);
-    // After dispatch, B's run_status is "starting" — a second dispatch
-    // to B in this window is gated by the defense (see below). Use a
-    // fresh agent_idle to clear B back to "idle" so the test can advance.
-    fireTo(`agent:${AGENT_B}`, { type: "agent_idle", agent_id: AGENT_B });
-    // Wait — agent_idle from "starting" is a no-op (guarded). Manually
-    // advance via the legitimate path: simulate the turn lifecycle
-    // turn_start → agent_idle. For this picker-ergonomic test, the
-    // cleanest path is to dispatch to a different agent. A is still idle.
-    state.dispatchUserTurn(AGENT_A, "user-2", "hi again", "s1", "2026-05-16T00:00:01Z");
-    expect(state.ui.lastRecipientId).toBe(AGENT_A);
-  });
-
   it("rejects calls for unregistered agents (fail-loud)", async () => {
     const state = await loadState();
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -400,7 +443,6 @@ describe("dispatchUserTurn", () => {
       expect.objectContaining({ agent_id: AGENT_A }),
     );
     expect(state.transcripts[AGENT_A]).toBeUndefined();
-    expect(state.ui.lastRecipientId).toBe(null);
     errSpy.mockRestore();
   });
 
@@ -877,7 +919,6 @@ describe("_testing.reset", () => {
     expect(state.transcripts[AGENT_B]).toBeUndefined();
     expect(state.runtimes[AGENT_A]).toBeUndefined();
     expect(state.runtimes[AGENT_B]).toBeUndefined();
-    expect(state.ui.lastRecipientId).toBe(null);
     expect(state._testing.hasListener(AGENT_A)).toBe(false);
     expect(state._testing.hasListener(AGENT_B)).toBe(false);
     // The unlisten spies should have been called.

@@ -158,9 +158,44 @@ fn parse_content_block_delta(
         return ParseOutcome::Skip;
     };
 
-    if delta.get("type").and_then(Value::as_str) != Some("text_delta") {
-        // input_json_delta (tool input), thinking_delta, etc. — all skipped.
-        return ParseOutcome::Skip;
+    match delta.get("type").and_then(Value::as_str) {
+        Some("text_delta") => {} // fall through to text handling below
+        Some("thinking_delta") => {
+            // Claude's thinking text is server-redacted to empty in `-p` mode
+            // today, so this normally carries no content and we surface it as a
+            // non-rendering liveness signal (keeping the heartbeat alive through
+            // a long thinking block). We deliberately do NOT depend on that
+            // redaction: if it is ever lifted, the text flows through as
+            // `Thinking` content rather than being silently dropped — matching
+            // how Antigravity surfaces reasoning, and what the reasoning
+            // renderer expects to "pick up for free."
+            let text = delta.get("thinking").and_then(Value::as_str).unwrap_or("");
+            if text.is_empty() {
+                return ParseOutcome::Event(AdapterEvent::Liveness { turn_id });
+            }
+            return ParseOutcome::Event(AdapterEvent::ContentChunk {
+                turn_id,
+                kind: ContentKind::Thinking,
+                text: text.to_owned(),
+            });
+        }
+        // `signature_delta` carries an opaque signature blob (no readable
+        // content), and `input_json_delta` streams a tool call's arguments —
+        // which we render via the `tool_started`/`tool_completed` pair, NOT
+        // from these deltas. But both are signs the harness is actively
+        // producing, so they re-arm the heartbeat as liveness rather than
+        // counting as silence (a large tool input can stream for many seconds
+        // before `tool_started` — emitted from the completed assistant
+        // envelope — arrives). `input_json_delta` is per-fragment, so a large
+        // tool input emits proportionally many liveness events; that volume is
+        // accepted (same order as text streaming, which the event pipeline
+        // already absorbs) in exchange for an honest heartbeat — dropping it
+        // would falsely show "no response" while the agent is actively
+        // generating the tool input.
+        Some("signature_delta" | "input_json_delta") => {
+            return ParseOutcome::Event(AdapterEvent::Liveness { turn_id });
+        }
+        _ => return ParseOutcome::Skip,
     }
 
     let text = delta.get("text").and_then(Value::as_str).unwrap_or("");
@@ -888,10 +923,66 @@ mod tests {
     }
 
     #[test]
-    fn thinking_delta_is_skipped() {
-        // ContentKind::Thinking is reserved but not currently emitted.
-        // Thinking deltas must produce ParseOutcome::Skip.
+    fn thinking_delta_empty_yields_liveness() {
+        // Thinking text is server-redacted to empty in `-p` mode today, so an
+        // empty thinking delta is not surfaced as content — but it is a sign the
+        // harness is alive, so it produces a non-rendering Liveness event to
+        // re-arm the frontend heartbeat.
+        let turn = tid();
+        let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}}"#;
+        match parse_one(line, turn) {
+            ParseOutcome::Event(AdapterEvent::Liveness { turn_id }) => assert_eq!(turn_id, turn),
+            other => panic!("expected Liveness, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn thinking_delta_with_text_yields_thinking_chunk() {
+        // We do not depend on the redaction: if Claude ever streams real
+        // thinking text, it must flow through as `Thinking` content rather than
+        // being silently dropped.
+        let turn = tid();
         let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"deliberating"}}}"#;
+        match parse_one(line, turn) {
+            ParseOutcome::Event(AdapterEvent::ContentChunk {
+                turn_id,
+                kind: ContentKind::Thinking,
+                text,
+            }) => {
+                assert_eq!(turn_id, turn);
+                assert_eq!(text, "deliberating");
+            }
+            other => panic!("expected ContentChunk(Thinking), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn signature_delta_yields_liveness() {
+        let turn = tid();
+        let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"abc"}}}"#;
+        match parse_one(line, turn) {
+            ParseOutcome::Event(AdapterEvent::Liveness { turn_id }) => assert_eq!(turn_id, turn),
+            other => panic!("expected Liveness, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn input_json_delta_yields_liveness() {
+        // Streaming a tool call's arguments is a sign the harness is alive — and
+        // it can run for many seconds before `tool_started` (emitted from the
+        // completed assistant envelope) arrives, so it must re-arm the heartbeat
+        // rather than counting as silence. It carries no renderable content.
+        let turn = tid();
+        let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{"}}}"#;
+        match parse_one(line, turn) {
+            ParseOutcome::Event(AdapterEvent::Liveness { turn_id }) => assert_eq!(turn_id, turn),
+            other => panic!("expected Liveness, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_delta_type_is_skipped() {
+        let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"some_future_delta"}}}"#;
         assert!(matches!(parse_one(line, tid()), ParseOutcome::Skip));
     }
 
@@ -926,9 +1017,15 @@ mod tests {
     }
 
     #[test]
-    fn input_json_delta_tool_input_is_skipped() {
+    fn input_json_delta_tool_input_yields_liveness() {
+        // Tool-input streaming is a liveness signal (it can run for seconds
+        // before `tool_started` arrives from the completed assistant envelope);
+        // it carries no renderable content.
         let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{"}}}"#;
-        assert!(matches!(parse_one(line, tid()), ParseOutcome::Skip));
+        assert!(matches!(
+            parse_one(line, tid()),
+            ParseOutcome::Event(AdapterEvent::Liveness { .. })
+        ));
     }
 
     #[test]
@@ -963,14 +1060,21 @@ mod tests {
 
     // --- Multi-text-block separator behaviour ---
 
+    /// Collects the answer prose (`Text` chunks only) emitted across a turn —
+    /// the surface the paragraph-separator tests below care about. `Thinking`
+    /// chunks are excluded: they are not part of the answer text and have no
+    /// bearing on text-block separator behavior.
     fn run_turn(lines: &[&str]) -> String {
         let mut state = ParserState::default();
         let turn_id = tid();
         let agent_id = aid();
         let mut out = String::new();
         for line in lines {
-            if let ParseOutcome::Event(AdapterEvent::ContentChunk { text, .. }) =
-                parse_line(line, turn_id, agent_id, &mut state)
+            if let ParseOutcome::Event(AdapterEvent::ContentChunk {
+                text,
+                kind: ContentKind::Text,
+                ..
+            }) = parse_line(line, turn_id, agent_id, &mut state)
             {
                 out.push_str(&text);
             }

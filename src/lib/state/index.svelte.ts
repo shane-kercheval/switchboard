@@ -28,7 +28,7 @@
 //
 // **UI integration**: App.svelte calls `registerAgent` at project-open
 // time and on dynamic agent add. Sidebar / UnifiedTranscript / ComposeBar
-// components read `transcripts` / `runtimes` / `ui` directly. ComposeBar
+// components read `transcripts` / `runtimes` directly. ComposeBar
 // drives `dispatchUserTurn` + Tauri `send_message` + `failSendStart` on
 // IPC error.
 
@@ -63,11 +63,6 @@ export const transcripts = $state<TranscriptMap>({});
 /// the compose-bar Send gate.
 export const runtimes = $state<RuntimeMap>({});
 
-/// Session-local ergonomic — the recipient picker preselects whichever
-/// agent the user last sent to. Not persisted across app reloads
-/// (ergonomic, not a semantic privilege).
-export const ui = $state<{ lastRecipientId: AgentId | null }>({ lastRecipientId: null });
-
 /// Per-agent unlisten functions for the Tauri event channel. Keyed by
 /// `agent_id`. We hold these so the test harness can drain them via
 /// `_testing.reset()`; production callers never unregister.
@@ -93,7 +88,10 @@ const pendingRegistrations = new Map<AgentId, Promise<void>>();
 //
 // Plain `Map` (not `SvelteMap`) for the same reason as `listenerRegistry`
 // — internal bookkeeping, not reactive state.
-type Heartbeat = { turn_id: TurnId; handle: ReturnType<typeof setTimeout> };
+// `handle` is `undefined` after the timer has fired: the entry is retained
+// (so the next activity event can re-arm and clear `quiet_since`) but no live
+// timer remains. clearTimeout(undefined) is a no-op.
+type Heartbeat = { turn_id: TurnId; handle: ReturnType<typeof setTimeout> | undefined };
 // eslint-disable-next-line svelte/prefer-svelte-reactivity
 const heartbeats = new Map<AgentId, Heartbeat>();
 
@@ -254,7 +252,7 @@ export async function registerAgent(agent: AgentRecord): Promise<void> {
 /// - Runtime must exist (agent registered via `registerAgent`).
 /// - `run_status` must be `"idle"`. A second click during `"starting"` /
 ///   `"processing"` is rejected here so no phantom user turn is appended
-///   for a dispatch that won't happen, and `lastRecipientId` stays put.
+///   for a dispatch that won't happen.
 ///
 /// Both violations log via `console.error` and no-op (the alternative —
 /// silently appending a turn for a dispatch we won't fire — would corrupt
@@ -301,7 +299,6 @@ export function dispatchUserTurn(
     runtime.run_status === "idle"
       ? { ...runtime, run_status: "starting", last_error: undefined, pending_sends: pending }
       : { ...runtime, pending_sends: pending };
-  ui.lastRecipientId = agentId;
 }
 
 /// Record the accepted-send receipt (`message_id`) onto this send's pending
@@ -565,13 +562,18 @@ function manageHeartbeat(agentId: AgentId, event: NormalizedEvent): void {
       return;
 
     case "content_chunk":
+    case "liveness":
     case "tool_started":
     case "tool_completed": {
-      // Re-arm on any per-turn activity for the turn the heartbeat is
+      // Re-arm on any sign the harness is alive for the turn the heartbeat is
       // watching. A long shell tool call legitimately produces zero
-      // content_chunks for minutes (`Bash` running a test suite); without
-      // tool-event re-arming, the heartbeat would falsely fail those
-      // turns. Stale events for unrelated turns are ignored.
+      // content_chunks for minutes (`Bash` running a test suite), and a long
+      // thinking block produces only `liveness` (Claude's redacted thinking
+      // deltas) — without re-arming on those, the heartbeat would falsely flag
+      // healthy turns as silent. `quiet_since` (if the timer already fired) is
+      // cleared on this same activity by `runtimeReducer`. Stale events for
+      // unrelated turns are ignored. Re-arming after the timer has fired works
+      // because the fire path retains the heartbeats entry (see armHeartbeat).
       const heartbeat = heartbeats.get(agentId);
       if (heartbeat?.turn_id === event.turn_id) {
         armHeartbeat(agentId, event.turn_id);
@@ -598,21 +600,21 @@ function manageHeartbeat(agentId: AgentId, event: NormalizedEvent): void {
 function armHeartbeat(agentId: AgentId, turnId: TurnId): void {
   clearHeartbeat(agentId);
   const handle = setTimeout(() => {
-    // Deliberate: do NOT call `manageHeartbeat()` here even though we
-    // feed events to the same reducers below. The heartbeat is cleared
-    // by `heartbeats.delete(agentId)` on the next line; re-arming via
-    // manageHeartbeat would leak a timer (the synthetic event isn't a
-    // terminal one from manageHeartbeat's perspective). Symmetric-looking
-    // refactors with `handleEvent` are wrong at this site.
-    heartbeats.delete(agentId);
+    // The turn has been silent for HEARTBEAT_TIMEOUT_MS but is still alive on
+    // the backend (it holds the busy-lock). Do NOT fail it — a frontend
+    // "failed" would be a lie and would not release the lock. Instead record
+    // `quiet_since` via the runtime reducer so the UI surfaces the silence; the
+    // real terminal (or a user cancel) resolves the turn.
+    //
+    // Retain the heartbeats entry (drop only the now-fired handle) so the next
+    // activity event for this turn re-arms via `manageHeartbeat` and clears
+    // `quiet_since`. Deleting the entry here would strand it set forever,
+    // because the re-arm guard keys on an existing entry. Deliberate: do NOT
+    // call `manageHeartbeat()` here — the synthetic heartbeat_timeout is not a
+    // re-arm trigger, and only the runtime (not the transcript) changes.
+    heartbeats.set(agentId, { turn_id: turnId, handle: undefined });
     const at = new Date().toISOString();
     const synthetic = { type: "heartbeat_timeout" as const, turn_id: turnId, at };
-    const priorTurns = transcripts[agentId] ?? [];
-    // `at` doubles as `receivedAt` here — the synthetic event is itself
-    // the "received" event from the reducer's perspective. Tool-event
-    // timestamps aren't relevant for a heartbeat_timeout (no tool item
-    // is being created), but the parameter is required by the signature.
-    transcripts[agentId] = transcriptReducer(priorTurns, synthetic, agentId, at);
     const priorRuntime = runtimes[agentId];
     if (priorRuntime !== undefined) {
       runtimes[agentId] = runtimeReducer(priorRuntime, synthetic);
@@ -651,7 +653,6 @@ export const _testing = {
     for (const key of Object.keys(runtimes)) {
       delete runtimes[key];
     }
-    ui.lastRecipientId = null;
   },
   hasListener(agentId: AgentId): boolean {
     return listenerRegistry.has(agentId);

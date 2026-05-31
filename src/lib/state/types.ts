@@ -224,10 +224,23 @@ export type AgentRuntime = {
   /// IPC reply lands; this tracking key lets late events still extend the
   /// timer correctly.
   in_flight_turn_id?: TurnId;
+  /// Transient: the ISO-8601 instant the heartbeat timer expired while this turn
+  /// was still in flight with no activity (i.e. when the turn went "quiet").
+  /// The turn is alive on the backend (it still holds the busy-lock) but silent,
+  /// so this drives a soft, counting-up "No response (…)" indicator — never a
+  /// failure. `undefined` means not quiet. Set on `heartbeat_timeout` (to that
+  /// event's `at`); cleared on the next activity event for `in_flight_turn_id`
+  /// (content/tool/liveness) or on turn end. The indicator is scoped to
+  /// `in_flight_turn_id` so it never paints an unrelated streaming turn's
+  /// footer; the footer derives elapsed silence as `now - quiet_since +
+  /// HEARTBEAT_TIMEOUT_MS` (the timer fired one threshold after the last
+  /// activity).
+  quiet_since?: string;
   /// Runtime record of the last turn's failure (not rendered — failures surface
-  /// in the transcript as a failed agent turn). Set on failed `TurnEnd`,
-  /// `heartbeat_timeout`, or a pre-start `message_failed`; cleared on the next
-  /// successful turn. Does NOT gate sendability.
+  /// in the transcript as a failed agent turn). Set on failed `TurnEnd` or a
+  /// pre-start `message_failed`; cleared on the next successful turn. Does NOT
+  /// gate sendability. (A heartbeat timeout no longer sets this — a silent turn
+  /// isn't a failure; see `quiet_since`.)
   last_error?: { message: string; kind: FailureKind };
   /// Populated by live `SessionMeta` events or by disk hydration of the
   /// agent's session file. Undefined on agents whose first dispatch

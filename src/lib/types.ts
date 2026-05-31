@@ -20,9 +20,13 @@ export type TurnOutcome =
   | { status: "failed"; kind: FailureKind; message: string }
   | { status: "cancelled"; source: CancelSource };
 
-// ContentChunk.kind discriminates rendering. `thinking` is reserved in the
-// wire format but not currently emitted — future reasoning UI can land
-// without a wire-format break.
+// ContentChunk.kind discriminates rendering. `thinking` is emitted by adapters
+// that surface reasoning text (Antigravity, Gemini session files). Claude's
+// thinking text is server-redacted to empty today, so its reasoning normally
+// surfaces only as a non-rendering `liveness` event — but if that redaction is
+// lifted, non-empty thinking flows through as a `thinking` content chunk (the
+// Rust parser branches on emptiness). The renderer currently shows `thinking`
+// and `text` identically; distinct reasoning styling is follow-up work.
 export type ContentKind = "text" | "thinking";
 
 // ToolStarted.kind discriminates tool origin so the UI can label calls
@@ -62,6 +66,10 @@ export type SendId = string;
 export type NormalizedEvent =
   | { type: "turn_start"; turn_id: TurnId; message_id: MessageId; started_at: string }
   | { type: "content_chunk"; turn_id: TurnId; kind: ContentKind; text: string }
+  // Content-free liveness signal: the harness is still alive mid-turn but
+  // produced no renderable content (e.g. Claude's redacted thinking deltas).
+  // Re-arms the per-turn heartbeat; renders nothing.
+  | { type: "liveness"; turn_id: TurnId }
   | {
       type: "tool_started";
       turn_id: TurnId;
@@ -119,10 +127,12 @@ export type NormalizedEvent =
   // renders its cancelled row from this rather than optimistically guessing.
   | { type: "message_cancelled"; message_id: MessageId; agent_id: AgentId; at: string };
 
-// Synthetic reducer input — fired by the state module's heartbeat timer
-// when no per-turn activity has been observed for HEARTBEAT_TIMEOUT_MS
-// while a turn is in flight. The reducer treats it as a transition to
-// "failed."
+// Synthetic reducer input — fired by the state module's heartbeat timer when
+// no per-turn activity has been observed for HEARTBEAT_TIMEOUT_MS while a turn
+// is in flight. It does NOT fail the turn: a silent-but-alive turn still holds
+// the backend's busy-lock, so the frontend only surfaces the silence by
+// setting a transient `quiet_since` timestamp on the agent runtime (cleared on
+// the next activity event, or on turn end). Real stream death is failed by the backend.
 //
 // Lives on the reducer-input union (not the wire-format `NormalizedEvent`)
 // because it's frontend-synthesized, not emitted by the dispatcher. The
@@ -382,11 +392,18 @@ export type DirectoryInfo = {
 };
 
 export const HEARTBEAT_TIMEOUT_MS = 60_000;
-// Heartbeat re-arms on any per-turn activity event for the heartbeat's
-// tracked turn: `content_chunk`, `tool_started`, `tool_completed`. 60s of
-// total silence across all three is the "stream is silent" threshold. Tool
-// events are load-bearing here — a long shell command (build, test run,
-// large grep) emits no `content_chunk`s for minutes and would otherwise
-// trigger a false-positive failure. Agent-scoped events (`session_meta`,
-// `rate_limit_event`) intentionally do NOT re-arm — they're not turn-anchored
-// and can flow at any time without indicating turn progress.
+// Heartbeat re-arms on any per-turn sign of life for the tracked turn:
+// `content_chunk`, `liveness`, `tool_started`, `tool_completed`. 1 minute of
+// total silence across all of these is the "stream is silent" threshold (kept
+// short because the indicator is harmless and the user can always cancel).
+// `liveness` and tool events are load-bearing: a long thinking block emits only
+// `liveness` (Claude's redacted thinking deltas) and a streaming tool input
+// emits only `liveness` (input_json_delta), while a long shell command (build,
+// test run) emits no events between `tool_started` and `tool_completed`. On
+// expiry the turn is NOT failed — it is marked transiently quiet (see
+// `AgentRuntime.quiet_since`), because a silent-but-alive turn still holds the
+// backend busy-lock. The threshold is therefore "when to surface the silence,"
+// not "when to fail." The footer counts up from the quiet onset once crossed.
+// Agent-scoped events (`session_meta`, `rate_limit_event`) intentionally do NOT
+// re-arm — they're not turn-anchored and can flow at any time without
+// indicating turn progress.

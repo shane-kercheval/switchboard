@@ -384,7 +384,7 @@ describe("UnifiedTranscript", () => {
     expect(tool.querySelector('[data-testid="tool-running"]')).not.toBeNull();
   });
 
-  it("shows processing… indicator for Codex turns with empty items array (streaming)", async () => {
+  it("shows a Working... footer for Codex turns with empty items array (streaming)", async () => {
     const state = await loadState();
     await state.registerAgent(CODEX_AGENT);
     state.transcripts[CODEX_AGENT.id] = [
@@ -401,10 +401,10 @@ describe("UnifiedTranscript", () => {
     const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CODEX_AGENT] } });
 
-    expect(screen.getByTestId("turn-processing")).toBeInTheDocument();
+    expect(screen.getByTestId("turn-working")).toHaveTextContent("Working...");
   });
 
-  it("hides processing… indicator once items arrive", async () => {
+  it("keeps the Working... footer at the bottom once items arrive", async () => {
     const state = await loadState();
     await state.registerAgent(CODEX_AGENT);
     state.transcripts[CODEX_AGENT.id] = [
@@ -421,8 +421,8 @@ describe("UnifiedTranscript", () => {
     const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CODEX_AGENT] } });
 
-    expect(screen.queryByTestId("turn-processing")).toBeNull();
     expect(screen.getByTestId("turn")).toHaveTextContent("ack");
+    expect(screen.getByTestId("turn-working")).toHaveTextContent("Working...");
   });
 
   it("live-streams an in-progress turn into the unified view", async () => {
@@ -463,6 +463,7 @@ describe("UnifiedTranscript", () => {
     expect(screen.queryByText("streaming…")).toBeNull();
     expect(screen.getByTestId("turn")).toHaveTextContent("hello");
     expect(screen.getByTestId("turn")).toHaveTextContent("world");
+    expect(screen.getByTestId("turn-working")).toHaveTextContent("Working...");
   });
 
   it("shows a live cancel control for a streaming standalone turn (send-scoped)", async () => {
@@ -504,7 +505,7 @@ describe("UnifiedTranscript", () => {
     const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
 
-    expect(screen.getByTestId("turn-queued")).toBeInTheDocument();
+    expect(screen.getByTestId("turn-queued")).toHaveTextContent("Queued...");
     // The cancel control targets the queued send (send-scoped).
     await fireEvent.click(screen.getByTestId("turn-live-control"));
     expect(invokeMock).toHaveBeenCalledWith(
@@ -655,7 +656,7 @@ describe("UnifiedTranscript — fan-out groups", () => {
     const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT, CODEX_AGENT] } });
 
-    expect(screen.getByTestId("fanout-queued")).toBeInTheDocument();
+    expect(screen.getByTestId("fanout-queued")).toHaveTextContent("Queued...");
     const columns = screen.getAllByTestId("fanout-column");
     expect(columns[1]).toHaveAttribute("data-state", "queued");
   });
@@ -670,15 +671,23 @@ describe("UnifiedTranscript — fan-out groups", () => {
     const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT, CODEX_AGENT] } });
 
-    const cancelControls = screen.getAllByTestId("fanout-card-cancel");
-    expect(cancelControls).toHaveLength(2);
-    await fireEvent.click(cancelControls[1]!);
+    const queuedCancel = screen.getByTestId("fanout-card-cancel");
+    const streamingCancel = screen.getByTestId("turn-live-control");
+    expect(screen.getByTestId("turn-working")).toHaveTextContent("Working...");
+    await fireEvent.click(queuedCancel);
     expect(invokeMock).toHaveBeenCalledWith(
       "cancel_send",
       expect.objectContaining({ sendId: SEND_1 }),
     );
     const call = invokeMock.mock.calls.find(([c]) => c === "cancel_send");
     expect((call?.[1] as { recipients: string[] }).recipients).toEqual([CODEX_AGENT.id]);
+
+    invokeMock.mockClear();
+    await fireEvent.click(streamingCancel);
+    expect(invokeMock).toHaveBeenCalledWith(
+      "cancel_send",
+      expect.objectContaining({ sendId: SEND_1, recipients: [CLAUDE_AGENT.id] }),
+    );
   });
 
   it("hides per-recipient cancel controls once every recipient has settled", async () => {

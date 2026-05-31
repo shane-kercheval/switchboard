@@ -9,7 +9,6 @@
   import CopyButton from "$lib/components/ui/CopyButton.svelte";
   import StatusChip from "$lib/components/ui/StatusChip.svelte";
   import StopIcon from "$lib/components/ui/StopIcon.svelte";
-  import Spinner from "$lib/components/ui/Spinner.svelte";
   import ToolCallWidget from "$lib/components/ToolCallWidget.svelte";
 
   type AgentTurn = Extract<Turn, { role: "agent" }>;
@@ -136,7 +135,6 @@
     }
     return "queued";
   }
-  const isLive = (s: ColumnState): boolean => s === "queued" || s === "streaming";
 
   // Auto-pin to bottom unless the user has scrolled up.
   let container = $state<HTMLDivElement | null>(null);
@@ -183,9 +181,6 @@
 </script>
 
 {#snippet turnBody(turn: AgentTurn)}
-  {#if turn.status === "streaming" && turn.items.length === 0}
-    <StatusChip status="processing" testid="turn-processing" />
-  {/if}
   {#each turn.items as item, i (i)}
     {#if item.item_kind === "text"}
       <Markdown text={item.text} />
@@ -195,6 +190,9 @@
   {/each}
   {#if turn.status === "failed" && turn.error}
     <div class="text-status-failed text-xs" data-testid="turn-error">{turn.error}</div>
+  {/if}
+  {#if turn.status === "streaming"}
+    {@render workingFooter(turn)}
   {/if}
 {/snippet}
 
@@ -209,18 +207,38 @@
 {#snippet liveTurnControl(onclick: () => void, label: string, testid: string)}
   <button
     type="button"
-    class="group/live-control text-muted hover:bg-status-failed-soft/70 hover:text-status-failed focus-visible:ring-accent focus-visible:bg-status-failed-soft/70 focus-visible:text-status-failed inline-flex h-6 w-6 items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none"
+    class="text-muted hover:bg-status-failed-soft/70 hover:text-status-failed focus-visible:ring-accent focus-visible:bg-status-failed-soft/70 focus-visible:text-status-failed inline-flex h-6 w-6 items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none"
     data-testid={testid}
     aria-label={label}
     {onclick}
   >
-    <Spinner
-      class="h-5 w-5 group-hover/live-control:hidden group-focus-visible/live-control:hidden"
-    />
-    <StopIcon
-      class="hidden h-5 w-5 group-hover/live-control:block group-focus-visible/live-control:block"
-    />
+    <StopIcon class="h-4 w-4" />
   </button>
+{/snippet}
+
+{#snippet workingFooter(turn: AgentTurn)}
+  <div class="text-muted mt-2 flex items-center gap-2 text-xs" data-testid="turn-working">
+    <span class="animate-pulse">Working...</span>
+    {#if turn.send_id !== undefined}
+      {@const sendId = turn.send_id}
+      {@render liveTurnControl(
+        () => cancelSend(sendId, [turn.agent_id]),
+        `Cancel turn for ${agentName(turn.agent_id)}`,
+        "turn-live-control",
+      )}
+    {/if}
+  </div>
+{/snippet}
+
+{#snippet queuedFooter(agentId: string, sendId: string, labelTestid: string, controlTestid: string)}
+  <div class="text-muted mt-2 flex items-center gap-2 text-xs" data-testid={labelTestid}>
+    <span class="animate-pulse">Queued...</span>
+    {@render liveTurnControl(
+      () => cancelSend(sendId, [agentId]),
+      `Cancel queued send for ${agentName(agentId)}`,
+      controlTestid,
+    )}
+  </div>
 {/snippet}
 
 {#snippet messageMeta(at: string, copyable: string, label: string, mt = "mt-1")}
@@ -279,14 +297,9 @@
       {#if agentById[agentId]?.harness}
         <HarnessIcon harness={agentById[agentId]!.harness} testid="turn-harness-icon" />
       {/if}
-      {@render liveTurnControl(
-        () => cancelSend(sendId, [agentId]),
-        `Cancel queued send for ${agentName(agentId)}`,
-        "turn-live-control",
-      )}
     </div>
     <div class="border-l-[0.5px] pl-3" style:border-left-color={agentBorderColor(agentId)}>
-      <StatusChip status="queued" testid="turn-queued" />
+      {@render queuedFooter(agentId, sendId, "turn-queued", "turn-live-control")}
     </div>
   </div>
 {/snippet}
@@ -298,14 +311,6 @@
     <div class="flex items-center gap-2 text-xs font-semibold tracking-wide uppercase">
       <span class="text-fg" data-testid="turn-agent-name">{agentName(turn.agent_id)}</span>
       {#if harness}<HarnessIcon {harness} testid="turn-harness-icon" />{:else}<Badge>?</Badge>{/if}
-      {#if turn.status === "streaming" && turn.send_id !== undefined}
-        {@const sendId = turn.send_id}
-        {@render liveTurnControl(
-          () => cancelSend(sendId, [turn.agent_id]),
-          `Cancel turn for ${agentName(turn.agent_id)}`,
-          "turn-live-control",
-        )}
-      {/if}
     </div>
     <div
       class="space-y-1.5 border-l-[0.5px] pl-3"
@@ -375,21 +380,19 @@
                     >{agentName(col.agent_id)}</span
                   >
                   {#if harness}<HarnessIcon {harness} />{/if}
-                  {#if isLive(state)}
-                    {@render liveTurnControl(
-                      () => cancelSend(block.send_id, [col.agent_id]),
-                      `Cancel turn for ${agentName(col.agent_id)}`,
-                      "fanout-card-cancel",
-                    )}
-                  {/if}
-                  {#if state === "queued"}
-                    <span class="text-status-processing" data-testid="fanout-queued">queued…</span>
-                  {/if}
                 </div>
                 <div
                   class="space-y-1.5 border-l-[0.5px] pl-3"
                   style:border-left-color={agentBorderColor(col.agent_id)}
                 >
+                  {#if state === "queued"}
+                    {@render queuedFooter(
+                      col.agent_id,
+                      block.send_id,
+                      "fanout-queued",
+                      "fanout-card-cancel",
+                    )}
+                  {/if}
                   {#each col.rows as r (r.key)}
                     {#if r.kind === "agent"}
                       {@render turnStatusLabel(r.turn.status)}

@@ -21,7 +21,7 @@ DEV_SUFFIX := $(if $(filter-out $(DEFAULT_DEV_PORT),$(DEV_PORT)),-$(DEV_PORT))
 DEV_CONFIG_DIR := $(HOME)/Library/Application Support/switchboard-dev$(DEV_SUFFIX)
 
 dev:
-	SWITCHBOARD_CONFIG_DIR="$(DEV_CONFIG_DIR)" VITE_DEV_PORT=$(DEV_PORT) VITE_GIT_BRANCH=$(shell git branch --show-current) TAURI_CONFIG='{"build":{"devUrl":"http://localhost:$(DEV_PORT)"}}' pnpm tauri dev
+	SWITCHBOARD_CONFIG_DIR="$(DEV_CONFIG_DIR)" VITE_DEV_PORT=$(DEV_PORT) VITE_GIT_BRANCH=$(shell git branch --show-current) pnpm tauri dev --config '{"build":{"devUrl":"http://localhost:$(DEV_PORT)"}}'
 
 # Release build of the macOS .app bundle (the only artifact that carries the
 # bundled icon). `--bundles app` skips the .dmg packaging step. Output:

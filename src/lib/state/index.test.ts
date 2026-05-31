@@ -433,24 +433,6 @@ describe("dispatchUserTurn", () => {
     expect(state.runtimes[AGENT_A]?.last_error).toBeUndefined();
   });
 
-  it("updates lastRecipientId for the picker preselect ergonomic", async () => {
-    const state = await loadState();
-    await state.registerAgent(agentRecord(AGENT_A));
-    await state.registerAgent(agentRecord(AGENT_B));
-    state.dispatchUserTurn(AGENT_B, "user-1", "hi", "s1", "2026-05-16T00:00:00Z");
-    expect(state.ui.lastRecipientId).toBe(AGENT_B);
-    // After dispatch, B's run_status is "starting" — a second dispatch
-    // to B in this window is gated by the defense (see below). Use a
-    // fresh agent_idle to clear B back to "idle" so the test can advance.
-    fireTo(`agent:${AGENT_B}`, { type: "agent_idle", agent_id: AGENT_B });
-    // Wait — agent_idle from "starting" is a no-op (guarded). Manually
-    // advance via the legitimate path: simulate the turn lifecycle
-    // turn_start → agent_idle. For this picker-ergonomic test, the
-    // cleanest path is to dispatch to a different agent. A is still idle.
-    state.dispatchUserTurn(AGENT_A, "user-2", "hi again", "s1", "2026-05-16T00:00:01Z");
-    expect(state.ui.lastRecipientId).toBe(AGENT_A);
-  });
-
   it("rejects calls for unregistered agents (fail-loud)", async () => {
     const state = await loadState();
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -461,7 +443,6 @@ describe("dispatchUserTurn", () => {
       expect.objectContaining({ agent_id: AGENT_A }),
     );
     expect(state.transcripts[AGENT_A]).toBeUndefined();
-    expect(state.ui.lastRecipientId).toBe(null);
     errSpy.mockRestore();
   });
 
@@ -938,7 +919,6 @@ describe("_testing.reset", () => {
     expect(state.transcripts[AGENT_B]).toBeUndefined();
     expect(state.runtimes[AGENT_A]).toBeUndefined();
     expect(state.runtimes[AGENT_B]).toBeUndefined();
-    expect(state.ui.lastRecipientId).toBe(null);
     expect(state._testing.hasListener(AGENT_A)).toBe(false);
     expect(state._testing.hasListener(AGENT_B)).toBe(false);
     // The unlisten spies should have been called.

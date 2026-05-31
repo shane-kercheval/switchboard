@@ -607,9 +607,9 @@ function appendFailedTurnImpl(
 /// Internal helper namespace. The underscore prefix signals "not for
 /// production callers" — both the state module (`index.svelte.ts`) and
 /// the reducer tests import from here. Production callers go through
-/// `index.svelte.ts::dispatchUserTurn`, which adds the recipient-picker
-/// ergonomic (`ui.lastRecipientId`) and the `run_status: "starting"`
-/// transition on top of this raw helper.
+/// `index.svelte.ts::dispatchUserTurn`, which adds the pending-send
+/// bookkeeping and the `run_status: "starting"` transition on top of this
+/// raw helper.
 export const _internal = {
   appendUserTurn: appendUserTurnImpl,
   appendFailedTurn: appendFailedTurnImpl,

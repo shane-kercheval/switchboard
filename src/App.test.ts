@@ -311,6 +311,8 @@ describe("App", () => {
     ws._testing.reset();
     const ha = await import("$lib/harnessAvailability.svelte");
     ha._testing.reset();
+    const compose = await import("$lib/state/composeStore");
+    compose._testing.reset();
   });
 
   // --- harness availability banners (workspace empty → welcome) ---

@@ -683,8 +683,11 @@
                 overlay={activeConvo?.items ?? []}
                 loadStatus={activeConvo?.status ?? "complete"}
               />
+              <!-- Remount per project: besides re-seeding the per-project
+                   draft/recipient state, this resets sendError, the @-menu, and
+                   focus so one project's compose state can't bleed into another. -->
               {#key selection.activeProjectId}
-                <ComposeBar agents={activeAgents} />
+                <ComposeBar projectId={selection.activeProjectId!} agents={activeAgents} />
               {/key}
             </div>
             {#if agentsSidebarOpen}

@@ -28,7 +28,7 @@
 //
 // **UI integration**: App.svelte calls `registerAgent` at project-open
 // time and on dynamic agent add. Sidebar / UnifiedTranscript / ComposeBar
-// components read `transcripts` / `runtimes` / `ui` directly. ComposeBar
+// components read `transcripts` / `runtimes` directly. ComposeBar
 // drives `dispatchUserTurn` + Tauri `send_message` + `failSendStart` on
 // IPC error.
 
@@ -62,11 +62,6 @@ export const transcripts = $state<TranscriptMap>({});
 /// (run_status, last_error, meta, last_rate_limit, hydration_status) and
 /// the compose-bar Send gate.
 export const runtimes = $state<RuntimeMap>({});
-
-/// Session-local ergonomic — the recipient picker preselects whichever
-/// agent the user last sent to. Not persisted across app reloads
-/// (ergonomic, not a semantic privilege).
-export const ui = $state<{ lastRecipientId: AgentId | null }>({ lastRecipientId: null });
 
 /// Per-agent unlisten functions for the Tauri event channel. Keyed by
 /// `agent_id`. We hold these so the test harness can drain them via
@@ -257,7 +252,7 @@ export async function registerAgent(agent: AgentRecord): Promise<void> {
 /// - Runtime must exist (agent registered via `registerAgent`).
 /// - `run_status` must be `"idle"`. A second click during `"starting"` /
 ///   `"processing"` is rejected here so no phantom user turn is appended
-///   for a dispatch that won't happen, and `lastRecipientId` stays put.
+///   for a dispatch that won't happen.
 ///
 /// Both violations log via `console.error` and no-op (the alternative —
 /// silently appending a turn for a dispatch we won't fire — would corrupt
@@ -304,7 +299,6 @@ export function dispatchUserTurn(
     runtime.run_status === "idle"
       ? { ...runtime, run_status: "starting", last_error: undefined, pending_sends: pending }
       : { ...runtime, pending_sends: pending };
-  ui.lastRecipientId = agentId;
 }
 
 /// Record the accepted-send receipt (`message_id`) onto this send's pending
@@ -659,7 +653,6 @@ export const _testing = {
     for (const key of Object.keys(runtimes)) {
       delete runtimes[key];
     }
-    ui.lastRecipientId = null;
   },
   hasListener(agentId: AgentId): boolean {
     return listenerRegistry.has(agentId);

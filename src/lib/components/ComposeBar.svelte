@@ -321,7 +321,7 @@
                 {...props}
                 type="button"
                 class={cn(
-                  "focus-visible:ring-accent inline-flex items-center gap-1 rounded-full border py-0.5 pr-2 pl-1.5 text-sm transition-colors focus-visible:ring-2 focus-visible:outline-none",
+                  "focus-visible:ring-accent inline-flex items-center gap-1 rounded-full border py-px pr-2 pl-1.5 text-sm transition-colors focus-visible:ring-2 focus-visible:outline-none",
                   selected
                     ? "bg-accent-soft text-fg border-transparent"
                     : "border-panel bg-panel text-muted hover:bg-raised hover:text-fg",
@@ -343,7 +343,7 @@
               <button
                 {...props}
                 type="button"
-                class="text-muted hover:text-fg hover:bg-panel ml-0.5 flex h-[26px] w-[26px] items-center justify-center rounded-full transition-colors"
+                class="text-muted hover:text-fg hover:bg-panel ml-0.5 flex h-6 w-6 items-center justify-center rounded-full transition-colors"
                 data-testid="recipient-clear"
                 aria-label="Clear recipients"
                 onclick={() => (selectedIds = [])}
@@ -354,7 +354,7 @@
                   stroke="currentColor"
                   stroke-width="1.75"
                   stroke-linecap="round"
-                  class="h-5 w-5"
+                  class="h-4 w-4"
                   aria-hidden="true"
                 >
                   <circle cx="12" cy="12" r="9" />

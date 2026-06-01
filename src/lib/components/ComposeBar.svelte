@@ -32,6 +32,7 @@
   let prompt = $state<string>(saved.draft);
   let sendError = $state<string | null>(null);
   let composeEl = $state<HTMLDivElement | undefined>(undefined);
+  let textareaEl = $state<HTMLTextAreaElement | undefined>(undefined);
 
   /// Recipient set — every agent is shown as a toggle chip (click to add/drop);
   /// `@name` is the keyboard path to the same toggle. Sticky across sends, and
@@ -55,6 +56,18 @@
     return [roster[0]!.id];
   }
 
+  function resizeTextarea(textarea: HTMLTextAreaElement | undefined, _draft: string): void {
+    if (textarea === undefined) return;
+    textarea.style.height = "auto";
+    const naturalHeight = textarea.scrollHeight;
+    const maxHeight = Number.parseFloat(getComputedStyle(textarea).maxHeight);
+    const cappedHeight = Number.isFinite(maxHeight)
+      ? Math.min(naturalHeight, maxHeight)
+      : naturalHeight;
+    textarea.style.height = `${cappedHeight}px`;
+    textarea.style.overflowY = naturalHeight > cappedHeight ? "auto" : "hidden";
+  }
+
   // Drop any selected ids whose agent disappeared (agent removed at runtime).
   $effect(() => {
     const valid = selectedIds.filter((id) => agents.some((a) => a.id === id));
@@ -66,6 +79,11 @@
   // can't be resurrected by a deferred write.
   $effect(() => {
     setDraft(projectId, prompt);
+  });
+  // Track both the draft and bound textarea: draft changes resize the box, and
+  // the ref change performs the initial resize once the DOM node is available.
+  $effect(() => {
+    resizeTextarea(textareaEl, prompt);
   });
   // The parent unmounts this bar the moment a project loses its last agent (it
   // falls back to the roster-loading / first-agent screen), so an empty roster
@@ -440,10 +458,11 @@
         data-testid="compose-textarea"
         placeholder="Type a message…  (⌘+Enter to send, @ to add a recipient)"
         rows={3}
+        bind:ref={textareaEl}
         bind:value={prompt}
         oninput={onInput}
         onkeydown={handleKey}
-        class="min-h-16 border-0 bg-transparent p-1 shadow-none focus-visible:ring-0"
+        class="max-h-48 min-h-16 border-0 bg-transparent p-1 shadow-none focus-visible:ring-0"
       />
       <Tooltip
         label={showStop ? (liveSends.size > 1 ? "Cancel all sends" : "Cancel send") : "Send"}

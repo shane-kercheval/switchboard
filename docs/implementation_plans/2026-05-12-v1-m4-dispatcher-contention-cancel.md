@@ -591,6 +591,8 @@ The capture (above) splits M4.9 into **two distinct surfaces**, because the harn
 ## M4.10 — Thinking/reasoning block rendering
 
 > **⚠️ DRAFT — not yet human-reviewed.** Added 2026-05-26 from observed-in-app research confirming that `ContentKind::Thinking` items are already emitted and stored correctly but rendered identically to answer text.
+>
+> **Superseded follow-up (2026-06-01):** this milestone's "Claude reasoning unavailable (redacted)" conclusion was per-model, not universal. A re-probe @ 2.1.159 found **Sonnet 4.6 streams real reasoning** (Opus 4.8 still redacts), so the `ThinkingWidget` built here now serves Claude live; the hydrate-path gap is closed in [`2026-06-01-claude-thinking-fix.md`](2026-06-01-claude-thinking-fix.md).
 
 ### Goal & Outcome
 

@@ -159,12 +159,23 @@ async fn live_claude_basic_turn_completes() {
 #[tokio::test]
 #[ignore = "requires claude installed — run with: make test-live"]
 async fn live_claude_thinking_emits_liveness() {
-    // Claude's thinking text is server-redacted to empty in `-p` mode, but the
-    // CLI still streams `thinking_delta`/`signature_delta` while the model
-    // reasons. The adapter must surface those as `Liveness` so the frontend
-    // heartbeat doesn't falsely fail a long thinking turn. If a CLI bump stops
-    // streaming during thinking, this test catches it (the fixture test proves
-    // the parser maps the delta; this proves the delta still arrives live).
+    // While the model reasons, the CLI streams `thinking_delta` /
+    // `signature_delta`. On a redacting model (Opus 4.8 — the dev's default,
+    // so what this test exercises) the thinking text is empty and the adapter
+    // surfaces `Liveness`; on a non-redacting model (Sonnet 4.6) it surfaces a
+    // `Thinking` `ContentChunk`. Either keeps the frontend heartbeat from
+    // falsely failing a long thinking turn. If a CLI bump stops streaming
+    // during thinking, this test catches it (the fixture test proves the
+    // parser maps the delta; this proves the delta still arrives live).
+    //
+    // COVERAGE GAP: the non-empty `Thinking` branch is NOT live-covered. This
+    // test runs on the dev default (Opus → redacted), so live runs only ever
+    // hit `Liveness`. We can't pin Sonnet because the adapter has no `--model`
+    // plumbing yet; until per-agent model selection lands
+    // (`docs/implementation_plans/2026-05-30-per-agent-model-selection.md` M2),
+    // the "real Sonnet still returns un-redacted reasoning" contract is held
+    // only by the `thinking_delta_with_text_yields_thinking_chunk` unit test
+    // plus the per-model re-probe mandate (`harness-behavior.md` §3.2).
     let adapter = ClaudeCodeAdapter::new();
     let agent = live_agent();
     let turn_id = Uuid::now_v7();
@@ -184,10 +195,10 @@ async fn live_claude_thinking_emits_liveness() {
     let events: Vec<AdapterEvent> = stream.collect().await;
 
     // A thinking block must produce a sign of life that re-arms the heartbeat:
-    // either `Liveness` (today, while thinking text is server-redacted to empty)
-    // or `ContentChunk { Thinking }` (if Claude ever stops redacting). Both are
-    // product-correct — assert the behavior, not which variant arrives, so a
-    // benign upstream un-redaction doesn't read as a regression.
+    // either `Liveness` (a redacting model like Opus 4.8) or
+    // `ContentChunk { Thinking }` (a non-redacting model like Sonnet 4.6).
+    // Both are product-correct — assert the behavior, not which variant
+    // arrives, so the per-model redaction split doesn't read as a regression.
     let sign_of_life = events.iter().any(|e| {
         matches!(e, AdapterEvent::Liveness { turn_id: t } if *t == turn_id)
             || matches!(

@@ -161,14 +161,14 @@ fn parse_content_block_delta(
     match delta.get("type").and_then(Value::as_str) {
         Some("text_delta") => {} // fall through to text handling below
         Some("thinking_delta") => {
-            // Claude's thinking text is server-redacted to empty in `-p` mode
-            // today, so this normally carries no content and we surface it as a
-            // non-rendering liveness signal (keeping the heartbeat alive through
-            // a long thinking block). We deliberately do NOT depend on that
-            // redaction: if it is ever lifted, the text flows through as
-            // `Thinking` content rather than being silently dropped — matching
-            // how Antigravity surfaces reasoning, and what the reasoning
-            // renderer expects to "pick up for free."
+            // Claude's reasoning redaction is per-model (see
+            // `harness-behavior.md` §3.2): Sonnet 4.6 streams non-empty
+            // reasoning text, which flows through as `Thinking` content;
+            // Opus 4.8 redacts it to empty, so an empty delta carries no
+            // content and surfaces as a non-rendering liveness signal
+            // (keeping the heartbeat alive through a long redacted block).
+            // Branching on emptiness — not on the model — keeps this correct
+            // across both models and any future shift in the server flag.
             let text = delta.get("thinking").and_then(Value::as_str).unwrap_or("");
             if text.is_empty() {
                 return ParseOutcome::Event(AdapterEvent::Liveness { turn_id });
@@ -924,10 +924,10 @@ mod tests {
 
     #[test]
     fn thinking_delta_empty_yields_liveness() {
-        // Thinking text is server-redacted to empty in `-p` mode today, so an
-        // empty thinking delta is not surfaced as content — but it is a sign the
-        // harness is alive, so it produces a non-rendering Liveness event to
-        // re-arm the frontend heartbeat.
+        // An empty thinking delta (Opus 4.8 redacts reasoning to "") is not
+        // surfaced as content — but it is a sign the harness is alive, so it
+        // produces a non-rendering Liveness event to re-arm the frontend
+        // heartbeat.
         let turn = tid();
         let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}}"#;
         match parse_one(line, turn) {
@@ -938,9 +938,8 @@ mod tests {
 
     #[test]
     fn thinking_delta_with_text_yields_thinking_chunk() {
-        // We do not depend on the redaction: if Claude ever streams real
-        // thinking text, it must flow through as `Thinking` content rather than
-        // being silently dropped.
+        // Non-empty reasoning (Sonnet 4.6 streams it; Opus 4.8 redacts) must
+        // flow through as `Thinking` content rather than being dropped.
         let turn = tid();
         let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"deliberating"}}}"#;
         match parse_one(line, turn) {

@@ -630,29 +630,39 @@ Resolved by the 2026-05-29 probe (Background + harness-behavior §7): Claude's r
 
 **Step 3 — Frontend: render `kind: "thinking"` distinctly (the main work).**
 
-> **Prerequisite — Markdown rendering lands first.** The Markdown plan
-> (`docs/implementation_plans/2026-05-26-markdown-rendering.md`) ships before this
-> milestone and converts the `{#if item.item_kind === "text"}` branch to render
-> through a content-agnostic `<Markdown>` primitive (covering both `text` and
-> `thinking` items, formatted identically for now). **This step builds on that,
-> not on the raw-text renderer.** Reuse `<Markdown>` for the reasoning body —
-> wrap it, do not replace it.
+> **Prerequisite — Markdown rendering has shipped (verified 2026-05-31).** The
+> Markdown plan (`docs/implementation_plans/2026-05-26-markdown-rendering.md`) is
+> merged and wired: `src/lib/components/ui/Markdown.svelte` exists and is tested,
+> and `UnifiedTranscript.svelte`'s `{#if item.item_kind === "text"}` branch
+> already renders both `text` and `thinking` items through `<Markdown>` (formatted
+> identically today — which is exactly why reasoning is indistinguishable from the
+> answer). **Proceed immediately; do not wait on or re-verify a prerequisite that
+> is already the present state.** (The markdown *plan doc* still reads
+> "Status: proposed" — trust the merged code, not the doc's status field.) Reuse
+> `<Markdown>` for the reasoning body — wrap it, do not replace it.
 
-In `UnifiedTranscript.svelte`'s `turnBody` snippet, the `{#if item.item_kind === "text"}` branch renders all text items through `<Markdown>` (after the Markdown plan). Add a sub-branch on `item.kind`:
+In `UnifiedTranscript.svelte`'s `turnBody` snippet, the `{#if item.item_kind === "text"}` branch renders all text items through `<Markdown>`. Add a sub-branch on `item.kind`:
 
 - `kind === "text"` → unchanged (answer prose through `<Markdown>`).
-- `kind === "thinking"` → a new **`ThinkingWidget.svelte`**, modeled on `ToolCallWidget.svelte`:
-  - Same `<details>`/`<summary>` disclosure, same `max-w-[600px]` + muted container styling.
+- `kind === "thinking"` → a new **`ThinkingWidget.svelte`**:
+  - The `<details>`/`<summary>` chrome (rotating chevron, `max-w-[600px]`, summary row) is extracted into a shared **`ui/Disclosure.svelte`** primitive that both `ThinkingWidget` (uncontrolled, collapsed-always) and `ToolCallWidget` (controlled, open-while-running) consume, so the disclosure affordance lives in one place rather than being hand-rolled twice.
   - **Collapsed by default and stays collapsed** — do *not* reuse ToolCallWidget's open-while-running behavior. Reasoning reaches us as a whole block (no harness delta-streams it), so there is nothing to watch build, and auto-opening would flash for whole-block emitters.
   - **Header (`<summary>`)**: a "Thinking" label where the tool name sits, a truncated single-line preview of the reasoning text (`min-w-0 truncate`), and a chevron — a glimpse without expanding.
-  - **Body**: the full reasoning through the shared `<Markdown>` primitive (prose — not the `<pre>` ToolCallWidget uses for command output).
+  - **Body**: the full reasoning through the shared `<Markdown>` primitive (prose — not the `<pre>` ToolCallWidget uses for command output), rendered via `<Markdown class="markdown-thinking">`. A scoped `app.css` rule mutes that variant (body **and** headings) so opened reasoning reads as subordinate — a bare `text-muted` wrapper is insufficient because `.markdown-body` hard-sets `color: var(--fg)` and overrides it.
   - Key constraint: visually distinct enough that the user can tell where reasoning ends and the answer begins.
 
-No changes to `types.ts`, `reducers.ts`, or `events.rs` enum variants are needed for the frontend. The only backend change in this milestone is the Gemini emission removal (Step 1).
+No changes to `types.ts`, `reducers.ts`, or `events.rs` enum *variants* are needed for the frontend (only the comments — see Step 4). The only backend change in this milestone is the Gemini emission removal (Step 1).
 
-**Step 4 — Correct stale doc comment.**
+**Step 3b — Exclude reasoning from copied prose (review 2026-05-31).** "Copy message" must copy the **answer only**, never the reasoning. `agentTurnText()` (and `columnText()`, which builds on it) in `UnifiedTranscript.svelte` currently joins every `item_kind === "text"` item — which includes `kind: "thinking"`, so once the widget lands a copy would silently prepend the model's private reasoning to the answer. Tighten the filter to `item_kind === "text" && kind === "text"`. One change to `agentTurnText` covers fan-out columns too. (Decided: reasoning is subordinate/private; do not copy it.)
 
-In `crates/harness/src/events.rs`, replace the `ContentKind::Thinking` doc comment ("Reserved; not currently emitted"). Describe what the variant means and the current reality: **Antigravity** emits it (live transcript tail); Gemini's disk-only emission was removed (Step 1); Claude's is server-redacted and Codex's encrypted (both unavailable). Keep it short — point to harness-behavior §3.2 for detail rather than duplicating it.
+**Step 4 — Correct stale doc comments (all three sites).**
+
+The "reserved / not currently emitted" claim is now false (Antigravity emits `Thinking` today) and appears in **three** places, not just `events.rs`:
+- `crates/harness/src/events.rs` — the `ContentKind::Thinking` doc comment, and the `ToolKind` `Plugin`/`Other` comment that cross-references it ("same forward-compat pattern as `ContentKind::Thinking`"). Rewrite the Thinking comment to the current reality; fix the cross-reference so it no longer points at the changed wording (`Plugin`/`Other` genuinely *are* still unemitted — keep that claim, just stop tying it to Thinking).
+- `src/lib/types.ts` — the `ContentKind` comment (and its `ToolKind` cross-reference).
+- `src/lib/state/types.ts` — the `TextChunk.kind` comment.
+
+Each should state the real contract briefly — `Thinking` **is** emitted (Antigravity, live + reopen); Gemini's disk-only emission removed (Step 1); Claude server-redacted / Codex encrypted (both unavailable) — and point to `harness-behavior.md §3.2` for per-harness detail rather than duplicating it.
 
 ### Definition of Done
 
@@ -661,7 +671,10 @@ In `crates/harness/src/events.rs`, replace the `ContentKind::Thinking` doc comme
 - **Claude recorded** in §3.2/§7 as **unavailable** — reasoning text server-redacted (probed @ 2.1.157; `showThinkingSummaries` tested-failed); tracked upstream regression with a re-probe-on-bump trigger. No code change. The #63147 resume-wedge is logged in §7 (verified not-exposed @ 2.1.157, both normal and cancel→resume paths).
 - **Codex recorded** in §3.2 — reasoning is encrypted/unrecoverable (class-D ceiling); no code change, no probe. (Seeded already; confirm it stays accurate.)
 - **Frontend rendering**: a `ThinkingWidget` renders thinking items **collapsed by default** with a header preview, distinct from the answer. Component test: a turn with a `thinking` item followed by a `text` item asserts (a) both render, (b) distinct `data-testid`s so thinking vs answer are distinguishable, (c) thinking does not bleed into the answer container, (d) the widget is collapsed by default.
-- **`events.rs` doc comment corrected** (per Step 4).
+- **Opened reasoning reads as subordinate**: the body routes through the `markdown-thinking` Markdown variant (muted body + headings via scoped CSS), not the overridden `text-muted` wrapper; a component test asserts the body carries that class.
+- **Disclosure chrome is shared**: `ui/Disclosure.svelte` backs both `ThinkingWidget` and `ToolCallWidget`; their existing disclosure tests (open-while-running, user-toggle persistence, collapsed-by-default) still pass.
+- **Copy excludes reasoning**: `agentTurnText` copies answer text only. Test: a turn with interleaved thinking + answer yields copy text containing only the answer.
+- **Stale comments corrected** (per Step 4) in `events.rs`, `src/lib/types.ts`, and `src/lib/state/types.ts`; the `events.rs` `ToolKind` cross-reference no longer points at the changed Thinking wording.
 - **Manual verification**: open an Antigravity project with thinking turns in `make dev` — confirm reasoning renders as a distinct collapsed widget, separate from the answer; expanding shows the Markdown body. Confirm a reopened Gemini project shows **no** reasoning block (emission removed). Claude/Codex surface nothing by design (§3.2).
 - **Open capture logged**: `[Thought: true]` handling is deferred in §5/§7.2 with the reason (not reproduced under the default config).
 

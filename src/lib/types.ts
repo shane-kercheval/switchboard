@@ -20,18 +20,20 @@ export type TurnOutcome =
   | { status: "failed"; kind: FailureKind; message: string }
   | { status: "cancelled"; source: CancelSource };
 
-// ContentChunk.kind discriminates rendering. `thinking` is emitted by adapters
-// that surface reasoning text (Antigravity, Gemini session files). Claude's
-// thinking text is server-redacted to empty today, so its reasoning normally
-// surfaces only as a non-rendering `liveness` event — but if that redaction is
-// lifted, non-empty thinking flows through as a `thinking` content chunk (the
-// Rust parser branches on emptiness). The renderer currently shows `thinking`
-// and `text` identically; distinct reasoning styling is follow-up work.
+// ContentChunk.kind discriminates rendering. `thinking` carries model reasoning,
+// rendered distinct from (and subordinate to) the answer (the `ThinkingWidget`).
+// Emitted today by Antigravity (live + on reopen). Gemini's reasoning is
+// disk-only and deliberately dropped (stale-on-reopen UX). Claude's thinking
+// text is server-redacted to empty, so its reasoning normally surfaces only as a
+// non-rendering `liveness` event — but if that redaction is lifted, non-empty
+// thinking flows through as a `thinking` content chunk (the Rust parser branches
+// on emptiness) and renders in the widget for free. See
+// docs/research/harness-behavior.md §3.2 for per-harness reality.
 export type ContentKind = "text" | "thinking";
 
 // ToolStarted.kind discriminates tool origin so the UI can label calls
 // without scraping the name. `plugin` and `other` are
-// reserved-but-not-currently-emitted (same pattern as ContentKind.thinking).
+// reserved-but-not-currently-emitted (a forward-compat pattern).
 export type ToolKind = "builtin" | "mcp" | "plugin" | "other";
 
 export type McpServerStatus = { name: string; status: string };

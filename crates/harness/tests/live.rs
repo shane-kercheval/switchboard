@@ -715,6 +715,72 @@ async fn live_gemini_resume_reuses_session() {
     );
 }
 
+#[tokio::test]
+#[ignore = "requires gemini installed — run with: make test-live"]
+async fn live_gemini_streamed_answer_completes_despite_trailing_error() {
+    // Gemini frequently (observed ~60% of runs on CLI 0.44.0, model auto)
+    // appends an empty/malformed trailing step after a complete answer,
+    // tainting the turn's `result.status` to `"error"`. This test pins the
+    // post-fix invariant: a turn that streamed a complete answer ALWAYS
+    // completes, regardless of whether the benign trailing error fired this
+    // run. It does NOT force the error (it's non-deterministic) — the
+    // deterministic proof of the rescue path is the fixture test
+    // `benign_trailing_error_fixture_completes_despite_result_error` in
+    // `gemini_adapter.rs`. A read-and-summarize prompt over a small file
+    // reliably triggers the tool-use shape where the quirk appears.
+    let tmp = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        tmp.path().join("hello.txt"),
+        "Hello, world! This is a tiny test file.",
+    )
+    .unwrap();
+
+    let adapter = GeminiAdapter::new();
+    let agent = live_gemini_agent();
+    let turn_id = Uuid::now_v7();
+
+    let stream = adapter
+        .dispatch(
+            &agent,
+            tmp.path(),
+            "Read and summarize the files in this directory in one short sentence.",
+            turn_id,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed with real gemini");
+
+    let events: Vec<AdapterEvent> = stream.collect().await;
+
+    let text: String = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::ContentChunk { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !text.trim().is_empty(),
+        "expected the model to stream a summary, got empty text"
+    );
+
+    let terminal = events
+        .iter()
+        .find(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+        .expect("should have a terminal TurnEnd");
+    assert!(
+        matches!(
+            terminal,
+            AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        ),
+        "a turn that streamed a complete answer must complete even if Gemini \
+         appended a benign trailing error, got: {terminal:?}"
+    );
+}
+
 // --- Antigravity live tests ---
 
 fn live_antigravity_agent() -> AgentRecord {

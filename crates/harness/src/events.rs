@@ -16,31 +16,32 @@ pub type MessageId = Uuid;
 
 /// Tells the reducer / UI which content rendering applies to a chunk.
 ///
-/// `Thinking` is emitted by adapters that surface reasoning text (e.g.
-/// Antigravity's planner records, Gemini session files). Claude's thinking text
-/// is server-redacted to empty in `-p` mode today, so the Claude adapter
-/// normally surfaces thinking only as a non-rendering [`AdapterEvent::Liveness`]
-/// signal — but if that redaction is lifted, its non-empty thinking flows
-/// through as `Thinking` content (see `parser.rs`). Note the frontend currently
-/// renders `Thinking` and `Text` identically (plain prose); distinct reasoning
-/// styling is follow-up work, so a redaction reversal would surface reasoning
-/// interleaved with the answer, not as a styled block. Per-harness reality lives
-/// in `docs/research/harness-behavior.md` §3.2.
+/// `Thinking` carries model reasoning text, rendered distinct from (and
+/// subordinate to) the answer (the frontend's `ThinkingWidget`). Whether a
+/// harness exposes reasoning text varies: Antigravity emits it (planner
+/// records, live + on reopen); Gemini writes it only to disk, so we deliberately
+/// drop it (reopened-only reasoning is stale UX); Claude's thinking text is
+/// server-redacted to empty in `-p` mode, so the Claude adapter surfaces it only
+/// as a non-rendering [`AdapterEvent::Liveness`] signal — if that redaction is
+/// lifted, its non-empty thinking flows through as `Thinking` content (see
+/// `parser.rs`) and renders in the widget for free; Codex encrypts it
+/// (unavailable). Per-harness reality lives in
+/// `docs/research/harness-behavior.md` §3.2.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ContentKind {
     /// User-facing assistant text.
     Text,
-    /// Model thinking/reasoning blocks (live reasoning text, where the harness
-    /// provides it).
+    /// Model reasoning blocks — live reasoning text where the harness provides
+    /// it (e.g. Antigravity's planner thinking).
     Thinking,
 }
 
 /// Discriminates tool origin so the UI can label calls (built-in tool vs MCP
 /// vs plugin) without scraping the name. `Plugin` and `Other` are reserved
-/// but not currently emitted — same forward-compat pattern as
-/// `ContentKind::Thinking`.
+/// but not currently emitted — a forward-compat pattern so future tool
+/// origins land without a wire-format break.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]

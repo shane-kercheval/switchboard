@@ -29,6 +29,25 @@ import type { Turn } from "./types";
 
 type AgentTurn = Extract<Turn, { role: "agent" }>;
 
+/// The canonical "answer prose" of an agent turn: its `text`-kind chunks joined,
+/// with tool calls AND reasoning (`kind: "thinking"`) excluded.
+///
+/// Use this for ANY "what is the response" extraction — copy today; forwarding
+/// one agent's reply into another's prompt, export, and search later. The trap
+/// it guards: `item_kind: "text"` spans both answer text and reasoning (the
+/// inner `kind` discriminates), so an ad-hoc `filter(item_kind === "text")` that
+/// forgets the inner `kind === "text"` check silently leaks the model's private
+/// reasoning into the response. Route every such consumer through here so that
+/// rule lives in exactly one place. See docs/research/harness-behavior.md §3.2.
+export function answerTextOf(turn: AgentTurn): string {
+  return turn.items
+    .filter((i) => i.item_kind === "text")
+    .filter((i) => i.kind === "text")
+    .map((i) => i.text)
+    .join("\n\n")
+    .trim();
+}
+
 /// One rendered row in the unified transcript.
 ///
 /// `agent_ids` on the user row is the recipient set — length 1 today

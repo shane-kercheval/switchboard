@@ -224,6 +224,22 @@ body {
   color: var(--fg);
   overflow-wrap: break-word;
 
+  /* Reasoning rendered in a Thinking disclosure: mute the whole body (incl.
+     headings, which the block below re-sets to `--fg`) so opened reasoning
+     reads as subordinate to the answer rather than competing with it. The
+     `:is()` keeps specificity above the bare `.markdown-body h1..h6` rule. */
+  &.markdown-thinking {
+    color: var(--muted);
+    /* Match the tool-call widget body (`text-xs`): reasoning is subordinate,
+       so it reads one step smaller than the answer prose. */
+    font-size: 0.75rem;
+    line-height: 1.125rem;
+
+    :is(h1, h2, h3, h4, h5, h6) {
+      color: var(--muted);
+    }
+  }
+
   > :first-child {
     margin-top: 0;
   }

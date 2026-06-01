@@ -49,6 +49,21 @@ const AUTH_FAILURE_SUBSTRINGS: &[&str] =
 pub const GEMINI_AUTH_MESSAGE: &str =
     "Gemini authentication required — run `gemini` interactively to sign in";
 
+/// Tail phrase that identifies Gemini's known-benign "streamed-then-error"
+/// quirk. Gemini frequently appends an empty/malformed trailing step *after*
+/// it has already streamed a complete answer; that step taints the turn's
+/// `result.status` to `"error"` even though the user got a full response. The
+/// real reason rides a standalone `type:"error"` event one line before the
+/// `result`, carrying this message.
+///
+/// We match the distinctive tail phrase (not the generic "invalid stream"
+/// prefix, which could front more serious failures) so the rescue is narrow.
+/// A narrow match fails safe: if Gemini ever changes this wording the match
+/// stops firing and such turns go back to being classified FAILED — never the
+/// reverse (a genuine failure silently shown as success because the phrase
+/// drifted into matching).
+const GEMINI_BENIGN_TRAILING_ERROR: &str = "empty response or malformed tool call";
+
 /// Substring that identifies Gemini's clean-logout shape on stderr
 /// (captured 2026-05-27: exit 41 with stderr "Please set an Auth method
 /// in your settings…", no stream-json). Case-insensitive match on the
@@ -70,6 +85,28 @@ pub struct GeminiParserState {
     /// tool that has no `ToolStarted` would render a phantom completion
     /// badge in the UI.
     filtered_tool_ids: HashSet<String>,
+    /// `true` once a non-empty assistant `message` chunk has been emitted.
+    /// Gates the benign streamed-then-error rescue in `parse_result`: the
+    /// user only got a complete answer if content actually streamed.
+    streamed_content: bool,
+    /// Message from the most-recent standalone `type:"error"` event (last-wins
+    /// if several precede the result). Gemini's terminal `result.status:"error"`
+    /// line often has no `error` field; the real reason rides this separate
+    /// event one line earlier. `parse_result` falls back to it so a failed turn
+    /// surfaces a real message.
+    last_error_message: Option<String>,
+}
+
+/// Return `true` if a Gemini error message is the known-benign
+/// "streamed-then-error" quirk (Gemini appends an empty/malformed trailing
+/// step after a complete answer). Matched case-insensitively on the
+/// distinctive tail phrase, not the generic prefix — see
+/// `GEMINI_BENIGN_TRAILING_ERROR` for the fail-safe rationale.
+#[must_use]
+fn is_benign_invalid_stream_error(message: &str) -> bool {
+    message
+        .to_lowercase()
+        .contains(GEMINI_BENIGN_TRAILING_ERROR)
 }
 
 /// Return `true` if the message looks like an auth failure. The two
@@ -99,10 +136,11 @@ pub fn parse_line(
 
     match value.get("type").and_then(Value::as_str) {
         Some("init") => parse_init(&value, agent_id),
-        Some("message") => parse_message(&value, turn_id),
+        Some("message") => parse_message(&value, turn_id, state),
         Some("tool_use") => parse_tool_use(&value, turn_id, state),
         Some("tool_result") => parse_tool_result(&value, turn_id, state),
-        Some("result") => parse_result(&value, turn_id),
+        Some("error") => parse_error_event(&value, state),
+        Some("result") => parse_result(&value, turn_id, state),
         Some(other) => {
             tracing::warn!(
                 event_type = other,
@@ -133,7 +171,7 @@ fn parse_init(obj: &Value, agent_id: AgentId) -> ParseOutcome {
     })
 }
 
-fn parse_message(obj: &Value, turn_id: TurnId) -> ParseOutcome {
+fn parse_message(obj: &Value, turn_id: TurnId, state: &mut GeminiParserState) -> ParseOutcome {
     let role = obj.get("role").and_then(Value::as_str).unwrap_or("");
     if role != "assistant" {
         // The `user` echo of the prompt is intentionally skipped; Switchboard
@@ -161,11 +199,26 @@ fn parse_message(obj: &Value, turn_id: TurnId) -> ParseOutcome {
     if text.is_empty() {
         return ParseOutcome::Skip;
     }
+    // Record that the user actually received answer content this turn. Gates
+    // the benign streamed-then-error rescue in `parse_result`.
+    state.streamed_content = true;
     ParseOutcome::Event(AdapterEvent::ContentChunk {
         turn_id,
         kind: ContentKind::Text,
         text,
     })
+}
+
+/// Capture a standalone `type:"error"` event. It emits nothing on its own —
+/// it's terminal-adjacent context that Gemini sometimes emits one line before
+/// a `result.status:"error"` whose own `error` field is absent. `parse_result`
+/// reads `state.last_error_message` to surface the real reason and to detect
+/// the known-benign streamed-then-error quirk.
+fn parse_error_event(obj: &Value, state: &mut GeminiParserState) -> ParseOutcome {
+    if let Some(message) = obj.get("message").and_then(Value::as_str) {
+        state.last_error_message = Some(message.to_owned());
+    }
+    ParseOutcome::Skip
 }
 
 fn parse_tool_use(obj: &Value, turn_id: TurnId, state: &mut GeminiParserState) -> ParseOutcome {
@@ -214,33 +267,13 @@ fn parse_tool_result(obj: &Value, turn_id: TurnId, state: &mut GeminiParserState
     })
 }
 
-fn parse_result(obj: &Value, turn_id: TurnId) -> ParseOutcome {
+fn parse_result(obj: &Value, turn_id: TurnId, state: &GeminiParserState) -> ParseOutcome {
     let status = obj.get("status").and_then(Value::as_str).unwrap_or("");
     let usage = extract_usage(obj.get("stats"));
     let outcome = if status == "success" {
         TurnOutcome::Completed
     } else {
-        let message = obj
-            .get("error")
-            .and_then(|e| e.get("message"))
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_owned();
-        // Deliberate scope: only `is_gemini_auth_failure_message` is checked
-        // here, not `is_gemini_logged_out_message`. The exit-41 logged-out
-        // shape is an EOF/stderr-only surface (no stream events emitted), so
-        // a stream `result:error` never carries the "Please set an Auth
-        // method" text in practice. Revisit if a future Gemini adds a
-        // `result.status:"error"` stream variant for logout.
-        let (kind, message) = if is_gemini_auth_failure_message(&message) {
-            // Author across all auth surfaces (stream, exit-41, exit-42) so the
-            // user sees one consistent actionable message — not the raw
-            // "401 Unauthorized" / etc. that vary by failure shape.
-            (FailureKind::AuthFailure, GEMINI_AUTH_MESSAGE.to_owned())
-        } else {
-            (FailureKind::HarnessError, message)
-        };
-        TurnOutcome::Failed { kind, message }
+        classify_result_failure(obj, state)
     };
     ParseOutcome::Event(AdapterEvent::TurnEnd {
         turn_id,
@@ -248,6 +281,60 @@ fn parse_result(obj: &Value, turn_id: TurnId) -> ParseOutcome {
         ended_at: chrono::Utc::now(),
         usage: Some(usage),
     })
+}
+
+/// Classify a non-success Gemini `result` into a `TurnOutcome`. Resolves the
+/// failure message (falling back to the captured standalone `type:"error"`
+/// event when the `result` line carries none), applies the benign
+/// streamed-then-error rescue, and otherwise classifies auth-vs-`HarnessError`.
+fn classify_result_failure(obj: &Value, state: &GeminiParserState) -> TurnOutcome {
+    // The `result` line's own `error.message` is often absent on the benign
+    // quirk; fall back to the standalone `type:"error"` event captured into
+    // `state.last_error_message` so the real reason surfaces instead of an
+    // empty FAILED chip.
+    let result_message = obj
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let message = if result_message.is_empty() {
+        state.last_error_message.clone().unwrap_or_default()
+    } else {
+        result_message
+    };
+
+    // Benign streamed-then-error rescue: Gemini frequently appends an
+    // empty/malformed trailing step *after* a complete answer, tainting the
+    // turn's status to `"error"`. If answer content actually streamed and the
+    // failure carries this specific known-benign signature, the user got a
+    // complete response — treat the turn as Completed rather than flashing a
+    // misleading FAILED chip.
+    //
+    // RESIDUAL RISK: a turn that genuinely failed *after* streaming only
+    // partial content, emitting this same benign signature, would be shown as
+    // success. Accepted trade vs. a misleading FAILED chip on every other
+    // complete turn. The match is narrow (distinctive tail phrase, not the
+    // generic prefix) and gated on `streamed_content`.
+    if state.streamed_content && is_benign_invalid_stream_error(&message) {
+        return TurnOutcome::Completed;
+    }
+
+    // Deliberate scope: only `is_gemini_auth_failure_message` is checked here,
+    // not `is_gemini_logged_out_message`. The exit-41 logged-out shape is an
+    // EOF/stderr-only surface (no stream events emitted), so a stream
+    // `result:error` never carries the "Please set an Auth method" text in
+    // practice. Revisit if a future Gemini adds a `result.status:"error"`
+    // stream variant for logout.
+    let (kind, message) = if is_gemini_auth_failure_message(&message) {
+        // Author across all auth surfaces (stream, exit-41, exit-42) so the
+        // user sees one consistent actionable message — not the raw
+        // "401 Unauthorized" / etc. that vary by failure shape.
+        (FailureKind::AuthFailure, GEMINI_AUTH_MESSAGE.to_owned())
+    } else {
+        (FailureKind::HarnessError, message)
+    };
+    TurnOutcome::Failed { kind, message }
 }
 
 /// Map Gemini's `result.stats` shape into Switchboard's `TurnUsage`.
@@ -568,5 +655,163 @@ mod tests {
             parse_line(line, turn_id(), agent_id(), &mut s),
             ParseOutcome::Error(_)
         ));
+    }
+
+    #[test]
+    fn parse_error_event_captures_message_into_state() {
+        let line = r#"{"type":"error","severity":"error","message":"Invalid stream: The model returned an empty response or malformed tool call."}"#;
+        let mut s = GeminiParserState::default();
+        assert!(matches!(
+            parse_line(line, turn_id(), agent_id(), &mut s),
+            ParseOutcome::Skip
+        ));
+        assert_eq!(
+            s.last_error_message.as_deref(),
+            Some("Invalid stream: The model returned an empty response or malformed tool call.")
+        );
+    }
+
+    #[test]
+    fn message_less_error_event_does_not_clobber_prior_capture() {
+        // A message-bearing error captures the reason; a later message-less
+        // error event must leave it intact (don't blank the real reason that
+        // `parse_result` falls back to).
+        let mut s = GeminiParserState::default();
+        let _ = parse_line(
+            r#"{"type":"error","message":"the real reason"}"#,
+            turn_id(),
+            agent_id(),
+            &mut s,
+        );
+        let _ = parse_line(
+            r#"{"type":"error","severity":"error"}"#,
+            turn_id(),
+            agent_id(),
+            &mut s,
+        );
+        assert_eq!(s.last_error_message.as_deref(), Some("the real reason"));
+    }
+
+    #[test]
+    fn message_less_error_event_stays_none_when_nothing_captured() {
+        let mut s = GeminiParserState::default();
+        assert!(matches!(
+            parse_line(r#"{"type":"error"}"#, turn_id(), agent_id(), &mut s),
+            ParseOutcome::Skip
+        ));
+        assert!(s.last_error_message.is_none());
+    }
+
+    #[test]
+    fn benign_trailing_error_after_streamed_content_completes_the_turn() {
+        // The full answer streamed first; the trailing benign error must not
+        // taint the turn — the user got a complete response.
+        let mut s = GeminiParserState::default();
+        let _ = parse_line(
+            r#"{"type":"message","role":"assistant","content":"full answer","delta":true}"#,
+            turn_id(),
+            agent_id(),
+            &mut s,
+        );
+        let _ = parse_line(
+            r#"{"type":"error","severity":"error","message":"Invalid stream: The model returned an empty response or malformed tool call."}"#,
+            turn_id(),
+            agent_id(),
+            &mut s,
+        );
+        match parse_line(
+            r#"{"type":"result","status":"error","stats":{}}"#,
+            turn_id(),
+            agent_id(),
+            &mut s,
+        ) {
+            ParseOutcome::Event(AdapterEvent::TurnEnd { outcome, .. }) => {
+                assert!(
+                    matches!(outcome, TurnOutcome::Completed),
+                    "benign trailing error after streamed content must complete, got {outcome:?}"
+                );
+            }
+            other => panic!("expected TurnEnd, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn benign_trailing_error_without_streamed_content_fails_with_captured_message() {
+        // No answer streamed → the rescue must NOT fire. The turn fails, but
+        // the captured standalone error message surfaces (was empty before).
+        let mut s = GeminiParserState::default();
+        let _ = parse_line(
+            r#"{"type":"error","severity":"error","message":"Invalid stream: The model returned an empty response or malformed tool call."}"#,
+            turn_id(),
+            agent_id(),
+            &mut s,
+        );
+        match parse_line(
+            r#"{"type":"result","status":"error","stats":{}}"#,
+            turn_id(),
+            agent_id(),
+            &mut s,
+        ) {
+            ParseOutcome::Event(AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Failed { kind, message },
+                ..
+            }) => {
+                assert_eq!(kind, FailureKind::HarnessError);
+                assert!(
+                    message.contains("empty response or malformed tool call"),
+                    "captured standalone error message must surface, got {message:?}"
+                );
+            }
+            other => panic!("expected Failed TurnEnd, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn genuine_error_after_streamed_content_still_fails() {
+        // A non-benign error after streamed content must remain Failed — the
+        // rescue is narrow and must not fire on arbitrary trailing errors.
+        let mut s = GeminiParserState::default();
+        let _ = parse_line(
+            r#"{"type":"message","role":"assistant","content":"partial","delta":true}"#,
+            turn_id(),
+            agent_id(),
+            &mut s,
+        );
+        let line = r#"{"type":"result","status":"error","error":{"message":"[API Error: Requested entity was not found.]"},"stats":{}}"#;
+        match parse_line(line, turn_id(), agent_id(), &mut s) {
+            ParseOutcome::Event(AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Failed { kind, message },
+                ..
+            }) => {
+                assert_eq!(kind, FailureKind::HarnessError);
+                assert!(message.contains("Requested entity was not found"));
+            }
+            other => panic!("expected Failed TurnEnd, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auth_error_after_streamed_content_still_classifies_as_auth_failure() {
+        // Regression guard: the benign rescue must not shadow auth
+        // classification. An auth-substring error stays AuthFailure even when
+        // content streamed first.
+        let mut s = GeminiParserState::default();
+        let _ = parse_line(
+            r#"{"type":"message","role":"assistant","content":"hi","delta":true}"#,
+            turn_id(),
+            agent_id(),
+            &mut s,
+        );
+        let line = r#"{"type":"result","status":"error","error":{"message":"[API Error: 401 Unauthorized]"},"stats":{}}"#;
+        match parse_line(line, turn_id(), agent_id(), &mut s) {
+            ParseOutcome::Event(AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Failed { kind, message },
+                ..
+            }) => {
+                assert_eq!(kind, FailureKind::AuthFailure);
+                assert_eq!(message, GEMINI_AUTH_MESSAGE);
+            }
+            other => panic!("expected Failed(AuthFailure) TurnEnd, got {other:?}"),
+        }
     }
 }

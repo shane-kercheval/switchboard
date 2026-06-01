@@ -14,6 +14,10 @@
   import type { Snippet } from "svelte";
 
   type Props = {
+    /// Controlled open state. Pass this ONLY together with `ontoggle` —
+    /// supplying `open` without `ontoggle` suppresses the native toggle but has
+    /// no callback to flip the state, locking the panel open or shut. Omit both
+    /// for uncontrolled (native-toggle) mode.
     open?: boolean;
     ontoggle?: () => void;
     testid?: string;
@@ -28,6 +32,12 @@
 
   function onsummaryclick(event: Event): void {
     if (!controlled) return;
+    // Controlled mode requires `ontoggle`; without it the suppressed native
+    // toggle leaves the panel stuck. Surface that loudly in dev rather than
+    // letting a new consumer ship a frozen panel.
+    if (import.meta.env.DEV && !ontoggle) {
+      console.error("Disclosure: `open` was passed without `ontoggle` — the panel will be stuck");
+    }
     // preventDefault stops the native toggle from double-applying on top of the
     // consumer-driven `open`.
     event.preventDefault();

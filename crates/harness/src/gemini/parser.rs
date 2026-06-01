@@ -89,10 +89,11 @@ pub struct GeminiParserState {
     /// Gates the benign streamed-then-error rescue in `parse_result`: the
     /// user only got a complete answer if content actually streamed.
     streamed_content: bool,
-    /// Message captured from a standalone `type:"error"` event. Gemini's
-    /// terminal `result.status:"error"` line often has no `error` field; the
-    /// real reason rides this separate event one line earlier. `parse_result`
-    /// falls back to it so a failed turn surfaces a real message.
+    /// Message from the most-recent standalone `type:"error"` event (last-wins
+    /// if several precede the result). Gemini's terminal `result.status:"error"`
+    /// line often has no `error` field; the real reason rides this separate
+    /// event one line earlier. `parse_result` falls back to it so a failed turn
+    /// surfaces a real message.
     last_error_message: Option<String>,
 }
 
@@ -668,6 +669,37 @@ mod tests {
             s.last_error_message.as_deref(),
             Some("Invalid stream: The model returned an empty response or malformed tool call.")
         );
+    }
+
+    #[test]
+    fn message_less_error_event_does_not_clobber_prior_capture() {
+        // A message-bearing error captures the reason; a later message-less
+        // error event must leave it intact (don't blank the real reason that
+        // `parse_result` falls back to).
+        let mut s = GeminiParserState::default();
+        let _ = parse_line(
+            r#"{"type":"error","message":"the real reason"}"#,
+            turn_id(),
+            agent_id(),
+            &mut s,
+        );
+        let _ = parse_line(
+            r#"{"type":"error","severity":"error"}"#,
+            turn_id(),
+            agent_id(),
+            &mut s,
+        );
+        assert_eq!(s.last_error_message.as_deref(), Some("the real reason"));
+    }
+
+    #[test]
+    fn message_less_error_event_stays_none_when_nothing_captured() {
+        let mut s = GeminiParserState::default();
+        assert!(matches!(
+            parse_line(r#"{"type":"error"}"#, turn_id(), agent_id(), &mut s),
+            ParseOutcome::Skip
+        ));
+        assert!(s.last_error_message.is_none());
     }
 
     #[test]

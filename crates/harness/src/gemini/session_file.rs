@@ -1045,8 +1045,8 @@ mod tests {
     #[test]
     fn parse_ignores_thoughts_but_keeps_answer_and_token_telemetry() {
         // Gemini writes reasoning (`thoughts`) only to disk, never to the live
-        // stream, so we deliberately do not surface it (stale-on-reopen UX —
-        // M4.10). The answer text and token usage must still come through.
+        // stream, so we deliberately do not surface it (stale-on-reopen UX).
+        // The answer text and token usage must still come through.
         let session_id = Uuid::parse_str("00000000-0000-4000-8000-0000000000bb").unwrap();
         let body = format!(
             r#"{{"sessionId":"{session_id}","kind":"main","startTime":"2026-05-18T00:00:00Z"}}

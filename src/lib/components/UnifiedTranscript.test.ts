@@ -1123,6 +1123,74 @@ describe("UnifiedTranscript — per-message copy", () => {
     expect(copyTextMock).toHaveBeenCalledWith("Here is **step one**\n\nand step two.");
   });
 
+  it("renders a thinking item as a distinct collapsed widget, separate from the answer", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "agent-thinking",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:00Z",
+        status: "complete",
+        items: [
+          { item_kind: "text", kind: "thinking", text: "secret reasoning" },
+          { item_kind: "text", kind: "text", text: "Final answer" },
+        ],
+      },
+    ];
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+
+    // Both render, via distinct containers.
+    const thinking = screen.getByTestId("turn-thinking");
+    expect(thinking).toBeInTheDocument();
+    expect(screen.getByText("Final answer")).toBeInTheDocument();
+
+    // Collapsed by default.
+    expect((thinking as HTMLDetailsElement).open).toBe(false);
+
+    // Reasoning lives in the thinking widget's body, not the answer container.
+    expect(screen.getByTestId("thinking-body").textContent).toContain("secret reasoning");
+    expect(thinking.textContent).not.toContain("Final answer");
+    // The body renders through the muted Markdown variant so opened reasoning
+    // reads as subordinate (the bare `.markdown-body` color matches the answer).
+    expect(
+      screen.getByTestId("thinking-body").querySelector(".markdown-body.markdown-thinking"),
+    ).not.toBeNull();
+  });
+
+  it("excludes reasoning from the copied answer text", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "agent-copy-thinking",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:00Z",
+        status: "complete",
+        items: [
+          { item_kind: "text", kind: "thinking", text: "secret reasoning" },
+          { item_kind: "text", kind: "text", text: "Answer text" },
+        ],
+      },
+    ];
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+    copyTextMock.mockClear();
+
+    const turn = screen.getByTestId("turn");
+    const copy = turn.querySelector('[data-testid="message-copy"]');
+    if (!copy) throw new Error("expected a copy button on the agent message");
+    await fireEvent.click(copy);
+
+    // Only the answer is copied; the reasoning is omitted.
+    expect(copyTextMock).toHaveBeenCalledWith("Answer text");
+  });
+
   it("shows a timestamp (titled with the ISO start) on each message", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);

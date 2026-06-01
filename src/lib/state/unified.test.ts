@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 import type { ConversationItem } from "$lib/types";
-import { buildUnifiedRows, groupRenderBlocks, type RenderBlock, type UnifiedRow } from "./unified";
+import {
+  answerTextOf,
+  buildUnifiedRows,
+  groupRenderBlocks,
+  type RenderBlock,
+  type UnifiedRow,
+} from "./unified";
 import type { Turn } from "./types";
 
 const AGENT_A = "00000000-0000-7000-8000-000000000aaa";
@@ -36,6 +42,48 @@ function agentTurn(turnId: string, agentId: string, startedAt: string, sendId?: 
     items: [],
   };
 }
+
+describe("answerTextOf", () => {
+  it("joins answer text and excludes reasoning + tool calls", () => {
+    const turn: Extract<Turn, { role: "agent" }> = {
+      role: "agent",
+      turn_id: TURN_1,
+      agent_id: AGENT_A,
+      started_at: "2026-05-16T00:00:00Z",
+      status: "complete",
+      items: [
+        { item_kind: "text", kind: "thinking", text: "private reasoning" },
+        { item_kind: "text", kind: "text", text: "Step one." },
+        {
+          item_kind: "tool",
+          tool_use_id: "t1",
+          kind: "builtin",
+          name: "Bash",
+          input: {},
+          output: "tool output",
+          is_error: false,
+          started_at: "2026-05-16T00:00:01Z",
+          completed_at: "2026-05-16T00:00:02Z",
+        },
+        { item_kind: "text", kind: "text", text: "Step two." },
+      ],
+    };
+    // Only the answer prose, joined — no reasoning, no tool output.
+    expect(answerTextOf(turn)).toBe("Step one.\n\nStep two.");
+  });
+
+  it("returns empty string for a reasoning-only / tool-only turn", () => {
+    const turn: Extract<Turn, { role: "agent" }> = {
+      role: "agent",
+      turn_id: TURN_1,
+      agent_id: AGENT_A,
+      started_at: "2026-05-16T00:00:00Z",
+      status: "complete",
+      items: [{ item_kind: "text", kind: "thinking", text: "just thinking" }],
+    };
+    expect(answerTextOf(turn)).toBe("");
+  });
+});
 
 describe("buildUnifiedRows", () => {
   it("renders a live user turn as a length-1 agent_ids row (M4.7-ready shape)", () => {

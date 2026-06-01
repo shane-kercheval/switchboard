@@ -382,16 +382,9 @@ struct GeminiAgentBuilder {
 struct GeminiRecord {
     id: String,
     content: String,
-    thoughts: Vec<GeminiThought>,
     tool_calls: Vec<GeminiToolCall>,
     usage: Option<TurnUsage>,
     model: Option<String>,
-}
-
-#[derive(Clone)]
-struct GeminiThought {
-    subject: String,
-    description: String,
 }
 
 #[derive(Clone)]
@@ -507,12 +500,10 @@ impl GeminiReconstruction {
                     text: record.content.clone(),
                 });
             }
-            for thought in &record.thoughts {
-                items.push(TurnItem::Text {
-                    kind: ContentKind::Thinking,
-                    text: format!("{}\n{}", thought.subject, thought.description),
-                });
-            }
+            // Gemini's reasoning (`thoughts`) is intentionally NOT surfaced: it
+            // is written only to the session file, never to the live stream, so
+            // rendering it would show after-the-fact reasoning that only appears
+            // on reopen — stale UX. See docs/research/harness-behavior.md §3.2.
             for tc in &record.tool_calls {
                 if GEMINI_INTERNAL_TOOL_NAMES.contains(&tc.name.as_str()) {
                     continue;
@@ -584,34 +575,6 @@ fn parse_gemini_record(id: &str, record: &Value) -> GeminiRecord {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_owned();
-    let thoughts = record
-        .get("thoughts")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|t| {
-                    let subject = t
-                        .get("subject")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_owned();
-                    let description = t
-                        .get("description")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_owned();
-                    if subject.is_empty() && description.is_empty() {
-                        None
-                    } else {
-                        Some(GeminiThought {
-                            subject,
-                            description,
-                        })
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default();
     let tool_calls = record
         .get("toolCalls")
         .and_then(Value::as_array)
@@ -625,7 +588,6 @@ fn parse_gemini_record(id: &str, record: &Value) -> GeminiRecord {
     GeminiRecord {
         id: id.to_owned(),
         content,
-        thoughts,
         tool_calls,
         usage,
         model,
@@ -1081,7 +1043,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_surfaces_thoughts_as_thinking_items() {
+    fn parse_ignores_thoughts_but_keeps_answer_and_token_telemetry() {
+        // Gemini writes reasoning (`thoughts`) only to disk, never to the live
+        // stream, so we deliberately do not surface it (stale-on-reopen UX —
+        // M4.10). The answer text and token usage must still come through.
         let session_id = Uuid::parse_str("00000000-0000-4000-8000-0000000000bb").unwrap();
         let body = format!(
             r#"{{"sessionId":"{session_id}","kind":"main","startTime":"2026-05-18T00:00:00Z"}}
@@ -1089,7 +1054,7 @@ mod tests {
 {{"id":"g1","timestamp":"2026-05-18T00:00:02Z","type":"gemini","content":"reply","thoughts":[{{"subject":"plan","description":"do the thing"}}],"tokens":{{"input":1,"output":1,"cached":0}},"model":"gemini-3-flash-preview"}}"#
         );
         let t = parse_gemini_transcript_content(&body, agent_id());
-        let Turn::Agent { items, .. } = t
+        let Turn::Agent { items, usage, .. } = t
             .turns
             .iter()
             .find(|turn| matches!(turn, Turn::Agent { .. }))
@@ -1097,18 +1062,33 @@ mod tests {
         else {
             unreachable!();
         };
-        let thinking = items
-            .iter()
-            .find_map(|item| match item {
+        // The thought is not surfaced as a Thinking item...
+        assert!(
+            !items.iter().any(|item| matches!(
+                item,
                 TurnItem::Text {
                     kind: ContentKind::Thinking,
+                    ..
+                }
+            )),
+            "gemini thoughts must not surface as Thinking items"
+        );
+        // ...but the answer text still does.
+        let texts: Vec<&str> = items
+            .iter()
+            .filter_map(|item| match item {
+                TurnItem::Text {
+                    kind: ContentKind::Text,
                     text,
                 } => Some(text.as_str()),
                 _ => None,
             })
-            .expect("thinking item present");
-        assert!(thinking.contains("plan"));
-        assert!(thinking.contains("do the thing"));
+            .collect();
+        assert_eq!(texts, vec!["reply"]);
+        // Token telemetry is independent of thoughts and still flows through.
+        let usage = usage.as_ref().expect("usage present");
+        assert_eq!(usage.input_tokens, 1);
+        assert_eq!(usage.output_tokens, 1);
     }
 
     #[test]

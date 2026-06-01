@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { ToolCall } from "$lib/state/index.svelte";
+  import Disclosure from "$lib/components/ui/Disclosure.svelte";
   import Badge from "$lib/components/ui/Badge.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
   import { cn } from "$lib/utils";
@@ -9,15 +10,12 @@
   const isRunning = $derived(tool.completed_at === undefined);
   const hasOutput = $derived(tool.output !== undefined && tool.output !== "");
 
-  // Disclosure: by default open while running (so streaming output is visible)
-  // and collapsed once done. A manual toggle (`userOpen`) takes over from then
-  // on, so completion won't yank a panel the user opened shut.
+  // Open while running (so streaming output is visible) and collapsed once done.
+  // A manual toggle (`userOpen`) takes over from then on, so completion won't
+  // yank a panel the user opened shut.
   let userOpen = $state<boolean | null>(null);
   const open = $derived(userOpen ?? isRunning);
-  function toggle(event: Event): void {
-    // Drive `open` ourselves so a user choice survives the running→complete
-    // transition; preventDefault stops the native toggle from double-applying.
-    event.preventDefault();
+  function toggle(): void {
     userOpen = !open;
   }
 
@@ -28,22 +26,8 @@
   }
 </script>
 
-<!-- Width-capped so wide tool I/O (long command lines, JSON blobs) doesn't
-     sprawl the full transcript width and hurt readability. -->
-<details
-  class="bg-panel/35 group/tool max-w-[600px] rounded-md text-xs"
-  data-testid="turn-tool"
-  data-tool-use-id={tool.tool_use_id}
-  {open}
->
-  <summary
-    class="text-fg flex min-h-8 cursor-pointer list-none items-center gap-2 px-2.5 py-1.5 marker:hidden"
-    onclick={toggle}
-  >
-    <span
-      class="text-muted flex h-4 w-4 shrink-0 items-center justify-center transition-transform group-open/tool:rotate-90"
-      aria-hidden="true">›</span
-    >
+<Disclosure {open} ontoggle={toggle} testid="turn-tool" data-tool-use-id={tool.tool_use_id}>
+  {#snippet header()}
     {#if tool.kind === "builtin" || tool.kind === "other"}
       <span class="text-muted shrink-0 text-[10px] font-semibold tracking-wide uppercase"
         >{kindLabel(tool.kind)}</span
@@ -93,7 +77,7 @@
         <path d="m8.5 12 2.5 2.5 4.5-5" />
       </svg>
     {/if}
-  </summary>
+  {/snippet}
 
   {#if hasOutput}
     <div class="border-border/70 border-t px-2.5 py-2">
@@ -104,4 +88,4 @@
         )}>{tool.output}</pre>
     </div>
   {/if}
-</details>
+</Disclosure>

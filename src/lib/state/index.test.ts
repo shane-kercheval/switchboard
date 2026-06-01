@@ -223,8 +223,9 @@ describe("heartbeat orchestration", () => {
   });
 
   it("re-arms on liveness (thinking keepalive) for the tracked turn", async () => {
-    // A long Claude thinking block emits only `liveness` (redacted thinking
-    // deltas); it must keep the turn alive the same way tool events do.
+    // A long redacted Claude thinking block (Opus 4.8) emits only `liveness`
+    // (redacted thinking deltas); it must keep the turn alive the same way tool
+    // events do.
     vi.useFakeTimers({ shouldAdvanceTime: true });
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));

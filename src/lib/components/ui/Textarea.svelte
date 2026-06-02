@@ -4,12 +4,14 @@
 
   type Props = HTMLTextareaAttributes & {
     value?: string;
+    ref?: HTMLTextAreaElement;
   };
 
-  let { class: className, value = $bindable(""), ...rest }: Props = $props();
+  let { class: className, value = $bindable(""), ref = $bindable(), ...rest }: Props = $props();
 </script>
 
 <textarea
+  bind:this={ref}
   bind:value
   class={cn(
     "border-border bg-raised w-full resize-none rounded-md border px-3 py-2 text-sm",

@@ -206,6 +206,16 @@ pub enum AppError {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync + 'static>,
     },
+
+    /// Project-file search could not walk the loaded project tree. The
+    /// frontend degrades this to "File search unavailable" instead of showing
+    /// an empty result set that looks authoritative.
+    #[error("failed to search project files under {root}: {source}")]
+    ProjectFileSearch {
+        root: PathBuf,
+        #[source]
+        source: ignore::Error,
+    },
 }
 
 impl AppError {

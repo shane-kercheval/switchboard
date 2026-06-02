@@ -1,6 +1,14 @@
 import { describe, expect, it } from "vitest";
 import type { ConversationItem } from "$lib/types";
-import { buildUnifiedRows, groupRenderBlocks, type RenderBlock, type UnifiedRow } from "./unified";
+import {
+  answerTextOf,
+  buildUnifiedRows,
+  copyTextOf,
+  groupRenderBlocks,
+  lastAnswerTextOf,
+  type RenderBlock,
+  type UnifiedRow,
+} from "./unified";
 import type { Turn } from "./types";
 
 const AGENT_A = "00000000-0000-7000-8000-000000000aaa";
@@ -36,6 +44,152 @@ function agentTurn(turnId: string, agentId: string, startedAt: string, sendId?: 
     items: [],
   };
 }
+
+describe("answerTextOf", () => {
+  it("joins answer text and excludes reasoning + tool calls", () => {
+    const turn: Extract<Turn, { role: "agent" }> = {
+      role: "agent",
+      turn_id: TURN_1,
+      agent_id: AGENT_A,
+      started_at: "2026-05-16T00:00:00Z",
+      status: "complete",
+      items: [
+        { item_kind: "text", kind: "thinking", text: "private reasoning" },
+        { item_kind: "text", kind: "text", text: "Step one." },
+        {
+          item_kind: "tool",
+          tool_use_id: "t1",
+          kind: "builtin",
+          name: "Bash",
+          input: {},
+          output: "tool output",
+          is_error: false,
+          started_at: "2026-05-16T00:00:01Z",
+          completed_at: "2026-05-16T00:00:02Z",
+        },
+        { item_kind: "text", kind: "text", text: "Step two." },
+      ],
+    };
+    // Only the answer prose, joined — no reasoning, no tool output.
+    expect(answerTextOf(turn)).toBe("Step one.\n\nStep two.");
+  });
+
+  it("removes blank outer lines from each answer block before joining", () => {
+    const turn: Extract<Turn, { role: "agent" }> = {
+      role: "agent",
+      turn_id: TURN_1,
+      agent_id: AGENT_A,
+      started_at: "2026-05-16T00:00:00Z",
+      status: "complete",
+      items: [
+        { item_kind: "text", kind: "text", text: "\n\nStep one.\n\n" },
+        { item_kind: "text", kind: "thinking", text: "private reasoning" },
+        { item_kind: "text", kind: "text", text: "\n\nStep two.\n\n" },
+      ],
+    };
+    expect(answerTextOf(turn)).toBe("Step one.\n\nStep two.");
+  });
+
+  it("preserves indentation and trailing spaces on meaningful lines", () => {
+    const turn: Extract<Turn, { role: "agent" }> = {
+      role: "agent",
+      turn_id: TURN_1,
+      agent_id: AGENT_A,
+      started_at: "2026-05-16T00:00:00Z",
+      status: "complete",
+      items: [
+        {
+          item_kind: "text",
+          kind: "text",
+          text: "\n\n    indented code  \n    still indented\n\n",
+        },
+      ],
+    };
+    expect(answerTextOf(turn)).toBe("    indented code  \n    still indented");
+  });
+
+  it("returns empty string for a reasoning-only / tool-only turn", () => {
+    const turn: Extract<Turn, { role: "agent" }> = {
+      role: "agent",
+      turn_id: TURN_1,
+      agent_id: AGENT_A,
+      started_at: "2026-05-16T00:00:00Z",
+      status: "complete",
+      items: [{ item_kind: "text", kind: "thinking", text: "just thinking" }],
+    };
+    expect(answerTextOf(turn)).toBe("");
+  });
+});
+
+describe("lastAnswerTextOf", () => {
+  it("returns only the final non-empty answer text block", () => {
+    const turn: Extract<Turn, { role: "agent" }> = {
+      role: "agent",
+      turn_id: TURN_1,
+      agent_id: AGENT_A,
+      started_at: "2026-05-16T00:00:00Z",
+      status: "complete",
+      items: [
+        { item_kind: "text", kind: "text", text: "Step one." },
+        {
+          item_kind: "tool",
+          tool_use_id: "t1",
+          kind: "builtin",
+          name: "Bash",
+          input: {},
+          output: "tool output",
+          is_error: false,
+          started_at: "2026-05-16T00:00:01Z",
+          completed_at: "2026-05-16T00:00:02Z",
+        },
+        { item_kind: "text", kind: "text", text: "Step two." },
+      ],
+    };
+    expect(lastAnswerTextOf(turn)).toBe("Step two.");
+  });
+
+  it("scans backward past thinking, tools, and blank answer blocks", () => {
+    const turn: Extract<Turn, { role: "agent" }> = {
+      role: "agent",
+      turn_id: TURN_1,
+      agent_id: AGENT_A,
+      started_at: "2026-05-16T00:00:00Z",
+      status: "complete",
+      items: [
+        { item_kind: "text", kind: "text", text: "Useful answer" },
+        { item_kind: "text", kind: "text", text: " \n " },
+        { item_kind: "text", kind: "thinking", text: "private reasoning" },
+        {
+          item_kind: "tool",
+          tool_use_id: "t1",
+          kind: "builtin",
+          name: "Bash",
+          input: {},
+          started_at: "2026-05-16T00:00:01Z",
+        },
+      ],
+    };
+    expect(lastAnswerTextOf(turn)).toBe("Useful answer");
+  });
+});
+
+describe("copyTextOf", () => {
+  it("copyTextOf dispatches by copy mode", () => {
+    const turn: Extract<Turn, { role: "agent" }> = {
+      role: "agent",
+      turn_id: TURN_1,
+      agent_id: AGENT_A,
+      started_at: "2026-05-16T00:00:00Z",
+      status: "complete",
+      items: [
+        { item_kind: "text", kind: "text", text: "Step one." },
+        { item_kind: "text", kind: "text", text: "Step two." },
+      ],
+    };
+    expect(copyTextOf(turn, "full_answer")).toBe("Step one.\n\nStep two.");
+    expect(copyTextOf(turn, "last_answer_block")).toBe("Step two.");
+  });
+});
 
 describe("buildUnifiedRows", () => {
   it("renders a live user turn as a length-1 agent_ids row (M4.7-ready shape)", () => {

@@ -17,7 +17,7 @@
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import { cn } from "$lib/utils";
   import { shortcut } from "$lib/platform";
-  import { untrack } from "svelte";
+  import { onDestroy, untrack } from "svelte";
 
   let { projectId, agents }: { projectId: ProjectId; agents: AgentRecord[] } = $props();
 
@@ -32,6 +32,8 @@
   let prompt = $state<string>(saved.draft);
   let sendError = $state<string | null>(null);
   let composeEl = $state<HTMLDivElement | undefined>(undefined);
+  let inputWrapEl = $state<HTMLDivElement | undefined>(undefined);
+  let textareaEl = $state<HTMLTextAreaElement | undefined>(undefined);
 
   /// Recipient set — every agent is shown as a toggle chip (click to add/drop);
   /// `@name` is the keyboard path to the same toggle. Sticky across sends, and
@@ -55,6 +57,18 @@
     return [roster[0]!.id];
   }
 
+  function resizeTextarea(textarea: HTMLTextAreaElement | undefined, _draft: string): void {
+    if (textarea === undefined) return;
+    textarea.style.height = "auto";
+    const naturalHeight = textarea.scrollHeight;
+    const maxHeight = Number.parseFloat(getComputedStyle(textarea).maxHeight);
+    const cappedHeight = Number.isFinite(maxHeight)
+      ? Math.min(naturalHeight, maxHeight)
+      : naturalHeight;
+    textarea.style.height = `${cappedHeight}px`;
+    textarea.style.overflowY = naturalHeight > cappedHeight ? "auto" : "hidden";
+  }
+
   // Drop any selected ids whose agent disappeared (agent removed at runtime).
   $effect(() => {
     const valid = selectedIds.filter((id) => agents.some((a) => a.id === id));
@@ -66,6 +80,11 @@
   // can't be resurrected by a deferred write.
   $effect(() => {
     setDraft(projectId, prompt);
+  });
+  // Track both the draft and bound textarea: draft changes resize the box, and
+  // the ref change performs the initial resize once the DOM node is available.
+  $effect(() => {
+    resizeTextarea(textareaEl, prompt);
   });
   // The parent unmounts this bar the moment a project loses its last agent (it
   // falls back to the roster-loading / first-agent screen), so an empty roster
@@ -132,10 +151,19 @@
   let menuOpen = $state(false);
   let menuEl = $state<HTMLDivElement | undefined>(undefined);
   let menuQuery = $state("");
+  let fileMatches = $state<string[]>([]);
+  let fileSearchState = $state<"idle" | "searching" | "ready" | "error">("idle");
+  // Non-reactive cancellation state: it only invalidates pending async file searches.
+  let fileSearchToken = 0;
+  let fileSearchTimer: ReturnType<typeof setTimeout> | undefined = undefined;
+  let menuAnchor = $state<{ left: number; top: number } | null>(null);
   let highlighted = $state(0);
-  const AT_TOKEN = /(^|\s)@([\w-]*)$/;
+  const AT_TOKEN = /(^|\s)@([^\s]*)$/;
+  const FILE_MATCH_LIMIT = 12;
+  const FILE_SEARCH_DEBOUNCE_MS = 180;
+  const MENU_WIDTH = 256;
 
-  const candidates = $derived(
+  const agentCandidates = $derived(
     menuOpen
       ? agents.filter(
           (a) =>
@@ -144,32 +172,60 @@
       : [],
   );
 
-  /// The menu's navigable rows: the bulk actions (matched by the query, like
-  /// the agents) lead, then the unselected agents. **All** appears only when
-  /// not everyone is selected and its keyword matches the query; **Clear** only
-  /// when something is selected and its keyword matches. So a bare `@` shows
-  /// both, `@a` keeps All, `@c`/`@cl` keeps Clear, `@bo` shows just agents.
-  type MenuItem =
+  /// The menu's navigable rows: file matches render first in their own section,
+  /// then recipient actions and unselected agents. **All** appears only when not
+  /// everyone is selected and its keyword matches the query; **Clear** only when
+  /// something is selected and its keyword matches. Even though files render
+  /// first, keyboard selection prefers a matched agent when one exists.
+  type FileMenuItem = { kind: "file"; key: string; path: string };
+  type RecipientMenuItem =
     | { kind: "all"; key: string }
     | { kind: "clear"; key: string }
     | { kind: "agent"; key: string; agent: AgentRecord };
-  const menuItems = $derived.by<MenuItem[]>(() => {
-    if (!menuOpen) return [];
+  type MenuItem = FileMenuItem | RecipientMenuItem;
+  const fileItems = $derived<FileMenuItem[]>(
+    menuOpen
+      ? fileMatches.map((path) => ({
+          kind: "file",
+          key: `file:${path}`,
+          path,
+        }))
+      : [],
+  );
+  const recipientItems = $derived.by<RecipientMenuItem[]>(() => {
+    // Single-agent projects suppress the recipient section entirely; the lone
+    // agent is already the implicit recipient, so @ is only useful for files.
+    if (!menuOpen || agents.length <= 1) return [];
     const q = menuQuery.toLowerCase();
-    const actions: MenuItem[] = [];
+    const items: RecipientMenuItem[] = [];
     if (selectedIds.length < agents.length && "all".includes(q)) {
-      actions.push({ kind: "all", key: "all" });
+      items.push({ kind: "all", key: "all" });
     }
     if (selectedIds.length > 0 && "clear".includes(q)) {
-      actions.push({ kind: "clear", key: "clear" });
+      items.push({ kind: "clear", key: "clear" });
     }
-    const agentRows: MenuItem[] = candidates.map((agent) => ({
-      kind: "agent",
-      key: agent.id,
-      agent,
-    }));
-    return [...actions, ...agentRows];
+    return [
+      ...items,
+      ...agentCandidates.map((agent) => ({
+        kind: "agent" as const,
+        key: agent.id,
+        agent,
+      })),
+    ];
   });
+  const menuItems = $derived.by<MenuItem[]>(() => {
+    if (!menuOpen) return [];
+    return [...fileItems, ...recipientItems];
+  });
+  const fileStatusText = $derived.by<string | null>(() => {
+    if (fileItems.length > 0) return null;
+    if (fileSearchState === "searching") return "Searching files...";
+    if (fileSearchState === "ready") return "No matching files";
+    if (fileSearchState === "error") return "File search unavailable";
+    return null;
+  });
+  const showFileSection = $derived(fileItems.length > 0 || fileStatusText !== null);
+  const hasMenuContent = $derived(menuItems.length > 0 || showFileSection);
 
   /// Send is gated only on a recipient + non-empty prompt + every recipient's
   /// history being loaded (`complete`/`failed`). **Not** on run_status — a busy
@@ -202,37 +258,190 @@
       : [...selectedIds, id];
   }
 
+  function preferredHighlightIndex(items: MenuItem[]): number {
+    const agentIndex = items.findIndex((item) => item.kind === "agent");
+    return agentIndex >= 0 ? agentIndex : 0;
+  }
+
+  function fileMenuItemsFor(paths: string[]): FileMenuItem[] {
+    return paths.map((path) => ({
+      kind: "file",
+      key: `file:${path}`,
+      path,
+    }));
+  }
+
+  function stripAtToken(): void {
+    prompt = prompt.replace(AT_TOKEN, "$1");
+  }
+
+  function markdownCodeSpan(text: string): string {
+    const runs = text.match(/`+/g) ?? [];
+    const longest = runs.reduce((max, run) => Math.max(max, run.length), 0);
+    const fence = "`".repeat(longest + 1);
+    if (text.startsWith("`") || text.endsWith("`")) {
+      return `${fence} ${text} ${fence}`;
+    }
+    return `${fence}${text}${fence}`;
+  }
+
+  function insertFileMention(path: string): void {
+    prompt = prompt.replace(AT_TOKEN, (_match, prefix: string) => {
+      return `${prefix}${markdownCodeSpan(path)} `;
+    });
+  }
+
   function pickItem(item: MenuItem): void {
-    if (item.kind === "all") {
+    if (item.kind === "file") {
+      insertFileMention(item.path);
+    } else if (item.kind === "all") {
       selectedIds = agents.map((a) => a.id);
+      stripAtToken();
     } else if (item.kind === "clear") {
       selectedIds = [];
-    } else if (!selectedIds.includes(item.agent.id)) {
-      selectedIds = [...selectedIds, item.agent.id];
+      stripAtToken();
+    } else {
+      selectedIds = [item.agent.id];
+      stripAtToken();
     }
-    // The menu only opens from a typed `@token`, so always strip it.
-    prompt = prompt.replace(AT_TOKEN, "$1");
+    closeMentionMenu();
+  }
+
+  function clearFileSearchTimer(): void {
+    if (fileSearchTimer === undefined) return;
+    clearTimeout(fileSearchTimer);
+    fileSearchTimer = undefined;
+  }
+
+  function scheduleFileMatchRefresh(query: string): void {
+    clearFileSearchTimer();
+    const token = (fileSearchToken += 1);
+    fileSearchState = "searching";
+    fileSearchTimer = setTimeout(() => {
+      fileSearchTimer = undefined;
+      void refreshFileMatches(query, token);
+    }, FILE_SEARCH_DEBOUNCE_MS);
+  }
+
+  function closeMentionMenu(): void {
     menuOpen = false;
+    fileMatches = [];
+    fileSearchState = "idle";
+    menuAnchor = null;
+    clearFileSearchTimer();
+    fileSearchToken += 1;
+  }
+
+  onDestroy(() => {
+    clearFileSearchTimer();
+    fileSearchToken += 1;
+  });
+
+  async function refreshFileMatches(query: string, token: number): Promise<void> {
+    try {
+      const matches = await api.searchProjectFiles(projectId, query, FILE_MATCH_LIMIT);
+      if (token !== fileSearchToken || !menuOpen || menuQuery !== query) return;
+      fileMatches = matches;
+      fileSearchState = "ready";
+      highlighted = preferredHighlightIndex([...fileMenuItemsFor(matches), ...recipientItems]);
+    } catch {
+      if (token !== fileSearchToken || !menuOpen || menuQuery !== query) return;
+      fileMatches = [];
+      fileSearchState = "error";
+      highlighted = preferredHighlightIndex(recipientItems);
+    }
+  }
+
+  function activeAtToken(text: string): { query: string; atIndex: number } | null {
+    const match = AT_TOKEN.exec(text);
+    if (!match) return null;
+    return {
+      query: match[2] ?? "",
+      atIndex: match.index + (match[1]?.length ?? 0),
+    };
+  }
+
+  function updateMenuAnchor(atIndex: number): void {
+    if (textareaEl === undefined || inputWrapEl === undefined) {
+      menuAnchor = null;
+      return;
+    }
+
+    const style = getComputedStyle(textareaEl);
+    const mirror = document.createElement("div");
+    mirror.style.position = "absolute";
+    mirror.style.visibility = "hidden";
+    mirror.style.pointerEvents = "none";
+    mirror.style.whiteSpace = "pre-wrap";
+    mirror.style.overflowWrap = "break-word";
+    mirror.style.boxSizing = style.boxSizing;
+    mirror.style.width = `${textareaEl.clientWidth}px`;
+    mirror.style.font = style.font;
+    mirror.style.letterSpacing = style.letterSpacing;
+    mirror.style.lineHeight = style.lineHeight;
+    mirror.style.padding = style.padding;
+    mirror.style.border = style.border;
+
+    const marker = document.createElement("span");
+    marker.textContent = "@";
+    mirror.append(document.createTextNode(prompt.slice(0, atIndex)), marker);
+    // eslint-disable-next-line svelte/no-dom-manipulating -- textarea caret measurement needs an off-tree mirror that Svelte does not own
+    inputWrapEl.append(mirror);
+
+    const left = textareaEl.offsetLeft + marker.offsetLeft - textareaEl.scrollLeft;
+    const top = textareaEl.offsetTop + marker.offsetTop - textareaEl.scrollTop;
+    mirror.remove();
+
+    menuAnchor = {
+      left: Math.max(0, Math.min(left, Math.max(0, inputWrapEl.clientWidth - MENU_WIDTH))),
+      top: Math.max(0, top),
+    };
   }
 
   $effect(() => {
     if (!menuOpen) return;
     function onPointerDown(e: PointerEvent): void {
       if (menuEl?.contains(e.target as Node)) return;
-      menuOpen = false;
+      closeMentionMenu();
     }
     document.addEventListener("pointerdown", onPointerDown);
     return () => document.removeEventListener("pointerdown", onPointerDown);
   });
 
+  $effect(() => {
+    if (!menuOpen) return;
+    if (menuItems.length === 0) return;
+    if (highlighted >= menuItems.length) highlighted = menuItems.length - 1;
+  });
+
   function onInput(): void {
-    const m = AT_TOKEN.exec(prompt);
-    if (m && agents.length > 1) {
-      menuQuery = m[2] ?? "";
-      highlighted = 0;
+    const token = activeAtToken(prompt);
+    const hasAtToken = token !== null;
+    const hasRecipientOptions = agents.length > 1;
+    const shouldSearchFiles = hasAtToken && (token.query.length > 0 || agents.length === 1);
+    const shouldOpenMenu = hasAtToken && (hasRecipientOptions || shouldSearchFiles);
+    if (token !== null && shouldOpenMenu) {
+      menuQuery = token.query;
       menuOpen = true;
+      updateMenuAnchor(token.atIndex);
+      if (shouldSearchFiles) {
+        const q = token.query.toLowerCase();
+        const retainedFileMatches = fileMatches.filter((path) => path.toLowerCase().includes(q));
+        fileMatches = retainedFileMatches;
+        highlighted = preferredHighlightIndex([
+          ...fileMenuItemsFor(retainedFileMatches),
+          ...recipientItems,
+        ]);
+        scheduleFileMatchRefresh(token.query);
+      } else {
+        fileMatches = [];
+        highlighted = preferredHighlightIndex(recipientItems);
+        clearFileSearchTimer();
+        fileSearchState = "idle";
+        fileSearchToken += 1;
+      }
     } else {
-      menuOpen = false;
+      closeMentionMenu();
     }
   }
 
@@ -321,7 +530,7 @@
                 {...props}
                 type="button"
                 class={cn(
-                  "focus-visible:ring-accent inline-flex items-center gap-1 rounded-full border py-0.5 pr-2 pl-1.5 text-sm transition-colors focus-visible:ring-2 focus-visible:outline-none",
+                  "focus-visible:ring-accent inline-flex items-center gap-1 rounded-full border py-px pr-2 pl-1.5 text-sm transition-colors focus-visible:ring-2 focus-visible:outline-none",
                   selected
                     ? "bg-accent-soft text-fg border-transparent"
                     : "border-panel bg-panel text-muted hover:bg-raised hover:text-fg",
@@ -343,7 +552,7 @@
               <button
                 {...props}
                 type="button"
-                class="text-muted hover:text-fg hover:bg-panel ml-0.5 flex h-[26px] w-[26px] items-center justify-center rounded-full transition-colors"
+                class="text-muted hover:text-fg hover:bg-panel ml-0.5 flex h-6 w-6 items-center justify-center rounded-full transition-colors"
                 data-testid="recipient-clear"
                 aria-label="Clear recipients"
                 onclick={() => (selectedIds = [])}
@@ -354,7 +563,7 @@
                   stroke="currentColor"
                   stroke-width="1.75"
                   stroke-linecap="round"
-                  class="h-5 w-5"
+                  class="h-4 w-4"
                   aria-hidden="true"
                 >
                   <circle cx="12" cy="12" r="9" />
@@ -366,23 +575,77 @@
         {/if}
       </div>
     {/if}
-    <div class="relative flex items-end gap-2">
-      {#if menuOpen && menuItems.length > 0}
+    <div class="relative flex items-end gap-2" bind:this={inputWrapEl}>
+      {#if menuOpen && hasMenuContent}
         <div
-          class="border-border/90 bg-raised absolute bottom-full left-0 z-10 mb-1 max-h-64 w-64 overflow-y-auto rounded-lg border p-1 text-[13px] shadow-[0_10px_28px_rgba(0,0,0,0.10)]"
+          class="border-border/90 bg-raised absolute z-10 w-64 overflow-hidden rounded-lg border p-1 text-[13px] shadow-[0_10px_28px_rgba(0,0,0,0.10)]"
+          style={menuAnchor === null
+            ? undefined
+            : `left: ${menuAnchor.left}px; top: ${menuAnchor.top}px; transform: translateY(calc(-100% - 0.25rem));`}
           data-testid="recipient-menu"
           role="listbox"
           bind:this={menuEl}
         >
-          <div
-            class="text-muted px-2.5 py-1 text-[11px] font-medium tracking-wide uppercase select-none"
-          >
-            Send to
+          {#if showFileSection}
+            <div
+              class="text-muted px-2.5 py-0.5 text-[11px] font-medium tracking-wide uppercase select-none"
+            >
+              Files
+            </div>
+          {/if}
+          <div class="max-h-48 overflow-y-auto" data-testid="file-options-scroll">
+            {#each fileItems as item (item.key)}
+              {@const i = menuItems.findIndex((candidate) => candidate.key === item.key)}
+              <button
+                type="button"
+                class={"hover:bg-panel/80 flex w-full cursor-pointer items-center gap-2 rounded-md px-2.5 py-1 text-left leading-5 outline-none select-none " +
+                  (i === highlighted ? "bg-panel/80" : "")}
+                data-testid={`file-option-${item.path}`}
+                role="option"
+                aria-selected={i === highlighted}
+                onclick={() => pickItem(item)}
+              >
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.8"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  class="text-muted h-4 w-4 shrink-0"
+                  aria-hidden="true"
+                >
+                  <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
+                  <path d="M14 3v5h5" />
+                </svg>
+                <span class="text-fg truncate">{item.path}</span>
+              </button>
+            {/each}
+            {#if fileStatusText !== null}
+              <div
+                class="text-muted flex min-h-7 items-center px-2.5 py-1 text-left leading-5 select-none"
+                data-testid="file-options-status"
+              >
+                {fileStatusText}
+              </div>
+            {/if}
           </div>
-          {#each menuItems as item, i (item.key)}
+
+          {#if recipientItems.length > 0}
+            <div
+              class={cn(
+                "text-muted px-2.5 py-0.5 text-[11px] font-medium tracking-wide uppercase select-none",
+                fileItems.length > 0 ? "mt-1" : "",
+              )}
+            >
+              Send to
+            </div>
+          {/if}
+          {#each recipientItems as item (item.key)}
+            {@const i = menuItems.findIndex((candidate) => candidate.key === item.key)}
             <button
               type="button"
-              class={"hover:bg-panel/80 flex w-full cursor-pointer items-center gap-2.5 rounded-md px-2.5 py-1.5 text-left leading-5 outline-none select-none " +
+              class={"hover:bg-panel/80 flex w-full cursor-pointer items-center gap-2 rounded-md px-2.5 py-1 text-left leading-5 outline-none select-none " +
                 (i === highlighted ? "bg-panel/80" : "")}
               data-testid={`recipient-option-${item.key}`}
               role="option"
@@ -422,7 +685,7 @@
                 </svg>
                 <span class="text-fg">Clear</span>
                 <span class="text-muted ml-auto font-mono text-[13px]">{shortcut("esc")}</span>
-              {:else}
+              {:else if item.kind === "agent"}
                 {@const agentIndex = agents.findIndex((a) => a.id === item.agent.id)}
                 <HarnessIcon harness={item.agent.harness} size="sm" class="h-4 w-4" />
                 <span class="text-fg">{item.agent.name}</span>
@@ -440,10 +703,11 @@
         data-testid="compose-textarea"
         placeholder="Type a message…  (⌘+Enter to send, @ to add a recipient)"
         rows={3}
+        bind:ref={textareaEl}
         bind:value={prompt}
         oninput={onInput}
         onkeydown={handleKey}
-        class="min-h-16 border-0 bg-transparent p-1 shadow-none focus-visible:ring-0"
+        class="max-h-48 min-h-16 border-0 bg-transparent p-1 shadow-none focus-visible:ring-0"
       />
       <Tooltip
         label={showStop ? (liveSends.size > 1 ? "Cancel all sends" : "Cancel send") : "Send"}

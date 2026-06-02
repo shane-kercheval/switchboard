@@ -3,7 +3,13 @@
   import { HEARTBEAT_TIMEOUT_MS } from "$lib/types";
   import { formatDuration } from "$lib/utils";
   import { cancelSend, runtimes, transcripts, type Turn } from "$lib/state/index.svelte";
-  import { buildUnifiedRows, groupRenderBlocks, type UnifiedRow } from "$lib/state/unified";
+  import {
+    buildUnifiedRows,
+    copyTextOf,
+    groupRenderBlocks,
+    type UnifiedRow,
+  } from "$lib/state/unified";
+  import { agentCopy } from "$lib/agentCopy.svelte";
   import { HARNESS_COLOR } from "$lib/harnessDisplay";
   import Badge from "$lib/components/ui/Badge.svelte";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
@@ -12,6 +18,7 @@
   import StatusChip from "$lib/components/ui/StatusChip.svelte";
   import StopIcon from "$lib/components/ui/StopIcon.svelte";
   import ToolCallWidget from "$lib/components/ToolCallWidget.svelte";
+  import ThinkingWidget from "$lib/components/ThinkingWidget.svelte";
 
   type AgentTurn = Extract<Turn, { role: "agent" }>;
   type NonUserRow = Exclude<UnifiedRow, { kind: "user" }>;
@@ -82,22 +89,12 @@
     return harness ? HARNESS_COLOR[harness] : "var(--border)";
   }
 
-  /// The copyable prose of an agent turn: its text segments joined, with tool
-  /// calls omitted (people copy the response, not the tool I/O). A turn that is
-  /// only tool calls (or still empty) yields "", which suppresses the button.
-  function agentTurnText(turn: AgentTurn): string {
-    return turn.items
-      .filter((i) => i.item_kind === "text")
-      .map((i) => i.text)
-      .join("\n\n")
-      .trim();
-  }
-
-  /// A fan-out column's copyable prose: the joined text of its agent turns.
+  /// A fan-out column's copyable prose: the joined answer text of its agent
+  /// turns (reasoning + tool calls excluded — see `answerTextOf`).
   function columnText(colRows: NonUserRow[]): string {
     return colRows
       .filter((r) => r.kind === "agent")
-      .map((r) => agentTurnText(r.turn))
+      .map((r) => copyTextOf(r.turn, agentCopy.mode))
       .filter((t) => t.length > 0)
       .join("\n\n");
   }
@@ -204,7 +201,11 @@
 {#snippet turnBody(turn: AgentTurn)}
   {#each turn.items as item, i (i)}
     {#if item.item_kind === "text"}
-      <Markdown text={item.text} />
+      {#if item.kind === "thinking"}
+        <ThinkingWidget text={item.text} />
+      {:else}
+        <Markdown text={item.text} />
+      {/if}
     {:else}
       <ToolCallWidget tool={item} />
     {/if}
@@ -349,7 +350,7 @@
 
 {#snippet agentRow(turn: AgentTurn)}
   {@const harness = agentById[turn.agent_id]?.harness}
-  {@const copyable = agentTurnText(turn)}
+  {@const copyable = copyTextOf(turn, agentCopy.mode)}
   <div class="group space-y-1.5" data-testid="turn" data-role="agent">
     <div class="flex items-center gap-2 text-xs font-semibold tracking-wide uppercase">
       <span class="text-fg" data-testid="turn-agent-name">{agentName(turn.agent_id)}</span>

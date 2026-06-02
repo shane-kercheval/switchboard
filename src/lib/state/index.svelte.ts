@@ -568,9 +568,10 @@ function manageHeartbeat(agentId: AgentId, event: NormalizedEvent): void {
       // Re-arm on any sign the harness is alive for the turn the heartbeat is
       // watching. A long shell tool call legitimately produces zero
       // content_chunks for minutes (`Bash` running a test suite), and a long
-      // thinking block produces only `liveness` (Claude's redacted thinking
-      // deltas) — without re-arming on those, the heartbeat would falsely flag
-      // healthy turns as silent. `quiet_since` (if the timer already fired) is
+      // redacted thinking block produces only `liveness` (Claude Opus 4.8's
+      // redacted thinking deltas) — without re-arming on those, the heartbeat
+      // would falsely flag healthy turns as silent. `quiet_since` (if the timer
+      // already fired) is
       // cleared on this same activity by `runtimeReducer`. Stale events for
       // unrelated turns are ignored. Re-arming after the timer has fired works
       // because the fire path retains the heartbeats entry (see armHeartbeat).

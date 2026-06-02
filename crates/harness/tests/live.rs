@@ -159,12 +159,23 @@ async fn live_claude_basic_turn_completes() {
 #[tokio::test]
 #[ignore = "requires claude installed — run with: make test-live"]
 async fn live_claude_thinking_emits_liveness() {
-    // Claude's thinking text is server-redacted to empty in `-p` mode, but the
-    // CLI still streams `thinking_delta`/`signature_delta` while the model
-    // reasons. The adapter must surface those as `Liveness` so the frontend
-    // heartbeat doesn't falsely fail a long thinking turn. If a CLI bump stops
-    // streaming during thinking, this test catches it (the fixture test proves
-    // the parser maps the delta; this proves the delta still arrives live).
+    // While the model reasons, the CLI streams `thinking_delta` /
+    // `signature_delta`. On a redacting model (Opus 4.8 — the dev's default,
+    // so what this test exercises) the thinking text is empty and the adapter
+    // surfaces `Liveness`; on a non-redacting model (Sonnet 4.6) it surfaces a
+    // `Thinking` `ContentChunk`. Either keeps the frontend heartbeat from
+    // falsely failing a long thinking turn. If a CLI bump stops streaming
+    // during thinking, this test catches it (the fixture test proves the
+    // parser maps the delta; this proves the delta still arrives live).
+    //
+    // COVERAGE GAP: the non-empty `Thinking` branch is NOT live-covered. This
+    // test runs on the dev default (Opus → redacted), so live runs only ever
+    // hit `Liveness`. We can't pin Sonnet because the adapter has no `--model`
+    // plumbing yet; until per-agent model selection lands
+    // (`docs/implementation_plans/2026-05-30-per-agent-model-selection.md` M2),
+    // the "real Sonnet still returns un-redacted reasoning" contract is held
+    // only by the `thinking_delta_with_text_yields_thinking_chunk` unit test
+    // plus the per-model re-probe mandate (`harness-behavior.md` §3.2).
     let adapter = ClaudeCodeAdapter::new();
     let agent = live_agent();
     let turn_id = Uuid::now_v7();
@@ -184,10 +195,10 @@ async fn live_claude_thinking_emits_liveness() {
     let events: Vec<AdapterEvent> = stream.collect().await;
 
     // A thinking block must produce a sign of life that re-arms the heartbeat:
-    // either `Liveness` (today, while thinking text is server-redacted to empty)
-    // or `ContentChunk { Thinking }` (if Claude ever stops redacting). Both are
-    // product-correct — assert the behavior, not which variant arrives, so a
-    // benign upstream un-redaction doesn't read as a regression.
+    // either `Liveness` (a redacting model like Opus 4.8) or
+    // `ContentChunk { Thinking }` (a non-redacting model like Sonnet 4.6).
+    // Both are product-correct — assert the behavior, not which variant
+    // arrives, so the per-model redaction split doesn't read as a regression.
     let sign_of_life = events.iter().any(|e| {
         matches!(e, AdapterEvent::Liveness { turn_id: t } if *t == turn_id)
             || matches!(
@@ -712,6 +723,72 @@ async fn live_gemini_resume_reuses_session() {
     assert!(
         recall_text.to_lowercase().contains("mango"),
         "--resume must restore the prior turn's context: turn2 reply was {recall_text:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires gemini installed — run with: make test-live"]
+async fn live_gemini_streamed_answer_completes_despite_trailing_error() {
+    // Gemini frequently (observed ~60% of runs on CLI 0.44.0, model auto)
+    // appends an empty/malformed trailing step after a complete answer,
+    // tainting the turn's `result.status` to `"error"`. This test pins the
+    // post-fix invariant: a turn that streamed a complete answer ALWAYS
+    // completes, regardless of whether the benign trailing error fired this
+    // run. It does NOT force the error (it's non-deterministic) — the
+    // deterministic proof of the rescue path is the fixture test
+    // `benign_trailing_error_fixture_completes_despite_result_error` in
+    // `gemini_adapter.rs`. A read-and-summarize prompt over a small file
+    // reliably triggers the tool-use shape where the quirk appears.
+    let tmp = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        tmp.path().join("hello.txt"),
+        "Hello, world! This is a tiny test file.",
+    )
+    .unwrap();
+
+    let adapter = GeminiAdapter::new();
+    let agent = live_gemini_agent();
+    let turn_id = Uuid::now_v7();
+
+    let stream = adapter
+        .dispatch(
+            &agent,
+            tmp.path(),
+            "Read and summarize the files in this directory in one short sentence.",
+            turn_id,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed with real gemini");
+
+    let events: Vec<AdapterEvent> = stream.collect().await;
+
+    let text: String = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::ContentChunk { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !text.trim().is_empty(),
+        "expected the model to stream a summary, got empty text"
+    );
+
+    let terminal = events
+        .iter()
+        .find(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+        .expect("should have a terminal TurnEnd");
+    assert!(
+        matches!(
+            terminal,
+            AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        ),
+        "a turn that streamed a complete answer must complete even if Gemini \
+         appended a benign trailing error, got: {terminal:?}"
     );
 }
 

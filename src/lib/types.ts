@@ -20,18 +20,18 @@ export type TurnOutcome =
   | { status: "failed"; kind: FailureKind; message: string }
   | { status: "cancelled"; source: CancelSource };
 
-// ContentChunk.kind discriminates rendering. `thinking` is emitted by adapters
-// that surface reasoning text (Antigravity, Gemini session files). Claude's
-// thinking text is server-redacted to empty today, so its reasoning normally
-// surfaces only as a non-rendering `liveness` event — but if that redaction is
-// lifted, non-empty thinking flows through as a `thinking` content chunk (the
-// Rust parser branches on emptiness). The renderer currently shows `thinking`
-// and `text` identically; distinct reasoning styling is follow-up work.
+// ContentChunk.kind discriminates rendering. `thinking` carries model reasoning,
+// rendered distinct from (and subordinate to) the answer (the `ThinkingWidget`).
+// Emitted by Antigravity (live + on reopen) and Claude Sonnet 4.6 (live + on
+// reopen). Gemini's reasoning is disk-only and deliberately dropped
+// (stale-on-reopen UX). Claude's redaction is per-model: Opus 4.8 redacts the
+// text to empty, so its reasoning surfaces only as a non-rendering `liveness`
+// event. See docs/research/harness-behavior.md §3.2 for per-harness reality.
 export type ContentKind = "text" | "thinking";
 
 // ToolStarted.kind discriminates tool origin so the UI can label calls
 // without scraping the name. `plugin` and `other` are
-// reserved-but-not-currently-emitted (same pattern as ContentKind.thinking).
+// reserved-but-not-currently-emitted (a forward-compat pattern).
 export type ToolKind = "builtin" | "mcp" | "plugin" | "other";
 
 export type McpServerStatus = { name: string; status: string };
@@ -67,8 +67,8 @@ export type NormalizedEvent =
   | { type: "turn_start"; turn_id: TurnId; message_id: MessageId; started_at: string }
   | { type: "content_chunk"; turn_id: TurnId; kind: ContentKind; text: string }
   // Content-free liveness signal: the harness is still alive mid-turn but
-  // produced no renderable content (e.g. Claude's redacted thinking deltas).
-  // Re-arms the per-turn heartbeat; renders nothing.
+  // produced no renderable content (e.g. Claude Opus 4.8's redacted thinking
+  // deltas). Re-arms the per-turn heartbeat; renders nothing.
   | { type: "liveness"; turn_id: TurnId }
   | {
       type: "tool_started";
@@ -396,10 +396,11 @@ export const HEARTBEAT_TIMEOUT_MS = 60_000;
 // `content_chunk`, `liveness`, `tool_started`, `tool_completed`. 1 minute of
 // total silence across all of these is the "stream is silent" threshold (kept
 // short because the indicator is harmless and the user can always cancel).
-// `liveness` and tool events are load-bearing: a long thinking block emits only
-// `liveness` (Claude's redacted thinking deltas) and a streaming tool input
-// emits only `liveness` (input_json_delta), while a long shell command (build,
-// test run) emits no events between `tool_started` and `tool_completed`. On
+// `liveness` and tool events are load-bearing: a long redacted thinking block
+// emits only `liveness` (Claude Opus 4.8's redacted thinking deltas) and a
+// streaming tool input emits only `liveness` (input_json_delta), while a long
+// shell command (build, test run) emits no events between `tool_started` and
+// `tool_completed`. On
 // expiry the turn is NOT failed — it is marked transiently quiet (see
 // `AgentRuntime.quiet_since`), because a silent-but-alive turn still holds the
 // backend busy-lock. The threshold is therefore "when to surface the silence,"

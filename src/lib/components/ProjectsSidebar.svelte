@@ -1,15 +1,13 @@
 <script lang="ts">
-  import { untrack } from "svelte";
   import {
     activateProject,
-    agentsByProject,
+    backgroundCompletedProjectIds,
+    liveProjectSends,
     projects,
     selection,
     workspace,
   } from "$lib/state/workspace.svelte";
-  import { cancelSend, runtimes, transcripts } from "$lib/state/index.svelte";
-  import { buildLiveSendsMap } from "$lib/state/liveSends";
-  import type { AgentId, SendId } from "$lib/types";
+  import { cancelSend } from "$lib/state/index.svelte";
   import { basename, cn, relativeTime } from "$lib/utils";
   import SidebarPanel from "$lib/components/ui/SidebarPanel.svelte";
   import SidebarSection from "$lib/components/ui/SidebarSection.svelte";
@@ -36,38 +34,11 @@
     settingsOpen?: boolean;
   } = $props();
 
-  /// Live sends across one project's agents (the shared selector scoped to this
-  /// project's roster).
-  function liveProjectSends(projectId: string): Map<SendId, AgentId[]> {
-    return buildLiveSendsMap(agentsByProject[projectId] ?? [], runtimes, transcripts);
-  }
-
   function cancelAllForProject(projectId: string): void {
     for (const [sendId, agentIds] of liveProjectSends(projectId)) {
       cancelSend(sendId, agentIds);
     }
   }
-
-  /// Projects that completed (busy → idle) while the user was not viewing them.
-  /// Cleared when the user clicks that project. Plain object so Svelte 5 tracks
-  /// property reads and writes for fine-grained reactivity.
-  let completedProjectIds = $state<Record<string, true>>({});
-  let _prevBusy = new Set<string>();
-
-  $effect(() => {
-    const nowBusy = new Set(
-      projects.list.filter((p) => liveProjectSends(p.id).size > 0).map((p) => p.id),
-    );
-    const added: string[] = [];
-    for (const id of _prevBusy) {
-      if (!nowBusy.has(id) && id !== selection.activeProjectId) added.push(id);
-    }
-    _prevBusy = nowBusy;
-    // untrack so writing completedProjectIds doesn't re-subscribe this effect
-    untrack(() => {
-      for (const id of added) completedProjectIds[id] = true;
-    });
-  });
 </script>
 
 <SidebarPanel side="left" width="w-72" testid="projects-sidebar">
@@ -115,7 +86,7 @@
       {#each projects.list as project (project.id)}
         {@const liveSends = liveProjectSends(project.id)}
         {@const busy = liveSends.size > 0}
-        {@const completed = !busy && project.id in completedProjectIds}
+        {@const completed = !busy && project.id in backgroundCompletedProjectIds}
         <div
           class={cn(
             "hover:bg-raised/70 flex w-full items-center rounded-md transition-colors",
@@ -129,7 +100,6 @@
             type="button"
             class="flex min-w-0 flex-1 flex-col items-start gap-0.5 px-2.5 py-2 text-left"
             onclick={() => {
-              delete completedProjectIds[project.id];
               onProjectSelect();
               void activateProject(project.id);
             }}

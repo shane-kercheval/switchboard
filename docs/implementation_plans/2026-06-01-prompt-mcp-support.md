@@ -32,15 +32,16 @@ Codex and Gemini have limited or absent native MCP-prompt support. Because Switc
 - **Transport: Streamable HTTP.** Prod endpoint `https://prompt-mcp.tiddly.me/mcp`; local dev `http://localhost:8002/mcp`. (The notes/bookmarks server `content-mcp.tiddly.me` / `:8001` is **out of scope** — we use the prompts server only.)
 - **Auth: `Authorization: Bearer <token>`** on every request. Production validates a Tiddly PAT (`bm_` prefix); **dev mode accepts any non-empty string** (this is what makes the local dev server a cheap integration target). The bearer token IS the account scoping — nothing else to configure.
 - Implements `prompts/list` (paginated, 100/page) and `prompts/get` per spec, **plus** prompt-management *tools* (`get_prompt_content`, `search_prompts`, …). Switchboard uses **only the prompts capability**; the tools are ignored. Templates are Jinja2; the server renders and returns one `user` text message. Missing required arg → `InvalidParams`.
+- **No live list updates.** The server advertises `prompts.listChanged: false`, never sends `notifications/prompts/list_changed`, and runs stateless (JSON responses, no held-open SSE stream) — so it has no mechanism to push prompt-set changes. (`listChanged` has been in MCP since the first spec, `2024-11-05`; it is not a feature Tiddly is missing for being out of date — most simple servers leave it off. Receiving it at all would require the client to hold an SSE stream open via an HTTP GET, which a stateless/JSON server like Tiddly does not offer.) Practical consequence: a user who edits a prompt in Tiddly must **Sync** (or restart) to see it — the concrete reason v1 uses build-once + Sync rather than a subscription.
 
-### 2.3 Tiddly login + PAT minting (for the "Connect Tiddly" preset — option C)
+### 2.3 Tiddly login + PAT minting (for the "Connect Tiddly" preset)
 
 Talks to the Tiddly **API host** (`https://api.tiddly.me`, dev `http://localhost:8000`), distinct from the MCP host.
 
 1. **Auth0 device-code login.** `POST https://tiddly.us.auth0.com/oauth/device/code` with `client_id=Gpv1ZrySgEeoTHlPyq3vSqHdFkS1vPwI`, `scope=openid profile email offline_access`, `audience=tiddly-api`. Returns `{ device_code, user_code, verification_uri, verification_uri_complete?, expires_in (~600), interval (~5) }`. Show the user the code + URL and open `verification_uri_complete` in their browser.
 2. **Poll** `POST https://tiddly.us.auth0.com/oauth/token` with `grant_type=urn:ietf:params:oauth:grant-type:device_code`, `device_code`, `client_id`. Handle `authorization_pending` (keep polling), `slow_down` (increase interval by 5s, per RFC 8628), `expired_token` / `access_denied` (fail). Success → `{ access_token (JWT), refresh_token, expires_in }`.
 3. **Mint a PAT** `POST https://api.tiddly.me/tokens/` with the **Auth0 JWT** as bearer (this endpoint is **Auth0-only — it rejects PATs with 403**), body `{ name: "switchboard-<short-suffix>", expires_in_days: <bounded> }`. Response (`TokenCreateResponse`) includes a stable `id` (UUID) and `token: "bm_..."` **shown exactly once**. May return `402` (PAT quota exceeded) or `451` (consent required) — surface these as actionable errors. **Mint with a bounded expiry (e.g. 365 days), not `null`** — see the revocation constraint below; a bounded lifetime backstops a token we may be unable to revoke server-side.
-4. **Store the `bm_` PAT, its `id`, and the Auth0 refresh token in the OS Keychain.** The PAT serves all prompt operations, so the hot path never touches Auth0 — no JWT refresh to babysit in steady state (the reason for choosing option C). The `id` (non-secret) and the refresh token are retained solely for the disconnect/revoke path below; the short-lived access token is discarded. This mirrors the Tiddly CLI, which keeps the refresh token and silently refreshes when it needs an Auth0-only operation.
+4. **Store the `bm_` PAT, its `id`, and the Auth0 refresh token in the OS Keychain.** The PAT serves all prompt operations, so the hot path never touches Auth0 — no JWT refresh to babysit in steady state (the point of minting a long-lived PAT rather than driving requests off short-lived Auth0 tokens). The `id` (non-secret) and the refresh token are retained solely for the disconnect/revoke path below; the short-lived access token is discarded. This mirrors the Tiddly CLI, which keeps the refresh token and silently refreshes when it needs an Auth0-only operation.
 5. Validate/identify with `GET https://api.tiddly.me/users/me` (accepts both PAT and Auth0 JWT bearer). Returns `{ id, email }` — useful to show "Connected as <email>".
 
 **Revocation constraint (important).** Token management is **Auth0-only**: `DELETE /tokens/{id}` (hard delete, 204 on success, 404 if already gone) and `GET /tokens/` both reject PAT auth with 403 — a PAT cannot revoke itself. Revoking therefore needs a live Auth0 token, obtained by refreshing the retained refresh token (`POST /oauth/token`, `grant_type=refresh_token`). The Tiddly CLI works exactly this way — `tiddly tokens delete` / `tiddly mcp remove --delete-tokens` refresh silently, no re-login. Switchboard differs in one respect: its hot path uses the PAT, so the refresh token sits unused between connect and disconnect and can lapse if Auth0's refresh-token inactivity window is exceeded first. Hence revoke-on-disconnect is **best-effort with a graceful fallback** — see open question 8.4.
@@ -87,7 +88,7 @@ Plus Tiddly auth commands (M3), a `sync_prompts()` command that rebuilds the cac
 
 ## 4. Decisions already made (confirmed with engineer)
 
-1. **Tiddly login = option C:** browser/Auth0 device-code login → mint a long-lived `bm_` PAT → store PAT in Keychain → use as MCP bearer. No Auth0 token refresh in steady state.
+1. **Tiddly login flow:** browser/Auth0 device-code login → mint a long-lived `bm_` PAT → store PAT in Keychain → use as MCP bearer. No Auth0 token refresh in steady state. (Chosen over hand-pasting a PAT, and over driving requests with short-lived Auth0 tokens that would need constant refresh.)
 2. **Secrets live in the OS Keychain, never in `config.yaml`.** The Tiddly preset stores its PAT in the keychain keyed by provider name; `config.yaml` holds only a non-secret `preset: tiddly` reference. Generic MCP providers may *additionally* support `${ENV}`-style token references for power users, but the keychain is the path for the one-click preset. `docs/system-design.md` §6 amended in place (it previously showed `token: ${TIDDLY_PAT}`).
 3. **MCP client = official `rmcp` crate**, Streamable HTTP.
 4. **Sequencing is backend-first, the inline-chip editor last** — it is the riskiest piece and everything else is testable without it.
@@ -98,14 +99,14 @@ Plus Tiddly auth commands (M3), a `sync_prompts()` command that rebuilds the cac
 
 ## 5. Scope / non-goals
 
-**In scope (v1):** local prompt provider; HTTP MCP prompt provider (generic + Tiddly preset); Tiddly browser login (option C); slash-command selection; argument dialog (required/optional); preview; inline chip; send-time resolution; user-global provider config; build-once prompt cache + Settings Sync.
+**In scope (v1):** local prompt provider; HTTP MCP prompt provider (generic + Tiddly preset); Tiddly browser login (device-code → minted PAT); slash-command selection; argument dialog (required/optional); preview; inline chip; send-time resolution; user-global provider config; build-once prompt cache + Settings Sync.
 
 **Out of scope / deferred (state explicitly; `log`/document rather than silently drop):**
 - **stdio MCP providers** — deferred; revisit when a real stdio prompt source appears.
 - **MCP tools and resources** — only `prompts/*`. Tools remain per-harness (model-invoked mid-turn; Switchboard cannot proxy them).
 - **Prompt versioning / history** — references resolve to whatever the provider returns at invocation time (§6).
 - **Prompt library browse/search view** — v2+ (§6 "Future direction"). `tags` is parsed and stored but unused in the v1 slash UI.
-- **`prompts/list_changed` live subscription** — v1 builds once + Sync; live notification subscription is a later enhancement.
+- **`prompts/list_changed` live subscription** — v1 builds once + Sync. Moot for Tiddly regardless (advertises `listChanged: false`, stateless — see §2.2), and for any provider it would require holding a persistent SSE stream open per provider for the app's lifetime; deferred.
 - **Non-text prompt content** (image/audio/embedded resource `PromptMessage` parts) — v1 handles text content; other parts are dropped with a warning.
 - **Multimedia/typed arguments, argument autocompletion (completion API)** — strings only, no completion.
 
@@ -164,7 +165,7 @@ Milestones are dependency-ordered. Each is independently reviewable and should l
 
 ---
 
-### M3 — Keychain secret store + Tiddly preset + "Connect Tiddly" login (option C)
+### M3 — Keychain secret store + Tiddly preset + "Connect Tiddly" login
 
 **Goal & Outcome.** Make Tiddly a first-class, one-click integration. When done:
 - A user clicks "Connect Tiddly," completes a browser login, and ends in a "Connected as `<email>`" state — no token handling at any point.
@@ -245,7 +246,7 @@ These apply across milestones. Carry the *why* into the code (comments/commit me
 
 ## 8. Open questions / decisions to confirm in review
 
-Resolved with the engineer (treat as settled): option C login; keychain over `config.yaml`; `rmcp`; backend-first sequencing; stdio deferred; inline chip embedded in free text; user-global provider scope (no project arg, §6 amended); build-once cache + Settings Sync (the `/` menu never fetches); retain the Auth0 refresh token for disconnect/renewal; Tiddly implements the MCP `prompts` capability and its management *tools* are unused.
+Resolved with the engineer (treat as settled): Tiddly login via browser device-code → minted PAT in keychain; keychain over `config.yaml`; `rmcp`; backend-first sequencing; stdio deferred; inline chip embedded in free text; user-global provider scope (no project arg, §6 amended); build-once cache + Settings Sync (the `/` menu never fetches); retain the Auth0 refresh token for disconnect/renewal; Tiddly implements the MCP `prompts` capability and its management *tools* are unused.
 
 Still open — raise in review:
 

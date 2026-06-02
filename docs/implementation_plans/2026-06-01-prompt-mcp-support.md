@@ -9,7 +9,7 @@ Switchboard should let a user invoke **prompts** — reusable, optionally parame
 
 [Tiddly](https://tiddly.me) is the canonical MCP provider and the development reference. It is integrated as a **first-class preset**: the user clicks "Connect Tiddly," logs into their Tiddly account in a browser, and Switchboard handles everything else.
 
-The user selects a prompt via a **slash command** in the compose box. The prompt renders as an **inline chip within the message text** (not a block above it, unlike recipient chips). Prompts with arguments open a small dialog to collect values, with a preview affordance. At send time, Switchboard resolves the chip to rendered text and the agent receives only that text — never the template, provider, or arguments.
+The user selects a prompt from the compose area — a `+` button, or `/` when the box is empty. The composer then switches to a **prompt mode**: it keeps the recipients header, lets the user change the prompt, renders each declared argument as a labeled input, and offers an **Appended text** field and a **Preview**. At send time, Switchboard renders the prompt with the entered arguments, combines it with the appended text, and the agent receives only that final text — never the template, provider, or arguments. (This deliberately avoids a rich-text editor; inline/interleaved prompt chips and multiple prompts per message are deferred to v2 — see §5.)
 
 This plan implements the design specified in **`docs/system-design.md` §6 ("Prompts and prompt providers")**; read that section first. The design is directional, not gospel — this plan refines three points it did not fully settle (all confirmed with the engineer and recorded in §4): prompt config is **user-global** (the doc's directory-scoping was dropped and §6 amended in place), secrets live in the **OS keychain** (not `config.yaml`), and the Tiddly preset is a **browser login** (not a pasted token).
 
@@ -44,9 +44,11 @@ Talks to the Tiddly **API host** (`https://api.tiddly.me`, dev `http://localhost
 4. **Store the `bm_` PAT, its `id`, and the Auth0 refresh token in the OS Keychain.** The PAT serves all prompt operations, so the hot path never touches Auth0 — no JWT refresh to babysit in steady state (the point of minting a long-lived PAT rather than driving requests off short-lived Auth0 tokens). The `id` (non-secret) and the refresh token are retained solely for the disconnect/revoke path below; the short-lived access token is discarded. This mirrors the Tiddly CLI, which keeps the refresh token and silently refreshes when it needs an Auth0-only operation.
 5. Validate/identify with `GET https://api.tiddly.me/users/me` (accepts both PAT and Auth0 JWT bearer). Returns `{ id, email }` — useful to show "Connected as <email>".
 
-**Revocation constraint (important).** Token management is **Auth0-only**: `DELETE /tokens/{id}` (hard delete, 204 on success, 404 if already gone) and `GET /tokens/` both reject PAT auth with 403 — a PAT cannot revoke itself. Revoking therefore needs a live Auth0 token, obtained by refreshing the retained refresh token (`POST /oauth/token`, `grant_type=refresh_token`). The Tiddly CLI works exactly this way — `tiddly tokens delete` / `tiddly mcp remove --delete-tokens` refresh silently, no re-login. Switchboard differs in one respect: its hot path uses the PAT, so the refresh token sits unused between connect and disconnect and can lapse if Auth0's refresh-token inactivity window is exceeded first. Hence revoke-on-disconnect is **best-effort with a graceful fallback** — see open question 8.4.
+**Revocation constraint (important).** Token management is **Auth0-only**: `DELETE /tokens/{id}` (hard delete, 204 on success, 404 if already gone) and `GET /tokens/` both reject PAT auth with 403 — a PAT cannot revoke itself. Revoking therefore needs a live Auth0 token, obtained by refreshing the retained refresh token (`POST /oauth/token`, `grant_type=refresh_token`). The Tiddly CLI works exactly this way — `tiddly tokens delete` / `tiddly mcp remove --delete-tokens` refresh silently, no re-login. Switchboard differs in one respect: its hot path uses the PAT, so the refresh token sits unused between connect and disconnect and can lapse if Auth0's refresh-token inactivity window is exceeded first. Hence revoke-on-disconnect is **best-effort with a graceful fallback** (settled — see §4 decision 9 and M3 "Disconnect").
 
 Constants are overridable via env (`TIDDLY_AUTH0_DOMAIN`, `TIDDLY_AUTH0_CLIENT_ID`, `TIDDLY_AUTH0_AUDIENCE`); the API base should be overridable too so the integration can point at local dev. **Re-verify these endpoints and constants against the current `bookmarks` repo at implementation time** — they were read on 2026-06-01 and Tiddly is independently maintained.
+
+The `client_id` is a **public** value — the device flow uses no client secret — so it ships as a baked constant (env-overridable). Switchboard registers its own dedicated Auth0 application (§4 decision 11), with reuse of the CLI's client as a zero-code fallback; the runbook is in M3's **Auth0 prerequisite**.
 
 ### 2.4 Switchboard substrate (what exists today)
 
@@ -91,15 +93,20 @@ Plus Tiddly auth commands (M3), a `sync_prompts()` command that rebuilds the cac
 1. **Tiddly login flow:** browser/Auth0 device-code login → mint a long-lived `bm_` PAT → store PAT in Keychain → use as MCP bearer. No Auth0 token refresh in steady state. (Chosen over hand-pasting a PAT, and over driving requests with short-lived Auth0 tokens that would need constant refresh.)
 2. **Secrets live in the OS Keychain, never in `config.yaml`.** The Tiddly preset stores its PAT in the keychain keyed by provider name; `config.yaml` holds only a non-secret `preset: tiddly` reference. Generic MCP providers may *additionally* support `${ENV}`-style token references for power users, but the keychain is the path for the one-click preset. `docs/system-design.md` §6 amended in place (it previously showed `token: ${TIDDLY_PAT}`).
 3. **MCP client = official `rmcp` crate**, Streamable HTTP.
-4. **Sequencing is backend-first, the inline-chip editor last** — it is the riskiest piece and everything else is testable without it.
+4. **Sequencing is backend-first** — providers, MCP client, and auth land before the prompt-mode composer UI; the backend is fully testable without the UI.
 5. **stdio MCP providers are deferred** (see Non-goals). Tiddly is HTTP; v1 ships local + HTTP MCP.
-6. **Prompt chip is embedded inline within free message text** (the user may type text before/after the chip). M4 ships the full slash/argument/preview/send flow with a simple interim representation; M5 upgrades the compose input to render the chip truly inline.
+6. **Prompt UI = a structured "prompt-mode" composer (Option C), not inline chips.** When a prompt is selected the compose area switches to a layout with the recipients header, a prompt selector, argument inputs (required-validated), an "Appended text" field, and a preview; at send the prompt is rendered and combined with the appended text. **One prompt per send.** This deliberately avoids a `contenteditable` rich-text editor — inline/interleaved chips and multiple prompts per message are deferred to v2 (that is where the rich-text question would return). Considered and rejected for v1: inline chips in free text (needs `contenteditable`, the highest-risk path) and plain-text tokens (poor fit for arguments).
 7. **Prompt providers are user-global — no directory/project scope.** `list_prompts` / `render_prompt` take no project argument. §6 amended in place to drop the directory-scoped prompt config it previously described. Repo-shipped per-directory prompts can return additively in v2.
 8. **Prompt list is built once and cached** (background build at app load + on provider connect), with a **Sync button** in Settings to rebuild; the `/` menu reads the cache and never fetches.
+9. **PAT revocation on disconnect = best-effort silent revoke** (mirrors the CLI): refresh the retained token → `DELETE /tokens/{id}` → wipe local entries; on a lapsed refresh token or 404, fall back to local-delete + a "manage at tiddly.me/settings" notice. Chosen over local-delete-only because it leaves no live credential on Tiddly in the common case, at small incremental cost (the refresh token is retained anyway).
+10. **PAT expiry = long (~365 days) + 401-driven silent reconnect; no user-facing expiry picker in v1.** A short expiry only adds renewal churn — the renewal machinery is identical either way, and the PAT and refresh token co-locate in the keychain, so a shorter PAT window doesn't shrink the blast radius.
+11. **Auth0 = a dedicated "Switchboard" Native app** (own branding/analytics/revocation), reusing the existing `tiddly-api` audience. Reuse of the CLI's public client is a zero-code fallback (configure its `client_id`) and stays documented in M3's Auth0 prerequisite.
+12. **Generic (non-preset) MCP providers supply their bearer via `${ENV}` references** in `config.yaml`, alongside the keychain path used by the Tiddly preset. Effectively required for generic providers in v1 — only the Tiddly preset gets a credential-writing UI.
+13. **Account-wide PAT accepted.** Tiddly's `POST /tokens/` issues a general-capability PAT (no prompts-only scope exists); Switchboard uses it only for prompts. Not a preference — the only option Tiddly exposes, matching the CLI.
 
 ## 5. Scope / non-goals
 
-**In scope (v1):** local prompt provider; HTTP MCP prompt provider (generic + Tiddly preset); Tiddly browser login (device-code → minted PAT); slash-command selection; argument dialog (required/optional); preview; inline chip; send-time resolution; user-global provider config; build-once prompt cache + Settings Sync.
+**In scope (v1):** local prompt provider; HTTP MCP prompt provider (generic + Tiddly preset); Tiddly browser login (device-code → minted PAT); prompt-mode composer (slash/`+` selection, argument inputs, appended text, preview); single prompt per send; send-time render-and-combine; user-global provider config; build-once prompt cache + Settings Sync.
 
 **Out of scope / deferred (state explicitly; `log`/document rather than silently drop):**
 - **stdio MCP providers** — deferred; revisit when a real stdio prompt source appears.
@@ -109,6 +116,7 @@ Plus Tiddly auth commands (M3), a `sync_prompts()` command that rebuilds the cac
 - **`prompts/list_changed` live subscription** — v1 builds once + Sync. Moot for Tiddly regardless (advertises `listChanged: false`, stateless — see §2.2), and for any provider it would require holding a persistent SSE stream open per provider for the app's lifetime; deferred.
 - **Non-text prompt content** (image/audio/embedded resource `PromptMessage` parts) — v1 handles text content; other parts are dropped with a warning.
 - **Multimedia/typed arguments, argument autocompletion (completion API)** — strings only, no completion.
+- **Inline/interleaved prompt chips and multiple prompts per message** — v1 uses the prompt-mode composer (one prompt + appended text). A `contenteditable` rich-text editor for chips embedded in free text is the v2 path if multiple/interleaved prompts are wanted.
 
 ## 6. Milestones
 
@@ -175,6 +183,12 @@ Milestones are dependency-ordered. Each is independently reviewable and should l
 - An expired or externally-revoked credential renews silently on next use; the user only sees another browser login after a long idle period.
 - A **Sync** button in Settings refreshes the cached prompt list (e.g. after editing prompts in Tiddly mid-session).
 
+**Prerequisite — Auth0 application (one-time operator task in the Tiddly Auth0 tenant; not code).** Device-code login needs a **Native (public, no-secret)** Auth0 application. Decision: register a dedicated app (the first option below; §4 decision 11). Reuse of the CLI's client is a documented zero-code fallback:
+- **Dedicated Switchboard app (recommended):** Auth0 Dashboard → Applications → Create Application → type **Native**, name "Switchboard" → Advanced → Grant Types → enable **Device Code** + **Refresh Token** → Refresh Token Rotation ON (0s overlap). No callback URLs (device flow has no redirect). Note the Client ID and wire it in as Switchboard's baked constant. Cleaner branding/analytics/revocation than sharing.
+- **Reuse the CLI's public client** (`Gpv1ZrySgEeoTHlPyq3vSqHdFkS1vPwI`): zero Auth0 setup, but Switchboard's logins attribute to the "Tiddly CLI" app and the two share rate-limit/revocation surface.
+
+Either way: scopes `openid profile email offline_access`, audience `tiddly-api` (its API already has Allow Offline Access ON — no change), first-party (no Auth0 consent screen). The backend's separate policy-consent (HTTP 451) still applies and **must be completed by the human user** — Switchboard surfaces it as an actionable error and never auto-consents.
+
 **Implementation Outline.**
 - Keychain secret store over the `keyring` crate (store/fetch/delete a provider secret keyed by provider name). `McpProvider` resolves the bearer for keychain-backed providers through it.
 - Tiddly preset: baked-in MCP URL (`prompt-mcp.tiddly.me/mcp`) and API base (`api.tiddly.me`), both env-overridable for local dev. A `preset: tiddly` config entry resolves its bearer from the keychain.
@@ -193,44 +207,26 @@ Milestones are dependency-ordered. Each is independently reviewable and should l
 
 ---
 
-### M4 — Compose: slash menu + argument dialog + preview + send (interim representation)
+### M4 — Prompt-mode composer (selection, arguments, appended text, preview, send)
 
-**Goal & Outcome.** Wire the full user-facing flow, using a simple (not-yet-inline) chip so the logic is validated before the editor rewrite. When done:
-- Typing `/` in the compose box opens an **instant** menu (read from cache) of all prompts across providers, filterable, selectable by keyboard or click.
-- Selecting a prompt that declares arguments opens a dialog to fill them (required enforced; optional may be left blank), and the user can **preview** the rendered result before sending.
-- Sending resolves the prompt to text **once** and dispatches; each recipient (one or many) receives the same rendered text; the agent never sees the template, provider, or arguments.
-- If rendering fails at send, the user sees an error and **no phantom transcript entry** is created.
-- A draft containing a pending prompt survives an app reload.
-
-**Implementation Outline.**
-- Slash-command menu in `ComposeBar.svelte`, mirroring the existing `@`-menu pattern but reading the **cached** global prompt list — **no network on open**. Reuse the existing menu/keyboard scaffolding.
-- On select: if the prompt has ≥1 argument, open an argument dialog (required fields block submit; optional allowed empty; show each argument's description). A preview affordance calls `render_prompt` (handle MCP latency/errors).
-- Draft model (`composeStore.ts`): represent a selected prompt as a structured token `{ provider, name, args }` persisted with the draft. **Add a `version` discriminant to the stored compose snapshot** (it is unversioned/string-only today) so M5's reader can degrade an M4-era draft gracefully instead of corrupting it.
-- Interim UI: render the selected prompt as a single pill (above the textarea is acceptable this milestone) — **not** yet inline.
-- Send — **render before dispatch**: introduce an async `prepareSubmit` phase that resolves all prompt tokens via `render_prompt` **once** and assembles the final plain text **before** any optimistic transcript turn or journal write, then calls the existing `send_message` path unchanged. (Today `ComposeBar` appends the optimistic user turn and clears the draft synchronously before IPC; folding rendering in naively would leave a phantom user turn for text never sent on a render failure — worse on multi-recipient sends.) On failure: compose-level error, preserve the draft, append no transcript/journal state. The rendered text is the user's send content for history/journal.
-
-**Definition of Done.**
-- Component-level tests per the project's IPC-component rule (mock `invoke`/`listen`, capture callbacks): slash menu opens from cache without a network call; argument-dialog required-field validation; preview success and error; token persistence across draft save/restore; send assembles correct final text; multi-recipient renders **once**; **render-fails-at-send appends no transcript turn, preserves the draft, surfaces an error**. Use `tick()`/`waitFor` for presence assertions.
-- Behavior verified: select `tiddly:<prompt>` and `local:<prompt>`, fill args, preview, send to one and to multiple agents — each receives the correct rendered text; a draft with a pending prompt token survives reload.
-
----
-
-### M5 — Inline chip in the compose input
-
-**Goal & Outcome.** Replace M4's interim pill with a true inline chip. When done:
-- The user can type free text **before and after** a prompt chip in the compose box; the chip is a compact, removable widget showing the prompt name and a preview affordance.
-- Multiple chips can coexist in one message; each resolves independently at send and is spliced in at its position in the surrounding text.
-- Every prior compose behavior still works: recipient chips, the `@` menu, send/clear keyboard shortcuts, and draft persistence.
+**Goal & Outcome.** Deliver the full user-facing prompt flow as a structured composer — no rich-text editor. When done:
+- From the compose area the user opens prompt selection via a `+` button (or `/` when the box is empty) and picks a prompt from the cached list across providers.
+- Selecting a prompt switches the compose area to **prompt mode**: it keeps the "To" recipients header, shows the chosen prompt with a way to change or remove it, renders each declared argument as a labeled multi-line input (required fields validated), and shows an **Appended text** field.
+- A **Preview** shows exactly what each recipient will receive — the rendered prompt plus the appended text.
+- Sending renders the prompt **once** with the entered arguments, combines it with the appended text, and dispatches to all recipients; the agent receives only the final text, never the template/provider/arguments.
+- Removing the prompt returns to the normal text composer (appended text carried back); plain, no-prompt messages are completely unchanged.
 
 **Implementation Outline.**
-- Upgrade the compose input from a plain `<textarea>` to a token-aware inline editor (e.g. a `contenteditable` region) that renders text segments and prompt-chip tokens in document order. The draft model stays the structured `{ text-segments, prompt-tokens }` sequence from M4; the M4 `version` discriminant lets the reader degrade older drafts.
-- Preserve and re-verify every existing compose behavior against the new editor (draft persistence, `@` recipient menu, keyboard shortcuts, recipient chips above the input).
-- Send assembly splices each chip's rendered text into its position in the surrounding free text (multiple chips resolve independently).
+- Entry: a `+` affordance in the compose area, plus `/` when the textarea is empty, opens a typeahead reading the **cached** global prompt list (**no network on open**; reuse the existing `@`-menu/keyboard scaffolding). Selecting a prompt enters prompt mode; if the user had already typed text, pre-fill **Appended text** with it (nothing lost).
+- Prompt mode is a **state of `ComposeBar.svelte`, not a modal** (a layout swap; taller). It retains the recipients header; a prompt selector to change/remove the prompt; argument inputs generated from the prompt's declared `arguments` (multi-line, all strings; required validated and block send; optional may be empty; show each argument's description); an **Appended text** textarea. Removing the prompt reverts to the plain textarea, carrying the appended text back. This folds the former separate argument dialog into the composer — there is no modal.
+- **Preview** button calls `render_prompt` and shows the full combined message (`rendered prompt` + blank line + `appended text`) — what the agent receives. Handle MCP latency/errors.
+- Draft model (`composeStore.ts`): persist the structured prompt-mode state `{ provider, name, args, appendedText }` alongside the plain-text draft. **Add a `version` discriminant to the stored snapshot** (unversioned/string-only today) so the persisted shape can evolve without corrupting older drafts. Plain mode and prompt mode are distinct persisted states.
+- Send — **render before dispatch**: an async `prepareSubmit` phase renders the prompt **once** via `render_prompt`, combines it with the appended text, and only **then** calls the existing `send_message` path — before any optimistic transcript turn or journal write. (Today `ComposeBar` appends the optimistic user turn and clears the draft synchronously before IPC; folding rendering in naively would leave a phantom user turn for text never sent on a render failure — worse on multi-recipient sends.) On failure: compose-level error, preserve the composer state, append no transcript/journal state. Multi-recipient: render once, the same final text to all. **One prompt per send** (combine rule: rendered prompt + blank line + appended text).
 
 **Definition of Done.**
-- Editor-behavior tests: insert chip inline, type around it, delete a chip, multiple chips; caret/selection sanity; paste of plain text; draft round-trip with mixed text+chips; **an M4-era (older `version`) saved draft degrades gracefully rather than corrupting**; send produces correctly ordered final text. Regression-cover the `@` menu and keyboard shortcuts under the new editor. Keep assertions deterministic via the reactive-flush helpers.
-- Behavior verified: a message like `please review this then summarize: [tiddly:code-review] and also check the tests` sends with the chip's rendered text spliced in at its position; all prior compose behaviors pass.
-- **Risk note (record, don't hide):** this is the highest-risk milestone — `contenteditable` interacts subtly with IME, paste, undo, and selection. It is intentionally last so M1–M4 deliver working prompts behind the interim representation even if this milestone needs iteration.
+- Component-level tests per the project's IPC-component rule (mock `invoke`/`listen`, capture callbacks): prompt menu opens from cache **without a network call**; entering prompt mode pre-fills appended text from prior textarea content; required-argument validation blocks send; preview renders the full combined message (and handles error); remove-prompt returns to the plain composer carrying appended text back; send combines `prompt + appended text` and dispatches **once** to N recipients; **render-fails-at-send surfaces an error, preserves composer state, and appends no transcript turn**; draft round-trip preserves prompt-mode state. Use `tick()`/`waitFor` for presence assertions.
+- Behavior verified: select `tiddly:<prompt>` and `local:<prompt>`, fill arguments, preview, and send to one and to many agents — each receives `rendered prompt + appended text`; plain (no-prompt) sends are unaffected.
+- Recorded limitation: **one prompt per send**; inline/interleaved chips and multiple prompts are deferred (that is where a `contenteditable` editor would return — v2).
 
 ## 7. Cross-cutting requirements
 
@@ -244,18 +240,13 @@ These apply across milestones. Carry the *why* into the code (comments/commit me
 - **Wire-format conventions** — new IPC types follow the existing `#[serde(rename_all = "snake_case")]` + TS discriminated-union pattern; mark evolving enums `#[non_exhaustive]`.
 - **Live-test naming/runner** — the live-test convention (`live_<harness>_`, runner `LIVE_PKGS` = harness/dispatcher/app) is built around the four *harnesses*; Tiddly is a prompt *provider*, not a harness, and `crates/prompts` is not in `LIVE_PKGS`. Before adding Tiddly live tests, give them a runner home: add `switchboard-prompts` to `LIVE_PKGS` + a `make test-live-tiddly` target and document a `live_tiddly_` provider category in `AGENTS.md`, **or** house them in `switchboard-app`. Otherwise a `live_tiddly_` test silently never runs under `make test-live`.
 
-## 8. Open questions / decisions to confirm in review
+## 8. Decisions (settled) and standing tasks
 
-Resolved with the engineer (treat as settled): Tiddly login via browser device-code → minted PAT in keychain; keychain over `config.yaml`; `rmcp`; backend-first sequencing; stdio deferred; inline chip embedded in free text; user-global provider scope (no project arg, §6 amended); build-once cache + Settings Sync (the `/` menu never fetches); retain the Auth0 refresh token for disconnect/renewal; Tiddly implements the MCP `prompts` capability and its management *tools* are unused.
+Resolved with the engineer (treat as settled): Tiddly login via browser device-code → minted PAT in keychain; keychain over `config.yaml`; `rmcp`; backend-first sequencing; stdio deferred; user-global provider scope (no project arg, §6 amended); build-once cache + Settings Sync (the `/` menu never fetches); retain the Auth0 refresh token for disconnect/renewal; Tiddly implements the MCP `prompts` capability and its management *tools* are unused; best-effort silent revoke on disconnect; long PAT expiry (~365d) + 401 reconnect, no expiry picker; dedicated Auth0 app (CLI-client reuse as a zero-code fallback); `${ENV}` bearer for generic providers; account-wide PAT accepted (no narrower scope exists); prompt-mode composer (Option C) — single prompt + appended text, no inline chips/`contenteditable` (§4 decision 6). See §4 decisions 9–13 for the rationale on the credential decisions.
 
-Still open — raise in review:
+No open product/scope decisions remain. Standing implementation-time task (not a decision):
 
-1. **Multiple prompt chips per message** — the plan allows multiple independent inline chips (M5). Confirm, or restrict to one chip per send for v1 simplicity.
-2. **Minted PAT is account-wide, not prompts-scoped** — `POST /tokens/` issues a general PAT (full account capability), used only for prompts. Matches the Tiddly CLI; no narrower scope exists. Recommend accepting; confirm.
-3. **`${ENV}` token references for generic MCP providers** — kept for power users alongside the keychain. Confirm both, or keychain-only.
-4. **PAT revocation on disconnect** — `DELETE /tokens/{id}` is Auth0-only; revoking needs the retained refresh token. Recommended default: best-effort silent revoke on disconnect (refresh → delete), falling back to local-delete + a "manage at tiddly.me/settings" notice if the refresh token has lapsed (likelier here than for the CLI, since the hot path uses the PAT and leaves the refresh token idle). Bounded mint expiry (~365 days) backstops it regardless. **Confirm: best-effort silent revoke (recommended) vs. local-delete-only.**
-5. **Re-verify Tiddly endpoints/constants** (§2.3) against the current `bookmarks` repo before building M2/M3.
-6. **PAT expiry policy** — recommend long expiry (~365 days) + 401-driven reconnect over short expiry (~90 days) + auto-renew (the PAT and refresh token share the keychain, so a short PAT expiry is not a strong security boundary on its own). Recommend **no** user-facing expiry picker in v1. Renewal mechanics are identical either way (M3).
+- **Re-verify Tiddly endpoints/constants** (§2.3) against the current `bookmarks` repo before building M2/M3 — Tiddly is independently maintained.
 
 ## 9. Reference docs (read before implementing)
 

@@ -36,10 +36,10 @@
   const sectionHeadingClass = "text-fg text-base font-semibold";
 </script>
 
-<div class="flex flex-1 overflow-y-auto px-8 pt-4 pb-7" data-testid="settings-view">
-  <div class="w-full max-w-2xl space-y-7">
-    <div class="flex items-center justify-between gap-3">
-      <h1 class="text-fg text-xl font-semibold">Settings</h1>
+<div class="flex flex-1 overflow-y-auto px-8 pb-7" data-testid="settings-view">
+  <div class="w-full max-w-2xl">
+    <div class="flex h-16 items-center justify-between gap-3">
+      <h1 class="text-fg text-2xl font-semibold">Settings</h1>
       <button
         type="button"
         class={cn(ICON_BUTTON_CLASS, "hover:bg-panel")}
@@ -93,7 +93,7 @@
       </div>
     </section>
 
-    <section class={sectionClass}>
+    <section class={cn(sectionClass, "mt-7")}>
       <div>
         <h2 class={sectionHeadingClass}>Agent Message Copy Behavior</h2>
         <p class="text-muted mt-1 text-sm leading-relaxed">
@@ -127,7 +127,7 @@
       </div>
     </section>
 
-    <section class={sectionClass}>
+    <section class={cn(sectionClass, "mt-7")}>
       <h2 class={sectionHeadingClass}>Shortcuts</h2>
 
       <div>
@@ -148,7 +148,7 @@
       </div>
     </section>
 
-    <section class={sectionClass}>
+    <section class={cn(sectionClass, "mt-7")}>
       <div>
         <h2 class={sectionHeadingClass}>Supported CLIs</h2>
         <p class="text-muted mt-1 text-sm leading-relaxed">

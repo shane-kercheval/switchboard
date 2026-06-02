@@ -37,6 +37,7 @@ directories = "6.0.0"
 futures.workspace = true
 tauri-plugin-clipboard-manager = "2.3.2"
 url = "2.5.8"
+ignore = "0.4.25"
 
 [dev-dependencies]
 tokio = { workspace = true }

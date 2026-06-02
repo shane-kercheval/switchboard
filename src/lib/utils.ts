@@ -28,6 +28,10 @@ export function formatDuration(ms: number): string {
   return h > 0 ? `${h}h ${pad(m)}m` : `${m}m ${pad(s)}s`;
 }
 
+export function currentIsoTimestamp(now: Date = new Date()): string {
+  return now.toISOString();
+}
+
 // Compact "time since" label for the project list's last-activity column.
 // `now` is injectable so tests stay deterministic (no wall-clock dependency).
 // Falls back to a short locale date for anything older than ~4 weeks, and to

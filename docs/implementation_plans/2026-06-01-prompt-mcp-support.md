@@ -142,7 +142,7 @@ Milestones are dependency-ordered. Each is independently reviewable and should l
 - `provider:name` address parsing; strict prefixed lookup; `local` reserved.
 - Tauri command shims `list_prompts` and `render_prompt` (local providers only this milestone) — fixing the no-project-argument signatures the rest of the plan depends on.
 - **Doc/code reconciliation:** `crates/core`'s `DirectoryConfig` and the `AGENTS.md` reference to a per-directory `.switchboard/prompts/` predate the global model — drop or de-special-case the per-directory prompts dir so docs and code agree with §6 (already amended).
-- Ship the example prompt(s) the design references (e.g. `code-review.md`) at the user-global default prompts path.
+- **Seed example prompts (first-run only).** Bundle `code-review.md` (and any other examples) as a Tauri resource and seed them into the user-global default prompts dir **once on first run** — gated on the dir being *absent* (or a one-time seed marker), **not** on "empty" (so deleting an example never triggers re-seeding). Never overwrite an existing file. Seeded files are real, user-editable local prompts — serving §2's file-first, zero-setup onboarding. This adds first-run write infra to `crates/app`.
 
 **Definition of Done.**
 - Unit/fixture tests (deterministic, no network): frontmatter parsing (valid / invalid / missing required fields); `local_prompt_dirs` declared-order shadowing; MiniJinja render with required + optional args; missing-required-arg error; unknown-arg handling; `provider:name` address parsing (`local:x`, bare, malformed).
@@ -239,7 +239,7 @@ These apply across milestones. Carry the *why* into the code (comments/commit me
 
 - **No secrets in logs or error messages** — bearer tokens and PATs never appear in tracing, error strings, or test output. Redact in any diagnostic.
 - **Graceful degradation** — a misconfigured or unreachable provider never breaks the compose box or local prompts; it degrades to empty-with-warning.
-- **Optional-argument semantics (settle once; touches M1 local, M2 MCP, M4 preview).** Omit unfilled optional args from the `prompts/get` call (let the server template apply its own conditionals/defaults); local MiniJinja renders missing optionals as empty. **Preview and send must pass the identical argument map** so the preview never diverges from what the agent receives.
+- **Argument semantics (settle once; touches M1 local, M2 MCP, M4 preview).** Omit unfilled optional args from the `prompts/get` call (let the server template apply its own conditionals/defaults); local MiniJinja renders missing optionals as empty. **Unknown supplied args are rejected** (error listing the valid argument names) for *both* local and MCP providers — local matches Tiddly's strict behavior so a prompt behaves identically whichever store it lives in (portability). Missing *required* args are a typed error at render; the composer also blocks send on empty required fields. **Preview and send must pass the identical argument map** so the preview never diverges from what the agent receives.
 - **Determinism in tests** — inject clocks/intervals for the device-flow polling; no wall-clock or time-of-day dependencies.
 - **Dependency hygiene** — add all crates via `cargo add` / `pnpm add` per `AGENTS.md`; commit manifest + lockfile together.
 - **Wire-format conventions** — new IPC types follow the existing `#[serde(rename_all = "snake_case")]` + TS discriminated-union pattern; mark evolving enums `#[non_exhaustive]`.

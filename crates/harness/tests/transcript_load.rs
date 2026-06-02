@@ -20,7 +20,7 @@ use futures::StreamExt;
 use switchboard_core::{AgentRecord, HarnessKind, SessionLocator};
 use switchboard_harness::{
     AdapterEvent, AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, DispatchOptions,
-    GeminiAdapter, HarnessAdapter, Turn, TurnItem, TurnStatus, antigravity, codex::sidecar,
+    GeminiAdapter, HarnessAdapter, Turn, TurnItem, TurnStatus, codex::sidecar,
     load_antigravity_transcript,
 };
 use uuid::Uuid;
@@ -736,19 +736,22 @@ fn assert_gemini_agent_usage(turn: &Turn) {
 async fn live_antigravity_two_turns_hydrate_in_order() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let adapter = AntigravityAdapter::new();
-    let agent = AgentRecord {
+    // Antigravity agents start with no locator; the conversation UUID is
+    // captured on first dispatch (a `SessionLocatorCaptured` event) and lives on
+    // the record thereafter. We simulate the dispatcher here: fold the captured
+    // locator back onto the agent so the second dispatch resumes it.
+    let mut agent = AgentRecord {
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
         name: "transcript-agy".to_owned(),
         harness: HarnessKind::Antigravity,
-        // Antigravity agents carry session_locator: None; the conversation UUID
-        // lives in the per-agent sidecar after the first dispatch.
         session_locator: None,
         created_at: chrono::Utc::now(),
     };
 
-    // Two prompts against the same agent: the second resumes via the sidecar
-    // and appends to the same transcript.jsonl (single-file-per-conversation).
+    // Two prompts against the same agent: the second resumes the captured
+    // conversation and appends to the same transcript.jsonl.
+    let mut conversation_id: Option<Uuid> = None;
     for prompt in [
         "Reply with only the single word 'one' and nothing else.",
         "Reply with only the single word 'two' and nothing else.",
@@ -763,21 +766,24 @@ async fn live_antigravity_two_turns_hydrate_in_order() {
             )
             .await
             .expect("dispatch should succeed with real agy");
-        let _events: Vec<AdapterEvent> = stream.collect().await;
+        let events: Vec<AdapterEvent> = stream.collect().await;
+        for event in &events {
+            if let AdapterEvent::SessionLocatorCaptured {
+                locator: SessionLocator::Uuid(u),
+                ..
+            } = event
+            {
+                conversation_id = Some(*u);
+                agent.session_locator = Some(SessionLocator::Uuid(*u));
+            }
+        }
     }
 
-    let sidecar = antigravity::sidecar::sidecar_path(tmp.path(), agent.project_id, agent.id);
-    let record = antigravity::sidecar::read_latest(&sidecar)
-        .expect("sidecar must read cleanly")
-        .expect("sidecar must contain a record after live dispatches");
-
-    let transcript = load_antigravity_transcript(
-        &real_home(),
-        tmp.path(),
-        Some(record.conversation_id),
-        agent.id,
-    )
-    .expect("load_antigravity_transcript must succeed");
+    let conversation_id =
+        conversation_id.expect("a capture event must have bound the conversation id");
+    let transcript =
+        load_antigravity_transcript(&real_home(), tmp.path(), Some(conversation_id), agent.id)
+            .expect("load_antigravity_transcript must succeed");
 
     assert!(
         transcript.warnings.is_empty(),

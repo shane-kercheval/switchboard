@@ -22,8 +22,9 @@ use chrono::{DateTime, Utc};
 use switchboard_core::{AgentId, AgentRecord, HarnessKind, SendId, SessionLocator};
 use switchboard_dispatcher::{
     CancelOutcome, ConversationJournal, DispatchContext, DispatchContextFactory, Dispatcher,
-    EventEmitter, JournalError, MetadataCache, NoopJournal, NoopMetadataCache, NotQueued, OnBusy,
-    RecordingEmitter, SendOutcome,
+    EventEmitter, JournalError, MetadataCache, NoopJournal, NoopMetadataCache,
+    NoopSessionLocatorSink, NotQueued, OnBusy, RecordingEmitter, SendOutcome, SessionLocatorError,
+    SessionLocatorSink,
 };
 use switchboard_harness::{
     CancelSource, DispatchOptions, HarnessAdapter, MessageId, MockHarnessAdapter, MockScenario,
@@ -74,6 +75,7 @@ struct TestFactory {
     emitter: Arc<dyn EventEmitter>,
     journal: Arc<dyn ConversationJournal>,
     metadata: Arc<dyn MetadataCache>,
+    locator_sink: Arc<dyn SessionLocatorSink>,
 }
 
 impl TestFactory {
@@ -115,6 +117,27 @@ impl TestFactory {
         journal: Arc<dyn ConversationJournal>,
         metadata: Arc<dyn MetadataCache>,
     ) -> Arc<Self> {
+        Self::sequence_with_locator_sink(
+            scenarios,
+            agent,
+            emitter,
+            journal,
+            metadata,
+            Arc::new(NoopSessionLocatorSink),
+        )
+    }
+
+    /// As [`Self::sequence_with_metadata`], but with an injected
+    /// [`SessionLocatorSink`] so the runtime-capture tests can capture what the
+    /// dispatcher persists (or assert a persist failure fails the turn).
+    fn sequence_with_locator_sink(
+        scenarios: impl IntoIterator<Item = MockScenario>,
+        agent: AgentRecord,
+        emitter: Arc<RecordingEmitter>,
+        journal: Arc<dyn ConversationJournal>,
+        metadata: Arc<dyn MetadataCache>,
+        locator_sink: Arc<dyn SessionLocatorSink>,
+    ) -> Arc<Self> {
         let queue: std::collections::VecDeque<Arc<dyn HarnessAdapter>> = scenarios
             .into_iter()
             .map(|s| Arc::new(MockHarnessAdapter::with_scenario(s)) as Arc<dyn HarnessAdapter>)
@@ -127,6 +150,7 @@ impl TestFactory {
             emitter: emitter as Arc<dyn EventEmitter>,
             journal,
             metadata,
+            locator_sink,
         })
     }
 }
@@ -149,6 +173,7 @@ impl DispatchContextFactory for TestFactory {
             options: DispatchOptions::default(),
             journal: Arc::clone(&self.journal),
             metadata: Arc::clone(&self.metadata),
+            locator_sink: Arc::clone(&self.locator_sink),
         }
     }
 
@@ -238,6 +263,34 @@ impl ConversationJournal for FailingJournal {
         _: DateTime<Utc>,
         _: DateTime<Utc>,
     ) {
+    }
+}
+
+/// Records every captured locator the dispatcher persists, so tests can assert
+/// the sink fired once per capture event (and is never deduped).
+#[derive(Default)]
+struct RecordingLocatorSink {
+    persisted: Mutex<Vec<(AgentId, SessionLocator)>>,
+}
+
+impl SessionLocatorSink for RecordingLocatorSink {
+    fn persist(
+        &self,
+        agent_id: AgentId,
+        locator: SessionLocator,
+    ) -> Result<(), SessionLocatorError> {
+        self.persisted.lock().unwrap().push((agent_id, locator));
+        Ok(())
+    }
+}
+
+/// A locator sink that always fails — used to assert a first-capture persist
+/// failure fails the turn (the load-bearing distinction from `MetadataCache`).
+struct FailingLocatorSink;
+
+impl SessionLocatorSink for FailingLocatorSink {
+    fn persist(&self, _: AgentId, _: SessionLocator) -> Result<(), SessionLocatorError> {
+        Err(SessionLocatorError("registry on fire".into()))
     }
 }
 
@@ -2538,4 +2591,154 @@ async fn cancel_agent_cancels_in_flight_clears_backlog_and_stays_alive() {
         emitter.wait_for_type("turn_start", 2),
     )
     .await;
+}
+
+#[tokio::test]
+async fn captured_locator_is_persisted_and_turn_completes() {
+    // A SessionLocatorCaptured event (Codex/Antigravity learning its locator at
+    // runtime) is persisted via the injected sink and is NOT forwarded to the
+    // frontend; the turn completes normally.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let locator = SessionLocator::Uuid(Uuid::now_v7());
+    let sink = Arc::new(RecordingLocatorSink::default());
+    let factory = TestFactory::sequence_with_locator_sink(
+        [MockScenario::CapturesLocator(locator.clone())],
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+        Arc::new(NoopMetadataCache),
+        Arc::clone(&sink) as Arc<dyn SessionLocatorSink>,
+    );
+
+    dispatcher
+        .send_message(agent.id, "hello", Uuid::now_v7(), factory, OnBusy::Enqueue)
+        .await;
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+
+    let persisted = sink.persisted.lock().unwrap();
+    assert_eq!(
+        persisted.len(),
+        1,
+        "the sink is invoked once per capture event"
+    );
+    assert_eq!(persisted[0], (agent.id, locator));
+
+    let snapshot = emitter.snapshot();
+    // The turn completed...
+    assert!(
+        snapshot
+            .iter()
+            .any(|(_, v)| event_type(v) == "turn_end" && v["outcome"]["status"] == "completed"),
+        "turn completes after a successful capture"
+    );
+    // ...and the internal capture event never reached the wire.
+    assert!(
+        !snapshot
+            .iter()
+            .any(|(_, v)| event_type(v) == "session_locator_captured"),
+        "the capture event must not be forwarded to the frontend"
+    );
+}
+
+#[tokio::test]
+async fn capture_persist_failure_fails_the_turn() {
+    // The load-bearing distinction from MetadataCache: a persist failure on
+    // capture fails the turn (a lost locator silently starts a fresh session
+    // next turn), rather than being swallowed.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let factory = TestFactory::sequence_with_locator_sink(
+        [MockScenario::CapturesLocator(SessionLocator::Uuid(
+            Uuid::now_v7(),
+        ))],
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+        Arc::new(NoopMetadataCache),
+        Arc::new(FailingLocatorSink),
+    );
+
+    dispatcher
+        .send_message(agent.id, "hello", Uuid::now_v7(), factory, OnBusy::Enqueue)
+        .await;
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+
+    let snapshot = emitter.snapshot();
+    let terminal = snapshot
+        .iter()
+        .find(|(_, v)| event_type(v) == "turn_end")
+        .expect("a turn_end terminal");
+    assert_eq!(
+        terminal.1["outcome"]["status"], "failed",
+        "a capture-persist failure fails the turn"
+    );
+    assert_eq!(terminal.1["outcome"]["kind"], "adapter_failure");
+    assert!(
+        !snapshot
+            .iter()
+            .any(|(_, v)| event_type(v) == "turn_end" && v["outcome"]["status"] == "completed"),
+        "the turn must not also complete"
+    );
+}
+
+#[tokio::test]
+async fn repeated_capture_events_each_persist_and_are_not_deduped() {
+    // The fork-and-heal shape at the dispatcher layer: a capture event on a
+    // second turn re-invokes the sink — the dispatcher never suppresses a
+    // capture as a duplicate (else a healed locator would be dropped).
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let sink = Arc::new(RecordingLocatorSink::default());
+    let factory = TestFactory::sequence_with_locator_sink(
+        [
+            MockScenario::CapturesLocator(SessionLocator::Uuid(Uuid::now_v7())),
+            MockScenario::CapturesLocator(SessionLocator::Uuid(Uuid::now_v7())),
+        ],
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+        Arc::new(NoopMetadataCache),
+        Arc::clone(&sink) as Arc<dyn SessionLocatorSink>,
+    );
+
+    // Send each turn only after the prior drained to idle, so they run as two
+    // distinct turns (back-to-back enqueues would chain into one drain and emit
+    // a single agent_idle).
+    for n in 1..=2 {
+        dispatcher
+            .send_message(
+                agent.id,
+                "hello",
+                Uuid::now_v7(),
+                Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
+                OnBusy::Enqueue,
+            )
+            .await;
+        within(
+            &emitter,
+            "agent_idle",
+            emitter.wait_for_type("agent_idle", n),
+        )
+        .await;
+    }
+
+    assert_eq!(
+        sink.persisted.lock().unwrap().len(),
+        2,
+        "each turn's capture event persists independently — never deduped"
+    );
 }

@@ -1,10 +1,16 @@
 //! Per-agent session-link sidecar for Antigravity agents.
 //!
+//! **Legacy / migration-only.** Session identity now lives on the agent's
+//! registry record (`AgentRecord.session_locator`); the adapter no longer reads
+//! or writes this sidecar, and no new `.antigravity.jsonl` is ever created. This
+//! module is retained solely so the one-time migration pass can fold any
+//! pre-existing sidecar into the registry, after which it is deleted. Do not
+//! wire new code to it.
+//!
 //! Antigravity assigns the conversation UUID server-side; the adapter
 //! captures it post-spawn (by watching for a new
-//! `~/.gemini/antigravity-cli/brain/<uuid>/` directory) and writes it
-//! here. Subsequent dispatches resume against the captured UUID via
-//! `agy -p --conversation <uuid>`.
+//! `~/.gemini/antigravity-cli/brain/<uuid>/` directory). Subsequent dispatches
+//! resume against the captured UUID via `agy -p --conversation <uuid>`.
 //!
 //! **Schema deliberately does not store the transcript file path.** The
 //! transcript path is derivable from `conversation_id` via the constants

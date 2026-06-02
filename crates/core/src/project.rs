@@ -176,19 +176,23 @@ impl Project {
         )
     }
 
-    /// Register an attached **Antigravity** agent using a caller-supplied
-    /// `agent_id`. Mirrors the Codex sidecar pattern, not the Claude/Gemini
-    /// caller-controlled-UUID pattern: Antigravity's conversation UUID is
-    /// server-assigned and lives in the per-agent sidecar, so `session_locator`
-    /// stays `None`. The attach flow pre-writes the sidecar before committing
-    /// the registry record (same pre-generated-id ordering and failure-mode
-    /// rationale as [`Self::register_attached_codex_agent_with_id`]).
-    pub fn register_attached_antigravity_agent_with_id(
+    /// Register an attached **Antigravity** agent — one that wraps an existing
+    /// server-assigned conversation. Now mirrors the Claude/Gemini
+    /// caller-controlled-UUID pattern: the conversation UUID is the agent's
+    /// session locator and is written straight onto the record, so there is no
+    /// sidecar and no pre-generated-id ordering dance. The commands layer
+    /// validates the conversation directory exists before calling this.
+    pub fn register_attached_antigravity_agent(
         &self,
         name: &str,
-        agent_id: crate::agent::AgentId,
+        conversation_id: Uuid,
     ) -> Result<AgentRecord> {
-        self.register_agent_inner_with_id(name, HarnessKind::Antigravity, None, agent_id)
+        self.register_agent_inner_with_id(
+            name,
+            HarnessKind::Antigravity,
+            Some(SessionLocator::Uuid(conversation_id)),
+            Uuid::now_v7(),
+        )
     }
 
     /// Shared validation + JSONL append. Caller decides the `session_locator`
@@ -724,13 +728,17 @@ mod tests {
     }
 
     #[test]
-    fn register_attached_antigravity_leaves_session_locator_none() {
+    fn register_attached_antigravity_persists_conversation_uuid() {
         let (_tmp, project) = fresh_project();
+        let conversation_id = Uuid::new_v4();
         let record = project
-            .register_attached_antigravity_agent_with_id("attached", Uuid::now_v7())
+            .register_attached_antigravity_agent("attached", conversation_id)
             .unwrap();
         assert_eq!(record.harness, HarnessKind::Antigravity);
-        assert!(record.session_locator.is_none());
+        assert_eq!(
+            record.session_locator,
+            Some(SessionLocator::Uuid(conversation_id))
+        );
     }
 
     #[test]

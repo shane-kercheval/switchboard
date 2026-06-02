@@ -2,7 +2,7 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use switchboard_core::AgentRecord;
+use switchboard_core::{AgentRecord, SessionLocator};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::adapter::{DispatchError, EventStream, HarnessAdapter};
@@ -83,6 +83,13 @@ pub enum MockScenario {
     /// (must persist) and once with `SessionFileBacked` (must not), asserting
     /// the injected `MetadataCache`.
     RateLimitWithSource(crate::events::RateLimitSource),
+
+    /// Emits `ContentChunk → SessionLocatorCaptured(locator) → TurnEnd(Completed)`.
+    /// The vehicle for the dispatcher's runtime-capture tests: drives the
+    /// internal capture event so the dispatcher's injected `SessionLocatorSink`
+    /// fires (and, with a failing sink, the turn fails). Stands in for a
+    /// Codex/Antigravity adapter without a subprocess.
+    CapturesLocator(SessionLocator),
 }
 
 /// A `HarnessAdapter` that produces canned events without spawning any subprocess.
@@ -302,6 +309,23 @@ impl HarnessAdapter for MockHarnessAdapter {
                         agent_id,
                         info: serde_json::json!({"primary": {"used_percent": 42.0}}),
                         source,
+                    });
+                });
+            }
+            MockScenario::CapturesLocator(ref locator) => {
+                let locator = locator.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send(AdapterEvent::ContentChunk {
+                        turn_id,
+                        kind: ContentKind::Text,
+                        text: "ack".to_owned(),
+                    });
+                    let _ = tx.send(AdapterEvent::SessionLocatorCaptured { agent_id, locator });
+                    let _ = tx.send(AdapterEvent::TurnEnd {
+                        turn_id,
+                        outcome: TurnOutcome::Completed,
+                        ended_at: Utc::now(),
+                        usage: None,
                     });
                 });
             }

@@ -10,11 +10,8 @@ use std::path::Path;
 
 use futures::StreamExt;
 use serde_json::{Value, json};
-use switchboard_core::{AgentRecord, HarnessKind};
+use switchboard_core::{AgentRecord, HarnessKind, SessionLocator};
 use switchboard_harness::antigravity::paths;
-use switchboard_harness::antigravity::sidecar::{
-    SessionLinkRecord, append_record, read_latest, sidecar_path,
-};
 use switchboard_harness::antigravity::{FAKE_AGY_INVOCATIONS_FILE, FAKE_AGY_SCRIPT_FILE};
 use switchboard_harness::{
     AdapterEvent, AntigravityAdapter, DispatchOptions, FailureKind, HarnessAdapter, Turn, TurnItem,
@@ -34,6 +31,34 @@ fn agy_agent() -> AgentRecord {
         session_locator: None,
         created_at: chrono::Utc::now(),
     }
+}
+
+/// An agent resuming an existing conversation — its locator is already on the
+/// record (as the dispatcher's live-read factory would supply it).
+fn agy_agent_resuming(conversation_id: Uuid) -> AgentRecord {
+    AgentRecord {
+        session_locator: Some(SessionLocator::Uuid(conversation_id)),
+        ..agy_agent()
+    }
+}
+
+/// The conversation UUID carried by the dispatch's capture event, or `None` if
+/// it emitted none (a plain resume). Asserts at most one capture per dispatch —
+/// the adapter must emit it once on first capture / fork-and-heal, never twice.
+fn captured_uuid(events: &[AdapterEvent]) -> Option<Uuid> {
+    let mut captures = events.iter().filter_map(|e| match e {
+        AdapterEvent::SessionLocatorCaptured {
+            locator: SessionLocator::Uuid(u),
+            ..
+        } => Some(*u),
+        _ => None,
+    });
+    let first = captures.next();
+    assert!(
+        captures.next().is_none(),
+        "a dispatch must emit at most one SessionLocatorCaptured event"
+    );
+    first
 }
 
 fn user_record(prompt: &str, ts: &str) -> String {
@@ -130,7 +155,7 @@ fn count<P: Fn(&AdapterEvent) -> bool>(events: &[AdapterEvent], pred: P) -> usiz
 }
 
 /// A first turn that captures the server-assigned UUID, tails the transcript
-/// for tool lifecycle and the answer text, and persists the sidecar. Timed
+/// for tool lifecycle and the answer text, and emits the capture event. Timed
 /// record appends force some records to be tailed mid-loop and the rest in the
 /// post-exit drain — so the single-emission assertions also prove the cursor
 /// advances and never re-emits across drains.
@@ -182,15 +207,13 @@ async fn first_turn_captures_uuid_tails_tools_and_completes() {
         "answer text emitted from the transcript"
     );
 
-    // Sidecar healed/persisted with the captured UUID.
-    let latest = read_latest(&sidecar_path(cwd.path(), agent.project_id, agent.id))
-        .unwrap()
-        .expect("sidecar persisted");
-    assert_eq!(latest.conversation_id, uuid);
+    // Capture event emitted with the server-assigned UUID — the dispatcher
+    // persists it to the registry (no sidecar written by the adapter).
+    assert_eq!(captured_uuid(&events), Some(uuid));
 }
 
 /// `fake_agy` writes everything and exits with zero delays — before any 100ms
-/// poll tick can run. The post-exit final capture must still bind and persist
+/// poll tick can run. The post-exit final capture must still bind and emit
 /// the UUID, and the turn must complete.
 #[tokio::test]
 async fn fast_first_turn_still_captures_uuid() {
@@ -215,10 +238,11 @@ async fn fast_first_turn_still_captures_uuid() {
 
     let events = dispatch(&adapter, &agent, cwd.path(), "quick").await;
     assert!(matches!(outcome(&events), TurnOutcome::Completed));
-    let latest = read_latest(&sidecar_path(cwd.path(), agent.project_id, agent.id))
-        .unwrap()
-        .expect("sidecar persisted even on the fast path");
-    assert_eq!(latest.conversation_id, uuid);
+    assert_eq!(
+        captured_uuid(&events),
+        Some(uuid),
+        "post-exit capture still emits the UUID on the fast path"
+    );
 }
 
 /// A reply streamed but no matching `brain/<uuid>/` directory exists (a broken
@@ -283,38 +307,29 @@ async fn capture_falls_back_to_brain_dir_when_log_omits_the_id() {
         matches!(outcome(&events), TurnOutcome::Completed),
         "fallback prompt-correlation should still bind the conversation"
     );
-    let latest = read_latest(&sidecar_path(cwd.path(), agent.project_id, agent.id))
-        .unwrap()
-        .expect("sidecar persisted via the fallback path");
-    assert_eq!(latest.conversation_id, uuid);
+    assert_eq!(
+        captured_uuid(&events),
+        Some(uuid),
+        "capture event emitted via the fallback path"
+    );
 }
 
 /// The load-bearing case. A resume whose `--conversation <stale>` expired
 /// server-side: `agy` warns and forks a fresh conversation. The adapter must
-/// (a) heal the sidecar to the new UUID, (b) surface the forked turn's tool
-/// events (re-pointed transcript), and (c) make the *next* dispatch resume the
-/// healed UUID.
+/// (a) emit a capture event healing the locator to the new UUID, (b) surface the
+/// forked turn's tool events (re-pointed transcript), and (c) make the *next*
+/// dispatch (whose record now holds the healed UUID) resume that UUID.
 #[tokio::test]
 async fn fork_and_heal_recaptures_new_conversation_and_next_dispatch_resumes_it() {
     let home = tempfile::TempDir::new().unwrap();
     let cwd = tempfile::TempDir::new().unwrap();
     let adapter = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home.path());
-    let agent = agy_agent();
     let stale_uuid = Uuid::new_v4();
     let new_uuid = Uuid::new_v4();
-    let sidecar = sidecar_path(cwd.path(), agent.project_id, agent.id);
 
-    // Pre-seed the sidecar so dispatch 1 is a resume against the stale UUID.
-    append_record(
-        &sidecar,
-        &SessionLinkRecord {
-            conversation_id: stale_uuid,
-            captured_at: chrono::Utc::now(),
-        },
-    )
-    .unwrap();
-
-    // Dispatch 1: agy can't find the stale conversation, forks `new_uuid`.
+    // Dispatch 1 resumes the stale UUID (carried on the record); agy can't find
+    // it and forks `new_uuid`.
+    let agent1 = agy_agent_resuming(stale_uuid);
     write_script(
         cwd.path(),
         &json!({
@@ -330,7 +345,7 @@ async fn fork_and_heal_recaptures_new_conversation_and_next_dispatch_resumes_it(
             "exit_code": 0,
         }),
     );
-    let events1 = dispatch(&adapter, &agent, cwd.path(), "first prompt").await;
+    let events1 = dispatch(&adapter, &agent1, cwd.path(), "first prompt").await;
 
     // (c-prereq) Turn still completes — a real answer streamed.
     assert!(matches!(outcome(&events1), TurnOutcome::Completed));
@@ -347,14 +362,18 @@ async fn fork_and_heal_recaptures_new_conversation_and_next_dispatch_resumes_it(
         )),
         1
     );
-    // (a) Sidecar healed to the new UUID.
-    let healed = read_latest(&sidecar).unwrap().expect("healed sidecar");
+    // (a) Capture event heals the locator to the forked UUID — the dispatcher
+    // persists it, so the next turn's record carries `new_uuid`.
     assert_eq!(
-        healed.conversation_id, new_uuid,
-        "sidecar healed to forked UUID"
+        captured_uuid(&events1),
+        Some(new_uuid),
+        "fork-and-heal emits a capture event with the forked UUID"
     );
 
-    // Dispatch 2: a normal resume (no fork). It should pass --conversation <new_uuid>.
+    // Dispatch 2: a normal resume against the healed UUID (as the dispatcher's
+    // live-read factory would now supply it). It must pass --conversation
+    // <new_uuid> and emit no further capture.
+    let agent2 = agy_agent_resuming(new_uuid);
     write_script(
         cwd.path(),
         &json!({
@@ -367,8 +386,13 @@ async fn fork_and_heal_recaptures_new_conversation_and_next_dispatch_resumes_it(
             "exit_code": 0,
         }),
     );
-    let events2 = dispatch(&adapter, &agent, cwd.path(), "second prompt").await;
+    let events2 = dispatch(&adapter, &agent2, cwd.path(), "second prompt").await;
     assert!(matches!(outcome(&events2), TurnOutcome::Completed));
+    assert_eq!(
+        captured_uuid(&events2),
+        None,
+        "a plain resume (locator unchanged) emits no capture event"
+    );
 
     // (c) The post-heal dispatch resumed the healed UUID.
     let invocations = std::fs::read_to_string(cwd.path().join(FAKE_AGY_INVOCATIONS_FILE)).unwrap();
@@ -383,7 +407,7 @@ async fn fork_and_heal_recaptures_new_conversation_and_next_dispatch_resumes_it(
 
 /// Hydration against a real-shape `transcript.jsonl` captured from `agy`
 /// (multi-step tool use). Stages it where the loader resolves the path from the
-/// sidecar's conversation UUID and asserts the reconstructed turns.
+/// conversation UUID and asserts the reconstructed turns.
 #[tokio::test]
 async fn hydration_reconstructs_real_tool_use_transcript() {
     let home = tempfile::TempDir::new().unwrap();
@@ -444,10 +468,9 @@ async fn resume_turn_does_not_accumulate_prior_answers() {
     let home = tempfile::TempDir::new().unwrap();
     let cwd = tempfile::TempDir::new().unwrap();
     let adapter = AntigravityAdapter::with_binary_and_home(FAKE_AGY, home.path());
-    let agent = agy_agent();
     let uuid = Uuid::new_v4();
 
-    // Turn 1 (fresh): answer "ALPHA".
+    // Turn 1 (fresh): answer "ALPHA". Captures `uuid`.
     write_script(
         cwd.path(),
         &json!({
@@ -460,10 +483,13 @@ async fn resume_turn_does_not_accumulate_prior_answers() {
             "exit_code": 0,
         }),
     );
-    let _ = dispatch(&adapter, &agent, cwd.path(), "first").await;
+    let events1 = dispatch(&adapter, &agy_agent(), cwd.path(), "first").await;
+    assert_eq!(captured_uuid(&events1), Some(uuid));
 
-    // Turn 2 (resume): the new answer is "BETA", but stdout replays "ALPHA"
-    // then "BETA" — the producer must emit only "BETA" (from the transcript).
+    // Turn 2 (resume): the dispatcher would have persisted `uuid` onto the
+    // record, so the resuming agent carries it. The new answer is "BETA", but
+    // stdout replays "ALPHA" then "BETA" — the producer must emit only "BETA"
+    // (from the transcript, past the resume cursor).
     write_script(
         cwd.path(),
         &json!({
@@ -476,7 +502,7 @@ async fn resume_turn_does_not_accumulate_prior_answers() {
             "exit_code": 0,
         }),
     );
-    let events = dispatch(&adapter, &agent, cwd.path(), "second").await;
+    let events = dispatch(&adapter, &agy_agent_resuming(uuid), cwd.path(), "second").await;
 
     let text: String = events
         .iter()

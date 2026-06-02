@@ -45,7 +45,7 @@ use std::time::Duration;
 use switchboard_core::{AgentRecord, Directory, HarnessKind, SendId};
 use switchboard_dispatcher::{
     ConversationJournal, DispatchContext, DispatchContextFactory, Dispatcher, EventEmitter,
-    NoopJournal, NoopMetadataCache, OnBusy, RecordingEmitter, SendOutcome,
+    NoopJournal, NoopMetadataCache, NoopSessionLocatorSink, OnBusy, RecordingEmitter, SendOutcome,
 };
 use switchboard_harness::{
     AntigravityAdapter, CancelSource, ClaudeCodeAdapter, CodexAdapter, DispatchOptions,
@@ -99,6 +99,7 @@ impl DispatchContextFactory for LiveFactory {
             options: DispatchOptions::default(),
             journal: noop_journal(),
             metadata: Arc::new(NoopMetadataCache),
+            locator_sink: Arc::new(NoopSessionLocatorSink),
         }
     }
 

@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use switchboard_core::AgentId;
+use switchboard_core::{AgentId, SessionLocator};
 use uuid::Uuid;
 
 /// UUID v7 turn identifier — consistent with `AgentId` and `ProjectId`.
@@ -113,9 +113,14 @@ pub struct TurnUsage {
 ///
 /// Variant scope: `ContentChunk`, `ToolStarted`, `ToolCompleted`, `TurnEnd` are
 /// turn-scoped (the `turn_id` self-discriminates the agent via the transcript
-/// map). `SessionMeta`, `RateLimitEvent` are agent-scoped (no turn anchor) and
-/// carry `agent_id` in the payload so they're self-describing for logs,
-/// persistence, and any future non-channel transport.
+/// map). `SessionMeta`, `RateLimitEvent`, `SessionLocatorCaptured` are
+/// agent-scoped (no turn anchor) and carry `agent_id` in the payload so they're
+/// self-describing for logs, persistence, and any future non-channel transport.
+///
+/// `SessionLocatorCaptured` is **internal** (adapter → dispatcher only): the
+/// dispatcher persists the locator to the registry and does not forward it to
+/// the frontend, so it has no `NormalizedEvent` counterpart — see
+/// [`AdapterEvent::into_normalized`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[non_exhaustive]
@@ -168,6 +173,17 @@ pub enum AdapterEvent {
         mcp_servers: Vec<McpServerStatus>,
         skills: Vec<String>,
         raw: serde_json::Value,
+    },
+    /// A runtime-assigned session locator the adapter just learned for this
+    /// agent (Codex's `thread_id`+date on first dispatch; Antigravity's
+    /// conversation UUID on first dispatch or a fork-and-heal). The dispatcher
+    /// persists it to the agent's registry record via its injected
+    /// `SessionLocatorSink`; it is **not** forwarded to the frontend. Emitted
+    /// only when the locator is newly learned or changes — never on a plain
+    /// resume where it's unchanged.
+    SessionLocatorCaptured {
+        agent_id: AgentId,
+        locator: SessionLocator,
     },
 }
 
@@ -279,9 +295,16 @@ pub enum NormalizedEvent {
     AgentIdle { agent_id: AgentId },
 }
 
-impl From<AdapterEvent> for NormalizedEvent {
-    fn from(e: AdapterEvent) -> Self {
-        match e {
+impl AdapterEvent {
+    /// Lift an adapter event into its frontend-facing [`NormalizedEvent`], or
+    /// `None` for an **internal** event that the dispatcher consumes without
+    /// forwarding. Not every adapter event has a wire representation:
+    /// `SessionLocatorCaptured` is persisted to the registry and dropped, so it
+    /// returns `None`. (Replaces a total `From` impl, which couldn't honestly
+    /// represent the no-wire-form case without a panicking arm.)
+    #[must_use]
+    pub fn into_normalized(self) -> Option<NormalizedEvent> {
+        Some(match self {
             AdapterEvent::ContentChunk {
                 turn_id,
                 kind,
@@ -349,7 +372,10 @@ impl From<AdapterEvent> for NormalizedEvent {
                 skills,
                 raw,
             },
-        }
+            // Internal adapter → dispatcher event; persisted to the registry,
+            // never shown to the frontend.
+            AdapterEvent::SessionLocatorCaptured { .. } => return None,
+        })
     }
 }
 
@@ -728,7 +754,9 @@ mod tests {
             kind: ContentKind::Text,
             text: "hi".to_owned(),
         };
-        let normalized = NormalizedEvent::from(adapter);
+        let normalized = adapter
+            .into_normalized()
+            .expect("lifts to a normalized event");
         assert!(matches!(
             normalized,
             NormalizedEvent::ContentChunk {
@@ -742,7 +770,9 @@ mod tests {
     #[test]
     fn adapter_event_lifts_to_normalized_liveness() {
         let turn_id = fresh_turn_id();
-        let normalized = NormalizedEvent::from(AdapterEvent::Liveness { turn_id });
+        let normalized = AdapterEvent::Liveness { turn_id }
+            .into_normalized()
+            .expect("lifts to a normalized event");
         assert!(matches!(
             normalized,
             NormalizedEvent::Liveness { turn_id: t } if t == turn_id
@@ -757,7 +787,9 @@ mod tests {
             ended_at: fresh_time(),
             usage: None,
         };
-        let normalized = NormalizedEvent::from(adapter);
+        let normalized = adapter
+            .into_normalized()
+            .expect("lifts to a normalized event");
         assert!(matches!(
             normalized,
             NormalizedEvent::TurnEnd {
@@ -779,7 +811,9 @@ mod tests {
             ended_at: fresh_time(),
             usage: None,
         };
-        let normalized = NormalizedEvent::from(adapter);
+        let normalized = adapter
+            .into_normalized()
+            .expect("lifts to a normalized event");
         assert!(matches!(
             normalized,
             NormalizedEvent::TurnEnd {
@@ -801,7 +835,9 @@ mod tests {
             name: "Bash".to_owned(),
             input: json!({}),
         };
-        let normalized = NormalizedEvent::from(adapter);
+        let normalized = adapter
+            .into_normalized()
+            .expect("lifts to a normalized event");
         assert!(matches!(
             normalized,
             NormalizedEvent::ToolStarted { name, .. } if name == "Bash"
@@ -816,7 +852,9 @@ mod tests {
             output: "ok".to_owned(),
             is_error: false,
         };
-        let normalized = NormalizedEvent::from(adapter);
+        let normalized = adapter
+            .into_normalized()
+            .expect("lifts to a normalized event");
         assert!(matches!(
             normalized,
             NormalizedEvent::ToolCompleted { output, .. } if output == "ok"
@@ -833,7 +871,9 @@ mod tests {
         };
         // The `source` discriminator is internal — it must not survive the
         // conversion to the wire-format event (the frontend never sees it).
-        let normalized = NormalizedEvent::from(adapter);
+        let normalized = adapter
+            .into_normalized()
+            .expect("lifts to a normalized event");
         assert!(matches!(
             normalized,
             NormalizedEvent::RateLimitEvent { agent_id: a, .. } if a == agent_id
@@ -856,10 +896,23 @@ mod tests {
             skills: vec![],
             raw: json!({}),
         };
-        let normalized = NormalizedEvent::from(adapter);
+        let normalized = adapter
+            .into_normalized()
+            .expect("lifts to a normalized event");
         assert!(matches!(
             normalized,
             NormalizedEvent::SessionMeta { model, .. } if model == "claude-sonnet-4-6"
         ));
+    }
+
+    #[test]
+    fn session_locator_captured_does_not_lift_to_a_wire_event() {
+        // Internal adapter→dispatcher event: persisted to the registry, never
+        // forwarded to the frontend, so it has no NormalizedEvent counterpart.
+        let adapter = AdapterEvent::SessionLocatorCaptured {
+            agent_id: fresh_agent_id(),
+            locator: SessionLocator::Uuid(Uuid::now_v7()),
+        };
+        assert!(adapter.into_normalized().is_none());
     }
 }

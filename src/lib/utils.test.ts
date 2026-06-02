@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { basename, formatDuration, relativeTime } from "./utils";
+import { basename, currentIsoTimestamp, formatDuration, relativeTime } from "./utils";
 
 describe("formatDuration", () => {
   it("formats minutes and seconds under an hour with padded seconds", () => {
@@ -52,5 +52,11 @@ describe("relativeTime", () => {
 
   it("returns empty string for an unparseable timestamp", () => {
     expect(relativeTime("not-a-date", now)).toBe("");
+  });
+});
+
+describe("currentIsoTimestamp", () => {
+  it("accepts an injected clock for deterministic callers", () => {
+    expect(currentIsoTimestamp(new Date("2026-05-25T12:00:00Z"))).toBe("2026-05-25T12:00:00.000Z");
   });
 });

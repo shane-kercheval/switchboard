@@ -4,11 +4,12 @@
   import { formatDuration } from "$lib/utils";
   import { cancelSend, runtimes, transcripts, type Turn } from "$lib/state/index.svelte";
   import {
-    answerTextOf,
     buildUnifiedRows,
+    copyTextOf,
     groupRenderBlocks,
     type UnifiedRow,
   } from "$lib/state/unified";
+  import { agentCopy } from "$lib/agentCopy.svelte";
   import { HARNESS_COLOR } from "$lib/harnessDisplay";
   import Badge from "$lib/components/ui/Badge.svelte";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
@@ -93,7 +94,7 @@
   function columnText(colRows: NonUserRow[]): string {
     return colRows
       .filter((r) => r.kind === "agent")
-      .map((r) => answerTextOf(r.turn))
+      .map((r) => copyTextOf(r.turn, agentCopy.mode))
       .filter((t) => t.length > 0)
       .join("\n\n");
   }
@@ -349,7 +350,7 @@
 
 {#snippet agentRow(turn: AgentTurn)}
   {@const harness = agentById[turn.agent_id]?.harness}
-  {@const copyable = answerTextOf(turn)}
+  {@const copyable = copyTextOf(turn, agentCopy.mode)}
   <div class="group space-y-1.5" data-testid="turn" data-role="agent">
     <div class="flex items-center gap-2 text-xs font-semibold tracking-wide uppercase">
       <span class="text-fg" data-testid="turn-agent-name">{agentName(turn.agent_id)}</span>

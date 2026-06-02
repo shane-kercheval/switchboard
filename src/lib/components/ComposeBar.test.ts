@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/svelte";
+import { tick } from "svelte";
 import type { AgentRecord, NormalizedEvent } from "$lib/types";
 
 const invokeMock = vi.fn(
@@ -57,6 +58,10 @@ const chip = (id: string) => screen.getByTestId(`recipient-chip-${id}`);
 beforeEach(() => {
   listeners.clear();
   invokeMock.mockReset();
+  invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+    if (cmd === "search_project_files") return [];
+    return null;
+  });
 });
 
 afterEach(async () => {
@@ -102,6 +107,41 @@ describe("ComposeBar", () => {
     expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "false");
   });
 
+  it("grows the message box with content up to its max height", async () => {
+    const scrollHeight = vi.spyOn(HTMLTextAreaElement.prototype, "scrollHeight", "get");
+    const getComputedStyleSpy = vi.spyOn(window, "getComputedStyle");
+    try {
+      const state = await loadState();
+      await state.registerAgent(AGENT_A);
+
+      getComputedStyleSpy.mockReturnValue({ maxHeight: "192px" } as CSSStyleDeclaration);
+      scrollHeight.mockImplementation(function (this: HTMLTextAreaElement): number {
+        if (this.value.includes("six")) return this.style.height === "auto" ? 240 : 192;
+        if (this.value === "short again") return 72;
+        return 96;
+      });
+      const ComposeBar = (await import("./ComposeBar.svelte")).default;
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+      await tick();
+      const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+      expect(textarea.style.height).toBe("96px");
+      expect(textarea.style.overflowY).toBe("hidden");
+
+      await fireEvent.input(textarea, { target: { value: "one\ntwo\nthree\nfour\nfive\nsix" } });
+      await tick();
+      expect(textarea.style.height).toBe("192px");
+      expect(textarea.style.overflowY).toBe("auto");
+
+      await fireEvent.input(textarea, { target: { value: "short again" } });
+      await tick();
+      expect(textarea.style.height).toBe("72px");
+      expect(textarea.style.overflowY).toBe("hidden");
+    } finally {
+      scrollHeight.mockRestore();
+      getComputedStyleSpy.mockRestore();
+    }
+  });
+
   it("toggles a recipient on and off by clicking its chip", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
@@ -128,13 +168,277 @@ describe("ComposeBar", () => {
 
     const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
     await fireEvent.input(textarea, { target: { value: "ping @bo" } });
-    // bob is offered (alice is already selected); Enter picks the highlighted.
+    // bob is offered (alice is already selected); Enter picks bob as the sole recipient.
     await screen.findByTestId(`recipient-option-${AGENT_B.id}`);
     await fireEvent.keyDown(textarea, { key: "Enter" });
 
+    expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "false");
     expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "true");
     // The "@bo" token is stripped; the text typed before it (with its space) stays.
     expect(textarea.value).toBe("ping ");
+  });
+
+  it("@ menu shows matching files above recipients but Enter prefers a matched recipient", async () => {
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "search_project_files") return ["docs/bob.md", "src/box.ts"];
+      return null;
+    });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "ping @bo" } });
+
+    const file = await screen.findByTestId("file-option-docs/bob.md");
+    const bob = await screen.findByTestId(`recipient-option-${AGENT_B.id}`);
+    const menu = screen.getByTestId("recipient-menu");
+    const menuText = menu.textContent ?? "";
+    expect(menuText.indexOf("Files")).toBeLessThan(menuText.indexOf("Send to"));
+    expect(file).toHaveAttribute("aria-selected", "false");
+    expect(bob).toHaveAttribute("aria-selected", "true");
+
+    await fireEvent.keyDown(textarea, { key: "Enter" });
+    expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "false");
+    expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "true");
+    expect(textarea.value).toBe("ping ");
+  });
+
+  it("@ menu inserts a selected README file mention without changing recipients", async () => {
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "search_project_files") return ["README.md"];
+      return null;
+    });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "read @readme" } });
+    await fireEvent.click(await screen.findByTestId("file-option-README.md"));
+
+    expect(textarea.value).toBe("read `README.md` ");
+    expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "true");
+    expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "false");
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith("search_project_files", {
+        projectId: PROJECT_ID,
+        query: "readme",
+        limit: 12,
+      });
+    });
+  });
+
+  it("single-agent projects show files on a bare @", async () => {
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "search_project_files") return ["README.md"];
+      return null;
+    });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "@" } });
+    expect(screen.getByTestId("file-options-status")).toHaveTextContent("Searching files...");
+    await fireEvent.click(await screen.findByTestId("file-option-README.md"));
+
+    expect(screen.queryByTestId("recipient-field")).toBeNull();
+    expect(textarea.value).toBe("`README.md` ");
+  });
+
+  it("@ file search shows an empty state when there are no matches", async () => {
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "search_project_files") return [];
+      return null;
+    });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "open @zz" } });
+    expect(screen.getByTestId("file-options-status")).toHaveTextContent("Searching files...");
+    await waitFor(() => {
+      expect(screen.getByTestId("file-options-status")).toHaveTextContent("No matching files");
+    });
+  });
+
+  it("@ file insertion handles replacement markers and backticks in paths", async () => {
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "search_project_files") return ["hello/$&.txt", "weird`name.ts"];
+      return null;
+    });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "open @hello" } });
+    await fireEvent.click(await screen.findByTestId("file-option-hello/$&.txt"));
+    expect(textarea.value).toBe("open `hello/$&.txt` ");
+
+    await fireEvent.input(textarea, { target: { value: "open @weird" } });
+    await fireEvent.click(await screen.findByTestId("file-option-weird`name.ts"));
+    expect(textarea.value).toBe("open ``weird`name.ts`` ");
+  });
+
+  it("keeps recipient options visible when file search fails", async () => {
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "search_project_files") throw new Error("project unavailable");
+      return null;
+    });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "ping @bo" } });
+
+    expect(await screen.findByTestId(`recipient-option-${AGENT_B.id}`)).toBeInTheDocument();
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith("search_project_files", {
+        projectId: PROJECT_ID,
+        query: "bo",
+        limit: 12,
+      });
+    });
+    expect(screen.getByTestId("recipient-menu")).toBeInTheDocument();
+    expect(screen.getByTestId("file-options-status")).toHaveTextContent("File search unavailable");
+    expect(screen.queryByTestId("file-option-stale.ts")).toBeNull();
+  });
+
+  it("debounces file search without delaying recipient filtering", async () => {
+    vi.useFakeTimers();
+    try {
+      const state = await loadState();
+      await state.registerAgent(AGENT_A);
+      await state.registerAgent(AGENT_B);
+
+      const ComposeBar = (await import("./ComposeBar.svelte")).default;
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+      const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+      await fireEvent.input(textarea, { target: { value: "ping @b" } });
+      expect(screen.getByTestId(`recipient-option-${AGENT_B.id}`)).toBeInTheDocument();
+      await fireEvent.input(textarea, { target: { value: "ping @bo" } });
+
+      expect(invokeMock.mock.calls.some(([cmd]) => cmd === "search_project_files")).toBe(false);
+      await vi.advanceTimersByTimeAsync(179);
+      expect(invokeMock.mock.calls.some(([cmd]) => cmd === "search_project_files")).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+
+      await waitFor(() => {
+        expect(invokeMock).toHaveBeenCalledWith("search_project_files", {
+          projectId: PROJECT_ID,
+          query: "bo",
+          limit: 12,
+        });
+      });
+      expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "search_project_files")).toHaveLength(
+        1,
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancels pending file search when unmounted", async () => {
+    vi.useFakeTimers();
+    try {
+      const state = await loadState();
+      await state.registerAgent(AGENT_A);
+      await state.registerAgent(AGENT_B);
+
+      const ComposeBar = (await import("./ComposeBar.svelte")).default;
+      const { unmount } = render(ComposeBar, {
+        props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] },
+      });
+
+      const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+      await fireEvent.input(textarea, { target: { value: "ping @bo" } });
+      unmount();
+      await vi.advanceTimersByTimeAsync(180);
+
+      expect(invokeMock.mock.calls.some(([cmd]) => cmd === "search_project_files")).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps still-matching file rows visible while the next search is pending", async () => {
+    vi.useFakeTimers();
+    try {
+      invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+        if (cmd !== "search_project_files") return null;
+        const query = args?.query;
+        if (query === "r") return ["README.md"];
+        if (query === "re") return ["README.md", "docs/release-notes.md"];
+        return [];
+      });
+      const state = await loadState();
+      await state.registerAgent(AGENT_A);
+      await state.registerAgent(AGENT_B);
+
+      const ComposeBar = (await import("./ComposeBar.svelte")).default;
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+      const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+      await fireEvent.input(textarea, { target: { value: "open @r" } });
+      await vi.advanceTimersByTimeAsync(180);
+      expect(await screen.findByTestId("file-option-README.md")).toBeInTheDocument();
+
+      await fireEvent.input(textarea, { target: { value: "open @re" } });
+      expect(screen.getByTestId("file-option-README.md")).toBeInTheDocument();
+      expect(screen.queryByTestId("file-option-docs/release-notes.md")).toBeNull();
+
+      await vi.advanceTimersByTimeAsync(180);
+      expect(await screen.findByTestId("file-option-docs/release-notes.md")).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the matching agent highlighted when retained file rows stay visible", async () => {
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "search_project_files") return ["docs/bob.md"];
+      return null;
+    });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "ping @b" } });
+
+    const file = await screen.findByTestId("file-option-docs/bob.md");
+    const bob = await screen.findByTestId(`recipient-option-${AGENT_B.id}`);
+    expect(file).toHaveAttribute("aria-selected", "false");
+    expect(bob).toHaveAttribute("aria-selected", "true");
+
+    await fireEvent.input(textarea, { target: { value: "ping @bo" } });
+    expect(file).toHaveAttribute("aria-selected", "false");
+    expect(bob).toHaveAttribute("aria-selected", "true");
   });
 
   it("a bare @ offers All / Clear actions that bulk-select and deselect", async () => {
@@ -147,6 +451,8 @@ describe("ComposeBar", () => {
 
     const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
     await fireEvent.input(textarea, { target: { value: "@" } });
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "search_project_files")).toBe(false);
+    expect(screen.queryByText("Files")).toBeNull();
 
     // All → every agent selected.
     await fireEvent.click(await screen.findByTestId("recipient-option-all"));

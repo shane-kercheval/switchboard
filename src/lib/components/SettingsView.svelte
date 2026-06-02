@@ -157,5 +157,7 @@
       </div>
       <HarnessStatusList />
     </section>
+
+    <div class="h-10" aria-hidden="true"></div>
   </div>
 </div>

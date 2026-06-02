@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/svelte";
+import { tick } from "svelte";
 import type { AgentRecord, NormalizedEvent } from "$lib/types";
 
 const invokeMock = vi.fn(
@@ -102,6 +103,41 @@ describe("ComposeBar", () => {
     expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "false");
   });
 
+  it("grows the message box with content up to its max height", async () => {
+    const scrollHeight = vi.spyOn(HTMLTextAreaElement.prototype, "scrollHeight", "get");
+    const getComputedStyleSpy = vi.spyOn(window, "getComputedStyle");
+    try {
+      const state = await loadState();
+      await state.registerAgent(AGENT_A);
+
+      getComputedStyleSpy.mockReturnValue({ maxHeight: "192px" } as CSSStyleDeclaration);
+      scrollHeight.mockImplementation(function (this: HTMLTextAreaElement): number {
+        if (this.value.includes("six")) return this.style.height === "auto" ? 240 : 192;
+        if (this.value === "short again") return 72;
+        return 96;
+      });
+      const ComposeBar = (await import("./ComposeBar.svelte")).default;
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+      await tick();
+      const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+      expect(textarea.style.height).toBe("96px");
+      expect(textarea.style.overflowY).toBe("hidden");
+
+      await fireEvent.input(textarea, { target: { value: "one\ntwo\nthree\nfour\nfive\nsix" } });
+      await tick();
+      expect(textarea.style.height).toBe("192px");
+      expect(textarea.style.overflowY).toBe("auto");
+
+      await fireEvent.input(textarea, { target: { value: "short again" } });
+      await tick();
+      expect(textarea.style.height).toBe("72px");
+      expect(textarea.style.overflowY).toBe("hidden");
+    } finally {
+      scrollHeight.mockRestore();
+      getComputedStyleSpy.mockRestore();
+    }
+  });
+
   it("toggles a recipient on and off by clicking its chip", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
@@ -128,10 +164,11 @@ describe("ComposeBar", () => {
 
     const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
     await fireEvent.input(textarea, { target: { value: "ping @bo" } });
-    // bob is offered (alice is already selected); Enter picks the highlighted.
+    // bob is offered (alice is already selected); Enter picks bob as the sole recipient.
     await screen.findByTestId(`recipient-option-${AGENT_B.id}`);
     await fireEvent.keyDown(textarea, { key: "Enter" });
 
+    expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "false");
     expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "true");
     // The "@bo" token is stripped; the text typed before it (with its space) stays.
     expect(textarea.value).toBe("ping ");

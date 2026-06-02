@@ -32,6 +32,7 @@
   let prompt = $state<string>(saved.draft);
   let sendError = $state<string | null>(null);
   let composeEl = $state<HTMLDivElement | undefined>(undefined);
+  let textareaEl = $state<HTMLTextAreaElement | undefined>(undefined);
 
   /// Recipient set — every agent is shown as a toggle chip (click to add/drop);
   /// `@name` is the keyboard path to the same toggle. Sticky across sends, and
@@ -55,6 +56,18 @@
     return [roster[0]!.id];
   }
 
+  function resizeTextarea(textarea: HTMLTextAreaElement | undefined, _draft: string): void {
+    if (textarea === undefined) return;
+    textarea.style.height = "auto";
+    const naturalHeight = textarea.scrollHeight;
+    const maxHeight = Number.parseFloat(getComputedStyle(textarea).maxHeight);
+    const cappedHeight = Number.isFinite(maxHeight)
+      ? Math.min(naturalHeight, maxHeight)
+      : naturalHeight;
+    textarea.style.height = `${cappedHeight}px`;
+    textarea.style.overflowY = naturalHeight > cappedHeight ? "auto" : "hidden";
+  }
+
   // Drop any selected ids whose agent disappeared (agent removed at runtime).
   $effect(() => {
     const valid = selectedIds.filter((id) => agents.some((a) => a.id === id));
@@ -66,6 +79,11 @@
   // can't be resurrected by a deferred write.
   $effect(() => {
     setDraft(projectId, prompt);
+  });
+  // Track both the draft and bound textarea: draft changes resize the box, and
+  // the ref change performs the initial resize once the DOM node is available.
+  $effect(() => {
+    resizeTextarea(textareaEl, prompt);
   });
   // The parent unmounts this bar the moment a project loses its last agent (it
   // falls back to the roster-loading / first-agent screen), so an empty roster
@@ -207,8 +225,8 @@
       selectedIds = agents.map((a) => a.id);
     } else if (item.kind === "clear") {
       selectedIds = [];
-    } else if (!selectedIds.includes(item.agent.id)) {
-      selectedIds = [...selectedIds, item.agent.id];
+    } else {
+      selectedIds = [item.agent.id];
     }
     // The menu only opens from a typed `@token`, so always strip it.
     prompt = prompt.replace(AT_TOKEN, "$1");
@@ -321,7 +339,7 @@
                 {...props}
                 type="button"
                 class={cn(
-                  "focus-visible:ring-accent inline-flex items-center gap-1 rounded-full border py-0.5 pr-2 pl-1.5 text-sm transition-colors focus-visible:ring-2 focus-visible:outline-none",
+                  "focus-visible:ring-accent inline-flex items-center gap-1 rounded-full border py-px pr-2 pl-1.5 text-sm transition-colors focus-visible:ring-2 focus-visible:outline-none",
                   selected
                     ? "bg-accent-soft text-fg border-transparent"
                     : "border-panel bg-panel text-muted hover:bg-raised hover:text-fg",
@@ -343,7 +361,7 @@
               <button
                 {...props}
                 type="button"
-                class="text-muted hover:text-fg hover:bg-panel ml-0.5 flex h-[26px] w-[26px] items-center justify-center rounded-full transition-colors"
+                class="text-muted hover:text-fg hover:bg-panel ml-0.5 flex h-6 w-6 items-center justify-center rounded-full transition-colors"
                 data-testid="recipient-clear"
                 aria-label="Clear recipients"
                 onclick={() => (selectedIds = [])}
@@ -354,7 +372,7 @@
                   stroke="currentColor"
                   stroke-width="1.75"
                   stroke-linecap="round"
-                  class="h-5 w-5"
+                  class="h-4 w-4"
                   aria-hidden="true"
                 >
                   <circle cx="12" cy="12" r="9" />
@@ -440,10 +458,11 @@
         data-testid="compose-textarea"
         placeholder="Type a message…  (⌘+Enter to send, @ to add a recipient)"
         rows={3}
+        bind:ref={textareaEl}
         bind:value={prompt}
         oninput={onInput}
         onkeydown={handleKey}
-        class="min-h-16 border-0 bg-transparent p-1 shadow-none focus-visible:ring-0"
+        class="max-h-48 min-h-16 border-0 bg-transparent p-1 shadow-none focus-visible:ring-0"
       />
       <Tooltip
         label={showStop ? (liveSends.size > 1 ? "Cancel all sends" : "Cancel send") : "Send"}

@@ -25,9 +25,21 @@
 // agent (1) < outcome (2).
 
 import type { AgentId, ConversationItem, OutcomeStatus, TurnId } from "$lib/types";
+import type { AgentCopyMode } from "$lib/agentCopyMode";
 import type { Turn } from "./types";
 
 type AgentTurn = Extract<Turn, { role: "agent" }>;
+
+function trimBlankOuterLines(text: string): string {
+  const lines = text.split(/\r?\n/);
+  let start = 0;
+  while (start < lines.length && lines[start]!.trim().length === 0) start += 1;
+
+  let end = lines.length;
+  while (end > start && lines[end - 1]!.trim().length === 0) end -= 1;
+
+  return lines.slice(start, end).join("\n");
+}
 
 /// The canonical "answer prose" of an agent turn: its `text`-kind chunks joined,
 /// with tool calls AND reasoning (`kind: "thinking"`) excluded.
@@ -38,14 +50,38 @@ type AgentTurn = Extract<Turn, { role: "agent" }>;
 /// inner `kind` discriminates), so an ad-hoc `filter(item_kind === "text")` that
 /// forgets the inner `kind === "text"` check silently leaks the model's private
 /// reasoning into the response. Route every such consumer through here so that
-/// rule lives in exactly one place. See docs/research/harness-behavior.md §3.2.
+/// rule lives in exactly one place. Empty outer lines are removed from each
+/// answer block, while indentation and trailing spaces on meaningful lines are
+/// preserved for Markdown fidelity. See docs/research/harness-behavior.md §3.2.
 export function answerTextOf(turn: AgentTurn): string {
   return turn.items
     .filter((i) => i.item_kind === "text")
     .filter((i) => i.kind === "text")
-    .map((i) => i.text)
-    .join("\n\n")
-    .trim();
+    .map((i) => trimBlankOuterLines(i.text))
+    .filter((text) => text.length > 0)
+    .join("\n\n");
+}
+
+/// The final answer-prose block of an agent turn: scan backward for the last
+/// non-empty answer text item, skipping tools and model reasoning.
+export function lastAnswerTextOf(turn: AgentTurn): string {
+  for (let i = turn.items.length - 1; i >= 0; i--) {
+    const item = turn.items[i]!;
+    if (item.item_kind === "text" && item.kind === "text") {
+      const text = trimBlankOuterLines(item.text);
+      if (text.length > 0) return text;
+    }
+  }
+  return "";
+}
+
+export function copyTextOf(turn: AgentTurn, mode: AgentCopyMode): string {
+  switch (mode) {
+    case "last_answer_block":
+      return lastAnswerTextOf(turn);
+    case "full_answer":
+      return answerTextOf(turn);
+  }
 }
 
 /// One rendered row in the unified transcript.

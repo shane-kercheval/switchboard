@@ -17,7 +17,7 @@
 use std::path::PathBuf;
 
 use futures::StreamExt;
-use switchboard_core::{AgentRecord, HarnessKind};
+use switchboard_core::{AgentRecord, HarnessKind, SessionLocator};
 use switchboard_harness::{
     AdapterEvent, AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, DispatchOptions,
     GeminiAdapter, HarnessAdapter, Turn, TurnItem, TurnStatus, antigravity, codex::sidecar,
@@ -33,6 +33,16 @@ fn real_home() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .expect("HOME must be set for live tests")
+}
+
+/// Extract the session UUID from a Claude/Gemini agent's locator (those
+/// harnesses always carry a `Uuid` variant). Panics on any other shape — a
+/// test setup error, not a runtime condition.
+fn uuid_locator(agent: &AgentRecord) -> Uuid {
+    match &agent.session_locator {
+        Some(SessionLocator::Uuid(id)) => *id,
+        other => panic!("expected a Uuid session locator, got {other:?}"),
+    }
 }
 
 fn collect_text(events: &[AdapterEvent]) -> String {
@@ -55,7 +65,7 @@ async fn live_claude_transcript_load_round_trips() {
         project_id: Uuid::now_v7(),
         name: "transcript-claude".to_owned(),
         harness: HarnessKind::ClaudeCode,
-        session_id: Some(Uuid::now_v7()),
+        session_locator: Some(SessionLocator::Uuid(Uuid::now_v7())),
         created_at: chrono::Utc::now(),
     };
     let prompt = "Reply with only the single word 'ack' and nothing else.";
@@ -77,7 +87,7 @@ async fn live_claude_transcript_load_round_trips() {
     let transcript = switchboard_harness::load_claude_transcript(
         &real_home(),
         tmp.path(),
-        agent.session_id.unwrap(),
+        uuid_locator(&agent),
         agent.id,
     )
     .expect("load_claude_transcript must succeed");
@@ -113,7 +123,7 @@ async fn live_claude_transcript_load_hydrates_tool_items() {
         project_id: Uuid::now_v7(),
         name: "transcript-claude-tool".to_owned(),
         harness: HarnessKind::ClaudeCode,
-        session_id: Some(Uuid::now_v7()),
+        session_locator: Some(SessionLocator::Uuid(Uuid::now_v7())),
         created_at: chrono::Utc::now(),
     };
     let turn_id = Uuid::now_v7();
@@ -136,7 +146,7 @@ async fn live_claude_transcript_load_hydrates_tool_items() {
     let transcript = switchboard_harness::load_claude_transcript(
         &real_home(),
         tmp.path(),
-        agent.session_id.unwrap(),
+        uuid_locator(&agent),
         agent.id,
     )
     .expect("load_claude_transcript must succeed");
@@ -219,7 +229,7 @@ async fn live_claude_tool_results_bind_after_restart() {
         project_id: Uuid::now_v7(),
         name: "transcript-claude-tool-bind".to_owned(),
         harness: HarnessKind::ClaudeCode,
-        session_id: Some(Uuid::now_v7()),
+        session_locator: Some(SessionLocator::Uuid(Uuid::now_v7())),
         created_at: chrono::Utc::now(),
     };
     let turn_id = Uuid::now_v7();
@@ -241,7 +251,7 @@ async fn live_claude_tool_results_bind_after_restart() {
     let transcript = switchboard_harness::load_claude_transcript(
         &real_home(),
         tmp.path(),
-        agent.session_id.unwrap(),
+        uuid_locator(&agent),
         agent.id,
     )
     .expect("load_claude_transcript must succeed");
@@ -306,7 +316,7 @@ async fn live_codex_transcript_load_via_sidecar_round_trips() {
         project_id: Uuid::now_v7(),
         name: "transcript-codex".to_owned(),
         harness: HarnessKind::Codex,
-        session_id: None,
+        session_locator: None,
         created_at: chrono::Utc::now(),
     };
     let prompt = "Reply with only the single word 'ack' and nothing else.";
@@ -378,7 +388,7 @@ async fn live_codex_transcript_load_hydrates_tool_items() {
         project_id: Uuid::now_v7(),
         name: "transcript-codex-tool".to_owned(),
         harness: HarnessKind::Codex,
-        session_id: None,
+        session_locator: None,
         created_at: chrono::Utc::now(),
     };
     let turn_id = Uuid::now_v7();
@@ -566,7 +576,7 @@ async fn live_gemini_transcript_load_via_session_file_round_trips() {
         project_id: Uuid::now_v7(),
         name: "transcript-gemini".to_owned(),
         harness: HarnessKind::Gemini,
-        session_id: Some(session_id),
+        session_locator: Some(SessionLocator::Uuid(session_id)),
         created_at: chrono::Utc::now(),
     };
     let prompt = "Reply with only the single word 'ack' and nothing else.";
@@ -588,7 +598,7 @@ async fn live_gemini_transcript_load_via_session_file_round_trips() {
     let transcript = switchboard_harness::load_gemini_transcript(
         &real_home(),
         tmp.path(),
-        agent.session_id.unwrap(),
+        uuid_locator(&agent),
         agent.id,
     )
     .expect("load_gemini_transcript must succeed");
@@ -630,7 +640,7 @@ async fn live_gemini_transcript_load_hydrates_tool_items() {
         project_id: Uuid::now_v7(),
         name: "transcript-gemini-tool".to_owned(),
         harness: HarnessKind::Gemini,
-        session_id: Some(session_id),
+        session_locator: Some(SessionLocator::Uuid(session_id)),
         created_at: chrono::Utc::now(),
     };
     let turn_id = Uuid::now_v7();
@@ -652,7 +662,7 @@ async fn live_gemini_transcript_load_hydrates_tool_items() {
     let transcript = switchboard_harness::load_gemini_transcript(
         &real_home(),
         tmp.path(),
-        agent.session_id.unwrap(),
+        uuid_locator(&agent),
         agent.id,
     )
     .expect("load_gemini_transcript must succeed");
@@ -731,9 +741,9 @@ async fn live_antigravity_two_turns_hydrate_in_order() {
         project_id: Uuid::now_v7(),
         name: "transcript-agy".to_owned(),
         harness: HarnessKind::Antigravity,
-        // Antigravity agents carry session_id: None; the conversation UUID
+        // Antigravity agents carry session_locator: None; the conversation UUID
         // lives in the per-agent sidecar after the first dispatch.
-        session_id: None,
+        session_locator: None,
         created_at: chrono::Utc::now(),
     };
 

@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use futures::StreamExt;
-use switchboard_core::{AgentRecord, HarnessKind};
+use switchboard_core::{AgentRecord, HarnessKind, SessionLocator};
 use switchboard_harness::{
     AdapterEvent, ClaudeCodeAdapter, ContentKind, DispatchError, DispatchOptions, FailureKind,
     HarnessAdapter, ToolKind, TurnOutcome,
@@ -28,7 +28,7 @@ fn fake_agent() -> AgentRecord {
         project_id: Uuid::now_v7(),
         name: "test-agent".to_owned(),
         harness: HarnessKind::ClaudeCode,
-        session_id: Some(Uuid::now_v7()),
+        session_locator: Some(SessionLocator::Uuid(Uuid::now_v7())),
         created_at: chrono::Utc::now(),
     }
 }

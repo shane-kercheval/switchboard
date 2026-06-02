@@ -140,8 +140,11 @@ pub struct AppState {
     /// register/attach, and `list_agents`; the removed directory's entries are
     /// dropped on `remove_directory`. v1 has no agent/project deletion, so
     /// invalidation is insert-only within a session plus a targeted prune when
-    /// a directory is removed. `AgentRecord` is immutable after registration,
-    /// so a cached copy never goes stale.
+    /// a directory is removed. An `AgentRecord` is otherwise immutable after
+    /// registration, with one exception: `rename_agent_impl` and
+    /// `set_agent_session_locator_impl` (the runtime session-locator capture)
+    /// mutate a record in place and re-insert the updated copy here in the same
+    /// `registry_write` critical section, so the cache never lags the registry.
     pub agents_by_id: Mutex<HashMap<AgentId, AgentRecord>>,
 
     /// User-global workspace registry — the set of working directories the app

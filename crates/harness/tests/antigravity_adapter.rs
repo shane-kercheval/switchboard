@@ -31,7 +31,7 @@ fn agy_agent() -> AgentRecord {
         project_id: Uuid::now_v7(),
         name: "test-agy".to_owned(),
         harness: HarnessKind::Antigravity,
-        session_id: None,
+        session_locator: None,
         created_at: chrono::Utc::now(),
     }
 }

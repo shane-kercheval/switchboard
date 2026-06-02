@@ -8,7 +8,7 @@
 use std::path::Path;
 
 use futures::StreamExt;
-use switchboard_core::{AgentRecord, HarnessKind};
+use switchboard_core::{AgentRecord, HarnessKind, SessionLocator};
 use switchboard_harness::{
     AdapterEvent, AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, ContentKind,
     DispatchOptions, GeminiAdapter, HarnessAdapter, RateLimitSource, TurnOutcome,
@@ -21,7 +21,7 @@ fn live_agent() -> AgentRecord {
         project_id: Uuid::now_v7(),
         name: "live-test-agent".to_owned(),
         harness: HarnessKind::ClaudeCode,
-        session_id: Some(Uuid::now_v7()),
+        session_locator: Some(SessionLocator::Uuid(Uuid::now_v7())),
         created_at: chrono::Utc::now(),
     }
 }
@@ -242,7 +242,7 @@ async fn live_claude_resume_reuses_session() {
         project_id: Uuid::now_v7(),
         name: "session-test-1".to_owned(),
         harness: HarnessKind::ClaudeCode,
-        session_id: Some(session_id),
+        session_locator: Some(SessionLocator::Uuid(session_id)),
         created_at: chrono::Utc::now(),
     };
 
@@ -276,7 +276,7 @@ async fn live_claude_resume_reuses_session() {
         project_id: Uuid::now_v7(),
         name: "session-test-2".to_owned(),
         harness: HarnessKind::ClaudeCode,
-        session_id: Some(session_id),
+        session_locator: Some(SessionLocator::Uuid(session_id)),
         created_at: chrono::Utc::now(),
     };
 
@@ -317,7 +317,7 @@ fn live_codex_agent() -> AgentRecord {
         harness: HarnessKind::Codex,
         // Codex agents always have session_id = None — the per-agent
         // session-link sidecar is the system-of-record.
-        session_id: None,
+        session_locator: None,
         created_at: chrono::Utc::now(),
     }
 }
@@ -582,7 +582,7 @@ fn live_gemini_agent() -> AgentRecord {
         // millisecond share their first 8 chars. v4 makes the collision
         // probability ~1/2^32. The production `Project::register_agent`
         // honors this contract; tests must mint v4 explicitly here too.
-        session_id: Some(Uuid::new_v4()),
+        session_locator: Some(SessionLocator::Uuid(Uuid::new_v4())),
         created_at: chrono::Utc::now(),
     }
 }
@@ -802,7 +802,7 @@ fn live_antigravity_agent() -> AgentRecord {
         harness: HarnessKind::Antigravity,
         // Antigravity assigns the conversation UUID server-side; the adapter
         // captures it post-spawn into the per-agent sidecar. Always None.
-        session_id: None,
+        session_locator: None,
         created_at: chrono::Utc::now(),
     }
 }

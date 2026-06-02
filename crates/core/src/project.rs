@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::agent::AgentRecord;
+use crate::agent::{AgentRecord, SessionLocator};
 use crate::error::{CoreError, Result};
 use crate::harness::HarnessKind;
 use crate::io::{append_jsonl, read_jsonl, read_yaml, write_jsonl, write_yaml};
@@ -62,8 +62,8 @@ impl Project {
 
     /// Append a new agent to this project's registry. Validates the name (regex +
     /// per-project uniqueness with hyphen↔underscore + case normalization), generates
-    /// a UUID v7 `AgentId`, and (for Claude Code) pre-generates a UUID v7 `session_id`
-    /// the adapter will pass via `--session-id <uuid>`.
+    /// a UUID v7 `AgentId`, and (for Claude Code) pre-generates a UUID v7
+    /// `SessionLocator::Uuid` the adapter will pass via `--session-id <uuid>`.
     ///
     /// # Concurrency
     ///
@@ -84,28 +84,28 @@ impl Project {
     /// appear on the next `list_agents`. There is no destructive cleanup to
     /// undo here (unlike `Directory::create_project`), so no rollback applies.
     pub fn register_agent(&self, name: &str, harness: HarnessKind) -> Result<AgentRecord> {
-        // Harness-asymmetry rule:
-        // - Claude Code pre-generates session_id (UUID v7) at registration
-        //   time; passed via `--session-id`/`--resume`.
-        // - Gemini pre-generates session_id (UUID **v4**) at registration
-        //   time; passed via `--session-id`/`--resume`. Gemini's session
+        // Harness-asymmetry rule (which harnesses can pre-generate their
+        // session locator at registration vs. learn it at runtime):
+        // - Claude Code pre-generates a UUID v7 locator; passed via
+        //   `--session-id`/`--resume`.
+        // - Gemini pre-generates a UUID **v4** locator. Gemini's session
         //   filename embeds the first 8 hex chars of the session ID, and
         //   UUID v7s minted in the same millisecond share their first 8
         //   chars — concurrent Gemini dispatches in one cwd would interleave
         //   on disk. v4's first 8 chars are random across 32 bits, so the
         //   collision probability is ~1/2^32. Localized to Gemini.
-        // - Codex leaves it None and relies on the per-agent session-link
-        //   sidecar populated from `thread.started` on first dispatch.
-        // - Antigravity leaves it None for the same structural reason as
-        //   Codex: the conversation UUID is assigned server-side, so it
-        //   isn't knowable at registration time. The per-agent sidecar at
-        //   `<agent_id>.antigravity.jsonl` carries it after first dispatch.
-        let session_id = match harness {
-            HarnessKind::ClaudeCode => Some(Uuid::now_v7()),
-            HarnessKind::Gemini => Some(Uuid::new_v4()),
+        // - Codex and Antigravity leave it `None`: their session id is
+        //   assigned by the harness at runtime (Codex's `thread_id` from
+        //   `thread.started`; Antigravity's server-assigned conversation
+        //   UUID), so it isn't knowable at registration time. The adapter
+        //   captures it on first dispatch and it's persisted to this record's
+        //   `session_locator` via `set_session_locator`.
+        let session_locator = match harness {
+            HarnessKind::ClaudeCode => Some(SessionLocator::Uuid(Uuid::now_v7())),
+            HarnessKind::Gemini => Some(SessionLocator::Uuid(Uuid::new_v4())),
             HarnessKind::Codex | HarnessKind::Antigravity => None,
         };
-        self.register_agent_inner_with_id(name, harness, session_id, Uuid::now_v7())
+        self.register_agent_inner_with_id(name, harness, session_locator, Uuid::now_v7())
     }
 
     /// Register an attached **Claude Code** agent — one that wraps an
@@ -122,7 +122,7 @@ impl Project {
         self.register_agent_inner_with_id(
             name,
             HarnessKind::ClaudeCode,
-            Some(session_id),
+            Some(SessionLocator::Uuid(session_id)),
             Uuid::now_v7(),
         )
     }
@@ -171,7 +171,7 @@ impl Project {
         self.register_agent_inner_with_id(
             name,
             HarnessKind::Gemini,
-            Some(session_id),
+            Some(SessionLocator::Uuid(session_id)),
             Uuid::now_v7(),
         )
     }
@@ -179,7 +179,7 @@ impl Project {
     /// Register an attached **Antigravity** agent using a caller-supplied
     /// `agent_id`. Mirrors the Codex sidecar pattern, not the Claude/Gemini
     /// caller-controlled-UUID pattern: Antigravity's conversation UUID is
-    /// server-assigned and lives in the per-agent sidecar, so `session_id`
+    /// server-assigned and lives in the per-agent sidecar, so `session_locator`
     /// stays `None`. The attach flow pre-writes the sidecar before committing
     /// the registry record (same pre-generated-id ordering and failure-mode
     /// rationale as [`Self::register_attached_codex_agent_with_id`]).
@@ -191,20 +191,20 @@ impl Project {
         self.register_agent_inner_with_id(name, HarnessKind::Antigravity, None, agent_id)
     }
 
-    /// Shared validation + JSONL append. Caller decides the `session_id`
+    /// Shared validation + JSONL append. Caller decides the `session_locator`
     /// strategy (create vs. attach, per-harness) and the `agent_id`
     /// (typically `Uuid::now_v7()` from the wrappers; the Codex attach flow
     /// pre-mints to coordinate with sidecar-first writing). Private to
     /// enforce the public surface invariants: create-path uses
     /// `register_agent`, attach-path uses the harness-specific
     /// `register_attached_*` methods, so a Claude attach without a
-    /// `session_id` (or a Codex attach with one) is unrepresentable at the
+    /// `session_locator` (or a Codex attach with one) is unrepresentable at the
     /// API boundary.
     fn register_agent_inner_with_id(
         &self,
         name: &str,
         harness: HarnessKind,
-        session_id: Option<Uuid>,
+        session_locator: Option<SessionLocator>,
         agent_id: Uuid,
     ) -> Result<AgentRecord> {
         validate_name(name)?;
@@ -215,7 +215,7 @@ impl Project {
             project_id: self.id,
             name: name.to_owned(),
             harness,
-            session_id,
+            session_locator,
             created_at: Utc::now(),
         };
 
@@ -260,6 +260,43 @@ impl Project {
             .ok_or(CoreError::AgentNotFound(agent_id))?;
         check_name_unique(&agents, new_name, Some(agent_id))?;
         new_name.clone_into(&mut agents[idx].name);
+        let updated = agents[idx].clone();
+        write_jsonl(&self.registry_path, &agents)?;
+        Ok(updated)
+    }
+
+    /// Set one agent's `session_locator` in place, rewriting `registry.jsonl`
+    /// with the new value and every other record (and their order) preserved.
+    /// Returns the updated record.
+    ///
+    /// This is the registry's only in-place field mutation beyond `rename_agent`.
+    /// It exists for the runtime-capture path: Codex/Antigravity learn their
+    /// session locator on first dispatch (and Antigravity can re-learn it on a
+    /// fork-and-heal), and the captured locator is identity that belongs on the
+    /// record. Same atomic full-rewrite + concurrency contract as
+    /// `remove_agent`/`rename_agent` — callers serialize via the app's
+    /// `registry_write` mutex. Deliberately *not* a generic update API; this is
+    /// the one mutation the capture path needs.
+    pub fn set_session_locator(
+        &self,
+        agent_id: crate::agent::AgentId,
+        locator: SessionLocator,
+    ) -> Result<AgentRecord> {
+        let mut agents = self.list_agents()?;
+        let idx = agents
+            .iter()
+            .position(|a| a.id == agent_id)
+            .ok_or(CoreError::AgentNotFound(agent_id))?;
+        // Reject a locator whose shape doesn't match the agent's harness (e.g.
+        // a Codex locator on a Claude agent). This is the persistence-boundary
+        // guard: an adapter capture bug would otherwise durably store a record
+        // that silently fails to resume. The enum makes intra-variant invalid
+        // states unrepresentable; this closes the harness↔variant gap.
+        let harness = agents[idx].harness;
+        if !locator.is_valid_for(harness) {
+            return Err(CoreError::SessionLocatorHarnessMismatch { agent_id, harness });
+        }
+        agents[idx].session_locator = Some(locator);
         let updated = agents[idx].clone();
         write_jsonl(&self.registry_path, &agents)?;
         Ok(updated)
@@ -384,7 +421,7 @@ mod tests {
             .unwrap();
         assert_eq!(record.name, "assistant");
         assert_eq!(record.project_id, project.id);
-        assert!(record.session_id.is_some()); // ClaudeCode pre-generates session UUID.
+        assert!(record.session_locator.is_some()); // ClaudeCode pre-generates a UUID locator.
 
         let listed = project.list_agents().unwrap();
         assert_eq!(listed, vec![record]);
@@ -398,7 +435,12 @@ mod tests {
         // concurrent dispatches in one cwd corrupt transcripts.
         let (_tmp, project) = fresh_project();
         let record = project.register_agent("g", HarnessKind::Gemini).unwrap();
-        let session_id = record.session_id.expect("Gemini pre-generates session_id");
+        let SessionLocator::Uuid(session_id) = record
+            .session_locator
+            .expect("Gemini pre-generates a UUID locator")
+        else {
+            panic!("Gemini locator must be the Uuid variant");
+        };
         assert_eq!(
             session_id.get_version_num(),
             4,
@@ -411,7 +453,7 @@ mod tests {
     fn register_codex_agent_leaves_session_id_none() {
         let (_tmp, project) = fresh_project();
         let record = project.register_agent("c", HarnessKind::Codex).unwrap();
-        assert!(record.session_id.is_none());
+        assert!(record.session_locator.is_none());
     }
 
     #[test]
@@ -423,7 +465,7 @@ mod tests {
         let record = project
             .register_agent("a", HarnessKind::Antigravity)
             .unwrap();
-        assert!(record.session_id.is_none());
+        assert!(record.session_locator.is_none());
     }
 
     #[test]
@@ -554,6 +596,101 @@ mod tests {
     }
 
     #[test]
+    fn set_session_locator_updates_only_target_and_preserves_order() {
+        let (_tmp, project) = fresh_project();
+        // Three agents in a known order; Codex starts with no locator.
+        let a = project
+            .register_agent("alpha", HarnessKind::ClaudeCode)
+            .unwrap();
+        let b = project.register_agent("beta", HarnessKind::Codex).unwrap();
+        let c = project
+            .register_agent("gamma", HarnessKind::Gemini)
+            .unwrap();
+        assert!(b.session_locator.is_none());
+
+        let locator = SessionLocator::Codex {
+            thread_id: "thread-xyz".to_owned(),
+            partition_date: chrono::NaiveDate::from_ymd_opt(2026, 5, 16).unwrap(),
+        };
+        let updated = project.set_session_locator(b.id, locator.clone()).unwrap();
+        assert_eq!(updated.id, b.id);
+        assert_eq!(updated.session_locator, Some(locator.clone()));
+
+        let listed = project.list_agents().unwrap();
+        // Order preserved: alpha, beta, gamma.
+        assert_eq!(
+            listed.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![a.id, b.id, c.id]
+        );
+        // Only beta changed.
+        assert_eq!(listed[0].session_locator, a.session_locator);
+        assert_eq!(listed[1].session_locator, Some(locator));
+        assert_eq!(listed[2].session_locator, c.session_locator);
+    }
+
+    #[test]
+    fn set_session_locator_overwrites_an_existing_locator() {
+        // Fork-and-heal shape: a locator already present is replaced.
+        let (_tmp, project) = fresh_project();
+        let a = project
+            .register_agent("a", HarnessKind::Antigravity)
+            .unwrap();
+        let first = SessionLocator::Uuid(Uuid::new_v4());
+        project.set_session_locator(a.id, first).unwrap();
+        let healed = SessionLocator::Uuid(Uuid::new_v4());
+        let updated = project.set_session_locator(a.id, healed.clone()).unwrap();
+        assert_eq!(updated.session_locator, Some(healed.clone()));
+        assert_eq!(
+            project.list_agents().unwrap()[0].session_locator,
+            Some(healed)
+        );
+    }
+
+    #[test]
+    fn set_session_locator_nonexistent_returns_not_found() {
+        let (_tmp, project) = fresh_project();
+        let err = project
+            .set_session_locator(Uuid::now_v7(), SessionLocator::Uuid(Uuid::new_v4()))
+            .unwrap_err();
+        assert!(matches!(err, CoreError::AgentNotFound(_)));
+    }
+
+    #[test]
+    fn set_session_locator_rejects_harness_shape_mismatch() {
+        // A Codex locator on a Claude agent must be refused (it would never
+        // resume) — and the registry left untouched.
+        let (_tmp, project) = fresh_project();
+        let claude = project
+            .register_agent("c", HarnessKind::ClaudeCode)
+            .unwrap();
+        let before = project.list_agents().unwrap();
+        let err = project
+            .set_session_locator(
+                claude.id,
+                SessionLocator::Codex {
+                    thread_id: "t".to_owned(),
+                    partition_date: chrono::NaiveDate::from_ymd_opt(2026, 5, 16).unwrap(),
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CoreError::SessionLocatorHarnessMismatch { .. }
+        ));
+        assert_eq!(project.list_agents().unwrap(), before);
+
+        // The inverse: a Uuid locator on a Codex agent is likewise refused.
+        let codex = project.register_agent("x", HarnessKind::Codex).unwrap();
+        let err = project
+            .set_session_locator(codex.id, SessionLocator::Uuid(Uuid::new_v4()))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CoreError::SessionLocatorHarnessMismatch { .. }
+        ));
+    }
+
+    #[test]
     fn register_rejects_invalid_name() {
         let (_tmp, project) = fresh_project();
         let err = project
@@ -570,30 +707,30 @@ mod tests {
             .register_attached_claude_agent("attached", provided)
             .unwrap();
         assert_eq!(record.harness, HarnessKind::ClaudeCode);
-        assert_eq!(record.session_id, Some(provided));
+        assert_eq!(record.session_locator, Some(SessionLocator::Uuid(provided)));
         // Round-trips via the registry.
         let listed = project.list_agents().unwrap();
         assert_eq!(listed, vec![record]);
     }
 
     #[test]
-    fn register_attached_codex_leaves_session_id_none() {
+    fn register_attached_codex_leaves_session_locator_none() {
         let (_tmp, project) = fresh_project();
         let record = project
             .register_attached_codex_agent_with_id("attached", Uuid::now_v7())
             .unwrap();
         assert_eq!(record.harness, HarnessKind::Codex);
-        assert!(record.session_id.is_none());
+        assert!(record.session_locator.is_none());
     }
 
     #[test]
-    fn register_attached_antigravity_leaves_session_id_none() {
+    fn register_attached_antigravity_leaves_session_locator_none() {
         let (_tmp, project) = fresh_project();
         let record = project
             .register_attached_antigravity_agent_with_id("attached", Uuid::now_v7())
             .unwrap();
         assert_eq!(record.harness, HarnessKind::Antigravity);
-        assert!(record.session_id.is_none());
+        assert!(record.session_locator.is_none());
     }
 
     #[test]

@@ -33,7 +33,7 @@ fn codex_agent() -> AgentRecord {
         name: "test-codex".to_owned(),
         harness: HarnessKind::Codex,
         // Codex agents always have session_id = None.
-        session_id: None,
+        session_locator: None,
         created_at: chrono::Utc::now(),
     }
 }

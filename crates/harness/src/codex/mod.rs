@@ -798,7 +798,7 @@ mod tests {
             project_id: Uuid::now_v7(),
             name: "test".to_owned(),
             harness: switchboard_core::HarnessKind::Codex,
-            session_id: None,
+            session_locator: None,
             created_at: Utc::now(),
         };
         let path = sidecar_path(tmp.path(), agent.project_id, agent.id);

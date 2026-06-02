@@ -14,7 +14,7 @@ pub mod name;
 mod paths;
 pub mod project;
 
-pub use agent::{AgentId, AgentRecord};
+pub use agent::{AgentId, AgentRecord, SessionLocator};
 pub use directory::{Directory, DirectoryConfig};
 pub use error::{CoreError, Result};
 pub use harness::HarnessKind;

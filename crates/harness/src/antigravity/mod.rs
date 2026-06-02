@@ -1333,7 +1333,7 @@ mod tests {
             project_id: Uuid::new_v4(),
             name: "a".to_owned(),
             harness: switchboard_core::HarnessKind::Antigravity,
-            session_id: None,
+            session_locator: None,
             created_at: Utc::now(),
         };
         let cwd = TempDir::new().unwrap();

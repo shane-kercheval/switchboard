@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use switchboard_core::{AgentId, AgentRecord, HarnessKind, SendId};
+use switchboard_core::{AgentId, AgentRecord, HarnessKind, SendId, SessionLocator};
 use switchboard_dispatcher::{
     CancelOutcome, ConversationJournal, DispatchContext, DispatchContextFactory, Dispatcher,
     EventEmitter, JournalError, MetadataCache, NoopJournal, NoopMetadataCache, NotQueued, OnBusy,
@@ -247,7 +247,7 @@ fn agent_record() -> AgentRecord {
         project_id: Uuid::now_v7(),
         name: "test-agent".to_owned(),
         harness: HarnessKind::ClaudeCode,
-        session_id: Some(Uuid::now_v7()),
+        session_locator: Some(SessionLocator::Uuid(Uuid::now_v7())),
         created_at: Utc::now(),
     }
 }

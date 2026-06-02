@@ -11,7 +11,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use switchboard_core::{
     AgentId, AgentRecord, CoreError, Directory, HarnessKind, Project, ProjectId, ProjectSummary,
-    SendId,
+    SendId, SessionLocator,
 };
 use switchboard_dispatcher::{
     CancelOutcome, DispatchContextFactory, OnBusy, RemovedQueuedMessage, SendOutcome,
@@ -638,6 +638,31 @@ pub fn rename_agent_impl(
     Ok(updated)
 }
 
+/// Persist a runtime-captured session locator onto an agent's registry record,
+/// in place, and refresh the `agents_by_id` cache. Serialized against the other
+/// registry mutations by `registry_write`, exactly like `rename_agent_impl`.
+///
+/// This is the app-side mechanism the runtime-capture sink calls when a
+/// Codex/Antigravity adapter learns (or, on an Antigravity fork-and-heal,
+/// re-learns) its locator. Returns the updated record. (The dispatch factory
+/// freezes the agent record at construction today, so the refreshed cache is
+/// not yet read mid-session; the factory's live-read of `agents_by_id` lands
+/// alongside the capture sink, at which point the next turn sees the update.)
+// Exercised by tests but not yet on a production call path — the M2 runtime-
+// capture sink is its first caller.
+#[allow(dead_code)]
+pub fn set_agent_session_locator_impl(
+    state: &AppState,
+    agent_id: AgentId,
+    locator: SessionLocator,
+) -> Result<AgentRecord, AppError> {
+    let _write = lock(&state.registry_write);
+    let (project, _) = lookup_agent(state, agent_id)?;
+    let updated = project.set_session_locator(agent_id, locator)?;
+    lock(&state.agents_by_id).insert(agent_id, updated.clone());
+    Ok(updated)
+}
+
 /// Attach an existing harness session (Claude Code, Codex, Gemini, or
 /// Antigravity) as a new Switchboard agent in the active project.
 ///
@@ -657,10 +682,10 @@ pub fn rename_agent_impl(
 ///    scan would false-reject a legitimately-distinct same-id-different-cwd
 ///    session. Codex and Antigravity scan **all loaded directories**
 ///    (`enumerate_all_projects`) because their ids are server-assigned and
-///    globally unique. Claude and Gemini scan `AgentRecord.session_id`
+///    globally unique. Claude and Gemini scan `AgentRecord.session_locator`
 ///    (caller-controlled UUID); Codex and Antigravity scan every project's
 ///    `sessions/<agent_id>.*.jsonl` sidecar
-///    (those agents leave `AgentRecord.session_id = None` — the id lives in
+///    (those agents leave `AgentRecord.session_locator = None` — the id lives in
 ///    the sidecar). Two `AgentRecord`s pointing at the same harness session
 ///    is the same-session-parallel-invocation hazard
 ///    (`docs/research/same-session-parallel-invocation.md`); unloaded
@@ -906,6 +931,18 @@ fn enumerate_directory_projects(
     Ok(all)
 }
 
+/// The UUID an agent's session locator carries, if it's the `Uuid` variant
+/// (Claude/Gemini/Antigravity). `None` for a Codex locator (which has no single
+/// UUID) or an unset locator. Thin `agent`-level adapter over
+/// [`SessionLocator::as_uuid`]; used by the Claude/Gemini collision scans,
+/// hydration, and session-info, which compare against a session UUID.
+fn locator_uuid(agent: &AgentRecord) -> Option<Uuid> {
+    agent
+        .session_locator
+        .as_ref()
+        .and_then(SessionLocator::as_uuid)
+}
+
 /// Per-directory Claude session-id collision check. Walks every project on
 /// disk in the **attach's target directory** — not just `state.projects` —
 /// because an unloaded project's `AgentRecord` could still be opened later and
@@ -921,7 +958,7 @@ fn check_claude_session_id_unique(
 ) -> Result<(), AppError> {
     for project in enumerate_directory_projects(state, directory)? {
         for agent in project.list_agents()? {
-            if agent.session_id == Some(*candidate) {
+            if locator_uuid(&agent) == Some(*candidate) {
                 return Err(AppError::SessionAlreadyAttached {
                     existing_agent_id: agent.id,
                     existing_agent_name: agent.name,
@@ -935,7 +972,7 @@ fn check_claude_session_id_unique(
 }
 
 /// Cross-project Codex session-id collision check. Codex agents leave
-/// `AgentRecord.session_id = None`; the session-link sidecar at
+/// `AgentRecord.session_locator = None`; the session-link sidecar at
 /// `<directory>/.switchboard/projects/<project-id>/sessions/<agent-id>.jsonl`
 /// is the system-of-record. Walks every project on disk in the bound
 /// directory.
@@ -948,7 +985,7 @@ fn check_claude_session_id_unique(
 /// "the failure is about an *unrelated* agent's state, not your attach
 /// target."
 /// Per-directory Gemini session-id collision check. Gemini agents carry
-/// `AgentRecord.session_id = Some(uuid)` (Claude shape). Walks every project on
+/// `AgentRecord.session_locator = Some(SessionLocator::Uuid(uuid))` (Claude shape). Walks every project on
 /// disk in the **attach's target directory** and rejects if any agent already
 /// attached to the same UUID. Scoped per-directory for the same cwd-namespacing
 /// reason as Claude.
@@ -962,7 +999,7 @@ fn check_gemini_session_id_unique(
             if agent.harness != HarnessKind::Gemini {
                 continue;
             }
-            if agent.session_id == Some(*candidate) {
+            if locator_uuid(&agent) == Some(*candidate) {
                 return Err(AppError::SessionAlreadyAttached {
                     existing_agent_id: agent.id,
                     existing_agent_name: agent.name,
@@ -1384,7 +1421,7 @@ fn load_agent_transcript_raw(
     let directory_path = project.directory.clone();
     match agent.harness {
         HarnessKind::ClaudeCode => {
-            let Some(session_id) = agent.session_id else {
+            let Some(session_id) = locator_uuid(agent) else {
                 return Ok(switchboard_harness::LoadedTranscript::default());
             };
             Ok(switchboard_harness::load_claude_transcript(
@@ -1423,7 +1460,7 @@ fn load_agent_transcript_raw(
             )?)
         }
         HarnessKind::Gemini => {
-            let Some(session_id) = agent.session_id else {
+            let Some(session_id) = locator_uuid(agent) else {
                 return Ok(switchboard_harness::LoadedTranscript::default());
             };
             Ok(switchboard_harness::load_gemini_transcript(
@@ -1434,10 +1471,10 @@ fn load_agent_transcript_raw(
             )?)
         }
         HarnessKind::Antigravity => {
-            // Antigravity agents carry `session_id: None` — the conversation
+            // Antigravity agents carry `session_locator: None` — the conversation
             // UUID is server-assigned and lives in the per-agent sidecar, so
             // this follows the Codex shape (sidecar lookup), not the Gemini
-            // one (`agent.session_id`). Corrupt sidecar is fail-loud per the
+            // one (`agent.session_locator`). Corrupt sidecar is fail-loud per the
             // Switchboard-owned-JSONL invariant; `Ok(None)` is the legitimate
             // never-dispatched case — passed through as `None` so the loader
             // still surfaces registry meta (matching the Codex arm).
@@ -1480,7 +1517,7 @@ pub struct AgentSessionInfo {
 
 /// Resolve the per-agent session actions ([`AgentSessionInfo`]). Mirrors
 /// [`load_agent_transcript`]'s per-harness session-id resolution (Claude/Gemini
-/// from `AgentRecord.session_id`; Codex/Antigravity from their sidecars — corrupt
+/// from `AgentRecord.session_locator`; Codex/Antigravity from their sidecars — corrupt
 /// sidecars fail loud, never-dispatched is the legitimate empty case). `home_dir`
 /// is injected for testability; the Tauri shim reads `$HOME`.
 pub fn agent_session_info_impl(
@@ -1493,7 +1530,7 @@ pub fn agent_session_info_impl(
 
     // (session file if it exists, resume identifier if the agent can be resumed)
     let (session_file, resume_ref): (Option<PathBuf>, Option<String>) = match agent.harness {
-        HarnessKind::ClaudeCode => match agent.session_id {
+        HarnessKind::ClaudeCode => match locator_uuid(&agent) {
             Some(sid) => {
                 let path =
                     switchboard_harness::claude_session_file_path(home_dir, &directory, &sid);
@@ -1503,7 +1540,7 @@ pub fn agent_session_info_impl(
             }
             None => (None, None),
         },
-        HarnessKind::Gemini => match agent.session_id {
+        HarnessKind::Gemini => match locator_uuid(&agent) {
             Some(sid) => {
                 let mut candidates =
                     switchboard_harness::gemini_session_file_candidates(home_dir, &directory, &sid);
@@ -3940,7 +3977,10 @@ mod tests {
             tmp_home.path(),
         )
         .unwrap();
-        assert_eq!(record.session_id, Some(session_id));
+        assert_eq!(
+            record.session_locator,
+            Some(SessionLocator::Uuid(session_id))
+        );
         assert_eq!(record.harness, HarnessKind::ClaudeCode);
         // Codex-only invariant: Claude attaches must NOT populate
         // `needs_session_meta`. Claude emits SessionMeta from its
@@ -4009,8 +4049,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            record.session_id, None,
-            "Codex AgentRecord.session_id stays None"
+            record.session_locator, None,
+            "Codex AgentRecord.session_locator stays None"
         );
         assert!(
             lock(&state.needs_session_meta).contains(&record.id),
@@ -4801,7 +4841,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_session_info_for_codex_resolves_resume_id_from_sidecar() {
-        // Codex carries `session_id: None` on the record; the resume id lives in
+        // Codex carries `session_locator: None` on the record; the resume id lives in
         // the sidecar (written post-dispatch). Resume is offered from it even
         // when the local session file isn't present.
         let (tmp_workdir, tmp_home, state, proj) = fresh_state_with_active_project("alpha").await;
@@ -4897,8 +4937,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            record.session_id, None,
-            "Antigravity AgentRecord.session_id stays None (sidecar-carried)"
+            record.session_locator, None,
+            "Antigravity AgentRecord.session_locator stays None (sidecar-carried)"
         );
         // Unlike Codex, Antigravity emits SessionMeta every turn, so attach
         // does not force it via needs_session_meta.
@@ -5159,7 +5199,10 @@ mod tests {
             tmp_home.path(),
         )
         .unwrap();
-        assert_eq!(record.session_id, Some(session_id));
+        assert_eq!(
+            record.session_locator,
+            Some(SessionLocator::Uuid(session_id))
+        );
         assert_eq!(record.harness, HarnessKind::Gemini);
         // Gemini follows the Claude pattern (caller-controlled session
         // UUID); no sidecar, no needs_session_meta override.
@@ -5243,7 +5286,7 @@ mod tests {
             tmp_home.path(),
         )
         .unwrap();
-        assert_eq!(record.session_id, Some(id_b));
+        assert_eq!(record.session_locator, Some(SessionLocator::Uuid(id_b)));
     }
 
     #[tokio::test]
@@ -5826,6 +5869,56 @@ mod tests {
     async fn rename_agent_nonexistent_errors() {
         let (_tmp, state, _) = fresh_state_with_mock();
         let err = rename_agent_impl(&state, Uuid::now_v7(), "x").unwrap_err();
+        assert!(matches!(err, AppError::AgentNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn set_session_locator_persists_to_registry_and_cache() {
+        // The runtime-capture mechanism (M1 plumbing, wired to the M2 sink): a
+        // Codex agent starts with no locator; setting one must land both on
+        // disk (registry.jsonl) and in the `agents_by_id` cache, so the next
+        // dispatch's DispatchContext reads the captured locator.
+        let (tmp, state, _) = fresh_state_with_mock();
+        let (_claude, project_id) = project_with_agent(&state, &tmp).await;
+        let codex = create_agent_impl(&state, "codex1", HarnessKind::Codex).unwrap();
+        assert!(codex.session_locator.is_none());
+
+        let locator = SessionLocator::Codex {
+            thread_id: "thread-abc".to_owned(),
+            partition_date: chrono::NaiveDate::from_ymd_opt(2026, 5, 16).unwrap(),
+        };
+        let updated = set_agent_session_locator_impl(&state, codex.id, locator.clone()).unwrap();
+        assert_eq!(updated.session_locator, Some(locator.clone()));
+
+        // On disk.
+        let project = lock(&state.projects).get(&project_id).cloned().unwrap();
+        let on_disk = project
+            .list_agents()
+            .unwrap()
+            .into_iter()
+            .find(|a| a.id == codex.id)
+            .unwrap();
+        assert_eq!(on_disk.session_locator, Some(locator.clone()));
+
+        // In the cache.
+        assert_eq!(
+            lock(&state.agents_by_id)
+                .get(&codex.id)
+                .unwrap()
+                .session_locator,
+            Some(locator)
+        );
+    }
+
+    #[tokio::test]
+    async fn set_session_locator_nonexistent_errors() {
+        let (_tmp, state, _) = fresh_state_with_mock();
+        let err = set_agent_session_locator_impl(
+            &state,
+            Uuid::now_v7(),
+            SessionLocator::Uuid(Uuid::new_v4()),
+        )
+        .unwrap_err();
         assert!(matches!(err, AppError::AgentNotFound(_)));
     }
 

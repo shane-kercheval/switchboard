@@ -219,7 +219,7 @@ async fn live_claude_full_stack_two_consecutive_turns_succeed() {
         .register_agent("assistant", HarnessKind::ClaudeCode)
         .expect("register_agent");
     assert!(
-        agent.session_id.is_some(),
+        agent.session_locator.is_some(),
         "ClaudeCode agents must have a pre-generated session_id"
     );
 
@@ -434,7 +434,7 @@ async fn live_gemini_full_stack_emits_turn_start_then_content_then_turn_end() {
         .register_agent("assistant", HarnessKind::Gemini)
         .expect("agent");
     assert!(
-        agent.session_id.is_some(),
+        agent.session_locator.is_some(),
         "Gemini agents must have a pre-generated session_id (Claude-shape)"
     );
 
@@ -473,7 +473,7 @@ async fn live_gemini_full_stack_emits_turn_start_then_content_then_turn_end() {
 async fn live_codex_full_stack_emits_turn_start_then_content_then_turn_end() {
     // Codex agents register with `session_id = None` (the per-agent sidecar is
     // the system-of-record); the dispatcher must not depend on
-    // `agent.session_id.is_some()` to function.
+    // `agent.session_locator.is_some()` to function.
     let tmp = TempDir::new().expect("tempdir");
     let directory = Directory::at(tmp.path()).expect("Directory::at");
     directory.init().expect("init");
@@ -484,7 +484,7 @@ async fn live_codex_full_stack_emits_turn_start_then_content_then_turn_end() {
         .register_agent("assistant", HarnessKind::Codex)
         .expect("agent");
     assert!(
-        agent.session_id.is_none(),
+        agent.session_locator.is_none(),
         "Codex agents must register with session_id = None"
     );
 
@@ -535,7 +535,7 @@ async fn live_antigravity_full_stack_two_turns_resume_through_dispatcher() {
         .register_agent("assistant", HarnessKind::Antigravity)
         .expect("agent");
     assert!(
-        agent.session_id.is_none(),
+        agent.session_locator.is_none(),
         "Antigravity agents carry session_id: None (server-assigned, sidecar-carried)"
     );
 

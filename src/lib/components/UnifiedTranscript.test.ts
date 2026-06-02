@@ -4,6 +4,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/svelte";
 import { tick } from "svelte";
 import type { AgentRecord, NormalizedEvent } from "$lib/types";
 import { HEARTBEAT_TIMEOUT_MS } from "$lib/types";
+import { agentCopy } from "$lib/agentCopy.svelte";
 
 const listeners = new Map<string, (e: { payload: NormalizedEvent }) => void>();
 vi.mock("@tauri-apps/api/event", () => ({
@@ -55,6 +56,7 @@ const CODEX_AGENT: AgentRecord = {
 beforeEach(() => {
   listeners.clear();
   invokeMock.mockReset();
+  agentCopy.set("last_answer_block");
 });
 
 const SEND_1 = "00000000-0000-7000-8000-0000000000d1";
@@ -1082,7 +1084,7 @@ describe("UnifiedTranscript — per-message copy", () => {
     expect(copyTextMock).toHaveBeenCalledWith("please do the thing");
   });
 
-  it("copies an agent message's prose, excluding tool calls", async () => {
+  it("copies an agent message's last answer block by default", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     state.transcripts[CLAUDE_AGENT.id] = [
@@ -1119,7 +1121,49 @@ describe("UnifiedTranscript — per-message copy", () => {
     if (!copy) throw new Error("expected a copy button on the agent message");
     await fireEvent.click(copy);
 
-    // Prose segments joined; tool output ("hi") is omitted.
+    expect(copyTextMock).toHaveBeenCalledWith("and step two.");
+  });
+
+  it("copies full agent answer prose when that copy mode is selected", async () => {
+    agentCopy.set("full_answer");
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "agent-1",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:00Z",
+        status: "complete",
+        items: [
+          { item_kind: "text", kind: "text", text: "\nHere is **step one**\n\n" },
+          {
+            item_kind: "tool",
+            tool_use_id: "tool-1",
+            kind: "builtin",
+            name: "Bash",
+            input: { command: "echo hi" },
+            output: "hi\n",
+            is_error: false,
+            started_at: "2026-05-16T00:00:01Z",
+            completed_at: "2026-05-16T00:00:02Z",
+          },
+          { item_kind: "text", kind: "thinking", text: "private reasoning" },
+          { item_kind: "text", kind: "text", text: "\nand step two.\n" },
+        ],
+      },
+    ];
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+    copyTextMock.mockClear();
+
+    const turn = screen.getByTestId("turn");
+    const copy = turn.querySelector('[data-testid="message-copy"]');
+    if (!copy) throw new Error("expected a copy button on the agent message");
+    await fireEvent.click(copy);
+
+    // Prose segments joined with normalized spacing; tool output and reasoning are omitted.
     expect(copyTextMock).toHaveBeenCalledWith("Here is **step one**\n\nand step two.");
   });
 
@@ -1244,5 +1288,63 @@ describe("UnifiedTranscript — per-message copy", () => {
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
 
     expect(screen.getByTestId("turn").querySelector('[data-testid="message-copy"]')).toBeNull();
+  });
+
+  it("applies last-block copy mode to fan-out columns", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "user-claude",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: SEND_1,
+        started_at: "2026-05-16T00:00:00Z",
+        text: "fan out",
+      },
+      {
+        role: "agent",
+        turn_id: "agent-claude",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: SEND_1,
+        started_at: "2026-05-16T00:00:01Z",
+        status: "complete",
+        items: [
+          { item_kind: "text", kind: "text", text: "first block" },
+          { item_kind: "text", kind: "text", text: "final block" },
+        ],
+      },
+    ];
+    state.transcripts[CODEX_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "user-codex",
+        agent_id: CODEX_AGENT.id,
+        send_id: SEND_1,
+        started_at: "2026-05-16T00:00:00Z",
+        text: "fan out",
+      },
+      {
+        role: "agent",
+        turn_id: "agent-codex",
+        agent_id: CODEX_AGENT.id,
+        send_id: SEND_1,
+        started_at: "2026-05-16T00:00:01Z",
+        status: "complete",
+        items: [{ item_kind: "text", kind: "text", text: "codex final" }],
+      },
+    ];
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT, CODEX_AGENT] } });
+    copyTextMock.mockClear();
+
+    const firstColumn = screen.getAllByTestId("fanout-column")[0]!;
+    const copy = firstColumn.querySelector('[data-testid="message-copy"]');
+    if (!copy) throw new Error("expected a copy button on the fan-out column");
+    await fireEvent.click(copy);
+
+    expect(copyTextMock).toHaveBeenCalledWith("final block");
   });
 });

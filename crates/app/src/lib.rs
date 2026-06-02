@@ -32,7 +32,8 @@ use crate::commands::{
     create_project_impl, get_harness_install_status_impl, init_directory_impl, list_agents_impl,
     list_projects_impl, list_workspace_directories_impl, load_project_conversation_impl,
     load_transcript_impl, open_project_impl, parse_uuid, pick_directory_impl, remove_agent_impl,
-    remove_directory_impl, remove_queued_message_impl, rename_agent_impl, send_message_impl,
+    remove_directory_impl, remove_queued_message_impl, rename_agent_impl,
+    search_project_files_in_root, search_project_files_root_impl, send_message_impl,
     set_active_project_impl, validate_external_url,
 };
 use crate::state::AppState;
@@ -202,6 +203,21 @@ async fn list_agents(
         None => None,
     };
     list_agents_impl(state.inner(), pid).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn search_project_files(
+    state: State<'_, AppState>,
+    project_id: String,
+    query: String,
+    limit: usize,
+) -> Result<Vec<String>, String> {
+    let id = parse_uuid(&project_id).map_err(|e| e.to_string())?;
+    let root = search_project_files_root_impl(state.inner(), id).map_err(|e| e.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || search_project_files_in_root(&root, &query, limit))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -557,6 +573,7 @@ pub fn run() {
             rename_agent,
             attach_agent,
             list_agents,
+            search_project_files,
             send_message,
             remove_queued_message,
             cancel_turn,

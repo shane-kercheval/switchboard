@@ -57,6 +57,21 @@ impl SessionLocator {
         }
     }
 
+    /// The Codex `thread_id` + partition-date, if this is the `Codex` variant.
+    /// `None` for a `Uuid` locator. The Codex counterpart to [`Self::as_uuid`] —
+    /// used by the Codex adapter (resume + enrichment), hydration, and the
+    /// collision scan.
+    #[must_use]
+    pub fn as_codex(&self) -> Option<(&str, NaiveDate)> {
+        match self {
+            SessionLocator::Codex {
+                thread_id,
+                partition_date,
+            } => Some((thread_id, *partition_date)),
+            SessionLocator::Uuid(_) => None,
+        }
+    }
+
     /// Whether this locator's shape is the one `harness` uses. The mapping is
     /// the inverse of [`crate::project::Project::register_agent`]'s per-harness
     /// assignment: `Codex` ⇒ `HarnessKind::Codex`; `Uuid` ⇒ Claude / Gemini /
@@ -167,6 +182,20 @@ mod tests {
             .as_uuid(),
             None
         );
+    }
+
+    #[test]
+    fn as_codex_extracts_only_the_codex_variant() {
+        let date = NaiveDate::from_ymd_opt(2026, 5, 16).unwrap();
+        assert_eq!(
+            SessionLocator::Codex {
+                thread_id: "t".to_owned(),
+                partition_date: date,
+            }
+            .as_codex(),
+            Some(("t", date))
+        );
+        assert_eq!(SessionLocator::Uuid(Uuid::now_v7()).as_codex(), None);
     }
 
     #[test]

@@ -8,8 +8,12 @@
 //!   shape (Claude uses separate `assistant` / `user` envelopes for `tool_use`
 //!   and `tool_result` blocks).
 //! - Session id is captured from the first `thread.started` stream event, not
-//!   pre-generated at agent registration. The per-agent session-link sidecar
-//!   (see `sidecar.rs`) is the system-of-record for the captured `thread_id`.
+//!   pre-generated at agent registration. The captured `thread_id` (plus the
+//!   local partition-date) is emitted as a `SessionLocatorCaptured` event and
+//!   persisted by the dispatcher onto the agent's registry record
+//!   (`SessionLocator::Codex`); on resume it's read back from that record. The
+//!   `sidecar.rs` module is retained only for the one-time migration of
+//!   pre-existing session-link files (see its module doc).
 //!
 //! **Resume command-line asymmetry.** `codex exec resume` does **not**
 //! accept `-C` / `--cd`; verified against codex-cli 0.130.0 via the
@@ -30,8 +34,8 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
-use chrono::Utc;
-use switchboard_core::{AgentId, AgentRecord};
+use chrono::{NaiveDate, Utc};
+use switchboard_core::{AgentId, AgentRecord, SessionLocator};
 use tokio::io::AsyncBufReadExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -41,12 +45,38 @@ use crate::events::{AdapterEvent, FailureKind, TurnId, TurnOutcome, TurnUsage};
 
 use parser::{CodexParserState, parse_line};
 use session_file::{Enrichment, TokioSleeper};
-use sidecar::{SessionLinkRecord, append_record, read_latest, sidecar_path};
+
+/// Codex's session locator carried through a dispatch: the runtime `thread_id`
+/// plus the **local** date its rollout file is partitioned under
+/// (`~/.codex/sessions/<YYYY>/<MM>/<DD>/`). On resume it's read from the agent's
+/// `SessionLocator::Codex`; on the first dispatch the `thread_id` is captured
+/// from `thread.started` and the date is stamped once (never recomputed). Used
+/// for both `exec resume` and post-terminal enrichment.
+#[derive(Clone)]
+struct CodexLocator {
+    thread_id: String,
+    partition_date: NaiveDate,
+}
+
+/// Extract the Codex resume locator from an agent's registry record. `None` on
+/// the first dispatch (no locator yet) — the adapter captures it from the
+/// stream and emits it for the dispatcher to persist.
+fn codex_locator(agent: &AgentRecord) -> Option<CodexLocator> {
+    agent
+        .session_locator
+        .as_ref()
+        .and_then(SessionLocator::as_codex)
+        .map(|(thread_id, partition_date)| CodexLocator {
+            thread_id: thread_id.to_owned(),
+            partition_date,
+        })
+}
 
 /// Adapter for Codex (`codex exec --json`). Spawns a `codex` subprocess and
 /// maps the stream-event output to `AdapterEvent`s. Session continuity is
-/// captured from the first `thread.started` stream event and persisted to a
-/// per-agent JSONL sidecar (see [`sidecar`]).
+/// captured from the first `thread.started` stream event and emitted as a
+/// `SessionLocatorCaptured` event the dispatcher persists to the agent's
+/// registry record; on resume the locator is read back from that record.
 ///
 /// For testing, construct with `with_binary_path(path)` pointing to the
 /// `fake_codex` fixture binary — the adapter's behaviour is identical;
@@ -130,17 +160,12 @@ impl HarnessAdapter for CodexAdapter {
         options: crate::DispatchOptions,
     ) -> Result<EventStream, DispatchError> {
         let binary = crate::subprocess::resolve_binary(&self.codex_binary_path)?;
-        // Sidecar path: <cwd>/.switchboard/projects/<project-id>/sessions/<agent-id>.jsonl.
-        // cwd here is the user's bound working directory (per send_message_impl
-        // in crates/app/src/commands.rs), not the per-project metadata directory.
-        let sidecar = sidecar_path(cwd, agent.project_id, agent.id);
-        // SidecarError::Corrupt is the load-bearing case (fail-loud per
-        // AGENTS.md). IO errors (including NotFound, though `read_latest`
-        // already maps that to Ok(None)) also surface here as
-        // PreStreamRead — uniform pre-stream failure on any read problem.
-        let prior =
-            read_latest(&sidecar).map_err(|e| DispatchError::PreStreamRead(e.to_string()))?;
-        let args = build_args(prompt, prior.as_ref());
+        // Resume locator: the `thread_id` + partition-date captured on a prior
+        // dispatch, now carried on the agent's registry record (`session_locator`)
+        // and passed in as dispatch input — like Claude/Gemini. `None` is the
+        // first-dispatch case; the adapter captures it from the stream below.
+        let prior = codex_locator(agent);
+        let args = build_args(prompt, prior.as_ref().map(|l| l.thread_id.as_str()));
 
         let mut command = tokio::process::Command::new(&binary);
         command
@@ -171,11 +196,11 @@ impl HarnessAdapter for CodexAdapter {
         let home_dir = resolve_home_dir(self.home_dir_override.as_deref());
 
         // SessionMeta-emission gate: normally first-dispatch-of-an-agent
-        // (no prior sidecar). The attach flow pre-writes a sidecar at
-        // attach time, so without this override the first post-attach
-        // dispatch would be misclassified as a resume and SessionMeta
-        // would never fire for the attached agent's sidebar. Caller signals
-        // "treat this as first turn" via DispatchOptions.
+        // (no prior locator). The attach flow writes the locator onto the
+        // record at attach time, so without this override the first
+        // post-attach dispatch would be misclassified as a resume and
+        // SessionMeta would never fire for the attached agent's sidebar.
+        // Caller signals "treat this as first turn" via DispatchOptions.
         let force_session_meta = options.is_first_dispatch_after_attach;
 
         tokio::spawn(run_producer(
@@ -185,7 +210,6 @@ impl HarnessAdapter for CodexAdapter {
             tx,
             turn_id,
             agent_id,
-            sidecar,
             prior,
             home_dir,
             cwd.to_owned(),
@@ -215,8 +239,8 @@ fn resolve_home_dir(override_path: Option<&Path>) -> PathBuf {
 /// codex-cli 0.130.0; see the module-level docstring and
 /// `docs/research/archive/codex-cli-observed.md` for the `-C`-on-resume rejection
 /// finding.
-fn build_args(prompt: &str, prior: Option<&SessionLinkRecord>) -> Vec<String> {
-    if let Some(record) = prior {
+fn build_args(prompt: &str, resume_thread_id: Option<&str>) -> Vec<String> {
+    if let Some(thread_id) = resume_thread_id {
         // Resume subcommand — NO `-C` (rejected by codex 0.130.0). cwd is
         // pinned via `Command::current_dir(cwd)` instead.
         vec![
@@ -225,7 +249,7 @@ fn build_args(prompt: &str, prior: Option<&SessionLinkRecord>) -> Vec<String> {
             "--json".to_owned(),
             "--skip-git-repo-check".to_owned(),
             "--dangerously-bypass-approvals-and-sandbox".to_owned(),
-            record.session_id.clone(),
+            thread_id.to_owned(),
             prompt.to_owned(),
         ]
     } else {
@@ -260,8 +284,7 @@ async fn run_producer(
     tx: tokio::sync::mpsc::UnboundedSender<AdapterEvent>,
     turn_id: TurnId,
     agent_id: AgentId,
-    sidecar_file: PathBuf,
-    prior: Option<SessionLinkRecord>,
+    prior: Option<CodexLocator>,
     home_dir: PathBuf,
     cwd: PathBuf,
     force_session_meta: bool,
@@ -287,10 +310,11 @@ async fn run_producer(
     // `Cancelled` (from the fired token) is authoritative.
     let mut cancelled = false;
     let mut state = CodexParserState::default();
-    // Once we've written the sidecar for this dispatch, ignore any
-    // subsequent thread.started events (defensive — Codex emits one per
-    // dispatch in observed fixtures).
-    let mut sidecar_written = false;
+    // The locator captured from the first `thread.started` of a first dispatch
+    // (None on resume — `prior` already holds it). Once set, later
+    // thread.started events are ignored (defensive — Codex emits one per
+    // dispatch). Drives post-terminal enrichment when `prior` is absent.
+    let mut captured: Option<CodexLocator> = None;
     // Set on any error path that ends the producer loop with the subprocess
     // still potentially running. The child is then killed before awaiting
     // `stderr_task` / `child.wait()` so the stream closes promptly and the
@@ -314,16 +338,18 @@ async fn run_producer(
             Ok(Some(line)) => {
                 let outcome = parse_line(&line, turn_id, &mut state);
 
-                // Corrupt thread.started — fail-loud rather than silently
-                // creating an unresumable agent. The sidecar invariant
-                // requires a valid thread_id; missing/non-string is an
-                // upstream contract violation.
-                if state.corrupt_thread_started {
+                // Corrupt thread.started on a **first** dispatch — fail-loud
+                // rather than silently creating an unresumable agent. We need a
+                // valid thread_id to capture the locator; missing/non-string is
+                // an upstream contract violation. On a resume the locator is
+                // already on the record, so a corrupt thread.started is harmless
+                // and ignored.
+                if prior.is_none() && state.corrupt_thread_started {
                     let _ = tx.send(AdapterEvent::TurnEnd {
                         turn_id,
                         outcome: TurnOutcome::Failed {
                             kind: FailureKind::AdapterFailure,
-                            message: "Codex thread.started event missing or non-string thread_id — sidecar unwritable; resume would fail"
+                            message: "Codex thread.started event missing or non-string thread_id — cannot capture session locator; resume would fail"
                                 .to_owned(),
                         },
                         ended_at: Utc::now(),
@@ -334,16 +360,26 @@ async fn run_producer(
                     break 'lines;
                 }
 
-                if !sidecar_written && let Some(thread_id) = state.pending_thread_id.take() {
-                    if let Some(failure) =
-                        try_persist_sidecar(&sidecar_file, prior.as_ref(), thread_id, turn_id)
-                    {
-                        let _ = tx.send(failure);
-                        terminal_seen = true;
-                        force_kill_child = true;
-                        break 'lines;
-                    }
-                    sidecar_written = true;
+                // First-dispatch capture: stamp the partition-date once (local
+                // date — Codex partitions rollout files by local date and never
+                // re-partitions on resume) and emit the locator for the
+                // dispatcher to persist (load-bearing; a persist failure fails
+                // the turn there). On resume `prior` is set, so we never capture.
+                if prior.is_none()
+                    && captured.is_none()
+                    && let Some(thread_id) = state.pending_thread_id.take()
+                {
+                    let locator = CodexLocator {
+                        thread_id,
+                        partition_date: chrono::Local::now().date_naive(),
+                    };
+                    let _ = tx.send(AdapterEvent::SessionLocatorCaptured {
+                        locator: SessionLocator::Codex {
+                            thread_id: locator.thread_id.clone(),
+                            partition_date: locator.partition_date,
+                        },
+                    });
+                    captured = Some(locator);
                 }
 
                 let events = match outcome {
@@ -373,20 +409,49 @@ async fn run_producer(
                             ended_at,
                             usage,
                         } => {
+                            terminal_seen = true;
+                            // A first dispatch that *completes* without ever
+                            // capturing a locator (the stream omitted
+                            // thread.started) would leave the agent unresumable:
+                            // the next dispatch starts a fresh session and
+                            // silently loses context. Fail loud instead —
+                            // mirroring the corrupt-thread.started guard above
+                            // and Antigravity's unresumable path. A *failed*
+                            // first turn has nothing to resume, so only
+                            // Completed is converted.
+                            if prior.is_none()
+                                && captured.is_none()
+                                && matches!(outcome, TurnOutcome::Completed)
+                            {
+                                let _ = tx.send(AdapterEvent::TurnEnd {
+                                    turn_id: ev_turn_id,
+                                    outcome: TurnOutcome::Failed {
+                                        kind: FailureKind::AdapterFailure,
+                                        message: "Codex completed a first turn without a thread.started event — no session locator captured; resume would lose context"
+                                            .to_owned(),
+                                    },
+                                    ended_at,
+                                    usage: None,
+                                });
+                                force_kill_child = true;
+                                break 'lines;
+                            }
                             if matches!(outcome, TurnOutcome::Completed) {
                                 terminal_was_completed = true;
                             }
-                            terminal_seen = true;
-                            // First-turn gate. Normal case: no prior sidecar
-                            // record. Attach-flow case: prior is Some but the
-                            // caller explicitly signals "treat as first turn"
-                            // via DispatchOptions, so the sidebar's
-                            // MCP/skills/model registry populates on the
-                            // first post-attach dispatch.
+                            // First-turn gate. Normal case: no prior locator.
+                            // Attach-flow case: prior is Some but the caller
+                            // explicitly signals "treat as first turn" via
+                            // DispatchOptions, so the sidebar's MCP/skills/model
+                            // registry populates on the first post-attach dispatch.
                             let is_first_turn = prior.is_none() || force_session_meta;
+                            // Enrichment locates the rollout file from the
+                            // effective locator: the resume locator (`prior`) or
+                            // the one just captured this dispatch.
+                            let locator = prior.as_ref().or(captured.as_ref());
                             emit_terminal_with_enrichment(
                                 &tx,
-                                &sidecar_file,
+                                locator,
                                 &home_dir,
                                 &cwd,
                                 agent_id,
@@ -478,9 +543,9 @@ async fn run_producer(
 
 /// Run the post-terminal enrichment cycle for a parser-emitted `TurnEnd`:
 ///
-/// 1. Re-read the sidecar (single source of truth for `session_id` +
-///    `session_partition_date` — never recompute the date from
-///    `Utc::today()` at enrichment time; see [`session_file`] module docs).
+/// 1. Locate the rollout file from the passed-in locator (`thread_id` +
+///    `partition_date` — never recompute the date from `Utc::today()` at
+///    enrichment time; see [`session_file`] module docs).
 /// 2. Read the Codex session file with the 200ms + 200ms retry policy.
 /// 3. Emit the (now-enriched) `TurnEnd`. The enriched `context_window`
 ///    overlays `usage.context_window` if `usage` was `Some`; if `usage` was
@@ -490,19 +555,19 @@ async fn run_producer(
 /// 5. Emit `SessionMeta` if this is the first turn AND the enrichment
 ///    yielded a model or `cli_version`.
 ///
-/// All steps degrade gracefully — sidecar read failure or session-file
-/// absence emits a non-enriched `TurnEnd` only, and the post-terminal
-/// derived events are simply skipped.
+/// All steps degrade gracefully — a missing locator or session-file absence
+/// emits a non-enriched `TurnEnd` only, and the post-terminal derived events
+/// are simply skipped.
 ///
 /// `is_first_turn` is computed by the caller as `prior.is_none() ||
-/// options.is_first_dispatch_after_attach` — the attach flow pre-writes
-/// a sidecar at attach time, so the `prior.is_none()` heuristic alone
+/// options.is_first_dispatch_after_attach` — the attach flow writes the locator
+/// onto the record at attach time, so the `prior.is_none()` heuristic alone
 /// would misclassify a post-attach dispatch as a resume and skip the
 /// load-bearing `SessionMeta` emission that populates the sidebar.
 #[allow(clippy::too_many_arguments)]
 async fn emit_terminal_with_enrichment(
     tx: &tokio::sync::mpsc::UnboundedSender<AdapterEvent>,
-    sidecar_file: &Path,
+    locator: Option<&CodexLocator>,
     home_dir: &Path,
     cwd: &Path,
     agent_id: AgentId,
@@ -512,35 +577,19 @@ async fn emit_terminal_with_enrichment(
     usage: Option<TurnUsage>,
     is_first_turn: bool,
 ) {
-    // Step 1: re-read sidecar to get the canonical date/session_id pair.
-    // If unreadable, skip enrichment entirely and emit a plain TurnEnd.
-    let enrichment = match read_latest(sidecar_file) {
-        Ok(Some(record)) => {
-            session_file::load_with_retry(
-                home_dir,
-                record.session_partition_date,
-                &record.session_id,
-                &TokioSleeper,
-            )
+    // Step 1: locate the rollout file from the locator (resume locator, or the
+    // one captured this dispatch). Absent only if capture failed/never
+    // happened — then skip enrichment and emit a plain TurnEnd.
+    let enrichment = if let Some(loc) = locator {
+        session_file::load_with_retry(home_dir, loc.partition_date, &loc.thread_id, &TokioSleeper)
             .await
-        }
-        Ok(None) => {
-            tracing::warn!(
-                agent_id = %agent_id,
-                %turn_id,
-                "Codex enrichment: sidecar absent at terminal-event time; emitting TurnEnd without enrichment"
-            );
-            Enrichment::default()
-        }
-        Err(e) => {
-            tracing::warn!(
-                agent_id = %agent_id,
-                %turn_id,
-                error = %e,
-                "Codex enrichment: sidecar re-read failed; emitting TurnEnd without enrichment"
-            );
-            Enrichment::default()
-        }
+    } else {
+        tracing::warn!(
+            agent_id = %agent_id,
+            %turn_id,
+            "Codex enrichment: no session locator at terminal-event time; emitting TurnEnd without enrichment"
+        );
+        Enrichment::default()
     };
 
     // Step 3: emit the enriched TurnEnd.
@@ -619,49 +668,6 @@ fn apply_context_window(
     }
 }
 
-/// Write a session-link record on the first `thread.started` of the
-/// dispatch. Returns `None` on success, or `Some(TurnEnd{AdapterFailure})`
-/// to emit and terminate the stream on failure. Sidecar persistence is
-/// load-bearing for resume and post-terminal enrichment; silent swallow
-/// would create an unresumable agent, so continuing is worse than stopping.
-fn try_persist_sidecar(
-    path: &Path,
-    prior: Option<&SessionLinkRecord>,
-    thread_id: String,
-    turn_id: TurnId,
-) -> Option<AdapterEvent> {
-    // Codex partitions session files by **local date** under
-    // `~/.codex/sessions/<YYYY>/<MM>/<DD>/`. Capture
-    // `chrono::Local::now().date_naive()` once on the first dispatch and
-    // copy it verbatim on every resume — never recompute. The sidecar's
-    // `session_partition_date` is the authoritative directory key for
-    // locating the rollout file at enrichment time, even if local date
-    // changes between dispatches (Codex keeps appending to the original
-    // file). If a future Codex CLI release switches partition behavior
-    // (e.g., to UTC), the right fix is to derive the date from the actual
-    // rollout file path rather than re-guess from a clock.
-    let record = SessionLinkRecord {
-        session_id: thread_id,
-        session_partition_date: prior.map_or_else(
-            || chrono::Local::now().date_naive(),
-            |r| r.session_partition_date,
-        ),
-        started_at: Utc::now(),
-    };
-    match append_record(path, &record) {
-        Ok(()) => None,
-        Err(e) => Some(AdapterEvent::TurnEnd {
-            turn_id,
-            outcome: TurnOutcome::Failed {
-                kind: FailureKind::AdapterFailure,
-                message: format!("sidecar write failed: {e}"),
-            },
-            ended_at: Utc::now(),
-            usage: None,
-        }),
-    }
-}
-
 /// Build the synthesized `TurnEnd(Failed)` event emitted when stdout EOFs
 /// without a terminal event. `buffered_error` is the most-recent `{type:
 /// "error"}` stdout payload (after JSON unwrap), used as the primary
@@ -702,16 +708,8 @@ fn synthesize_truncation_turn_end(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::NaiveDate;
-    use uuid::Uuid;
 
-    fn fresh_prior_record() -> SessionLinkRecord {
-        SessionLinkRecord {
-            session_id: "019e2c5f-aaaa-7000-8000-000000000001".to_owned(),
-            session_partition_date: NaiveDate::from_ymd_opt(2026, 5, 1).unwrap(),
-            started_at: Utc::now(),
-        }
-    }
+    const RESUME_THREAD_ID: &str = "019e2c5f-aaaa-7000-8000-000000000001";
 
     #[test]
     fn build_args_first_turn_omits_resume_and_session_id_and_includes_dash_c() {
@@ -739,8 +737,7 @@ mod tests {
     fn build_args_resume_includes_session_id_and_omits_dash_c() {
         // Verified against codex-cli 0.130.0: `codex exec resume` rejects -C.
         // This test pins the behaviour against regression.
-        let prior = fresh_prior_record();
-        let args = build_args("hello again", Some(&prior));
+        let args = build_args("hello again", Some(RESUME_THREAD_ID));
         // resume subcommand
         let exec_idx = args
             .iter()
@@ -752,8 +749,8 @@ mod tests {
             .expect("resume subcommand");
         assert!(resume_idx > exec_idx, "resume comes after exec");
 
-        // session_id is the second-to-last arg (last is prompt)
-        assert_eq!(args[args.len() - 2], prior.session_id);
+        // thread_id is the second-to-last arg (last is prompt)
+        assert_eq!(args[args.len() - 2], RESUME_THREAD_ID);
         assert_eq!(args.last(), Some(&"hello again".to_owned()));
 
         // Critical: no -C / --cd on resume
@@ -784,43 +781,6 @@ mod tests {
             adapter.probe(),
             Err(DispatchError::BinaryNotFound)
         ));
-    }
-
-    #[tokio::test]
-    async fn dispatch_with_corrupt_sidecar_returns_pre_stream_read_error() {
-        // Write a malformed sidecar before dispatch. The adapter must
-        // surface SidecarError::Corrupt as DispatchError::PreStreamRead
-        // (per the AGENTS.md invariant: corruption in Switchboard-owned
-        // JSONL is fail-loud).
-        let tmp = tempfile::TempDir::new().unwrap();
-        let agent = AgentRecord {
-            id: Uuid::now_v7(),
-            project_id: Uuid::now_v7(),
-            name: "test".to_owned(),
-            harness: switchboard_core::HarnessKind::Codex,
-            session_locator: None,
-            created_at: Utc::now(),
-        };
-        let path = sidecar_path(tmp.path(), agent.project_id, agent.id);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, "{not valid json\n").unwrap();
-
-        // Use any binary path — dispatch fails on sidecar read before spawn.
-        let adapter = CodexAdapter::with_binary_path("/nonexistent");
-        match adapter
-            .dispatch(
-                &agent,
-                tmp.path(),
-                "hi",
-                Uuid::now_v7(),
-                crate::DispatchOptions::default(),
-            )
-            .await
-        {
-            Err(DispatchError::PreStreamRead(_)) => {}
-            Err(other) => panic!("expected PreStreamRead, got {other:?}"),
-            Ok(_) => panic!("dispatch must fail on corrupt sidecar"),
-        }
     }
 
     fn usage_with_window(window: Option<u32>) -> TurnUsage {

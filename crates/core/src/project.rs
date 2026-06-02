@@ -127,34 +127,27 @@ impl Project {
         )
     }
 
-    /// Register an attached **Codex** agent using a caller-supplied
-    /// `agent_id`. The attach-flow callable (`attach_agent_impl`) uses this
-    /// to **write the per-agent session-link sidecar before** committing
-    /// the `AgentRecord` to the registry:
-    ///
-    /// 1. Mint `agent_id` upfront.
-    /// 2. Compute the sidecar path from that id and write the link record.
-    /// 3. Call this method to append the registry record with the **same**
-    ///    id.
-    ///
-    /// **Why pre-generation is the public surface.** If the sidecar write
-    /// happened *after* the registry append and failed, the `AgentRecord`
-    /// would be orphaned: the adapter sees `prior.is_none()` on first
-    /// dispatch and creates a brand-new Codex session (not the attached
-    /// one), silently defeating the attach intent. The pre-generated-id
-    /// ordering inverts the failure mode — at worst an orphan sidecar
-    /// file with no `AgentRecord` pointing at it, invisible to dispatch
-    /// and the collision scan. **No "register-without-id" Codex variant
-    /// exists by design** — a parallel API that minted the id internally
-    /// would be a trap for future callers who'd then need to compute the
-    /// sidecar path post-register (the exact failure mode this method
-    /// prevents).
-    pub fn register_attached_codex_agent_with_id(
+    /// Register an attached **Codex** agent — one that wraps an existing Codex
+    /// session. The `thread_id` and partition-date (parsed from the existing
+    /// rollout file's name and directory) are the agent's session locator and
+    /// are written straight onto the record — no sidecar, no pre-generated-id
+    /// ordering. The commands layer locates and validates the rollout file
+    /// before calling this.
+    pub fn register_attached_codex_agent(
         &self,
         name: &str,
-        agent_id: crate::agent::AgentId,
+        thread_id: String,
+        partition_date: chrono::NaiveDate,
     ) -> Result<AgentRecord> {
-        self.register_agent_inner_with_id(name, HarnessKind::Codex, None, agent_id)
+        self.register_agent_inner_with_id(
+            name,
+            HarnessKind::Codex,
+            Some(SessionLocator::Codex {
+                thread_id,
+                partition_date,
+            }),
+            Uuid::now_v7(),
+        )
     }
 
     /// Register an attached **Gemini** agent — one that wraps an
@@ -718,13 +711,20 @@ mod tests {
     }
 
     #[test]
-    fn register_attached_codex_leaves_session_locator_none() {
+    fn register_attached_codex_persists_thread_id_and_date() {
         let (_tmp, project) = fresh_project();
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 5, 16).unwrap();
         let record = project
-            .register_attached_codex_agent_with_id("attached", Uuid::now_v7())
+            .register_attached_codex_agent("attached", "thread-abc".to_owned(), date)
             .unwrap();
         assert_eq!(record.harness, HarnessKind::Codex);
-        assert!(record.session_locator.is_none());
+        assert_eq!(
+            record.session_locator,
+            Some(SessionLocator::Codex {
+                thread_id: "thread-abc".to_owned(),
+                partition_date: date,
+            })
+        );
     }
 
     #[test]

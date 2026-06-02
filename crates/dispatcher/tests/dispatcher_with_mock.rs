@@ -2648,6 +2648,43 @@ async fn captured_locator_is_persisted_and_turn_completes() {
 }
 
 #[tokio::test]
+async fn codex_variant_capture_flows_through_the_same_sink() {
+    // The capture path is locator-variant-agnostic: a `Codex` locator persists
+    // through the same dispatcher event + sink as the `Uuid` (Antigravity) one,
+    // with no `match harness` anywhere in the dispatcher.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let locator = SessionLocator::Codex {
+        thread_id: "thread-abc".to_owned(),
+        partition_date: chrono::NaiveDate::from_ymd_opt(2026, 5, 16).unwrap(),
+    };
+    let sink = Arc::new(RecordingLocatorSink::default());
+    let factory = TestFactory::sequence_with_locator_sink(
+        [MockScenario::CapturesLocator(locator.clone())],
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+        Arc::new(NoopMetadataCache),
+        Arc::clone(&sink) as Arc<dyn SessionLocatorSink>,
+    );
+
+    dispatcher
+        .send_message(agent.id, "hello", Uuid::now_v7(), factory, OnBusy::Enqueue)
+        .await;
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+
+    let persisted = sink.persisted.lock().unwrap();
+    assert_eq!(persisted.len(), 1);
+    assert_eq!(persisted[0], (agent.id, locator));
+}
+
+#[tokio::test]
 async fn capture_persist_failure_fails_the_turn() {
     // The load-bearing distinction from MetadataCache: a persist failure on
     // capture fails the turn (a lost locator silently starts a fresh session

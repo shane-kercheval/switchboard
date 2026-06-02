@@ -315,11 +315,26 @@ fn live_codex_agent() -> AgentRecord {
         project_id: Uuid::now_v7(),
         name: "live-codex-agent".to_owned(),
         harness: HarnessKind::Codex,
-        // Codex agents always have session_id = None — the per-agent
-        // session-link sidecar is the system-of-record.
+        // A fresh Codex agent has no locator until its first dispatch captures
+        // one (emitted as a `SessionLocatorCaptured` event, persisted by the
+        // dispatcher onto the record).
         session_locator: None,
         created_at: chrono::Utc::now(),
     }
+}
+
+/// The Codex locator carried by a dispatch's capture event, or `None` on resume.
+fn codex_capture(events: &[AdapterEvent]) -> Option<(String, chrono::NaiveDate)> {
+    events.iter().find_map(|e| match e {
+        AdapterEvent::SessionLocatorCaptured {
+            locator:
+                SessionLocator::Codex {
+                    thread_id,
+                    partition_date,
+                },
+        } => Some((thread_id.clone(), *partition_date)),
+        _ => None,
+    })
 }
 
 #[tokio::test]
@@ -473,7 +488,15 @@ async fn live_codex_basic_turn_completes() {
         _ => unreachable!(),
     }
 
-    // Sidecar must exist after the first turn with the captured thread_id.
+    // The first turn emits a capture event with the thread_id + partition-date
+    // (the dispatcher persists it to the registry; no sidecar is written).
+    let (thread_id, _date) =
+        codex_capture(&events).expect("first dispatch emits a captured Codex locator");
+    assert!(
+        !thread_id.is_empty(),
+        "captured thread_id must be non-empty"
+    );
+
     let sidecar = tmp
         .path()
         .join(".switchboard")
@@ -482,12 +505,9 @@ async fn live_codex_basic_turn_completes() {
         .join("sessions")
         .join(format!("{}.jsonl", agent.id));
     assert!(
-        sidecar.is_file(),
-        "sidecar must be written on first dispatch"
+        !sidecar.exists(),
+        "the adapter no longer writes a session-link sidecar"
     );
-    let content = std::fs::read_to_string(&sidecar).unwrap();
-    assert!(content.contains("session_id"));
-    assert!(content.contains("session_partition_date"));
 }
 
 #[tokio::test]
@@ -501,7 +521,8 @@ async fn live_codex_resume_reuses_session() {
     let adapter = CodexAdapter::new();
     let agent = live_codex_agent();
 
-    // Turn 1: ask Codex to remember a specific word.
+    // Turn 1: ask Codex to remember a specific word (fresh agent → first
+    // dispatch captures the locator).
     let turn1 = Uuid::now_v7();
     let stream1 = adapter
         .dispatch(
@@ -513,13 +534,26 @@ async fn live_codex_resume_reuses_session() {
         )
         .await
         .expect("first dispatch should succeed");
-    let _events1: Vec<AdapterEvent> = stream1.collect().await;
+    let events1: Vec<AdapterEvent> = stream1.collect().await;
+
+    // Simulate the dispatcher: fold the captured locator onto the agent so the
+    // next dispatch resumes via the registry-stored locator (the production
+    // factory live-reads it from `agents_by_id`).
+    let (thread_id, partition_date) =
+        codex_capture(&events1).expect("first dispatch emits a captured Codex locator");
+    let resumed_agent = AgentRecord {
+        session_locator: Some(SessionLocator::Codex {
+            thread_id,
+            partition_date,
+        }),
+        ..agent.clone()
+    };
 
     // Turn 2 (resume): ask Codex to recall the word.
     let turn2 = Uuid::now_v7();
     let stream2 = adapter
         .dispatch(
-            &agent,
+            &resumed_agent,
             tmp.path(),
             "What word did I ask you to remember? Reply with only that word.",
             turn2,
@@ -540,31 +574,10 @@ async fn live_codex_resume_reuses_session() {
         "resume must restore the prior turn's context: turn2 reply was {recall_text:?}"
     );
 
-    // Sidecar should have two records (one per dispatch), same session_id.
-    // Codex echoes the same thread_id on resume.
-    let sidecar = tmp
-        .path()
-        .join(".switchboard")
-        .join("projects")
-        .join(agent.project_id.to_string())
-        .join("sessions")
-        .join(format!("{}.jsonl", agent.id));
-    let lines: Vec<String> = std::fs::read_to_string(&sidecar)
-        .unwrap()
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(str::to_owned)
-        .collect();
-    assert_eq!(lines.len(), 2, "two dispatches → two records");
-    let r1: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
-    let r2: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
-    assert_eq!(
-        r1["session_id"], r2["session_id"],
-        "real Codex echoes the same thread_id on resume"
-    );
-    assert_eq!(
-        r1["session_partition_date"], r2["session_partition_date"],
-        "resume preserves session_partition_date"
+    // A resume reuses the record's locator and emits no further capture event.
+    assert!(
+        codex_capture(&events2).is_none(),
+        "a resume must not re-capture the locator"
     );
 }
 

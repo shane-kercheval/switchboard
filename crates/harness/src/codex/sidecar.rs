@@ -1,9 +1,17 @@
 //! Per-agent session-link sidecar for Codex agents.
 //!
+//! **Legacy / migration-only.** Session identity now lives on the agent's
+//! registry record (`AgentRecord.session_locator` → `SessionLocator::Codex`);
+//! the adapter no longer reads or writes this sidecar, and no new
+//! `<agent_id>.jsonl` is created. This module is retained solely so the
+//! one-time migration pass can fold any pre-existing sidecar into the registry,
+//! after which it is deleted. Do not wire new code to it.
+//!
 //! Codex assigns its own session id (the `thread_id` from `thread.started`)
-//! on first dispatch. Switchboard records the mapping in an append-only
-//! JSONL file at `<directory>/.switchboard/projects/<project-id>/sessions/
-//! <agent_id>.jsonl`. Schema contract:
+//! on first dispatch. Switchboard previously recorded the mapping in an
+//! append-only JSONL file at
+//! `<directory>/.switchboard/projects/<project-id>/sessions/<agent_id>.jsonl`.
+//! Schema contract:
 //! - `session_id` drives the Codex session-file filename glob.
 //! - `session_partition_date` drives the date-partition path lookup; it
 //!   is set on the very first dispatch (from the **local** date — Codex

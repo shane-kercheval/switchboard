@@ -20,8 +20,7 @@ use futures::StreamExt;
 use switchboard_core::{AgentRecord, HarnessKind, SessionLocator};
 use switchboard_harness::{
     AdapterEvent, AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, DispatchOptions,
-    GeminiAdapter, HarnessAdapter, Turn, TurnItem, TurnStatus, codex::sidecar,
-    load_antigravity_transcript,
+    GeminiAdapter, HarnessAdapter, Turn, TurnItem, TurnStatus, load_antigravity_transcript,
 };
 use uuid::Uuid;
 
@@ -43,6 +42,25 @@ fn uuid_locator(agent: &AgentRecord) -> Uuid {
         Some(SessionLocator::Uuid(id)) => *id,
         other => panic!("expected a Uuid session locator, got {other:?}"),
     }
+}
+
+/// Extract the Codex `thread_id` + partition-date from the dispatch's capture
+/// event (a first Codex dispatch emits one; the dispatcher persists it to the
+/// record). Used by the live Codex hydration tests in place of a sidecar read.
+fn captured_codex_locator(events: &[AdapterEvent]) -> (String, chrono::NaiveDate) {
+    events
+        .iter()
+        .find_map(|e| match e {
+            AdapterEvent::SessionLocatorCaptured {
+                locator:
+                    SessionLocator::Codex {
+                        thread_id,
+                        partition_date,
+                    },
+            } => Some((thread_id.clone(), *partition_date)),
+            _ => None,
+        })
+        .expect("a first Codex dispatch must emit a captured Codex locator")
 }
 
 fn collect_text(events: &[AdapterEvent]) -> String {
@@ -308,7 +326,7 @@ async fn live_claude_tool_results_bind_after_restart() {
 
 #[tokio::test]
 #[ignore = "requires codex installed — run with: make test-live"]
-async fn live_codex_transcript_load_via_sidecar_round_trips() {
+async fn live_codex_transcript_load_via_captured_locator_round_trips() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let adapter = CodexAdapter::new();
     let agent = AgentRecord {
@@ -335,16 +353,13 @@ async fn live_codex_transcript_load_via_sidecar_round_trips() {
     let live_events: Vec<AdapterEvent> = stream.collect().await;
     let live_text = collect_text(&live_events);
 
-    let sidecar = sidecar::sidecar_path(tmp.path(), agent.project_id, agent.id);
-    let record = sidecar::read_latest(&sidecar)
-        .expect("sidecar must read cleanly")
-        .expect("sidecar must contain a record after a live dispatch");
+    let (thread_id, partition_date) = captured_codex_locator(&live_events);
 
     let transcript = switchboard_harness::load_codex_transcript(
         &real_home(),
         tmp.path(),
-        &record.session_id,
-        Some(record.session_partition_date),
+        &thread_id,
+        Some(partition_date),
         agent.id,
     )
     .expect("load_codex_transcript must succeed");
@@ -406,18 +421,15 @@ async fn live_codex_transcript_load_hydrates_tool_items() {
     // Drain the stream to flush the subprocess; the session file isn't
     // written until the stream completes. Dropping this line would
     // race the hydration read against the subprocess.
-    let _events: Vec<AdapterEvent> = stream.collect().await;
+    let events: Vec<AdapterEvent> = stream.collect().await;
 
-    let sidecar = sidecar::sidecar_path(tmp.path(), agent.project_id, agent.id);
-    let record = sidecar::read_latest(&sidecar)
-        .expect("sidecar must read cleanly")
-        .expect("sidecar must contain a record after a live dispatch");
+    let (thread_id, partition_date) = captured_codex_locator(&events);
 
     let transcript = switchboard_harness::load_codex_transcript(
         &real_home(),
         tmp.path(),
-        &record.session_id,
-        Some(record.session_partition_date),
+        &thread_id,
+        Some(partition_date),
         agent.id,
     )
     .expect("load_codex_transcript must succeed");

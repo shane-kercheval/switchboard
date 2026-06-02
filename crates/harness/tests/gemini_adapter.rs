@@ -245,6 +245,43 @@ async fn error_invalid_model_fixture_emits_failed_with_harness_error_kind() {
 }
 
 #[tokio::test]
+async fn benign_trailing_error_fixture_completes_despite_result_error() {
+    // Real captured failing run (Gemini CLI 0.44.0, model auto): the full
+    // answer streamed, then a standalone `type:"error"` carrying the benign
+    // "empty response or malformed tool call" signature, then a terminal
+    // `result.status:"error"` with no `error` field. The adapter must
+    // reclassify this as Completed because answer content streamed and the
+    // failure is the known-benign streamed-then-error quirk. Deterministic
+    // proof of the benign-rescue path.
+    let (adapter, _home) = adapter();
+    let agent = gemini_agent();
+    let events = collect_events(&adapter, &agent, &fixture("benign-trailing-error.stream")).await;
+
+    // Answer content must have actually been emitted (the rescue is gated on
+    // streamed content).
+    let chunks: String = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::ContentChunk { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !chunks.is_empty(),
+        "expected streamed answer content before the trailing error"
+    );
+
+    assert_eq!(count_terminals(&events), 1, "expected exactly one TurnEnd");
+    match find_terminal(&events) {
+        AdapterEvent::TurnEnd {
+            outcome: TurnOutcome::Completed,
+            ..
+        } => {}
+        other => panic!("expected Completed TurnEnd from benign trailing error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn auth_failure_inline_fixture_emits_auth_failure_kind() {
     // Inline-JSON fixture: live capture did not yield an auth-failure
     // stream because triggering one would break the developer's OAuth

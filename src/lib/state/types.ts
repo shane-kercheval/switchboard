@@ -88,8 +88,8 @@ export type TurnItem = TextChunk | ToolCall;
 
 export type TextChunk = {
   item_kind: "text";
-  /// Mirrors wire `content_chunk.kind`. `"thinking"` is reserved for
-  /// future reasoning UI but not currently emitted.
+  /// Mirrors wire `content_chunk.kind`. `"thinking"` carries model reasoning,
+  /// rendered distinct from the answer (see harness-behavior.md §3.2).
   kind: ContentKind;
   text: string;
 };

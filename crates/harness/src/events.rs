@@ -16,31 +16,31 @@ pub type MessageId = Uuid;
 
 /// Tells the reducer / UI which content rendering applies to a chunk.
 ///
-/// `Thinking` is emitted by adapters that surface reasoning text (e.g.
-/// Antigravity's planner records, Gemini session files). Claude's thinking text
-/// is server-redacted to empty in `-p` mode today, so the Claude adapter
-/// normally surfaces thinking only as a non-rendering [`AdapterEvent::Liveness`]
-/// signal — but if that redaction is lifted, its non-empty thinking flows
-/// through as `Thinking` content (see `parser.rs`). Note the frontend currently
-/// renders `Thinking` and `Text` identically (plain prose); distinct reasoning
-/// styling is follow-up work, so a redaction reversal would surface reasoning
-/// interleaved with the answer, not as a styled block. Per-harness reality lives
-/// in `docs/research/harness-behavior.md` §3.2.
+/// `Thinking` carries model reasoning text, rendered distinct from (and
+/// subordinate to) the answer (the frontend's `ThinkingWidget`). Whether a
+/// harness exposes reasoning text varies: Antigravity emits it (planner
+/// records, live + on reopen); Gemini writes it only to disk, so we deliberately
+/// drop it (reopened-only reasoning is stale UX); Claude's redaction is
+/// **per-model** — Sonnet 4.6 returns non-empty reasoning (live `thinking_delta`
+/// and on disk, reconstructed on hydrate), while Opus 4.8 redacts the text to
+/// empty so it surfaces only as a non-rendering [`AdapterEvent::Liveness`]
+/// signal; Codex encrypts it (unavailable). Per-harness reality lives in
+/// `docs/research/harness-behavior.md` §3.2.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ContentKind {
     /// User-facing assistant text.
     Text,
-    /// Model thinking/reasoning blocks (live reasoning text, where the harness
-    /// provides it).
+    /// Model reasoning blocks — live reasoning text where the harness provides
+    /// it (e.g. Antigravity's planner thinking).
     Thinking,
 }
 
 /// Discriminates tool origin so the UI can label calls (built-in tool vs MCP
 /// vs plugin) without scraping the name. `Plugin` and `Other` are reserved
-/// but not currently emitted — same forward-compat pattern as
-/// `ContentKind::Thinking`.
+/// but not currently emitted — a forward-compat pattern so future tool
+/// origins land without a wire-format break.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -127,11 +127,11 @@ pub enum AdapterEvent {
     },
     /// A content-free sign that the harness is still alive mid-turn. Emitted
     /// when the stream carries activity that produces no renderable content —
-    /// e.g. Claude's `thinking_delta`/`signature_delta` (the thinking text is
-    /// server-redacted to empty, but the deltas still arrive periodically while
-    /// the model reasons). It re-arms the frontend liveness timer so a long
-    /// silent-but-thinking turn is not falsely declared dead. Never becomes a
-    /// transcript item.
+    /// e.g. Claude's `signature_delta`, or a `thinking_delta` whose text is
+    /// empty (Opus 4.8 redacts reasoning to `""`; a non-empty delta becomes a
+    /// `Thinking` `ContentChunk` instead). It re-arms the frontend liveness
+    /// timer so a long silent-but-thinking turn is not falsely declared dead.
+    /// Never becomes a transcript item.
     Liveness { turn_id: TurnId },
     ToolStarted {
         turn_id: TurnId,

@@ -17,11 +17,14 @@
 //!   tools by `tool_use_id`; does **not** start a new user turn.
 //! - `assistant` → accumulates into the current pending agent turn. Each
 //!   content block in `message.content`:
-//!   - `type: "text"` → append `TurnItem::Text`.
+//!   - `type: "text"` → append `TurnItem::Text { kind: Text }`.
+//!   - `type: "thinking"` → append `TurnItem::Text { kind: Thinking }` when
+//!     the block carries non-empty reasoning text (e.g. Sonnet 4.6); a
+//!     redacted empty block (e.g. Opus 4.8) produces no item, mirroring the
+//!     live parser's empty-thinking → `Liveness` → no-item contract.
 //!   - `type: "tool_use"` → append `TurnItem::Tool` (`output`/`completed_at`
 //!     filled in by the later paired user/`tool_result` record).
-//!   - other types (e.g., `thinking`) → currently dropped with a warning;
-//!     reserved for future expansion.
+//!   - any other block type → silently skipped; reserved for future expansion.
 //!
 //! ## Lifecycle
 //!
@@ -352,9 +355,24 @@ impl ReconstructionState {
                         completed_at,
                     });
                 }
+                Some("thinking") => {
+                    // Reasoning block. Mirror the live parser's contract
+                    // (`parser.rs` `thinking_delta`): surface non-empty
+                    // reasoning as a `Thinking` item; drop an empty/absent
+                    // block (Opus 4.8 redacts the text to `""`) so live and
+                    // reopened transcripts agree for the same session and no
+                    // empty reasoning placeholder appears.
+                    if let Some(text) = block.get("thinking").and_then(Value::as_str)
+                        && !text.is_empty()
+                    {
+                        builder.items.push(TurnItem::Text {
+                            kind: ContentKind::Thinking,
+                            text: text.to_owned(),
+                        });
+                    }
+                }
                 _ => {
-                    // `thinking` and any other future block type — silently
-                    // skipped for now. Future reasoning UI work will revisit.
+                    // Any other future block type — silently skipped for now.
                 }
             }
         }
@@ -615,6 +633,107 @@ mod tests {
         }
         let meta = result.meta.unwrap();
         assert_eq!(meta.model, "claude-sonnet-4-6");
+    }
+
+    /// A non-empty `thinking` block followed by a `text` block reconstructs
+    /// to two distinct items in order — `Thinking` then `Text`, neither folded
+    /// into the other. This is the Sonnet 4.6 shape (reasoning is no longer
+    /// universally redacted); the hydrate path must match what the live stream
+    /// already renders.
+    #[test]
+    fn thinking_block_reconstructs_as_thinking_item_before_text() {
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let session_id = Uuid::now_v7();
+        let agent_id = Uuid::now_v7();
+        let assistant_thinking_then_text = json!({
+            "type": "assistant",
+            "message": {
+                "model": "claude-sonnet-4-6",
+                "role": "assistant",
+                "content": [
+                    { "type": "thinking", "thinking": "Let me reason about this.", "signature": "sig" },
+                    { "type": "text", "text": "42" }
+                ],
+                "usage": { "input_tokens": 1, "output_tokens": 1 }
+            },
+            "timestamp": "2026-05-14T04:43:16Z"
+        });
+        let content = jsonl(&[
+            user_record("Think then answer", "2026-05-14T04:43:15Z"),
+            assistant_thinking_then_text,
+        ]);
+        stage_session_file(home.path(), cwd.path(), session_id, &content);
+
+        let result = load_claude_transcript(home.path(), cwd.path(), session_id, agent_id).unwrap();
+        let Turn::Agent { items, .. } = &result.turns[1] else {
+            panic!("expected Agent turn");
+        };
+        assert_eq!(items.len(), 2, "thinking and text must be separate items");
+        match &items[0] {
+            TurnItem::Text { kind, text } => {
+                assert_eq!(*kind, ContentKind::Thinking);
+                assert_eq!(text, "Let me reason about this.");
+            }
+            other => panic!("expected Thinking Text item first, got {other:?}"),
+        }
+        match &items[1] {
+            TurnItem::Text { kind, text } => {
+                assert_eq!(*kind, ContentKind::Text);
+                assert_eq!(text, "42");
+            }
+            other => panic!("expected answer Text item second, got {other:?}"),
+        }
+    }
+
+    /// An empty (redacted) `thinking` block — the Opus 4.8 shape, `thinking:""`
+    /// with a `signature` — produces **no** item, matching the live path's
+    /// empty-thinking → `Liveness` → no-item behavior. Surfacing an empty
+    /// reasoning placeholder would read as a bug.
+    #[test]
+    fn empty_thinking_block_produces_no_item() {
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let session_id = Uuid::now_v7();
+        let agent_id = Uuid::now_v7();
+        let assistant_empty_thinking = json!({
+            "type": "assistant",
+            "message": {
+                "model": "claude-opus-4-8",
+                "role": "assistant",
+                "content": [
+                    { "type": "thinking", "thinking": "", "signature": "sig" },
+                    { "type": "text", "text": "42" }
+                ],
+                "usage": { "input_tokens": 1, "output_tokens": 1 }
+            },
+            "timestamp": "2026-05-14T04:43:16Z"
+        });
+        let content = jsonl(&[
+            user_record("Think then answer", "2026-05-14T04:43:15Z"),
+            assistant_empty_thinking,
+        ]);
+        stage_session_file(home.path(), cwd.path(), session_id, &content);
+
+        let result = load_claude_transcript(home.path(), cwd.path(), session_id, agent_id).unwrap();
+        let Turn::Agent { items, .. } = &result.turns[1] else {
+            panic!("expected Agent turn");
+        };
+        assert_eq!(items.len(), 1, "redacted thinking must not produce an item");
+        assert!(
+            !items.iter().any(|i| matches!(
+                i,
+                TurnItem::Text {
+                    kind: ContentKind::Thinking,
+                    ..
+                }
+            )),
+            "no Thinking item may be created from an empty block",
+        );
+        assert!(
+            matches!(&items[0], TurnItem::Text { kind: ContentKind::Text, text } if text == "42"),
+            "only the answer text survives",
+        );
     }
 
     #[test]

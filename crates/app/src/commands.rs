@@ -8,6 +8,7 @@ use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use switchboard_core::{
     AgentId, AgentRecord, CoreError, Directory, HarnessKind, Project, ProjectId, ProjectSummary,
@@ -1195,6 +1196,64 @@ pub fn list_agents_impl(
         }
     }
     Ok(agents)
+}
+
+pub fn search_project_files_root_impl(
+    state: &AppState,
+    project_id: ProjectId,
+) -> Result<PathBuf, AppError> {
+    let project = lock(&state.projects)
+        .get(&project_id)
+        .cloned()
+        .ok_or(AppError::ProjectNotLoaded(project_id))?;
+    Ok(project.directory)
+}
+
+/// Search user-visible project files under `root`, honoring ignore rules while
+/// keeping hidden files eligible for explicit mentions.
+pub fn search_project_files_in_root(
+    root: &Path,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<String>, AppError> {
+    let query = query.to_lowercase();
+    let limit = limit.clamp(1, 100);
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .hidden(false)
+        .require_git(false)
+        .sort_by_file_path(std::cmp::Ord::cmp);
+
+    let mut matches = Vec::new();
+    for entry in builder
+        .filter_entry(|entry| {
+            entry.file_name() != std::ffi::OsStr::new(".git")
+                && entry.file_name() != std::ffi::OsStr::new(".switchboard")
+        })
+        .build()
+    {
+        let entry = entry.map_err(|source| AppError::ProjectFileSearch {
+            root: root.to_path_buf(),
+            source,
+        })?;
+        if matches.len() >= limit {
+            break;
+        }
+        let Some(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        let Ok(relative) = entry.path().strip_prefix(root) else {
+            continue;
+        };
+        let path = relative.to_string_lossy().replace('\\', "/");
+        if query.is_empty() || path.to_lowercase().contains(&query) {
+            matches.push(path);
+        }
+    }
+    Ok(matches)
 }
 
 /// Resolves the agent (across all loaded projects) and accepts the send into
@@ -2534,6 +2593,54 @@ mod tests {
             dirs.keys().next().unwrap().to_string_lossy().into_owned()
         };
         create_project_impl(state, name, &path).unwrap()
+    }
+
+    #[tokio::test]
+    async fn search_project_files_honors_gitignore_and_includes_hidden_files() {
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "alpha");
+
+        std::fs::write(tmp.path().join(".gitignore"), "ignored.log\nignored-dir/\n").unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("ignored-dir")).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        std::fs::write(tmp.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(tmp.path().join("README.md"), "# Read me\n").unwrap();
+        std::fs::write(tmp.path().join(".env"), "TOKEN=secret\n").unwrap();
+        std::fs::write(tmp.path().join("ignored.log"), "ignored\n").unwrap();
+        std::fs::write(tmp.path().join("ignored-dir/secret.rs"), "ignored\n").unwrap();
+        std::fs::write(tmp.path().join(".git/config"), "ignored\n").unwrap();
+
+        let root = search_project_files_root_impl(&state, project.id).unwrap();
+        let matches = search_project_files_in_root(&root, "", 20).unwrap();
+        assert!(matches.contains(&".env".to_owned()));
+        assert!(matches.contains(&".gitignore".to_owned()));
+        assert!(matches.contains(&"src/main.rs".to_owned()));
+        assert!(!matches.contains(&"ignored.log".to_owned()));
+        assert!(!matches.contains(&"ignored-dir/secret.rs".to_owned()));
+        assert!(!matches.contains(&".git/config".to_owned()));
+        assert!(!matches.iter().any(|path| path.starts_with(".switchboard/")));
+
+        let queried = search_project_files_in_root(&root, "readme", 20).unwrap();
+        assert_eq!(queried, vec!["README.md"]);
+
+        let limited = search_project_files_in_root(&root, "", 1).unwrap();
+        assert_eq!(limited.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn search_project_files_reports_walk_failures() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        drop(tmp);
+        let err = search_project_files_in_root(&root, "", 20).unwrap_err();
+        match err {
+            AppError::ProjectFileSearch { root: actual, .. } => assert_eq!(actual, root),
+            other => panic!("expected project file search error, got {other:?}"),
+        }
     }
 
     fn fresh_state_with_mock() -> (TempDir, AppState, Arc<RecordingEmitter>) {

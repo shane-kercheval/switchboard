@@ -142,6 +142,14 @@ export async function listAgents(projectId?: ProjectId): Promise<AgentRecord[]> 
   return await invoke<AgentRecord[]>("list_agents", { projectId });
 }
 
+export async function searchProjectFiles(
+  projectId: ProjectId,
+  query: string,
+  limit: number,
+): Promise<string[]> {
+  return await invoke<string[]>("search_project_files", { projectId, query, limit });
+}
+
 // Returns the accepted-send receipt (`message_id`), NOT the turn_id. The
 // turn's real `turn_id` arrives later on the correlated `turn_start` event
 // (matched by `message_id`); a failure before the turn starts arrives as a

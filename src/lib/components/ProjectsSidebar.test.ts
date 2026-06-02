@@ -21,6 +21,15 @@ async function loadWorkspace() {
   return await import("$lib/state/workspace.svelte");
 }
 
+const observerStops: (() => void)[] = [];
+
+async function startActivityObserver(
+  getNow: () => string = () => "2026-05-25T12:00:00.000Z",
+): Promise<void> {
+  const ws = await loadWorkspace();
+  observerStops.push(ws.startProjectActivityObserver(getNow));
+}
+
 const PROJECT_1 = "00000000-0000-7000-8000-0000000000f1";
 const PROJECT_2 = "00000000-0000-7000-8000-0000000000f2";
 const AGENT_1 = "00000000-0000-7000-8000-00000000000a";
@@ -60,6 +69,7 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+  for (const stop of observerStops.splice(0)) stop();
   const state = await loadState();
   state._testing.reset();
   const ws = await loadWorkspace();
@@ -111,6 +121,7 @@ describe("ProjectsSidebar — background activity", () => {
     const ws = await loadWorkspace();
     ws.selection.activeProjectId = PROJECT_2; // PROJECT_1 is not being viewed
 
+    await startActivityObserver();
     const ProjectsSidebar = (await import("./ProjectsSidebar.svelte")).default;
     render(ProjectsSidebar, { props: noopProps });
     await tick(); // let the effect record PROJECT_1 as busy
@@ -124,12 +135,49 @@ describe("ProjectsSidebar — background activity", () => {
     expect(screen.queryByTestId("project-cancel")).toBeNull();
   });
 
+  it("moves a completed background project to the top with a fresh timestamp", async () => {
+    const state = await loadState();
+    const ws = await loadWorkspace();
+    const background = project(PROJECT_1);
+    const foreground = {
+      ...project(PROJECT_2),
+      last_activity: "2026-05-20T00:00:00Z",
+    };
+    ws.projects.list = [foreground, background];
+    const a = agent(AGENT_1, PROJECT_1);
+    ws.agentsByProject[PROJECT_1] = [a];
+    await state.registerAgent(a);
+    state.dispatchUserTurn(AGENT_1, "user-1", "go", "send-1", background.last_activity);
+    ws.selection.activeProjectId = PROJECT_2;
+
+    await startActivityObserver();
+    await tick();
+
+    const rt = state.runtimes[AGENT_1];
+    if (rt === undefined) throw new Error("unreachable");
+    state.runtimes[AGENT_1] = { ...rt, run_status: "idle", pending_sends: undefined };
+    await tick();
+
+    const ProjectsSidebar = (await import("./ProjectsSidebar.svelte")).default;
+    render(ProjectsSidebar, { props: noopProps });
+    await tick();
+
+    const rows = screen.getAllByTestId("project-row");
+    expect(rows[0]).toHaveAttribute("data-project-id", PROJECT_1);
+    expect(screen.getByTestId("project-completed")).toBeInTheDocument();
+    expect(ws.projects.list[0]).toMatchObject({
+      id: PROJECT_1,
+      last_activity: "2026-05-25T12:00:00.000Z",
+    });
+  });
+
   it("clears the completed marker when the project is selected", async () => {
     await seedBusyProject(PROJECT_1);
     const state = await loadState();
     const ws = await loadWorkspace();
     ws.selection.activeProjectId = PROJECT_2;
 
+    await startActivityObserver();
     const ProjectsSidebar = (await import("./ProjectsSidebar.svelte")).default;
     render(ProjectsSidebar, { props: noopProps });
     await tick();
@@ -145,12 +193,13 @@ describe("ProjectsSidebar — background activity", () => {
     await waitFor(() => expect(screen.queryByTestId("project-completed")).toBeNull());
   });
 
-  it("does not mark the active project completed when its work finishes", async () => {
+  it("updates active project activity without showing a completed marker", async () => {
     await seedBusyProject(PROJECT_1);
     const state = await loadState();
     const ws = await loadWorkspace();
     ws.selection.activeProjectId = PROJECT_1; // the user is viewing it
 
+    await startActivityObserver();
     const ProjectsSidebar = (await import("./ProjectsSidebar.svelte")).default;
     render(ProjectsSidebar, { props: noopProps });
     await tick();
@@ -160,6 +209,10 @@ describe("ProjectsSidebar — background activity", () => {
     await tick();
 
     expect(screen.queryByTestId("project-completed")).toBeNull();
+    expect(ws.projects.list[0]).toMatchObject({
+      id: PROJECT_1,
+      last_activity: "2026-05-25T12:00:00.000Z",
+    });
   });
 });
 

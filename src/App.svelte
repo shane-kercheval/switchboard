@@ -31,6 +31,7 @@
     loadWorkspace,
     projects,
     selection,
+    startProjectActivityObserver,
     workspace,
   } from "$lib/state/workspace.svelte";
   import type { AgentRecord, HarnessAvailability, HarnessBanner, HarnessKind } from "$lib/types";
@@ -121,6 +122,7 @@
   // lazy. Auth probes intentionally not called here — see the
   // `harnessAvailability` comment above.
   onMount(() => {
+    const stopProjectActivityObserver = startProjectActivityObserver();
     void refreshHarnessAvailability();
     void loadWorkspace().catch((err) => {
       dirError = err instanceof Error ? err.message : String(err);
@@ -128,6 +130,7 @@
 
     window.addEventListener("keydown", handleGlobalKeydown);
     return () => {
+      stopProjectActivityObserver();
       window.removeEventListener("keydown", handleGlobalKeydown);
     };
   });

@@ -35,15 +35,20 @@ import type {
   LoadedTurn,
   ProjectId,
   ProjectListing,
+  SendId,
   WorkspaceDirectoryInfo,
 } from "$lib/types";
+import { untrack } from "svelte";
 import { harnessAvailability, refreshHarnessAvailability } from "$lib/harnessAvailability.svelte";
 import { HARNESS_DEFAULT_AGENT_NAME } from "$lib/harnessDisplay";
+import { currentIsoTimestamp } from "$lib/utils";
+import { buildLiveSendsMap } from "$lib/state/liveSends";
 import {
   applyAgentHydrate,
   markHydrationAttempted,
   registerAgent,
   runtimes,
+  transcripts,
   unregisterAgents,
 } from "./index.svelte";
 
@@ -94,6 +99,14 @@ export const agentCreationFailures = $state<{ harness: HarnessKind; error: strin
 /// Per-project hydrated conversation overlays, keyed by project id.
 export const conversations = $state<Record<ProjectId, ProjectConversationState>>({});
 
+/// Projects that completed live work while the user was not viewing them.
+export const backgroundCompletedProjectIds = $state<Record<ProjectId, true>>({});
+
+/// Session-local response-completion activity. The backend listing remains the
+/// durable baseline; this overlay preserves live completions observed after the
+/// workspace registry was loaded, including across later registry refreshes.
+export const projectActivityOverrides = $state<Record<ProjectId, string>>({});
+
 /// First-activation guard: holds the in-flight load promise per project so
 /// concurrent activations share one load, and so re-activation is a pure
 /// display switch (roster + hydration already done).
@@ -111,6 +124,58 @@ function sortByActivity(list: ProjectListing[]): ProjectListing[] {
   return [...list].sort((a, b) => b.last_activity.localeCompare(a.last_activity));
 }
 
+function applyActivityOverrides(list: ProjectListing[]): ProjectListing[] {
+  return sortByActivity(
+    list.map((project) => {
+      const override = projectActivityOverrides[project.id];
+      return override !== undefined && override > project.last_activity
+        ? { ...project, last_activity: override }
+        : project;
+    }),
+  );
+}
+
+export function recordProjectsActivityLocally(projectIds: ProjectId[], at: string): void {
+  if (projectIds.length === 0) return;
+  let changed = false;
+  for (const id of projectIds) {
+    if (!projects.list.some((project) => project.id === id)) continue;
+    projectActivityOverrides[id] = at;
+    changed = true;
+  }
+  if (changed) projects.list = applyActivityOverrides(projects.list);
+}
+
+export function liveProjectSends(projectId: ProjectId): Map<SendId, AgentId[]> {
+  return buildLiveSendsMap(agentsByProject[projectId] ?? [], runtimes, transcripts);
+}
+
+let previousBusyProjectIds: ProjectId[] = [];
+
+export function startProjectActivityObserver(
+  getNow: () => string = currentIsoTimestamp,
+): () => void {
+  return $effect.root(() => {
+    $effect(() => {
+      const nowBusy = Object.keys(agentsByProject).filter(
+        (projectId) => liveProjectSends(projectId).size > 0,
+      );
+      const completed: ProjectId[] = [];
+      const backgroundCompleted: ProjectId[] = [];
+      for (const id of previousBusyProjectIds) {
+        if (nowBusy.includes(id)) continue;
+        completed.push(id);
+        if (id !== selection.activeProjectId) backgroundCompleted.push(id);
+      }
+      previousBusyProjectIds = nowBusy;
+      untrack(() => {
+        if (completed.length > 0) recordProjectsActivityLocally(completed, getNow());
+        for (const id of backgroundCompleted) backgroundCompletedProjectIds[id] = true;
+      });
+    });
+  });
+}
+
 /// Fetch the eager registry: the directory list (incl. empty directories + the
 /// persistability signal) and the flat project list. Called at startup and
 /// after any add/remove/create that changes the registry.
@@ -121,7 +186,7 @@ export async function loadWorkspace(): Promise<void> {
   ]);
   workspace.directories = dirs.directories;
   workspace.persistable = dirs.persistable;
-  projects.list = sortByActivity(projectList);
+  projects.list = applyActivityOverrides(projectList);
 }
 
 /// Add a working directory to the workspace and refresh the registry.
@@ -154,9 +219,12 @@ export async function removeDirectory(path: string): Promise<void> {
   for (const id of removedProjectIds) {
     delete agentsByProject[id];
     delete conversations[id];
+    delete backgroundCompletedProjectIds[id];
+    delete projectActivityOverrides[id];
     loadStarted.delete(id);
     hydrationStarted.delete(id);
   }
+  previousBusyProjectIds = previousBusyProjectIds.filter((id) => !removedProjectIds.includes(id));
   if (activeRemoved) {
     selection.activeProjectId = null;
     selection.activationError = null;
@@ -288,6 +356,7 @@ export function dismissAgentCreationFailure(harness: HarnessKind): void {
 export async function activateProject(projectId: ProjectId): Promise<void> {
   selection.activeProjectId = projectId;
   selection.activationError = null;
+  delete backgroundCompletedProjectIds[projectId];
   // Auto-create failures pertain to a just-created project; switching away (or
   // re-activating) clears the banner. `createProjectAndActivate` seeds *after*
   // this, so its failures survive.
@@ -421,10 +490,14 @@ export const _testing = {
     projects.list = [];
     selection.activeProjectId = null;
     selection.activationError = null;
+    previousBusyProjectIds = [];
     loadStarted.clear();
     hydrationStarted.clear();
     for (const key of Object.keys(agentsByProject)) delete agentsByProject[key];
     for (const key of Object.keys(conversations)) delete conversations[key];
+    for (const key of Object.keys(backgroundCompletedProjectIds))
+      delete backgroundCompletedProjectIds[key];
+    for (const key of Object.keys(projectActivityOverrides)) delete projectActivityOverrides[key];
     agentCreationFailures.length = 0;
   },
 };

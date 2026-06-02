@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/svelte";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import { tick } from "svelte";
 import SettingsView from "./SettingsView.svelte";
 import { theme } from "$lib/theme.svelte";
+import { agentCopy } from "$lib/agentCopy.svelte";
 import { _testing as availabilityTesting } from "$lib/harnessAvailability.svelte";
 
 // SettingsView embeds HarnessStatusList, which probes install/auth on mount.
@@ -17,6 +18,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 
 beforeEach(() => {
   theme.set("system");
+  agentCopy.set("last_answer_block");
   invokeMock.mockClear();
   // The embedded HarnessStatusList reads the shared singleton store; reset it
   // so probed values don't leak across tests.
@@ -51,7 +53,7 @@ describe("SettingsView", () => {
     render(SettingsView, { props: { onClose: vi.fn() } });
     const group = screen.getByRole("radiogroup", { name: "Theme" });
     expect(group).toBeInTheDocument();
-    const radios = screen.getAllByRole("radio");
+    const radios = within(group).getAllByRole("radio");
     expect(radios).toHaveLength(3);
     const labels = radios.map((r) => r.textContent?.trim());
     expect(labels).toEqual(["System", "Light", "Dark"]);
@@ -59,7 +61,8 @@ describe("SettingsView", () => {
 
   it("aria-checked tracks the active theme and updates on click", async () => {
     render(SettingsView, { props: { onClose: vi.fn() } });
-    const [system, light, dark] = screen.getAllByRole("radio");
+    const group = screen.getByRole("radiogroup", { name: "Theme" });
+    const [system, light, dark] = within(group).getAllByRole("radio");
 
     // Initial state: system is checked
     expect(system).toHaveAttribute("aria-checked", "true");
@@ -76,6 +79,22 @@ describe("SettingsView", () => {
     await tick();
     expect(dark).toHaveAttribute("aria-checked", "true");
     expect(light).toHaveAttribute("aria-checked", "false");
+  });
+
+  it("agent message copy picker updates the copy preference", async () => {
+    render(SettingsView, { props: { onClose: vi.fn() } });
+    const group = screen.getByRole("radiogroup", { name: "Agent message copy" });
+    const [lastBlock, fullAnswer] = within(group).getAllByRole("radio");
+
+    expect(lastBlock).toHaveAttribute("aria-checked", "true");
+    expect(fullAnswer).toHaveAttribute("aria-checked", "false");
+
+    await fireEvent.click(fullAnswer!);
+    await tick();
+
+    expect(agentCopy.mode).toBe("full_answer");
+    expect(lastBlock).toHaveAttribute("aria-checked", "false");
+    expect(fullAnswer).toHaveAttribute("aria-checked", "true");
   });
 
   it("shortcuts section lists expected keyboard shortcuts", () => {

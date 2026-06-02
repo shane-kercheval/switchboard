@@ -334,8 +334,8 @@ mcp_providers:
       type: http
       url: https://mcp.example.com
     auth:
-      type: bearer
-      token: ${TEAM_MCP_TOKEN}
+      type: bearer                  # token entered via Settings → "Add MCP server"
+                                    # and stored in the OS keychain, not in this file
 
   - name: my-local-stdio            # generic stdio MCP server (e.g. an npm-packaged server)
     transport:
@@ -343,7 +343,7 @@ mcp_providers:
       command: ["npx", "-y", "@example/mcp-server"]
 ```
 
-**Tiddly is a first-class preset.** The Switchboard UI offers a one-click "Connect Tiddly" action: the user logs into their Tiddly account through a browser (Auth0 device-code flow); Switchboard mints a long-lived Personal Access Token, stores it in the OS keychain, and writes the corresponding `preset: tiddly` config entry automatically. No token is ever hand-pasted or written to `config.yaml`. Tiddly's URL and auth workflow are baked in. Other MCP servers require manual config (or a generic "Add MCP server" form in the UI), supplying their bearer token via an `${ENV}` reference or the keychain. The presets list is open — additional first-class integrations (e.g., a future popular prompt-store MCP) can be added the same way.
+**Tiddly is a first-class preset.** The Switchboard UI offers a one-click "Connect Tiddly" action: the user logs into their Tiddly account through a browser (Auth0 device-code flow); Switchboard mints a long-lived Personal Access Token, stores it in the OS keychain, and writes the corresponding `preset: tiddly` config entry automatically. No token is ever hand-pasted or written to `config.yaml`. Tiddly's URL and auth workflow are baked in. Other MCP servers are added via a generic "Add MCP server" form in Settings (name + URL + bearer token); the token is stored in the OS keychain, never in `config.yaml`. The presets list is open — additional first-class integrations (e.g., a future popular prompt-store MCP) can be added the same way.
 
 ### Addressing prompts
 

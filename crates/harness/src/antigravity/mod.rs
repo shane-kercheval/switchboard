@@ -479,7 +479,7 @@ async fn run_producer(ctx: ProducerCtx) {
                             // persist is load-bearing (a lost locator leaves the
                             // agent unresumable) but its fatality now lives in
                             // the dispatcher sink, not here.
-                            emit_locator_captured(&tx, agent_id, uuid);
+                            emit_locator_captured(&tx, uuid);
                         }
                         CaptureOutcome::Ambiguous => ambiguous_capture = true,
                         CaptureOutcome::NotYet => {}
@@ -601,7 +601,7 @@ async fn run_producer(ctx: ProducerCtx) {
                 // one every turn.
                 transcript_path = Some(paths::transcript_path(&home_dir, uuid));
                 cursor = 0;
-                emit_locator_captured(&tx, agent_id, uuid);
+                emit_locator_captured(&tx, uuid);
             }
             CaptureOutcome::Ambiguous => ambiguous_capture = true,
             CaptureOutcome::NotYet => {
@@ -727,16 +727,12 @@ fn drain_transcript(
 }
 
 /// Emit the captured conversation UUID as a normalized capture event. The
-/// dispatcher persists it to the agent's registry record (load-bearing — a
-/// persist failure fails the turn). Emitted only when the locator is newly
-/// learned (first dispatch) or changes (fork-and-heal), never on a plain resume.
-fn emit_locator_captured(
-    tx: &tokio::sync::mpsc::UnboundedSender<AdapterEvent>,
-    agent_id: AgentId,
-    uuid: Uuid,
-) {
+/// dispatcher persists it to the running turn's agent registry record
+/// (load-bearing — a persist failure fails the turn). Emitted only when the
+/// locator is newly learned (first dispatch) or changes (fork-and-heal), never
+/// on a plain resume.
+fn emit_locator_captured(tx: &tokio::sync::mpsc::UnboundedSender<AdapterEvent>, uuid: Uuid) {
     let _ = tx.send(AdapterEvent::SessionLocatorCaptured {
-        agent_id,
         locator: SessionLocator::Uuid(uuid),
     });
 }

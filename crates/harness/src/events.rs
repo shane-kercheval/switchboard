@@ -113,14 +113,14 @@ pub struct TurnUsage {
 ///
 /// Variant scope: `ContentChunk`, `ToolStarted`, `ToolCompleted`, `TurnEnd` are
 /// turn-scoped (the `turn_id` self-discriminates the agent via the transcript
-/// map). `SessionMeta`, `RateLimitEvent`, `SessionLocatorCaptured` are
-/// agent-scoped (no turn anchor) and carry `agent_id` in the payload so they're
-/// self-describing for logs, persistence, and any future non-channel transport.
+/// map). `SessionMeta`, `RateLimitEvent` are agent-scoped and carry `agent_id`
+/// in the payload because they reach the frontend, which keys them by agent.
 ///
 /// `SessionLocatorCaptured` is **internal** (adapter → dispatcher only): the
 /// dispatcher persists the locator to the registry and does not forward it to
-/// the frontend, so it has no `NormalizedEvent` counterpart — see
-/// [`AdapterEvent::into_normalized`].
+/// the frontend, so it has no `NormalizedEvent` counterpart (see
+/// [`AdapterEvent::into_normalized`]) and carries no `agent_id` — its sole
+/// consumer binds it to the running turn's agent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[non_exhaustive]
@@ -174,17 +174,20 @@ pub enum AdapterEvent {
         skills: Vec<String>,
         raw: serde_json::Value,
     },
-    /// A runtime-assigned session locator the adapter just learned for this
-    /// agent (Codex's `thread_id`+date on first dispatch; Antigravity's
-    /// conversation UUID on first dispatch or a fork-and-heal). The dispatcher
-    /// persists it to the agent's registry record via its injected
+    /// A runtime-assigned session locator the adapter just learned (Codex's
+    /// `thread_id`+date on first dispatch; Antigravity's conversation UUID on
+    /// first dispatch or a fork-and-heal). The dispatcher persists it to the
+    /// **running turn's** agent registry record via its injected
     /// `SessionLocatorSink`; it is **not** forwarded to the frontend. Emitted
     /// only when the locator is newly learned or changes — never on a plain
     /// resume where it's unchanged.
-    SessionLocatorCaptured {
-        agent_id: AgentId,
-        locator: SessionLocator,
-    },
+    ///
+    /// Deliberately carries **no `agent_id`**: unlike the other agent-scoped
+    /// events, this one never reaches the frontend and its sole consumer
+    /// (`drain_turn`) always knows the running turn's agent. Binding the locator
+    /// to the turn's agent rather than an event-supplied id makes "persist to
+    /// the wrong agent" unrepresentable.
+    SessionLocatorCaptured { locator: SessionLocator },
 }
 
 /// Wire format across the IPC boundary to the frontend.
@@ -910,7 +913,6 @@ mod tests {
         // Internal adapter→dispatcher event: persisted to the registry, never
         // forwarded to the frontend, so it has no NormalizedEvent counterpart.
         let adapter = AdapterEvent::SessionLocatorCaptured {
-            agent_id: fresh_agent_id(),
             locator: SessionLocator::Uuid(Uuid::now_v7()),
         };
         assert!(adapter.into_normalized().is_none());

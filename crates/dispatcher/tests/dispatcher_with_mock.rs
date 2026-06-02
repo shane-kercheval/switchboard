@@ -2695,6 +2695,54 @@ async fn capture_persist_failure_fails_the_turn() {
 }
 
 #[tokio::test]
+async fn capture_persist_failure_suppresses_subsequent_stream_events() {
+    // After a force-failed turn, the adapter may keep emitting (Antigravity's
+    // post-exit drain emits content + terminal after the capture). None of it
+    // may reach the wire — the turn is authoritatively over, and a "failed"
+    // terminal followed by more content would corrupt the lifecycle contract.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let factory = TestFactory::sequence_with_locator_sink(
+        // capture FIRST, then content + a completed terminal.
+        [MockScenario::CapturesLocatorThenContent(
+            SessionLocator::Uuid(Uuid::now_v7()),
+        )],
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+        Arc::new(NoopMetadataCache),
+        Arc::new(FailingLocatorSink),
+    );
+
+    dispatcher
+        .send_message(agent.id, "hello", Uuid::now_v7(), factory, OnBusy::Enqueue)
+        .await;
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+
+    let snapshot = emitter.snapshot();
+    // Exactly one terminal, and it's the synthesized failure.
+    let terminals: Vec<_> = snapshot
+        .iter()
+        .filter(|(_, v)| event_type(v) == "turn_end")
+        .collect();
+    assert_eq!(terminals.len(), 1, "exactly one terminal");
+    assert_eq!(terminals[0].1["outcome"]["status"], "failed");
+    // No post-capture content leaked past the failed terminal.
+    assert!(
+        !snapshot
+            .iter()
+            .any(|(_, v)| event_type(v) == "content_chunk"),
+        "content emitted after the capture must be suppressed on a force-failed turn"
+    );
+}
+
+#[tokio::test]
 async fn repeated_capture_events_each_persist_and_are_not_deduped() {
     // The fork-and-heal shape at the dispatcher layer: a capture event on a
     // second turn re-invokes the sink — the dispatcher never suppresses a

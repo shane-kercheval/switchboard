@@ -969,6 +969,15 @@ async fn drain_turn(
     let mut cancel_source: Option<CancelSource> = None;
     let mut shutdown_reply: Option<oneshot::Sender<()>> = None;
     let mut channel_closed = false;
+    // Set when the dispatcher itself synthesizes a `Failed` terminal (a
+    // load-bearing locator-persist failure). Distinct from the cancel latch:
+    // cancellation deliberately still forwards buffered content (system-design
+    // §7) and a normal terminal still forwards Codex post-terminal enrichment —
+    // but a force-failed turn is authoritatively over, so **every** subsequent
+    // adapter event is dropped (the adapter may still be mid-stream, e.g.
+    // Antigravity's post-exit drain emits content + `SessionMeta` after the
+    // capture). We keep looping only to service commands and let the child exit.
+    let mut force_failed = false;
 
     loop {
         tokio::select! {
@@ -978,14 +987,20 @@ async fn drain_turn(
 
             maybe_event = stream.next() => {
                 let Some(event) = maybe_event else { break };
+                // A force-failed turn is authoritatively over — drop every
+                // further adapter event (content, meta, terminal) rather than
+                // forward output for a turn the UI already saw fail.
+                if force_failed {
+                    continue;
+                }
                 // Internal adapter→dispatcher event: persist the runtime-captured
-                // session locator to the registry. Load-bearing — a lost locator
-                // silently starts a fresh session next turn — so a persist failure
-                // fails the turn and tears the child down via the cancel token
-                // (the adapter ends its stream without a terminal on cancel, and
-                // our synthesized `Failed` terminal already won). Never forwarded.
-                if let AdapterEvent::SessionLocatorCaptured { agent_id: ev_agent, locator } = &event {
-                    if let Err(e) = locator_sink.persist(*ev_agent, locator.clone()) {
+                // session locator to the **running turn's** agent (never an
+                // event-supplied id — see `SessionLocatorCaptured`). Load-bearing:
+                // a lost locator silently starts a fresh session next turn, so a
+                // persist failure fails the turn and tears the child down via the
+                // cancel token. Never forwarded to the frontend.
+                if let AdapterEvent::SessionLocatorCaptured { locator } = &event {
+                    if let Err(e) = locator_sink.persist(agent_id, locator.clone()) {
                         if terminal_seen {
                             // Can't fail an already-terminal turn; the locator is
                             // lost but the turn outcome stands. Surface loudly.
@@ -1012,8 +1027,10 @@ async fn drain_turn(
                             );
                             journal.record_outcome(turn_id, agent_id, &outcome, started_at, ended_at);
                             terminal_seen = true;
-                            // Tear down the child; the real terminal that follows is
-                            // dropped by the `token.is_cancelled()` latch above.
+                            force_failed = true;
+                            // Tear down the child; the adapter may still be
+                            // mid-stream (Antigravity's post-exit drain), and
+                            // `force_failed` drops anything it emits from here on.
                             token.cancel();
                         }
                     }

@@ -1115,6 +1115,15 @@ fn check_codex_session_id_unique(state: &AppState, candidate: &str) -> Result<()
 /// ids are server-assigned and globally unique: two agents resuming one
 /// `--conversation <uuid>` would interleave server-side
 /// (same-session-parallel-invocation).
+///
+/// **Accepted migration-window gap:** an Antigravity agent created before the
+/// locator moved onto the record still carries its conversation id in an
+/// unmigrated `.antigravity.jsonl` sidecar (`session_locator: None`), so this
+/// scan can't see it and a duplicate attach of that conversation would slip
+/// through until the one-time migration folds the sidecar into the record. The
+/// migration handles Antigravity sidecars explicitly; the exposure is the
+/// dev-only window before it runs (same accepted window as legacy `session_id`
+/// records).
 fn check_antigravity_session_id_unique(state: &AppState, candidate: Uuid) -> Result<(), AppError> {
     for project in enumerate_all_projects(state)? {
         for agent in project.list_agents()? {

@@ -90,6 +90,13 @@ pub enum MockScenario {
     /// fires (and, with a failing sink, the turn fails). Stands in for a
     /// Codex/Antigravity adapter without a subprocess.
     CapturesLocator(SessionLocator),
+
+    /// Emits `SessionLocatorCaptured(locator) → ContentChunk → TurnEnd(Completed)`
+    /// — content and a terminal **after** the capture. Models Antigravity's
+    /// post-exit drain (capture, then more transcript content + terminal). The
+    /// vehicle for the persist-failure suppression test: with a failing sink the
+    /// dispatcher force-fails on the capture, and nothing after it may forward.
+    CapturesLocatorThenContent(SessionLocator),
 }
 
 /// A `HarnessAdapter` that produces canned events without spawning any subprocess.
@@ -320,7 +327,24 @@ impl HarnessAdapter for MockHarnessAdapter {
                         kind: ContentKind::Text,
                         text: "ack".to_owned(),
                     });
-                    let _ = tx.send(AdapterEvent::SessionLocatorCaptured { agent_id, locator });
+                    let _ = tx.send(AdapterEvent::SessionLocatorCaptured { locator });
+                    let _ = tx.send(AdapterEvent::TurnEnd {
+                        turn_id,
+                        outcome: TurnOutcome::Completed,
+                        ended_at: Utc::now(),
+                        usage: None,
+                    });
+                });
+            }
+            MockScenario::CapturesLocatorThenContent(ref locator) => {
+                let locator = locator.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send(AdapterEvent::SessionLocatorCaptured { locator });
+                    let _ = tx.send(AdapterEvent::ContentChunk {
+                        turn_id,
+                        kind: ContentKind::Text,
+                        text: "post-capture content".to_owned(),
+                    });
                     let _ = tx.send(AdapterEvent::TurnEnd {
                         turn_id,
                         outcome: TurnOutcome::Completed,

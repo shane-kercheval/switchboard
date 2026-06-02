@@ -31,8 +31,8 @@ use crate::commands::{
     create_project_impl, get_harness_install_status_impl, init_directory_impl, list_agents_impl,
     list_projects_impl, list_workspace_directories_impl, load_project_conversation_impl,
     load_transcript_impl, open_project_impl, parse_uuid, pick_directory_impl, remove_agent_impl,
-    remove_directory_impl, remove_queued_message_impl, rename_agent_impl, send_message_impl,
-    set_active_project_impl, validate_external_url,
+    remove_directory_impl, remove_queued_message_impl, rename_agent_impl, rename_project_impl,
+    send_message_impl, set_active_project_impl, validate_external_url,
 };
 use crate::state::AppState;
 
@@ -133,6 +133,16 @@ async fn create_project(
     directory: String,
 ) -> Result<ProjectSummary, String> {
     create_project_impl(state.inner(), &name, &directory).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn rename_project(
+    state: State<'_, AppState>,
+    project_id: String,
+    new_name: String,
+) -> Result<ProjectListing, String> {
+    let id = parse_uuid(&project_id).map_err(|e| e.to_string())?;
+    rename_project_impl(state.inner(), id, &new_name).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -549,6 +559,7 @@ pub fn run() {
             list_projects,
             list_workspace_directories,
             create_project,
+            rename_project,
             open_project,
             set_active_project,
             create_agent,

@@ -4,7 +4,9 @@ import { render, screen, fireEvent, waitFor } from "@testing-library/svelte";
 import { tick } from "svelte";
 import type { AgentRecord, ProjectListing } from "$lib/types";
 
-const invokeMock = vi.fn(async (_cmd: string, _args?: Record<string, unknown>) => undefined);
+const invokeMock = vi.fn<(cmd: string, args?: Record<string, unknown>) => Promise<unknown>>(
+  async () => undefined,
+);
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: (cmd: string, args?: Record<string, unknown>) => invokeMock(cmd, args),
 }));
@@ -158,5 +160,184 @@ describe("ProjectsSidebar — background activity", () => {
     await tick();
 
     expect(screen.queryByTestId("project-completed")).toBeNull();
+  });
+});
+
+function projectIn(id: string, name: string, directory: string): ProjectListing {
+  return {
+    id,
+    name,
+    created_at: "2026-05-16T00:00:00Z",
+    directory,
+    available: true,
+    last_activity: "2026-05-16T00:00:00Z",
+  };
+}
+
+/// Make `rename_project` echo back the renamed row (the backend's contract); all
+/// other commands stay no-ops.
+function mockRenameEchoes(): void {
+  invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+    if (cmd === "rename_project") {
+      const id = args?.projectId as string;
+      return projectIn(id, args?.newName as string, "/work/a");
+    }
+    return undefined;
+  });
+}
+
+async function renderWith(list: ProjectListing[]) {
+  const ws = await loadWorkspace();
+  ws.projects.list = list;
+  const ProjectsSidebar = (await import("./ProjectsSidebar.svelte")).default;
+  render(ProjectsSidebar, { props: noopProps });
+}
+
+function rowSelectButton(index = 0): HTMLButtonElement {
+  const rows = screen.getAllByTestId("project-row");
+  const btn = rows[index]?.querySelector("button");
+  if (!btn) throw new Error("expected a select button in the project row");
+  return btn as HTMLButtonElement;
+}
+
+describe("ProjectsSidebar — rename", () => {
+  const A1 = "00000000-0000-7000-8000-0000000000a1";
+  const A2 = "00000000-0000-7000-8000-0000000000a2";
+
+  it("enters edit via double-click and via the kebab Rename item", async () => {
+    mockRenameEchoes();
+    await renderWith([projectIn(A1, "alpha", "/work/a")]);
+
+    // Double-click the row.
+    await fireEvent.dblClick(rowSelectButton());
+    expect(await screen.findByTestId("project-rename-input")).toBeInTheDocument();
+
+    // Escape back out, then use the menu.
+    await fireEvent.keyDown(screen.getByTestId("project-rename-input"), { key: "Escape" });
+    await waitFor(() => expect(screen.queryByTestId("project-rename-input")).toBeNull());
+
+    await fireEvent.click(screen.getByTestId("project-actions-trigger"));
+    await fireEvent.click(await screen.findByTestId("project-action-rename"));
+    expect(await screen.findByTestId("project-rename-input")).toBeInTheDocument();
+  });
+
+  it("Enter commits the rename and updates the row", async () => {
+    mockRenameEchoes();
+    await renderWith([projectIn(A1, "alpha", "/work/a")]);
+
+    await fireEvent.dblClick(rowSelectButton());
+    const input = await screen.findByTestId("project-rename-input");
+    await fireEvent.input(input, { target: { value: "renamed" } });
+    await fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(invokeMock).toHaveBeenCalledWith("rename_project", {
+      projectId: A1,
+      newName: "renamed",
+    });
+    await waitFor(() => expect(screen.queryByTestId("project-rename-input")).toBeNull());
+    expect(screen.getByText("renamed")).toBeInTheDocument();
+  });
+
+  it("Escape and blur cancel without persisting", async () => {
+    mockRenameEchoes();
+    await renderWith([projectIn(A1, "alpha", "/work/a")]);
+
+    await fireEvent.dblClick(rowSelectButton());
+    let input = await screen.findByTestId("project-rename-input");
+    await fireEvent.input(input, { target: { value: "changed" } });
+    await fireEvent.keyDown(input, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByTestId("project-rename-input")).toBeNull());
+
+    await fireEvent.dblClick(rowSelectButton());
+    input = await screen.findByTestId("project-rename-input");
+    await fireEvent.input(input, { target: { value: "changed-again" } });
+    await fireEvent.blur(input);
+    await waitFor(() => expect(screen.queryByTestId("project-rename-input")).toBeNull());
+
+    expect(invokeMock).not.toHaveBeenCalledWith("rename_project", expect.anything());
+    expect(screen.getByText("alpha")).toBeInTheDocument();
+  });
+
+  it("an unchanged name exits edit without a round-trip", async () => {
+    mockRenameEchoes();
+    await renderWith([projectIn(A1, "alpha", "/work/a")]);
+
+    await fireEvent.dblClick(rowSelectButton());
+    const input = await screen.findByTestId("project-rename-input");
+    await fireEvent.keyDown(input, { key: "Enter" });
+
+    await waitFor(() => expect(screen.queryByTestId("project-rename-input")).toBeNull());
+    expect(invokeMock).not.toHaveBeenCalledWith("rename_project", expect.anything());
+  });
+
+  it("disables save and flags the input on a same-directory duplicate", async () => {
+    mockRenameEchoes();
+    await renderWith([projectIn(A1, "alpha", "/work/a"), projectIn(A2, "beta", "/work/a")]);
+
+    await fireEvent.dblClick(rowSelectButton()); // edits alpha (first row)
+    const input = await screen.findByTestId("project-rename-input");
+    await fireEvent.input(input, { target: { value: "BETA" } }); // canonical collision
+    expect(screen.getByTestId("project-rename-save")).toBeDisabled();
+    expect(input).toHaveAttribute("aria-invalid", "true");
+    expect(input).toHaveAttribute("title", "A project named 'beta' already exists");
+  });
+
+  it("allows a name that only collides in a different directory", async () => {
+    mockRenameEchoes();
+    await renderWith([projectIn(A1, "alpha", "/work/a"), projectIn(A2, "beta", "/work/b")]);
+
+    await fireEvent.dblClick(rowSelectButton()); // edits alpha in /work/a
+    const input = await screen.findByTestId("project-rename-input");
+    await fireEvent.input(input, { target: { value: "beta" } }); // beta lives in /work/b
+    expect(screen.getByTestId("project-rename-save")).not.toBeDisabled();
+    expect(input).toHaveAttribute("aria-invalid", "false");
+  });
+
+  it("disables save on empty without showing a message", async () => {
+    mockRenameEchoes();
+    await renderWith([projectIn(A1, "alpha", "/work/a")]);
+
+    await fireEvent.dblClick(rowSelectButton());
+    const input = await screen.findByTestId("project-rename-input");
+    await fireEvent.input(input, { target: { value: "" } });
+    expect(screen.getByTestId("project-rename-save")).toBeDisabled();
+    expect(input).not.toHaveAttribute("title");
+  });
+
+  it("keeps the editor open and surfaces a backend rejection", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "rename_project") throw new Error("registry locked");
+      return undefined;
+    });
+    await renderWith([projectIn(A1, "alpha", "/work/a")]);
+
+    await fireEvent.dblClick(rowSelectButton());
+    const input = await screen.findByTestId("project-rename-input");
+    await fireEvent.input(input, { target: { value: "renamed" } });
+    await fireEvent.keyDown(input, { key: "Enter" });
+
+    const err = await screen.findByTestId("project-rename-error");
+    expect(err).toHaveTextContent("registry locked");
+    expect(screen.getByTestId("project-rename-input")).toBeInTheDocument();
+  });
+
+  it("double-Enter commits once", async () => {
+    mockRenameEchoes();
+    await renderWith([projectIn(A1, "alpha", "/work/a")]);
+
+    await fireEvent.dblClick(rowSelectButton());
+    const input = await screen.findByTestId("project-rename-input");
+    await fireEvent.input(input, { target: { value: "renamed" } });
+    await fireEvent.keyDown(input, { key: "Enter" });
+    await fireEvent.keyDown(input, { key: "Enter" });
+
+    const renameCalls = invokeMock.mock.calls.filter((c) => c[0] === "rename_project");
+    expect(renameCalls).toHaveLength(1);
+  });
+
+  it("omits the kebab on unavailable rows (through M1–M2)", async () => {
+    mockRenameEchoes();
+    await renderWith([{ ...projectIn(A1, "alpha", "/work/a"), available: false }]);
+    expect(screen.queryByTestId("project-actions-trigger")).toBeNull();
   });
 });

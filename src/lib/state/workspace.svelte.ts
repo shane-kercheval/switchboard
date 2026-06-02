@@ -259,6 +259,18 @@ export async function renameAgent(agentId: AgentId, newName: string): Promise<vo
   }
 }
 
+/// Rename a project. The backend re-validates format + per-directory uniqueness
+/// (the frontend pre-check is UX only) and returns the updated listing, which
+/// replaces the matching row in `projects.list` in place. The name renders
+/// everywhere from `projects.list` (sidebar row + breadcrumb derive from it), so
+/// no other state needs touching. Rename doesn't change `last_activity`, so the
+/// list order is preserved. Errors propagate to the caller (the inline editor
+/// surfaces them and stays in edit mode).
+export async function renameProject(projectId: ProjectId, newName: string): Promise<void> {
+  const updated = await api.renameProject(projectId, newName);
+  projects.list = projects.list.map((p) => (p.id === projectId ? updated : p));
+}
+
 /// Dismiss the auto-create failure banner for one harness.
 export function dismissAgentCreationFailure(harness: HarnessKind): void {
   const idx = agentCreationFailures.findIndex((f) => f.harness === harness);

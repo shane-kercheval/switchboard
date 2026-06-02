@@ -4,13 +4,17 @@
     activateProject,
     agentsByProject,
     projects,
+    renameProject,
     selection,
     workspace,
   } from "$lib/state/workspace.svelte";
   import { cancelSend, runtimes, transcripts } from "$lib/state/index.svelte";
   import { buildLiveSendsMap } from "$lib/state/liveSends";
-  import type { AgentId, SendId } from "$lib/types";
+  import type { AgentId, ProjectId, ProjectListing, SendId } from "$lib/types";
+  import { validateProjectName, normalizeProjectName } from "$lib/projectName";
+  import type { NameValidation } from "$lib/nameValidation";
   import { basename, cn, relativeTime } from "$lib/utils";
+  import ProjectActionsMenu from "$lib/components/ProjectActionsMenu.svelte";
   import SidebarPanel from "$lib/components/ui/SidebarPanel.svelte";
   import SidebarSection from "$lib/components/ui/SidebarSection.svelte";
   import Badge from "$lib/components/ui/Badge.svelte";
@@ -68,6 +72,95 @@
       for (const id of added) completedProjectIds[id] = true;
     });
   });
+
+  /// Inline rename editor (mirrors the agent-card rename in `Sidebar.svelte`).
+  /// Only one row edits at a time, so a single `editingProjectId` + `draftName`
+  /// suffices; `renameError` holds a backend rejection (the live format/
+  /// uniqueness check is `renameValidation`, the frontend mirror of the backend
+  /// rules — the backend stays authoritative).
+  let editingProjectId = $state<ProjectId | null>(null);
+  let draftName = $state<string>("");
+  let renaming = $state<boolean>(false);
+  let renameError = $state<string | null>(null);
+
+  /// Project names are unique per directory, so validate against the *other*
+  /// projects sharing the edited project's directory, excluding itself. Empty is
+  /// suppressed from the message (disables save without nagging mid-edit), same
+  /// as the agent editor.
+  const editingProject = $derived(
+    editingProjectId === null
+      ? null
+      : (projects.list.find((p) => p.id === editingProjectId) ?? null),
+  );
+  const renameSiblings = $derived(
+    editingProject === null
+      ? []
+      : projects.list.filter((p) => p.directory === editingProject.directory),
+  );
+  const renameValidation = $derived<NameValidation>(
+    editingProjectId === null
+      ? { ok: true }
+      : validateProjectName(draftName, renameSiblings, editingProjectId),
+  );
+  const renameMessage = $derived(
+    renameValidation.ok || renameValidation.reason === "empty" ? null : renameValidation.message,
+  );
+  const canSave = $derived(renameValidation.ok && !renaming);
+
+  function startEdit(project: ProjectListing): void {
+    editingProjectId = project.id;
+    draftName = project.name;
+    renameError = null;
+  }
+
+  function cancelEdit(): void {
+    editingProjectId = null;
+    renameError = null;
+  }
+
+  /// Commit the draft. An unchanged verbatim name skips the round-trip. On
+  /// success the row updates and we leave edit mode; on a backend rejection we
+  /// stay in edit mode and surface it.
+  async function commitEdit(project: ProjectListing): Promise<void> {
+    if (!canSave) return;
+    const next = normalizeProjectName(draftName);
+    if (next === project.name) {
+      cancelEdit();
+      return;
+    }
+    renaming = true;
+    renameError = null;
+    try {
+      await renameProject(project.id, next);
+      editingProjectId = null;
+    } catch (err) {
+      renameError = err instanceof Error ? err.message : String(err);
+    } finally {
+      renaming = false;
+    }
+  }
+
+  function onRenameKeydown(event: KeyboardEvent, project: ProjectListing): void {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      void commitEdit(project);
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      cancelEdit();
+    }
+  }
+
+  /// Focus + select the edit field once it mounts. Deferred a frame so it wins
+  /// the dropdown menu's on-close focus restore (the "Rename" item closes the
+  /// menu, returning focus to its trigger); focusing synchronously would be
+  /// stolen back and fire the input's blur-cancel. (Same rationale as the agent
+  /// editor's `focusSelect`.)
+  function focusSelect(node: HTMLInputElement): void {
+    requestAnimationFrame(() => {
+      node.focus();
+      node.select();
+    });
+  }
 </script>
 
 <SidebarPanel side="left" width="w-72" testid="projects-sidebar">
@@ -116,66 +209,152 @@
         {@const liveSends = liveProjectSends(project.id)}
         {@const busy = liveSends.size > 0}
         {@const completed = !busy && project.id in completedProjectIds}
+        {@const editing = editingProjectId === project.id}
         <div
           class={cn(
-            "hover:bg-raised/70 flex w-full items-center rounded-md transition-colors",
+            "group hover:bg-raised/70 flex w-full items-center rounded-md transition-colors",
             project.id === selection.activeProjectId && "bg-raised hover:bg-raised",
           )}
           data-testid="project-row"
           data-project-id={project.id}
           data-active={project.id === selection.activeProjectId}
         >
-          <button
-            type="button"
-            class="flex min-w-0 flex-1 flex-col items-start gap-0.5 px-2.5 py-2 text-left"
-            onclick={() => {
-              delete completedProjectIds[project.id];
-              onProjectSelect();
-              void activateProject(project.id);
-            }}
-          >
-            <div class="flex w-full items-center gap-2">
-              <span class="text-fg truncate text-[13px] font-semibold">
-                {project.name}
-              </span>
-              {#if !project.available}
-                <Badge class="ml-auto shrink-0" testid="project-unavailable">unavailable</Badge>
+          {#if editing}
+            <!-- Edit mode swaps the select button for an inline editor. Blur
+                 cancels (never persist on blur); the save button's
+                 mousedown-preventDefault keeps focus so its click commits before
+                 blur-cancel fires. The directory line stays for context. -->
+            <div class="flex min-w-0 flex-1 flex-col gap-0.5 px-2.5 py-2">
+              <div class="flex w-full items-center gap-2">
+                <input
+                  use:focusSelect
+                  bind:value={draftName}
+                  class={cn(
+                    "text-fg border-border bg-panel h-6 min-w-0 flex-1 rounded border px-1.5 text-[13px] font-semibold",
+                    "focus-visible:ring-accent focus-visible:ring-1 focus-visible:outline-none",
+                    renameMessage && "border-status-failed",
+                  )}
+                  aria-label="Project name"
+                  aria-invalid={!renameValidation.ok}
+                  aria-describedby={renameError ? `project-rename-error-${project.id}` : undefined}
+                  title={renameMessage ?? undefined}
+                  data-testid="project-rename-input"
+                  onkeydown={(event) => onRenameKeydown(event, project)}
+                  onblur={cancelEdit}
+                />
+                <button
+                  type="button"
+                  class={cn(
+                    ICON_BUTTON_CLASS,
+                    "shrink-0 disabled:cursor-not-allowed disabled:opacity-50",
+                  )}
+                  disabled={!canSave}
+                  aria-label="Save name"
+                  title="Save"
+                  data-testid="project-rename-save"
+                  onmousedown={(event) => event.preventDefault()}
+                  onclick={() => void commitEdit(project)}
+                >
+                  <svg
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    class="h-4 w-4"
+                    aria-hidden="true"
+                  >
+                    <path d="M20 6 9 17l-5-5" />
+                  </svg>
+                </button>
+              </div>
+              <div class="text-muted flex w-full items-center gap-1 text-xs leading-4">
+                <span class="truncate" title={project.directory}>{basename(project.directory)}</span
+                >
+              </div>
+              {#if renameError}
+                <div
+                  id={`project-rename-error-${project.id}`}
+                  class="text-status-failed text-xs"
+                  data-testid="project-rename-error"
+                >
+                  {renameError}
+                </div>
               {/if}
             </div>
-            <div class="text-muted flex w-full items-center gap-1 text-xs leading-4">
-              <span class="truncate" title={project.directory}>{basename(project.directory)}</span>
-              <span>·</span>
-              <span class="shrink-0">{relativeTime(project.last_activity)}</span>
-            </div>
-          </button>
-          {#if busy}
-            <div class="flex shrink-0 items-center pr-1.5">
-              <button
-                type="button"
-                class="group text-muted hover:bg-status-failed-soft/70 hover:text-status-failed focus-visible:ring-accent focus-visible:bg-status-failed-soft/70 focus-visible:text-status-failed inline-flex h-6 w-6 items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none"
-                aria-label="Cancel all running agents"
-                data-testid="project-cancel"
-                onclick={() => cancelAllForProject(project.id)}
-              >
-                <Spinner class="h-5 w-5 group-hover:hidden group-focus-visible:hidden" />
-                <StopIcon class="hidden h-5 w-5 group-hover:block group-focus-visible:block" />
-              </button>
-            </div>
-          {:else if completed}
-            <div class="flex shrink-0 items-center pr-1.5" data-testid="project-completed">
-              <svg
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="1.5"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-                class="text-accent h-5 w-5"
-                aria-hidden="true"
-              >
-                <circle cx="12" cy="12" r="9" />
-                <path d="m8.5 12 2.5 2.5 4.5-5" />
-              </svg>
+          {:else}
+            <!-- Double-click the row to rename (the kebab's "Rename" item is the
+                 other entry point); single-click still activates the project. -->
+            <button
+              type="button"
+              class="flex min-w-0 flex-1 flex-col items-start gap-0.5 px-2.5 py-2 text-left"
+              onclick={() => {
+                delete completedProjectIds[project.id];
+                onProjectSelect();
+                void activateProject(project.id);
+              }}
+              ondblclick={() => startEdit(project)}
+            >
+              <div class="flex w-full items-center gap-2">
+                <span class="text-fg truncate text-[13px] font-semibold">
+                  {project.name}
+                </span>
+                {#if !project.available}
+                  <Badge class="ml-auto shrink-0" testid="project-unavailable">unavailable</Badge>
+                {/if}
+              </div>
+              <div class="text-muted flex w-full items-center gap-1 text-xs leading-4">
+                <span class="truncate" title={project.directory}>{basename(project.directory)}</span
+                >
+                <span>·</span>
+                <span class="shrink-0">{relativeTime(project.last_activity)}</span>
+              </div>
+            </button>
+            <div class="flex shrink-0 items-center gap-0.5 pr-1.5">
+              {#if busy}
+                <button
+                  type="button"
+                  class="group/cancel text-muted hover:bg-status-failed-soft/70 hover:text-status-failed focus-visible:ring-accent focus-visible:bg-status-failed-soft/70 focus-visible:text-status-failed inline-flex h-6 w-6 items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none"
+                  aria-label="Cancel all running agents"
+                  data-testid="project-cancel"
+                  onclick={() => cancelAllForProject(project.id)}
+                >
+                  <Spinner
+                    class="h-5 w-5 group-hover/cancel:hidden group-focus-visible/cancel:hidden"
+                  />
+                  <StopIcon
+                    class="hidden h-5 w-5 group-hover/cancel:block group-focus-visible/cancel:block"
+                  />
+                </button>
+              {:else if completed}
+                <div class="flex items-center" data-testid="project-completed">
+                  <svg
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.5"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    class="text-accent h-5 w-5"
+                    aria-hidden="true"
+                  >
+                    <circle cx="12" cy="12" r="9" />
+                    <path d="m8.5 12 2.5 2.5 4.5-5" />
+                  </svg>
+                </div>
+              {/if}
+              <!-- Rename/Delete need on-disk access, so the kebab is shown only
+                   for available projects through M1–M2; M3 (Archive, which works
+                   offline) will render it on unavailable rows too. Hover/focus/
+                   menu-open-revealed; the status icon stays always-visible. -->
+              {#if project.available}
+                <div
+                  class="opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100 has-[[data-state=open]]:opacity-100"
+                >
+                  <ProjectActionsMenu {project} onRename={() => startEdit(project)} />
+                </div>
+              {/if}
             </div>
           {/if}
         </div>

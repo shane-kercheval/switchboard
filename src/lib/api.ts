@@ -78,6 +78,16 @@ export async function createProject(name: string, directory: string): Promise<Pr
   return await invoke<ProjectSummary>("create_project", { name, directory });
 }
 
+/// Rename a project. The backend re-validates format + per-directory uniqueness
+/// (the frontend pre-check is UX only) and returns the updated listing row (or
+/// rejects with a collision/invalid-name error).
+export async function renameProject(
+  projectId: ProjectId,
+  newName: string,
+): Promise<ProjectListing> {
+  return await invoke<ProjectListing>("rename_project", { projectId, newName });
+}
+
 // Removes a directory from the workspace: drains its projects' in-flight turns,
 // releases their locks, and drops the entry — leaving `.switchboard/` on disk.
 export async function removeDirectory(path: string): Promise<void> {

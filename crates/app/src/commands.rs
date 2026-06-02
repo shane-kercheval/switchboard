@@ -448,6 +448,46 @@ pub fn create_project_impl(
     Ok(summary)
 }
 
+/// Rename a project: validate + dual-write its identity (`config.yaml` +
+/// `projects.jsonl`) in core, then sync in-memory state. Synchronous under
+/// `registry_write` — rename never touches running agents, so no dispatcher
+/// drain (contrast delete). Resolves the project's owning directory from the
+/// loaded set; an unavailable (unloaded) directory can't be mutated, so this
+/// surfaces `ProjectNotLoaded` (the frontend gates Rename on availability — this
+/// is the defensive backstop). Format + per-directory uniqueness are
+/// re-validated in core; the frontend pre-checks, but the backend stays
+/// authoritative.
+pub fn rename_project_impl(
+    state: &AppState,
+    project_id: ProjectId,
+    new_name: &str,
+) -> Result<ProjectListing, AppError> {
+    let _write = lock(&state.registry_write);
+    let directory = find_directory_for_project(state, project_id)?;
+    let summary = directory.rename_project(project_id, new_name)?;
+
+    // Sync the in-memory `Project` (canonical name) if the project is loaded.
+    if let Some(project) = lock(&state.projects).get_mut(&project_id) {
+        summary.name.clone_into(&mut project.config.name);
+    }
+
+    // Refresh the workspace cache for this directory so the flat list reflects
+    // the new name before the next `list_projects` round-trip.
+    if let Ok(summaries) = directory.list_projects() {
+        lock(&state.workspace).refresh_cache(&directory.path, summaries);
+        persist_workspace(state);
+    }
+
+    Ok(ProjectListing {
+        directory: directory.path.to_string_lossy().into_owned(),
+        available: true,
+        last_activity: directory.project_last_activity(summary.id, summary.created_at),
+        id: summary.id,
+        name: summary.name,
+        created_at: summary.created_at,
+    })
+}
+
 pub fn open_project_impl(
     state: &AppState,
     project_id: ProjectId,
@@ -2382,6 +2422,36 @@ fn find_project_in_directories(
         };
         if summaries.iter().any(|s| s.id == project_id) {
             return directory.open_project(project_id).map_err(AppError::from);
+        }
+    }
+    Err(AppError::ProjectNotLoaded(project_id))
+}
+
+/// Resolve the loaded `Directory` that owns `project_id` by scanning each
+/// loaded directory's on-disk index. Unlike [`find_project_in_directories`],
+/// this returns the owning `Directory` (not the loaded `Project`) and does not
+/// open/lock the project — used by metadata mutations (`rename`, `delete`) that
+/// rewrite the directory's files directly. A directory whose index can't be
+/// read is skipped with a warning. Returns `ProjectNotLoaded` if no loaded
+/// directory claims the id (e.g. its directory is currently unavailable).
+fn find_directory_for_project(
+    state: &AppState,
+    project_id: ProjectId,
+) -> Result<Directory, AppError> {
+    let directories: Vec<Directory> = lock(&state.directories).values().cloned().collect();
+    for directory in directories {
+        match directory.list_projects() {
+            Ok(summaries) if summaries.iter().any(|s| s.id == project_id) => {
+                return Ok(directory);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    directory = %directory.path.display(),
+                    error = %e,
+                    "skipping directory while locating project's owning directory — its index could not be read"
+                );
+            }
         }
     }
     Err(AppError::ProjectNotLoaded(project_id))
@@ -5827,6 +5897,96 @@ mod tests {
         let (_tmp, state, _) = fresh_state_with_mock();
         let err = rename_agent_impl(&state, Uuid::now_v7(), "x").unwrap_err();
         assert!(matches!(err, AppError::AgentNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn rename_project_updates_state_cache_and_returns_listing() {
+        let (tmp, state, _) = fresh_state_with_mock();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "alpha");
+
+        let listing = rename_project_impl(&state, project.id, "renamed").unwrap();
+        assert_eq!(listing.name, "renamed");
+        assert_eq!(listing.id, project.id);
+        assert!(listing.available);
+
+        // In-memory `Project` (canonical name) reflects the change.
+        assert_eq!(
+            lock(&state.projects).get(&project.id).unwrap().name(),
+            "renamed"
+        );
+        // The flat list (from disk + refreshed cache) reflects the change.
+        let listed = list_projects_impl(&state).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "renamed");
+    }
+
+    #[tokio::test]
+    async fn rename_project_rejects_duplicate_in_same_directory() {
+        let (tmp, state, _) = fresh_state_with_mock();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let a = create_project_in_only_dir(&state, "alpha");
+        create_project_in_only_dir(&state, "beta");
+
+        let err = rename_project_impl(&state, a.id, "BETA").unwrap_err();
+        assert!(matches!(
+            err,
+            AppError::Core(CoreError::DuplicateProjectName { .. })
+        ));
+        // The reject path leaves the canonical name untouched.
+        assert_eq!(lock(&state.projects).get(&a.id).unwrap().name(), "alpha");
+    }
+
+    #[tokio::test]
+    async fn rename_project_rejects_invalid_name() {
+        let (tmp, state, _) = fresh_state_with_mock();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let a = create_project_in_only_dir(&state, "alpha");
+        let err = rename_project_impl(&state, a.id, "bad name").unwrap_err();
+        assert!(matches!(err, AppError::Core(CoreError::InvalidName { .. })));
+    }
+
+    #[tokio::test]
+    async fn rename_project_unknown_id_errors_without_loaded_directory() {
+        let (_tmp, state, _) = fresh_state_with_mock();
+        // No loaded directory owns this id → resolution fails (the same path an
+        // unavailable directory takes).
+        let err = rename_project_impl(&state, Uuid::now_v7(), "x").unwrap_err();
+        assert!(matches!(err, AppError::ProjectNotLoaded(_)));
+    }
+
+    #[tokio::test]
+    async fn rename_project_succeeds_when_not_yet_opened() {
+        // The project exists on disk in a loaded directory but was never
+        // activated (not in `AppState.projects`); rename resolves the owning
+        // directory from the index and still works.
+        let (tmp, state, _) = fresh_state_with_mock();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "alpha");
+        // Drop the loaded `Project` to simulate "available but not opened".
+        lock(&state.projects).remove(&project.id);
+
+        let listing = rename_project_impl(&state, project.id, "renamed").unwrap();
+        assert_eq!(listing.name, "renamed");
+        assert_eq!(
+            list_projects_impl(&state).unwrap()[0].name,
+            "renamed",
+            "the on-disk rename is reflected in the flat list"
+        );
+        // The in-memory sync block (`if let Some(..) = ...get_mut`) must *skip* an
+        // unloaded project, not insert a phantom entry for it.
+        assert!(
+            lock(&state.projects).get(&project.id).is_none(),
+            "rename of an unopened project must not insert it into state.projects"
+        );
     }
 
     #[tokio::test]

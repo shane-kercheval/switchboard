@@ -164,10 +164,11 @@ describe("ComposeBar", () => {
 
     const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
     await fireEvent.input(textarea, { target: { value: "ping @bo" } });
-    // bob is offered (alice is already selected); Enter picks the highlighted.
+    // bob is offered (alice is already selected); Enter picks bob as the sole recipient.
     await screen.findByTestId(`recipient-option-${AGENT_B.id}`);
     await fireEvent.keyDown(textarea, { key: "Enter" });
 
+    expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "false");
     expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "true");
     // The "@bo" token is stripped; the text typed before it (with its space) stays.
     expect(textarea.value).toBe("ping ");

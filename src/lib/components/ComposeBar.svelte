@@ -225,8 +225,8 @@
       selectedIds = agents.map((a) => a.id);
     } else if (item.kind === "clear") {
       selectedIds = [];
-    } else if (!selectedIds.includes(item.agent.id)) {
-      selectedIds = [...selectedIds, item.agent.id];
+    } else {
+      selectedIds = [item.agent.id];
     }
     // The menu only opens from a typed `@token`, so always strip it.
     prompt = prompt.replace(AT_TOKEN, "$1");

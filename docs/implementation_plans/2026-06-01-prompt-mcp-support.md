@@ -25,7 +25,7 @@ Codex and Gemini have limited or absent native MCP-prompt support. Because Switc
 - `prompts/get` with `{ name, arguments: { k: v } }` → `{ description?, messages: [{ role, content: { type:"text", text } }] }`. The client receives **already-rendered text**.
 - Capability `prompts.listChanged: true` ⇒ server emits `notifications/prompts/list_changed` when its prompt set changes.
 - Errors are JSON-RPC: `-32602` invalid params (bad name / missing required arg), `-32603` internal.
-- Spec: https://modelcontextprotocol.io/specification/2025-06-18/server/prompts
+- Spec: https://modelcontextprotocol.io/specification/2025-06-18/server/prompts (the live Tiddly server negotiates protocol `2025-11-25` via mcp-SDK 1.26.0 — newer, but the `prompts/list` / `prompts/get` shapes above are unchanged across these versions).
 
 ### 2.2 Tiddly's prompt MCP server (the reference target)
 
@@ -249,9 +249,9 @@ These apply across milestones. Carry the *why* into the code (comments/commit me
 
 Resolved with the engineer (treat as settled): Tiddly login via browser device-code → minted PAT in keychain; keychain over `config.yaml`; `rmcp`; backend-first sequencing; stdio deferred; user-global provider scope (no project arg, §6 amended); build-once cache + Settings Sync (the `/` menu never fetches); retain the Auth0 refresh token for disconnect/renewal; Tiddly implements the MCP `prompts` capability and its management *tools* are unused; best-effort silent revoke on disconnect; long PAT expiry (~365d) + 401 reconnect, no expiry picker; dedicated Auth0 app (CLI-client reuse as a zero-code fallback); keychain for all provider secrets + a generic MCP-server management UI (no `${ENV}`); background-context 401 never launches a browser login; account-wide PAT accepted (no narrower scope exists); prompt-mode composer (Option C) — single prompt + appended text, no inline chips/`contenteditable` (§4 decision 6). See §4 decisions 9–13 for the rationale on the credential decisions.
 
-No open product/scope decisions remain. Standing implementation-time task (not a decision):
+No open product/scope decisions remain.
 
-- **Re-verify Tiddly endpoints/constants** (§2.3) against the current `bookmarks` repo before building M2/M3 — Tiddly is independently maintained.
+**Re-verified 2026-06-02** (the standing task): the §2.2/§2.3 constants and endpoints are unchanged in the current `bookmarks` source — Auth0 domain/client/audience, `/tokens/` (Auth0-only POST/GET/PATCH/DELETE), `GET /users/me`, and the prompt MCP server (`StreamableHTTPSessionManager(json_response=True, stateless=True)`, port 8002, with `@server.list_prompts()` / `@server.get_prompt()` implemented). A **live probe** of the running prompt MCP server confirmed over the wire that it advertises `prompts = PromptsCapability(listChanged=False)` (and `tools`, which Switchboard ignores). The full `prompts/list` / `prompts/get` *data* round-trip was not exercised live (needs the local API + DB, currently blocked by a stale PG16 dev volume; low residual value given the source and capability are confirmed). Re-run if Tiddly ships changes before M2/M3 begin.
 
 ## 9. Reference docs (read before implementing)
 

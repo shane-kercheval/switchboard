@@ -722,6 +722,7 @@
       {/if}
       <Textarea
         data-testid="compose-textarea"
+        data-shortcut-scope="composer"
         placeholder="Type a message…  (⌘+Enter to send, @ to add a recipient)"
         rows={3}
         bind:ref={textareaEl}

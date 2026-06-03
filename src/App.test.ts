@@ -1342,7 +1342,7 @@ describe("App", () => {
     expect(screen.getByTestId("compose-textarea")).toBeInTheDocument();
   });
 
-  it("global shortcuts are suppressed when focus is inside an editable element", async () => {
+  it("global shortcuts work when focus is inside the compose box", async () => {
     seedProject({
       projectId: "p-a",
       directory: DIR_A,
@@ -1355,18 +1355,45 @@ describe("App", () => {
     await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
 
     const textarea = screen.getByTestId("compose-textarea");
+    textarea.focus();
 
-    // ⌘B fired from the textarea must not toggle the projects sidebar.
+    // ⌘B from the composer toggles the projects sidebar.
     await fireEvent.keyDown(textarea, { key: "b", metaKey: true });
-    expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByTestId("projects-sidebar")).not.toBeInTheDocument());
+    await fireEvent.keyDown(textarea, { key: "b", metaKey: true });
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
 
-    // ⌘⇧B must not toggle the agents sidebar.
+    // ⌘⇧B from the composer toggles the agents sidebar.
     expect(screen.getByTestId("sidebar")).toBeInTheDocument();
     await fireEvent.keyDown(textarea, { key: "B", metaKey: true, shiftKey: true });
-    expect(screen.getByTestId("sidebar")).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByTestId("sidebar")).not.toBeInTheDocument());
+    await fireEvent.keyDown(textarea, { key: "B", metaKey: true, shiftKey: true });
+    await waitFor(() => expect(screen.getByTestId("sidebar")).toBeInTheDocument());
 
-    // ⌘, must not open settings.
+    // ⌘, from the composer opens settings.
     await fireEvent.keyDown(textarea, { key: ",", metaKey: true });
+    await waitFor(() => expect(screen.getByTestId("settings-view")).toBeInTheDocument());
+  });
+
+  it("global shortcuts are suppressed inside non-composer editable elements", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+
+    const input = document.createElement("input");
+    document.body.appendChild(input);
+    input.focus();
+
+    await fireEvent.keyDown(input, { key: "b", metaKey: true });
+    expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument();
+
+    await fireEvent.keyDown(input, { key: ",", metaKey: true });
     expect(screen.queryByTestId("settings-view")).not.toBeInTheDocument();
+    input.remove();
   });
 });

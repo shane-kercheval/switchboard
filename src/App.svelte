@@ -72,8 +72,14 @@
     );
   }
 
+  function isComposerShortcutTarget(target: EventTarget | null): boolean {
+    return (
+      target instanceof HTMLElement && target.closest('[data-shortcut-scope="composer"]') !== null
+    );
+  }
+
   function handleGlobalKeydown(event: KeyboardEvent): void {
-    if (isEditableShortcutTarget(event.target)) return;
+    if (isEditableShortcutTarget(event.target) && !isComposerShortcutTarget(event.target)) return;
 
     const command = event.metaKey || event.ctrlKey;
     if (!command) return;

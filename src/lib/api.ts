@@ -79,6 +79,32 @@ export async function createProject(name: string, directory: string): Promise<Pr
   return await invoke<ProjectSummary>("create_project", { name, directory });
 }
 
+/// Rename a project. The backend re-validates format + per-directory uniqueness
+/// (the frontend pre-check is UX only) and returns the updated listing row (or
+/// rejects with a collision/invalid-name error).
+export async function renameProject(
+  projectId: ProjectId,
+  newName: string,
+): Promise<ProjectListing> {
+  return await invoke<ProjectListing>("rename_project", { projectId, newName });
+}
+
+/// Permanently delete one project's Switchboard state: drains its agents and
+/// removes its index entry, then best-effort removes
+/// `<directory>/.switchboard/projects/<id>/`. The working directory and each
+/// agent's own harness session files are kept. "Already gone" is benign
+/// success; failures that prevent removing the project from the listing reject.
+export async function deleteProject(projectId: ProjectId): Promise<void> {
+  await invoke("delete_project", { projectId });
+}
+
+/// Archive or unarchive a project — a user-global view-state flip
+/// (`workspace.yaml`). Display-only: never stops a running agent and works even
+/// when the project's directory is offline.
+export async function setProjectArchived(projectId: ProjectId, archived: boolean): Promise<void> {
+  await invoke("set_project_archived", { projectId, archived });
+}
+
 // Removes a directory from the workspace: drains its projects' in-flight turns,
 // releases their locks, and drops the entry — leaving `.switchboard/` on disk.
 export async function removeDirectory(path: string): Promise<void> {

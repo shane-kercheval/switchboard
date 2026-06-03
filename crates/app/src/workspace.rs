@@ -12,10 +12,11 @@
 //! A missing or corrupt `workspace.yaml` degrades to an empty registry rather
 //! than failing app startup.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use switchboard_core::{CoreError, ProjectSummary};
+use switchboard_core::{CoreError, ProjectId, ProjectSummary};
 
 use crate::error::AppError;
 
@@ -32,6 +33,14 @@ pub struct DirectoryEntry {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Workspace {
     entries: Vec<DirectoryEntry>,
+    /// Projects the user has archived (hidden from the default view). This is
+    /// **user-global view-state**, not on-disk project state: it lives here so
+    /// archive works even when a project's directory is offline, and so it never
+    /// touches the project's own files. `BTreeSet` keeps `workspace.yaml`
+    /// deterministically ordered. `#[serde(default)]` so an older file without
+    /// the field loads as "nothing archived" — no migration.
+    #[serde(default)]
+    archived: BTreeSet<ProjectId>,
 }
 
 impl Workspace {
@@ -78,12 +87,54 @@ impl Workspace {
         false
     }
 
+    /// Drop a single project id from `path`'s cached snapshot. Used on a delete
+    /// whose post-delete index re-read isn't available (e.g. the index file
+    /// vanished out-of-band), so the deleted project can't resurrect as a stale
+    /// cached row the next time `list_projects` falls back to the cache. No-op
+    /// (returns `false`) if `path` is unknown or the id wasn't cached.
+    pub fn remove_cached_project(&mut self, path: &Path, id: ProjectId) -> bool {
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.path == path) {
+            let before = entry.cached_projects.len();
+            entry.cached_projects.retain(|p| p.id != id);
+            return entry.cached_projects.len() != before;
+        }
+        false
+    }
+
     pub fn entries(&self) -> &[DirectoryEntry] {
         &self.entries
     }
 
     pub fn contains(&self, path: &Path) -> bool {
         self.entries.iter().any(|entry| entry.path == path)
+    }
+
+    /// Set (or clear) a project's archived flag. Returns whether the set
+    /// actually changed, so callers persist `workspace.yaml` only on a real
+    /// change (mirrors `refresh_cache`).
+    pub fn set_archived(&mut self, id: ProjectId, archived: bool) -> bool {
+        if archived {
+            self.archived.insert(id)
+        } else {
+            self.archived.remove(&id)
+        }
+    }
+
+    pub fn is_archived(&self, id: ProjectId) -> bool {
+        self.archived.contains(&id)
+    }
+
+    /// Whether any known directory's cached snapshot lists this project — i.e.
+    /// the project is one the workspace actually knows about. Used to reject
+    /// archiving a bogus/typo'd id so it can't accumulate junk in the archived
+    /// set. Every project a UI row can target is in a cached snapshot
+    /// (`list_projects` / `create_project` refresh it), including projects whose
+    /// directory is currently unavailable — which is exactly the set archive
+    /// must still work for.
+    pub fn knows_project(&self, id: ProjectId) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.cached_projects.iter().any(|p| p.id == id))
     }
 }
 
@@ -268,6 +319,80 @@ mod tests {
             !workspace.refresh_cache(Path::new("/unknown"), vec![summary("x")]),
             "an unknown path is never a change"
         );
+    }
+
+    #[test]
+    fn remove_cached_project_drops_one_id() {
+        let mut workspace = Workspace::default();
+        workspace.add(PathBuf::from("/a"));
+        let keep = summary("keep");
+        let drop = summary("drop");
+        workspace.refresh_cache(Path::new("/a"), vec![keep.clone(), drop.clone()]);
+
+        assert!(workspace.remove_cached_project(Path::new("/a"), drop.id));
+        assert_eq!(workspace.entries()[0].cached_projects, vec![keep]);
+        // Removing an absent id, or operating on an unknown path, is a no-op.
+        assert!(!workspace.remove_cached_project(Path::new("/a"), drop.id));
+        assert!(!workspace.remove_cached_project(Path::new("/unknown"), keep_id(&workspace)));
+    }
+
+    fn keep_id(workspace: &Workspace) -> uuid::Uuid {
+        workspace.entries()[0].cached_projects[0].id
+    }
+
+    #[test]
+    fn set_archived_reports_change_and_round_trips() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("workspace.yaml");
+        let mut workspace = Workspace::default();
+        let id = Uuid::new_v4();
+
+        assert!(
+            !workspace.is_archived(id),
+            "unknown id defaults to not archived"
+        );
+        assert!(workspace.set_archived(id, true), "archiving is a change");
+        assert!(
+            !workspace.set_archived(id, true),
+            "re-archiving is not a change"
+        );
+        assert!(workspace.is_archived(id));
+
+        save(&path, &workspace).unwrap();
+        assert!(
+            load(&path).workspace.is_archived(id),
+            "archived state survives a round-trip"
+        );
+
+        assert!(workspace.set_archived(id, false), "unarchiving is a change");
+        assert!(!workspace.is_archived(id));
+        assert!(
+            !workspace.set_archived(id, false),
+            "clearing an absent id is not a change"
+        );
+    }
+
+    #[test]
+    fn archived_defaults_empty_for_old_workspace_yaml() {
+        // A pre-archive `workspace.yaml` has no `archived` key; it must load as
+        // "nothing archived" (serde default), not fail.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("workspace.yaml");
+        std::fs::write(&path, "entries: []\n").unwrap();
+
+        let workspace = load(&path).workspace;
+        assert!(!workspace.is_archived(Uuid::new_v4()));
+    }
+
+    #[test]
+    fn knows_project_checks_cached_snapshots() {
+        let mut workspace = Workspace::default();
+        workspace.add(PathBuf::from("/a"));
+        let known = summary("known");
+        workspace.refresh_cache(Path::new("/a"), vec![known.clone()]);
+
+        assert!(workspace.knows_project(known.id));
+        assert!(!workspace.knows_project(Uuid::new_v4()));
     }
 
     #[test]

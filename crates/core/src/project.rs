@@ -14,10 +14,15 @@ use crate::paths::{CONFIG_FILE, JOURNAL_FILE, REGISTRY_FILE};
 
 pub type ProjectId = Uuid;
 
-const PROJECT_CONFIG_VERSION: u32 = 1;
+/// `pub(crate)` so `Directory::rename_project` can stamp the current version
+/// when rewriting `config.yaml` without a redundant read-back.
+pub(crate) const PROJECT_CONFIG_VERSION: u32 = 1;
 
 /// One entry in `<directory>/.switchboard/projects.jsonl` — the directory-level
-/// index of which projects exist under this directory. Append-only.
+/// index of which projects exist under this directory. Appended on
+/// `create_project`; rewritten in place on rename/delete (see
+/// `Directory::rename_project` / `Directory::delete_project`), exactly as
+/// `registry.jsonl` is for agents.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectSummary {
     pub id: ProjectId,

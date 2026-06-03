@@ -69,12 +69,15 @@ Switchboard-managed state lives in a `.switchboard/` directory at the working di
 └── .switchboard/
     ├── config.yaml             # directory-level config (placeholder in v1; mostly empty)
     ├── workflows/              # workflow definitions (YAML), shared across projects in this directory
-    ├── projects.jsonl          # append-only index of projects: { id, name, created_at }
+    ├── projects.jsonl          # index of projects: { id, name, created_at } — appended on
+    │                           #   create, rewritten in place on rename/delete
+    │                           #   (like registry.jsonl)
     └── projects/
         └── <project-id>/       # per-project state (one subdirectory per project)
             ├── config.yaml     # per-project config
             ├── instance.lock   # M4+ flock — one Switchboard process per project at a time
-            ├── registry.jsonl  # agent registry for this project (append-only)
+            ├── registry.jsonl  # agent registry for this project (appended on
+            │                   #   register, rewritten on rename/remove)
             ├── sessions/       # per-agent stream-only-metadata cache
             │                   #   (<agent-id>.meta.json — restart continuity).
             │                   #   All harnesses' session identity lives on the
@@ -87,7 +90,8 @@ Switchboard-managed state lives in a `.switchboard/` directory at the working di
 ├── config.yaml                 # personal preferences + prompt providers (local_prompt_dirs, mcp_providers — see §6)
 ├── prompts/                    # default local prompt store (seeded with example prompts on first run — see §6)
 └── workspace.yaml              # app-managed: the working directories the user works across,
-                                #   each with a cached snapshot of its projects
+                                #   each with a cached snapshot of its projects, plus the
+                                #   user-global set of archived project ids (view-state)
 ```
 
 Switchboard is **single-instance**: launching it again focuses the running window rather than starting a second process, so there is exactly one writer of `workspace.yaml`. The per-project `instance.lock` (below) remains as defense-in-depth for the pathological case of two processes (e.g. a dev build alongside the bundled app); multi-window is out of scope for v1.
@@ -100,7 +104,9 @@ The directory-level `config.yaml` and `workflows/` are intended to be checked in
 
 Each working directory owns its projects: the source of truth for a directory's projects and their state is that directory's own `.switchboard/`, so a directory is self-contained and travels with its git repo. Switchboard tracks the set of working directories the user works across in a user-global `workspace.yaml` and presents the projects from all of them as a single flat list — the user opens Switchboard and sees every project across every directory at once, each labelled with its directory, without choosing a directory first.
 
-`workspace.yaml` records, per directory, its path and a cached snapshot of its projects (each the project's `{ id, name, created_at }`, so an unavailable directory's rows keep their identity and ordering). The cache lets the flat list render even when a directory is temporarily unavailable (unmounted, moved, or deleted): its projects appear marked unavailable with a remove action, rather than silently vanishing. The cache is refreshed from a directory's `.switchboard/` whenever that directory is read successfully **and** after any project create/rename in it — the directory's own state always wins, and the cache is consulted only when the directory can't be read. Projects are addressed by their globally-unique `ProjectId`; each carries its owning directory for routing (the agent spawn cwd) and labelling.
+`workspace.yaml` records, per directory, its path and a cached snapshot of its projects (each the project's `{ id, name, created_at }`, so an unavailable directory's rows keep their identity and ordering). The cache lets the flat list render even when a directory is temporarily unavailable (unmounted, moved, or deleted): its projects appear marked unavailable with a remove action, rather than silently vanishing. The cache is refreshed from a directory's `.switchboard/` whenever that directory is read successfully **and** after any project create/rename/delete in it — the directory's own state always wins, and the cache is consulted only when the directory can't be read. Projects are addressed by their globally-unique `ProjectId`; each carries its owning directory for routing (the agent spawn cwd) and labelling.
+
+`workspace.yaml` also holds a user-global **set of archived project ids** — *view-state* (which projects are hidden from the default list), deliberately kept here rather than on the project's own files. Because it lives in user-global state, archiving works even when the project's directory is offline (it never writes the directory) and never interferes with a running agent; the trade-off is that archived-ness is per-install rather than travelling with the project (acceptable — the project's runtime state is `.gitignore`d anyway).
 
 Adding a directory appends it to `workspace.yaml`; removing one drops its entry and leaves the directory's on-disk `.switchboard/` untouched (re-adding the directory restores its projects — removing from the workspace is not deletion). Re-pointing a moved directory to a new path is a planned affordance.
 
@@ -117,7 +123,13 @@ The two sources **partition** cleanly (no correlation or de-dup between them): a
 
 **Project name uniqueness within a directory** uses the same canonicalization as agent names (per §4 Primitive 1): hyphens normalized to underscores, lowercased, for the uniqueness check only — `feature-a` and `feature_a` collide; `feature-A` and `feature-a` collide. Stored verbatim as the user typed.
 
-**Deletion in v1.** Project and agent deletion are deliberately out of scope for v1. No UI affordance, no command-level deletion API, no canonical deletion semantics are defined. Users may manually edit `.switchboard/` state at their own risk (the file formats are documented), but this is not a supported workflow — first-class deletion semantics (cascade behavior, in-flight flock handling, append-only-vs-tombstone, history retention) will be specified when the feature is added. Tracked: M4 may add project deletion via the project switcher; agent deletion is unscheduled.
+**Project lifecycle — rename, delete, archive.** A project can be renamed, archived (hidden from the default list, reversible), or deleted from the projects sidebar. The sidebar lists projects under an `Active | Archived` toggle and a name/directory search filter. Project row actions are inline and hover-revealed; rename is triggered by double-clicking the project name.
+
+- **Rename** changes the display name in place (same per-directory uniqueness rules as agent names), dual-writing the canonical `config.yaml` and the `projects.jsonl` index entry.
+- **Archive/unarchive** flips the user-global view-state above; it is display-only — it never stops a running agent or touches the project's files, and works for offline directories.
+- **Delete** is hard and irreversible: it drains the project's agents, then removes `<directory>/.switchboard/projects/<id>/` (config, registry, journal, sessions, runs) and its `projects.jsonl` entry. It **never** touches the working directory, `.switchboard/` itself, sibling projects, or harness-native session files (`~/.claude/…`, `~/.codex/…`) — so each agent's own session history survives; only the journal's failed/cancelled outcome markers are genuinely lost. The index-entry removal is the commit (the project stops listing); the directory removal is best-effort, leaving a benign unreachable orphan on the rare failure rather than surfacing an error.
+
+Agent-level deletion (remove/reset from the agent sidebar row) is the shipped `remove_agent`; broader history-retention/tombstone semantics remain unspecified and out of scope.
 
 ## 4. Functional primitives
 
@@ -433,7 +445,7 @@ The user opens Switchboard and sees a single flat list of all their projects, dr
 
 The user sees a **single unified transcript view** for the project — every turn from every agent appears in one chronologically-ordered stream, with each turn attributed to the agent that produced it (name + harness badge). Tool calls, errors, and per-turn metadata (cost / context utilization) nest under the turn they belong to. The user reads the project's conversation flow as one timeline; "Agent X responded at 10:02, then I forwarded to Agent Y at 10:03, then Y responded at 10:04" is legible at a glance without manually correlating across panes. The user's **own** messages appear **once** in this timeline regardless of how many agents received them — a single fan-out send to several agents is one "User → B|C" entry, not one per recipient (the user's side of the conversation is Switchboard-owned; see §3 and "Cancelling a workflow or turn" below). A fan-out's N responses render as **one group** at the send's point in the timeline, laid out **side-by-side** (one card per recipient, collapsing to a vertical stack on narrow viewports) — a horizontal layout *within* a single timeline entry, which preserves the single-stream model rather than departing from it.
 
-A **per-agent overview sidebar** lists every agent in the project with its real-time operational state — name, harness badge, status (idle, processing, waiting on tool, errored), context utilization, last-turn cost (Claude Code) or quota signal (Codex). Clicking an agent in the sidebar surfaces its context menu (fork session, open session file, reset/remove, cancel in-flight turn). The sidebar is the agent-management surface; the unified transcript is the conversation surface.
+A **per-agent overview sidebar** lists every agent in the project with its real-time operational state — name, harness badge, status (idle, processing, waiting on tool, errored), context utilization, last-turn cost (Claude Code) or quota signal (Codex). Agent row actions expose session controls such as fork session, open session file, reset/remove, and cancel in-flight turn. The sidebar is the agent-management surface; the unified transcript is the conversation surface.
 
 **No singleton "active" or "focused" agent.** All agents in a loaded project are equally first-class. The compose bar picks recipient(s) explicitly per send (single agent or multi-select) — no agent is the default recipient by virtue of being "viewed." Users may colloquially think of one agent as primary (e.g., the implementer in a review workflow) and others as secondary (the reviewers), but the architecture does not encode this — it's a label, not a structural concept.
 
@@ -473,9 +485,9 @@ Antigravity's model / MCP / skills cells populate from its `SessionMeta` (model 
 
 Empty rows are not Switchboard-side roadmap items — they reflect what the underlying harness emits. If a harness adds a telemetry field upstream, the sidebar surface follows.
 
-Each agent also exposes a context menu of user actions (accessed from the sidebar entry, or from any of its turns in the unified transcript):
+Each agent also exposes user actions from the sidebar row and, where relevant, from its turns in the unified transcript:
 
-- **Fork session** — create a new agent branched from the current state. Native in Claude Code via `--fork-session`. Unavailable for Codex agents in v1 (per resolved 10.14) — the menu item is shown only on Claude Code agents; Codex agents see an explanatory tooltip.
+- **Fork session** — create a new agent branched from the current state. Native in Claude Code via `--fork-session`. Unavailable for Codex agents in v1 (per resolved 10.14) — the action is shown only on Claude Code agents; Codex agents see an explanatory tooltip.
 - **Open session file** — open the underlying harness JSONL session file in the user's default editor for inspection or external tooling.
 - **Reset / remove** — clean up the agent (CRUD-y; not enumerated in §4 primitives, just a UI affordance).
 
@@ -816,7 +828,7 @@ Switchboard's own logic (workflow parser, prompt resolver, MCP client, normalize
 
 Switchboard ships as a **single-binary desktop application** rather than a TUI or browser-based tool. Reasoning:
 
-- The UX vision (unified per-project transcript with per-agent attribution, real-time per-agent status sidebar, native context menus, slick aesthetics) is desktop-shaped — TUIs can approximate it but always feel cramped at the high end.
+- The UX vision (unified per-project transcript with per-agent attribution, real-time per-agent status sidebar, native-feeling controls, slick aesthetics) is desktop-shaped — TUIs can approximate it but always feel cramped at the high end.
 - Single-binary distribution: download an installer or run a package-manager command, double-click. No language runtime prereq, no browser tab to manage, no separate server to start.
 - Native OS integration: dock icon, system notifications, native file dialogs, proper window management, system tray.
 - The "anyone who wants" audience benefits more from a polished desktop app than from either a TUI or a browser-tab UX.
@@ -915,7 +927,7 @@ Aggregated from inline flags above, plus a few additional:
 - **10.11** Compaction strategy. Programmatic `/compact` is unavailable in Claude / Codex / Gemini today; all three do auto-compact at high utilization (Antigravity's compaction is server-side and unverified). Working assumption: Switchboard monitors token usage, warns the user as the auto-compact threshold approaches, and defers actual compaction to the harness. We do not implement Switchboard-side summarization (would underperform the harnesses' tuned compaction). Alternative to consider: surface a "fork from checkpoint with summary" action that uses the existing fork primitive plus an explicit summarize-and-restart prompt, as a coarse user-driven alternative when the user wants to reclaim context outside auto-compact. Background in [docs/research/archive/claude-code-headless.md](research/archive/claude-code-headless.md) and [docs/research/archive/codex-noninteractive.md](research/archive/codex-noninteractive.md).
 - ~~**10.12** Model→max-context map maintenance.~~ **Resolved (commitment).** No bundled model→max-context map ships in v1. Each harness sources the value from whatever it makes available: Claude reads `contextWindow` per turn from the stream's `result.modelUsage.<model>`; Codex enriches `task_started.model_context_window` from the session file post-terminal (per resolved 10.15); Gemini has neither a stream field nor a session-file analog, so `usage.context_window` stays `None` and the per-agent context-utilization bar is hidden for Gemini agents (per the §7 sidebar matrix). The harness-asymmetric sourcing is documented in the §9 SessionMeta source table; the "what the user sees" implications are documented in the §7 sidebar matrix.
 - **10.13 (monitoring)** Programmatic `/compact` exposure in either harness. Multiple Anthropic feature requests open ([anthropics/claude-code#5643](https://github.com/anthropics/claude-code/issues/5643), [#39275](https://github.com/anthropics/claude-code/issues/39275), [#39574](https://github.com/anthropics/claude-code/issues/39574), [#26488](https://github.com/anthropics/claude-code/issues/26488)); Codex equivalent not documented. When upstream lands, Switchboard can offer first-class compaction control inside workflows.
-- ~~**10.14** Codex non-interactive fork.~~ **Resolved for v1: option (a).** Fork is unavailable for Codex agents in v1 — the agent context-menu Fork action is shown only on Claude Code agents; Codex agents show an explanatory tooltip ("Fork is not available for Codex sessions in v1; see the docs for workarounds"). Workarounds (b) copy session JSONL and (c) re-feed summarized prior context are deferred to v2+ if user demand surfaces. The asymmetry is documented in §9 and the M4 deliverables.
+- ~~**10.14** Codex non-interactive fork.~~ **Resolved for v1: option (a).** Fork is unavailable for Codex agents in v1 — the Fork action is shown only on Claude Code agents; Codex agents show an explanatory tooltip ("Fork is not available for Codex sessions in v1; see the docs for workarounds"). Workarounds (b) copy session JSONL and (c) re-feed summarized prior context are deferred to v2+ if user demand surfaces. The asymmetry is documented in §9 and the M4 deliverables.
 - ~~**10.15** Should the Codex adapter read the session file (`~/.codex/sessions/...jsonl`) in addition to the `--json` stream?~~ **Resolved (commitment).** The Codex adapter reads the session file on turn completion to enrich the normalized event stream with fields the `--json` stream omits (rate limits, `model_context_window`, full reasoning blocks, `session_meta` for the SessionMeta event). Multiple §7 and §9 commitments now depend on this (per-turn context-utilization for Codex, RateLimitEvent timing, SessionMeta). What remains as implementation detail: tail-vs-completion timing for any future live-stream enrichment, and the lookup-strategy mechanics for the date-partitioned session path (see the archived `research/archive/codex-cli-observed.md` research note).
 - **10.16** Disk usage of harness session files. Both harnesses persist transcripts indefinitely (Claude Code at `~/.claude/projects/<encoded-cwd>/*.jsonl`, Codex at `~/.codex/sessions/YYYY/MM/DD/...`). A long-lived project with many agents and many turns will accumulate. Should Switchboard offer pruning, surface totals, or otherwise manage this? Out of scope for v1, but the architecture should not preclude it.
 - **10.17** Network failure and retry policy. What does Switchboard do when a turn fails mid-workflow because of a transient API error or network blip? Working assumption: a single configurable retry on transient errors (rate-limit, 5xx) before marking the step as failed. Permanent errors (auth, invalid model, denied content) fail immediately. To be detailed in §7 once we have an implementation footprint.

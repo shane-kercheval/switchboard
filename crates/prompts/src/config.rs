@@ -3,27 +3,97 @@
 //! project-scope (`docs/system-design.md` §6). The config file's path is
 //! resolved and injected by `crates/app`; this module only parses and resolves.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// On-disk shape of the user-global `config.yaml` prompt sections. Unknown
-/// top-level keys are ignored (the file may hold other personal preferences —
-/// and, until the MCP client lands, the entire `mcp_providers:` section), and
-/// `local_prompt_dirs` defaults to empty so a partial or absent file is valid.
-///
-/// `mcp_providers` is **not modeled here**: this milestone never consumes it, so
-/// modeling it would be speculative and — worse — would couple its parse to
-/// `local_prompt_dirs`, letting a typo in the (inert) MCP section discard a
-/// user's valid local prompt directories. Leaving it as an ignored unknown key
-/// means a malformed MCP section can never break local prompts. The MCP config
-/// model arrives in the milestone that reads and writes it.
+use crate::model::LOCAL_PROVIDER;
+
+/// On-disk shape of the user-global `config.yaml` **local** prompt section.
+/// Deliberately models *only* `local_prompt_dirs` and ignores everything else
+/// (including `mcp_providers`): MCP providers are read by a **separate** parse
+/// (`load_mcp_providers`) so a malformed MCP section can never fail this parse
+/// and discard a user's valid local prompt directories. `local_prompt_dirs`
+/// defaults to empty so a partial or absent file is valid.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PromptConfig {
     /// Directories scanned for local prompts, in declared (resolution) order.
     /// Empty/absent means "use the default prompts dir" (see `resolve_local_dirs`).
     #[serde(default)]
     pub local_prompt_dirs: Vec<PathBuf>,
+}
+
+/// A configured generic MCP-server prompt provider — non-secret config only. The
+/// bearer token lives in the keychain (resolved at use time via `SecretStore`),
+/// never here. `name` is the addressing prefix (`<name>:<prompt>`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpProviderConfig {
+    pub name: String,
+    pub transport: McpTransport,
+}
+
+/// Transport for an MCP provider. Only HTTP (Streamable HTTP) is supported in
+/// v1; `#[non_exhaustive]` + the `type` tag leave room for `stdio` later without
+/// a breaking change. Mirrors the `transport: { type: http, url: … }` config shape.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum McpTransport {
+    Http { url: String },
+}
+
+/// The `mcp_providers:` section, captured as raw values so each entry can be
+/// validated independently (a malformed entry degrades that one provider rather
+/// than failing the whole section). Read separately from [`PromptConfig`].
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct McpSection {
+    #[serde(default)]
+    pub mcp_providers: Vec<serde_norway::Value>,
+}
+
+impl McpSection {
+    /// Validate each raw entry into an `McpProviderConfig`, skipping (with a
+    /// warning) any that don't parse, carry an invalid name, or duplicate an
+    /// earlier name — so one bad entry never discards the rest, and the surviving
+    /// set is a clean addressing namespace.
+    pub(crate) fn into_configs(self) -> Vec<McpProviderConfig> {
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let mut out = Vec::new();
+        for value in self.mcp_providers {
+            let config = match serde_norway::from_value::<McpProviderConfig>(value) {
+                Ok(config) => config,
+                Err(e) => {
+                    tracing::warn!(error = %e, "skipping malformed mcp_providers entry");
+                    continue;
+                }
+            };
+            if !is_valid_provider_name(&config.name) {
+                tracing::warn!(
+                    name = %config.name,
+                    "skipping mcp provider with invalid name (empty, reserved `local`, or containing `:`)"
+                );
+                continue;
+            }
+            if !seen.insert(config.name.clone()) {
+                // First occurrence wins; a later duplicate would otherwise share
+                // one secret-store key and shadow the first under one prefix.
+                tracing::warn!(name = %config.name, "skipping duplicate mcp provider name");
+                continue;
+            }
+            out.push(config);
+        }
+        out
+    }
+}
+
+/// Whether `name` is usable as a provider addressing prefix. A provider name is
+/// the prefix in `<name>:<prompt>`, so it must be non-empty, must not be the
+/// reserved `local` (which always routes to the file store), and must not contain
+/// `:` (which would break address parsing). Duplicate detection is the caller's
+/// job — it needs the full set. M3's "Add MCP server" form reuses this rule.
+pub(crate) fn is_valid_provider_name(name: &str) -> bool {
+    !name.trim().is_empty() && name != LOCAL_PROVIDER && !name.contains(':')
 }
 
 /// Resolve the ordered list of directories to scan for local prompts.
@@ -134,6 +204,95 @@ mcp_providers:
             config.local_prompt_dirs,
             vec![PathBuf::from("~/repos/my-prompts")]
         );
+    }
+
+    #[test]
+    fn mcp_section_validates_per_entry_and_skips_bad_ones() {
+        let yaml = r"
+mcp_providers:
+  - name: team
+    transport:
+      type: http
+      url: https://mcp.example.com
+  - nme: typo-no-name
+    transport:
+      type: http
+      url: https://bad.example.com
+  - name: no-transport
+";
+        let section: McpSection = serde_norway::from_str(yaml).unwrap();
+        let configs = section.into_configs();
+        // Only the well-formed entry survives; the typo'd-name and the
+        // missing-transport entries are skipped, not fatal.
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].name, "team");
+        assert_eq!(
+            configs[0].transport,
+            McpTransport::Http {
+                url: "https://mcp.example.com".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn absent_mcp_section_yields_no_providers() {
+        let section: McpSection = serde_norway::from_str("local_prompt_dirs:\n  - /a\n").unwrap();
+        assert!(section.into_configs().is_empty());
+    }
+
+    #[test]
+    fn rejects_invalid_provider_names() {
+        // `local` is reserved (routes to the file store); names with `:` break
+        // address parsing; empty/whitespace names are unusable prefixes. Each is
+        // skipped-with-warning, leaving the valid sibling.
+        let yaml = r#"
+mcp_providers:
+  - name: local
+    transport: { type: http, url: https://a.example.com }
+  - name: "has:colon"
+    transport: { type: http, url: https://b.example.com }
+  - name: "   "
+    transport: { type: http, url: https://c.example.com }
+  - name: ok
+    transport: { type: http, url: https://d.example.com }
+"#;
+        let section: McpSection = serde_norway::from_str(yaml).unwrap();
+        let names: Vec<String> = section.into_configs().into_iter().map(|c| c.name).collect();
+        assert_eq!(names, vec!["ok".to_owned()]);
+    }
+
+    #[test]
+    fn dedupes_provider_names_first_wins() {
+        let yaml = r"
+mcp_providers:
+  - name: team
+    transport:
+      type: http
+      url: https://first.example.com
+  - name: team
+    transport:
+      type: http
+      url: https://second.example.com
+";
+        let section: McpSection = serde_norway::from_str(yaml).unwrap();
+        let configs = section.into_configs();
+        assert_eq!(configs.len(), 1);
+        assert_eq!(
+            configs[0].transport,
+            McpTransport::Http {
+                url: "https://first.example.com".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn provider_name_validator_rules() {
+        assert!(is_valid_provider_name("team"));
+        assert!(is_valid_provider_name("my-team_mcp"));
+        assert!(!is_valid_provider_name("local"));
+        assert!(!is_valid_provider_name(""));
+        assert!(!is_valid_provider_name("   "));
+        assert!(!is_valid_provider_name("a:b"));
     }
 
     #[test]

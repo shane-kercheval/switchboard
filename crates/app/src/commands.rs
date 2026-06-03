@@ -417,15 +417,16 @@ pub fn list_prompts_impl(state: &AppState) -> Vec<switchboard_prompts::Prompt> {
     state.prompts.list()
 }
 
-/// Render a prompt to its finished text. Provider-dispatched; this milestone
-/// resolves only `local`. Serves both preview and send with the identical args.
-pub fn render_prompt_impl(
+/// Render a prompt to its finished text. Provider-dispatched (local → `MiniJinja`,
+/// MCP → `prompts/get`). Serves both preview and send with the identical args.
+/// Async because the MCP path does network I/O.
+pub async fn render_prompt_impl(
     state: &AppState,
     provider: &str,
     name: &str,
     args: &std::collections::BTreeMap<String, String>,
 ) -> Result<switchboard_prompts::RenderedPrompt, AppError> {
-    Ok(state.prompts.render(provider, name, args)?)
+    Ok(state.prompts.render(provider, name, args).await?)
 }
 
 pub fn create_project_impl(
@@ -7951,18 +7952,21 @@ mod tests {
             tmp.path().join("config.yaml"),
             prompts_dir,
             None,
+            Arc::new(switchboard_prompts::InMemorySecretStore::new()),
         );
         (tmp, state.with_prompts(service))
     }
 
-    #[test]
-    fn list_prompts_surfaces_a_local_prompt() {
+    const GREET_PROMPT: &str = "---\nname: greet\ndescription: Greeting.\narguments:\n  - name: who\n    required: true\n---\nHi {{ who }}\n";
+
+    #[tokio::test]
+    async fn list_prompts_surfaces_a_local_prompt_after_sync() {
         let (tmp, state) = state_with_prompts();
-        std::fs::write(
-            tmp.path().join("prompts").join("greet.md"),
-            "---\nname: greet\ndescription: Greeting.\narguments:\n  - name: who\n    required: true\n---\nHi {{ who }}\n",
-        )
-        .unwrap();
+        std::fs::write(tmp.path().join("prompts").join("greet.md"), GREET_PROMPT).unwrap();
+
+        // `list_prompts` reads the cache; it's empty until a sync runs.
+        assert!(list_prompts_impl(&state).is_empty());
+        state.prompts.sync().await;
 
         let prompts = list_prompts_impl(&state);
         assert_eq!(prompts.len(), 1);
@@ -7972,37 +7976,34 @@ mod tests {
         assert!(prompts[0].arguments[0].required);
     }
 
-    #[test]
-    fn render_prompt_substitutes_arguments() {
+    #[tokio::test]
+    async fn render_prompt_substitutes_arguments() {
         let (tmp, state) = state_with_prompts();
-        std::fs::write(
-            tmp.path().join("prompts").join("greet.md"),
-            "---\nname: greet\ndescription: Greeting.\narguments:\n  - name: who\n    required: true\n---\nHi {{ who }}\n",
-        )
-        .unwrap();
+        std::fs::write(tmp.path().join("prompts").join("greet.md"), GREET_PROMPT).unwrap();
 
         let args = std::collections::BTreeMap::from([("who".to_owned(), "Ada".to_owned())]);
-        let rendered = render_prompt_impl(&state, "local", "greet", &args).unwrap();
+        // Render does not depend on the cache (no sync needed).
+        let rendered = render_prompt_impl(&state, "local", "greet", &args)
+            .await
+            .unwrap();
         assert!(rendered.text.contains("Hi Ada"));
     }
 
-    #[test]
-    fn render_prompt_missing_required_arg_is_error() {
+    #[tokio::test]
+    async fn render_prompt_missing_required_arg_is_error() {
         let (tmp, state) = state_with_prompts();
-        std::fs::write(
-            tmp.path().join("prompts").join("greet.md"),
-            "---\nname: greet\ndescription: Greeting.\narguments:\n  - name: who\n    required: true\n---\nHi {{ who }}\n",
-        )
-        .unwrap();
+        std::fs::write(tmp.path().join("prompts").join("greet.md"), GREET_PROMPT).unwrap();
 
         let err = render_prompt_impl(&state, "local", "greet", &std::collections::BTreeMap::new())
+            .await
             .unwrap_err();
         assert!(matches!(err, AppError::Prompt(_)));
     }
 
     #[test]
     fn list_prompts_on_disabled_service_is_empty() {
-        // A state without `with_prompts` keeps the disabled default.
+        // A state without `with_prompts` keeps the disabled default; its cache
+        // is empty without a sync.
         let (_tmp, state, _) = fresh_state_with_mock();
         assert!(list_prompts_impl(&state).is_empty());
     }

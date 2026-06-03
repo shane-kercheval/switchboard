@@ -56,11 +56,23 @@ impl LocalProvider {
 }
 
 impl PromptProvider for LocalProvider {
-    fn prefix(&self) -> &str {
-        LOCAL_PROVIDER
+    async fn list(&self) -> Vec<Prompt> {
+        self.list_sync()
     }
 
-    fn list(&self) -> Vec<Prompt> {
+    async fn render(
+        &self,
+        name: &str,
+        args: &BTreeMap<String, String>,
+    ) -> Result<String, PromptError> {
+        self.render_sync(name, args)
+    }
+}
+
+impl LocalProvider {
+    /// Synchronous listing — the filesystem scan. The trait's `async list`
+    /// delegates here; the work is blocking I/O, fast enough to run inline.
+    fn list_sync(&self) -> Vec<Prompt> {
         let mut out = Vec::new();
         let mut seen: BTreeSet<String> = BTreeSet::new();
         for dir in &self.dirs {
@@ -89,7 +101,13 @@ impl PromptProvider for LocalProvider {
         out
     }
 
-    fn render(&self, name: &str, args: &BTreeMap<String, String>) -> Result<String, PromptError> {
+    /// Synchronous render — find the named prompt and apply `MiniJinja`. The
+    /// trait's `async render` delegates here.
+    fn render_sync(
+        &self,
+        name: &str,
+        args: &BTreeMap<String, String>,
+    ) -> Result<String, PromptError> {
         let parsed = self.find(name)?;
         render_template(name, &parsed.body, &parsed.arguments, args)
     }
@@ -289,7 +307,7 @@ mod tests {
         write(dir.path(), "code-review.md", CODE_REVIEW);
         let provider = LocalProvider::new(vec![dir.path().to_path_buf()]);
 
-        let prompts = provider.list();
+        let prompts = provider.list_sync();
         assert_eq!(prompts.len(), 1);
         let p = &prompts[0];
         assert_eq!(p.provider, "local");
@@ -312,7 +330,7 @@ mod tests {
         let provider = LocalProvider::new(vec![dir.path().to_path_buf()]);
 
         let out = provider
-            .render("code-review", &args(&[("focus", "security")]))
+            .render_sync("code-review", &args(&[("focus", "security")]))
             .unwrap();
         assert!(out.contains("Review the changes."));
         assert!(out.contains("Focus: security"));
@@ -324,7 +342,7 @@ mod tests {
         write(dir.path(), "code-review.md", CODE_REVIEW);
         let provider = LocalProvider::new(vec![dir.path().to_path_buf()]);
 
-        let out = provider.render("code-review", &args(&[])).unwrap();
+        let out = provider.render_sync("code-review", &args(&[])).unwrap();
         assert!(out.contains("Review the changes."));
         // The `{% if focus %}` block is omitted because focus is undefined/falsy.
         assert!(!out.contains("Focus:"));
@@ -340,7 +358,7 @@ mod tests {
         );
         let provider = LocalProvider::new(vec![dir.path().to_path_buf()]);
 
-        let err = provider.render("p", &args(&[])).unwrap_err();
+        let err = provider.render_sync("p", &args(&[])).unwrap_err();
         assert!(matches!(
             err,
             PromptError::MissingRequiredArgument { argument, .. } if argument == "target"
@@ -357,7 +375,9 @@ mod tests {
         );
         let provider = LocalProvider::new(vec![dir.path().to_path_buf()]);
 
-        let out = provider.render("p", &args(&[("target", "X")])).unwrap();
+        let out = provider
+            .render_sync("p", &args(&[("target", "X")]))
+            .unwrap();
         assert!(out.contains("Do X"));
     }
 
@@ -368,7 +388,7 @@ mod tests {
         let provider = LocalProvider::new(vec![dir.path().to_path_buf()]);
 
         let err = provider
-            .render("code-review", &args(&[("focus", "x"), ("bogus", "y")]))
+            .render_sync("code-review", &args(&[("focus", "x"), ("bogus", "y")]))
             .unwrap_err();
         match err {
             PromptError::UnknownArgument {
@@ -385,7 +405,7 @@ mod tests {
     fn render_unknown_prompt_is_not_found() {
         let dir = TempDir::new().unwrap();
         let provider = LocalProvider::new(vec![dir.path().to_path_buf()]);
-        let err = provider.render("nope", &args(&[])).unwrap_err();
+        let err = provider.render_sync("nope", &args(&[])).unwrap_err();
         assert!(matches!(err, PromptError::PromptNotFound { .. }));
     }
 
@@ -408,11 +428,11 @@ mod tests {
             second.path().to_path_buf(),
         ]);
 
-        let prompts = provider.list();
+        let prompts = provider.list_sync();
         assert_eq!(prompts.len(), 1);
         assert_eq!(prompts[0].description.as_deref(), Some("from-first"));
 
-        let out = provider.render("shared", &args(&[])).unwrap();
+        let out = provider.render_sync("shared", &args(&[])).unwrap();
         assert!(out.contains("FIRST"));
         assert!(!out.contains("SECOND"));
     }
@@ -429,11 +449,11 @@ mod tests {
         );
         let provider = LocalProvider::new(vec![dir.path().to_path_buf()]);
 
-        let prompts = provider.list();
+        let prompts = provider.list_sync();
         assert_eq!(prompts.len(), 1);
         assert_eq!(prompts[0].name, "my-skill");
         assert!(prompts[0].arguments.is_empty());
-        let out = provider.render("my-skill", &args(&[])).unwrap();
+        let out = provider.render_sync("my-skill", &args(&[])).unwrap();
         assert!(out.contains("Skill body instructions."));
     }
 
@@ -453,7 +473,7 @@ mod tests {
         );
         let provider = LocalProvider::new(vec![dir.path().to_path_buf()]);
 
-        let prompts = provider.list();
+        let prompts = provider.list_sync();
         assert_eq!(prompts.len(), 1);
         assert_eq!(prompts[0].name, "good");
     }
@@ -484,7 +504,7 @@ mod tests {
         );
         let provider = LocalProvider::new(vec![dir.path().to_path_buf()]);
 
-        let prompts = provider.list();
+        let prompts = provider.list_sync();
         assert_eq!(prompts.len(), 1);
         assert_eq!(prompts[0].name, "crlf");
         assert!(prompts[0].arguments[0].required);
@@ -492,7 +512,9 @@ mod tests {
         // CRLF is normalized to LF in the body; MiniJinja trims the single
         // trailing newline (Jinja2 default). The point of the assertion is that
         // no `\r` survives into the rendered output.
-        let out = provider.render("crlf", &args(&[("who", "Ada")])).unwrap();
+        let out = provider
+            .render_sync("crlf", &args(&[("who", "Ada")]))
+            .unwrap();
         assert_eq!(out, "Hi Ada\nbye");
         assert!(!out.contains('\r'));
     }
@@ -507,7 +529,7 @@ mod tests {
         );
         write(dir.path(), "p.md", "---\nname: p\ndescription: d\n---\nB\n");
         let provider = LocalProvider::new(vec![dir.path().to_path_buf()]);
-        let prompts = provider.list();
+        let prompts = provider.list_sync();
         assert_eq!(prompts.len(), 1);
         assert_eq!(prompts[0].name, "p");
     }
@@ -515,6 +537,6 @@ mod tests {
     #[test]
     fn missing_directory_contributes_nothing() {
         let provider = LocalProvider::new(vec![PathBuf::from("/no/such/dir")]);
-        assert!(provider.list().is_empty());
+        assert!(provider.list_sync().is_empty());
     }
 }

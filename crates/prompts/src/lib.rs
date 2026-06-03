@@ -1,27 +1,29 @@
-//! Switchboard prompts — provider framework and the local file-based prompt
-//! provider. Pure Rust, no Tauri, no async, no network (the MCP provider lands
-//! in a later milestone).
+//! Switchboard prompts — the provider framework, the local file-based prompt
+//! provider, and the MCP-server provider. Pure Rust, no Tauri.
 //!
 //! A **prompt** is a reusable, optionally parameterized text template resolved
 //! from a **provider**. Providers are addressed by prefix (`local:<name>`,
 //! `<provider>:<name>`); the `local` prefix is reserved for the built-in file
 //! store. The prompt/argument data model mirrors the MCP `prompts/list` shape so
-//! the local and (future) MCP providers share one type. See
-//! `docs/system-design.md` §6 and the milestone plan for the design.
+//! the local and MCP providers share one type. See `docs/system-design.md` §6
+//! and the milestone plan for the design.
 //!
-//! Config-directory resolution lives in `crates/app` (it owns the
-//! `directories`/`SWITCHBOARD_CONFIG_DIR` logic); this crate takes already
-//! resolved paths so dev-instance isolation and test hermeticity stay intact.
+//! Config-directory resolution and the secret-store backend live in `crates/app`
+//! (it owns the `directories`/`SWITCHBOARD_CONFIG_DIR` logic and the keychain);
+//! this crate takes already-resolved paths and an injected [`SecretStore`] so
+//! dev-instance isolation and test hermeticity stay intact.
 
 mod config;
 mod local;
+mod mcp;
 mod model;
 mod provider;
+mod secret;
 mod service;
 
-pub use config::{PromptConfig, resolve_local_dirs};
+pub use config::{McpProviderConfig, McpTransport, PromptConfig, resolve_local_dirs};
 pub use model::{LOCAL_PROVIDER, Prompt, PromptArgument, PromptId};
-pub use provider::PromptProvider;
+pub use secret::{InMemorySecretStore, SecretStore, SecretStoreError};
 pub use service::{PromptService, RenderedPrompt};
 
 pub use error::PromptError;
@@ -78,5 +80,33 @@ mod error {
             #[source]
             source: std::io::Error,
         },
+
+        /// Could not connect to (or initialize a session with) an MCP provider.
+        /// `message` is the transport/SDK error — never a bearer token.
+        #[error("could not reach MCP provider {provider:?}: {message}")]
+        McpConnect { provider: String, message: String },
+
+        /// An MCP `prompts/get` failed for a reason other than bad arguments.
+        #[error("MCP provider {provider:?} failed to render prompt {name:?}: {message}")]
+        McpRequest {
+            provider: String,
+            name: String,
+            message: String,
+        },
+
+        /// The MCP server rejected the supplied arguments (`-32602` invalid
+        /// params — bad name or missing/invalid required argument). The server's
+        /// message is surfaced (it typically names the offending argument).
+        #[error("MCP provider {provider:?} rejected arguments for prompt {name:?}: {message}")]
+        McpInvalidArguments {
+            provider: String,
+            name: String,
+            message: String,
+        },
+
+        /// `prompts/get` succeeded but returned no text content (only image /
+        /// resource parts, which v1 drops) — there is nothing to send.
+        #[error("MCP prompt {name:?} from provider {provider:?} produced no text content")]
+        McpEmptyContent { provider: String, name: String },
     }
 }

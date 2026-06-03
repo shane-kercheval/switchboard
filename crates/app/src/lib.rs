@@ -140,6 +140,7 @@ async fn list_prompts(state: State<'_, AppState>) -> Result<Vec<Prompt>, String>
 
 /// Render `name` from `provider` with `args`, returning the finished text.
 /// Serves both preview and send — the caller passes the identical args map.
+/// May touch the network (MCP `prompts/get`), hence async.
 #[tauri::command]
 async fn render_prompt(
     state: State<'_, AppState>,
@@ -147,7 +148,17 @@ async fn render_prompt(
     name: String,
     args: std::collections::BTreeMap<String, String>,
 ) -> Result<RenderedPrompt, String> {
-    render_prompt_impl(state.inner(), &provider, &name, &args).map_err(|e| e.to_string())
+    render_prompt_impl(state.inner(), &provider, &name, &args)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Rebuild the cached prompt list from all configured providers. Wired to the
+/// Settings "Sync" button; used to pick up prompts edited on a server mid-session.
+#[tauri::command]
+async fn sync_prompts(state: State<'_, AppState>) -> Result<(), String> {
+    state.inner().prompts.sync().await;
+    Ok(())
 }
 
 #[tauri::command]
@@ -515,13 +526,20 @@ fn workspace_config_path() -> Option<std::path::PathBuf> {
 
 /// Build the prompt service from the user-global config dir, seeding the example
 /// prompts on first run. The pure `crates/prompts` never touches `directories`;
-/// the app resolves and injects the config path, default prompts dir, and home.
+/// the app resolves and injects the config path, default prompts dir, home, and
+/// the secret store.
+///
+/// The injected secret store is in-memory (process-lifetime) for now: nothing
+/// populates the keychain until the "Add MCP server" Settings flow lands, so an
+/// empty in-memory store is behaviorally identical and avoids committing to a
+/// keychain backend before it's exercised end-to-end.
 fn build_prompt_service() -> switchboard_prompts::PromptService {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     if let Some(dir) = config_dir() {
         let prompts_dir = dir.join("prompts");
         crate::prompts_setup::seed_example_prompts(&prompts_dir);
-        switchboard_prompts::PromptService::new(dir.join("config.yaml"), prompts_dir, home)
+        let secrets = Arc::new(switchboard_prompts::InMemorySecretStore::new());
+        switchboard_prompts::PromptService::new(dir.join("config.yaml"), prompts_dir, home, secrets)
     } else {
         tracing::warn!("no home directory resolved — prompt providers disabled");
         switchboard_prompts::PromptService::disabled()
@@ -585,7 +603,16 @@ pub fn run() {
             };
             // Resolve and inject the user-global prompt config + default prompts
             // store (seeding the example prompts on first run).
-            let state = state.with_prompts(build_prompt_service());
+            let prompts = build_prompt_service();
+            // Warm the prompt cache in the background so a slow/cold MCP server
+            // never blocks startup. `PromptService` is cheaply cloneable and
+            // shares its cache `Arc`, so the clone the task syncs is the same
+            // cache the managed state reads.
+            let prompts_for_build = prompts.clone();
+            tauri::async_runtime::spawn(async move {
+                prompts_for_build.sync().await;
+            });
+            let state = state.with_prompts(prompts);
             // Cold start: open a `Directory` handle for every workspace entry so
             // restored directories report `available: true` and participate in
             // the cross-harness session-id collision scan. Unopenable
@@ -611,6 +638,7 @@ pub fn run() {
             list_workspace_directories,
             list_prompts,
             render_prompt,
+            sync_prompts,
             create_project,
             open_project,
             set_active_project,

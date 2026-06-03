@@ -18,6 +18,12 @@ serde_norway = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 minijinja = "2.20.0"
+rmcp = { version = "1.7.0", default-features = false, features = ["client", "transport-streamable-http-client-reqwest", "macros"] }
+tokio.workspace = true
+serde_json.workspace = true
+futures.workspace = true
 
 [dev-dependencies]
+axum = "0.8.9"
+rmcp = { version = "1.7.0", features = ["server", "transport-streamable-http-server"] }
 tempfile = { workspace = true }

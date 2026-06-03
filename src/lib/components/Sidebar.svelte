@@ -601,13 +601,13 @@
                   style={`--agent-action-width: ${agentActionWidth(actionCount)}`}
                 >
                   {#if confirmingRemove}
-                    <Tooltip label="Cancel remove" delayDuration={AGENT_ACTION_DELAY_MS}>
+                    <Tooltip label="Cancel delete" delayDuration={AGENT_ACTION_DELAY_MS}>
                       {#snippet trigger(props)}
                         <button
                           {...props}
                           type="button"
                           class={agentActionClass}
-                          aria-label="Cancel remove"
+                          aria-label="Cancel delete"
                           tabindex="-1"
                           data-testid="agent-remove-cancel"
                           onclick={() => cancelRemove(agent.id)}
@@ -627,14 +627,14 @@
                         </button>
                       {/snippet}
                     </Tooltip>
-                    <Tooltip label="Confirm remove" delayDuration={AGENT_ACTION_DELAY_MS}>
+                    <Tooltip label="Confirm delete" delayDuration={AGENT_ACTION_DELAY_MS}>
                       {#snippet trigger(props)}
                         <button
                           {...props}
                           type="button"
                           class={agentDangerActionClass}
                           disabled={removingAgentId === agent.id}
-                          aria-label="Confirm remove"
+                          aria-label="Confirm delete"
                           tabindex="-1"
                           data-testid="agent-remove-confirm"
                           onclick={() => void confirmRemove(agent)}
@@ -737,13 +737,13 @@
                       </Tooltip>
                     {/if}
                     {#if !active}
-                      <Tooltip label="Remove agent" delayDuration={AGENT_ACTION_DELAY_MS}>
+                      <Tooltip delayDuration={AGENT_ACTION_DELAY_MS}>
                         {#snippet trigger(props)}
                           <button
                             {...props}
                             type="button"
                             class={agentDangerActionClass}
-                            aria-label="Remove agent"
+                            aria-label="Delete agent"
                             tabindex="-1"
                             data-testid="agent-action-remove"
                             onclick={() => startRemove(agent)}
@@ -765,6 +765,13 @@
                             </svg>
                           </button>
                         {/snippet}
+                        <div class="max-w-56">
+                          <div class="text-[13px] font-medium">Delete agent</div>
+                          <div class="text-primary-fg/75 mt-1 text-xs leading-4">
+                            Deletes Switchboard's files for this agent; underlying session files are
+                            kept, and its responses are removed from the conversation.
+                          </div>
+                        </div>
                       </Tooltip>
                     {/if}
                   {/if}
@@ -965,7 +972,7 @@
           {/if}
           {#if removeError?.agentId === agent.id}
             <div class="text-status-failed mt-1 text-xs" data-testid="agent-remove-error">
-              Couldn't remove agent: {removeError.message}
+              Couldn't delete agent: {removeError.message}
             </div>
           {/if}
         </div>

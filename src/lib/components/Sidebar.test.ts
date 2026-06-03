@@ -255,6 +255,28 @@ describe("Sidebar", () => {
     expect(removeAgentMock).not.toHaveBeenCalled();
   });
 
+  it("warns in the delete tooltip that responses are removed from the conversation", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const state = await loadState();
+      await state.registerAgent(CLAUDE_AGENT);
+
+      const Sidebar = (await import("./Sidebar.svelte")).default;
+      render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+
+      await fireEvent.pointerEnter(screen.getByTestId("agent-action-remove"));
+      await vi.advanceTimersByTimeAsync(500);
+
+      const tooltip = await waitFor(() => screen.getByTestId("tooltip-content"));
+      expect(tooltip).toHaveTextContent("Delete agent");
+      expect(tooltip).toHaveTextContent(
+        "Deletes Switchboard's files for this agent; underlying session files are kept, and its responses are removed from the conversation.",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("confirming remove calls removeAgent and failures keep the row", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);

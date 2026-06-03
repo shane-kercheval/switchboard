@@ -530,3 +530,83 @@ describe("ProjectsSidebar — archive + view toggle", () => {
     expect(screen.getByTestId("project-action-delete")).toHaveAttribute("data-disabled");
   });
 });
+
+describe("ProjectsSidebar — search", () => {
+  const S1 = "00000000-0000-7000-8000-0000000000c1";
+  const S2 = "00000000-0000-7000-8000-0000000000c2";
+
+  function rowIds(): string[] {
+    return screen
+      .queryAllByTestId("project-row")
+      .map((r) => r.getAttribute("data-project-id") ?? "");
+  }
+
+  async function type(value: string): Promise<void> {
+    await fireEvent.input(screen.getByTestId("project-search"), { target: { value } });
+  }
+
+  it("filters by project name, case-insensitively", async () => {
+    await renderWith([projectIn(S1, "Alpha", "/work/one"), projectIn(S2, "Beta", "/work/two")]);
+    await type("alp");
+    expect(rowIds()).toEqual([S1]);
+  });
+
+  it("filters by directory basename (not the full path)", async () => {
+    await renderWith([
+      projectIn(S1, "Alpha", "/home/me/frontend"),
+      projectIn(S2, "Beta", "/home/me/backend"),
+    ]);
+    // "me" is in both full paths but neither basename → no matches.
+    await type("me");
+    expect(rowIds()).toEqual([]);
+    // Basename match.
+    await type("front");
+    expect(rowIds()).toEqual([S1]);
+  });
+
+  it("clearing the query (and the clear button) restores the list", async () => {
+    await renderWith([projectIn(S1, "Alpha", "/work/one"), projectIn(S2, "Beta", "/work/two")]);
+    await type("alpha");
+    expect(rowIds()).toEqual([S1]);
+
+    await fireEvent.click(screen.getByTestId("project-search-clear"));
+    expect(rowIds()).toEqual([S1, S2]);
+    expect(screen.queryByTestId("project-search-clear")).toBeNull(); // hidden when empty
+  });
+
+  it("composes with the Archived view", async () => {
+    await renderWith([
+      projectIn(S1, "alpha-active", "/work/one"),
+      projectIn(S2, "alpha-archived", "/work/two", true),
+    ]);
+    await type("alpha");
+    // Active view: only the non-archived "alpha".
+    expect(rowIds()).toEqual([S1]);
+    // Same query, Archived view: only the archived "alpha".
+    await fireEvent.click(screen.getByTestId("project-view-archived"));
+    expect(rowIds()).toEqual([S2]);
+  });
+
+  it("shows a distinct no-match state", async () => {
+    await renderWith([projectIn(S1, "Alpha", "/work/one")]);
+    await type("zzz");
+    expect(rowIds()).toEqual([]);
+    expect(screen.getByText("No projects match.")).toBeInTheDocument();
+  });
+
+  it("an empty Active view (all projects archived) says 'No active projects', not 'No projects yet'", async () => {
+    // Projects exist, but all are archived → the Active view is empty without
+    // being a query miss or a truly-empty workspace.
+    await renderWith([projectIn(S1, "alpha", "/work/one", true)]);
+    expect(rowIds()).toEqual([]);
+    expect(screen.getByText("No active projects.")).toBeInTheDocument();
+    expect(screen.queryByText("No projects yet.")).toBeNull();
+  });
+
+  it("an empty Archived view says 'No archived projects'", async () => {
+    await renderWith([projectIn(S1, "alpha", "/work/one")]);
+    await fireEvent.click(screen.getByTestId("project-view-archived"));
+    expect(rowIds()).toEqual([]);
+    expect(screen.getByText("No archived projects.")).toBeInTheDocument();
+  });
+});

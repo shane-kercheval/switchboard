@@ -14,6 +14,7 @@
   import type { NameValidation } from "$lib/nameValidation";
   import { basename, cn, relativeTime } from "$lib/utils";
   import ProjectActionsMenu from "$lib/components/ProjectActionsMenu.svelte";
+  import Input from "$lib/components/ui/Input.svelte";
   import SidebarPanel from "$lib/components/ui/SidebarPanel.svelte";
   import SidebarSection from "$lib/components/ui/SidebarSection.svelte";
   import Badge from "$lib/components/ui/Badge.svelte";
@@ -23,11 +24,7 @@
   import StopIcon from "$lib/components/ui/StopIcon.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
   import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
-  import {
-    SEGMENTED_CONTAINER_CLASS,
-    SEGMENTED_ITEM_ACTIVE_CLASS,
-    SEGMENTED_ITEM_INACTIVE_CLASS,
-  } from "$lib/components/ui/segmentedControl";
+  import { SEGMENTED_CONTAINER_CLASS } from "$lib/components/ui/segmentedControl";
   import { windowDragRegion } from "$lib/windowDrag";
 
   let {
@@ -54,13 +51,32 @@
   /// each view shows exactly the projects whose `archived` flag matches it
   /// (sorting is unchanged — `projects.list` stays `last_activity`-ordered).
   let archivedView = $state<"active" | "archived">("active");
-  const visibleProjects = $derived(
+
+  /// Free-text filter, composed *after* the archived view: case-insensitive
+  /// substring over the project name and the directory basename (the segment
+  /// shown on the row, not the full path). Frontend-only — `projects.list` is
+  /// already in memory.
+  let searchQuery = $state("");
+  /// The current Active/Archived view *before* search — used to tell "this view
+  /// is empty" apart from "the search hid everything" in the empty state.
+  const projectsInView = $derived(
     projects.list.filter((p) => p.archived === (archivedView === "archived")),
   );
+  const visibleProjects = $derived.by(() => {
+    const q = searchQuery.trim().toLowerCase();
+    if (q === "") return projectsInView;
+    return projectsInView.filter(
+      (p) => p.name.toLowerCase().includes(q) || basename(p.directory).toLowerCase().includes(q),
+    );
+  });
+  // Filled selected pill, but a lightened medium-gray fill (`bg-muted/65`)
+  // rather than the near-black `bg-primary` the dialog toggles use — softer for
+  // a control that lives in the main view. `text-primary-fg` is the contrasting
+  // label in both themes.
   const segmentClass = (selected: boolean): string =>
     cn(
-      "h-6 rounded-full px-2 text-[11px] font-medium transition-colors",
-      selected ? SEGMENTED_ITEM_ACTIVE_CLASS : SEGMENTED_ITEM_INACTIVE_CLASS,
+      "flex h-4 items-center rounded-full px-2 text-[11px] font-medium transition-colors",
+      selected ? "bg-muted/65 text-primary-fg" : "text-muted hover:bg-raised",
     );
 
   /// Inline rename editor (mirrors the agent-card rename in `Sidebar.svelte`).
@@ -220,9 +236,56 @@
       </div>
     {/snippet}
 
+    <!-- Search lives pinned under the header (not crammed beside the toggle/+
+         in the narrow header), filtering the current Active/Archived view. Only
+         shown when there's something to search. -->
+    {#snippet subheader()}
+      {#if projects.list.length > 0}
+        <div class="relative px-2 pb-1.5">
+          <Input
+            bind:value={searchQuery}
+            placeholder="Search projects"
+            aria-label="Search projects"
+            data-testid="project-search"
+            class="h-7 pr-7 text-xs"
+          />
+          {#if searchQuery !== ""}
+            <button
+              type="button"
+              class="text-muted hover:text-fg absolute top-1/2 right-3.5 -translate-y-1/2"
+              aria-label="Clear search"
+              data-testid="project-search-clear"
+              onclick={() => (searchQuery = "")}
+            >
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                class="h-3.5 w-3.5"
+                aria-hidden="true"
+              >
+                <path d="M18 6 6 18M6 6l12 12" />
+              </svg>
+            </button>
+          {/if}
+        </div>
+      {/if}
+    {/snippet}
+
     {#if visibleProjects.length === 0}
       <p class="text-muted px-3 py-3 text-xs">
-        {archivedView === "archived" ? "No archived projects." : "No projects yet."}
+        {#if searchQuery.trim() !== "" && projectsInView.length > 0}
+          No projects match.
+        {:else if projects.list.length === 0}
+          No projects yet.
+        {:else if archivedView === "archived"}
+          No archived projects.
+        {:else}
+          No active projects.
+        {/if}
       </p>
     {/if}
     <div class="flex flex-col gap-0.5 px-2 pb-2">

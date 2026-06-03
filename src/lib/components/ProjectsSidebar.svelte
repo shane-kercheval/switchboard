@@ -4,8 +4,10 @@
     backgroundCompletedProjectIds,
     liveProjectSends,
     projects,
+    deleteProject,
     renameProject,
     selection,
+    setProjectArchived,
     workspace,
   } from "$lib/state/workspace.svelte";
   import { cancelSend } from "$lib/state/index.svelte";
@@ -13,7 +15,6 @@
   import { validateProjectName, normalizeProjectName } from "$lib/projectName";
   import type { NameValidation } from "$lib/nameValidation";
   import { basename, cn, relativeTime } from "$lib/utils";
-  import ProjectActionsMenu from "$lib/components/ProjectActionsMenu.svelte";
   import Input from "$lib/components/ui/Input.svelte";
   import SidebarPanel from "$lib/components/ui/SidebarPanel.svelte";
   import SidebarSection from "$lib/components/ui/SidebarSection.svelte";
@@ -23,6 +24,7 @@
   import PlusIcon from "$lib/components/ui/PlusIcon.svelte";
   import StopIcon from "$lib/components/ui/StopIcon.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
+  import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
   import { SEGMENTED_CONTAINER_CLASS } from "$lib/components/ui/segmentedControl";
   import { windowDragRegion } from "$lib/windowDrag";
@@ -46,6 +48,11 @@
       cancelSend(sendId, agentIds);
     }
   }
+
+  let deleteConfirmProjectId = $state<ProjectId | null>(null);
+  let deletingProjectId = $state<ProjectId | null>(null);
+  let archiveError = $state<{ projectId: ProjectId; message: string } | null>(null);
+  let deleteError = $state<{ projectId: ProjectId; message: string } | null>(null);
 
   /// `Active | Archived` view filter. Default `Active`. A true either/or split:
   /// each view shows exactly the projects whose `archived` flag matches it
@@ -78,6 +85,10 @@
       "flex h-4 items-center rounded-full px-2 text-[11px] font-medium transition-colors",
       selected ? "bg-muted/65 text-primary-fg" : "text-muted hover:bg-raised",
     );
+  const projectActionClass =
+    "text-muted hover:bg-border/60 hover:text-fg focus-visible:ring-accent focus-visible:bg-border/60 focus-visible:text-fg inline-flex h-6 w-6 items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none";
+  const projectDeleteClass =
+    "text-muted hover:bg-status-failed-soft/70 hover:text-status-failed focus-visible:ring-accent focus-visible:bg-status-failed-soft/70 focus-visible:text-status-failed inline-flex h-6 w-6 items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50";
 
   /// Inline rename editor (mirrors the agent-card rename in `Sidebar.svelte`).
   /// Only one row edits at a time, so a single `editingProjectId` + `draftName`
@@ -114,6 +125,7 @@
   const canSave = $derived(renameValidation.ok && !renaming);
 
   function startEdit(project: ProjectListing): void {
+    deleteConfirmProjectId = null;
     editingProjectId = project.id;
     draftName = project.name;
     renameError = null;
@@ -156,16 +168,71 @@
     }
   }
 
-  /// Focus + select the edit field once it mounts. Deferred a frame so it wins
-  /// the dropdown menu's on-close focus restore (the "Rename" item closes the
-  /// menu, returning focus to its trigger); focusing synchronously would be
-  /// stolen back and fire the input's blur-cancel. (Same rationale as the agent
-  /// editor's `focusSelect`.)
+  /// Focus + select the edit field once it mounts. Deferred a frame so the
+  /// input is mounted and ready before selection.
   function focusSelect(node: HTMLInputElement): void {
     requestAnimationFrame(() => {
       node.focus();
       node.select();
     });
+  }
+
+  $effect(() => {
+    if (
+      deleteConfirmProjectId !== null &&
+      !visibleProjects.some((project) => project.id === deleteConfirmProjectId)
+    ) {
+      deleteConfirmProjectId = null;
+    }
+  });
+
+  async function toggleArchive(project: ProjectListing): Promise<void> {
+    archiveError = null;
+    deleteError = null;
+    try {
+      await setProjectArchived(project.id, !project.archived);
+      if (deleteConfirmProjectId === project.id) deleteConfirmProjectId = null;
+    } catch (err) {
+      archiveError = {
+        projectId: project.id,
+        message: err instanceof Error ? err.message : String(err),
+      };
+    }
+  }
+
+  function startDelete(project: ProjectListing): void {
+    archiveError = null;
+    deleteError = null;
+    deleteConfirmProjectId = project.id;
+  }
+
+  function cancelDelete(projectId: ProjectId): void {
+    if (deleteConfirmProjectId === projectId) deleteConfirmProjectId = null;
+  }
+
+  function disarmDeleteOnLeave(node: HTMLElement, projectId: ProjectId): { destroy: () => void } {
+    const handlePointerLeave = (): void => cancelDelete(projectId);
+    node.addEventListener("pointerleave", handlePointerLeave);
+    return {
+      destroy: () => node.removeEventListener("pointerleave", handlePointerLeave),
+    };
+  }
+
+  async function confirmDelete(project: ProjectListing): Promise<void> {
+    deletingProjectId = project.id;
+    deleteError = null;
+    try {
+      await deleteProject(project.id);
+      if (deleteConfirmProjectId === project.id) deleteConfirmProjectId = null;
+    } catch (err) {
+      deleteConfirmProjectId = null;
+      deleteError = {
+        projectId: project.id,
+        message: err instanceof Error ? err.message : String(err),
+      };
+    } finally {
+      deletingProjectId = null;
+    }
   }
 </script>
 
@@ -296,155 +363,298 @@
         {@const editing = editingProjectId === project.id}
         <div
           class={cn(
-            "group hover:bg-raised/70 flex w-full items-center rounded-md transition-colors",
+            "group hover:bg-raised/70 flex w-full flex-col rounded-md transition-colors",
             project.id === selection.activeProjectId && "bg-raised hover:bg-raised",
           )}
           data-testid="project-row"
           data-project-id={project.id}
           data-active={project.id === selection.activeProjectId}
+          use:disarmDeleteOnLeave={project.id}
         >
-          {#if editing}
-            <!-- Edit mode swaps the select button for an inline editor. Blur
-                 cancels (never persist on blur); the save button's
-                 mousedown-preventDefault keeps focus so its click commits before
-                 blur-cancel fires. The directory line stays for context. -->
-            <div class="flex min-w-0 flex-1 flex-col gap-0.5 px-2.5 py-2">
-              <div class="flex w-full items-center gap-2">
-                <input
-                  use:focusSelect
-                  bind:value={draftName}
-                  class={cn(
-                    "text-fg border-border bg-panel h-6 min-w-0 flex-1 rounded border px-1.5 text-[13px] font-semibold",
-                    "focus-visible:ring-accent focus-visible:ring-1 focus-visible:outline-none",
-                    renameMessage && "border-status-failed",
-                  )}
-                  aria-label="Project name"
-                  aria-invalid={!renameValidation.ok}
-                  aria-describedby={renameError ? `project-rename-error-${project.id}` : undefined}
-                  title={renameMessage ?? undefined}
-                  data-testid="project-rename-input"
-                  onkeydown={(event) => onRenameKeydown(event, project)}
-                  onblur={cancelEdit}
-                />
-                <button
-                  type="button"
-                  class={cn(
-                    ICON_BUTTON_CLASS,
-                    "shrink-0 disabled:cursor-not-allowed disabled:opacity-50",
-                  )}
-                  disabled={!canSave}
-                  aria-label="Save name"
-                  title="Save"
-                  data-testid="project-rename-save"
-                  onmousedown={(event) => event.preventDefault()}
-                  onclick={() => void commitEdit(project)}
-                >
-                  <svg
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="2"
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                    class="h-4 w-4"
-                    aria-hidden="true"
+          <div class="flex w-full items-center">
+            {#if editing}
+              <!-- Edit mode swaps the select button for an inline editor. Blur
+                   cancels; the save button prevents mousedown so click commits
+                   before blur-cancel fires. The directory line stays for
+                   context. -->
+              <div class="flex min-w-0 flex-1 flex-col gap-0.5 px-2.5 py-2">
+                <div class="flex w-full items-center gap-2">
+                  <input
+                    use:focusSelect
+                    bind:value={draftName}
+                    class={cn(
+                      "text-fg border-border bg-panel h-6 min-w-0 flex-1 rounded border px-1.5 text-[13px] font-semibold",
+                      "focus-visible:ring-accent focus-visible:ring-1 focus-visible:outline-none",
+                      renameMessage && "border-status-failed",
+                    )}
+                    aria-label="Project name"
+                    aria-invalid={!renameValidation.ok}
+                    aria-describedby={renameError
+                      ? `project-rename-error-${project.id}`
+                      : undefined}
+                    title={renameMessage ?? undefined}
+                    data-testid="project-rename-input"
+                    onkeydown={(event) => onRenameKeydown(event, project)}
+                    onblur={cancelEdit}
+                  />
+                  <button
+                    type="button"
+                    class={cn(
+                      ICON_BUTTON_CLASS,
+                      "shrink-0 disabled:cursor-not-allowed disabled:opacity-50",
+                    )}
+                    disabled={!canSave}
+                    aria-label="Save name"
+                    title="Save"
+                    data-testid="project-rename-save"
+                    onmousedown={(event) => event.preventDefault()}
+                    onclick={() => void commitEdit(project)}
                   >
-                    <path d="M20 6 9 17l-5-5" />
-                  </svg>
-                </button>
-              </div>
-              <div class="text-muted flex w-full items-center gap-1 text-xs leading-4">
-                <span class="truncate" title={project.directory}>{basename(project.directory)}</span
-                >
-              </div>
-              {#if renameError}
-                <div
-                  id={`project-rename-error-${project.id}`}
-                  class="text-status-failed text-xs"
-                  data-testid="project-rename-error"
-                >
-                  {renameError}
+                    <svg
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="2"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      class="h-4 w-4"
+                      aria-hidden="true"
+                    >
+                      <path d="M20 6 9 17l-5-5" />
+                    </svg>
+                  </button>
                 </div>
-              {/if}
-            </div>
-          {:else}
-            <!-- Double-click the row to rename (the kebab's "Rename" item is the
-                 other entry point); single-click still activates the project. -->
-            <button
-              type="button"
-              class="flex min-w-0 flex-1 flex-col items-start gap-0.5 px-2.5 py-2 text-left"
-              onclick={() => {
-                onProjectSelect();
-                void activateProject(project.id);
-              }}
-              ondblclick={() => startEdit(project)}
-            >
-              <div class="flex w-full items-center gap-2">
-                <span class="text-fg truncate text-[13px] font-semibold">
-                  {project.name}
-                </span>
-                {#if !project.available}
-                  <Badge class="ml-auto shrink-0" testid="project-unavailable">unavailable</Badge>
+                <div class="text-muted flex w-full items-center gap-1 text-xs leading-4">
+                  <span class="truncate" title={project.directory}
+                    >{basename(project.directory)}</span
+                  >
+                </div>
+                {#if renameError}
+                  <div
+                    id={`project-rename-error-${project.id}`}
+                    class="text-status-failed text-xs"
+                    data-testid="project-rename-error"
+                  >
+                    {renameError}
+                  </div>
                 {/if}
               </div>
-              <div class="text-muted flex w-full items-center gap-1 text-xs leading-4">
-                <span class="truncate" title={project.directory}>{basename(project.directory)}</span
-                >
-                <span>·</span>
-                <span class="shrink-0">{relativeTime(project.last_activity)}</span>
-              </div>
-            </button>
-            <div class="flex shrink-0 items-center gap-0.5 pr-1.5">
-              <!-- Kebab first so the status icon (spinner/checkmark) stays the
-                   rightmost element, flush to the edge — the kebab's reserved
-                   (opacity-0) slot sits to its LEFT and only becomes visible on
-                   hover/focus/menu-open, so a completed checkmark never looks
-                   indented. Gated on `!busy` only: Archive/Unarchive works even
-                   when the directory is unavailable, so the menu shows on
-                   unavailable rows too (Rename/Delete disabled there via
-                   `available`); while busy the spinner/cancel owns the slot, so
-                   the kebab isn't rendered at all and hovering to cancel never
-                   shifts it. Mutating a running project is intentionally
-                   unavailable — stop it first. -->
-              {#if !busy}
-                <div
-                  class="opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100 has-[[data-state=open]]:opacity-100"
-                >
-                  <ProjectActionsMenu {project} onRename={() => startEdit(project)} />
+            {:else}
+              <button
+                type="button"
+                class="flex min-w-0 flex-1 flex-col items-start gap-0.5 px-2.5 py-2 text-left"
+                onclick={() => {
+                  onProjectSelect();
+                  void activateProject(project.id);
+                }}
+                ondblclick={() => startEdit(project)}
+              >
+                <div class="flex w-full items-center gap-2">
+                  <span class="text-fg truncate text-[13px] font-semibold">
+                    {project.name}
+                  </span>
+                  {#if !project.available}
+                    <Badge class="ml-auto shrink-0" testid="project-unavailable">unavailable</Badge>
+                  {/if}
                 </div>
-              {/if}
-              {#if busy}
-                <button
-                  type="button"
-                  class="group/cancel text-muted hover:bg-status-failed-soft/70 hover:text-status-failed focus-visible:ring-accent focus-visible:bg-status-failed-soft/70 focus-visible:text-status-failed inline-flex h-6 w-6 items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none"
-                  aria-label="Cancel all running agents"
-                  data-testid="project-cancel"
-                  onclick={() => cancelAllForProject(project.id)}
-                >
-                  <Spinner
-                    class="h-5 w-5 group-hover/cancel:hidden group-focus-visible/cancel:hidden"
-                  />
-                  <StopIcon
-                    class="hidden h-5 w-5 group-hover/cancel:block group-focus-visible/cancel:block"
-                  />
-                </button>
-              {:else if completed}
-                <div class="flex items-center" data-testid="project-completed">
-                  <svg
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="1.5"
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                    class="text-accent h-5 w-5"
-                    aria-hidden="true"
+                <div class="text-muted flex w-full items-center gap-1 text-xs leading-4">
+                  <span class="truncate" title={project.directory}
+                    >{basename(project.directory)}</span
                   >
-                    <circle cx="12" cy="12" r="9" />
-                    <path d="m8.5 12 2.5 2.5 4.5-5" />
-                  </svg>
+                  <span>·</span>
+                  <span class="shrink-0">{relativeTime(project.last_activity)}</span>
                 </div>
-              {/if}
+              </button>
+              <div class="flex shrink-0 items-center gap-0.5 pr-1.5">
+                {#if !busy}
+                  <div
+                    class="pointer-events-none flex max-w-0 items-center gap-0.5 overflow-hidden opacity-0 transition-[max-width,opacity] group-hover:pointer-events-auto group-hover:max-w-[3.25rem] group-hover:opacity-100"
+                  >
+                    {#if deleteConfirmProjectId === project.id}
+                      <Tooltip label="Cancel delete" delayDuration={1000}>
+                        {#snippet trigger(props)}
+                          <button
+                            {...props}
+                            type="button"
+                            class={projectActionClass}
+                            aria-label="Cancel delete"
+                            tabindex="-1"
+                            data-testid="project-delete-cancel"
+                            onclick={() => cancelDelete(project.id)}
+                          >
+                            <svg
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              stroke-width="2"
+                              stroke-linecap="round"
+                              stroke-linejoin="round"
+                              class="h-4 w-4"
+                              aria-hidden="true"
+                            >
+                              <path d="M18 6 6 18M6 6l12 12" />
+                            </svg>
+                          </button>
+                        {/snippet}
+                      </Tooltip>
+                      <Tooltip label="Confirm delete" delayDuration={1000}>
+                        {#snippet trigger(props)}
+                          <button
+                            {...props}
+                            type="button"
+                            class="text-status-failed hover:bg-status-failed-soft/70 focus-visible:ring-accent focus-visible:bg-status-failed-soft/70 inline-flex h-6 w-6 items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+                            disabled={deletingProjectId === project.id}
+                            aria-label="Confirm delete"
+                            tabindex="-1"
+                            data-testid="project-delete-confirm"
+                            onclick={() => void confirmDelete(project)}
+                          >
+                            <svg
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              stroke-width="2"
+                              stroke-linecap="round"
+                              stroke-linejoin="round"
+                              class="h-4 w-4"
+                              aria-hidden="true"
+                            >
+                              <path d="M20 6 9 17l-5-5" />
+                            </svg>
+                          </button>
+                        {/snippet}
+                      </Tooltip>
+                    {:else}
+                      <Tooltip
+                        label={project.archived ? "Unarchive project" : "Archive project"}
+                        delayDuration={1000}
+                      >
+                        {#snippet trigger(props)}
+                          <button
+                            {...props}
+                            type="button"
+                            class={projectActionClass}
+                            aria-label={project.archived ? "Unarchive project" : "Archive project"}
+                            tabindex="-1"
+                            data-testid="project-action-archive"
+                            onclick={() => void toggleArchive(project)}
+                          >
+                            {#if project.archived}
+                              <svg
+                                viewBox="0 0 24 24"
+                                fill="none"
+                                stroke="currentColor"
+                                stroke-width="1.8"
+                                stroke-linecap="round"
+                                stroke-linejoin="round"
+                                class="h-4 w-4"
+                                aria-hidden="true"
+                              >
+                                <path d="M9 14 4 9l5-5" />
+                                <path d="M4 9h10a6 6 0 0 1 0 12h-2" />
+                              </svg>
+                            {:else}
+                              <svg
+                                viewBox="0 0 24 24"
+                                fill="none"
+                                stroke="currentColor"
+                                stroke-width="1.8"
+                                stroke-linecap="round"
+                                stroke-linejoin="round"
+                                class="h-4 w-4"
+                                aria-hidden="true"
+                              >
+                                <rect x="3" y="4" width="18" height="4" rx="1" />
+                                <path d="M5 8v10a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8" />
+                                <path d="M10 12h4" />
+                              </svg>
+                            {/if}
+                          </button>
+                        {/snippet}
+                      </Tooltip>
+                      <Tooltip delayDuration={1000}>
+                        {#snippet trigger(props)}
+                          <button
+                            {...props}
+                            type="button"
+                            class={projectDeleteClass}
+                            disabled={!project.available}
+                            aria-label="Delete project"
+                            tabindex="-1"
+                            data-testid="project-action-delete"
+                            onclick={() => startDelete(project)}
+                          >
+                            <svg
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              stroke-width="1.8"
+                              stroke-linecap="round"
+                              stroke-linejoin="round"
+                              class="h-4 w-4"
+                              aria-hidden="true"
+                            >
+                              <path d="M3 6h18" />
+                              <path d="M8 6V4h8v2" />
+                              <path d="M19 6 18 20H6L5 6" />
+                              <path d="M10 11v5M14 11v5" />
+                            </svg>
+                          </button>
+                        {/snippet}
+                        <div class="max-w-56">
+                          <div class="text-[13px] font-medium">Delete project</div>
+                          <div class="text-primary-fg/75 mt-1 text-xs leading-4">
+                            Removes Switchboard's files for this project; your code and agent
+                            session files are kept.
+                          </div>
+                        </div>
+                      </Tooltip>
+                    {/if}
+                  </div>
+                {/if}
+                {#if busy}
+                  <button
+                    type="button"
+                    class="group/cancel text-muted hover:bg-status-failed-soft/70 hover:text-status-failed focus-visible:ring-accent focus-visible:bg-status-failed-soft/70 focus-visible:text-status-failed inline-flex h-6 w-6 items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none"
+                    aria-label="Cancel all running agents"
+                    data-testid="project-cancel"
+                    onclick={() => cancelAllForProject(project.id)}
+                  >
+                    <Spinner
+                      class="h-5 w-5 group-hover/cancel:hidden group-focus-visible/cancel:hidden"
+                    />
+                    <StopIcon
+                      class="hidden h-5 w-5 group-hover/cancel:block group-focus-visible/cancel:block"
+                    />
+                  </button>
+                {:else if completed}
+                  <div class="flex items-center" data-testid="project-completed">
+                    <svg
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="1.5"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      class="text-accent h-5 w-5"
+                      aria-hidden="true"
+                    >
+                      <circle cx="12" cy="12" r="9" />
+                      <path d="m8.5 12 2.5 2.5 4.5-5" />
+                    </svg>
+                  </div>
+                {/if}
+              </div>
+            {/if}
+          </div>
+          {#if archiveError?.projectId === project.id}
+            <div class="text-status-failed px-2.5 pb-2 text-xs" data-testid="project-archive-error">
+              Couldn't update project: {archiveError.message}
+            </div>
+          {/if}
+          {#if deleteError?.projectId === project.id}
+            <div class="text-status-failed px-2.5 pb-2 text-xs" data-testid="project-delete-error">
+              Couldn't delete project: {deleteError.message}
             </div>
           {/if}
         </div>

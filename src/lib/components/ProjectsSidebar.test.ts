@@ -259,20 +259,11 @@ describe("ProjectsSidebar — rename", () => {
   const A1 = "00000000-0000-7000-8000-0000000000a1";
   const A2 = "00000000-0000-7000-8000-0000000000a2";
 
-  it("enters edit via double-click and via the kebab Rename item", async () => {
+  it("enters edit via double-click", async () => {
     mockRenameEchoes();
     await renderWith([projectIn(A1, "alpha", "/work/a")]);
 
-    // Double-click the row.
     await fireEvent.dblClick(rowSelectButton());
-    expect(await screen.findByTestId("project-rename-input")).toBeInTheDocument();
-
-    // Escape back out, then use the menu.
-    await fireEvent.keyDown(screen.getByTestId("project-rename-input"), { key: "Escape" });
-    await waitFor(() => expect(screen.queryByTestId("project-rename-input")).toBeNull());
-
-    await fireEvent.click(screen.getByTestId("project-actions-trigger"));
-    await fireEvent.click(await screen.findByTestId("project-action-rename"));
     expect(await screen.findByTestId("project-rename-input")).toBeInTheDocument();
   });
 
@@ -390,42 +381,46 @@ describe("ProjectsSidebar — rename", () => {
     expect(renameCalls).toHaveLength(1);
   });
 
-  it("omits the kebab while the project is busy so the cancel control owns the right slot", async () => {
-    // A live send makes the project busy → the spinner/cancel renders and the
-    // kebab is suppressed entirely (no hidden-but-laid-out button pushing it).
+  it("omits project action icons while the project is busy so the cancel control owns the right slot", async () => {
     await seedBusyProject(PROJECT_1);
     const ProjectsSidebar = (await import("./ProjectsSidebar.svelte")).default;
     render(ProjectsSidebar, { props: noopProps });
 
     expect(screen.getByTestId("project-cancel")).toBeInTheDocument();
-    expect(screen.queryByTestId("project-actions-trigger")).toBeNull();
+    expect(screen.queryByTestId("project-action-archive")).toBeNull();
+    expect(screen.queryByTestId("project-action-delete")).toBeNull();
   });
 });
 
 describe("ProjectsSidebar — delete", () => {
   const A1 = "00000000-0000-7000-8000-0000000000d1";
+  const A2 = "00000000-0000-7000-8000-0000000000d2";
 
-  async function openMenu(): Promise<void> {
-    await fireEvent.click(screen.getByTestId("project-actions-trigger"));
-    await screen.findByTestId("project-action-delete");
-  }
-
-  it("Delete swaps the menu to a confirm sub-view without calling the backend", async () => {
+  it("Delete swaps Archive | Delete to Cancel | Confirm without calling the backend", async () => {
     await renderWith([projectIn(A1, "alpha", "/work/a")]);
-    await openMenu();
     await fireEvent.click(screen.getByTestId("project-action-delete"));
 
-    expect(screen.getByTestId("project-delete-prompt")).toBeInTheDocument();
-    expect(screen.getByTestId("project-delete-confirm")).toBeInTheDocument();
     expect(screen.getByTestId("project-delete-cancel")).toBeInTheDocument();
-    // Live actions are gone mid-confirm; nothing dispatched yet.
-    expect(screen.queryByTestId("project-action-rename")).not.toBeInTheDocument();
+    expect(screen.getByTestId("project-delete-confirm")).toBeInTheDocument();
+    expect(screen.queryByTestId("project-action-archive")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("project-action-delete")).not.toBeInTheDocument();
     expect(invokeMock).not.toHaveBeenCalledWith("delete_project", expect.anything());
+  });
+
+  it("keeps hover-only project actions out of the tab order", async () => {
+    await renderWith([projectIn(A1, "alpha", "/work/a")]);
+
+    expect(screen.getByTestId("project-action-archive")).toHaveAttribute("tabindex", "-1");
+    expect(screen.getByTestId("project-action-delete")).toHaveAttribute("tabindex", "-1");
+
+    await fireEvent.click(screen.getByTestId("project-action-delete"));
+
+    expect(screen.getByTestId("project-delete-cancel")).toHaveAttribute("tabindex", "-1");
+    expect(screen.getByTestId("project-delete-confirm")).toHaveAttribute("tabindex", "-1");
   });
 
   it("confirming deletes through the backend and removes the row", async () => {
     await renderWith([projectIn(A1, "alpha", "/work/a")]);
-    await openMenu();
     await fireEvent.click(screen.getByTestId("project-action-delete"));
     await fireEvent.click(screen.getByTestId("project-delete-confirm"));
 
@@ -435,14 +430,43 @@ describe("ProjectsSidebar — delete", () => {
 
   it("cancel restores the menu without deleting", async () => {
     await renderWith([projectIn(A1, "alpha", "/work/a")]);
-    await openMenu();
     await fireEvent.click(screen.getByTestId("project-action-delete"));
     await fireEvent.click(screen.getByTestId("project-delete-cancel"));
 
-    expect(await screen.findByTestId("project-action-delete")).toBeInTheDocument();
+    expect(screen.getByTestId("project-action-archive")).toBeInTheDocument();
+    expect(screen.getByTestId("project-action-delete")).toBeInTheDocument();
     expect(screen.queryByTestId("project-delete-confirm")).not.toBeInTheDocument();
     expect(invokeMock).not.toHaveBeenCalledWith("delete_project", expect.anything());
     expect(screen.getByTestId("project-row")).toBeInTheDocument();
+  });
+
+  it("pointer leave cancels an armed delete", async () => {
+    await renderWith([projectIn(A1, "alpha", "/work/a")]);
+    await fireEvent.click(screen.getByTestId("project-action-delete"));
+
+    await fireEvent.pointerLeave(screen.getByTestId("project-row"));
+
+    expect(screen.getByTestId("project-action-archive")).toBeInTheDocument();
+    expect(screen.getByTestId("project-action-delete")).toBeInTheDocument();
+    expect(screen.queryByTestId("project-delete-confirm")).not.toBeInTheDocument();
+    expect(invokeMock).not.toHaveBeenCalledWith("delete_project", expect.anything());
+  });
+
+  it("arming another row disarms the previous row", async () => {
+    await renderWith([projectIn(A1, "alpha", "/work/a"), projectIn(A2, "beta", "/work/b")]);
+
+    const firstDelete = screen.getAllByTestId("project-action-delete").at(0);
+    if (firstDelete === undefined) throw new Error("expected first row delete button");
+    await fireEvent.click(firstDelete);
+    expect(screen.getAllByTestId("project-delete-confirm")).toHaveLength(1);
+
+    const secondDelete = screen.getAllByTestId("project-action-delete").at(0);
+    if (secondDelete === undefined) throw new Error("expected second row delete button");
+    await fireEvent.click(secondDelete);
+    expect(screen.getAllByTestId("project-delete-confirm")).toHaveLength(1);
+    expect(screen.getAllByTestId("project-row")[1]).toContainElement(
+      screen.getByTestId("project-delete-confirm"),
+    );
   });
 
   it("surfaces a backend failure and keeps the project", async () => {
@@ -451,15 +475,32 @@ describe("ProjectsSidebar — delete", () => {
       return undefined;
     });
     await renderWith([projectIn(A1, "alpha", "/work/a")]);
-    await openMenu();
     await fireEvent.click(screen.getByTestId("project-action-delete"));
     await fireEvent.click(screen.getByTestId("project-delete-confirm"));
 
     const err = await screen.findByTestId("project-delete-error");
     expect(err).toHaveTextContent("disk busy");
-    // The row is kept, and the menu is back to its idle actions.
     expect(screen.getByTestId("project-row")).toBeInTheDocument();
     expect(screen.getByTestId("project-action-delete")).toBeInTheDocument();
+  });
+
+  it("uses the themed delete tooltip for the Switchboard-only deletion copy", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      await renderWith([projectIn(A1, "alpha", "/work/a")]);
+      const button = screen.getByTestId("project-action-delete");
+      expect(button).not.toHaveAttribute("title");
+
+      await fireEvent.pointerEnter(button);
+      await vi.advanceTimersByTimeAsync(1000);
+
+      const tooltip = await waitFor(() => screen.getByTestId("tooltip-content"));
+      expect(tooltip).toHaveTextContent("Delete project");
+      expect(tooltip).toHaveTextContent("Removes Switchboard's files for this project");
+      expect(tooltip).toHaveTextContent("your code and agent session files are kept");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -494,7 +535,6 @@ describe("ProjectsSidebar — archive + view toggle", () => {
 
   it("Archive item calls through and the row leaves the Active view", async () => {
     await renderWith([projectIn(A1, "alpha", "/work/a")]);
-    await fireEvent.click(screen.getByTestId("project-actions-trigger"));
     await fireEvent.click(await screen.findByTestId("project-action-archive"));
 
     expect(invokeMock).toHaveBeenCalledWith("set_project_archived", {
@@ -505,29 +545,24 @@ describe("ProjectsSidebar — archive + view toggle", () => {
     await waitFor(() => expect(screen.queryByTestId("project-row")).toBeNull());
   });
 
-  it("menu shows Unarchive for an archived project", async () => {
+  it("archive button becomes Unarchive for an archived project", async () => {
     await renderWith([projectIn(A1, "alpha", "/work/a", true)]);
     await fireEvent.click(screen.getByTestId("project-view-archived"));
-    await fireEvent.click(screen.getByTestId("project-actions-trigger"));
 
-    const item = await screen.findByTestId("project-action-archive");
-    expect(item).toHaveTextContent("Unarchive project");
-    await fireEvent.click(item);
+    const button = await screen.findByTestId("project-action-archive");
+    expect(button).toHaveAttribute("aria-label", "Unarchive project");
+    await fireEvent.click(button);
     expect(invokeMock).toHaveBeenCalledWith("set_project_archived", {
       projectId: A1,
       archived: false,
     });
   });
 
-  it("on an unavailable row the menu still shows, with Archive enabled and Rename/Delete disabled", async () => {
+  it("on an unavailable row Archive stays enabled and Delete is disabled", async () => {
     await renderWith([{ ...projectIn(A1, "alpha", "/work/a"), available: false }]);
-    await fireEvent.click(screen.getByTestId("project-actions-trigger"));
 
-    expect(await screen.findByTestId("project-action-archive")).not.toHaveAttribute(
-      "data-disabled",
-    );
-    expect(screen.getByTestId("project-action-rename")).toHaveAttribute("data-disabled");
-    expect(screen.getByTestId("project-action-delete")).toHaveAttribute("data-disabled");
+    expect(await screen.findByTestId("project-action-archive")).not.toBeDisabled();
+    expect(screen.getByTestId("project-action-delete")).toBeDisabled();
   });
 });
 

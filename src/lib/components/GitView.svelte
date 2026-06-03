@@ -11,10 +11,10 @@
   import Spinner from "$lib/components/ui/Spinner.svelte";
   import GitRepoNode from "$lib/components/GitRepoNode.svelte";
   import {
-    SEGMENTED_CONTAINER_CLASS,
-    SEGMENTED_ITEM_CLASS,
-    SEGMENTED_ITEM_ACTIVE_CLASS,
-    SEGMENTED_ITEM_INACTIVE_CLASS,
+    SEGMENTED_MAIN_CONTAINER_CLASS,
+    SEGMENTED_MAIN_ITEM_ACTIVE_CLASS,
+    SEGMENTED_MAIN_ITEM_CLASS,
+    SEGMENTED_MAIN_ITEM_INACTIVE_CLASS,
   } from "$lib/components/ui/segmentedControl";
   import { gitView, fetchStates, refreshAll, fetchAll, addRepo } from "$lib/state/gitView.svelte";
   import { pickDirectory } from "$lib/native";
@@ -59,7 +59,7 @@
 <div class="flex min-h-0 flex-1 flex-col overflow-hidden" data-testid="git-view">
   <div class="border-border/60 flex items-center gap-3 border-b px-4 py-2">
     <div
-      class={cn(SEGMENTED_CONTAINER_CLASS, "inline-grid grid-cols-3")}
+      class={cn(SEGMENTED_MAIN_CONTAINER_CLASS, "inline-grid grid-cols-3")}
       role="radiogroup"
       aria-label="Branch filter"
     >
@@ -68,11 +68,11 @@
           type="button"
           role="radio"
           class={cn(
-            SEGMENTED_ITEM_CLASS,
+            SEGMENTED_MAIN_ITEM_CLASS,
             "px-3",
             branchFilter === option.value
-              ? SEGMENTED_ITEM_ACTIVE_CLASS
-              : SEGMENTED_ITEM_INACTIVE_CLASS,
+              ? SEGMENTED_MAIN_ITEM_ACTIVE_CLASS
+              : SEGMENTED_MAIN_ITEM_INACTIVE_CLASS,
           )}
           aria-checked={branchFilter === option.value}
           data-testid={`branch-filter-${option.value}`}

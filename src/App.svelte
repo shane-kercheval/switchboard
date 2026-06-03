@@ -42,10 +42,10 @@
   import GitView from "$lib/components/GitView.svelte";
   import { view, setViewMode, enterGitView } from "$lib/state/gitView.svelte";
   import {
-    SEGMENTED_CONTAINER_CLASS,
-    SEGMENTED_ITEM_CLASS,
-    SEGMENTED_ITEM_ACTIVE_CLASS,
-    SEGMENTED_ITEM_INACTIVE_CLASS,
+    SEGMENTED_MAIN_CONTAINER_CLASS,
+    SEGMENTED_MAIN_ITEM_ACTIVE_CLASS,
+    SEGMENTED_MAIN_ITEM_CLASS,
+    SEGMENTED_MAIN_ITEM_INACTIVE_CLASS,
   } from "$lib/components/ui/segmentedControl";
   import { cn } from "$lib/utils";
 
@@ -348,7 +348,7 @@
         <!-- Top-level view toggle: Projects | Git (⌘⇧G). Session-only; settings
              is a modal-over, so its toggle press lands on the chosen view. -->
         <div
-          class={cn(SEGMENTED_CONTAINER_CLASS, "flex shrink-0")}
+          class={cn(SEGMENTED_MAIN_CONTAINER_CLASS, "flex shrink-0")}
           role="radiogroup"
           aria-label="View"
         >
@@ -356,10 +356,10 @@
             type="button"
             role="radio"
             class={cn(
-              SEGMENTED_ITEM_CLASS,
+              SEGMENTED_MAIN_ITEM_CLASS,
               !settingsOpen && view.mode === "projects"
-                ? SEGMENTED_ITEM_ACTIVE_CLASS
-                : SEGMENTED_ITEM_INACTIVE_CLASS,
+                ? SEGMENTED_MAIN_ITEM_ACTIVE_CLASS
+                : SEGMENTED_MAIN_ITEM_INACTIVE_CLASS,
             )}
             aria-checked={!settingsOpen && view.mode === "projects"}
             data-testid="view-toggle-projects"
@@ -372,10 +372,10 @@
             type="button"
             role="radio"
             class={cn(
-              SEGMENTED_ITEM_CLASS,
+              SEGMENTED_MAIN_ITEM_CLASS,
               !settingsOpen && view.mode === "git"
-                ? SEGMENTED_ITEM_ACTIVE_CLASS
-                : SEGMENTED_ITEM_INACTIVE_CLASS,
+                ? SEGMENTED_MAIN_ITEM_ACTIVE_CLASS
+                : SEGMENTED_MAIN_ITEM_INACTIVE_CLASS,
             )}
             aria-checked={!settingsOpen && view.mode === "git"}
             data-testid="view-toggle-git"

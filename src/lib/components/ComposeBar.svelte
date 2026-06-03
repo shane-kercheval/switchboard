@@ -734,7 +734,7 @@
                 : "Cancel send"
               : "Send"}
             class={cn(
-              "flex h-8 w-8 shrink-0 items-center justify-center rounded-full transition-colors",
+              "flex h-7 w-7 shrink-0 items-center justify-center rounded-full transition-colors",
               showStop
                 ? "bg-border text-muted hover:bg-status-failed-soft/70 hover:text-status-failed"
                 : sendDisabled
@@ -743,7 +743,7 @@
             )}
           >
             {#if showStop}
-              <StopIcon class="size-6" />
+              <StopIcon class="size-5" />
             {:else}
               <svg
                 viewBox="0 0 24 24"
@@ -752,7 +752,7 @@
                 stroke-width="2.25"
                 stroke-linecap="round"
                 stroke-linejoin="round"
-                class="h-4 w-4"
+                class="h-3.5 w-3.5"
                 aria-hidden="true"
               >
                 <path d="M12 19V5M5 12l7-7 7 7" />

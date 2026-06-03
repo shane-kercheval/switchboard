@@ -446,7 +446,7 @@
               stroke-width="1.5"
               stroke-linecap="round"
               stroke-linejoin="round"
-              class="h-[18px] w-[18px]"
+              class="h-4 w-4"
               aria-hidden="true"
             >
               {#if allExpanded}

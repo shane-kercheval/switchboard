@@ -3553,6 +3553,7 @@ dependencies = [
  "serde_json",
  "switchboard-core",
  "switchboard-dispatcher",
+ "switchboard-git",
  "switchboard-harness",
  "tauri",
  "tauri-build",

@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use crate::dispatch_context::ProjectDispatchContextFactory;
 use crate::error::AppError;
-use crate::state::{AppState, lock, persist_workspace};
+use crate::state::{AppState, lock, persist_git_registry, persist_workspace};
 
 /// Returned by `init_directory_impl` — gives the caller everything it needs
 /// to render the directory header (path) and project list in one round trip.
@@ -119,6 +119,21 @@ pub async fn init_directory_impl(state: &AppState, path: &str) -> Result<Directo
         workspace.refresh_cache(&canonical, projects);
     }
     persist_workspace(state);
+
+    // One-directional Git-view auto-sync: if this directory lives in a git repo,
+    // track that repo's canonical root in the Git view. Adding a subdirectory or
+    // a linked worktree resolves to the same root and dedups. A non-git
+    // directory simply doesn't resolve — skipped, no error. `git_registry` is
+    // acquired here under the held `registry_write`, per the documented order.
+    if let Some(root) = switchboard_git::resolve_repo_root(&canonical) {
+        let mut git_registry = lock(&state.git_registry);
+        let added = !git_registry.contains(&root);
+        git_registry.add(root);
+        drop(git_registry);
+        if added {
+            persist_git_registry(state);
+        }
+    }
 
     Ok(info)
 }
@@ -408,6 +423,225 @@ pub fn list_workspace_directories_impl(state: &AppState) -> WorkspaceDirectories
         directories,
         persistable: state.workspace_path.is_some(),
     }
+}
+
+// --- Git view: tracked-repo registry, project linking, aggregate read --------
+
+/// A Switchboard project linked to a worktree by exact path-match (decision 7).
+/// The minimal identity the Git view needs to label a worktree's projects.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct LinkedProject {
+    pub id: ProjectId,
+    pub name: String,
+    /// The owning directory (== the worktree path, since linking is exact-match).
+    pub directory: String,
+}
+
+/// One tracked repo for the Git view: the M1 read-model plus the project links.
+///
+/// `repo` is `switchboard_git::RepoView` verbatim — the single source of the git
+/// contract, never re-mirrored here. Project linking is returned *alongside* as
+/// a `worktree path → projects` map (computed on the backend, decision 7) rather
+/// than nested into `RepoView`, so the git contract and the linking concern stay
+/// decoupled and `RepoView` can't drift. The frontend joins them by worktree
+/// path at render time (an O(1) lookup keyed by the path string).
+#[derive(Debug, Clone, Serialize)]
+pub struct RepoListing {
+    pub repo: switchboard_git::RepoView,
+    /// Keyed by worktree path (`to_string_lossy`), matching `WorktreeView.path`'s
+    /// serialization, so the frontend can look up a worktree's links directly.
+    pub linked_projects: HashMap<String, Vec<LinkedProject>>,
+}
+
+/// Add a repo to the Git-view registry by an explicit user action ("Add Repo").
+///
+/// Accepts any path inside a git repo — a subdirectory or a linked worktree
+/// resolves to the same canonical root (decision 5a) and dedups. A path not
+/// inside any git repo is rejected with [`AppError::NotAGitRepo`] for the
+/// inline-error UX. Registry-only: never creates a workspace entry or a project.
+pub fn add_tracked_repo_impl(state: &AppState, path: &str) -> Result<(), AppError> {
+    let root = switchboard_git::resolve_repo_root(Path::new(path)).ok_or_else(|| {
+        AppError::NotAGitRepo {
+            path: path.to_owned(),
+        }
+    })?;
+    // Serialize the registry mutation + its persistence under `registry_write`,
+    // the same gate the auto-sync hook in `init_directory_impl` uses, so two
+    // concurrent registry writes can't interleave a stale snapshot over a newer
+    // one on disk.
+    let _write = lock(&state.registry_write);
+    let added = {
+        let mut registry = lock(&state.git_registry);
+        let added = !registry.contains(&root);
+        registry.add(root);
+        added
+    };
+    if added {
+        persist_git_registry(state);
+    }
+    Ok(())
+}
+
+/// Remove a repo from the Git-view registry. **Registry only** — never touches
+/// files, the on-disk repo, or `workspace.yaml` (decision 5). Idempotent.
+///
+/// Accepts the stored root or any path inside the tracked repo: a live path
+/// resolves to its repo root (collapsing a subdirectory / linked worktree to the
+/// stored entry); a dead path (the repo dir is gone) falls back to
+/// `canonicalize_boundary`, which matches the root stored while it was available.
+pub fn remove_tracked_repo_impl(state: &AppState, path: &str) {
+    let target = switchboard_git::resolve_repo_root(Path::new(path))
+        .unwrap_or_else(|| canonicalize_boundary(path));
+    // Same serialization gate as add (see `add_tracked_repo_impl`).
+    let _write = lock(&state.registry_write);
+    let removed = lock(&state.git_registry).remove(&target);
+    if removed {
+        persist_git_registry(state);
+    }
+}
+
+/// The aggregate Git-view read: for every tracked repo, the M1 `RepoView`
+/// enriched with the Switchboard projects living in each worktree. The **sole**
+/// read command (no separate cheap "list" — the per-repo availability is already
+/// in each `RepoView`).
+///
+/// Partial success: a repo that errors mid-read (corrupt/I-O) is degraded to an
+/// `available: false` row rather than failing the whole call — one bad repo
+/// never blanks the view (mirrors `list_projects_impl`'s per-directory
+/// resilience).
+///
+/// Split into a cheap state-reading half ([`tracked_repos_inputs`]) and this
+/// pure compute half so the command shim can run the heavy `git2` reads under
+/// `spawn_blocking` (decision 8) without borrowing `AppState` across threads.
+#[must_use]
+pub fn list_tracked_repos_from_inputs(inputs: &GitReadInputs) -> Vec<RepoListing> {
+    inputs
+        .roots
+        .iter()
+        .map(|root| read_one_repo_listing(root, &inputs.links))
+        .collect()
+}
+
+/// Re-read a single tracked repo (per-repo refresh; decision 8 two-read split).
+/// Same partial-success degradation and linking as the aggregate.
+///
+/// Honors the tracked set: `path` may be the stored root *or* any path inside a
+/// tracked repo (a subdirectory / linked worktree) — it resolves to the repo
+/// root and is read only if that root is tracked. An untracked path yields an
+/// `available: false` row rather than live git data, so a refresh racing a
+/// remove can't surface a ghost repo. A dead path (repo dir gone) falls back to
+/// `canonicalize_boundary`, matching the root stored while it was available.
+#[must_use]
+pub fn read_tracked_repo_from_inputs(path: &str, inputs: &GitReadInputs) -> RepoListing {
+    let root = switchboard_git::resolve_repo_root(Path::new(path))
+        .unwrap_or_else(|| canonicalize_boundary(path));
+    if !inputs.roots.contains(&root) {
+        let name = root.file_name().map_or_else(
+            || root.to_string_lossy().into_owned(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        return RepoListing {
+            repo: switchboard_git::RepoView::unavailable(root, name),
+            linked_projects: HashMap::new(),
+        };
+    }
+    read_one_repo_listing(&root, &inputs.links)
+}
+
+/// The `AppState`-derived inputs a Git-view read needs, snapshotted so the
+/// `git2` work can move onto a blocking thread. Cheap to build (registry paths +
+/// the flat project list); the expensive part is the git reads that consume it.
+pub struct GitReadInputs {
+    pub roots: Vec<PathBuf>,
+    pub links: HashMap<PathBuf, Vec<LinkedProject>>,
+}
+
+/// Snapshot the registry roots + project-linking index from `AppState`. Run on
+/// the async thread before handing `GitReadInputs` to `spawn_blocking`.
+#[must_use]
+pub fn tracked_repos_inputs(state: &AppState) -> GitReadInputs {
+    GitReadInputs {
+        roots: lock(&state.git_registry).roots().to_vec(),
+        links: project_links_by_path(state),
+    }
+}
+
+/// Read one repo's view and attach the worktree→projects links. A `GitError`
+/// (genuine mid-read failure) degrades to a marked unavailable row, logged —
+/// not propagated — so the aggregate never fails wholesale on one bad repo.
+fn read_one_repo_listing(root: &Path, links: &HashMap<PathBuf, Vec<LinkedProject>>) -> RepoListing {
+    let repo = switchboard_git::read_repo(root).unwrap_or_else(|e| {
+        tracing::warn!(
+            root = %root.display(),
+            error = %e,
+            "git read failed for a tracked repo — listing it as unavailable"
+        );
+        let name = root.file_name().map_or_else(
+            || root.to_string_lossy().into_owned(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        switchboard_git::RepoView::unavailable(root.to_path_buf(), name)
+    });
+
+    // Build the worktree-path → projects map for just this repo's worktrees.
+    // Match on the canonicalized path (the `links` keys are canonicalized too),
+    // since git2's worktree paths carry a trailing slash and other spelling
+    // differences that an exact string compare would miss. The output map is
+    // keyed by the *raw* worktree path string so the frontend can look it up
+    // directly against `WorktreeView.path`'s serialization.
+    let mut linked_projects: HashMap<String, Vec<LinkedProject>> = HashMap::new();
+    for path in worktree_paths(&repo) {
+        let canonical = canonicalize_boundary(&path.to_string_lossy());
+        if let Some(projects) = links.get(&canonical) {
+            linked_projects.insert(path.to_string_lossy().into_owned(), projects.clone());
+        }
+    }
+    RepoListing {
+        repo,
+        linked_projects,
+    }
+}
+
+/// Every checked-out worktree path in a repo view — the branch worktrees plus the
+/// detached ones — the set against which project links are matched.
+fn worktree_paths(repo: &switchboard_git::RepoView) -> Vec<PathBuf> {
+    repo.local_branches
+        .iter()
+        .filter_map(|b| b.worktree.as_ref().map(|w| w.path.clone()))
+        .chain(repo.detached_worktrees.iter().map(|w| w.path.clone()))
+        .collect()
+}
+
+/// Build the project-linking index: canonical worktree/working-directory path →
+/// the projects whose directory is exactly that path (decision 7, exact match —
+/// a project in a *subfolder* of a worktree is intentionally not linked). Keyed
+/// by canonicalized `PathBuf` so it matches `RepoView` worktree paths regardless
+/// of spelling.
+///
+/// Reads the **in-memory** workspace cached snapshots, **not** `list_projects_impl`.
+/// The Git-view read is polled by M3, so it must be side-effect-free: going
+/// through `list_projects_impl` would re-scan every directory from disk and could
+/// rewrite `workspace.yaml` as a cache-refresh side effect. The cached snapshot
+/// is the workspace registry's purpose and is kept current by project
+/// create/init/list, so linking stays accurate without that cost. (A brand-new
+/// project links on the next workspace refresh — but create already refreshes the
+/// cache, so in practice it's immediate.)
+fn project_links_by_path(state: &AppState) -> HashMap<PathBuf, Vec<LinkedProject>> {
+    let mut map: HashMap<PathBuf, Vec<LinkedProject>> = HashMap::new();
+    for entry in lock(&state.workspace).entries() {
+        let dir = entry.path.to_string_lossy().into_owned();
+        let canonical = canonicalize_boundary(&dir);
+        for s in &entry.cached_projects {
+            map.entry(canonical.clone())
+                .or_default()
+                .push(LinkedProject {
+                    id: s.id,
+                    name: s.name.clone(),
+                    directory: dir.clone(),
+                });
+        }
+    }
+    map
 }
 
 pub fn create_project_impl(
@@ -8044,6 +8278,301 @@ mod tests {
         assert!(
             conv.items.is_empty(),
             "no journal ⇒ no user/outcome items; empty transcript adds none"
+        );
+    }
+
+    // --- Git view: registry, auto-sync, linking, aggregate ------------------
+
+    /// Run `git` in `dir`, asserting success. Fixtures are built with the real
+    /// CLI so they match on-disk repo shapes (worktree records, origin/HEAD).
+    fn git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A git repo with one commit on `main`, hermetic config.
+    fn init_git_repo(dir: &Path) {
+        git(dir, &["init", "-q", "-b", "main"]);
+        git(dir, &["config", "user.email", "t@e.com"]);
+        git(dir, &["config", "user.name", "T"]);
+        git(dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(dir.join("README.md"), "hi\n").unwrap();
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", "init"]);
+    }
+
+    /// State with both registries pointed at temp files (so persistence is
+    /// exercised without touching user-global state). Returns the temp dir
+    /// holding the yaml files alongside the state.
+    fn state_with_registries() -> (TempDir, AppState) {
+        let cfg = TempDir::new().unwrap();
+        let state = mock_app_state()
+            .with_workspace(cfg.path().join("workspace.yaml"))
+            .with_git_registry(cfg.path().join("git-view.yaml"));
+        (cfg, state)
+    }
+
+    #[tokio::test]
+    async fn init_directory_auto_adds_repo_root_to_git_registry() {
+        let (_cfg, state) = state_with_registries();
+        let repo = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+
+        init_directory_impl(&state, repo.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        let canonical = repo.path().canonicalize().unwrap();
+        assert!(
+            lock(&state.git_registry).contains(&canonical),
+            "a git working directory auto-syncs its repo root into the git registry"
+        );
+    }
+
+    #[tokio::test]
+    async fn init_directory_does_not_track_a_non_git_directory() {
+        let (_cfg, state) = state_with_registries();
+        let plain = TempDir::new().unwrap(); // no `git init`
+
+        init_directory_impl(&state, plain.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        assert!(
+            lock(&state.git_registry).roots().is_empty(),
+            "a non-git directory must not be tracked (auto-sync is a no-op, not an error)"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_sync_dedups_subdirectory_and_worktree_to_one_root() {
+        let (_cfg, state) = state_with_registries();
+        let repo = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        git(repo.path(), &["branch", "feature"]);
+
+        // Add the repo root, a subdirectory, and a linked worktree as separate
+        // working directories — all must resolve to the one canonical root.
+        let sub = repo.path().join("src/inner");
+        std::fs::create_dir_all(&sub).unwrap();
+        let wt = TempDir::new().unwrap();
+        let wt_path = wt.path().join("feature-wt");
+        git(
+            repo.path(),
+            &["worktree", "add", wt_path.to_str().unwrap(), "feature"],
+        );
+
+        init_directory_impl(&state, repo.path().to_str().unwrap())
+            .await
+            .unwrap();
+        init_directory_impl(&state, sub.to_str().unwrap())
+            .await
+            .unwrap();
+        init_directory_impl(&state, wt_path.to_str().unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            lock(&state.git_registry).roots().len(),
+            1,
+            "subdirectory + linked worktree of one repo dedup to a single tracked root"
+        );
+    }
+
+    #[test]
+    fn add_tracked_repo_accepts_subdirectory_and_rejects_non_git() {
+        let (_cfg, state) = state_with_registries();
+        let repo = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        let sub = repo.path().join("nested");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        // A subdirectory resolves to the root and is accepted.
+        add_tracked_repo_impl(&state, sub.to_str().unwrap()).unwrap();
+        let canonical = repo.path().canonicalize().unwrap();
+        assert!(lock(&state.git_registry).contains(&canonical));
+
+        // A second add (the root itself) dedups — still one entry.
+        add_tracked_repo_impl(&state, repo.path().to_str().unwrap()).unwrap();
+        assert_eq!(lock(&state.git_registry).roots().len(), 1);
+
+        // A non-git path is rejected with the typed error for the inline UX.
+        let plain = TempDir::new().unwrap();
+        let err = add_tracked_repo_impl(&state, plain.path().to_str().unwrap()).unwrap_err();
+        assert!(matches!(err, AppError::NotAGitRepo { .. }));
+    }
+
+    #[tokio::test]
+    async fn remove_directory_leaves_repo_tracked_in_git_view() {
+        // Decision 5: the git view is a superset — removing a working directory
+        // does NOT untrack its repo.
+        let (_cfg, state) = state_with_registries();
+        let repo = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        init_directory_impl(&state, repo.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let canonical = repo.path().canonicalize().unwrap();
+        assert!(lock(&state.git_registry).contains(&canonical));
+
+        remove_directory_impl(&state, repo.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        assert!(
+            lock(&state.git_registry).contains(&canonical),
+            "removing a working directory must leave the repo tracked in the git view"
+        );
+        assert!(
+            !lock(&state.workspace).contains(&canonical),
+            "but it is removed from the workspace"
+        );
+    }
+
+    #[test]
+    fn remove_tracked_repo_touches_only_the_registry() {
+        let (_cfg, state) = state_with_registries();
+        let repo = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        add_tracked_repo_impl(&state, repo.path().to_str().unwrap()).unwrap();
+
+        remove_tracked_repo_impl(&state, repo.path().to_str().unwrap());
+
+        assert!(lock(&state.git_registry).roots().is_empty());
+        // Files on disk are untouched — the repo still exists.
+        assert!(repo.path().join(".git").exists());
+        assert!(repo.path().join("README.md").exists());
+    }
+
+    #[tokio::test]
+    async fn aggregate_links_project_to_its_worktree_and_is_partial_on_bad_repo() {
+        let (_cfg, state) = state_with_registries();
+
+        // A tracked repo hosting a Switchboard project at its main worktree.
+        let repo = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        init_directory_impl(&state, repo.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "alpha");
+        let canonical = repo.path().canonicalize().unwrap();
+
+        // A second tracked repo whose path no longer exists → unavailable row.
+        let gone = TempDir::new().unwrap();
+        init_git_repo(gone.path());
+        add_tracked_repo_impl(&state, gone.path().to_str().unwrap()).unwrap();
+        let gone_root = gone.path().canonicalize().unwrap();
+        drop(gone); // directory removed from disk
+
+        let inputs = tracked_repos_inputs(&state);
+        let listings = list_tracked_repos_from_inputs(&inputs);
+        assert_eq!(
+            listings.len(),
+            2,
+            "both tracked repos appear (partial success)"
+        );
+
+        let live = listings
+            .iter()
+            .find(|l| l.repo.root == canonical)
+            .expect("the live repo is listed");
+        assert!(live.repo.available);
+        // Look up links by the main branch's actual worktree path (the same key
+        // the frontend uses — `WorktreeView.path`).
+        let main_wt = live
+            .repo
+            .local_branches
+            .iter()
+            .find(|b| b.name == "main")
+            .and_then(|b| b.worktree.as_ref())
+            .expect("main is checked out in a worktree");
+        let key = main_wt.path.to_string_lossy().into_owned();
+        let links = live
+            .linked_projects
+            .get(&key)
+            .expect("the main worktree has linked projects");
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].id, project.id);
+        assert_eq!(links[0].name, "alpha");
+
+        let dead = listings
+            .iter()
+            .find(|l| l.repo.root == gone_root)
+            .expect("the vanished repo still appears, marked unavailable");
+        assert!(
+            !dead.repo.available,
+            "a vanished repo degrades to an unavailable row, not a failed call"
+        );
+    }
+
+    #[tokio::test]
+    async fn aggregate_does_not_link_a_project_in_a_subfolder_of_a_worktree() {
+        // Decision 7: linking is exact path-match. A project whose directory is a
+        // *subfolder* of the worktree is not linked.
+        let (_cfg, state) = state_with_registries();
+        let repo = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        let subdir = repo.path().join("packages/app");
+        std::fs::create_dir_all(&subdir).unwrap();
+
+        // Track the repo, but create the project in a subfolder of it.
+        add_tracked_repo_impl(&state, repo.path().to_str().unwrap()).unwrap();
+        init_directory_impl(&state, subdir.to_str().unwrap())
+            .await
+            .unwrap();
+        create_project_impl(&state, "sub", subdir.to_str().unwrap()).unwrap();
+
+        let inputs = tracked_repos_inputs(&state);
+        let listings = list_tracked_repos_from_inputs(&inputs);
+        let canonical = repo.path().canonicalize().unwrap();
+        let repo_listing = listings
+            .iter()
+            .find(|l| l.repo.root == canonical)
+            .expect("the repo is listed");
+        assert!(
+            repo_listing.linked_projects.is_empty(),
+            "a project in a subfolder of the worktree is not linked (exact-match only)"
+        );
+    }
+
+    #[test]
+    fn read_tracked_repo_rejects_an_untracked_path() {
+        let (_cfg, state) = state_with_registries();
+        let repo = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        // Repo exists on disk but is NOT in the registry.
+        let inputs = tracked_repos_inputs(&state);
+        let listing = read_tracked_repo_from_inputs(repo.path().to_str().unwrap(), &inputs);
+        assert!(
+            !listing.repo.available,
+            "an untracked path must not return live git data"
+        );
+    }
+
+    #[test]
+    fn read_tracked_repo_accepts_a_path_inside_a_tracked_repo() {
+        let (_cfg, state) = state_with_registries();
+        let repo = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        add_tracked_repo_impl(&state, repo.path().to_str().unwrap()).unwrap();
+        let sub = repo.path().join("src");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        // A subdirectory of a tracked repo resolves to the tracked root and reads.
+        let inputs = tracked_repos_inputs(&state);
+        let listing = read_tracked_repo_from_inputs(sub.to_str().unwrap(), &inputs);
+        assert!(listing.repo.available);
+        assert_eq!(
+            listing.repo.root.canonicalize().unwrap(),
+            repo.path().canonicalize().unwrap()
         );
     }
 }

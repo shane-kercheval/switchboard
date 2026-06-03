@@ -14,6 +14,7 @@ import type {
   ProjectId,
   ProjectListing,
   ProjectSummary,
+  RepoListing,
   SendId,
   WorkspaceDirectories,
 } from "./types";
@@ -76,6 +77,32 @@ export async function listWorkspaceDirectories(): Promise<WorkspaceDirectories> 
 
 export async function createProject(name: string, directory: string): Promise<ProjectSummary> {
   return await invoke<ProjectSummary>("create_project", { name, directory });
+}
+
+// --- Git view ---------------------------------------------------------------
+
+// Track a repo in the Git view. Accepts any path inside a git repo (a
+// subdirectory or linked worktree resolves to the same canonical root and
+// dedups); rejects a non-git path so the caller can show an inline error.
+export async function addTrackedRepo(path: string): Promise<void> {
+  await invoke<null>("add_tracked_repo", { path });
+}
+
+// Untrack a repo. Registry-only — never touches files or the workspace.
+export async function removeTrackedRepo(path: string): Promise<void> {
+  await invoke<null>("remove_tracked_repo", { path });
+}
+
+// The aggregate Git-view read: every tracked repo's git read-model plus the
+// Switchboard projects linked to each worktree. One unreadable repo degrades to
+// an `available: false` row rather than failing the whole call.
+export async function listTrackedRepos(): Promise<RepoListing[]> {
+  return await invoke<RepoListing[]>("list_tracked_repos");
+}
+
+// Re-read a single tracked repo (per-repo refresh) without re-walking the rest.
+export async function readTrackedRepo(path: string): Promise<RepoListing> {
+  return await invoke<RepoListing>("read_tracked_repo", { path });
 }
 
 // Removes a directory from the workspace: drains its projects' in-flight turns,

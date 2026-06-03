@@ -216,6 +216,23 @@ pub enum AppError {
         #[source]
         source: ignore::Error,
     },
+
+    /// Git-view "Add Repo": the chosen path isn't inside any git repository, so
+    /// it can't be resolved to a repo root to track. The frontend surfaces this
+    /// inline ("not a git repository") on the add affordance.
+    #[error("{path} is not inside a git repository")]
+    NotAGitRepo { path: String },
+
+    /// Persisting the Git-view tracked-repo registry (`git-view.yaml`) failed.
+    /// Best-effort like [`WorkspacePersist`](Self::WorkspacePersist) — callers log
+    /// rather than abort — but a distinct variant so diagnostics name the right
+    /// file instead of mislabeling it as the workspace registry.
+    #[error("failed to persist git-view registry at {path}: {source}")]
+    GitRegistryPersist {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 impl AppError {

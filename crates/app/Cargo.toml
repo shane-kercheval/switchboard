@@ -38,6 +38,7 @@ futures.workspace = true
 tauri-plugin-clipboard-manager = "2.3.2"
 url = "2.5.8"
 ignore = "0.4.25"
+switchboard-git = { version = "0.0.1", path = "../git" }
 
 [dev-dependencies]
 tokio = { workspace = true }

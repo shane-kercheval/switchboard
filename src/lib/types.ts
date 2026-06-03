@@ -319,6 +319,78 @@ export type WorkspaceDirectories = {
   persistable: boolean;
 };
 
+// --- Git view (mirror of `switchboard_git` model + `crates/app` RepoListing) --
+// Branch-primary, two-level status (see the crate docs): branch-level signals on
+// BranchView/RemoteBranchView, worktree-level on WorktreeView. `null` fields are
+// the Rust `Option::None` ("couldn't determine") wire form.
+
+// Mirror of Rust `SyncState` (`#[serde(tag = "kind", rename_all = "snake_case")]`)
+// — a branch's position vs. its own upstream. `local_only` (never pushed) is
+// deliberately distinct from `unknown` (couldn't compute).
+export type SyncState =
+  | { kind: "in_sync" }
+  | { kind: "ahead"; commits: number }
+  | { kind: "behind"; commits: number }
+  | { kind: "diverged"; ahead: number; behind: number }
+  | { kind: "local_only" }
+  | { kind: "unknown" };
+
+export type WorktreeWarning = "orphaned" | "prunable";
+
+export type WorktreeView = {
+  path: string;
+  dirty: boolean;
+  untracked: boolean;
+  detached_hash: string | null;
+  warning: WorktreeWarning | null;
+};
+
+export type BranchView = {
+  name: string;
+  upstream: string | null;
+  sync: SyncState;
+  behind_base: number | null;
+  merged: boolean | null;
+  dangling: boolean;
+  worktree: WorktreeView | null;
+};
+
+// Remote branches carry only the cleanup signals (merged, behind_base) — the
+// local-branch fields are meaningless for a remote-tracking ref.
+export type RemoteBranchView = {
+  name: string;
+  merged: boolean | null;
+  behind_base: number | null;
+};
+
+export type RepoView = {
+  root: string;
+  name: string;
+  default_branch: string | null;
+  available: boolean;
+  is_bare: boolean;
+  local_branches: BranchView[];
+  remote_branches: RemoteBranchView[];
+  detached_worktrees: WorktreeView[];
+};
+
+// Mirror of Rust `LinkedProject` — a Switchboard project linked to a worktree by
+// exact path-match.
+export type LinkedProject = {
+  id: ProjectId;
+  name: string;
+  directory: string;
+};
+
+// Mirror of Rust `RepoListing`. `repo` is the git read-model verbatim;
+// `linked_projects` is a worktree-path → projects map joined at render time
+// (linking is computed on the backend, kept alongside rather than nested into
+// `RepoView`).
+export type RepoListing = {
+  repo: RepoView;
+  linked_projects: Record<string, LinkedProject[]>;
+};
+
 // Mirror of Rust `ProjectConversation` / `ConversationItem` / `OutcomeStatus` /
 // `AgentConversationMeta` (`crates/app/src/commands.rs`). The post-restart
 // unified history: the three `ConversationItem` kinds are disjoint sources

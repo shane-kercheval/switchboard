@@ -48,8 +48,11 @@ pub struct RepoView {
 
 impl RepoView {
     /// The non-error "this path can't be read as a repo" result: an empty,
-    /// clearly-marked view rather than a `GitError`.
-    pub(crate) fn unavailable(root: PathBuf, name: String) -> Self {
+    /// clearly-marked view rather than a `GitError`. Public so the command layer
+    /// can represent a tracked repo that errored or vanished as a still-visible
+    /// `available: false` row (partial-success aggregation) rather than dropping
+    /// it from the list.
+    pub fn unavailable(root: PathBuf, name: String) -> Self {
         Self {
             root,
             name,

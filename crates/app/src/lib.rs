@@ -7,6 +7,7 @@ mod commands;
 mod dispatch_context;
 mod emitter;
 mod error;
+mod git_registry;
 mod journal;
 mod metadata;
 mod state;
@@ -23,17 +24,19 @@ use tauri::{Emitter, Manager, State};
 
 use crate::commands::ProjectConversation;
 use crate::commands::{
-    AgentSessionInfo, DirectoryInfo, HarnessInstallStatus, ProjectListing, WorkspaceDirectories,
-    agent_session_info_impl, attach_agent_impl, cancel_agent_impl, cancel_send_impl,
-    cancel_turn_impl, check_antigravity_auth_impl, check_antigravity_binary_impl,
-    check_claude_auth_impl, check_claude_binary_impl, check_codex_auth_impl,
-    check_codex_binary_impl, check_gemini_auth_impl, check_gemini_binary_impl, create_agent_impl,
-    create_project_impl, get_harness_install_status_impl, init_directory_impl, list_agents_impl,
-    list_projects_impl, list_workspace_directories_impl, load_project_conversation_impl,
-    load_transcript_impl, open_project_impl, parse_uuid, pick_directory_impl, remove_agent_impl,
-    remove_directory_impl, remove_queued_message_impl, rename_agent_impl,
+    AgentSessionInfo, DirectoryInfo, HarnessInstallStatus, ProjectListing, RepoListing,
+    WorkspaceDirectories, add_tracked_repo_impl, agent_session_info_impl, attach_agent_impl,
+    cancel_agent_impl, cancel_send_impl, cancel_turn_impl, check_antigravity_auth_impl,
+    check_antigravity_binary_impl, check_claude_auth_impl, check_claude_binary_impl,
+    check_codex_auth_impl, check_codex_binary_impl, check_gemini_auth_impl,
+    check_gemini_binary_impl, create_agent_impl, create_project_impl,
+    get_harness_install_status_impl, init_directory_impl, list_agents_impl, list_projects_impl,
+    list_tracked_repos_from_inputs, list_workspace_directories_impl,
+    load_project_conversation_impl, load_transcript_impl, open_project_impl, parse_uuid,
+    pick_directory_impl, read_tracked_repo_from_inputs, remove_agent_impl, remove_directory_impl,
+    remove_queued_message_impl, remove_tracked_repo_impl, rename_agent_impl,
     search_project_files_in_root, search_project_files_root_impl, send_message_impl,
-    set_active_project_impl, validate_external_url,
+    set_active_project_impl, tracked_repos_inputs, validate_external_url,
 };
 use crate::state::AppState;
 
@@ -125,6 +128,42 @@ async fn list_workspace_directories(
     state: State<'_, AppState>,
 ) -> Result<WorkspaceDirectories, String> {
     Ok(list_workspace_directories_impl(state.inner()))
+}
+
+#[tauri::command]
+async fn add_tracked_repo(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    add_tracked_repo_impl(state.inner(), &path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn remove_tracked_repo(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    // Infallible by design — `Result` matches the idempotent-ack convention of
+    // the `cancel_*` commands. Registry persistence is best-effort and logged in
+    // `persist_git_registry`, deliberately not surfaced here.
+    remove_tracked_repo_impl(state.inner(), &path);
+    Ok(())
+}
+
+#[tauri::command]
+async fn list_tracked_repos(state: State<'_, AppState>) -> Result<Vec<RepoListing>, String> {
+    // Snapshot the cheap state-derived inputs on the async thread, then run the
+    // synchronous `git2` reads on a blocking worker (decision 8) so they don't
+    // stall the async runtime.
+    let inputs = tracked_repos_inputs(state.inner());
+    tauri::async_runtime::spawn_blocking(move || list_tracked_repos_from_inputs(&inputs))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn read_tracked_repo(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<RepoListing, String> {
+    let inputs = tracked_repos_inputs(state.inner());
+    tauri::async_runtime::spawn_blocking(move || read_tracked_repo_from_inputs(&path, &inputs))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -462,28 +501,50 @@ fn build_adapters() -> (
 /// cannot relocate the installed app's data.
 #[cfg(not(debug_assertions))]
 fn workspace_config_path() -> Option<std::path::PathBuf> {
-    directories::ProjectDirs::from("", "", "switchboard")
-        .map(|dirs| dirs.config_dir().join("workspace.yaml"))
+    user_config_path("workspace.yaml")
 }
 
 #[cfg(debug_assertions)]
 fn workspace_config_path() -> Option<std::path::PathBuf> {
-    debug_workspace_config_path(std::env::var_os("SWITCHBOARD_CONFIG_DIR"))
+    debug_user_config_path("workspace.yaml", std::env::var_os("SWITCHBOARD_CONFIG_DIR"))
 }
 
-/// Pure decision behind the debug arm of [`workspace_config_path`], split out so
+/// The Git-view tracked-repo registry (`git-view.yaml`) — a sibling of
+/// `workspace.yaml` in the same user-global config dir, resolved by the same
+/// mechanism so both move together (and the debug `SWITCHBOARD_CONFIG_DIR`
+/// override relocates both at once).
+#[cfg(not(debug_assertions))]
+fn git_registry_config_path() -> Option<std::path::PathBuf> {
+    user_config_path("git-view.yaml")
+}
+
+#[cfg(debug_assertions)]
+fn git_registry_config_path() -> Option<std::path::PathBuf> {
+    debug_user_config_path("git-view.yaml", std::env::var_os("SWITCHBOARD_CONFIG_DIR"))
+}
+
+/// Resolve `<os-config-dir>/switchboard/<file>` for release builds. `None` only
+/// when no home directory is resolvable (exotic host), in which case persistence
+/// of that file is disabled.
+#[cfg(not(debug_assertions))]
+fn user_config_path(file: &str) -> Option<std::path::PathBuf> {
+    directories::ProjectDirs::from("", "", "switchboard").map(|dirs| dirs.config_dir().join(file))
+}
+
+/// Pure decision behind the debug arm of the config-path resolvers, split out so
 /// the override mapping is testable without mutating process-global env (which
 /// is `unsafe` and racy under edition 2024). An explicit override is used
-/// verbatim; otherwise the shared `switchboard-dev` registry is the fallback.
+/// verbatim; otherwise the shared `switchboard-dev` dir is the fallback.
 #[cfg(debug_assertions)]
-fn debug_workspace_config_path(
+fn debug_user_config_path(
+    file: &str,
     override_dir: Option<std::ffi::OsString>,
 ) -> Option<std::path::PathBuf> {
     if let Some(dir) = override_dir {
-        return Some(std::path::PathBuf::from(dir).join("workspace.yaml"));
+        return Some(std::path::PathBuf::from(dir).join(file));
     }
     directories::ProjectDirs::from("", "", "switchboard-dev")
-        .map(|dirs| dirs.config_dir().join("workspace.yaml"))
+        .map(|dirs| dirs.config_dir().join(file))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -541,6 +602,14 @@ pub fn run() {
                 );
                 state
             };
+            // Load the Git-view tracked-repo registry from its sibling
+            // `git-view.yaml`. Same degradation: no resolvable location → empty,
+            // persistence disabled.
+            let state = if let Some(path) = git_registry_config_path() {
+                state.with_git_registry(path)
+            } else {
+                state
+            };
             // Cold start: open a `Directory` handle for every workspace entry so
             // restored directories report `available: true` and participate in
             // the cross-harness session-id collision scan. Unopenable
@@ -564,6 +633,10 @@ pub fn run() {
             remove_directory,
             list_projects,
             list_workspace_directories,
+            add_tracked_repo,
+            remove_tracked_repo,
+            list_tracked_repos,
+            read_tracked_repo,
             create_project,
             open_project,
             set_active_project,
@@ -592,14 +665,22 @@ pub fn run() {
 // in debug builds; `cargo test --release` turns those off and the symbol away.
 #[cfg(all(test, debug_assertions))]
 mod tests {
-    use super::debug_workspace_config_path;
+    use super::debug_user_config_path;
     use std::path::PathBuf;
 
     #[test]
-    fn override_dir_is_used_verbatim_with_workspace_yaml_appended() {
-        let path = debug_workspace_config_path(Some("/tmp/switchboard-test".into()))
+    fn override_dir_is_used_verbatim_with_file_appended() {
+        let path = debug_user_config_path("workspace.yaml", Some("/tmp/switchboard-test".into()))
             .expect("an explicit override always yields a path");
         assert_eq!(path, PathBuf::from("/tmp/switchboard-test/workspace.yaml"));
+        // The same override relocates the Git-view registry alongside it.
+        let git_path =
+            debug_user_config_path("git-view.yaml", Some("/tmp/switchboard-test".into()))
+                .expect("an explicit override always yields a path");
+        assert_eq!(
+            git_path,
+            PathBuf::from("/tmp/switchboard-test/git-view.yaml")
+        );
     }
 
     #[test]
@@ -607,7 +688,7 @@ mod tests {
         // Routes through `ProjectDirs`, which is `None` only on a host with no
         // resolvable home (not a dev machine or normal CI). Skip rather than
         // unwrap so an exotic host degrades quietly instead of panicking.
-        if let Some(path) = debug_workspace_config_path(None) {
+        if let Some(path) = debug_user_config_path("workspace.yaml", None) {
             assert!(path.ends_with("switchboard-dev/workspace.yaml"));
         }
     }

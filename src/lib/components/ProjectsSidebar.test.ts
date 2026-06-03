@@ -405,3 +405,64 @@ describe("ProjectsSidebar — rename", () => {
     expect(screen.queryByTestId("project-actions-trigger")).toBeNull();
   });
 });
+
+describe("ProjectsSidebar — delete", () => {
+  const A1 = "00000000-0000-7000-8000-0000000000d1";
+
+  async function openMenu(): Promise<void> {
+    await fireEvent.click(screen.getByTestId("project-actions-trigger"));
+    await screen.findByTestId("project-action-delete");
+  }
+
+  it("Delete swaps the menu to a confirm sub-view without calling the backend", async () => {
+    await renderWith([projectIn(A1, "alpha", "/work/a")]);
+    await openMenu();
+    await fireEvent.click(screen.getByTestId("project-action-delete"));
+
+    expect(screen.getByTestId("project-delete-prompt")).toBeInTheDocument();
+    expect(screen.getByTestId("project-delete-confirm")).toBeInTheDocument();
+    expect(screen.getByTestId("project-delete-cancel")).toBeInTheDocument();
+    // Live actions are gone mid-confirm; nothing dispatched yet.
+    expect(screen.queryByTestId("project-action-rename")).not.toBeInTheDocument();
+    expect(invokeMock).not.toHaveBeenCalledWith("delete_project", expect.anything());
+  });
+
+  it("confirming deletes through the backend and removes the row", async () => {
+    await renderWith([projectIn(A1, "alpha", "/work/a")]);
+    await openMenu();
+    await fireEvent.click(screen.getByTestId("project-action-delete"));
+    await fireEvent.click(screen.getByTestId("project-delete-confirm"));
+
+    expect(invokeMock).toHaveBeenCalledWith("delete_project", { projectId: A1 });
+    await waitFor(() => expect(screen.queryByTestId("project-row")).toBeNull());
+  });
+
+  it("cancel restores the menu without deleting", async () => {
+    await renderWith([projectIn(A1, "alpha", "/work/a")]);
+    await openMenu();
+    await fireEvent.click(screen.getByTestId("project-action-delete"));
+    await fireEvent.click(screen.getByTestId("project-delete-cancel"));
+
+    expect(await screen.findByTestId("project-action-delete")).toBeInTheDocument();
+    expect(screen.queryByTestId("project-delete-confirm")).not.toBeInTheDocument();
+    expect(invokeMock).not.toHaveBeenCalledWith("delete_project", expect.anything());
+    expect(screen.getByTestId("project-row")).toBeInTheDocument();
+  });
+
+  it("surfaces a backend failure and keeps the project", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "delete_project") throw new Error("disk busy");
+      return undefined;
+    });
+    await renderWith([projectIn(A1, "alpha", "/work/a")]);
+    await openMenu();
+    await fireEvent.click(screen.getByTestId("project-action-delete"));
+    await fireEvent.click(screen.getByTestId("project-delete-confirm"));
+
+    const err = await screen.findByTestId("project-delete-error");
+    expect(err).toHaveTextContent("disk busy");
+    // The row is kept, and the menu is back to its idle actions.
+    expect(screen.getByTestId("project-row")).toBeInTheDocument();
+    expect(screen.getByTestId("project-action-delete")).toBeInTheDocument();
+  });
+});

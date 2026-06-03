@@ -88,6 +88,14 @@ export async function renameProject(
   return await invoke<ProjectListing>("rename_project", { projectId, newName });
 }
 
+/// Permanently delete one project's Switchboard state: drains its agents and
+/// removes `<directory>/.switchboard/projects/<id>/` + its index entry. The
+/// working directory and each agent's own harness session files are kept.
+/// "Already gone" is benign success; a real I/O failure rejects.
+export async function deleteProject(projectId: ProjectId): Promise<void> {
+  await invoke("delete_project", { projectId });
+}
+
 // Removes a directory from the workspace: drains its projects' in-flight turns,
 // releases their locks, and drops the entry — leaving `.switchboard/` on disk.
 export async function removeDirectory(path: string): Promise<void> {

@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use switchboard_core::{CoreError, ProjectSummary};
+use switchboard_core::{CoreError, ProjectId, ProjectSummary};
 
 use crate::error::AppError;
 
@@ -74,6 +74,20 @@ impl Workspace {
             }
             entry.cached_projects = projects;
             return true;
+        }
+        false
+    }
+
+    /// Drop a single project id from `path`'s cached snapshot. Used on a delete
+    /// whose post-delete index re-read isn't available (e.g. the index file
+    /// vanished out-of-band), so the deleted project can't resurrect as a stale
+    /// cached row the next time `list_projects` falls back to the cache. No-op
+    /// (returns `false`) if `path` is unknown or the id wasn't cached.
+    pub fn remove_cached_project(&mut self, path: &Path, id: ProjectId) -> bool {
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.path == path) {
+            let before = entry.cached_projects.len();
+            entry.cached_projects.retain(|p| p.id != id);
+            return entry.cached_projects.len() != before;
         }
         false
     }
@@ -268,6 +282,25 @@ mod tests {
             !workspace.refresh_cache(Path::new("/unknown"), vec![summary("x")]),
             "an unknown path is never a change"
         );
+    }
+
+    #[test]
+    fn remove_cached_project_drops_one_id() {
+        let mut workspace = Workspace::default();
+        workspace.add(PathBuf::from("/a"));
+        let keep = summary("keep");
+        let drop = summary("drop");
+        workspace.refresh_cache(Path::new("/a"), vec![keep.clone(), drop.clone()]);
+
+        assert!(workspace.remove_cached_project(Path::new("/a"), drop.id));
+        assert_eq!(workspace.entries()[0].cached_projects, vec![keep]);
+        // Removing an absent id, or operating on an unknown path, is a no-op.
+        assert!(!workspace.remove_cached_project(Path::new("/a"), drop.id));
+        assert!(!workspace.remove_cached_project(Path::new("/unknown"), keep_id(&workspace)));
+    }
+
+    fn keep_id(workspace: &Workspace) -> uuid::Uuid {
+        workspace.entries()[0].cached_projects[0].id
     }
 
     #[test]

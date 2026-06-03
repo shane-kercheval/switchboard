@@ -222,6 +222,70 @@ impl Directory {
         Ok(updated)
     }
 
+    /// Permanently delete a project's Switchboard state: drop its
+    /// `projects.jsonl` entry, then recursively remove its `projects/<id>/`
+    /// directory (config, registry, journal, sessions, runs). **Scoped to
+    /// `projects_dir()`** — never the working directory, `.switchboard/` itself,
+    /// sibling projects, or any harness-native session file (`~/.claude/…`,
+    /// `~/.codex/…`, …). This is the rewrite-on-mutation path for the otherwise
+    /// append-only index, like rename.
+    ///
+    /// # Atomicity / ordering / failure model
+    ///
+    /// Index-rewrite first (**the commit**), then `remove_dir_all`. Dropping the
+    /// index entry is the point at which the project stops existing — once it
+    /// returns, the project no longer lists. The directory removal that follows
+    /// is **best-effort**: a leftover directory with no index entry is a benign,
+    /// unreachable orphan (its UUID is unrecoverable; `list_projects` never
+    /// surfaces it), exactly the tolerated state `create_project` leaves when its
+    /// post-directory index append fails. So a failed removal is **not** an
+    /// error here — surfacing one would imply "nothing was deleted," but the
+    /// listing is already gone. The reverse order (rmdir then index) is what we
+    /// avoid: a removed directory with a surviving index entry *would* surface as
+    /// a broken listing.
+    ///
+    /// The **only** failures this returns are reading or rewriting the index
+    /// (the steps that actually change what lists) — i.e. genuine "the project
+    /// could not be removed from the listing" conditions. A missing index file
+    /// (`MissingAppendOnlyFile`) is *not* such a failure: there's no entry to
+    /// drop, so we skip the rewrite and still remove the directory.
+    ///
+    /// # Idempotency
+    ///
+    /// A missing project is a benign no-op: if `id` isn't in the index the
+    /// rewrite is skipped, and a missing directory is ignored. A double-delete
+    /// (or deleting a project removed out-of-band) returns `Ok(())`.
+    ///
+    /// # Concurrency
+    ///
+    /// Same instance-level serialization requirement as `create_project`.
+    pub fn delete_project(&self, id: ProjectId) -> Result<()> {
+        // Tolerate a missing index file (`.switchboard/` present but
+        // `projects.jsonl` gone out-of-band): no entry to drop, but the project
+        // directory below must still be removed. A genuine read failure (I/O,
+        // corruption) propagates — we must not rewrite an index we couldn't
+        // read, or we'd lose sibling entries.
+        let mut summaries = match self.list_projects() {
+            Ok(summaries) => summaries,
+            Err(CoreError::MissingAppendOnlyFile { .. }) => Vec::new(),
+            Err(e) => return Err(e),
+        };
+        let before = summaries.len();
+        summaries.retain(|s| s.id != id);
+        // Rewrite only when an entry was actually dropped — a double-delete must
+        // not churn the index, and a never-existent id must not recreate it.
+        // This is the commit: once it returns Ok, the project no longer lists.
+        if summaries.len() != before {
+            write_jsonl(&self.projects_index_path(), &summaries)?;
+        }
+
+        // Best-effort directory removal (see "failure model" above): a failure
+        // leaves a benign orphan, not a surfaced error.
+        let root = self.projects_dir().join(id.to_string());
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
     /// Best-effort "last activity" timestamp for a project, used to order the
     /// cross-directory project list by recency. Returns the later of the
     /// project's conversation-journal modification time and `fallback`
@@ -563,6 +627,107 @@ mod tests {
         assert_eq!(
             directory.open_project(project.id).unwrap().config.name,
             "renamed"
+        );
+    }
+
+    #[test]
+    fn delete_project_drops_entry_and_removes_dir_keeping_siblings() {
+        let tmp = TempDir::new().unwrap();
+        let directory = Directory::at(tmp.path()).unwrap();
+        directory.init().unwrap();
+        let a = directory.create_project("alpha").unwrap();
+        let b = directory.create_project("beta").unwrap();
+
+        directory.delete_project(a.id).unwrap();
+
+        // Index drops only the deleted project; the sibling remains.
+        let listed = directory.list_projects().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, b.id);
+
+        // The deleted project's directory is gone; the sibling's is intact.
+        assert!(!a.root.exists());
+        assert!(b.root.exists());
+        // Delete stays inside projects/ — the directory's own config.yaml (a
+        // sibling of projects/, not under it) is untouched.
+        assert!(tmp.path().join(".switchboard").join(CONFIG_FILE).exists());
+    }
+
+    #[test]
+    fn delete_project_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let directory = Directory::at(tmp.path()).unwrap();
+        directory.init().unwrap();
+        let a = directory.create_project("alpha").unwrap();
+
+        directory.delete_project(a.id).unwrap();
+        // Re-deleting (entry already gone, dir already removed) is a clean no-op.
+        directory.delete_project(a.id).unwrap();
+        assert!(directory.list_projects().unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_project_unknown_id_is_noop() {
+        let tmp = TempDir::new().unwrap();
+        let directory = Directory::at(tmp.path()).unwrap();
+        directory.init().unwrap();
+        let a = directory.create_project("alpha").unwrap();
+
+        directory.delete_project(uuid::Uuid::now_v7()).unwrap();
+        // The unrelated project and its directory are untouched.
+        let listed = directory.list_projects().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, a.id);
+        assert!(a.root.exists());
+    }
+
+    #[test]
+    fn delete_project_with_missing_index_still_removes_dir() {
+        // The index file vanished out-of-band but the project directory remains:
+        // there's no entry to drop, yet the directory must still be removed (not
+        // stranded). Delete tolerates `MissingAppendOnlyFile` and proceeds.
+        let tmp = TempDir::new().unwrap();
+        let directory = Directory::at(tmp.path()).unwrap();
+        directory.init().unwrap();
+        let a = directory.create_project("alpha").unwrap();
+        std::fs::remove_file(directory.projects_index_path()).unwrap();
+
+        directory.delete_project(a.id).unwrap();
+        assert!(!a.root.exists(), "the project directory is removed");
+    }
+
+    // Unix-only: forces `remove_dir_all` to fail *after* the index commit by
+    // making the `projects/` parent unwritable, exercising the best-effort
+    // directory-removal contract — the index entry is dropped (committed) and a
+    // benign orphan directory is left, with no error surfaced.
+    #[cfg(unix)]
+    #[test]
+    fn delete_project_rmdir_failure_still_commits_index_and_leaves_orphan() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let directory = Directory::at(tmp.path()).unwrap();
+        directory.init().unwrap();
+        let a = directory.create_project("alpha").unwrap();
+
+        // Make `projects/` read-only so the final unlink of `projects/<id>`
+        // fails. `projects.jsonl` lives in the writable `.switchboard/`, so the
+        // index rewrite (the commit) still succeeds.
+        let projects_dir = directory.projects_dir();
+        std::fs::set_permissions(&projects_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        // Best-effort removal failure is not surfaced.
+        directory.delete_project(a.id).unwrap();
+
+        // Restore perms before asserting (and before TempDir cleanup).
+        std::fs::set_permissions(&projects_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // The index committed the removal (project no longer lists)…
+        assert!(directory.list_projects().unwrap().is_empty());
+        // …but the directory is a benign leftover orphan.
+        assert!(
+            a.root.exists(),
+            "a failed rmdir leaves the directory in place"
         );
     }
 

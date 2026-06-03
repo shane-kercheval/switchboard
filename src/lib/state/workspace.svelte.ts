@@ -339,6 +339,34 @@ export async function renameProject(projectId: ProjectId, newName: string): Prom
   projects.list = projects.list.map((p) => (p.id === projectId ? updated : p));
 }
 
+/// Permanently delete one project's Switchboard state. The backend drains its
+/// agents and removes its on-disk state (never the working directory or harness
+/// session files); on success we perform the matching **frontend lifecycle
+/// teardown** for that single project — the same set `removeDirectory` clears,
+/// scoped to one id — so a project id reused later (ids persist on disk) starts
+/// clean and no listeners/state leak. Errors propagate to the caller (the menu's
+/// inline confirm surfaces them and keeps the row).
+export async function deleteProject(projectId: ProjectId): Promise<void> {
+  // Snapshot the agent ids before the await — the roster is dropped below.
+  const removedAgentIds = (agentsByProject[projectId] ?? []).map((a) => a.id);
+
+  await api.deleteProject(projectId);
+
+  unregisterAgents(removedAgentIds);
+  projects.list = projects.list.filter((p) => p.id !== projectId);
+  delete agentsByProject[projectId];
+  delete conversations[projectId];
+  delete backgroundCompletedProjectIds[projectId];
+  delete projectActivityOverrides[projectId];
+  loadStarted.delete(projectId);
+  hydrationStarted.delete(projectId);
+  previousBusyProjectIds = previousBusyProjectIds.filter((id) => id !== projectId);
+  if (selection.activeProjectId === projectId) {
+    selection.activeProjectId = null;
+    selection.activationError = null;
+  }
+}
+
 /// Dismiss the auto-create failure banner for one harness.
 export function dismissAgentCreationFailure(harness: HarnessKind): void {
   const idx = agentCreationFailures.findIndex((f) => f.harness === harness);

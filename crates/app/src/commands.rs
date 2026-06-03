@@ -464,7 +464,7 @@ pub fn rename_project_impl(
     new_name: &str,
 ) -> Result<ProjectListing, AppError> {
     let _write = lock(&state.registry_write);
-    let directory = find_directory_for_project(state, project_id)?;
+    let directory = resolve_owning_directory(state, project_id)?;
     let summary = directory.rename_project(project_id, new_name)?;
 
     // Sync the in-memory `Project` (canonical name) if the project is loaded.
@@ -487,6 +487,108 @@ pub fn rename_project_impl(
         name: summary.name,
         created_at: summary.created_at,
     })
+}
+
+/// Permanently delete one project's Switchboard state. Mirrors
+/// `remove_directory_impl`'s two phases, scoped to a single project:
+///
+/// **(a)** With no locks held, drain every loaded agent in the project
+/// (`shutdown_agent` cancels any in-flight turn and waits) so no orphaned
+/// subprocess survives the removal.
+///
+/// **(b)** Under `registry_write`: drop the project's `instance.lock` handle (so
+/// the directory frees before removal on all platforms), delete the on-disk
+/// state via `Directory::delete_project`, then prune in-memory state (the
+/// `Project`, its cached agents, its `needs_session_meta` entries, and
+/// `active_project_id` if it pointed here) and refresh the workspace cache.
+///
+/// **Error policy (engineer-approved).** "Already gone" is benign success:
+/// - the project isn't resolvable in any loaded directory (`ProjectNotLoaded`
+///   from `find_directory_for_project`) → nothing on disk we can reach;
+/// - the directory's index file vanished out-of-band (`MissingAppendOnlyFile`)
+///   → the entry is effectively gone.
+///
+/// In both cases we still prune in-memory state and return `Ok`. Only a genuine
+/// failure to remove state that *is* present (a real I/O error on the rmdir, or
+/// a corrupt index we must not rewrite) surfaces as `Err` — and on that path we
+/// leave the in-memory maps intact so the row is kept and a retry can succeed.
+///
+/// **Not atomic across phases.** Phase (a) is irreversible (it cancels in-flight
+/// turns); a phase-(b) failure means work may have been cancelled even though
+/// the project remains. Same accepted trade-off as `remove_agent_impl`.
+pub async fn delete_project_impl(state: &AppState, project_id: ProjectId) -> Result<(), AppError> {
+    // Resolve the owning directory up front. If no loaded directory claims the
+    // id, there's nothing on disk we can reach — treat as already-gone and fall
+    // through to in-memory pruning.
+    let directory = match resolve_owning_directory(state, project_id) {
+        Ok(dir) => Some(dir),
+        Err(AppError::ProjectNotLoaded(_)) => None,
+        Err(e) => return Err(e),
+    };
+
+    // Phase (a): drain this project's loaded agents (only loaded projects have
+    // cached agents, so an unopened/unavailable project drains nothing). No lock
+    // is held across the await.
+    let agent_ids: Vec<AgentId> = lock(&state.agents_by_id)
+        .values()
+        .filter(|r| r.project_id == project_id)
+        .map(|r| r.id)
+        .collect();
+    for &agent_id in &agent_ids {
+        state
+            .dispatcher
+            .shutdown_agent(agent_id, CancelSource::Shutdown)
+            .await;
+    }
+
+    // Phase (b): synchronous under `registry_write`, no `.await`.
+    let _write = lock(&state.registry_write);
+
+    // Delete on disk first, *before* dropping the project's inter-process lock.
+    // `Directory::delete_project` only returns `Err` when it couldn't change
+    // what lists (index read/rewrite failure) — i.e. nothing was removed; a
+    // best-effort directory-removal failure is folded into `Ok` (benign orphan).
+    // So on `Err` we keep both the row and the lock (project stays safely owned
+    // and the delete is retryable). On unix `remove_dir_all` unlinks the in-dir
+    // `instance.lock` despite our held handle, so holding the lock across the
+    // removal is fine; a future Windows target would instead need
+    // drop-before-removal + re-acquire-on-failure.
+    if let Some(directory) = &directory {
+        directory.delete_project(project_id)?;
+    }
+
+    // Committed (or nothing was on disk to reach) — drop the now-stale lock and
+    // prune routable in-memory state, in the documented lock order.
+    lock(&state.project_locks).remove(&project_id);
+    lock(&state.projects).remove(&project_id);
+    {
+        let mut active = lock(&state.active_project_id);
+        if *active == Some(project_id) {
+            *active = None;
+        }
+    }
+    {
+        let mut needs = lock(&state.needs_session_meta);
+        needs.retain(|id| !agent_ids.contains(id));
+    }
+    lock(&state.agents_by_id).retain(|_, r| r.project_id != project_id);
+
+    // Keep the workspace cache from resurrecting the deleted project: refresh
+    // from a fresh index read when available, else drop just the deleted id from
+    // the cached snapshot (the index read can fail in the same out-of-band cases
+    // the delete tolerated, and `list_projects_impl` serves the cache on those).
+    if let Some(directory) = &directory {
+        match directory.list_projects() {
+            Ok(summaries) => {
+                lock(&state.workspace).refresh_cache(&directory.path, summaries);
+            }
+            Err(_) => {
+                lock(&state.workspace).remove_cached_project(&directory.path, project_id);
+            }
+        }
+    }
+    persist_workspace(state);
+    Ok(())
 }
 
 pub fn open_project_impl(
@@ -2459,6 +2561,28 @@ fn find_directory_for_project(
         }
     }
     Err(AppError::ProjectNotLoaded(project_id))
+}
+
+/// Resolve the owning `Directory` for `project_id`, preferring an in-memory
+/// lookup. A loaded project carries its canonical `directory` path, so we get
+/// the handle straight from `state.directories` without reading any index —
+/// which also means a transient index read error can't masquerade as "project
+/// not found" and ghost-delete a project whose files are actually present. Falls
+/// back to the on-disk index scan for an available-but-never-opened project.
+/// Returns `ProjectNotLoaded` only when no loaded directory claims the id.
+fn resolve_owning_directory(
+    state: &AppState,
+    project_id: ProjectId,
+) -> Result<Directory, AppError> {
+    let loaded_dir = lock(&state.projects)
+        .get(&project_id)
+        .map(|p| p.directory.clone());
+    if let Some(dir_path) = loaded_dir
+        && let Some(directory) = lock(&state.directories).get(&dir_path).cloned()
+    {
+        return Ok(directory);
+    }
+    find_directory_for_project(state, project_id)
 }
 
 fn lookup_agent(state: &AppState, agent_id: AgentId) -> Result<(Project, AgentRecord), AppError> {
@@ -5850,6 +5974,179 @@ mod tests {
         assert!(
             lock(&state.projects).get(&project.id).is_none(),
             "rename of an unopened project must not insert it into state.projects"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_project_removes_project_agents_lock_and_clears_active() {
+        let (tmp, state, _) = fresh_state_with_mock();
+        let (agent, project_id) = project_with_agent(&state, &tmp).await;
+
+        delete_project_impl(&state, project_id).await.unwrap();
+
+        // In-memory state for the project and its agent is gone.
+        assert!(lock(&state.projects).get(&project_id).is_none());
+        assert!(lock(&state.agents_by_id).get(&agent.id).is_none());
+        assert!(lock(&state.project_locks).get(&project_id).is_none());
+        // It was the active project → active is cleared.
+        assert!(lock(&state.active_project_id).is_none());
+        // Gone from disk too — the flat list no longer shows it.
+        assert!(list_projects_impl(&state).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_project_leaves_sibling_and_active_intact() {
+        let (tmp, state, _) = fresh_state_with_mock();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let a = create_project_in_only_dir(&state, "alpha");
+        let b = create_project_in_only_dir(&state, "beta");
+        set_active_project_impl(&state, b.id).unwrap();
+
+        delete_project_impl(&state, a.id).await.unwrap();
+
+        // The non-active sibling is untouched and still active.
+        assert_eq!(*lock(&state.active_project_id), Some(b.id));
+        assert!(lock(&state.projects).get(&b.id).is_some());
+        assert!(lock(&state.project_locks).get(&b.id).is_some());
+        // Only `alpha` is gone, on disk and in memory.
+        assert!(lock(&state.projects).get(&a.id).is_none());
+        let listed = list_projects_impl(&state).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, b.id);
+    }
+
+    #[tokio::test]
+    async fn delete_project_drains_in_flight_turn() {
+        // Phase (a) must cancel + drain a running turn before removal, with no
+        // deadlock (no `.await` under `registry_write`). The `AwaitCancellation`
+        // scenario parks the turn until the shutdown cancel fires.
+        let (tmp, state, emitter) =
+            fresh_state_with_scenario(switchboard_harness::MockScenario::AwaitCancellation);
+        let (agent, project_id) = project_with_agent(&state, &tmp).await;
+
+        send_msg(&state, agent.id, "long task").await.unwrap();
+        within(
+            &emitter,
+            "turn_start",
+            emitter.wait_for_type("turn_start", 1),
+        )
+        .await;
+
+        // Bounded: if delete failed to drain it would hang here and trip the
+        // timeout rather than deadlocking the suite.
+        within(&emitter, "delete drains the project", async {
+            delete_project_impl(&state, project_id).await.unwrap();
+        })
+        .await;
+
+        assert!(lock(&state.projects).get(&project_id).is_none());
+        assert!(lock(&state.agents_by_id).get(&agent.id).is_none());
+        let channel = format!("agent:{}", agent.id);
+        let cancelled = emitter.snapshot().into_iter().any(|(name, v)| {
+            name == channel && v["type"] == "turn_end" && v["outcome"]["status"] == "cancelled"
+        });
+        assert!(
+            cancelled,
+            "draining a deleted project cancels its in-flight turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_project_succeeds_when_not_yet_opened() {
+        // Available but never activated (not in `state.projects` / not locked):
+        // delete resolves the owning directory from the index and still removes
+        // the on-disk state.
+        let (tmp, state, _) = fresh_state_with_mock();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "alpha");
+        // Simulate "available, not opened": drop the loaded handle + lock.
+        lock(&state.projects).remove(&project.id);
+        lock(&state.project_locks).remove(&project.id);
+
+        delete_project_impl(&state, project.id).await.unwrap();
+        assert!(list_projects_impl(&state).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_project_unknown_id_is_benign_success() {
+        // No loaded directory owns the id (e.g. a stale row / already removed
+        // out-of-band) → benign success, not an error (engineer-approved policy).
+        let (tmp, state, _) = fresh_state_with_mock();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let keep = create_project_in_only_dir(&state, "alpha");
+
+        delete_project_impl(&state, Uuid::now_v7()).await.unwrap();
+
+        // The real project is untouched.
+        assert!(lock(&state.projects).get(&keep.id).is_some());
+        assert_eq!(list_projects_impl(&state).unwrap().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_project_keeps_row_and_lock_when_on_disk_delete_fails() {
+        // A real index-rewrite failure (the only thing core surfaces) must keep
+        // the project loaded AND keep its inter-process lock — never leave it
+        // routable-without-lock (the concurrency hazard).
+        use std::os::unix::fs::PermissionsExt;
+
+        let (tmp, state, _) = fresh_state_with_mock();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "alpha");
+
+        // Make `.switchboard/` read-only so `write_jsonl` (index rewrite) can't
+        // create its tmp file → core delete fails before the commit.
+        let sb = tmp.path().join(".switchboard");
+        std::fs::set_permissions(&sb, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let err = delete_project_impl(&state, project.id).await.unwrap_err();
+        assert!(matches!(err, AppError::Core(CoreError::Io { .. })));
+
+        std::fs::set_permissions(&sb, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Row kept, and crucially the lock is retained.
+        assert!(lock(&state.projects).get(&project.id).is_some());
+        assert!(lock(&state.project_locks).get(&project.id).is_some());
+    }
+
+    #[tokio::test]
+    async fn delete_project_with_missing_index_removes_dir_and_does_not_resurrect_from_cache() {
+        // Out-of-band missing index: the fast-path still resolves the loaded
+        // project's directory (no ghosting), core removes the directory, and the
+        // deleted id is dropped from the workspace cache so a later list can't
+        // serve it back from the stale snapshot.
+        let (tmp, state, _) = fresh_state_with_mock();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "alpha");
+        let root = lock(&state.projects)
+            .get(&project.id)
+            .map(|p| p.root.clone())
+            .unwrap();
+        // Prime the cache, then remove the index out-of-band.
+        let _ = list_projects_impl(&state).unwrap();
+        let canonical = tmp.path().canonicalize().unwrap();
+        std::fs::remove_file(canonical.join(".switchboard").join("projects.jsonl")).unwrap();
+
+        delete_project_impl(&state, project.id).await.unwrap();
+
+        // The directory was actually removed (fast-path resolved it, not ghosted)…
+        assert!(!root.exists());
+        // …and the project does not reappear from the cached snapshot.
+        assert!(
+            list_projects_impl(&state)
+                .unwrap()
+                .iter()
+                .all(|p| p.id != project.id)
         );
     }
 

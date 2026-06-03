@@ -70,12 +70,15 @@ Switchboard-managed state lives in a `.switchboard/` directory at the working di
     ├── config.yaml             # directory-level config (placeholder in v1; mostly empty)
     ├── workflows/              # workflow definitions (YAML), shared across projects in this directory
     ├── prompts/                # local prompts (markdown body + YAML frontmatter), shared across projects
-    ├── projects.jsonl          # append-only index of projects: { id, name, created_at }
+    ├── projects.jsonl          # index of projects: { id, name, created_at } — appended on
+    │                           #   create, rewritten in place on rename/delete
+    │                           #   (like registry.jsonl)
     └── projects/
         └── <project-id>/       # per-project state (one subdirectory per project)
             ├── config.yaml     # per-project config
             ├── instance.lock   # M4+ flock — one Switchboard process per project at a time
-            ├── registry.jsonl  # agent registry for this project (append-only)
+            ├── registry.jsonl  # agent registry for this project (appended on
+            │                   #   register, rewritten on rename/remove)
             ├── sessions/       # per-agent stream-only-metadata cache
             │                   #   (<agent-id>.meta.json — restart continuity).
             │                   #   All harnesses' session identity lives on the
@@ -88,7 +91,8 @@ Switchboard-managed state lives in a `.switchboard/` directory at the working di
 ├── config.yaml                 # personal preferences (prompt library location, accounts)
 ├── prompts/                    # optional personal prompt library (see §6)
 └── workspace.yaml              # app-managed: the working directories the user works across,
-                                #   each with a cached snapshot of its projects
+                                #   each with a cached snapshot of its projects, plus the
+                                #   user-global set of archived project ids (view-state)
 ```
 
 Switchboard is **single-instance**: launching it again focuses the running window rather than starting a second process, so there is exactly one writer of `workspace.yaml`. The per-project `instance.lock` (below) remains as defense-in-depth for the pathological case of two processes (e.g. a dev build alongside the bundled app); multi-window is out of scope for v1.
@@ -101,7 +105,9 @@ The directory-level `config.yaml`, `workflows/`, and `prompts/` are intended to 
 
 Each working directory owns its projects: the source of truth for a directory's projects and their state is that directory's own `.switchboard/`, so a directory is self-contained and travels with its git repo. Switchboard tracks the set of working directories the user works across in a user-global `workspace.yaml` and presents the projects from all of them as a single flat list — the user opens Switchboard and sees every project across every directory at once, each labelled with its directory, without choosing a directory first.
 
-`workspace.yaml` records, per directory, its path and a cached snapshot of its projects (each the project's `{ id, name, created_at }`, so an unavailable directory's rows keep their identity and ordering). The cache lets the flat list render even when a directory is temporarily unavailable (unmounted, moved, or deleted): its projects appear marked unavailable with a remove action, rather than silently vanishing. The cache is refreshed from a directory's `.switchboard/` whenever that directory is read successfully **and** after any project create/rename in it — the directory's own state always wins, and the cache is consulted only when the directory can't be read. Projects are addressed by their globally-unique `ProjectId`; each carries its owning directory for routing (the agent spawn cwd) and labelling.
+`workspace.yaml` records, per directory, its path and a cached snapshot of its projects (each the project's `{ id, name, created_at }`, so an unavailable directory's rows keep their identity and ordering). The cache lets the flat list render even when a directory is temporarily unavailable (unmounted, moved, or deleted): its projects appear marked unavailable with a remove action, rather than silently vanishing. The cache is refreshed from a directory's `.switchboard/` whenever that directory is read successfully **and** after any project create/rename/delete in it — the directory's own state always wins, and the cache is consulted only when the directory can't be read. Projects are addressed by their globally-unique `ProjectId`; each carries its owning directory for routing (the agent spawn cwd) and labelling.
+
+`workspace.yaml` also holds a user-global **set of archived project ids** — *view-state* (which projects are hidden from the default list), deliberately kept here rather than on the project's own files. Because it lives in user-global state, archiving works even when the project's directory is offline (it never writes the directory) and never interferes with a running agent; the trade-off is that archived-ness is per-install rather than travelling with the project (acceptable — the project's runtime state is `.gitignore`d anyway).
 
 Adding a directory appends it to `workspace.yaml`; removing one drops its entry and leaves the directory's on-disk `.switchboard/` untouched (re-adding the directory restores its projects — removing from the workspace is not deletion). Re-pointing a moved directory to a new path is a planned affordance.
 
@@ -118,7 +124,13 @@ The two sources **partition** cleanly (no correlation or de-dup between them): a
 
 **Project name uniqueness within a directory** uses the same canonicalization as agent names (per §4 Primitive 1): hyphens normalized to underscores, lowercased, for the uniqueness check only — `feature-a` and `feature_a` collide; `feature-A` and `feature-a` collide. Stored verbatim as the user typed.
 
-**Deletion in v1.** Project and agent deletion are deliberately out of scope for v1. No UI affordance, no command-level deletion API, no canonical deletion semantics are defined. Users may manually edit `.switchboard/` state at their own risk (the file formats are documented), but this is not a supported workflow — first-class deletion semantics (cascade behavior, in-flight flock handling, append-only-vs-tombstone, history retention) will be specified when the feature is added. Tracked: M4 may add project deletion via the project switcher; agent deletion is unscheduled.
+**Project lifecycle — rename, delete, archive.** A project can be renamed, archived (hidden from the default list, reversible), or deleted from the projects sidebar's per-project menu. The sidebar lists projects under an `Active | Archived` toggle and a name/directory search filter.
+
+- **Rename** changes the display name in place (same per-directory uniqueness rules as agent names), dual-writing the canonical `config.yaml` and the `projects.jsonl` index entry.
+- **Archive/unarchive** flips the user-global view-state above; it is display-only — it never stops a running agent or touches the project's files, and works for offline directories.
+- **Delete** is hard and irreversible: it drains the project's agents, then removes `<directory>/.switchboard/projects/<id>/` (config, registry, journal, sessions, runs) and its `projects.jsonl` entry. It **never** touches the working directory, `.switchboard/` itself, sibling projects, or harness-native session files (`~/.claude/…`, `~/.codex/…`) — so each agent's own session history survives; only the journal's failed/cancelled outcome markers are genuinely lost. The index-entry removal is the commit (the project stops listing); the directory removal is best-effort, leaving a benign unreachable orphan on the rare failure rather than surfacing an error.
+
+Agent-level deletion (remove/reset from the agent context menu) is the shipped `remove_agent`; broader history-retention/tombstone semantics remain unspecified and out of scope.
 
 ## 4. Functional primitives
 

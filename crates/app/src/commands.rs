@@ -534,11 +534,11 @@ pub fn set_project_archived_impl(
 /// (`shutdown_agent` cancels any in-flight turn and waits) so no orphaned
 /// subprocess survives the removal.
 ///
-/// **(b)** Under `registry_write`: drop the project's `instance.lock` handle (so
-/// the directory frees before removal on all platforms), delete the on-disk
-/// state via `Directory::delete_project`, then prune in-memory state (the
-/// `Project`, its cached agents, its `needs_session_meta` entries, and
-/// `active_project_id` if it pointed here) and refresh the workspace cache.
+/// **(b)** Under `registry_write`: delete the on-disk state via
+/// `Directory::delete_project`, then drop the stale `instance.lock` handle and
+/// prune in-memory state (the `Project`, its cached agents, its
+/// `needs_session_meta` entries, and `active_project_id` if it pointed here)
+/// and refresh the workspace cache.
 ///
 /// **Error policy (engineer-approved).** "Already gone" is benign success:
 /// - the project isn't resolvable in any loaded directory (`ProjectNotLoaded`
@@ -546,10 +546,12 @@ pub fn set_project_archived_impl(
 /// - the directory's index file vanished out-of-band (`MissingAppendOnlyFile`)
 ///   → the entry is effectively gone.
 ///
-/// In both cases we still prune in-memory state and return `Ok`. Only a genuine
-/// failure to remove state that *is* present (a real I/O error on the rmdir, or
-/// a corrupt index we must not rewrite) surfaces as `Err` — and on that path we
-/// leave the in-memory maps intact so the row is kept and a retry can succeed.
+/// In both cases we still prune in-memory state and return `Ok`. The directory
+/// removal is best-effort after the index rewrite commits: a removal failure
+/// leaves a benign, unlisted orphan. Only a genuine failure to update what lists
+/// (such as an unreadable or corrupt index we must not rewrite) surfaces as
+/// `Err` — and on that path we leave the in-memory maps intact so the row is
+/// kept and a retry can succeed.
 ///
 /// **Not atomic across phases.** Phase (a) is irreversible (it cancels in-flight
 /// turns); a phase-(b) failure means work may have been cancelled even though

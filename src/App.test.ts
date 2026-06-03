@@ -146,6 +146,7 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
         directory: args?.directory as string,
         available: true,
         last_activity: "2026-05-20T00:00:00Z",
+        archived: false,
       };
       backend.projects.push(row);
       backend.rosters.set(id, []);
@@ -246,6 +247,7 @@ function listing(
     created_at: "2026-05-20T00:00:00Z",
     available: true,
     last_activity: "2026-05-20T00:00:00Z",
+    archived: false,
     ...over,
   };
 }

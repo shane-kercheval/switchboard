@@ -31,15 +31,16 @@ use crate::commands::{
     cancel_agent_impl, cancel_send_impl, cancel_turn_impl, check_antigravity_auth_impl,
     check_antigravity_binary_impl, check_claude_auth_impl, check_claude_binary_impl,
     check_codex_auth_impl, check_codex_binary_impl, check_gemini_auth_impl,
-    check_gemini_binary_impl, create_agent_impl, create_project_impl, editor_open_argv,
-    fetch_repo_impl, get_harness_install_status_impl, get_preferences_impl, init_directory_impl,
-    list_agents_impl, list_projects_impl, list_tracked_repos_from_inputs,
+    check_gemini_binary_impl, create_agent_impl, create_project_impl, delete_project_impl,
+    editor_open_argv, fetch_repo_impl, get_harness_install_status_impl, get_preferences_impl,
+    init_directory_impl, list_agents_impl, list_projects_impl, list_tracked_repos_from_inputs,
     list_workspace_directories_impl, load_project_conversation_impl, load_transcript_impl,
     open_project_impl, parse_uuid, pick_directory_impl, read_tracked_repo_from_inputs,
     remove_agent_impl, remove_directory_impl, remove_queued_message_impl, remove_tracked_repo_impl,
-    rename_agent_impl, reveal_in_finder_argv, search_project_files_in_root,
+    rename_agent_impl, rename_project_impl, reveal_in_finder_argv, search_project_files_in_root,
     search_project_files_root_impl, send_message_impl, set_active_project_impl,
-    set_preferences_impl, terminal_open_argv, tracked_repos_inputs, validate_external_url,
+    set_preferences_impl, set_project_archived_impl, terminal_open_argv, tracked_repos_inputs,
+    validate_external_url,
 };
 use crate::preferences::Preferences;
 use crate::state::AppState;
@@ -197,6 +198,34 @@ async fn create_project(
     directory: String,
 ) -> Result<ProjectSummary, String> {
     create_project_impl(state.inner(), &name, &directory).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn rename_project(
+    state: State<'_, AppState>,
+    project_id: String,
+    new_name: String,
+) -> Result<ProjectListing, String> {
+    let id = parse_uuid(&project_id).map_err(|e| e.to_string())?;
+    rename_project_impl(state.inner(), id, &new_name).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn delete_project(state: State<'_, AppState>, project_id: String) -> Result<(), String> {
+    let id = parse_uuid(&project_id).map_err(|e| e.to_string())?;
+    delete_project_impl(state.inner(), id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn set_project_archived(
+    state: State<'_, AppState>,
+    project_id: String,
+    archived: bool,
+) -> Result<(), String> {
+    let id = parse_uuid(&project_id).map_err(|e| e.to_string())?;
+    set_project_archived_impl(state.inner(), id, archived).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -619,6 +648,32 @@ fn debug_user_config_path(
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+/// Attach the user-global persistence locations to a fresh `AppState`. Each is
+/// independently optional: if a location can't be resolved (exotic host with no
+/// home dir), that registry/preferences set stays in-memory only and its persist
+/// is a no-op — safe because all three are convenience state, never load-bearing.
+fn with_persistence_paths(state: AppState) -> AppState {
+    // `workspace.yaml` — the cross-directory project registry.
+    let state = if let Some(path) = workspace_config_path() {
+        state.with_workspace(path)
+    } else {
+        tracing::warn!("no home directory resolved — workspace registry persistence disabled");
+        state
+    };
+    // `git-view.yaml` — the Git-view tracked-repo registry.
+    let state = if let Some(path) = git_registry_config_path() {
+        state.with_git_registry(path)
+    } else {
+        state
+    };
+    // `config.yaml` — personal preferences.
+    if let Some(path) = preferences_config_path() {
+        state.with_preferences(path)
+    } else {
+        state
+    }
+}
+
 pub fn run() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
@@ -661,33 +716,7 @@ pub fn run() {
                 Arc::clone(&antigravity_adapter),
                 emitter,
             );
-            // Resolve the user-global `workspace.yaml` location. If no home
-            // directory is resolvable (exotic host), skip workspace persistence
-            // entirely — the registry stays empty and `persist_workspace` is a
-            // no-op, which is safe since the registry is convenience state.
-            let state = if let Some(path) = workspace_config_path() {
-                state.with_workspace(path)
-            } else {
-                tracing::warn!(
-                    "no home directory resolved — workspace registry persistence disabled"
-                );
-                state
-            };
-            // Load the Git-view tracked-repo registry from its sibling
-            // `git-view.yaml`. Same degradation: no resolvable location → empty,
-            // persistence disabled.
-            let state = if let Some(path) = git_registry_config_path() {
-                state.with_git_registry(path)
-            } else {
-                state
-            };
-            // Load personal preferences (`config.yaml`). No resolvable location →
-            // defaults this session, saves are no-ops.
-            let state = if let Some(path) = preferences_config_path() {
-                state.with_preferences(path)
-            } else {
-                state
-            };
+            let state = with_persistence_paths(state);
             // Cold start: open a `Directory` handle for every workspace entry so
             // restored directories report `available: true` and participate in
             // the cross-harness session-id collision scan. Unopenable
@@ -719,6 +748,9 @@ pub fn run() {
             get_preferences,
             set_preferences,
             create_project,
+            rename_project,
+            delete_project,
+            set_project_archived,
             open_project,
             set_active_project,
             create_agent,

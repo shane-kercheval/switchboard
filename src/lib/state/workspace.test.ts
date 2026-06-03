@@ -25,6 +25,7 @@ function project(id: string, lastActivity: string): ProjectListing {
     directory: `/work/${id.slice(-2)}`,
     available: true,
     last_activity: lastActivity,
+    archived: false,
   };
 }
 

@@ -7,10 +7,13 @@
   type Props = {
     title: string;
     action?: Snippet;
+    /// Optional content pinned between the header and the scrollable body (e.g.
+    /// a filter/search input that should stay put while the list scrolls).
+    subheader?: Snippet;
     children: Snippet;
   };
 
-  let { title, action, children }: Props = $props();
+  let { title, action, subheader, children }: Props = $props();
 </script>
 
 <div class="flex min-h-0 flex-1 flex-col">
@@ -22,6 +25,11 @@
       {@render action()}
     {/if}
   </div>
+  {#if subheader}
+    <div class="shrink-0">
+      {@render subheader()}
+    </div>
+  {/if}
   <div class="flex-1 overflow-y-auto">
     {@render children()}
   </div>

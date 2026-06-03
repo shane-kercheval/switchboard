@@ -592,7 +592,9 @@
                 class="relative flex h-8 w-8 shrink-0 items-center justify-end transition-[width] group-hover:w-[var(--agent-action-width)]"
                 style={`--agent-action-width: ${agentActionWidth(actionCount)}`}
               >
-                <div class="absolute top-1/2 right-0 -translate-y-1/2 transition-opacity group-hover:opacity-0">
+                <div
+                  class="absolute top-1/2 right-0 -translate-y-1/2 transition-opacity group-hover:opacity-0"
+                >
                   <HarnessIcon harness={agent.harness} size="md" testid="agent-harness-icon" />
                 </div>
                 <div

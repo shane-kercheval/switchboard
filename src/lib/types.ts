@@ -225,11 +225,6 @@ export type ReducerInput = NormalizedEvent | HeartbeatTimeout | Hydrate;
 // Internal state types (Turn, AgentRuntime, etc.) live in
 // `src/lib/state/types.ts`. This file is wire-format-only.
 
-// Mirror of `crates/core::AgentRecord`. `session_id` is `null` for harnesses
-// that assign their own session ID (Codex and Antigravity — set to `null`
-// for life; the per-agent session-link sidecar is the system-of-record for
-// the captured conversation UUID); for Claude Code and Gemini it's
-// pre-generated at registration time.
 export type HarnessKind = "claude_code" | "codex" | "gemini" | "antigravity";
 
 /// State of the `which`-on-PATH binary probe for a single harness.
@@ -274,12 +269,24 @@ export type HarnessInstallStatus = {
   version: string | null;
 };
 
+/// Mirror of the Rust `SessionLocator` (externally tagged enum) — the identity
+/// Switchboard uses to find and resume a harness's conversation. Most harnesses
+/// identify a session by one UUID (`{ uuid }`); Codex needs a thread-id string
+/// plus the local date its rollout file is partitioned under (`{ codex }`).
+export type SessionLocator =
+  | { uuid: string }
+  | { codex: { thread_id: string; partition_date: string } };
+
+// Mirror of `crates/core::AgentRecord`. `session_locator` is `null` for
+// harnesses that assign their own session id at runtime (Codex and Antigravity)
+// until the first dispatch captures it; for Claude Code and Gemini it's
+// pre-generated at registration time as a `{ uuid }` locator.
 export type AgentRecord = {
   id: AgentId;
   project_id: ProjectId;
   name: string;
   harness: HarnessKind;
-  session_id: string | null;
+  session_locator: SessionLocator | null;
   created_at: string;
 };
 

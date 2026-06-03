@@ -134,40 +134,6 @@ pub enum AppError {
         paths: Vec<PathBuf>,
     },
 
-    /// Attach-flow (Codex only): registering the `AgentRecord` succeeded but
-    /// writing the per-agent session-link sidecar failed. The
-    /// `AgentRecord` is already in the registry; until the user retries the
-    /// attach (or the sidecar appears via some other path), this Codex
-    /// agent will look like a fresh-spawn to the adapter.
-    #[error(transparent)]
-    Sidecar(#[from] switchboard_harness::codex::sidecar::SidecarError),
-
-    /// Attach-flow (Antigravity): the per-agent session-link sidecar write
-    /// failed during attach. Same consequence as the Codex case — the
-    /// attached agent would look like a fresh-spawn (new server conversation)
-    /// on its first dispatch instead of resuming the attached one.
-    #[error(transparent)]
-    AntigravitySidecar(#[from] switchboard_harness::antigravity::sidecar::SidecarError),
-
-    /// Attach-flow: the cross-project collision scan tripped over an
-    /// unrelated agent's corrupt sidecar. Per the Switchboard-owned-JSONL
-    /// loud-fail invariant in `AGENTS.md`, corruption must surface rather
-    /// than be skipped (which could let a duplicate attach through and
-    /// violate the same-session-uniqueness contract). Wrapped instead of
-    /// re-using `Sidecar` so the user-facing message can call out that
-    /// the failure is about a *different* agent's state, not the session
-    /// they're trying to attach.
-    #[error(
-        "cannot scan for session collisions: sidecar at {path} is corrupt — repair or remove before retrying attach"
-    )]
-    AttachBlockedByCorruption {
-        path: PathBuf,
-        // Boxed because the collision scan reads Codex *or* Antigravity
-        // sidecars, whose error types differ.
-        #[source]
-        source: Box<dyn std::error::Error + Send + Sync + 'static>,
-    },
-
     /// Attach-flow: catch-all for future `AttachLookupError` variants we
     /// don't yet know how to surface specifically. The Codex date-scan
     /// helper is `#[non_exhaustive]`; this lands a useful message rather
@@ -193,22 +159,6 @@ pub enum AppError {
     /// not surface here.
     #[error(transparent)]
     LoadTranscript(#[from] switchboard_harness::LoadTranscriptError),
-
-    /// Transcript hydration tripped over a corrupt per-agent sidecar (Codex or
-    /// Antigravity — both store the harness session link as Switchboard-owned
-    /// JSONL). Parallel to [`AppError::AttachBlockedByCorruption`] but specific
-    /// to the hydration call path. Per the AGENTS.md fail-loud invariant on our
-    /// own files, corruption must surface rather than degrade to "agent has no
-    /// history." Source is boxed because the two harnesses' sidecar error types
-    /// are distinct.
-    #[error(
-        "cannot hydrate transcript: sidecar at {path} is corrupt — repair or remove before retrying"
-    )]
-    HydrationBlockedByCorruption {
-        path: PathBuf,
-        #[source]
-        source: Box<dyn std::error::Error + Send + Sync + 'static>,
-    },
 
     /// Project-file search could not walk the loaded project tree. The
     /// frontend degrades this to "File search unavailable" instead of showing

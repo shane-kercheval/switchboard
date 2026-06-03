@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use futures::StreamExt;
-use switchboard_core::{AgentRecord, HarnessKind};
+use switchboard_core::{AgentRecord, HarnessKind, SessionLocator};
 use switchboard_harness::{
     AdapterEvent, CodexAdapter, DispatchOptions, FailureKind, HarnessAdapter, ToolKind, TurnOutcome,
 };
@@ -32,10 +32,54 @@ fn codex_agent() -> AgentRecord {
         project_id: Uuid::now_v7(),
         name: "test-codex".to_owned(),
         harness: HarnessKind::Codex,
-        // Codex agents always have session_id = None.
-        session_id: None,
+        // A fresh Codex agent has no locator until its first dispatch captures one.
+        session_locator: None,
         created_at: chrono::Utc::now(),
     }
+}
+
+/// A Codex agent resuming an existing session — its locator is already on the
+/// record (as the dispatcher's live-read factory would supply it after a prior
+/// capture).
+fn codex_agent_resuming(thread_id: &str, partition_date: chrono::NaiveDate) -> AgentRecord {
+    AgentRecord {
+        session_locator: Some(SessionLocator::Codex {
+            thread_id: thread_id.to_owned(),
+            partition_date,
+        }),
+        ..codex_agent()
+    }
+}
+
+/// The Codex locator carried by the dispatch's capture event, or `None` if it
+/// emitted none (a resume). Asserts at most one capture per dispatch.
+fn captured_codex(events: &[AdapterEvent]) -> Option<(String, chrono::NaiveDate)> {
+    let mut captures = events.iter().filter_map(|e| match e {
+        AdapterEvent::SessionLocatorCaptured {
+            locator:
+                SessionLocator::Codex {
+                    thread_id,
+                    partition_date,
+                },
+        } => Some((thread_id.clone(), *partition_date)),
+        _ => None,
+    });
+    let first = captures.next();
+    assert!(
+        captures.next().is_none(),
+        "a dispatch must emit at most one SessionLocatorCaptured event"
+    );
+    first
+}
+
+fn outcome_of(events: &[AdapterEvent]) -> &TurnOutcome {
+    events
+        .iter()
+        .find_map(|e| match e {
+            AdapterEvent::TurnEnd { outcome, .. } => Some(outcome),
+            _ => None,
+        })
+        .expect("a TurnEnd event")
 }
 
 /// Dispatch the agent at the `fake_codex` binary with the named fixture as
@@ -227,12 +271,17 @@ async fn errored_fixture_unwraps_json_encoded_message() {
 }
 
 #[tokio::test]
-async fn first_dispatch_writes_sidecar_with_captured_thread_id() {
+async fn first_dispatch_emits_captured_locator_with_thread_id() {
     let tmp = tempfile::TempDir::new().unwrap();
     let agent = codex_agent();
-    let _ = dispatch_fixture(&agent, tmp.path(), &fixture("text-only")).await;
+    let events = dispatch_fixture(&agent, tmp.path(), &fixture("text-only")).await;
 
-    // Sidecar path: <cwd>/.switchboard/projects/<project-id>/sessions/<agent-id>.jsonl
+    // The capture event carries the thread_id from the fixture's thread.started;
+    // the dispatcher persists it to the registry (no sidecar written here).
+    let (thread_id, _date) =
+        captured_codex(&events).expect("first dispatch emits a captured Codex locator");
+    assert_eq!(thread_id, "00000000-0000-7000-8000-000000000001");
+
     let sidecar = tmp
         .path()
         .join(".switchboard")
@@ -241,135 +290,64 @@ async fn first_dispatch_writes_sidecar_with_captured_thread_id() {
         .join("sessions")
         .join(format!("{}.jsonl", agent.id));
     assert!(
-        sidecar.is_file(),
-        "sidecar must be created on first dispatch"
+        !sidecar.exists(),
+        "the adapter no longer writes a session-link sidecar"
     );
-
-    let content = std::fs::read_to_string(&sidecar).unwrap();
-    let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
-    assert_eq!(lines.len(), 1, "exactly one record after first dispatch");
-    // Fixture's thread_id is 00000000-0000-7000-8000-000000000001.
-    assert!(
-        lines[0].contains("00000000-0000-7000-8000-000000000001"),
-        "captured thread_id should land in the record, got: {}",
-        lines[0]
-    );
-    // Sanity: shape includes the sidecar schema fields.
-    assert!(lines[0].contains("session_id"));
-    assert!(lines[0].contains("session_partition_date"));
-    assert!(lines[0].contains("started_at"));
 }
 
 #[tokio::test]
 async fn first_dispatch_captures_local_date_not_utc() {
     // Pins the date-partition contract: Codex partitions session files by
-    // **local** date, so `try_persist_sidecar` captures
-    // `chrono::Local::now().date_naive()` (not `Utc::now()`). For hosts
-    // whose local date differs from UTC at sidecar write time (any user
-    // west of UTC after ~16:00 local, or east of UTC before ~08:00), a
-    // regression to `Utc::now()` surfaces here.
+    // **local** date, so the captured locator stamps
+    // `chrono::Local::now().date_naive()` (not `Utc::now()`). For hosts whose
+    // local date differs from UTC at capture time (any user west of UTC after
+    // ~16:00 local, or east of UTC before ~08:00), a regression to `Utc::now()`
+    // surfaces here.
     //
-    // **Detection is timezone-conditional.** On hosts where local date
-    // equals UTC date (CI at UTC; users at UTC) `Local::now() == Utc::now()`
-    // collapses the two paths, and a reverted-to-`Utc::now()` regression
-    // would pass this test. Clock-injection is the proper fix; deferred.
-    // For now this test is a developer-machine drift catcher (which is
-    // where `make test-live` runs anyway) plus a JSON-field-name pin.
+    // **Detection is timezone-conditional.** On hosts where local date equals
+    // UTC date (CI at UTC; users at UTC) `Local::now() == Utc::now()` collapses
+    // the two paths, and a reverted-to-`Utc::now()` regression would pass this
+    // test. Clock-injection is the proper fix; deferred. For now this is a
+    // developer-machine drift catcher (where `make test-live` runs anyway).
     //
-    // The acceptance window is `[local_before, local_after]` — a dispatch
-    // that legitimately straddles local midnight may write either date.
-    // Accepting arbitrary "yesterday" would be too loose: a `Utc::now()`
-    // regression on a UTC+N host during early-morning hours can produce
-    // yesterday-local while local-today is the right answer, and the
-    // before/after window correctly rejects that case.
+    // The acceptance window is `[local_before, local_after]` — a dispatch that
+    // legitimately straddles local midnight may stamp either date.
     let tmp = tempfile::TempDir::new().unwrap();
     let agent = codex_agent();
 
     let local_before = chrono::Local::now().date_naive();
-    let _ = dispatch_fixture(&agent, tmp.path(), &fixture("text-only")).await;
+    let events = dispatch_fixture(&agent, tmp.path(), &fixture("text-only")).await;
     let local_after = chrono::Local::now().date_naive();
 
-    let sidecar = tmp
-        .path()
-        .join(".switchboard")
-        .join("projects")
-        .join(agent.project_id.to_string())
-        .join("sessions")
-        .join(format!("{}.jsonl", agent.id));
-    let content = std::fs::read_to_string(&sidecar).unwrap();
-    let record: serde_json::Value = serde_json::from_str(content.lines().next().unwrap()).unwrap();
-    let written_date: chrono::NaiveDate =
-        serde_json::from_value(record["session_partition_date"].clone()).unwrap();
+    let (_thread_id, captured_date) =
+        captured_codex(&events).expect("first dispatch emits a captured Codex locator");
 
     assert!(
-        written_date == local_before || written_date == local_after,
-        "session_partition_date must be the LOCAL date at dispatch time \
-         (one of [{local_before}, {local_after}]), not the UTC date. wrote {written_date}",
+        captured_date == local_before || captured_date == local_after,
+        "partition_date must be the LOCAL date at capture time \
+         (one of [{local_before}, {local_after}]), not the UTC date. got {captured_date}",
     );
 }
 
 #[tokio::test]
-async fn resume_dispatch_appends_second_record_preserving_original_date() {
-    // Pin two contract properties together:
-    //
-    //   (a) session_id on a record is whatever the dispatch's thread.started
-    //       carried (in real Codex, the resumed thread_id echoes back the
-    //       same id; in tests, it's whatever the fixture says — and we use
-    //       two distinguishable fixtures here to prove the producer records
-    //       *each dispatch's* captured id, not just the first).
-    //   (b) session_partition_date is copied verbatim from the prior record
-    //       on resume — never re-derived from Utc::today().
-    //
-    // The earlier first-fixture-twice shape couldn't catch a regression
-    // that read the prior record but failed to copy session_partition_date,
-    // because both records carried identical content from the same fixture.
-    // Using a second fixture with a distinct thread_id exercises the
-    // copy-vs-recompute distinction directly.
+async fn resume_dispatch_reads_record_locator_and_emits_no_capture() {
+    // On resume the locator is on the record (no re-capture). The adapter reads
+    // it as dispatch input and emits no SessionLocatorCaptured event — so the
+    // dispatcher never re-persists, and the partition-date can't be recomputed.
     let tmp = tempfile::TempDir::new().unwrap();
-    let fixture_alt_path = tmp.path().join("text-only-alt.jsonl");
-    std::fs::write(
-        &fixture_alt_path,
-        r#"{"type":"thread.started","thread_id":"019aaaaa-bbbb-7777-8888-000000000042"}
-{"type":"turn.started"}
-{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"ack-alt"}}
-{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}
-"#,
-    )
-    .unwrap();
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
+    let agent = codex_agent_resuming("00000000-0000-7000-8000-000000000001", date);
 
-    let agent = codex_agent();
-    // First dispatch: canonical fixture (thread_id ends in 001).
-    let _ = dispatch_fixture(&agent, tmp.path(), &fixture("text-only")).await;
-    // Second dispatch: alt fixture with a DIFFERENT thread_id.
-    let _ = dispatch_fixture(&agent, tmp.path(), fixture_alt_path.to_str().unwrap()).await;
+    let events = dispatch_fixture(&agent, tmp.path(), &fixture("text-only")).await;
 
-    let sidecar = tmp
-        .path()
-        .join(".switchboard")
-        .join("projects")
-        .join(agent.project_id.to_string())
-        .join("sessions")
-        .join(format!("{}.jsonl", agent.id));
-    let content = std::fs::read_to_string(&sidecar).unwrap();
-    let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
-    assert_eq!(lines.len(), 2, "second dispatch appends a record");
-    let r1: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-    let r2: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
-    // session_id reflects each dispatch's captured thread.started (the
-    // two fixtures emit different ids, so the recorded ids must differ).
-    assert_eq!(r1["session_id"], "00000000-0000-7000-8000-000000000001");
-    assert_eq!(r2["session_id"], "019aaaaa-bbbb-7777-8888-000000000042");
-    // session_partition_date preserved verbatim across records — even
-    // though session_id changed, the date must NOT be recomputed.
-    assert_eq!(
-        r1["session_partition_date"], r2["session_partition_date"],
-        "resume must copy session_partition_date verbatim regardless of thread_id change"
+    assert!(
+        matches!(outcome_of(&events), TurnOutcome::Completed),
+        "resume turn completes"
     );
-    // started_at differs per record (each dispatch gets a fresh wall-clock
-    // stamp). Loose check — exact equality only on the date components is
-    // not enforced; we just confirm both records carry the field.
-    assert!(r1["started_at"].is_string());
-    assert!(r2["started_at"].is_string());
+    assert!(
+        captured_codex(&events).is_none(),
+        "a resume (locator already on the record) emits no capture event"
+    );
 }
 
 #[tokio::test]
@@ -433,8 +411,8 @@ async fn truncated_stream_synthesizes_adapter_failure_with_buffered_error() {
 
 #[tokio::test]
 async fn corrupt_thread_started_emits_adapter_failure() {
-    // thread.started without a thread_id field — the sidecar can't be
-    // written, so the adapter must fail-loud rather than silently produce
+    // thread.started without a thread_id field — the locator can't be
+    // captured, so the adapter must fail-loud rather than silently produce
     // an unresumable agent.
     let tmp = tempfile::TempDir::new().unwrap();
     let fixture_path = tmp.path().join("corrupt-thread.jsonl");
@@ -487,18 +465,58 @@ async fn corrupt_thread_started_emits_adapter_failure() {
         other => panic!("expected TurnEnd(AdapterFailure), got {other:?}"),
     }
 
-    // Sidecar must NOT exist — we refused to write a record without a
-    // valid thread_id, so the next dispatch correctly sees no prior session.
-    let sidecar = tmp
-        .path()
-        .join(".switchboard")
-        .join("projects")
-        .join(agent.project_id.to_string())
-        .join("sessions")
-        .join(format!("{}.jsonl", agent.id));
+    // No locator captured — we refused to emit one without a valid thread_id,
+    // so the registry stays empty and the next dispatch correctly sees no
+    // prior session.
     assert!(
-        !sidecar.exists(),
-        "sidecar must not be written when thread_id is invalid"
+        captured_codex(&events).is_none(),
+        "no locator must be captured when thread_id is invalid"
+    );
+}
+
+#[tokio::test]
+async fn first_dispatch_completing_without_thread_started_fails_loud() {
+    // A first dispatch that *completes* but never emitted thread.started would
+    // capture no locator — the next dispatch would start a fresh session and
+    // silently lose context. The adapter must fail the turn loudly instead,
+    // mirroring the corrupt-thread.started guard.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let fixture_path = tmp.path().join("no-thread-started.jsonl");
+    std::fs::write(
+        &fixture_path,
+        r#"{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"ack"}}
+{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}
+"#,
+    )
+    .unwrap();
+
+    let agent = codex_agent();
+    let events = dispatch_fixture(&agent, tmp.path(), fixture_path.to_str().unwrap()).await;
+
+    match outcome_of(&events) {
+        TurnOutcome::Failed {
+            kind: FailureKind::AdapterFailure,
+            message,
+        } => assert!(
+            message.contains("thread.started"),
+            "expected a no-capture explanation, got: {message}"
+        ),
+        other => panic!("expected AdapterFailure, got {other:?}"),
+    }
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        )),
+        "the turn must not also complete"
+    );
+    assert!(
+        captured_codex(&events).is_none(),
+        "no locator is captured when thread.started never arrives"
     );
 }
 
@@ -617,111 +635,15 @@ async fn force_kill_signals_whole_process_group_not_just_parent() {
     );
 }
 
-#[cfg(unix)]
-#[tokio::test]
-async fn sidecar_write_failure_terminates_stream_with_adapter_failure() {
-    // Goal: prove that an in-stream sidecar-write failure (post-dispatch,
-    // during the producer task's first thread.started capture) synthesizes
-    // TurnEnd(AdapterFailure) and stops the stream. To trigger a
-    // write-but-not-read failure, pre-create an empty sidecar file and
-    // chmod it 444 — `read_latest` opens, sees no records, returns Ok(None);
-    // `append_record` then fails on PermissionDenied when reopening for
-    // append. Unix-only because Windows file permissions don't behave the
-    // same way.
-    use std::os::unix::fs::PermissionsExt;
-    let tmp = tempfile::TempDir::new().unwrap();
-    let agent = codex_agent();
-    let sidecar = tmp
-        .path()
-        .join(".switchboard")
-        .join("projects")
-        .join(agent.project_id.to_string())
-        .join("sessions")
-        .join(format!("{}.jsonl", agent.id));
-    std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
-    std::fs::write(&sidecar, b"").unwrap();
-    let mut perms = std::fs::metadata(&sidecar).unwrap().permissions();
-    perms.set_mode(0o444); // read-only
-    std::fs::set_permissions(&sidecar, perms).unwrap();
-
-    // Bounded: the producer must force-kill the child after emitting the
-    // AdapterFailure event so the stream closes promptly. A regression that
-    // emitted the event but failed to kill would let the producer task
-    // hang awaiting child.wait() while the consumer's stream stayed open;
-    // this timeout catches that.
-    let events = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        dispatch_fixture(&agent, tmp.path(), &fixture("text-only")),
-    )
-    .await
-    .expect("stream must close promptly after sidecar write failure");
-    let terminals: Vec<&AdapterEvent> = events
-        .iter()
-        .filter(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
-        .collect();
-    assert_eq!(terminals.len(), 1, "exactly one terminal event");
-    match terminals[0] {
-        AdapterEvent::TurnEnd {
-            outcome:
-                TurnOutcome::Failed {
-                    kind: FailureKind::AdapterFailure,
-                    message,
-                },
-            ..
-        } => {
-            assert!(
-                message.contains("sidecar write failed"),
-                "expected sidecar-write-failure message, got: {message}"
-            );
-        }
-        other => panic!("expected TurnEnd(AdapterFailure), got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn dispatch_with_corrupt_sidecar_returns_pre_stream_read_error() {
-    // The Codex adapter must fail loudly on corrupt sidecar JSONL (per
-    // AGENTS.md cross-cutting invariant). This is the dispatch-time path
-    // (before any stream is established).
-    let tmp = tempfile::TempDir::new().unwrap();
-    let agent = codex_agent();
-    let path = tmp
-        .path()
-        .join(".switchboard")
-        .join("projects")
-        .join(agent.project_id.to_string())
-        .join("sessions")
-        .join(format!("{}.jsonl", agent.id));
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(&path, "{not valid json\n").unwrap();
-
-    let home = tempfile::TempDir::new().unwrap();
-    let result = CodexAdapter::with_binary_and_home(FAKE_CODEX, home.path())
-        .dispatch(
-            &agent,
-            tmp.path(),
-            &fixture("text-only"),
-            Uuid::now_v7(),
-            DispatchOptions::default(),
-        )
-        .await;
-    assert!(
-        matches!(
-            result,
-            Err(switchboard_harness::DispatchError::PreStreamRead(_))
-        ),
-        "expected PreStreamRead error on corrupt sidecar"
-    );
-}
-
 // --- Post-terminal enrichment ---
 //
 // These tests stage a temp `home_dir` (via `CodexAdapter::with_binary_and_home`)
-// and pre-write a Codex session file at the path the adapter will look up
-// via the sidecar's `session_id` + `session_partition_date`. The fixture's
+// and pre-write a Codex session file at the path the adapter will look up via
+// the agent's Codex locator (`thread_id` + `partition_date`). The fixture's
 // hardcoded thread_id (`00000000-0000-7000-8000-000000000001`) is what
-// `fake_codex` echoes back via the `thread.started` stream event, so the
-// sidecar's session_id is predictable for staging.
+// `fake_codex` echoes back via the `thread.started` stream event, so on a first
+// dispatch the captured thread_id is predictable; resume tests supply the same
+// id via `codex_agent_resuming`.
 
 const FIXTURE_THREAD_ID: &str = "00000000-0000-7000-8000-000000000001";
 
@@ -757,27 +679,6 @@ fn stage_session_file(
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, content).unwrap();
     path
-}
-
-fn write_sidecar(
-    cwd: &Path,
-    agent: &AgentRecord,
-    session_id: &str,
-    session_partition_date: chrono::NaiveDate,
-) {
-    let sidecar = cwd
-        .join(".switchboard")
-        .join("projects")
-        .join(agent.project_id.to_string())
-        .join("sessions")
-        .join(format!("{}.jsonl", agent.id));
-    std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
-    let record = serde_json::json!({
-        "session_id": session_id,
-        "session_partition_date": session_partition_date.format("%Y-%m-%d").to_string(),
-        "started_at": "2026-05-15T00:00:00Z",
-    });
-    std::fs::write(&sidecar, format!("{record}\n")).unwrap();
 }
 
 async fn dispatch_with_home(
@@ -926,14 +827,13 @@ command = "x"
 
 #[tokio::test]
 async fn resume_turn_omits_session_meta_but_still_emits_rate_limit_and_enriches() {
-    // Pre-write a sidecar to mark this as a resume from the adapter's
-    // point of view. SessionMeta is first-turn-only (prior.is_none() → true
-    // only when sidecar is absent at dispatch start).
+    // A resuming agent carries its locator on the record, so the adapter treats
+    // this as a resume. SessionMeta is first-turn-only (prior.is_none() → true
+    // only when there's no locator at dispatch start).
     let cwd = tempfile::TempDir::new().unwrap();
     let home = tempfile::TempDir::new().unwrap();
-    let agent = codex_agent();
     let today = chrono::Utc::now().date_naive();
-    write_sidecar(cwd.path(), &agent, FIXTURE_THREAD_ID, today);
+    let agent = codex_agent_resuming(FIXTURE_THREAD_ID, today);
     stage_session_file(
         home.path(),
         today,
@@ -974,21 +874,21 @@ async fn resume_turn_omits_session_meta_but_still_emits_rate_limit_and_enriches(
 }
 
 #[tokio::test]
-async fn attach_flow_first_dispatch_forces_session_meta_despite_sidecar_present() {
-    // Pre-write sidecar (mimicking the attach-existing-session flow). The
-    // adapter's prior.is_none() heuristic would normally classify this as
-    // a resume and skip SessionMeta — leaving the sidebar's MCP/skills/model
-    // listing empty for attached Codex agents until some other path fires.
+async fn attach_flow_first_dispatch_forces_session_meta_despite_locator_present() {
+    // An attached agent already has its locator on the record (mimicking the
+    // attach-existing-session flow). The adapter's prior.is_none() heuristic
+    // would normally classify this as a resume and skip SessionMeta — leaving
+    // the sidebar's MCP/skills/model listing empty for attached Codex agents
+    // until some other path fires.
     //
-    // With DispatchOptions::is_first_dispatch_after_attach = true, the
-    // adapter must treat the dispatch as a first turn and emit SessionMeta.
+    // With DispatchOptions::is_first_dispatch_after_attach = true, the adapter
+    // must treat the dispatch as a first turn and emit SessionMeta.
     let cwd = tempfile::TempDir::new().unwrap();
     let home = tempfile::TempDir::new().unwrap();
-    let agent = codex_agent();
     let today = chrono::Utc::now().date_naive();
-    // Sidecar exists at dispatch start — without the override this would
+    // Locator present at dispatch start — without the override this would
     // suppress SessionMeta.
-    write_sidecar(cwd.path(), &agent, FIXTURE_THREAD_ID, today);
+    let agent = codex_agent_resuming(FIXTURE_THREAD_ID, today);
     stage_session_file(
         home.path(),
         today,
@@ -1019,19 +919,18 @@ async fn attach_flow_first_dispatch_forces_session_meta_despite_sidecar_present(
 }
 
 #[tokio::test]
-async fn cross_midnight_uses_sidecar_date_not_today() {
-    // Sidecar's session_partition_date says yesterday; host clock says
-    // today. Lookup must use the sidecar's date.
+async fn cross_midnight_uses_record_date_not_today() {
+    // The record's partition_date says yesterday; host clock says today.
+    // Enrichment must use the record's date, not recompute it.
     //
-    // We can't move the host clock backwards in this test, so we stage the
-    // file at "yesterday" relative to Utc::now(). The adapter, on this
-    // resume dispatch, must read the sidecar (yesterday) and find the file
-    // — not call Utc::today() and look in today's empty directory.
+    // We can't move the host clock backwards, so we stage the file at
+    // "yesterday" relative to Utc::now(). The adapter, on this resume dispatch,
+    // must read the locator's date (yesterday) and find the file — not call
+    // Utc::today() and look in today's empty directory.
     let cwd = tempfile::TempDir::new().unwrap();
     let home = tempfile::TempDir::new().unwrap();
-    let agent = codex_agent();
     let yesterday = chrono::Utc::now().date_naive() - chrono::Duration::days(1);
-    write_sidecar(cwd.path(), &agent, FIXTURE_THREAD_ID, yesterday);
+    let agent = codex_agent_resuming(FIXTURE_THREAD_ID, yesterday);
     stage_session_file(
         home.path(),
         yesterday,
@@ -1048,7 +947,7 @@ async fn cross_midnight_uses_sidecar_date_not_today() {
     assert_eq!(
         enriched_window,
         Some(Some(258_400)),
-        "lookup must use sidecar's session_partition_date (yesterday), not today"
+        "enrichment must use the record's partition_date (yesterday), not today"
     );
     // Also confirms the RateLimitEvent path traverses the cross-day file.
     assert!(

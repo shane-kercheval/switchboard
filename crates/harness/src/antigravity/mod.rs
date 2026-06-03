@@ -21,8 +21,9 @@
 //!   conversation this exact invocation used — available in ~seconds
 //!   regardless of cold-start latency, and never cross-attributed from a
 //!   concurrent or background `agy` (each writes its own log). It is then
-//!   persisted to the per-agent sidecar (see [`sidecar`]) for resume /
-//!   hydration. A filesystem fallback (watch `brain/<uuid>/` for a dir whose
+//!   emitted as a `SessionLocatorCaptured` event and persisted by the
+//!   dispatcher onto the agent's registry record for resume / hydration. A
+//!   filesystem fallback (watch `brain/<uuid>/` for a dir whose
 //!   transcript echoes the prompt) covers the case where that Google-internal
 //!   log line ever moves — see [`capture_conversation_id`].
 //! - **Transcript-sourced content; stdout is a control channel.** All
@@ -53,7 +54,6 @@ pub mod config;
 pub mod parser;
 pub mod paths;
 pub mod session_file;
-pub mod sidecar;
 pub mod skills;
 
 use std::collections::VecDeque;
@@ -64,7 +64,7 @@ use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use chrono::Utc;
-use switchboard_core::{AgentId, AgentRecord};
+use switchboard_core::{AgentId, AgentRecord, SessionLocator};
 use tokio::io::AsyncBufReadExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -77,7 +77,6 @@ use parser::{
     AntigravityParserState, TranscriptRecord, first_error_line, is_auth_failure_line,
     record_to_live_events,
 };
-use sidecar::{SessionLinkRecord, append_record, read_latest, sidecar_path};
 
 /// The binary name on PATH. Centralized so the adapter and the pre-adapter
 /// binary probe agree on the name.
@@ -210,13 +209,15 @@ impl HarnessAdapter for AntigravityAdapter {
         let skills = skills::load_skills(&home_dir, cwd);
 
         // Resume target: the conversation UUID captured on a prior dispatch,
-        // read from the per-agent sidecar. Corrupt sidecar is fail-loud
-        // (PreStreamRead) per the AGENTS.md Switchboard-owned-JSONL
-        // invariant; `Ok(None)` is the legitimate never-dispatched case.
-        let sidecar_file = sidecar_path(cwd, agent.project_id, agent.id);
-        let prior =
-            read_latest(&sidecar_file).map_err(|e| DispatchError::PreStreamRead(e.to_string()))?;
-        let resume_id = prior.as_ref().map(|r| r.conversation_id);
+        // now carried on the agent's registry record (`session_locator`) and
+        // passed in as dispatch input — like Claude/Gemini. `None` is the
+        // legitimate never-dispatched case; a `Codex` locator can't appear on
+        // an Antigravity agent (the registry rejects the mismatch), so a
+        // non-`Uuid` locator degrades to `None`.
+        let resume_id = agent
+            .session_locator
+            .as_ref()
+            .and_then(SessionLocator::as_uuid);
 
         let log_file_path = build_log_file_path(turn_id);
         let args = build_args(prompt, cwd, resume_id, &log_file_path);
@@ -266,7 +267,6 @@ impl HarnessAdapter for AntigravityAdapter {
             turn_id,
             agent_id: agent.id,
             home_dir,
-            sidecar_file,
             resume_id,
             harness_version,
             mcp_servers,
@@ -341,7 +341,6 @@ struct ProducerCtx {
     turn_id: TurnId,
     agent_id: AgentId,
     home_dir: PathBuf,
-    sidecar_file: PathBuf,
     resume_id: Option<Uuid>,
     harness_version: String,
     /// MCP-server registry resolved at dispatch time (display-only). Carried
@@ -380,7 +379,6 @@ async fn run_producer(ctx: ProducerCtx) {
         turn_id,
         agent_id,
         home_dir,
-        sidecar_file,
         resume_id,
         harness_version,
         mcp_servers,
@@ -402,18 +400,10 @@ async fn run_producer(ctx: ProducerCtx) {
     ));
 
     let is_resume = resume_id.is_some();
-    // Resume re-append: non-fatal. The prior record already holds this UUID
-    // (resume passes it via `--conversation`), so a failed re-append loses
-    // only debug history, not resumability. (First-turn capture, below, is
-    // the load-bearing write and is fatal on failure.)
-    if let Some(uuid) = resume_id
-        && let Err(e) = persist_sidecar(&sidecar_file, uuid)
-    {
-        tracing::warn!(
-            %turn_id, agent_id = %agent_id, error = %e,
-            "antigravity: resume sidecar re-append failed (non-fatal; prior record holds the UUID)"
-        );
-    }
+    // A plain resume re-emits nothing: the locator already lives on the registry
+    // record (it's how `resume_id` got here), so there's no new identity to
+    // persist. The capture event fires only when the locator is newly learned
+    // (first dispatch) or changes (fork-and-heal) — see the capture sites below.
 
     let spawn_time = SystemTime::now();
     let mut conversation_id = resume_id;
@@ -430,7 +420,6 @@ async fn run_producer(ctx: ProducerCtx) {
     let mut saw_stdout_content = false;
     let mut auth_failed = false;
     let mut ambiguous_capture = false;
-    let mut sidecar_write_failed = false;
     // Set post-loop when a required (re)capture could not locate the
     // conversation directory — the agent would be unresumable, so the turn
     // must fail loudly rather than silently complete on the stdout answer.
@@ -485,12 +474,12 @@ async fn run_producer(ctx: ProducerCtx) {
                             conversation_id = Some(uuid);
                             transcript_path = Some(paths::transcript_path(&home_dir, uuid));
                             cursor = 0;
-                            // First-turn capture is the load-bearing write: if
-                            // it fails, the UUID exists nowhere and the agent is
-                            // silently unresumable. Fail the turn loudly.
-                            if persist_sidecar(&sidecar_file, uuid).is_err() {
-                                sidecar_write_failed = true;
-                            }
+                            // First-turn capture: emit the locator so the
+                            // dispatcher persists it to the registry. The
+                            // persist is load-bearing (a lost locator leaves the
+                            // agent unresumable) but its fatality now lives in
+                            // the dispatcher sink, not here.
+                            emit_locator_captured(&tx, uuid);
                         }
                         CaptureOutcome::Ambiguous => ambiguous_capture = true,
                         CaptureOutcome::NotYet => {}
@@ -523,7 +512,7 @@ async fn run_producer(ctx: ProducerCtx) {
         }
 
         // Abort paths: stop immediately and force-kill below.
-        if auth_failed || ambiguous_capture || sidecar_write_failed {
+        if auth_failed || ambiguous_capture {
             break;
         }
         // Terminator: the process has exited AND stdout drained. The
@@ -600,18 +589,19 @@ async fn run_producer(ctx: ProducerCtx) {
                     tracing::warn!(
                         %turn_id, agent_id = %agent_id, new_conversation = %uuid,
                         "antigravity: resumed conversation no longer exists server-side; \
-                         agy forked a fresh conversation. Healing the sidecar to the new id; \
-                         this turn's prior context was lost."
+                         agy forked a fresh conversation. Healing the registry locator to the \
+                         new id; this turn's prior context was lost."
                     );
                 }
-                // Only `transcript_path` (for the final drain) and the
-                // persisted sidecar matter from here — `conversation_id`
-                // itself isn't read again, so it isn't reassigned.
+                // Only `transcript_path` (for the final drain) and the emitted
+                // locator matter from here — `conversation_id` itself isn't read
+                // again, so it isn't reassigned. Emit the (possibly forked) id so
+                // the dispatcher heals the registry locator; the next turn then
+                // resumes the new conversation instead of re-forking the stale
+                // one every turn.
                 transcript_path = Some(paths::transcript_path(&home_dir, uuid));
                 cursor = 0;
-                if persist_sidecar(&sidecar_file, uuid).is_err() {
-                    sidecar_write_failed = true;
-                }
+                emit_locator_captured(&tx, uuid);
             }
             CaptureOutcome::Ambiguous => ambiguous_capture = true,
             CaptureOutcome::NotYet => {
@@ -663,6 +653,10 @@ async fn run_producer(ctx: ProducerCtx) {
     // Scan the per-dispatch CLI log only when the turn produced no answer —
     // a successful turn has nothing in the log we'd want to surface. Best-
     // effort: an unreadable / missing log falls back to the generic message.
+    // Load-bearing gate: `find_rpc_error_marker` matches broadly (any
+    // `(code N)` status line), so this scan MUST stay gated on
+    // `!saw_terminal_answer` — otherwise a stray log match could fail a turn
+    // that actually produced an answer. Preserve this ordering if refactored.
     let log_error = if saw_terminal_answer {
         None
     } else {
@@ -675,7 +669,6 @@ async fn run_producer(ctx: ProducerCtx) {
         &OutcomeSignals {
             auth_failed,
             ambiguous_capture,
-            sidecar_write_failed,
             unresumable,
             saw_terminal_answer,
             saw_stdout_content,
@@ -737,17 +730,15 @@ fn drain_transcript(
     }
 }
 
-/// Append a conversation-UUID record to the per-agent sidecar. Returns the
-/// result so the caller decides fatality (first-turn capture is fatal;
-/// resume re-append is not — see [`run_producer`]).
-fn persist_sidecar(sidecar_file: &Path, uuid: Uuid) -> Result<(), sidecar::SidecarError> {
-    append_record(
-        sidecar_file,
-        &SessionLinkRecord {
-            conversation_id: uuid,
-            captured_at: Utc::now(),
-        },
-    )
+/// Emit the captured conversation UUID as a normalized capture event. The
+/// dispatcher persists it to the running turn's agent registry record
+/// (load-bearing — a persist failure fails the turn). Emitted only when the
+/// locator is newly learned (first dispatch) or changes (fork-and-heal), never
+/// on a plain resume.
+fn emit_locator_captured(tx: &tokio::sync::mpsc::UnboundedSender<AdapterEvent>, uuid: Uuid) {
+    let _ = tx.send(AdapterEvent::SessionLocatorCaptured {
+        locator: SessionLocator::Uuid(uuid),
+    });
 }
 
 /// Outcome of correlating a freshly-spawned dispatch to its conversation
@@ -1003,14 +994,13 @@ fn extract_model_from_record(rec: &TranscriptRecord) -> Option<String> {
 /// Post-exit signals fed to [`classify_outcome`]. Bundled into a struct so
 /// the classifier stays a small-arity pure function (testable without
 /// spawning `agy`).
-// Five independent booleans, each a distinct terminal condition the producer
+// Independent booleans, each a distinct terminal condition the producer
 // observed. Modeling them as two-variant enums or a state machine would
 // obscure rather than clarify — they're orthogonal flags, not states.
 #[allow(clippy::struct_excessive_bools)]
 struct OutcomeSignals {
     auth_failed: bool,
     ambiguous_capture: bool,
-    sidecar_write_failed: bool,
     unresumable: bool,
     saw_terminal_answer: bool,
     saw_stdout_content: bool,
@@ -1025,7 +1015,7 @@ struct OutcomeSignals {
 /// (`Warning: conversation "<uuid>" not found.`). Drives the producer's
 /// fork-and-heal recapture path on resume — it does **not** fail the turn
 /// (`agy` produced a real answer in a fresh conversation; we heal the
-/// sidecar to the new id so future turns continue it).
+/// registry locator to the new id so future turns continue it).
 fn is_conversation_not_found(line: &str) -> bool {
     let l = line.to_ascii_lowercase();
     l.contains("conversation") && l.contains("not found")
@@ -1044,9 +1034,10 @@ fn conversation_not_found(stdout_lines: &[String], stderr_tail: &Mutex<VecDeque<
         .is_ok_and(|buf| buf.iter().any(|l| is_conversation_not_found(l)))
 }
 
-/// Scan a per-dispatch `agy` CLI log for the first `rpc error: code = …`
-/// line and return a human-readable message, or `None` if the file is
-/// missing/unreadable or contains no matching line.
+/// Scan a per-dispatch `agy` CLI log for the first RPC/status error line —
+/// both the old `rpc error: code = …` gRPC shape and agy 1.0.4's
+/// `<STATUS> (code N): …` shape — and return a human-readable message, or
+/// `None` if the file is missing/unreadable or contains no matching line.
 ///
 /// Why this exists: `agy` exits 0 with empty stdout/stderr on
 /// `RESOURCE_EXHAUSTED` (quota) and similar RPC failures — the *only* place
@@ -1075,12 +1066,30 @@ fn scan_agy_log_for_error(path: &Path) -> Option<String> {
     None
 }
 
-/// Find the byte index of the `rpc error: code = ` marker (case-insensitive)
-/// in a log line, or `None` if absent.
+/// Find the byte index where a gRPC status error begins in an `agy` log line,
+/// or `None` if the line carries no recognizable RPC error.
+///
+/// Two `agy` formats are matched:
+/// - Old gRPC plumbing: `… rpc error: code = <Code> desc = …`.
+/// - agy 1.0.4: `… <STATUS> (code <NNN>): <message>` (e.g.
+///   `RESOURCE_EXHAUSTED (code 429): Individual quota reached…`) — the
+///   `rpc error: code = ` / `desc = ` wrapper was dropped, so anchor on the
+///   ` (code <digit>` token and back up to the start of the `<STATUS>` word so
+///   the surfaced detail begins at the status, not the Go log preamble.
 fn find_rpc_error_marker(line: &str) -> Option<usize> {
-    const MARKER: &str = "rpc error: code = ";
-    // MARKER is already lowercase; only the input needs normalization.
-    line.to_ascii_lowercase().find(MARKER)
+    let lower = line.to_ascii_lowercase();
+    if let Some(idx) = lower.find("rpc error: code = ") {
+        return Some(idx);
+    }
+    let paren = lower.match_indices(" (code ").find_map(|(i, _)| {
+        lower[i + " (code ".len()..]
+            .starts_with(|c: char| c.is_ascii_digit())
+            .then_some(i)
+    })?;
+    let start = line[..paren]
+        .rfind(char::is_whitespace)
+        .map_or(0, |s| s + 1);
+    Some(start)
 }
 
 /// Map an RPC error detail line into a user-facing failure message.
@@ -1107,11 +1116,10 @@ fn rpc_error_to_message(detail: &str) -> String {
         }
         return msg;
     }
-    // Unknown/never-observed code: strip the `rpc error: code = … desc = `
-    // gRPC plumbing the same way the quota branch does, so the user sees the
-    // descriptive tail rather than Go boilerplate. (No `desc = ` → the tail
-    // helper returns the line unchanged, which is acceptable for a code we
-    // haven't yet authored a message for.)
+    // Unknown/never-observed code: run it through the same descriptive-tail
+    // extraction as the quota branch — strips the `rpc error: code = … desc = `
+    // plumbing or agy 1.0.4's `<STATUS> (code N): ` prefix and collapses the
+    // doubled message — so the user sees the cause rather than Go boilerplate.
     format!(
         "Antigravity error: {}",
         extract_rpc_descriptive_tail(detail)
@@ -1128,26 +1136,33 @@ fn extract_rpc_descriptive_tail(detail: &str) -> String {
         .split_once("desc = ")
         .map_or(detail, |(_, rest)| rest);
     let trimmed = after_desc.trim().trim_end_matches('.').trim();
-    // `agy` logs `"<msg>: <msg>"` — same sentence repeated on either side of
-    // the colon. The first half retains its mid-string trailing period
-    // (`"…25s.: …25s"`), the second doesn't — so equality must compare on
-    // the period-stripped form, then return either half (they're
-    // semantically identical) trimmed to the user-facing shape.
-    let halved = match trimmed.split_once(": ") {
-        Some((first, second))
-            if first.trim_end_matches('.').trim() == second.trim_end_matches('.').trim() =>
-        {
-            second.trim_end_matches('.').trim()
-        }
-        _ => trimmed,
-    };
-    halved.to_owned()
+    // `agy` logs the message doubled (`"<msg>: <msg>"`). The duplication colon
+    // is the `": "` whose two period-stripped halves are equal — try every
+    // boundary, because the message itself can contain a colon (agy 1.0.4's
+    // `RESOURCE_EXHAUSTED (code 429): …` shape has one, so splitting on the
+    // first `": "` would cut in the wrong place).
+    let halved = trimmed
+        .match_indices(": ")
+        .find_map(|(i, _)| {
+            let first = trimmed[..i].trim_end_matches('.').trim();
+            let second = trimmed[i + 2..].trim_end_matches('.').trim();
+            (first == second).then_some(second)
+        })
+        .unwrap_or(trimmed);
+    // agy 1.0.4 prefixes the human message with `<STATUS> (code <N>): `; strip
+    // it so the surfaced tail is just the message (the old `desc = ` form had
+    // no such prefix).
+    halved
+        .split_once("): ")
+        .filter(|(prefix, _)| prefix.contains("(code "))
+        .map_or(halved, |(_, rest)| rest)
+        .to_owned()
 }
 
 /// Build the terminal `TurnOutcome` from the post-exit signals. Pure so the
 /// classification logic is unit-tested without spawning `agy`.
 ///
-/// Precedence: auth fast-fail → ambiguous capture → sidecar write failure →
+/// Precedence: auth fast-fail → ambiguous capture →
 /// stdout `Error:` line → log-derived RPC error → unresumable-with-a-streamed-reply
 /// (required recapture failed) → **transcript terminal answer → Completed** →
 /// output-but-no-answer (adapter failure) → no output (adapter failure). A
@@ -1190,12 +1205,9 @@ fn classify_outcome(
             message: "could not unambiguously identify this Antigravity conversation (concurrent same-directory dispatch) — retry".to_owned(),
         };
     }
-    if sig.sidecar_write_failed {
-        return TurnOutcome::Failed {
-            kind: FailureKind::AdapterFailure,
-            message: "failed to persist the Antigravity conversation id; the agent would be unresumable — check .switchboard/ write permissions and retry".to_owned(),
-        };
-    }
+    // Note: persisting the captured locator is now the dispatcher sink's job;
+    // a persist failure fails the turn there, not here. The adapter only
+    // classifies what it observed about the `agy` run itself.
     // A concrete `Error:` line is the real root cause and must win over the
     // generic "unresumable" classification below — e.g. a first turn that
     // timed out and so never created a conversation dir should surface the
@@ -1333,7 +1345,7 @@ mod tests {
             project_id: Uuid::new_v4(),
             name: "a".to_owned(),
             harness: switchboard_core::HarnessKind::Antigravity,
-            session_id: None,
+            session_locator: None,
             created_at: Utc::now(),
         };
         let cwd = TempDir::new().unwrap();
@@ -1666,7 +1678,6 @@ mod tests {
         OutcomeSignals {
             auth_failed: false,
             ambiguous_capture: false,
-            sidecar_write_failed: false,
             unresumable: false,
             saw_terminal_answer: true,
             saw_stdout_content: true,
@@ -1771,21 +1782,6 @@ mod tests {
                 message,
             } => assert!(message.contains("without producing an answer")),
             other => panic!("expected no-answer AdapterFailure, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn classify_outcome_sidecar_write_failed_is_adapter_failure() {
-        let sig = OutcomeSignals {
-            sidecar_write_failed: true,
-            ..ok_signals()
-        };
-        match classify_outcome(&sig, &[], &empty_tail()) {
-            TurnOutcome::Failed {
-                kind: FailureKind::AdapterFailure,
-                message,
-            } => assert!(message.contains("unresumable")),
-            other => panic!("expected AdapterFailure, got {other:?}"),
         }
     }
 
@@ -1930,6 +1926,40 @@ mod tests {
     }
 
     #[test]
+    fn scan_agy_log_resource_exhausted_new_1_0_4_format_returns_authored_message() {
+        // agy 1.0.4 dropped the gRPC `rpc error: code = ResourceExhausted desc
+        // = …` plumbing for `RESOURCE_EXHAUSTED (code 429): …`. Without matching
+        // the new shape the quota error went undetected and surfaced as the
+        // generic "transcript path may have changed" failure. This is the real
+        // captured line (Resets value redacted to a fixed duration).
+        let tmp = TempDir::new().unwrap();
+        let log = tmp.path().join("agy.log");
+        std::fs::write(
+            &log,
+            "E0602 20:37:59.639860 15879 log.go:398] agent executor error: RESOURCE_EXHAUSTED (code 429): Individual quota reached. Contact your administrator to enable overages. Resets in 46h52m7s.: RESOURCE_EXHAUSTED (code 429): Individual quota reached. Contact your administrator to enable overages. Resets in 46h52m7s.\n",
+        )
+        .unwrap();
+        let msg = scan_agy_log_for_error(&log).expect("new-format log scan must find the error");
+        assert!(
+            msg.starts_with("Antigravity quota exhausted"),
+            "authored prefix: {msg}"
+        );
+        assert!(
+            msg.contains("Resets in 46h52m7s"),
+            "carries the reset-time tail: {msg}"
+        );
+        assert!(
+            !msg.contains("(code 429)"),
+            "the status-code prefix is stripped from the surfaced tail: {msg}"
+        );
+        assert_eq!(
+            msg.matches("Individual quota reached").count(),
+            1,
+            "doubled descriptive sentence must be collapsed: {msg}"
+        );
+    }
+
+    #[test]
     fn scan_agy_log_unknown_code_passes_through_as_authored_prefix() {
         let tmp = TempDir::new().unwrap();
         let log = tmp.path().join("agy.log");
@@ -1950,6 +1980,37 @@ mod tests {
         assert!(
             !msg.contains("rpc error: code = "),
             "Go RPC boilerplate is stripped: {msg}"
+        );
+    }
+
+    #[test]
+    fn scan_agy_log_unknown_code_new_1_0_4_format_passes_through_as_authored_prefix() {
+        // Non-quota RPC failures (network/backend) in agy 1.0.4's new format
+        // must also surface their cause, not the generic transcript-path error.
+        let tmp = TempDir::new().unwrap();
+        let log = tmp.path().join("agy.log");
+        std::fs::write(
+            &log,
+            "E0602 20:37:59.639860 15879 log.go:398] agent executor error: UNAVAILABLE (code 503): backend exploded: UNAVAILABLE (code 503): backend exploded\n",
+        )
+        .unwrap();
+        let msg = scan_agy_log_for_error(&log).expect("scan must surface unknown new-format codes");
+        assert!(
+            msg.starts_with("Antigravity error: "),
+            "unknown code passes through with authored prefix: {msg}"
+        );
+        assert!(
+            msg.contains("backend exploded"),
+            "carries the descriptive tail: {msg}"
+        );
+        assert!(
+            !msg.contains("(code 503)"),
+            "the status-code prefix is stripped: {msg}"
+        );
+        assert_eq!(
+            msg.matches("backend exploded").count(),
+            1,
+            "doubled descriptive sentence must be collapsed: {msg}"
         );
     }
 

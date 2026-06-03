@@ -41,7 +41,7 @@ function agentRecord(
     project_id: "00000000-0000-7000-8000-0000000000ff",
     name,
     harness,
-    session_id: null,
+    session_locator: null,
     created_at: "2026-05-15T00:00:00Z",
   };
 }

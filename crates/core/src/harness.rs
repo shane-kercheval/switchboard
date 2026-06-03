@@ -6,13 +6,14 @@ use serde::{Deserialize, Serialize};
 /// `#[non_exhaustive]` so further variants remain non-breaking.
 ///
 /// **Session-id asymmetry** (load-bearing): Claude Code and Gemini agents
-/// pre-generate `AgentRecord.session_id` at registration time (passed via
+/// pre-generate `AgentRecord.session_locator` at registration time (passed via
 /// `--session-id <uuid>` on first dispatch, `--resume <uuid>` thereafter);
-/// Codex and Antigravity agents leave it `None` and rely on a per-agent
-/// session-link sidecar populated post-spawn — Codex from the
-/// `thread.started` stream event on first dispatch, Antigravity from the
-/// server-assigned conversation UUID captured by watching for a new
-/// `~/.gemini/antigravity-cli/brain/<uuid>/` directory.
+/// Codex and Antigravity agents leave it `None` and capture the locator
+/// post-spawn — Codex from the `thread.started` stream event on first dispatch,
+/// Antigravity from the server-assigned conversation UUID captured by watching
+/// for a new `~/.gemini/antigravity-cli/brain/<uuid>/` directory. The captured
+/// locator is emitted as a `SessionLocatorCaptured` event and persisted by the
+/// dispatcher onto the registry record (no sidecar).
 ///
 /// **UUID-version asymmetry** (load-bearing): Claude Code uses UUID v7
 /// (time-ordered) like the rest of Switchboard; Gemini uses UUID v4

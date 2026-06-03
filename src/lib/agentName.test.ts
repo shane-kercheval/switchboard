@@ -8,7 +8,7 @@ function agent(id: string, name: string): AgentRecord {
     project_id: "project-1",
     name,
     harness: "claude_code",
-    session_id: null,
+    session_locator: null,
     created_at: "2026-05-29T00:00:00Z",
   };
 }

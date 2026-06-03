@@ -18,7 +18,7 @@
 //! Run with: `make test-live`. All tests are `#[ignore]`-gated.
 
 use futures::StreamExt;
-use switchboard_core::{AgentRecord, HarnessKind};
+use switchboard_core::{AgentRecord, HarnessKind, SessionLocator};
 use switchboard_harness::{
     AdapterEvent, AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, ContentKind,
     DispatchOptions, GeminiAdapter, HarnessAdapter, TurnOutcome,
@@ -36,7 +36,7 @@ fn claude_agent() -> AgentRecord {
         project_id: Uuid::now_v7(),
         name: "tool-use-claude".to_owned(),
         harness: HarnessKind::ClaudeCode,
-        session_id: Some(Uuid::now_v7()),
+        session_locator: Some(SessionLocator::Uuid(Uuid::now_v7())),
         created_at: chrono::Utc::now(),
     }
 }
@@ -47,7 +47,7 @@ fn codex_agent() -> AgentRecord {
         project_id: Uuid::now_v7(),
         name: "tool-use-codex".to_owned(),
         harness: HarnessKind::Codex,
-        session_id: None,
+        session_locator: None,
         created_at: chrono::Utc::now(),
     }
 }
@@ -139,7 +139,7 @@ fn gemini_agent() -> AgentRecord {
         harness: HarnessKind::Gemini,
         // UUID v4 for Gemini session IDs (8-char-prefix filename collision
         // hazard under v7 — see `gemini-cli-observed.md`).
-        session_id: Some(Uuid::new_v4()),
+        session_locator: Some(SessionLocator::Uuid(Uuid::new_v4())),
         created_at: chrono::Utc::now(),
     }
 }
@@ -261,7 +261,7 @@ fn antigravity_agent() -> AgentRecord {
         project_id: Uuid::now_v7(),
         name: "tool-use-antigravity".to_owned(),
         harness: HarnessKind::Antigravity,
-        session_id: None,
+        session_locator: None,
         created_at: chrono::Utc::now(),
     }
 }
@@ -481,9 +481,10 @@ async fn live_claude_subagent_collapses_to_parent_tool_call() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let adapter = ClaudeCodeAdapter::new();
     let agent = claude_agent();
-    let session_id = agent
-        .session_id
-        .expect("Claude agents pre-mint a session id");
+    let session_id = match &agent.session_locator {
+        Some(SessionLocator::Uuid(id)) => *id,
+        _ => panic!("Claude agents pre-mint a UUID session locator"),
+    };
     let turn_id = Uuid::now_v7();
     let stream = adapter
         .dispatch(

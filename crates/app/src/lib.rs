@@ -31,7 +31,7 @@ use crate::commands::{
     cancel_agent_impl, cancel_send_impl, cancel_turn_impl, check_antigravity_auth_impl,
     check_antigravity_binary_impl, check_claude_auth_impl, check_claude_binary_impl,
     check_codex_auth_impl, check_codex_binary_impl, check_gemini_auth_impl,
-    check_gemini_binary_impl, create_agent_impl, create_project_impl,
+    check_gemini_binary_impl, create_agent_impl, create_project_impl, fetch_repo_impl,
     get_harness_install_status_impl, get_preferences_impl, init_directory_impl, list_agents_impl,
     list_projects_impl, list_tracked_repos_from_inputs, list_workspace_directories_impl,
     load_project_conversation_impl, load_transcript_impl, open_project_impl, parse_uuid,
@@ -165,6 +165,13 @@ async fn read_tracked_repo(
 ) -> Result<RepoListing, String> {
     let inputs = tracked_repos_inputs(state.inner());
     tauri::async_runtime::spawn_blocking(move || read_tracked_repo_from_inputs(&path, &inputs))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn fetch_repo(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    fetch_repo_impl(state.inner(), &path)
         .await
         .map_err(|e| e.to_string())
 }
@@ -673,6 +680,7 @@ pub fn run() {
             remove_tracked_repo,
             list_tracked_repos,
             read_tracked_repo,
+            fetch_repo,
             get_preferences,
             set_preferences,
             create_project,

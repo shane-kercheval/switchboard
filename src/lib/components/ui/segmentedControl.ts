@@ -13,7 +13,7 @@ export const SEGMENTED_CONTAINER_CLASS =
 /// A single segment. Height/typography are fixed here (the standard `h-7`);
 /// add centering (`flex items-center justify-center`) or `flex-1`, plus the
 /// active/inactive color classes below.
-export const SEGMENTED_ITEM_CLASS = "h-7 rounded-full px-2 text-xs font-medium transition-colors";
+export const SEGMENTED_ITEM_CLASS = "h-6 rounded-full px-2 text-xs font-medium transition-colors";
 
 /// The selected segment.
 export const SEGMENTED_ITEM_ACTIVE_CLASS = "bg-primary text-primary-fg";

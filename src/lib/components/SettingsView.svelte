@@ -27,11 +27,21 @@
     { mode: "full_answer", label: "Entire Response" },
   ];
 
-  const shortcuts = [
+  // `note` adds a parenthetical clarifier rendered after the action — used where
+  // the key isn't literal (the compose-bar number keys map to a chip's position,
+  // not a fixed digit).
+  const shortcuts: { action: string; keys: string[]; note?: string }[] = [
+    { action: "Toggle Projects / Git view", keys: ["⌘", "⇧", "G"] },
     { action: "Toggle projects sidebar", keys: ["⌘", "B"] },
     { action: "Toggle agents sidebar", keys: ["⌘", "⇧", "B"] },
     { action: "Toggle both sidebars", keys: ["⌘", "⌥", "B"] },
     { action: "Toggle settings", keys: ["⌘", ","] },
+    {
+      action: "Toggle a compose recipient",
+      keys: ["⌘", "1–9"],
+      note: "by chip position",
+    },
+    { action: "Select all compose recipients", keys: ["⌘", "⇧", "A"] },
   ];
 
   const sectionClass = "border-border space-y-3 border-t pt-5";
@@ -180,7 +190,11 @@
       <div>
         {#each shortcuts as shortcut (shortcut.action)}
           <div class="flex min-h-11 items-center justify-between gap-4 py-2">
-            <div class="text-fg text-sm">{shortcut.action}</div>
+            <div class="text-fg text-sm">
+              {shortcut.action}{#if shortcut.note}<span class="text-muted ml-1 text-xs"
+                  >({shortcut.note})</span
+                >{/if}
+            </div>
             <div class="flex items-center gap-1">
               {#each shortcut.keys as key, index (`${shortcut.action}-${index}`)}
                 <kbd

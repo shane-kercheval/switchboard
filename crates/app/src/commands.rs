@@ -645,6 +645,51 @@ fn project_links_by_path(state: &AppState) -> HashMap<PathBuf, Vec<LinkedProject
     map
 }
 
+/// Shell out `git fetch` for a tracked repo to refresh its remote-tracking refs
+/// (so the next local read's sync / behind-base is current). Shelled rather than
+/// via `git2` (decision 2) because fetch needs the user's configured credential
+/// helpers / SSH agent, which `git2`'s callbacks reproduce poorly.
+///
+/// Best-effort: returns the git error (stderr) so the caller can record a
+/// "fetch failed" state, but a failure is never fatal — the view degrades to a
+/// stale read, not an error surface. Runs against the repo root; a repo with no
+/// remote simply fetches nothing.
+///
+/// Gated on the tracked set: `path` is resolved to a repo root (the stored root,
+/// or any subdirectory / linked worktree inside it; a dead path falls back to
+/// `canonicalize_boundary`) and the fetch runs **only** if that root is tracked,
+/// else [`AppError::RepoNotTracked`]. Fetch is the one Git-view command that
+/// spawns a subprocess, so it never acts on an arbitrary caller-supplied path.
+pub async fn fetch_repo_impl(state: &AppState, path: &str) -> Result<(), AppError> {
+    let root = switchboard_git::resolve_repo_root(Path::new(path))
+        .unwrap_or_else(|| canonicalize_boundary(path));
+    if !lock(&state.git_registry).contains(&root) {
+        return Err(AppError::RepoNotTracked {
+            root: root.to_string_lossy().into_owned(),
+        });
+    }
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .arg("fetch")
+        .arg("--all")
+        .arg("--quiet")
+        .output()
+        .await
+        .map_err(|source| AppError::GitFetch {
+            root: root.to_string_lossy().into_owned(),
+            message: source.to_string(),
+        })?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(AppError::GitFetch {
+            root: root.to_string_lossy().into_owned(),
+            message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        })
+    }
+}
+
 // --- Preferences (config.yaml) ----------------------------------------------
 
 /// Return the current personal preferences (`config.yaml`).
@@ -8359,6 +8404,39 @@ mod tests {
         // Files on disk are untouched — the repo still exists.
         assert!(repo.path().join(".git").exists());
         assert!(repo.path().join("README.md").exists());
+    }
+
+    #[tokio::test]
+    async fn fetch_repo_refuses_untracked_path() {
+        // Fetch is the one Git-view command that spawns a subprocess, so it must
+        // only run against roots the user has explicitly tracked — a path that
+        // resolves outside the registry is refused before any `git` runs.
+        let (_cfg, state) = state_with_registries();
+        let repo = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+
+        let err = fetch_repo_impl(&state, repo.path().to_str().unwrap())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::RepoNotTracked { .. }));
+    }
+
+    #[tokio::test]
+    async fn fetch_repo_runs_for_tracked_repo() {
+        // A tracked repo (here with no remote) passes the membership gate; the
+        // fetch itself is a no-op that succeeds, proving the guard lets real
+        // tracked roots through. A subdirectory of the tracked root resolves to
+        // it and is accepted too.
+        let (_cfg, state) = state_with_registries();
+        let repo = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        add_tracked_repo_impl(&state, repo.path().to_str().unwrap()).unwrap();
+        let sub = repo.path().join("nested");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        fetch_repo_impl(&state, sub.to_str().unwrap())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

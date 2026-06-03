@@ -540,6 +540,14 @@
                 aria-pressed={selected}
                 onclick={() => toggleRecipient(agent.id)}
               >
+                {#if i < 9}
+                  <!-- Leading position number makes the ⌘1–9 toggle shortcut
+                       discoverable at a glance (it maps to chip position, not a
+                       fixed agent). -->
+                  <span class="text-muted/80 font-mono text-[10px] tabular-nums" aria-hidden="true">
+                    {i + 1}
+                  </span>
+                {/if}
                 <HarnessIcon harness={agent.harness} size="sm" class="h-3.5 w-3.5" />
                 {agent.name}
               </button>

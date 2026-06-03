@@ -106,6 +106,13 @@ export async function readTrackedRepo(path: string): Promise<RepoListing> {
   return await invoke<RepoListing>("read_tracked_repo", { path });
 }
 
+// Shell out `git fetch` for a tracked repo to refresh its remote-tracking refs.
+// Best-effort: rejects with git's error on failure (no remote, no network, auth),
+// which the caller records as a "fetch failed" state — never a fatal error.
+export async function fetchRepo(path: string): Promise<void> {
+  await invoke("fetch_repo", { path });
+}
+
 // Backend-owned personal preferences (`config.yaml`). `getPreferences` always
 // returns a value (defaults if unset); `setPreferences` replaces the whole
 // object and persists it, surfacing a write failure.

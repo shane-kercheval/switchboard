@@ -194,6 +194,21 @@ pub enum AppError {
         #[source]
         source: std::io::Error,
     },
+
+    /// `git fetch` for a tracked repo failed (no network, no remote, auth, or
+    /// `git` not on PATH). Carries git's stderr verbatim. Best-effort at the call
+    /// site — the Git view records a "fetch failed" state and degrades to a stale
+    /// read rather than treating this as fatal.
+    #[error("git fetch failed for {root}: {message}")]
+    GitFetch { root: String, message: String },
+
+    /// `fetch_repo` was asked to fetch a path that doesn't resolve to a tracked
+    /// repo root — a stale frontend reference, or a fetch racing a remove. Refuse
+    /// rather than shell `git fetch` against an arbitrary caller-supplied path:
+    /// fetch is the one Git-view command that runs a subprocess, so it only acts
+    /// on roots the user has explicitly tracked.
+    #[error("{root} is not a tracked repository")]
+    RepoNotTracked { root: String },
 }
 
 impl AppError {

@@ -166,9 +166,9 @@
       .filter((a): a is AgentRecord => a !== undefined),
   );
 
-  /// `@`-quick-add: a trailing `@token` opens a typeahead of *unselected*
-  /// agents; Enter / click adds the highlighted one and strips the token. This
-  /// is the keyboard route to selecting recipients without touching the mouse.
+  /// `@` recipient picker: a trailing `@token` opens a typeahead of all agents;
+  /// Enter / click picks one as the sole recipient and strips the token. This is
+  /// the keyboard route to selecting recipients without touching the mouse.
   let menuOpen = $state(false);
   let menuEl = $state<HTMLDivElement | undefined>(undefined);
   let menuQuery = $state("");
@@ -185,16 +185,11 @@
   const MENU_WIDTH = 256;
 
   const agentCandidates = $derived(
-    menuOpen
-      ? agents.filter(
-          (a) =>
-            !selectedIds.includes(a.id) && a.name.toLowerCase().includes(menuQuery.toLowerCase()),
-        )
-      : [],
+    menuOpen ? agents.filter((a) => a.name.toLowerCase().includes(menuQuery.toLowerCase())) : [],
   );
 
   /// The menu's navigable rows: file matches render first in their own section,
-  /// then recipient actions and unselected agents. **All** appears only when not
+  /// then recipient actions and matching agents. **All** appears only when not
   /// everyone is selected and its keyword matches the query; **Clear** only when
   /// something is selected and its keyword matches. Even though files render
   /// first, keyboard selection prefers a matched agent when one exists.

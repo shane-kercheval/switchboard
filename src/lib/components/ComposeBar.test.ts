@@ -178,6 +178,27 @@ describe("ComposeBar", () => {
     expect(textarea.value).toBe("ping ");
   });
 
+  it("@ menu includes already-selected agents because picking one makes it the sole recipient", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+    await fireEvent.click(chip(AGENT_B.id)); // alice + bob selected
+    expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "true");
+    expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "true");
+
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "send @ali" } });
+    await fireEvent.click(await screen.findByTestId(`recipient-option-${AGENT_A.id}`));
+
+    expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "true");
+    expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "false");
+    expect(textarea.value).toBe("send ");
+  });
+
   it("@ menu shows matching files above recipients but Enter prefers a matched recipient", async () => {
     invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
       if (cmd === "search_project_files") return ["docs/bob.md", "src/box.ts"];

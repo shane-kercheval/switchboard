@@ -466,7 +466,7 @@
                 </div>
               </button>
               <div class="flex shrink-0 items-center gap-0.5 pr-1.5">
-                {#if !busy}
+                {#if !busy && !completed}
                   <div
                     class="pointer-events-none flex max-w-0 items-center gap-0.5 overflow-hidden opacity-0 transition-[max-width,opacity] group-hover:pointer-events-auto group-hover:max-w-[3.25rem] group-hover:opacity-100"
                   >

@@ -194,6 +194,33 @@ describe("ProjectsSidebar — background activity", () => {
     await waitFor(() => expect(screen.queryByTestId("project-completed")).toBeNull());
   });
 
+  it("hides project actions behind the completed marker until the project is selected", async () => {
+    await seedBusyProject(PROJECT_1);
+    const state = await loadState();
+    const ws = await loadWorkspace();
+    ws.selection.activeProjectId = PROJECT_2;
+
+    await startActivityObserver();
+    const ProjectsSidebar = (await import("./ProjectsSidebar.svelte")).default;
+    render(ProjectsSidebar, { props: noopProps });
+    await tick();
+    const rt = state.runtimes[AGENT_1];
+    if (rt === undefined) throw new Error("unreachable");
+    state.runtimes[AGENT_1] = { ...rt, run_status: "idle", pending_sends: undefined };
+
+    await waitFor(() => expect(screen.getByTestId("project-completed")).toBeInTheDocument());
+    expect(screen.queryByTestId("project-action-archive")).toBeNull();
+    expect(screen.queryByTestId("project-action-delete")).toBeNull();
+
+    const selectButton = screen.getByTestId("project-row").querySelector("button");
+    if (!selectButton) throw new Error("expected a select button in the project row");
+    await fireEvent.click(selectButton);
+
+    await waitFor(() => expect(screen.queryByTestId("project-completed")).toBeNull());
+    expect(screen.getByTestId("project-action-archive")).toBeInTheDocument();
+    expect(screen.getByTestId("project-action-delete")).toBeInTheDocument();
+  });
+
   it("updates active project activity without showing a completed marker", async () => {
     await seedBusyProject(PROJECT_1);
     const state = await loadState();

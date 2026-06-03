@@ -32,7 +32,7 @@ const AGENT: AgentRecord = {
   project_id: "00000000-0000-7000-8000-0000000000ff",
   name: "alice",
   harness: "claude_code",
-  session_id: "00000000-0000-7000-8000-000000000001",
+  session_locator: { uuid: "00000000-0000-7000-8000-000000000001" },
   created_at: "2026-05-16T00:00:00Z",
 };
 

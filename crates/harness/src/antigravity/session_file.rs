@@ -32,16 +32,16 @@ use super::{extract_model_from_record, paths, user_request_body};
 
 /// Load an Antigravity conversation's transcript into a [`LoadedTranscript`].
 ///
-/// `conversation_id` comes from the per-agent sidecar
-/// ([`super::sidecar::SessionLinkRecord::conversation_id`]) — Antigravity
-/// agents carry `session_id: None`, since the UUID is assigned server-side and
-/// captured post-dispatch. Pass `None` for an agent that has **never
-/// dispatched** (no sidecar yet): the result has empty turns but still carries
-/// the loader-derived MCP / skills registries, so the sidebar populates the
-/// moment the agent is selected — matching Codex's never-dispatched path.
+/// `conversation_id` comes from the agent's registry locator
+/// (`SessionLocator::Uuid`) — Antigravity agents register with
+/// `session_locator: None`, since the UUID is assigned server-side and captured
+/// post-dispatch. Pass `None` for an agent that has **never dispatched** (no
+/// locator yet): the result has empty turns but still carries the
+/// loader-derived MCP / skills registries, so the sidebar populates the moment
+/// the agent is selected — matching Codex's never-dispatched path.
 ///
 /// **Missing-transcript case** (conversation exists only as encrypted
-/// protobuf, or the sidecar points at a path that no longer exists): returns
+/// protobuf, or the locator points at a path that no longer exists): returns
 /// `Ok` with empty turns and loader-derived meta, plus a single debug log —
 /// degrading display, never blocking project open. Only an I/O error on a file
 /// that *does* exist raises [`LoadTranscriptError`].

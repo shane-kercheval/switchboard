@@ -58,7 +58,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use chrono::Utc;
-use switchboard_core::{AgentId, AgentRecord};
+use switchboard_core::{AgentId, AgentRecord, SessionLocator};
 use tokio::io::AsyncBufReadExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -233,8 +233,8 @@ fn build_args(agent: &AgentRecord, prompt: &str, cwd: &Path, home_dir: &Path) ->
         "--output-format".to_owned(),
         "stream-json".to_owned(),
     ];
-    if let Some(session_id) = agent.session_id {
-        if session_file::session_file_exists_for(home_dir, cwd, &session_id) {
+    if let Some(SessionLocator::Uuid(session_id)) = &agent.session_locator {
+        if session_file::session_file_exists_for(home_dir, cwd, session_id) {
             args.push("--resume".to_owned());
         } else {
             args.push("--session-id".to_owned());
@@ -556,9 +556,29 @@ mod tests {
             project_id: Uuid::now_v7(),
             name: "g".to_owned(),
             harness: HarnessKind::Gemini,
-            session_id: Some(session_id),
+            session_locator: Some(SessionLocator::Uuid(session_id)),
             created_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn build_args_omits_session_flags_when_locator_absent() {
+        // Defensive: Gemini agents always pre-mint a locator, but `build_args`
+        // is pure — a `None` locator omits both session flags.
+        let home = tempfile::TempDir::new().unwrap();
+        let cwd = tempfile::TempDir::new().unwrap();
+        let agent = AgentRecord {
+            id: Uuid::now_v7(),
+            project_id: Uuid::now_v7(),
+            name: "g".to_owned(),
+            harness: HarnessKind::Gemini,
+            session_locator: None,
+            created_at: Utc::now(),
+        };
+        let args = build_args(&agent, "hi", cwd.path(), home.path());
+
+        assert!(!args.contains(&"--session-id".to_owned()));
+        assert!(!args.contains(&"--resume".to_owned()));
     }
 
     #[test]

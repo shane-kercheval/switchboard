@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use chrono::Utc;
-use switchboard_core::{AgentId, AgentRecord};
+use switchboard_core::{AgentId, AgentRecord, SessionLocator};
 use tokio::io::AsyncBufReadExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -153,7 +153,7 @@ fn build_args(
         "--verbose".to_owned(),
         "--dangerously-skip-permissions".to_owned(),
     ];
-    if let Some(session_id) = agent.session_id {
+    if let Some(SessionLocator::Uuid(session_id)) = &agent.session_locator {
         // --session-id creates a new session with the given UUID (first turn).
         // --resume continues an existing session (all subsequent turns).
         // Claude Code stores sessions at ~/.claude/projects/<encoded-cwd>/<uuid>.jsonl;
@@ -163,8 +163,8 @@ fn build_args(
         // its actual cwd, so any divergence here means we look in the
         // wrong place and pass `--session-id` when we should `--resume`.
         let exists = match home_override {
-            Some(home) => session_exists_in(home, cwd, &session_id),
-            None => session_file_exists(cwd, &session_id),
+            Some(home) => session_exists_in(home, cwd, session_id),
+            None => session_file_exists(cwd, session_id),
         };
         if exists {
             args.push("--resume".to_owned());
@@ -416,7 +416,7 @@ mod tests {
             project_id: Uuid::now_v7(),
             name: "test".to_owned(),
             harness: HarnessKind::ClaudeCode,
-            session_id: Some(session_id),
+            session_locator: Some(SessionLocator::Uuid(session_id)),
             created_at: chrono::Utc::now(),
         }
     }
@@ -473,6 +473,28 @@ mod tests {
 
         assert!(args.contains(&"--resume".to_owned()));
         assert!(!args.contains(&"--session-id".to_owned()));
+    }
+
+    #[test]
+    fn build_args_omits_session_flags_when_locator_absent() {
+        // Defensive: Claude agents always pre-mint a locator, but `build_args`
+        // is a pure function — a `None` locator must omit both session flags
+        // rather than emit a flag with no id.
+        let home = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let agent = AgentRecord {
+            id: Uuid::now_v7(),
+            project_id: Uuid::now_v7(),
+            name: "test".to_owned(),
+            harness: HarnessKind::ClaudeCode,
+            session_locator: None,
+            created_at: chrono::Utc::now(),
+        };
+
+        let args = build_args(&agent, "hi", project.path(), Some(home.path()));
+
+        assert!(!args.contains(&"--session-id".to_owned()));
+        assert!(!args.contains(&"--resume".to_owned()));
     }
 
     #[test]

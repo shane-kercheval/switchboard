@@ -410,6 +410,24 @@ pub fn list_workspace_directories_impl(state: &AppState) -> WorkspaceDirectories
     }
 }
 
+/// All prompts across configured providers (user-global; no project argument).
+/// Never hard-fails: an unreachable/misconfigured provider contributes nothing
+/// rather than breaking the listing.
+pub fn list_prompts_impl(state: &AppState) -> Vec<switchboard_prompts::Prompt> {
+    state.prompts.list()
+}
+
+/// Render a prompt to its finished text. Provider-dispatched; this milestone
+/// resolves only `local`. Serves both preview and send with the identical args.
+pub fn render_prompt_impl(
+    state: &AppState,
+    provider: &str,
+    name: &str,
+    args: &std::collections::BTreeMap<String, String>,
+) -> Result<switchboard_prompts::RenderedPrompt, AppError> {
+    Ok(state.prompts.render(provider, name, args)?)
+}
+
 pub fn create_project_impl(
     state: &AppState,
     name: &str,
@@ -8045,5 +8063,72 @@ mod tests {
             conv.items.is_empty(),
             "no journal ⇒ no user/outcome items; empty transcript adds none"
         );
+    }
+
+    /// Build a state whose prompt service points at a fresh temp prompts dir
+    /// (with `config.yaml` absent, so the default dir is used). Returns the dir
+    /// so the test can drop prompt files into it.
+    fn state_with_prompts() -> (TempDir, AppState) {
+        let (tmp, state, _) = fresh_state_with_mock();
+        let prompts_dir = tmp.path().join("prompts");
+        std::fs::create_dir_all(&prompts_dir).unwrap();
+        let service = switchboard_prompts::PromptService::new(
+            tmp.path().join("config.yaml"),
+            prompts_dir,
+            None,
+        );
+        (tmp, state.with_prompts(service))
+    }
+
+    #[test]
+    fn list_prompts_surfaces_a_local_prompt() {
+        let (tmp, state) = state_with_prompts();
+        std::fs::write(
+            tmp.path().join("prompts").join("greet.md"),
+            "---\nname: greet\ndescription: Greeting.\narguments:\n  - name: who\n    required: true\n---\nHi {{ who }}\n",
+        )
+        .unwrap();
+
+        let prompts = list_prompts_impl(&state);
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].provider, "local");
+        assert_eq!(prompts[0].name, "greet");
+        assert_eq!(prompts[0].arguments.len(), 1);
+        assert!(prompts[0].arguments[0].required);
+    }
+
+    #[test]
+    fn render_prompt_substitutes_arguments() {
+        let (tmp, state) = state_with_prompts();
+        std::fs::write(
+            tmp.path().join("prompts").join("greet.md"),
+            "---\nname: greet\ndescription: Greeting.\narguments:\n  - name: who\n    required: true\n---\nHi {{ who }}\n",
+        )
+        .unwrap();
+
+        let args = std::collections::BTreeMap::from([("who".to_owned(), "Ada".to_owned())]);
+        let rendered = render_prompt_impl(&state, "local", "greet", &args).unwrap();
+        assert!(rendered.text.contains("Hi Ada"));
+    }
+
+    #[test]
+    fn render_prompt_missing_required_arg_is_error() {
+        let (tmp, state) = state_with_prompts();
+        std::fs::write(
+            tmp.path().join("prompts").join("greet.md"),
+            "---\nname: greet\ndescription: Greeting.\narguments:\n  - name: who\n    required: true\n---\nHi {{ who }}\n",
+        )
+        .unwrap();
+
+        let err = render_prompt_impl(&state, "local", "greet", &std::collections::BTreeMap::new())
+            .unwrap_err();
+        assert!(matches!(err, AppError::Prompt(_)));
+    }
+
+    #[test]
+    fn list_prompts_on_disabled_service_is_empty() {
+        // A state without `with_prompts` keeps the disabled default.
+        let (_tmp, state, _) = fresh_state_with_mock();
+        assert!(list_prompts_impl(&state).is_empty());
     }
 }

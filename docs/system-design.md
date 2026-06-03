@@ -69,7 +69,6 @@ Switchboard-managed state lives in a `.switchboard/` directory at the working di
 └── .switchboard/
     ├── config.yaml             # directory-level config (placeholder in v1; mostly empty)
     ├── workflows/              # workflow definitions (YAML), shared across projects in this directory
-    ├── prompts/                # local prompts (markdown body + YAML frontmatter), shared across projects
     ├── projects.jsonl          # append-only index of projects: { id, name, created_at }
     └── projects/
         └── <project-id>/       # per-project state (one subdirectory per project)
@@ -83,8 +82,8 @@ Switchboard-managed state lives in a `.switchboard/` directory at the working di
 
 ~/.config/switchboard/          # user-global config (illustrative Linux/XDG path; resolved via the `directories` crate —
 │                               #   on macOS this is ~/Library/Application Support/switchboard/)
-├── config.yaml                 # personal preferences (prompt library location, accounts)
-├── prompts/                    # optional personal prompt library (see §6)
+├── config.yaml                 # personal preferences + prompt providers (local_prompt_dirs, mcp_providers — see §6)
+├── prompts/                    # default local prompt store (seeded with example prompts on first run — see §6)
 └── workspace.yaml              # app-managed: the working directories the user works across,
                                 #   each with a cached snapshot of its projects
 ```
@@ -93,7 +92,7 @@ Switchboard is **single-instance**: launching it again focuses the running windo
 
 **What's directory-scoped vs project-scoped vs user-global:** workflows are directory-scoped — defined once per repo, reusable across projects in that directory. Agents, runtime state, workflow runs, and harness session links are project-scoped — each project has its own. Prompt providers (local directories + MCP servers) are **user-global** — configured once at the user level and available in every project regardless of directory (see §6). Rationale: workflow definitions are about *how to do the work in this repo*; they belong to the directory. Agents and runtime state are about *the work in progress*; they belong to the project. Prompt libraries are personal, portable templates; they belong to the user.
 
-The directory-level `config.yaml`, `workflows/`, and `prompts/` are intended to be checked into git and shared. Everything else — `projects.jsonl`, the entire `projects/` tree (including per-project `config.yaml`, `registry.jsonl`, `journal.jsonl`, `sessions/`, `runs/`), and lock files — is local-machine runtime data and should be `.gitignore`d.
+The directory-level `config.yaml` and `workflows/` are intended to be checked into git and shared. (Local prompts are user-global, not directory-scoped — there is no per-directory `prompts/` store; see §6.) Everything else — `projects.jsonl`, the entire `projects/` tree (including per-project `config.yaml`, `registry.jsonl`, `journal.jsonl`, `sessions/`, `runs/`), and lock files — is local-machine runtime data and should be `.gitignore`d.
 
 ### Working directories and the workspace
 

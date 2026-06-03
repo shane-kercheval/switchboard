@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use switchboard_core::{AgentId, AgentRecord, Directory, Project, ProjectId};
 use switchboard_dispatcher::{Dispatcher, EventEmitter};
 use switchboard_harness::HarnessAdapter;
+use switchboard_prompts::PromptService;
 
 use crate::workspace::{self, Workspace};
 
@@ -155,6 +156,13 @@ pub struct AppState {
     /// resolved (tests, or an exotic host with no home dir). `persist_workspace`
     /// is a no-op while this is `None`, so tests never touch user-global state.
     pub workspace_path: Option<PathBuf>,
+
+    /// User-global prompt resolution (local file providers; MCP later). Read-only
+    /// after construction — the command shims call `list`/`render` through it.
+    /// Defaults to an inert (disabled) service; production injects the configured
+    /// one via [`AppState::with_prompts`], and tests that exercise prompts do the
+    /// same with temp paths.
+    pub prompts: PromptService,
 }
 
 impl AppState {
@@ -181,7 +189,17 @@ impl AppState {
             agents_by_id: Mutex::new(HashMap::new()),
             workspace: Mutex::new(Workspace::default()),
             workspace_path: None,
+            prompts: PromptService::disabled(),
         }
+    }
+
+    /// Builder step that injects the configured prompt service. Production calls
+    /// this after `new`; tests that exercise prompts pass a service over temp
+    /// paths, while others keep the disabled default.
+    #[must_use]
+    pub fn with_prompts(mut self, prompts: PromptService) -> Self {
+        self.prompts = prompts;
+        self
     }
 
     /// Builder step that loads the workspace registry from `path` and records

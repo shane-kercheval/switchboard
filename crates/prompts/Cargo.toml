@@ -1,0 +1,23 @@
+[package]
+name = "switchboard-prompts"
+description = "Switchboard prompts: provider framework, local file prompts, MiniJinja rendering (pure Rust, no Tauri)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+switchboard-core = { path = "../core" }
+serde = { workspace = true }
+serde_norway = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+minijinja = "2.20.0"
+
+[dev-dependencies]
+tempfile = { workspace = true }

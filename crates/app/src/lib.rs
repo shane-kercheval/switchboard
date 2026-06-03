@@ -9,6 +9,7 @@ mod emitter;
 mod error;
 mod journal;
 mod metadata;
+mod prompts_setup;
 mod state;
 mod workspace;
 
@@ -29,15 +30,17 @@ use crate::commands::{
     check_claude_auth_impl, check_claude_binary_impl, check_codex_auth_impl,
     check_codex_binary_impl, check_gemini_auth_impl, check_gemini_binary_impl, create_agent_impl,
     create_project_impl, get_harness_install_status_impl, init_directory_impl, list_agents_impl,
-    list_projects_impl, list_workspace_directories_impl, load_project_conversation_impl,
-    load_transcript_impl, open_project_impl, parse_uuid, pick_directory_impl, remove_agent_impl,
-    remove_directory_impl, remove_queued_message_impl, rename_agent_impl,
-    search_project_files_in_root, search_project_files_root_impl, send_message_impl,
-    set_active_project_impl, validate_external_url,
+    list_projects_impl, list_prompts_impl, list_workspace_directories_impl,
+    load_project_conversation_impl, load_transcript_impl, open_project_impl, parse_uuid,
+    pick_directory_impl, remove_agent_impl, remove_directory_impl, remove_queued_message_impl,
+    rename_agent_impl, render_prompt_impl, search_project_files_in_root,
+    search_project_files_root_impl, send_message_impl, set_active_project_impl,
+    validate_external_url,
 };
 use crate::state::AppState;
 
 use switchboard_core::{AgentRecord, HarnessKind, ProjectSummary};
+use switchboard_prompts::{Prompt, RenderedPrompt};
 
 #[tauri::command]
 async fn check_claude_binary(state: State<'_, AppState>) -> Result<(), String> {
@@ -125,6 +128,25 @@ async fn list_workspace_directories(
     state: State<'_, AppState>,
 ) -> Result<WorkspaceDirectories, String> {
     Ok(list_workspace_directories_impl(state.inner()))
+}
+
+/// List all prompts across configured providers (user-global; no project
+/// argument). Reads local providers this milestone; never hits the network.
+#[tauri::command]
+async fn list_prompts(state: State<'_, AppState>) -> Result<Vec<Prompt>, String> {
+    Ok(list_prompts_impl(state.inner()))
+}
+
+/// Render `name` from `provider` with `args`, returning the finished text.
+/// Serves both preview and send — the caller passes the identical args map.
+#[tauri::command]
+async fn render_prompt(
+    state: State<'_, AppState>,
+    provider: String,
+    name: String,
+    args: std::collections::BTreeMap<String, String>,
+) -> Result<RenderedPrompt, String> {
+    render_prompt_impl(state.inner(), &provider, &name, &args).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -447,43 +469,62 @@ fn build_adapters() -> (
     }
 }
 
-/// Resolve the path to the user-global `workspace.yaml` (the cross-directory
-/// project list). `None` only when no home directory is resolvable, in which
-/// case workspace persistence is disabled.
+/// Resolve the user-global config directory — the single location that holds
+/// `workspace.yaml`, the prompt `config.yaml`, and the default `prompts/` store.
+/// `None` only when no home directory is resolvable, in which case user-global
+/// persistence (workspace registry, prompt config) is disabled.
 ///
 /// Release builds always resolve the OS config dir for `switchboard`, so the
-/// installed app's list lives at one fixed, predictable location no env var can
+/// installed app's state lives at one fixed, predictable location no env var can
 /// move.
 ///
-/// Debug builds resolve a separate dev registry so dev runs never read or
-/// overwrite the installed app's list. `SWITCHBOARD_CONFIG_DIR` (set per port by
+/// Debug builds resolve a separate dev directory so dev runs never read or
+/// overwrite the installed app's state. `SWITCHBOARD_CONFIG_DIR` (set per port by
 /// `make dev`) overrides the location outright; without it the fallback is a
 /// shared `switchboard-dev`. The override is debug-only by construction — it
 /// cannot relocate the installed app's data.
 #[cfg(not(debug_assertions))]
-fn workspace_config_path() -> Option<std::path::PathBuf> {
+fn config_dir() -> Option<std::path::PathBuf> {
     directories::ProjectDirs::from("", "", "switchboard")
-        .map(|dirs| dirs.config_dir().join("workspace.yaml"))
+        .map(|dirs| dirs.config_dir().to_path_buf())
 }
 
 #[cfg(debug_assertions)]
-fn workspace_config_path() -> Option<std::path::PathBuf> {
-    debug_workspace_config_path(std::env::var_os("SWITCHBOARD_CONFIG_DIR"))
+fn config_dir() -> Option<std::path::PathBuf> {
+    debug_config_dir(std::env::var_os("SWITCHBOARD_CONFIG_DIR"))
 }
 
-/// Pure decision behind the debug arm of [`workspace_config_path`], split out so
-/// the override mapping is testable without mutating process-global env (which
-/// is `unsafe` and racy under edition 2024). An explicit override is used
-/// verbatim; otherwise the shared `switchboard-dev` registry is the fallback.
+/// Pure decision behind the debug arm of [`config_dir`], split out so the
+/// override mapping is testable without mutating process-global env (which is
+/// `unsafe` and racy under edition 2024). An explicit override is used verbatim;
+/// otherwise the shared `switchboard-dev` directory is the fallback.
 #[cfg(debug_assertions)]
-fn debug_workspace_config_path(
-    override_dir: Option<std::ffi::OsString>,
-) -> Option<std::path::PathBuf> {
+fn debug_config_dir(override_dir: Option<std::ffi::OsString>) -> Option<std::path::PathBuf> {
     if let Some(dir) = override_dir {
-        return Some(std::path::PathBuf::from(dir).join("workspace.yaml"));
+        return Some(std::path::PathBuf::from(dir));
     }
     directories::ProjectDirs::from("", "", "switchboard-dev")
-        .map(|dirs| dirs.config_dir().join("workspace.yaml"))
+        .map(|dirs| dirs.config_dir().to_path_buf())
+}
+
+/// Path to the user-global `workspace.yaml` (the cross-directory project list).
+fn workspace_config_path() -> Option<std::path::PathBuf> {
+    config_dir().map(|dir| dir.join("workspace.yaml"))
+}
+
+/// Build the prompt service from the user-global config dir, seeding the example
+/// prompts on first run. The pure `crates/prompts` never touches `directories`;
+/// the app resolves and injects the config path, default prompts dir, and home.
+fn build_prompt_service() -> switchboard_prompts::PromptService {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    if let Some(dir) = config_dir() {
+        let prompts_dir = dir.join("prompts");
+        crate::prompts_setup::seed_example_prompts(&prompts_dir);
+        switchboard_prompts::PromptService::new(dir.join("config.yaml"), prompts_dir, home)
+    } else {
+        tracing::warn!("no home directory resolved — prompt providers disabled");
+        switchboard_prompts::PromptService::disabled()
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -541,6 +582,9 @@ pub fn run() {
                 );
                 state
             };
+            // Resolve and inject the user-global prompt config + default prompts
+            // store (seeding the example prompts on first run).
+            let state = state.with_prompts(build_prompt_service());
             // Cold start: open a `Directory` handle for every workspace entry so
             // restored directories report `available: true` and participate in
             // the cross-harness session-id collision scan. Unopenable
@@ -564,6 +608,8 @@ pub fn run() {
             remove_directory,
             list_projects,
             list_workspace_directories,
+            list_prompts,
+            render_prompt,
             create_project,
             open_project,
             set_active_project,
@@ -588,18 +634,18 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
-// Gated on `debug_assertions` because `debug_workspace_config_path` exists only
-// in debug builds; `cargo test --release` turns those off and the symbol away.
+// Gated on `debug_assertions` because `debug_config_dir` exists only in debug
+// builds; `cargo test --release` turns those off and the symbol away.
 #[cfg(all(test, debug_assertions))]
 mod tests {
-    use super::debug_workspace_config_path;
+    use super::debug_config_dir;
     use std::path::PathBuf;
 
     #[test]
-    fn override_dir_is_used_verbatim_with_workspace_yaml_appended() {
-        let path = debug_workspace_config_path(Some("/tmp/switchboard-test".into()))
+    fn override_dir_is_used_verbatim() {
+        let path = debug_config_dir(Some("/tmp/switchboard-test".into()))
             .expect("an explicit override always yields a path");
-        assert_eq!(path, PathBuf::from("/tmp/switchboard-test/workspace.yaml"));
+        assert_eq!(path, PathBuf::from("/tmp/switchboard-test"));
     }
 
     #[test]
@@ -607,8 +653,8 @@ mod tests {
         // Routes through `ProjectDirs`, which is `None` only on a host with no
         // resolvable home (not a dev machine or normal CI). Skip rather than
         // unwrap so an exotic host degrades quietly instead of panicking.
-        if let Some(path) = debug_workspace_config_path(None) {
-            assert!(path.ends_with("switchboard-dev/workspace.yaml"));
+        if let Some(path) = debug_config_dir(None) {
+            assert!(path.ends_with("switchboard-dev"));
         }
     }
 }

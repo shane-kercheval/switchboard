@@ -7,11 +7,15 @@
   import Badge from "$lib/components/ui/Badge.svelte";
   import GitBadge from "$lib/components/GitBadge.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
+  import DropdownMenu from "$lib/components/ui/DropdownMenu.svelte";
+  import DropdownMenuItem from "$lib/components/ui/DropdownMenuItem.svelte";
   import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
   import { localBranchBadges, remoteBranchBadges } from "$lib/gitBadges";
   import type { RepoListing } from "$lib/types";
   import type { FetchState } from "$lib/state/gitView.svelte";
-  import { refreshRepo, fetchRepo } from "$lib/state/gitView.svelte";
+  import { refreshRepo, fetchRepo, removeRepo } from "$lib/state/gitView.svelte";
+  import { openInEditor, openInTerminal, revealInFinder } from "$lib/api";
+  import { copyText } from "$lib/native";
 
   let {
     listing,
@@ -63,6 +67,15 @@
     } finally {
       busy = false;
     }
+  }
+
+  // Open actions fire-and-forget: a silently-swallowed failure looks like
+  // "nothing happened," so surface it to the console (the path is opened
+  // backend-side). Copy actions go straight to the clipboard.
+  function runAction(action: Promise<void>): void {
+    void action.catch((e: unknown) => {
+      console.error("[switchboard] git view open action failed", e);
+    });
   }
 </script>
 
@@ -130,6 +143,40 @@
           </svg>
         {/if}
       </button>
+
+      <DropdownMenu
+        triggerLabel={`Actions for ${repo.name}`}
+        triggerTestid="repo-actions-trigger"
+        triggerClass={cn(ICON_BUTTON_CLASS)}
+        contentTestid="repo-actions-menu"
+      >
+        {#snippet trigger()}
+          <svg viewBox="0 0 24 24" fill="currentColor" class="h-4 w-4" aria-hidden="true">
+            <circle cx="12" cy="5" r="1.6" />
+            <circle cx="12" cy="12" r="1.6" />
+            <circle cx="12" cy="19" r="1.6" />
+          </svg>
+        {/snippet}
+        <DropdownMenuItem
+          onSelect={() => runAction(revealInFinder(repo.root))}
+          data-testid="repo-action-reveal"
+        >
+          Reveal in Finder
+        </DropdownMenuItem>
+        <DropdownMenuItem
+          onSelect={() => runAction(copyText(repo.root))}
+          data-testid="repo-action-copy-path"
+        >
+          Copy path
+        </DropdownMenuItem>
+        <DropdownMenuItem
+          onSelect={() => runAction(removeRepo(repo.root))}
+          class="text-status-failed"
+          data-testid="repo-action-remove"
+        >
+          Remove from view
+        </DropdownMenuItem>
+      </DropdownMenu>
     </div>
   </div>
 
@@ -167,6 +214,53 @@
                   {/each}
                 {/if}
               </div>
+              {#if branch.worktree}
+                {@const worktreePath = branch.worktree.path}
+                <DropdownMenu
+                  triggerLabel={`Actions for ${branch.name}`}
+                  triggerTestid="worktree-actions-trigger"
+                  triggerClass={cn(ICON_BUTTON_CLASS, "shrink-0")}
+                  contentTestid="worktree-actions-menu"
+                >
+                  {#snippet trigger()}
+                    <svg viewBox="0 0 24 24" fill="currentColor" class="h-4 w-4" aria-hidden="true">
+                      <circle cx="12" cy="5" r="1.6" />
+                      <circle cx="12" cy="12" r="1.6" />
+                      <circle cx="12" cy="19" r="1.6" />
+                    </svg>
+                  {/snippet}
+                  <DropdownMenuItem
+                    onSelect={() => runAction(openInEditor(worktreePath))}
+                    data-testid="worktree-action-editor"
+                  >
+                    Open in editor
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onSelect={() => runAction(openInTerminal(worktreePath))}
+                    data-testid="worktree-action-terminal"
+                  >
+                    Open in terminal
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onSelect={() => runAction(revealInFinder(worktreePath))}
+                    data-testid="worktree-action-reveal"
+                  >
+                    Reveal in Finder
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onSelect={() => runAction(copyText(worktreePath))}
+                    data-testid="worktree-action-copy-path"
+                  >
+                    Copy path
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onSelect={() => runAction(copyText(branch.name))}
+                    data-testid="worktree-action-copy-branch"
+                  >
+                    Copy branch name
+                  </DropdownMenuItem>
+                </DropdownMenu>
+              {/if}
             </div>
           {/each}
           {#if localBranches.length === 0}

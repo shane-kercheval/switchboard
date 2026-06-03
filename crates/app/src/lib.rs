@@ -31,14 +31,15 @@ use crate::commands::{
     cancel_agent_impl, cancel_send_impl, cancel_turn_impl, check_antigravity_auth_impl,
     check_antigravity_binary_impl, check_claude_auth_impl, check_claude_binary_impl,
     check_codex_auth_impl, check_codex_binary_impl, check_gemini_auth_impl,
-    check_gemini_binary_impl, create_agent_impl, create_project_impl, fetch_repo_impl,
-    get_harness_install_status_impl, get_preferences_impl, init_directory_impl, list_agents_impl,
-    list_projects_impl, list_tracked_repos_from_inputs, list_workspace_directories_impl,
-    load_project_conversation_impl, load_transcript_impl, open_project_impl, parse_uuid,
-    pick_directory_impl, read_tracked_repo_from_inputs, remove_agent_impl, remove_directory_impl,
-    remove_queued_message_impl, remove_tracked_repo_impl, rename_agent_impl,
-    search_project_files_in_root, search_project_files_root_impl, send_message_impl,
-    set_active_project_impl, set_preferences_impl, tracked_repos_inputs, validate_external_url,
+    check_gemini_binary_impl, create_agent_impl, create_project_impl, editor_open_argv,
+    fetch_repo_impl, get_harness_install_status_impl, get_preferences_impl, init_directory_impl,
+    list_agents_impl, list_projects_impl, list_tracked_repos_from_inputs,
+    list_workspace_directories_impl, load_project_conversation_impl, load_transcript_impl,
+    open_project_impl, parse_uuid, pick_directory_impl, read_tracked_repo_from_inputs,
+    remove_agent_impl, remove_directory_impl, remove_queued_message_impl, remove_tracked_repo_impl,
+    rename_agent_impl, reveal_in_finder_argv, search_project_files_in_root,
+    search_project_files_root_impl, send_message_impl, set_active_project_impl,
+    set_preferences_impl, terminal_open_argv, tracked_repos_inputs, validate_external_url,
 };
 use crate::preferences::Preferences;
 use crate::state::AppState;
@@ -435,6 +436,40 @@ async fn open_external_url(url: String) -> Result<(), String> {
     }
 }
 
+/// Spawn a macOS opener argv (program in `argv[0]`, args in the rest) and map a
+/// spawn failure / non-zero exit to a flat error string. Shared by the Git-view
+/// open actions, which differ only in how they build the argv.
+async fn run_open_argv(argv: Vec<String>) -> Result<(), String> {
+    let (program, rest) = argv.split_first().ok_or("empty open command")?;
+    let status = tokio::process::Command::new(program)
+        .args(rest)
+        .status()
+        .await
+        .map_err(|e| e.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("`{program}` failed (exit {status})"))
+    }
+}
+
+#[tauri::command]
+async fn open_in_editor(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    let editor = get_preferences_impl(state.inner()).editor_command;
+    run_open_argv(editor_open_argv(editor.as_deref(), &path)).await
+}
+
+#[tauri::command]
+async fn open_in_terminal(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    let terminal = get_preferences_impl(state.inner()).terminal_app;
+    run_open_argv(terminal_open_argv(&terminal, &path)).await
+}
+
+#[tauri::command]
+async fn reveal_in_finder(path: String) -> Result<(), String> {
+    run_open_argv(reveal_in_finder_argv(&path)).await
+}
+
 #[tauri::command]
 async fn load_project_conversation(
     state: State<'_, AppState>,
@@ -700,6 +735,9 @@ pub fn run() {
             agent_session_info,
             open_session_file,
             open_external_url,
+            open_in_editor,
+            open_in_terminal,
+            reveal_in_finder,
             load_transcript,
             load_project_conversation,
         ])

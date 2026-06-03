@@ -9,11 +9,19 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: (cmd: string, args?: Record<string, unknown>) => invokeMock(cmd, args),
 }));
 
+const pickDirectoryMock = vi.fn<() => Promise<string | null>>(async () => null);
+vi.mock("$lib/native", () => ({
+  pickDirectory: () => pickDirectoryMock(),
+  copyText: vi.fn(async () => {}),
+}));
+
 const { refreshAll, _testing } = await import("$lib/state/gitView.svelte");
 
 afterEach(() => {
   _testing.reset();
   invokeMock.mockReset();
+  pickDirectoryMock.mockReset();
+  pickDirectoryMock.mockResolvedValue(null);
 });
 
 const repo = (over: Partial<RepoListing["repo"]> = {}): RepoListing => ({
@@ -134,6 +142,61 @@ describe("GitView", () => {
     await fireEvent.click(screen.getByTestId("git-refresh-all"));
     await waitFor(() =>
       expect(invokeMock.mock.calls.some((c) => c[0] === "list_tracked_repos")).toBe(true),
+    );
+  });
+
+  it("Add Repo: a chosen folder is added and the list re-read", async () => {
+    wire([]);
+    await refreshAll();
+    render(GitView);
+    await waitFor(() => expect(screen.getByTestId("git-empty")).toBeInTheDocument());
+
+    pickDirectoryMock.mockResolvedValueOnce("/repos/app");
+    invokeMock.mockClear();
+    wire([repo()]);
+    await fireEvent.click(screen.getByTestId("git-add-repo"));
+
+    await waitFor(() =>
+      expect(
+        invokeMock.mock.calls.some(
+          (c) => c[0] === "add_tracked_repo" && (c[1] as { path: string }).path === "/repos/app",
+        ),
+      ).toBe(true),
+    );
+    // The added repo appears (list was re-read).
+    await waitFor(() => expect(screen.getByTestId("git-repo")).toBeInTheDocument());
+  });
+
+  it("Add Repo: cancelling the picker adds nothing", async () => {
+    wire([]);
+    await refreshAll();
+    render(GitView);
+    await waitFor(() => expect(screen.getByTestId("git-empty")).toBeInTheDocument());
+
+    pickDirectoryMock.mockResolvedValueOnce(null); // user cancelled
+    invokeMock.mockClear();
+    await fireEvent.click(screen.getByTestId("git-add-repo"));
+
+    expect(invokeMock.mock.calls.some((c) => c[0] === "add_tracked_repo")).toBe(false);
+  });
+
+  it("Add Repo: a non-git path surfaces the backend error inline", async () => {
+    wire([]);
+    await refreshAll();
+    render(GitView);
+    await waitFor(() => expect(screen.getByTestId("git-empty")).toBeInTheDocument());
+
+    pickDirectoryMock.mockResolvedValueOnce("/tmp/not-a-repo");
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "add_tracked_repo")
+        return Promise.reject(new Error("/tmp/not-a-repo is not inside a git repository"));
+      if (cmd === "list_tracked_repos") return Promise.resolve([]);
+      return Promise.resolve(null);
+    });
+    await fireEvent.click(screen.getByTestId("git-add-repo"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("git-add-error")).toHaveTextContent("not inside a git repository"),
     );
   });
 });

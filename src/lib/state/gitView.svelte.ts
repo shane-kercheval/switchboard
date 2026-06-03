@@ -79,32 +79,47 @@ export async function enterGitView(): Promise<void> {
 /// and the entry path (`refreshStale`) pairs it with the staleness-gated fetch.
 /// Keeping fetch out of here avoids double-fetching on a global refresh and keeps
 /// the read independently reasoned about.
+async function loadTrackedRepos(): Promise<void> {
+  const repos = await api.listTrackedRepos();
+  applyRepos(repos);
+  gitView.status = "complete";
+}
+
 export async function refreshAll(): Promise<void> {
   gitView.status = gitView.repos.length === 0 ? "loading" : gitView.status;
   try {
-    // TEMPORARY (remove in M3 commit C, which adds the "Add Repo" button): seed a
-    // repo so the tree is reviewable before the add affordance exists. Best-effort
-    // — a failure here must not block the read.
-    await seedDevRepo();
-    const repos = await api.listTrackedRepos();
-    applyRepos(repos);
-    gitView.status = "complete";
+    await loadTrackedRepos();
   } catch (e) {
     console.warn("[switchboard] git view refreshAll failed", e);
     gitView.status = "failed";
   }
 }
 
-/// TEMPORARY scaffolding — delete with this whole function in M3 commit C.
-let devRepoSeeded = false;
-async function seedDevRepo(): Promise<void> {
-  if (devRepoSeeded) return;
-  devRepoSeeded = true;
-  try {
-    await api.addTrackedRepo("/Users/shanekercheval/repos/switchboard-git-view");
-  } catch (e) {
-    console.warn("[switchboard] dev repo seed failed", e);
-  }
+/// Track a repo by an explicit "Add Repo" action: the path is resolved to its
+/// canonical root and added (a subdirectory / linked worktree of an
+/// already-tracked repo dedups). On success the list is re-read so the repo
+/// appears, then a staleness-gated fetch refreshes its sync state.
+///
+/// Unlike the passive global refresh, this is a *mutation* the user just
+/// triggered, so it must report the truth: it re-reads via the **throwing**
+/// `loadTrackedRepos` (not best-effort `refreshAll`) so that either the add and
+/// its re-read both succeed, or the error propagates to the caller for an inline
+/// surface — never a silent success that leaves the new repo invisible. A non-git
+/// path also rejects from the backend through the same channel.
+export async function addRepo(path: string): Promise<void> {
+  await api.addTrackedRepo(path);
+  await loadTrackedRepos();
+  void fetchStaleRepos();
+}
+
+/// Untrack a repo ("Remove from view"): registry-only — never touches files or
+/// the workspace. The list is re-read so the row disappears and its runtime /
+/// fetch bookkeeping is dropped. Re-reads via the throwing primitive (same
+/// honesty rationale as `addRepo`): a failed re-read surfaces rather than leaving
+/// the removed row on screen as a false success.
+export async function removeRepo(path: string): Promise<void> {
+  await api.removeTrackedRepo(path);
+  await loadTrackedRepos();
 }
 
 /// Entry refresh (called on view entry): full read if nothing's loaded, else
@@ -216,7 +231,11 @@ function upsertRepo(listing: RepoListing): void {
 
 function recordFetch(root: string, state: FetchState): void {
   const rt = runtime.get(root);
-  if (rt !== undefined) rt.fetch = state;
+  // The repo was untracked while this fetch was in flight (`removeRepo`'s re-read
+  // dropped its runtime + fetch-state). Don't resurrect a dangling key for an
+  // untracked root.
+  if (rt === undefined) return;
+  rt.fetch = state;
   fetchStates[root] = state;
 }
 
@@ -246,7 +265,6 @@ export const _testing = {
     runtime.clear();
     inFlightFetch.clear();
     for (const k of Object.keys(fetchStates)) delete fetchStates[k];
-    devRepoSeeded = false; // TEMPORARY — remove with the dev-repo seed in commit C
   },
   runtimeSize(): number {
     return runtime.size;

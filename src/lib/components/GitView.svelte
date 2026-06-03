@@ -16,11 +16,14 @@
     SEGMENTED_ITEM_ACTIVE_CLASS,
     SEGMENTED_ITEM_INACTIVE_CLASS,
   } from "$lib/components/ui/segmentedControl";
-  import { gitView, fetchStates, refreshAll, fetchAll } from "$lib/state/gitView.svelte";
+  import { gitView, fetchStates, refreshAll, fetchAll, addRepo } from "$lib/state/gitView.svelte";
+  import { pickDirectory } from "$lib/native";
 
   let branchFilter = $state<"local" | "remote" | "both">("local");
   let showInactive = $state(false);
   let refreshing = $state(false);
+  let adding = $state(false);
+  let addError = $state<string | null>(null);
 
   const filterOptions: { value: "local" | "remote" | "both"; label: string }[] = [
     { value: "local", label: "Local" },
@@ -35,6 +38,20 @@
       await fetchAll();
     } finally {
       refreshing = false;
+    }
+  }
+
+  async function onAddRepo(): Promise<void> {
+    addError = null;
+    const path = await pickDirectory();
+    if (path === null) return;
+    adding = true;
+    try {
+      await addRepo(path);
+    } catch (e) {
+      addError = e instanceof Error ? e.message : String(e);
+    } finally {
+      adding = false;
     }
   }
 </script>
@@ -71,20 +88,43 @@
       Show inactive branches
     </label>
 
-    <Button
-      variant="secondary"
-      size="sm"
-      class="ml-auto"
-      data-testid="git-refresh-all"
-      disabled={refreshing}
-      onclick={onGlobalRefresh}
-    >
-      {#if refreshing}
-        <Spinner class="mr-1.5 h-3.5 w-3.5" />
-      {/if}
-      Refresh
-    </Button>
+    <div class="ml-auto flex items-center gap-2">
+      <Button
+        variant="secondary"
+        size="sm"
+        data-testid="git-add-repo"
+        disabled={adding}
+        onclick={onAddRepo}
+      >
+        {#if adding}
+          <Spinner class="mr-1.5 h-3.5 w-3.5" />
+        {/if}
+        Add Repo
+      </Button>
+
+      <Button
+        variant="secondary"
+        size="sm"
+        data-testid="git-refresh-all"
+        disabled={refreshing}
+        onclick={onGlobalRefresh}
+      >
+        {#if refreshing}
+          <Spinner class="mr-1.5 h-3.5 w-3.5" />
+        {/if}
+        Refresh
+      </Button>
+    </div>
   </div>
+
+  {#if addError}
+    <p
+      class="text-status-failed border-border/60 border-b px-4 py-2 text-xs"
+      data-testid="git-add-error"
+    >
+      {addError}
+    </p>
+  {/if}
 
   <div class="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto p-3" data-testid="git-repo-list">
     {#if gitView.status === "loading" && gitView.repos.length === 0}
@@ -104,8 +144,14 @@
       <EmptyState
         testid="git-empty"
         title="No repositories tracked yet."
-        description="Repositories are tracked automatically when you add a project that lives in a git repo."
-      />
+        description="Repositories are tracked automatically when you add a project that lives in a git repo, or add one with Add Repo."
+      >
+        {#snippet action()}
+          <Button variant="secondary" size="sm" disabled={adding} onclick={onAddRepo}>
+            Add Repo
+          </Button>
+        {/snippet}
+      </EmptyState>
     {:else}
       {#each gitView.repos as listing (listing.repo.root)}
         <GitRepoNode

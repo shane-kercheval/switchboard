@@ -15,6 +15,8 @@ const {
   refreshStale,
   fetchRepo,
   fetchAll,
+  addRepo,
+  removeRepo,
   _testing,
 } = await import("./gitView.svelte");
 
@@ -124,6 +126,88 @@ describe("gitView store", () => {
 
     expect(secondSettled).toBe(true);
     expect(invokeMock.mock.calls.filter((c) => c[0] === "fetch_repo")).toHaveLength(1);
+  });
+
+  it("addRepo adds the path then re-reads so the repo appears", async () => {
+    wire({ list: [] });
+    await refreshAll();
+    expect(gitView.repos).toHaveLength(0);
+
+    wire({ list: [listing("/a")] });
+    await addRepo("/a");
+
+    expect(invokeMock.mock.calls.some((c) => c[0] === "add_tracked_repo")).toBe(true);
+    expect(gitView.repos.map((r) => r.repo.root)).toEqual(["/a"]);
+  });
+
+  it("addRepo propagates a backend rejection (non-git path) for inline display", async () => {
+    wire({ list: [] });
+    await refreshAll();
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "add_tracked_repo") return Promise.reject(new Error("not a git repo"));
+      return Promise.resolve([]);
+    });
+    await expect(addRepo("/nope")).rejects.toThrow("not a git repo");
+  });
+
+  it("addRepo propagates a failed re-read (mutation never silently succeeds)", async () => {
+    // The add persists, but the follow-up list read fails. A mutation must not
+    // resolve as success while the new repo stays invisible — the error
+    // propagates so the caller (GitView) can surface it inline.
+    wire({ list: [] });
+    await refreshAll();
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "add_tracked_repo") return Promise.resolve(null);
+      if (cmd === "list_tracked_repos") return Promise.reject(new Error("read boom"));
+      return Promise.resolve(null);
+    });
+    await expect(addRepo("/a")).rejects.toThrow("read boom");
+  });
+
+  it("removeRepo untracks the repo and re-reads without it", async () => {
+    wire({ list: [listing("/a"), listing("/b")] });
+    await refreshAll();
+    expect(gitView.repos).toHaveLength(2);
+
+    wire({ list: [listing("/b")] });
+    await removeRepo("/a");
+
+    expect(invokeMock.mock.calls.some((c) => c[0] === "remove_tracked_repo")).toBe(true);
+    expect(gitView.repos.map((r) => r.repo.root)).toEqual(["/b"]);
+  });
+
+  it("a fetch settling after its repo is removed leaves no dangling fetch state", async () => {
+    // Race: a background fetch is in flight when the user removes the repo. The
+    // backend's tracked-membership gate then rejects the now-untracked fetch, and
+    // when that rejection settles it must not resurrect bookkeeping for the
+    // removed root.
+    let rejectFetch!: () => void;
+    invokeMock.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "fetch_repo")
+        return new Promise<null>(
+          (_, reject) => (rejectFetch = () => reject(new Error("untracked"))),
+        );
+      if (cmd === "list_tracked_repos") return Promise.resolve([listing("/a")]);
+      if (cmd === "read_tracked_repo") return Promise.resolve(listing(String(args?.path)));
+      return Promise.resolve(null);
+    });
+    await refreshAll();
+
+    const fetching = fetchRepo("/a"); // in flight, promise held open
+
+    // Remove /a before the fetch settles; the re-read returns an empty list.
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "list_tracked_repos") return Promise.resolve([]);
+      return Promise.resolve(null);
+    });
+    await removeRepo("/a");
+    expect(_testing.runtimeSize()).toBe(0);
+
+    rejectFetch();
+    await fetching; // fetchRepo swallows the rejection internally
+
+    expect(fetchStates["/a"]).toBeUndefined();
+    expect(_testing.runtimeSize()).toBe(0);
   });
 
   it("fetchAll fetches every tracked repo", async () => {

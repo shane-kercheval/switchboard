@@ -690,6 +690,53 @@ pub async fn fetch_repo_impl(state: &AppState, path: &str) -> Result<(), AppErro
     }
 }
 
+// --- Git-view open actions --------------------------------------------------
+
+/// The macOS argv for opening a worktree folder in an external editor: the
+/// user's configured `editor_command` run against the path, or the OS
+/// folder-open (`open <path>`) when no editor command is set. The blank-command
+/// fallback means open-in-editor works with zero config. argv[0] is the program;
+/// the rest are its arguments.
+///
+/// The editor command is **shell-split** so a command carrying flags
+/// (`code --reuse-window`, `cursor -n`) resolves the program from the first
+/// token and forwards the rest as arguments, rather than treating the whole
+/// string as one impossible binary name. A command that splits to nothing
+/// (malformed quoting) falls back to the OS folder-open so the action still does
+/// something useful instead of silently failing.
+#[must_use]
+pub fn editor_open_argv(editor_command: Option<&str>, path: &str) -> Vec<String> {
+    let Some(cmd) = editor_command else {
+        return vec!["open".to_owned(), path.to_owned()];
+    };
+    match shlex::split(cmd) {
+        Some(mut tokens) if !tokens.is_empty() => {
+            tokens.push(path.to_owned());
+            tokens
+        }
+        _ => vec!["open".to_owned(), path.to_owned()],
+    }
+}
+
+/// The macOS argv for opening a path in the user's terminal app
+/// (`open -a <terminal_app> <path>`).
+#[must_use]
+pub fn terminal_open_argv(terminal_app: &str, path: &str) -> Vec<String> {
+    vec![
+        "open".to_owned(),
+        "-a".to_owned(),
+        terminal_app.to_owned(),
+        path.to_owned(),
+    ]
+}
+
+/// The macOS argv for revealing a path in Finder (`open -R <path>` selects the
+/// item in its containing folder rather than opening it).
+#[must_use]
+pub fn reveal_in_finder_argv(path: &str) -> Vec<String> {
+    vec!["open".to_owned(), "-R".to_owned(), path.to_owned()]
+}
+
 // --- Preferences (config.yaml) ----------------------------------------------
 
 /// Return the current personal preferences (`config.yaml`).
@@ -8437,6 +8484,40 @@ mod tests {
         fetch_repo_impl(&state, sub.to_str().unwrap())
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn editor_open_argv_uses_command_or_falls_back_to_os_open() {
+        // A bare editor command runs against the path…
+        assert_eq!(
+            editor_open_argv(Some("cursor"), "/repo/wt"),
+            vec!["cursor", "/repo/wt"]
+        );
+        // …a command with flags is shell-split into program + args + path…
+        assert_eq!(
+            editor_open_argv(Some("code --reuse-window"), "/repo/wt"),
+            vec!["code", "--reuse-window", "/repo/wt"]
+        );
+        // …an absent command falls back to the OS folder-open…
+        assert_eq!(editor_open_argv(None, "/repo/wt"), vec!["open", "/repo/wt"]);
+        // …and a command with malformed quoting (splits to nothing) also falls
+        // back rather than silently failing to spawn.
+        assert_eq!(
+            editor_open_argv(Some("\"unterminated"), "/repo/wt"),
+            vec!["open", "/repo/wt"]
+        );
+    }
+
+    #[test]
+    fn terminal_and_reveal_argv_are_macos_open_invocations() {
+        assert_eq!(
+            terminal_open_argv("iTerm", "/repo/wt"),
+            vec!["open", "-a", "iTerm", "/repo/wt"]
+        );
+        assert_eq!(
+            reveal_in_finder_argv("/repo/wt"),
+            vec!["open", "-R", "/repo/wt"]
+        );
     }
 
     #[tokio::test]

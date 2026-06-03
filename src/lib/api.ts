@@ -113,6 +113,23 @@ export async function fetchRepo(path: string): Promise<void> {
   await invoke("fetch_repo", { path });
 }
 
+// Open a worktree folder in the user's configured editor (`editor_command`), or
+// the OS folder-open when no editor command is set. Rejects with the opener's
+// error on failure.
+export async function openInEditor(path: string): Promise<void> {
+  await invoke("open_in_editor", { path });
+}
+
+// Open a path in the user's configured terminal app.
+export async function openInTerminal(path: string): Promise<void> {
+  await invoke("open_in_terminal", { path });
+}
+
+// Reveal a path in Finder (selects the item in its containing folder).
+export async function revealInFinder(path: string): Promise<void> {
+  await invoke("reveal_in_finder", { path });
+}
+
 // Backend-owned personal preferences (`config.yaml`). `getPreferences` always
 // returns a value (defaults if unset); `setPreferences` replaces the whole
 // object and persists it, surfacing a write failure.

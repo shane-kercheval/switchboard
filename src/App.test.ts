@@ -210,8 +210,7 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
     case "get_preferences":
       return { editor_command: null, terminal_app: "Terminal" };
     case "add_tracked_repo":
-      // TEMPORARY: the Git view seeds a dev repo on first entry (removed in M3
-      // commit C). Accept it as a no-op here.
+    case "remove_tracked_repo":
       return null;
     case "list_tracked_repos":
       return backend.trackedRepos;

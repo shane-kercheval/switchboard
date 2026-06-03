@@ -49,20 +49,29 @@
     return total;
   }
 
-  /// Context utilization — `(input_tokens + output_tokens) / context_window`
-  /// from the most recent completed agent turn. Forward-looking signal
-  /// ("how full will the next turn's context be"). All three fields must
-  /// be present; otherwise returns undefined and the bar is hidden.
+  /// Context utilization — `(context_input_tokens + output_tokens) /
+  /// context_window` from the most recent completed agent turn. Forward-looking
+  /// signal ("how full will the next turn's context be").
+  ///
+  /// `context_input_tokens` is the harness-reconciled input-side occupancy
+  /// (see `TurnUsage`): for Claude it sums the disjoint cache fields (cached +
+  /// cache-creation, which `input_tokens` alone excludes — the cause of the
+  /// near-0% bug), for Codex it is `input_tokens` alone (its cached count is a
+  /// subset, so adding it would double-count). Consuming the pre-reconciled
+  /// value keeps this formula harness-agnostic — do not re-add per-harness
+  /// token summation here. Both it and `context_window` must be present;
+  /// otherwise the bar is hidden.
   function contextUtilization(agentId: AgentId): number | undefined {
     const turns = transcripts[agentId] ?? [];
     for (let i = turns.length - 1; i >= 0; i--) {
       const turn = turns[i];
       if (turn?.role !== "agent" || turn.usage === undefined) continue;
-      const inputTokens = turn.usage.input_tokens ?? 0;
-      const outputTokens = turn.usage.output_tokens ?? 0;
       const window = turn.usage.context_window;
       if (window === undefined || window === null || window === 0) continue;
-      return (inputTokens + outputTokens) / window;
+      const contextInput = turn.usage.context_input_tokens;
+      if (contextInput === undefined || contextInput === null) continue;
+      const outputTokens = turn.usage.output_tokens ?? 0;
+      return (contextInput + outputTokens) / window;
     }
     return undefined;
   }

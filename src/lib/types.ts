@@ -45,6 +45,13 @@ export type TurnUsage = {
   input_tokens: number;
   output_tokens: number;
   cached_input_tokens?: number | null;
+  cache_creation_input_tokens?: number | null;
+  // Harness-reconciled input-side tokens occupying the context window after
+  // this turn. The emitting adapter computes it because harnesses count cached
+  // tokens differently (Claude: disjoint additions; Codex: a subset already in
+  // input_tokens). Context utilization consumes this directly so the frontend
+  // formula stays harness-agnostic. `null` where a harness doesn't compute it.
+  context_input_tokens?: number | null;
   reasoning_output_tokens?: number | null;
   context_window?: number | null;
   total_cost_usd?: number | null;

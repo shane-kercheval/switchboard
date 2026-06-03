@@ -355,6 +355,11 @@ fn extract_usage(stats: Option<&Value>) -> TurnUsage {
         input_tokens,
         output_tokens,
         cached_input_tokens,
+        cache_creation_input_tokens: None,
+        // Gemini exposes no context window, so occupancy is never computed and
+        // the bar stays hidden; leave the reconciled value `None` rather than
+        // guess at its (unverified) cache accounting.
+        context_input_tokens: None,
         reasoning_output_tokens: None,
         context_window: None,
         total_cost_usd: None,

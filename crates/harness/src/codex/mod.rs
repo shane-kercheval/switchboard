@@ -785,6 +785,8 @@ mod tests {
             input_tokens: 0,
             output_tokens: 0,
             cached_input_tokens: None,
+            cache_creation_input_tokens: None,
+            context_input_tokens: Some(0),
             reasoning_output_tokens: None,
             context_window: window,
             total_cost_usd: None,

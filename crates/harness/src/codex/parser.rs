@@ -290,6 +290,13 @@ fn extract_usage_from_turn_completed(obj: &Value) -> Option<TurnUsage> {
         input_tokens,
         output_tokens,
         cached_input_tokens,
+        cache_creation_input_tokens: None,
+        // Codex (OpenAI) reports `cached_input_tokens` as a *subset* already
+        // counted inside `input_tokens` (verified against captured fixtures:
+        // cached < input every time), so the input side occupying the window
+        // is `input_tokens` alone. Adding the cached count would double-count
+        // and inflate the bar. (Claude differs — see `TurnUsage` docs.)
+        context_input_tokens: Some(input_tokens),
         reasoning_output_tokens,
         context_window: None,
         total_cost_usd: None,
@@ -434,6 +441,12 @@ mod tests {
                 assert_eq!(u.input_tokens, 15568);
                 assert_eq!(u.output_tokens, 5);
                 assert_eq!(u.cached_input_tokens, Some(7552));
+                assert_eq!(u.cache_creation_input_tokens, None);
+                // No-double-count guard: Codex's cached count (7552) is a
+                // subset of input (15568), so the input-side occupancy is
+                // input alone — NOT input + cached (which would be 23120 and
+                // inflate the bar).
+                assert_eq!(u.context_input_tokens, Some(15568));
                 assert_eq!(
                     u.context_window, None,
                     "context_window is enriched post-terminal from the session file"

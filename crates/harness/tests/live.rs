@@ -230,6 +230,88 @@ async fn live_claude_thinking_emits_liveness() {
 
 #[tokio::test]
 #[ignore = "requires claude installed — run with: make test-live"]
+async fn live_claude_multi_call_turn_context_occupancy_is_final_call() {
+    // Context-occupancy drift guard for tool-use (multi-call) turns.
+    //
+    // A turn that calls a tool makes ≥2 model calls. Claude's terminal
+    // `result.usage` reports usage SUMMED across those calls (verified on
+    // 2.1.161: a 2-call turn's input / cache_read / cache_creation are the
+    // per-call sums). Using that sum as window occupancy double-counts the
+    // shared cached prefix and over-reports ~N× for an N-call turn. The adapter
+    // therefore derives `context_input_tokens` from the FINAL assistant
+    // message's own usage (the real current window contents), not from
+    // `result.usage`.
+    //
+    // This is the exact assumption that can only be checked against the real
+    // CLI: a fixture proves our parser maps the shapes, but only a live run
+    // proves Claude still (a) emits per-message usage on each assistant message
+    // and (b) sums it into `result.usage`. If a CLI bump changes either, the
+    // occupancy bar silently regresses — this catches it.
+    let adapter = ClaudeCodeAdapter::new();
+    let agent = live_agent();
+    let turn_id = Uuid::now_v7();
+
+    let stream = adapter
+        .dispatch(
+            &agent,
+            Path::new("/tmp"),
+            "Use the Bash tool to run `echo hi`, then reply with only the word: done.",
+            turn_id,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed with real claude");
+
+    let events: Vec<AdapterEvent> = stream.collect().await;
+
+    // The test is only meaningful if a tool actually ran (forcing a 2nd model
+    // call). If this fails, the prompt no longer triggers a tool call — fix the
+    // prompt, don't weaken the assertion.
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::ToolStarted { .. })),
+        "prompt must trigger a tool call so the turn makes ≥2 model calls; events: {events:?}"
+    );
+
+    let terminal = events
+        .iter()
+        .find(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+        .expect("should have a terminal TurnEnd");
+    let AdapterEvent::TurnEnd {
+        outcome: TurnOutcome::Completed,
+        usage: Some(usage),
+        ..
+    } = terminal
+    else {
+        panic!("expected TurnEnd(Completed) with usage, got: {terminal:?}");
+    };
+
+    // The summed-across-calls total that `result.usage` reports (the trap).
+    let summed_total = usage.input_tokens
+        + usage.cached_input_tokens.unwrap_or(0)
+        + usage.cache_creation_input_tokens.unwrap_or(0);
+    let occupancy = usage
+        .context_input_tokens
+        .expect("context_input_tokens must be populated for a Claude turn");
+
+    assert!(occupancy > 0, "occupancy must be non-zero, got 0");
+    assert!(
+        occupancy < summed_total,
+        "occupancy ({occupancy}) must be the FINAL call's prompt size — strictly less than the \
+         across-call sum `result.usage` reports ({summed_total}). Equal/greater means the adapter \
+         regressed to using the summed total, which over-reports the context bar on tool-use turns."
+    );
+    if let Some(window) = usage.context_window {
+        assert!(
+            occupancy <= u64::from(window),
+            "occupancy ({occupancy}) must not exceed the context window ({window})"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires claude installed — run with: make test-live"]
 async fn live_claude_resume_reuses_session() {
     // Verifies that session state persists across turns: the first turn uses
     // --session-id to create the session; the second reuses the same session_id

@@ -742,6 +742,11 @@ impl CodexReconstruction {
                     input_tokens: input,
                     output_tokens: output,
                     cached_input_tokens: last.get("cached_input_tokens").and_then(Value::as_u64),
+                    cache_creation_input_tokens: None,
+                    // Codex's cached count is a subset of `input_tokens`, so
+                    // the input-side occupancy is `input_tokens` alone — matches
+                    // the live parser (see `codex/parser.rs` and `TurnUsage` docs).
+                    context_input_tokens: Some(input),
                     reasoning_output_tokens: last
                         .get("reasoning_output_tokens")
                         .and_then(Value::as_u64),

@@ -206,10 +206,79 @@ describe("Sidebar", () => {
     expect(screen.getByTestId("agent-rate-limit")).toHaveTextContent("quota used: 43%");
   });
 
-  it("displays context-utilization bar from the latest agent turn's usage", async () => {
+  it("displays context-utilization bar from the latest agent turn's reconciled occupancy", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
 
+    // The Claude bug fixture: caching makes raw `input_tokens` tiny (only the
+    // new prompt), but `context_input_tokens` carries the full cached prefix.
+    // The bar must reflect the reconciled occupancy, not the marginal input.
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "turn-1",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:00Z",
+        ended_at: "2026-05-16T00:00:01Z",
+        status: "complete",
+        items: [],
+        usage: {
+          input_tokens: 5_000,
+          output_tokens: 10_000,
+          context_input_tokens: 130_000,
+          context_window: 200_000,
+        },
+      },
+    ];
+
+    const Sidebar = (await import("./Sidebar.svelte")).default;
+    render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+
+    // (130000 + 10000) / 200000 = 0.70 → "70%" (NOT the ~8% the old
+    // input-only formula would have shown from the marginal 5000 input).
+    expect(screen.getByTestId("agent-context-bar")).toHaveTextContent("70%");
+  });
+
+  it("does not over-report Codex context (cached is already inside input)", async () => {
+    const state = await loadState();
+    await state.registerAgent(CODEX_AGENT);
+
+    // Codex's adapter sets context_input_tokens to input_tokens alone (its
+    // cached count is a subset). The bar must use that reconciled value, not
+    // re-add cached on top — which would inflate the percentage.
+    state.transcripts[CODEX_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "turn-1",
+        agent_id: CODEX_AGENT.id,
+        started_at: "2026-05-16T00:00:00Z",
+        ended_at: "2026-05-16T00:00:01Z",
+        status: "complete",
+        items: [],
+        usage: {
+          input_tokens: 80_000,
+          cached_input_tokens: 60_000,
+          output_tokens: 20_000,
+          context_input_tokens: 80_000,
+          context_window: 200_000,
+        },
+      },
+    ];
+
+    const Sidebar = (await import("./Sidebar.svelte")).default;
+    render(Sidebar, { props: { agents: [CODEX_AGENT] } });
+
+    // (80000 + 20000) / 200000 = 0.50 → "50%". Re-adding cached would give
+    // (80000 + 60000 + 20000) / 200000 = 80%, the regression this guards.
+    expect(screen.getByTestId("agent-context-bar")).toHaveTextContent("50%");
+  });
+
+  it("hides the context bar when context_input_tokens is absent", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+
+    // A window without a reconciled occupancy value → occupancy unknown, bar
+    // hidden (clean-hide), rather than falling back to a misleading raw input.
     state.transcripts[CLAUDE_AGENT.id] = [
       {
         role: "agent",
@@ -230,8 +299,7 @@ describe("Sidebar", () => {
     const Sidebar = (await import("./Sidebar.svelte")).default;
     render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
 
-    // (60000 + 10000) / 200000 = 0.35 → "35%"
-    expect(screen.getByTestId("agent-context-bar")).toHaveTextContent("35%");
+    expect(screen.queryByTestId("agent-context-bar")).toBeNull();
   });
 
   it("renders meta info (model + mcp/skills counts) when SessionMeta has arrived", async () => {

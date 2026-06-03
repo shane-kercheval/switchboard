@@ -89,7 +89,21 @@ pub enum RateLimitSource {
 /// `total_cost_usd` is Claude Code only (subscription auth has no dollar
 /// number for Codex). `context_window` for Claude comes from
 /// `result.modelUsage.<model>.contextWindow`; for Codex it's populated by
-/// post-terminal session-file enrichment. All other fields are tokens.
+/// post-terminal session-file enrichment. The remaining `*_tokens` fields
+/// mirror exactly what the harness reported — do not normalize them; the
+/// reconciled occupancy value lives in `context_input_tokens` instead.
+///
+/// `context_input_tokens` is **derived, not raw**: the total input-side
+/// tokens occupying the context window after this turn, reconciled by the
+/// emitting adapter because harnesses count cached tokens *differently*.
+/// For Claude, `cached_input_tokens` and `cache_creation_input_tokens` are
+/// disjoint additions to `input_tokens`, so the input side is their sum.
+/// For Codex, `cached_input_tokens` is a subset already inside
+/// `input_tokens`, so the input side is just `input_tokens` — adding the
+/// cached count would double-count. Keeping this reconciliation here (not in
+/// the frontend) lets the context-utilization formula stay harness-agnostic:
+/// `(context_input_tokens + output_tokens) / context_window`. `None` where a
+/// harness doesn't compute it (e.g. Gemini, which exposes no window anyway).
 ///
 /// Populated when the harness reports usage on its terminal event. Claude
 /// carries it on both `Completed` and `Failed` turns; Codex carries it on
@@ -102,6 +116,8 @@ pub struct TurnUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_input_tokens: Option<u64>,
+    pub cache_creation_input_tokens: Option<u64>,
+    pub context_input_tokens: Option<u64>,
     pub reasoning_output_tokens: Option<u64>,
     pub context_window: Option<u32>,
     pub total_cost_usd: Option<f64>,
@@ -555,6 +571,8 @@ mod tests {
                 input_tokens: 100,
                 output_tokens: 25,
                 cached_input_tokens: Some(50),
+                cache_creation_input_tokens: Some(30),
+                context_input_tokens: Some(180),
                 reasoning_output_tokens: Some(5),
                 context_window: Some(200_000),
                 total_cost_usd: Some(0.0125),
@@ -564,6 +582,8 @@ mod tests {
         assert_eq!(value["usage"]["input_tokens"], 100);
         assert_eq!(value["usage"]["output_tokens"], 25);
         assert_eq!(value["usage"]["cached_input_tokens"], 50);
+        assert_eq!(value["usage"]["cache_creation_input_tokens"], 30);
+        assert_eq!(value["usage"]["context_input_tokens"], 180);
         assert_eq!(value["usage"]["reasoning_output_tokens"], 5);
         assert_eq!(value["usage"]["context_window"], 200_000);
         assert_eq!(value["usage"]["total_cost_usd"], 0.0125);

@@ -492,17 +492,34 @@ fn parse_timestamp(record: &Value) -> Option<DateTime<Utc>> {
 /// `context_window` is unrecoverable from disk (lives in stream-only
 /// `result.modelUsage`) — emit `None`. `total_cost_usd` is similarly
 /// stream-only; emit `None`.
+///
+/// `context_input_tokens` reconstructs the same disjoint sum the live parser
+/// computes (`input + cache_read + cache_creation`), so a hydrated turn's
+/// context-utilization matches what it showed live. The window denominator is
+/// still absent on disk until the Milestone 2 sidecar fills it, but the
+/// numerator is recoverable here.
 fn parse_usage(usage: &serde_json::Map<String, Value>) -> TurnUsage {
+    let input_tokens = usage
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cached_input_tokens = usage.get("cache_read_input_tokens").and_then(Value::as_u64);
+    let cache_creation_input_tokens = usage
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_u64);
     TurnUsage {
-        input_tokens: usage
-            .get("input_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
+        input_tokens,
         output_tokens: usage
             .get("output_tokens")
             .and_then(Value::as_u64)
             .unwrap_or(0),
-        cached_input_tokens: usage.get("cache_read_input_tokens").and_then(Value::as_u64),
+        cached_input_tokens,
+        cache_creation_input_tokens,
+        context_input_tokens: Some(
+            input_tokens
+                + cached_input_tokens.unwrap_or(0)
+                + cache_creation_input_tokens.unwrap_or(0),
+        ),
         reasoning_output_tokens: usage.get("reasoning_output_tokens").and_then(Value::as_u64),
         context_window: None,
         total_cost_usd: None,
@@ -564,6 +581,7 @@ mod tests {
                     "input_tokens": 10,
                     "output_tokens": 5,
                     "cache_read_input_tokens": 2,
+                    "cache_creation_input_tokens": 3,
                 }
             },
             "timestamp": timestamp,
@@ -627,6 +645,11 @@ mod tests {
                 let usage = usage.as_ref().unwrap();
                 assert_eq!(usage.input_tokens, 10);
                 assert_eq!(usage.output_tokens, 5);
+                assert_eq!(usage.cached_input_tokens, Some(2));
+                assert_eq!(usage.cache_creation_input_tokens, Some(3));
+                // Disk reconstructs the same disjoint input-side sum the live
+                // parser computes: 10 + 2 + 3.
+                assert_eq!(usage.context_input_tokens, Some(15));
                 assert!(usage.context_window.is_none());
             }
             _ => panic!("expected Agent turn second"),
@@ -734,6 +757,61 @@ mod tests {
             matches!(&items[0], TurnItem::Text { kind: ContentKind::Text, text } if text == "42"),
             "only the answer text survives",
         );
+    }
+
+    #[test]
+    fn multi_assistant_turn_uses_final_call_usage_for_occupancy() {
+        // A tool-use turn writes two assistant records (two model calls).
+        // Occupancy must reflect the FINAL call's prompt size, matching the
+        // live path — not the first call's, nor a sum. `handle_assistant`
+        // keeps the last record's usage, so this is the disk-side guarantee
+        // that hydrated and live context bars agree.
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let session_id = Uuid::now_v7();
+        let agent_id = Uuid::now_v7();
+        let call1 = json!({
+            "type": "assistant",
+            "message": {
+                "model": "claude-opus-4-8",
+                "role": "assistant",
+                "content": [{ "type": "tool_use", "id": "t1", "name": "Bash", "input": {} }],
+                "usage": { "input_tokens": 3133, "cache_read_input_tokens": 16833, "cache_creation_input_tokens": 2422, "output_tokens": 4 }
+            },
+            "timestamp": "2026-05-14T04:43:16Z"
+        });
+        let tool_result = user_tool_result("t1", "hi", "2026-05-14T04:43:17Z");
+        let call2 = json!({
+            "type": "assistant",
+            "message": {
+                "model": "claude-opus-4-8",
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "done" }],
+                "usage": { "input_tokens": 2, "cache_read_input_tokens": 19255, "cache_creation_input_tokens": 3220, "output_tokens": 1 }
+            },
+            "timestamp": "2026-05-14T04:43:18Z"
+        });
+        let content = jsonl(&[
+            user_record("run echo", "2026-05-14T04:43:15Z"),
+            call1,
+            tool_result,
+            call2,
+        ]);
+        stage_session_file(home.path(), cwd.path(), session_id, &content);
+
+        let result = load_claude_transcript(home.path(), cwd.path(), session_id, agent_id).unwrap();
+        let Turn::Agent { usage, .. } = result
+            .turns
+            .iter()
+            .rev()
+            .find(|t| matches!(t, Turn::Agent { .. }))
+            .expect("an Agent turn")
+        else {
+            unreachable!();
+        };
+        let usage = usage.as_ref().expect("usage present");
+        // Final call's prompt: 2 + 19255 + 3220 = 22477 — not call 1's 22388.
+        assert_eq!(usage.context_input_tokens, Some(22_477));
     }
 
     #[test]

@@ -6,6 +6,7 @@ import SettingsView from "./SettingsView.svelte";
 import { theme } from "$lib/theme.svelte";
 import { agentCopy } from "$lib/agentCopy.svelte";
 import { _testing as availabilityTesting } from "$lib/harnessAvailability.svelte";
+import { _testing as prefsTesting } from "$lib/preferences.svelte";
 
 // SettingsView embeds HarnessStatusList, which probes install/auth on mount.
 const invokeMock = vi.fn(async (cmd: string, _args?: Record<string, unknown>) => {
@@ -23,6 +24,7 @@ beforeEach(() => {
   // The embedded HarnessStatusList reads the shared singleton store; reset it
   // so probed values don't leak across tests.
   availabilityTesting.reset();
+  prefsTesting.reset();
 });
 
 afterEach(() => {
@@ -95,6 +97,70 @@ describe("SettingsView", () => {
     expect(agentCopy.mode).toBe("full_answer");
     expect(lastBlock).toHaveAttribute("aria-checked", "false");
     expect(fullAnswer).toHaveAttribute("aria-checked", "true");
+  });
+
+  it("git-view editor preference persists via set_preferences (blank → null)", async () => {
+    render(SettingsView, { props: { onClose: vi.fn() } });
+    const editor = screen.getByTestId("git-editor-command");
+
+    await fireEvent.input(editor, { target: { value: "cursor" } });
+    await fireEvent.change(editor);
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
+        preferences: { editor_command: "cursor", terminal_app: "Terminal" },
+      }),
+    );
+
+    // Clearing the field persists null (fall back to OS default), not "".
+    invokeMock.mockClear();
+    await fireEvent.input(editor, { target: { value: "  " } });
+    await fireEvent.change(editor);
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
+        preferences: { editor_command: null, terminal_app: "Terminal" },
+      }),
+    );
+  });
+
+  it("git-view terminal preference persists, defaulting a blank to Terminal", async () => {
+    render(SettingsView, { props: { onClose: vi.fn() } });
+    const terminal = screen.getByTestId("git-terminal-app");
+
+    await fireEvent.input(terminal, { target: { value: "iTerm" } });
+    await fireEvent.change(terminal);
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
+        preferences: { editor_command: null, terminal_app: "iTerm" },
+      }),
+    );
+
+    invokeMock.mockClear();
+    await fireEvent.input(terminal, { target: { value: "" } });
+    await fireEvent.change(terminal);
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
+        preferences: { editor_command: null, terminal_app: "Terminal" },
+      }),
+    );
+  });
+
+  it("surfaces an inline error when a preference save fails, keeping the value", async () => {
+    // A failed config.yaml write must not be silent: the user sees an error and
+    // the typed value stays (surface-and-keep, not revert).
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "get_harness_install_status") return { installed: true, version: "1.0.0" };
+      if (cmd === "set_preferences") throw new Error("disk full");
+      return null;
+    });
+    render(SettingsView, { props: { onClose: vi.fn() } });
+    const editor = screen.getByTestId("git-editor-command") as HTMLInputElement;
+
+    await fireEvent.input(editor, { target: { value: "cursor" } });
+    await fireEvent.change(editor);
+
+    await waitFor(() => expect(screen.getByTestId("git-prefs-save-error")).toBeInTheDocument());
+    // Value is kept, not reverted.
+    expect(editor.value).toBe("cursor");
   });
 
   it("shortcuts section lists expected keyboard shortcuts", () => {

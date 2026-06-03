@@ -22,6 +22,7 @@ use uuid::Uuid;
 
 use crate::dispatch_context::ProjectDispatchContextFactory;
 use crate::error::AppError;
+use crate::preferences::{self, Preferences};
 use crate::state::{AppState, lock, persist_git_registry, persist_workspace};
 
 /// Returned by `init_directory_impl` — gives the caller everything it needs
@@ -642,6 +643,39 @@ fn project_links_by_path(state: &AppState) -> HashMap<PathBuf, Vec<LinkedProject
         }
     }
     map
+}
+
+// --- Preferences (config.yaml) ----------------------------------------------
+
+/// Return the current personal preferences (`config.yaml`).
+#[must_use]
+pub fn get_preferences_impl(state: &AppState) -> Preferences {
+    lock(&state.preferences).clone()
+}
+
+/// Replace the personal preferences and persist them to `config.yaml`. The value
+/// is `normalized` at this boundary (blank editor → `None`, blank terminal →
+/// default) so consumers never see an empty command. Unlike the best-effort
+/// registry persists, a save failure is surfaced (the user explicitly asked to
+/// save) — but the in-memory value is updated regardless, so the running session
+/// reflects the change even if the write fails. A `None` path (no resolvable
+/// config location — tests/exotic host) updates memory only.
+///
+/// **The `preferences` guard is held across the file write** (the one place we
+/// hold a state lock across I/O). `write_yaml` uses a fixed `<file>.tmp`, so two
+/// unserialized saves would race on that temp file and could corrupt
+/// `config.yaml`. Serializing here is safe and clearer than routing through
+/// `registry_write`: `preferences` is a singleton touched only by get/set, the
+/// write is a tiny YAML file on an explicit user action, and nothing
+/// latency-sensitive waits behind it. See the lock-order note in `state.rs`.
+pub fn set_preferences_impl(state: &AppState, prefs: &Preferences) -> Result<(), AppError> {
+    let normalized = prefs.clone().normalized();
+    let mut guard = lock(&state.preferences);
+    guard.clone_from(&normalized);
+    let Some(path) = state.preferences_path.as_ref() else {
+        return Ok(());
+    };
+    preferences::save(path, &normalized)
 }
 
 pub fn create_project_impl(
@@ -8449,5 +8483,67 @@ mod tests {
             listing.repo.root.canonicalize().unwrap(),
             repo.path().canonicalize().unwrap()
         );
+    }
+
+    // --- Preferences (config.yaml) --------------------------------------------
+
+    #[test]
+    fn preferences_default_then_set_round_trips_through_state_and_disk() {
+        let cfg = TempDir::new().unwrap();
+        let path = cfg.path().join("config.yaml");
+        let state = mock_app_state().with_preferences(path.clone());
+
+        // Defaults until set.
+        let defaults = get_preferences_impl(&state);
+        assert_eq!(defaults.editor_command, None);
+        assert_eq!(defaults.terminal_app, "Terminal");
+
+        let prefs = Preferences {
+            editor_command: Some("zed".to_owned()),
+            terminal_app: "iTerm".to_owned(),
+        };
+        set_preferences_impl(&state, &prefs).unwrap();
+
+        // In-memory reflects the change immediately...
+        assert_eq!(get_preferences_impl(&state), prefs);
+        // ...and a fresh load from disk sees the persisted value.
+        assert_eq!(preferences::load(&path), prefs);
+    }
+
+    #[test]
+    fn set_preferences_normalizes_blank_values_at_the_boundary() {
+        // A client (or a future caller) sending blank strings must be normalized
+        // by the backend, not stored verbatim — the open-actions consume this.
+        let cfg = TempDir::new().unwrap();
+        let path = cfg.path().join("config.yaml");
+        let state = mock_app_state().with_preferences(path.clone());
+
+        set_preferences_impl(
+            &state,
+            &Preferences {
+                editor_command: Some("  ".to_owned()),
+                terminal_app: String::new(),
+            },
+        )
+        .unwrap();
+
+        let got = get_preferences_impl(&state);
+        assert_eq!(got.editor_command, None);
+        assert_eq!(got.terminal_app, "Terminal");
+        // ...and the normalized form is what hit disk.
+        assert_eq!(preferences::load(&path), got);
+    }
+
+    #[test]
+    fn set_preferences_with_no_path_updates_memory_only() {
+        // No `with_preferences` → no path; set must still update the running
+        // session (and not error) without touching any user-global file.
+        let state = mock_app_state();
+        let prefs = Preferences {
+            editor_command: Some("code".to_owned()),
+            terminal_app: "Terminal".to_owned(),
+        };
+        set_preferences_impl(&state, &prefs).unwrap();
+        assert_eq!(get_preferences_impl(&state), prefs);
     }
 }

@@ -53,6 +53,7 @@
   import { bannerCopy, bannerTestid } from "$lib/harnessAvailability";
   import { ALL_HARNESSES, HARNESS_LABEL } from "$lib/harnessDisplay";
   import { harnessAvailability, refreshHarnessAvailability } from "$lib/harnessAvailability.svelte";
+  import { loadPreferences } from "$lib/preferences.svelte";
   import { basename, cn } from "$lib/utils";
 
   // One availability map keyed by harness, derived from the shared
@@ -140,6 +141,7 @@
   onMount(() => {
     const stopProjectActivityObserver = startProjectActivityObserver();
     void refreshHarnessAvailability();
+    void loadPreferences();
     void loadWorkspace().catch((err) => {
       dirError = err instanceof Error ? err.message : String(err);
     });

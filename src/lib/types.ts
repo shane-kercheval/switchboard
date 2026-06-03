@@ -398,6 +398,15 @@ export type RepoListing = {
   linked_projects: Record<string, LinkedProject[]>;
 };
 
+// Mirror of Rust `Preferences` (`crates/app/src/preferences.rs`) — backend-owned
+// `config.yaml`. `editor_command` null/absent → OS default folder-open;
+// `terminal_app` defaults to "Terminal". Theme is NOT here — it stays in
+// frontend localStorage (a device-local presentation concern).
+export type Preferences = {
+  editor_command: string | null;
+  terminal_app: string;
+};
+
 // Mirror of Rust `ProjectConversation` / `ConversationItem` / `OutcomeStatus` /
 // `AgentConversationMeta` (`crates/app/src/commands.rs`). The post-restart
 // unified history: the three `ConversationItem` kinds are disjoint sources

@@ -183,6 +183,17 @@ pub enum AppError {
         #[source]
         source: std::io::Error,
     },
+
+    /// Persisting user preferences (`config.yaml`) failed. Unlike the registries
+    /// this surfaces to the caller (the `set_preferences` command), since a
+    /// failed explicit save is something the user just asked for and should hear
+    /// about — not silent best-effort state.
+    #[error("failed to persist preferences at {path}: {source}")]
+    PreferencesPersist {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 impl AppError {

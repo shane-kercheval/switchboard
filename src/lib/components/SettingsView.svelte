@@ -11,6 +11,8 @@
     SEGMENTED_ITEM_INACTIVE_CLASS,
   } from "$lib/components/ui/segmentedControl";
   import HarnessStatusList from "$lib/components/HarnessStatusList.svelte";
+  import Input from "$lib/components/ui/Input.svelte";
+  import { preferences, saveStatus, updatePreferences } from "$lib/preferences.svelte";
 
   let { onClose }: { onClose: () => void } = $props();
 
@@ -125,6 +127,51 @@
           </button>
         {/each}
       </div>
+    </section>
+
+    <section class={cn(sectionClass, "mt-7")} data-testid="git-view-prefs">
+      <div>
+        <h2 class={sectionHeadingClass}>Git View</h2>
+        <p class="text-muted mt-1 text-sm leading-relaxed">
+          How the Git view opens a worktree's folder. Leave the editor blank to use your system's
+          default folder handler.
+        </p>
+      </div>
+
+      <div class="space-y-1.5">
+        <label for="git-editor-command" class="text-muted block text-xs">Editor command</label>
+        <Input
+          id="git-editor-command"
+          data-testid="git-editor-command"
+          placeholder="e.g. code, cursor, zed (blank = system default)"
+          value={preferences.editor_command ?? ""}
+          onchange={(e: Event) => {
+            const v = (e.currentTarget as HTMLInputElement).value.trim();
+            void updatePreferences({ editor_command: v === "" ? null : v });
+          }}
+        />
+      </div>
+
+      <div class="space-y-1.5">
+        <label for="git-terminal-app" class="text-muted block text-xs">Terminal app</label>
+        <Input
+          id="git-terminal-app"
+          data-testid="git-terminal-app"
+          placeholder="Terminal"
+          value={preferences.terminal_app}
+          onchange={(e: Event) => {
+            const v = (e.currentTarget as HTMLInputElement).value.trim();
+            void updatePreferences({ terminal_app: v === "" ? "Terminal" : v });
+          }}
+        />
+      </div>
+
+      {#if saveStatus.error}
+        <p class="text-status-failed text-xs leading-relaxed" data-testid="git-prefs-save-error">
+          Couldn't save your preferences ({saveStatus.error}). The change applies for now but may
+          not survive a restart.
+        </p>
+      {/if}
     </section>
 
     <section class={cn(sectionClass, "mt-7")}>

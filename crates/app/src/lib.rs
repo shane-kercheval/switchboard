@@ -11,6 +11,7 @@ mod git_registry;
 mod journal;
 mod locator_sink;
 mod metadata;
+mod preferences;
 mod state;
 mod workspace;
 
@@ -31,14 +32,15 @@ use crate::commands::{
     check_antigravity_binary_impl, check_claude_auth_impl, check_claude_binary_impl,
     check_codex_auth_impl, check_codex_binary_impl, check_gemini_auth_impl,
     check_gemini_binary_impl, create_agent_impl, create_project_impl,
-    get_harness_install_status_impl, init_directory_impl, list_agents_impl, list_projects_impl,
-    list_tracked_repos_from_inputs, list_workspace_directories_impl,
+    get_harness_install_status_impl, get_preferences_impl, init_directory_impl, list_agents_impl,
+    list_projects_impl, list_tracked_repos_from_inputs, list_workspace_directories_impl,
     load_project_conversation_impl, load_transcript_impl, open_project_impl, parse_uuid,
     pick_directory_impl, read_tracked_repo_from_inputs, remove_agent_impl, remove_directory_impl,
     remove_queued_message_impl, remove_tracked_repo_impl, rename_agent_impl,
     search_project_files_in_root, search_project_files_root_impl, send_message_impl,
-    set_active_project_impl, tracked_repos_inputs, validate_external_url,
+    set_active_project_impl, set_preferences_impl, tracked_repos_inputs, validate_external_url,
 };
+use crate::preferences::Preferences;
 use crate::state::AppState;
 
 use switchboard_core::{AgentRecord, HarnessKind, ProjectSummary};
@@ -165,6 +167,19 @@ async fn read_tracked_repo(
     tauri::async_runtime::spawn_blocking(move || read_tracked_repo_from_inputs(&path, &inputs))
         .await
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_preferences(state: State<'_, AppState>) -> Result<Preferences, String> {
+    Ok(get_preferences_impl(state.inner()))
+}
+
+#[tauri::command]
+async fn set_preferences(
+    state: State<'_, AppState>,
+    preferences: Preferences,
+) -> Result<(), String> {
+    set_preferences_impl(state.inner(), &preferences).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -524,6 +539,19 @@ fn git_registry_config_path() -> Option<std::path::PathBuf> {
     debug_user_config_path("git-view.yaml", std::env::var_os("SWITCHBOARD_CONFIG_DIR"))
 }
 
+/// Personal preferences (`config.yaml`) — another sibling in the same
+/// user-global config dir, resolved identically (so the debug override moves it
+/// with the rest).
+#[cfg(not(debug_assertions))]
+fn preferences_config_path() -> Option<std::path::PathBuf> {
+    user_config_path("config.yaml")
+}
+
+#[cfg(debug_assertions)]
+fn preferences_config_path() -> Option<std::path::PathBuf> {
+    debug_user_config_path("config.yaml", std::env::var_os("SWITCHBOARD_CONFIG_DIR"))
+}
+
 /// Resolve `<os-config-dir>/switchboard/<file>` for release builds. `None` only
 /// when no home directory is resolvable (exotic host), in which case persistence
 /// of that file is disabled.
@@ -611,6 +639,13 @@ pub fn run() {
             } else {
                 state
             };
+            // Load personal preferences (`config.yaml`). No resolvable location →
+            // defaults this session, saves are no-ops.
+            let state = if let Some(path) = preferences_config_path() {
+                state.with_preferences(path)
+            } else {
+                state
+            };
             // Cold start: open a `Directory` handle for every workspace entry so
             // restored directories report `available: true` and participate in
             // the cross-harness session-id collision scan. Unopenable
@@ -638,6 +673,8 @@ pub fn run() {
             remove_tracked_repo,
             list_tracked_repos,
             read_tracked_repo,
+            get_preferences,
+            set_preferences,
             create_project,
             open_project,
             set_active_project,

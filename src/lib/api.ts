@@ -12,6 +12,7 @@ import type {
   MessageId,
   ProjectConversation,
   ProjectId,
+  Preferences,
   ProjectListing,
   ProjectSummary,
   RepoListing,
@@ -103,6 +104,17 @@ export async function listTrackedRepos(): Promise<RepoListing[]> {
 // Re-read a single tracked repo (per-repo refresh) without re-walking the rest.
 export async function readTrackedRepo(path: string): Promise<RepoListing> {
   return await invoke<RepoListing>("read_tracked_repo", { path });
+}
+
+// Backend-owned personal preferences (`config.yaml`). `getPreferences` always
+// returns a value (defaults if unset); `setPreferences` replaces the whole
+// object and persists it, surfacing a write failure.
+export async function getPreferences(): Promise<Preferences> {
+  return await invoke<Preferences>("get_preferences");
+}
+
+export async function setPreferences(preferences: Preferences): Promise<void> {
+  await invoke("set_preferences", { preferences });
 }
 
 // Removes a directory from the workspace: drains its projects' in-flight turns,

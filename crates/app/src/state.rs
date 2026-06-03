@@ -11,6 +11,7 @@ use switchboard_dispatcher::{Dispatcher, EventEmitter};
 use switchboard_harness::HarnessAdapter;
 
 use crate::git_registry::{self, GitRegistry};
+use crate::preferences::{self, Preferences};
 use crate::workspace::{self, Workspace};
 
 /// The single piece of state managed by Tauri. Multi-project and
@@ -42,6 +43,13 @@ use crate::workspace::{self, Workspace};
 /// `registry_write` is held during open/create/remove — which precedes them in
 /// the order, so those nestings are compliant.
 /// When nesting them, follow the documented tail order.
+///
+/// `preferences` is a **standalone leaf**: it is only ever acquired by
+/// `get_preferences` / `set_preferences`, never nested with another state lock.
+/// `set_preferences_impl` deliberately holds it **across its `config.yaml`
+/// write** to serialize saves (the temp file is a fixed path, so concurrent
+/// unserialized writes would corrupt it). Because it's a leaf taken alone, no
+/// other lock may be acquired while holding it — keep it that way.
 ///
 /// `registry_write` serializes append-only-log mutations
 /// (`create_project`, `register_agent`, `init_directory`).
@@ -182,6 +190,16 @@ pub struct AppState {
     /// host) or when the existing file couldn't be read this session.
     /// `persist_git_registry` is a no-op while this is `None`.
     pub git_registry_path: Option<PathBuf>,
+
+    /// User-global personal preferences (see `crate::preferences`). Backend-owned
+    /// `config.yaml`; the first backend-persisted settings (theme stays
+    /// frontend-only). Defaults until hydrated via [`AppState::with_preferences`].
+    pub preferences: Mutex<Preferences>,
+
+    /// Resolved path of `config.yaml`, or `None` when no global location was
+    /// resolved (tests, exotic host). `set_preferences` errors-as-noop persist
+    /// while this is `None`, so tests never touch user-global state.
+    pub preferences_path: Option<PathBuf>,
 }
 
 impl AppState {
@@ -210,6 +228,8 @@ impl AppState {
             workspace_path: None,
             git_registry: Mutex::new(GitRegistry::default()),
             git_registry_path: None,
+            preferences: Mutex::new(Preferences::default()),
+            preferences_path: None,
         }
     }
 
@@ -236,6 +256,17 @@ impl AppState {
         let outcome = git_registry::load(&path);
         self.git_registry = Mutex::new(outcome.registry);
         self.git_registry_path = outcome.persistable.then_some(path);
+        self
+    }
+
+    /// Builder step that loads personal preferences from `path` and records the
+    /// path for later saves. Unlike the registries there is no persistability
+    /// gate: preferences are written only on explicit user save, so a corrupt
+    /// file simply yields defaults this session and the next save replaces it.
+    #[must_use]
+    pub fn with_preferences(mut self, path: PathBuf) -> Self {
+        self.preferences = Mutex::new(preferences::load(&path));
+        self.preferences_path = Some(path);
         self
     }
 }

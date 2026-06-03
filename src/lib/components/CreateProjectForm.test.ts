@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/svelte";
+import { tick } from "svelte";
 import type { DirectoryInfo, ProjectSummary } from "$lib/types";
 
 // The form picks a folder via the native dialog, probes it via `pick_directory`,
@@ -126,6 +127,46 @@ describe("CreateProjectForm — new project", () => {
     await fireEvent.input(name, { target: { value: "brand-new" } });
     // Folder was set before the probe failed, so Create is still allowed.
     expect(screen.getByTestId("new-project-submit")).not.toBeDisabled();
+  });
+
+  it("ignores an out-of-order folder probe so the newer pick wins", async () => {
+    // Pick folder A, then folder B before A's probe resolves; resolve A LAST.
+    // A's stale result must not overwrite B's canonical path / siblings.
+    let resolveA!: (v: DirectoryInfo) => void;
+    let resolveB!: (v: DirectoryInfo) => void;
+    const aProbe = new Promise<DirectoryInfo>((r) => {
+      resolveA = r;
+    });
+    const bProbe = new Promise<DirectoryInfo>((r) => {
+      resolveB = r;
+    });
+    pickDirectoryMock.mockImplementation((path: string) =>
+      path === "/picked/a" ? aProbe : bProbe,
+    );
+    renderForm();
+
+    openMock.mockResolvedValueOnce("/picked/a");
+    await fireEvent.click(screen.getByTestId("new-project-choose-folder"));
+    await waitFor(() => expect(pickDirectoryMock).toHaveBeenCalledWith("/picked/a"));
+
+    openMock.mockResolvedValueOnce("/picked/b");
+    await fireEvent.click(screen.getByTestId("new-project-choose-folder"));
+    await waitFor(() => expect(pickDirectoryMock).toHaveBeenCalledWith("/picked/b"));
+
+    // Newer pick (B) resolves first and is applied; then the stale A resolves —
+    // with a sibling that would *wrongly* flag a duplicate if A overwrote B.
+    resolveB(info("/canonical/b", []));
+    await tick();
+    resolveA(info("/canonical/a", [summary("from-b")]));
+    await tick();
+
+    const name = screen.getByTestId("new-project-name") as HTMLInputElement;
+    await fireEvent.input(name, { target: { value: "from-b" } });
+    // Not flagged as a duplicate (A's stale siblings were discarded)...
+    expect(screen.queryByTestId("new-project-name-error")).not.toBeInTheDocument();
+    await fireEvent.click(screen.getByTestId("new-project-submit"));
+    // ...and the canonical path is B's, not A's.
+    expect(createProjectAndActivateMock).toHaveBeenCalledWith("from-b", "/canonical/b");
   });
 
   it("surfaces a create failure and keeps the dialog open", async () => {

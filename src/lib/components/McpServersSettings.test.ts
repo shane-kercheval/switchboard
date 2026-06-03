@@ -9,11 +9,22 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: (cmd: string, args?: Record<string, unknown>) => invokeMock(cmd, args),
 }));
 
+// Capture event listeners so a test can fire the backend's `prompts:synced`
+// signal and assert the component re-refreshes.
+const eventListeners = new Map<string, (e: { payload: unknown }) => void>();
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: (event: string, handler: (e: { payload: unknown }) => void) => {
+    eventListeners.set(event, handler);
+    return Promise.resolve(() => eventListeners.delete(event));
+  },
+}));
+
 // A mutable fake backend so add/remove reflect in the next list fetch.
 let providers: McpProviderInfo[];
 
 beforeEach(() => {
   providers = [];
+  eventListeners.clear();
   invokeMock.mockReset();
   invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
     switch (cmd) {
@@ -109,6 +120,30 @@ describe("McpServersSettings", () => {
     await fireEvent.click(screen.getByTestId("mcp-remove-team"));
     await waitFor(() => expect(screen.queryByTestId("mcp-row-team")).not.toBeInTheDocument());
     expect(invokeMock).toHaveBeenCalledWith("remove_mcp_provider", { name: "team" });
+  });
+
+  it("refreshes a just-added provider's status on the prompts:synced event", async () => {
+    providers = [
+      { name: "team", url: "https://x", has_token: false, status: { state: "unknown" } },
+    ];
+    render(McpServersSettings);
+    await waitFor(() => expect(screen.getByTestId("mcp-status-team")).toBeInTheDocument());
+    expect(screen.getByTestId("mcp-status-team")).not.toHaveTextContent("2 prompts");
+
+    // Background sync completes: backend now reports a real status.
+    providers = [
+      {
+        name: "team",
+        url: "https://x",
+        has_token: false,
+        status: { state: "ok", prompt_count: 2 },
+      },
+    ];
+    eventListeners.get("prompts:synced")?.({ payload: null });
+
+    await waitFor(() =>
+      expect(screen.getByTestId("mcp-status-team")).toHaveTextContent("2 prompts"),
+    );
   });
 
   it("test connection reports the prompt count", async () => {

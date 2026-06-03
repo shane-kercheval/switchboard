@@ -478,10 +478,15 @@ pub async fn test_mcp_connection_impl(
 
 /// Rebuild the prompt cache off the command thread. `PromptService` is cheaply
 /// cloneable and shares its cache, so the spawned clone warms the same cache.
+/// Emits `prompts:synced` when the rebuild finishes so Settings can refresh a
+/// just-added provider's status (the add/remove command returns before the
+/// background build completes, so the first read shows `Unknown`).
 fn spawn_prompt_sync(state: &AppState) {
     let prompts = state.prompts.clone();
+    let emitter = Arc::clone(&state.emitter);
     tokio::spawn(async move {
         prompts.sync().await;
+        emitter.emit("prompts:synced", serde_json::Value::Null);
     });
 }
 

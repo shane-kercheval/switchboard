@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { listen } from "@tauri-apps/api/event";
   import Button from "$lib/components/ui/Button.svelte";
   import Input from "$lib/components/ui/Input.svelte";
   import {
@@ -56,7 +57,19 @@
     }
   }
 
-  onMount(refresh);
+  // A background cache rebuild runs after add/remove; the command returns before
+  // it finishes, so the new row first reads `Unknown`. Re-refresh when the
+  // backend signals the rebuild is done to pick up the real status.
+  onMount(() => {
+    refresh();
+    let unlisten: (() => void) | undefined;
+    void listen("prompts:synced", () => {
+      void refresh();
+    }).then((u) => {
+      unlisten = u;
+    });
+    return () => unlisten?.();
+  });
 
   function resetForm(): void {
     name = "";

@@ -16,6 +16,10 @@ const invokeMock = vi.fn(async (cmd: string, _args?: Record<string, unknown>) =>
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: (cmd: string, args?: Record<string, unknown>) => invokeMock(cmd, args),
 }));
+// Embedded McpServersSettings subscribes to `prompts:synced` on mount.
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: () => Promise.resolve(() => {}),
+}));
 
 beforeEach(() => {
   theme.set("system");

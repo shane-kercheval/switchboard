@@ -95,6 +95,10 @@ pub struct PromptService {
     /// Serializes cache rebuilds so an older, slower `sync` can't finish after a
     /// newer one and overwrite the cache with stale results.
     sync_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes the config-file read-modify-write in `add`/`remove` so two
+    /// concurrent edits can't both read the old file and clobber each other's
+    /// change. Synchronous (the mutators are sync fns), distinct from `sync_lock`.
+    config_write_lock: Arc<std::sync::Mutex<()>>,
 }
 
 impl PromptService {
@@ -113,6 +117,7 @@ impl PromptService {
             cache: Arc::new(RwLock::new(Vec::new())),
             provider_status: Arc::new(RwLock::new(HashMap::new())),
             sync_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config_write_lock: Arc::new(std::sync::Mutex::new(())),
         }
     }
 
@@ -128,6 +133,7 @@ impl PromptService {
             cache: Arc::new(RwLock::new(Vec::new())),
             provider_status: Arc::new(RwLock::new(HashMap::new())),
             sync_lock: Arc::new(tokio::sync::Mutex::new(())),
+            config_write_lock: Arc::new(std::sync::Mutex::new(())),
         }
     }
 
@@ -359,6 +365,10 @@ impl PromptService {
                 name: name.to_owned(),
             });
         }
+        let _guard = self
+            .config_write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut configs = self.mcp_provider_configs();
         if configs.iter().any(|c| c.name == name) {
             return Err(PromptError::DuplicateProvider {
@@ -371,24 +381,40 @@ impl PromptService {
                 url: url.to_owned(),
             },
         });
-        self.write_mcp_providers(&configs)?;
+        // Store the secret *before* writing the config entry. A stored secret with
+        // no config entry is benign (never read, overwritten on retry); a config
+        // entry with no secret is a visible, retry-blocking broken provider. If the
+        // config write then fails, roll the secret back so a failed add is a no-op.
         if let Some(bearer) = bearer {
             self.secrets.set(name, bearer)?;
+        }
+        if let Err(e) = self.write_mcp_providers(&configs) {
+            if bearer.is_some() {
+                let _ = self.secrets.delete(name);
+            }
+            return Err(e);
         }
         Ok(())
     }
 
-    /// Remove a generic MCP provider: drop its config entry (preserving others),
-    /// delete its stored bearer (best-effort, idempotent), and clear its status.
-    /// Idempotent — removing an unconfigured name is not an error.
+    /// Remove a generic MCP provider: delete its stored bearer, drop its config
+    /// entry (preserving others), and clear its status. Idempotent — removing an
+    /// unconfigured name is not an error. Deletes the secret *first* and surfaces
+    /// a deletion failure rather than swallowing it: removing the config while the
+    /// token lingers would report the server gone while its credential remains in
+    /// the keychain.
     pub fn remove_mcp_provider(&self, name: &str) -> Result<(), PromptError> {
+        let _guard = self
+            .config_write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut configs = self.mcp_provider_configs();
         let before = configs.len();
         configs.retain(|c| c.name != name);
+        self.secrets.delete(name)?;
         if configs.len() != before {
             self.write_mcp_providers(&configs)?;
         }
-        let _ = self.secrets.delete(name);
         self.provider_status
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -422,6 +448,11 @@ impl PromptService {
     /// Overwrite only the `mcp_providers:` key in `config.yaml`, preserving every
     /// other top-level key (`local_prompt_dirs` and any personal prefs). Refuses
     /// to write — rather than clobber — if the existing file isn't a YAML mapping.
+    ///
+    /// This is the user-global config (the OS config dir, not the git-tracked
+    /// per-directory `.switchboard/config.yaml`). Because the round-trip goes
+    /// through `serde`, hand-added YAML comments in this file are **not**
+    /// preserved when a server is added or removed from Settings.
     fn write_mcp_providers(&self, configs: &[McpProviderConfig]) -> Result<(), PromptError> {
         let path = self.config_path()?;
         let mut root = read_config_mapping(path)?;
@@ -493,6 +524,21 @@ mod tests {
         }
         fn delete(&self, _: &str) -> Result<(), SecretStoreError> {
             Ok(())
+        }
+    }
+
+    /// A secret store that holds a value but whose `delete` always fails — for
+    /// the remove-path "credential deletion failed" case.
+    struct FailingDeleteSecretStore;
+    impl SecretStore for FailingDeleteSecretStore {
+        fn get(&self, _: &str) -> Result<Option<String>, SecretStoreError> {
+            Ok(Some("tok".to_owned()))
+        }
+        fn set(&self, _: &str, _: &str) -> Result<(), SecretStoreError> {
+            Ok(())
+        }
+        fn delete(&self, _: &str) -> Result<(), SecretStoreError> {
+            Err(SecretStoreError::Backend("store offline".to_owned()))
         }
     }
 
@@ -756,6 +802,58 @@ mod tests {
         assert!(!raw.contains("mcp_providers"));
         // Idempotent: removing again is fine.
         service.remove_mcp_provider("team").unwrap();
+    }
+
+    #[tokio::test]
+    async fn add_leaves_no_provider_configured_when_secret_store_fails() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        let service = PromptService::new(
+            config_path.clone(),
+            dir.path().join("prompts"),
+            None,
+            Arc::new(FailingSecretStore),
+        );
+
+        // Secret is stored before the config entry, so a failed `set` aborts the
+        // add before anything is written — no half-added, retry-blocking provider.
+        let err = service
+            .add_mcp_provider("team", "https://a", Some("tok"))
+            .unwrap_err();
+        assert!(matches!(err, PromptError::Secret(_)));
+        assert!(service.list_mcp_providers().is_empty());
+        assert!(
+            !config_path.exists()
+                || !std::fs::read_to_string(&config_path)
+                    .unwrap()
+                    .contains("mcp_providers")
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_surfaces_secret_deletion_failure_and_keeps_provider() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        std::fs::write(&config_path, http_provider_yaml("team", "https://a")).unwrap();
+        let service = PromptService::new(
+            config_path.clone(),
+            dir.path().join("prompts"),
+            None,
+            Arc::new(FailingDeleteSecretStore),
+        );
+
+        // Deleting the token fails → the whole remove fails, leaving the provider
+        // visible rather than reporting it gone while its credential lingers.
+        let err = service.remove_mcp_provider("team").unwrap_err();
+        assert!(matches!(err, PromptError::Secret(_)));
+        let providers = service.list_mcp_providers();
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].name, "team");
+        assert!(
+            std::fs::read_to_string(&config_path)
+                .unwrap()
+                .contains("mcp_providers")
+        );
     }
 
     #[tokio::test]

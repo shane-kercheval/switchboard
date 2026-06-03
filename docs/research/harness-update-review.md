@@ -8,7 +8,7 @@ The version each harness was last vetted against. **Update the relevant row at t
 
 | Harness | Last reviewed | Date | How / result |
 |---|---|---|---|
-| Codex | `0.135.0` | 2026-05-30 | changelog + code review — no impact (see `harness-behavior.md` §6) |
+| Codex | `0.136.0` | 2026-06-02 | changelog + code review — no impact |
 | Claude Code | `2.1.153` | 2026-05-27 | subagent stream/disk probe (3 parent-tagged shapes, disk-side collapse verified — see `harness-behavior.md` §6); prior auth-failure/overage probes 2026-05-25 against 2.1.149 still current |
 | Gemini | `0.42.0` | 2026-05-27 | core probes from M3; logged-out auth shape captured 2026-05-27 |
 | Antigravity (`agy`) | `1.0.2` | 2026-05-26 | hands-on probes (transcript, quota, auth) |

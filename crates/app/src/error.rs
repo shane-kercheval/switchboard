@@ -131,21 +131,6 @@ pub enum AppError {
         paths: Vec<PathBuf>,
     },
 
-    /// Attach-flow (Codex only): registering the `AgentRecord` succeeded but
-    /// writing the per-agent session-link sidecar failed. The
-    /// `AgentRecord` is already in the registry; until the user retries the
-    /// attach (or the sidecar appears via some other path), this Codex
-    /// agent will look like a fresh-spawn to the adapter.
-    #[error(transparent)]
-    Sidecar(#[from] switchboard_harness::codex::sidecar::SidecarError),
-
-    /// Attach-flow (Antigravity): the per-agent session-link sidecar write
-    /// failed during attach. Same consequence as the Codex case — the
-    /// attached agent would look like a fresh-spawn (new server conversation)
-    /// on its first dispatch instead of resuming the attached one.
-    #[error(transparent)]
-    AntigravitySidecar(#[from] switchboard_harness::antigravity::sidecar::SidecarError),
-
     /// Attach-flow: catch-all for future `AttachLookupError` variants we
     /// don't yet know how to surface specifically. The Codex date-scan
     /// helper is `#[non_exhaustive]`; this lands a useful message rather

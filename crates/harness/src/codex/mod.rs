@@ -11,9 +11,7 @@
 //!   pre-generated at agent registration. The captured `thread_id` (plus the
 //!   local partition-date) is emitted as a `SessionLocatorCaptured` event and
 //!   persisted by the dispatcher onto the agent's registry record
-//!   (`SessionLocator::Codex`); on resume it's read back from that record. The
-//!   `sidecar.rs` module is retained only for the one-time migration of
-//!   pre-existing session-link files (see its module doc).
+//!   (`SessionLocator::Codex`); on resume it's read back from that record.
 //!
 //! **Resume command-line asymmetry.** `codex exec resume` does **not**
 //! accept `-C` / `--cd`; verified against codex-cli 0.130.0 via the
@@ -25,7 +23,6 @@
 pub mod config;
 pub mod parser;
 pub mod session_file;
-pub mod sidecar;
 pub mod skills;
 
 use std::collections::VecDeque;
@@ -272,8 +269,8 @@ fn build_args(prompt: &str, resume_thread_id: Option<&str>) -> Vec<String> {
 }
 
 // Parallel to `ClaudeCodeAdapter::run_producer` (which sits just under the
-// `too_many_lines` threshold). The Codex variant adds sidecar persistence,
-// EOF synthesis that consumes the buffered stdout error, and post-terminal
+// `too_many_lines` threshold). The Codex variant adds locator-capture
+// emission, EOF synthesis that consumes the buffered stdout error, and post-terminal
 // session-file enrichment. Splitting further would fragment the per-line
 // control flow without improving readability.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]

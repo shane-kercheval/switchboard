@@ -21,8 +21,9 @@
 //!   conversation this exact invocation used — available in ~seconds
 //!   regardless of cold-start latency, and never cross-attributed from a
 //!   concurrent or background `agy` (each writes its own log). It is then
-//!   persisted to the per-agent sidecar (see [`sidecar`]) for resume /
-//!   hydration. A filesystem fallback (watch `brain/<uuid>/` for a dir whose
+//!   emitted as a `SessionLocatorCaptured` event and persisted by the
+//!   dispatcher onto the agent's registry record for resume / hydration. A
+//!   filesystem fallback (watch `brain/<uuid>/` for a dir whose
 //!   transcript echoes the prompt) covers the case where that Google-internal
 //!   log line ever moves — see [`capture_conversation_id`].
 //! - **Transcript-sourced content; stdout is a control channel.** All
@@ -53,7 +54,6 @@ pub mod config;
 pub mod parser;
 pub mod paths;
 pub mod session_file;
-pub mod sidecar;
 pub mod skills;
 
 use std::collections::VecDeque;
@@ -1011,7 +1011,7 @@ struct OutcomeSignals {
 /// (`Warning: conversation "<uuid>" not found.`). Drives the producer's
 /// fork-and-heal recapture path on resume — it does **not** fail the turn
 /// (`agy` produced a real answer in a fresh conversation; we heal the
-/// sidecar to the new id so future turns continue it).
+/// registry locator to the new id so future turns continue it).
 fn is_conversation_not_found(line: &str) -> bool {
     let l = line.to_ascii_lowercase();
     l.contains("conversation") && l.contains("not found")
@@ -1133,7 +1133,7 @@ fn extract_rpc_descriptive_tail(detail: &str) -> String {
 /// Build the terminal `TurnOutcome` from the post-exit signals. Pure so the
 /// classification logic is unit-tested without spawning `agy`.
 ///
-/// Precedence: auth fast-fail → ambiguous capture → sidecar write failure →
+/// Precedence: auth fast-fail → ambiguous capture →
 /// stdout `Error:` line → log-derived RPC error → unresumable-with-a-streamed-reply
 /// (required recapture failed) → **transcript terminal answer → Completed** →
 /// output-but-no-answer (adapter failure) → no output (adapter failure). A

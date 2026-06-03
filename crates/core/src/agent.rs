@@ -105,19 +105,35 @@ impl SessionLocator {
 ///
 /// `session_locator` is the agent's session identity (see [`SessionLocator`]).
 /// Claude/Gemini pre-generate it at creation; Codex/Antigravity leave it `None`
-/// until the harness assigns one at runtime. `#[serde(default)]` lets a record
-/// written before this field existed deserialize as `None` rather than failing
-/// loud — a transitional allowance removed once existing registries are
-/// migrated.
+/// until the harness assigns one at runtime. The field is always written (as
+/// `null` when no locator yet), and the key is **required** on read — a record
+/// missing it entirely is treated as corruption and fails loud (see
+/// [`deserialize_required_locator`]), consistent with the Switchboard-owned
+/// JSONL invariant.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentRecord {
     pub id: AgentId,
     pub project_id: Uuid,
     pub name: String,
     pub harness: HarnessKind,
-    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_required_locator")]
     pub session_locator: Option<SessionLocator>,
     pub created_at: DateTime<Utc>,
+}
+
+/// Deserialize `session_locator`, requiring the key to be present (an explicit
+/// `null` is allowed and yields `None`). Serde's built-in handling fills a
+/// *missing* `Option` field with `None` silently; here that would mask a record
+/// written before the locator migration — one carrying the old `session_id` key
+/// and no `session_locator` — by loading it as "no locator" and dropping a
+/// Claude/Gemini agent's resume continuity. Forcing the key present turns that
+/// into a loud failure instead, surfacing an unmigrated record rather than
+/// degrading silently.
+fn deserialize_required_locator<'de, D>(deserializer: D) -> Result<Option<SessionLocator>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<SessionLocator>::deserialize(deserializer)
 }
 
 #[cfg(test)]
@@ -229,13 +245,18 @@ mod tests {
     }
 
     #[test]
-    fn record_missing_session_locator_deserializes_as_none() {
-        // The `#[serde(default)]` transitional allowance: a record written
-        // before the field existed (no `session_locator` key) loads as `None`
-        // rather than failing to deserialize.
+    fn record_missing_session_locator_fails_to_deserialize() {
+        // Post-migration contract: the transitional `#[serde(default)]` shim is
+        // gone, so a record lacking the `session_locator` key is corruption and
+        // must fail loud rather than silently loading as `None` (which would
+        // mask session-identity loss). Every migrated record carries the field
+        // explicitly, written as `null` when absent.
         let json = r#"{"id":"019e2c5f-aaaa-7000-8000-000000000001","project_id":"019e2c5f-bbbb-7000-8000-000000000002","name":"legacy","harness":"claude_code","created_at":"2026-05-15T12:30:45Z"}"#;
-        let parsed: AgentRecord = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed.session_locator, None);
-        assert_eq!(parsed.name, "legacy");
+        let err = serde_json::from_str::<AgentRecord>(json)
+            .expect_err("a record without session_locator must fail to deserialize");
+        assert!(
+            err.to_string().contains("session_locator"),
+            "error should name the missing field, got: {err}"
+        );
     }
 }

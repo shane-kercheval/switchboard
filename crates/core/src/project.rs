@@ -454,10 +454,10 @@ mod tests {
     }
 
     #[test]
-    fn register_antigravity_agent_leaves_session_id_none() {
-        // Antigravity assigns the conversation UUID server-side; the
-        // adapter captures it post-spawn and writes the per-agent sidecar.
-        // Mirrors Codex's pattern.
+    fn register_antigravity_agent_leaves_session_locator_none() {
+        // Antigravity assigns the conversation UUID server-side; the adapter
+        // captures it post-spawn and the dispatcher persists it onto the
+        // registry record. Mirrors Codex's pattern.
         let (_tmp, project) = fresh_project();
         let record = project
             .register_agent("a", HarnessKind::Antigravity)

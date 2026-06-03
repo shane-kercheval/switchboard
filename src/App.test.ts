@@ -767,7 +767,13 @@ describe("App", () => {
       agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
     });
     backend.agentQueue.push(
-      agent({ id: "ag-2", project_id: "p-a", name: "second", harness: "codex", session_locator: null }),
+      agent({
+        id: "ag-2",
+        project_id: "p-a",
+        name: "second",
+        harness: "codex",
+        session_locator: null,
+      }),
     );
     await mountApp();
     await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());

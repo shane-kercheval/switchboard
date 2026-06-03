@@ -173,13 +173,13 @@ Outcomes:
   2. For each agent record: if `session_locator` is already present, skip. If `session_id` is present (old Claude/Gemini shape), rewrite the record with `session_locator: {"uuid": "<uuid>"}` and no `session_id`. If neither is present (old Codex/Antigravity — `None`), check for the matching sidecar; if found, read its latest record and write the appropriate locator; if not found, leave `session_locator: null`.
   3. Deletes the sidecar file **only after** the registry write is confirmed.
   4. Reports any corrupt sidecar loudly rather than deleting it.
-- **Delete the legacy code.** Once the migration pass is confirmed clean: remove the retained sidecar modules/structs from M2/M3, remove the `#[serde(default)]` shim from `session_locator`, and delete any sidecar-related test fixtures that are no longer needed.
+- **Delete the legacy code.** Once the migration pass is confirmed clean: remove the retained sidecar modules/structs from M2/M3, remove the `#[serde(default)]` shim from `session_locator`, and delete any sidecar-related test fixtures that are no longer needed. **Note:** dropping `#[serde(default)]` alone does **not** make a missing `session_locator` fail loud — serde fills a missing `Option` field with `None` implicitly. To actually surface an unmigrated record (old `session_id` key, no `session_locator`) instead of silently loading it as "no locator," the field carries a `#[serde(deserialize_with = …)]` that requires the key to be present (explicit `null` still allowed → `None`).
 
 ### Definition of Done
 
 - **Migration confirmed:** the agent reports which projects/agents were migrated and the developer verifies the registry files look correct (spot-check a few records).
 - **Grep:** no session-link sidecar modules remain; `sessions/` holds only `.meta.json` (plus the metadata plan's `.turnmeta.jsonl`); no `session_id` field appears in any `registry.jsonl`.
-- **`#[serde(default)]` removed** from `session_locator`; a record missing the field now fails deserialization (fail-loud, as intended).
+- **`#[serde(default)]` removed** from `session_locator` and replaced with a required-key `deserialize_with` (serde would otherwise still default a missing `Option` to `None`); a record missing the field now fails deserialization (fail-loud, as intended), while an explicit `null` still loads as `None`.
 - **Docs:** `system-design.md` §10.3 + AGENTS.md updated to record that session-link sidecars are fully removed.
 - **Known limitation (record):** no downgrade support — a pre-refactor build cannot read migrated projects. Acceptable.
 

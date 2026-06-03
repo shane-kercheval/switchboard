@@ -10,14 +10,12 @@
 //! until the next event. This sidecar persists the latest snapshot on each
 //! event and re-reads it on project open.
 //!
-//! **Harness-agnostic, keyed on `AgentId`.** Unlike the per-harness
-//! session-link sidecars (`codex::sidecar`, `antigravity::sidecar`), this is
-//! not tied to any harness's session conventions — it's keyed on the
-//! Switchboard-owned `AgentId`, so harness session-id reassignment (e.g.
-//! Antigravity's expired-conversation reheal) is irrelevant. It lives at
-//! `<directory>/.switchboard/projects/<project-id>/sessions/<agent-id>.meta.json`,
-//! the same directory as the harness ID sidecars but a different filename
-//! and concern.
+//! **Harness-agnostic, keyed on `AgentId`.** Unlike a harness's session
+//! locator (`AgentRecord.session_locator`), this is not tied to any harness's
+//! session conventions — it's keyed on the Switchboard-owned `AgentId`, so
+//! harness session-id reassignment (e.g. Antigravity's expired-conversation
+//! reheal) is irrelevant. It lives at
+//! `<directory>/.switchboard/projects/<project-id>/sessions/<agent-id>.meta.json`.
 //!
 //! **Last-write-wins per field, not an append-log.** Each write replaces the
 //! whole file with the latest snapshot. Correlating snapshots to individual
@@ -28,7 +26,7 @@
 //! corrupt file logs and reads as empty (never fails hydration). Writes that
 //! fail are logged and dropped by the caller — the sidecar is a UX
 //! improvement (restart continuity), not a correctness dependency, so unlike
-//! the harness session-link sidecars it never fails a turn.
+//! the registry-resident session locator it never fails a turn.
 
 use std::path::{Path, PathBuf};
 
@@ -73,8 +71,8 @@ impl Default for MetaSidecar {
 
 /// Canonical metadata-sidecar path:
 /// `<directory>/.switchboard/projects/<project-id>/sessions/<agent-id>.meta.json`.
-/// Same parent directory as the harness session-link sidecars
-/// (`<agent-id>.jsonl`), different filename and concern.
+/// Shares the per-agent `sessions/` directory with the registry's metadata
+/// cache, but is a distinct filename and concern.
 #[must_use]
 pub fn meta_sidecar_path(directory: &Path, project_id: ProjectId, agent_id: AgentId) -> PathBuf {
     directory
@@ -247,8 +245,7 @@ mod tests {
 
     #[test]
     fn write_creates_parent_directory_chain() {
-        // Deep path whose parents don't exist — write must create them, like
-        // the harness session-link sidecars.
+        // Deep path whose parents don't exist — write must create them.
         let tmp = TempDir::new().unwrap();
         let path = tmp
             .path()

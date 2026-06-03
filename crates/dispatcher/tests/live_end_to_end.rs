@@ -472,9 +472,9 @@ async fn live_gemini_full_stack_emits_turn_start_then_content_then_turn_end() {
 #[tokio::test]
 #[ignore = "requires codex installed and authenticated — run with: make test-live"]
 async fn live_codex_full_stack_emits_turn_start_then_content_then_turn_end() {
-    // Codex agents register with `session_id = None` (the per-agent sidecar is
-    // the system-of-record); the dispatcher must not depend on
-    // `agent.session_locator.is_some()` to function.
+    // Codex agents register with `session_locator = None` (the locator is
+    // captured at runtime and persisted to the registry record); the dispatcher
+    // must not depend on `agent.session_locator.is_some()` to function.
     let tmp = TempDir::new().expect("tempdir");
     let directory = Directory::at(tmp.path()).expect("Directory::at");
     directory.init().expect("init");
@@ -486,7 +486,7 @@ async fn live_codex_full_stack_emits_turn_start_then_content_then_turn_end() {
         .expect("agent");
     assert!(
         agent.session_locator.is_none(),
-        "Codex agents must register with session_id = None"
+        "Codex agents must register with session_locator = None"
     );
 
     let dispatcher = Arc::new(Dispatcher::new());
@@ -523,9 +523,9 @@ async fn live_codex_full_stack_emits_turn_start_then_content_then_turn_end() {
 #[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
 async fn live_antigravity_full_stack_two_turns_resume_through_dispatcher() {
     // The full backend slice for Antigravity, exercising the capture→resume
-    // path through the dispatcher: turn 1 captures the server-assigned UUID into
-    // the per-agent sidecar; turn 2 must read that sidecar and resume via
-    // `--conversation <uuid>`.
+    // path through the dispatcher: turn 1 captures the server-assigned UUID and
+    // persists it to the registry record; turn 2 must resume via the
+    // registry-stored locator (`--conversation <uuid>`).
     let tmp = TempDir::new().expect("tempdir");
     let directory = Directory::at(tmp.path()).expect("Directory::at");
     directory.init().expect("init");
@@ -537,7 +537,7 @@ async fn live_antigravity_full_stack_two_turns_resume_through_dispatcher() {
         .expect("agent");
     assert!(
         agent.session_locator.is_none(),
-        "Antigravity agents carry session_id: None (server-assigned, sidecar-carried)"
+        "Antigravity agents carry session_locator: None (server-assigned, captured at runtime)"
     );
 
     let dispatcher = Arc::new(Dispatcher::new());

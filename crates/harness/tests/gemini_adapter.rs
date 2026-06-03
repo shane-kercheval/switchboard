@@ -1,5 +1,5 @@
 use futures::StreamExt;
-use switchboard_core::{AgentRecord, HarnessKind};
+use switchboard_core::{AgentRecord, HarnessKind, SessionLocator};
 use switchboard_harness::{
     AdapterEvent, ContentKind, DispatchError, DispatchOptions, FailureKind, GeminiAdapter,
     HarnessAdapter, ToolKind, TurnOutcome,
@@ -29,7 +29,7 @@ fn gemini_agent() -> AgentRecord {
         project_id: Uuid::now_v7(),
         name: "gemini-test".to_owned(),
         harness: HarnessKind::Gemini,
-        session_id: Some(Uuid::new_v4()),
+        session_locator: Some(SessionLocator::Uuid(Uuid::new_v4())),
         created_at: chrono::Utc::now(),
     }
 }

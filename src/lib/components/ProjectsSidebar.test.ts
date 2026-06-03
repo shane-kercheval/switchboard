@@ -51,7 +51,7 @@ function agent(id: string, projectId: string): AgentRecord {
     project_id: projectId,
     name: `agent-${id.slice(-1)}`,
     harness: "claude_code",
-    session_id: null,
+    session_locator: null,
     created_at: "2026-05-16T00:00:00Z",
   };
 }

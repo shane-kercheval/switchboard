@@ -17,11 +17,10 @@
 use std::path::PathBuf;
 
 use futures::StreamExt;
-use switchboard_core::{AgentRecord, HarnessKind};
+use switchboard_core::{AgentRecord, HarnessKind, SessionLocator};
 use switchboard_harness::{
     AdapterEvent, AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, DispatchOptions,
-    GeminiAdapter, HarnessAdapter, Turn, TurnItem, TurnStatus, antigravity, codex::sidecar,
-    load_antigravity_transcript,
+    GeminiAdapter, HarnessAdapter, Turn, TurnItem, TurnStatus, load_antigravity_transcript,
 };
 use uuid::Uuid;
 
@@ -33,6 +32,35 @@ fn real_home() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .expect("HOME must be set for live tests")
+}
+
+/// Extract the session UUID from a Claude/Gemini agent's locator (those
+/// harnesses always carry a `Uuid` variant). Panics on any other shape — a
+/// test setup error, not a runtime condition.
+fn uuid_locator(agent: &AgentRecord) -> Uuid {
+    match &agent.session_locator {
+        Some(SessionLocator::Uuid(id)) => *id,
+        other => panic!("expected a Uuid session locator, got {other:?}"),
+    }
+}
+
+/// Extract the Codex `thread_id` + partition-date from the dispatch's capture
+/// event (a first Codex dispatch emits one; the dispatcher persists it to the
+/// record). Used by the live Codex hydration tests in place of a sidecar read.
+fn captured_codex_locator(events: &[AdapterEvent]) -> (String, chrono::NaiveDate) {
+    events
+        .iter()
+        .find_map(|e| match e {
+            AdapterEvent::SessionLocatorCaptured {
+                locator:
+                    SessionLocator::Codex {
+                        thread_id,
+                        partition_date,
+                    },
+            } => Some((thread_id.clone(), *partition_date)),
+            _ => None,
+        })
+        .expect("a first Codex dispatch must emit a captured Codex locator")
 }
 
 fn collect_text(events: &[AdapterEvent]) -> String {
@@ -55,7 +83,7 @@ async fn live_claude_transcript_load_round_trips() {
         project_id: Uuid::now_v7(),
         name: "transcript-claude".to_owned(),
         harness: HarnessKind::ClaudeCode,
-        session_id: Some(Uuid::now_v7()),
+        session_locator: Some(SessionLocator::Uuid(Uuid::now_v7())),
         created_at: chrono::Utc::now(),
     };
     let prompt = "Reply with only the single word 'ack' and nothing else.";
@@ -77,7 +105,7 @@ async fn live_claude_transcript_load_round_trips() {
     let transcript = switchboard_harness::load_claude_transcript(
         &real_home(),
         tmp.path(),
-        agent.session_id.unwrap(),
+        uuid_locator(&agent),
         agent.id,
     )
     .expect("load_claude_transcript must succeed");
@@ -113,7 +141,7 @@ async fn live_claude_transcript_load_hydrates_tool_items() {
         project_id: Uuid::now_v7(),
         name: "transcript-claude-tool".to_owned(),
         harness: HarnessKind::ClaudeCode,
-        session_id: Some(Uuid::now_v7()),
+        session_locator: Some(SessionLocator::Uuid(Uuid::now_v7())),
         created_at: chrono::Utc::now(),
     };
     let turn_id = Uuid::now_v7();
@@ -136,7 +164,7 @@ async fn live_claude_transcript_load_hydrates_tool_items() {
     let transcript = switchboard_harness::load_claude_transcript(
         &real_home(),
         tmp.path(),
-        agent.session_id.unwrap(),
+        uuid_locator(&agent),
         agent.id,
     )
     .expect("load_claude_transcript must succeed");
@@ -219,7 +247,7 @@ async fn live_claude_tool_results_bind_after_restart() {
         project_id: Uuid::now_v7(),
         name: "transcript-claude-tool-bind".to_owned(),
         harness: HarnessKind::ClaudeCode,
-        session_id: Some(Uuid::now_v7()),
+        session_locator: Some(SessionLocator::Uuid(Uuid::now_v7())),
         created_at: chrono::Utc::now(),
     };
     let turn_id = Uuid::now_v7();
@@ -241,7 +269,7 @@ async fn live_claude_tool_results_bind_after_restart() {
     let transcript = switchboard_harness::load_claude_transcript(
         &real_home(),
         tmp.path(),
-        agent.session_id.unwrap(),
+        uuid_locator(&agent),
         agent.id,
     )
     .expect("load_claude_transcript must succeed");
@@ -298,7 +326,7 @@ async fn live_claude_tool_results_bind_after_restart() {
 
 #[tokio::test]
 #[ignore = "requires codex installed — run with: make test-live"]
-async fn live_codex_transcript_load_via_sidecar_round_trips() {
+async fn live_codex_transcript_load_via_captured_locator_round_trips() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let adapter = CodexAdapter::new();
     let agent = AgentRecord {
@@ -306,7 +334,7 @@ async fn live_codex_transcript_load_via_sidecar_round_trips() {
         project_id: Uuid::now_v7(),
         name: "transcript-codex".to_owned(),
         harness: HarnessKind::Codex,
-        session_id: None,
+        session_locator: None,
         created_at: chrono::Utc::now(),
     };
     let prompt = "Reply with only the single word 'ack' and nothing else.";
@@ -325,16 +353,13 @@ async fn live_codex_transcript_load_via_sidecar_round_trips() {
     let live_events: Vec<AdapterEvent> = stream.collect().await;
     let live_text = collect_text(&live_events);
 
-    let sidecar = sidecar::sidecar_path(tmp.path(), agent.project_id, agent.id);
-    let record = sidecar::read_latest(&sidecar)
-        .expect("sidecar must read cleanly")
-        .expect("sidecar must contain a record after a live dispatch");
+    let (thread_id, partition_date) = captured_codex_locator(&live_events);
 
     let transcript = switchboard_harness::load_codex_transcript(
         &real_home(),
         tmp.path(),
-        &record.session_id,
-        Some(record.session_partition_date),
+        &thread_id,
+        Some(partition_date),
         agent.id,
     )
     .expect("load_codex_transcript must succeed");
@@ -378,7 +403,7 @@ async fn live_codex_transcript_load_hydrates_tool_items() {
         project_id: Uuid::now_v7(),
         name: "transcript-codex-tool".to_owned(),
         harness: HarnessKind::Codex,
-        session_id: None,
+        session_locator: None,
         created_at: chrono::Utc::now(),
     };
     let turn_id = Uuid::now_v7();
@@ -396,18 +421,15 @@ async fn live_codex_transcript_load_hydrates_tool_items() {
     // Drain the stream to flush the subprocess; the session file isn't
     // written until the stream completes. Dropping this line would
     // race the hydration read against the subprocess.
-    let _events: Vec<AdapterEvent> = stream.collect().await;
+    let events: Vec<AdapterEvent> = stream.collect().await;
 
-    let sidecar = sidecar::sidecar_path(tmp.path(), agent.project_id, agent.id);
-    let record = sidecar::read_latest(&sidecar)
-        .expect("sidecar must read cleanly")
-        .expect("sidecar must contain a record after a live dispatch");
+    let (thread_id, partition_date) = captured_codex_locator(&events);
 
     let transcript = switchboard_harness::load_codex_transcript(
         &real_home(),
         tmp.path(),
-        &record.session_id,
-        Some(record.session_partition_date),
+        &thread_id,
+        Some(partition_date),
         agent.id,
     )
     .expect("load_codex_transcript must succeed");
@@ -566,7 +588,7 @@ async fn live_gemini_transcript_load_via_session_file_round_trips() {
         project_id: Uuid::now_v7(),
         name: "transcript-gemini".to_owned(),
         harness: HarnessKind::Gemini,
-        session_id: Some(session_id),
+        session_locator: Some(SessionLocator::Uuid(session_id)),
         created_at: chrono::Utc::now(),
     };
     let prompt = "Reply with only the single word 'ack' and nothing else.";
@@ -588,7 +610,7 @@ async fn live_gemini_transcript_load_via_session_file_round_trips() {
     let transcript = switchboard_harness::load_gemini_transcript(
         &real_home(),
         tmp.path(),
-        agent.session_id.unwrap(),
+        uuid_locator(&agent),
         agent.id,
     )
     .expect("load_gemini_transcript must succeed");
@@ -630,7 +652,7 @@ async fn live_gemini_transcript_load_hydrates_tool_items() {
         project_id: Uuid::now_v7(),
         name: "transcript-gemini-tool".to_owned(),
         harness: HarnessKind::Gemini,
-        session_id: Some(session_id),
+        session_locator: Some(SessionLocator::Uuid(session_id)),
         created_at: chrono::Utc::now(),
     };
     let turn_id = Uuid::now_v7();
@@ -652,7 +674,7 @@ async fn live_gemini_transcript_load_hydrates_tool_items() {
     let transcript = switchboard_harness::load_gemini_transcript(
         &real_home(),
         tmp.path(),
-        agent.session_id.unwrap(),
+        uuid_locator(&agent),
         agent.id,
     )
     .expect("load_gemini_transcript must succeed");
@@ -726,19 +748,22 @@ fn assert_gemini_agent_usage(turn: &Turn) {
 async fn live_antigravity_two_turns_hydrate_in_order() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let adapter = AntigravityAdapter::new();
-    let agent = AgentRecord {
+    // Antigravity agents start with no locator; the conversation UUID is
+    // captured on first dispatch (a `SessionLocatorCaptured` event) and lives on
+    // the record thereafter. We simulate the dispatcher here: fold the captured
+    // locator back onto the agent so the second dispatch resumes it.
+    let mut agent = AgentRecord {
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
         name: "transcript-agy".to_owned(),
         harness: HarnessKind::Antigravity,
-        // Antigravity agents carry session_id: None; the conversation UUID
-        // lives in the per-agent sidecar after the first dispatch.
-        session_id: None,
+        session_locator: None,
         created_at: chrono::Utc::now(),
     };
 
-    // Two prompts against the same agent: the second resumes via the sidecar
-    // and appends to the same transcript.jsonl (single-file-per-conversation).
+    // Two prompts against the same agent: the second resumes the captured
+    // conversation and appends to the same transcript.jsonl.
+    let mut conversation_id: Option<Uuid> = None;
     for prompt in [
         "Reply with only the single word 'one' and nothing else.",
         "Reply with only the single word 'two' and nothing else.",
@@ -753,21 +778,24 @@ async fn live_antigravity_two_turns_hydrate_in_order() {
             )
             .await
             .expect("dispatch should succeed with real agy");
-        let _events: Vec<AdapterEvent> = stream.collect().await;
+        let events: Vec<AdapterEvent> = stream.collect().await;
+        for event in &events {
+            if let AdapterEvent::SessionLocatorCaptured {
+                locator: SessionLocator::Uuid(u),
+                ..
+            } = event
+            {
+                conversation_id = Some(*u);
+                agent.session_locator = Some(SessionLocator::Uuid(*u));
+            }
+        }
     }
 
-    let sidecar = antigravity::sidecar::sidecar_path(tmp.path(), agent.project_id, agent.id);
-    let record = antigravity::sidecar::read_latest(&sidecar)
-        .expect("sidecar must read cleanly")
-        .expect("sidecar must contain a record after live dispatches");
-
-    let transcript = load_antigravity_transcript(
-        &real_home(),
-        tmp.path(),
-        Some(record.conversation_id),
-        agent.id,
-    )
-    .expect("load_antigravity_transcript must succeed");
+    let conversation_id =
+        conversation_id.expect("a capture event must have bound the conversation id");
+    let transcript =
+        load_antigravity_transcript(&real_home(), tmp.path(), Some(conversation_id), agent.id)
+            .expect("load_antigravity_transcript must succeed");
 
     assert!(
         transcript.warnings.is_empty(),

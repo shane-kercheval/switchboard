@@ -65,8 +65,10 @@ pub struct AppState {
     /// Acquired around any operation that appends to a JSONL on disk
     /// (`projects.jsonl` or a project's `registry.jsonl`). `std::sync::Mutex`
     /// because the protected work is fully synchronous — no `.await` while
-    /// the guard is held.
-    pub registry_write: Mutex<()>,
+    /// the guard is held. `Arc` so the per-dispatch session-locator sink (which
+    /// outlives any single command, living on the dispatcher's `'static` actor
+    /// task) can hold a handle and serialize its registry write here.
+    pub registry_write: Arc<Mutex<()>>,
     pub dispatcher: Arc<Dispatcher>,
     /// Adapter for `HarnessKind::ClaudeCode` agents. Named fields per harness
     /// (one per supported `HarnessKind`) make the routing rule
@@ -140,9 +142,16 @@ pub struct AppState {
     /// register/attach, and `list_agents`; the removed directory's entries are
     /// dropped on `remove_directory`. v1 has no agent/project deletion, so
     /// invalidation is insert-only within a session plus a targeted prune when
-    /// a directory is removed. `AgentRecord` is immutable after registration,
-    /// so a cached copy never goes stale.
-    pub agents_by_id: Mutex<HashMap<AgentId, AgentRecord>>,
+    /// a directory is removed. An `AgentRecord` is otherwise immutable after
+    /// registration, with one exception: `rename_agent_impl` and
+    /// `set_agent_session_locator_impl` (the runtime session-locator capture)
+    /// mutate a record in place and re-insert the updated copy here in the same
+    /// `registry_write` critical section, so the cache never lags the registry.
+    /// `Arc` so the dispatch-context factory and its per-dispatch
+    /// session-locator sink (both `'static` on the actor task) share this one
+    /// map: the sink writes the captured locator here, and the factory
+    /// live-reads the agent record from it at the next turn's start.
+    pub agents_by_id: Arc<Mutex<HashMap<AgentId, AgentRecord>>>,
 
     /// User-global workspace registry — the set of working directories the app
     /// knows about plus a cached snapshot of each directory's projects (see
@@ -169,7 +178,7 @@ impl AppState {
             directories: Mutex::new(HashMap::new()),
             projects: Mutex::new(HashMap::new()),
             active_project_id: Mutex::new(None),
-            registry_write: Mutex::new(()),
+            registry_write: Arc::new(Mutex::new(())),
             dispatcher: Arc::new(Dispatcher::new()),
             claude_adapter,
             codex_adapter,
@@ -178,7 +187,7 @@ impl AppState {
             emitter,
             needs_session_meta: Arc::new(Mutex::new(HashSet::new())),
             project_locks: Mutex::new(HashMap::new()),
-            agents_by_id: Mutex::new(HashMap::new()),
+            agents_by_id: Arc::new(Mutex::new(HashMap::new())),
             workspace: Mutex::new(Workspace::default()),
             workspace_path: None,
         }

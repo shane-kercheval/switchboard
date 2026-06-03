@@ -8,7 +8,7 @@
 use std::path::Path;
 
 use futures::StreamExt;
-use switchboard_core::{AgentRecord, HarnessKind};
+use switchboard_core::{AgentRecord, HarnessKind, SessionLocator};
 use switchboard_harness::{
     AdapterEvent, AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, ContentKind,
     DispatchOptions, GeminiAdapter, HarnessAdapter, RateLimitSource, TurnOutcome,
@@ -21,7 +21,7 @@ fn live_agent() -> AgentRecord {
         project_id: Uuid::now_v7(),
         name: "live-test-agent".to_owned(),
         harness: HarnessKind::ClaudeCode,
-        session_id: Some(Uuid::now_v7()),
+        session_locator: Some(SessionLocator::Uuid(Uuid::now_v7())),
         created_at: chrono::Utc::now(),
     }
 }
@@ -242,7 +242,7 @@ async fn live_claude_resume_reuses_session() {
         project_id: Uuid::now_v7(),
         name: "session-test-1".to_owned(),
         harness: HarnessKind::ClaudeCode,
-        session_id: Some(session_id),
+        session_locator: Some(SessionLocator::Uuid(session_id)),
         created_at: chrono::Utc::now(),
     };
 
@@ -276,7 +276,7 @@ async fn live_claude_resume_reuses_session() {
         project_id: Uuid::now_v7(),
         name: "session-test-2".to_owned(),
         harness: HarnessKind::ClaudeCode,
-        session_id: Some(session_id),
+        session_locator: Some(SessionLocator::Uuid(session_id)),
         created_at: chrono::Utc::now(),
     };
 
@@ -315,11 +315,26 @@ fn live_codex_agent() -> AgentRecord {
         project_id: Uuid::now_v7(),
         name: "live-codex-agent".to_owned(),
         harness: HarnessKind::Codex,
-        // Codex agents always have session_id = None — the per-agent
-        // session-link sidecar is the system-of-record.
-        session_id: None,
+        // A fresh Codex agent has no locator until its first dispatch captures
+        // one (emitted as a `SessionLocatorCaptured` event, persisted by the
+        // dispatcher onto the record).
+        session_locator: None,
         created_at: chrono::Utc::now(),
     }
+}
+
+/// The Codex locator carried by a dispatch's capture event, or `None` on resume.
+fn codex_capture(events: &[AdapterEvent]) -> Option<(String, chrono::NaiveDate)> {
+    events.iter().find_map(|e| match e {
+        AdapterEvent::SessionLocatorCaptured {
+            locator:
+                SessionLocator::Codex {
+                    thread_id,
+                    partition_date,
+                },
+        } => Some((thread_id.clone(), *partition_date)),
+        _ => None,
+    })
 }
 
 #[tokio::test]
@@ -473,7 +488,15 @@ async fn live_codex_basic_turn_completes() {
         _ => unreachable!(),
     }
 
-    // Sidecar must exist after the first turn with the captured thread_id.
+    // The first turn emits a capture event with the thread_id + partition-date
+    // (the dispatcher persists it to the registry; no sidecar is written).
+    let (thread_id, _date) =
+        codex_capture(&events).expect("first dispatch emits a captured Codex locator");
+    assert!(
+        !thread_id.is_empty(),
+        "captured thread_id must be non-empty"
+    );
+
     let sidecar = tmp
         .path()
         .join(".switchboard")
@@ -482,12 +505,9 @@ async fn live_codex_basic_turn_completes() {
         .join("sessions")
         .join(format!("{}.jsonl", agent.id));
     assert!(
-        sidecar.is_file(),
-        "sidecar must be written on first dispatch"
+        !sidecar.exists(),
+        "the adapter no longer writes a session-link sidecar"
     );
-    let content = std::fs::read_to_string(&sidecar).unwrap();
-    assert!(content.contains("session_id"));
-    assert!(content.contains("session_partition_date"));
 }
 
 #[tokio::test]
@@ -501,7 +521,8 @@ async fn live_codex_resume_reuses_session() {
     let adapter = CodexAdapter::new();
     let agent = live_codex_agent();
 
-    // Turn 1: ask Codex to remember a specific word.
+    // Turn 1: ask Codex to remember a specific word (fresh agent → first
+    // dispatch captures the locator).
     let turn1 = Uuid::now_v7();
     let stream1 = adapter
         .dispatch(
@@ -513,13 +534,26 @@ async fn live_codex_resume_reuses_session() {
         )
         .await
         .expect("first dispatch should succeed");
-    let _events1: Vec<AdapterEvent> = stream1.collect().await;
+    let events1: Vec<AdapterEvent> = stream1.collect().await;
+
+    // Simulate the dispatcher: fold the captured locator onto the agent so the
+    // next dispatch resumes via the registry-stored locator (the production
+    // factory live-reads it from `agents_by_id`).
+    let (thread_id, partition_date) =
+        codex_capture(&events1).expect("first dispatch emits a captured Codex locator");
+    let resumed_agent = AgentRecord {
+        session_locator: Some(SessionLocator::Codex {
+            thread_id,
+            partition_date,
+        }),
+        ..agent.clone()
+    };
 
     // Turn 2 (resume): ask Codex to recall the word.
     let turn2 = Uuid::now_v7();
     let stream2 = adapter
         .dispatch(
-            &agent,
+            &resumed_agent,
             tmp.path(),
             "What word did I ask you to remember? Reply with only that word.",
             turn2,
@@ -540,31 +574,10 @@ async fn live_codex_resume_reuses_session() {
         "resume must restore the prior turn's context: turn2 reply was {recall_text:?}"
     );
 
-    // Sidecar should have two records (one per dispatch), same session_id.
-    // Codex echoes the same thread_id on resume.
-    let sidecar = tmp
-        .path()
-        .join(".switchboard")
-        .join("projects")
-        .join(agent.project_id.to_string())
-        .join("sessions")
-        .join(format!("{}.jsonl", agent.id));
-    let lines: Vec<String> = std::fs::read_to_string(&sidecar)
-        .unwrap()
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(str::to_owned)
-        .collect();
-    assert_eq!(lines.len(), 2, "two dispatches → two records");
-    let r1: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
-    let r2: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
-    assert_eq!(
-        r1["session_id"], r2["session_id"],
-        "real Codex echoes the same thread_id on resume"
-    );
-    assert_eq!(
-        r1["session_partition_date"], r2["session_partition_date"],
-        "resume preserves session_partition_date"
+    // A resume reuses the record's locator and emits no further capture event.
+    assert!(
+        codex_capture(&events2).is_none(),
+        "a resume must not re-capture the locator"
     );
 }
 
@@ -582,7 +595,7 @@ fn live_gemini_agent() -> AgentRecord {
         // millisecond share their first 8 chars. v4 makes the collision
         // probability ~1/2^32. The production `Project::register_agent`
         // honors this contract; tests must mint v4 explicitly here too.
-        session_id: Some(Uuid::new_v4()),
+        session_locator: Some(SessionLocator::Uuid(Uuid::new_v4())),
         created_at: chrono::Utc::now(),
     }
 }
@@ -801,10 +814,22 @@ fn live_antigravity_agent() -> AgentRecord {
         name: "live-antigravity-agent".to_owned(),
         harness: HarnessKind::Antigravity,
         // Antigravity assigns the conversation UUID server-side; the adapter
-        // captures it post-spawn into the per-agent sidecar. Always None.
-        session_id: None,
+        // captures it post-spawn and emits it as a `SessionLocatorCaptured`
+        // event (the dispatcher persists it onto the record). Always None.
+        session_locator: None,
         created_at: chrono::Utc::now(),
     }
+}
+
+/// The Antigravity conversation UUID carried by a dispatch's capture event, or
+/// `None` on a resume (which reuses the record's locator and emits nothing).
+fn antigravity_capture(events: &[AdapterEvent]) -> Option<Uuid> {
+    events.iter().find_map(|e| match e {
+        AdapterEvent::SessionLocatorCaptured {
+            locator: SessionLocator::Uuid(uuid),
+        } => Some(*uuid),
+        _ => None,
+    })
 }
 
 #[tokio::test]
@@ -885,8 +910,15 @@ async fn live_antigravity_basic_turn_completes() {
         other => panic!("expected SessionMeta, got {other:?}"),
     }
 
-    // Sidecar must exist after the first turn with the captured conversation
-    // UUID — the system-of-record for resume / hydration.
+    // The first turn emits a capture event carrying the conversation UUID (the
+    // dispatcher persists it to the registry; no sidecar is written).
+    let conversation_id =
+        antigravity_capture(&events).expect("first dispatch emits a captured Antigravity locator");
+    assert!(
+        !conversation_id.is_nil(),
+        "captured conversation UUID must be non-nil"
+    );
+
     let sidecar = tmp
         .path()
         .join(".switchboard")
@@ -895,11 +927,9 @@ async fn live_antigravity_basic_turn_completes() {
         .join("sessions")
         .join(format!("{}.antigravity.jsonl", agent.id));
     assert!(
-        sidecar.is_file(),
-        "sidecar must be written on first dispatch once the conversation UUID is captured"
+        !sidecar.exists(),
+        "the adapter no longer writes a session-link sidecar"
     );
-    let content = std::fs::read_to_string(&sidecar).unwrap();
-    assert!(content.contains("conversation_id"));
 }
 
 #[tokio::test]
@@ -1002,17 +1032,11 @@ async fn live_antigravity_adversarial_prompt_still_completes() {
          prompt — loosen transcript_echoes_prompt to a whitespace-normalized match."
     );
 
-    // And the sidecar was captured — i.e. correlation actually matched.
-    let sidecar = tmp
-        .path()
-        .join(".switchboard")
-        .join("projects")
-        .join(agent.project_id.to_string())
-        .join("sessions")
-        .join(format!("{}.antigravity.jsonl", agent.id));
+    // And the conversation UUID was captured — i.e. correlation actually
+    // matched and emitted the locator capture event.
     assert!(
-        sidecar.is_file(),
-        "correlation must have matched the adversarial prompt and persisted the sidecar"
+        antigravity_capture(&events).is_some(),
+        "correlation must have matched the adversarial prompt and emitted a captured locator"
     );
 }
 
@@ -1020,7 +1044,7 @@ async fn live_antigravity_adversarial_prompt_still_completes() {
 #[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
 async fn live_antigravity_resume_reuses_session() {
     // Memorize-then-recall: proof that `--conversation <uuid>` (driven by the
-    // sidecar-captured UUID) restores the prior turn's server-side context.
+    // registry-stored locator) restores the prior turn's server-side context.
     let tmp = tempfile::TempDir::new().unwrap();
     let adapter = AntigravityAdapter::new();
     let agent = live_antigravity_agent();
@@ -1036,12 +1060,22 @@ async fn live_antigravity_resume_reuses_session() {
         )
         .await
         .expect("first dispatch should succeed");
-    let _events1: Vec<AdapterEvent> = stream1.collect().await;
+    let events1: Vec<AdapterEvent> = stream1.collect().await;
+
+    // Simulate the dispatcher: fold the captured conversation UUID onto the
+    // agent so the next dispatch resumes via the registry-stored locator (the
+    // production factory live-reads it from `agents_by_id`).
+    let conversation_id =
+        antigravity_capture(&events1).expect("first dispatch emits a captured Antigravity locator");
+    let resumed_agent = AgentRecord {
+        session_locator: Some(SessionLocator::Uuid(conversation_id)),
+        ..agent.clone()
+    };
 
     let turn2 = Uuid::now_v7();
     let stream2 = adapter
         .dispatch(
-            &agent,
+            &resumed_agent,
             tmp.path(),
             "What word did I ask you to remember? Reply with only that word.",
             turn2,
@@ -1062,26 +1096,10 @@ async fn live_antigravity_resume_reuses_session() {
         "--conversation resume must restore prior context: turn2 reply was {recall_text:?}"
     );
 
-    // Two dispatches → two sidecar records, same conversation_id (resume
-    // reuses the captured UUID rather than minting a new conversation).
-    let sidecar = tmp
-        .path()
-        .join(".switchboard")
-        .join("projects")
-        .join(agent.project_id.to_string())
-        .join("sessions")
-        .join(format!("{}.antigravity.jsonl", agent.id));
-    let lines: Vec<String> = std::fs::read_to_string(&sidecar)
-        .unwrap()
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(str::to_owned)
-        .collect();
-    assert_eq!(lines.len(), 2, "two dispatches → two records");
-    let r1: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
-    let r2: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
-    assert_eq!(
-        r1["conversation_id"], r2["conversation_id"],
-        "resume must reuse the captured conversation UUID"
+    // A resume reuses the record's locator and emits no further capture event
+    // (unless `agy` forked an expired conversation, which this prompt won't).
+    assert!(
+        antigravity_capture(&events2).is_none(),
+        "a resume must not re-capture the locator"
     );
 }

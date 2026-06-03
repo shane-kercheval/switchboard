@@ -11,7 +11,7 @@ function rosterAgent(name: string): AgentRecord {
     project_id: "p1",
     name,
     harness: "claude_code",
-    session_id: null,
+    session_locator: null,
     created_at: "2026-05-29T00:00:00Z",
   };
 }

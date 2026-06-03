@@ -172,7 +172,7 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
           project_id: backend.activeProjectId ?? "",
           name: args?.name as string,
           harness: args?.harness as AgentRecord["harness"],
-          session_id: null,
+          session_locator: null,
           created_at: "2026-05-20T00:00:01Z",
         } satisfies AgentRecord);
       const pid = backend.activeProjectId ?? "";
@@ -237,7 +237,7 @@ function agent(over: Partial<AgentRecord> & { id: string; project_id: string }):
   return {
     name: "assistant",
     harness: "claude_code",
-    session_id: "33333333-3333-7000-8000-333333333333",
+    session_locator: { uuid: "33333333-3333-7000-8000-333333333333" },
     created_at: "2026-05-20T00:00:01Z",
     ...over,
   };
@@ -767,7 +767,13 @@ describe("App", () => {
       agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
     });
     backend.agentQueue.push(
-      agent({ id: "ag-2", project_id: "p-a", name: "second", harness: "codex", session_id: null }),
+      agent({
+        id: "ag-2",
+        project_id: "p-a",
+        name: "second",
+        harness: "codex",
+        session_locator: null,
+      }),
     );
     await mountApp();
     await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
@@ -1144,7 +1150,7 @@ describe("App", () => {
           project_id: "p-a",
           name: "broken",
           harness: "codex",
-          session_id: null,
+          session_locator: null,
         }),
       ],
       conversation: convo,

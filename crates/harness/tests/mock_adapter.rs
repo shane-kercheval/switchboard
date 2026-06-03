@@ -195,6 +195,7 @@ async fn failed_turn_outcome_wire_shape_roundtrips() {
         },
         ended_at: chrono::Utc::now(),
         usage: None,
+        context_window_source: None,
     };
 
     let normalized = event

@@ -84,6 +84,25 @@ pub enum RateLimitSource {
     SessionFileBacked,
 }
 
+/// Where a `TurnEnd`'s `context_window` is durable — the dispatcher's gate for
+/// whether to persist it to the per-agent metadata sidecar. The exact analogue
+/// of [`RateLimitSource`] for the window: an **internal adapter→dispatcher**
+/// discriminator carried on [`AdapterEvent::TurnEnd`] and dropped at the
+/// [`NormalizedEvent`] boundary, so the dispatcher persists only the class-C
+/// (stream-only) window without a `match harness {…}`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ContextWindowSource {
+    /// Stream-only (class C): Claude's `result.modelUsage.<model>.contextWindow`,
+    /// absent from the session file. The dispatcher persists it to the metadata
+    /// sidecar so the context bar survives restart.
+    StreamOnly,
+    /// Already durable in the harness's own session file (class B): Codex's
+    /// post-terminal session-file enrichment fills the window. Not re-persisted.
+    SessionFileBacked,
+}
+
 /// Per-turn usage and cost. Carried on `TurnEnd.usage`.
 ///
 /// `total_cost_usd` is Claude Code only (subscription auth has no dollar
@@ -172,6 +191,11 @@ pub enum AdapterEvent {
         outcome: TurnOutcome,
         ended_at: DateTime<Utc>,
         usage: Option<TurnUsage>,
+        /// Where `usage.context_window` is durable — gates whether the
+        /// dispatcher persists it to the metadata sidecar. `None` when the turn
+        /// carries no window. Internal: dropped at the `NormalizedEvent`
+        /// boundary (the frontend reads the window off `usage`, not the source).
+        context_window_source: Option<ContextWindowSource>,
     },
     RateLimitEvent {
         agent_id: AgentId,
@@ -358,11 +382,15 @@ impl AdapterEvent {
                 output,
                 is_error,
             },
+            // `context_window_source` is intentionally dropped — an internal
+            // persistence discriminator the frontend doesn't need (mirrors the
+            // `RateLimitEvent` source drop below).
             AdapterEvent::TurnEnd {
                 turn_id,
                 outcome,
                 ended_at,
                 usage,
+                ..
             } => NormalizedEvent::TurnEnd {
                 turn_id,
                 outcome,
@@ -809,6 +837,7 @@ mod tests {
             outcome: TurnOutcome::Completed,
             ended_at: fresh_time(),
             usage: None,
+            context_window_source: None,
         };
         let normalized = adapter
             .into_normalized()
@@ -833,6 +862,7 @@ mod tests {
             },
             ended_at: fresh_time(),
             usage: None,
+            context_window_source: None,
         };
         let normalized = adapter
             .into_normalized()

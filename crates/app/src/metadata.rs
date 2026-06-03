@@ -81,4 +81,39 @@ impl MetadataCache for ProjectMetadataCache {
             );
         }
     }
+
+    fn record_context_window(
+        &self,
+        agent_id: AgentId,
+        context_window: u32,
+        captured_at: DateTime<Utc>,
+    ) {
+        // Same per-agent wiring guard as `record_rate_limit`: the path was
+        // resolved for `self.agent_id`, so a mismatched event id is a wiring
+        // bug. Skip rather than write another agent's window under this one.
+        debug_assert_eq!(
+            agent_id, self.agent_id,
+            "metadata cache built for {} received event for {agent_id}",
+            self.agent_id
+        );
+        if agent_id != self.agent_id {
+            tracing::warn!(
+                expected = %self.agent_id,
+                got = %agent_id,
+                "metadata cache agent_id mismatch — skipping context-window write to avoid persisting another agent's data"
+            );
+            return;
+        }
+        if let Err(e) = switchboard_harness::meta_sidecar::write_context_window(
+            &self.sidecar_path,
+            context_window,
+            captured_at,
+        ) {
+            tracing::warn!(
+                agent_id = %self.agent_id,
+                error = %e,
+                "failed to persist context-window snapshot to metadata sidecar — restart continuity degraded; turn unaffected"
+            );
+        }
+    }
 }

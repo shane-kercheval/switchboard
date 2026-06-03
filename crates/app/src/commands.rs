@@ -1389,25 +1389,67 @@ fn load_agent_transcript(
     Ok(transcript)
 }
 
-/// Overlay a metadata sidecar's snapshot onto a freshly-loaded transcript.
+/// Overlay a metadata sidecar's snapshots onto a freshly-loaded transcript.
 ///
-/// **Fill-if-empty**: the sidecar fills `last_rate_limit` (+ its
-/// `last_rate_limit_as_of` capture time) *only* when the loader left
-/// `last_rate_limit` unset. A loader-provided value is a class-B source
-/// (e.g. Codex's session-file rate-limit) that's already durable and
-/// authoritative — it wins, and carries no `as_of` qualifier because it
-/// isn't a stale snapshot. Mirrors the frontend reducer's hydrate fill-if-
-/// empty semantics. A `None` sidecar (missing/corrupt) is a no-op.
+/// Two independent stream-only fields are restored, each fill-if-empty:
+///
+/// - **Rate limit** (transcript-level): fills `last_rate_limit` (+ its
+///   `last_rate_limit_as_of` capture time) *only* when the loader left it
+///   unset. A loader-provided value is a class-B source (e.g. Codex's
+///   session-file rate-limit) that's already durable and authoritative — it
+///   wins, and carries no `as_of` qualifier because it isn't a stale snapshot.
+/// - **Context window** (per-turn): Claude's window is stream-only, so a
+///   hydrated turn has `usage.context_window == None` and the context bar would
+///   blank until the next send. Fill it on the most recent agent turn the bar
+///   would actually read — i.e. one with `usage`, a usable `context_input_tokens`,
+///   and no usable window. The selection **must mirror `contextUtilization` in
+///   `Sidebar.svelte`**: that scans newest→oldest and skips any agent turn
+///   missing *either* a window or `context_input_tokens`. If the overlay filled
+///   a turn the bar then skips (e.g. one lacking `context_input_tokens`), the
+///   snapshot would go unread and the bar would stay blank — the exact failure
+///   this milestone targets. So scan past non-qualifying turns rather than
+///   stopping at the first turn with `usage`. No agent turn qualifies → no-op
+///   (bar stays hidden); never synthesize a turn or a `TurnUsage`. No `as_of`
+///   qualifier — a model's window is fixed, so the value doesn't go stale.
+///
+/// A `None` sidecar (missing/corrupt) is a no-op. Mirrors the frontend
+/// reducer's hydrate fill-if-empty semantics.
 fn apply_meta_sidecar_overlay(
     transcript: &mut switchboard_harness::LoadedTranscript,
     sidecar: Option<switchboard_harness::meta_sidecar::MetaSidecar>,
 ) {
-    if transcript.last_rate_limit.is_some() {
+    let Some(sidecar) = sidecar else {
         return;
-    }
-    if let Some(snapshot) = sidecar.and_then(|m| m.rate_limit) {
+    };
+
+    if transcript.last_rate_limit.is_none()
+        && let Some(snapshot) = sidecar.rate_limit
+    {
         transcript.last_rate_limit = Some(snapshot.payload);
         transcript.last_rate_limit_as_of = Some(snapshot.captured_at);
+    }
+
+    if let Some(snapshot) = sidecar.context_window {
+        for turn in transcript.turns.iter_mut().rev() {
+            if let switchboard_harness::Turn::Agent {
+                usage: Some(usage), ..
+            } = turn
+            {
+                // Match `contextUtilization`: the bar reads the latest agent
+                // turn with BOTH a usable window and `context_input_tokens`. A
+                // turn missing `context_input_tokens` is skipped by the bar, so
+                // the overlay skips it too (scan to an earlier qualifying turn)
+                // rather than filling an unread turn. `Some(0)` is "no usable
+                // window" on both sides.
+                if usage.context_input_tokens.is_none() {
+                    continue;
+                }
+                if usage.context_window.is_none() || usage.context_window == Some(0) {
+                    usage.context_window = Some(snapshot.context_window);
+                }
+                break;
+            }
+        }
     }
 }
 
@@ -3353,6 +3395,7 @@ mod tests {
                     outcome: switchboard_harness::TurnOutcome::Completed,
                     ended_at: chrono::Utc::now(),
                     usage: None,
+                    context_window_source: None,
                 });
             });
             Ok(Box::pin(
@@ -3617,6 +3660,7 @@ mod tests {
                         outcome: switchboard_harness::TurnOutcome::Completed,
                         ended_at: chrono::Utc::now(),
                         usage: None,
+                        context_window_source: None,
                     });
                 });
                 Ok(Box::pin(
@@ -3733,6 +3777,7 @@ mod tests {
                         outcome: switchboard_harness::TurnOutcome::Completed,
                         ended_at: chrono::Utc::now(),
                         usage: None,
+                        context_window_source: None,
                     });
                 });
                 Ok(Box::pin(
@@ -4588,6 +4633,7 @@ mod tests {
                 payload: serde_json::json!({"isUsingOverage": true}),
                 captured_at: captured,
             }),
+            context_window: None,
         };
         apply_meta_sidecar_overlay(&mut transcript, Some(sidecar));
         assert_eq!(
@@ -4613,6 +4659,7 @@ mod tests {
                 payload: serde_json::json!({"should": "not win"}),
                 captured_at: chrono::Utc::now(),
             }),
+            context_window: None,
         };
         apply_meta_sidecar_overlay(&mut transcript, Some(sidecar));
         assert_eq!(
@@ -4632,6 +4679,141 @@ mod tests {
         apply_meta_sidecar_overlay(&mut transcript, None);
         assert!(transcript.last_rate_limit.is_none());
         assert!(transcript.last_rate_limit_as_of.is_none());
+    }
+
+    /// An agent turn carrying `usage` with the given `context_input_tokens` and
+    /// `context_window`. `context_input_tokens: None` models a turn that
+    /// terminated before any assistant content streamed (the bar skips it).
+    fn overlay_agent_turn(
+        context_input_tokens: Option<u64>,
+        context_window: Option<u32>,
+    ) -> switchboard_harness::Turn {
+        switchboard_harness::Turn::Agent {
+            turn_id: Uuid::now_v7(),
+            agent_id: Uuid::now_v7(),
+            started_at: chrono::Utc::now(),
+            ended_at: Some(chrono::Utc::now()),
+            status: switchboard_harness::TurnStatus::Complete,
+            items: vec![],
+            usage: Some(switchboard_harness::TurnUsage {
+                input_tokens: 100,
+                output_tokens: 25,
+                cached_input_tokens: None,
+                cache_creation_input_tokens: None,
+                context_input_tokens,
+                reasoning_output_tokens: None,
+                context_window,
+                total_cost_usd: None,
+            }),
+        }
+    }
+
+    fn overlay_turn_window(turn: &switchboard_harness::Turn) -> Option<u32> {
+        match turn {
+            switchboard_harness::Turn::Agent { usage: Some(u), .. } => u.context_window,
+            _ => None,
+        }
+    }
+
+    fn context_window_sidecar(window: u32) -> switchboard_harness::meta_sidecar::MetaSidecar {
+        switchboard_harness::meta_sidecar::MetaSidecar {
+            schema_version: 1,
+            rate_limit: None,
+            context_window: Some(switchboard_harness::meta_sidecar::ContextWindowSnapshot {
+                context_window: window,
+                captured_at: chrono::Utc::now(),
+            }),
+        }
+    }
+
+    #[test]
+    fn overlay_fills_context_window_on_latest_agent_turn() {
+        // Claude hydrate shape: the session file carries no window (stream-only),
+        // so the latest agent turn has usage + context_input_tokens but no
+        // window. The snapshot fills it so the bar renders on reopen.
+        let mut transcript = switchboard_harness::LoadedTranscript {
+            turns: vec![
+                overlay_agent_turn(Some(100), None),
+                overlay_agent_turn(Some(100), None),
+            ],
+            ..Default::default()
+        };
+        apply_meta_sidecar_overlay(&mut transcript, Some(context_window_sidecar(200_000)));
+        assert_eq!(
+            overlay_turn_window(&transcript.turns[1]),
+            Some(200_000),
+            "the latest qualifying agent turn gets the persisted window"
+        );
+        assert_eq!(
+            overlay_turn_window(&transcript.turns[0]),
+            None,
+            "only the turn the bar reads is filled"
+        );
+    }
+
+    #[test]
+    fn overlay_skips_latest_turn_lacking_context_input_tokens() {
+        // Regression guard for overlay/bar divergence: the LATEST agent turn has
+        // usage + window-absent but NO context_input_tokens (e.g. it terminated
+        // before any assistant content), so the bar skips it and reads an
+        // earlier turn. The overlay must fill that earlier turn — the one the
+        // bar actually reads — not the latest. Filling the latest would leave
+        // the snapshot unread and the bar blank.
+        let mut transcript = switchboard_harness::LoadedTranscript {
+            turns: vec![
+                overlay_agent_turn(Some(100), None), // earlier: qualifies
+                overlay_agent_turn(None, None),      // latest: no context_input → bar skips
+            ],
+            ..Default::default()
+        };
+        apply_meta_sidecar_overlay(&mut transcript, Some(context_window_sidecar(200_000)));
+        assert_eq!(
+            overlay_turn_window(&transcript.turns[0]),
+            Some(200_000),
+            "the earlier turn the bar reads must be filled"
+        );
+        assert_eq!(
+            overlay_turn_window(&transcript.turns[1]),
+            None,
+            "the latest turn (skipped by the bar) must not be filled"
+        );
+    }
+
+    #[test]
+    fn overlay_context_window_no_qualifying_turn_is_a_noop() {
+        // No agent turn with usage → nothing to fill; must not panic or
+        // synthesize. (Here: a user-only transcript.)
+        let mut transcript = switchboard_harness::LoadedTranscript {
+            turns: vec![switchboard_harness::Turn::User {
+                turn_id: Uuid::now_v7(),
+                agent_id: Uuid::now_v7(),
+                started_at: chrono::Utc::now(),
+                text: "hi".to_owned(),
+            }],
+            ..Default::default()
+        };
+        apply_meta_sidecar_overlay(&mut transcript, Some(context_window_sidecar(200_000)));
+        assert_eq!(transcript.turns.len(), 1, "no synthetic turn is created");
+        assert!(matches!(
+            transcript.turns[0],
+            switchboard_harness::Turn::User { .. }
+        ));
+    }
+
+    #[test]
+    fn overlay_does_not_override_loader_provided_context_window() {
+        // Codex-shape (class B): the session file already supplied the window.
+        // The snapshot must not clobber it.
+        let mut transcript = switchboard_harness::LoadedTranscript {
+            turns: vec![overlay_agent_turn(Some(100), Some(272_000))],
+            ..Default::default()
+        };
+        apply_meta_sidecar_overlay(&mut transcript, Some(context_window_sidecar(200_000)));
+        assert_eq!(
+            overlay_turn_window(&transcript.turns[0]),
+            Some(272_000),
+            "a loader-provided window must win over the sidecar"
+        );
     }
 
     #[tokio::test]

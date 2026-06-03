@@ -280,6 +280,9 @@ fn parse_result(obj: &Value, turn_id: TurnId, state: &GeminiParserState) -> Pars
         outcome,
         ended_at: chrono::Utc::now(),
         usage: Some(usage),
+        // Gemini exposes no context window (`extract_usage` leaves it `None`),
+        // so there's nothing to persist.
+        context_window_source: None,
     })
 }
 

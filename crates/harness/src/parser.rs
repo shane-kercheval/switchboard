@@ -273,11 +273,21 @@ fn parse_result(obj: &Value, turn_id: TurnId, state: &mut ParserState) -> ParseO
 
     let usage = extract_usage_from_result(obj, state.last_assistant_context_input_tokens);
 
+    // Claude's context window is stream-only (`result.modelUsage`), absent from
+    // the session file — so when this turn carries one, tag it `StreamOnly` for
+    // the dispatcher to persist to the metadata sidecar. `None` when there's no
+    // window (nothing to persist).
+    let context_window_source = usage
+        .as_ref()
+        .and_then(|u| u.context_window)
+        .map(|_| crate::events::ContextWindowSource::StreamOnly);
+
     ParseOutcome::Event(AdapterEvent::TurnEnd {
         turn_id,
         outcome,
         ended_at: Utc::now(),
         usage,
+        context_window_source,
     })
 }
 

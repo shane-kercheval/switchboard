@@ -27,8 +27,8 @@ use switchboard_dispatcher::{
     SessionLocatorSink,
 };
 use switchboard_harness::{
-    CancelSource, DispatchOptions, HarnessAdapter, MessageId, MockHarnessAdapter, MockScenario,
-    RateLimitSource, TurnId, TurnOutcome,
+    CancelSource, ContextWindowSource, DispatchOptions, HarnessAdapter, MessageId,
+    MockHarnessAdapter, MockScenario, RateLimitSource, TurnId, TurnOutcome,
 };
 use uuid::Uuid;
 
@@ -219,12 +219,14 @@ impl ConversationJournal for RecordingJournal {
     }
 }
 
-/// Captures metadata-cache calls so the durability-gate test can assert the
-/// dispatcher persists `StreamOnly` rate-limit payloads and skips
-/// `SessionFileBacked` ones, with a roughly-now `captured_at`.
+/// Captures metadata-cache calls so the durability-gate tests can assert the
+/// dispatcher persists `StreamOnly` rate-limit payloads (skipping
+/// `SessionFileBacked` ones) and `StreamOnly` context windows, with a
+/// roughly-now `captured_at`.
 #[derive(Default)]
 struct RecordingMetadataCache {
     calls: Mutex<Vec<(AgentId, serde_json::Value, DateTime<Utc>)>>,
+    context_window_calls: Mutex<Vec<(AgentId, u32, DateTime<Utc>)>>,
 }
 
 impl MetadataCache for RecordingMetadataCache {
@@ -238,6 +240,18 @@ impl MetadataCache for RecordingMetadataCache {
             .lock()
             .unwrap()
             .push((agent_id, info, captured_at));
+    }
+
+    fn record_context_window(
+        &self,
+        agent_id: AgentId,
+        context_window: u32,
+        captured_at: DateTime<Utc>,
+    ) {
+        self.context_window_calls
+            .lock()
+            .unwrap()
+            .push((agent_id, context_window, captured_at));
     }
 }
 
@@ -905,6 +919,89 @@ async fn session_file_backed_rate_limit_is_not_persisted() {
     assert!(
         metadata.calls.lock().unwrap().is_empty(),
         "SessionFileBacked rate-limit must NOT be persisted (harness file is canonical)"
+    );
+}
+
+#[tokio::test]
+async fn stream_only_context_window_is_persisted_to_metadata_cache() {
+    // Restart-continuity gate: a TurnEnd carrying a StreamOnly context window
+    // (class-C — Claude's `result.modelUsage`) must be recorded to the metadata
+    // cache so the context bar renders on reopen. Keyed on the running agent.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let metadata = Arc::new(RecordingMetadataCache::default());
+    let before = Utc::now();
+    let factory = TestFactory::sequence_with_metadata(
+        [MockScenario::CompletesWithContextWindow {
+            context_window: 200_000,
+            source: ContextWindowSource::StreamOnly,
+        }],
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+        Arc::clone(&metadata) as Arc<dyn MetadataCache>,
+    );
+
+    dispatcher
+        .send_message(agent.id, "hello", Uuid::now_v7(), factory, OnBusy::Enqueue)
+        .await;
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+    let after = Utc::now();
+
+    let calls = metadata.context_window_calls.lock().unwrap();
+    assert_eq!(
+        calls.len(),
+        1,
+        "a StreamOnly context window must be persisted exactly once"
+    );
+    let (recorded_agent, context_window, captured_at) = &calls[0];
+    assert_eq!(*recorded_agent, agent.id);
+    assert_eq!(*context_window, 200_000);
+    assert!(
+        *captured_at >= before && *captured_at <= after,
+        "captured_at must be stamped at record time (roughly now)"
+    );
+}
+
+#[tokio::test]
+async fn session_file_backed_context_window_is_not_persisted() {
+    // Durability gate, negative case: a SessionFileBacked context window
+    // (class-B, already durable in Codex's own session file) must NOT be
+    // shadow-cached to the metadata sidecar — mirrors the rate-limit gate.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let metadata = Arc::new(RecordingMetadataCache::default());
+    let factory = TestFactory::sequence_with_metadata(
+        [MockScenario::CompletesWithContextWindow {
+            context_window: 272_000,
+            source: ContextWindowSource::SessionFileBacked,
+        }],
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+        Arc::clone(&metadata) as Arc<dyn MetadataCache>,
+    );
+
+    dispatcher
+        .send_message(agent.id, "hello", Uuid::now_v7(), factory, OnBusy::Enqueue)
+        .await;
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+
+    assert!(
+        metadata.context_window_calls.lock().unwrap().is_empty(),
+        "SessionFileBacked context window must NOT be persisted (harness file is canonical)"
     );
 }
 

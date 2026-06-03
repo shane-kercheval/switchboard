@@ -36,8 +36,8 @@ pub use codex::session_file::{
     AttachLookupError, find_codex_session_file_for_attach, load_codex_transcript,
 };
 pub use events::{
-    AdapterEvent, CancelSource, ContentKind, FailureKind, McpServerStatus, MessageId,
-    NormalizedEvent, RateLimitSource, ToolKind, TurnId, TurnOutcome, TurnUsage,
+    AdapterEvent, CancelSource, ContentKind, ContextWindowSource, FailureKind, McpServerStatus,
+    MessageId, NormalizedEvent, RateLimitSource, ToolKind, TurnId, TurnOutcome, TurnUsage,
 };
 pub use gemini::GeminiAdapter;
 pub use gemini::session_file::{

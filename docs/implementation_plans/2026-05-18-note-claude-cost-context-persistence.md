@@ -1,6 +1,8 @@
 # Note — Persist Claude cost and context-window across project reopen
 
-**Status**: investigation needed; not an implementation plan.
+> **Superseded in part by [`2026-05-31-per-message-metadata-and-context-formula.md`](2026-05-31-per-message-metadata-and-context-formula.md).** The **context-window** half is **done** (that plan's Milestone 2): `context_window` is now persisted to the per-agent metadata sidecar (`<agent-id>.meta.json`) as a last-write-wins snapshot and overlaid onto the latest hydrated agent turn on reopen — a simpler mechanism than the per-turn join this note speculated about, because the window is effectively a per-model constant. The **cost** half remains open and is addressed by that plan's Milestone 4 (per-turn cost + overage, which *does* need the per-message join discussed below). Delete this note entirely once Milestone 4 lands.
+
+**Status**: investigation needed (cost half only); not an implementation plan.
 **Date**: 2026-05-18.
 **Out of scope of M3**; surfaced during M3 testing.
 

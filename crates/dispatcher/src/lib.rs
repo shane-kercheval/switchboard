@@ -50,8 +50,8 @@ use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use switchboard_core::{AgentId, AgentRecord, SendId, SessionLocator};
 use switchboard_harness::{
-    AdapterEvent, CancelSource, DispatchOptions, EventStream, FailureKind, HarnessAdapter,
-    MessageId, NormalizedEvent, RateLimitSource, TurnId, TurnOutcome,
+    AdapterEvent, CancelSource, ContextWindowSource, DispatchOptions, EventStream, FailureKind,
+    HarnessAdapter, MessageId, NormalizedEvent, RateLimitSource, TurnId, TurnOutcome,
 };
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -322,6 +322,17 @@ pub trait MetadataCache: Send + Sync {
         info: serde_json::Value,
         captured_at: DateTime<Utc>,
     );
+
+    /// Persist the latest context-window size for `agent_id`. Last-write-wins.
+    /// Stream-only for Claude (the window lives in `result.modelUsage`, never
+    /// in the session file), so it must be cached to let the context bar
+    /// render on reopen instead of blanking until the next turn.
+    fn record_context_window(
+        &self,
+        agent_id: AgentId,
+        context_window: u32,
+        captured_at: DateTime<Utc>,
+    );
 }
 
 /// No-op metadata cache for tests and any caller that doesn't persist
@@ -330,6 +341,7 @@ pub struct NoopMetadataCache;
 
 impl MetadataCache for NoopMetadataCache {
     fn record_rate_limit(&self, _: AgentId, _: serde_json::Value, _: DateTime<Utc>) {}
+    fn record_context_window(&self, _: AgentId, _: u32, _: DateTime<Utc>) {}
 }
 
 /// Error returned when persisting a captured session locator fails. See
@@ -1058,6 +1070,23 @@ async fn drain_turn(
                     && *source == RateLimitSource::StreamOnly
                 {
                     metadata.record_rate_limit(*a, info.clone(), Utc::now());
+                }
+                // Persist the stream-only context window so the context bar
+                // survives restart. Same source-gated, harness-agnostic posture
+                // as the rate-limit snapshot above: only `StreamOnly` (Claude's
+                // `result.modelUsage`, class C) is persisted; `SessionFileBacked`
+                // (Codex, class B) is already durable in the harness file and is
+                // NOT shadow-cached. Keyed on the running turn's `agent_id` since
+                // `TurnEnd` carries none. A cancelled terminal already `continue`d
+                // above, so this only fires for a real completed/failed turn.
+                if let AdapterEvent::TurnEnd {
+                    usage: Some(usage),
+                    context_window_source: Some(ContextWindowSource::StreamOnly),
+                    ..
+                } = &event
+                    && let Some(context_window) = usage.context_window
+                {
+                    metadata.record_context_window(agent_id, context_window, Utc::now());
                 }
                 // Capture events are handled above and never reach here, so this
                 // always yields `Some`; the `if let` keeps the contract explicit.

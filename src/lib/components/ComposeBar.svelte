@@ -69,6 +69,20 @@
     textarea.style.overflowY = naturalHeight > cappedHeight ? "auto" : "hidden";
   }
 
+  function isEditableShortcutTarget(target: EventTarget | null): boolean {
+    if (!(target instanceof HTMLElement)) return false;
+    return (
+      target.isContentEditable ||
+      target.tagName === "INPUT" ||
+      target.tagName === "TEXTAREA" ||
+      target.tagName === "SELECT"
+    );
+  }
+
+  function hasOpenDialog(): boolean {
+    return document.querySelector('[role="dialog"], [role="alertdialog"]') !== null;
+  }
+
   // Drop any selected ids whose agent disappeared (agent removed at runtime).
   $effect(() => {
     const valid = selectedIds.filter((id) => agents.some((a) => a.id === id));
@@ -107,6 +121,14 @@
   // Escape is left alone for whatever else owns it.
   $effect(() => {
     function onKeydown(e: KeyboardEvent): void {
+      const mod = e.metaKey || e.ctrlKey;
+      if (mod && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "k") {
+        if (hasOpenDialog()) return;
+        if (isEditableShortcutTarget(e.target) && e.target !== textareaEl) return;
+        e.preventDefault();
+        textareaEl?.focus();
+        return;
+      }
       if (e.key === "Escape") {
         if (composeEl === undefined || !composeEl.contains(document.activeElement)) return;
         // First dismiss the @ menu, otherwise clear the recipient set. The draft
@@ -120,7 +142,6 @@
         }
         return;
       }
-      const mod = e.metaKey || e.ctrlKey;
       if (!mod || e.altKey) return;
       if (e.shiftKey) {
         if (e.key.toLowerCase() === "a") {

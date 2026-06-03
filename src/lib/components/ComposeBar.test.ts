@@ -519,6 +519,64 @@ describe("ComposeBar", () => {
     expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "true");
   });
 
+  it("Mod+K focuses the message box from outside the composer", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    const outside = document.createElement("button");
+    document.body.appendChild(outside);
+    outside.focus();
+    expect(document.activeElement).toBe(outside);
+
+    await fireEvent.keyDown(outside, { key: "k", metaKey: true });
+
+    expect(screen.getByTestId("compose-textarea")).toHaveFocus();
+    outside.remove();
+  });
+
+  it("Mod+K does not steal focus from another editable field", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    const input = document.createElement("input");
+    document.body.appendChild(input);
+    input.focus();
+    expect(document.activeElement).toBe(input);
+
+    await fireEvent.keyDown(input, { key: "k", metaKey: true });
+
+    expect(input).toHaveFocus();
+    input.remove();
+  });
+
+  it("Mod+K does not focus the message box behind an alert dialog", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    const alertDialog = document.createElement("div");
+    alertDialog.setAttribute("role", "alertdialog");
+    const dialogButton = document.createElement("button");
+    alertDialog.appendChild(dialogButton);
+    document.body.appendChild(alertDialog);
+    dialogButton.focus();
+    expect(dialogButton).toHaveFocus();
+
+    await fireEvent.keyDown(dialogButton, { key: "k", metaKey: true });
+
+    expect(dialogButton).toHaveFocus();
+    expect(screen.getByTestId("compose-textarea")).not.toHaveFocus();
+    alertDialog.remove();
+  });
+
   it("fans one message out to all selected recipients sharing one send_id", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);

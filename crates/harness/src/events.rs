@@ -142,6 +142,31 @@ pub struct TurnUsage {
     pub total_cost_usd: Option<f64>,
 }
 
+/// Per-turn real-spend attribution — the gate for showing a turn's cost and an
+/// overage marker inline on the message. Distinct from [`TurnUsage`]: usage is
+/// raw telemetry, this answers "did this turn cost real money, and was it
+/// overage." Stamped per turn by the **adapter** (the harness owns the rule),
+/// so the frontend renders on `real_spend` without a `match harness`.
+///
+/// - `real_spend` — the harness-agnostic render gate: show the cost + marker
+///   only when set. For subscription Claude, `total_cost_usd` is a *notional*
+///   API-equivalent figure that isn't money charged unless the agent is in
+///   overage, so `real_spend == is_overage`. A future pay-per-use harness would
+///   set `real_spend` true whenever cost is present, regardless of overage.
+/// - `is_overage` — the Claude-derived source of the signal (`isUsingOverage`),
+///   kept distinct from `real_spend` so the seam stays honest.
+/// - `overage_resets_at` — the credit/overage window reset, for the marker's
+///   tooltip, when the harness reports it (`overageResetsAt`).
+///
+/// `None` on a `TurnEnd` means "no real-spend info" (non-Claude harness, or a
+/// turn with no rate-limit signal) → the message shows neither cost nor marker.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TurnSpend {
+    pub real_spend: bool,
+    pub is_overage: bool,
+    pub overage_resets_at: Option<DateTime<Utc>>,
+}
+
 /// Events emitted by harness adapters. `TurnStart` is deliberately absent — it is
 /// dispatcher-owned and synthesized before the stream is established. Excluding
 /// it here makes the invariant type-enforced: no adapter author can accidentally emit it.
@@ -196,6 +221,11 @@ pub enum AdapterEvent {
         /// carries no window. Internal: dropped at the `NormalizedEvent`
         /// boundary (the frontend reads the window off `usage`, not the source).
         context_window_source: Option<ContextWindowSource>,
+        /// Per-turn real-spend attribution (cost/overage gate). Stamped by the
+        /// adapter; carried through to the frontend (unlike
+        /// `context_window_source`, this *is* rendered). `None` = no real-spend
+        /// info for this turn.
+        spend: Option<TurnSpend>,
     },
     RateLimitEvent {
         agent_id: AgentId,
@@ -276,6 +306,9 @@ pub enum NormalizedEvent {
         outcome: TurnOutcome,
         ended_at: DateTime<Utc>,
         usage: Option<TurnUsage>,
+        /// Per-turn real-spend attribution — gates the inline cost + overage
+        /// marker on the message. `None` = show neither. See [`TurnSpend`].
+        spend: Option<TurnSpend>,
     },
     RateLimitEvent {
         agent_id: AgentId,
@@ -382,20 +415,23 @@ impl AdapterEvent {
                 output,
                 is_error,
             },
-            // `context_window_source` is intentionally dropped — an internal
-            // persistence discriminator the frontend doesn't need (mirrors the
-            // `RateLimitEvent` source drop below).
+            // `context_window_source` is intentionally dropped (the `..`) — an
+            // internal persistence discriminator the frontend doesn't need
+            // (mirrors the `RateLimitEvent` source drop below). `spend` *is*
+            // carried through — it's rendered on the message.
             AdapterEvent::TurnEnd {
                 turn_id,
                 outcome,
                 ended_at,
                 usage,
+                spend,
                 ..
             } => NormalizedEvent::TurnEnd {
                 turn_id,
                 outcome,
                 ended_at,
                 usage,
+                spend,
             },
             // `source` is intentionally dropped — it's an internal persistence
             // discriminator the frontend doesn't need (see `RateLimitSource`).
@@ -580,6 +616,7 @@ mod tests {
             outcome: TurnOutcome::Completed,
             ended_at: fresh_time(),
             usage: None,
+            spend: None,
         };
         let value = serde_json::to_value(&event).unwrap();
         assert_eq!(value["type"], "turn_end");
@@ -605,6 +642,11 @@ mod tests {
                 context_window: Some(200_000),
                 total_cost_usd: Some(0.0125),
             }),
+            spend: Some(TurnSpend {
+                real_spend: true,
+                is_overage: true,
+                overage_resets_at: None,
+            }),
         };
         let value = serde_json::to_value(&event).unwrap();
         assert_eq!(value["usage"]["input_tokens"], 100);
@@ -615,6 +657,8 @@ mod tests {
         assert_eq!(value["usage"]["reasoning_output_tokens"], 5);
         assert_eq!(value["usage"]["context_window"], 200_000);
         assert_eq!(value["usage"]["total_cost_usd"], 0.0125);
+        assert_eq!(value["spend"]["real_spend"], true);
+        assert_eq!(value["spend"]["is_overage"], true);
         let parsed: NormalizedEvent = serde_json::from_value(value).unwrap();
         assert_eq!(parsed, event);
     }
@@ -629,6 +673,7 @@ mod tests {
             },
             ended_at: fresh_time(),
             usage: None,
+            spend: None,
         };
         let value = serde_json::to_value(&event).unwrap();
         assert_eq!(value["outcome"]["status"], "failed");
@@ -650,6 +695,7 @@ mod tests {
                 outcome: TurnOutcome::Cancelled { source },
                 ended_at: fresh_time(),
                 usage: None,
+                spend: None,
             };
             let value = serde_json::to_value(&event).unwrap();
             assert_eq!(value["outcome"]["status"], "cancelled");
@@ -669,6 +715,7 @@ mod tests {
             },
             ended_at: fresh_time(),
             usage: None,
+            spend: None,
         };
         let value = serde_json::to_value(&event).unwrap();
         assert_eq!(value["outcome"]["status"], "failed");
@@ -691,6 +738,7 @@ mod tests {
             },
             ended_at: fresh_time(),
             usage: None,
+            spend: None,
         };
         let value = serde_json::to_value(&event).unwrap();
         assert_eq!(value["outcome"]["kind"], "adapter_failure");
@@ -838,6 +886,7 @@ mod tests {
             ended_at: fresh_time(),
             usage: None,
             context_window_source: None,
+            spend: None,
         };
         let normalized = adapter
             .into_normalized()
@@ -863,6 +912,7 @@ mod tests {
             ended_at: fresh_time(),
             usage: None,
             context_window_source: None,
+            spend: None,
         };
         let normalized = adapter
             .into_normalized()

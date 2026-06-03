@@ -285,11 +285,35 @@
   </div>
 {/snippet}
 
-{#snippet messageMeta(at: string, copyable: string, label: string, mt = "mt-1")}
+{#snippet messageMeta(
+  at: string,
+  copyable: string,
+  label: string,
+  mt = "mt-1",
+  spend: AgentTurn["spend"] = undefined,
+  costUsd: number | null | undefined = undefined,
+)}
   <div
     class={`${mt} flex items-center justify-end gap-2 opacity-0 group-focus-within:opacity-100 group-hover:opacity-100`}
     data-testid="message-meta"
   >
+    <!-- Cost + overage marker render only on real-spend turns (the adapter's
+         `spend.real_spend` gate — no harness check here). For subscription
+         Claude that's the overage case; `total_cost_usd` is notional otherwise,
+         so showing it on every turn would imply spend that didn't happen. The
+         caller passes `spend`/`costUsd` only at agent-turn sites. -->
+    {#if spend?.is_overage}
+      <span
+        class="text-warning text-xs"
+        data-testid="message-overage"
+        title={spend.overage_resets_at
+          ? `Spending overage credits — window resets ${new Date(spend.overage_resets_at).toLocaleString()}`
+          : "Spending overage credits"}>⚡ using credits</span
+      >
+    {/if}
+    {#if spend?.real_spend && costUsd != null}
+      <span class="text-muted text-xs" data-testid="message-cost">${costUsd.toFixed(4)}</span>
+    {/if}
     {#if at}
       <time class="text-muted text-xs" datetime={at} title={at} data-testid="message-time"
         >{formatTime(at)}</time
@@ -363,7 +387,14 @@
       {@render turnStatusLabel(turn.status)}
       {@render turnBody(turn)}
     </div>
-    {@render messageMeta(turn.started_at, copyable, "Copy message")}
+    {@render messageMeta(
+      turn.started_at,
+      copyable,
+      "Copy message",
+      "mt-1",
+      turn.spend,
+      turn.usage?.total_cost_usd,
+    )}
   </div>
 {/snippet}
 

@@ -684,6 +684,7 @@ async fn run_producer(ctx: ProducerCtx) {
         usage: None,
         // Antigravity reports no token/window data — nothing to persist.
         context_window_source: None,
+        spend: None,
     });
 
     // Post-terminal SessionMeta (mirrors Codex's enrichment ordering: flows

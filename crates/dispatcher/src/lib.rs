@@ -1034,6 +1034,7 @@ async fn drain_turn(
                                     outcome: outcome.clone(),
                                     ended_at,
                                     usage: None,
+                                    spend: None,
                                 },
                                 agent_id,
                             );
@@ -1188,6 +1189,8 @@ async fn drain_turn(
                 outcome: outcome.clone(),
                 ended_at,
                 usage: None,
+                // A cancelled turn never completed — no cost/overage to attribute.
+                spend: None,
             },
             agent_id,
         );

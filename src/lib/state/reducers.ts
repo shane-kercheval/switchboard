@@ -219,6 +219,7 @@ export function transcriptReducer(
           status: "complete",
           ended_at: input.ended_at,
           usage: input.usage ?? undefined,
+          spend: input.spend ?? undefined,
         });
       }
       if (input.outcome.status === "cancelled") {
@@ -227,6 +228,7 @@ export function transcriptReducer(
           status: "cancelled",
           ended_at: input.ended_at,
           usage: input.usage ?? undefined,
+          spend: input.spend ?? undefined,
         });
       }
       return updateTurn(turns, input.turn_id, {
@@ -236,6 +238,7 @@ export function transcriptReducer(
         error: input.outcome.message,
         error_kind: input.outcome.kind,
         usage: input.usage ?? undefined,
+        spend: input.spend ?? undefined,
       });
     }
 

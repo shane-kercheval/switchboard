@@ -1,10 +1,10 @@
-use chrono::Utc;
+use chrono::{DateTime, TimeZone, Utc};
 use serde_json::Value;
 use switchboard_core::AgentId;
 
 use crate::events::{
     AdapterEvent, ContentKind, FailureKind, McpServerStatus, ToolKind, TurnId, TurnOutcome,
-    TurnUsage,
+    TurnSpend, TurnUsage,
 };
 
 /// Authored auth-failure message for Claude. Replaces Claude's
@@ -73,6 +73,14 @@ pub struct ParserState {
     /// ~N× for an N-call (tool-use) turn. Mirrors the session-file path, which
     /// keeps the last assistant record's usage.
     last_assistant_context_input_tokens: Option<u64>,
+    /// Overage state from the most recent `rate_limit_event` this turn, stashed
+    /// so the terminal `result` can stamp the completing turn's `TurnSpend`.
+    /// Claude streams the `rate_limit_event` *before* the terminal `result`
+    /// (verified against claude 2.1.161 across normal + tool-use turns), so by
+    /// `TurnEnd` this reflects the turn's overage. Defaults to "not overage"
+    /// until a rate-limit is seen — so a turn without one shows no cost/marker.
+    pending_is_overage: bool,
+    pending_overage_resets_at: Option<DateTime<Utc>>,
 }
 
 /// Parse one stream-json line. Stateful: `state` accumulates text-block
@@ -134,7 +142,7 @@ pub fn parse_line(
         Some("system") => parse_system_event(&value, agent_id),
         Some("assistant") => parse_assistant_envelope(&value, turn_id, state),
         Some("user") => parse_user_envelope(&value, turn_id),
-        Some("rate_limit_event") => parse_rate_limit_event(&value, agent_id),
+        Some("rate_limit_event") => parse_rate_limit_event(&value, agent_id, state),
         _ => ParseOutcome::Skip,
     }
 }
@@ -282,12 +290,24 @@ fn parse_result(obj: &Value, turn_id: TurnId, state: &mut ParserState) -> ParseO
         .and_then(|u| u.context_window)
         .map(|_| crate::events::ContextWindowSource::StreamOnly);
 
+    // Stamp the turn's real-spend attribution from the overage state seen on
+    // this turn's `rate_limit_event` (which precedes the `result` — verified).
+    // For Claude, real-spend == overage: subscription `total_cost_usd` is only
+    // money actually charged when spending overage credits. The frontend gates
+    // the inline cost + marker on `real_spend` with no `match harness`.
+    let spend = Some(TurnSpend {
+        real_spend: state.pending_is_overage,
+        is_overage: state.pending_is_overage,
+        overage_resets_at: state.pending_overage_resets_at,
+    });
+
     ParseOutcome::Event(AdapterEvent::TurnEnd {
         turn_id,
         outcome,
         ended_at: Utc::now(),
         usage,
         context_window_source,
+        spend,
     })
 }
 
@@ -612,8 +632,23 @@ fn stringify_tool_result_content(content: Option<&Value>) -> String {
     String::new()
 }
 
-fn parse_rate_limit_event(obj: &Value, agent_id: AgentId) -> ParseOutcome {
+fn parse_rate_limit_event(obj: &Value, agent_id: AgentId, state: &mut ParserState) -> ParseOutcome {
     let info = obj.get("rate_limit_info").cloned().unwrap_or(Value::Null);
+
+    // Stash the overage state so the terminal `result` can stamp this turn's
+    // `TurnSpend`. `isUsingOverage` is the real-spend signal for Claude (the
+    // only harness with cost in v1); `overageResetsAt` (epoch seconds) is the
+    // credit-window reset for the marker tooltip. The opaque `info` still rides
+    // the event for the Sidebar's Bucket-A rate-limit rendering.
+    state.pending_is_overage = info
+        .get("isUsingOverage")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    state.pending_overage_resets_at = info
+        .get("overageResetsAt")
+        .and_then(Value::as_i64)
+        .and_then(|secs| Utc.timestamp_opt(secs, 0).single());
+
     // Claude's rate-limit payload lives only on the live stream — no
     // session-file equivalent (class C). Mark it `StreamOnly` so the
     // dispatcher persists it to the metadata sidecar for restart continuity.
@@ -1034,6 +1069,49 @@ mod tests {
             }
             _ => panic!("expected RateLimitEvent"),
         }
+    }
+
+    /// Drive a turn's `rate_limit_event` then its `result` through one shared
+    /// state (the stream order — rate-limit precedes result), returning the
+    /// terminal `TurnEnd`'s `spend`. Models how `run_producer` feeds the parser.
+    fn turn_end_spend(rate_limit_info: &str) -> Option<TurnSpend> {
+        let mut state = ParserState::default();
+        let turn_id = tid();
+        let agent_id = aid();
+        let rl = format!(r#"{{"type":"rate_limit_event","rate_limit_info":{rate_limit_info}}}"#);
+        parse_line(&rl, turn_id, agent_id, &mut state);
+        let result = r#"{"type":"result","is_error":false,"api_error_status":null,"result":"ok","usage":{"input_tokens":10,"output_tokens":5}}"#;
+        match parse_line(result, turn_id, agent_id, &mut state) {
+            ParseOutcome::Event(AdapterEvent::TurnEnd { spend, .. }) => spend,
+            other => panic!("expected TurnEnd, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn overage_rate_limit_stamps_turn_as_real_spend() {
+        // An overage rate-limit (isUsingOverage:true) seen before the result
+        // stamps the turn as real spend, with the overage reset for the marker.
+        let spend = turn_end_spend(r#"{"isUsingOverage":true,"overageResetsAt":1778701800}"#)
+            .expect("Claude turns carry spend");
+        assert!(spend.real_spend, "overage turn is real spend");
+        assert!(spend.is_overage);
+        assert!(
+            spend.overage_resets_at.is_some(),
+            "overageResetsAt is parsed for the marker tooltip"
+        );
+    }
+
+    #[test]
+    fn normal_rate_limit_stamps_turn_as_no_real_spend() {
+        // A normal-quota rate-limit → not real spend → the message shows no cost
+        // and no marker (subscription cost is notional unless in overage).
+        let spend = turn_end_spend(
+            r#"{"status":"allowed","resetsAt":1778701800,"rateLimitType":"five_hour","isUsingOverage":false}"#,
+        )
+        .expect("Claude turns carry spend");
+        assert!(!spend.real_spend);
+        assert!(!spend.is_overage);
+        assert!(spend.overage_resets_at.is_none());
     }
 
     #[test]

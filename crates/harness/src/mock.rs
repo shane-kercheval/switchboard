@@ -184,6 +184,7 @@ impl HarnessAdapter for MockHarnessAdapter {
                         ended_at: Utc::now(),
                         usage: None,
                         context_window_source: None,
+                        spend: None,
                     });
                 });
             }
@@ -228,6 +229,7 @@ impl HarnessAdapter for MockHarnessAdapter {
                         ended_at: Utc::now(),
                         usage: None,
                         context_window_source: None,
+                        spend: None,
                     });
                 });
             }
@@ -277,6 +279,7 @@ impl HarnessAdapter for MockHarnessAdapter {
                         ended_at: Utc::now(),
                         usage: None,
                         context_window_source: None,
+                        spend: None,
                     });
                 });
             }
@@ -293,6 +296,7 @@ impl HarnessAdapter for MockHarnessAdapter {
                         ended_at: Utc::now(),
                         usage: None,
                         context_window_source: None,
+                        spend: None,
                     });
                     let _ = tx.send(AdapterEvent::RateLimitEvent {
                         agent_id,
@@ -327,6 +331,7 @@ impl HarnessAdapter for MockHarnessAdapter {
                         ended_at: Utc::now(),
                         usage: None,
                         context_window_source: None,
+                        spend: None,
                     });
                     let _ = tx.send(AdapterEvent::RateLimitEvent {
                         agent_id,
@@ -360,6 +365,7 @@ impl HarnessAdapter for MockHarnessAdapter {
                             total_cost_usd: None,
                         }),
                         context_window_source: Some(source),
+                        spend: None,
                     });
                 });
             }
@@ -378,6 +384,7 @@ impl HarnessAdapter for MockHarnessAdapter {
                         ended_at: Utc::now(),
                         usage: None,
                         context_window_source: None,
+                        spend: None,
                     });
                 });
             }
@@ -396,6 +403,7 @@ impl HarnessAdapter for MockHarnessAdapter {
                         ended_at: Utc::now(),
                         usage: None,
                         context_window_source: None,
+                        spend: None,
                     });
                 });
             }

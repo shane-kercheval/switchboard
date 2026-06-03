@@ -57,6 +57,20 @@ export type TurnUsage = {
   total_cost_usd?: number | null;
 };
 
+// Per-turn real-spend attribution — the gate for showing a turn's cost and an
+// overage marker inline on the message. Stamped per turn by the adapter, so the
+// frontend renders on `real_spend` without a harness check. `real_spend` is the
+// harness-agnostic gate (for Claude == `is_overage`, since subscription cost is
+// only real money in overage); `is_overage` is the Claude-derived source kept
+// distinct so the seam stays honest; `overage_resets_at` (ISO-8601) is the
+// credit-window reset for the marker tooltip when reported. Absent/`null` =
+// no real-spend info → show neither cost nor marker.
+export type TurnSpend = {
+  real_spend: boolean;
+  is_overage: boolean;
+  overage_resets_at?: string | null;
+};
+
 // Identifier minted by the dispatcher for every accepted send (idle or
 // queued), returned synchronously from `send_message`. The turn later started
 // for that message carries the same `message_id` on its `turn_start`, so the
@@ -99,6 +113,7 @@ export type NormalizedEvent =
       outcome: TurnOutcome;
       ended_at: string;
       usage?: TurnUsage | null;
+      spend?: TurnSpend | null;
     }
   | { type: "rate_limit_event"; agent_id: AgentId; info: unknown }
   | {

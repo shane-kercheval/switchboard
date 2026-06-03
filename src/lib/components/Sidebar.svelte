@@ -170,20 +170,6 @@
     }
   }
 
-  /// Claude session-total cost — null-safe sum across the agent's completed
-  /// turns. Codex turns have `total_cost_usd: null` so the `?? 0` is
-  /// load-bearing (without it, the result is `NaN`). Codex agents typically
-  /// return 0 here; the sidebar branches on harness for what to display.
-  function sessionTotalCost(agentId: AgentId): number {
-    const turns = transcripts[agentId] ?? [];
-    let total = 0;
-    for (const turn of turns) {
-      if (turn.role !== "agent") continue;
-      total += turn.usage?.total_cost_usd ?? 0;
-    }
-    return total;
-  }
-
   /// Context utilization — `(context_input_tokens + output_tokens) /
   /// context_window` from the most recent completed agent turn. Forward-looking
   /// signal ("how full will the next turn's context be").
@@ -489,7 +475,6 @@
     <div class="flex flex-col gap-1.5 px-2 pb-2">
       {#each agents as agent (agent.id)}
         {@const runtime = runtimes[agent.id]}
-        {@const cost = sessionTotalCost(agent.id)}
         {@const util = contextUtilization(agent.id)}
         {@const codexWindows =
           agent.harness === "codex" ? codexRateLimitView(runtime?.last_rate_limit, Date.now()) : []}
@@ -865,11 +850,12 @@
                 {/if}
               </div>
             {/if}
-            {#if agent.harness === "claude_code" && cost > 0}
-              <div class="text-fg mt-1.5 text-xs" data-testid="agent-cost">
-                ${cost.toFixed(4)}
-              </div>
-            {/if}
+            <!-- Per-turn cost is deliberately NOT shown on the card — it
+                 renders inline per-message in the transcript (real-spend turns
+                 only). There is no per-agent cost total (system-design §2): the
+                 old accumulating `$` figure read as a running total but wasn't
+                 one. Do not re-add it. The current overage *status* below stays
+                 (Bucket-A "as of now" state). -->
             {#if rlView !== null}
               <!-- Claude rate-limit surface — two independent signals, each
                    shown only while its own reset is still in the future (a past

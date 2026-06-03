@@ -379,6 +379,23 @@ describe("transcriptReducer", () => {
       expect(turn.usage?.total_cost_usd).toBe(0.012);
     });
 
+    it("records the per-turn spend signal from turn_end", () => {
+      let turns = reduce([], turnStart(TURN_1));
+      const ev: NormalizedEvent = {
+        type: "turn_end",
+        turn_id: TURN_1,
+        outcome: { status: "completed" },
+        ended_at: "2026-05-16T00:00:05Z",
+        usage: { input_tokens: 10, output_tokens: 5, total_cost_usd: 0.0125 },
+        spend: { real_spend: true, is_overage: true, overage_resets_at: null },
+      };
+      turns = reduce(turns, ev);
+      const turn = turns[0];
+      if (turn?.role !== "agent") throw new Error("unreachable");
+      expect(turn.spend?.real_spend).toBe(true);
+      expect(turn.spend?.is_overage).toBe(true);
+    });
+
     it("transitions to failed with error fields populated", () => {
       let turns = reduce([], turnStart(TURN_1));
       turns = reduce(turns, turnEndFailed(TURN_1, "rate limited"));

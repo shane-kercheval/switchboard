@@ -8,9 +8,9 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 
 // The inline rename editor commits through the workspace state's `renameAgent`;
-// AgentActionsMenu (rendered per card) imports `removeAgent` from the same
-// module, so the mock provides both. `$lib/state/index.svelte` (the real module
-// the other suites drive) does not import either, so these mocks are orthogonal.
+// inline row actions remove agents through the same module. `$lib/state/index.svelte`
+// (the real module the other suites drive) does not import either, so these
+// mocks are orthogonal.
 const renameAgentMock = vi.fn<(id: string, name: string) => Promise<void>>();
 const removeAgentMock = vi.fn<(id: string) => Promise<void>>();
 vi.mock("$lib/state/workspace.svelte", () => ({
@@ -18,12 +18,19 @@ vi.mock("$lib/state/workspace.svelte", () => ({
   removeAgent: (id: string) => removeAgentMock(id),
 }));
 
-// Opening the actions menu resolves session info; stub it so the "Rename via
-// menu" path doesn't reach the real Tauri `invoke`.
 const agentSessionInfoMock = vi.fn();
+const openSessionFileMock = vi.fn();
 vi.mock("$lib/api", () => ({
   agentSessionInfo: (id: string) => agentSessionInfoMock(id),
-  openSessionFile: vi.fn(),
+  openSessionFile: async (id: string) => {
+    openSessionFileMock(id);
+  },
+  cancelAgent: vi.fn(),
+}));
+
+const copyTextMock = vi.fn<(t: string) => Promise<void>>();
+vi.mock("$lib/native", () => ({
+  copyText: (t: string) => copyTextMock(t),
 }));
 
 async function loadState() {
@@ -52,6 +59,9 @@ beforeEach(() => {
   renameAgentMock.mockResolvedValue(undefined);
   removeAgentMock.mockResolvedValue(undefined);
   agentSessionInfoMock.mockResolvedValue({ session_file: null, resume_command: null });
+  openSessionFileMock.mockReset();
+  copyTextMock.mockReset();
+  copyTextMock.mockResolvedValue(undefined);
 });
 
 afterEach(async () => {
@@ -121,6 +131,145 @@ describe("Sidebar", () => {
 
     expect(header).toHaveAttribute("aria-expanded", "false");
     expect(screen.queryByTestId("agent-cost")).toBeNull();
+  });
+
+  it("renders the harness icon by default and keeps inline action icons hover-only", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    agentSessionInfoMock.mockResolvedValue({
+      session_file: "/sessions/alice.jsonl",
+      resume_command: "cd '/proj' && claude --resume abc --dangerously-skip-permissions",
+    });
+
+    const Sidebar = (await import("./Sidebar.svelte")).default;
+    render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+
+    expect(screen.getByTestId("agent-harness-icon")).toBeInTheDocument();
+    const actions = screen.getByTestId("agent-inline-actions");
+    expect(actions).toHaveClass("max-w-0");
+    expect(actions).toHaveClass("group-hover:max-w-[var(--agent-action-width)]");
+
+    const resume = await screen.findByTestId("agent-action-resume");
+    const open = await screen.findByTestId("agent-action-open-session");
+    expect(actions).toHaveAttribute("style", "--agent-action-width: 4.75rem;");
+    expect(resume).toHaveAttribute("tabindex", "-1");
+    expect(open).toHaveAttribute("tabindex", "-1");
+  });
+
+  it("shows only currently available inline actions", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.dispatchUserTurn(CLAUDE_AGENT.id, "user-1", "go", "send-1", "2026-05-16T00:00:00Z");
+    agentSessionInfoMock.mockResolvedValue({
+      session_file: "/sessions/alice.jsonl",
+      resume_command: "cd '/proj' && claude --resume abc --dangerously-skip-permissions",
+    });
+
+    const Sidebar = (await import("./Sidebar.svelte")).default;
+    render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+
+    expect(screen.getByTestId("agent-action-stop")).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByTestId("agent-action-resume")).toBeInTheDocument());
+    expect(screen.getByTestId("agent-action-open-session")).toBeInTheDocument();
+    expect(screen.queryByTestId("agent-action-remove")).toBeNull();
+  });
+
+  it("opens session-backed inline actions when session info is available", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    agentSessionInfoMock.mockResolvedValue({
+      session_file: "/sessions/alice.jsonl",
+      resume_command: "cd '/proj' && claude --resume abc --dangerously-skip-permissions",
+    });
+
+    const Sidebar = (await import("./Sidebar.svelte")).default;
+    render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+
+    await fireEvent.click(await screen.findByTestId("agent-action-open-session"));
+    expect(openSessionFileMock).toHaveBeenCalledWith(CLAUDE_AGENT.id);
+
+    await fireEvent.click(screen.getByTestId("agent-action-resume"));
+    await waitFor(() => expect(screen.getByTestId("resume-panel")).toBeInTheDocument());
+    expect(screen.getByTestId("resume-command")).toHaveTextContent("claude --resume abc");
+
+    await fireEvent.click(screen.getByTestId("resume-copy"));
+    expect(copyTextMock).toHaveBeenCalledWith(
+      "cd '/proj' && claude --resume abc --dangerously-skip-permissions",
+    );
+  });
+
+  it("omits session-backed actions when no session is bound", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    agentSessionInfoMock.mockResolvedValue({ session_file: null, resume_command: null });
+
+    const Sidebar = (await import("./Sidebar.svelte")).default;
+    render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+
+    await waitFor(() => expect(agentSessionInfoMock).toHaveBeenCalledWith(CLAUDE_AGENT.id));
+    expect(screen.queryByTestId("agent-action-resume")).toBeNull();
+    expect(screen.queryByTestId("agent-action-open-session")).toBeNull();
+    expect(screen.getByTestId("agent-action-remove")).toBeInTheDocument();
+  });
+
+  it("refetches empty session info on row hover so new session actions can appear", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    agentSessionInfoMock
+      .mockResolvedValueOnce({ session_file: null, resume_command: null })
+      .mockResolvedValueOnce({
+        session_file: "/sessions/alice.jsonl",
+        resume_command: "cd '/proj' && claude --resume abc --dangerously-skip-permissions",
+      });
+
+    const Sidebar = (await import("./Sidebar.svelte")).default;
+    render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+
+    await waitFor(() => expect(agentSessionInfoMock).toHaveBeenCalledTimes(1));
+    expect(screen.queryByTestId("agent-action-resume")).toBeNull();
+    expect(screen.queryByTestId("agent-action-open-session")).toBeNull();
+
+    await fireEvent.pointerEnter(screen.getByTestId("sidebar-agent"));
+
+    await waitFor(() => expect(agentSessionInfoMock).toHaveBeenCalledTimes(2));
+    expect(await screen.findByTestId("agent-action-resume")).toBeInTheDocument();
+    expect(screen.getByTestId("agent-action-open-session")).toBeInTheDocument();
+  });
+
+  it("remove swaps inline actions to Cancel | Confirm and pointer leave disarms it", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+
+    const Sidebar = (await import("./Sidebar.svelte")).default;
+    render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+
+    await fireEvent.click(screen.getByTestId("agent-action-remove"));
+    expect(screen.getByTestId("agent-remove-cancel")).toBeInTheDocument();
+    expect(screen.getByTestId("agent-remove-confirm")).toBeInTheDocument();
+    expect(screen.queryByTestId("agent-action-remove")).toBeNull();
+
+    await fireEvent.pointerLeave(screen.getByTestId("sidebar-agent"));
+
+    expect(screen.getByTestId("agent-action-remove")).toBeInTheDocument();
+    expect(screen.queryByTestId("agent-remove-confirm")).not.toBeInTheDocument();
+    expect(removeAgentMock).not.toHaveBeenCalled();
+  });
+
+  it("confirming remove calls removeAgent and failures keep the row", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    removeAgentMock.mockRejectedValueOnce(new Error("registry locked"));
+
+    const Sidebar = (await import("./Sidebar.svelte")).default;
+    render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+
+    await fireEvent.click(screen.getByTestId("agent-action-remove"));
+    await fireEvent.click(screen.getByTestId("agent-remove-confirm"));
+
+    expect(removeAgentMock).toHaveBeenCalledWith(CLAUDE_AGENT.id);
+    const err = await screen.findByTestId("agent-remove-error");
+    expect(err).toHaveTextContent("registry locked");
+    expect(screen.getByTestId("sidebar-agent")).toBeInTheDocument();
   });
 
   it("collapse-all hides every agent's details; toggling again restores them", async () => {
@@ -692,11 +841,11 @@ describe("Sidebar agent-scoped event tolerance", () => {
   });
 });
 
-/// Inline rename editor (M7). The card's name swaps to an <input> with live
+/// Inline rename editor. The card's name swaps to an <input> with live
 /// validation; Enter / the save icon commit, Escape / blur cancel (never
-/// persist on blur). The menu's "Rename" item and a double-click on the name
-/// row are the two entry points. Commits route through the mocked workspace
-/// `renameAgent`; the backend stays authoritative, the frontend check is UX.
+/// persist on blur). Double-click on the name row is the entry point. Commits
+/// route through the mocked workspace `renameAgent`; the backend stays
+/// authoritative, the frontend check is UX.
 describe("Sidebar inline rename", () => {
   async function enterEditViaDoubleClick(agent: AgentRecord): Promise<HTMLInputElement> {
     const state = await loadState();
@@ -719,19 +868,6 @@ describe("Sidebar inline rename", () => {
   it("the input is not nested inside the collapse toggle (no nested interactive)", async () => {
     const input = await enterEditViaDoubleClick(CLAUDE_AGENT);
     expect(input.closest("button")).toBeNull();
-  });
-
-  it("the menu's Rename item enters edit mode", async () => {
-    const state = await loadState();
-    await state.registerAgent(CLAUDE_AGENT);
-    const Sidebar = (await import("./Sidebar.svelte")).default;
-    render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
-
-    await fireEvent.click(screen.getByTestId("agent-actions-trigger"));
-    await fireEvent.click(await screen.findByTestId("agent-action-rename"));
-
-    const input = (await screen.findByTestId("agent-rename-input")) as HTMLInputElement;
-    expect(input).toHaveValue("alice");
   });
 
   it("Enter commits the new name via renameAgent and exits edit mode", async () => {

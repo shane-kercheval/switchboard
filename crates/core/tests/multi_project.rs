@@ -37,9 +37,9 @@ fn multi_project_directory_end_to_end_with_layout_assertion() {
     assert_ne!(agent_a.id, agent_b.id);
     // Both must be Some (Claude Code pre-generates) AND distinct. A bare
     // assert_ne! would silently pass if both were None.
-    assert!(agent_a.session_id.is_some());
-    assert!(agent_b.session_id.is_some());
-    assert_ne!(agent_a.session_id, agent_b.session_id);
+    assert!(agent_a.session_locator.is_some());
+    assert!(agent_b.session_locator.is_some());
+    assert_ne!(agent_a.session_locator, agent_b.session_locator);
 
     // Adding a second agent in project_a so we can confirm registries don't cross-pollinate.
     let reviewer_a = project_a

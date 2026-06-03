@@ -9,6 +9,7 @@ mod emitter;
 mod error;
 mod git_registry;
 mod journal;
+mod locator_sink;
 mod metadata;
 mod state;
 mod workspace;

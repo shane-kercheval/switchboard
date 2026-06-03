@@ -62,6 +62,15 @@ pub enum CoreError {
 
     #[error("expected append-only file is missing after init: {path}")]
     MissingAppendOnlyFile { path: PathBuf },
+
+    #[error(
+        "session locator shape does not match agent {agent_id}'s harness {harness:?} \
+         — refusing to persist a locator that would not resume"
+    )]
+    SessionLocatorHarnessMismatch {
+        agent_id: uuid::Uuid,
+        harness: crate::harness::HarnessKind,
+    },
 }
 
 impl CoreError {

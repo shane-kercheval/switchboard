@@ -48,7 +48,7 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
-use switchboard_core::{AgentId, AgentRecord, SendId};
+use switchboard_core::{AgentId, AgentRecord, SendId, SessionLocator};
 use switchboard_harness::{
     AdapterEvent, CancelSource, DispatchOptions, EventStream, FailureKind, HarnessAdapter,
     MessageId, NormalizedEvent, RateLimitSource, TurnId, TurnOutcome,
@@ -332,6 +332,46 @@ impl MetadataCache for NoopMetadataCache {
     fn record_rate_limit(&self, _: AgentId, _: serde_json::Value, _: DateTime<Utc>) {}
 }
 
+/// Error returned when persisting a captured session locator fails. See
+/// [`SessionLocatorSink`].
+#[derive(Debug, thiserror::Error)]
+#[error("session locator persist failed: {0}")]
+pub struct SessionLocatorError(pub Box<dyn std::error::Error + Send + Sync + 'static>);
+
+/// Sink for a runtime-captured [`SessionLocator`], injected like
+/// [`MetadataCache`]/[`ConversationJournal`] so the dispatcher stays
+/// app-agnostic. The dispatcher calls this on an
+/// [`AdapterEvent::SessionLocatorCaptured`] (emitted when a Codex/Antigravity
+/// adapter first learns — or, on an Antigravity fork-and-heal, re-learns — its
+/// locator); the app-side impl persists it to the agent's registry record.
+///
+/// **Load-bearing, unlike `MetadataCache`.** A persist failure means the next
+/// turn would start a fresh session and silently drop context, so the
+/// dispatcher fails the turn (synthesizes a `Failed { AdapterFailure }` terminal
+/// and tears the child down via the turn's cancel token), matching the old
+/// sidecar-write-failure semantics. The metadata cache, by contrast, swallows
+/// write errors.
+pub trait SessionLocatorSink: Send + Sync {
+    /// Persist `locator` as `agent_id`'s session identity. Returns `Err` only on
+    /// a genuine persistence failure (registry write / lookup error).
+    fn persist(
+        &self,
+        agent_id: AgentId,
+        locator: SessionLocator,
+    ) -> Result<(), SessionLocatorError>;
+}
+
+/// No-op locator sink for tests and callers with no registry (e.g. the live
+/// end-to-end harness, which dispatches against the real CLI without persisting
+/// the locator). Always succeeds, so a capture event never fails the turn.
+pub struct NoopSessionLocatorSink;
+
+impl SessionLocatorSink for NoopSessionLocatorSink {
+    fn persist(&self, _: AgentId, _: SessionLocator) -> Result<(), SessionLocatorError> {
+        Ok(())
+    }
+}
+
 /// No-op journal for tests and any caller that doesn't persist the user side.
 pub struct NoopJournal;
 
@@ -369,6 +409,7 @@ pub struct DispatchContext {
     pub options: DispatchOptions,
     pub journal: Arc<dyn ConversationJournal>,
     pub metadata: Arc<dyn MetadataCache>,
+    pub locator_sink: Arc<dyn SessionLocatorSink>,
 }
 
 /// Builds a [`DispatchContext`] for an agent's next turn. Injected by the app
@@ -823,6 +864,7 @@ async fn run_turn(
         mut options,
         journal,
         metadata,
+        locator_sink,
     } = factory.build(item.send_id);
     let turn_id: TurnId = Uuid::now_v7();
     let started_at = Utc::now();
@@ -893,6 +935,7 @@ async fn run_turn(
         &emitter,
         &journal,
         &metadata,
+        &locator_sink,
         &token,
         stream,
         commands,
@@ -916,6 +959,7 @@ async fn drain_turn(
     emitter: &Arc<dyn EventEmitter>,
     journal: &Arc<dyn ConversationJournal>,
     metadata: &Arc<dyn MetadataCache>,
+    locator_sink: &Arc<dyn SessionLocatorSink>,
     token: &CancellationToken,
     mut stream: EventStream,
     commands: &mut mpsc::UnboundedReceiver<Command>,
@@ -925,6 +969,15 @@ async fn drain_turn(
     let mut cancel_source: Option<CancelSource> = None;
     let mut shutdown_reply: Option<oneshot::Sender<()>> = None;
     let mut channel_closed = false;
+    // Set when the dispatcher itself synthesizes a `Failed` terminal (a
+    // load-bearing locator-persist failure). Distinct from the cancel latch:
+    // cancellation deliberately still forwards buffered content (system-design
+    // §7) and a normal terminal still forwards Codex post-terminal enrichment —
+    // but a force-failed turn is authoritatively over, so **every** subsequent
+    // adapter event is dropped (the adapter may still be mid-stream, e.g.
+    // Antigravity's post-exit drain emits content + `SessionMeta` after the
+    // capture). We keep looping only to service commands and let the child exit.
+    let mut force_failed = false;
 
     loop {
         tokio::select! {
@@ -934,6 +987,55 @@ async fn drain_turn(
 
             maybe_event = stream.next() => {
                 let Some(event) = maybe_event else { break };
+                // A force-failed turn is authoritatively over — drop every
+                // further adapter event (content, meta, terminal) rather than
+                // forward output for a turn the UI already saw fail.
+                if force_failed {
+                    continue;
+                }
+                // Internal adapter→dispatcher event: persist the runtime-captured
+                // session locator to the **running turn's** agent (never an
+                // event-supplied id — see `SessionLocatorCaptured`). Load-bearing:
+                // a lost locator silently starts a fresh session next turn, so a
+                // persist failure fails the turn and tears the child down via the
+                // cancel token. Never forwarded to the frontend.
+                if let AdapterEvent::SessionLocatorCaptured { locator } = &event {
+                    if let Err(e) = locator_sink.persist(agent_id, locator.clone()) {
+                        if terminal_seen {
+                            // Can't fail an already-terminal turn; the locator is
+                            // lost but the turn outcome stands. Surface loudly.
+                            tracing::error!(
+                                agent_id = %agent_id, %turn_id, error = %e,
+                                "session locator persist failed after the turn's terminal — locator lost"
+                            );
+                        } else {
+                            let ended_at = Utc::now();
+                            let outcome = TurnOutcome::Failed {
+                                kind: FailureKind::AdapterFailure,
+                                message: format!("failed to persist session locator: {e}"),
+                            };
+                            emit_event(
+                                emitter.as_ref(),
+                                channel,
+                                &NormalizedEvent::TurnEnd {
+                                    turn_id,
+                                    outcome: outcome.clone(),
+                                    ended_at,
+                                    usage: None,
+                                },
+                                agent_id,
+                            );
+                            journal.record_outcome(turn_id, agent_id, &outcome, started_at, ended_at);
+                            terminal_seen = true;
+                            force_failed = true;
+                            // Tear down the child; the adapter may still be
+                            // mid-stream (Antigravity's post-exit drain), and
+                            // `force_failed` drops anything it emits from here on.
+                            token.cancel();
+                        }
+                    }
+                    continue;
+                }
                 if let AdapterEvent::TurnEnd { outcome, ended_at, .. } = &event {
                     // Cancellation latch: once cancel fired, the actor owns the
                     // terminal — drop a real terminal that races in afterwards
@@ -957,8 +1059,11 @@ async fn drain_turn(
                 {
                     metadata.record_rate_limit(*a, info.clone(), Utc::now());
                 }
-                let normalized: NormalizedEvent = event.into();
-                emit_event(emitter.as_ref(), channel, &normalized, agent_id);
+                // Capture events are handled above and never reach here, so this
+                // always yields `Some`; the `if let` keeps the contract explicit.
+                if let Some(normalized) = event.into_normalized() {
+                    emit_event(emitter.as_ref(), channel, &normalized, agent_id);
+                }
             }
 
             maybe_cmd = commands.recv() => {

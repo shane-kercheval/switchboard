@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use futures::StreamExt;
-use switchboard_core::{AgentRecord, HarnessKind};
+use switchboard_core::{AgentRecord, HarnessKind, SessionLocator};
 use switchboard_harness::{
     AdapterEvent, DispatchOptions, FailureKind, HarnessAdapter, MockHarnessAdapter, MockScenario,
     TurnId, TurnOutcome,
@@ -14,7 +14,7 @@ fn fake_agent() -> AgentRecord {
         project_id: Uuid::now_v7(),
         name: "mock-test-agent".to_owned(),
         harness: HarnessKind::ClaudeCode,
-        session_id: Some(Uuid::now_v7()),
+        session_locator: Some(SessionLocator::Uuid(Uuid::now_v7())),
         created_at: chrono::Utc::now(),
     }
 }
@@ -169,7 +169,10 @@ async fn completed_turn_outcome_wire_shape_roundtrips() {
         .find(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
         .expect("must have TurnEnd");
 
-    let normalized = NormalizedEvent::from(turn_end.clone());
+    let normalized = turn_end
+        .clone()
+        .into_normalized()
+        .expect("TurnEnd lifts to a normalized event");
     let json = serde_json::to_string(&normalized).unwrap();
     let parsed: NormalizedEvent = serde_json::from_str(&json).unwrap();
     assert_eq!(normalized, parsed);
@@ -178,7 +181,7 @@ async fn completed_turn_outcome_wire_shape_roundtrips() {
 #[tokio::test]
 async fn failed_turn_outcome_wire_shape_roundtrips() {
     // Checks that TurnEnd(Failed) serializes and deserializes correctly via the
-    // NormalizedEvent lifting path. Exercises the From<AdapterEvent> lift for the
+    // NormalizedEvent lifting path. Exercises `into_normalized` for the
     // Failed variant, which the completed test above does not cover.
     use switchboard_harness::NormalizedEvent;
     use uuid::Uuid;
@@ -194,7 +197,9 @@ async fn failed_turn_outcome_wire_shape_roundtrips() {
         usage: None,
     };
 
-    let normalized = NormalizedEvent::from(event);
+    let normalized = event
+        .into_normalized()
+        .expect("TurnEnd lifts to a normalized event");
     let json = serde_json::to_string(&normalized).unwrap();
     let parsed: NormalizedEvent = serde_json::from_str(&json).unwrap();
     assert_eq!(normalized, parsed);

@@ -498,19 +498,19 @@ pub struct SessionMetaFields {
 /// [`crate::transcript::LoadedTranscript`]. Used by transcript hydration on
 /// project open and on attach.
 ///
-/// `session_partition_date` MUST come from the per-agent session-link sidecar
-/// (`crate::codex::sidecar::SessionLinkRecord.session_partition_date`). Codex
-/// partitions session files by **local date** at first dispatch and resumes
-/// append to the original-partition file across local-date boundaries; the
-/// stored date is authoritative — never recompute from `Local::today()`.
+/// `session_partition_date` MUST come from the agent's registry locator
+/// (`SessionLocator::Codex { partition_date, .. }`). Codex partitions session
+/// files by **local date** at first dispatch and resumes append to the
+/// original-partition file across local-date boundaries; the stored date is
+/// authoritative — never recompute from `Local::today()`.
 ///
 /// `cwd` is the user's bound working directory, used for project-scoped
 /// MCP config and skill loaders (the same loaders live dispatch uses).
 ///
-/// **Stale-sidecar case**: if `session_partition_date` is present but no
+/// **Stale-locator case**: if `session_partition_date` is present but no
 /// session file lives at the recorded path (user deleted it, external
-/// rotation), returns `Ok(LoadedTranscript { turns: vec![], warnings: vec![<stale-sidecar warning>] })`.
-/// **Missing-sidecar case** (agent created, never dispatched): caller passes
+/// rotation), returns `Ok(LoadedTranscript { turns: vec![], warnings: vec![<stale warning>] })`.
+/// **Never-dispatched case** (agent created, no locator yet): caller passes
 /// `None` for the date — returns `Ok(LoadedTranscript::default())` with no
 /// warning.
 pub fn load_codex_transcript(

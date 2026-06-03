@@ -393,4 +393,15 @@ describe("ProjectsSidebar — rename", () => {
     await renderWith([{ ...projectIn(A1, "alpha", "/work/a"), available: false }]);
     expect(screen.queryByTestId("project-actions-trigger")).toBeNull();
   });
+
+  it("omits the kebab while the project is busy so the cancel control owns the right slot", async () => {
+    // A live send makes the project busy → the spinner/cancel renders and the
+    // kebab is suppressed entirely (no hidden-but-laid-out button pushing it).
+    await seedBusyProject(PROJECT_1);
+    const ProjectsSidebar = (await import("./ProjectsSidebar.svelte")).default;
+    render(ProjectsSidebar, { props: noopProps });
+
+    expect(screen.getByTestId("project-cancel")).toBeInTheDocument();
+    expect(screen.queryByTestId("project-actions-trigger")).toBeNull();
+  });
 });

@@ -282,6 +282,23 @@
               </div>
             </button>
             <div class="flex shrink-0 items-center gap-0.5 pr-1.5">
+              <!-- Kebab first so the status icon (spinner/checkmark) stays the
+                   rightmost element, flush to the edge — the kebab's reserved
+                   (opacity-0) slot sits to its LEFT and only becomes visible on
+                   hover/focus/menu-open, so a completed checkmark never looks
+                   indented. Shown only for available, non-busy projects:
+                   Rename/Delete need on-disk access (M3's offline Archive will
+                   relax `available`), and while busy the spinner/cancel owns the
+                   slot — the kebab isn't rendered at all so hovering to cancel
+                   never shifts it. Mutating a project mid-run is intentionally
+                   unavailable — stop it first. -->
+              {#if project.available && !busy}
+                <div
+                  class="opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100 has-[[data-state=open]]:opacity-100"
+                >
+                  <ProjectActionsMenu {project} onRename={() => startEdit(project)} />
+                </div>
+              {/if}
               {#if busy}
                 <button
                   type="button"
@@ -312,17 +329,6 @@
                     <circle cx="12" cy="12" r="9" />
                     <path d="m8.5 12 2.5 2.5 4.5-5" />
                   </svg>
-                </div>
-              {/if}
-              <!-- Rename/Delete need on-disk access, so the kebab is shown only
-                   for available projects through M1–M2; M3 (Archive, which works
-                   offline) will render it on unavailable rows too. Hover/focus/
-                   menu-open-revealed; the status icon stays always-visible. -->
-              {#if project.available}
-                <div
-                  class="opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100 has-[[data-state=open]]:opacity-100"
-                >
-                  <ProjectActionsMenu {project} onRename={() => startEdit(project)} />
                 </div>
               {/if}
             </div>

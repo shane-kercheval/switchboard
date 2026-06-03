@@ -324,27 +324,22 @@ local_prompt_dirs:
   - ~/repos/my-prompts-library      # personal git-managed library
   - ~/.config/switchboard/prompts   # OS-conventional default; explicitly include if you want it
 
+# MCP prompt servers, added via Settings → "Add MCP server". Only the
+# non-secret name + URL live here; the bearer token (if any) is stored in
+# the OS keychain, keyed by the provider name — never in this file.
 mcp_providers:
-  - name: tiddly                    # used as the prefix (tiddly:my-prompt)
-    preset: tiddly                  # first-class preset; credential obtained via the
-                                    # "Connect Tiddly" browser login and stored in the
-                                    # OS keychain — no token is written to this file
+  - name: tiddly                    # the prefix (tiddly:my-prompt); a Tiddly PAT
+    transport:                      #   is pasted into the form and stored in the keychain
+      type: http
+      url: https://prompts-mcp.tiddly.me/mcp
 
-  - name: my-team-mcp               # generic HTTP MCP server
+  - name: my-team-mcp
     transport:
       type: http
-      url: https://mcp.example.com
-    auth:
-      type: bearer                  # token entered via Settings → "Add MCP server"
-                                    # and stored in the OS keychain, not in this file
-
-  - name: my-local-stdio            # generic stdio MCP server (e.g. an npm-packaged server)
-    transport:
-      type: stdio
-      command: ["npx", "-y", "@example/mcp-server"]
+      url: https://mcp.example.com/mcp
 ```
 
-**Tiddly is a first-class preset.** The Switchboard UI offers a one-click "Connect Tiddly" action: the user logs into their Tiddly account through a browser (Auth0 device-code flow); Switchboard mints a long-lived Personal Access Token, stores it in the OS keychain, and writes the corresponding `preset: tiddly` config entry automatically. No token is ever hand-pasted or written to `config.yaml`. Tiddly's URL and auth workflow are baked in. Other MCP servers are added via a generic "Add MCP server" form in Settings (name + URL + bearer token); the token is stored in the OS keychain, never in `config.yaml`. The presets list is open — additional first-class integrations (e.g., a future popular prompt-store MCP) can be added the same way.
+**V1: all MCP servers are added through one generic form.** Settings offers an "Add MCP server" form (name + URL + optional bearer token); the non-secret `name`/`url` are written to `config.yaml` and the token is stored in the OS keychain, never in `config.yaml`. **Tiddly is configured this way in V1** — paste a Tiddly Personal Access Token (minted in Tiddly's own UI/CLI) as the bearer, with URL `https://prompts-mcp.tiddly.me/mcp`. A **first-class one-click "Connect Tiddly" preset** (browser/Auth0 login, no token handling, a `preset: tiddly` config entry) is a **deferred post-V1 follow-up** — see the implementation plan's M5. **stdio MCP providers** are likewise deferred (V1 is HTTP-only); a `transport: { type: stdio, … }` entry is not yet supported. Both can return additively without changing the config model.
 
 ### Addressing prompts
 

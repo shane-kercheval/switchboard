@@ -16,15 +16,16 @@
 //! clone to a background task that warms the cache at startup while the original
 //! lives in `AppState`; both share the same cache `Arc`.
 
-use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use serde::Serialize;
 
 use crate::config::{
-    McpProviderConfig, McpSection, McpTransport, PromptConfig, resolve_local_dirs,
+    McpProviderConfig, McpSection, McpTransport, PromptConfig, is_valid_provider_name,
+    resolve_local_dirs,
 };
 use crate::error::PromptError;
 use crate::local::LocalProvider;
@@ -44,6 +45,39 @@ pub struct RenderedPrompt {
     pub text: String,
 }
 
+/// An MCP provider as shown in Settings: its non-secret config plus whether a
+/// bearer is stored and the outcome of the last cache build.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct McpProviderInfo {
+    pub name: String,
+    pub url: String,
+    /// Whether a bearer token is currently stored for this provider.
+    pub has_token: bool,
+    pub status: ProviderStatus,
+}
+
+/// Outcome of the last attempt to list a provider's prompts.
+///
+/// Deliberately coarse: `rmcp` collapses transport failures (connection refused,
+/// HTTP 401/403) into one opaque error that can't be reliably sub-classified
+/// without coupling to its internals, so a failure is one `errored` bucket with
+/// the underlying message surfaced for detail — rather than a fragile
+/// auth-vs-unreachable split. `store_unavailable` (the keychain couldn't be read)
+/// is genuinely distinct and knowable locally; the "no credential stored" nudge
+/// is carried by [`McpProviderInfo::has_token`].
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ProviderStatus {
+    /// The last sync listed prompts successfully.
+    Ok { prompt_count: usize },
+    /// The last sync failed; `message` is the redacted error (never a token).
+    Errored { message: String },
+    /// The secret store couldn't be read (e.g. keychain locked/absent).
+    StoreUnavailable,
+    /// No sync has recorded a status yet (e.g. just added, not yet built).
+    Unknown,
+}
+
 /// Resolves prompts from user-global config. Construct with [`PromptService::new`]
 /// in production (paths + secret store injected by `crates/app`);
 /// [`PromptService::disabled`] yields an inert service (lists nothing, render
@@ -55,6 +89,9 @@ pub struct PromptService {
     home: Option<PathBuf>,
     secrets: Arc<dyn SecretStore>,
     cache: Arc<RwLock<Vec<Prompt>>>,
+    /// Per-MCP-provider outcome of the last cache build, keyed by provider name.
+    /// Read by `list_mcp_providers` to drive the Settings status column.
+    provider_status: Arc<RwLock<HashMap<String, ProviderStatus>>>,
     /// Serializes cache rebuilds so an older, slower `sync` can't finish after a
     /// newer one and overwrite the cache with stale results.
     sync_lock: Arc<tokio::sync::Mutex<()>>,
@@ -74,6 +111,7 @@ impl PromptService {
             home,
             secrets,
             cache: Arc::new(RwLock::new(Vec::new())),
+            provider_status: Arc::new(RwLock::new(HashMap::new())),
             sync_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
@@ -88,6 +126,7 @@ impl PromptService {
             home: None,
             secrets: Arc::new(InMemorySecretStore::new()),
             cache: Arc::new(RwLock::new(Vec::new())),
+            provider_status: Arc::new(RwLock::new(HashMap::new())),
             sync_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
@@ -113,6 +152,14 @@ impl PromptService {
     ///   slow provider can't delay the others. A provider that errors or times
     ///   out contributes nothing (with a warning).
     pub async fn sync(&self) {
+        // One provider being prepared for the concurrent query phase; carries the
+        // secret-store read outcome for the StoreUnavailable status.
+        struct Pending {
+            name: String,
+            store_unavailable: bool,
+            provider: McpProvider,
+        }
+
         let _guard = self.sync_lock.lock().await;
 
         let mut prompts = match self.local_provider() {
@@ -121,19 +168,50 @@ impl PromptService {
         };
         self.publish(prompts.clone());
 
-        let providers: Vec<McpProvider> = self
+        let pendings: Vec<Pending> = self
             .mcp_provider_configs()
             .into_iter()
             .map(|config| {
                 let McpTransport::Http { url } = &config.transport;
-                let bearer = self.resolve_bearer(&config.name);
-                McpProvider::new(config.name.clone(), url.clone(), bearer, PROVIDER_TIMEOUT)
+                let (bearer, store_unavailable) = self.resolve_bearer(&config.name);
+                Pending {
+                    name: config.name.clone(),
+                    store_unavailable,
+                    provider: McpProvider::new(
+                        config.name.clone(),
+                        url.clone(),
+                        bearer,
+                        PROVIDER_TIMEOUT,
+                    ),
+                }
             })
             .collect();
-        let mcp_lists = futures::future::join_all(providers.iter().map(McpProvider::list)).await;
-        for list in mcp_lists {
-            prompts.extend(list);
+        let results =
+            futures::future::join_all(pendings.iter().map(|p| p.provider.list_result())).await;
+
+        let mut statuses: HashMap<String, ProviderStatus> = HashMap::new();
+        for (pending, result) in pendings.iter().zip(results) {
+            let status = match result {
+                Ok(provider_prompts) => {
+                    let status = ProviderStatus::Ok {
+                        prompt_count: provider_prompts.len(),
+                    };
+                    prompts.extend(provider_prompts);
+                    status
+                }
+                // A store-read failure is the more actionable root cause when the
+                // list also failed; otherwise surface the provider's own error.
+                Err(_) if pending.store_unavailable => ProviderStatus::StoreUnavailable,
+                Err(e) => ProviderStatus::Errored {
+                    message: e.to_string(),
+                },
+            };
+            statuses.insert(pending.name.clone(), status);
         }
+        *self
+            .provider_status
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = statuses;
         self.publish(prompts);
     }
 
@@ -169,7 +247,7 @@ impl PromptService {
                     provider: provider.to_owned(),
                 })?;
             let McpTransport::Http { url } = &config.transport;
-            let bearer = self.resolve_bearer(&config.name);
+            let (bearer, _) = self.resolve_bearer(&config.name);
             McpProvider::new(config.name.clone(), url.clone(), bearer, PROVIDER_TIMEOUT)
                 .render(name, args)
                 .await?
@@ -177,16 +255,16 @@ impl PromptService {
         Ok(RenderedPrompt { text })
     }
 
-    /// Resolve a provider's bearer from the secret store. A *missing* credential
-    /// (`Ok(None)`) and a *store failure* (`Err`) both degrade to unauthenticated
-    /// here, but the store failure is logged distinctly — M3's status UI uses the
-    /// same distinction to show "store unavailable" vs "token missing".
-    fn resolve_bearer(&self, provider: &str) -> Option<String> {
+    /// Resolve a provider's bearer from the secret store, returning the bearer and
+    /// whether the store read **failed** (vs. simply having no credential). Both
+    /// degrade to unauthenticated, but the failure flag lets the caller record a
+    /// distinct `StoreUnavailable` status.
+    fn resolve_bearer(&self, provider: &str) -> (Option<String>, bool) {
         match self.secrets.get(provider) {
-            Ok(bearer) => bearer,
+            Ok(bearer) => (bearer, false),
             Err(e) => {
                 tracing::warn!(provider = %provider, error = %e, "could not read secret store; treating provider as unauthenticated");
-                None
+                (None, true)
             }
         }
     }
@@ -237,16 +315,195 @@ impl PromptService {
             }
         }
     }
+
+    /// All configured MCP providers with their last-build status and whether a
+    /// bearer is stored. Status comes from the most recent [`sync`](Self::sync);
+    /// a just-added provider reads `Unknown` until the next build completes.
+    #[must_use]
+    pub fn list_mcp_providers(&self) -> Vec<McpProviderInfo> {
+        let statuses = self
+            .provider_status
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.mcp_provider_configs()
+            .into_iter()
+            .map(|config| {
+                let McpTransport::Http { url } = &config.transport;
+                let has_token = matches!(self.secrets.get(&config.name), Ok(Some(_)));
+                let status = statuses
+                    .get(&config.name)
+                    .cloned()
+                    .unwrap_or(ProviderStatus::Unknown);
+                McpProviderInfo {
+                    name: config.name.clone(),
+                    url: url.clone(),
+                    has_token,
+                    status,
+                }
+            })
+            .collect()
+    }
+
+    /// Add a generic HTTP MCP provider: validate the name, write its non-secret
+    /// config entry (preserving every other config key), and store its bearer in
+    /// the secret store. Does **not** rebuild the cache — the caller triggers a
+    /// background sync so a slow server can't block the command.
+    pub fn add_mcp_provider(
+        &self,
+        name: &str,
+        url: &str,
+        bearer: Option<&str>,
+    ) -> Result<(), PromptError> {
+        if !is_valid_provider_name(name) {
+            return Err(PromptError::InvalidProviderName {
+                name: name.to_owned(),
+            });
+        }
+        let mut configs = self.mcp_provider_configs();
+        if configs.iter().any(|c| c.name == name) {
+            return Err(PromptError::DuplicateProvider {
+                name: name.to_owned(),
+            });
+        }
+        configs.push(McpProviderConfig {
+            name: name.to_owned(),
+            transport: McpTransport::Http {
+                url: url.to_owned(),
+            },
+        });
+        self.write_mcp_providers(&configs)?;
+        if let Some(bearer) = bearer {
+            self.secrets.set(name, bearer)?;
+        }
+        Ok(())
+    }
+
+    /// Remove a generic MCP provider: drop its config entry (preserving others),
+    /// delete its stored bearer (best-effort, idempotent), and clear its status.
+    /// Idempotent — removing an unconfigured name is not an error.
+    pub fn remove_mcp_provider(&self, name: &str) -> Result<(), PromptError> {
+        let mut configs = self.mcp_provider_configs();
+        let before = configs.len();
+        configs.retain(|c| c.name != name);
+        if configs.len() != before {
+            self.write_mcp_providers(&configs)?;
+        }
+        let _ = self.secrets.delete(name);
+        self.provider_status
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(name);
+        Ok(())
+    }
+
+    /// Probe a candidate provider before saving: connect, list, and return the
+    /// prompt count, or an error. Uses the supplied bearer directly (the form's
+    /// value, not yet stored).
+    pub async fn test_mcp_connection(
+        &self,
+        url: &str,
+        bearer: Option<String>,
+    ) -> Result<usize, PromptError> {
+        let provider = McpProvider::new(
+            "(test)".to_owned(),
+            url.to_owned(),
+            bearer,
+            PROVIDER_TIMEOUT,
+        );
+        Ok(provider.list_result().await?.len())
+    }
+
+    fn config_path(&self) -> Result<&Path, PromptError> {
+        self.config_path
+            .as_deref()
+            .ok_or(PromptError::NotConfigured)
+    }
+
+    /// Overwrite only the `mcp_providers:` key in `config.yaml`, preserving every
+    /// other top-level key (`local_prompt_dirs` and any personal prefs). Refuses
+    /// to write — rather than clobber — if the existing file isn't a YAML mapping.
+    fn write_mcp_providers(&self, configs: &[McpProviderConfig]) -> Result<(), PromptError> {
+        let path = self.config_path()?;
+        let mut root = read_config_mapping(path)?;
+        let key = serde_norway::Value::String("mcp_providers".to_owned());
+        if configs.is_empty() {
+            root.remove(&key);
+        } else {
+            let value = serde_norway::to_value(configs).map_err(|e| PromptError::ConfigWrite {
+                path: path.to_owned(),
+                message: e.to_string(),
+            })?;
+            root.insert(key, value);
+        }
+        switchboard_core::write_yaml(path, &serde_norway::Value::Mapping(root)).map_err(|e| {
+            PromptError::ConfigWrite {
+                path: path.to_owned(),
+                message: e.to_string(),
+            }
+        })
+    }
+}
+
+/// Read `config.yaml` as a generic YAML mapping for an in-place key edit. Absent,
+/// empty, or null → a fresh mapping. A non-mapping or unparseable file is an
+/// error: we will not clobber a config we can't safely round-trip.
+fn read_config_mapping(path: &Path) -> Result<serde_norway::Mapping, PromptError> {
+    use serde_norway::Value;
+    if !path.exists() {
+        return Ok(serde_norway::Mapping::new());
+    }
+    let bytes = std::fs::read(path).map_err(|e| PromptError::ConfigWrite {
+        path: path.to_owned(),
+        message: e.to_string(),
+    })?;
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return Ok(serde_norway::Mapping::new());
+    }
+    match serde_norway::from_slice::<Value>(&bytes) {
+        Ok(Value::Mapping(mapping)) => Ok(mapping),
+        Ok(Value::Null) => Ok(serde_norway::Mapping::new()),
+        Ok(_) => Err(PromptError::ConfigWrite {
+            path: path.to_owned(),
+            message: "config.yaml is not a YAML mapping; refusing to overwrite it".to_owned(),
+        }),
+        Err(e) => Err(PromptError::ConfigWrite {
+            path: path.to_owned(),
+            message: format!(
+                "config.yaml is not valid YAML ({e}); fix it before editing providers from Settings"
+            ),
+        }),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secret::SecretStoreError;
     use std::path::Path;
     use tempfile::TempDir;
 
+    /// A secret store whose reads always fail — for the `StoreUnavailable` path.
+    struct FailingSecretStore;
+    impl SecretStore for FailingSecretStore {
+        fn get(&self, _: &str) -> Result<Option<String>, SecretStoreError> {
+            Err(SecretStoreError::Backend("store offline".to_owned()))
+        }
+        fn set(&self, _: &str, _: &str) -> Result<(), SecretStoreError> {
+            Err(SecretStoreError::Backend("store offline".to_owned()))
+        }
+        fn delete(&self, _: &str) -> Result<(), SecretStoreError> {
+            Ok(())
+        }
+    }
+
     fn write(dir: &Path, file: &str, content: &str) {
         std::fs::write(dir.join(file), content).unwrap();
+    }
+
+    fn http_provider_yaml(name: &str, url: &str) -> String {
+        format!(
+            "mcp_providers:\n  - name: {name}\n    transport:\n      type: http\n      url: {url}\n"
+        )
     }
 
     fn service_with_prompts_dir() -> (TempDir, PromptService) {
@@ -409,5 +666,157 @@ mod tests {
         );
         service.sync().await;
         assert_eq!(service.list().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn add_provider_preserves_local_dirs_and_unknown_keys() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        // A pre-existing config with a local dir and a non-prompt personal pref.
+        std::fs::write(
+            &config_path,
+            "theme: dark\nlocal_prompt_dirs:\n  - /my/prompts\n",
+        )
+        .unwrap();
+        let store = Arc::new(InMemorySecretStore::new());
+        let service = PromptService::new(
+            config_path.clone(),
+            dir.path().join("prompts"),
+            None,
+            store.clone(),
+        );
+
+        service
+            .add_mcp_provider("team", "https://mcp.example.com", Some("secret-tok"))
+            .unwrap();
+
+        // The MCP entry was added; the local dir and the unknown `theme` key survive.
+        let raw = std::fs::read_to_string(&config_path).unwrap();
+        let value: serde_norway::Value = serde_norway::from_str(&raw).unwrap();
+        let map = value.as_mapping().unwrap();
+        assert_eq!(map.get("theme").and_then(|v| v.as_str()), Some("dark"));
+        assert!(map.contains_key("local_prompt_dirs"));
+        assert!(map.contains_key("mcp_providers"));
+        // The bearer went to the store, never the file.
+        assert!(!raw.contains("secret-tok"));
+        assert_eq!(store.get("team").unwrap().as_deref(), Some("secret-tok"));
+
+        let providers = service.list_mcp_providers();
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].name, "team");
+        assert_eq!(providers[0].url, "https://mcp.example.com");
+        assert!(providers[0].has_token);
+        // No sync yet → Unknown.
+        assert_eq!(providers[0].status, ProviderStatus::Unknown);
+    }
+
+    #[tokio::test]
+    async fn add_rejects_duplicate_and_invalid_names() {
+        let dir = TempDir::new().unwrap();
+        let service = PromptService::new(
+            dir.path().join("config.yaml"),
+            dir.path().join("prompts"),
+            None,
+            Arc::new(InMemorySecretStore::new()),
+        );
+        service.add_mcp_provider("team", "https://a", None).unwrap();
+        assert!(matches!(
+            service.add_mcp_provider("team", "https://b", None),
+            Err(PromptError::DuplicateProvider { .. })
+        ));
+        assert!(matches!(
+            service.add_mcp_provider("local", "https://b", None),
+            Err(PromptError::InvalidProviderName { .. })
+        ));
+        assert!(matches!(
+            service.add_mcp_provider("a:b", "https://b", None),
+            Err(PromptError::InvalidProviderName { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn remove_provider_deletes_config_and_token_and_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        std::fs::write(&config_path, http_provider_yaml("team", "https://a")).unwrap();
+        let store = Arc::new(InMemorySecretStore::new());
+        store.set("team", "tok").unwrap();
+        let service = PromptService::new(
+            config_path.clone(),
+            dir.path().join("prompts"),
+            None,
+            store.clone(),
+        );
+
+        service.remove_mcp_provider("team").unwrap();
+        assert!(service.list_mcp_providers().is_empty());
+        assert_eq!(store.get("team").unwrap(), None);
+        // The now-empty section drops the key rather than leaving `mcp_providers: []`.
+        let raw = std::fs::read_to_string(&config_path).unwrap();
+        assert!(!raw.contains("mcp_providers"));
+        // Idempotent: removing again is fine.
+        service.remove_mcp_provider("team").unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_refuses_to_clobber_unparseable_config() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        std::fs::write(&config_path, "just a scalar, not a mapping\n").unwrap();
+        let service = PromptService::new(
+            config_path,
+            dir.path().join("prompts"),
+            None,
+            Arc::new(InMemorySecretStore::new()),
+        );
+        assert!(matches!(
+            service.add_mcp_provider("team", "https://a", None),
+            Err(PromptError::ConfigWrite { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn sync_marks_unreachable_provider_errored() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        std::fs::write(
+            &config_path,
+            http_provider_yaml("team", "http://127.0.0.1:1/mcp"),
+        )
+        .unwrap();
+        let service = PromptService::new(
+            config_path,
+            dir.path().join("prompts"),
+            None,
+            Arc::new(InMemorySecretStore::new()),
+        );
+        service.sync().await;
+        let providers = service.list_mcp_providers();
+        assert_eq!(providers.len(), 1);
+        assert!(matches!(
+            providers[0].status,
+            ProviderStatus::Errored { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn sync_marks_store_unavailable_when_secret_read_fails() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        std::fs::write(
+            &config_path,
+            http_provider_yaml("team", "http://127.0.0.1:1/mcp"),
+        )
+        .unwrap();
+        let service = PromptService::new(
+            config_path,
+            dir.path().join("prompts"),
+            None,
+            Arc::new(FailingSecretStore),
+        );
+        service.sync().await;
+        let providers = service.list_mcp_providers();
+        assert_eq!(providers[0].status, ProviderStatus::StoreUnavailable);
+        assert!(!providers[0].has_token);
     }
 }

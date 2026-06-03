@@ -18,7 +18,7 @@ serde_norway = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 minijinja = "2.20.0"
-rmcp = { version = "1.7.0", default-features = false, features = ["client", "transport-streamable-http-client-reqwest", "macros"] }
+rmcp = { version = "1.7.0", default-features = false, features = ["client", "transport-streamable-http-client-reqwest", "macros", "reqwest-native-tls"] }
 tokio.workspace = true
 serde_json.workspace = true
 futures.workspace = true

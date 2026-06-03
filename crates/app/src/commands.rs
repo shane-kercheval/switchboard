@@ -429,6 +429,53 @@ pub async fn render_prompt_impl(
     Ok(state.prompts.render(provider, name, args).await?)
 }
 
+/// Configured MCP providers with their last-build status and whether a token is
+/// stored — drives the Settings provider list.
+pub fn list_mcp_providers_impl(state: &AppState) -> Vec<switchboard_prompts::McpProviderInfo> {
+    state.prompts.list_mcp_providers()
+}
+
+/// Add a generic MCP provider (name + URL + optional bearer): writes its config
+/// entry, stores the bearer in the keychain, and kicks off a background cache
+/// rebuild so its prompts appear without blocking the command on a slow server.
+pub fn add_mcp_provider_impl(
+    state: &AppState,
+    name: &str,
+    url: &str,
+    bearer: Option<&str>,
+) -> Result<(), AppError> {
+    state.prompts.add_mcp_provider(name, url, bearer)?;
+    spawn_prompt_sync(state);
+    Ok(())
+}
+
+/// Remove a generic MCP provider: deletes its config entry + keychain token and
+/// rebuilds the cache in the background.
+pub fn remove_mcp_provider_impl(state: &AppState, name: &str) -> Result<(), AppError> {
+    state.prompts.remove_mcp_provider(name)?;
+    spawn_prompt_sync(state);
+    Ok(())
+}
+
+/// Probe a candidate provider before saving (connect + list); returns the prompt
+/// count on success or an actionable error.
+pub async fn test_mcp_connection_impl(
+    state: &AppState,
+    url: &str,
+    bearer: Option<String>,
+) -> Result<usize, AppError> {
+    Ok(state.prompts.test_mcp_connection(url, bearer).await?)
+}
+
+/// Rebuild the prompt cache off the command thread. `PromptService` is cheaply
+/// cloneable and shares its cache, so the spawned clone warms the same cache.
+fn spawn_prompt_sync(state: &AppState) {
+    let prompts = state.prompts.clone();
+    tokio::spawn(async move {
+        prompts.sync().await;
+    });
+}
+
 pub fn create_project_impl(
     state: &AppState,
     name: &str,
@@ -8006,5 +8053,27 @@ mod tests {
         // is empty without a sync.
         let (_tmp, state, _) = fresh_state_with_mock();
         assert!(list_prompts_impl(&state).is_empty());
+    }
+
+    #[tokio::test]
+    async fn mcp_provider_add_list_remove_round_trip() {
+        // Wiring check through the command impls (service logic is covered in the
+        // prompts crate). Uses the state's in-memory secret store.
+        let (_tmp, state) = state_with_prompts();
+
+        add_mcp_provider_impl(&state, "team", "https://mcp.example.com", Some("tok")).unwrap();
+        let providers = list_mcp_providers_impl(&state);
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].name, "team");
+        assert!(providers[0].has_token);
+
+        // Duplicate names are rejected at the command boundary.
+        assert!(matches!(
+            add_mcp_provider_impl(&state, "team", "https://other", None),
+            Err(AppError::Prompt(_))
+        ));
+
+        remove_mcp_provider_impl(&state, "team").unwrap();
+        assert!(list_mcp_providers_impl(&state).is_empty());
     }
 }

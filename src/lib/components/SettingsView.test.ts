@@ -10,6 +10,7 @@ import { _testing as availabilityTesting } from "$lib/harnessAvailability.svelte
 // SettingsView embeds HarnessStatusList, which probes install/auth on mount.
 const invokeMock = vi.fn(async (cmd: string, _args?: Record<string, unknown>) => {
   if (cmd === "get_harness_install_status") return { installed: true, version: "1.0.0" };
+  if (cmd === "list_mcp_providers") return []; // embedded McpServersSettings loads on mount
   return null; // auth probes resolve = authenticated
 });
 vi.mock("@tauri-apps/api/core", () => ({

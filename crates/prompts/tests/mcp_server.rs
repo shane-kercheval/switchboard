@@ -169,6 +169,16 @@ async fn lists_local_and_paginated_mcp_prompts() {
     let greet = prompts.iter().find(|p| p.name == "greet").unwrap();
     assert_eq!(greet.arguments.len(), 1);
     assert!(greet.arguments[0].required);
+
+    // The provider's status reflects a successful build.
+    let info = service.list_mcp_providers();
+    assert_eq!(info.len(), 1);
+    assert_eq!(info[0].name, "team");
+    assert!(info[0].has_token);
+    assert_eq!(
+        info[0].status,
+        switchboard_prompts::ProviderStatus::Ok { prompt_count: 2 }
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

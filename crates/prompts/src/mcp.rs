@@ -62,8 +62,11 @@ impl McpProvider {
             })
     }
 
-    /// Connect + `prompts/list` (paginated to completion), bounded by `timeout`.
-    async fn list_inner(&self) -> Result<Vec<Prompt>, PromptError> {
+    /// Connect + `prompts/list` (paginated to completion), bounded by `timeout`,
+    /// **surfacing the error** so the caller can record a per-provider status.
+    /// The infallible trait `list` wraps this (degrade-to-empty); the cache build
+    /// uses this form to distinguish "ok" from "errored" for the Settings UI.
+    pub(crate) async fn list_result(&self) -> Result<Vec<Prompt>, PromptError> {
         tokio::time::timeout(self.timeout, self.list_uncapped())
             .await
             .map_err(|_| self.timed_out())?
@@ -121,7 +124,7 @@ impl McpProvider {
 
 impl PromptProvider for McpProvider {
     async fn list(&self) -> Vec<Prompt> {
-        match self.list_inner().await {
+        match self.list_result().await {
             Ok(prompts) => prompts,
             Err(e) => {
                 // Degrade-to-empty-with-warning: one down provider must not fail
@@ -247,6 +250,37 @@ fn to_json_object(args: &BTreeMap<String, String>) -> Option<rmcp::model::JsonOb
             .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
             .collect(),
     )
+}
+
+/// HTTPS reachability smoke test — guards against a missing TLS backend (a
+/// transitive `rmcp`/reqwest feature regression: the streamable-HTTP-client
+/// feature pulls reqwest *without* TLS, so HTTPS silently fails with "error
+/// sending request"). Hits a stable public HTTPS endpoint that is **not** an MCP
+/// server, so it needs no token: if TLS works the connection establishes and the
+/// failure is a downstream protocol error, never reqwest's send failure.
+///
+/// Developer-local (`#[ignore]` — needs network). Run after any `rmcp`/reqwest
+/// dependency or feature change: `cargo test -p switchboard-prompts -- --ignored`.
+#[cfg(test)]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires network — verifies HTTPS/TLS works end to end"]
+async fn live_https_connection_establishes() {
+    use std::time::Duration;
+    let provider = McpProvider::new(
+        "(tls-smoke)".to_owned(),
+        "https://example.com/".to_owned(),
+        None,
+        Duration::from_secs(10),
+    );
+    let err = provider
+        .list_result()
+        .await
+        .expect_err("example.com is not an MCP server, so listing must fail");
+    let message = err.to_string();
+    assert!(
+        !message.contains("error sending request"),
+        "HTTPS connection failed — is a TLS backend enabled on rmcp/reqwest? ({message})"
+    );
 }
 
 #[cfg(test)]

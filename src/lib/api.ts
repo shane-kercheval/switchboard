@@ -9,6 +9,7 @@ import type {
   HarnessInstallStatus,
   HarnessKind,
   LoadedTranscript,
+  McpProviderInfo,
   MessageId,
   ProjectConversation,
   ProjectId,
@@ -197,4 +198,36 @@ export async function openExternalUrl(url: string): Promise<void> {
 
 export async function loadTranscript(agentId: AgentId): Promise<LoadedTranscript> {
   return await invoke<LoadedTranscript>("load_transcript", { agentId });
+}
+
+/// Configured MCP prompt-server providers with their status (Settings list).
+export async function listMcpProviders(): Promise<McpProviderInfo[]> {
+  return await invoke<McpProviderInfo[]>("list_mcp_providers");
+}
+
+/// Add a generic MCP server. `bearer` is `null` for an unauthenticated server;
+/// when present it is stored in the OS keychain, never in config. Triggers a
+/// background cache rebuild.
+export async function addMcpProvider(
+  name: string,
+  url: string,
+  bearer: string | null,
+): Promise<void> {
+  await invoke("add_mcp_provider", { name, url, bearer });
+}
+
+/// Remove a configured MCP server (deletes its config entry and stored token).
+export async function removeMcpProvider(name: string): Promise<void> {
+  await invoke("remove_mcp_provider", { name });
+}
+
+/// Probe a candidate server before saving; resolves to the prompt count or
+/// rejects with an actionable error.
+export async function testMcpConnection(url: string, bearer: string | null): Promise<number> {
+  return await invoke<number>("test_mcp_connection", { url, bearer });
+}
+
+/// Rebuild the cached prompt list from all providers (the Settings "Sync" action).
+export async function syncPrompts(): Promise<void> {
+  await invoke("sync_prompts");
 }

@@ -11,6 +11,7 @@ mod journal;
 mod locator_sink;
 mod metadata;
 mod prompts_setup;
+mod secret_store;
 mod state;
 mod workspace;
 
@@ -26,22 +27,22 @@ use tauri::{Emitter, Manager, State};
 use crate::commands::ProjectConversation;
 use crate::commands::{
     AgentSessionInfo, DirectoryInfo, HarnessInstallStatus, ProjectListing, WorkspaceDirectories,
-    agent_session_info_impl, attach_agent_impl, cancel_agent_impl, cancel_send_impl,
-    cancel_turn_impl, check_antigravity_auth_impl, check_antigravity_binary_impl,
+    add_mcp_provider_impl, agent_session_info_impl, attach_agent_impl, cancel_agent_impl,
+    cancel_send_impl, cancel_turn_impl, check_antigravity_auth_impl, check_antigravity_binary_impl,
     check_claude_auth_impl, check_claude_binary_impl, check_codex_auth_impl,
     check_codex_binary_impl, check_gemini_auth_impl, check_gemini_binary_impl, create_agent_impl,
     create_project_impl, get_harness_install_status_impl, init_directory_impl, list_agents_impl,
-    list_projects_impl, list_prompts_impl, list_workspace_directories_impl,
-    load_project_conversation_impl, load_transcript_impl, open_project_impl, parse_uuid,
-    pick_directory_impl, remove_agent_impl, remove_directory_impl, remove_queued_message_impl,
-    rename_agent_impl, render_prompt_impl, search_project_files_in_root,
-    search_project_files_root_impl, send_message_impl, set_active_project_impl,
-    validate_external_url,
+    list_mcp_providers_impl, list_projects_impl, list_prompts_impl,
+    list_workspace_directories_impl, load_project_conversation_impl, load_transcript_impl,
+    open_project_impl, parse_uuid, pick_directory_impl, remove_agent_impl, remove_directory_impl,
+    remove_mcp_provider_impl, remove_queued_message_impl, rename_agent_impl, render_prompt_impl,
+    search_project_files_in_root, search_project_files_root_impl, send_message_impl,
+    set_active_project_impl, test_mcp_connection_impl, validate_external_url,
 };
 use crate::state::AppState;
 
 use switchboard_core::{AgentRecord, HarnessKind, ProjectSummary};
-use switchboard_prompts::{Prompt, RenderedPrompt};
+use switchboard_prompts::{McpProviderInfo, Prompt, RenderedPrompt};
 
 #[tauri::command]
 async fn check_claude_binary(state: State<'_, AppState>) -> Result<(), String> {
@@ -159,6 +160,42 @@ async fn render_prompt(
 async fn sync_prompts(state: State<'_, AppState>) -> Result<(), String> {
     state.inner().prompts.sync().await;
     Ok(())
+}
+
+/// Configured MCP providers with status, for the Settings list.
+#[tauri::command]
+async fn list_mcp_providers(state: State<'_, AppState>) -> Result<Vec<McpProviderInfo>, String> {
+    Ok(list_mcp_providers_impl(state.inner()))
+}
+
+/// Add a generic MCP server (name + URL + optional bearer token).
+#[tauri::command]
+async fn add_mcp_provider(
+    state: State<'_, AppState>,
+    name: String,
+    url: String,
+    bearer: Option<String>,
+) -> Result<(), String> {
+    add_mcp_provider_impl(state.inner(), &name, &url, bearer.as_deref()).map_err(|e| e.to_string())
+}
+
+/// Remove a configured MCP server (deletes its config entry and stored token).
+#[tauri::command]
+async fn remove_mcp_provider(state: State<'_, AppState>, name: String) -> Result<(), String> {
+    remove_mcp_provider_impl(state.inner(), &name).map_err(|e| e.to_string())
+}
+
+/// Probe a candidate MCP server (connect + list) before saving; returns the
+/// number of prompts it exposes.
+#[tauri::command]
+async fn test_mcp_connection(
+    state: State<'_, AppState>,
+    url: String,
+    bearer: Option<String>,
+) -> Result<usize, String> {
+    test_mcp_connection_impl(state.inner(), &url, bearer)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -529,21 +566,45 @@ fn workspace_config_path() -> Option<std::path::PathBuf> {
 /// the app resolves and injects the config path, default prompts dir, home, and
 /// the secret store.
 ///
-/// The injected secret store is in-memory (process-lifetime) for now: nothing
-/// populates the keychain until the "Add MCP server" Settings flow lands, so an
-/// empty in-memory store is behaviorally identical and avoids committing to a
-/// keychain backend before it's exercised end-to-end.
+/// The injected secret store is the OS keychain (`KeyringSecretStore`), namespaced
+/// by build so debug tokens stay separate from a release install's.
 fn build_prompt_service() -> switchboard_prompts::PromptService {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     if let Some(dir) = config_dir() {
         let prompts_dir = dir.join("prompts");
         crate::prompts_setup::seed_example_prompts(&prompts_dir);
-        let secrets = Arc::new(switchboard_prompts::InMemorySecretStore::new());
+        let secrets = build_secret_store(&dir);
         switchboard_prompts::PromptService::new(dir.join("config.yaml"), prompts_dir, home, secrets)
     } else {
         tracing::warn!("no home directory resolved — prompt providers disabled");
         switchboard_prompts::PromptService::disabled()
     }
+}
+
+/// Release builds use the OS keychain. **Debug builds use a plaintext file store**
+/// in the dev config dir instead — an unsigned dev binary's signature changes on
+/// every compile, so the macOS Keychain re-prompts on every credential read; the
+/// file store sidesteps that. Dev-only tradeoff: the token sits in plaintext on
+/// the developer's own machine.
+#[cfg(not(debug_assertions))]
+fn build_secret_store(_dir: &std::path::Path) -> Arc<dyn switchboard_prompts::SecretStore> {
+    Arc::new(crate::secret_store::KeyringSecretStore::new(
+        keyring_service(),
+    ))
+}
+
+#[cfg(debug_assertions)]
+fn build_secret_store(dir: &std::path::Path) -> Arc<dyn switchboard_prompts::SecretStore> {
+    Arc::new(crate::secret_store::FileSecretStore::new(
+        dir.join("mcp-secrets.json"),
+    ))
+}
+
+/// Keychain service name for stored provider bearers (release only — debug uses
+/// the file store, so this isn't compiled there).
+#[cfg(not(debug_assertions))]
+fn keyring_service() -> &'static str {
+    "switchboard"
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -639,6 +700,10 @@ pub fn run() {
             list_prompts,
             render_prompt,
             sync_prompts,
+            list_mcp_providers,
+            add_mcp_provider,
+            remove_mcp_provider,
+            test_mcp_connection,
             create_project,
             open_project,
             set_active_project,

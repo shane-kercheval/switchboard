@@ -31,7 +31,7 @@ Codex and Gemini have limited or absent native MCP-prompt support. Because Switc
 
 ### 2.2 Tiddly's prompt MCP server (the reference target)
 
-- **Transport: Streamable HTTP.** Prod endpoint `https://prompt-mcp.tiddly.me/mcp`; local dev `http://localhost:8002/mcp`. (The notes/bookmarks server `content-mcp.tiddly.me` / `:8001` is **out of scope** — we use the prompts server only.)
+- **Transport: Streamable HTTP.** Prod endpoint `https://prompts-mcp.tiddly.me/mcp`; local dev `http://localhost:8002/mcp`. (The notes/bookmarks server `content-mcp.tiddly.me` / `:8001` is **out of scope** — we use the prompts server only.)
 - **Auth: `Authorization: Bearer <token>`** on every request. Production validates a Tiddly PAT (`bm_` prefix); **dev mode accepts any non-empty string** (this is what makes the local dev server a cheap integration target). The bearer token IS the account scoping — nothing else to configure.
 - Implements `prompts/list` (paginated, 100/page) and `prompts/get` per spec, **plus** prompt-management *tools* (`get_prompt_content`, `search_prompts`, …). Switchboard uses **only the prompts capability**; the tools are ignored. Templates are Jinja2; the server renders and returns one `user` text message. Missing required arg → `InvalidParams`.
 - **No live list updates.** The server advertises `prompts.listChanged: false`, never sends `notifications/prompts/list_changed`, and runs stateless (JSON responses, no held-open SSE stream) — so it has no mechanism to push prompt-set changes. (`listChanged` has been in MCP since the first spec, `2024-11-05`; it is not a feature Tiddly is missing for being out of date — most simple servers leave it off. Receiving it at all would require the client to hold an SSE stream open via an HTTP GET, which a stateless/JSON server like Tiddly does not offer.) Practical consequence: a user who edits a prompt in Tiddly must **Sync** (or restart) to see it — the concrete reason v1 uses build-once + Sync rather than a subscription.
@@ -193,7 +193,7 @@ Milestones are dependency-ordered. Each is independently reviewable and should l
 - All credentials live in the OS keychain — never in `config.yaml`, logs, or error text.
 - A **Sync** button in Settings refreshes the cached prompt list (e.g. after editing prompts on the server mid-session).
 
-(Tiddly is configured through this same generic form in V1 — URL `prompt-mcp.tiddly.me/mcp` + a pasted PAT. The one-click "Connect Tiddly" preset is the deferred M5.)
+(Tiddly is configured through this same generic form in V1 — URL `prompts-mcp.tiddly.me/mcp` + a pasted PAT. The one-click "Connect Tiddly" preset is the deferred M5.)
 
 **Implementation Outline.**
 - Secret store: M2 shipped the `SecretStore` trait + in-memory impl. **M3 implements `KeyringSecretStore`** (the OS-secure-store backend) and the app injects it instead of the in-memory store, then the Add form *populates* it. **Pin `keyring` 3.x** (mature, simple `Entry` API, feature-gated cross-platform stores: `apple-native` / `windows-native` / `sync-secret-service`), **not** the just-released 4.0.1 rearchitecture (`keyring_core` + separately-registered store + global init — heavier, immature store-provider ecosystem); re-evaluate 4.x later. `keyring` is cross-platform, so one impl covers macOS/Windows/Linux; the trait seam means a no-store environment (e.g. headless Linux without Secret Service) can fall back to a different impl without touching providers. `SecretStore::get` returns `Result<Option<…>>` so the status UI can distinguish "no credential" from "secure store unavailable."
@@ -243,7 +243,7 @@ Milestones are dependency-ordered. Each is independently reviewable and should l
 - **Auth0 application prerequisite** (one-time operator task — Native/public app, Device Code + Refresh Token grants; or reuse the CLI's public client as a zero-code fallback). See the original §4 decision 11 detail.
 - **Auth flow** (pure, HTTP-client-injected, in `crates/prompts`): device-code request → poll (`slow_down`/`expired`/`pending`) → mint PAT via `POST /tokens/` with the Auth0 JWT → store PAT + PAT `id` + Auth0 refresh token + email in the keychain (reusing M2's `SecretStore`, extended to a multi-field credential). Map `402`/`451`/`access_denied` to actionable errors. Identify via `GET /users/me`.
 - **Tauri commands + events:** `tiddly_login_start` (returns `user_code` + `verification_uri_complete`, opens the browser via the Tauri host), `tiddly_login_poll` / progress events, `tiddly_disconnect`, `tiddly_status`.
-- **`preset: tiddly` config entry:** baked-in MCP URL (`prompt-mcp.tiddly.me/mcp`) + API base (`api.tiddly.me`), env-overridable; resolves its bearer from the keychain like any provider.
+- **`preset: tiddly` config entry:** baked-in MCP URL (`prompts-mcp.tiddly.me/mcp`) + API base (`api.tiddly.me`), env-overridable; resolves its bearer from the keychain like any provider.
 - **Disconnect** (best-effort silent revoke) and **reconnect/renewal** (401 → refresh → re-mint; background context never launches a browser) per §4 decisions 9–10.
 - **Settings UI:** a "Connect Tiddly" section (device-code spinner; connected state with email + disconnect; quota/consent/timeout error states).
 

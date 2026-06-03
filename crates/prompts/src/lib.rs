@@ -24,7 +24,7 @@ mod service;
 pub use config::{McpProviderConfig, McpTransport, PromptConfig, resolve_local_dirs};
 pub use model::{LOCAL_PROVIDER, Prompt, PromptArgument, PromptId};
 pub use secret::{InMemorySecretStore, SecretStore, SecretStoreError};
-pub use service::{PromptService, RenderedPrompt};
+pub use service::{McpProviderInfo, PromptService, ProviderStatus, RenderedPrompt};
 
 pub use error::PromptError;
 
@@ -108,5 +108,30 @@ mod error {
         /// resource parts, which v1 drops) — there is nothing to send.
         #[error("MCP prompt {name:?} from provider {provider:?} produced no text content")]
         McpEmptyContent { provider: String, name: String },
+
+        /// A provider name supplied to add/update is not a usable addressing
+        /// prefix (empty, reserved `local`, or contains `:`).
+        #[error(
+            "invalid provider name {name:?}: must be non-empty, not `local`, and contain no `:`"
+        )]
+        InvalidProviderName { name: String },
+
+        /// A provider with this name is already configured.
+        #[error("an MCP provider named {name:?} already exists")]
+        DuplicateProvider { name: String },
+
+        /// Writing the user-global `config.yaml` failed (I/O, or it isn't a YAML
+        /// mapping we can safely round-trip).
+        #[error("could not update {path}: {message}")]
+        ConfigWrite { path: PathBuf, message: String },
+
+        /// The service has no resolved config path (the disabled service); there
+        /// is nowhere to persist provider config.
+        #[error("prompt providers are not configured (no config path)")]
+        NotConfigured,
+
+        /// The secret store could not store or delete a credential.
+        #[error(transparent)]
+        Secret(#[from] crate::secret::SecretStoreError),
     }
 }

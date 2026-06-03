@@ -39,6 +39,7 @@ tauri-plugin-clipboard-manager = "2.3.2"
 url = "2.5.8"
 ignore = "0.4.25"
 switchboard-prompts = { version = "0.0.1", path = "../prompts" }
+keyring = { version = "3", features = ["apple-native"] }
 
 [dev-dependencies]
 tokio = { workspace = true }

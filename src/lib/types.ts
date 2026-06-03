@@ -415,3 +415,18 @@ export const HEARTBEAT_TIMEOUT_MS = 60_000;
 // Agent-scoped events (`session_meta`, `rate_limit_event`) intentionally do NOT
 // re-arm — they're not turn-anchored and can flow at any time without
 // indicating turn progress.
+
+// ── Prompt providers (MCP server management — system-design §6) ───────────────
+// Mirror the Rust `#[serde(tag = "state", rename_all = "snake_case")]` shape.
+export type ProviderStatus =
+  | { state: "ok"; prompt_count: number }
+  | { state: "errored"; message: string }
+  | { state: "store_unavailable" }
+  | { state: "unknown" };
+
+export type McpProviderInfo = {
+  name: string;
+  url: string;
+  has_token: boolean;
+  status: ProviderStatus;
+};

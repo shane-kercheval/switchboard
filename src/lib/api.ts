@@ -96,6 +96,13 @@ export async function deleteProject(projectId: ProjectId): Promise<void> {
   await invoke("delete_project", { projectId });
 }
 
+/// Archive or unarchive a project — a user-global view-state flip
+/// (`workspace.yaml`). Display-only: never stops a running agent and works even
+/// when the project's directory is offline.
+export async function setProjectArchived(projectId: ProjectId, archived: boolean): Promise<void> {
+  await invoke("set_project_archived", { projectId, archived });
+}
+
 // Removes a directory from the workspace: drains its projects' in-flight turns,
 // releases their locks, and drops the entry — leaving `.switchboard/` on disk.
 export async function removeDirectory(path: string): Promise<void> {

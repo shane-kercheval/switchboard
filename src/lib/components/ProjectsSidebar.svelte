@@ -23,6 +23,11 @@
   import StopIcon from "$lib/components/ui/StopIcon.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
   import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
+  import {
+    SEGMENTED_CONTAINER_CLASS,
+    SEGMENTED_ITEM_ACTIVE_CLASS,
+    SEGMENTED_ITEM_INACTIVE_CLASS,
+  } from "$lib/components/ui/segmentedControl";
   import { windowDragRegion } from "$lib/windowDrag";
 
   let {
@@ -44,6 +49,20 @@
       cancelSend(sendId, agentIds);
     }
   }
+
+  /// `Active | Archived` view filter. Default `Active`. A true either/or split:
+  /// each view shows exactly the projects whose `archived` flag matches it
+  /// (sorting is unchanged — `projects.list` stays `last_activity`-ordered).
+  let archivedView = $state<"active" | "archived">("active");
+  const visibleProjects = $derived(
+    projects.list.filter((p) => p.archived === (archivedView === "archived")),
+  );
+  const segmentClass = (selected: boolean): string =>
+    cn(
+      "h-6 rounded-full px-2 text-[11px] font-medium transition-colors",
+      selected ? SEGMENTED_ITEM_ACTIVE_CLASS : SEGMENTED_ITEM_INACTIVE_CLASS,
+    );
+
   /// Inline rename editor (mirrors the agent-card rename in `Sidebar.svelte`).
   /// Only one row edits at a time, so a single `editingProjectId` + `draftName`
   /// suffices; `renameError` holds a backend rejection (the live format/
@@ -161,22 +180,53 @@
 
   <SidebarSection title="Projects">
     {#snippet action()}
-      <button
-        type="button"
-        class={ICON_BUTTON_CLASS}
-        aria-label="Add a project"
-        data-testid="add-project"
-        onclick={onAddProject}
-      >
-        <PlusIcon />
-      </button>
+      <div class="flex items-center gap-1.5">
+        <div
+          class={cn(SEGMENTED_CONTAINER_CLASS, "flex")}
+          role="tablist"
+          aria-label="Filter projects"
+          data-testid="project-view-toggle"
+        >
+          <button
+            type="button"
+            role="tab"
+            aria-selected={archivedView === "active"}
+            class={segmentClass(archivedView === "active")}
+            data-testid="project-view-active"
+            onclick={() => (archivedView = "active")}
+          >
+            Active
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={archivedView === "archived"}
+            class={segmentClass(archivedView === "archived")}
+            data-testid="project-view-archived"
+            onclick={() => (archivedView = "archived")}
+          >
+            Archived
+          </button>
+        </div>
+        <button
+          type="button"
+          class={ICON_BUTTON_CLASS}
+          aria-label="Add a project"
+          data-testid="add-project"
+          onclick={onAddProject}
+        >
+          <PlusIcon />
+        </button>
+      </div>
     {/snippet}
 
-    {#if projects.list.length === 0}
-      <p class="text-muted px-3 py-3 text-xs">No projects yet.</p>
+    {#if visibleProjects.length === 0}
+      <p class="text-muted px-3 py-3 text-xs">
+        {archivedView === "archived" ? "No archived projects." : "No projects yet."}
+      </p>
     {/if}
     <div class="flex flex-col gap-0.5 px-2 pb-2">
-      {#each projects.list as project (project.id)}
+      {#each visibleProjects as project (project.id)}
         {@const liveSends = liveProjectSends(project.id)}
         {@const busy = liveSends.size > 0}
         {@const completed = !busy && project.id in backgroundCompletedProjectIds}
@@ -286,13 +336,14 @@
                    rightmost element, flush to the edge — the kebab's reserved
                    (opacity-0) slot sits to its LEFT and only becomes visible on
                    hover/focus/menu-open, so a completed checkmark never looks
-                   indented. Shown only for available, non-busy projects:
-                   Rename/Delete need on-disk access (M3's offline Archive will
-                   relax `available`), and while busy the spinner/cancel owns the
-                   slot — the kebab isn't rendered at all so hovering to cancel
-                   never shifts it. Mutating a project mid-run is intentionally
+                   indented. Gated on `!busy` only: Archive/Unarchive works even
+                   when the directory is unavailable, so the menu shows on
+                   unavailable rows too (Rename/Delete disabled there via
+                   `available`); while busy the spinner/cancel owns the slot, so
+                   the kebab isn't rendered at all and hovering to cancel never
+                   shifts it. Mutating a running project is intentionally
                    unavailable — stop it first. -->
-              {#if project.available && !busy}
+              {#if !busy}
                 <div
                   class="opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100 has-[[data-state=open]]:opacity-100"
                 >

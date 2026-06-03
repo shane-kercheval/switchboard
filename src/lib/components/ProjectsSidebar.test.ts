@@ -42,6 +42,7 @@ function project(id: string): ProjectListing {
     directory: `/work/${id.slice(-2)}`,
     available: true,
     last_activity: "2026-05-16T00:00:00Z",
+    archived: false,
   };
 }
 
@@ -216,7 +217,7 @@ describe("ProjectsSidebar — background activity", () => {
   });
 });
 
-function projectIn(id: string, name: string, directory: string): ProjectListing {
+function projectIn(id: string, name: string, directory: string, archived = false): ProjectListing {
   return {
     id,
     name,
@@ -224,6 +225,7 @@ function projectIn(id: string, name: string, directory: string): ProjectListing 
     directory,
     available: true,
     last_activity: "2026-05-16T00:00:00Z",
+    archived,
   };
 }
 
@@ -388,12 +390,6 @@ describe("ProjectsSidebar — rename", () => {
     expect(renameCalls).toHaveLength(1);
   });
 
-  it("omits the kebab on unavailable rows (through M1–M2)", async () => {
-    mockRenameEchoes();
-    await renderWith([{ ...projectIn(A1, "alpha", "/work/a"), available: false }]);
-    expect(screen.queryByTestId("project-actions-trigger")).toBeNull();
-  });
-
   it("omits the kebab while the project is busy so the cancel control owns the right slot", async () => {
     // A live send makes the project busy → the spinner/cancel renders and the
     // kebab is suppressed entirely (no hidden-but-laid-out button pushing it).
@@ -464,5 +460,73 @@ describe("ProjectsSidebar — delete", () => {
     // The row is kept, and the menu is back to its idle actions.
     expect(screen.getByTestId("project-row")).toBeInTheDocument();
     expect(screen.getByTestId("project-action-delete")).toBeInTheDocument();
+  });
+});
+
+describe("ProjectsSidebar — archive + view toggle", () => {
+  const A1 = "00000000-0000-7000-8000-0000000000b1";
+  const A2 = "00000000-0000-7000-8000-0000000000b2";
+
+  it("Active view hides archived projects; Archived view shows only them", async () => {
+    await renderWith([
+      projectIn(A1, "active-one", "/work/a"),
+      projectIn(A2, "archived-one", "/work/a", true),
+    ]);
+
+    // Default Active view: only the non-archived row.
+    let rows = screen.getAllByTestId("project-row");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toHaveAttribute("data-project-id", A1);
+
+    // Switch to Archived: only the archived row.
+    await fireEvent.click(screen.getByTestId("project-view-archived"));
+    rows = screen.getAllByTestId("project-row");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toHaveAttribute("data-project-id", A2);
+  });
+
+  it("empty-state copy is view-aware", async () => {
+    await renderWith([projectIn(A1, "active-one", "/work/a")]);
+    // No archived projects → Archived view shows the archived empty message.
+    await fireEvent.click(screen.getByTestId("project-view-archived"));
+    expect(screen.getByText("No archived projects.")).toBeInTheDocument();
+  });
+
+  it("Archive item calls through and the row leaves the Active view", async () => {
+    await renderWith([projectIn(A1, "alpha", "/work/a")]);
+    await fireEvent.click(screen.getByTestId("project-actions-trigger"));
+    await fireEvent.click(await screen.findByTestId("project-action-archive"));
+
+    expect(invokeMock).toHaveBeenCalledWith("set_project_archived", {
+      projectId: A1,
+      archived: true,
+    });
+    // The (now-archived) row drops out of the default Active view.
+    await waitFor(() => expect(screen.queryByTestId("project-row")).toBeNull());
+  });
+
+  it("menu shows Unarchive for an archived project", async () => {
+    await renderWith([projectIn(A1, "alpha", "/work/a", true)]);
+    await fireEvent.click(screen.getByTestId("project-view-archived"));
+    await fireEvent.click(screen.getByTestId("project-actions-trigger"));
+
+    const item = await screen.findByTestId("project-action-archive");
+    expect(item).toHaveTextContent("Unarchive project");
+    await fireEvent.click(item);
+    expect(invokeMock).toHaveBeenCalledWith("set_project_archived", {
+      projectId: A1,
+      archived: false,
+    });
+  });
+
+  it("on an unavailable row the menu still shows, with Archive enabled and Rename/Delete disabled", async () => {
+    await renderWith([{ ...projectIn(A1, "alpha", "/work/a"), available: false }]);
+    await fireEvent.click(screen.getByTestId("project-actions-trigger"));
+
+    expect(await screen.findByTestId("project-action-archive")).not.toHaveAttribute(
+      "data-disabled",
+    );
+    expect(screen.getByTestId("project-action-rename")).toHaveAttribute("data-disabled");
+    expect(screen.getByTestId("project-action-delete")).toHaveAttribute("data-disabled");
   });
 });

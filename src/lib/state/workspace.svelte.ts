@@ -367,6 +367,16 @@ export async function deleteProject(projectId: ProjectId): Promise<void> {
   }
 }
 
+/// Archive or unarchive a project (user-global view-state). The backend flips
+/// the flag in `workspace.yaml`; on success we mirror it onto the matching
+/// `projects.list` row so the `Active | Archived` filter updates immediately
+/// without a relist. Display-only — never touches the project's agents. Errors
+/// propagate to the caller (the menu surfaces them and keeps the current state).
+export async function setProjectArchived(projectId: ProjectId, archived: boolean): Promise<void> {
+  await api.setProjectArchived(projectId, archived);
+  projects.list = projects.list.map((p) => (p.id === projectId ? { ...p, archived } : p));
+}
+
 /// Dismiss the auto-create failure banner for one harness.
 export function dismissAgentCreationFailure(harness: HarnessKind): void {
   const idx = agentCreationFailures.findIndex((f) => f.harness === harness);

@@ -49,6 +49,11 @@ pub struct ProjectListing {
     /// unavailable directory (served from the cache) this is just `created_at`
     /// — its journal can't be stat'd while the directory is unreadable.
     pub last_activity: chrono::DateTime<chrono::Utc>,
+    /// Whether the user has archived this project (hidden from the default
+    /// view). User-global view-state from `workspace.yaml`, not on-disk project
+    /// state — computed per row from the archived set, so it's reported even for
+    /// rows served from the cache while their directory is unavailable.
+    pub archived: bool,
 }
 
 /// Read-only inspection. Canonicalizes the path, checks whether
@@ -326,6 +331,7 @@ pub fn list_projects_impl(state: &AppState) -> Result<Vec<ProjectListing>, AppEr
                 let last_activity = directory.map_or(s.created_at, |d| {
                     d.project_last_activity(s.id, s.created_at)
                 });
+                let archived = lock(&state.workspace).is_archived(s.id);
                 listings.push(ProjectListing {
                     id: s.id,
                     name: s.name,
@@ -333,6 +339,7 @@ pub fn list_projects_impl(state: &AppState) -> Result<Vec<ProjectListing>, AppEr
                     directory: dir_str.clone(),
                     available: true,
                     last_activity,
+                    archived,
                 });
             }
         } else {
@@ -343,6 +350,7 @@ pub fn list_projects_impl(state: &AppState) -> Result<Vec<ProjectListing>, AppEr
                 .map(|e| e.cached_projects.clone())
                 .unwrap_or_default();
             for s in cached {
+                let archived = lock(&state.workspace).is_archived(s.id);
                 listings.push(ProjectListing {
                     id: s.id,
                     name: s.name,
@@ -350,6 +358,7 @@ pub fn list_projects_impl(state: &AppState) -> Result<Vec<ProjectListing>, AppEr
                     directory: dir_str.clone(),
                     available: false,
                     last_activity: s.created_at,
+                    archived,
                 });
             }
         }
@@ -479,6 +488,7 @@ pub fn rename_project_impl(
         persist_workspace(state);
     }
 
+    let archived = lock(&state.workspace).is_archived(summary.id);
     Ok(ProjectListing {
         directory: directory.path.to_string_lossy().into_owned(),
         available: true,
@@ -486,7 +496,35 @@ pub fn rename_project_impl(
         id: summary.id,
         name: summary.name,
         created_at: summary.created_at,
+        archived,
     })
+}
+
+/// Archive or unarchive a project — a user-global *view-state* flip stored in
+/// `workspace.yaml`. Deliberately the lightest of the project ops: it takes only
+/// the `workspace` lock, touches **no** on-disk project state, **no**
+/// `registry_write`, **no** directory resolution, and **no** dispatcher — so it
+/// works whether the project's directory is loaded, available, or offline, and
+/// never interrupts a running agent. Validates the id is one the workspace knows
+/// (present in some cached snapshot) so a bogus id can't accumulate in the set.
+/// Returns `()`; the frontend flips the row locally and the next `list_projects`
+/// confirms it from the persisted set.
+pub fn set_project_archived_impl(
+    state: &AppState,
+    project_id: ProjectId,
+    archived: bool,
+) -> Result<(), AppError> {
+    let changed = {
+        let mut workspace = lock(&state.workspace);
+        if !workspace.knows_project(project_id) {
+            return Err(AppError::ProjectNotLoaded(project_id));
+        }
+        workspace.set_archived(project_id, archived)
+    };
+    if changed {
+        persist_workspace(state);
+    }
+    Ok(())
 }
 
 /// Permanently delete one project's Switchboard state. Mirrors
@@ -572,6 +610,9 @@ pub async fn delete_project_impl(state: &AppState, project_id: ProjectId) -> Res
         needs.retain(|id| !agent_ids.contains(id));
     }
     lock(&state.agents_by_id).retain(|_, r| r.project_id != project_id);
+    // Scrub the archived flag so a future project re-created with this id (ids
+    // are minted fresh, but be defensive) can't inherit a stale archived state.
+    lock(&state.workspace).set_archived(project_id, false);
 
     // Keep the workspace cache from resurrecting the deleted project: refresh
     // from a fresh index read when available, else drop just the deleted id from
@@ -6086,6 +6127,88 @@ mod tests {
         // The real project is untouched.
         assert!(lock(&state.projects).get(&keep.id).is_some());
         assert_eq!(list_projects_impl(&state).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn set_project_archived_flips_flag_in_listing() {
+        let (tmp, state, _) = fresh_state_with_mock();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "alpha");
+
+        let archived_of = |s: &AppState| list_projects_impl(s).unwrap()[0].archived;
+        assert!(!archived_of(&state), "new projects start un-archived");
+
+        set_project_archived_impl(&state, project.id, true).unwrap();
+        assert!(archived_of(&state));
+
+        set_project_archived_impl(&state, project.id, false).unwrap();
+        assert!(!archived_of(&state));
+    }
+
+    #[tokio::test]
+    async fn set_project_archived_unknown_id_errors() {
+        let (tmp, state, _) = fresh_state_with_mock();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        create_project_in_only_dir(&state, "alpha");
+
+        let err = set_project_archived_impl(&state, Uuid::now_v7(), true).unwrap_err();
+        assert!(matches!(err, AppError::ProjectNotLoaded(_)));
+    }
+
+    #[tokio::test]
+    async fn set_project_archived_works_for_unavailable_project() {
+        // Archive is global view-state — it must work even when the project's
+        // directory is offline (the "clear a stale unavailable row" lever).
+        let (tmp, state, _) = fresh_state_with_mock();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "alpha");
+        // Simulate the directory going unavailable: drop the loaded handle but
+        // keep the workspace cache (which is how an unavailable row is served).
+        lock(&state.directories).clear();
+
+        set_project_archived_impl(&state, project.id, true).unwrap();
+        assert!(lock(&state.workspace).is_archived(project.id));
+    }
+
+    #[tokio::test]
+    async fn set_project_archived_does_not_interrupt_a_running_agent() {
+        // Archive is display-only: it must not cancel/drain an in-flight turn.
+        let (tmp, state, emitter) =
+            fresh_state_with_scenario(switchboard_harness::MockScenario::AwaitCancellation);
+        let (agent, project_id) = project_with_agent(&state, &tmp).await;
+
+        send_msg(&state, agent.id, "long task").await.unwrap();
+        within(
+            &emitter,
+            "turn_start",
+            emitter.wait_for_type("turn_start", 1),
+        )
+        .await;
+
+        set_project_archived_impl(&state, project_id, true).unwrap();
+
+        // The turn is untouched: no cancellation terminal, still parked.
+        let channel = format!("agent:{}", agent.id);
+        let cancelled = emitter
+            .snapshot()
+            .into_iter()
+            .any(|(name, v)| name == channel && v["type"] == "turn_end");
+        assert!(!cancelled, "archiving must not end the running turn");
+
+        // Wind the parked turn down so the test doesn't leave it hanging.
+        cancel_agent_impl(&state, agent.id);
+        within(
+            &emitter,
+            "agent_idle",
+            emitter.wait_for_type("agent_idle", 1),
+        )
+        .await;
     }
 
     #[cfg(unix)]

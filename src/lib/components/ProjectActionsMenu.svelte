@@ -6,7 +6,7 @@
   /// triggers; Delete is self-contained here via an inline confirm sub-view,
   /// mirroring `AgentActionsMenu`'s remove flow (no separate dialog).
   import type { ProjectListing } from "$lib/types";
-  import { deleteProject } from "$lib/state/workspace.svelte";
+  import { deleteProject, setProjectArchived } from "$lib/state/workspace.svelte";
   import DropdownMenu from "$lib/components/ui/DropdownMenu.svelte";
   import DropdownMenuItem from "$lib/components/ui/DropdownMenuItem.svelte";
 
@@ -16,6 +16,14 @@
     open = $bindable(false),
   }: { project: ProjectListing; onRename: () => void; open?: boolean } = $props();
 
+  /// Rename/Delete need the project's directory loaded, so they're gated on
+  /// availability — derived from the project model itself (single source of
+  /// truth; no separate prop a caller could forget and silently re-enable them).
+  /// Archive/Unarchive is global view-state and stays enabled regardless (it's
+  /// why the menu shows on unavailable rows at all).
+  const available = $derived(project.available);
+  const unavailableTitle = $derived(available ? undefined : "Directory unavailable");
+
   // Inline-confirm state for Delete — no dialog. The first click swaps the menu's
   // contents to a focused confirm view while keeping it open (the Delete item
   // sets `closeOnSelect={false}`); `deleting` guards against a double-confirm
@@ -24,13 +32,29 @@
   let deleting = $state(false);
   let deleteError = $state<string | null>(null);
 
+  let archiveError = $state<string | null>(null);
+
   // Reopening the menu resets the confirm affordance to its idle state.
   $effect(() => {
     if (!open) {
       confirmingDelete = false;
       deleteError = null;
+      archiveError = null;
     }
   });
+
+  // Archive/Unarchive is a direct view-state flip (no confirm). On success the
+  // row leaves the current view (Active hides it / Archived reveals it), so we
+  // close the menu; on failure we keep it open and surface the error.
+  async function toggleArchive(): Promise<void> {
+    archiveError = null;
+    try {
+      await setProjectArchived(project.id, !project.archived);
+      open = false;
+    } catch (err) {
+      archiveError = err instanceof Error ? err.message : String(err);
+    }
+  }
 
   function startDelete(): void {
     deleteError = null;
@@ -100,17 +124,36 @@
       Cancel
     </DropdownMenuItem>
   {:else}
-    <DropdownMenuItem onSelect={onRename} data-testid="project-action-rename">
+    <DropdownMenuItem
+      onSelect={onRename}
+      disabled={!available}
+      title={unavailableTitle}
+      data-testid="project-action-rename"
+    >
       Rename project
+    </DropdownMenuItem>
+    <DropdownMenuItem
+      onSelect={toggleArchive}
+      closeOnSelect={false}
+      data-testid="project-action-archive"
+    >
+      {project.archived ? "Unarchive project" : "Archive project"}
     </DropdownMenuItem>
     <DropdownMenuItem
       onSelect={startDelete}
       closeOnSelect={false}
+      disabled={!available}
+      title={unavailableTitle}
       class="text-status-failed"
       data-testid="project-action-delete"
     >
       Delete project
     </DropdownMenuItem>
+    {#if archiveError !== null}
+      <div class="text-status-failed px-2.5 py-1.5 text-xs" data-testid="project-archive-error">
+        Couldn't update project: {archiveError}
+      </div>
+    {/if}
     {#if deleteError !== null}
       <div class="text-status-failed px-2.5 py-1.5 text-xs" data-testid="project-delete-error">
         Couldn't delete project: {deleteError}

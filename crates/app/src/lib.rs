@@ -29,12 +29,13 @@ use crate::commands::{
     cancel_turn_impl, check_antigravity_auth_impl, check_antigravity_binary_impl,
     check_claude_auth_impl, check_claude_binary_impl, check_codex_auth_impl,
     check_codex_binary_impl, check_gemini_auth_impl, check_gemini_binary_impl, create_agent_impl,
-    create_project_impl, get_harness_install_status_impl, init_directory_impl, list_agents_impl,
-    list_projects_impl, list_workspace_directories_impl, load_project_conversation_impl,
-    load_transcript_impl, open_project_impl, parse_uuid, pick_directory_impl, remove_agent_impl,
-    remove_directory_impl, remove_queued_message_impl, rename_agent_impl,
-    search_project_files_in_root, search_project_files_root_impl, send_message_impl,
-    set_active_project_impl, validate_external_url,
+    create_project_impl, delete_project_impl, get_harness_install_status_impl, init_directory_impl,
+    list_agents_impl, list_projects_impl, list_workspace_directories_impl,
+    load_project_conversation_impl, load_transcript_impl, open_project_impl, parse_uuid,
+    pick_directory_impl, remove_agent_impl, remove_directory_impl, remove_queued_message_impl,
+    rename_agent_impl, rename_project_impl, search_project_files_in_root,
+    search_project_files_root_impl, send_message_impl, set_active_project_impl,
+    set_project_archived_impl, validate_external_url,
 };
 use crate::state::AppState;
 
@@ -135,6 +136,34 @@ async fn create_project(
     directory: String,
 ) -> Result<ProjectSummary, String> {
     create_project_impl(state.inner(), &name, &directory).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn rename_project(
+    state: State<'_, AppState>,
+    project_id: String,
+    new_name: String,
+) -> Result<ProjectListing, String> {
+    let id = parse_uuid(&project_id).map_err(|e| e.to_string())?;
+    rename_project_impl(state.inner(), id, &new_name).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn delete_project(state: State<'_, AppState>, project_id: String) -> Result<(), String> {
+    let id = parse_uuid(&project_id).map_err(|e| e.to_string())?;
+    delete_project_impl(state.inner(), id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn set_project_archived(
+    state: State<'_, AppState>,
+    project_id: String,
+    archived: bool,
+) -> Result<(), String> {
+    let id = parse_uuid(&project_id).map_err(|e| e.to_string())?;
+    set_project_archived_impl(state.inner(), id, archived).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -566,6 +595,9 @@ pub fn run() {
             list_projects,
             list_workspace_directories,
             create_project,
+            rename_project,
+            delete_project,
+            set_project_archived,
             open_project,
             set_active_project,
             create_agent,

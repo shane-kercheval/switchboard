@@ -34,6 +34,8 @@ crates/app/gen/
 # Local switchboard state
 .switchboard/
 /.antigravitycli
+# Per-checkout dev runtime cache (maps repo path → id); developer-local, never committed
+/cache/
 
 # fake_agy test-fixture control files (written into per-test cwds by
 # fixture-backed dispatches)

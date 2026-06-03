@@ -5,9 +5,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, Result};
-use crate::io::{append_jsonl, read_jsonl, read_yaml, write_yaml};
+use crate::io::{append_jsonl, read_jsonl, read_yaml, write_jsonl, write_yaml};
 use crate::name::{canonicalize_for_uniqueness, validate_name};
-use crate::project::{self, Project, ProjectId, ProjectSummary};
+use crate::project::{
+    self, PROJECT_CONFIG_VERSION, Project, ProjectConfig, ProjectId, ProjectSummary,
+};
 
 use crate::paths::{
     CONFIG_FILE, JOURNAL_FILE, PROJECTS_DIR, PROJECTS_INDEX, PROMPTS_DIR, SWITCHBOARD_DIR,
@@ -146,6 +148,142 @@ impl Directory {
             .ok_or(CoreError::ProjectNotFound(id))?;
         let root = self.projects_dir().join(summary.id.to_string());
         project::load(&self.path, summary.id, root)
+    }
+
+    /// Rename a project in place: same directory, new display name. Validates
+    /// the new name's format and its per-directory canonicalized uniqueness
+    /// against the *other* projects (self excluded, so re-saving the same name —
+    /// or a case/hyphen variant — is allowed), then **dual-writes** both copies
+    /// of the project's identity: the canonical `config.yaml` and the
+    /// denormalized `projects.jsonl` index entry. Returns the updated summary.
+    ///
+    /// # Atomicity / partial-write contract
+    ///
+    /// The two writes can't be made atomic without a journal, so the order is
+    /// deliberate: rewrite `config.yaml` (canonical) **first**, then
+    /// `projects.jsonl` (the index every UI surface reads) as the **commit**.
+    /// If the index write fails — `Err` returned, *or* a crash between the two —
+    /// `config.yaml` is left "ahead" with the new name while the index still
+    /// holds the old one. This is benign and parallels `create_project`'s
+    /// orphan-directory note: the index is what lists/renders, so the user sees
+    /// the old name (consistent with the failure they were shown), and the next
+    /// successful rename of the same project reconciles both files. Hence an
+    /// `Err` from this method does **not** guarantee nothing changed on disk —
+    /// callers must not treat it as "no-op" (`rename_project_impl` correctly
+    /// leaves in-memory state untouched on `Err`, matching the stale index). We
+    /// deliberately do **not** roll back `config.yaml`: rolling back after a
+    /// possible commit is the exact anti-pattern `io::append_jsonl` warns
+    /// against, and `write_jsonl`'s post-rename dir-fsync window means an `Err`
+    /// doesn't even prove the index is still old.
+    ///
+    /// # Concurrency
+    ///
+    /// Same instance-level serialization requirement as `create_project` — the
+    /// read-check-then-write sequence has a TOCTOU window. Callers serialize via
+    /// the app's `registry_write` mutex.
+    pub fn rename_project(&self, id: ProjectId, new_name: &str) -> Result<ProjectSummary> {
+        validate_name(new_name)?;
+        let mut summaries = self.list_projects()?;
+        let idx = summaries
+            .iter()
+            .position(|s| s.id == id)
+            .ok_or(CoreError::ProjectNotFound(id))?;
+        let canonical = canonicalize_for_uniqueness(new_name);
+        for (i, existing) in summaries.iter().enumerate() {
+            if i == idx {
+                continue;
+            }
+            if canonicalize_for_uniqueness(&existing.name) == canonical {
+                return Err(CoreError::DuplicateProjectName {
+                    name: new_name.to_owned(),
+                    existing: existing.name.clone(),
+                });
+            }
+        }
+
+        // Rewrite the canonical config.yaml first, then the denormalized index
+        // (the commit). Build the config directly rather than reading it back:
+        // `version` is the current constant and `created_at` already lives in
+        // the index summary, so a read would only add a disk round-trip and a
+        // late failure window *after* uniqueness already passed. (If
+        // `ProjectConfig` ever gains a field a rename must preserve, switch back
+        // to read-then-mutate here.)
+        let config_path = self.projects_dir().join(id.to_string()).join(CONFIG_FILE);
+        let config = ProjectConfig {
+            version: PROJECT_CONFIG_VERSION,
+            name: new_name.to_owned(),
+            created_at: summaries[idx].created_at,
+        };
+        write_yaml(&config_path, &config)?;
+
+        new_name.clone_into(&mut summaries[idx].name);
+        let updated = summaries[idx].clone();
+        write_jsonl(&self.projects_index_path(), &summaries)?;
+        Ok(updated)
+    }
+
+    /// Permanently delete a project's Switchboard state: drop its
+    /// `projects.jsonl` entry, then recursively remove its `projects/<id>/`
+    /// directory (config, registry, journal, sessions, runs). **Scoped to
+    /// `projects_dir()`** — never the working directory, `.switchboard/` itself,
+    /// sibling projects, or any harness-native session file (`~/.claude/…`,
+    /// `~/.codex/…`, …). This is the rewrite-on-mutation path for the otherwise
+    /// append-only index, like rename.
+    ///
+    /// # Atomicity / ordering / failure model
+    ///
+    /// Index-rewrite first (**the commit**), then `remove_dir_all`. Dropping the
+    /// index entry is the point at which the project stops existing — once it
+    /// returns, the project no longer lists. The directory removal that follows
+    /// is **best-effort**: a leftover directory with no index entry is a benign,
+    /// unreachable orphan (its UUID is unrecoverable; `list_projects` never
+    /// surfaces it), exactly the tolerated state `create_project` leaves when its
+    /// post-directory index append fails. So a failed removal is **not** an
+    /// error here — surfacing one would imply "nothing was deleted," but the
+    /// listing is already gone. The reverse order (rmdir then index) is what we
+    /// avoid: a removed directory with a surviving index entry *would* surface as
+    /// a broken listing.
+    ///
+    /// The **only** failures this returns are reading or rewriting the index
+    /// (the steps that actually change what lists) — i.e. genuine "the project
+    /// could not be removed from the listing" conditions. A missing index file
+    /// (`MissingAppendOnlyFile`) is *not* such a failure: there's no entry to
+    /// drop, so we skip the rewrite and still remove the directory.
+    ///
+    /// # Idempotency
+    ///
+    /// A missing project is a benign no-op: if `id` isn't in the index the
+    /// rewrite is skipped, and a missing directory is ignored. A double-delete
+    /// (or deleting a project removed out-of-band) returns `Ok(())`.
+    ///
+    /// # Concurrency
+    ///
+    /// Same instance-level serialization requirement as `create_project`.
+    pub fn delete_project(&self, id: ProjectId) -> Result<()> {
+        // Tolerate a missing index file (`.switchboard/` present but
+        // `projects.jsonl` gone out-of-band): no entry to drop, but the project
+        // directory below must still be removed. A genuine read failure (I/O,
+        // corruption) propagates — we must not rewrite an index we couldn't
+        // read, or we'd lose sibling entries.
+        let mut summaries = match self.list_projects() {
+            Ok(summaries) => summaries,
+            Err(CoreError::MissingAppendOnlyFile { .. }) => Vec::new(),
+            Err(e) => return Err(e),
+        };
+        let before = summaries.len();
+        summaries.retain(|s| s.id != id);
+        // Rewrite only when an entry was actually dropped — a double-delete must
+        // not churn the index, and a never-existent id must not recreate it.
+        // This is the commit: once it returns Ok, the project no longer lists.
+        if summaries.len() != before {
+            write_jsonl(&self.projects_index_path(), &summaries)?;
+        }
+
+        // Best-effort directory removal (see "failure model" above): a failure
+        // leaves a benign orphan, not a surfaced error.
+        let root = self.projects_dir().join(id.to_string());
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 
     /// Best-effort "last activity" timestamp for a project, used to order the
@@ -352,6 +490,245 @@ mod tests {
                 "{collision:?} should collide with 'feature-a'"
             );
         }
+    }
+
+    #[test]
+    fn rename_project_persists_to_both_config_and_index() {
+        let tmp = TempDir::new().unwrap();
+        let directory = Directory::at(tmp.path()).unwrap();
+        directory.init().unwrap();
+        let project = directory.create_project("alpha").unwrap();
+
+        let updated = directory.rename_project(project.id, "renamed").unwrap();
+        assert_eq!(updated.name, "renamed");
+        assert_eq!(updated.id, project.id);
+
+        // Index (denormalized) reflects the new name.
+        let listed = directory.list_projects().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "renamed");
+
+        // config.yaml (canonical) reflects the new name and preserves identity.
+        let reopened = directory.open_project(project.id).unwrap();
+        assert_eq!(reopened.config.name, "renamed");
+        assert_eq!(reopened.config.created_at, project.config.created_at);
+        assert_eq!(reopened.config.version, project.config.version);
+    }
+
+    #[test]
+    fn rename_project_to_own_name_variant_succeeds() {
+        // Self is excluded from the uniqueness check, so a case/hyphen variant
+        // of the project's own name is allowed.
+        let tmp = TempDir::new().unwrap();
+        let directory = Directory::at(tmp.path()).unwrap();
+        directory.init().unwrap();
+        let project = directory.create_project("feature-a").unwrap();
+        let updated = directory.rename_project(project.id, "Feature_A").unwrap();
+        assert_eq!(updated.name, "Feature_A");
+    }
+
+    #[test]
+    fn rename_project_rejects_canonical_collision_with_another() {
+        let tmp = TempDir::new().unwrap();
+        let directory = Directory::at(tmp.path()).unwrap();
+        directory.init().unwrap();
+        let a = directory.create_project("alpha").unwrap();
+        directory.create_project("beta").unwrap();
+        let err = directory.rename_project(a.id, "BETA").unwrap_err();
+        assert!(matches!(err, CoreError::DuplicateProjectName { .. }));
+        // The reject path leaves both files untouched.
+        assert_eq!(directory.open_project(a.id).unwrap().config.name, "alpha");
+    }
+
+    #[test]
+    fn rename_project_same_name_allowed_in_different_directory() {
+        // Uniqueness is scoped per-directory: renaming a project to a name that
+        // exists in a *different* directory is fine.
+        let tmp_a = TempDir::new().unwrap();
+        let dir_a = Directory::at(tmp_a.path()).unwrap();
+        dir_a.init().unwrap();
+        dir_a.create_project("shared").unwrap();
+
+        let tmp_b = TempDir::new().unwrap();
+        let dir_b = Directory::at(tmp_b.path()).unwrap();
+        dir_b.init().unwrap();
+        let b = dir_b.create_project("other").unwrap();
+
+        let updated = dir_b.rename_project(b.id, "shared").unwrap();
+        assert_eq!(updated.name, "shared");
+    }
+
+    #[test]
+    fn rename_project_rejects_invalid_name() {
+        let tmp = TempDir::new().unwrap();
+        let directory = Directory::at(tmp.path()).unwrap();
+        directory.init().unwrap();
+        let project = directory.create_project("alpha").unwrap();
+        let err = directory
+            .rename_project(project.id, "bad name")
+            .unwrap_err();
+        assert!(matches!(err, CoreError::InvalidName { .. }));
+    }
+
+    #[test]
+    fn rename_project_nonexistent_returns_not_found() {
+        let tmp = TempDir::new().unwrap();
+        let directory = Directory::at(tmp.path()).unwrap();
+        directory.init().unwrap();
+        let err = directory
+            .rename_project(uuid::Uuid::now_v7(), "x")
+            .unwrap_err();
+        assert!(matches!(err, CoreError::ProjectNotFound(_)));
+    }
+
+    // Unix-only: forces the index-write (commit) to fail *after* config.yaml was
+    // already rewritten, exercising the documented partial-write contract — the
+    // canonical config is left "ahead", and a retry reconciles both files.
+    #[cfg(unix)]
+    #[test]
+    fn rename_project_index_write_failure_leaves_config_ahead_and_retry_heals() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let directory = Directory::at(tmp.path()).unwrap();
+        directory.init().unwrap();
+        let project = directory.create_project("alpha").unwrap();
+
+        // `write_jsonl` writes `<index>.tmp` then renames over the index, so a
+        // read-only index *file* wouldn't block it (rename needs write on the
+        // *directory*, not the target). Make `.switchboard/` itself read-only
+        // (r-x) so the index tmp can't be created — config.yaml lives in the
+        // separate, still-writable `projects/<id>/` subdir, so it is rewritten
+        // before the index write fails.
+        let sb = directory.switchboard_dir();
+        std::fs::set_permissions(&sb, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let err = directory.rename_project(project.id, "renamed").unwrap_err();
+        assert!(
+            matches!(err, CoreError::Io { .. }),
+            "expected Io, got {err:?}"
+        );
+
+        // Partial state: canonical config is "ahead" (new name); the index is
+        // stale (old name), so list/UI still show the old name.
+        assert_eq!(
+            directory.open_project(project.id).unwrap().config.name,
+            "renamed"
+        );
+        assert_eq!(directory.list_projects().unwrap()[0].name, "alpha");
+
+        // Retry once `.switchboard/` is writable again: the same rename
+        // reconciles both files (uniqueness still passes — nothing else is
+        // named "renamed").
+        std::fs::set_permissions(&sb, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let updated = directory.rename_project(project.id, "renamed").unwrap();
+        assert_eq!(updated.name, "renamed");
+        assert_eq!(directory.list_projects().unwrap()[0].name, "renamed");
+        assert_eq!(
+            directory.open_project(project.id).unwrap().config.name,
+            "renamed"
+        );
+    }
+
+    #[test]
+    fn delete_project_drops_entry_and_removes_dir_keeping_siblings() {
+        let tmp = TempDir::new().unwrap();
+        let directory = Directory::at(tmp.path()).unwrap();
+        directory.init().unwrap();
+        let a = directory.create_project("alpha").unwrap();
+        let b = directory.create_project("beta").unwrap();
+
+        directory.delete_project(a.id).unwrap();
+
+        // Index drops only the deleted project; the sibling remains.
+        let listed = directory.list_projects().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, b.id);
+
+        // The deleted project's directory is gone; the sibling's is intact.
+        assert!(!a.root.exists());
+        assert!(b.root.exists());
+        // Delete stays inside projects/ — the directory's own config.yaml (a
+        // sibling of projects/, not under it) is untouched.
+        assert!(tmp.path().join(".switchboard").join(CONFIG_FILE).exists());
+    }
+
+    #[test]
+    fn delete_project_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let directory = Directory::at(tmp.path()).unwrap();
+        directory.init().unwrap();
+        let a = directory.create_project("alpha").unwrap();
+
+        directory.delete_project(a.id).unwrap();
+        // Re-deleting (entry already gone, dir already removed) is a clean no-op.
+        directory.delete_project(a.id).unwrap();
+        assert!(directory.list_projects().unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_project_unknown_id_is_noop() {
+        let tmp = TempDir::new().unwrap();
+        let directory = Directory::at(tmp.path()).unwrap();
+        directory.init().unwrap();
+        let a = directory.create_project("alpha").unwrap();
+
+        directory.delete_project(uuid::Uuid::now_v7()).unwrap();
+        // The unrelated project and its directory are untouched.
+        let listed = directory.list_projects().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, a.id);
+        assert!(a.root.exists());
+    }
+
+    #[test]
+    fn delete_project_with_missing_index_still_removes_dir() {
+        // The index file vanished out-of-band but the project directory remains:
+        // there's no entry to drop, yet the directory must still be removed (not
+        // stranded). Delete tolerates `MissingAppendOnlyFile` and proceeds.
+        let tmp = TempDir::new().unwrap();
+        let directory = Directory::at(tmp.path()).unwrap();
+        directory.init().unwrap();
+        let a = directory.create_project("alpha").unwrap();
+        std::fs::remove_file(directory.projects_index_path()).unwrap();
+
+        directory.delete_project(a.id).unwrap();
+        assert!(!a.root.exists(), "the project directory is removed");
+    }
+
+    // Unix-only: forces `remove_dir_all` to fail *after* the index commit by
+    // making the `projects/` parent unwritable, exercising the best-effort
+    // directory-removal contract — the index entry is dropped (committed) and a
+    // benign orphan directory is left, with no error surfaced.
+    #[cfg(unix)]
+    #[test]
+    fn delete_project_rmdir_failure_still_commits_index_and_leaves_orphan() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let directory = Directory::at(tmp.path()).unwrap();
+        directory.init().unwrap();
+        let a = directory.create_project("alpha").unwrap();
+
+        // Make `projects/` read-only so the final unlink of `projects/<id>`
+        // fails. `projects.jsonl` lives in the writable `.switchboard/`, so the
+        // index rewrite (the commit) still succeeds.
+        let projects_dir = directory.projects_dir();
+        std::fs::set_permissions(&projects_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        // Best-effort removal failure is not surfaced.
+        directory.delete_project(a.id).unwrap();
+
+        // Restore perms before asserting (and before TempDir cleanup).
+        std::fs::set_permissions(&projects_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // The index committed the removal (project no longer lists)…
+        assert!(directory.list_projects().unwrap().is_empty());
+        // …but the directory is a benign leftover orphan.
+        assert!(
+            a.root.exists(),
+            "a failed rmdir leaves the directory in place"
+        );
     }
 
     #[test]

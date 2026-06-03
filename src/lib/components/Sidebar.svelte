@@ -1,15 +1,22 @@
 <script lang="ts">
   import type { AgentRecord, AgentId } from "$lib/types";
-  import { runtimes, transcripts } from "$lib/state/index.svelte";
-  import { renameAgent } from "$lib/state/workspace.svelte";
+  import { runtimes, stopAgent, transcripts } from "$lib/state/index.svelte";
+  import { removeAgent, renameAgent } from "$lib/state/workspace.svelte";
+  import {
+    agentSessionInfo,
+    openSessionFile as apiOpenSessionFile,
+    type AgentSessionInfo,
+  } from "$lib/api";
   import { normalizeAgentName, validateAgentName, type NameValidation } from "$lib/agentName";
   import { cn, relativeTime } from "$lib/utils";
   import SidebarPanel from "$lib/components/ui/SidebarPanel.svelte";
   import SidebarSection from "$lib/components/ui/SidebarSection.svelte";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
   import PlusIcon from "$lib/components/ui/PlusIcon.svelte";
-  import AgentActionsMenu from "$lib/components/AgentActionsMenu.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
+  import Dialog from "$lib/components/ui/Dialog.svelte";
+  import CopyButton from "$lib/components/ui/CopyButton.svelte";
+  import StopIcon from "$lib/components/ui/StopIcon.svelte";
   import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
 
   /// Cap the per-tooltip warning rows so a session with a long tail
@@ -30,10 +37,138 @@
     );
   }
 
+  const agentActionClass =
+    "text-muted hover:bg-raised hover:text-fg focus-visible:ring-accent focus-visible:bg-raised focus-visible:text-fg inline-flex h-6 w-6 items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none";
+  const agentDangerActionClass =
+    "text-muted hover:bg-raised hover:text-status-failed focus-visible:ring-accent focus-visible:bg-raised focus-visible:text-status-failed inline-flex h-6 w-6 items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none";
+  const AGENT_ACTION_DELAY_MS = 500;
+
   /// `onAddAgent` is the "+ Add agent" entry point in the sidebar header.
   /// Optional so existing callers + tests that don't pass it continue
   /// rendering; when absent, the button isn't shown.
   let { agents, onAddAgent }: { agents: AgentRecord[]; onAddAgent?: () => void } = $props();
+
+  let sessionInfoByAgent = $state<Record<AgentId, AgentSessionInfo | null>>({});
+  let sessionInfoStarted = $state<Record<AgentId, boolean>>({});
+  let sessionInfoInFlight = $state<Record<AgentId, boolean>>({});
+  let sessionInfoError = $state<{ agentId: AgentId; message: string } | null>(null);
+  let resumeAgentId = $state<AgentId | null>(null);
+  let resumeOpen = $state(false);
+  let removeConfirmAgentId = $state<AgentId | null>(null);
+  let removingAgentId = $state<AgentId | null>(null);
+  let removeError = $state<{ agentId: AgentId; message: string } | null>(null);
+
+  const resumeAgent = $derived(
+    resumeAgentId === null ? null : (agents.find((agent) => agent.id === resumeAgentId) ?? null),
+  );
+  const resumeInfo = $derived(
+    resumeAgentId === null ? null : (sessionInfoByAgent[resumeAgentId] ?? null),
+  );
+
+  function hasSessionActions(info: AgentSessionInfo | null | undefined): boolean {
+    return Boolean(info?.session_file || info?.resume_command);
+  }
+
+  function refreshAgentSessionInfo(agentId: AgentId, force = false): void {
+    if (sessionInfoInFlight[agentId] === true) return;
+    if (!force && sessionInfoStarted[agentId] === true) return;
+    if (force && hasSessionActions(sessionInfoByAgent[agentId])) return;
+
+    sessionInfoStarted[agentId] = true;
+    sessionInfoInFlight[agentId] = true;
+    void agentSessionInfo(agentId)
+      .then((info) => {
+        sessionInfoByAgent[agentId] = info;
+        if (sessionInfoError?.agentId === agentId) sessionInfoError = null;
+      })
+      .catch((err: unknown) => {
+        sessionInfoByAgent[agentId] = null;
+        sessionInfoError = {
+          agentId,
+          message: err instanceof Error ? err.message : String(err),
+        };
+      })
+      .finally(() => {
+        sessionInfoInFlight[agentId] = false;
+      });
+  }
+
+  function agentActionWidth(count: number): string {
+    const visibleCount = Math.max(count, 1);
+    const iconWidthRem = 1.5;
+    const gapRem = 0.125;
+    const width = visibleCount * iconWidthRem + Math.max(visibleCount - 1, 0) * gapRem;
+    return `${Math.max(width, 2)}rem`;
+  }
+
+  $effect(() => {
+    const ids = new Set(agents.map((agent) => agent.id));
+    for (const agent of agents) {
+      refreshAgentSessionInfo(agent.id);
+    }
+
+    for (const id of Object.keys(sessionInfoByAgent)) {
+      if (!ids.has(id)) delete sessionInfoByAgent[id];
+    }
+    for (const id of Object.keys(sessionInfoStarted)) {
+      if (!ids.has(id)) delete sessionInfoStarted[id];
+    }
+    for (const id of Object.keys(sessionInfoInFlight)) {
+      if (!ids.has(id)) delete sessionInfoInFlight[id];
+    }
+    if (removeConfirmAgentId !== null && !ids.has(removeConfirmAgentId))
+      removeConfirmAgentId = null;
+    if (resumeAgentId !== null && !ids.has(resumeAgentId)) {
+      resumeAgentId = null;
+      resumeOpen = false;
+    }
+  });
+
+  function openSessionFile(agent: AgentRecord): void {
+    if (!sessionInfoByAgent[agent.id]?.session_file) return;
+    void apiOpenSessionFile(agent.id).catch((err: unknown) => {
+      console.error("[switchboard] open session file failed", err);
+    });
+  }
+
+  function startRemove(agent: AgentRecord): void {
+    removeError = null;
+    removeConfirmAgentId = agent.id;
+  }
+
+  function cancelRemove(agentId: AgentId): void {
+    if (removeConfirmAgentId === agentId) removeConfirmAgentId = null;
+  }
+
+  function agentRowPointerActions(node: HTMLElement, agentId: AgentId): { destroy: () => void } {
+    const handlePointerEnter = (): void => refreshAgentSessionInfo(agentId, true);
+    const handlePointerLeave = (): void => cancelRemove(agentId);
+    node.addEventListener("pointerenter", handlePointerEnter);
+    node.addEventListener("pointerleave", handlePointerLeave);
+    return {
+      destroy: () => {
+        node.removeEventListener("pointerenter", handlePointerEnter);
+        node.removeEventListener("pointerleave", handlePointerLeave);
+      },
+    };
+  }
+
+  async function confirmRemove(agent: AgentRecord): Promise<void> {
+    removingAgentId = agent.id;
+    removeError = null;
+    try {
+      await removeAgent(agent.id);
+      if (removeConfirmAgentId === agent.id) removeConfirmAgentId = null;
+    } catch (err) {
+      removeConfirmAgentId = null;
+      removeError = {
+        agentId: agent.id,
+        message: err instanceof Error ? err.message : String(err),
+      };
+    } finally {
+      removingAgentId = null;
+    }
+  }
 
   /// Claude session-total cost — null-safe sum across the agent's completed
   /// turns. Codex turns have `total_cost_usd: null` so the `?? 0` is
@@ -290,12 +425,8 @@
     }
   }
 
-  /// Focus + select the edit field once it mounts. Deferred a frame so it wins
-  /// the dropdown menu's on-close focus restore (the "Rename" item closes the
-  /// menu, which returns focus to its trigger) — focusing synchronously would be
-  /// immediately stolen back, firing the input's blur-cancel. By the next frame
-  /// the menu teardown is done and the field takes focus cleanly. (Blur is the
-  /// cancel trigger, so the field must never be focused only to lose it.)
+  /// Focus + select the edit field once it mounts. Deferred a frame so the
+  /// input is mounted and ready before selection.
   function focusSelect(node: HTMLInputElement): void {
     requestAnimationFrame(() => {
       node.focus();
@@ -372,10 +503,20 @@
             : null}
         {@const overageAsOf = runtime?.last_rate_limit_as_of}
         {@const isCollapsed = collapsed[agent.id] ?? false}
+        {@const active = isActive(agent.id)}
+        {@const sessionInfo = sessionInfoByAgent[agent.id]}
+        {@const confirmingRemove = removeConfirmAgentId === agent.id}
+        {@const actionCount = confirmingRemove
+          ? 2
+          : (active ? 1 : 0) +
+            (sessionInfo?.resume_command ? 1 : 0) +
+            (sessionInfo?.session_file ? 1 : 0) +
+            (!active ? 1 : 0)}
         <div
-          class="bg-raised/90 hover:bg-border/40 rounded-md px-2.5 py-2 transition-colors"
+          class="group bg-raised/90 hover:bg-border/40 rounded-md px-2.5 py-2 transition-colors"
           data-testid="sidebar-agent"
           data-agent-id={agent.id}
+          use:agentRowPointerActions={agent.id}
         >
           <div class="flex items-center justify-between gap-2">
             {#if editingAgentId === agent.id}
@@ -427,11 +568,9 @@
                 </svg>
               </button>
             {:else}
-              <!-- Double-click the name row to rename (the menu's "Rename" item
-                   is the other entry point); the handler is on the button — a
-                   real interactive element — so it's a11y-clean. Single-click
-                   still toggles collapse; a double-click toggles it twice (net
-                   no change) before edit mode opens. -->
+              <!-- Double-click the name row to rename. Single-click still
+                   toggles collapse; a double-click toggles it twice (net no
+                   change) before edit mode opens. -->
               <button
                 type="button"
                 class="flex min-w-0 flex-1 items-center gap-1.5 text-left"
@@ -458,16 +597,204 @@
                   {agent.name}
                 </span>
               </button>
-              <div class="flex shrink-0 items-center gap-1">
-                <HarnessIcon harness={agent.harness} size="md" testid="agent-harness-icon" />
-                <AgentActionsMenu
-                  {agent}
-                  active={isActive(agent.id)}
-                  onRename={() => startEdit(agent)}
-                />
+              <div
+                class="relative flex h-8 w-8 shrink-0 items-center justify-end transition-[width] group-hover:w-[var(--agent-action-width)]"
+                style={`--agent-action-width: ${agentActionWidth(actionCount)}`}
+              >
+                <div
+                  class="absolute top-1/2 right-0 -translate-y-1/2 transition-opacity group-hover:opacity-0"
+                >
+                  <HarnessIcon harness={agent.harness} size="md" testid="agent-harness-icon" />
+                </div>
+                <div
+                  class="pointer-events-none absolute top-1/2 right-0 flex max-w-0 -translate-y-1/2 items-center gap-0.5 overflow-hidden opacity-0 transition-[max-width,opacity] group-hover:pointer-events-auto group-hover:max-w-[var(--agent-action-width)] group-hover:opacity-100"
+                  data-testid="agent-inline-actions"
+                  style={`--agent-action-width: ${agentActionWidth(actionCount)}`}
+                >
+                  {#if confirmingRemove}
+                    <Tooltip label="Cancel delete" delayDuration={AGENT_ACTION_DELAY_MS}>
+                      {#snippet trigger(props)}
+                        <button
+                          {...props}
+                          type="button"
+                          class={agentActionClass}
+                          aria-label="Cancel delete"
+                          tabindex="-1"
+                          data-testid="agent-remove-cancel"
+                          onclick={() => cancelRemove(agent.id)}
+                        >
+                          <svg
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            stroke-width="2"
+                            stroke-linecap="round"
+                            stroke-linejoin="round"
+                            class="h-4 w-4"
+                            aria-hidden="true"
+                          >
+                            <path d="M18 6 6 18M6 6l12 12" />
+                          </svg>
+                        </button>
+                      {/snippet}
+                    </Tooltip>
+                    <Tooltip label="Confirm delete" delayDuration={AGENT_ACTION_DELAY_MS}>
+                      {#snippet trigger(props)}
+                        <button
+                          {...props}
+                          type="button"
+                          class={agentDangerActionClass}
+                          disabled={removingAgentId === agent.id}
+                          aria-label="Confirm delete"
+                          tabindex="-1"
+                          data-testid="agent-remove-confirm"
+                          onclick={() => void confirmRemove(agent)}
+                        >
+                          <svg
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            stroke-width="2"
+                            stroke-linecap="round"
+                            stroke-linejoin="round"
+                            class="h-4 w-4"
+                            aria-hidden="true"
+                          >
+                            <path d="M20 6 9 17l-5-5" />
+                          </svg>
+                        </button>
+                      {/snippet}
+                    </Tooltip>
+                  {:else}
+                    {#if active}
+                      <Tooltip label="Stop agent" delayDuration={AGENT_ACTION_DELAY_MS}>
+                        {#snippet trigger(props)}
+                          <button
+                            {...props}
+                            type="button"
+                            class={agentDangerActionClass}
+                            aria-label="Stop agent"
+                            tabindex="-1"
+                            data-testid="agent-action-stop"
+                            onclick={() => stopAgent(agent.id)}
+                          >
+                            <StopIcon class="h-4 w-4" />
+                          </button>
+                        {/snippet}
+                      </Tooltip>
+                    {/if}
+                    {#if sessionInfo?.resume_command}
+                      <Tooltip label="Resume in terminal" delayDuration={AGENT_ACTION_DELAY_MS}>
+                        {#snippet trigger(props)}
+                          <button
+                            {...props}
+                            type="button"
+                            class={agentActionClass}
+                            aria-label="Resume in terminal"
+                            tabindex="-1"
+                            data-testid="agent-action-resume"
+                            onclick={() => {
+                              resumeAgentId = agent.id;
+                              resumeOpen = true;
+                            }}
+                          >
+                            <svg
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              stroke-width="1.8"
+                              stroke-linecap="round"
+                              stroke-linejoin="round"
+                              class="h-4 w-4"
+                              aria-hidden="true"
+                            >
+                              <path d="M4 17 10 11 4 5" />
+                              <path d="M12 19h8" />
+                            </svg>
+                          </button>
+                        {/snippet}
+                      </Tooltip>
+                    {/if}
+                    {#if sessionInfo?.session_file}
+                      <Tooltip label="Open session file" delayDuration={AGENT_ACTION_DELAY_MS}>
+                        {#snippet trigger(props)}
+                          <button
+                            {...props}
+                            type="button"
+                            class={agentActionClass}
+                            aria-label="Open session file"
+                            tabindex="-1"
+                            data-testid="agent-action-open-session"
+                            onclick={() => openSessionFile(agent)}
+                          >
+                            <svg
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              stroke-width="1.8"
+                              stroke-linecap="round"
+                              stroke-linejoin="round"
+                              class="h-4 w-4"
+                              aria-hidden="true"
+                            >
+                              <path
+                                d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"
+                              />
+                              <path d="M14 2v6h6" />
+                              <path d="M8 13h8M8 17h5" />
+                            </svg>
+                          </button>
+                        {/snippet}
+                      </Tooltip>
+                    {/if}
+                    {#if !active}
+                      <Tooltip delayDuration={AGENT_ACTION_DELAY_MS}>
+                        {#snippet trigger(props)}
+                          <button
+                            {...props}
+                            type="button"
+                            class={agentDangerActionClass}
+                            aria-label="Delete agent"
+                            tabindex="-1"
+                            data-testid="agent-action-remove"
+                            onclick={() => startRemove(agent)}
+                          >
+                            <svg
+                              viewBox="0 0 24 24"
+                              fill="none"
+                              stroke="currentColor"
+                              stroke-width="1.8"
+                              stroke-linecap="round"
+                              stroke-linejoin="round"
+                              class="h-4 w-4"
+                              aria-hidden="true"
+                            >
+                              <path d="M3 6h18" />
+                              <path d="M8 6V4h8v2" />
+                              <path d="M19 6 18 20H6L5 6" />
+                              <path d="M10 11v5M14 11v5" />
+                            </svg>
+                          </button>
+                        {/snippet}
+                        <div class="max-w-56">
+                          <div class="text-[13px] font-medium">Delete agent</div>
+                          <div class="text-primary-fg/75 mt-1 text-xs leading-4">
+                            Deletes Switchboard's files for this agent; underlying session files are
+                            kept, and its responses are removed from the conversation.
+                          </div>
+                        </div>
+                      </Tooltip>
+                    {/if}
+                  {/if}
+                </div>
               </div>
             {/if}
           </div>
+          {#if sessionInfoError?.agentId === agent.id}
+            <div class="text-status-failed mt-1 text-xs" data-testid="agent-actions-error">
+              Couldn't read session state: {sessionInfoError.message}
+            </div>
+          {/if}
           {#if editingAgentId === agent.id && renameError}
             <div
               id={`agent-rename-error-${agent.id}`}
@@ -654,8 +981,49 @@
               </div>
             {/if}
           {/if}
+          {#if removeError?.agentId === agent.id}
+            <div class="text-status-failed mt-1 text-xs" data-testid="agent-remove-error">
+              Couldn't delete agent: {removeError.message}
+            </div>
+          {/if}
         </div>
       {/each}
     </div>
   </SidebarSection>
 </SidebarPanel>
+
+<Dialog
+  bind:open={resumeOpen}
+  onClose={() => (resumeAgentId = null)}
+  title="Resume in terminal"
+  contentClass="max-w-lg"
+>
+  <div class="space-y-3" data-testid="resume-panel">
+    <p class="text-muted text-xs">
+      Run this in your terminal to resume this session interactively.
+    </p>
+    <div class="flex items-center gap-2">
+      <code
+        class="bg-panel text-fg min-w-0 flex-1 overflow-x-auto rounded-md px-2.5 py-2 font-mono text-xs whitespace-pre"
+        data-testid="resume-command">{resumeInfo?.resume_command ?? ""}</code
+      >
+      <CopyButton
+        text={resumeInfo?.resume_command ?? ""}
+        label="Copy command"
+        testid="resume-copy"
+        class="shrink-0"
+      />
+    </div>
+    {#if resumeAgent !== null && isActive(resumeAgent.id)}
+      <p class="text-status-failed text-xs" data-testid="resume-warning-active">
+        ⚠ Switchboard is currently driving this session — stop the agent before running this
+        command, or two processes will write one session file and corrupt it.
+      </p>
+    {:else}
+      <p class="text-muted text-xs" data-testid="resume-warning">
+        ⚠ Don't run this while the agent is active in Switchboard — two processes writing one
+        session file will corrupt it.
+      </p>
+    {/if}
+  </div>
+</Dialog>

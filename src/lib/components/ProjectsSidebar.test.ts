@@ -4,7 +4,9 @@ import { render, screen, fireEvent, waitFor } from "@testing-library/svelte";
 import { tick } from "svelte";
 import type { AgentRecord, ProjectListing } from "$lib/types";
 
-const invokeMock = vi.fn(async (_cmd: string, _args?: Record<string, unknown>) => undefined);
+const invokeMock = vi.fn<(cmd: string, args?: Record<string, unknown>) => Promise<unknown>>(
+  async () => undefined,
+);
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: (cmd: string, args?: Record<string, unknown>) => invokeMock(cmd, args),
 }));
@@ -40,6 +42,7 @@ function project(id: string): ProjectListing {
     directory: `/work/${id.slice(-2)}`,
     available: true,
     last_activity: "2026-05-16T00:00:00Z",
+    archived: false,
   };
 }
 
@@ -211,5 +214,434 @@ describe("ProjectsSidebar — background activity", () => {
       id: PROJECT_1,
       last_activity: "2026-05-25T12:00:00.000Z",
     });
+  });
+});
+
+function projectIn(id: string, name: string, directory: string, archived = false): ProjectListing {
+  return {
+    id,
+    name,
+    created_at: "2026-05-16T00:00:00Z",
+    directory,
+    available: true,
+    last_activity: "2026-05-16T00:00:00Z",
+    archived,
+  };
+}
+
+/// Make `rename_project` echo back the renamed row (the backend's contract); all
+/// other commands stay no-ops.
+function mockRenameEchoes(): void {
+  invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+    if (cmd === "rename_project") {
+      const id = args?.projectId as string;
+      return projectIn(id, args?.newName as string, "/work/a");
+    }
+    return undefined;
+  });
+}
+
+async function renderWith(list: ProjectListing[]) {
+  const ws = await loadWorkspace();
+  ws.projects.list = list;
+  const ProjectsSidebar = (await import("./ProjectsSidebar.svelte")).default;
+  render(ProjectsSidebar, { props: noopProps });
+}
+
+function rowSelectButton(index = 0): HTMLButtonElement {
+  const rows = screen.getAllByTestId("project-row");
+  const btn = rows[index]?.querySelector("button");
+  if (!btn) throw new Error("expected a select button in the project row");
+  return btn as HTMLButtonElement;
+}
+
+describe("ProjectsSidebar — rename", () => {
+  const A1 = "00000000-0000-7000-8000-0000000000a1";
+  const A2 = "00000000-0000-7000-8000-0000000000a2";
+
+  it("enters edit via double-click", async () => {
+    mockRenameEchoes();
+    await renderWith([projectIn(A1, "alpha", "/work/a")]);
+
+    await fireEvent.dblClick(rowSelectButton());
+    expect(await screen.findByTestId("project-rename-input")).toBeInTheDocument();
+  });
+
+  it("Enter commits the rename and updates the row", async () => {
+    mockRenameEchoes();
+    await renderWith([projectIn(A1, "alpha", "/work/a")]);
+
+    await fireEvent.dblClick(rowSelectButton());
+    const input = await screen.findByTestId("project-rename-input");
+    await fireEvent.input(input, { target: { value: "renamed" } });
+    await fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(invokeMock).toHaveBeenCalledWith("rename_project", {
+      projectId: A1,
+      newName: "renamed",
+    });
+    await waitFor(() => expect(screen.queryByTestId("project-rename-input")).toBeNull());
+    expect(screen.getByText("renamed")).toBeInTheDocument();
+  });
+
+  it("Escape and blur cancel without persisting", async () => {
+    mockRenameEchoes();
+    await renderWith([projectIn(A1, "alpha", "/work/a")]);
+
+    await fireEvent.dblClick(rowSelectButton());
+    let input = await screen.findByTestId("project-rename-input");
+    await fireEvent.input(input, { target: { value: "changed" } });
+    await fireEvent.keyDown(input, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByTestId("project-rename-input")).toBeNull());
+
+    await fireEvent.dblClick(rowSelectButton());
+    input = await screen.findByTestId("project-rename-input");
+    await fireEvent.input(input, { target: { value: "changed-again" } });
+    await fireEvent.blur(input);
+    await waitFor(() => expect(screen.queryByTestId("project-rename-input")).toBeNull());
+
+    expect(invokeMock).not.toHaveBeenCalledWith("rename_project", expect.anything());
+    expect(screen.getByText("alpha")).toBeInTheDocument();
+  });
+
+  it("an unchanged name exits edit without a round-trip", async () => {
+    mockRenameEchoes();
+    await renderWith([projectIn(A1, "alpha", "/work/a")]);
+
+    await fireEvent.dblClick(rowSelectButton());
+    const input = await screen.findByTestId("project-rename-input");
+    await fireEvent.keyDown(input, { key: "Enter" });
+
+    await waitFor(() => expect(screen.queryByTestId("project-rename-input")).toBeNull());
+    expect(invokeMock).not.toHaveBeenCalledWith("rename_project", expect.anything());
+  });
+
+  it("disables save and flags the input on a same-directory duplicate", async () => {
+    mockRenameEchoes();
+    await renderWith([projectIn(A1, "alpha", "/work/a"), projectIn(A2, "beta", "/work/a")]);
+
+    await fireEvent.dblClick(rowSelectButton()); // edits alpha (first row)
+    const input = await screen.findByTestId("project-rename-input");
+    await fireEvent.input(input, { target: { value: "BETA" } }); // canonical collision
+    expect(screen.getByTestId("project-rename-save")).toBeDisabled();
+    expect(input).toHaveAttribute("aria-invalid", "true");
+    expect(input).toHaveAttribute("title", "A project named 'beta' already exists");
+  });
+
+  it("allows a name that only collides in a different directory", async () => {
+    mockRenameEchoes();
+    await renderWith([projectIn(A1, "alpha", "/work/a"), projectIn(A2, "beta", "/work/b")]);
+
+    await fireEvent.dblClick(rowSelectButton()); // edits alpha in /work/a
+    const input = await screen.findByTestId("project-rename-input");
+    await fireEvent.input(input, { target: { value: "beta" } }); // beta lives in /work/b
+    expect(screen.getByTestId("project-rename-save")).not.toBeDisabled();
+    expect(input).toHaveAttribute("aria-invalid", "false");
+  });
+
+  it("disables save on empty without showing a message", async () => {
+    mockRenameEchoes();
+    await renderWith([projectIn(A1, "alpha", "/work/a")]);
+
+    await fireEvent.dblClick(rowSelectButton());
+    const input = await screen.findByTestId("project-rename-input");
+    await fireEvent.input(input, { target: { value: "" } });
+    expect(screen.getByTestId("project-rename-save")).toBeDisabled();
+    expect(input).not.toHaveAttribute("title");
+  });
+
+  it("keeps the editor open and surfaces a backend rejection", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "rename_project") throw new Error("registry locked");
+      return undefined;
+    });
+    await renderWith([projectIn(A1, "alpha", "/work/a")]);
+
+    await fireEvent.dblClick(rowSelectButton());
+    const input = await screen.findByTestId("project-rename-input");
+    await fireEvent.input(input, { target: { value: "renamed" } });
+    await fireEvent.keyDown(input, { key: "Enter" });
+
+    const err = await screen.findByTestId("project-rename-error");
+    expect(err).toHaveTextContent("registry locked");
+    expect(screen.getByTestId("project-rename-input")).toBeInTheDocument();
+  });
+
+  it("double-Enter commits once", async () => {
+    mockRenameEchoes();
+    await renderWith([projectIn(A1, "alpha", "/work/a")]);
+
+    await fireEvent.dblClick(rowSelectButton());
+    const input = await screen.findByTestId("project-rename-input");
+    await fireEvent.input(input, { target: { value: "renamed" } });
+    await fireEvent.keyDown(input, { key: "Enter" });
+    await fireEvent.keyDown(input, { key: "Enter" });
+
+    const renameCalls = invokeMock.mock.calls.filter((c) => c[0] === "rename_project");
+    expect(renameCalls).toHaveLength(1);
+  });
+
+  it("omits project action icons while the project is busy so the cancel control owns the right slot", async () => {
+    await seedBusyProject(PROJECT_1);
+    const ProjectsSidebar = (await import("./ProjectsSidebar.svelte")).default;
+    render(ProjectsSidebar, { props: noopProps });
+
+    expect(screen.getByTestId("project-cancel")).toBeInTheDocument();
+    expect(screen.queryByTestId("project-action-archive")).toBeNull();
+    expect(screen.queryByTestId("project-action-delete")).toBeNull();
+  });
+});
+
+describe("ProjectsSidebar — delete", () => {
+  const A1 = "00000000-0000-7000-8000-0000000000d1";
+  const A2 = "00000000-0000-7000-8000-0000000000d2";
+
+  it("Delete swaps Archive | Delete to Cancel | Confirm without calling the backend", async () => {
+    await renderWith([projectIn(A1, "alpha", "/work/a")]);
+    await fireEvent.click(screen.getByTestId("project-action-delete"));
+
+    expect(screen.getByTestId("project-delete-cancel")).toBeInTheDocument();
+    expect(screen.getByTestId("project-delete-confirm")).toBeInTheDocument();
+    expect(screen.queryByTestId("project-action-archive")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("project-action-delete")).not.toBeInTheDocument();
+    expect(invokeMock).not.toHaveBeenCalledWith("delete_project", expect.anything());
+  });
+
+  it("keeps hover-only project actions out of the tab order", async () => {
+    await renderWith([projectIn(A1, "alpha", "/work/a")]);
+
+    expect(screen.getByTestId("project-action-archive")).toHaveAttribute("tabindex", "-1");
+    expect(screen.getByTestId("project-action-delete")).toHaveAttribute("tabindex", "-1");
+
+    await fireEvent.click(screen.getByTestId("project-action-delete"));
+
+    expect(screen.getByTestId("project-delete-cancel")).toHaveAttribute("tabindex", "-1");
+    expect(screen.getByTestId("project-delete-confirm")).toHaveAttribute("tabindex", "-1");
+  });
+
+  it("confirming deletes through the backend and removes the row", async () => {
+    await renderWith([projectIn(A1, "alpha", "/work/a")]);
+    await fireEvent.click(screen.getByTestId("project-action-delete"));
+    await fireEvent.click(screen.getByTestId("project-delete-confirm"));
+
+    expect(invokeMock).toHaveBeenCalledWith("delete_project", { projectId: A1 });
+    await waitFor(() => expect(screen.queryByTestId("project-row")).toBeNull());
+  });
+
+  it("cancel restores the menu without deleting", async () => {
+    await renderWith([projectIn(A1, "alpha", "/work/a")]);
+    await fireEvent.click(screen.getByTestId("project-action-delete"));
+    await fireEvent.click(screen.getByTestId("project-delete-cancel"));
+
+    expect(screen.getByTestId("project-action-archive")).toBeInTheDocument();
+    expect(screen.getByTestId("project-action-delete")).toBeInTheDocument();
+    expect(screen.queryByTestId("project-delete-confirm")).not.toBeInTheDocument();
+    expect(invokeMock).not.toHaveBeenCalledWith("delete_project", expect.anything());
+    expect(screen.getByTestId("project-row")).toBeInTheDocument();
+  });
+
+  it("pointer leave cancels an armed delete", async () => {
+    await renderWith([projectIn(A1, "alpha", "/work/a")]);
+    await fireEvent.click(screen.getByTestId("project-action-delete"));
+
+    await fireEvent.pointerLeave(screen.getByTestId("project-row"));
+
+    expect(screen.getByTestId("project-action-archive")).toBeInTheDocument();
+    expect(screen.getByTestId("project-action-delete")).toBeInTheDocument();
+    expect(screen.queryByTestId("project-delete-confirm")).not.toBeInTheDocument();
+    expect(invokeMock).not.toHaveBeenCalledWith("delete_project", expect.anything());
+  });
+
+  it("arming another row disarms the previous row", async () => {
+    await renderWith([projectIn(A1, "alpha", "/work/a"), projectIn(A2, "beta", "/work/b")]);
+
+    const firstDelete = screen.getAllByTestId("project-action-delete").at(0);
+    if (firstDelete === undefined) throw new Error("expected first row delete button");
+    await fireEvent.click(firstDelete);
+    expect(screen.getAllByTestId("project-delete-confirm")).toHaveLength(1);
+
+    const secondDelete = screen.getAllByTestId("project-action-delete").at(0);
+    if (secondDelete === undefined) throw new Error("expected second row delete button");
+    await fireEvent.click(secondDelete);
+    expect(screen.getAllByTestId("project-delete-confirm")).toHaveLength(1);
+    expect(screen.getAllByTestId("project-row")[1]).toContainElement(
+      screen.getByTestId("project-delete-confirm"),
+    );
+  });
+
+  it("surfaces a backend failure and keeps the project", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "delete_project") throw new Error("disk busy");
+      return undefined;
+    });
+    await renderWith([projectIn(A1, "alpha", "/work/a")]);
+    await fireEvent.click(screen.getByTestId("project-action-delete"));
+    await fireEvent.click(screen.getByTestId("project-delete-confirm"));
+
+    const err = await screen.findByTestId("project-delete-error");
+    expect(err).toHaveTextContent("disk busy");
+    expect(screen.getByTestId("project-row")).toBeInTheDocument();
+    expect(screen.getByTestId("project-action-delete")).toBeInTheDocument();
+  });
+
+  it("uses the themed delete tooltip for the Switchboard-only deletion copy", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      await renderWith([projectIn(A1, "alpha", "/work/a")]);
+      const button = screen.getByTestId("project-action-delete");
+      expect(button).not.toHaveAttribute("title");
+
+      await fireEvent.pointerEnter(button);
+      await vi.advanceTimersByTimeAsync(1000);
+
+      const tooltip = await waitFor(() => screen.getByTestId("tooltip-content"));
+      expect(tooltip).toHaveTextContent("Delete project");
+      expect(tooltip).toHaveTextContent("Removes Switchboard's files for this project");
+      expect(tooltip).toHaveTextContent("your code and agent session files are kept");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("ProjectsSidebar — archive + view toggle", () => {
+  const A1 = "00000000-0000-7000-8000-0000000000b1";
+  const A2 = "00000000-0000-7000-8000-0000000000b2";
+
+  it("Active view hides archived projects; Archived view shows only them", async () => {
+    await renderWith([
+      projectIn(A1, "active-one", "/work/a"),
+      projectIn(A2, "archived-one", "/work/a", true),
+    ]);
+
+    // Default Active view: only the non-archived row.
+    let rows = screen.getAllByTestId("project-row");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toHaveAttribute("data-project-id", A1);
+
+    // Switch to Archived: only the archived row.
+    await fireEvent.click(screen.getByTestId("project-view-archived"));
+    rows = screen.getAllByTestId("project-row");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toHaveAttribute("data-project-id", A2);
+  });
+
+  it("empty-state copy is view-aware", async () => {
+    await renderWith([projectIn(A1, "active-one", "/work/a")]);
+    // No archived projects → Archived view shows the archived empty message.
+    await fireEvent.click(screen.getByTestId("project-view-archived"));
+    expect(screen.getByText("No archived projects.")).toBeInTheDocument();
+  });
+
+  it("Archive item calls through and the row leaves the Active view", async () => {
+    await renderWith([projectIn(A1, "alpha", "/work/a")]);
+    await fireEvent.click(await screen.findByTestId("project-action-archive"));
+
+    expect(invokeMock).toHaveBeenCalledWith("set_project_archived", {
+      projectId: A1,
+      archived: true,
+    });
+    // The (now-archived) row drops out of the default Active view.
+    await waitFor(() => expect(screen.queryByTestId("project-row")).toBeNull());
+  });
+
+  it("archive button becomes Unarchive for an archived project", async () => {
+    await renderWith([projectIn(A1, "alpha", "/work/a", true)]);
+    await fireEvent.click(screen.getByTestId("project-view-archived"));
+
+    const button = await screen.findByTestId("project-action-archive");
+    expect(button).toHaveAttribute("aria-label", "Unarchive project");
+    await fireEvent.click(button);
+    expect(invokeMock).toHaveBeenCalledWith("set_project_archived", {
+      projectId: A1,
+      archived: false,
+    });
+  });
+
+  it("on an unavailable row Archive stays enabled and Delete is disabled", async () => {
+    await renderWith([{ ...projectIn(A1, "alpha", "/work/a"), available: false }]);
+
+    expect(await screen.findByTestId("project-action-archive")).not.toBeDisabled();
+    expect(screen.getByTestId("project-action-delete")).toBeDisabled();
+  });
+});
+
+describe("ProjectsSidebar — search", () => {
+  const S1 = "00000000-0000-7000-8000-0000000000c1";
+  const S2 = "00000000-0000-7000-8000-0000000000c2";
+
+  function rowIds(): string[] {
+    return screen
+      .queryAllByTestId("project-row")
+      .map((r) => r.getAttribute("data-project-id") ?? "");
+  }
+
+  async function type(value: string): Promise<void> {
+    await fireEvent.input(screen.getByTestId("project-search"), { target: { value } });
+  }
+
+  it("filters by project name, case-insensitively", async () => {
+    await renderWith([projectIn(S1, "Alpha", "/work/one"), projectIn(S2, "Beta", "/work/two")]);
+    await type("alp");
+    expect(rowIds()).toEqual([S1]);
+  });
+
+  it("filters by directory basename (not the full path)", async () => {
+    await renderWith([
+      projectIn(S1, "Alpha", "/home/me/frontend"),
+      projectIn(S2, "Beta", "/home/me/backend"),
+    ]);
+    // "me" is in both full paths but neither basename → no matches.
+    await type("me");
+    expect(rowIds()).toEqual([]);
+    // Basename match.
+    await type("front");
+    expect(rowIds()).toEqual([S1]);
+  });
+
+  it("clearing the query (and the clear button) restores the list", async () => {
+    await renderWith([projectIn(S1, "Alpha", "/work/one"), projectIn(S2, "Beta", "/work/two")]);
+    await type("alpha");
+    expect(rowIds()).toEqual([S1]);
+
+    await fireEvent.click(screen.getByTestId("project-search-clear"));
+    expect(rowIds()).toEqual([S1, S2]);
+    expect(screen.queryByTestId("project-search-clear")).toBeNull(); // hidden when empty
+  });
+
+  it("composes with the Archived view", async () => {
+    await renderWith([
+      projectIn(S1, "alpha-active", "/work/one"),
+      projectIn(S2, "alpha-archived", "/work/two", true),
+    ]);
+    await type("alpha");
+    // Active view: only the non-archived "alpha".
+    expect(rowIds()).toEqual([S1]);
+    // Same query, Archived view: only the archived "alpha".
+    await fireEvent.click(screen.getByTestId("project-view-archived"));
+    expect(rowIds()).toEqual([S2]);
+  });
+
+  it("shows a distinct no-match state", async () => {
+    await renderWith([projectIn(S1, "Alpha", "/work/one")]);
+    await type("zzz");
+    expect(rowIds()).toEqual([]);
+    expect(screen.getByText("No projects match.")).toBeInTheDocument();
+  });
+
+  it("an empty Active view (all projects archived) says 'No active projects', not 'No projects yet'", async () => {
+    // Projects exist, but all are archived → the Active view is empty without
+    // being a query miss or a truly-empty workspace.
+    await renderWith([projectIn(S1, "alpha", "/work/one", true)]);
+    expect(rowIds()).toEqual([]);
+    expect(screen.getByText("No active projects.")).toBeInTheDocument();
+    expect(screen.queryByText("No projects yet.")).toBeNull();
+  });
+
+  it("an empty Archived view says 'No archived projects'", async () => {
+    await renderWith([projectIn(S1, "alpha", "/work/one")]);
+    await fireEvent.click(screen.getByTestId("project-view-archived"));
+    expect(rowIds()).toEqual([]);
+    expect(screen.getByText("No archived projects.")).toBeInTheDocument();
   });
 });

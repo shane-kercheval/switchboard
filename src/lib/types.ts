@@ -315,6 +315,9 @@ export type ProjectListing = {
   directory: string;
   available: boolean;
   last_activity: string;
+  /// User-global view-state (from `workspace.yaml`): the user archived this
+  /// project, hiding it from the default `Active` view. Not on-disk project state.
+  archived: boolean;
 };
 
 // Mirror of Rust `WorkspaceDirectoryInfo` / `WorkspaceDirectories`. The

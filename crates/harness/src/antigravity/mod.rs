@@ -653,6 +653,10 @@ async fn run_producer(ctx: ProducerCtx) {
     // Scan the per-dispatch CLI log only when the turn produced no answer —
     // a successful turn has nothing in the log we'd want to surface. Best-
     // effort: an unreadable / missing log falls back to the generic message.
+    // Load-bearing gate: `find_rpc_error_marker` matches broadly (any
+    // `(code N)` status line), so this scan MUST stay gated on
+    // `!saw_terminal_answer` — otherwise a stray log match could fail a turn
+    // that actually produced an answer. Preserve this ordering if refactored.
     let log_error = if saw_terminal_answer {
         None
     } else {
@@ -1030,9 +1034,10 @@ fn conversation_not_found(stdout_lines: &[String], stderr_tail: &Mutex<VecDeque<
         .is_ok_and(|buf| buf.iter().any(|l| is_conversation_not_found(l)))
 }
 
-/// Scan a per-dispatch `agy` CLI log for the first `rpc error: code = …`
-/// line and return a human-readable message, or `None` if the file is
-/// missing/unreadable or contains no matching line.
+/// Scan a per-dispatch `agy` CLI log for the first RPC/status error line —
+/// both the old `rpc error: code = …` gRPC shape and agy 1.0.4's
+/// `<STATUS> (code N): …` shape — and return a human-readable message, or
+/// `None` if the file is missing/unreadable or contains no matching line.
 ///
 /// Why this exists: `agy` exits 0 with empty stdout/stderr on
 /// `RESOURCE_EXHAUSTED` (quota) and similar RPC failures — the *only* place
@@ -1061,12 +1066,30 @@ fn scan_agy_log_for_error(path: &Path) -> Option<String> {
     None
 }
 
-/// Find the byte index of the `rpc error: code = ` marker (case-insensitive)
-/// in a log line, or `None` if absent.
+/// Find the byte index where a gRPC status error begins in an `agy` log line,
+/// or `None` if the line carries no recognizable RPC error.
+///
+/// Two `agy` formats are matched:
+/// - Old gRPC plumbing: `… rpc error: code = <Code> desc = …`.
+/// - agy 1.0.4: `… <STATUS> (code <NNN>): <message>` (e.g.
+///   `RESOURCE_EXHAUSTED (code 429): Individual quota reached…`) — the
+///   `rpc error: code = ` / `desc = ` wrapper was dropped, so anchor on the
+///   ` (code <digit>` token and back up to the start of the `<STATUS>` word so
+///   the surfaced detail begins at the status, not the Go log preamble.
 fn find_rpc_error_marker(line: &str) -> Option<usize> {
-    const MARKER: &str = "rpc error: code = ";
-    // MARKER is already lowercase; only the input needs normalization.
-    line.to_ascii_lowercase().find(MARKER)
+    let lower = line.to_ascii_lowercase();
+    if let Some(idx) = lower.find("rpc error: code = ") {
+        return Some(idx);
+    }
+    let paren = lower.match_indices(" (code ").find_map(|(i, _)| {
+        lower[i + " (code ".len()..]
+            .starts_with(|c: char| c.is_ascii_digit())
+            .then_some(i)
+    })?;
+    let start = line[..paren]
+        .rfind(char::is_whitespace)
+        .map_or(0, |s| s + 1);
+    Some(start)
 }
 
 /// Map an RPC error detail line into a user-facing failure message.
@@ -1093,11 +1116,10 @@ fn rpc_error_to_message(detail: &str) -> String {
         }
         return msg;
     }
-    // Unknown/never-observed code: strip the `rpc error: code = … desc = `
-    // gRPC plumbing the same way the quota branch does, so the user sees the
-    // descriptive tail rather than Go boilerplate. (No `desc = ` → the tail
-    // helper returns the line unchanged, which is acceptable for a code we
-    // haven't yet authored a message for.)
+    // Unknown/never-observed code: run it through the same descriptive-tail
+    // extraction as the quota branch — strips the `rpc error: code = … desc = `
+    // plumbing or agy 1.0.4's `<STATUS> (code N): ` prefix and collapses the
+    // doubled message — so the user sees the cause rather than Go boilerplate.
     format!(
         "Antigravity error: {}",
         extract_rpc_descriptive_tail(detail)
@@ -1114,20 +1136,27 @@ fn extract_rpc_descriptive_tail(detail: &str) -> String {
         .split_once("desc = ")
         .map_or(detail, |(_, rest)| rest);
     let trimmed = after_desc.trim().trim_end_matches('.').trim();
-    // `agy` logs `"<msg>: <msg>"` — same sentence repeated on either side of
-    // the colon. The first half retains its mid-string trailing period
-    // (`"…25s.: …25s"`), the second doesn't — so equality must compare on
-    // the period-stripped form, then return either half (they're
-    // semantically identical) trimmed to the user-facing shape.
-    let halved = match trimmed.split_once(": ") {
-        Some((first, second))
-            if first.trim_end_matches('.').trim() == second.trim_end_matches('.').trim() =>
-        {
-            second.trim_end_matches('.').trim()
-        }
-        _ => trimmed,
-    };
-    halved.to_owned()
+    // `agy` logs the message doubled (`"<msg>: <msg>"`). The duplication colon
+    // is the `": "` whose two period-stripped halves are equal — try every
+    // boundary, because the message itself can contain a colon (agy 1.0.4's
+    // `RESOURCE_EXHAUSTED (code 429): …` shape has one, so splitting on the
+    // first `": "` would cut in the wrong place).
+    let halved = trimmed
+        .match_indices(": ")
+        .find_map(|(i, _)| {
+            let first = trimmed[..i].trim_end_matches('.').trim();
+            let second = trimmed[i + 2..].trim_end_matches('.').trim();
+            (first == second).then_some(second)
+        })
+        .unwrap_or(trimmed);
+    // agy 1.0.4 prefixes the human message with `<STATUS> (code <N>): `; strip
+    // it so the surfaced tail is just the message (the old `desc = ` form had
+    // no such prefix).
+    halved
+        .split_once("): ")
+        .filter(|(prefix, _)| prefix.contains("(code "))
+        .map_or(halved, |(_, rest)| rest)
+        .to_owned()
 }
 
 /// Build the terminal `TurnOutcome` from the post-exit signals. Pure so the
@@ -1897,6 +1926,40 @@ mod tests {
     }
 
     #[test]
+    fn scan_agy_log_resource_exhausted_new_1_0_4_format_returns_authored_message() {
+        // agy 1.0.4 dropped the gRPC `rpc error: code = ResourceExhausted desc
+        // = …` plumbing for `RESOURCE_EXHAUSTED (code 429): …`. Without matching
+        // the new shape the quota error went undetected and surfaced as the
+        // generic "transcript path may have changed" failure. This is the real
+        // captured line (Resets value redacted to a fixed duration).
+        let tmp = TempDir::new().unwrap();
+        let log = tmp.path().join("agy.log");
+        std::fs::write(
+            &log,
+            "E0602 20:37:59.639860 15879 log.go:398] agent executor error: RESOURCE_EXHAUSTED (code 429): Individual quota reached. Contact your administrator to enable overages. Resets in 46h52m7s.: RESOURCE_EXHAUSTED (code 429): Individual quota reached. Contact your administrator to enable overages. Resets in 46h52m7s.\n",
+        )
+        .unwrap();
+        let msg = scan_agy_log_for_error(&log).expect("new-format log scan must find the error");
+        assert!(
+            msg.starts_with("Antigravity quota exhausted"),
+            "authored prefix: {msg}"
+        );
+        assert!(
+            msg.contains("Resets in 46h52m7s"),
+            "carries the reset-time tail: {msg}"
+        );
+        assert!(
+            !msg.contains("(code 429)"),
+            "the status-code prefix is stripped from the surfaced tail: {msg}"
+        );
+        assert_eq!(
+            msg.matches("Individual quota reached").count(),
+            1,
+            "doubled descriptive sentence must be collapsed: {msg}"
+        );
+    }
+
+    #[test]
     fn scan_agy_log_unknown_code_passes_through_as_authored_prefix() {
         let tmp = TempDir::new().unwrap();
         let log = tmp.path().join("agy.log");
@@ -1917,6 +1980,37 @@ mod tests {
         assert!(
             !msg.contains("rpc error: code = "),
             "Go RPC boilerplate is stripped: {msg}"
+        );
+    }
+
+    #[test]
+    fn scan_agy_log_unknown_code_new_1_0_4_format_passes_through_as_authored_prefix() {
+        // Non-quota RPC failures (network/backend) in agy 1.0.4's new format
+        // must also surface their cause, not the generic transcript-path error.
+        let tmp = TempDir::new().unwrap();
+        let log = tmp.path().join("agy.log");
+        std::fs::write(
+            &log,
+            "E0602 20:37:59.639860 15879 log.go:398] agent executor error: UNAVAILABLE (code 503): backend exploded: UNAVAILABLE (code 503): backend exploded\n",
+        )
+        .unwrap();
+        let msg = scan_agy_log_for_error(&log).expect("scan must surface unknown new-format codes");
+        assert!(
+            msg.starts_with("Antigravity error: "),
+            "unknown code passes through with authored prefix: {msg}"
+        );
+        assert!(
+            msg.contains("backend exploded"),
+            "carries the descriptive tail: {msg}"
+        );
+        assert!(
+            !msg.contains("(code 503)"),
+            "the status-code prefix is stripped: {msg}"
+        );
+        assert_eq!(
+            msg.matches("backend exploded").count(),
+            1,
+            "doubled descriptive sentence must be collapsed: {msg}"
         );
     }
 

@@ -2,10 +2,12 @@
 //!
 //! Usage (mirrors how `ClaudeCodeAdapter` invokes claude):
 //!
-//!   `fake_claude` -p <fixture-path> [other claude flags ignored]
+//!   `fake_claude` -p [flags…] -- <fixture-path>
 //!
-//! The value after `-p` is treated as a path to a JSONL fixture file. Each
-//! non-empty, non-comment line is written to stdout verbatim.
+//! The adapter passes the prompt as the LAST argv entry (a positional after the
+//! `--` end-of-options separator, so a leading-dash prompt isn't misparsed). The
+//! fake binary mirrors that by treating the last arg as a path to a JSONL
+//! fixture file. Each non-empty, non-comment line is written to stdout verbatim.
 //!
 //! Special comment lines in the fixture (processed, never forwarded to stdout):
 //!   `// exit:<N>` — exit with code N instead of 0; stops line processing.
@@ -31,14 +33,15 @@ use std::process;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
-    // Find the value immediately after `-p`.
-    let fixture_path = args.windows(2).find(|w| w[0] == "-p").map_or_else(
-        || {
-            eprintln!("fake_claude: missing -p <fixture-path>");
+    // The adapter passes the prompt (here, the fixture path) as the LAST argv
+    // entry, after a `--` separator. Mirror that by reading the last arg.
+    let fixture_path = match args.last() {
+        Some(p) if args.len() >= 2 => p.clone(),
+        _ => {
+            eprintln!("fake_claude: expected fixture path as the last argument");
             process::exit(1);
-        },
-        |w| w[1].clone(),
-    );
+        }
+    };
 
     let file = std::fs::File::open(&fixture_path).unwrap_or_else(|e| {
         eprintln!("fake_claude: cannot open fixture {fixture_path}: {e}");

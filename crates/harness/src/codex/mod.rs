@@ -19,6 +19,12 @@
 //! accept `-C`. cwd is set instead via
 //! `tokio::process::Command::current_dir(cwd)` for both paths — Codex
 //! inherits cwd from the parent process automatically.
+//!
+//! **Prompt positional / leading dash.** Codex takes the prompt as a bare
+//! positional. We pass it after a `--` end-of-options separator so a prompt
+//! beginning with `-` (e.g. a markdown bullet) is not misparsed as a flag —
+//! without it, clap aborts with `unexpected argument '- '` and the turn fails
+//! before any model call (verified against codex-cli 0.136.0).
 
 pub mod config;
 pub mod parser;
@@ -235,7 +241,9 @@ fn resolve_home_dir(override_path: Option<&Path>) -> PathBuf {
 /// Build the args for `codex exec [resume <id>]`. Flag set verified against
 /// codex-cli 0.130.0; see the module-level docstring and
 /// `docs/research/archive/codex-cli-observed.md` for the `-C`-on-resume rejection
-/// finding.
+/// finding. Positionals (session id, prompt) follow a `--` end-of-options
+/// separator so a prompt beginning with `-` is not misparsed as a flag (verified
+/// against codex-cli 0.136.0).
 fn build_args(prompt: &str, resume_thread_id: Option<&str>) -> Vec<String> {
     if let Some(thread_id) = resume_thread_id {
         // Resume subcommand — NO `-C` (rejected by codex 0.130.0). cwd is
@@ -246,6 +254,11 @@ fn build_args(prompt: &str, resume_thread_id: Option<&str>) -> Vec<String> {
             "--json".to_owned(),
             "--skip-git-repo-check".to_owned(),
             "--dangerously-bypass-approvals-and-sandbox".to_owned(),
+            // End-of-options separator so the positionals (session id and,
+            // critically, the prompt) are never parsed as flags. Without it a
+            // prompt beginning with `-` (e.g. a markdown bullet) makes clap
+            // abort with `unexpected argument '- '`. Verified against codex 0.136.0.
+            "--".to_owned(),
             thread_id.to_owned(),
             prompt.to_owned(),
         ]
@@ -263,6 +276,9 @@ fn build_args(prompt: &str, resume_thread_id: Option<&str>) -> Vec<String> {
             // set by Command::current_dir — "." is interpreted relative to
             // the child's pwd, which IS cwd. Avoids encoding the path twice.
             ".".to_owned(),
+            // End-of-options separator (see the resume branch) — guards the
+            // prompt positional against a leading `-`.
+            "--".to_owned(),
             prompt.to_owned(),
         ]
     }
@@ -756,6 +772,19 @@ mod tests {
             Some(&"hello".to_owned()),
             "prompt is the last positional"
         );
+        // `-- ` precedes the prompt positional so a leading-dash prompt is not
+        // parsed as a flag. Tail must be exactly `-C . -- <prompt>`.
+        let n = args.len();
+        assert_eq!(
+            &args[n - 4..],
+            &[
+                "-C".to_owned(),
+                ".".to_owned(),
+                "--".to_owned(),
+                "hello".to_owned()
+            ],
+            "first-turn tail is `-C . -- <prompt>`; got {args:?}"
+        );
     }
 
     #[test]
@@ -774,9 +803,18 @@ mod tests {
             .expect("resume subcommand");
         assert!(resume_idx > exec_idx, "resume comes after exec");
 
-        // thread_id is the second-to-last arg (last is prompt)
-        assert_eq!(args[args.len() - 2], RESUME_THREAD_ID);
-        assert_eq!(args.last(), Some(&"hello again".to_owned()));
+        // Tail must be exactly `-- <thread_id> <prompt>`: the `--` end-of-options
+        // separator guards both positionals against a leading dash.
+        let n = args.len();
+        assert_eq!(
+            &args[n - 3..],
+            &[
+                "--".to_owned(),
+                RESUME_THREAD_ID.to_owned(),
+                "hello again".to_owned()
+            ],
+            "resume tail is `-- <thread_id> <prompt>`; got {args:?}"
+        );
 
         // Critical: no -C / --cd on resume
         assert!(
@@ -788,6 +826,32 @@ mod tests {
         assert!(args.contains(&"--json".to_owned()));
         assert!(args.contains(&"--skip-git-repo-check".to_owned()));
         assert!(args.contains(&"--dangerously-bypass-approvals-and-sandbox".to_owned()));
+    }
+
+    #[test]
+    fn build_args_dash_leading_prompt_stays_last_positional() {
+        // Regression for the reported failure: a prompt that begins with `-`
+        // (markdown bullet) or `--` must remain the final positional in both
+        // branches, sitting after the `--` separator rather than being parsed
+        // as a flag.
+        for prompt in ["- the left border is cut off", "--help"] {
+            let first = build_args(prompt, None);
+            assert_eq!(first.last(), Some(&prompt.to_owned()));
+            assert_eq!(
+                first[first.len() - 2],
+                "--",
+                "prompt is preceded by the `--` separator (first turn); got {first:?}"
+            );
+
+            let resume = build_args(prompt, Some(RESUME_THREAD_ID));
+            assert_eq!(resume.last(), Some(&prompt.to_owned()));
+            assert_eq!(resume[resume.len() - 2], RESUME_THREAD_ID);
+            assert_eq!(
+                resume[resume.len() - 3],
+                "--",
+                "`--` separator precedes the positionals (resume); got {resume:?}"
+            );
+        }
     }
 
     #[test]

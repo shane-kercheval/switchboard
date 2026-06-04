@@ -436,6 +436,57 @@ async fn live_claude_resume_reuses_session() {
     );
 }
 
+#[tokio::test]
+#[ignore = "requires claude installed — run with: make test-live"]
+async fn live_claude_dash_leading_prompt_completes() {
+    // Canary: a prompt beginning with `-` must dispatch and complete. `claude`'s
+    // parser (commander) takes the prompt as a positional, so without the `--`
+    // separator a leading-dash prompt aborts with `unknown option '- …'`. Doubles
+    // as a drift tripwire if a CLI bump changes prompt parsing.
+    let adapter = ClaudeCodeAdapter::new();
+    let agent = live_agent();
+    let turn_id = Uuid::now_v7();
+
+    let stream = adapter
+        .dispatch(
+            &agent,
+            Path::new("/tmp"),
+            "- Reply with the single word 'ack' and nothing else.",
+            turn_id,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed with a dash-leading prompt");
+    let events: Vec<AdapterEvent> = stream.collect().await;
+
+    let text: String = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::ContentChunk { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        text.to_lowercase().contains("ack"),
+        "expected 'ack' in response text, got: {text:?}"
+    );
+
+    let terminal = events
+        .iter()
+        .find(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+        .expect("should have a terminal TurnEnd");
+    assert!(
+        matches!(
+            terminal,
+            AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        ),
+        "dash-leading prompt must complete, got: {terminal:?}"
+    );
+}
+
 // --- Codex live tests ---
 
 fn live_codex_agent() -> AgentRecord {
@@ -678,13 +729,17 @@ async fn live_codex_resume_reuses_session() {
         ..agent.clone()
     };
 
-    // Turn 2 (resume): ask Codex to recall the word.
+    // Turn 2 (resume): ask Codex to recall the word. The prompt deliberately
+    // begins with `-` (a markdown bullet) — the exact shape that crashed the
+    // resume path in production before the `--` end-of-options separator was
+    // added to `build_args`. A leading-dash prompt would otherwise make clap
+    // abort with `unexpected argument '- '` and fail the turn.
     let turn2 = Uuid::now_v7();
     let stream2 = adapter
         .dispatch(
             &resumed_agent,
             tmp.path(),
-            "What word did I ask you to remember? Reply with only that word.",
+            "- What word did I ask you to remember? Reply with only that word.",
             turn2,
             DispatchOptions::default(),
         )
@@ -931,6 +986,57 @@ async fn live_gemini_streamed_answer_completes_despite_trailing_error() {
         ),
         "a turn that streamed a complete answer must complete even if Gemini \
          appended a benign trailing error, got: {terminal:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires gemini installed — run with: make test-live"]
+async fn live_gemini_dash_leading_prompt_completes() {
+    // Canary: a prompt beginning with `-` must dispatch and complete. `gemini`'s
+    // parser (yargs) otherwise rejects a `-`-leading `-p` value with `Not enough
+    // arguments following: p` — the adapter passes it as `--prompt=<value>`.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let adapter = GeminiAdapter::new();
+    let agent = live_gemini_agent();
+    let turn_id = Uuid::now_v7();
+
+    let stream = adapter
+        .dispatch(
+            &agent,
+            tmp.path(),
+            "- Reply with the single word 'ack' and nothing else.",
+            turn_id,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed with a dash-leading prompt");
+    let events: Vec<AdapterEvent> = stream.collect().await;
+
+    let text: String = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::ContentChunk { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        text.to_lowercase().contains("ack"),
+        "expected 'ack' in response text, got: {text:?}"
+    );
+
+    let terminal = events
+        .iter()
+        .find(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+        .expect("should have a terminal TurnEnd");
+    assert!(
+        matches!(
+            terminal,
+            AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        ),
+        "dash-leading prompt must complete, got: {terminal:?}"
     );
 }
 
@@ -1230,5 +1336,57 @@ async fn live_antigravity_resume_reuses_session() {
     assert!(
         antigravity_capture(&events2).is_none(),
         "a resume must not re-capture the locator"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
+async fn live_antigravity_dash_leading_prompt_completes() {
+    // Canary / drift tripwire: `agy` currently tolerates a `-`-leading `-p`
+    // value (so the adapter passes the prompt unchanged), unlike claude/gemini/
+    // codex. This guards that assumption — if a CLI bump makes `agy` dash-
+    // sensitive, this fails and the adapter needs the same treatment.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let adapter = AntigravityAdapter::new();
+    let agent = live_antigravity_agent();
+    let turn_id = Uuid::now_v7();
+
+    let stream = adapter
+        .dispatch(
+            &agent,
+            tmp.path(),
+            "- Reply with the single word 'ack' and nothing else.",
+            turn_id,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed with a dash-leading prompt");
+    let events: Vec<AdapterEvent> = stream.collect().await;
+
+    let text: String = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::ContentChunk { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        text.to_lowercase().contains("ack"),
+        "expected 'ack' in transcript-derived response text, got: {text:?}"
+    );
+
+    let terminal = events
+        .iter()
+        .find(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+        .expect("should have a terminal TurnEnd");
+    assert!(
+        matches!(
+            terminal,
+            AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        ),
+        "dash-leading prompt must complete, got: {terminal:?}"
     );
 }

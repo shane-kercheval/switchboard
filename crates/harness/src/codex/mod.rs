@@ -345,6 +345,7 @@ async fn run_producer(
                     let _ = tx.send(AdapterEvent::TurnEnd {
                         turn_id,
                         context_window_source: None,
+                        stable_message_id: None,
                         spend: None,
                         outcome: TurnOutcome::Failed {
                             kind: FailureKind::AdapterFailure,
@@ -395,6 +396,7 @@ async fn run_producer(
                             ended_at: Utc::now(),
                             usage: None,
                             context_window_source: None,
+                            stable_message_id: None,
                             spend: None,
                         });
                         terminal_seen = true;
@@ -435,6 +437,7 @@ async fn run_producer(
                                     ended_at,
                                     usage: None,
                                     context_window_source: None,
+                                    stable_message_id: None,
                                     spend: None,
                                 });
                                 force_kill_child = true;
@@ -487,6 +490,7 @@ async fn run_producer(
                     ended_at: Utc::now(),
                     usage: None,
                     context_window_source: None,
+                    stable_message_id: None,
                     spend: None,
                 });
                 terminal_seen = true;
@@ -613,8 +617,10 @@ async fn emit_terminal_with_enrichment(
         ended_at,
         usage: enriched_usage,
         context_window_source,
-        // Codex has no cost/overage in v1 — no real-spend attribution.
+        // Codex has no cost/overage in v1 — no real-spend attribution, and no
+        // join key (the durable per-turn store is Claude-only).
         spend: None,
+        stable_message_id: None,
     });
 
     // Step 4: emit RateLimitEvent if rate-limit info was found. Codex's
@@ -719,6 +725,7 @@ fn synthesize_truncation_turn_end(
         ended_at: Utc::now(),
         usage: None,
         context_window_source: None,
+        stable_message_id: None,
         spend: None,
     }
 }

@@ -908,6 +908,9 @@ impl CodexReconstruction {
             status,
             items: builder.items,
             usage: builder.usage,
+            // Codex has no cost/overage and no join key (Claude-only feature).
+            spend: None,
+            stable_message_id: None,
         });
     }
 

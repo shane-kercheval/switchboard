@@ -456,6 +456,7 @@ export async function hydrateProject(projectId: ProjectId): Promise<void> {
           status: item.status,
           items: item.items,
           usage: item.usage ?? null,
+          spend: item.spend ?? null,
         });
         turnsByAgent.set(item.agent_id, arr);
       } else {

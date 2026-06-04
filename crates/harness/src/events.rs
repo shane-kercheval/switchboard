@@ -232,6 +232,14 @@ pub enum AdapterEvent {
         /// `context_window_source`, this *is* rendered). `None` = no real-spend
         /// info for this turn.
         spend: Option<TurnSpend>,
+        /// Stable per-turn join key: the final non-subagent assistant message's
+        /// Anthropic `message.id`, which appears identically in the live stream
+        /// and the on-disk session file (verified). The dispatcher keys the
+        /// durable per-turn metadata (`turnmeta` sidecar) on it so cost/overage
+        /// can re-attach to the right message on reopen. Internal: dropped at
+        /// the `NormalizedEvent` boundary (the frontend never sees it). `None`
+        /// when the harness has no such id (non-Claude) or no assistant message.
+        stable_message_id: Option<String>,
     },
     RateLimitEvent {
         agent_id: AgentId,
@@ -421,10 +429,10 @@ impl AdapterEvent {
                 output,
                 is_error,
             },
-            // `context_window_source` is intentionally dropped (the `..`) — an
-            // internal persistence discriminator the frontend doesn't need
-            // (mirrors the `RateLimitEvent` source drop below). `spend` *is*
-            // carried through — it's rendered on the message.
+            // `context_window_source` and `stable_message_id` are intentionally
+            // dropped (the `..`) — internal persistence/join plumbing the
+            // frontend doesn't need (mirrors the `RateLimitEvent` source drop
+            // below). `spend` *is* carried through — it's rendered on the message.
             AdapterEvent::TurnEnd {
                 turn_id,
                 outcome,
@@ -892,6 +900,7 @@ mod tests {
             ended_at: fresh_time(),
             usage: None,
             context_window_source: None,
+            stable_message_id: None,
             spend: None,
         };
         let normalized = adapter
@@ -918,6 +927,7 @@ mod tests {
             ended_at: fresh_time(),
             usage: None,
             context_window_source: None,
+            stable_message_id: None,
             spend: None,
         };
         let normalized = adapter

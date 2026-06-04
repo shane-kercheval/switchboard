@@ -71,7 +71,7 @@ Same denominator; the numerator now includes the cached prefix.
 
 ## What this is **not**
 
-- Not a fix for the "context % missing on project reopen" issue — that's persistence, covered separately in `2026-05-18-note-claude-cost-context-persistence.md`. The formula fix applies once data is available; the persistence note handles the "no data after reopen" gap.
+- Not a fix for the "context % missing on project reopen" issue — that's persistence, resolved separately by `2026-05-31-per-message-metadata-and-context-formula.md` (Milestones 2 and 4). The formula fix applies once data is available; persistence handles the "no data after reopen" gap.
 - Not relevant for Gemini — Gemini doesn't report a context window at all, so the bar hides regardless of formula.
 - Not a change to the underlying `TurnUsage` shape — the data is already there, the consumer just doesn't read all of it.
 

@@ -1571,7 +1571,70 @@ fn load_agent_transcript(
         &mut transcript,
         switchboard_harness::meta_sidecar::read(&sidecar_path),
     );
+    // Re-attach persisted per-turn cost + overage by joining the turn-metadata
+    // sidecar's records onto the hydrated turns by `stable_message_id`. Same
+    // best-effort posture: a missing/corrupt log reads as empty and the join is
+    // a no-op (turns render no cost/overage — the no-backfill case).
+    let turnmeta_path = switchboard_harness::turnmeta_sidecar::turnmeta_sidecar_path(
+        &project.directory,
+        project.id,
+        agent.id,
+    );
+    apply_turnmeta_overlay(
+        &mut transcript,
+        &switchboard_harness::turnmeta_sidecar::read(&turnmeta_path),
+    );
     Ok(transcript)
+}
+
+/// Overlay persisted per-turn cost + overage onto a freshly-loaded transcript
+/// by joining on `stable_message_id`.
+///
+/// Each [`TurnMetaRecord`] is keyed on the turn's final non-subagent
+/// assistant-message id — the same value the Claude session-file parser stamps
+/// onto `Turn::Agent.stable_message_id`. For every agent turn carrying that id,
+/// we fill (fill-if-empty) the turn's `spend` from the record and its
+/// `usage.total_cost_usd` from the persisted cost, so the inline cost +
+/// "using credits" marker re-renders exactly as it did live.
+///
+/// Records are indexed by `message_id`; the last record wins for a repeated key
+/// (a turn re-run after resume appends a fresh record — the newest is correct).
+/// A turn with no matching record keeps its loaded values (none, for a
+/// pre-feature or non-Claude turn). Best-effort: an empty record set is a no-op.
+fn apply_turnmeta_overlay(
+    transcript: &mut switchboard_harness::LoadedTranscript,
+    records: &[switchboard_harness::turnmeta_sidecar::TurnMetaRecord],
+) {
+    if records.is_empty() {
+        return;
+    }
+    let by_message_id: std::collections::HashMap<&str, &_> =
+        records.iter().map(|r| (r.message_id.as_str(), r)).collect();
+    for turn in &mut transcript.turns {
+        if let switchboard_harness::Turn::Agent {
+            stable_message_id: Some(message_id),
+            spend,
+            usage,
+            ..
+        } = turn
+            && let Some(record) = by_message_id.get(message_id.as_str())
+        {
+            if spend.is_none() {
+                *spend = Some(record.spend.clone());
+            }
+            // `spend` (the overage marker) restores unconditionally, but the
+            // dollar figure lives *inside* `usage` — so cost reattaches only
+            // when the turn carries `usage`. For Claude this is always true
+            // (completed turns carry usage), so a marker-without-cost turn is
+            // currently unreachable; we don't synthesize a `usage` shell to
+            // hold an orphaned cost (that struct also drives the context bar).
+            if let (Some(usage), Some(cost)) = (usage.as_mut(), record.total_cost_usd)
+                && usage.total_cost_usd.is_none()
+            {
+                usage.total_cost_usd = Some(cost);
+            }
+        }
+    }
 }
 
 /// Overlay a metadata sidecar's snapshots onto a freshly-loaded transcript.
@@ -1926,6 +1989,12 @@ pub enum ConversationItem {
         status: switchboard_harness::TurnStatus,
         items: Vec<switchboard_harness::TurnItem>,
         usage: Option<switchboard_harness::TurnUsage>,
+        /// Per-turn cost + overage, present when this turn was a real-spend turn
+        /// whose telemetry was persisted (re-joined from the turn-metadata
+        /// sidecar on reopen). `None` for normal-quota or pre-feature turns —
+        /// the message then renders no cost and no "using credits" marker.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        spend: Option<switchboard_harness::TurnSpend>,
     },
     /// A non-completed-turn marker (failed or cancelled), sourced from the
     /// journal. Carries no agent content; `reason` is a best-effort
@@ -2153,6 +2222,8 @@ fn merge_project_conversation(
                     status,
                     items: t_items,
                     usage,
+                    spend,
+                    ..
                 } => {
                     let send_id = if agent_seen >= turn_offset {
                         completed.get(agent_seen - turn_offset).copied()
@@ -2168,6 +2239,7 @@ fn merge_project_conversation(
                         status,
                         items: t_items,
                         usage,
+                        spend,
                     });
                     agent_seen += 1;
                 }
@@ -3633,6 +3705,7 @@ mod tests {
                     ended_at: chrono::Utc::now(),
                     usage: None,
                     context_window_source: None,
+                    stable_message_id: None,
                     spend: None,
                 });
             });
@@ -3899,6 +3972,7 @@ mod tests {
                         ended_at: chrono::Utc::now(),
                         usage: None,
                         context_window_source: None,
+                        stable_message_id: None,
                         spend: None,
                     });
                 });
@@ -4017,6 +4091,7 @@ mod tests {
                         ended_at: chrono::Utc::now(),
                         usage: None,
                         context_window_source: None,
+                        stable_message_id: None,
                         spend: None,
                     });
                 });
@@ -4945,6 +5020,8 @@ mod tests {
                 context_window,
                 total_cost_usd: None,
             }),
+            spend: None,
+            stable_message_id: None,
         }
     }
 
@@ -5053,6 +5130,240 @@ mod tests {
             overlay_turn_window(&transcript.turns[0]),
             Some(272_000),
             "a loader-provided window must win over the sidecar"
+        );
+    }
+
+    /// An agent turn carrying the given join key (`stable_message_id`) and an
+    /// optional `total_cost_usd`, with `spend: None` (the un-rejoined hydrate
+    /// shape the turnmeta overlay fills).
+    fn turnmeta_agent_turn(
+        message_id: Option<&str>,
+        cost: Option<f64>,
+    ) -> switchboard_harness::Turn {
+        switchboard_harness::Turn::Agent {
+            turn_id: Uuid::now_v7(),
+            agent_id: Uuid::now_v7(),
+            started_at: chrono::Utc::now(),
+            ended_at: Some(chrono::Utc::now()),
+            status: switchboard_harness::TurnStatus::Complete,
+            items: vec![],
+            usage: Some(switchboard_harness::TurnUsage {
+                input_tokens: 100,
+                output_tokens: 25,
+                cached_input_tokens: None,
+                cache_creation_input_tokens: None,
+                context_input_tokens: Some(100),
+                reasoning_output_tokens: None,
+                context_window: None,
+                total_cost_usd: cost,
+            }),
+            spend: None,
+            stable_message_id: message_id.map(str::to_owned),
+        }
+    }
+
+    fn turnmeta_record(
+        message_id: &str,
+        cost: Option<f64>,
+        is_overage: bool,
+    ) -> switchboard_harness::turnmeta_sidecar::TurnMetaRecord {
+        switchboard_harness::turnmeta_sidecar::TurnMetaRecord {
+            message_id: message_id.to_owned(),
+            total_cost_usd: cost,
+            spend: switchboard_harness::TurnSpend {
+                real_spend: is_overage,
+                is_overage,
+                overage_resets_at: None,
+            },
+            captured_at: chrono::Utc::now(),
+        }
+    }
+
+    fn turn_spend_and_cost(turn: &switchboard_harness::Turn) -> (Option<bool>, Option<f64>) {
+        match turn {
+            switchboard_harness::Turn::Agent { spend, usage, .. } => (
+                spend.as_ref().map(|s| s.is_overage),
+                usage.as_ref().and_then(|u| u.total_cost_usd),
+            ),
+            _ => (None, None),
+        }
+    }
+
+    #[test]
+    fn turnmeta_overlay_fills_spend_and_cost_by_message_id() {
+        // The reopen join: a persisted record keyed on the turn's message id
+        // fills both the overage `spend` and the `total_cost_usd` so the inline
+        // cost + marker re-render exactly as they did live.
+        let mut transcript = switchboard_harness::LoadedTranscript {
+            turns: vec![
+                turnmeta_agent_turn(Some("msg_other"), None),
+                turnmeta_agent_turn(Some("msg_test31"), None),
+            ],
+            ..Default::default()
+        };
+        apply_turnmeta_overlay(
+            &mut transcript,
+            &[turnmeta_record("msg_test31", Some(0.0125), true)],
+        );
+        assert_eq!(
+            turn_spend_and_cost(&transcript.turns[1]),
+            (Some(true), Some(0.0125)),
+            "the matching turn gets the persisted overage + cost"
+        );
+        assert_eq!(
+            turn_spend_and_cost(&transcript.turns[0]),
+            (None, None),
+            "a turn with no matching record is untouched"
+        );
+    }
+
+    #[test]
+    fn turnmeta_overlay_no_matching_record_is_noop() {
+        // A pre-feature / non-Claude turn (no record for its id) renders
+        // neither cost nor marker.
+        let mut transcript = switchboard_harness::LoadedTranscript {
+            turns: vec![turnmeta_agent_turn(Some("msg_unmatched"), None)],
+            ..Default::default()
+        };
+        apply_turnmeta_overlay(
+            &mut transcript,
+            &[turnmeta_record("msg_test31", Some(0.0125), true)],
+        );
+        assert_eq!(turn_spend_and_cost(&transcript.turns[0]), (None, None));
+    }
+
+    #[test]
+    fn turnmeta_overlay_empty_records_is_noop() {
+        // Missing/corrupt log (read returns empty) → no-op, no panic.
+        let mut transcript = switchboard_harness::LoadedTranscript {
+            turns: vec![turnmeta_agent_turn(Some("msg_test31"), None)],
+            ..Default::default()
+        };
+        apply_turnmeta_overlay(&mut transcript, &[]);
+        assert_eq!(turn_spend_and_cost(&transcript.turns[0]), (None, None));
+    }
+
+    #[test]
+    fn turnmeta_overlay_does_not_override_existing_spend() {
+        // Defensive fill-if-empty: a turn that already carries spend/cost (e.g.
+        // a live stamp that somehow persisted to the loaded turn) wins over the
+        // record — the join never clobbers an existing value.
+        let mut transcript = switchboard_harness::LoadedTranscript {
+            turns: vec![{
+                let mut turn = turnmeta_agent_turn(Some("msg_test31"), Some(9.99));
+                if let switchboard_harness::Turn::Agent { spend, .. } = &mut turn {
+                    *spend = Some(switchboard_harness::TurnSpend {
+                        real_spend: true,
+                        is_overage: false,
+                        overage_resets_at: None,
+                    });
+                }
+                turn
+            }],
+            ..Default::default()
+        };
+        apply_turnmeta_overlay(
+            &mut transcript,
+            &[turnmeta_record("msg_test31", Some(0.0125), true)],
+        );
+        assert_eq!(
+            turn_spend_and_cost(&transcript.turns[0]),
+            (Some(false), Some(9.99)),
+            "existing spend + cost on the turn win over the persisted record"
+        );
+    }
+
+    #[test]
+    fn turnmeta_overlay_last_record_wins_on_duplicate_key() {
+        // A turn re-run after resume appends a fresh record under the same id;
+        // the newest record is authoritative.
+        let mut transcript = switchboard_harness::LoadedTranscript {
+            turns: vec![turnmeta_agent_turn(Some("msg_test31"), None)],
+            ..Default::default()
+        };
+        apply_turnmeta_overlay(
+            &mut transcript,
+            &[
+                turnmeta_record("msg_test31", Some(0.01), true),
+                turnmeta_record("msg_test31", Some(0.99), false),
+            ],
+        );
+        assert_eq!(
+            turn_spend_and_cost(&transcript.turns[0]),
+            (Some(false), Some(0.99)),
+            "the last record for a repeated key wins"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_transcript_rejoins_persisted_turn_spend_for_claude_agent() {
+        // End-to-end wiring through the real load path: a Claude agent whose
+        // session file produces a turn with message id `msg_test31`, plus a
+        // staged turnmeta sidecar record keyed on that id, surfaces the
+        // persisted cost + overage on the hydrated turn after reopen.
+        let (tmp_workdir, tmp_home, state, proj) = fresh_state_with_active_project("alpha").await;
+        let session_id = Uuid::now_v7();
+        let canonical_cwd = tmp_workdir.path().canonicalize().unwrap();
+        let session_path = switchboard_harness::claude_session_file_path(
+            tmp_home.path(),
+            &canonical_cwd,
+            &session_id,
+        );
+        std::fs::create_dir_all(session_path.parent().unwrap()).unwrap();
+        let session_jsonl = [
+            serde_json::json!({
+                "type": "user",
+                "message": { "role": "user", "content": "hello" },
+                "timestamp": "2026-05-31T18:00:00Z",
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "message": {
+                    "id": "msg_test31",
+                    "model": "claude-opus-4-8",
+                    "role": "assistant",
+                    "content": [{ "type": "text", "text": "hi" }],
+                    "usage": { "input_tokens": 10, "output_tokens": 5 }
+                },
+                "timestamp": "2026-05-31T18:00:01Z",
+            }),
+        ]
+        .iter()
+        .map(|r| serde_json::to_string(r).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+        std::fs::write(&session_path, session_jsonl).unwrap();
+
+        let record = attach_agent_impl(
+            &state,
+            "x",
+            HarnessKind::ClaudeCode,
+            &session_id.to_string(),
+            tmp_home.path(),
+        )
+        .unwrap();
+
+        let turnmeta_path = switchboard_harness::turnmeta_sidecar::turnmeta_sidecar_path(
+            tmp_workdir.path(),
+            proj.id,
+            record.id,
+        );
+        switchboard_harness::turnmeta_sidecar::append(
+            &turnmeta_path,
+            &turnmeta_record("msg_test31", Some(0.0125), true),
+        )
+        .unwrap();
+
+        let result = load_transcript_impl(&state, record.id, tmp_home.path()).unwrap();
+        let agent_turn = result
+            .turns
+            .iter()
+            .find(|t| matches!(t, switchboard_harness::Turn::Agent { .. }))
+            .expect("an agent turn is hydrated from the session file");
+        assert_eq!(
+            turn_spend_and_cost(agent_turn),
+            (Some(true), Some(0.0125)),
+            "the staged turnmeta record re-attaches its cost + overage to the matching turn on reopen"
         );
     }
 
@@ -7507,6 +7818,8 @@ mod tests {
                 text: text.to_owned(),
             }],
             usage: None,
+            spend: None,
+            stable_message_id: None,
         }
     }
 
@@ -8492,6 +8805,8 @@ mod tests {
                 text: "partial output".to_owned(),
             }],
             usage: None,
+            spend: None,
+            stable_message_id: None,
         };
         let journal = vec![
             send_record(send_id, turn_id, agent, "do work", 0),

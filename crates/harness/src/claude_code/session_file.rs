@@ -175,6 +175,12 @@ struct AgentTurnBuilder {
     last_seen_at: DateTime<Utc>,
     items: Vec<TurnItem>,
     usage: Option<TurnUsage>,
+    /// The most recent assistant record's `message.id`, overwritten per record
+    /// so it ends up as the turn's *final* assistant message id — the durable
+    /// join key the app overlay uses to re-attach persisted cost/overage on
+    /// reopen. Mirrors the live parser's `last_assistant_message_id` so live
+    /// and disk anchor on the same message by construction.
+    last_message_id: Option<String>,
 }
 
 struct DeferredToolResult {
@@ -289,6 +295,7 @@ impl ReconstructionState {
             last_seen_at: timestamp,
             items: Vec::new(),
             usage: None,
+            last_message_id: None,
         });
         builder.last_seen_at = timestamp;
 
@@ -298,6 +305,16 @@ impl ReconstructionState {
             .and_then(Value::as_object)
         {
             builder.usage = Some(parse_usage(usage));
+        }
+
+        // Track the message id (keep last → final assistant message of the
+        // turn), the join key for re-attaching persisted cost/overage.
+        if let Some(id) = record
+            .get("message")
+            .and_then(|m| m.get("id"))
+            .and_then(Value::as_str)
+        {
+            builder.last_message_id = Some(id.to_owned());
         }
 
         let Some(blocks) = record
@@ -439,6 +456,11 @@ impl ReconstructionState {
             status,
             items: builder.items,
             usage: builder.usage,
+            // Cost/overage are restored by the app's metadata overlay (joining
+            // the turnmeta sidecar on `stable_message_id`); the parser itself
+            // never reads `.switchboard/` state.
+            spend: None,
+            stable_message_id: builder.last_message_id,
         });
     }
 
@@ -656,6 +678,76 @@ mod tests {
         }
         let meta = result.meta.unwrap();
         assert_eq!(meta.model, "claude-sonnet-4-6");
+    }
+
+    /// Join-key parity (disk side), multi-assistant tool-use turn. A single
+    /// agent turn spans two assistant records — `msg_test02` (`tool_use`) and
+    /// `msg_test03` (final answer) — separated by a `tool_result` user record
+    /// (array content, which does NOT close the turn). `stable_message_id` must
+    /// anchor on the **final** assistant message (`msg_test03`), matching the
+    /// live side
+    /// (`parser.rs::tool_use_turn_anchors_stable_id_on_final_assistant_message`)
+    /// so the M4 overlay's join holds across reopen. The two paths derive the
+    /// key independently (keep-last here vs. keep-last live); this pins them to
+    /// the same value for the shape most able to expose a divergence.
+    #[test]
+    fn hydrated_tool_use_turn_anchors_stable_id_on_final_assistant() {
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let session_id = Uuid::now_v7();
+        let agent_id = Uuid::now_v7();
+        let content = jsonl(&[
+            user_record("run a tool then answer", "2026-05-14T04:43:15Z"),
+            json!({
+                "type": "assistant",
+                "message": {
+                    "id": "msg_test02",
+                    "model": "claude-sonnet-4-6",
+                    "role": "assistant",
+                    "content": [{ "type": "tool_use", "id": "t1", "name": "Bash", "input": {} }],
+                    "usage": { "input_tokens": 10, "output_tokens": 5 }
+                },
+                "timestamp": "2026-05-14T04:43:16Z",
+            }),
+            json!({
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [{ "type": "tool_result", "tool_use_id": "t1", "content": "ok" }]
+                },
+                "timestamp": "2026-05-14T04:43:17Z",
+            }),
+            json!({
+                "type": "assistant",
+                "message": {
+                    "id": "msg_test03",
+                    "model": "claude-sonnet-4-6",
+                    "role": "assistant",
+                    "content": [{ "type": "text", "text": "done" }],
+                    "usage": { "input_tokens": 12, "output_tokens": 8 }
+                },
+                "timestamp": "2026-05-14T04:43:18Z",
+            }),
+        ]);
+        stage_session_file(home.path(), cwd.path(), session_id, &content);
+
+        let result = load_claude_transcript(home.path(), cwd.path(), session_id, agent_id).unwrap();
+
+        let agent_turn = result
+            .turns
+            .iter()
+            .find(|t| matches!(t, Turn::Agent { .. }))
+            .expect("one agent turn spanning both assistant records");
+        match agent_turn {
+            Turn::Agent {
+                stable_message_id, ..
+            } => assert_eq!(
+                stable_message_id.as_deref(),
+                Some("msg_test03"),
+                "the final assistant message's id must be the join key (not msg_test02)"
+            ),
+            _ => unreachable!(),
+        }
     }
 
     /// A non-empty `thinking` block followed by a `text` block reconstructs

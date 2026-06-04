@@ -81,6 +81,13 @@ pub struct ParserState {
     /// until a rate-limit is seen — so a turn without one shows no cost/marker.
     pending_is_overage: bool,
     pending_overage_resets_at: Option<DateTime<Utc>>,
+    /// The most recent assistant message's Anthropic `message.id`, overwritten
+    /// on each assistant envelope so at `TurnEnd` it holds the **final**
+    /// non-subagent assistant message's id (subagent envelopes are skipped
+    /// before this runs). Emitted as the turn's `stable_message_id` — the
+    /// durable join key that re-attaches cost/overage to the right message on
+    /// reopen (the same id appears in the on-disk session file; verified).
+    last_assistant_message_id: Option<String>,
 }
 
 /// Parse one stream-json line. Stateful: `state` accumulates text-block
@@ -308,6 +315,10 @@ fn parse_result(obj: &Value, turn_id: TurnId, state: &mut ParserState) -> ParseO
         usage,
         context_window_source,
         spend,
+        // The final assistant message's id — the durable join key for
+        // re-attaching cost/overage on reopen. `take()` so a fresh dispatch's
+        // state can't carry a stale id (defensive; state is per-turn anyway).
+        stable_message_id: state.last_assistant_message_id.take(),
     })
 }
 
@@ -490,6 +501,19 @@ fn parse_assistant_envelope(obj: &Value, turn_id: TurnId, state: &mut ParserStat
             .and_then(Value::as_u64)
             .unwrap_or(0);
         state.last_assistant_context_input_tokens = Some(input + cache_read + cache_creation);
+    }
+
+    // Track this message's Anthropic id as the turn's durable join key (keep
+    // last → the final assistant message's id). Same envelope, same "keep last"
+    // discipline as the occupancy above; subagent envelopes never reach here
+    // (skipped on `parent_tool_use_id`), so this is the final *non-subagent*
+    // message by construction.
+    if let Some(id) = obj
+        .get("message")
+        .and_then(|m| m.get("id"))
+        .and_then(Value::as_str)
+    {
+        state.last_assistant_message_id = Some(id.to_owned());
     }
 
     if obj.get("error").and_then(Value::as_str) == Some("authentication_failed") {
@@ -1495,6 +1519,70 @@ mod tests {
             .filter(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
             .collect();
         assert_eq!(turn_ends.len(), 1, "expected exactly one TurnEnd");
+    }
+
+    /// Collect the events from replaying every line of a Claude live fixture
+    /// through `parse_line` under one `ParserState` (one turn).
+    fn replay_fixture(fixture: &str) -> Vec<AdapterEvent> {
+        let mut state = ParserState::default();
+        let turn_id = tid();
+        let agent_id = aid();
+        let mut events: Vec<AdapterEvent> = Vec::new();
+        for line in fixture.lines().filter(|l| !l.trim().is_empty()) {
+            match parse_line(line, turn_id, agent_id, &mut state) {
+                ParseOutcome::Event(ev) => events.push(ev),
+                ParseOutcome::Events(evs) => events.extend(evs),
+                ParseOutcome::Skip => {}
+                ParseOutcome::Error(e) => panic!("unexpected parse error: {e}"),
+            }
+        }
+        events
+    }
+
+    fn turn_end_stable_id(events: &[AdapterEvent]) -> Option<String> {
+        events.iter().find_map(|e| match e {
+            AdapterEvent::TurnEnd {
+                stable_message_id, ..
+            } => Some(stable_message_id.clone()),
+            _ => None,
+        })?
+    }
+
+    /// Join-key parity (live side), multi-assistant tool-use turn. The turn has
+    /// two non-subagent assistant messages — `msg_test02` (`tool_use`) then
+    /// `msg_test03` (final answer) — and cost arrives on the terminal `result`.
+    /// `stable_message_id` must anchor on the **final** assistant message, so
+    /// the M4 overlay re-attaches cost to the right message. Pairs with the
+    /// session-file side
+    /// (`session_file.rs::hydrated_tool_use_turn_anchors_stable_id_on_final_assistant`):
+    /// both paths must land on `msg_test03` for the join to hold on reopen.
+    #[test]
+    fn tool_use_turn_anchors_stable_id_on_final_assistant_message() {
+        let events = replay_fixture(include_str!("../tests/fixtures/claude/tool-use.jsonl"));
+        assert_eq!(
+            turn_end_stable_id(&events),
+            Some("msg_test03".to_owned()),
+            "the final non-subagent assistant message's id must be the join key (not msg_test02)"
+        );
+    }
+
+    /// Join-key parity (live side), subagent-delegation turn. The *last*
+    /// assistant envelope in the stream (`msg_…a003`) is a **subagent** message
+    /// (`parent_tool_use_id` set) and is skipped, so keep-last must fall back to
+    /// the parent's `msg_…a001`. This guards the live exclusion mechanism that
+    /// keeps the join key in sync with the disk side, where Claude structurally
+    /// omits subagent records from the main session file (so the disk loader
+    /// never sees `a003` at all and lands on `a001` by construction).
+    #[test]
+    fn subagent_turn_anchors_stable_id_on_final_non_subagent_message() {
+        let events = replay_fixture(include_str!(
+            "../tests/fixtures/claude/subagent-delegation.jsonl"
+        ));
+        assert_eq!(
+            turn_end_stable_id(&events),
+            Some("msg_00000000000000000000a001".to_owned()),
+            "the subagent envelope's id must not win the join key; keep-last skips it"
+        );
     }
 
     /// Direct unit-level coverage of the short-circuit rule. The fixture

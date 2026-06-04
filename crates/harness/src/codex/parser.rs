@@ -272,6 +272,7 @@ fn parse_turn_completed(obj: &Value, turn_id: TurnId) -> ParseOutcome {
         // The live Codex parser carries no window yet; post-terminal
         // session-file enrichment adds it and tags it `SessionFileBacked`.
         context_window_source: None,
+        stable_message_id: None,
         spend: None,
     })
 }
@@ -343,6 +344,7 @@ fn parse_turn_failed(obj: &Value, turn_id: TurnId, state: &mut CodexParserState)
         ended_at: chrono::Utc::now(),
         usage: None,
         context_window_source: None,
+        stable_message_id: None,
         spend: None,
     })
 }

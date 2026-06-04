@@ -51,7 +51,7 @@ use futures::StreamExt;
 use switchboard_core::{AgentId, AgentRecord, SendId, SessionLocator};
 use switchboard_harness::{
     AdapterEvent, CancelSource, ContextWindowSource, DispatchOptions, EventStream, FailureKind,
-    HarnessAdapter, MessageId, NormalizedEvent, RateLimitSource, TurnId, TurnOutcome,
+    HarnessAdapter, MessageId, NormalizedEvent, RateLimitSource, TurnId, TurnOutcome, TurnSpend,
 };
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -333,6 +333,23 @@ pub trait MetadataCache: Send + Sync {
         context_window: u32,
         captured_at: DateTime<Utc>,
     );
+
+    /// Append one real-spend turn's cost + overage telemetry, keyed on the
+    /// turn's per-message id. Stream-only for Claude (cost/overage arrive on the
+    /// `result` record, never in the session file), so it must be persisted to
+    /// re-attach the inline cost + "using credits" marker to the right message
+    /// on reopen. Unlike the snapshots above this is an append-log (one record
+    /// per turn), not last-write-wins. `message_id` is the join key the
+    /// hydrated turn carries; the dispatcher gates on its presence + real-spend,
+    /// not on harness identity.
+    fn record_turn_spend(
+        &self,
+        agent_id: AgentId,
+        message_id: String,
+        total_cost_usd: Option<f64>,
+        spend: TurnSpend,
+        captured_at: DateTime<Utc>,
+    );
 }
 
 /// No-op metadata cache for tests and any caller that doesn't persist
@@ -342,6 +359,15 @@ pub struct NoopMetadataCache;
 impl MetadataCache for NoopMetadataCache {
     fn record_rate_limit(&self, _: AgentId, _: serde_json::Value, _: DateTime<Utc>) {}
     fn record_context_window(&self, _: AgentId, _: u32, _: DateTime<Utc>) {}
+    fn record_turn_spend(
+        &self,
+        _: AgentId,
+        _: String,
+        _: Option<f64>,
+        _: TurnSpend,
+        _: DateTime<Utc>,
+    ) {
+    }
 }
 
 /// Error returned when persisting a captured session locator fails. See
@@ -1088,6 +1114,31 @@ async fn drain_turn(
                     && let Some(context_window) = usage.context_window
                 {
                     metadata.record_context_window(agent_id, context_window, Utc::now());
+                }
+                // Persist the turn's stream-only cost + overage so the inline
+                // cost / "using credits" marker re-attaches to the right message
+                // on reopen. Gate on a join key being present AND the turn being
+                // real-spend — not on harness identity (Claude is the only
+                // harness that derives a key + real-spend today, so the gate is
+                // self-selecting and the dispatcher stays harness-agnostic). A
+                // cancelled terminal already `continue`d above, so this only
+                // fires for a real completed/failed turn. Best-effort: the cache
+                // logs and swallows write errors.
+                if let AdapterEvent::TurnEnd {
+                    usage,
+                    spend: Some(spend),
+                    stable_message_id: Some(message_id),
+                    ..
+                } = &event
+                    && spend.real_spend
+                {
+                    metadata.record_turn_spend(
+                        agent_id,
+                        message_id.clone(),
+                        usage.as_ref().and_then(|u| u.total_cost_usd),
+                        spend.clone(),
+                        Utc::now(),
+                    );
                 }
                 // Capture events are handled above and never reach here, so this
                 // always yields `Some`; the `if let` keeps the contract explicit.

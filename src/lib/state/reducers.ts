@@ -285,6 +285,7 @@ function loadedTurnToTurn(t: LoadedTurn): Turn {
     status: t.status,
     items: t.items.map(loadedItemToItem),
     usage: t.usage ?? undefined,
+    spend: t.spend ?? undefined,
   };
 }
 

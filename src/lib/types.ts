@@ -204,6 +204,10 @@ export type LoadedTurn =
       status: "streaming" | "complete" | "failed";
       items: LoadedTurnItem[];
       usage?: TurnUsage | null;
+      // Per-turn cost/overage re-joined from the turn-metadata sidecar on
+      // reopen. Present only on real-spend turns that were persisted; absent
+      // for normal-quota and pre-feature turns (render neither cost nor marker).
+      spend?: TurnSpend | null;
     };
 
 export type LoadedTurnItem =
@@ -385,6 +389,9 @@ export type ConversationItem =
       status: "streaming" | "complete" | "failed";
       items: LoadedTurnItem[];
       usage?: TurnUsage | null;
+      // Per-turn cost/overage re-joined from the turn-metadata sidecar on
+      // reopen — same source + meaning as `LoadedTurn.spend`.
+      spend?: TurnSpend | null;
     }
   | {
       kind: "outcome";

@@ -539,6 +539,9 @@ impl GeminiReconstruction {
             status,
             items,
             usage: builder.last_usage,
+            // Gemini has no cost/overage and no join key (Claude-only feature).
+            spend: None,
+            stable_message_id: None,
         });
     }
 

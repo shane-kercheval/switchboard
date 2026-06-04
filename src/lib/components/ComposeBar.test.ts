@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/svelte";
 import { tick } from "svelte";
-import type { AgentRecord, NormalizedEvent } from "$lib/types";
+import type { AgentRecord, NormalizedEvent, Prompt } from "$lib/types";
 
 const invokeMock = vi.fn(
   async (_cmd: string, _args?: Record<string, unknown>): Promise<unknown> => null,
@@ -768,7 +768,7 @@ describe("ComposeBar persistence", () => {
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
     const store = await loadComposeStore();
-    store.setDraft(PROJECT_ID, "from last time");
+    store.setContent(PROJECT_ID, { kind: "plain", draft: "from last time" });
     store.setSelection(PROJECT_ID, [AGENT_B.id]);
     store._testing.reloadFromStorage(); // drop in-memory copy; re-read localStorage
 
@@ -794,7 +794,8 @@ describe("ComposeBar persistence", () => {
 
     await waitFor(() => expect(textarea.value).toBe(""));
     const store = await loadComposeStore();
-    expect(store.getCompose(PROJECT_ID).draft).toBe("");
+    const content = store.getCompose(PROJECT_ID).content;
+    expect(content).toEqual({ kind: "plain", draft: "" });
   });
 
   it("persists a deliberate deselect-all and restores it as empty (not the default)", async () => {
@@ -909,5 +910,302 @@ describe("ComposeBar persistence", () => {
     await rerender({ projectId: PROJECT_ID, agents: [] });
     // The roster-gated write must skip the empty roster, leaving the save intact.
     expect(store.getCompose(PROJECT_ID).selectedIds).toEqual([AGENT_A.id, AGENT_B.id]);
+  });
+});
+
+const REVIEW: Prompt = {
+  provider: "local",
+  name: "review",
+  title: null,
+  description: "Review a diff",
+  arguments: [{ name: "focus", description: "What to focus on", required: true }],
+  tags: [],
+};
+const SUMMARY: Prompt = {
+  provider: "tiddly",
+  name: "summary",
+  title: "Summary",
+  description: null,
+  arguments: [],
+  tags: [],
+};
+
+/// Route invoke per command for the prompt-mode flow. `render` lets a test
+/// substitute a rejection or a deferred gate for `render_prompt`.
+function mockPromptBackend(
+  opts: {
+    prompts?: Prompt[];
+    render?: () => Promise<{ text: string }>;
+  } = {},
+): void {
+  invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+    if (cmd === "search_project_files") return [];
+    if (cmd === "list_prompts") return opts.prompts ?? [];
+    if (cmd === "render_prompt") return opts.render ? await opts.render() : { text: "RENDERED" };
+    if (cmd === "send_message") return "msg-id";
+    return null;
+  });
+}
+
+async function enterPromptMode(testId: string): Promise<void> {
+  await fireEvent.click(screen.getByTestId("compose-prompt-button"));
+  await waitFor(() => expect(screen.getByTestId(testId)).toBeInTheDocument());
+  await fireEvent.click(screen.getByTestId(testId));
+  await waitFor(() => expect(screen.getByTestId("prompt-composer")).toBeInTheDocument());
+}
+
+describe("ComposeBar prompt mode", () => {
+  it("opens the prompt picker from the cache without a render (network) call", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    mockPromptBackend({ prompts: [REVIEW, SUMMARY] });
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    await fireEvent.click(screen.getByTestId("compose-prompt-button"));
+    await waitFor(() =>
+      expect(screen.getByTestId("prompt-option-local:review")).toBeInTheDocument(),
+    );
+    expect(invokeMock.mock.calls.some(([c]) => c === "list_prompts")).toBe(true);
+    expect(invokeMock.mock.calls.some(([c]) => c === "render_prompt")).toBe(false);
+  });
+
+  it("pre-fills appended text from the textarea when entering prompt mode", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    mockPromptBackend({ prompts: [SUMMARY] });
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    await fireEvent.input(screen.getByTestId("compose-textarea"), {
+      target: { value: "carried text" },
+    });
+    await enterPromptMode("prompt-option-tiddly:summary");
+    expect((screen.getByTestId("prompt-appended") as HTMLTextAreaElement).value).toBe(
+      "carried text",
+    );
+  });
+
+  it("blocks send until required arguments are filled", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    mockPromptBackend({ prompts: [REVIEW] });
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    await enterPromptMode("prompt-option-local:review");
+    expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(true);
+    await fireEvent.input(screen.getByTestId("prompt-arg-focus"), { target: { value: "tests" } });
+    expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("returns to the plain composer carrying appended text back on remove", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    mockPromptBackend({ prompts: [SUMMARY] });
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    await fireEvent.input(screen.getByTestId("compose-textarea"), { target: { value: "keep me" } });
+    await enterPromptMode("prompt-option-tiddly:summary");
+    await fireEvent.click(screen.getByTestId("prompt-remove"));
+
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+    expect((screen.getByTestId("compose-textarea") as HTMLTextAreaElement).value).toBe("keep me");
+    expect(screen.queryByTestId("prompt-composer")).toBeNull();
+  });
+
+  it("renders once and fans the combined message out to all recipients", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    mockPromptBackend({ prompts: [SUMMARY] });
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+    await fireEvent.click(chip(AGENT_B.id)); // select both
+    await enterPromptMode("prompt-option-tiddly:summary");
+    await fireEvent.input(screen.getByTestId("prompt-appended"), { target: { value: "tail" } });
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    await waitFor(() => {
+      const sends = invokeMock.mock.calls.filter(([c]) => c === "send_message");
+      expect(sends).toHaveLength(2);
+    });
+    const renders = invokeMock.mock.calls.filter(([c]) => c === "render_prompt");
+    expect(renders).toHaveLength(1); // rendered ONCE, not per recipient
+    const sends = invokeMock.mock.calls.filter(([c]) => c === "send_message");
+    for (const call of sends) {
+      expect((call[1] as { prompt: string }).prompt).toBe("RENDERED\n\ntail");
+    }
+    const sendIds = new Set(sends.map((c) => (c[1] as { sendId: string }).sendId));
+    expect(sendIds.size).toBe(1);
+    expect((state.transcripts[AGENT_A.id] ?? [])[0]).toMatchObject({ text: "RENDERED\n\ntail" });
+  });
+
+  it("a render failure at send surfaces an error, keeps state, and writes no turn", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    mockPromptBackend({
+      prompts: [SUMMARY],
+      render: () => Promise.reject(new Error("render boom")),
+    });
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    await enterPromptMode("prompt-option-tiddly:summary");
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("compose-send-error")).toHaveTextContent("render boom"),
+    );
+    // Composer state preserved; no optimistic turn, no send.
+    expect(screen.getByTestId("prompt-composer")).toBeInTheDocument();
+    expect((state.transcripts[AGENT_A.id] ?? []).length).toBe(0);
+    expect(invokeMock.mock.calls.some(([c]) => c === "send_message")).toBe(false);
+  });
+
+  it("shows a pending, disabled send while the render is in flight, then dispatches", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    let release!: (v: { text: string }) => void;
+    const gate = new Promise<{ text: string }>((res) => {
+      release = res;
+    });
+    mockPromptBackend({ prompts: [SUMMARY], render: () => gate });
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    await enterPromptMode("prompt-option-tiddly:summary");
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    // Render is awaiting → send is disabled (pending), no dispatch yet.
+    await waitFor(() =>
+      expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(true),
+    );
+    expect(invokeMock.mock.calls.some(([c]) => c === "send_message")).toBe(false);
+
+    release({ text: "DONE" });
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.some(([c]) => c === "send_message")).toBe(true),
+    );
+    // Successful send returns to the plain composer.
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+    expect((state.transcripts[AGENT_A.id] ?? [])[0]).toMatchObject({ text: "DONE" });
+  });
+
+  it("restores a persisted prompt-mode draft (prompt, args, appended text)", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const store = await loadComposeStore();
+    store.setContent(PROJECT_ID, {
+      kind: "prompt",
+      provider: "local",
+      name: "review",
+      args: { focus: "saved focus" },
+      appendedText: "saved tail",
+    });
+    store._testing.reloadFromStorage();
+    mockPromptBackend({ prompts: [REVIEW] });
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    await waitFor(() => expect(screen.getByTestId("prompt-composer")).toBeInTheDocument());
+    expect((screen.getByTestId("prompt-arg-focus") as HTMLTextAreaElement).value).toBe(
+      "saved focus",
+    );
+    expect((screen.getByTestId("prompt-appended") as HTMLTextAreaElement).value).toBe("saved tail");
+  });
+
+  it("keeps a saved prompt draft pending on a cold cache, then restores it after sync", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const store = await loadComposeStore();
+    store.setContent(PROJECT_ID, {
+      kind: "prompt",
+      provider: "local",
+      name: "review",
+      args: { focus: "saved focus" },
+      appendedText: "tail",
+    });
+    store._testing.reloadFromStorage();
+
+    let promptList: Prompt[] = []; // cache cold at mount (MCP not synced yet)
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "search_project_files") return [];
+      if (cmd === "list_prompts") return promptList;
+      return null;
+    });
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    // Cold: shows the restoring placeholder (not plain), and must NOT clobber the
+    // saved snapshot in storage.
+    await waitFor(() => expect(screen.getByTestId("compose-restoring")).toBeInTheDocument());
+    expect(screen.queryByTestId("prompt-composer")).toBeNull();
+    expect(store.getCompose(PROJECT_ID).content).toMatchObject({ kind: "prompt", name: "review" });
+
+    // Sync completes with the prompt present → restore with args intact.
+    promptList = [REVIEW];
+    listeners.get("prompts:synced")?.({ payload: null as unknown as NormalizedEvent });
+
+    await waitFor(() => expect(screen.getByTestId("prompt-composer")).toBeInTheDocument());
+    expect((screen.getByTestId("prompt-arg-focus") as HTMLTextAreaElement).value).toBe(
+      "saved focus",
+    );
+    expect((screen.getByTestId("prompt-appended") as HTMLTextAreaElement).value).toBe("tail");
+  });
+
+  it("downgrades a saved prompt draft to plain (carrying appended text) once a sync proves it gone", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const store = await loadComposeStore();
+    store.setContent(PROJECT_ID, {
+      kind: "prompt",
+      provider: "tiddly",
+      name: "ghost",
+      args: { focus: "x" },
+      appendedText: "leftover text",
+    });
+    store._testing.reloadFromStorage();
+    mockPromptBackend({ prompts: [] }); // prompt never appears, even after sync
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    await waitFor(() => expect(screen.getByTestId("compose-restoring")).toBeInTheDocument());
+    listeners.get("prompts:synced")?.({ payload: null as unknown as NormalizedEvent });
+
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+    expect((screen.getByTestId("compose-textarea") as HTMLTextAreaElement).value).toBe(
+      "leftover text",
+    );
+  });
+
+  it("a Remove during the in-flight render aborts the send", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    let release!: (v: { text: string }) => void;
+    const gate = new Promise<{ text: string }>((res) => {
+      release = res;
+    });
+    mockPromptBackend({ prompts: [SUMMARY], render: () => gate });
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    await enterPromptMode("prompt-option-tiddly:summary");
+    await fireEvent.click(screen.getByTestId("compose-send"));
+    // Back out mid-render via the ✕.
+    await fireEvent.click(screen.getByTestId("prompt-remove"));
+    release({ text: "DONE" });
+    await tick();
+    await tick();
+
+    // The send was aborted: no dispatch, no optimistic turn, composer is plain.
+    expect(invokeMock.mock.calls.some(([c]) => c === "send_message")).toBe(false);
+    expect((state.transcripts[AGENT_A.id] ?? []).length).toBe(0);
+    expect(screen.getByTestId("compose-textarea")).toBeInTheDocument();
   });
 });

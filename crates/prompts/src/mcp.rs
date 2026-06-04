@@ -150,6 +150,7 @@ fn map_prompt(provider: &str, prompt: McpPrompt) -> Prompt {
     Prompt {
         provider: provider.to_owned(),
         name: prompt.name,
+        title: prompt.title,
         description: prompt.description,
         arguments: prompt
             .arguments
@@ -293,7 +294,7 @@ mod tests {
 
     #[test]
     fn maps_prompt_fields_and_defaults_required_to_false() {
-        let mcp = McpPrompt::new(
+        let mut mcp = McpPrompt::new(
             "p",
             Some("d"),
             Some(vec![
@@ -303,9 +304,12 @@ mod tests {
                 McpArg::new("opt"),
             ]),
         );
+        // The server's human-friendly title (distinct from the `name` slug).
+        mcp.title = Some("Pretty P".to_owned());
         let mapped = map_prompt("team", mcp);
         assert_eq!(mapped.provider, "team");
         assert_eq!(mapped.name, "p");
+        assert_eq!(mapped.title.as_deref(), Some("Pretty P"));
         assert_eq!(mapped.description.as_deref(), Some("d"));
         assert!(mapped.tags.is_empty());
         assert_eq!(mapped.arguments.len(), 2);

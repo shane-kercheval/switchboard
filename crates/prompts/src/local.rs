@@ -128,6 +128,8 @@ impl ParsedPrompt {
         Prompt {
             provider: LOCAL_PROVIDER.to_owned(),
             name: self.name,
+            // Local prompts have no separate title; `name` is their display label.
+            title: None,
             description: Some(self.description),
             arguments: self.arguments,
             tags: self.tags,

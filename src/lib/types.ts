@@ -433,3 +433,28 @@ export type McpProviderInfo = {
   has_token: boolean;
   status: ProviderStatus;
 };
+
+// A prompt as listed from the cache. Mirrors the Rust `Prompt`. `provider` is
+// the prefix it resolves under (`local` or an MCP provider's name); `arguments`
+// are the declared template variables the composer renders as inputs.
+export type PromptArgument = {
+  name: string;
+  description: string | null;
+  required: boolean;
+};
+
+export type Prompt = {
+  provider: string;
+  name: string;
+  // Human-friendly display name (MCP `title`); `name` is the slug identifier.
+  // Null for local prompts and servers that omit it — the UI falls back to `name`.
+  title: string | null;
+  description: string | null;
+  arguments: PromptArgument[];
+  tags: string[];
+};
+
+// The finished text returned by `render_prompt` — what the agent receives.
+export type RenderedPrompt = {
+  text: string;
+};

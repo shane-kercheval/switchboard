@@ -15,6 +15,8 @@ import type {
   ProjectId,
   ProjectListing,
   ProjectSummary,
+  Prompt,
+  RenderedPrompt,
   SendId,
   WorkspaceDirectories,
 } from "./types";
@@ -256,4 +258,22 @@ export async function testMcpConnection(url: string, bearer: string | null): Pro
 /// Rebuild the cached prompt list from all providers (the Settings "Sync" action).
 export async function syncPrompts(): Promise<void> {
   await invoke("sync_prompts");
+}
+
+/// All prompts across configured providers, from the build-once cache. Cheap and
+/// offline — never hits the network — so the compose-bar prompt picker can open
+/// against it instantly.
+export async function listPrompts(): Promise<Prompt[]> {
+  return await invoke<Prompt[]>("list_prompts");
+}
+
+/// Render `name` from `provider` with `args` to its finished text. Serves both
+/// the composer's preview and its send (the same args map for both). May touch
+/// the network (MCP `prompts/get`), so callers show a pending state.
+export async function renderPrompt(
+  provider: string,
+  name: string,
+  args: Record<string, string>,
+): Promise<RenderedPrompt> {
+  return await invoke<RenderedPrompt>("render_prompt", { provider, name, args });
 }

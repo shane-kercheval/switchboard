@@ -19,6 +19,10 @@ pub struct Prompt {
     /// provider's registered name).
     pub provider: String,
     pub name: String,
+    /// Human-friendly display name (MCP 2025-06-18 `title`). `name` is a slug
+    /// identifier; `title` is what to show a user. `None` for local prompts and
+    /// MCP servers that omit it — the UI falls back to `name`.
+    pub title: Option<String>,
     /// Optional in the MCP shape; required for local frontmatter (enforced at
     /// parse time). Modeled as `Option` so the two providers share one type.
     pub description: Option<String>,

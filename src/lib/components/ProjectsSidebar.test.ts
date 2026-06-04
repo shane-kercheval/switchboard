@@ -282,6 +282,52 @@ function rowSelectButton(index = 0): HTMLButtonElement {
   return btn as HTMLButtonElement;
 }
 
+describe("ProjectsSidebar — relative activity labels", () => {
+  const A1 = "00000000-0000-7000-8000-0000000000r1";
+
+  it("refreshes relative timestamps while the sidebar is mounted", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-05-25T12:00:00Z"));
+    try {
+      await renderWith([
+        {
+          ...projectIn(A1, "alpha", "/work/a"),
+          last_activity: "2026-05-25T11:59:30Z",
+        },
+      ]);
+
+      expect(screen.getByText("just now")).toBeInTheDocument();
+
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      await waitFor(() => expect(screen.getByText("1m ago")).toBeInTheDocument());
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("refreshes relative timestamps when the app becomes visible again", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-05-25T12:00:00Z"));
+    try {
+      await renderWith([
+        {
+          ...projectIn(A1, "alpha", "/work/a"),
+          last_activity: "2026-05-25T11:59:30Z",
+        },
+      ]);
+      expect(screen.getByText("just now")).toBeInTheDocument();
+
+      vi.setSystemTime(new Date("2026-05-25T13:00:00Z"));
+      fireEvent(document, new Event("visibilitychange"));
+
+      await waitFor(() => expect(screen.getByText("1h ago")).toBeInTheDocument());
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("ProjectsSidebar — rename", () => {
   const A1 = "00000000-0000-7000-8000-0000000000a1";
   const A2 = "00000000-0000-7000-8000-0000000000a2";

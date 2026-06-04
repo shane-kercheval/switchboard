@@ -73,6 +73,23 @@ describe("CreateProjectForm — new project", () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
+  it("creates when Enter is pressed in the name field", async () => {
+    openMock.mockResolvedValue("/picked/a");
+    pickDirectoryMock.mockResolvedValue(info("/canonical/a", []));
+    const { onClose, onCreated } = renderForm();
+
+    await fireEvent.click(screen.getByTestId("new-project-choose-folder"));
+    await waitFor(() => expect(pickDirectoryMock).toHaveBeenCalledWith("/picked/a"));
+
+    const name = screen.getByTestId("new-project-name") as HTMLInputElement;
+    await fireEvent.input(name, { target: { value: "brand-new" } });
+    await fireEvent.keyDown(name, { key: "Enter" });
+
+    expect(createProjectAndActivateMock).toHaveBeenCalledWith("brand-new", "/canonical/a");
+    await waitFor(() => expect(onCreated).toHaveBeenCalledTimes(1));
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
   it("defaults the name to the folder basename when empty", async () => {
     openMock.mockResolvedValue("/picked/my-repo");
     pickDirectoryMock.mockResolvedValue(info("/picked/my-repo", []));

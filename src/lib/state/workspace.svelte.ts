@@ -38,7 +38,7 @@ import type {
   SendId,
   WorkspaceDirectoryInfo,
 } from "$lib/types";
-import { untrack } from "svelte";
+import { tick, untrack } from "svelte";
 import { harnessAvailability, refreshHarnessAvailability } from "$lib/harnessAvailability.svelte";
 import { HARNESS_DEFAULT_AGENT_NAME } from "$lib/harnessDisplay";
 import { currentIsoTimestamp } from "$lib/utils";
@@ -61,6 +61,8 @@ export type ProjectConversationState = {
   status: "pending" | "loading" | "complete" | "failed";
 };
 
+export type ActivationResult = "activated" | "superseded" | "failed";
+
 /// The registered directories + whether registry changes persist this session.
 /// `persistable === false` means an existing `workspace.yaml` couldn't be read
 /// at startup — surfaced distinctly from a fresh install.
@@ -81,10 +83,14 @@ export const projects = $state<{ list: ProjectListing[] }>({ list: [] });
 /// on every (re)activation and switch, set only on the current one's failure.
 /// The center pane renders a retry affordance instead of an endless loading
 /// state when it's set.
+///
+/// `loadingProjectId` is set during a project switch so the sidebar/header can
+/// paint the new selection before a large transcript is derived and rendered.
 export const selection = $state<{
   activeProjectId: ProjectId | null;
   activationError: string | null;
-}>({ activeProjectId: null, activationError: null });
+  loadingProjectId: ProjectId | null;
+}>({ activeProjectId: null, activationError: null, loadingProjectId: null });
 
 /// Per-project agent rosters, populated lazily on first activation.
 export const agentsByProject = $state<Record<ProjectId, AgentRecord[]>>({});
@@ -150,24 +156,68 @@ export function liveProjectSends(projectId: ProjectId): Map<SendId, AgentId[]> {
   return buildLiveSendsMap(agentsByProject[projectId] ?? [], runtimes, transcripts);
 }
 
-let previousBusyProjectIds: ProjectId[] = [];
+type LiveProjectSendPair = {
+  key: string;
+  projectId: ProjectId;
+  sendId: SendId;
+  agentId: AgentId;
+};
+
+let previousLiveProjectSendPairs: LiveProjectSendPair[] = [];
+let activationSeq = 0;
+
+function liveProjectSendPairs(): LiveProjectSendPair[] {
+  const pairs: LiveProjectSendPair[] = [];
+  for (const projectId of Object.keys(agentsByProject)) {
+    for (const [sendId, agentIds] of liveProjectSends(projectId)) {
+      for (const agentId of agentIds) {
+        pairs.push({ key: `${projectId}:${sendId}:${agentId}`, projectId, sendId, agentId });
+      }
+    }
+  }
+  return pairs;
+}
+
+function projectIdsInPairs(pairs: LiveProjectSendPair[]): ProjectId[] {
+  const projectIds: ProjectId[] = [];
+  for (const pair of pairs) {
+    if (!projectIds.includes(pair.projectId)) projectIds.push(pair.projectId);
+  }
+  return projectIds;
+}
+
+async function afterNextPaint(): Promise<void> {
+  await tick();
+  if (typeof requestAnimationFrame !== "function") {
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    return;
+  }
+  await new Promise<void>((resolve) => {
+    requestAnimationFrame(() => {
+      setTimeout(resolve, 0);
+    });
+  });
+}
 
 export function startProjectActivityObserver(
   getNow: () => string = currentIsoTimestamp,
 ): () => void {
   return $effect.root(() => {
     $effect(() => {
-      const nowBusy = Object.keys(agentsByProject).filter(
-        (projectId) => liveProjectSends(projectId).size > 0,
-      );
+      const nowLivePairs = liveProjectSendPairs();
+      const previousBusy = projectIdsInPairs(previousLiveProjectSendPairs);
+      const nowBusy = projectIdsInPairs(nowLivePairs);
       const completed: ProjectId[] = [];
       const backgroundCompleted: ProjectId[] = [];
-      for (const id of previousBusyProjectIds) {
+      for (const pair of previousLiveProjectSendPairs) {
+        if (nowLivePairs.some((nowPair) => nowPair.key === pair.key)) continue;
+        if (!completed.includes(pair.projectId)) completed.push(pair.projectId);
+      }
+      for (const id of previousBusy) {
         if (nowBusy.includes(id)) continue;
-        completed.push(id);
         if (id !== selection.activeProjectId) backgroundCompleted.push(id);
       }
-      previousBusyProjectIds = nowBusy;
+      previousLiveProjectSendPairs = nowLivePairs;
       untrack(() => {
         if (completed.length > 0) recordProjectsActivityLocally(completed, getNow());
         for (const id of backgroundCompleted) backgroundCompletedProjectIds[id] = true;
@@ -224,10 +274,13 @@ export async function removeDirectory(path: string): Promise<void> {
     loadStarted.delete(id);
     hydrationStarted.delete(id);
   }
-  previousBusyProjectIds = previousBusyProjectIds.filter((id) => !removedProjectIds.includes(id));
+  previousLiveProjectSendPairs = previousLiveProjectSendPairs.filter(
+    (pair) => !removedProjectIds.includes(pair.projectId),
+  );
   if (activeRemoved) {
     selection.activeProjectId = null;
     selection.activationError = null;
+    selection.loadingProjectId = null;
   }
   await loadWorkspace();
 }
@@ -243,8 +296,9 @@ export async function createProjectAndActivate(name: string, directory: string):
   // Activation must complete first: `create_agent` targets the backend's active
   // project, and `activateProject` issues `set_active_project`. It also clears
   // `agentCreationFailures`, so the seeding below starts from a clean slate.
-  await activateProject(summary.id);
-  await seedAgentsForInstalledHarnesses();
+  const activation = await activateProject(summary.id);
+  if (activation !== "activated") return;
+  await seedAgentsForInstalledHarnesses(summary.id);
 }
 
 /// Auto-populate a freshly created project with one agent per installed harness.
@@ -271,14 +325,16 @@ export async function createProjectAndActivate(name: string, directory: string):
 /// (belt). The durable fix is `create_agent`/`attach_agent` taking an explicit
 /// `project_id` instead of reading active state — out of scope here, but the
 /// same coupling affects M5's remove/rename.
-async function seedAgentsForInstalledHarnesses(): Promise<void> {
-  const projectId = selection.activeProjectId;
+async function seedAgentsForInstalledHarnesses(projectId: ProjectId): Promise<void> {
+  if (selection.activeProjectId !== projectId) return;
   await refreshHarnessAvailability();
   for (const harness of harnessAvailability.installed()) {
     if (selection.activeProjectId !== projectId) break;
     try {
       const agent = await api.createAgent(HARNESS_DEFAULT_AGENT_NAME[harness], harness);
+      if (selection.activeProjectId !== projectId) break;
       await registerAgent(agent);
+      if (selection.activeProjectId !== projectId) break;
       addAgentToActiveProject(agent);
     } catch (err) {
       // Don't strand a banner on a project the user already left.
@@ -360,10 +416,13 @@ export async function deleteProject(projectId: ProjectId): Promise<void> {
   delete projectActivityOverrides[projectId];
   loadStarted.delete(projectId);
   hydrationStarted.delete(projectId);
-  previousBusyProjectIds = previousBusyProjectIds.filter((id) => id !== projectId);
+  previousLiveProjectSendPairs = previousLiveProjectSendPairs.filter(
+    (pair) => pair.projectId !== projectId,
+  );
   if (selection.activeProjectId === projectId) {
     selection.activeProjectId = null;
     selection.activationError = null;
+    selection.loadingProjectId = null;
   }
 }
 
@@ -391,19 +450,30 @@ export function dismissAgentCreationFailure(harness: HarnessKind): void {
 /// pane shows a retry affordance instead of an endless loading state); the
 /// error is cleared here on every (re)activation, so switching away or retrying
 /// clears a stale failure.
-export async function activateProject(projectId: ProjectId): Promise<void> {
+export async function activateProject(projectId: ProjectId): Promise<ActivationResult> {
+  const seq = ++activationSeq;
   selection.activeProjectId = projectId;
   selection.activationError = null;
+  selection.loadingProjectId = projectId;
   delete backgroundCompletedProjectIds[projectId];
   // Auto-create failures pertain to a just-created project; switching away (or
   // re-activating) clears the banner. `createProjectAndActivate` seeds *after*
   // this, so its failures survive.
   agentCreationFailures.length = 0;
+  await afterNextPaint();
+  if (seq !== activationSeq || selection.activeProjectId !== projectId) return "superseded";
   try {
     await ensureProjectLoaded(projectId);
+    if (seq !== activationSeq || selection.activeProjectId !== projectId) return "superseded";
     await api.setActiveProject(projectId);
+    if (seq !== activationSeq || selection.activeProjectId !== projectId) return "superseded";
+    selection.loadingProjectId = null;
+    return "activated";
   } catch (err) {
+    if (seq !== activationSeq || selection.activeProjectId !== projectId) return "superseded";
     selection.activationError = err instanceof Error ? err.message : String(err);
+    selection.loadingProjectId = null;
+    return "failed";
   }
 }
 
@@ -529,7 +599,9 @@ export const _testing = {
     projects.list = [];
     selection.activeProjectId = null;
     selection.activationError = null;
-    previousBusyProjectIds = [];
+    selection.loadingProjectId = null;
+    previousLiveProjectSendPairs = [];
+    activationSeq = 0;
     loadStarted.clear();
     hydrationStarted.clear();
     for (const key of Object.keys(agentsByProject)) delete agentsByProject[key];

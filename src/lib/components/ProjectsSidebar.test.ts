@@ -194,6 +194,33 @@ describe("ProjectsSidebar — background activity", () => {
     await waitFor(() => expect(screen.queryByTestId("project-completed")).toBeNull());
   });
 
+  it("hides project actions behind the completed marker until the project is selected", async () => {
+    await seedBusyProject(PROJECT_1);
+    const state = await loadState();
+    const ws = await loadWorkspace();
+    ws.selection.activeProjectId = PROJECT_2;
+
+    await startActivityObserver();
+    const ProjectsSidebar = (await import("./ProjectsSidebar.svelte")).default;
+    render(ProjectsSidebar, { props: noopProps });
+    await tick();
+    const rt = state.runtimes[AGENT_1];
+    if (rt === undefined) throw new Error("unreachable");
+    state.runtimes[AGENT_1] = { ...rt, run_status: "idle", pending_sends: undefined };
+
+    await waitFor(() => expect(screen.getByTestId("project-completed")).toBeInTheDocument());
+    expect(screen.queryByTestId("project-action-archive")).toBeNull();
+    expect(screen.queryByTestId("project-action-delete")).toBeNull();
+
+    const selectButton = screen.getByTestId("project-row").querySelector("button");
+    if (!selectButton) throw new Error("expected a select button in the project row");
+    await fireEvent.click(selectButton);
+
+    await waitFor(() => expect(screen.queryByTestId("project-completed")).toBeNull());
+    expect(screen.getByTestId("project-action-archive")).toBeInTheDocument();
+    expect(screen.getByTestId("project-action-delete")).toBeInTheDocument();
+  });
+
   it("updates active project activity without showing a completed marker", async () => {
     await seedBusyProject(PROJECT_1);
     const state = await loadState();
@@ -254,6 +281,52 @@ function rowSelectButton(index = 0): HTMLButtonElement {
   if (!btn) throw new Error("expected a select button in the project row");
   return btn as HTMLButtonElement;
 }
+
+describe("ProjectsSidebar — relative activity labels", () => {
+  const A1 = "00000000-0000-7000-8000-0000000000r1";
+
+  it("refreshes relative timestamps while the sidebar is mounted", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-05-25T12:00:00Z"));
+    try {
+      await renderWith([
+        {
+          ...projectIn(A1, "alpha", "/work/a"),
+          last_activity: "2026-05-25T11:59:30Z",
+        },
+      ]);
+
+      expect(screen.getByText("just now")).toBeInTheDocument();
+
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      await waitFor(() => expect(screen.getByText("1m ago")).toBeInTheDocument());
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("refreshes relative timestamps when the app becomes visible again", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-05-25T12:00:00Z"));
+    try {
+      await renderWith([
+        {
+          ...projectIn(A1, "alpha", "/work/a"),
+          last_activity: "2026-05-25T11:59:30Z",
+        },
+      ]);
+      expect(screen.getByText("just now")).toBeInTheDocument();
+
+      vi.setSystemTime(new Date("2026-05-25T13:00:00Z"));
+      fireEvent(document, new Event("visibilitychange"));
+
+      await waitFor(() => expect(screen.getByText("1h ago")).toBeInTheDocument());
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
 
 describe("ProjectsSidebar — rename", () => {
   const A1 = "00000000-0000-7000-8000-0000000000a1";

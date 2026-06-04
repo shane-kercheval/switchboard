@@ -53,6 +53,7 @@
   let deletingProjectId = $state<ProjectId | null>(null);
   let archiveError = $state<{ projectId: ProjectId; message: string } | null>(null);
   let deleteError = $state<{ projectId: ProjectId; message: string } | null>(null);
+  let relativeNow = $state(Date.now());
 
   /// `Active | Archived` view filter. Default `Active`. A true either/or split:
   /// each view shows exactly the projects whose `archived` flag matches it
@@ -184,6 +185,21 @@
     ) {
       deleteConfirmProjectId = null;
     }
+  });
+
+  $effect(() => {
+    function refreshRelativeTimes(): void {
+      relativeNow = Date.now();
+    }
+    function refreshWhenVisible(): void {
+      if (document.visibilityState === "visible") refreshRelativeTimes();
+    }
+    const interval = setInterval(refreshRelativeTimes, 60_000);
+    document.addEventListener("visibilitychange", refreshWhenVisible);
+    return () => {
+      clearInterval(interval);
+      document.removeEventListener("visibilitychange", refreshWhenVisible);
+    };
   });
 
   async function toggleArchive(project: ProjectListing): Promise<void> {
@@ -462,11 +478,13 @@
                     >{basename(project.directory)}</span
                   >
                   <span>·</span>
-                  <span class="shrink-0">{relativeTime(project.last_activity)}</span>
+                  <span class="shrink-0"
+                    >{relativeTime(project.last_activity, new Date(relativeNow))}</span
+                  >
                 </div>
               </button>
               <div class="flex shrink-0 items-center gap-0.5 pr-1.5">
-                {#if !busy}
+                {#if !busy && !completed}
                   <div
                     class="pointer-events-none flex max-w-0 items-center gap-0.5 overflow-hidden opacity-0 transition-[max-width,opacity] group-hover:pointer-events-auto group-hover:max-w-[3.25rem] group-hover:opacity-100"
                   >

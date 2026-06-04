@@ -43,8 +43,8 @@ use crate::commands::{
     remove_tracked_repo_impl, rename_agent_impl, rename_project_impl, render_prompt_impl,
     reveal_in_finder_argv, search_project_files_in_root, search_project_files_root_impl,
     send_message_impl, set_active_project_impl, set_preferences_impl, set_project_archived_impl,
-    terminal_open_argv, test_mcp_connection_impl, tracked_repos_inputs, tracked_roots,
-    validate_external_url,
+    sync_prompts_and_notify, terminal_open_argv, test_mcp_connection_impl, tracked_repos_inputs,
+    tracked_roots, validate_external_url,
 };
 use crate::preferences::Preferences;
 use crate::state::AppState;
@@ -167,7 +167,8 @@ async fn render_prompt(
 /// Settings "Sync" button; used to pick up prompts edited on a server mid-session.
 #[tauri::command]
 async fn sync_prompts(state: State<'_, AppState>) -> Result<(), String> {
-    state.inner().prompts.sync().await;
+    let state = state.inner();
+    sync_prompts_and_notify(state.prompts.clone(), Arc::clone(&state.emitter)).await;
     Ok(())
 }
 
@@ -855,10 +856,10 @@ pub fn run() {
             // never blocks startup. `PromptService` is cheaply cloneable and
             // shares its cache `Arc`, so the clone the task syncs is the same
             // cache the managed state reads.
-            let prompts_for_build = prompts.clone();
-            tauri::async_runtime::spawn(async move {
-                prompts_for_build.sync().await;
-            });
+            tauri::async_runtime::spawn(sync_prompts_and_notify(
+                prompts.clone(),
+                Arc::clone(&state.emitter),
+            ));
             let state = state.with_prompts(prompts);
             // Cold start: open a `Directory` handle for every workspace entry so
             // restored directories report `available: true` and participate in

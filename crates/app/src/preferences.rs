@@ -140,52 +140,24 @@ pub fn save(path: &Path, prefs: &Preferences) -> Result<(), AppError> {
             source,
         })?;
     }
-    let mut root = read_config_mapping(path)?;
-    let serialized =
-        serde_norway::to_value(prefs).map_err(|e| persist_err(path, &e.to_string()))?;
-    if let serde_norway::Value::Mapping(fields) = serialized {
+    // Serialize before the edit so the closure stays infallible. `edit_yaml_mapping`
+    // merges only the preference keys into the existing mapping (preserving the
+    // prompt sections that share the file) and serializes against the prompt
+    // writer, so the two co-owners of `config.yaml` can't clobber each other.
+    let serialized = serde_norway::to_value(prefs).map_err(|e| AppError::PreferencesPersist {
+        path: path.to_owned(),
+        source: std::io::Error::other(e.to_string()),
+    })?;
+    let fields = match serialized {
+        serde_norway::Value::Mapping(fields) => fields,
+        _ => serde_norway::Mapping::new(),
+    };
+    switchboard_core::edit_yaml_mapping(path, move |root| {
         for (key, value) in fields {
             root.insert(key, value);
         }
-    }
-    switchboard_core::write_yaml(path, &serde_norway::Value::Mapping(root))?;
-    Ok(())
-}
-
-/// Read `config.yaml` as a generic YAML mapping so a save can merge the
-/// preference keys without disturbing the other sections it shares the file with.
-/// Missing / empty / `null` → an empty mapping; a file that isn't a mapping is
-/// refused (returning an error) so a save never clobbers a malformed-but-present
-/// config.
-fn read_config_mapping(path: &Path) -> Result<serde_norway::Mapping, AppError> {
-    if !path.exists() {
-        return Ok(serde_norway::Mapping::new());
-    }
-    let bytes = std::fs::read(path).map_err(|source| AppError::PreferencesPersist {
-        path: path.to_owned(),
-        source,
     })?;
-    if bytes.iter().all(u8::is_ascii_whitespace) {
-        return Ok(serde_norway::Mapping::new());
-    }
-    match serde_norway::from_slice::<serde_norway::Value>(&bytes) {
-        Ok(serde_norway::Value::Mapping(mapping)) => Ok(mapping),
-        Ok(serde_norway::Value::Null) => Ok(serde_norway::Mapping::new()),
-        Ok(_) => Err(persist_err(
-            path,
-            "config.yaml is not a YAML mapping; refusing to overwrite it",
-        )),
-        Err(e) => Err(persist_err(path, &e.to_string())),
-    }
-}
-
-/// Wrap a non-I/O persist failure (YAML parse / serialize / shape) as the
-/// preferences-persist error, reusing its `path`-naming Display.
-fn persist_err(path: &Path, message: &str) -> AppError {
-    AppError::PreferencesPersist {
-        path: path.to_owned(),
-        source: std::io::Error::other(message.to_owned()),
-    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -250,6 +222,57 @@ mod tests {
         );
         // …and the preference keys are written.
         assert!(raw.contains("zed") && raw.contains("iTerm"));
+    }
+
+    #[test]
+    fn concurrent_save_and_add_mcp_provider_preserve_both_sections() {
+        // The contract that matters: the two *real* co-owners of `config.yaml`
+        // (preferences here, the prompt service for `mcp_providers`) writing it
+        // concurrently must each preserve the other's keys. This exercises the
+        // production wiring — both routing through `switchboard_core::edit_yaml_mapping`
+        // — not just the generic helper in isolation.
+        use std::sync::Arc;
+        use switchboard_prompts::{InMemorySecretStore, PromptService};
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        let prompts = PromptService::new(
+            config_path.clone(),
+            dir.path().join("prompts"),
+            None,
+            Arc::new(InMemorySecretStore::new()),
+        );
+
+        let save_path = config_path.clone();
+        let saver = std::thread::spawn(move || {
+            save(
+                &save_path,
+                &Preferences {
+                    editor_command: Some("zed".to_owned()),
+                    terminal_app: "iTerm".to_owned(),
+                    diff_style: DiffStyle::Unified,
+                },
+            )
+            .unwrap();
+        });
+        let adder = std::thread::spawn(move || {
+            prompts
+                .add_mcp_provider("team", "https://example.test", None)
+                .unwrap();
+        });
+        saver.join().unwrap();
+        adder.join().unwrap();
+
+        // Both subsystems' sections survive, whichever order they interleaved in.
+        let reread: serde_norway::Value = switchboard_core::read_yaml(&config_path).unwrap();
+        let map = reread.as_mapping().unwrap();
+        let key = |k: &str| serde_norway::Value::String(k.to_owned());
+        assert!(
+            map.contains_key(key("mcp_providers")),
+            "the prompt provider section must survive: {map:?}"
+        );
+        assert_eq!(map.get(key("editor_command")), Some(&key("zed")));
+        assert_eq!(map.get(key("terminal_app")), Some(&key("iTerm")));
     }
 
     #[test]

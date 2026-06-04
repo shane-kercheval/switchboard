@@ -15,9 +15,10 @@ use switchboard_core::{
     SendId, SessionLocator,
 };
 use switchboard_dispatcher::{
-    CancelOutcome, DispatchContextFactory, OnBusy, RemovedQueuedMessage, SendOutcome,
+    CancelOutcome, DispatchContextFactory, EventEmitter, OnBusy, RemovedQueuedMessage, SendOutcome,
 };
 use switchboard_harness::{CancelSource, HarnessAdapter, MessageId};
+use switchboard_prompts::PromptService;
 use uuid::Uuid;
 
 use crate::dispatch_context::ProjectDispatchContextFactory;
@@ -897,18 +898,31 @@ pub async fn test_mcp_connection_impl(
     Ok(state.prompts.test_mcp_connection(url, bearer).await?)
 }
 
+/// Event emitted after a prompt-cache rebuild settles, so the frontend can
+/// refresh provider status and restore a prompt-mode compose draft that needed
+/// the cache warm. Every sync path — startup warm sync, the `sync_prompts`
+/// command, and add/remove — emits it via [`sync_prompts_and_notify`]; binding
+/// the emit to the operation is what keeps a draft from getting stuck unrestored
+/// when the cache is warmed by a path other than add/remove.
+pub const PROMPTS_SYNCED_EVENT: &str = "prompts:synced";
+
+/// Rebuild the prompt cache, then emit [`PROMPTS_SYNCED_EVENT`]. The emit is
+/// bound to the sync here so no caller can warm the cache without notifying — the
+/// single chokepoint every sync path routes through.
+pub async fn sync_prompts_and_notify(prompts: PromptService, emitter: Arc<dyn EventEmitter>) {
+    prompts.sync().await;
+    emitter.emit(PROMPTS_SYNCED_EVENT, serde_json::Value::Null);
+}
+
 /// Rebuild the prompt cache off the command thread. `PromptService` is cheaply
 /// cloneable and shares its cache, so the spawned clone warms the same cache.
-/// Emits `prompts:synced` when the rebuild finishes so Settings can refresh a
-/// just-added provider's status (the add/remove command returns before the
-/// background build completes, so the first read shows `Unknown`).
+/// Emits [`PROMPTS_SYNCED_EVENT`] when the rebuild finishes so Settings can
+/// refresh a just-added provider's status (the add/remove command returns before
+/// the background build completes, so the first read shows `Unknown`).
 fn spawn_prompt_sync(state: &AppState) {
     let prompts = state.prompts.clone();
     let emitter = Arc::clone(&state.emitter);
-    tokio::spawn(async move {
-        prompts.sync().await;
-        emitter.emit("prompts:synced", serde_json::Value::Null);
-    });
+    tauri::async_runtime::spawn(sync_prompts_and_notify(prompts, emitter));
 }
 
 pub fn create_project_impl(
@@ -10083,5 +10097,25 @@ mod tests {
 
         remove_mcp_provider_impl(&state, "team").unwrap();
         assert!(list_mcp_providers_impl(&state).is_empty());
+    }
+
+    #[tokio::test]
+    async fn sync_prompts_and_notify_emits_after_sync() {
+        // Every sync path routes through this helper; the emit is bound to the
+        // sync so a warm-cache draft restore can't get stuck waiting for an event
+        // that only add/remove used to fire.
+        let emitter = Arc::new(RecordingEmitter::new());
+        sync_prompts_and_notify(
+            PromptService::disabled(),
+            Arc::clone(&emitter) as Arc<dyn EventEmitter>,
+        )
+        .await;
+
+        let names: Vec<String> = emitter
+            .snapshot()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, vec![PROMPTS_SYNCED_EVENT.to_owned()]);
     }
 }

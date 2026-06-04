@@ -53,6 +53,13 @@ pub enum CoreError {
         source: serde_norway::Error,
     },
 
+    /// `edit_yaml_mapping` was asked to edit a file that parses to something other
+    /// than a top-level mapping. Refused rather than clobbered — a file with real
+    /// content we can't safely round-trip (e.g. a hand-edited shared config) must
+    /// not be silently overwritten.
+    #[error("{path} is not a YAML mapping; refusing to overwrite it")]
+    NotAMapping { path: PathBuf },
+
     #[error("failed to serialize value for {path}: {source}")]
     Serialize {
         path: PathBuf,

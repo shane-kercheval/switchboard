@@ -682,6 +682,10 @@ async fn run_producer(ctx: ProducerCtx) {
         outcome,
         ended_at: Utc::now(),
         usage: None,
+        // Antigravity reports no token/window data — nothing to persist.
+        context_window_source: None,
+        stable_message_id: None,
+        spend: None,
     });
 
     // Post-terminal SessionMeta (mirrors Codex's enrichment ordering: flows

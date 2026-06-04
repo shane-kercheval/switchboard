@@ -42,6 +42,13 @@
   /// stays authoritative either way.
   let newSiblings = $state<ProjectSummary[]>([]);
   let newError = $state<string | null>(null);
+  /// Monotonic stamp for the new-folder probe. Picking a folder is instant
+  /// (submit enables immediately — the probe runs best-effort behind it), so
+  /// nothing blocks a second pick while the first probe is in flight. Stamping
+  /// each pick and discarding a probe whose stamp is stale prevents an
+  /// out-of-order probe (folder A resolving after the user re-picked folder B)
+  /// from overwriting B's canonical path / sibling list. Non-reactive guard.
+  let newFolderProbeSeq = 0;
 
   // Add-existing sub-state. `addFound` is `null` until a folder is probed, then
   // the projects discovered in it (empty array = none found).
@@ -81,11 +88,17 @@
     newFolder = folder;
     if (normalizeProjectName(newName) === "") newName = basename(folder);
     newError = null;
+    // Only apply this probe's result if it's still the latest pick and the form
+    // is still in "new" mode — a slower, superseded probe must not clobber a
+    // newer selection (or resurrect new-mode state after a mode switch).
+    const seq = ++newFolderProbeSeq;
     try {
       const info = await api.pickDirectory(folder);
+      if (seq !== newFolderProbeSeq || mode !== "new") return;
       newFolder = info.path; // canonical path the backend keys on
       newSiblings = info.projects;
     } catch (err) {
+      if (seq !== newFolderProbeSeq || mode !== "new") return;
       newSiblings = [];
       newError = err instanceof Error ? err.message : String(err);
     }

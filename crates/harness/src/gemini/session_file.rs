@@ -539,6 +539,9 @@ impl GeminiReconstruction {
             status,
             items,
             usage: builder.last_usage,
+            // Gemini has no cost/overage and no join key (Claude-only feature).
+            spend: None,
+            stable_message_id: None,
         });
     }
 
@@ -644,6 +647,10 @@ fn parse_tokens(value: &Value) -> TurnUsage {
         input_tokens,
         output_tokens,
         cached_input_tokens,
+        cache_creation_input_tokens: None,
+        // Gemini exposes no context window — occupancy is never computed and
+        // the bar stays hidden; leave the reconciled value `None`.
+        context_input_tokens: None,
         reasoning_output_tokens: None,
         context_window: None,
         total_cost_usd: None,

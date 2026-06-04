@@ -479,7 +479,11 @@
               {/key}
             </div>
             {#if agentsSidebarOpen}
-              <Sidebar agents={activeAgents} onAddAgent={openAddAgent} />
+              <Sidebar
+                agents={activeAgents}
+                project={activeProject ?? undefined}
+                onAddAgent={openAddAgent}
+              />
             {/if}
           </div>
         {/if}

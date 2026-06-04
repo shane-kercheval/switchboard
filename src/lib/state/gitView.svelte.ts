@@ -11,7 +11,7 @@
 // this never persists. It lives here (not component-local) so it's testable.
 
 import * as api from "$lib/api";
-import type { RepoListing } from "$lib/types";
+import type { BranchView, RepoListing } from "$lib/types";
 
 /// Re-read a repo's local git state if its last read is older than this. The
 /// local read is cheap + offline, so a short window keeps "I just committed,
@@ -143,7 +143,14 @@ export async function removeRepo(path: string): Promise<void> {
 /// re-read only the locally-stale repos, then kick a background fetch for the
 /// fetch-stale ones. The fetch is fire-and-forget so the tree paints immediately.
 export async function refreshStale(): Promise<void> {
-  if (gitView.repos.length === 0) {
+  // Gate on whether the *aggregate* has loaded, not on cache size: the project
+  // panel (`loadProjectRepo`) upserts a single repo into the shared cache while
+  // in Projects mode, so a non-empty cache no longer implies the full list was
+  // read. `status === "complete"` is set only by a full `loadTrackedRepos`
+  // (refreshAll / add / remove), so it's the precise "aggregate loaded" signal —
+  // without it, entering the Git view after a project-panel read would show only
+  // that one repo and hide every other tracked repo.
+  if (gitView.status !== "complete") {
     await refreshAll();
   } else {
     const now = performance.now();
@@ -157,25 +164,40 @@ export async function refreshStale(): Promise<void> {
 }
 
 /// Force a single repo's local re-read (per-repo refresh button / staleness).
-export async function refreshRepo(root: string): Promise<void> {
+/// Returns the listing it read (also upserted into `gitView.repos`), or `null`
+/// on failure — callers that need the resolved root (e.g. the project panel) use
+/// it; the fire-and-forget callers ignore it.
+export async function refreshRepo(root: string): Promise<RepoListing | null> {
   try {
     const listing = await api.readTrackedRepo(root);
     upsertRepo(listing);
+    return listing;
   } catch (e) {
     console.warn("[switchboard] git view refreshRepo failed", { root, error: e });
+    return null;
   }
+}
+
+/// Whether a repo's last fetch is stale (never fetched, or older than the fetch
+/// window) — the gate shared by the entry refresh and the project panel so the
+/// two surfaces don't double-fetch the same repo.
+function isFetchStale(root: string): boolean {
+  const rt = runtime.get(root);
+  if (rt === undefined) return true;
+  return rt.fetch.kind === "never" || performance.now() - rt.fetch.at > FETCH_STALE_MS;
+}
+
+/// Whether a repo's last local read is stale (never read, or older than the local
+/// window) — the read counterpart to `isFetchStale`, shared by the entry refresh
+/// and the project panel so a remount within the window doesn't re-hit the backend.
+function isReadStale(root: string): boolean {
+  const rt = runtime.get(root);
+  return rt === undefined || performance.now() - rt.lastRead > LOCAL_STALE_MS;
 }
 
 /// Background-fetch every repo whose fetch is stale, bounded by FETCH_CONCURRENCY.
 async function fetchStaleRepos(): Promise<void> {
-  const now = performance.now();
-  const due = gitView.repos
-    .map((r) => r.repo.root)
-    .filter((root) => {
-      const rt = runtime.get(root);
-      if (rt === undefined) return true;
-      return rt.fetch.kind === "never" || now - rt.fetch.at > FETCH_STALE_MS;
-    });
+  const due = gitView.repos.map((r) => r.repo.root).filter(isFetchStale);
   await runBounded(due, FETCH_CONCURRENCY, fetchRepo);
 }
 
@@ -207,6 +229,53 @@ export async function fetchRepo(root: string): Promise<void> {
 export async function fetchAll(): Promise<void> {
   const roots = gitView.repos.map((r) => r.repo.root);
   await runBounded(roots, FETCH_CONCURRENCY, fetchRepo);
+}
+
+/// Load the repo a project lives in, for the Projects-side git status panel
+/// (M6). Reuses the Git view's read + fetch + dedup (shared `gitView.repos`
+/// cache, no new fetch machinery): the panel `$effect` remounts on every sidebar
+/// toggle, so the read is **read-staleness-gated** like the Git view — a repo
+/// already read within the local window is served from cache rather than
+/// re-hitting the backend. A genuinely stale (or never-loaded) repo is re-read.
+/// Either way a fetch-stale repo gets a background fetch. `path` is the project's
+/// worktree directory; it resolves to the repo root.
+export async function loadProjectRepo(path: string): Promise<void> {
+  const cached = loadedRepoForWorktree(path);
+  const listing = cached && !isReadStale(cached.repo.root) ? cached : await refreshRepo(path);
+  if (listing?.repo.available && isFetchStale(listing.repo.root)) {
+    void fetchRepo(listing.repo.root);
+  }
+}
+
+/// The already-loaded repo whose worktree set includes `path`, or `undefined`.
+/// A path-spelling mismatch simply returns `undefined` (→ a fresh read), so this
+/// only ever skips a redundant read, never serves the wrong repo.
+function loadedRepoForWorktree(path: string): RepoListing | undefined {
+  return gitView.repos.find(
+    (r) =>
+      r.repo.local_branches.some((b) => b.worktree?.path === path) ||
+      r.repo.detached_worktrees.some((w) => w.path === path),
+  );
+}
+
+/// The `BranchView` for the worktree a project lives in, plus that repo's default
+/// branch (for badge computation), or `null` when not resolvable yet — the repo
+/// isn't loaded, the project's worktree is detached (no branch), or the directory
+/// isn't a tracked git repo. Matches on the backend-computed project↔worktree
+/// linking (robust against path-spelling differences), reading from the reactive
+/// `gitView.repos`, so a caller in a `$derived` re-runs as repos load/refresh.
+export function projectBranch(
+  projectId: string,
+): { branch: BranchView; defaultBranch: string | null } | null {
+  for (const listing of gitView.repos) {
+    const worktreePath = Object.keys(listing.linked_projects).find((p) =>
+      listing.linked_projects[p]?.some((lp) => lp.id === projectId),
+    );
+    if (worktreePath === undefined) continue;
+    const branch = listing.repo.local_branches.find((b) => b.worktree?.path === worktreePath);
+    if (branch) return { branch, defaultBranch: listing.repo.default_branch };
+  }
+  return null;
 }
 
 // --- internals --------------------------------------------------------------
@@ -259,6 +328,10 @@ function upsertRepo(listing: RepoListing): void {
     lastRead: performance.now(),
     fetch: existing?.fetch ?? { kind: "never" },
   });
+  // A single-repo update (per-repo refresh, post-fetch re-read, project-panel
+  // load) can drop the worktree the detail panel is open on — reconcile here too,
+  // not just in the full-list `applyRepos`, so the panel never dangles.
+  reconcileWorktreeSelection(gitView.repos);
 }
 
 function recordFetch(root: string, state: FetchState): void {

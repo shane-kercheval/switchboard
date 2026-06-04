@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { AgentRecord, AgentId } from "$lib/types";
+  import type { AgentRecord, AgentId, ProjectListing } from "$lib/types";
   import { runtimes, stopAgent, transcripts } from "$lib/state/index.svelte";
   import { removeAgent, renameAgent } from "$lib/state/workspace.svelte";
   import {
@@ -17,6 +17,7 @@
   import Dialog from "$lib/components/ui/Dialog.svelte";
   import CopyButton from "$lib/components/ui/CopyButton.svelte";
   import StopIcon from "$lib/components/ui/StopIcon.svelte";
+  import ProjectGitPanel from "$lib/components/ProjectGitPanel.svelte";
   import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
 
   /// Cap the per-tooltip warning rows so a session with a long tail
@@ -46,7 +47,13 @@
   /// `onAddAgent` is the "+ Add agent" entry point in the sidebar header.
   /// Optional so existing callers + tests that don't pass it continue
   /// rendering; when absent, the button isn't shown.
-  let { agents, onAddAgent }: { agents: AgentRecord[]; onAddAgent?: () => void } = $props();
+  /// `project` (the active project) drives the compact git-status block above the
+  /// agents list. Optional so callers/tests that don't pass it still render.
+  let {
+    agents,
+    onAddAgent,
+    project,
+  }: { agents: AgentRecord[]; onAddAgent?: () => void; project?: ProjectListing } = $props();
 
   let sessionInfoByAgent = $state<Record<AgentId, AgentSessionInfo | null>>({});
   let sessionInfoStarted = $state<Record<AgentId, boolean>>({});
@@ -422,6 +429,9 @@
 </script>
 
 <SidebarPanel side="right" width="w-60" testid="sidebar">
+  {#if project}
+    <ProjectGitPanel {project} />
+  {/if}
   <SidebarSection title="Agents">
     {#snippet action()}
       <div class="flex items-center gap-0.5">

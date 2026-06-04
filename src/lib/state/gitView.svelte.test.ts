@@ -13,12 +13,15 @@ const {
   enterGitView,
   refreshAll,
   refreshStale,
+  refreshRepo,
   fetchRepo,
   fetchAll,
   addRepo,
   removeRepo,
   selectWorktree,
   worktreeSelection,
+  loadProjectRepo,
+  projectBranch,
   _testing,
 } = await import("./gitView.svelte");
 
@@ -55,6 +58,14 @@ const listingWithWorktree = (root: string, wtPath: string): RepoListing => {
       worktree: { path: wtPath, dirty: true, untracked: false, detached_hash: null, warning: null },
     },
   ];
+  return l;
+};
+
+/// A listing whose `main` worktree at `wtPath` is linked to `projectId`, for the
+/// project-panel lookup.
+const listingWithProject = (root: string, wtPath: string, projectId: string): RepoListing => {
+  const l = listingWithWorktree(root, wtPath);
+  l.linked_projects = { [wtPath]: [{ id: projectId, name: "proj", directory: wtPath }] };
   return l;
 };
 
@@ -98,6 +109,76 @@ describe("gitView store", () => {
     // Immediately re-entering: nothing is stale, so no per-repo re-reads fire.
     await refreshStale();
     expect(listCalls()).toBe(0);
+  });
+
+  it("entering the Git view after a project-panel read still does the full aggregate load", async () => {
+    // Regression guard: a project-panel read upserts one repo into the shared
+    // cache while in Projects mode; entry must still load the *whole* tracked set
+    // (gate on aggregate-loaded status, not cache size) — else the Git view would
+    // show only that one repo.
+    // The project's worktree path resolves to repo root "/a" (the backend
+    // collapses a worktree path to its root), so the panel read and the aggregate
+    // refer to the same repo — not a separate "/a/wt" entry.
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "read_tracked_repo")
+        return Promise.resolve(listingWithProject("/a", "/a/wt", "p1"));
+      if (cmd === "list_tracked_repos")
+        return Promise.resolve([listing("/a"), listing("/b"), listing("/c")]);
+      return Promise.resolve(null);
+    });
+
+    await loadProjectRepo("/a/wt"); // one repo now cached, status still "pending"
+    expect(gitView.status).not.toBe("complete");
+
+    await refreshStale();
+    expect(invokeMock.mock.calls.some((c) => c[0] === "list_tracked_repos")).toBe(true);
+    expect(gitView.repos.map((r) => r.repo.root).sort()).toEqual(["/a", "/b", "/c"]);
+  });
+
+  it("a single-repo refresh clears a now-missing worktree selection", async () => {
+    wire({ list: [listingWithWorktree("/a", "/a/wt")] });
+    await refreshAll();
+    selectWorktree("/a/wt", "main");
+    expect(worktreeSelection.current?.path).toBe("/a/wt");
+
+    // A per-repo refresh of /a returns it without that worktree.
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "read_tracked_repo") return Promise.resolve(listing("/a"));
+      return Promise.resolve(null);
+    });
+    await refreshRepo("/a");
+    expect(worktreeSelection.current).toBeNull();
+  });
+
+  it("loadProjectRepo skips a redundant read when the repo was just read", async () => {
+    // Fetch rejects so there's no success-path follow-up re-read muddying the
+    // count — every `read_tracked_repo` here comes from loadProjectRepo's own read.
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "read_tracked_repo")
+        return Promise.resolve(listingWithProject("/a", "/a/wt", "p1"));
+      if (cmd === "fetch_repo") return Promise.reject(new Error("no remote"));
+      return Promise.resolve(null);
+    });
+
+    await loadProjectRepo("/a/wt");
+    expect(invokeMock.mock.calls.filter((c) => c[0] === "read_tracked_repo").length).toBe(1);
+
+    // A remount (sidebar toggle) within the read-staleness window serves from cache.
+    await loadProjectRepo("/a/wt");
+    expect(invokeMock.mock.calls.filter((c) => c[0] === "read_tracked_repo").length).toBe(1);
+  });
+
+  it("projectBranch is null for a project linked to a detached worktree (no branch)", async () => {
+    const detached = listing("/a");
+    detached.repo.detached_worktrees = [
+      { path: "/a/dt", dirty: true, untracked: false, detached_hash: "abc1234", warning: null },
+    ];
+    detached.linked_projects = { "/a/dt": [{ id: "p1", name: "proj", directory: "/a/dt" }] };
+    wire({ list: [detached] });
+    await refreshAll();
+
+    // Linked, but the worktree is detached → no `local_branches` row → null.
+    expect(projectBranch("p1")).toBeNull();
   });
 
   it("a failed fetch records a 'failed' state, never throws", async () => {
@@ -249,6 +330,35 @@ describe("gitView store", () => {
 
     expect(fetchStates["/a"]).toBeUndefined();
     expect(_testing.runtimeSize()).toBe(0);
+  });
+
+  it("projectBranch resolves the branch for a project's worktree via the linking", async () => {
+    wire({ list: [listingWithProject("/a", "/a/wt", "p1")] });
+    await refreshAll();
+
+    const found = projectBranch("p1");
+    expect(found?.branch.name).toBe("main");
+    expect(found?.defaultBranch).toBe("main");
+    // A project with no linked worktree resolves to null (graceful).
+    expect(projectBranch("nope")).toBeNull();
+  });
+
+  it("loadProjectRepo reads the project's repo and fetches it when stale", async () => {
+    invokeMock.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "read_tracked_repo")
+        return Promise.resolve(listingWithProject(String(args?.path), "/a/wt", "p1"));
+      return Promise.resolve(null); // fetch_repo
+    });
+
+    await loadProjectRepo("/a/wt");
+
+    // The repo is read (and upserted, so projectBranch can resolve it)…
+    expect(invokeMock.mock.calls.some((c) => c[0] === "read_tracked_repo")).toBe(true);
+    expect(projectBranch("p1")?.branch.name).toBe("main");
+    // …and a never-fetched repo is stale, so a background fetch is kicked.
+    await vi.waitFor(() =>
+      expect(invokeMock.mock.calls.some((c) => c[0] === "fetch_repo")).toBe(true),
+    );
   });
 
   it("fetchAll fetches every tracked repo", async () => {

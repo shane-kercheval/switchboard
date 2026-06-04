@@ -10,6 +10,8 @@ mod error;
 mod journal;
 mod locator_sink;
 mod metadata;
+mod prompts_setup;
+mod secret_store;
 mod state;
 mod workspace;
 
@@ -25,21 +27,23 @@ use tauri::{Emitter, Manager, State};
 use crate::commands::ProjectConversation;
 use crate::commands::{
     AgentSessionInfo, DirectoryInfo, HarnessInstallStatus, ProjectListing, WorkspaceDirectories,
-    agent_session_info_impl, attach_agent_impl, cancel_agent_impl, cancel_send_impl,
-    cancel_turn_impl, check_antigravity_auth_impl, check_antigravity_binary_impl,
+    add_mcp_provider_impl, agent_session_info_impl, attach_agent_impl, cancel_agent_impl,
+    cancel_send_impl, cancel_turn_impl, check_antigravity_auth_impl, check_antigravity_binary_impl,
     check_claude_auth_impl, check_claude_binary_impl, check_codex_auth_impl,
     check_codex_binary_impl, check_gemini_auth_impl, check_gemini_binary_impl, create_agent_impl,
     create_project_impl, delete_project_impl, get_harness_install_status_impl, init_directory_impl,
-    list_agents_impl, list_projects_impl, list_workspace_directories_impl,
-    load_project_conversation_impl, load_transcript_impl, open_project_impl, parse_uuid,
-    pick_directory_impl, remove_agent_impl, remove_directory_impl, remove_queued_message_impl,
-    rename_agent_impl, rename_project_impl, search_project_files_in_root,
-    search_project_files_root_impl, send_message_impl, set_active_project_impl,
-    set_project_archived_impl, validate_external_url,
+    list_agents_impl, list_mcp_providers_impl, list_projects_impl, list_prompts_impl,
+    list_workspace_directories_impl, load_project_conversation_impl, load_transcript_impl,
+    open_project_impl, parse_uuid, pick_directory_impl, remove_agent_impl, remove_directory_impl,
+    remove_mcp_provider_impl, remove_queued_message_impl, rename_agent_impl, rename_project_impl,
+    render_prompt_impl, search_project_files_in_root, search_project_files_root_impl,
+    send_message_impl, set_active_project_impl, set_project_archived_impl,
+    test_mcp_connection_impl, validate_external_url,
 };
 use crate::state::AppState;
 
 use switchboard_core::{AgentRecord, HarnessKind, ProjectSummary};
+use switchboard_prompts::{McpProviderInfo, Prompt, RenderedPrompt};
 
 #[tauri::command]
 async fn check_claude_binary(state: State<'_, AppState>) -> Result<(), String> {
@@ -127,6 +131,72 @@ async fn list_workspace_directories(
     state: State<'_, AppState>,
 ) -> Result<WorkspaceDirectories, String> {
     Ok(list_workspace_directories_impl(state.inner()))
+}
+
+/// List all prompts across configured providers (user-global; no project
+/// argument). Reads local providers this milestone; never hits the network.
+#[tauri::command]
+async fn list_prompts(state: State<'_, AppState>) -> Result<Vec<Prompt>, String> {
+    Ok(list_prompts_impl(state.inner()))
+}
+
+/// Render `name` from `provider` with `args`, returning the finished text.
+/// Serves both preview and send — the caller passes the identical args map.
+/// May touch the network (MCP `prompts/get`), hence async.
+#[tauri::command]
+async fn render_prompt(
+    state: State<'_, AppState>,
+    provider: String,
+    name: String,
+    args: std::collections::BTreeMap<String, String>,
+) -> Result<RenderedPrompt, String> {
+    render_prompt_impl(state.inner(), &provider, &name, &args)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Rebuild the cached prompt list from all configured providers. Wired to the
+/// Settings "Sync" button; used to pick up prompts edited on a server mid-session.
+#[tauri::command]
+async fn sync_prompts(state: State<'_, AppState>) -> Result<(), String> {
+    state.inner().prompts.sync().await;
+    Ok(())
+}
+
+/// Configured MCP providers with status, for the Settings list.
+#[tauri::command]
+async fn list_mcp_providers(state: State<'_, AppState>) -> Result<Vec<McpProviderInfo>, String> {
+    Ok(list_mcp_providers_impl(state.inner()))
+}
+
+/// Add a generic MCP server (name + URL + optional bearer token).
+#[tauri::command]
+async fn add_mcp_provider(
+    state: State<'_, AppState>,
+    name: String,
+    url: String,
+    bearer: Option<String>,
+) -> Result<(), String> {
+    add_mcp_provider_impl(state.inner(), &name, &url, bearer.as_deref()).map_err(|e| e.to_string())
+}
+
+/// Remove a configured MCP server (deletes its config entry and stored token).
+#[tauri::command]
+async fn remove_mcp_provider(state: State<'_, AppState>, name: String) -> Result<(), String> {
+    remove_mcp_provider_impl(state.inner(), &name).map_err(|e| e.to_string())
+}
+
+/// Probe a candidate MCP server (connect + list) before saving; returns the
+/// number of prompts it exposes.
+#[tauri::command]
+async fn test_mcp_connection(
+    state: State<'_, AppState>,
+    url: String,
+    bearer: Option<String>,
+) -> Result<usize, String> {
+    test_mcp_connection_impl(state.inner(), &url, bearer)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -477,43 +547,93 @@ fn build_adapters() -> (
     }
 }
 
-/// Resolve the path to the user-global `workspace.yaml` (the cross-directory
-/// project list). `None` only when no home directory is resolvable, in which
-/// case workspace persistence is disabled.
+/// Resolve the user-global config directory — the single location that holds
+/// `workspace.yaml`, the prompt `config.yaml`, and the default `prompts/` store.
+/// `None` only when no home directory is resolvable, in which case user-global
+/// persistence (workspace registry, prompt config) is disabled.
 ///
 /// Release builds always resolve the OS config dir for `switchboard`, so the
-/// installed app's list lives at one fixed, predictable location no env var can
+/// installed app's state lives at one fixed, predictable location no env var can
 /// move.
 ///
-/// Debug builds resolve a separate dev registry so dev runs never read or
-/// overwrite the installed app's list. `SWITCHBOARD_CONFIG_DIR` (set per port by
+/// Debug builds resolve a separate dev directory so dev runs never read or
+/// overwrite the installed app's state. `SWITCHBOARD_CONFIG_DIR` (set per port by
 /// `make dev`) overrides the location outright; without it the fallback is a
 /// shared `switchboard-dev`. The override is debug-only by construction — it
 /// cannot relocate the installed app's data.
 #[cfg(not(debug_assertions))]
-fn workspace_config_path() -> Option<std::path::PathBuf> {
+fn config_dir() -> Option<std::path::PathBuf> {
     directories::ProjectDirs::from("", "", "switchboard")
-        .map(|dirs| dirs.config_dir().join("workspace.yaml"))
+        .map(|dirs| dirs.config_dir().to_path_buf())
 }
 
 #[cfg(debug_assertions)]
-fn workspace_config_path() -> Option<std::path::PathBuf> {
-    debug_workspace_config_path(std::env::var_os("SWITCHBOARD_CONFIG_DIR"))
+fn config_dir() -> Option<std::path::PathBuf> {
+    debug_config_dir(std::env::var_os("SWITCHBOARD_CONFIG_DIR"))
 }
 
-/// Pure decision behind the debug arm of [`workspace_config_path`], split out so
-/// the override mapping is testable without mutating process-global env (which
-/// is `unsafe` and racy under edition 2024). An explicit override is used
-/// verbatim; otherwise the shared `switchboard-dev` registry is the fallback.
+/// Pure decision behind the debug arm of [`config_dir`], split out so the
+/// override mapping is testable without mutating process-global env (which is
+/// `unsafe` and racy under edition 2024). An explicit override is used verbatim;
+/// otherwise the shared `switchboard-dev` directory is the fallback.
 #[cfg(debug_assertions)]
-fn debug_workspace_config_path(
-    override_dir: Option<std::ffi::OsString>,
-) -> Option<std::path::PathBuf> {
+fn debug_config_dir(override_dir: Option<std::ffi::OsString>) -> Option<std::path::PathBuf> {
     if let Some(dir) = override_dir {
-        return Some(std::path::PathBuf::from(dir).join("workspace.yaml"));
+        return Some(std::path::PathBuf::from(dir));
     }
     directories::ProjectDirs::from("", "", "switchboard-dev")
-        .map(|dirs| dirs.config_dir().join("workspace.yaml"))
+        .map(|dirs| dirs.config_dir().to_path_buf())
+}
+
+/// Path to the user-global `workspace.yaml` (the cross-directory project list).
+fn workspace_config_path() -> Option<std::path::PathBuf> {
+    config_dir().map(|dir| dir.join("workspace.yaml"))
+}
+
+/// Build the prompt service from the user-global config dir, seeding the example
+/// prompts on first run. The pure `crates/prompts` never touches `directories`;
+/// the app resolves and injects the config path, default prompts dir, home, and
+/// the secret store.
+///
+/// The injected secret store is the OS keychain (`KeyringSecretStore`), namespaced
+/// by build so debug tokens stay separate from a release install's.
+fn build_prompt_service() -> switchboard_prompts::PromptService {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    if let Some(dir) = config_dir() {
+        let prompts_dir = dir.join("prompts");
+        crate::prompts_setup::seed_example_prompts(&prompts_dir);
+        let secrets = build_secret_store(&dir);
+        switchboard_prompts::PromptService::new(dir.join("config.yaml"), prompts_dir, home, secrets)
+    } else {
+        tracing::warn!("no home directory resolved — prompt providers disabled");
+        switchboard_prompts::PromptService::disabled()
+    }
+}
+
+/// Release builds use the OS keychain. **Debug builds use a plaintext file store**
+/// in the dev config dir instead — an unsigned dev binary's signature changes on
+/// every compile, so the macOS Keychain re-prompts on every credential read; the
+/// file store sidesteps that. Dev-only tradeoff: the token sits in plaintext on
+/// the developer's own machine.
+#[cfg(not(debug_assertions))]
+fn build_secret_store(_dir: &std::path::Path) -> Arc<dyn switchboard_prompts::SecretStore> {
+    Arc::new(crate::secret_store::KeyringSecretStore::new(
+        keyring_service(),
+    ))
+}
+
+#[cfg(debug_assertions)]
+fn build_secret_store(dir: &std::path::Path) -> Arc<dyn switchboard_prompts::SecretStore> {
+    Arc::new(crate::secret_store::FileSecretStore::new(
+        dir.join("mcp-secrets.json"),
+    ))
+}
+
+/// Keychain service name for stored provider bearers (release only — debug uses
+/// the file store, so this isn't compiled there).
+#[cfg(not(debug_assertions))]
+fn keyring_service() -> &'static str {
+    "switchboard"
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -571,6 +691,18 @@ pub fn run() {
                 );
                 state
             };
+            // Resolve and inject the user-global prompt config + default prompts
+            // store (seeding the example prompts on first run).
+            let prompts = build_prompt_service();
+            // Warm the prompt cache in the background so a slow/cold MCP server
+            // never blocks startup. `PromptService` is cheaply cloneable and
+            // shares its cache `Arc`, so the clone the task syncs is the same
+            // cache the managed state reads.
+            let prompts_for_build = prompts.clone();
+            tauri::async_runtime::spawn(async move {
+                prompts_for_build.sync().await;
+            });
+            let state = state.with_prompts(prompts);
             // Cold start: open a `Directory` handle for every workspace entry so
             // restored directories report `available: true` and participate in
             // the cross-harness session-id collision scan. Unopenable
@@ -594,6 +726,13 @@ pub fn run() {
             remove_directory,
             list_projects,
             list_workspace_directories,
+            list_prompts,
+            render_prompt,
+            sync_prompts,
+            list_mcp_providers,
+            add_mcp_provider,
+            remove_mcp_provider,
+            test_mcp_connection,
             create_project,
             rename_project,
             delete_project,
@@ -621,18 +760,18 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
-// Gated on `debug_assertions` because `debug_workspace_config_path` exists only
-// in debug builds; `cargo test --release` turns those off and the symbol away.
+// Gated on `debug_assertions` because `debug_config_dir` exists only in debug
+// builds; `cargo test --release` turns those off and the symbol away.
 #[cfg(all(test, debug_assertions))]
 mod tests {
-    use super::debug_workspace_config_path;
+    use super::debug_config_dir;
     use std::path::PathBuf;
 
     #[test]
-    fn override_dir_is_used_verbatim_with_workspace_yaml_appended() {
-        let path = debug_workspace_config_path(Some("/tmp/switchboard-test".into()))
+    fn override_dir_is_used_verbatim() {
+        let path = debug_config_dir(Some("/tmp/switchboard-test".into()))
             .expect("an explicit override always yields a path");
-        assert_eq!(path, PathBuf::from("/tmp/switchboard-test/workspace.yaml"));
+        assert_eq!(path, PathBuf::from("/tmp/switchboard-test"));
     }
 
     #[test]
@@ -640,8 +779,8 @@ mod tests {
         // Routes through `ProjectDirs`, which is `None` only on a host with no
         // resolvable home (not a dev machine or normal CI). Skip rather than
         // unwrap so an exotic host degrades quietly instead of panicking.
-        if let Some(path) = debug_workspace_config_path(None) {
-            assert!(path.ends_with("switchboard-dev/workspace.yaml"));
+        if let Some(path) = debug_config_dir(None) {
+            assert!(path.ends_with("switchboard-dev"));
         }
     }
 }

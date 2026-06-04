@@ -1,0 +1,29 @@
+[package]
+name = "switchboard-prompts"
+description = "Switchboard prompts: provider framework, local file prompts, MiniJinja rendering (pure Rust, no Tauri)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+switchboard-core = { path = "../core" }
+serde = { workspace = true }
+serde_norway = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+minijinja = "2.20.0"
+rmcp = { version = "1.7.0", default-features = false, features = ["client", "transport-streamable-http-client-reqwest", "macros", "reqwest-native-tls"] }
+tokio.workspace = true
+serde_json.workspace = true
+futures.workspace = true
+
+[dev-dependencies]
+axum = "0.8.9"
+rmcp = { version = "1.7.0", features = ["server", "transport-streamable-http-server"] }
+tempfile = { workspace = true }

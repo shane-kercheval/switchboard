@@ -53,6 +53,7 @@ Switchboard drives each agent through its own CLI, so it inherits that CLI's cap
 - **Model selection.** Claude Code, Codex, and Gemini let Switchboard choose the model per agent. **Antigravity does not** — its CLI exposes no model option, so Antigravity agents run on whatever model you've selected inside Antigravity itself, and Switchboard can't change it per agent.
 - **Codex models depend on your plan.** When you sign in to Codex with a ChatGPT subscription, only the models your plan includes are available; choosing one your plan doesn't cover fails the turn with Codex's own error.
 - **Antigravity and hidden folders.** Antigravity can't work in a project whose path contains a hidden (dot-prefixed) folder — for example anything under `~/.config/…`. The agent still runs but can't see your files. Keep projects under normal paths like `~/repos/…`.
+- **Prompts work across every harness.** Switchboard resolves prompts itself and sends each agent plain text, so a prompt library — local files or any MCP prompt server you add in Settings — works identically with Claude Code, Codex, Gemini, and Antigravity, with no per-CLI setup. This is especially useful for Codex and Gemini, whose native MCP-prompt support is limited. Add an MCP prompt server (e.g. [Tiddly](https://tiddly.me) — paste a Tiddly access token as the bearer) under Settings → "Add MCP server"; tokens are stored in your OS keychain. (HTTP MCP servers only for now; stdio servers and a one-click Tiddly login are planned.)
 
 ## Design and discussion
 

@@ -148,13 +148,19 @@ pub struct TurnUsage {
 /// overage." Stamped per turn by the **adapter** (the harness owns the rule),
 /// so the frontend renders on `real_spend` without a `match harness`.
 ///
-/// - `real_spend` — the harness-agnostic render gate: show the cost + marker
-///   only when set. For subscription Claude, `total_cost_usd` is a *notional*
-///   API-equivalent figure that isn't money charged unless the agent is in
+/// The frontend reads the two fields through **two distinct gates**: the
+/// **cost** renders on `real_spend`, the **"using credits" marker** on
+/// `is_overage`. They coincide for Claude, but the split is load-bearing for a
+/// future pay-per-use harness (cost shows, marker stays hidden), which is why
+/// they're separate fields rather than one.
+///
+/// - `real_spend` — the harness-agnostic gate for showing cost: set when the
+///   turn cost real money. For subscription Claude, `total_cost_usd` is a
+///   *notional* API-equivalent figure that isn't charged unless the agent is in
 ///   overage, so `real_spend == is_overage`. A future pay-per-use harness would
 ///   set `real_spend` true whenever cost is present, regardless of overage.
-/// - `is_overage` — the Claude-derived source of the signal (`isUsingOverage`),
-///   kept distinct from `real_spend` so the seam stays honest.
+/// - `is_overage` — the Claude-derived overage flag (`isUsingOverage`); gates
+///   the "using credits" marker specifically.
 /// - `overage_resets_at` — the credit/overage window reset, for the marker's
 ///   tooltip, when the harness reports it (`overageResetsAt`).
 ///

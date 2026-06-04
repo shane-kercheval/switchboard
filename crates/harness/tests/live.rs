@@ -158,6 +158,53 @@ async fn live_claude_basic_turn_completes() {
 
 #[tokio::test]
 #[ignore = "requires claude installed — run with: make test-live"]
+async fn live_claude_rate_limit_precedes_result() {
+    // Per-turn cost/overage stamping (M3) depends on the Claude parser seeing
+    // the turn's `rate_limit_event` (which carries `isUsingOverage`) BEFORE the
+    // terminal event: the `ParserState` overage stash is set when the
+    // rate-limit is parsed and read when the `TurnEnd` is built. If a CLI bump
+    // ever reordered or dropped the rate-limit, an overage turn would render
+    // with no cost and no marker — silent under-reporting on the money path,
+    // the worst failure direction for this feature. Fixture tests can't catch
+    // that drift (they replay the assumed order); this pins the ordering +
+    // presence invariant against the live CLI.
+    //
+    // The `isUsingOverage == true` branch itself is NOT live-coverable — we
+    // can't force overage on demand — so that residual risk is accepted
+    // knowingly; this guards the ordering/presence the stamp rests on.
+    let adapter = ClaudeCodeAdapter::new();
+    let agent = live_agent();
+    let turn_id = Uuid::now_v7();
+
+    let stream = adapter
+        .dispatch(
+            &agent,
+            Path::new("/tmp"),
+            "Reply with only the word ack.",
+            turn_id,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed with real claude");
+    let events: Vec<AdapterEvent> = stream.collect().await;
+
+    let rate_limit_idx = events
+        .iter()
+        .position(|e| matches!(e, AdapterEvent::RateLimitEvent { .. }))
+        .expect("Claude must emit a rate_limit_event every turn (the overage stash depends on it)");
+    let turn_end_idx = events
+        .iter()
+        .position(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+        .expect("should have a terminal TurnEnd");
+    assert!(
+        rate_limit_idx < turn_end_idx,
+        "rate_limit_event must precede the terminal TurnEnd so the parser's overage stash is set \
+         before the turn is stamped; got rate_limit at {rate_limit_idx}, TurnEnd at {turn_end_idx}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires claude installed — run with: make test-live"]
 async fn live_claude_thinking_emits_liveness() {
     // While the model reasons, the CLI streams `thinking_delta` /
     // `signature_delta`. On a redacting model (Opus 4.8 — the dev's default,

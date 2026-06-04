@@ -8,6 +8,7 @@
     transcripts,
   } from "$lib/state/index.svelte";
   import { buildLiveSendsMap } from "$lib/state/liveSends";
+  import { recordProjectsActivityLocally } from "$lib/state/workspace.svelte";
   import { getCompose, setDraft, setSelection } from "$lib/state/composeStore";
   import * as api from "$lib/api";
   import type { AgentId, AgentRecord, ProjectId } from "$lib/types";
@@ -15,7 +16,7 @@
   import StopIcon from "$lib/components/ui/StopIcon.svelte";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
-  import { cn } from "$lib/utils";
+  import { cn, currentIsoTimestamp } from "$lib/utils";
   import { shortcut } from "$lib/platform";
   import { onDestroy, untrack } from "svelte";
 
@@ -69,6 +70,20 @@
     textarea.style.overflowY = naturalHeight > cappedHeight ? "auto" : "hidden";
   }
 
+  function isEditableShortcutTarget(target: EventTarget | null): boolean {
+    if (!(target instanceof HTMLElement)) return false;
+    return (
+      target.isContentEditable ||
+      target.tagName === "INPUT" ||
+      target.tagName === "TEXTAREA" ||
+      target.tagName === "SELECT"
+    );
+  }
+
+  function hasOpenDialog(): boolean {
+    return document.querySelector('[role="dialog"], [role="alertdialog"]') !== null;
+  }
+
   // Drop any selected ids whose agent disappeared (agent removed at runtime).
   $effect(() => {
     const valid = selectedIds.filter((id) => agents.some((a) => a.id === id));
@@ -107,6 +122,14 @@
   // Escape is left alone for whatever else owns it.
   $effect(() => {
     function onKeydown(e: KeyboardEvent): void {
+      const mod = e.metaKey || e.ctrlKey;
+      if (mod && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "k") {
+        if (hasOpenDialog()) return;
+        if (isEditableShortcutTarget(e.target) && e.target !== textareaEl) return;
+        e.preventDefault();
+        textareaEl?.focus();
+        return;
+      }
       if (e.key === "Escape") {
         if (composeEl === undefined || !composeEl.contains(document.activeElement)) return;
         // First dismiss the @ menu, otherwise clear the recipient set. The draft
@@ -120,7 +143,6 @@
         }
         return;
       }
-      const mod = e.metaKey || e.ctrlKey;
       if (!mod || e.altKey) return;
       if (e.shiftKey) {
         if (e.key.toLowerCase() === "a") {
@@ -145,9 +167,9 @@
       .filter((a): a is AgentRecord => a !== undefined),
   );
 
-  /// `@`-quick-add: a trailing `@token` opens a typeahead of *unselected*
-  /// agents; Enter / click adds the highlighted one and strips the token. This
-  /// is the keyboard route to selecting recipients without touching the mouse.
+  /// `@` recipient picker: a trailing `@token` opens a typeahead of all agents;
+  /// Enter / click picks one as the sole recipient and strips the token. This is
+  /// the keyboard route to selecting recipients without touching the mouse.
   let menuOpen = $state(false);
   let menuEl = $state<HTMLDivElement | undefined>(undefined);
   let menuQuery = $state("");
@@ -164,16 +186,11 @@
   const MENU_WIDTH = 256;
 
   const agentCandidates = $derived(
-    menuOpen
-      ? agents.filter(
-          (a) =>
-            !selectedIds.includes(a.id) && a.name.toLowerCase().includes(menuQuery.toLowerCase()),
-        )
-      : [],
+    menuOpen ? agents.filter((a) => a.name.toLowerCase().includes(menuQuery.toLowerCase())) : [],
   );
 
   /// The menu's navigable rows: file matches render first in their own section,
-  /// then recipient actions and unselected agents. **All** appears only when not
+  /// then recipient actions and matching agents. **All** appears only when not
   /// everyone is selected and its keyword matches the query; **Clear** only when
   /// something is selected and its keyword matches. Even though files render
   /// first, keyboard selection prefers a matched agent when one exists.
@@ -489,6 +506,7 @@
     // sharing it (the backend groups, and cancel-send is scoped to it).
     const sendId = crypto.randomUUID();
     const targets = [...selectedAgents];
+    recordProjectsActivityLocally([projectId], currentIsoTimestamp());
     for (const agent of targets) {
       const userTurnId = crypto.randomUUID();
       dispatchUserTurn(agent.id, userTurnId, submittedText, sendId);
@@ -604,30 +622,39 @@
           <div class="max-h-48 overflow-y-auto" data-testid="file-options-scroll">
             {#each fileItems as item (item.key)}
               {@const i = menuItems.findIndex((candidate) => candidate.key === item.key)}
-              <button
-                type="button"
-                class={"hover:bg-panel/80 flex w-full cursor-pointer items-center gap-2 rounded-md px-2.5 py-1 text-left leading-5 outline-none select-none " +
-                  (i === highlighted ? "bg-panel/80" : "")}
-                data-testid={`file-option-${item.path}`}
-                role="option"
-                aria-selected={i === highlighted}
-                onclick={() => pickItem(item)}
-              >
-                <svg
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="1.8"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                  class="text-muted h-4 w-4 shrink-0"
-                  aria-hidden="true"
-                >
-                  <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
-                  <path d="M14 3v5h5" />
-                </svg>
-                <span class="text-fg truncate">{item.path}</span>
-              </button>
+              <Tooltip label={item.path} side="right" delayDuration={0}>
+                {#snippet trigger(props)}
+                  <button
+                    {...props}
+                    type="button"
+                    class={"hover:bg-panel/80 flex w-full cursor-pointer items-center gap-2 rounded-md px-2.5 py-1 text-left leading-5 outline-none select-none " +
+                      (i === highlighted ? "bg-panel/80" : "")}
+                    data-testid={`file-option-${item.path}`}
+                    role="option"
+                    aria-selected={i === highlighted}
+                    onclick={() => pickItem(item)}
+                  >
+                    <svg
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="1.8"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      class="text-muted h-4 w-4 shrink-0"
+                      aria-hidden="true"
+                    >
+                      <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
+                      <path d="M14 3v5h5" />
+                    </svg>
+                    <span
+                      class="text-fg min-w-0 truncate text-left"
+                      dir="rtl"
+                      data-testid="file-option-label">{item.path}</span
+                    >
+                  </button>
+                {/snippet}
+              </Tooltip>
             {/each}
             {#if fileStatusText !== null}
               <div
@@ -709,6 +736,7 @@
       {/if}
       <Textarea
         data-testid="compose-textarea"
+        data-shortcut-scope="composer"
         placeholder="Type a message…  (⌘+Enter to send, @ to add a recipient)"
         rows={3}
         bind:ref={textareaEl}

@@ -114,6 +114,12 @@
     }
   }
 
+  function submitNewFromName(event: KeyboardEvent): void {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    void submitNew();
+  }
+
   /// Add existing: the probe *is* the action (preview which projects will be
   /// added), so the folder is only committable once it discovers ≥1 project.
   async function chooseAddFolder(): Promise<void> {
@@ -232,9 +238,7 @@
           aria-invalid={!newValidation.ok}
           aria-describedby={newNameMessage ? "new-project-name-error" : undefined}
           title={newNameMessage ?? undefined}
-          onkeydown={(e: KeyboardEvent) => {
-            if (e.key === "Enter") void submitNew();
-          }}
+          onkeydown={submitNewFromName}
         />
         {#if newNameMessage}
           <span

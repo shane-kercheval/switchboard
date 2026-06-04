@@ -169,6 +169,7 @@ describe("SettingsView", () => {
 
   it("shortcuts section lists expected keyboard shortcuts", () => {
     render(SettingsView, { props: { onClose: vi.fn() } });
+    expect(screen.getByText("Focus message box")).toBeInTheDocument();
     expect(screen.getByText("Toggle projects sidebar")).toBeInTheDocument();
     expect(screen.getByText("Toggle agents sidebar")).toBeInTheDocument();
     expect(screen.getByText("Toggle settings")).toBeInTheDocument();

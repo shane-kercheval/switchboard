@@ -31,6 +31,7 @@
   // the key isn't literal (the compose-bar number keys map to a chip's position,
   // not a fixed digit).
   const shortcuts: { action: string; keys: string[]; note?: string }[] = [
+    { action: "Focus message box", keys: ["⌘", "K"] },
     { action: "Toggle Projects / Git view", keys: ["⌘", "⇧", "G"] },
     { action: "Toggle projects sidebar", keys: ["⌘", "B"] },
     { action: "Toggle agents sidebar", keys: ["⌘", "⇧", "B"] },

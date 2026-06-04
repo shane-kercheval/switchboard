@@ -82,8 +82,14 @@
     );
   }
 
+  function isComposerShortcutTarget(target: EventTarget | null): boolean {
+    return (
+      target instanceof HTMLElement && target.closest('[data-shortcut-scope="composer"]') !== null
+    );
+  }
+
   function handleGlobalKeydown(event: KeyboardEvent): void {
-    if (isEditableShortcutTarget(event.target)) return;
+    if (isEditableShortcutTarget(event.target) && !isComposerShortcutTarget(event.target)) return;
 
     const command = event.metaKey || event.ctrlKey;
     if (!command) return;
@@ -177,6 +183,9 @@
   );
   const activeProject = $derived(
     projects.list.find((p) => p.id === selection.activeProjectId) ?? null,
+  );
+  const projectSwitching = $derived(
+    selection.activeProjectId !== null && selection.loadingProjectId === selection.activeProjectId,
   );
   // The projects sidebar is a project picker — with no projects there's
   // nothing to pick, so it (and its re-open toggle) hide entirely; the
@@ -442,7 +451,7 @@
               </Button>
             {/snippet}
           </EmptyState>
-        {:else if !rosterLoaded}
+        {:else if projectSwitching || !rosterLoaded}
           <EmptyState testid="project-loading" title="Loading project…" />
         {:else if activeAgents.length === 0}
           <div class="flex flex-1 flex-col overflow-y-auto">

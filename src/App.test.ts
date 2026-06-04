@@ -59,6 +59,9 @@ type Backend = {
   // test park the seeding loop after its first create (call is recorded on
   // invoke) to exercise the captured-project-id bail.
   createAgentGate: Promise<void> | null;
+  // When set, `open_project` waits on this project's gate before resolving — lets a test
+  // observe the immediate UI state while project activation is still pending.
+  openProjectGates: Map<string, Promise<void>>;
   agentQueue: AgentRecord[];
   sendMessageId: string;
   loadConvoCalls: string[];
@@ -84,6 +87,7 @@ function freshBackend(): Backend {
     createAgentFailFor: new Set(),
     installGate: null,
     createAgentGate: null,
+    openProjectGates: new Map(),
     agentQueue: [],
     sendMessageId: "77777777-7777-7000-8000-777777777777",
     loadConvoCalls: [],
@@ -154,6 +158,8 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
     }
     case "open_project": {
       const pid = args?.projectId as string;
+      const gate = backend.openProjectGates.get(pid);
+      if (gate !== undefined) await gate;
       if (backend.failOpenFor.has(pid)) throw new Error("project is locked by another process");
       return summaryFor(pid);
     }
@@ -296,14 +302,26 @@ async function mountApp() {
 // Drives the new-project dialog flow (choose folder → name → submit). The
 // folder is resolved from the mocked native dialog; the project is created in
 // DIR_A unless `folder` overrides it.
-async function createNewProjectViaDialog(name: string, folder: string = DIR_A): Promise<void> {
+async function createNewProjectViaDialog(
+  name: string,
+  folder: string = DIR_A,
+  triggerTestId = "welcome-add-project",
+): Promise<void> {
   openDialogMock.mockResolvedValueOnce(folder);
-  await fireEvent.click(screen.getByTestId("welcome-add-project"));
+  await fireEvent.click(screen.getByTestId(triggerTestId));
   await waitFor(() => expect(screen.getByTestId("new-project-form")).toBeInTheDocument());
   await fireEvent.click(screen.getByTestId("new-project-choose-folder"));
   const nameInput = screen.getByTestId("new-project-name") as HTMLInputElement;
   await fireEvent.input(nameInput, { target: { value: name } });
   await fireEvent.click(screen.getByTestId("new-project-submit"));
+}
+
+function projectRowByName(name: string): HTMLElement {
+  const row = screen
+    .getAllByTestId("project-row")
+    .find((candidate) => within(candidate).queryByText(name) !== null);
+  if (row === undefined) throw new Error(`missing project row ${name}`);
+  return row;
 }
 
 // create_agent calls (name + harness pairs) in invocation order.
@@ -656,6 +674,51 @@ describe("App", () => {
     expect(createAgentCalls()).toHaveLength(1);
   });
 
+  it("new project: failed activation does not auto-seed agents", async () => {
+    backend.failOpenFor.add("00000000-0000-7000-8000-0000000c0001");
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("welcome-add-project")).toBeInTheDocument());
+
+    await createNewProjectViaDialog("brand-new");
+
+    await waitFor(() => expect(screen.getByTestId("activation-error")).toBeInTheDocument());
+    expect(createAgentCalls()).toHaveLength(0);
+  });
+
+  it("new project: superseded activation does not auto-seed agents into another project", async () => {
+    let releaseCreated!: () => void;
+    backend.openProjectGates.set(
+      "00000000-0000-7000-8000-0000000c0002",
+      new Promise<void>((resolve) => {
+        releaseCreated = resolve;
+      }),
+    );
+    seedProject({
+      projectId: "p-other",
+      directory: DIR_B,
+      name: "other",
+      agents: [agent({ id: "ag-other", project_id: "p-other", name: "other-agent" })],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("add-project")).toBeInTheDocument());
+
+    await createNewProjectViaDialog("brand-new", DIR_A, "add-project");
+    await waitFor(() =>
+      expect(projectRowByName("brand-new")).toHaveAttribute("data-active", "true"),
+    );
+
+    await fireEvent.click(within(projectRowByName("other")).getByText("other"));
+    await waitFor(() => expect(projectRowByName("other")).toHaveAttribute("data-active", "true"));
+    await waitFor(() => expect(backend.activeProjectId).toBe("p-other"));
+
+    releaseCreated();
+    await waitFor(() => expect(screen.queryByTestId("new-project-form")).not.toBeInTheDocument());
+
+    expect(createAgentCalls()).toHaveLength(0);
+    expect(backend.activeProjectId).toBe("p-other");
+    expect(backend.rosters.get("p-other")).toHaveLength(1);
+  });
+
   it("switching projects clears the auto-create failure banner", async () => {
     backend.createAgentFailFor.add("codex");
     seedProject({ projectId: "p-other", directory: DIR_B, name: "other", agents: [] });
@@ -716,6 +779,78 @@ describe("App", () => {
     await fireEvent.click(screen.getByText("alpha"));
     await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
     expect(backend.loadConvoCalls.filter((p) => p === "p-a")).toHaveLength(1);
+  });
+
+  it("selects a project row and clears the center pane while activation is pending", async () => {
+    let releaseOpen!: () => void;
+    backend.openProjectGates.set(
+      "p-a",
+      new Promise<void>((resolve) => {
+        releaseOpen = resolve;
+      }),
+    );
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
+    const row = screen.getByTestId("project-row");
+
+    await fireEvent.click(within(row).getByText("alpha"));
+
+    expect(row).toHaveAttribute("data-active", "true");
+    await waitFor(() => expect(screen.getByTestId("project-loading")).toBeInTheDocument());
+    expect(screen.queryByTestId("compose-textarea")).not.toBeInTheDocument();
+
+    releaseOpen();
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+  });
+
+  it("ignores stale activation completion after switching to another project", async () => {
+    let releaseAlpha!: () => void;
+    backend.openProjectGates.set(
+      "p-a",
+      new Promise<void>((resolve) => {
+        releaseAlpha = resolve;
+      }),
+    );
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    seedProject({
+      projectId: "p-b",
+      directory: DIR_B,
+      name: "beta",
+      agents: [agent({ id: "ag-2", project_id: "p-b", name: "helper" })],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getAllByTestId("project-row")).toHaveLength(2));
+
+    const alphaRow = screen
+      .getAllByTestId("project-row")
+      .find((row) => within(row).queryByText("alpha") !== null);
+    const betaRow = screen
+      .getAllByTestId("project-row")
+      .find((row) => within(row).queryByText("beta") !== null);
+    if (alphaRow === undefined || betaRow === undefined) throw new Error("missing project rows");
+
+    await fireEvent.click(within(alphaRow).getByText("alpha"));
+    await waitFor(() => expect(alphaRow).toHaveAttribute("data-active", "true"));
+    await fireEvent.click(within(betaRow).getByText("beta"));
+    await waitFor(() => expect(betaRow).toHaveAttribute("data-active", "true"));
+    await waitFor(() => expect(backend.activeProjectId).toBe("p-b"));
+
+    releaseAlpha();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(backend.activeProjectId).toBe("p-b");
+    expect(betaRow).toHaveAttribute("data-active", "true");
   });
 
   it("switching projects is display-only: a backgrounded agent's listener still updates state", async () => {
@@ -1361,7 +1496,7 @@ describe("App", () => {
     expect(screen.getByTestId("compose-textarea")).toBeInTheDocument();
   });
 
-  it("global shortcuts are suppressed when focus is inside an editable element", async () => {
+  it("global shortcuts work when focus is inside the compose box", async () => {
     seedProject({
       projectId: "p-a",
       directory: DIR_A,
@@ -1374,19 +1509,46 @@ describe("App", () => {
     await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
 
     const textarea = screen.getByTestId("compose-textarea");
+    textarea.focus();
 
-    // ⌘B fired from the textarea must not toggle the projects sidebar.
+    // ⌘B from the composer toggles the projects sidebar.
     await fireEvent.keyDown(textarea, { key: "b", metaKey: true });
-    expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByTestId("projects-sidebar")).not.toBeInTheDocument());
+    await fireEvent.keyDown(textarea, { key: "b", metaKey: true });
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
 
-    // ⌘⇧B must not toggle the agents sidebar.
+    // ⌘⇧B from the composer toggles the agents sidebar.
     expect(screen.getByTestId("sidebar")).toBeInTheDocument();
     await fireEvent.keyDown(textarea, { key: "B", metaKey: true, shiftKey: true });
-    expect(screen.getByTestId("sidebar")).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByTestId("sidebar")).not.toBeInTheDocument());
+    await fireEvent.keyDown(textarea, { key: "B", metaKey: true, shiftKey: true });
+    await waitFor(() => expect(screen.getByTestId("sidebar")).toBeInTheDocument());
 
-    // ⌘, must not open settings.
+    // ⌘, from the composer opens settings.
     await fireEvent.keyDown(textarea, { key: ",", metaKey: true });
+    await waitFor(() => expect(screen.getByTestId("settings-view")).toBeInTheDocument());
+  });
+
+  it("global shortcuts are suppressed inside non-composer editable elements", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+
+    const input = document.createElement("input");
+    document.body.appendChild(input);
+    input.focus();
+
+    await fireEvent.keyDown(input, { key: "b", metaKey: true });
+    expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument();
+
+    await fireEvent.keyDown(input, { key: ",", metaKey: true });
     expect(screen.queryByTestId("settings-view")).not.toBeInTheDocument();
+    input.remove();
   });
 
   // --- Git view toggle (M3 commit B) ---

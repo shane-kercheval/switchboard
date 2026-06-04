@@ -47,6 +47,10 @@ async function loadComposeStore() {
   return await import("$lib/state/composeStore");
 }
 
+async function loadWorkspace() {
+  return await import("$lib/state/workspace.svelte");
+}
+
 function fireTo(channel: string, event: NormalizedEvent): void {
   const cb = listeners.get(channel);
   if (cb === undefined) throw new Error(`no listener for ${channel}`);
@@ -68,6 +72,7 @@ afterEach(async () => {
   const { _testing } = await loadState();
   _testing.reset();
   (await loadComposeStore())._testing.reset();
+  (await loadWorkspace())._testing.reset();
 });
 
 describe("ComposeBar", () => {
@@ -178,6 +183,27 @@ describe("ComposeBar", () => {
     expect(textarea.value).toBe("ping ");
   });
 
+  it("@ menu includes already-selected agents because picking one makes it the sole recipient", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+    await fireEvent.click(chip(AGENT_B.id)); // alice + bob selected
+    expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "true");
+    expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "true");
+
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "send @ali" } });
+    await fireEvent.click(await screen.findByTestId(`recipient-option-${AGENT_A.id}`));
+
+    expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "true");
+    expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "false");
+    expect(textarea.value).toBe("send ");
+  });
+
   it("@ menu shows matching files above recipients but Enter prefers a matched recipient", async () => {
     invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
       if (cmd === "search_project_files") return ["docs/bob.md", "src/box.ts"];
@@ -199,6 +225,12 @@ describe("ComposeBar", () => {
     const menuText = menu.textContent ?? "";
     expect(menuText.indexOf("Files")).toBeLessThan(menuText.indexOf("Send to"));
     expect(file).toHaveAttribute("aria-selected", "false");
+    const fileLabel = file.querySelector('[data-testid="file-option-label"]');
+    expect(fileLabel).toHaveAttribute("dir", "rtl");
+    expect(fileLabel).not.toHaveAttribute("title");
+    expect(fileLabel).toHaveClass("min-w-0", "truncate", "text-left");
+    await fireEvent.pointerEnter(file);
+    expect(await screen.findByTestId("tooltip-content")).toHaveTextContent("docs/bob.md");
     expect(bob).toHaveAttribute("aria-selected", "true");
 
     await fireEvent.keyDown(textarea, { key: "Enter" });
@@ -519,6 +551,64 @@ describe("ComposeBar", () => {
     expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "true");
   });
 
+  it("Mod+K focuses the message box from outside the composer", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    const outside = document.createElement("button");
+    document.body.appendChild(outside);
+    outside.focus();
+    expect(document.activeElement).toBe(outside);
+
+    await fireEvent.keyDown(outside, { key: "k", metaKey: true });
+
+    expect(screen.getByTestId("compose-textarea")).toHaveFocus();
+    outside.remove();
+  });
+
+  it("Mod+K does not steal focus from another editable field", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    const input = document.createElement("input");
+    document.body.appendChild(input);
+    input.focus();
+    expect(document.activeElement).toBe(input);
+
+    await fireEvent.keyDown(input, { key: "k", metaKey: true });
+
+    expect(input).toHaveFocus();
+    input.remove();
+  });
+
+  it("Mod+K does not focus the message box behind an alert dialog", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    const alertDialog = document.createElement("div");
+    alertDialog.setAttribute("role", "alertdialog");
+    const dialogButton = document.createElement("button");
+    alertDialog.appendChild(dialogButton);
+    document.body.appendChild(alertDialog);
+    dialogButton.focus();
+    expect(dialogButton).toHaveFocus();
+
+    await fireEvent.keyDown(dialogButton, { key: "k", metaKey: true });
+
+    expect(dialogButton).toHaveFocus();
+    expect(screen.getByTestId("compose-textarea")).not.toHaveFocus();
+    alertDialog.remove();
+  });
+
   it("fans one message out to all selected recipients sharing one send_id", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
@@ -545,6 +635,43 @@ describe("ComposeBar", () => {
     expect(sendIds.size).toBe(1);
     expect((state.transcripts[AGENT_A.id] ?? []).length).toBe(1);
     expect((state.transcripts[AGENT_B.id] ?? []).length).toBe(1);
+  });
+
+  it("stamps project activity when a message is sent", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-05-25T12:00:00Z"));
+    try {
+      const state = await loadState();
+      const ws = await loadWorkspace();
+      await state.registerAgent(AGENT_A);
+      ws.projects.list = [
+        {
+          id: PROJECT_ID,
+          name: "project",
+          created_at: "2026-05-16T00:00:00Z",
+          directory: "/work/project",
+          available: true,
+          last_activity: "2026-05-16T00:00:00Z",
+          archived: false,
+        },
+      ];
+      invokeMock.mockResolvedValue("msg-1");
+
+      const ComposeBar = (await import("./ComposeBar.svelte")).default;
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+      const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+      await fireEvent.input(textarea, { target: { value: "status?" } });
+      await fireEvent.click(screen.getByTestId("compose-send"));
+
+      expect(ws.projectActivityOverrides[PROJECT_ID]).toBe("2026-05-25T12:00:00.000Z");
+      expect(ws.projects.list[0]).toMatchObject({
+        id: PROJECT_ID,
+        last_activity: "2026-05-25T12:00:00.000Z",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("turns the empty-draft send button into cancel for the latest live send", async () => {

@@ -223,20 +223,44 @@ describe("ComposeBar", () => {
     const bob = await screen.findByTestId(`recipient-option-${AGENT_B.id}`);
     const menu = screen.getByTestId("recipient-menu");
     const menuText = menu.textContent ?? "";
+    expect(menu).toHaveClass("inset-x-0", "bottom-full");
     expect(menuText.indexOf("Files")).toBeLessThan(menuText.indexOf("Send to"));
     expect(file).toHaveAttribute("aria-selected", "false");
     const fileLabel = file.querySelector('[data-testid="file-option-label"]');
-    expect(fileLabel).toHaveAttribute("dir", "rtl");
+    const filePath = file.querySelector('[data-testid="file-option-path"]');
+    expect(fileLabel).not.toHaveAttribute("dir");
     expect(fileLabel).not.toHaveAttribute("title");
-    expect(fileLabel).toHaveClass("min-w-0", "truncate", "text-left");
+    expect(fileLabel).toHaveTextContent("bob.md");
+    expect(fileLabel).toHaveClass("min-w-0", "truncate", "text-left", "text-xs", "font-medium");
+    expect(filePath).toHaveTextContent("docs");
+    expect(filePath).toHaveClass("truncate", "text-left", "text-[11px]");
+    expect(bob).not.toHaveClass("text-xs");
     await fireEvent.pointerEnter(file);
-    expect(await screen.findByTestId("tooltip-content")).toHaveTextContent("docs/bob.md");
+    expect(screen.queryByTestId("tooltip-content")).toBeNull();
     expect(bob).toHaveAttribute("aria-selected", "true");
 
     await fireEvent.keyDown(textarea, { key: "Enter" });
     expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "false");
     expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "true");
     expect(textarea.value).toBe("ping ");
+  });
+
+  it("@ menu closes the prompt menu before opening", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+    await fireEvent.click(screen.getByTestId("compose-prompt-button"));
+    expect(await screen.findByTestId("prompt-menu")).toBeInTheDocument();
+
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "ping @bo" } });
+
+    expect(await screen.findByTestId("recipient-menu")).toBeInTheDocument();
+    expect(screen.queryByTestId("prompt-menu")).toBeNull();
   });
 
   it("@ menu inserts a selected README file mention without changing recipients", async () => {

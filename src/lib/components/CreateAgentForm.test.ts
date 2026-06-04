@@ -45,6 +45,28 @@ describe("CreateAgentForm", () => {
     } satisfies AgentFormSubmit);
   });
 
+  it("submits create mode when Enter is pressed in the agent name field", async () => {
+    const { onSubmit } = renderForm();
+    const nameInput = screen.getByTestId("agent-name") as HTMLInputElement;
+    await fireEvent.input(nameInput, { target: { value: "  my-agent  " } });
+    await fireEvent.keyDown(nameInput, { key: "Enter" });
+
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
+      mode: "create",
+      name: "my-agent",
+      harness: "claude_code",
+    } satisfies AgentFormSubmit);
+  });
+
+  it("does not submit from Enter when the agent name is invalid", async () => {
+    const { onSubmit } = renderForm();
+    const nameInput = screen.getByTestId("agent-name") as HTMLInputElement;
+    await fireEvent.input(nameInput, { target: { value: "bad name" } });
+    await fireEvent.keyDown(nameInput, { key: "Enter" });
+
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
   it("create mode + Codex selection: submits {mode:create, harness:codex}", async () => {
     const { onSubmit } = renderForm();
     await fireEvent.click(screen.getByTestId("harness-codex"));

@@ -27,6 +27,15 @@
 //! fail are logged and dropped by the caller — the sidecar is a UX
 //! improvement (restart continuity), not a correctness dependency, so unlike
 //! the registry-resident session locator it never fails a turn.
+//!
+//! **Concurrency.** Within one app instance, an agent's writes are serialized
+//! by its single dispatcher actor, so there is no intra-instance race. Two app
+//! instances pointed at the *same* working directory (an unsupported setup —
+//! supported multi-instance uses `DEV_PORT`-isolated directories) could race on
+//! the read-modify-write cycle and lose an update (last writer wins). That is
+//! accepted for a best-effort cache: the lost field self-heals on the next
+//! event. No file locking — its cross-platform fragility and deadlock risk
+//! would be a worse failure mode than the self-healing miss it prevents.
 
 use std::path::{Path, PathBuf};
 
@@ -50,14 +59,33 @@ pub struct RateLimitSnapshot {
     pub captured_at: DateTime<Utc>,
 }
 
+/// One persisted snapshot of the model's context-window size. Stream-only for
+/// Claude (`result.modelUsage.<model>.contextWindow`), absent from the session
+/// file, so it must be cached to let the context bar render on reopen.
+///
+/// `captured_at` is recorded for parity with `RateLimitSnapshot`, but the
+/// context bar shows no staleness qualifier off it: a model's window is fixed,
+/// so the value doesn't go stale (it only changes if the agent switches model,
+/// at which point the next turn overwrites it).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextWindowSnapshot {
+    /// The model's total context-window size in tokens.
+    pub context_window: u32,
+    /// Wall-clock time this snapshot was captured (ISO-8601 UTC on disk).
+    pub captured_at: DateTime<Utc>,
+}
+
 /// The metadata sidecar file contents. Fields are optional so the schema can
-/// grow additively (a future class-C field is a new `Option` field, not a
-/// breaking change). Today only `rate_limit` is persisted.
+/// grow additively (a new class-C field is a new `Option` field, not a
+/// breaking change — `schema_version` is bumped only on a breaking shape
+/// change, never for an additive field).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MetaSidecar {
     pub schema_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateLimitSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<ContextWindowSnapshot>,
 }
 
 impl Default for MetaSidecar {
@@ -65,6 +93,7 @@ impl Default for MetaSidecar {
         Self {
             schema_version: SCHEMA_VERSION,
             rate_limit: None,
+            context_window: None,
         }
     }
 }
@@ -133,40 +162,60 @@ pub enum MetaSidecarError {
     },
 }
 
-/// Persist the latest rate-limit snapshot (last-write-wins). Reads the
-/// existing sidecar first (to preserve other fields when the schema grows),
-/// replaces `rate_limit`, and writes the whole file **atomically** via a
-/// sibling `.tmp` + `rename` so a crash mid-write can't leave a torn file.
-///
-/// The `.tmp` is created in the same `sessions/` directory as the target so
-/// the `rename` is a same-filesystem atomic replace (a cross-filesystem
-/// rename is not atomic and can fail).
+/// Persist the latest rate-limit snapshot (last-write-wins for that field).
+/// Other fields are preserved (read-then-replace), so writing one field never
+/// clobbers another's snapshot.
 pub fn write_rate_limit(
     path: &Path,
     payload: serde_json::Value,
     captured_at: DateTime<Utc>,
 ) -> Result<(), MetaSidecarError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| MetaSidecarError::Io {
-            path: parent.to_owned(),
-            source: e,
-        })?;
-    }
-    // Preserve any other fields a future schema adds; today there are none,
-    // but reading-then-replacing keeps the write forward-compatible.
     let mut sidecar = read(path).unwrap_or_default();
     sidecar.schema_version = SCHEMA_VERSION;
     sidecar.rate_limit = Some(RateLimitSnapshot {
         payload,
         captured_at,
     });
+    persist(path, &sidecar)
+}
 
-    let json = serde_json::to_vec_pretty(&sidecar)
+/// Persist the latest context-window snapshot (last-write-wins for that field).
+/// Preserves the rate-limit snapshot alongside it — the two stream-only fields
+/// are written from different events, so each writer must keep the other's
+/// value.
+pub fn write_context_window(
+    path: &Path,
+    context_window: u32,
+    captured_at: DateTime<Utc>,
+) -> Result<(), MetaSidecarError> {
+    let mut sidecar = read(path).unwrap_or_default();
+    sidecar.schema_version = SCHEMA_VERSION;
+    sidecar.context_window = Some(ContextWindowSnapshot {
+        context_window,
+        captured_at,
+    });
+    persist(path, &sidecar)
+}
+
+/// Write the whole sidecar **atomically** via a sibling `.tmp` + `rename` so a
+/// crash mid-write can't leave a torn file. The `.tmp` sits in the same
+/// directory as the target, guaranteeing a same-filesystem (atomic) rename — a
+/// cross-filesystem rename is not atomic and can fail. The fixed `.tmp` name is
+/// deliberately self-limiting: at most one stale temp per sidecar, overwritten
+/// on the next write and cleaned on a failed rename (a unique-per-write name
+/// would instead leak an unbounded orphan on every crash between write and
+/// rename, with nothing to reclaim it).
+fn persist(path: &Path, sidecar: &MetaSidecar) -> Result<(), MetaSidecarError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| MetaSidecarError::Io {
+            path: parent.to_owned(),
+            source: e,
+        })?;
+    }
+
+    let json = serde_json::to_vec_pretty(sidecar)
         .map_err(|source| MetaSidecarError::Serialize { source })?;
 
-    // Atomic replace: write a sibling temp file, then rename over the target.
-    // `<target>.tmp` sits in the same directory, guaranteeing a same-filesystem
-    // rename.
     let tmp_path = path.with_extension("json.tmp");
     std::fs::write(&tmp_path, &json).map_err(|e| MetaSidecarError::Io {
         path: tmp_path.clone(),
@@ -284,6 +333,65 @@ mod tests {
         let rl = read(&path).unwrap().rate_limit.unwrap();
         assert_eq!(rl.payload, serde_json::json!({"v": 2}));
         assert_eq!(rl.captured_at, ts("2026-05-27T01:00:00Z"));
+    }
+
+    #[test]
+    fn write_context_window_round_trips() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("agent.meta.json");
+        let captured = ts("2026-05-31T12:00:00Z");
+        write_context_window(&path, 200_000, captured).unwrap();
+
+        let read_back = read(&path).expect("sidecar present after write");
+        let cw = read_back.context_window.expect("context_window populated");
+        assert_eq!(cw.context_window, 200_000);
+        assert_eq!(cw.captured_at, captured);
+        assert_eq!(read_back.schema_version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn writing_one_field_preserves_the_other() {
+        // The two stream-only fields are written from different events; each
+        // writer reads-then-replaces, so neither clobbers the other.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("agent.meta.json");
+        write_rate_limit(
+            &path,
+            serde_json::json!({"isUsingOverage": true}),
+            ts("2026-05-31T12:00:00Z"),
+        )
+        .unwrap();
+        write_context_window(&path, 1_000_000, ts("2026-05-31T12:05:00Z")).unwrap();
+
+        let read_back = read(&path).expect("sidecar present");
+        assert_eq!(
+            read_back.rate_limit.unwrap().payload,
+            serde_json::json!({"isUsingOverage": true}),
+            "writing context_window must preserve the rate-limit snapshot"
+        );
+        assert_eq!(read_back.context_window.unwrap().context_window, 1_000_000);
+    }
+
+    #[test]
+    fn pre_existing_sidecar_without_context_window_reads_with_none() {
+        // Backwards compatibility: a sidecar written before the
+        // `context_window` field existed (rate_limit only) must still read —
+        // the new field is additive and defaults to None, no schema bump, no
+        // migration.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("agent.meta.json");
+        std::fs::write(
+            &path,
+            r#"{"schema_version":1,"rate_limit":{"payload":{"isUsingOverage":false},"captured_at":"2026-05-31T12:00:00Z"}}"#,
+        )
+        .unwrap();
+
+        let read_back = read(&path).expect("legacy sidecar must still read");
+        assert!(read_back.rate_limit.is_some(), "rate_limit preserved");
+        assert!(
+            read_back.context_window.is_none(),
+            "absent context_window reads as None, not an error"
+        );
     }
 
     #[test]

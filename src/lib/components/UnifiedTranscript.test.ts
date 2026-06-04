@@ -1348,3 +1348,76 @@ describe("UnifiedTranscript — per-message copy", () => {
     expect(copyTextMock).toHaveBeenCalledWith("final block");
   });
 });
+
+describe("UnifiedTranscript — per-message cost + overage", () => {
+  it("renders cost and the using-credits marker on an overage Claude turn", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "agent-1",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:01Z",
+        status: "complete",
+        items: [{ item_kind: "text", kind: "text", text: "done" }],
+        usage: { input_tokens: 10, output_tokens: 5, total_cost_usd: 0.0125 },
+        spend: { real_spend: true, is_overage: true, overage_resets_at: null },
+      },
+    ];
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+
+    expect(screen.getByTestId("message-cost")).toHaveTextContent("$0.0125");
+    expect(screen.getByTestId("message-overage")).toBeInTheDocument();
+  });
+
+  it("renders neither cost nor marker on a normal-quota Claude turn", async () => {
+    // Cost is present in usage but spend.real_spend is false (notional cost,
+    // not actual spend) → the message shows nothing cost-related.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "agent-1",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:01Z",
+        status: "complete",
+        items: [{ item_kind: "text", kind: "text", text: "done" }],
+        usage: { input_tokens: 10, output_tokens: 5, total_cost_usd: 0.0125 },
+        spend: { real_spend: false, is_overage: false },
+      },
+    ];
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+
+    expect(screen.queryByTestId("message-cost")).toBeNull();
+    expect(screen.queryByTestId("message-overage")).toBeNull();
+  });
+
+  it("renders no cost on a Codex turn (no spend signal)", async () => {
+    const state = await loadState();
+    await state.registerAgent(CODEX_AGENT);
+    state.transcripts[CODEX_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "agent-1",
+        agent_id: CODEX_AGENT.id,
+        started_at: "2026-05-16T00:00:01Z",
+        status: "complete",
+        items: [{ item_kind: "text", kind: "text", text: "done" }],
+        usage: { input_tokens: 10, output_tokens: 5 },
+        // No `spend` — Codex carries no real-spend attribution.
+      },
+    ];
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, { props: { agents: [CODEX_AGENT] } });
+
+    expect(screen.queryByTestId("message-cost")).toBeNull();
+    expect(screen.queryByTestId("message-overage")).toBeNull();
+  });
+});

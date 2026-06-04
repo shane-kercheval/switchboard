@@ -113,15 +113,20 @@ describe("Sidebar", () => {
         ended_at: "2026-05-16T00:00:01Z",
         status: "complete",
         items: [],
-        usage: { input_tokens: 100, output_tokens: 20, total_cost_usd: 0.01 },
+        usage: {
+          input_tokens: 100,
+          output_tokens: 20,
+          context_input_tokens: 100,
+          context_window: 200_000,
+        },
       },
     ];
 
     const Sidebar = (await import("./Sidebar.svelte")).default;
     render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
 
-    // Expanded by default → details (cost) are visible.
-    expect(screen.getByTestId("agent-cost")).toBeInTheDocument();
+    // Expanded by default → details (the context bar) are visible.
+    expect(screen.getByTestId("agent-context-bar")).toBeInTheDocument();
 
     const header = screen.getByTestId("agent-name").closest("button");
     if (!header) throw new Error("expected the agent name to sit in a toggle button");
@@ -130,7 +135,7 @@ describe("Sidebar", () => {
     await fireEvent.click(header);
 
     expect(header).toHaveAttribute("aria-expanded", "false");
-    expect(screen.queryByTestId("agent-cost")).toBeNull();
+    expect(screen.queryByTestId("agent-context-bar")).toBeNull();
   });
 
   it("renders the harness icon by default and keeps inline action icons hover-only", async () => {
@@ -307,30 +312,34 @@ describe("Sidebar", () => {
         ended_at: "2026-05-16T00:00:01Z",
         status: "complete",
         items: [],
-        usage: { input_tokens: 100, output_tokens: 20, total_cost_usd: 0.01 },
+        usage: {
+          input_tokens: 100,
+          output_tokens: 20,
+          context_input_tokens: 100,
+          context_window: 200_000,
+        },
       },
     ];
 
     const Sidebar = (await import("./Sidebar.svelte")).default;
     render(Sidebar, { props: { agents: [CLAUDE_AGENT, CODEX_AGENT] } });
 
-    expect(screen.getByTestId("agent-cost")).toBeInTheDocument();
+    expect(screen.getByTestId("agent-context-bar")).toBeInTheDocument();
 
     const toggleAll = screen.getByTestId("sidebar-toggle-all");
     await fireEvent.click(toggleAll);
-    expect(screen.queryByTestId("agent-cost")).toBeNull();
+    expect(screen.queryByTestId("agent-context-bar")).toBeNull();
 
     await fireEvent.click(toggleAll);
-    expect(screen.getByTestId("agent-cost")).toBeInTheDocument();
+    expect(screen.getByTestId("agent-context-bar")).toBeInTheDocument();
   });
 
-  it("displays Claude session-total cost (null-safe sum)", async () => {
+  it("does not render a per-agent cost total on the card (cost moved to the message)", async () => {
+    // Per-turn cost now renders inline in the transcript on real-spend turns;
+    // the card carries no accumulating `$` total (system-design §2). Even with
+    // a turn that reports a dollar cost, no `agent-cost` cell appears.
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
-
-    // Drive two completed agent turns with usage. Direct transcript
-    // population — bypasses dispatch since we're testing the sidebar's
-    // derivation, not the dispatch flow.
     state.transcripts[CLAUDE_AGENT.id] = [
       {
         role: "agent",
@@ -341,24 +350,14 @@ describe("Sidebar", () => {
         status: "complete",
         items: [],
         usage: { input_tokens: 100, output_tokens: 20, total_cost_usd: 0.01 },
-      },
-      {
-        role: "agent",
-        turn_id: "turn-2",
-        agent_id: CLAUDE_AGENT.id,
-        started_at: "2026-05-16T00:00:02Z",
-        ended_at: "2026-05-16T00:00:03Z",
-        status: "complete",
-        items: [],
-        // total_cost_usd: null — load-bearing for the ?? 0 null-safe sum.
-        usage: { input_tokens: 50, output_tokens: 10, total_cost_usd: null },
+        spend: { real_spend: true, is_overage: true },
       },
     ];
 
     const Sidebar = (await import("./Sidebar.svelte")).default;
     render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
 
-    expect(screen.getByTestId("agent-cost")).toHaveTextContent("$0.0100");
+    expect(screen.queryByTestId("agent-cost")).toBeNull();
   });
 
   it("displays Codex rate-limit % from last_rate_limit", async () => {
@@ -377,10 +376,79 @@ describe("Sidebar", () => {
     expect(screen.getByTestId("agent-rate-limit")).toHaveTextContent("quota used: 43%");
   });
 
-  it("displays context-utilization bar from the latest agent turn's usage", async () => {
+  it("displays context-utilization bar from the latest agent turn's reconciled occupancy", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
 
+    // The Claude bug fixture: caching makes raw `input_tokens` tiny (only the
+    // new prompt), but `context_input_tokens` carries the full cached prefix.
+    // The bar must reflect the reconciled occupancy, not the marginal input.
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "turn-1",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:00Z",
+        ended_at: "2026-05-16T00:00:01Z",
+        status: "complete",
+        items: [],
+        usage: {
+          input_tokens: 5_000,
+          output_tokens: 10_000,
+          context_input_tokens: 130_000,
+          context_window: 200_000,
+        },
+      },
+    ];
+
+    const Sidebar = (await import("./Sidebar.svelte")).default;
+    render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+
+    // (130000 + 10000) / 200000 = 0.70 → "70%" (NOT the ~8% the old
+    // input-only formula would have shown from the marginal 5000 input).
+    expect(screen.getByTestId("agent-context-bar")).toHaveTextContent("70%");
+  });
+
+  it("does not over-report Codex context (cached is already inside input)", async () => {
+    const state = await loadState();
+    await state.registerAgent(CODEX_AGENT);
+
+    // Codex's adapter sets context_input_tokens to input_tokens alone (its
+    // cached count is a subset). The bar must use that reconciled value, not
+    // re-add cached on top — which would inflate the percentage.
+    state.transcripts[CODEX_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "turn-1",
+        agent_id: CODEX_AGENT.id,
+        started_at: "2026-05-16T00:00:00Z",
+        ended_at: "2026-05-16T00:00:01Z",
+        status: "complete",
+        items: [],
+        usage: {
+          input_tokens: 80_000,
+          cached_input_tokens: 60_000,
+          output_tokens: 20_000,
+          context_input_tokens: 80_000,
+          context_window: 200_000,
+        },
+      },
+    ];
+
+    const Sidebar = (await import("./Sidebar.svelte")).default;
+    render(Sidebar, { props: { agents: [CODEX_AGENT] } });
+
+    // (80000 + 20000) / 200000 = 0.50 → "50%". Re-adding cached would give
+    // (80000 + 60000 + 20000) / 200000 = 80%, the regression this guards.
+    expect(screen.getByTestId("agent-context-bar")).toHaveTextContent("50%");
+  });
+
+  it("hides the context bar when context_input_tokens is absent", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+
+    // A window without a reconciled occupancy value → occupancy unknown, bar
+    // hidden (clean-hide), rather than falling back to a misleading raw input.
     state.transcripts[CLAUDE_AGENT.id] = [
       {
         role: "agent",
@@ -401,8 +469,7 @@ describe("Sidebar", () => {
     const Sidebar = (await import("./Sidebar.svelte")).default;
     render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
 
-    // (60000 + 10000) / 200000 = 0.35 → "35%"
-    expect(screen.getByTestId("agent-context-bar")).toHaveTextContent("35%");
+    expect(screen.queryByTestId("agent-context-bar")).toBeNull();
   });
 
   it("renders meta info (model + mcp/skills counts) when SessionMeta has arrived", async () => {

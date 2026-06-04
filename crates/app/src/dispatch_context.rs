@@ -100,8 +100,16 @@ impl DispatchContextFactory for ProjectDispatchContextFactory {
             self.project.id,
             agent_id,
         );
-        let metadata: Arc<dyn MetadataCache> =
-            Arc::new(ProjectMetadataCache::new(agent_id, sidecar_path));
+        let turnmeta_path = switchboard_harness::turnmeta_sidecar::turnmeta_sidecar_path(
+            &self.project.directory,
+            self.project.id,
+            agent_id,
+        );
+        let metadata: Arc<dyn MetadataCache> = Arc::new(ProjectMetadataCache::new(
+            agent_id,
+            sidecar_path,
+            turnmeta_path,
+        ));
         let locator_sink: Arc<dyn SessionLocatorSink> = Arc::new(ProjectSessionLocatorSink::new(
             self.project.clone(),
             Arc::clone(&self.registry_write),

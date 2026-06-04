@@ -175,6 +175,12 @@ struct AgentTurnBuilder {
     last_seen_at: DateTime<Utc>,
     items: Vec<TurnItem>,
     usage: Option<TurnUsage>,
+    /// The most recent assistant record's `message.id`, overwritten per record
+    /// so it ends up as the turn's *final* assistant message id — the durable
+    /// join key the app overlay uses to re-attach persisted cost/overage on
+    /// reopen. Mirrors the live parser's `last_assistant_message_id` so live
+    /// and disk anchor on the same message by construction.
+    last_message_id: Option<String>,
 }
 
 struct DeferredToolResult {
@@ -289,6 +295,7 @@ impl ReconstructionState {
             last_seen_at: timestamp,
             items: Vec::new(),
             usage: None,
+            last_message_id: None,
         });
         builder.last_seen_at = timestamp;
 
@@ -298,6 +305,16 @@ impl ReconstructionState {
             .and_then(Value::as_object)
         {
             builder.usage = Some(parse_usage(usage));
+        }
+
+        // Track the message id (keep last → final assistant message of the
+        // turn), the join key for re-attaching persisted cost/overage.
+        if let Some(id) = record
+            .get("message")
+            .and_then(|m| m.get("id"))
+            .and_then(Value::as_str)
+        {
+            builder.last_message_id = Some(id.to_owned());
         }
 
         let Some(blocks) = record
@@ -439,6 +456,11 @@ impl ReconstructionState {
             status,
             items: builder.items,
             usage: builder.usage,
+            // Cost/overage are restored by the app's metadata overlay (joining
+            // the turnmeta sidecar on `stable_message_id`); the parser itself
+            // never reads `.switchboard/` state.
+            spend: None,
+            stable_message_id: builder.last_message_id,
         });
     }
 
@@ -492,17 +514,34 @@ fn parse_timestamp(record: &Value) -> Option<DateTime<Utc>> {
 /// `context_window` is unrecoverable from disk (lives in stream-only
 /// `result.modelUsage`) — emit `None`. `total_cost_usd` is similarly
 /// stream-only; emit `None`.
+///
+/// `context_input_tokens` reconstructs the same disjoint sum the live parser
+/// computes (`input + cache_read + cache_creation`), so a hydrated turn's
+/// context-utilization matches what it showed live. The window denominator is
+/// still absent on disk until the Milestone 2 sidecar fills it, but the
+/// numerator is recoverable here.
 fn parse_usage(usage: &serde_json::Map<String, Value>) -> TurnUsage {
+    let input_tokens = usage
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cached_input_tokens = usage.get("cache_read_input_tokens").and_then(Value::as_u64);
+    let cache_creation_input_tokens = usage
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_u64);
     TurnUsage {
-        input_tokens: usage
-            .get("input_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
+        input_tokens,
         output_tokens: usage
             .get("output_tokens")
             .and_then(Value::as_u64)
             .unwrap_or(0),
-        cached_input_tokens: usage.get("cache_read_input_tokens").and_then(Value::as_u64),
+        cached_input_tokens,
+        cache_creation_input_tokens,
+        context_input_tokens: Some(
+            input_tokens
+                + cached_input_tokens.unwrap_or(0)
+                + cache_creation_input_tokens.unwrap_or(0),
+        ),
         reasoning_output_tokens: usage.get("reasoning_output_tokens").and_then(Value::as_u64),
         context_window: None,
         total_cost_usd: None,
@@ -564,6 +603,7 @@ mod tests {
                     "input_tokens": 10,
                     "output_tokens": 5,
                     "cache_read_input_tokens": 2,
+                    "cache_creation_input_tokens": 3,
                 }
             },
             "timestamp": timestamp,
@@ -627,12 +667,87 @@ mod tests {
                 let usage = usage.as_ref().unwrap();
                 assert_eq!(usage.input_tokens, 10);
                 assert_eq!(usage.output_tokens, 5);
+                assert_eq!(usage.cached_input_tokens, Some(2));
+                assert_eq!(usage.cache_creation_input_tokens, Some(3));
+                // Disk reconstructs the same disjoint input-side sum the live
+                // parser computes: 10 + 2 + 3.
+                assert_eq!(usage.context_input_tokens, Some(15));
                 assert!(usage.context_window.is_none());
             }
             _ => panic!("expected Agent turn second"),
         }
         let meta = result.meta.unwrap();
         assert_eq!(meta.model, "claude-sonnet-4-6");
+    }
+
+    /// Join-key parity (disk side), multi-assistant tool-use turn. A single
+    /// agent turn spans two assistant records — `msg_test02` (`tool_use`) and
+    /// `msg_test03` (final answer) — separated by a `tool_result` user record
+    /// (array content, which does NOT close the turn). `stable_message_id` must
+    /// anchor on the **final** assistant message (`msg_test03`), matching the
+    /// live side
+    /// (`parser.rs::tool_use_turn_anchors_stable_id_on_final_assistant_message`)
+    /// so the M4 overlay's join holds across reopen. The two paths derive the
+    /// key independently (keep-last here vs. keep-last live); this pins them to
+    /// the same value for the shape most able to expose a divergence.
+    #[test]
+    fn hydrated_tool_use_turn_anchors_stable_id_on_final_assistant() {
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let session_id = Uuid::now_v7();
+        let agent_id = Uuid::now_v7();
+        let content = jsonl(&[
+            user_record("run a tool then answer", "2026-05-14T04:43:15Z"),
+            json!({
+                "type": "assistant",
+                "message": {
+                    "id": "msg_test02",
+                    "model": "claude-sonnet-4-6",
+                    "role": "assistant",
+                    "content": [{ "type": "tool_use", "id": "t1", "name": "Bash", "input": {} }],
+                    "usage": { "input_tokens": 10, "output_tokens": 5 }
+                },
+                "timestamp": "2026-05-14T04:43:16Z",
+            }),
+            json!({
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [{ "type": "tool_result", "tool_use_id": "t1", "content": "ok" }]
+                },
+                "timestamp": "2026-05-14T04:43:17Z",
+            }),
+            json!({
+                "type": "assistant",
+                "message": {
+                    "id": "msg_test03",
+                    "model": "claude-sonnet-4-6",
+                    "role": "assistant",
+                    "content": [{ "type": "text", "text": "done" }],
+                    "usage": { "input_tokens": 12, "output_tokens": 8 }
+                },
+                "timestamp": "2026-05-14T04:43:18Z",
+            }),
+        ]);
+        stage_session_file(home.path(), cwd.path(), session_id, &content);
+
+        let result = load_claude_transcript(home.path(), cwd.path(), session_id, agent_id).unwrap();
+
+        let agent_turn = result
+            .turns
+            .iter()
+            .find(|t| matches!(t, Turn::Agent { .. }))
+            .expect("one agent turn spanning both assistant records");
+        match agent_turn {
+            Turn::Agent {
+                stable_message_id, ..
+            } => assert_eq!(
+                stable_message_id.as_deref(),
+                Some("msg_test03"),
+                "the final assistant message's id must be the join key (not msg_test02)"
+            ),
+            _ => unreachable!(),
+        }
     }
 
     /// A non-empty `thinking` block followed by a `text` block reconstructs
@@ -734,6 +849,61 @@ mod tests {
             matches!(&items[0], TurnItem::Text { kind: ContentKind::Text, text } if text == "42"),
             "only the answer text survives",
         );
+    }
+
+    #[test]
+    fn multi_assistant_turn_uses_final_call_usage_for_occupancy() {
+        // A tool-use turn writes two assistant records (two model calls).
+        // Occupancy must reflect the FINAL call's prompt size, matching the
+        // live path — not the first call's, nor a sum. `handle_assistant`
+        // keeps the last record's usage, so this is the disk-side guarantee
+        // that hydrated and live context bars agree.
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let session_id = Uuid::now_v7();
+        let agent_id = Uuid::now_v7();
+        let call1 = json!({
+            "type": "assistant",
+            "message": {
+                "model": "claude-opus-4-8",
+                "role": "assistant",
+                "content": [{ "type": "tool_use", "id": "t1", "name": "Bash", "input": {} }],
+                "usage": { "input_tokens": 3133, "cache_read_input_tokens": 16833, "cache_creation_input_tokens": 2422, "output_tokens": 4 }
+            },
+            "timestamp": "2026-05-14T04:43:16Z"
+        });
+        let tool_result = user_tool_result("t1", "hi", "2026-05-14T04:43:17Z");
+        let call2 = json!({
+            "type": "assistant",
+            "message": {
+                "model": "claude-opus-4-8",
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "done" }],
+                "usage": { "input_tokens": 2, "cache_read_input_tokens": 19255, "cache_creation_input_tokens": 3220, "output_tokens": 1 }
+            },
+            "timestamp": "2026-05-14T04:43:18Z"
+        });
+        let content = jsonl(&[
+            user_record("run echo", "2026-05-14T04:43:15Z"),
+            call1,
+            tool_result,
+            call2,
+        ]);
+        stage_session_file(home.path(), cwd.path(), session_id, &content);
+
+        let result = load_claude_transcript(home.path(), cwd.path(), session_id, agent_id).unwrap();
+        let Turn::Agent { usage, .. } = result
+            .turns
+            .iter()
+            .rev()
+            .find(|t| matches!(t, Turn::Agent { .. }))
+            .expect("an Agent turn")
+        else {
+            unreachable!();
+        };
+        let usage = usage.as_ref().expect("usage present");
+        // Final call's prompt: 2 + 19255 + 3220 = 22477 — not call 1's 22388.
+        assert_eq!(usage.context_input_tokens, Some(22_477));
     }
 
     #[test]

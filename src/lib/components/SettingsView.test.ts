@@ -8,19 +8,30 @@ import { agentCopy } from "$lib/agentCopy.svelte";
 import { _testing as availabilityTesting } from "$lib/harnessAvailability.svelte";
 import { _testing as prefsTesting } from "$lib/preferences.svelte";
 
-// SettingsView embeds HarnessStatusList, which probes install/auth on mount.
-const invokeMock = vi.fn(async (cmd: string, _args?: Record<string, unknown>) => {
+// SettingsView embeds HarnessStatusList (probes install/auth on mount) and
+// McpServersSettings (loads providers on mount). Tests that override the mock
+// must keep these baseline stubs, so it's a named default restored per test.
+const defaultInvoke = async (cmd: string, _args?: Record<string, unknown>): Promise<unknown> => {
   if (cmd === "get_harness_install_status") return { installed: true, version: "1.0.0" };
+  if (cmd === "list_mcp_providers") return []; // embedded McpServersSettings loads on mount
   return null; // auth probes resolve = authenticated
-});
+};
+const invokeMock = vi.fn(defaultInvoke);
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: (cmd: string, args?: Record<string, unknown>) => invokeMock(cmd, args),
+}));
+// Embedded McpServersSettings subscribes to `prompts:synced` on mount.
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: () => Promise.resolve(() => {}),
 }));
 
 beforeEach(() => {
   theme.set("system");
   agentCopy.set("last_answer_block");
-  invokeMock.mockClear();
+  // Restore the baseline impl so an override in one test can't leak into the next
+  // (the embedded McpServersSettings loads on every mount).
+  invokeMock.mockReset();
+  invokeMock.mockImplementation(defaultInvoke);
   // The embedded HarnessStatusList reads the shared singleton store; reset it
   // so probed values don't leak across tests.
   availabilityTesting.reset();
@@ -153,6 +164,7 @@ describe("SettingsView", () => {
     // the typed value stays (surface-and-keep, not revert).
     invokeMock.mockImplementation(async (cmd: string) => {
       if (cmd === "get_harness_install_status") return { installed: true, version: "1.0.0" };
+      if (cmd === "list_mcp_providers") return [];
       if (cmd === "set_preferences") throw new Error("disk full");
       return null;
     });

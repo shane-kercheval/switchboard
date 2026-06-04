@@ -125,6 +125,14 @@ pub fn load(path: &Path) -> Preferences {
 
 /// Persist preferences to `path`, creating the parent directory if needed.
 /// Atomic temp-write + rename via `switchboard_core::write_yaml`.
+///
+/// `config.yaml` is **shared**: it also holds the prompt providers
+/// (`mcp_providers`) and local prompt dirs. So this merges only the preference
+/// keys into the existing mapping rather than serializing the `Preferences`
+/// struct over the whole file — otherwise saving a preference would wipe the
+/// user's prompt config (and vice-versa; the prompt service round-trips the same
+/// way). Refuses to write if the existing file isn't a YAML mapping, rather than
+/// clobber it.
 pub fn save(path: &Path, prefs: &Preferences) -> Result<(), AppError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|source| AppError::PreferencesPersist {
@@ -132,8 +140,52 @@ pub fn save(path: &Path, prefs: &Preferences) -> Result<(), AppError> {
             source,
         })?;
     }
-    switchboard_core::write_yaml(path, prefs)?;
+    let mut root = read_config_mapping(path)?;
+    let serialized =
+        serde_norway::to_value(prefs).map_err(|e| persist_err(path, &e.to_string()))?;
+    if let serde_norway::Value::Mapping(fields) = serialized {
+        for (key, value) in fields {
+            root.insert(key, value);
+        }
+    }
+    switchboard_core::write_yaml(path, &serde_norway::Value::Mapping(root))?;
     Ok(())
+}
+
+/// Read `config.yaml` as a generic YAML mapping so a save can merge the
+/// preference keys without disturbing the other sections it shares the file with.
+/// Missing / empty / `null` → an empty mapping; a file that isn't a mapping is
+/// refused (returning an error) so a save never clobbers a malformed-but-present
+/// config.
+fn read_config_mapping(path: &Path) -> Result<serde_norway::Mapping, AppError> {
+    if !path.exists() {
+        return Ok(serde_norway::Mapping::new());
+    }
+    let bytes = std::fs::read(path).map_err(|source| AppError::PreferencesPersist {
+        path: path.to_owned(),
+        source,
+    })?;
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return Ok(serde_norway::Mapping::new());
+    }
+    match serde_norway::from_slice::<serde_norway::Value>(&bytes) {
+        Ok(serde_norway::Value::Mapping(mapping)) => Ok(mapping),
+        Ok(serde_norway::Value::Null) => Ok(serde_norway::Mapping::new()),
+        Ok(_) => Err(persist_err(
+            path,
+            "config.yaml is not a YAML mapping; refusing to overwrite it",
+        )),
+        Err(e) => Err(persist_err(path, &e.to_string())),
+    }
+}
+
+/// Wrap a non-I/O persist failure (YAML parse / serialize / shape) as the
+/// preferences-persist error, reusing its `path`-naming Display.
+fn persist_err(path: &Path, message: &str) -> AppError {
+    AppError::PreferencesPersist {
+        path: path.to_owned(),
+        source: std::io::Error::other(message.to_owned()),
+    }
 }
 
 #[cfg(test)]
@@ -162,6 +214,56 @@ mod tests {
         };
         save(&path, &prefs).unwrap();
         assert_eq!(load(&path), prefs);
+    }
+
+    #[test]
+    fn save_preserves_unknown_keys_in_the_shared_config() {
+        // `config.yaml` is shared with the prompt providers; saving preferences
+        // must merge its keys, not clobber the rest of the file.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            "mcp_providers:\n  - name: team\n    url: https://example.test\nlocal_prompt_dirs:\n  - ~/prompts\n",
+        )
+        .unwrap();
+
+        save(
+            &path,
+            &Preferences {
+                editor_command: Some("zed".to_owned()),
+                terminal_app: "iTerm".to_owned(),
+                diff_style: DiffStyle::Unified,
+            },
+        )
+        .unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        // The prompt sections survive…
+        assert!(
+            raw.contains("mcp_providers"),
+            "mcp_providers must be preserved: {raw}"
+        );
+        assert!(
+            raw.contains("local_prompt_dirs"),
+            "local_prompt_dirs must be preserved: {raw}"
+        );
+        // …and the preference keys are written.
+        assert!(raw.contains("zed") && raw.contains("iTerm"));
+    }
+
+    #[test]
+    fn save_refuses_to_clobber_a_non_mapping_config() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "just a scalar, not a mapping\n").unwrap();
+
+        assert!(save(&path, &Preferences::default()).is_err());
+        // The original content is left untouched.
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "just a scalar, not a mapping\n"
+        );
     }
 
     #[test]

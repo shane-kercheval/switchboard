@@ -12,6 +12,9 @@ pub enum AppError {
     #[error(transparent)]
     Core(#[from] CoreError),
 
+    #[error(transparent)]
+    Prompt(#[from] switchboard_prompts::PromptError),
+
     /// The agent was busy and the caller requested fail-fast (workflow §7).
     /// Not reachable on the compose-bar `Enqueue` path (which queues); kept for
     /// the future workflow-step dispatch path.

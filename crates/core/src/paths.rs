@@ -10,4 +10,3 @@ pub(crate) const PROJECTS_INDEX: &str = "projects.jsonl";
 pub(crate) const PROJECTS_DIR: &str = "projects";
 pub(crate) const JOURNAL_FILE: &str = "journal.jsonl";
 pub(crate) const WORKFLOWS_DIR: &str = "workflows";
-pub(crate) const PROMPTS_DIR: &str = "prompts";

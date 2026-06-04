@@ -840,6 +840,77 @@ pub fn set_preferences_impl(state: &AppState, prefs: &Preferences) -> Result<(),
     preferences::save(path, &normalized)
 }
 
+/// All prompts across configured providers (user-global; no project argument).
+/// Never hard-fails: an unreachable/misconfigured provider contributes nothing
+/// rather than breaking the listing.
+pub fn list_prompts_impl(state: &AppState) -> Vec<switchboard_prompts::Prompt> {
+    state.prompts.list()
+}
+
+/// Render a prompt to its finished text. Provider-dispatched (local → `MiniJinja`,
+/// MCP → `prompts/get`). Serves both preview and send with the identical args.
+/// Async because the MCP path does network I/O.
+pub async fn render_prompt_impl(
+    state: &AppState,
+    provider: &str,
+    name: &str,
+    args: &std::collections::BTreeMap<String, String>,
+) -> Result<switchboard_prompts::RenderedPrompt, AppError> {
+    Ok(state.prompts.render(provider, name, args).await?)
+}
+
+/// Configured MCP providers with their last-build status and whether a token is
+/// stored — drives the Settings provider list.
+pub fn list_mcp_providers_impl(state: &AppState) -> Vec<switchboard_prompts::McpProviderInfo> {
+    state.prompts.list_mcp_providers()
+}
+
+/// Add a generic MCP provider (name + URL + optional bearer): writes its config
+/// entry, stores the bearer in the keychain, and kicks off a background cache
+/// rebuild so its prompts appear without blocking the command on a slow server.
+pub fn add_mcp_provider_impl(
+    state: &AppState,
+    name: &str,
+    url: &str,
+    bearer: Option<&str>,
+) -> Result<(), AppError> {
+    state.prompts.add_mcp_provider(name, url, bearer)?;
+    spawn_prompt_sync(state);
+    Ok(())
+}
+
+/// Remove a generic MCP provider: deletes its config entry + keychain token and
+/// rebuilds the cache in the background.
+pub fn remove_mcp_provider_impl(state: &AppState, name: &str) -> Result<(), AppError> {
+    state.prompts.remove_mcp_provider(name)?;
+    spawn_prompt_sync(state);
+    Ok(())
+}
+
+/// Probe a candidate provider before saving (connect + list); returns the prompt
+/// count on success or an actionable error.
+pub async fn test_mcp_connection_impl(
+    state: &AppState,
+    url: &str,
+    bearer: Option<String>,
+) -> Result<usize, AppError> {
+    Ok(state.prompts.test_mcp_connection(url, bearer).await?)
+}
+
+/// Rebuild the prompt cache off the command thread. `PromptService` is cheaply
+/// cloneable and shares its cache, so the spawned clone warms the same cache.
+/// Emits `prompts:synced` when the rebuild finishes so Settings can refresh a
+/// just-added provider's status (the add/remove command returns before the
+/// background build completes, so the first read shows `Unknown`).
+fn spawn_prompt_sync(state: &AppState) {
+    let prompts = state.prompts.clone();
+    let emitter = Arc::clone(&state.emitter);
+    tokio::spawn(async move {
+        prompts.sync().await;
+        emitter.emit("prompts:synced", serde_json::Value::Null);
+    });
+}
+
 pub fn create_project_impl(
     state: &AppState,
     name: &str,
@@ -9923,5 +9994,94 @@ mod tests {
         };
         set_preferences_impl(&state, &prefs).unwrap();
         assert_eq!(get_preferences_impl(&state), prefs);
+    }
+
+    /// Build a state whose prompt service points at a fresh temp prompts dir
+    /// (with `config.yaml` absent, so the default dir is used). Returns the dir
+    /// so the test can drop prompt files into it.
+    fn state_with_prompts() -> (TempDir, AppState) {
+        let (tmp, state, _) = fresh_state_with_mock();
+        let prompts_dir = tmp.path().join("prompts");
+        std::fs::create_dir_all(&prompts_dir).unwrap();
+        let service = switchboard_prompts::PromptService::new(
+            tmp.path().join("config.yaml"),
+            prompts_dir,
+            None,
+            Arc::new(switchboard_prompts::InMemorySecretStore::new()),
+        );
+        (tmp, state.with_prompts(service))
+    }
+
+    const GREET_PROMPT: &str = "---\nname: greet\ndescription: Greeting.\narguments:\n  - name: who\n    required: true\n---\nHi {{ who }}\n";
+
+    #[tokio::test]
+    async fn list_prompts_surfaces_a_local_prompt_after_sync() {
+        let (tmp, state) = state_with_prompts();
+        std::fs::write(tmp.path().join("prompts").join("greet.md"), GREET_PROMPT).unwrap();
+
+        // `list_prompts` reads the cache; it's empty until a sync runs.
+        assert!(list_prompts_impl(&state).is_empty());
+        state.prompts.sync().await;
+
+        let prompts = list_prompts_impl(&state);
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].provider, "local");
+        assert_eq!(prompts[0].name, "greet");
+        assert_eq!(prompts[0].arguments.len(), 1);
+        assert!(prompts[0].arguments[0].required);
+    }
+
+    #[tokio::test]
+    async fn render_prompt_substitutes_arguments() {
+        let (tmp, state) = state_with_prompts();
+        std::fs::write(tmp.path().join("prompts").join("greet.md"), GREET_PROMPT).unwrap();
+
+        let args = std::collections::BTreeMap::from([("who".to_owned(), "Ada".to_owned())]);
+        // Render does not depend on the cache (no sync needed).
+        let rendered = render_prompt_impl(&state, "local", "greet", &args)
+            .await
+            .unwrap();
+        assert!(rendered.text.contains("Hi Ada"));
+    }
+
+    #[tokio::test]
+    async fn render_prompt_missing_required_arg_is_error() {
+        let (tmp, state) = state_with_prompts();
+        std::fs::write(tmp.path().join("prompts").join("greet.md"), GREET_PROMPT).unwrap();
+
+        let err = render_prompt_impl(&state, "local", "greet", &std::collections::BTreeMap::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Prompt(_)));
+    }
+
+    #[test]
+    fn list_prompts_on_disabled_service_is_empty() {
+        // A state without `with_prompts` keeps the disabled default; its cache
+        // is empty without a sync.
+        let (_tmp, state, _) = fresh_state_with_mock();
+        assert!(list_prompts_impl(&state).is_empty());
+    }
+
+    #[tokio::test]
+    async fn mcp_provider_add_list_remove_round_trip() {
+        // Wiring check through the command impls (service logic is covered in the
+        // prompts crate). Uses the state's in-memory secret store.
+        let (_tmp, state) = state_with_prompts();
+
+        add_mcp_provider_impl(&state, "team", "https://mcp.example.com", Some("tok")).unwrap();
+        let providers = list_mcp_providers_impl(&state);
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].name, "team");
+        assert!(providers[0].has_token);
+
+        // Duplicate names are rejected at the command boundary.
+        assert!(matches!(
+            add_mcp_provider_impl(&state, "team", "https://other", None),
+            Err(AppError::Prompt(_))
+        ));
+
+        remove_mcp_provider_impl(&state, "team").unwrap();
+        assert!(list_mcp_providers_impl(&state).is_empty());
     }
 }

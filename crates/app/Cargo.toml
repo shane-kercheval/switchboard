@@ -39,7 +39,10 @@ tauri-plugin-clipboard-manager = "2.3.2"
 url = "2.5.8"
 ignore = "0.4.25"
 switchboard-git = { version = "0.0.1", path = "../git" }
+switchboard-prompts = { version = "0.0.1", path = "../prompts" }
 shlex = "2.0.1"
+keyring = { version = "3", features = ["apple-native"] }
+serde_norway.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true }

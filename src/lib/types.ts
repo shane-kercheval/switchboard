@@ -569,3 +569,43 @@ export const HEARTBEAT_TIMEOUT_MS = 60_000;
 // Agent-scoped events (`session_meta`, `rate_limit_event`) intentionally do NOT
 // re-arm — they're not turn-anchored and can flow at any time without
 // indicating turn progress.
+
+// ── Prompt providers (MCP server management — system-design §6) ───────────────
+// Mirror the Rust `#[serde(tag = "state", rename_all = "snake_case")]` shape.
+export type ProviderStatus =
+  | { state: "ok"; prompt_count: number }
+  | { state: "errored"; message: string }
+  | { state: "store_unavailable" }
+  | { state: "unknown" };
+
+export type McpProviderInfo = {
+  name: string;
+  url: string;
+  has_token: boolean;
+  status: ProviderStatus;
+};
+
+// A prompt as listed from the cache. Mirrors the Rust `Prompt`. `provider` is
+// the prefix it resolves under (`local` or an MCP provider's name); `arguments`
+// are the declared template variables the composer renders as inputs.
+export type PromptArgument = {
+  name: string;
+  description: string | null;
+  required: boolean;
+};
+
+export type Prompt = {
+  provider: string;
+  name: string;
+  // Human-friendly display name (MCP `title`); `name` is the slug identifier.
+  // Null for local prompts and servers that omit it — the UI falls back to `name`.
+  title: string | null;
+  description: string | null;
+  arguments: PromptArgument[];
+  tags: string[];
+};
+
+// The finished text returned by `render_prompt` — what the agent receives.
+export type RenderedPrompt = {
+  text: string;
+};

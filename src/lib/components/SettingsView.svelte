@@ -13,6 +13,7 @@
   import HarnessStatusList from "$lib/components/HarnessStatusList.svelte";
   import Input from "$lib/components/ui/Input.svelte";
   import { preferences, saveStatus, updatePreferences } from "$lib/preferences.svelte";
+  import McpServersSettings from "$lib/components/McpServersSettings.svelte";
 
   let { onClose }: { onClose: () => void } = $props();
 
@@ -218,6 +219,17 @@
         </p>
       </div>
       <HarnessStatusList />
+    </section>
+
+    <section class={cn(sectionClass, "mt-7")}>
+      <div>
+        <h2 class={sectionHeadingClass}>Prompt servers (MCP)</h2>
+        <p class="text-muted mt-1 text-sm leading-relaxed">
+          Add MCP servers that expose prompts (e.g. Tiddly). Their prompts become available to every
+          agent via the compose bar. Bearer tokens are stored in your OS keychain, never in config.
+        </p>
+      </div>
+      <McpServersSettings />
     </section>
 
     <div class="h-10" aria-hidden="true"></div>

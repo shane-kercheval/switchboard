@@ -612,30 +612,39 @@
           <div class="max-h-48 overflow-y-auto" data-testid="file-options-scroll">
             {#each fileItems as item (item.key)}
               {@const i = menuItems.findIndex((candidate) => candidate.key === item.key)}
-              <button
-                type="button"
-                class={"hover:bg-panel/80 flex w-full cursor-pointer items-center gap-2 rounded-md px-2.5 py-1 text-left leading-5 outline-none select-none " +
-                  (i === highlighted ? "bg-panel/80" : "")}
-                data-testid={`file-option-${item.path}`}
-                role="option"
-                aria-selected={i === highlighted}
-                onclick={() => pickItem(item)}
-              >
-                <svg
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="1.8"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                  class="text-muted h-4 w-4 shrink-0"
-                  aria-hidden="true"
-                >
-                  <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
-                  <path d="M14 3v5h5" />
-                </svg>
-                <span class="text-fg truncate">{item.path}</span>
-              </button>
+              <Tooltip label={item.path} side="right" delayDuration={0}>
+                {#snippet trigger(props)}
+                  <button
+                    {...props}
+                    type="button"
+                    class={"hover:bg-panel/80 flex w-full cursor-pointer items-center gap-2 rounded-md px-2.5 py-1 text-left leading-5 outline-none select-none " +
+                      (i === highlighted ? "bg-panel/80" : "")}
+                    data-testid={`file-option-${item.path}`}
+                    role="option"
+                    aria-selected={i === highlighted}
+                    onclick={() => pickItem(item)}
+                  >
+                    <svg
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="1.8"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      class="text-muted h-4 w-4 shrink-0"
+                      aria-hidden="true"
+                    >
+                      <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
+                      <path d="M14 3v5h5" />
+                    </svg>
+                    <span
+                      class="text-fg min-w-0 truncate text-left"
+                      dir="rtl"
+                      data-testid="file-option-label">{item.path}</span
+                    >
+                  </button>
+                {/snippet}
+              </Tooltip>
             {/each}
             {#if fileStatusText !== null}
               <div

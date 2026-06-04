@@ -220,6 +220,12 @@ describe("ComposeBar", () => {
     const menuText = menu.textContent ?? "";
     expect(menuText.indexOf("Files")).toBeLessThan(menuText.indexOf("Send to"));
     expect(file).toHaveAttribute("aria-selected", "false");
+    const fileLabel = file.querySelector('[data-testid="file-option-label"]');
+    expect(fileLabel).toHaveAttribute("dir", "rtl");
+    expect(fileLabel).not.toHaveAttribute("title");
+    expect(fileLabel).toHaveClass("min-w-0", "truncate", "text-left");
+    await fireEvent.pointerEnter(file);
+    expect(await screen.findByTestId("tooltip-content")).toHaveTextContent("docs/bob.md");
     expect(bob).toHaveAttribute("aria-selected", "true");
 
     await fireEvent.keyDown(textarea, { key: "Enter" });

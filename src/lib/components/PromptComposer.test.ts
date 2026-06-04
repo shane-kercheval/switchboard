@@ -49,6 +49,61 @@ describe("PromptComposer", () => {
     expect(screen.getByTestId("prompt-selector")).toHaveTextContent("Code Review");
   });
 
+  it("keeps prompt fields in a capped scroll region", () => {
+    setup({ focus: "", tone: "" });
+    expect(screen.getByTestId("prompt-composer")).toHaveClass(
+      "max-h-[min(56dvh,34rem)]",
+      "overflow-hidden",
+    );
+    expect(screen.getByTestId("prompt-fields-scroll")).toHaveClass(
+      "min-h-0",
+      "overflow-y-auto",
+      "pl-1",
+      "pr-3",
+      "[scrollbar-gutter:stable]",
+    );
+  });
+
+  it("autosizes argument and appended textareas up to their max height", async () => {
+    const scrollHeight = vi.spyOn(HTMLTextAreaElement.prototype, "scrollHeight", "get");
+    const getComputedStyleSpy = vi.spyOn(window, "getComputedStyle");
+    try {
+      scrollHeight.mockImplementation(function (this: HTMLTextAreaElement): number {
+        return this.value.includes("\n") ? 220 : 60;
+      });
+      getComputedStyleSpy.mockReturnValue({ maxHeight: "160px" } as CSSStyleDeclaration);
+
+      setup({ focus: "", tone: "" });
+      const focus = screen.getByTestId("prompt-arg-focus") as HTMLTextAreaElement;
+      const appended = screen.getByTestId("prompt-appended") as HTMLTextAreaElement;
+
+      await fireEvent.input(focus, { target: { value: "one\ntwo\nthree\nfour" } });
+      expect(focus.style.height).toBe("160px");
+      expect(focus.style.overflowY).toBe("auto");
+
+      await fireEvent.input(appended, { target: { value: "short" } });
+      expect(appended.style.height).toBe("60px");
+      expect(appended.style.overflowY).toBe("hidden");
+    } finally {
+      scrollHeight.mockRestore();
+      getComputedStyleSpy.mockRestore();
+    }
+  });
+
+  it("focuses the first prompt field when requested", async () => {
+    render(PromptComposer, {
+      props: {
+        prompt: PROMPT,
+        args: { focus: "", tone: "" },
+        appendedText: "",
+        onremove: vi.fn(),
+        focusFirstField: true,
+      },
+    });
+
+    await waitFor(() => expect(screen.getByTestId("prompt-arg-focus")).toHaveFocus());
+  });
+
   it("previews the combined message (rendered prompt + appended text) as markdown", async () => {
     invokeMock.mockResolvedValue({ text: "# RENDERED BODY" });
     setup({ focus: "tests", tone: "" }, "extra note");
@@ -70,6 +125,17 @@ describe("PromptComposer", () => {
       args: { focus: "tests" },
     });
     expect((call?.[1] as { args: Record<string, string> }).args).not.toHaveProperty("tone");
+  });
+
+  it("shows a spinner while preview rendering is pending", async () => {
+    invokeMock.mockReturnValue(new Promise(() => undefined));
+    setup({ focus: "tests", tone: "" });
+
+    await fireEvent.click(screen.getByTestId("prompt-preview-button"));
+
+    const loading = await screen.findByTestId("prompt-preview-loading");
+    expect(loading).toHaveTextContent("Rendering preview");
+    expect(loading.querySelector(".animate-spin")).not.toBeNull();
   });
 
   it("disables Preview until required arguments are filled", async () => {

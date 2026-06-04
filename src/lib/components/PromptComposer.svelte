@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { Snippet } from "svelte";
+  import { tick } from "svelte";
   import * as api from "$lib/api";
   import type { Prompt } from "$lib/types";
   import {
@@ -12,6 +13,7 @@
   import Button from "$lib/components/ui/Button.svelte";
   import Dialog from "$lib/components/ui/Dialog.svelte";
   import Markdown from "$lib/components/ui/Markdown.svelte";
+  import Spinner from "$lib/components/ui/Spinner.svelte";
   import { cn } from "$lib/utils";
 
   /// Prompt mode: the chosen prompt, its argument inputs, an appended-text field,
@@ -26,6 +28,7 @@
     appendedText = $bindable(),
     onremove,
     send,
+    focusFirstField = false,
   }: {
     prompt: Prompt;
     args: Record<string, string>;
@@ -34,6 +37,9 @@
     /// The compose bar's send button, rendered in the footer row beside Preview
     /// so the two actions align. Optional so the component stands alone in tests.
     send?: Snippet;
+    /// Focuses the first editable prompt field when a user explicitly selects a
+    /// prompt from the picker. Saved/restored prompt drafts leave focus alone.
+    focusFirstField?: boolean;
   } = $props();
 
   type PreviewState =
@@ -43,8 +49,52 @@
     | { kind: "error"; message: string };
   let preview = $state<PreviewState>({ kind: "idle" });
   let previewOpen = $state(false);
+  let argRefs = $state<Record<string, HTMLTextAreaElement | undefined>>({});
+  let appendedRef = $state<HTMLTextAreaElement | undefined>(undefined);
+  let focusedPromptKey = $state<string | null>(null);
 
   const missing = $derived(missingRequiredArgs(prompt, args));
+  const promptKey = $derived(`${prompt.provider}:${prompt.name}`);
+
+  function resizeTextarea(textarea: HTMLTextAreaElement | undefined, _value: string): void {
+    if (textarea == null) return;
+    textarea.style.height = "auto";
+    const naturalHeight = textarea.scrollHeight;
+    const maxHeight = Number.parseFloat(getComputedStyle(textarea).maxHeight);
+    const cappedHeight = Number.isFinite(maxHeight)
+      ? Math.min(naturalHeight, maxHeight)
+      : naturalHeight;
+    textarea.style.height = `${cappedHeight}px`;
+    textarea.style.overflowY = naturalHeight > cappedHeight ? "auto" : "hidden";
+  }
+
+  function firstPromptField(): HTMLTextAreaElement | undefined {
+    const firstArg = prompt.arguments[0];
+    return firstArg === undefined ? appendedRef : argRefs[firstArg.name];
+  }
+
+  function resizeInput(event: Event): void {
+    resizeTextarea(
+      event.currentTarget as HTMLTextAreaElement,
+      (event.currentTarget as HTMLTextAreaElement).value,
+    );
+  }
+
+  $effect(() => {
+    for (const arg of prompt.arguments) {
+      resizeTextarea(argRefs[arg.name], args[arg.name] ?? "");
+    }
+    resizeTextarea(appendedRef, appendedText);
+  });
+
+  $effect(() => {
+    if (!focusFirstField || focusedPromptKey === promptKey) return;
+    const targetPromptKey = promptKey;
+    focusedPromptKey = targetPromptKey;
+    void tick().then(() => {
+      if (focusedPromptKey === targetPromptKey) firstPromptField()?.focus();
+    });
+  });
 
   function openPreview(): void {
     previewOpen = true;
@@ -66,7 +116,10 @@
   }
 </script>
 
-<div class="flex flex-col gap-3" data-testid="prompt-composer">
+<div
+  class="flex max-h-[min(56dvh,34rem)] min-h-0 flex-col gap-3 overflow-hidden"
+  data-testid="prompt-composer"
+>
   <div class="flex items-center gap-1.5">
     <div
       class="border-border bg-panel inline-flex h-7 min-w-0 items-center gap-1.5 rounded-full border px-3"
@@ -102,45 +155,54 @@
     <p class="text-muted text-xs">{prompt.description}</p>
   {/if}
 
-  {#each prompt.arguments as arg (arg.name)}
-    {@const isMissing = missing.includes(arg.name)}
-    <div class="flex flex-col gap-1">
-      <label
-        class="text-fg flex items-baseline gap-1.5 text-xs font-medium"
-        for={`prompt-arg-${arg.name}`}
-      >
-        <span>{arg.name}</span>
-        {#if arg.required}
-          <span class="text-status-failed" data-testid={`prompt-arg-required-${arg.name}`}
-            >required</span
-          >
-        {:else}
-          <span class="text-muted font-normal">optional</span>
+  <div
+    class="min-h-0 [scrollbar-gutter:stable] space-y-3 overflow-y-auto py-1 pr-3 pl-1"
+    data-testid="prompt-fields-scroll"
+  >
+    {#each prompt.arguments as arg (arg.name)}
+      {@const isMissing = missing.includes(arg.name)}
+      <div class="flex flex-col gap-1">
+        <label
+          class="text-fg flex items-baseline gap-1.5 text-xs font-medium"
+          for={`prompt-arg-${arg.name}`}
+        >
+          <span>{arg.name}</span>
+          {#if arg.required}
+            <span class="text-status-failed" data-testid={`prompt-arg-required-${arg.name}`}
+              >required</span
+            >
+          {:else}
+            <span class="text-muted font-normal">optional</span>
+          {/if}
+        </label>
+        {#if arg.description}
+          <p class="text-muted text-[11px]">{arg.description}</p>
         {/if}
-      </label>
-      {#if arg.description}
-        <p class="text-muted text-[11px]">{arg.description}</p>
-      {/if}
+        <Textarea
+          id={`prompt-arg-${arg.name}`}
+          data-testid={`prompt-arg-${arg.name}`}
+          rows={2}
+          bind:ref={argRefs[arg.name]}
+          bind:value={args[arg.name]}
+          oninput={resizeInput}
+          class={cn("max-h-40 min-h-9 text-sm", isMissing ? "border-status-failed" : "")}
+        />
+      </div>
+    {/each}
+
+    <div class="flex flex-col gap-1">
+      <label class="text-fg text-xs font-medium" for="prompt-appended">Appended text</label>
       <Textarea
-        id={`prompt-arg-${arg.name}`}
-        data-testid={`prompt-arg-${arg.name}`}
+        id="prompt-appended"
+        data-testid="prompt-appended"
         rows={2}
-        bind:value={args[arg.name]}
-        class={cn("max-h-40 min-h-9 text-sm", isMissing ? "border-status-failed" : "")}
+        placeholder="Optional text appended after the prompt…"
+        bind:ref={appendedRef}
+        bind:value={appendedText}
+        oninput={resizeInput}
+        class="max-h-40 min-h-9 text-sm"
       />
     </div>
-  {/each}
-
-  <div class="flex flex-col gap-1">
-    <label class="text-fg text-xs font-medium" for="prompt-appended">Appended text</label>
-    <Textarea
-      id="prompt-appended"
-      data-testid="prompt-appended"
-      rows={2}
-      placeholder="Optional text appended after the prompt…"
-      bind:value={appendedText}
-      class="max-h-40 min-h-9 text-sm"
-    />
   </div>
 
   <div class="flex items-center justify-between gap-2">
@@ -164,7 +226,14 @@
   contentClass="max-w-2xl"
 >
   {#if preview.kind === "loading"}
-    <div class="text-muted text-sm" data-testid="prompt-preview-loading">Rendering preview…</div>
+    <div
+      class="text-muted flex items-center gap-2 text-sm"
+      data-testid="prompt-preview-loading"
+      role="status"
+    >
+      <Spinner class="h-4 w-4" />
+      Rendering preview…
+    </div>
   {:else if preview.kind === "error"}
     <div class="text-status-failed text-sm" data-testid="prompt-preview-error">
       Preview failed: {preview.message}

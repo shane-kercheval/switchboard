@@ -1145,9 +1145,17 @@ describe("ComposeBar prompt mode", () => {
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
 
     await enterPromptMode("prompt-option-local:review");
+    const focusArg = screen.getByTestId("prompt-arg-focus");
+    expect(focusArg).toHaveFocus();
     expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(true);
-    await fireEvent.input(screen.getByTestId("prompt-arg-focus"), { target: { value: "tests" } });
+    await fireEvent.input(focusArg, { target: { value: "tests" } });
     expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(false);
+    await fireEvent.keyDown(focusArg, { key: "Enter", metaKey: true });
+
+    await waitFor(() => {
+      const sends = invokeMock.mock.calls.filter(([c]) => c === "send_message");
+      expect(sends).toHaveLength(1);
+    });
   });
 
   it("returns to the plain composer carrying appended text back on remove", async () => {

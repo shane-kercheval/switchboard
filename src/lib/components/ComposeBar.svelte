@@ -59,6 +59,7 @@
   let promptMenuOpen = $state(false);
   let promptMenuWrapEl = $state<HTMLDivElement | undefined>(undefined);
   let prompts = $state<Prompt[]>([]);
+  let focusPromptFieldOnMount = $state(false);
   // Whether the cache has been read at least once, so the picker can show a
   // "loading" row instead of momentarily claiming there are no prompts.
   let promptsLoaded = $state(false);
@@ -636,6 +637,7 @@
     selectedPrompt = prompt;
     promptArgs = Object.fromEntries(prompt.arguments.map((a) => [a.name, ""]));
     appendedText = carried;
+    focusPromptFieldOnMount = true;
     draft = "";
     mode = "prompt";
     promptMenuOpen = false;
@@ -647,6 +649,7 @@
     mode = "plain";
     selectedPrompt = null;
     promptArgs = {};
+    focusPromptFieldOnMount = false;
     appendedText = "";
   }
 
@@ -723,6 +726,7 @@
       // carried back.
       selectedPrompt = null;
       promptArgs = {};
+      focusPromptFieldOnMount = false;
       appendedText = "";
       draft = "";
       mode = "plain";
@@ -1008,6 +1012,7 @@
           prompt={selectedPrompt}
           bind:args={promptArgs}
           bind:appendedText
+          focusFirstField={focusPromptFieldOnMount}
           onremove={removePrompt}
           send={sendButton}
         />

@@ -47,6 +47,10 @@ async function loadComposeStore() {
   return await import("$lib/state/composeStore");
 }
 
+async function loadWorkspace() {
+  return await import("$lib/state/workspace.svelte");
+}
+
 function fireTo(channel: string, event: NormalizedEvent): void {
   const cb = listeners.get(channel);
   if (cb === undefined) throw new Error(`no listener for ${channel}`);
@@ -68,6 +72,7 @@ afterEach(async () => {
   const { _testing } = await loadState();
   _testing.reset();
   (await loadComposeStore())._testing.reset();
+  (await loadWorkspace())._testing.reset();
 });
 
 describe("ComposeBar", () => {
@@ -630,6 +635,43 @@ describe("ComposeBar", () => {
     expect(sendIds.size).toBe(1);
     expect((state.transcripts[AGENT_A.id] ?? []).length).toBe(1);
     expect((state.transcripts[AGENT_B.id] ?? []).length).toBe(1);
+  });
+
+  it("stamps project activity when a message is sent", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-05-25T12:00:00Z"));
+    try {
+      const state = await loadState();
+      const ws = await loadWorkspace();
+      await state.registerAgent(AGENT_A);
+      ws.projects.list = [
+        {
+          id: PROJECT_ID,
+          name: "project",
+          created_at: "2026-05-16T00:00:00Z",
+          directory: "/work/project",
+          available: true,
+          last_activity: "2026-05-16T00:00:00Z",
+          archived: false,
+        },
+      ];
+      invokeMock.mockResolvedValue("msg-1");
+
+      const ComposeBar = (await import("./ComposeBar.svelte")).default;
+      render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+      const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+      await fireEvent.input(textarea, { target: { value: "status?" } });
+      await fireEvent.click(screen.getByTestId("compose-send"));
+
+      expect(ws.projectActivityOverrides[PROJECT_ID]).toBe("2026-05-25T12:00:00.000Z");
+      expect(ws.projects.list[0]).toMatchObject({
+        id: PROJECT_ID,
+        last_activity: "2026-05-25T12:00:00.000Z",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("turns the empty-draft send button into cancel for the latest live send", async () => {

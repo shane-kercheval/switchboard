@@ -8,6 +8,7 @@
     transcripts,
   } from "$lib/state/index.svelte";
   import { buildLiveSendsMap } from "$lib/state/liveSends";
+  import { recordProjectsActivityLocally } from "$lib/state/workspace.svelte";
   import { getCompose, setDraft, setSelection } from "$lib/state/composeStore";
   import * as api from "$lib/api";
   import type { AgentId, AgentRecord, ProjectId } from "$lib/types";
@@ -15,7 +16,7 @@
   import StopIcon from "$lib/components/ui/StopIcon.svelte";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
-  import { cn } from "$lib/utils";
+  import { cn, currentIsoTimestamp } from "$lib/utils";
   import { shortcut } from "$lib/platform";
   import { onDestroy, untrack } from "svelte";
 
@@ -505,6 +506,7 @@
     // sharing it (the backend groups, and cancel-send is scoped to it).
     const sendId = crypto.randomUUID();
     const targets = [...selectedAgents];
+    recordProjectsActivityLocally([projectId], currentIsoTimestamp());
     for (const agent of targets) {
       const userTurnId = crypto.randomUUID();
       dispatchUserTurn(agent.id, userTurnId, submittedText, sendId);

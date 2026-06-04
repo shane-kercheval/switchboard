@@ -16,6 +16,7 @@ const PROJECT_1 = "00000000-0000-7000-8000-0000000000f1";
 const PROJECT_2 = "00000000-0000-7000-8000-0000000000f2";
 const PROJECT_3 = "00000000-0000-7000-8000-0000000000f3";
 const AGENT_1 = "00000000-0000-7000-8000-00000000000a";
+const AGENT_2 = "00000000-0000-7000-8000-00000000000b";
 
 function project(id: string, lastActivity: string): ProjectListing {
   return {
@@ -173,6 +174,34 @@ describe("workspace project activity", () => {
       id: PROJECT_1,
       last_activity: "2026-05-25T12:00:00.000Z",
     });
+  });
+
+  it("records activity when any agent's live work ends even if the project stays busy", async () => {
+    const state = await loadAgentState();
+    const ws = await loadWorkspaceState();
+    const p = project(PROJECT_1, "2026-05-16T00:00:00Z");
+    ws.projects.list = [p];
+    const agentA = agent(AGENT_1, PROJECT_1);
+    const agentB = agent(AGENT_2, PROJECT_1);
+    ws.agentsByProject[PROJECT_1] = [agentA, agentB];
+    await state.registerAgent(agentA);
+    await state.registerAgent(agentB);
+    state.dispatchUserTurn(AGENT_1, "user-1", "go", "send-1", p.last_activity);
+    state.dispatchUserTurn(AGENT_2, "user-2", "go", "send-2", p.last_activity);
+    observerStops.push(ws.startProjectActivityObserver(() => "2026-05-25T12:00:00.000Z"));
+    await tick();
+
+    const rt = state.runtimes[AGENT_1];
+    if (rt === undefined) throw new Error("unreachable");
+    state.runtimes[AGENT_1] = { ...rt, run_status: "idle", pending_sends: undefined };
+    await tick();
+
+    expect(ws.projectActivityOverrides[PROJECT_1]).toBe("2026-05-25T12:00:00.000Z");
+    expect(ws.projects.list[0]).toMatchObject({
+      id: PROJECT_1,
+      last_activity: "2026-05-25T12:00:00.000Z",
+    });
+    expect(ws.backgroundCompletedProjectIds[PROJECT_1]).toBeUndefined();
   });
 
   it("removing a busy project clears activity observer memory and local markers", async () => {

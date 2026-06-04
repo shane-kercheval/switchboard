@@ -150,24 +150,54 @@ export function liveProjectSends(projectId: ProjectId): Map<SendId, AgentId[]> {
   return buildLiveSendsMap(agentsByProject[projectId] ?? [], runtimes, transcripts);
 }
 
-let previousBusyProjectIds: ProjectId[] = [];
+type LiveProjectSendPair = {
+  key: string;
+  projectId: ProjectId;
+  sendId: SendId;
+  agentId: AgentId;
+};
+
+let previousLiveProjectSendPairs: LiveProjectSendPair[] = [];
+
+function liveProjectSendPairs(): LiveProjectSendPair[] {
+  const pairs: LiveProjectSendPair[] = [];
+  for (const projectId of Object.keys(agentsByProject)) {
+    for (const [sendId, agentIds] of liveProjectSends(projectId)) {
+      for (const agentId of agentIds) {
+        pairs.push({ key: `${projectId}:${sendId}:${agentId}`, projectId, sendId, agentId });
+      }
+    }
+  }
+  return pairs;
+}
+
+function projectIdsInPairs(pairs: LiveProjectSendPair[]): ProjectId[] {
+  const projectIds: ProjectId[] = [];
+  for (const pair of pairs) {
+    if (!projectIds.includes(pair.projectId)) projectIds.push(pair.projectId);
+  }
+  return projectIds;
+}
 
 export function startProjectActivityObserver(
   getNow: () => string = currentIsoTimestamp,
 ): () => void {
   return $effect.root(() => {
     $effect(() => {
-      const nowBusy = Object.keys(agentsByProject).filter(
-        (projectId) => liveProjectSends(projectId).size > 0,
-      );
+      const nowLivePairs = liveProjectSendPairs();
+      const previousBusy = projectIdsInPairs(previousLiveProjectSendPairs);
+      const nowBusy = projectIdsInPairs(nowLivePairs);
       const completed: ProjectId[] = [];
       const backgroundCompleted: ProjectId[] = [];
-      for (const id of previousBusyProjectIds) {
+      for (const pair of previousLiveProjectSendPairs) {
+        if (nowLivePairs.some((nowPair) => nowPair.key === pair.key)) continue;
+        if (!completed.includes(pair.projectId)) completed.push(pair.projectId);
+      }
+      for (const id of previousBusy) {
         if (nowBusy.includes(id)) continue;
-        completed.push(id);
         if (id !== selection.activeProjectId) backgroundCompleted.push(id);
       }
-      previousBusyProjectIds = nowBusy;
+      previousLiveProjectSendPairs = nowLivePairs;
       untrack(() => {
         if (completed.length > 0) recordProjectsActivityLocally(completed, getNow());
         for (const id of backgroundCompleted) backgroundCompletedProjectIds[id] = true;
@@ -224,7 +254,9 @@ export async function removeDirectory(path: string): Promise<void> {
     loadStarted.delete(id);
     hydrationStarted.delete(id);
   }
-  previousBusyProjectIds = previousBusyProjectIds.filter((id) => !removedProjectIds.includes(id));
+  previousLiveProjectSendPairs = previousLiveProjectSendPairs.filter(
+    (pair) => !removedProjectIds.includes(pair.projectId),
+  );
   if (activeRemoved) {
     selection.activeProjectId = null;
     selection.activationError = null;
@@ -360,7 +392,9 @@ export async function deleteProject(projectId: ProjectId): Promise<void> {
   delete projectActivityOverrides[projectId];
   loadStarted.delete(projectId);
   hydrationStarted.delete(projectId);
-  previousBusyProjectIds = previousBusyProjectIds.filter((id) => id !== projectId);
+  previousLiveProjectSendPairs = previousLiveProjectSendPairs.filter(
+    (pair) => pair.projectId !== projectId,
+  );
   if (selection.activeProjectId === projectId) {
     selection.activeProjectId = null;
     selection.activationError = null;
@@ -528,7 +562,7 @@ export const _testing = {
     projects.list = [];
     selection.activeProjectId = null;
     selection.activationError = null;
-    previousBusyProjectIds = [];
+    previousLiveProjectSendPairs = [];
     loadStarted.clear();
     hydrationStarted.clear();
     for (const key of Object.keys(agentsByProject)) delete agentsByProject[key];

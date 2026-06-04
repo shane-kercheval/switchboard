@@ -84,12 +84,45 @@ pub enum RateLimitSource {
     SessionFileBacked,
 }
 
+/// Where a `TurnEnd`'s `context_window` is durable — the dispatcher's gate for
+/// whether to persist it to the per-agent metadata sidecar. The exact analogue
+/// of [`RateLimitSource`] for the window: an **internal adapter→dispatcher**
+/// discriminator carried on [`AdapterEvent::TurnEnd`] and dropped at the
+/// [`NormalizedEvent`] boundary, so the dispatcher persists only the class-C
+/// (stream-only) window without a `match harness {…}`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ContextWindowSource {
+    /// Stream-only (class C): Claude's `result.modelUsage.<model>.contextWindow`,
+    /// absent from the session file. The dispatcher persists it to the metadata
+    /// sidecar so the context bar survives restart.
+    StreamOnly,
+    /// Already durable in the harness's own session file (class B): Codex's
+    /// post-terminal session-file enrichment fills the window. Not re-persisted.
+    SessionFileBacked,
+}
+
 /// Per-turn usage and cost. Carried on `TurnEnd.usage`.
 ///
 /// `total_cost_usd` is Claude Code only (subscription auth has no dollar
 /// number for Codex). `context_window` for Claude comes from
 /// `result.modelUsage.<model>.contextWindow`; for Codex it's populated by
-/// post-terminal session-file enrichment. All other fields are tokens.
+/// post-terminal session-file enrichment. The remaining `*_tokens` fields
+/// mirror exactly what the harness reported — do not normalize them; the
+/// reconciled occupancy value lives in `context_input_tokens` instead.
+///
+/// `context_input_tokens` is **derived, not raw**: the total input-side
+/// tokens occupying the context window after this turn, reconciled by the
+/// emitting adapter because harnesses count cached tokens *differently*.
+/// For Claude, `cached_input_tokens` and `cache_creation_input_tokens` are
+/// disjoint additions to `input_tokens`, so the input side is their sum.
+/// For Codex, `cached_input_tokens` is a subset already inside
+/// `input_tokens`, so the input side is just `input_tokens` — adding the
+/// cached count would double-count. Keeping this reconciliation here (not in
+/// the frontend) lets the context-utilization formula stay harness-agnostic:
+/// `(context_input_tokens + output_tokens) / context_window`. `None` where a
+/// harness doesn't compute it (e.g. Gemini, which exposes no window anyway).
 ///
 /// Populated when the harness reports usage on its terminal event. Claude
 /// carries it on both `Completed` and `Failed` turns; Codex carries it on
@@ -102,9 +135,42 @@ pub struct TurnUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_input_tokens: Option<u64>,
+    pub cache_creation_input_tokens: Option<u64>,
+    pub context_input_tokens: Option<u64>,
     pub reasoning_output_tokens: Option<u64>,
     pub context_window: Option<u32>,
     pub total_cost_usd: Option<f64>,
+}
+
+/// Per-turn real-spend attribution — the gate for showing a turn's cost and an
+/// overage marker inline on the message. Distinct from [`TurnUsage`]: usage is
+/// raw telemetry, this answers "did this turn cost real money, and was it
+/// overage." Stamped per turn by the **adapter** (the harness owns the rule),
+/// so the frontend renders on `real_spend` without a `match harness`.
+///
+/// The frontend reads the two fields through **two distinct gates**: the
+/// **cost** renders on `real_spend`, the **"using credits" marker** on
+/// `is_overage`. They coincide for Claude, but the split is load-bearing for a
+/// future pay-per-use harness (cost shows, marker stays hidden), which is why
+/// they're separate fields rather than one.
+///
+/// - `real_spend` — the harness-agnostic gate for showing cost: set when the
+///   turn cost real money. For subscription Claude, `total_cost_usd` is a
+///   *notional* API-equivalent figure that isn't charged unless the agent is in
+///   overage, so `real_spend == is_overage`. A future pay-per-use harness would
+///   set `real_spend` true whenever cost is present, regardless of overage.
+/// - `is_overage` — the Claude-derived overage flag (`isUsingOverage`); gates
+///   the "using credits" marker specifically.
+/// - `overage_resets_at` — the credit/overage window reset, for the marker's
+///   tooltip, when the harness reports it (`overageResetsAt`).
+///
+/// `None` on a `TurnEnd` means "no real-spend info" (non-Claude harness, or a
+/// turn with no rate-limit signal) → the message shows neither cost nor marker.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TurnSpend {
+    pub real_spend: bool,
+    pub is_overage: bool,
+    pub overage_resets_at: Option<DateTime<Utc>>,
 }
 
 /// Events emitted by harness adapters. `TurnStart` is deliberately absent — it is
@@ -156,6 +222,24 @@ pub enum AdapterEvent {
         outcome: TurnOutcome,
         ended_at: DateTime<Utc>,
         usage: Option<TurnUsage>,
+        /// Where `usage.context_window` is durable — gates whether the
+        /// dispatcher persists it to the metadata sidecar. `None` when the turn
+        /// carries no window. Internal: dropped at the `NormalizedEvent`
+        /// boundary (the frontend reads the window off `usage`, not the source).
+        context_window_source: Option<ContextWindowSource>,
+        /// Per-turn real-spend attribution (cost/overage gate). Stamped by the
+        /// adapter; carried through to the frontend (unlike
+        /// `context_window_source`, this *is* rendered). `None` = no real-spend
+        /// info for this turn.
+        spend: Option<TurnSpend>,
+        /// Stable per-turn join key: the final non-subagent assistant message's
+        /// Anthropic `message.id`, which appears identically in the live stream
+        /// and the on-disk session file (verified). The dispatcher keys the
+        /// durable per-turn metadata (`turnmeta` sidecar) on it so cost/overage
+        /// can re-attach to the right message on reopen. Internal: dropped at
+        /// the `NormalizedEvent` boundary (the frontend never sees it). `None`
+        /// when the harness has no such id (non-Claude) or no assistant message.
+        stable_message_id: Option<String>,
     },
     RateLimitEvent {
         agent_id: AgentId,
@@ -236,6 +320,9 @@ pub enum NormalizedEvent {
         outcome: TurnOutcome,
         ended_at: DateTime<Utc>,
         usage: Option<TurnUsage>,
+        /// Per-turn real-spend attribution — gates the inline cost + overage
+        /// marker on the message. `None` = show neither. See [`TurnSpend`].
+        spend: Option<TurnSpend>,
     },
     RateLimitEvent {
         agent_id: AgentId,
@@ -342,16 +429,23 @@ impl AdapterEvent {
                 output,
                 is_error,
             },
+            // `context_window_source` and `stable_message_id` are intentionally
+            // dropped (the `..`) — internal persistence/join plumbing the
+            // frontend doesn't need (mirrors the `RateLimitEvent` source drop
+            // below). `spend` *is* carried through — it's rendered on the message.
             AdapterEvent::TurnEnd {
                 turn_id,
                 outcome,
                 ended_at,
                 usage,
+                spend,
+                ..
             } => NormalizedEvent::TurnEnd {
                 turn_id,
                 outcome,
                 ended_at,
                 usage,
+                spend,
             },
             // `source` is intentionally dropped — it's an internal persistence
             // discriminator the frontend doesn't need (see `RateLimitSource`).
@@ -536,6 +630,7 @@ mod tests {
             outcome: TurnOutcome::Completed,
             ended_at: fresh_time(),
             usage: None,
+            spend: None,
         };
         let value = serde_json::to_value(&event).unwrap();
         assert_eq!(value["type"], "turn_end");
@@ -555,18 +650,29 @@ mod tests {
                 input_tokens: 100,
                 output_tokens: 25,
                 cached_input_tokens: Some(50),
+                cache_creation_input_tokens: Some(30),
+                context_input_tokens: Some(180),
                 reasoning_output_tokens: Some(5),
                 context_window: Some(200_000),
                 total_cost_usd: Some(0.0125),
+            }),
+            spend: Some(TurnSpend {
+                real_spend: true,
+                is_overage: true,
+                overage_resets_at: None,
             }),
         };
         let value = serde_json::to_value(&event).unwrap();
         assert_eq!(value["usage"]["input_tokens"], 100);
         assert_eq!(value["usage"]["output_tokens"], 25);
         assert_eq!(value["usage"]["cached_input_tokens"], 50);
+        assert_eq!(value["usage"]["cache_creation_input_tokens"], 30);
+        assert_eq!(value["usage"]["context_input_tokens"], 180);
         assert_eq!(value["usage"]["reasoning_output_tokens"], 5);
         assert_eq!(value["usage"]["context_window"], 200_000);
         assert_eq!(value["usage"]["total_cost_usd"], 0.0125);
+        assert_eq!(value["spend"]["real_spend"], true);
+        assert_eq!(value["spend"]["is_overage"], true);
         let parsed: NormalizedEvent = serde_json::from_value(value).unwrap();
         assert_eq!(parsed, event);
     }
@@ -581,6 +687,7 @@ mod tests {
             },
             ended_at: fresh_time(),
             usage: None,
+            spend: None,
         };
         let value = serde_json::to_value(&event).unwrap();
         assert_eq!(value["outcome"]["status"], "failed");
@@ -602,6 +709,7 @@ mod tests {
                 outcome: TurnOutcome::Cancelled { source },
                 ended_at: fresh_time(),
                 usage: None,
+                spend: None,
             };
             let value = serde_json::to_value(&event).unwrap();
             assert_eq!(value["outcome"]["status"], "cancelled");
@@ -621,6 +729,7 @@ mod tests {
             },
             ended_at: fresh_time(),
             usage: None,
+            spend: None,
         };
         let value = serde_json::to_value(&event).unwrap();
         assert_eq!(value["outcome"]["status"], "failed");
@@ -643,6 +752,7 @@ mod tests {
             },
             ended_at: fresh_time(),
             usage: None,
+            spend: None,
         };
         let value = serde_json::to_value(&event).unwrap();
         assert_eq!(value["outcome"]["kind"], "adapter_failure");
@@ -789,6 +899,9 @@ mod tests {
             outcome: TurnOutcome::Completed,
             ended_at: fresh_time(),
             usage: None,
+            context_window_source: None,
+            stable_message_id: None,
+            spend: None,
         };
         let normalized = adapter
             .into_normalized()
@@ -813,6 +926,9 @@ mod tests {
             },
             ended_at: fresh_time(),
             usage: None,
+            context_window_source: None,
+            stable_message_id: None,
+            spend: None,
         };
         let normalized = adapter
             .into_normalized()

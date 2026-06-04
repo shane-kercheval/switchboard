@@ -345,6 +345,9 @@ impl Reconstruction {
             status,
             items: b.items,
             usage: None,
+            // Antigravity has no cost/overage and no join key (Claude-only).
+            spend: None,
+            stable_message_id: None,
         });
     }
 

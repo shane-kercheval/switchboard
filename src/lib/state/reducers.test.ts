@@ -379,6 +379,23 @@ describe("transcriptReducer", () => {
       expect(turn.usage?.total_cost_usd).toBe(0.012);
     });
 
+    it("records the per-turn spend signal from turn_end", () => {
+      let turns = reduce([], turnStart(TURN_1));
+      const ev: NormalizedEvent = {
+        type: "turn_end",
+        turn_id: TURN_1,
+        outcome: { status: "completed" },
+        ended_at: "2026-05-16T00:00:05Z",
+        usage: { input_tokens: 10, output_tokens: 5, total_cost_usd: 0.0125 },
+        spend: { real_spend: true, is_overage: true, overage_resets_at: null },
+      };
+      turns = reduce(turns, ev);
+      const turn = turns[0];
+      if (turn?.role !== "agent") throw new Error("unreachable");
+      expect(turn.spend?.real_spend).toBe(true);
+      expect(turn.spend?.is_overage).toBe(true);
+    });
+
     it("transitions to failed with error fields populated", () => {
       let turns = reduce([], turnStart(TURN_1));
       turns = reduce(turns, turnEndFailed(TURN_1, "rate limited"));
@@ -462,6 +479,63 @@ describe("transcriptReducer", () => {
       expect(turns).toHaveLength(2);
       expect(turns[0]?.role).toBe("user");
       expect(turns[1]?.role).toBe("agent");
+    });
+
+    it("carries a hydrated turn's persisted spend onto the state turn", () => {
+      // Reopen join: a LoadedTurn re-joined from the turn-metadata sidecar
+      // carries `spend`; the reducer must surface it so the inline cost +
+      // overage marker re-render after reopen (not just live).
+      const turns = reduce([], {
+        type: "hydrate",
+        agent_id: AGENT_A,
+        turns: [
+          {
+            role: "agent",
+            turn_id: TURN_1,
+            agent_id: AGENT_A,
+            started_at: "2026-05-14T00:00:02Z",
+            status: "complete",
+            items: [{ item_kind: "text", kind: "text", text: "1" }],
+            usage: {
+              input_tokens: 10,
+              output_tokens: 5,
+              total_cost_usd: 0.0125,
+            },
+            spend: { real_spend: true, is_overage: true, overage_resets_at: null },
+          },
+        ],
+      });
+      const turn = turns[0];
+      expect(turn?.role).toBe("agent");
+      if (turn?.role === "agent") {
+        expect(turn.spend?.real_spend).toBe(true);
+        expect(turn.spend?.is_overage).toBe(true);
+        expect(turn.usage?.total_cost_usd).toBe(0.0125);
+      }
+    });
+
+    it("leaves spend undefined for a hydrated turn with no persisted record", () => {
+      // Pre-feature / normal-quota turn: no `spend` on the LoadedTurn → the
+      // state turn renders neither cost nor marker.
+      const turns = reduce([], {
+        type: "hydrate",
+        agent_id: AGENT_A,
+        turns: [
+          {
+            role: "agent",
+            turn_id: TURN_1,
+            agent_id: AGENT_A,
+            started_at: "2026-05-14T00:00:02Z",
+            status: "complete",
+            items: [{ item_kind: "text", kind: "text", text: "1" }],
+          },
+        ],
+      });
+      const turn = turns[0];
+      expect(turn?.role).toBe("agent");
+      if (turn?.role === "agent") {
+        expect(turn.spend).toBeUndefined();
+      }
     });
 
     it("preserves a live in-flight turn when hydrate carries the same turn_id", () => {

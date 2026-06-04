@@ -344,6 +344,9 @@ async fn run_producer(
                 if prior.is_none() && state.corrupt_thread_started {
                     let _ = tx.send(AdapterEvent::TurnEnd {
                         turn_id,
+                        context_window_source: None,
+                        stable_message_id: None,
+                        spend: None,
                         outcome: TurnOutcome::Failed {
                             kind: FailureKind::AdapterFailure,
                             message: "Codex thread.started event missing or non-string thread_id — cannot capture session locator; resume would fail"
@@ -392,6 +395,9 @@ async fn run_producer(
                             },
                             ended_at: Utc::now(),
                             usage: None,
+                            context_window_source: None,
+                            stable_message_id: None,
+                            spend: None,
                         });
                         terminal_seen = true;
                         force_kill_child = true;
@@ -405,6 +411,7 @@ async fn run_producer(
                             outcome,
                             ended_at,
                             usage,
+                            ..
                         } => {
                             terminal_seen = true;
                             // A first dispatch that *completes* without ever
@@ -429,6 +436,9 @@ async fn run_producer(
                                     },
                                     ended_at,
                                     usage: None,
+                                    context_window_source: None,
+                                    stable_message_id: None,
+                                    spend: None,
                                 });
                                 force_kill_child = true;
                                 break 'lines;
@@ -479,6 +489,9 @@ async fn run_producer(
                     },
                     ended_at: Utc::now(),
                     usage: None,
+                    context_window_source: None,
+                    stable_message_id: None,
+                    spend: None,
                 });
                 terminal_seen = true;
                 force_kill_child = true;
@@ -589,13 +602,25 @@ async fn emit_terminal_with_enrichment(
         Enrichment::default()
     };
 
-    // Step 3: emit the enriched TurnEnd.
+    // Step 3: emit the enriched TurnEnd. The window (when present) comes from
+    // Codex's own session file — class B, already durable — so it's tagged
+    // `SessionFileBacked` and the dispatcher does NOT re-persist it to the
+    // metadata sidecar (mirrors the rate-limit gate below).
     let enriched_usage = apply_context_window(usage, enrichment.context_window);
+    let context_window_source = enriched_usage
+        .as_ref()
+        .and_then(|u| u.context_window)
+        .map(|_| crate::events::ContextWindowSource::SessionFileBacked);
     let _ = tx.send(AdapterEvent::TurnEnd {
         turn_id,
         outcome,
         ended_at,
         usage: enriched_usage,
+        context_window_source,
+        // Codex has no cost/overage in v1 — no real-spend attribution, and no
+        // join key (the durable per-turn store is Claude-only).
+        spend: None,
+        stable_message_id: None,
     });
 
     // Step 4: emit RateLimitEvent if rate-limit info was found. Codex's
@@ -699,6 +724,9 @@ fn synthesize_truncation_turn_end(
         },
         ended_at: Utc::now(),
         usage: None,
+        context_window_source: None,
+        stable_message_id: None,
+        spend: None,
     }
 }
 
@@ -785,6 +813,8 @@ mod tests {
             input_tokens: 0,
             output_tokens: 0,
             cached_input_tokens: None,
+            cache_creation_input_tokens: None,
+            context_input_tokens: Some(0),
             reasoning_output_tokens: None,
             context_window: window,
             total_cost_usd: None,

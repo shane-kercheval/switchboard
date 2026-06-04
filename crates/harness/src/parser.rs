@@ -1,10 +1,10 @@
-use chrono::Utc;
+use chrono::{DateTime, TimeZone, Utc};
 use serde_json::Value;
 use switchboard_core::AgentId;
 
 use crate::events::{
     AdapterEvent, ContentKind, FailureKind, McpServerStatus, ToolKind, TurnId, TurnOutcome,
-    TurnUsage,
+    TurnSpend, TurnUsage,
 };
 
 /// Authored auth-failure message for Claude. Replaces Claude's
@@ -59,6 +59,35 @@ pub struct ParserState {
     /// State-flag pattern: `parse_result` remains the sole `TurnEnd` emitter,
     /// preserving the exactly-one-terminal-event invariant.
     pending_auth_failure: Option<String>,
+    /// Context-window occupancy of the **most recent** assistant message in
+    /// this turn: `input_tokens + cache_read + cache_creation` for that one
+    /// model call. Overwritten on every assistant envelope, so at `TurnEnd`
+    /// it holds the *final* call's prompt size — which is exactly what the
+    /// context window currently holds.
+    ///
+    /// This is deliberately **not** taken from the terminal `result.usage`:
+    /// Claude's `result` event reports usage *summed across every model call*
+    /// in the turn (verified against claude 2.1.161 — a two-call turn reports
+    /// `input`/`cache_read`/`cache_creation` as the per-call sums). Summed
+    /// usage double-counts the shared cached prefix and over-reports occupancy
+    /// ~N× for an N-call (tool-use) turn. Mirrors the session-file path, which
+    /// keeps the last assistant record's usage.
+    last_assistant_context_input_tokens: Option<u64>,
+    /// Overage state from the most recent `rate_limit_event` this turn, stashed
+    /// so the terminal `result` can stamp the completing turn's `TurnSpend`.
+    /// Claude streams the `rate_limit_event` *before* the terminal `result`
+    /// (verified against claude 2.1.161 across normal + tool-use turns), so by
+    /// `TurnEnd` this reflects the turn's overage. Defaults to "not overage"
+    /// until a rate-limit is seen — so a turn without one shows no cost/marker.
+    pending_is_overage: bool,
+    pending_overage_resets_at: Option<DateTime<Utc>>,
+    /// The most recent assistant message's Anthropic `message.id`, overwritten
+    /// on each assistant envelope so at `TurnEnd` it holds the **final**
+    /// non-subagent assistant message's id (subagent envelopes are skipped
+    /// before this runs). Emitted as the turn's `stable_message_id` — the
+    /// durable join key that re-attaches cost/overage to the right message on
+    /// reopen (the same id appears in the on-disk session file; verified).
+    last_assistant_message_id: Option<String>,
 }
 
 /// Parse one stream-json line. Stateful: `state` accumulates text-block
@@ -120,7 +149,7 @@ pub fn parse_line(
         Some("system") => parse_system_event(&value, agent_id),
         Some("assistant") => parse_assistant_envelope(&value, turn_id, state),
         Some("user") => parse_user_envelope(&value, turn_id),
-        Some("rate_limit_event") => parse_rate_limit_event(&value, agent_id),
+        Some("rate_limit_event") => parse_rate_limit_event(&value, agent_id, state),
         _ => ParseOutcome::Skip,
     }
 }
@@ -257,13 +286,39 @@ fn parse_result(obj: &Value, turn_id: TurnId, state: &mut ParserState) -> ParseO
         TurnOutcome::Completed
     };
 
-    let usage = extract_usage_from_result(obj);
+    let usage = extract_usage_from_result(obj, state.last_assistant_context_input_tokens);
+
+    // Claude's context window is stream-only (`result.modelUsage`), absent from
+    // the session file — so when this turn carries one, tag it `StreamOnly` for
+    // the dispatcher to persist to the metadata sidecar. `None` when there's no
+    // window (nothing to persist).
+    let context_window_source = usage
+        .as_ref()
+        .and_then(|u| u.context_window)
+        .map(|_| crate::events::ContextWindowSource::StreamOnly);
+
+    // Stamp the turn's real-spend attribution from the overage state seen on
+    // this turn's `rate_limit_event` (which precedes the `result` — verified).
+    // For Claude, real-spend == overage: subscription `total_cost_usd` is only
+    // money actually charged when spending overage credits. The frontend gates
+    // the inline cost + marker on `real_spend` with no `match harness`.
+    let spend = Some(TurnSpend {
+        real_spend: state.pending_is_overage,
+        is_overage: state.pending_is_overage,
+        overage_resets_at: state.pending_overage_resets_at,
+    });
 
     ParseOutcome::Event(AdapterEvent::TurnEnd {
         turn_id,
         outcome,
         ended_at: Utc::now(),
         usage,
+        context_window_source,
+        spend,
+        // The final assistant message's id — the durable join key for
+        // re-attaching cost/overage on reopen. `take()` so a fresh dispatch's
+        // state can't carry a stale id (defensive; state is per-turn anyway).
+        stable_message_id: state.last_assistant_message_id.take(),
     })
 }
 
@@ -278,7 +333,16 @@ fn parse_result(obj: &Value, turn_id: TurnId, state: &mut ParserState) -> ParseO
 ///
 /// Populated for both Completed and Failed turns. The harness charges for
 /// partial work, so token counts on failure are meaningful telemetry.
-fn extract_usage_from_result(obj: &Value) -> Option<TurnUsage> {
+/// The token/cost fields come from the terminal `result.usage` (turn totals,
+/// matching how cost is billed). The **occupancy** field
+/// (`context_input_tokens`) does NOT: it is the final assistant message's
+/// per-call prompt size, threaded in via `last_call_context_input_tokens`,
+/// because `result.usage` sums across calls and would over-report a multi-call
+/// turn's window fullness (see `ParserState::last_assistant_context_input_tokens`).
+fn extract_usage_from_result(
+    obj: &Value,
+    last_call_context_input_tokens: Option<u64>,
+) -> Option<TurnUsage> {
     let usage_obj = obj.get("usage")?;
 
     let input_tokens = usage_obj.get("input_tokens").and_then(Value::as_u64)?;
@@ -288,6 +352,9 @@ fn extract_usage_from_result(obj: &Value) -> Option<TurnUsage> {
         .get("cache_read_input_tokens")
         .and_then(Value::as_u64)
         .or_else(|| usage_obj.get("cached_input_tokens").and_then(Value::as_u64));
+    let cache_creation_input_tokens = usage_obj
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_u64);
     let reasoning_output_tokens = usage_obj
         .get("reasoning_output_tokens")
         .and_then(Value::as_u64);
@@ -299,6 +366,11 @@ fn extract_usage_from_result(obj: &Value) -> Option<TurnUsage> {
         input_tokens,
         output_tokens,
         cached_input_tokens,
+        cache_creation_input_tokens,
+        // Occupancy = the final model call's prompt size, NOT the summed
+        // `result.usage` (which double-counts the shared cached prefix). See
+        // `ParserState::last_assistant_context_input_tokens`.
+        context_input_tokens: last_call_context_input_tokens,
         reasoning_output_tokens,
         context_window,
         total_cost_usd,
@@ -407,6 +479,43 @@ fn parse_mcp_server_status(v: &Value) -> Option<McpServerStatus> {
 /// sole `TurnEnd` emitter; the stash just refines its `FailureKind` from
 /// `HarnessError` to `AuthFailure`.
 fn parse_assistant_envelope(obj: &Value, turn_id: TurnId, state: &mut ParserState) -> ParseOutcome {
+    // Track this model call's prompt size for context-occupancy. Done before
+    // the content/early-return below so the final *text-only* answer message
+    // (which produces no tool event) still updates the occupancy — its usage
+    // reflects the largest, most-recent context. Overwrite → keep last.
+    if let Some(usage) = obj
+        .get("message")
+        .and_then(|m| m.get("usage"))
+        .and_then(Value::as_object)
+    {
+        let input = usage
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let cache_read = usage
+            .get("cache_read_input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let cache_creation = usage
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        state.last_assistant_context_input_tokens = Some(input + cache_read + cache_creation);
+    }
+
+    // Track this message's Anthropic id as the turn's durable join key (keep
+    // last → the final assistant message's id). Same envelope, same "keep last"
+    // discipline as the occupancy above; subagent envelopes never reach here
+    // (skipped on `parent_tool_use_id`), so this is the final *non-subagent*
+    // message by construction.
+    if let Some(id) = obj
+        .get("message")
+        .and_then(|m| m.get("id"))
+        .and_then(Value::as_str)
+    {
+        state.last_assistant_message_id = Some(id.to_owned());
+    }
+
     if obj.get("error").and_then(Value::as_str) == Some("authentication_failed") {
         // Stash the authored Switchboard auth message rather than Claude's
         // own `Please run /login` (which is the interactive-session slash
@@ -547,8 +656,23 @@ fn stringify_tool_result_content(content: Option<&Value>) -> String {
     String::new()
 }
 
-fn parse_rate_limit_event(obj: &Value, agent_id: AgentId) -> ParseOutcome {
+fn parse_rate_limit_event(obj: &Value, agent_id: AgentId, state: &mut ParserState) -> ParseOutcome {
     let info = obj.get("rate_limit_info").cloned().unwrap_or(Value::Null);
+
+    // Stash the overage state so the terminal `result` can stamp this turn's
+    // `TurnSpend`. `isUsingOverage` is the real-spend signal for Claude (the
+    // only harness with cost in v1); `overageResetsAt` (epoch seconds) is the
+    // credit-window reset for the marker tooltip. The opaque `info` still rides
+    // the event for the Sidebar's Bucket-A rate-limit rendering.
+    state.pending_is_overage = info
+        .get("isUsingOverage")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    state.pending_overage_resets_at = info
+        .get("overageResetsAt")
+        .and_then(Value::as_i64)
+        .and_then(|secs| Utc.timestamp_opt(secs, 0).single());
+
     // Claude's rate-limit payload lives only on the live stream — no
     // session-file equivalent (class C). Mark it `StreamOnly` so the
     // dispatcher persists it to the metadata sidecar for restart continuity.
@@ -644,21 +768,70 @@ mod tests {
         }
     }
 
+    /// Drives a sequence of lines through one shared `ParserState` (one turn)
+    /// and returns the `TurnEnd` usage. Needed because occupancy is now sourced
+    /// from the turn's assistant messages, not the lone `result` event.
+    fn turn_end_usage(lines: &[&str]) -> Option<TurnUsage> {
+        let mut state = ParserState::default();
+        let turn_id = tid();
+        let agent_id = aid();
+        let mut last = None;
+        for line in lines {
+            if let ParseOutcome::Event(AdapterEvent::TurnEnd { usage, .. }) =
+                parse_line(line, turn_id, agent_id, &mut state)
+            {
+                last = Some(usage);
+            }
+        }
+        last.expect("a TurnEnd was emitted")
+    }
+
     #[test]
     fn result_with_usage_populates_turn_usage() {
-        let line = r#"{"type":"result","is_error":false,"api_error_status":null,"result":"ok","model":"claude-sonnet-4-6","usage":{"input_tokens":100,"output_tokens":25,"cache_read_input_tokens":50},"modelUsage":{"claude-sonnet-4-6":{"inputTokens":100,"outputTokens":25,"contextWindow":200000}},"total_cost_usd":0.05}"#;
-        match parse_one(line, tid()) {
-            ParseOutcome::Event(AdapterEvent::TurnEnd {
-                usage: Some(usage), ..
-            }) => {
-                assert_eq!(usage.input_tokens, 100);
-                assert_eq!(usage.output_tokens, 25);
-                assert_eq!(usage.cached_input_tokens, Some(50));
-                assert_eq!(usage.context_window, Some(200_000));
-                assert!((usage.total_cost_usd.unwrap() - 0.05).abs() < f64::EPSILON);
-            }
-            _ => panic!("expected TurnEnd with Some(usage)"),
-        }
+        // Raw token/cost fields come from `result.usage` (turn totals);
+        // occupancy comes from the assistant message's per-call usage.
+        let assistant = r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":100,"output_tokens":25,"cache_read_input_tokens":50,"cache_creation_input_tokens":30}}}"#;
+        let result = r#"{"type":"result","is_error":false,"api_error_status":null,"result":"ok","model":"claude-sonnet-4-6","usage":{"input_tokens":100,"output_tokens":25,"cache_read_input_tokens":50,"cache_creation_input_tokens":30},"modelUsage":{"claude-sonnet-4-6":{"inputTokens":100,"outputTokens":25,"contextWindow":200000}},"total_cost_usd":0.05}"#;
+        let usage = turn_end_usage(&[assistant, result]).expect("Some(usage)");
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 25);
+        assert_eq!(usage.cached_input_tokens, Some(50));
+        assert_eq!(usage.cache_creation_input_tokens, Some(30));
+        // Occupancy from the assistant message: 100 + 50 + 30.
+        assert_eq!(usage.context_input_tokens, Some(180));
+        assert_eq!(usage.context_window, Some(200_000));
+        assert!((usage.total_cost_usd.unwrap() - 0.05).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn result_usage_without_cache_fields_context_input_is_input_only() {
+        // No cache fields on the assistant message → occupancy is input alone.
+        let assistant = r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":120,"output_tokens":5}}}"#;
+        let result = r#"{"type":"result","is_error":false,"api_error_status":null,"result":"ok","usage":{"input_tokens":120,"output_tokens":5}}"#;
+        let usage = turn_end_usage(&[assistant, result]).expect("Some(usage)");
+        assert_eq!(usage.cached_input_tokens, None);
+        assert_eq!(usage.cache_creation_input_tokens, None);
+        assert_eq!(usage.context_input_tokens, Some(120));
+    }
+
+    #[test]
+    fn multi_call_turn_context_input_is_final_call_not_result_sum() {
+        // Verified against claude 2.1.161: a turn with a tool call makes two
+        // model calls, and `result.usage` reports the per-call SUMS. Using that
+        // sum for occupancy double-counts the shared cached prefix. Occupancy
+        // must be the FINAL call's prompt size.
+        // Call 1 (tool call): prompt 3133 + 16833 + 2422 = 22388.
+        let call1 = r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}],"usage":{"input_tokens":3133,"cache_read_input_tokens":16833,"cache_creation_input_tokens":2422,"output_tokens":4}}}"#;
+        // Call 2 (final answer): prompt 2 + 19255 + 3220 = 22477.
+        let call2 = r#"{"type":"assistant","message":{"id":"m2","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":2,"cache_read_input_tokens":19255,"cache_creation_input_tokens":3220,"output_tokens":1}}}"#;
+        // result: cumulative sums across both calls (the trap).
+        let result = r#"{"type":"result","is_error":false,"result":"done","usage":{"input_tokens":3135,"cache_read_input_tokens":36088,"cache_creation_input_tokens":5642,"output_tokens":85},"modelUsage":{"claude-opus-4-8":{"inputTokens":3135,"contextWindow":1000000}}}"#;
+        let usage = turn_end_usage(&[call1, call2, result]).expect("Some(usage)");
+        // Final call's prompt, not the result sum (3135 + 36088 + 5642 = 44865,
+        // which would ~2x over-report).
+        assert_eq!(usage.context_input_tokens, Some(22_477));
+        assert_ne!(usage.context_input_tokens, Some(44_865));
+        assert_eq!(usage.context_window, Some(1_000_000));
     }
 
     #[test]
@@ -920,6 +1093,49 @@ mod tests {
             }
             _ => panic!("expected RateLimitEvent"),
         }
+    }
+
+    /// Drive a turn's `rate_limit_event` then its `result` through one shared
+    /// state (the stream order — rate-limit precedes result), returning the
+    /// terminal `TurnEnd`'s `spend`. Models how `run_producer` feeds the parser.
+    fn turn_end_spend(rate_limit_info: &str) -> Option<TurnSpend> {
+        let mut state = ParserState::default();
+        let turn_id = tid();
+        let agent_id = aid();
+        let rl = format!(r#"{{"type":"rate_limit_event","rate_limit_info":{rate_limit_info}}}"#);
+        parse_line(&rl, turn_id, agent_id, &mut state);
+        let result = r#"{"type":"result","is_error":false,"api_error_status":null,"result":"ok","usage":{"input_tokens":10,"output_tokens":5}}"#;
+        match parse_line(result, turn_id, agent_id, &mut state) {
+            ParseOutcome::Event(AdapterEvent::TurnEnd { spend, .. }) => spend,
+            other => panic!("expected TurnEnd, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn overage_rate_limit_stamps_turn_as_real_spend() {
+        // An overage rate-limit (isUsingOverage:true) seen before the result
+        // stamps the turn as real spend, with the overage reset for the marker.
+        let spend = turn_end_spend(r#"{"isUsingOverage":true,"overageResetsAt":1778701800}"#)
+            .expect("Claude turns carry spend");
+        assert!(spend.real_spend, "overage turn is real spend");
+        assert!(spend.is_overage);
+        assert!(
+            spend.overage_resets_at.is_some(),
+            "overageResetsAt is parsed for the marker tooltip"
+        );
+    }
+
+    #[test]
+    fn normal_rate_limit_stamps_turn_as_no_real_spend() {
+        // A normal-quota rate-limit → not real spend → the message shows no cost
+        // and no marker (subscription cost is notional unless in overage).
+        let spend = turn_end_spend(
+            r#"{"status":"allowed","resetsAt":1778701800,"rateLimitType":"five_hour","isUsingOverage":false}"#,
+        )
+        .expect("Claude turns carry spend");
+        assert!(!spend.real_spend);
+        assert!(!spend.is_overage);
+        assert!(spend.overage_resets_at.is_none());
     }
 
     #[test]
@@ -1303,6 +1519,70 @@ mod tests {
             .filter(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
             .collect();
         assert_eq!(turn_ends.len(), 1, "expected exactly one TurnEnd");
+    }
+
+    /// Collect the events from replaying every line of a Claude live fixture
+    /// through `parse_line` under one `ParserState` (one turn).
+    fn replay_fixture(fixture: &str) -> Vec<AdapterEvent> {
+        let mut state = ParserState::default();
+        let turn_id = tid();
+        let agent_id = aid();
+        let mut events: Vec<AdapterEvent> = Vec::new();
+        for line in fixture.lines().filter(|l| !l.trim().is_empty()) {
+            match parse_line(line, turn_id, agent_id, &mut state) {
+                ParseOutcome::Event(ev) => events.push(ev),
+                ParseOutcome::Events(evs) => events.extend(evs),
+                ParseOutcome::Skip => {}
+                ParseOutcome::Error(e) => panic!("unexpected parse error: {e}"),
+            }
+        }
+        events
+    }
+
+    fn turn_end_stable_id(events: &[AdapterEvent]) -> Option<String> {
+        events.iter().find_map(|e| match e {
+            AdapterEvent::TurnEnd {
+                stable_message_id, ..
+            } => Some(stable_message_id.clone()),
+            _ => None,
+        })?
+    }
+
+    /// Join-key parity (live side), multi-assistant tool-use turn. The turn has
+    /// two non-subagent assistant messages — `msg_test02` (`tool_use`) then
+    /// `msg_test03` (final answer) — and cost arrives on the terminal `result`.
+    /// `stable_message_id` must anchor on the **final** assistant message, so
+    /// the M4 overlay re-attaches cost to the right message. Pairs with the
+    /// session-file side
+    /// (`session_file.rs::hydrated_tool_use_turn_anchors_stable_id_on_final_assistant`):
+    /// both paths must land on `msg_test03` for the join to hold on reopen.
+    #[test]
+    fn tool_use_turn_anchors_stable_id_on_final_assistant_message() {
+        let events = replay_fixture(include_str!("../tests/fixtures/claude/tool-use.jsonl"));
+        assert_eq!(
+            turn_end_stable_id(&events),
+            Some("msg_test03".to_owned()),
+            "the final non-subagent assistant message's id must be the join key (not msg_test02)"
+        );
+    }
+
+    /// Join-key parity (live side), subagent-delegation turn. The *last*
+    /// assistant envelope in the stream (`msg_…a003`) is a **subagent** message
+    /// (`parent_tool_use_id` set) and is skipped, so keep-last must fall back to
+    /// the parent's `msg_…a001`. This guards the live exclusion mechanism that
+    /// keeps the join key in sync with the disk side, where Claude structurally
+    /// omits subagent records from the main session file (so the disk loader
+    /// never sees `a003` at all and lands on `a001` by construction).
+    #[test]
+    fn subagent_turn_anchors_stable_id_on_final_non_subagent_message() {
+        let events = replay_fixture(include_str!(
+            "../tests/fixtures/claude/subagent-delegation.jsonl"
+        ));
+        assert_eq!(
+            turn_end_stable_id(&events),
+            Some("msg_00000000000000000000a001".to_owned()),
+            "the subagent envelope's id must not win the join key; keep-last skips it"
+        );
     }
 
     /// Direct unit-level coverage of the short-circuit rule. The fixture

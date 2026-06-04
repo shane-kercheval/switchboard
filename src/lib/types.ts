@@ -45,9 +45,30 @@ export type TurnUsage = {
   input_tokens: number;
   output_tokens: number;
   cached_input_tokens?: number | null;
+  cache_creation_input_tokens?: number | null;
+  // Harness-reconciled input-side tokens occupying the context window after
+  // this turn. The emitting adapter computes it because harnesses count cached
+  // tokens differently (Claude: disjoint additions; Codex: a subset already in
+  // input_tokens). Context utilization consumes this directly so the frontend
+  // formula stays harness-agnostic. `null` where a harness doesn't compute it.
+  context_input_tokens?: number | null;
   reasoning_output_tokens?: number | null;
   context_window?: number | null;
   total_cost_usd?: number | null;
+};
+
+// Per-turn real-spend attribution — the gate for showing a turn's cost and an
+// overage marker inline on the message. Stamped per turn by the adapter, so the
+// frontend renders on `real_spend` without a harness check. `real_spend` is the
+// harness-agnostic gate (for Claude == `is_overage`, since subscription cost is
+// only real money in overage); `is_overage` is the Claude-derived source kept
+// distinct so the seam stays honest; `overage_resets_at` (ISO-8601) is the
+// credit-window reset for the marker tooltip when reported. Absent/`null` =
+// no real-spend info → show neither cost nor marker.
+export type TurnSpend = {
+  real_spend: boolean;
+  is_overage: boolean;
+  overage_resets_at?: string | null;
 };
 
 // Identifier minted by the dispatcher for every accepted send (idle or
@@ -92,6 +113,7 @@ export type NormalizedEvent =
       outcome: TurnOutcome;
       ended_at: string;
       usage?: TurnUsage | null;
+      spend?: TurnSpend | null;
     }
   | { type: "rate_limit_event"; agent_id: AgentId; info: unknown }
   | {
@@ -182,6 +204,10 @@ export type LoadedTurn =
       status: "streaming" | "complete" | "failed";
       items: LoadedTurnItem[];
       usage?: TurnUsage | null;
+      // Per-turn cost/overage re-joined from the turn-metadata sidecar on
+      // reopen. Present only on real-spend turns that were persisted; absent
+      // for normal-quota and pre-feature turns (render neither cost nor marker).
+      spend?: TurnSpend | null;
     };
 
 export type LoadedTurnItem =
@@ -363,6 +389,9 @@ export type ConversationItem =
       status: "streaming" | "complete" | "failed";
       items: LoadedTurnItem[];
       usage?: TurnUsage | null;
+      // Per-turn cost/overage re-joined from the turn-metadata sidecar on
+      // reopen — same source + meaning as `LoadedTurn.spend`.
+      spend?: TurnSpend | null;
     }
   | {
       kind: "outcome";

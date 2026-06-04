@@ -21,6 +21,7 @@ import type {
   SendId,
   ToolKind,
   TurnId,
+  TurnSpend,
   TurnUsage,
 } from "$lib/types";
 
@@ -71,6 +72,11 @@ export type Turn =
       /// for exhaustive narrowing.
       items: TurnItem[];
       usage?: TurnUsage;
+      /// Per-turn real-spend attribution (cost/overage gate), stamped at turn
+      /// end. The transcript shows the inline cost + "using credits" marker only
+      /// when `spend.real_spend`. Absent on non-Claude turns and (until M4) on
+      /// hydrated turns — both render nothing.
+      spend?: TurnSpend;
       /// Populated when status = "failed". Preserved so retry UX can distinguish
       /// recoverable from non-recoverable failures (HarnessError → suggest retry;
       /// AdapterFailure → suggest "report bug"; AuthFailure → "run claude auth login").

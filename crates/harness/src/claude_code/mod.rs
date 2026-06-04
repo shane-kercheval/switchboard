@@ -291,6 +291,9 @@ async fn run_producer(
                             },
                             ended_at: Utc::now(),
                             usage: None,
+                            context_window_source: None,
+                            stable_message_id: None,
+                            spend: None,
                         });
                         terminal_seen = true;
                         break;
@@ -326,6 +329,9 @@ async fn run_producer(
                     },
                     ended_at: Utc::now(),
                     usage: None,
+                    context_window_source: None,
+                    stable_message_id: None,
+                    spend: None,
                 });
                 terminal_seen = true;
                 break;
@@ -401,6 +407,9 @@ fn synthesize_truncation_turn_end(
         },
         ended_at: Utc::now(),
         usage: None,
+        context_window_source: None,
+        stable_message_id: None,
+        spend: None,
     }
 }
 

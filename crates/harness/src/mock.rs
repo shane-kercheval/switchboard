@@ -6,7 +6,9 @@ use switchboard_core::{AgentRecord, SessionLocator};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::adapter::{DispatchError, EventStream, HarnessAdapter};
-use crate::events::{AdapterEvent, ContentKind, TurnId, TurnOutcome};
+use crate::events::{
+    AdapterEvent, ContentKind, ContextWindowSource, TurnId, TurnOutcome, TurnUsage,
+};
 
 /// Controls the behaviour of `MockHarnessAdapter`.
 ///
@@ -83,6 +85,26 @@ pub enum MockScenario {
     /// (must persist) and once with `SessionFileBacked` (must not), asserting
     /// the injected `MetadataCache`.
     RateLimitWithSource(crate::events::RateLimitSource),
+
+    /// Emits `ContentChunk → TurnEnd(Completed)` whose `usage` carries the given
+    /// `context_window`, tagged with the given [`ContextWindowSource`]. The
+    /// vehicle for the dispatcher's context-window persistence gate: run with
+    /// `StreamOnly` (must persist) and `SessionFileBacked` (must not).
+    CompletesWithContextWindow {
+        context_window: u32,
+        source: ContextWindowSource,
+    },
+
+    /// Emits `ContentChunk → TurnEnd(Completed)` whose `usage.total_cost_usd`,
+    /// `spend`, and `stable_message_id` are the given values. The vehicle for
+    /// the dispatcher's per-turn cost/overage persistence gate: run with a
+    /// real-spend `spend` + `Some(message_id)` (must persist) and with
+    /// `real_spend == false` or `stable_message_id == None` (must not).
+    CompletesWithSpend {
+        total_cost_usd: Option<f64>,
+        spend: Option<crate::events::TurnSpend>,
+        stable_message_id: Option<String>,
+    },
 
     /// Emits `ContentChunk → SessionLocatorCaptured(locator) → TurnEnd(Completed)`.
     /// The vehicle for the dispatcher's runtime-capture tests: drives the
@@ -172,6 +194,9 @@ impl HarnessAdapter for MockHarnessAdapter {
                         outcome: TurnOutcome::Completed,
                         ended_at: Utc::now(),
                         usage: None,
+                        context_window_source: None,
+                        stable_message_id: None,
+                        spend: None,
                     });
                 });
             }
@@ -215,6 +240,9 @@ impl HarnessAdapter for MockHarnessAdapter {
                         },
                         ended_at: Utc::now(),
                         usage: None,
+                        context_window_source: None,
+                        stable_message_id: None,
+                        spend: None,
                     });
                 });
             }
@@ -263,6 +291,9 @@ impl HarnessAdapter for MockHarnessAdapter {
                         outcome: TurnOutcome::Completed,
                         ended_at: Utc::now(),
                         usage: None,
+                        context_window_source: None,
+                        stable_message_id: None,
+                        spend: None,
                     });
                 });
             }
@@ -278,6 +309,9 @@ impl HarnessAdapter for MockHarnessAdapter {
                         outcome: TurnOutcome::Completed,
                         ended_at: Utc::now(),
                         usage: None,
+                        context_window_source: None,
+                        stable_message_id: None,
+                        spend: None,
                     });
                     let _ = tx.send(AdapterEvent::RateLimitEvent {
                         agent_id,
@@ -311,11 +345,77 @@ impl HarnessAdapter for MockHarnessAdapter {
                         outcome: TurnOutcome::Completed,
                         ended_at: Utc::now(),
                         usage: None,
+                        context_window_source: None,
+                        stable_message_id: None,
+                        spend: None,
                     });
                     let _ = tx.send(AdapterEvent::RateLimitEvent {
                         agent_id,
                         info: serde_json::json!({"primary": {"used_percent": 42.0}}),
                         source,
+                    });
+                });
+            }
+            MockScenario::CompletesWithContextWindow {
+                context_window,
+                source,
+            } => {
+                tokio::spawn(async move {
+                    let _ = tx.send(AdapterEvent::ContentChunk {
+                        turn_id,
+                        kind: ContentKind::Text,
+                        text: "ack".to_owned(),
+                    });
+                    let _ = tx.send(AdapterEvent::TurnEnd {
+                        turn_id,
+                        outcome: TurnOutcome::Completed,
+                        ended_at: Utc::now(),
+                        usage: Some(TurnUsage {
+                            input_tokens: 100,
+                            output_tokens: 25,
+                            cached_input_tokens: None,
+                            cache_creation_input_tokens: None,
+                            context_input_tokens: Some(100),
+                            reasoning_output_tokens: None,
+                            context_window: Some(context_window),
+                            total_cost_usd: None,
+                        }),
+                        context_window_source: Some(source),
+                        spend: None,
+                        stable_message_id: None,
+                    });
+                });
+            }
+            MockScenario::CompletesWithSpend {
+                total_cost_usd,
+                ref spend,
+                ref stable_message_id,
+            } => {
+                let spend = spend.clone();
+                let stable_message_id = stable_message_id.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send(AdapterEvent::ContentChunk {
+                        turn_id,
+                        kind: ContentKind::Text,
+                        text: "ack".to_owned(),
+                    });
+                    let _ = tx.send(AdapterEvent::TurnEnd {
+                        turn_id,
+                        outcome: TurnOutcome::Completed,
+                        ended_at: Utc::now(),
+                        usage: Some(TurnUsage {
+                            input_tokens: 100,
+                            output_tokens: 25,
+                            cached_input_tokens: None,
+                            cache_creation_input_tokens: None,
+                            context_input_tokens: Some(100),
+                            reasoning_output_tokens: None,
+                            context_window: None,
+                            total_cost_usd,
+                        }),
+                        context_window_source: None,
+                        spend,
+                        stable_message_id,
                     });
                 });
             }
@@ -333,6 +433,9 @@ impl HarnessAdapter for MockHarnessAdapter {
                         outcome: TurnOutcome::Completed,
                         ended_at: Utc::now(),
                         usage: None,
+                        context_window_source: None,
+                        stable_message_id: None,
+                        spend: None,
                     });
                 });
             }
@@ -350,6 +453,9 @@ impl HarnessAdapter for MockHarnessAdapter {
                         outcome: TurnOutcome::Completed,
                         ended_at: Utc::now(),
                         usage: None,
+                        context_window_source: None,
+                        stable_message_id: None,
+                        spend: None,
                     });
                 });
             }

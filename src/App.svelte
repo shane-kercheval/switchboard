@@ -157,6 +157,9 @@
   const activeProject = $derived(
     projects.list.find((p) => p.id === selection.activeProjectId) ?? null,
   );
+  const projectSwitching = $derived(
+    selection.activeProjectId !== null && selection.loadingProjectId === selection.activeProjectId,
+  );
   // The projects sidebar is a project picker — with no projects there's
   // nothing to pick, so it (and its re-open toggle) hide entirely; the
   // welcome screen carries the New/Add affordances and Settings moves to the
@@ -369,7 +372,7 @@
               </Button>
             {/snippet}
           </EmptyState>
-        {:else if !rosterLoaded}
+        {:else if projectSwitching || !rosterLoaded}
           <EmptyState testid="project-loading" title="Loading project…" />
         {:else if activeAgents.length === 0}
           <div class="flex flex-1 flex-col overflow-y-auto">

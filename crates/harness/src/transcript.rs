@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use switchboard_core::AgentId;
 
-use crate::events::{ContentKind, McpServerStatus, ToolKind, TurnId, TurnUsage};
+use crate::events::{ContentKind, McpServerStatus, ToolKind, TurnId, TurnSpend, TurnUsage};
 
 /// One reconstructed turn. Discriminated by `role` matching the event-vocabulary
 /// convention. User turns carry just the prompt text; agent turns carry the
@@ -38,6 +38,21 @@ pub enum Turn {
         status: TurnStatus,
         items: Vec<TurnItem>,
         usage: Option<TurnUsage>,
+        /// Per-turn real-spend attribution restored on reopen. The session-file
+        /// parser leaves this `None`; the app's metadata overlay fills it from
+        /// the durable `turnmeta` sidecar by joining on `stable_message_id`, so
+        /// the inline cost/overage surface survives restart (M4). `None` for
+        /// non-real-spend turns and pre-feature turns (no backfill).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        spend: Option<TurnSpend>,
+        /// The final assistant message's Anthropic `message.id` (Claude only) —
+        /// the join key the overlay uses to look up this turn's persisted
+        /// cost/overage. Internal plumbing: set by the session-file parser,
+        /// consumed by the app overlay (which runs before serialization), then
+        /// **never serialized** — `skip_serializing` keeps it off the IPC wire so
+        /// the frontend never sees a field the backend treats as private.
+        #[serde(default, skip_serializing)]
+        stable_message_id: Option<String>,
     },
 }
 
@@ -239,6 +254,8 @@ mod tests {
                 },
             ],
             usage: None,
+            spend: None,
+            stable_message_id: None,
         };
         let value = serde_json::to_value(&turn).unwrap();
         assert_eq!(value["role"], "agent");

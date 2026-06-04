@@ -27,8 +27,8 @@ use switchboard_dispatcher::{
     SessionLocatorSink,
 };
 use switchboard_harness::{
-    CancelSource, DispatchOptions, HarnessAdapter, MessageId, MockHarnessAdapter, MockScenario,
-    RateLimitSource, TurnId, TurnOutcome,
+    CancelSource, ContextWindowSource, DispatchOptions, HarnessAdapter, MessageId,
+    MockHarnessAdapter, MockScenario, RateLimitSource, TurnId, TurnOutcome, TurnSpend,
 };
 use uuid::Uuid;
 
@@ -219,12 +219,19 @@ impl ConversationJournal for RecordingJournal {
     }
 }
 
-/// Captures metadata-cache calls so the durability-gate test can assert the
-/// dispatcher persists `StreamOnly` rate-limit payloads and skips
-/// `SessionFileBacked` ones, with a roughly-now `captured_at`.
+/// Captures metadata-cache calls so the durability-gate tests can assert the
+/// dispatcher persists `StreamOnly` rate-limit payloads (skipping
+/// `SessionFileBacked` ones) and `StreamOnly` context windows, with a
+/// roughly-now `captured_at`.
+/// One recorded `record_turn_spend` call: agent, the message-id join key, the
+/// turn's cost, the overage snapshot, and the capture time.
+type TurnSpendCall = (AgentId, String, Option<f64>, TurnSpend, DateTime<Utc>);
+
 #[derive(Default)]
 struct RecordingMetadataCache {
     calls: Mutex<Vec<(AgentId, serde_json::Value, DateTime<Utc>)>>,
+    context_window_calls: Mutex<Vec<(AgentId, u32, DateTime<Utc>)>>,
+    turn_spend_calls: Mutex<Vec<TurnSpendCall>>,
 }
 
 impl MetadataCache for RecordingMetadataCache {
@@ -238,6 +245,35 @@ impl MetadataCache for RecordingMetadataCache {
             .lock()
             .unwrap()
             .push((agent_id, info, captured_at));
+    }
+
+    fn record_context_window(
+        &self,
+        agent_id: AgentId,
+        context_window: u32,
+        captured_at: DateTime<Utc>,
+    ) {
+        self.context_window_calls
+            .lock()
+            .unwrap()
+            .push((agent_id, context_window, captured_at));
+    }
+
+    fn record_turn_spend(
+        &self,
+        agent_id: AgentId,
+        message_id: String,
+        total_cost_usd: Option<f64>,
+        spend: TurnSpend,
+        captured_at: DateTime<Utc>,
+    ) {
+        self.turn_spend_calls.lock().unwrap().push((
+            agent_id,
+            message_id,
+            total_cost_usd,
+            spend,
+            captured_at,
+        ));
     }
 }
 
@@ -905,6 +941,227 @@ async fn session_file_backed_rate_limit_is_not_persisted() {
     assert!(
         metadata.calls.lock().unwrap().is_empty(),
         "SessionFileBacked rate-limit must NOT be persisted (harness file is canonical)"
+    );
+}
+
+#[tokio::test]
+async fn stream_only_context_window_is_persisted_to_metadata_cache() {
+    // Restart-continuity gate: a TurnEnd carrying a StreamOnly context window
+    // (class-C — Claude's `result.modelUsage`) must be recorded to the metadata
+    // cache so the context bar renders on reopen. Keyed on the running agent.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let metadata = Arc::new(RecordingMetadataCache::default());
+    let before = Utc::now();
+    let factory = TestFactory::sequence_with_metadata(
+        [MockScenario::CompletesWithContextWindow {
+            context_window: 200_000,
+            source: ContextWindowSource::StreamOnly,
+        }],
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+        Arc::clone(&metadata) as Arc<dyn MetadataCache>,
+    );
+
+    dispatcher
+        .send_message(agent.id, "hello", Uuid::now_v7(), factory, OnBusy::Enqueue)
+        .await;
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+    let after = Utc::now();
+
+    let calls = metadata.context_window_calls.lock().unwrap();
+    assert_eq!(
+        calls.len(),
+        1,
+        "a StreamOnly context window must be persisted exactly once"
+    );
+    let (recorded_agent, context_window, captured_at) = &calls[0];
+    assert_eq!(*recorded_agent, agent.id);
+    assert_eq!(*context_window, 200_000);
+    assert!(
+        *captured_at >= before && *captured_at <= after,
+        "captured_at must be stamped at record time (roughly now)"
+    );
+}
+
+#[tokio::test]
+async fn session_file_backed_context_window_is_not_persisted() {
+    // Durability gate, negative case: a SessionFileBacked context window
+    // (class-B, already durable in Codex's own session file) must NOT be
+    // shadow-cached to the metadata sidecar — mirrors the rate-limit gate.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let metadata = Arc::new(RecordingMetadataCache::default());
+    let factory = TestFactory::sequence_with_metadata(
+        [MockScenario::CompletesWithContextWindow {
+            context_window: 272_000,
+            source: ContextWindowSource::SessionFileBacked,
+        }],
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+        Arc::clone(&metadata) as Arc<dyn MetadataCache>,
+    );
+
+    dispatcher
+        .send_message(agent.id, "hello", Uuid::now_v7(), factory, OnBusy::Enqueue)
+        .await;
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+
+    assert!(
+        metadata.context_window_calls.lock().unwrap().is_empty(),
+        "SessionFileBacked context window must NOT be persisted (harness file is canonical)"
+    );
+}
+
+#[tokio::test]
+async fn real_spend_turn_with_message_id_is_persisted_to_metadata_cache() {
+    // Restart-continuity gate: a TurnEnd carrying a real-spend `spend` and a
+    // join key (`stable_message_id`) must be recorded so the inline cost +
+    // overage marker re-attaches on reopen. Keyed on the running agent + the
+    // turn's message id.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let metadata = Arc::new(RecordingMetadataCache::default());
+    let before = Utc::now();
+    let factory = TestFactory::sequence_with_metadata(
+        [MockScenario::CompletesWithSpend {
+            total_cost_usd: Some(0.0125),
+            spend: Some(TurnSpend {
+                real_spend: true,
+                is_overage: true,
+                overage_resets_at: None,
+            }),
+            stable_message_id: Some("msg_test31".to_owned()),
+        }],
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+        Arc::clone(&metadata) as Arc<dyn MetadataCache>,
+    );
+
+    dispatcher
+        .send_message(agent.id, "hello", Uuid::now_v7(), factory, OnBusy::Enqueue)
+        .await;
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+    let after = Utc::now();
+
+    let calls = metadata.turn_spend_calls.lock().unwrap();
+    assert_eq!(
+        calls.len(),
+        1,
+        "a real-spend turn with a message id must be persisted exactly once"
+    );
+    let (recorded_agent, message_id, cost, spend, captured_at) = &calls[0];
+    assert_eq!(*recorded_agent, agent.id);
+    assert_eq!(message_id, "msg_test31");
+    assert_eq!(*cost, Some(0.0125));
+    assert!(spend.is_overage);
+    assert!(
+        *captured_at >= before && *captured_at <= after,
+        "captured_at must be stamped at record time (roughly now)"
+    );
+}
+
+#[tokio::test]
+async fn non_real_spend_turn_is_not_persisted() {
+    // Gate, negative case: a TurnEnd whose `spend.real_spend` is false (a
+    // normal-quota Claude turn) must NOT be persisted — the cost/overage
+    // surface only renders on real-spend turns, so there's nothing durable to
+    // re-attach.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let metadata = Arc::new(RecordingMetadataCache::default());
+    let factory = TestFactory::sequence_with_metadata(
+        [MockScenario::CompletesWithSpend {
+            total_cost_usd: Some(0.5),
+            spend: Some(TurnSpend {
+                real_spend: false,
+                is_overage: false,
+                overage_resets_at: None,
+            }),
+            stable_message_id: Some("msg_normal".to_owned()),
+        }],
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+        Arc::clone(&metadata) as Arc<dyn MetadataCache>,
+    );
+
+    dispatcher
+        .send_message(agent.id, "hello", Uuid::now_v7(), factory, OnBusy::Enqueue)
+        .await;
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+
+    assert!(
+        metadata.turn_spend_calls.lock().unwrap().is_empty(),
+        "a non-real-spend turn must NOT be persisted (nothing renders on reopen)"
+    );
+}
+
+#[tokio::test]
+async fn real_spend_turn_without_message_id_is_not_persisted() {
+    // Gate, negative case: without a join key (`stable_message_id`) the record
+    // could not be re-attached on reopen, so it must NOT be persisted even
+    // though the turn is real-spend. Gates on key presence, not harness.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let metadata = Arc::new(RecordingMetadataCache::default());
+    let factory = TestFactory::sequence_with_metadata(
+        [MockScenario::CompletesWithSpend {
+            total_cost_usd: Some(0.0125),
+            spend: Some(TurnSpend {
+                real_spend: true,
+                is_overage: true,
+                overage_resets_at: None,
+            }),
+            stable_message_id: None,
+        }],
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+        Arc::clone(&metadata) as Arc<dyn MetadataCache>,
+    );
+
+    dispatcher
+        .send_message(agent.id, "hello", Uuid::now_v7(), factory, OnBusy::Enqueue)
+        .await;
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+
+    assert!(
+        metadata.turn_spend_calls.lock().unwrap().is_empty(),
+        "a real-spend turn without a join key must NOT be persisted (un-rejoinable)"
     );
 }
 

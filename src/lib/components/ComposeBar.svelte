@@ -15,6 +15,7 @@
     type ComposeContent,
     type PromptContent,
   } from "$lib/state/composeStore";
+  import { recordProjectsActivityLocally } from "$lib/state/workspace.svelte";
   import * as api from "$lib/api";
   import type { AgentId, AgentRecord, ProjectId, Prompt } from "$lib/types";
   import { buildRenderArgs, combinePromptMessage, missingRequiredArgs } from "$lib/prompt";
@@ -25,7 +26,7 @@
   import PromptMenu from "$lib/components/PromptMenu.svelte";
   import PromptComposer from "$lib/components/PromptComposer.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
-  import { cn } from "$lib/utils";
+  import { cn, currentIsoTimestamp } from "$lib/utils";
   import { shortcut } from "$lib/platform";
   import { onDestroy, onMount, untrack } from "svelte";
   import { listen } from "@tauri-apps/api/event";
@@ -210,6 +211,23 @@
     return [roster[0]!.id];
   }
 
+  // Mod+K (focus the message box) ignores the chord while a dialog is open or
+  // while another editable element is focused, so it only ever pulls focus to
+  // this composer's textarea.
+  function isEditableShortcutTarget(target: EventTarget | null): boolean {
+    if (!(target instanceof HTMLElement)) return false;
+    return (
+      target.isContentEditable ||
+      target.tagName === "INPUT" ||
+      target.tagName === "TEXTAREA" ||
+      target.tagName === "SELECT"
+    );
+  }
+
+  function hasOpenDialog(): boolean {
+    return document.querySelector('[role="dialog"], [role="alertdialog"]') !== null;
+  }
+
   // Keyboard routes to the recipient chips, working even while typing (the
   // modifier chord inserts no text). Window-level so they fire regardless of
   // focus. Mod+Shift+A selects every agent; Mod+1..9 toggles the Nth agent
@@ -222,6 +240,14 @@
   // Escape is left alone for whatever else owns it.
   $effect(() => {
     function onKeydown(e: KeyboardEvent): void {
+      const mod = e.metaKey || e.ctrlKey;
+      if (mod && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "k") {
+        if (hasOpenDialog()) return;
+        if (isEditableShortcutTarget(e.target) && e.target !== textareaEl) return;
+        e.preventDefault();
+        textareaEl?.focus();
+        return;
+      }
       if (e.key === "Escape") {
         if (composeEl === undefined || !composeEl.contains(document.activeElement)) return;
         // First dismiss whichever menu is open, otherwise clear the recipient
@@ -238,7 +264,6 @@
         }
         return;
       }
-      const mod = e.metaKey || e.ctrlKey;
       if (!mod || e.altKey) return;
       if (e.key === "Enter") {
         if (mode === "prompt" && composeEl?.contains(document.activeElement)) {
@@ -270,9 +295,9 @@
       .filter((a): a is AgentRecord => a !== undefined),
   );
 
-  /// `@`-quick-add: a trailing `@token` opens a typeahead of *unselected*
-  /// agents; Enter / click adds the highlighted one and strips the token. This
-  /// is the keyboard route to selecting recipients without touching the mouse.
+  /// `@` recipient picker: a trailing `@token` opens a typeahead of all agents;
+  /// Enter / click picks one as the sole recipient and strips the token. This is
+  /// the keyboard route to selecting recipients without touching the mouse.
   let menuOpen = $state(false);
   let menuEl = $state<HTMLDivElement | undefined>(undefined);
   let menuQuery = $state("");
@@ -289,16 +314,11 @@
   const MENU_WIDTH = 256;
 
   const agentCandidates = $derived(
-    menuOpen
-      ? agents.filter(
-          (a) =>
-            !selectedIds.includes(a.id) && a.name.toLowerCase().includes(menuQuery.toLowerCase()),
-        )
-      : [],
+    menuOpen ? agents.filter((a) => a.name.toLowerCase().includes(menuQuery.toLowerCase())) : [],
   );
 
   /// The menu's navigable rows: file matches render first in their own section,
-  /// then recipient actions and unselected agents. **All** appears only when not
+  /// then recipient actions and matching agents. **All** appears only when not
   /// everyone is selected and its keyword matches the query; **Clear** only when
   /// something is selected and its keyword matches. Even though files render
   /// first, keyboard selection prefers a matched agent when one exists.
@@ -670,6 +690,9 @@
   /// mid-render can't redirect the send).
   function dispatchToRecipients(text: string, targets: AgentRecord[]): void {
     const sendId = crypto.randomUUID();
+    // Bump this project's local last-activity so it sorts/reads as active right
+    // away, before any turn event round-trips. Once per send action.
+    recordProjectsActivityLocally([projectId], currentIsoTimestamp());
     for (const agent of targets) {
       const userTurnId = crypto.randomUUID();
       dispatchUserTurn(agent.id, userTurnId, text, sendId);
@@ -713,10 +736,13 @@
         return;
       }
       sending = false;
-      // The user may have backed out during the render (removed/swapped the
-      // prompt, or cleared recipients). Honor that: abort without dispatching and
-      // without resetting their new composer state.
-      if (selectedPrompt !== prompt || targets.length === 0) return;
+      // The user may have backed out during the render: removed/swapped the
+      // prompt, or deselected a chosen recipient. Honor that — abort without
+      // dispatching and without resetting their new composer state. (Adding a
+      // recipient mid-render is not an abort: the send commits to the recipients
+      // chosen at click time; a newly-added one wasn't part of this send.)
+      const stillSelected = new Set(selectedIds);
+      if (selectedPrompt !== prompt || targets.some((t) => !stillSelected.has(t.id))) return;
       dispatchToRecipients(finalText, targets);
       // Prompt selection is not sticky: a successful send returns to the plain
       // composer (recipients stay selected). Appended text is consumed, not
@@ -898,30 +924,39 @@
             <div class="max-h-48 overflow-y-auto" data-testid="file-options-scroll">
               {#each fileItems as item (item.key)}
                 {@const i = menuItems.findIndex((candidate) => candidate.key === item.key)}
-                <button
-                  type="button"
-                  class={"hover:bg-panel/80 flex w-full cursor-pointer items-center gap-2 rounded-md px-2.5 py-1 text-left leading-5 outline-none select-none " +
-                    (i === highlighted ? "bg-panel/80" : "")}
-                  data-testid={`file-option-${item.path}`}
-                  role="option"
-                  aria-selected={i === highlighted}
-                  onclick={() => pickItem(item)}
-                >
-                  <svg
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="1.8"
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                    class="text-muted h-4 w-4 shrink-0"
-                    aria-hidden="true"
-                  >
-                    <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
-                    <path d="M14 3v5h5" />
-                  </svg>
-                  <span class="text-fg truncate">{item.path}</span>
-                </button>
+                <Tooltip label={item.path} side="right" delayDuration={0}>
+                  {#snippet trigger(props)}
+                    <button
+                      {...props}
+                      type="button"
+                      class={"hover:bg-panel/80 flex w-full cursor-pointer items-center gap-2 rounded-md px-2.5 py-1 text-left leading-5 outline-none select-none " +
+                        (i === highlighted ? "bg-panel/80" : "")}
+                      data-testid={`file-option-${item.path}`}
+                      role="option"
+                      aria-selected={i === highlighted}
+                      onclick={() => pickItem(item)}
+                    >
+                      <svg
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="1.8"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        class="text-muted h-4 w-4 shrink-0"
+                        aria-hidden="true"
+                      >
+                        <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
+                        <path d="M14 3v5h5" />
+                      </svg>
+                      <span
+                        class="text-fg min-w-0 truncate text-left"
+                        dir="rtl"
+                        data-testid="file-option-label">{item.path}</span
+                      >
+                    </button>
+                  {/snippet}
+                </Tooltip>
               {/each}
               {#if fileStatusText !== null}
                 <div
@@ -1003,6 +1038,7 @@
         {/if}
         <Textarea
           data-testid="compose-textarea"
+          data-shortcut-scope="composer"
           placeholder="Type a message…  (⌘+Enter to send, @ to add a recipient, / for a prompt)"
           rows={3}
           bind:ref={textareaEl}

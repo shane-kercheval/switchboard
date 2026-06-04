@@ -285,19 +285,55 @@
   </div>
 {/snippet}
 
-{#snippet messageMeta(at: string, copyable: string, label: string, mt = "mt-1")}
-  <div
-    class={`${mt} flex items-center justify-end gap-2 opacity-0 group-focus-within:opacity-100 group-hover:opacity-100`}
-    data-testid="message-meta"
-  >
-    {#if at}
-      <time class="text-muted text-xs" datetime={at} title={at} data-testid="message-time"
-        >{formatTime(at)}</time
-      >
-    {/if}
-    {#if copyable}
-      <CopyButton text={copyable} {label} testid="message-copy" />
-    {/if}
+{#snippet messageMeta(
+  at: string,
+  copyable: string,
+  label: string,
+  mt = "mt-1",
+  spend: AgentTurn["spend"] = undefined,
+  costUsd: number | null | undefined = undefined,
+)}
+  <!-- `justify-between` pins the always-visible spend group to the LEFT and the
+       hover-revealed timestamp/copy to the RIGHT. The left group is always
+       rendered (empty when not real-spend) so a no-spend row still keeps
+       timestamp/copy right-aligned — and the spend never floats mid-row when
+       nothing is hovered. -->
+  <div class={`${mt} flex items-center justify-between gap-2`} data-testid="message-meta">
+    <!-- Left: cost + overage marker, always visible. Two distinct gates (no
+         `match harness`): the **cost** shows on `spend.real_spend` (the turn
+         cost real money — for subscription Claude that's overage, since
+         `total_cost_usd` is otherwise notional); the **"using credits" marker**
+         shows on `spend.is_overage` specifically. They coincide for Claude, but
+         a future pay-per-use harness would set `real_spend` without `is_overage`
+         → cost shows, marker correctly stays hidden. Caller passes `spend`/
+         `costUsd` only at agent-turn sites; a real-money signal isn't hover-hidden. -->
+    <div class="flex items-center gap-2">
+      {#if spend?.is_overage}
+        <span
+          class="text-warning text-xs"
+          data-testid="message-overage"
+          title={spend.overage_resets_at
+            ? `Spending overage credits — window resets ${new Date(spend.overage_resets_at).toLocaleString()}`
+            : "Spending overage credits"}>⚡ using credits</span
+        >
+      {/if}
+      {#if spend?.real_spend && costUsd != null}
+        <span class="text-muted text-xs" data-testid="message-cost">${costUsd.toFixed(4)}</span>
+      {/if}
+    </div>
+    <!-- Right: timestamp + copy stay hover/focus-revealed (unchanged). -->
+    <div
+      class="flex items-center gap-2 opacity-0 group-focus-within:opacity-100 group-hover:opacity-100"
+    >
+      {#if at}
+        <time class="text-muted text-xs" datetime={at} title={at} data-testid="message-time"
+          >{formatTime(at)}</time
+        >
+      {/if}
+      {#if copyable}
+        <CopyButton text={copyable} {label} testid="message-copy" />
+      {/if}
+    </div>
   </div>
 {/snippet}
 
@@ -363,7 +399,14 @@
       {@render turnStatusLabel(turn.status)}
       {@render turnBody(turn)}
     </div>
-    {@render messageMeta(turn.started_at, copyable, "Copy message")}
+    {@render messageMeta(
+      turn.started_at,
+      copyable,
+      "Copy message",
+      "mt-1",
+      turn.spend,
+      turn.usage?.total_cost_usd,
+    )}
   </div>
 {/snippet}
 

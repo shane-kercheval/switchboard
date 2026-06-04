@@ -27,6 +27,7 @@
   ];
 
   const shortcuts = [
+    { action: "Focus message box", keys: ["⌘", "K"] },
     { action: "Toggle projects sidebar", keys: ["⌘", "B"] },
     { action: "Toggle agents sidebar", keys: ["⌘", "⇧", "B"] },
     { action: "Toggle both sidebars", keys: ["⌘", "⌥", "B"] },

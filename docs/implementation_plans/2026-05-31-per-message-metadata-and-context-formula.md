@@ -8,7 +8,7 @@ Fixes three related defects the user observed on agent cards and consolidates tw
 
 This plan absorbs and replaces two 2026-05-18 notes (both "investigation needed," never implemented). Delete them when this plan's milestones land; do not leave them as live notes.
 
-- [`2026-05-18-note-claude-context-cache-formula.md`](2026-05-18-note-claude-context-cache-formula.md) — the context bar ignores prompt-cache tokens (→ Milestone 1).
+- `2026-05-18-note-claude-context-cache-formula.md` (deleted — resolved by Milestone 1) — the context bar ignored prompt-cache tokens; the cache-aware occupancy formula landed in M1.
 - `2026-05-18-note-claude-cost-context-persistence.md` (deleted — resolved by Milestones 2 and 4) — cost/context vanished on project reopen because they're stream-only; context-window persistence landed in M2 and per-turn cost/overage persistence in M4.
 
 It also picks up the **per-message metadata attribution** that [`2026-05-27-harness-failure-metadata-surfacing.md`](2026-05-27-harness-failure-metadata-surfacing.md) explicitly deferred ("Correlating which messages happened during overage was considered and deferred; if ever needed it lands additively in the journal at turn-start"). That plan's Milestone 3 built a per-*agent* `meta.json` snapshot for the rate-limit payload; this plan adds the per-*turn* dimension it left out.

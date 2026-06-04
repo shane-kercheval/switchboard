@@ -19,10 +19,10 @@ This orchestration model has a useful side effect for prompt management. Because
 - **Reusable, parameterized workflows.** Workflows are files that compose primitives — invoked by name, parameterized at invocation time.
 - **Agent-friendly authoring.** Workflow files and other authorable artifacts (local prompts, project setup) are documented in instruction docs under `docs/agent-instructions/` designed for AI coding agents to consume. The intended authoring path is to point an existing Claude Code, Codex, or Gemini agent at the relevant instruction file and ask it to generate the artifact from a description, rather than learning the DSL by hand.
 - **Autonomous workflow execution.** A workflow continues to run after launch so the user can switch focus to other work without babysitting it (within the lifetime of the Switchboard host process; see §7).
-- **Configurable prompt providers.** Apply prompt templates from one or more configured prompt providers during routing, with parameterized substitution. Providers include a built-in local file store (prompts authored as files inside the project or the user's Switchboard config directory) and any MCP server that exposes prompts (for example [Tiddly](https://tiddly.me)). Provider configuration is centralized in Switchboard, so a user's prompt library works identically across Claude Code, Codex, and future agent backends without per-agent MCP setup. Does not extend to MCP *tools* or to model-discovered *skills*, which remain per-agent concerns.
+- **Configurable prompt providers.** Apply prompt templates from one or more configured prompt providers during routing, with parameterized substitution. Providers include a built-in local file store (prompts authored as files in the user's Switchboard config directory or a personal prompt-library directory) and any MCP server that exposes prompts (for example [Tiddly](https://tiddly.me)). Provider configuration is centralized in Switchboard, so a user's prompt library works identically across Claude Code, Codex, and future agent backends without per-agent MCP setup. Does not extend to MCP *tools* or to model-discovered *skills*, which remain per-agent concerns.
 - **Zero-setup onboarding.** Switchboard ships with example prompts and example workflows in the local store so a new user can invoke a useful workflow within minutes of installation, without configuring an MCP server.
 - **Full access to the underlying harness.** Switchboard drives Claude Code, Codex, Gemini, and Antigravity; it doesn't replace them.
-- **Shareable, versioned configuration.** Workflows, local prompts, and project configuration are file-based and live inside the project's `.switchboard/` directory, so they version, diff, review, and share via the user's normal git workflow.
+- **Shareable, versioned configuration.** Workflows and project configuration are file-based and live inside the project's `.switchboard/` directory, so they version, diff, review, and share via the user's normal git workflow. Local prompts are likewise file-based and git-friendly, but live in user-global directories (e.g. a personal `~/repos/my-prompts/` library) rather than per-project — see §6.
 
 ### Non-goals
 
@@ -69,7 +69,6 @@ Switchboard-managed state lives in a `.switchboard/` directory at the working di
 └── .switchboard/
     ├── config.yaml             # directory-level config (placeholder in v1; mostly empty)
     ├── workflows/              # workflow definitions (YAML), shared across projects in this directory
-    ├── prompts/                # local prompts (markdown body + YAML frontmatter), shared across projects
     ├── projects.jsonl          # index of projects: { id, name, created_at } — appended on
     │                           #   create, rewritten in place on rename/delete
     │                           #   (like registry.jsonl)
@@ -89,8 +88,8 @@ Switchboard-managed state lives in a `.switchboard/` directory at the working di
 
 ~/.config/switchboard/          # user-global config (illustrative Linux/XDG path; resolved via the `directories` crate —
 │                               #   on macOS this is ~/Library/Application Support/switchboard/)
-├── config.yaml                 # personal preferences (prompt library location, accounts)
-├── prompts/                    # optional personal prompt library (see §6)
+├── config.yaml                 # personal preferences + prompt providers (local_prompt_dirs, mcp_providers — see §6)
+├── prompts/                    # default local prompt store (seeded with example prompts on first run — see §6)
 └── workspace.yaml              # app-managed: the working directories the user works across,
                                 #   each with a cached snapshot of its projects, plus the
                                 #   user-global set of archived project ids (view-state)
@@ -98,9 +97,9 @@ Switchboard-managed state lives in a `.switchboard/` directory at the working di
 
 Switchboard is **single-instance**: launching it again focuses the running window rather than starting a second process, so there is exactly one writer of `workspace.yaml`. The per-project `instance.lock` (below) remains as defense-in-depth for the pathological case of two processes (e.g. a dev build alongside the bundled app); multi-window is out of scope for v1.
 
-**What's directory-scoped vs project-scoped:** workflows and local prompts are directory-scoped — defined once per repo, reusable across projects. Agents, runtime state, workflow runs, and harness session links are project-scoped — each project has its own. Rationale: workflow definitions and prompt libraries are about *how to do the work*; they belong to the repo. Agents and runtime state are about *the work in progress*; they belong to the project (the task).
+**What's directory-scoped vs project-scoped vs user-global:** workflows are directory-scoped — defined once per repo, reusable across projects in that directory. Agents, runtime state, workflow runs, and harness session links are project-scoped — each project has its own. Prompt providers (local directories + MCP servers) are **user-global** — configured once at the user level and available in every project regardless of directory (see §6). Rationale: workflow definitions are about *how to do the work in this repo*; they belong to the directory. Agents and runtime state are about *the work in progress*; they belong to the project. Prompt libraries are personal, portable templates; they belong to the user.
 
-The directory-level `config.yaml`, `workflows/`, and `prompts/` are intended to be checked into git and shared. Everything else — `projects.jsonl`, the entire `projects/` tree (including per-project `config.yaml`, `registry.jsonl`, `journal.jsonl`, `sessions/`, `runs/`), and lock files — is local-machine runtime data and should be `.gitignore`d.
+The directory-level `config.yaml` and `workflows/` are intended to be checked into git and shared. (Local prompts are user-global, not directory-scoped — there is no per-directory `prompts/` store; see §6.) Everything else — `projects.jsonl`, the entire `projects/` tree (including per-project `config.yaml`, `registry.jsonl`, `journal.jsonl`, `sessions/`, `runs/`), and lock files — is local-machine runtime data and should be `.gitignore`d.
 
 ### Working directories and the workspace
 
@@ -226,7 +225,7 @@ A general-purpose DAG scheduler (topological sort over arbitrary node dependenci
 
 ## 5. Workflows
 
-A **workflow** is a named, parameterized composition of the primitives in §4, defined as a directory-scoped YAML file under `<directory>/.switchboard/workflows/` (shared across the projects in that working directory). Invoking a workflow fills in its parameters and runs it. Directory-scoped resources (workflows, local prompts) resolve relative to the owning directory of the project the workflow runs against — there is no single "current" directory in the flat workspace model.
+A **workflow** is a named, parameterized composition of the primitives in §4, defined as a directory-scoped YAML file under `<directory>/.switchboard/workflows/` (shared across the projects in that working directory). Invoking a workflow fills in its parameters and runs it. Workflows resolve relative to the owning directory of the project the workflow runs against — there is no single "current" directory in the flat workspace model. (Prompts, by contrast, are user-global — see §6.)
 
 Workflow definition format (illustrative; the authoritative schema is `docs/workflow-spec.md`):
 
@@ -284,12 +283,14 @@ A **prompt** is a reusable, optionally parameterized text template — for examp
 
 Two providers ship in v1:
 
-- **Local file store.** Prompts authored as files (markdown body with YAML frontmatter for metadata: name, description, arguments). Resolved across one or more directories: a fixed directory scope at `<directory>/.switchboard/prompts/` (shared across all projects in that working directory; see §3), plus an ordered list of user-configured directories (`local_prompt_dirs` in config — see "Configuring local prompt directories" below). This lets a power user keep their personal prompt library in their own git repo (e.g. `~/repos/my-prompts/`) instead of being limited to the OS-conventional app data directory. The local store is the lowest-friction way to author a prompt and the mechanism Switchboard uses to ship example prompts.
+- **Local file store.** Prompts authored as files (markdown body with YAML frontmatter for metadata: name, description, arguments). Resolved across an ordered list of user-configured directories (`local_prompt_dirs` in config — see "Configuring prompt providers" below), defaulting to the OS-conventional app data directory. This lets a power user keep their personal prompt library in their own git repo (e.g. `~/repos/my-prompts/`). The local store is the lowest-friction way to author a prompt and the mechanism Switchboard uses to ship example prompts.
+
+> **Prompt providers are global.** A configured local directory or MCP provider is available across **every** project, regardless of which working directory the project lives in. Prompts are a personal library, configured once at the user level — not a per-directory or per-project concern. (An earlier draft scoped prompt config per working directory; that was dropped as needless complexity for a use case v1 doesn't have. Repo-shipped, git-tracked team prompts can return later as an additive feature without changing this global model.)
 - **MCP-server provider.** Resolves IDs against any MCP server the user has configured that exposes prompts. [Tiddly](https://tiddly.me) is the canonical example and the development reference, but the integration is generic: pointing Switchboard at a different MCP prompt server is a configuration change, not a code change.
 
 ### Authoring a local prompt
 
-A local prompt is a single file. Example (`<directory>/.switchboard/prompts/code-review.md`):
+A local prompt is a single file. Example (`~/.config/switchboard/prompts/code-review.md`):
 
 ```markdown
 ---
@@ -322,17 +323,9 @@ This minimal set mirrors the MCP `prompts/list` standard, plus Tiddly's tag exte
 
 **Skill-file compatibility.** Because the frontmatter shape (`name` + `description` + body) is identical to a Claude Code skill's frontmatter, a skill `.md` file can be dropped into a Switchboard prompts directory and used as a local prompt as-is. The semantics differ — a skill is invoked by the model mid-turn within a Claude Code session, whereas a Switchboard prompt is dispatched by the user via slash command — but the file format is the same, and skill bodies typically read as instructions that work fine when sent as a user message. (The reverse — a Switchboard prompt with `arguments` working as a Claude Code skill — does not hold; skills aren't parameterized.)
 
-### Configuring local prompt directories and MCP-server providers
+### Configuring prompt providers
 
-Both local prompt directories (`local_prompt_dirs`) and MCP-server providers (`mcp_providers`) are declared in YAML config at one of two scopes:
-
-- **User-global**: `~/.config/switchboard/config.yaml` (path resolved per OS via the Rust `directories` crate). For personal preferences — your prompt library location, your Tiddly account, etc.
-- **Directory-scoped**: `<directory>/.switchboard/config.yaml`. Adds or replaces user-global config. Useful when a team workflow needs a specific MCP provider (e.g., a team Tiddly URL distinct from the user's personal one) or when a repo ships its own curated set of prompt directories. Shared across all projects in that working directory.
-
-Resolution rules differ slightly between the two keys:
-
-- **`local_prompt_dirs`**: directory's list, if set, *replaces* the user-global list (directory intent is explicit).
-- **`mcp_providers`**: directory providers shadow user-global providers with the same `name` (entry-level merge); the user's other providers stay available.
+Both local prompt directories (`local_prompt_dirs`) and MCP-server providers (`mcp_providers`) are declared in **user-global** YAML config — `~/.config/switchboard/config.yaml` (path resolved per OS via the Rust `directories` crate). There is no directory- or project-scoped prompt config: a provider configured here is available in every project the user opens.
 
 **Example config:**
 
@@ -344,26 +337,22 @@ local_prompt_dirs:
   - ~/repos/my-prompts-library      # personal git-managed library
   - ~/.config/switchboard/prompts   # OS-conventional default; explicitly include if you want it
 
+# MCP prompt servers, added via Settings → "Add MCP server". Only the
+# non-secret name + URL live here; the bearer token (if any) is stored in
+# the OS keychain, keyed by the provider name — never in this file.
 mcp_providers:
-  - name: tiddly                    # used as the prefix (tiddly:my-prompt)
-    preset: tiddly                  # first-class preset; only requires a token
-    token: ${TIDDLY_PAT}            # env var reference
+  - name: tiddly                    # the prefix (tiddly:my-prompt); a Tiddly PAT
+    transport:                      #   is pasted into the form and stored in the keychain
+      type: http
+      url: https://prompts-mcp.tiddly.me/mcp
 
-  - name: my-team-mcp               # generic HTTP MCP server
+  - name: my-team-mcp
     transport:
       type: http
-      url: https://mcp.example.com
-    auth:
-      type: bearer
-      token: ${TEAM_MCP_TOKEN}
-
-  - name: my-local-stdio            # generic stdio MCP server (e.g. an npm-packaged server)
-    transport:
-      type: stdio
-      command: ["npx", "-y", "@example/mcp-server"]
+      url: https://mcp.example.com/mcp
 ```
 
-**Tiddly is a first-class preset.** The Switchboard UI offers a one-click "Connect Tiddly" action: the user pastes a Personal Access Token, and the app writes the corresponding `preset: tiddly` config entry automatically. Tiddly's URL and auth workflow are baked in. Other MCP servers require manual config (or a generic "Add MCP server" form in the UI). The presets list is open — additional first-class integrations (e.g., a future popular prompt-store MCP) can be added the same way.
+**V1: all MCP servers are added through one generic form.** Settings offers an "Add MCP server" form (name + URL + optional bearer token); the non-secret `name`/`url` are written to `config.yaml` and the token is stored in the OS keychain, never in `config.yaml`. **Tiddly is configured this way in V1** — paste a Tiddly Personal Access Token (minted in Tiddly's own UI/CLI) as the bearer, with URL `https://prompts-mcp.tiddly.me/mcp`. A **first-class one-click "Connect Tiddly" preset** (browser/Auth0 login, no token handling, a `preset: tiddly` config entry) is a **deferred post-V1 follow-up** — see the implementation plan's M5. **stdio MCP providers** are likewise deferred (V1 is HTTP-only); a `transport: { type: stdio, … }` entry is not yet supported. Both can return additively without changing the config model.
 
 ### Addressing prompts
 
@@ -378,7 +367,7 @@ The prefix is the user-chosen registration name for an MCP-server provider, so a
 
 - **Workflow files require explicit prefix.** Every prompt reference in a workflow is fully qualified (e.g. `local:code-review`, `tiddly:code-review`). This keeps workflow files portable: a workflow shared between projects always resolves to the same prompt source, regardless of how the receiving user has their providers configured. There is no concept of a "default provider" for unprefixed lookup in workflow files.
 - **Prefixed lookup is strict.** A prefixed ID resolves only against the named provider; if not found, it errors. No cross-provider fallback.
-- **Local-store resolution.** Directory scope (`<directory>/.switchboard/prompts/`) is checked first, then each directory in `local_prompt_dirs` (from directory config if present, otherwise from user config) in declared order. Default value if not configured: `[<OS-conventional path>]` (e.g. `~/.config/switchboard/prompts/` on Linux, resolved via the Rust [`directories`](https://crates.io/crates/directories) crate). A prompt with the same name in an earlier-checked directory shadows later ones — intentional, lets a working directory override a personal library, lets a personal library override a team library, etc. Directory config's `local_prompt_dirs` (if set) replaces the user-config list rather than merging, so the directory's intent is explicit.
+- **Local-store resolution.** Each directory in the user-global `local_prompt_dirs` is checked in declared order. Default if not configured: `[<OS-conventional path>]` (e.g. `~/.config/switchboard/prompts/` on Linux, resolved via the Rust [`directories`](https://crates.io/crates/directories) crate). A prompt with the same name in an earlier-listed directory shadows later ones — intentional, lets a personal library override a shipped-defaults library, etc.
 - **Interactive UI ergonomics.** When the user types a slash command in the message bar, the UI may provide autocomplete across all configured providers and may accept a bare name if it matches exactly one provider's prompt. This is a UI-layer affordance only — it does not affect how workflows or other persisted artifacts reference prompts.
 - **Prompt versioning is out of scope for v1.** Workflow references resolve to whatever the provider returns at invocation time; if a Tiddly prompt is edited, every workflow referencing it picks up the new version on the next invocation. Recovery and history are deferred to the upstream tool — Tiddly's own version history for hosted prompts, git for local prompts.
 

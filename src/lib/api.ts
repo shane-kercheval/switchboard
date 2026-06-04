@@ -9,11 +9,14 @@ import type {
   HarnessInstallStatus,
   HarnessKind,
   LoadedTranscript,
+  McpProviderInfo,
   MessageId,
   ProjectConversation,
   ProjectId,
   ProjectListing,
   ProjectSummary,
+  Prompt,
+  RenderedPrompt,
   SendId,
   WorkspaceDirectories,
 } from "./types";
@@ -223,4 +226,54 @@ export async function openExternalUrl(url: string): Promise<void> {
 
 export async function loadTranscript(agentId: AgentId): Promise<LoadedTranscript> {
   return await invoke<LoadedTranscript>("load_transcript", { agentId });
+}
+
+/// Configured MCP prompt-server providers with their status (Settings list).
+export async function listMcpProviders(): Promise<McpProviderInfo[]> {
+  return await invoke<McpProviderInfo[]>("list_mcp_providers");
+}
+
+/// Add a generic MCP server. `bearer` is `null` for an unauthenticated server;
+/// when present it is stored in the OS keychain, never in config. Triggers a
+/// background cache rebuild.
+export async function addMcpProvider(
+  name: string,
+  url: string,
+  bearer: string | null,
+): Promise<void> {
+  await invoke("add_mcp_provider", { name, url, bearer });
+}
+
+/// Remove a configured MCP server (deletes its config entry and stored token).
+export async function removeMcpProvider(name: string): Promise<void> {
+  await invoke("remove_mcp_provider", { name });
+}
+
+/// Probe a candidate server before saving; resolves to the prompt count or
+/// rejects with an actionable error.
+export async function testMcpConnection(url: string, bearer: string | null): Promise<number> {
+  return await invoke<number>("test_mcp_connection", { url, bearer });
+}
+
+/// Rebuild the cached prompt list from all providers (the Settings "Sync" action).
+export async function syncPrompts(): Promise<void> {
+  await invoke("sync_prompts");
+}
+
+/// All prompts across configured providers, from the build-once cache. Cheap and
+/// offline — never hits the network — so the compose-bar prompt picker can open
+/// against it instantly.
+export async function listPrompts(): Promise<Prompt[]> {
+  return await invoke<Prompt[]>("list_prompts");
+}
+
+/// Render `name` from `provider` with `args` to its finished text. Serves both
+/// the composer's preview and its send (the same args map for both). May touch
+/// the network (MCP `prompts/get`), so callers show a pending state.
+export async function renderPrompt(
+  provider: string,
+  name: string,
+  args: Record<string, string>,
+): Promise<RenderedPrompt> {
+  return await invoke<RenderedPrompt>("render_prompt", { provider, name, args });
 }

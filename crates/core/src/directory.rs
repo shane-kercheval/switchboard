@@ -12,14 +12,16 @@ use crate::project::{
 };
 
 use crate::paths::{
-    CONFIG_FILE, JOURNAL_FILE, PROJECTS_DIR, PROJECTS_INDEX, PROMPTS_DIR, SWITCHBOARD_DIR,
-    WORKFLOWS_DIR,
+    CONFIG_FILE, JOURNAL_FILE, PROJECTS_DIR, PROJECTS_INDEX, SWITCHBOARD_DIR, WORKFLOWS_DIR,
 };
 
 const DIRECTORY_CONFIG_VERSION: u32 = 1;
 
 /// On-disk shape of `<directory>/.switchboard/config.yaml`. Mostly empty in v1;
-/// placeholder for future MCP/harness config per system-design §6.
+/// placeholder for future directory-scoped config (it carries only a schema
+/// version today). Prompt providers are user-global, not directory-scoped —
+/// their config lives in the user-global `config.yaml` (system-design §6), not
+/// here.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DirectoryConfig {
     pub version: u32,
@@ -48,15 +50,15 @@ impl Directory {
         self.path.join(SWITCHBOARD_DIR).is_dir()
     }
 
-    /// Creates `<path>/.switchboard/{config.yaml, workflows/, prompts/,
-    /// projects.jsonl, projects/}` if missing. Idempotent — calling twice on
-    /// the same directory leaves existing structure intact.
+    /// Creates `<path>/.switchboard/{config.yaml, workflows/, projects.jsonl,
+    /// projects/}` if missing. Idempotent — calling twice on the same directory
+    /// leaves existing structure intact. (Prompts are user-global, not
+    /// directory-scoped, so there is no per-directory `prompts/` dir — see §6.)
     pub fn init(&self) -> Result<()> {
         let sb = self.switchboard_dir();
         create_dir_all(&sb).map_err(|e| CoreError::io(&sb, e))?;
         create_dir_all(sb.join(WORKFLOWS_DIR))
             .map_err(|e| CoreError::io(sb.join(WORKFLOWS_DIR), e))?;
-        create_dir_all(sb.join(PROMPTS_DIR)).map_err(|e| CoreError::io(sb.join(PROMPTS_DIR), e))?;
         create_dir_all(sb.join(PROJECTS_DIR))
             .map_err(|e| CoreError::io(sb.join(PROJECTS_DIR), e))?;
 

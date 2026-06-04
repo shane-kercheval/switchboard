@@ -790,6 +790,46 @@ describe("App", () => {
     await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
   });
 
+  it("dehighlights the previous project row as soon as a new activation starts", async () => {
+    let releaseBeta!: () => void;
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    seedProject({
+      projectId: "p-b",
+      directory: DIR_B,
+      name: "beta",
+      agents: [agent({ id: "ag-2", project_id: "p-b", name: "helper" })],
+    });
+    backend.openProjectGates.set(
+      "p-b",
+      new Promise<void>((resolve) => {
+        releaseBeta = resolve;
+      }),
+    );
+    await mountApp();
+    await waitFor(() => expect(screen.getAllByTestId("project-row")).toHaveLength(2));
+
+    const alphaRow = projectRowByName("alpha");
+    const betaRow = projectRowByName("beta");
+    await fireEvent.click(within(alphaRow).getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+    expect(alphaRow).toHaveAttribute("data-active", "true");
+
+    await fireEvent.click(within(betaRow).getByText("beta"));
+
+    expect(betaRow).toHaveAttribute("data-active", "true");
+    expect(alphaRow).toHaveAttribute("data-active", "false");
+    expect(screen.getByTestId("project-loading")).toBeInTheDocument();
+    expect(screen.queryByTestId("compose-textarea")).not.toBeInTheDocument();
+
+    releaseBeta();
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+  });
+
   it("ignores stale activation completion after switching to another project", async () => {
     let releaseAlpha!: () => void;
     backend.openProjectGates.set(

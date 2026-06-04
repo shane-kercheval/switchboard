@@ -107,7 +107,11 @@ describe("SettingsView", () => {
     await fireEvent.change(editor);
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
-        preferences: { editor_command: "cursor", terminal_app: "Terminal" },
+        preferences: {
+          editor_command: "cursor",
+          terminal_app: "Terminal",
+          diff_style: "side_by_side",
+        },
       }),
     );
 
@@ -117,7 +121,7 @@ describe("SettingsView", () => {
     await fireEvent.change(editor);
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
-        preferences: { editor_command: null, terminal_app: "Terminal" },
+        preferences: { editor_command: null, terminal_app: "Terminal", diff_style: "side_by_side" },
       }),
     );
   });
@@ -130,7 +134,7 @@ describe("SettingsView", () => {
     await fireEvent.change(terminal);
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
-        preferences: { editor_command: null, terminal_app: "iTerm" },
+        preferences: { editor_command: null, terminal_app: "iTerm", diff_style: "side_by_side" },
       }),
     );
 
@@ -139,7 +143,7 @@ describe("SettingsView", () => {
     await fireEvent.change(terminal);
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
-        preferences: { editor_command: null, terminal_app: "Terminal" },
+        preferences: { editor_command: null, terminal_app: "Terminal", diff_style: "side_by_side" },
       }),
     );
   });

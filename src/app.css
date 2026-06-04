@@ -60,6 +60,15 @@
   --status-cancelled: #71717a;
   --status-cancelled-soft: #f4f4f5;
 
+  /* diff add/remove — the one place the palette gains a green role (green-for-
+     added is near-universal in diffs, a legitimate named role per the no-hue-
+     without-a-token rule). Strong fg for the line's gutter marker; soft fill for
+     the whole line background. The only new token group the Git view adds. */
+  --diff-added: #1a7f37;
+  --diff-added-soft: #e6ffec;
+  --diff-removed: #cf222e;
+  --diff-removed-soft: #ffebe9;
+
   /* syntax highlighting — the one place the model carries colors beyond the
      neutral/accent/status roles, because legible code needs several
      distinguishable hues. Named by syntactic role, not by hue, and mapped to
@@ -124,6 +133,11 @@
   --status-cancelled: #a1a1aa;
   --status-cancelled-soft: #27272a;
 
+  --diff-added: #3fb950;
+  --diff-added-soft: #12261c;
+  --diff-removed: #f85149;
+  --diff-removed-soft: #2d1517;
+
   --syntax-comment: #8b949e;
   --syntax-keyword: #ff7b72;
   --syntax-string: #a5d6ff;
@@ -178,6 +192,11 @@
   --color-status-failed-soft: var(--status-failed-soft);
   --color-status-cancelled: var(--status-cancelled);
   --color-status-cancelled-soft: var(--status-cancelled-soft);
+
+  --color-diff-added: var(--diff-added);
+  --color-diff-added-soft: var(--diff-added-soft);
+  --color-diff-removed: var(--diff-removed);
+  --color-diff-removed-soft: var(--diff-removed-soft);
 
   --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   --font-mono:
@@ -456,9 +475,13 @@ body {
     line-height: 1.25rem;
     color: var(--fg);
   }
+}
 
-  /* Prism token classes → semantic syntax roles. Same class names in both
-     themes; the `--syntax-*` values carry the light/dark difference. */
+/* Prism token classes → semantic syntax roles. Shared by the Markdown body and
+   the Git diff view (both highlight through the same Prism path), so the mapping
+   lives once here scoped to either ancestor. Same class names in both themes;
+   the `--syntax-*` values carry the light/dark difference. */
+:is(.markdown-body, .diff-view) {
   .token.comment,
   .token.prolog,
   .token.doctype,

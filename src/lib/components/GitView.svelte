@@ -10,13 +10,22 @@
   import EmptyState from "$lib/components/ui/EmptyState.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
   import GitRepoNode from "$lib/components/GitRepoNode.svelte";
+  import WorktreeDetailPanel from "$lib/components/WorktreeDetailPanel.svelte";
   import {
     SEGMENTED_MAIN_CONTAINER_CLASS,
     SEGMENTED_MAIN_ITEM_ACTIVE_CLASS,
     SEGMENTED_MAIN_ITEM_CLASS,
     SEGMENTED_MAIN_ITEM_INACTIVE_CLASS,
   } from "$lib/components/ui/segmentedControl";
-  import { gitView, fetchStates, refreshAll, fetchAll, addRepo } from "$lib/state/gitView.svelte";
+  import {
+    gitView,
+    fetchStates,
+    refreshAll,
+    fetchAll,
+    addRepo,
+    worktreeSelection,
+    clearWorktreeSelection,
+  } from "$lib/state/gitView.svelte";
   import { pickDirectory } from "$lib/native";
 
   let branchFilter = $state<"local" | "remote" | "both">("local");
@@ -24,6 +33,32 @@
   let refreshing = $state(false);
   let adding = $state(false);
   let addError = $state<string | null>(null);
+
+  // The open detail panel (a worktree), or null. Drives the bottom split.
+  const panel = $derived(worktreeSelection.current);
+
+  // Bottom-split sizing. `splitRatio` is the tree's share of the height; the diff
+  // panel takes the rest. Session-only (decision D1) — a fresh launch resets it,
+  // like the existing sidebars. The divider drags it within sane bounds.
+  let splitEl = $state<HTMLDivElement | null>(null);
+  let splitRatio = $state(0.55);
+  let dragging = false;
+
+  function startDrag(event: PointerEvent): void {
+    dragging = true;
+    event.preventDefault();
+  }
+
+  function onDrag(event: PointerEvent): void {
+    if (!dragging || splitEl === null) return;
+    const rect = splitEl.getBoundingClientRect();
+    const ratio = (event.clientY - rect.top) / rect.height;
+    splitRatio = Math.min(0.85, Math.max(0.2, ratio));
+  }
+
+  function endDrag(): void {
+    dragging = false;
+  }
 
   const filterOptions: { value: "local" | "remote" | "both"; label: string }[] = [
     { value: "local", label: "Local" },
@@ -126,41 +161,68 @@
     </p>
   {/if}
 
-  <div class="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto p-3" data-testid="git-repo-list">
-    {#if gitView.status === "loading" && gitView.repos.length === 0}
-      <EmptyState testid="git-loading" title="Loading repositories…" />
-    {:else if gitView.status === "failed" && gitView.repos.length === 0}
-      <EmptyState
-        testid="git-failed"
-        tone="error"
-        title="Couldn't load repositories."
-        description="Try refreshing."
-      >
-        {#snippet action()}
-          <Button variant="secondary" size="sm" onclick={onGlobalRefresh}>Retry</Button>
-        {/snippet}
-      </EmptyState>
-    {:else if gitView.repos.length === 0}
-      <EmptyState
-        testid="git-empty"
-        title="No repositories tracked yet."
-        description="Repositories are tracked automatically when you add a project that lives in a git repo, or add one with Add Repo."
-      >
-        {#snippet action()}
-          <Button variant="secondary" size="sm" disabled={adding} onclick={onAddRepo}>
-            Add Repo
-          </Button>
-        {/snippet}
-      </EmptyState>
-    {:else}
-      {#each gitView.repos as listing (listing.repo.root)}
-        <GitRepoNode
-          {listing}
-          {branchFilter}
-          {showInactive}
-          fetchState={fetchStates[listing.repo.root]}
+  <div class="flex min-h-0 flex-1 flex-col" bind:this={splitEl} data-testid="git-split">
+    <div
+      class={cn("flex min-h-0 flex-col gap-2 overflow-y-auto p-3", panel === null && "flex-1")}
+      style={panel !== null ? `flex: ${splitRatio} 1 0%` : undefined}
+      data-testid="git-repo-list"
+    >
+      {#if gitView.status === "loading" && gitView.repos.length === 0}
+        <EmptyState testid="git-loading" title="Loading repositories…" />
+      {:else if gitView.status === "failed" && gitView.repos.length === 0}
+        <EmptyState
+          testid="git-failed"
+          tone="error"
+          title="Couldn't load repositories."
+          description="Try refreshing."
+        >
+          {#snippet action()}
+            <Button variant="secondary" size="sm" onclick={onGlobalRefresh}>Retry</Button>
+          {/snippet}
+        </EmptyState>
+      {:else if gitView.repos.length === 0}
+        <EmptyState
+          testid="git-empty"
+          title="No repositories tracked yet."
+          description="Repositories are tracked automatically when you add a project that lives in a git repo, or add one with Add Repo."
+        >
+          {#snippet action()}
+            <Button variant="secondary" size="sm" disabled={adding} onclick={onAddRepo}>
+              Add Repo
+            </Button>
+          {/snippet}
+        </EmptyState>
+      {:else}
+        {#each gitView.repos as listing (listing.repo.root)}
+          <GitRepoNode
+            {listing}
+            {branchFilter}
+            {showInactive}
+            fetchState={fetchStates[listing.repo.root]}
+          />
+        {/each}
+      {/if}
+    </div>
+
+    {#if panel !== null}
+      <!-- Draggable divider: drags the tree/diff split (D1). -->
+      <div
+        class="border-border/60 hover:bg-accent/40 bg-panel/40 h-1.5 shrink-0 cursor-row-resize border-y transition-colors"
+        role="separator"
+        aria-orientation="horizontal"
+        aria-label="Resize diff panel"
+        data-testid="git-split-divider"
+        onpointerdown={startDrag}
+      ></div>
+      <div class="flex min-h-0 flex-col" style={`flex: ${1 - splitRatio} 1 0%`}>
+        <WorktreeDetailPanel
+          path={panel.path}
+          label={panel.label}
+          onClose={clearWorktreeSelection}
         />
-      {/each}
+      </div>
     {/if}
   </div>
 </div>
+
+<svelte:window onpointermove={onDrag} onpointerup={endDrag} />

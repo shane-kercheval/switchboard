@@ -209,6 +209,13 @@ pub enum AppError {
     /// on roots the user has explicitly tracked.
     #[error("{root} is not a tracked repository")]
     RepoNotTracked { root: String },
+
+    /// A genuine mid-read failure reading a worktree's changed files or a file's
+    /// diff (corrupt object, I/O fault) — distinct from the non-error empty
+    /// results those reads return for a clean or unreadable path. Carries git's
+    /// message so the diff panel can surface why it couldn't load.
+    #[error("failed to read git changes for {path}: {message}")]
+    GitRead { path: String, message: String },
 }
 
 impl AppError {

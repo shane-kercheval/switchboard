@@ -42,6 +42,23 @@ type RepoRuntime = {
 
 export const view = $state<{ mode: ViewMode }>({ mode: "projects" });
 
+/// The worktree whose diff detail panel is open, or `null` when none is selected.
+/// Session-only UI state (like `view.mode`): clicking a worktree row in the tree
+/// sets it; it drives the bottom-split detail panel in the Git view. `label` is
+/// the branch name (or short hash for a detached worktree) shown in the panel
+/// header; `path` is the worktree directory the diff reads from.
+export const worktreeSelection = $state<{ current: { path: string; label: string } | null }>({
+  current: null,
+});
+
+export function selectWorktree(path: string, label: string): void {
+  worktreeSelection.current = { path, label };
+}
+
+export function clearWorktreeSelection(): void {
+  worktreeSelection.current = null;
+}
+
 /// The tracked repos, in registry order. `status` distinguishes the first load
 /// (nothing rendered yet) from a populated/failed view.
 export const gitView = $state<{
@@ -212,6 +229,21 @@ function applyRepos(repos: RepoListing[]): void {
       delete fetchStates[root];
     }
   }
+  reconcileWorktreeSelection(repos);
+}
+
+/// Clear the open detail panel if its worktree is no longer in the tree — the
+/// user removed the repo, or a refresh dropped the branch/worktree. Without this
+/// the panel dangles open over a worktree the tree above no longer shows.
+function reconcileWorktreeSelection(repos: RepoListing[]): void {
+  const selected = worktreeSelection.current;
+  if (selected === null) return;
+  const present = repos.some(
+    (r) =>
+      r.repo.local_branches.some((b) => b.worktree?.path === selected.path) ||
+      r.repo.detached_worktrees.some((w) => w.path === selected.path),
+  );
+  if (!present) worktreeSelection.current = null;
 }
 
 function upsertRepo(listing: RepoListing): void {
@@ -265,6 +297,7 @@ export const _testing = {
     runtime.clear();
     inFlightFetch.clear();
     for (const k of Object.keys(fetchStates)) delete fetchStates[k];
+    worktreeSelection.current = null;
   },
   runtimeSize(): number {
     return runtime.size;

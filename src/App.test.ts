@@ -209,7 +209,7 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
       return { installed, version: installed ? "1.0.0" : null };
     }
     case "get_preferences":
-      return { editor_command: null, terminal_app: "Terminal" };
+      return { editor_command: null, terminal_app: "Terminal", diff_style: "side_by_side" };
     case "add_tracked_repo":
     case "remove_tracked_repo":
       return null;

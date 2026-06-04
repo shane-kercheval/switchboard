@@ -173,3 +173,68 @@ pub enum ChangeKind {
     Renamed,
     Untracked,
 }
+
+/// One file's working-tree diff as structured hunks, for the M5 diff panel.
+///
+/// Built straight from libgit2's structured diff rather than parsed back from
+/// unified-diff text — the frontend renders rows directly from this, so there's
+/// no text round-trip and the renderer can highlight each line's content with the
+/// app's existing syntax highlighter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FileDiff {
+    /// Repo-relative path the diff is for (the new path on a rename).
+    pub path: String,
+    /// Binary change: `hunks` is empty and the UI shows a placeholder instead of
+    /// a body (libgit2 declines to render binary content inline).
+    pub binary: bool,
+    /// The diff exceeded the render cap and `hunks` was truncated, so the UI can
+    /// say so rather than imply the whole file is shown.
+    pub truncated: bool,
+    pub hunks: Vec<DiffHunk>,
+}
+
+impl FileDiff {
+    /// An empty diff for `file` (clean, or a path that isn't a readable worktree)
+    /// — no hunks, not binary, not truncated.
+    #[must_use]
+    pub fn empty(file: impl Into<String>) -> Self {
+        Self {
+            path: file.into(),
+            binary: false,
+            truncated: false,
+            hunks: Vec::new(),
+        }
+    }
+}
+
+/// One contiguous run of changed lines plus its surrounding context.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DiffHunk {
+    /// The `@@ -a,b +c,d @@` header text, shown above the hunk.
+    pub header: String,
+    pub lines: Vec<DiffLine>,
+}
+
+/// One line within a hunk: its role plus the old/new line numbers (each present
+/// only on the side where the line exists) and its text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DiffLine {
+    pub origin: DiffLineKind,
+    /// Line number on the old side; `None` for an added line.
+    pub old_lineno: Option<u32>,
+    /// Line number on the new side; `None` for a removed line.
+    pub new_lineno: Option<u32>,
+    /// The line's text, without the leading +/-/space marker and without the
+    /// trailing newline.
+    pub content: String,
+}
+
+/// A diff line's role. Drives the add/remove line-background tokens and the
+/// side-by-side column placement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffLineKind {
+    Context,
+    Added,
+    Removed,
+}

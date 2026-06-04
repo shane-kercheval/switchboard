@@ -5,7 +5,9 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AgentId,
   AgentRecord,
+  ChangedFile,
   DirectoryInfo,
+  FileDiff,
   HarnessInstallStatus,
   HarnessKind,
   LoadedTranscript,
@@ -111,6 +113,18 @@ export async function readTrackedRepo(path: string): Promise<RepoListing> {
 // which the caller records as a "fetch failed" state — never a fatal error.
 export async function fetchRepo(path: string): Promise<void> {
   await invoke("fetch_repo", { path });
+}
+
+// The changed files in a worktree (working-tree changes vs. HEAD — staged,
+// unstaged, untracked). Empty for a clean or unreadable worktree.
+export async function changedFiles(path: string): Promise<ChangedFile[]> {
+  return await invoke<ChangedFile[]>("changed_files", { path });
+}
+
+// The structured working-tree diff for one file in a worktree. Empty hunks for a
+// clean file; `binary: true` for binary content; `truncated: true` when capped.
+export async function fileDiff(path: string, file: string): Promise<FileDiff> {
+  return await invoke<FileDiff>("file_diff", { path, file });
 }
 
 // Open a worktree folder in the user's configured editor (`editor_command`), or

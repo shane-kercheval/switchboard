@@ -15,6 +15,7 @@ import type { Preferences } from "$lib/types";
 const DEFAULTS: Preferences = {
   editor_command: null,
   terminal_app: "Terminal",
+  diff_style: "side_by_side",
 };
 
 export const preferences = $state<Preferences>({ ...DEFAULTS });
@@ -43,6 +44,7 @@ export async function loadPreferences(): Promise<void> {
     if (dirtied) return;
     preferences.editor_command = fetched.editor_command;
     preferences.terminal_app = fetched.terminal_app;
+    preferences.diff_style = fetched.diff_style;
   } catch (err) {
     // Backend unreachable / no config location — keep defaults. Allow a retry.
     loaded = false;
@@ -60,6 +62,7 @@ export async function updatePreferences(patch: Partial<Preferences>): Promise<vo
   const next: Preferences = { ...$state.snapshot(preferences), ...patch };
   preferences.editor_command = next.editor_command;
   preferences.terminal_app = next.terminal_app;
+  preferences.diff_style = next.diff_style;
   try {
     await api.setPreferences(next);
     saveStatus.error = null;
@@ -73,6 +76,7 @@ export const _testing = {
   reset(): void {
     preferences.editor_command = DEFAULTS.editor_command;
     preferences.terminal_app = DEFAULTS.terminal_app;
+    preferences.diff_style = DEFAULTS.diff_style;
     saveStatus.error = null;
     loaded = false;
     dirtied = false;

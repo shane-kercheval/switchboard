@@ -401,13 +401,54 @@ export type RepoListing = {
   linked_projects: Record<string, LinkedProject[]>;
 };
 
+// Mirror of Rust `ChangeKind` / `ChangedFile` — one changed file in a worktree,
+// for the diff panel's file list.
+export type ChangeKind = "modified" | "added" | "deleted" | "renamed" | "untracked";
+
+export type ChangedFile = {
+  path: string;
+  change: ChangeKind;
+};
+
+// Mirror of Rust `FileDiff` / `DiffHunk` / `DiffLine` / `DiffLineKind` — a file's
+// working-tree diff as structured hunks (built from libgit2's structured diff, not
+// parsed from unified text). The frontend renders rows directly from this.
+export type DiffLineKind = "context" | "added" | "removed";
+
+export type DiffLine = {
+  origin: DiffLineKind;
+  // Present only on the side where the line exists (added → old null; removed → new null).
+  old_lineno: number | null;
+  new_lineno: number | null;
+  // Line text, without the +/-/space marker and without the trailing newline.
+  content: string;
+};
+
+export type DiffHunk = {
+  header: string;
+  lines: DiffLine[];
+};
+
+export type FileDiff = {
+  path: string;
+  // Binary change: `hunks` is empty; the UI shows a placeholder instead of a body.
+  binary: boolean;
+  // The diff exceeded the render cap and was cut off.
+  truncated: boolean;
+  hunks: DiffHunk[];
+};
+
+// How the diff panel lays out a file's changes. Persisted in `config.yaml`.
+export type DiffStyle = "side_by_side" | "unified";
+
 // Mirror of Rust `Preferences` (`crates/app/src/preferences.rs`) — backend-owned
 // `config.yaml`. `editor_command` null/absent → OS default folder-open;
-// `terminal_app` defaults to "Terminal". Theme is NOT here — it stays in
-// frontend localStorage (a device-local presentation concern).
+// `terminal_app` defaults to "Terminal"; `diff_style` defaults to "side_by_side".
+// Theme is NOT here — it stays in frontend localStorage (a device-local concern).
 export type Preferences = {
   editor_command: string | null;
   terminal_app: string;
+  diff_style: DiffStyle;
 };
 
 // Mirror of Rust `ProjectConversation` / `ConversationItem` / `OutcomeStatus` /

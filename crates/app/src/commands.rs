@@ -558,6 +558,67 @@ pub fn read_tracked_repo_from_inputs(path: &str, inputs: &GitReadInputs) -> Repo
     read_one_repo_listing(&root, &inputs.links)
 }
 
+/// Snapshot the tracked repo roots from `AppState`. Run on the async thread so
+/// the owned `Vec` can move into a `spawn_blocking` git read without holding the
+/// registry lock across threads (mirrors [`tracked_repos_inputs`], but the diff
+/// reads need only the roots, not the project-linking index).
+#[must_use]
+pub fn tracked_roots(state: &AppState) -> Vec<PathBuf> {
+    lock(&state.git_registry).roots().to_vec()
+}
+
+/// Whether `path` resolves to a tracked repo root. The Git-view *data reads*
+/// (this and [`read_tracked_repo_from_inputs`]) all honor the tracked set so the
+/// backend never serves live git data for a repo the user hasn't added — a
+/// worktree path resolves to its repo root (a subdirectory / linked / detached
+/// worktree collapses to the same root), and a dead path falls back to
+/// `canonicalize_boundary`, matching the root stored while it was available.
+fn is_tracked_worktree(roots: &[PathBuf], path: &str) -> bool {
+    let root = switchboard_git::resolve_repo_root(Path::new(path))
+        .unwrap_or_else(|| canonicalize_boundary(path));
+    roots.contains(&root)
+}
+
+/// The changed files in a worktree (working-tree changes vs. HEAD — staged,
+/// unstaged, untracked), for the M5 diff panel's file list. A clean or
+/// unreadable path yields an empty list (the non-error state); a genuine mid-read
+/// failure surfaces as [`AppError::GitRead`] so the panel can say why it's empty.
+///
+/// `path` is the worktree directory itself (from the rendered tree), not a repo
+/// root — the read is scoped to that one checked-out working tree. An untracked
+/// path (a stale panel after "Remove from view") yields an empty list rather than
+/// live data. Synchronous `git2`; the shim runs it on a blocking worker.
+pub fn changed_files_impl(
+    roots: &[PathBuf],
+    path: &str,
+) -> Result<Vec<switchboard_git::ChangedFile>, AppError> {
+    if !is_tracked_worktree(roots, path) {
+        return Ok(Vec::new());
+    }
+    switchboard_git::changed_files(Path::new(path)).map_err(|e| AppError::GitRead {
+        path: path.to_owned(),
+        message: e.to_string(),
+    })
+}
+
+/// The structured working-tree diff for one `file` (repo-relative) in the
+/// worktree at `path`. Untracked path → empty [`FileDiff`]; clean/unreadable →
+/// empty; binary content → `binary: true` with no hunks; a genuine mid-read
+/// failure → [`AppError::GitRead`]. Synchronous `git2`; runs on a blocking worker.
+pub fn file_diff_impl(
+    roots: &[PathBuf],
+    path: &str,
+    file: &str,
+) -> Result<switchboard_git::FileDiff, AppError> {
+    if !is_tracked_worktree(roots, path) {
+        return Ok(switchboard_git::FileDiff::empty(file));
+    }
+    switchboard_git::file_diff(Path::new(path), file).map_err(|e| AppError::GitRead {
+        path: path.to_owned(),
+        message: e.to_string(),
+    })
+}
+
 /// The `AppState`-derived inputs a Git-view read needs, snapshotted so the
 /// `git2` work can move onto a blocking thread. Cheap to build (registry paths +
 /// the flat project list); the expensive part is the git reads that consume it.
@@ -9068,6 +9129,79 @@ mod tests {
             .unwrap();
     }
 
+    /// The tracked-root set for a repo, as the command layer would snapshot it.
+    fn roots_of(repo: &TempDir) -> Vec<PathBuf> {
+        vec![repo.path().canonicalize().unwrap()]
+    }
+
+    #[test]
+    fn changed_files_reports_staged_unstaged_and_untracked() {
+        let repo = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        // Tracked file modified (unstaged), a staged addition, and an untracked file.
+        std::fs::write(repo.path().join("README.md"), "changed\n").unwrap();
+        std::fs::write(repo.path().join("staged.txt"), "s\n").unwrap();
+        git(repo.path(), &["add", "staged.txt"]);
+        std::fs::write(repo.path().join("untracked.txt"), "u\n").unwrap();
+
+        let files = changed_files_impl(&roots_of(&repo), repo.path().to_str().unwrap()).unwrap();
+        let kind = |name: &str| files.iter().find(|f| f.path == name).map(|f| f.change);
+        assert_eq!(
+            kind("README.md"),
+            Some(switchboard_git::ChangeKind::Modified)
+        );
+        assert_eq!(kind("staged.txt"), Some(switchboard_git::ChangeKind::Added));
+        assert_eq!(
+            kind("untracked.txt"),
+            Some(switchboard_git::ChangeKind::Untracked)
+        );
+    }
+
+    #[test]
+    fn file_diff_returns_structured_hunks_through_the_command_layer() {
+        let repo = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        std::fs::write(repo.path().join("code.txt"), "a\nb\nc\n").unwrap();
+        git(repo.path(), &["add", "-A"]);
+        git(repo.path(), &["commit", "-q", "-m", "add code"]);
+        std::fs::write(repo.path().join("code.txt"), "a\nB\nc\n").unwrap();
+
+        let diff =
+            file_diff_impl(&roots_of(&repo), repo.path().to_str().unwrap(), "code.txt").unwrap();
+        assert!(!diff.binary && !diff.truncated);
+        let lines: Vec<_> = diff.hunks.iter().flat_map(|h| &h.lines).collect();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.origin == switchboard_git::DiffLineKind::Removed && l.content == "b"),
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.origin == switchboard_git::DiffLineKind::Added && l.content == "B"),
+        );
+    }
+
+    #[test]
+    fn diff_reads_refuse_an_untracked_worktree() {
+        // The Git-view data reads honor the tracked set: a path whose repo root
+        // isn't tracked (a stale panel after "Remove from view") yields the empty
+        // non-error result, never live git data.
+        let repo = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        std::fs::write(repo.path().join("README.md"), "changed\n").unwrap();
+        let untracked: &[PathBuf] = &[];
+
+        let files = changed_files_impl(untracked, repo.path().to_str().unwrap()).unwrap();
+        assert!(files.is_empty(), "untracked repo yields no changed files");
+
+        let diff = file_diff_impl(untracked, repo.path().to_str().unwrap(), "README.md").unwrap();
+        assert!(
+            diff.hunks.is_empty() && !diff.binary,
+            "untracked repo yields an empty diff"
+        );
+    }
+
     #[test]
     fn editor_open_argv_uses_command_or_falls_back_to_os_open() {
         // A bare editor command runs against the path…
@@ -9242,6 +9376,7 @@ mod tests {
         let prefs = Preferences {
             editor_command: Some("zed".to_owned()),
             terminal_app: "iTerm".to_owned(),
+            diff_style: preferences::DiffStyle::Unified,
         };
         set_preferences_impl(&state, &prefs).unwrap();
 
@@ -9264,6 +9399,7 @@ mod tests {
             &Preferences {
                 editor_command: Some("  ".to_owned()),
                 terminal_app: String::new(),
+                diff_style: preferences::DiffStyle::SideBySide,
             },
         )
         .unwrap();
@@ -9283,6 +9419,7 @@ mod tests {
         let prefs = Preferences {
             editor_command: Some("code".to_owned()),
             terminal_app: "Terminal".to_owned(),
+            diff_style: preferences::DiffStyle::SideBySide,
         };
         set_preferences_impl(&state, &prefs).unwrap();
         assert_eq!(get_preferences_impl(&state), prefs);

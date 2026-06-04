@@ -67,6 +67,9 @@ const repo = (over: Partial<RepoListing["repo"]> = {}): RepoListing => ({
 function wire(list: RepoListing[]) {
   invokeMock.mockImplementation((cmd: string) => {
     if (cmd === "list_tracked_repos") return Promise.resolve(list);
+    if (cmd === "changed_files") return Promise.resolve([]);
+    if (cmd === "file_diff")
+      return Promise.resolve({ path: "", binary: false, truncated: false, hunks: [] });
     if (cmd === "read_tracked_repo") return Promise.resolve(list[0] ?? repo());
     return Promise.resolve(null); // fetch_repo
   });
@@ -165,6 +168,29 @@ describe("GitView", () => {
     );
     // The added repo appears (list was re-read).
     await waitFor(() => expect(screen.getByTestId("git-repo")).toBeInTheDocument());
+  });
+
+  it("clicking a worktree opens the detail panel (bottom split); closing it returns to the full tree", async () => {
+    wire([repo()]);
+    await refreshAll();
+    render(GitView);
+    await waitFor(() => expect(screen.getByTestId("git-repo")).toBeInTheDocument());
+
+    // No panel until a worktree is selected.
+    expect(screen.queryByTestId("worktree-detail-panel")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("git-split-divider")).not.toBeInTheDocument();
+
+    // The `main` branch has a worktree → its row is selectable.
+    await fireEvent.click(screen.getByTestId("worktree-select"));
+
+    await waitFor(() => expect(screen.getByTestId("worktree-detail-panel")).toBeInTheDocument());
+    expect(screen.getByTestId("git-split-divider")).toBeInTheDocument();
+    expect(screen.getByTestId("detail-branch")).toHaveTextContent("main");
+
+    await fireEvent.click(screen.getByTestId("detail-close"));
+    await waitFor(() =>
+      expect(screen.queryByTestId("worktree-detail-panel")).not.toBeInTheDocument(),
+    );
   });
 
   it("Add Repo: cancelling the picker adds nothing", async () => {

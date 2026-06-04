@@ -17,6 +17,8 @@ const {
   fetchAll,
   addRepo,
   removeRepo,
+  selectWorktree,
+  worktreeSelection,
   _testing,
 } = await import("./gitView.svelte");
 
@@ -38,6 +40,23 @@ const listing = (root: string): RepoListing => ({
   },
   linked_projects: {},
 });
+
+/// A listing whose `main` branch is checked out at `wtPath`, for selection tests.
+const listingWithWorktree = (root: string, wtPath: string): RepoListing => {
+  const l = listing(root);
+  l.repo.local_branches = [
+    {
+      name: "main",
+      upstream: null,
+      sync: { kind: "in_sync" },
+      behind_base: null,
+      merged: null,
+      dangling: false,
+      worktree: { path: wtPath, dirty: true, untracked: false, detached_hash: null, warning: null },
+    },
+  ];
+  return l;
+};
 
 /// Route invoke by command; default list/read/fetch all succeed.
 function wire(opts: { list?: RepoListing[]; fetchRejects?: boolean } = {}) {
@@ -162,6 +181,28 @@ describe("gitView store", () => {
       return Promise.resolve(null);
     });
     await expect(addRepo("/a")).rejects.toThrow("read boom");
+  });
+
+  it("clears an open worktree selection when its worktree disappears from the tree", async () => {
+    wire({ list: [listingWithWorktree("/a", "/a/wt")] });
+    await refreshAll();
+    selectWorktree("/a/wt", "main");
+    expect(worktreeSelection.current?.path).toBe("/a/wt");
+
+    // A refresh where /a no longer reports that worktree (e.g. repo removed).
+    wire({ list: [] });
+    await refreshAll();
+    expect(worktreeSelection.current).toBeNull();
+  });
+
+  it("keeps a worktree selection that is still present after a refresh", async () => {
+    wire({ list: [listingWithWorktree("/a", "/a/wt")] });
+    await refreshAll();
+    selectWorktree("/a/wt", "main");
+
+    wire({ list: [listingWithWorktree("/a", "/a/wt")] });
+    await refreshAll();
+    expect(worktreeSelection.current?.path).toBe("/a/wt");
   });
 
   it("removeRepo untracks the repo and re-reads without it", async () => {

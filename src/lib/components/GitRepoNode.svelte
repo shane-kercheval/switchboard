@@ -11,9 +11,15 @@
   import DropdownMenuItem from "$lib/components/ui/DropdownMenuItem.svelte";
   import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
   import { localBranchBadges, remoteBranchBadges } from "$lib/gitBadges";
-  import type { RepoListing } from "$lib/types";
+  import type { BranchView, RepoListing, WorktreeView } from "$lib/types";
   import type { FetchState } from "$lib/state/gitView.svelte";
-  import { refreshRepo, fetchRepo, removeRepo } from "$lib/state/gitView.svelte";
+  import {
+    refreshRepo,
+    fetchRepo,
+    removeRepo,
+    selectWorktree,
+    worktreeSelection,
+  } from "$lib/state/gitView.svelte";
   import { openInEditor, openInTerminal, revealInFinder } from "$lib/api";
   import { copyText } from "$lib/native";
 
@@ -189,33 +195,31 @@
       {:else}
         {#if showLocal}
           {#each localBranches as branch (branch.name)}
+            {@const selected =
+              branch.worktree !== null && worktreeSelection.current?.path === branch.worktree.path}
             <div
               class={cn(
                 "flex items-start gap-2 rounded px-2 py-1.5",
                 branch.worktree === null && "opacity-60",
+                selected && "bg-raised",
               )}
               data-testid="git-branch"
               data-branch={branch.name}
             >
-              <span class="text-fg mt-0.5 shrink-0 text-[13px]">{branch.name}</span>
-              <div class="flex flex-1 flex-wrap items-center gap-1">
-                {#each localBranchBadges(branch, repo.default_branch) as badge (badge.key)}
-                  <GitBadge {badge} />
-                {/each}
-                {#if branch.worktree}
-                  <span
-                    class="text-muted ml-1 truncate font-mono text-[11px]"
-                    title={branch.worktree.path}
-                  >
-                    {basename(branch.worktree.path)}
-                  </span>
-                  {#each linkedProjects(branch.worktree.path) as project (project.id)}
-                    <Badge testid="linked-project">{project.name}</Badge>
-                  {/each}
-                {/if}
-              </div>
               {#if branch.worktree}
                 {@const worktreePath = branch.worktree.path}
+                <!-- Clicking the row (but not the actions menu) opens the diff
+                     panel for this worktree; the menu is a sibling button so the
+                     two clicks don't nest. -->
+                <button
+                  type="button"
+                  class="flex min-w-0 flex-1 items-start gap-2 text-left"
+                  data-testid="worktree-select"
+                  data-selected={selected}
+                  onclick={() => selectWorktree(worktreePath, branch.name)}
+                >
+                  {@render branchInner(branch)}
+                </button>
                 <DropdownMenu
                   triggerLabel={`Actions for ${branch.name}`}
                   triggerTestid="worktree-actions-trigger"
@@ -260,6 +264,11 @@
                     Copy branch name
                   </DropdownMenuItem>
                 </DropdownMenu>
+              {:else}
+                <!-- No worktree → not openable; render the same content inert. -->
+                <div class="flex min-w-0 flex-1 items-start gap-2">
+                  {@render branchInner(branch)}
+                </div>
               {/if}
             </div>
           {/each}
@@ -286,40 +295,67 @@
         {/if}
 
         {#each repo.detached_worktrees as wt (wt.path)}
+          {@const dselected = worktreeSelection.current?.path === wt.path}
           <div
-            class="flex items-start gap-2 rounded px-2 py-1.5"
+            class={cn("flex items-start gap-2 rounded px-2 py-1.5", dselected && "bg-raised")}
             data-testid="git-detached-worktree"
           >
-            <span class="text-muted mt-0.5 shrink-0 font-mono text-[11px]">
-              {wt.detached_hash ?? "detached"}
-            </span>
-            <div class="flex flex-1 flex-wrap items-center gap-1">
-              {#if wt.warning === "orphaned"}
-                <GitBadge
-                  badge={{
-                    key: "orphaned",
-                    label: "orphaned",
-                    tone: "warning",
-                    title: "Branch deleted",
-                  }}
-                />
-              {:else if wt.warning === "prunable"}
-                <GitBadge
-                  badge={{
-                    key: "prunable",
-                    label: "prunable",
-                    tone: "warning",
-                    title: "Directory gone",
-                  }}
-                />
-              {/if}
-              <span class="text-muted truncate font-mono text-[11px]" title={wt.path}>
-                {basename(wt.path)}
-              </span>
-            </div>
+            {#if wt.warning === "prunable"}
+              <!-- Directory is gone — nothing to inspect, so not openable. -->
+              <div class="flex min-w-0 flex-1 items-start gap-2">
+                {@render detachedInner(wt)}
+              </div>
+            {:else}
+              <button
+                type="button"
+                class="flex min-w-0 flex-1 items-start gap-2 text-left"
+                data-testid="worktree-select"
+                data-selected={dselected}
+                onclick={() => selectWorktree(wt.path, wt.detached_hash ?? "detached")}
+              >
+                {@render detachedInner(wt)}
+              </button>
+            {/if}
           </div>
         {/each}
       {/if}
     </div>
   {/if}
 </div>
+
+{#snippet branchInner(branch: BranchView)}
+  <span class="text-fg mt-0.5 shrink-0 text-[13px]">{branch.name}</span>
+  <div class="flex flex-1 flex-wrap items-center gap-1">
+    {#each localBranchBadges(branch, repo.default_branch) as badge (badge.key)}
+      <GitBadge {badge} />
+    {/each}
+    {#if branch.worktree}
+      <span class="text-muted ml-1 truncate font-mono text-[11px]" title={branch.worktree.path}>
+        {basename(branch.worktree.path)}
+      </span>
+      {#each linkedProjects(branch.worktree.path) as project (project.id)}
+        <Badge testid="linked-project">{project.name}</Badge>
+      {/each}
+    {/if}
+  </div>
+{/snippet}
+
+{#snippet detachedInner(wt: WorktreeView)}
+  <span class="text-muted mt-0.5 shrink-0 font-mono text-[11px]">
+    {wt.detached_hash ?? "detached"}
+  </span>
+  <div class="flex flex-1 flex-wrap items-center gap-1">
+    {#if wt.warning === "orphaned"}
+      <GitBadge
+        badge={{ key: "orphaned", label: "orphaned", tone: "warning", title: "Branch deleted" }}
+      />
+    {:else if wt.warning === "prunable"}
+      <GitBadge
+        badge={{ key: "prunable", label: "prunable", tone: "warning", title: "Directory gone" }}
+      />
+    {/if}
+    <span class="text-muted truncate font-mono text-[11px]" title={wt.path}>
+      {basename(wt.path)}
+    </span>
+  </div>
+{/snippet}

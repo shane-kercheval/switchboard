@@ -49,7 +49,7 @@ mod read;
 
 pub use error::{GitError, Result};
 pub use model::{
-    BranchView, ChangeKind, ChangedFile, RemoteBranchView, RepoView, SyncState, WorktreeView,
-    WorktreeWarning,
+    BranchView, ChangeKind, ChangedFile, DiffHunk, DiffLine, DiffLineKind, FileDiff,
+    RemoteBranchView, RepoView, SyncState, WorktreeView, WorktreeWarning,
 };
-pub use read::{changed_files, diff_text, read_repo, resolve_repo_root};
+pub use read::{changed_files, file_diff, read_repo, resolve_repo_root};

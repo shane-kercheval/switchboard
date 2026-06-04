@@ -8,7 +8,8 @@ use std::path::Path;
 use std::process::Command;
 
 use switchboard_git::{
-    ChangeKind, SyncState, WorktreeWarning, changed_files, diff_text, read_repo, resolve_repo_root,
+    ChangeKind, DiffLineKind, SyncState, WorktreeWarning, changed_files, file_diff, read_repo,
+    resolve_repo_root,
 };
 use tempfile::TempDir;
 
@@ -617,31 +618,141 @@ fn changed_files_covers_staged_unstaged_untracked() {
 }
 
 #[test]
-fn diff_text_renders_unified_diff_for_a_file() {
+fn file_diff_returns_structured_hunks_with_line_numbers() {
     let repo = repo_with_main();
-    write(repo.path(), "code.txt", "line one\nline two\n");
+    write(repo.path(), "code.txt", "line one\nline two\nline three\n");
     commit_all(repo.path(), "add code");
-    write(repo.path(), "code.txt", "line one\nline CHANGED\n");
+    write(
+        repo.path(),
+        "code.txt",
+        "line one\nline CHANGED\nline three\n",
+    );
 
-    let diff = diff_text(repo.path(), "code.txt").unwrap();
+    let diff = file_diff(repo.path(), "code.txt").unwrap();
+    assert!(!diff.binary);
+    assert!(!diff.truncated);
+    assert_eq!(diff.hunks.len(), 1, "one contiguous change → one hunk");
+
+    let lines = &diff.hunks[0].lines;
+    let removed = lines
+        .iter()
+        .find(|l| l.origin == DiffLineKind::Removed)
+        .expect("a removed line");
+    assert_eq!(removed.content, "line two");
+    // A removed line exists only on the old side.
+    assert!(removed.old_lineno.is_some() && removed.new_lineno.is_none());
+
+    let added = lines
+        .iter()
+        .find(|l| l.origin == DiffLineKind::Added)
+        .expect("an added line");
+    assert_eq!(added.content, "line CHANGED");
+    assert!(added.new_lineno.is_some() && added.old_lineno.is_none());
+
+    // Surrounding context carries both line numbers and keeps its text.
+    let context = lines
+        .iter()
+        .find(|l| l.origin == DiffLineKind::Context && l.content == "line one")
+        .expect("the context line");
+    assert!(context.old_lineno.is_some() && context.new_lineno.is_some());
+}
+
+#[test]
+fn file_diff_includes_untracked_file_content_as_additions() {
+    let repo = repo_with_main();
+    write(repo.path(), "brand-new.txt", "fresh content\n");
+
+    let diff = file_diff(repo.path(), "brand-new.txt").unwrap();
+    let added: Vec<&str> = diff
+        .hunks
+        .iter()
+        .flat_map(|h| &h.lines)
+        .filter(|l| l.origin == DiffLineKind::Added)
+        .map(|l| l.content.as_str())
+        .collect();
+    assert_eq!(added, vec!["fresh content"]);
+}
+
+#[test]
+fn file_diff_is_empty_for_a_clean_file() {
+    let repo = repo_with_main();
+    write(repo.path(), "code.txt", "stable\n");
+    commit_all(repo.path(), "add code");
+
+    let diff = file_diff(repo.path(), "code.txt").unwrap();
+    assert!(diff.hunks.is_empty() && !diff.binary && !diff.truncated);
+}
+
+#[test]
+fn file_diff_caps_a_huge_diff_and_flags_truncation() {
+    // The cap protects the panel from giant generated files. An untracked file
+    // larger than the cap should come back flagged `truncated`, with no more than
+    // the cap's worth of lines and no empty trailing hunks left after the cutoff.
+    let repo = repo_with_main();
+    let mut huge = String::new();
+    for i in 0..6_000 {
+        use std::fmt::Write as _;
+        let _ = writeln!(huge, "line {i}");
+    }
+    write(repo.path(), "huge.txt", &huge);
+
+    let diff = file_diff(repo.path(), "huge.txt").unwrap();
     assert!(
-        diff.contains("-line two"),
-        "diff should show the removed line: {diff}"
+        diff.truncated,
+        "a >5000-line diff must be flagged truncated"
+    );
+    let collected: usize = diff.hunks.iter().map(|h| h.lines.len()).sum();
+    assert!(
+        collected <= 5_000,
+        "collected {collected} lines, expected <= cap"
     );
     assert!(
-        diff.contains("+line CHANGED"),
-        "diff should show the added line: {diff}"
+        diff.hunks.iter().all(|h| !h.lines.is_empty()),
+        "no empty hunks should be appended after the cap"
     );
 }
 
 #[test]
-fn diff_text_includes_untracked_file_content() {
+fn file_diff_flags_binary_content_with_no_body() {
+    // The binary flag rests on libgit2 emitting a binary marker under our diff
+    // options; pin that end-to-end rather than trusting the assumption.
     let repo = repo_with_main();
-    write(repo.path(), "brand-new.txt", "fresh content\n");
-    let diff = diff_text(repo.path(), "brand-new.txt").unwrap();
+    std::fs::write(repo.path().join("blob.bin"), [0u8, 159, 146, 150, 0, 1, 2]).unwrap();
+    commit_all(repo.path(), "add binary");
+    std::fs::write(repo.path().join("blob.bin"), [0u8, 1, 2, 3, 0, 255, 254]).unwrap();
+
+    let diff = file_diff(repo.path(), "blob.bin").unwrap();
+    assert!(diff.binary, "binary content must set the binary flag");
+    assert!(diff.hunks.is_empty(), "binary diffs carry no rendered body");
+}
+
+#[test]
+fn file_diff_matches_the_path_literally_not_as_a_glob() {
+    // A real filename with pathspec metacharacters must match only itself — not a
+    // sibling its glob form would match — and the result must not merge files.
+    let repo = repo_with_main();
+    write(repo.path(), "a[1].txt", "base\n");
+    write(repo.path(), "a1.txt", "base\n"); // what `a[1].txt` would glob-match
+    commit_all(repo.path(), "add both");
+    write(repo.path(), "a[1].txt", "LITERAL CHANGE\n");
+    write(repo.path(), "a1.txt", "GLOB CHANGE\n");
+
+    let diff = file_diff(repo.path(), "a[1].txt").unwrap();
+    let added: Vec<&str> = diff
+        .hunks
+        .iter()
+        .flat_map(|h| &h.lines)
+        .filter(|l| l.origin == DiffLineKind::Added)
+        .map(|l| l.content.as_str())
+        .collect();
+    assert_eq!(
+        added,
+        vec!["LITERAL CHANGE"],
+        "only the literal file's change"
+    );
     assert!(
-        diff.contains("+fresh content"),
-        "untracked file content should appear as additions: {diff}"
+        !added.contains(&"GLOB CHANGE"),
+        "the glob-matched sibling must not bleed in"
     );
 }
 

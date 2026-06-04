@@ -28,24 +28,25 @@ use crate::commands::ProjectConversation;
 use crate::commands::{
     AgentSessionInfo, DirectoryInfo, HarnessInstallStatus, ProjectListing, RepoListing,
     WorkspaceDirectories, add_tracked_repo_impl, agent_session_info_impl, attach_agent_impl,
-    cancel_agent_impl, cancel_send_impl, cancel_turn_impl, check_antigravity_auth_impl,
-    check_antigravity_binary_impl, check_claude_auth_impl, check_claude_binary_impl,
-    check_codex_auth_impl, check_codex_binary_impl, check_gemini_auth_impl,
-    check_gemini_binary_impl, create_agent_impl, create_project_impl, delete_project_impl,
-    editor_open_argv, fetch_repo_impl, get_harness_install_status_impl, get_preferences_impl,
-    init_directory_impl, list_agents_impl, list_projects_impl, list_tracked_repos_from_inputs,
-    list_workspace_directories_impl, load_project_conversation_impl, load_transcript_impl,
-    open_project_impl, parse_uuid, pick_directory_impl, read_tracked_repo_from_inputs,
-    remove_agent_impl, remove_directory_impl, remove_queued_message_impl, remove_tracked_repo_impl,
-    rename_agent_impl, rename_project_impl, reveal_in_finder_argv, search_project_files_in_root,
-    search_project_files_root_impl, send_message_impl, set_active_project_impl,
-    set_preferences_impl, set_project_archived_impl, terminal_open_argv, tracked_repos_inputs,
-    validate_external_url,
+    cancel_agent_impl, cancel_send_impl, cancel_turn_impl, changed_files_impl,
+    check_antigravity_auth_impl, check_antigravity_binary_impl, check_claude_auth_impl,
+    check_claude_binary_impl, check_codex_auth_impl, check_codex_binary_impl,
+    check_gemini_auth_impl, check_gemini_binary_impl, create_agent_impl, create_project_impl,
+    delete_project_impl, editor_open_argv, fetch_repo_impl, file_diff_impl,
+    get_harness_install_status_impl, get_preferences_impl, init_directory_impl, list_agents_impl,
+    list_projects_impl, list_tracked_repos_from_inputs, list_workspace_directories_impl,
+    load_project_conversation_impl, load_transcript_impl, open_project_impl, parse_uuid,
+    pick_directory_impl, read_tracked_repo_from_inputs, remove_agent_impl, remove_directory_impl,
+    remove_queued_message_impl, remove_tracked_repo_impl, rename_agent_impl, rename_project_impl,
+    reveal_in_finder_argv, search_project_files_in_root, search_project_files_root_impl,
+    send_message_impl, set_active_project_impl, set_preferences_impl, set_project_archived_impl,
+    terminal_open_argv, tracked_repos_inputs, tracked_roots, validate_external_url,
 };
 use crate::preferences::Preferences;
 use crate::state::AppState;
 
 use switchboard_core::{AgentRecord, HarnessKind, ProjectSummary};
+use switchboard_git::{ChangedFile, FileDiff};
 
 #[tauri::command]
 async fn check_claude_binary(state: State<'_, AppState>) -> Result<(), String> {
@@ -175,6 +176,34 @@ async fn read_tracked_repo(
 async fn fetch_repo(state: State<'_, AppState>, path: String) -> Result<(), String> {
     fetch_repo_impl(state.inner(), &path)
         .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn changed_files(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<Vec<ChangedFile>, String> {
+    // Snapshot tracked roots on the async thread, then run the synchronous `git2`
+    // read on a blocking worker — consistent with the other Git-view reads, and
+    // gated on the tracked set so an untracked path returns empty, not live data.
+    let roots = tracked_roots(state.inner());
+    tauri::async_runtime::spawn_blocking(move || changed_files_impl(&roots, &path))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn file_diff(
+    state: State<'_, AppState>,
+    path: String,
+    file: String,
+) -> Result<FileDiff, String> {
+    let roots = tracked_roots(state.inner());
+    tauri::async_runtime::spawn_blocking(move || file_diff_impl(&roots, &path, &file))
+        .await
+        .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())
 }
 
@@ -745,6 +774,8 @@ pub fn run() {
             list_tracked_repos,
             read_tracked_repo,
             fetch_repo,
+            changed_files,
+            file_diff,
             get_preferences,
             set_preferences,
             create_project,

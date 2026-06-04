@@ -19,6 +19,7 @@ afterEach(() => {
 const PREFS = (editor: string | null, terminal: string): Preferences => ({
   editor_command: editor,
   terminal_app: terminal,
+  diff_style: "side_by_side",
 });
 
 describe("preferences store", () => {

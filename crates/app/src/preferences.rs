@@ -29,6 +29,18 @@ fn default_terminal_app() -> String {
     "Terminal".to_owned()
 }
 
+/// How the diff panel lays out a file's changes.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffStyle {
+    /// Old and new content in two columns. Default — the diff panel is a wide
+    /// bottom split, so side-by-side reads well.
+    #[default]
+    SideBySide,
+    /// One column with interleaved removed/added lines.
+    Unified,
+}
+
 /// Personal preferences, persisted to `config.yaml`. All fields default, so any
 /// subset may be present in the file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -42,6 +54,9 @@ pub struct Preferences {
     /// Name of the terminal application the "open in terminal" action launches
     /// (`open -a <name> <path>` on macOS). Defaults to `Terminal`.
     pub terminal_app: String,
+
+    /// Diff panel layout. Defaults to side-by-side.
+    pub diff_style: DiffStyle,
 }
 
 impl Default for Preferences {
@@ -49,6 +64,7 @@ impl Default for Preferences {
         Self {
             editor_command: None,
             terminal_app: default_terminal_app(),
+            diff_style: DiffStyle::default(),
         }
     }
 }
@@ -77,6 +93,7 @@ impl Preferences {
         Self {
             editor_command,
             terminal_app,
+            diff_style: self.diff_style,
         }
     }
 }
@@ -130,6 +147,7 @@ mod tests {
         let p = Preferences::default();
         assert_eq!(p.editor_command, None);
         assert_eq!(p.terminal_app, "Terminal");
+        assert_eq!(p.diff_style, DiffStyle::SideBySide);
     }
 
     #[test]
@@ -140,6 +158,7 @@ mod tests {
         let prefs = Preferences {
             editor_command: Some("cursor".to_owned()),
             terminal_app: "iTerm".to_owned(),
+            diff_style: DiffStyle::Unified,
         };
         save(&path, &prefs).unwrap();
         assert_eq!(load(&path), prefs);
@@ -178,14 +197,21 @@ mod tests {
         let p = Preferences {
             editor_command: Some("  cursor  ".to_owned()),
             terminal_app: "  iTerm  ".to_owned(),
+            diff_style: DiffStyle::Unified,
         }
         .normalized();
         assert_eq!(p.editor_command.as_deref(), Some("cursor"));
         assert_eq!(p.terminal_app, "iTerm");
+        assert_eq!(
+            p.diff_style,
+            DiffStyle::Unified,
+            "diff_style carries through"
+        );
 
         let blank = Preferences {
             editor_command: Some("   ".to_owned()),
             terminal_app: "   ".to_owned(),
+            diff_style: DiffStyle::default(),
         }
         .normalized();
         assert_eq!(blank.editor_command, None);

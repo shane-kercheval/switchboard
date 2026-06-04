@@ -11,8 +11,8 @@ use git2::{
 
 use crate::error::{GitError, Result};
 use crate::model::{
-    BranchView, ChangeKind, ChangedFile, RemoteBranchView, RepoView, SyncState, WorktreeView,
-    WorktreeWarning,
+    BranchView, ChangeKind, ChangedFile, DiffHunk, DiffLine, DiffLineKind, FileDiff,
+    RemoteBranchView, RepoView, SyncState, WorktreeView, WorktreeWarning,
 };
 
 /// Resolve any path inside (or at) a git repo to the canonical **main-worktree /
@@ -89,20 +89,26 @@ pub fn changed_files(path: &Path) -> Result<Vec<ChangedFile>> {
     Ok(files)
 }
 
-/// The unified-diff text for a single `file` (repo-relative) in the worktree at
-/// `path` — working-tree changes vs. HEAD, including untracked content. Returns
-/// an empty string when the file has no diff (clean, or binary content libgit2
-/// declines to render inline).
-pub fn diff_text(path: &Path, file: &str) -> Result<String> {
+/// The structured working-tree diff for a single `file` (repo-relative) in the
+/// worktree at `path` — changes vs. HEAD, including untracked content. Returns an
+/// empty [`FileDiff`] when the file has no diff (clean) or the path isn't a
+/// readable worktree; `binary: true` (no hunks) for binary content libgit2
+/// declines to render inline.
+pub fn file_diff(path: &Path, file: &str) -> Result<FileDiff> {
     let repo = match Repository::open(path) {
         Ok(repo) => repo,
-        Err(e) if is_not_found(&e) => return Ok(String::new()),
+        Err(e) if is_not_found(&e) => return Ok(FileDiff::empty(file)),
         Err(e) => return Err(GitError::read(path, e)),
     };
     let mut opts = DiffOptions::new();
     opts.include_untracked(true)
         .recurse_untracked_dirs(true)
         .show_untracked_content(true)
+        // Match `file` as a literal path, not a glob. Without this, a real
+        // filename containing pathspec metacharacters (`*`, `[`, `?`) would be
+        // treated as a pattern and could pull in other files' deltas, which
+        // `collect_file_diff` would then merge under the one requested name.
+        .disable_pathspec_match(true)
         .pathspec(file);
 
     let diff = match head_tree(&repo) {
@@ -112,7 +118,7 @@ pub fn diff_text(path: &Path, file: &str) -> Result<String> {
     }
     .map_err(|e| GitError::read(path, e))?;
 
-    render_patch(&diff).map_err(|e| GitError::read(path, e))
+    collect_file_diff(&diff, file).map_err(|e| GitError::read(path, e))
 }
 
 // --- internals -------------------------------------------------------------
@@ -662,21 +668,90 @@ fn renamed_target(entry: &git2::StatusEntry<'_>) -> Option<String> {
     })
 }
 
-fn render_patch(diff: &Diff<'_>) -> std::result::Result<String, git2::Error> {
-    let mut out = String::new();
-    // `print` with `Patch` emits unified-diff text; we reassemble the lines with
-    // their origin markers so the output matches what `git diff` would produce. A
-    // print failure (corrupt blob, mid-read I/O) is propagated rather than
-    // returning a partial/empty string that the UI can't tell from "unchanged."
-    diff.print(DiffFormat::Patch, |_delta, _hunk, line| {
+/// Cap on rendered diff lines per file. A generated file (lockfile, bundle) can
+/// be tens of thousands of lines; rendering that many rows would freeze the
+/// panel. Past the cap we stop collecting and flag `truncated` so the UI can say
+/// the file was cut off rather than imply it's fully shown.
+const MAX_DIFF_LINES: usize = 5_000;
+
+/// Walk libgit2's structured diff for one file into [`FileDiff`] hunks. Uses the
+/// same `print` traversal as the rest of this module, but collects structured
+/// lines instead of flattening to unified text — the frontend renders from this
+/// directly. A traversal failure (corrupt blob, mid-read I/O) is propagated.
+fn collect_file_diff(diff: &Diff<'_>, file: &str) -> std::result::Result<FileDiff, git2::Error> {
+    let mut hunks: Vec<DiffHunk> = Vec::new();
+    let mut binary = false;
+    let mut truncated = false;
+    let mut lines = 0usize;
+
+    diff.print(DiffFormat::Patch, |_delta, hunk, line| {
+        // Past the cap, append nothing more — not content *and not hunk headers*
+        // (otherwise a huge file leaves a tail of empty hunks). We keep returning
+        // `true`: returning `false` aborts `print` as a `GIT_EUSER` error that the
+        // `?` below would turn a successful-but-truncated diff into a `GitRead`
+        // failure. libgit2 has already computed the diff before this walk, so
+        // finishing the (now no-op) iteration is cheap.
+        if truncated {
+            return true;
+        }
         match line.origin() {
-            '+' | '-' | ' ' => out.push(line.origin()),
+            // Binary content: libgit2 emits a marker line, no body. Record the
+            // flag; the UI shows a placeholder.
+            'B' => binary = true,
+            // Hunk header: open a new hunk. The header text lives on `hunk`.
+            'H' => {
+                let header = hunk
+                    .map(|h| String::from_utf8_lossy(h.header()).trim_end().to_owned())
+                    .unwrap_or_default();
+                hunks.push(DiffHunk {
+                    header,
+                    lines: Vec::new(),
+                });
+            }
+            // Content lines. `=` is a context line on a file with no trailing
+            // newline; treat it like ordinary context. The `>`/`<` EOFNL markers
+            // and the `F` file header carry no renderable content — skip them.
+            origin @ (' ' | '=' | '+' | '-') => {
+                if lines >= MAX_DIFF_LINES {
+                    truncated = true;
+                    return true;
+                }
+                lines += 1;
+                let kind = match origin {
+                    '+' => DiffLineKind::Added,
+                    '-' => DiffLineKind::Removed,
+                    _ => DiffLineKind::Context,
+                };
+                // Strip the trailing newline (and a preceding CR for CRLF); a
+                // last line with no newline is left as-is.
+                let raw = String::from_utf8_lossy(line.content());
+                let content = match raw.strip_suffix('\n') {
+                    Some(without_lf) => without_lf.strip_suffix('\r').unwrap_or(without_lf),
+                    None => &raw,
+                }
+                .to_owned();
+                // Defensive: libgit2 always emits a hunk header before content,
+                // but never index past an empty stack.
+                if let Some(current) = hunks.last_mut() {
+                    current.lines.push(DiffLine {
+                        origin: kind,
+                        old_lineno: line.old_lineno(),
+                        new_lineno: line.new_lineno(),
+                        content,
+                    });
+                }
+            }
             _ => {}
         }
-        out.push_str(&String::from_utf8_lossy(line.content()));
         true
     })?;
-    Ok(out)
+
+    Ok(FileDiff {
+        path: file.to_owned(),
+        binary,
+        truncated,
+        hunks,
+    })
 }
 
 fn short_hash(oid: Oid) -> String {

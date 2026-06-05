@@ -4,6 +4,7 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/sve
 import type {
   AgentRecord,
   NormalizedEvent,
+  Prompt,
   ProjectConversation,
   ProjectListing,
   ProjectSummary,
@@ -70,6 +71,7 @@ type Backend = {
   failPickFor: Set<string>;
   // Git-view tracked repos returned by `list_tracked_repos` / `read_tracked_repo`.
   trackedRepos: RepoListing[];
+  prompts: Prompt[];
 };
 let backend: Backend;
 let agentSeq = 0;
@@ -95,8 +97,18 @@ function freshBackend(): Backend {
     failConvoFor: new Set(),
     failPickFor: new Set(),
     trackedRepos: [],
+    prompts: [],
   };
 }
+
+const REVIEW_PROMPT: Prompt = {
+  provider: "local",
+  name: "review",
+  title: "Code Review",
+  description: "Review code",
+  arguments: [{ name: "focus", description: "What to focus on", required: true }],
+  tags: [],
+};
 
 function summaryFor(id: string): ProjectSummary {
   const row = backend.projects.find((p) => p.id === id);
@@ -200,6 +212,8 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
     }
     case "send_message":
       return backend.sendMessageId;
+    case "list_prompts":
+      return backend.prompts;
     // The getting-started panel (no-project state) probes auth + install
     // status. Honor probeFailures so a "logged out" / "not installed" case
     // can be simulated; default to authed + installed.
@@ -806,6 +820,46 @@ describe("App", () => {
     expect(screen.queryByTestId("compose-textarea")).not.toBeInTheDocument();
 
     releaseOpen();
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+  });
+
+  it("dehighlights the previous project row as soon as a new activation starts", async () => {
+    let releaseBeta!: () => void;
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    seedProject({
+      projectId: "p-b",
+      directory: DIR_B,
+      name: "beta",
+      agents: [agent({ id: "ag-2", project_id: "p-b", name: "helper" })],
+    });
+    backend.openProjectGates.set(
+      "p-b",
+      new Promise<void>((resolve) => {
+        releaseBeta = resolve;
+      }),
+    );
+    await mountApp();
+    await waitFor(() => expect(screen.getAllByTestId("project-row")).toHaveLength(2));
+
+    const alphaRow = projectRowByName("alpha");
+    const betaRow = projectRowByName("beta");
+    await fireEvent.click(within(alphaRow).getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+    expect(alphaRow).toHaveAttribute("data-active", "true");
+
+    await fireEvent.click(within(betaRow).getByText("beta"));
+
+    expect(betaRow).toHaveAttribute("data-active", "true");
+    expect(alphaRow).toHaveAttribute("data-active", "false");
+    expect(screen.getByTestId("project-loading")).toBeInTheDocument();
+    expect(screen.queryByTestId("compose-textarea")).not.toBeInTheDocument();
+
+    releaseBeta();
     await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
   });
 
@@ -1526,6 +1580,45 @@ describe("App", () => {
 
     // ⌘, from the composer opens settings.
     await fireEvent.keyDown(textarea, { key: ",", metaKey: true });
+    await waitFor(() => expect(screen.getByTestId("settings-view")).toBeInTheDocument());
+  });
+
+  it("global shortcuts work when focus is inside a prompt field", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    backend.prompts = [REVIEW_PROMPT];
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("compose-prompt-button")).toBeInTheDocument());
+
+    await fireEvent.click(screen.getByTestId("compose-prompt-button"));
+    await waitFor(() =>
+      expect(screen.getByTestId("prompt-option-local:review")).toBeInTheDocument(),
+    );
+    await fireEvent.click(screen.getByTestId("prompt-option-local:review"));
+    const promptField = await screen.findByTestId("prompt-arg-focus");
+    promptField.focus();
+
+    // ⌘B from a prompt field toggles the projects sidebar just like the plain composer.
+    await fireEvent.keyDown(promptField, { key: "b", metaKey: true });
+    await waitFor(() => expect(screen.queryByTestId("projects-sidebar")).not.toBeInTheDocument());
+    await fireEvent.keyDown(promptField, { key: "b", metaKey: true });
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+
+    // ⌘⇧B from a prompt field toggles the agents sidebar.
+    expect(screen.getByTestId("sidebar")).toBeInTheDocument();
+    await fireEvent.keyDown(promptField, { key: "B", metaKey: true, shiftKey: true });
+    await waitFor(() => expect(screen.queryByTestId("sidebar")).not.toBeInTheDocument());
+    await fireEvent.keyDown(promptField, { key: "B", metaKey: true, shiftKey: true });
+    await waitFor(() => expect(screen.getByTestId("sidebar")).toBeInTheDocument());
+
+    // ⌘, from a prompt field opens settings.
+    await fireEvent.keyDown(promptField, { key: ",", metaKey: true });
     await waitFor(() => expect(screen.getByTestId("settings-view")).toBeInTheDocument());
   });
 

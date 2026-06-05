@@ -51,6 +51,11 @@ export const worktreeSelection = $state<{ current: { path: string; label: string
   current: null,
 });
 
+/// Monotonic signal for secondary views derived from a selected worktree path.
+/// A repo refresh can change changed-files/diff content without changing the
+/// selected path, so the detail panel depends on this in addition to `path`.
+export const gitRefresh = $state<{ revision: number }>({ revision: 0 });
+
 export function selectWorktree(path: string, label: string): void {
   worktreeSelection.current = { path, label };
 }
@@ -299,6 +304,7 @@ function applyRepos(repos: RepoListing[]): void {
     }
   }
   reconcileWorktreeSelection(repos);
+  bumpDetailRefreshIfSelectionPresent(repos);
 }
 
 /// Clear the open detail panel if its worktree is no longer in the tree — the
@@ -307,11 +313,7 @@ function applyRepos(repos: RepoListing[]): void {
 function reconcileWorktreeSelection(repos: RepoListing[]): void {
   const selected = worktreeSelection.current;
   if (selected === null) return;
-  const present = repos.some(
-    (r) =>
-      r.repo.local_branches.some((b) => b.worktree?.path === selected.path) ||
-      r.repo.detached_worktrees.some((w) => w.path === selected.path),
-  );
+  const present = repos.some((repo) => listingContainsWorktree(repo, selected.path));
   if (!present) worktreeSelection.current = null;
 }
 
@@ -332,6 +334,22 @@ function upsertRepo(listing: RepoListing): void {
   // load) can drop the worktree the detail panel is open on — reconcile here too,
   // not just in the full-list `applyRepos`, so the panel never dangles.
   reconcileWorktreeSelection(gitView.repos);
+  bumpDetailRefreshIfSelectionPresent([listing]);
+}
+
+function bumpDetailRefreshIfSelectionPresent(repos: RepoListing[]): void {
+  const selected = worktreeSelection.current;
+  if (selected === null) return;
+  if (repos.some((repo) => listingContainsWorktree(repo, selected.path))) {
+    gitRefresh.revision += 1;
+  }
+}
+
+function listingContainsWorktree(listing: RepoListing, path: string): boolean {
+  return (
+    listing.repo.local_branches.some((branch) => branch.worktree?.path === path) ||
+    listing.repo.detached_worktrees.some((worktree) => worktree.path === path)
+  );
 }
 
 function recordFetch(root: string, state: FetchState): void {
@@ -371,6 +389,7 @@ export const _testing = {
     inFlightFetch.clear();
     for (const k of Object.keys(fetchStates)) delete fetchStates[k];
     worktreeSelection.current = null;
+    gitRefresh.revision = 0;
   },
   runtimeSize(): number {
     return runtime.size;

@@ -164,4 +164,138 @@ describe("WorktreeDetailPanel", () => {
       ).toBe(true),
     );
   });
+
+  it("refreshes the selected file in place when the refresh revision changes", async () => {
+    let body = "initial";
+    let changedFilesResolve: ((files: ChangedFile[]) => void) | undefined;
+    let diffResolve: ((diff: FileDiff) => void) | undefined;
+    invokeMock.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "changed_files") {
+        if (body === "refreshed") {
+          return new Promise<ChangedFile[]>((resolve) => {
+            changedFilesResolve = resolve;
+          });
+        }
+        return Promise.resolve([
+          { path: "a.ts", change: "modified" },
+          { path: "b.ts", change: "modified" },
+        ]);
+      }
+      if (cmd === "file_diff") {
+        if (body === "refreshed") {
+          return new Promise<FileDiff>((resolve) => {
+            diffResolve = resolve;
+          });
+        }
+        return Promise.resolve(
+          diffFixture({
+            path: String(args?.file),
+            hunks: [
+              {
+                header: "@@ -1 +1 @@",
+                lines: [
+                  {
+                    origin: "added",
+                    old_lineno: null,
+                    new_lineno: 1,
+                    content: `${args?.file}:${body}`,
+                  },
+                ],
+              },
+            ],
+          }),
+        );
+      }
+      return Promise.resolve(null);
+    });
+    const { rerender } = render(WorktreeDetailPanel, {
+      path: "/wt",
+      label: "feature",
+      refreshRevision: 0,
+      onClose: noop,
+    });
+    await waitFor(() => expect(screen.getByTestId("diff-view")).toHaveTextContent("a.ts:initial"));
+
+    await fireEvent.click(screen.getAllByTestId("changed-file")[1]!);
+    await waitFor(() => expect(screen.getByTestId("diff-view")).toHaveTextContent("b.ts:initial"));
+
+    body = "refreshed";
+    await rerender({ path: "/wt", label: "feature", refreshRevision: 1, onClose: noop });
+    expect(screen.queryByTestId("detail-loading")).not.toBeInTheDocument();
+    expect(screen.getByTestId("diff-view")).toHaveTextContent("b.ts:initial");
+
+    changedFilesResolve?.([
+      { path: "a.ts", change: "modified" },
+      { path: "b.ts", change: "modified" },
+    ]);
+    diffResolve?.(
+      diffFixture({
+        path: "b.ts",
+        hunks: [
+          {
+            header: "@@ -1 +1 @@",
+            lines: [
+              {
+                origin: "added",
+                old_lineno: null,
+                new_lineno: 1,
+                content: "b.ts:refreshed",
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("diff-view")).toHaveTextContent("b.ts:refreshed"),
+    );
+    expect(screen.getAllByTestId("changed-file")[1]).toHaveAttribute("data-selected", "true");
+  });
+
+  it("falls back to the first changed file when the selected file disappears on refresh", async () => {
+    let files: ChangedFile[] = [
+      { path: "a.ts", change: "modified" },
+      { path: "b.ts", change: "modified" },
+    ];
+    invokeMock.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "changed_files") return Promise.resolve(files);
+      if (cmd === "file_diff") {
+        return Promise.resolve(
+          diffFixture({
+            path: String(args?.file),
+            hunks: [
+              {
+                header: "@@ -1 +1 @@",
+                lines: [
+                  {
+                    origin: "added",
+                    old_lineno: null,
+                    new_lineno: 1,
+                    content: String(args?.file),
+                  },
+                ],
+              },
+            ],
+          }),
+        );
+      }
+      return Promise.resolve(null);
+    });
+    const { rerender } = render(WorktreeDetailPanel, {
+      path: "/wt",
+      label: "feature",
+      refreshRevision: 0,
+      onClose: noop,
+    });
+    await waitFor(() => expect(screen.getByTestId("diff-view")).toHaveTextContent("a.ts"));
+    await fireEvent.click(screen.getAllByTestId("changed-file")[1]!);
+    await waitFor(() => expect(screen.getByTestId("diff-view")).toHaveTextContent("b.ts"));
+
+    files = [{ path: "a.ts", change: "modified" }];
+    await rerender({ path: "/wt", label: "feature", refreshRevision: 1, onClose: noop });
+
+    await waitFor(() => expect(screen.getByTestId("diff-view")).toHaveTextContent("a.ts"));
+    expect(screen.getAllByTestId("changed-file")).toHaveLength(1);
+    expect(screen.getByTestId("changed-file")).toHaveAttribute("data-selected", "true");
+  });
 });

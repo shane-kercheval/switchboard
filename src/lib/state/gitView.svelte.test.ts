@@ -20,6 +20,7 @@ const {
   removeRepo,
   selectWorktree,
   worktreeSelection,
+  gitRefresh,
   loadProjectRepo,
   projectBranch,
   _testing,
@@ -148,6 +149,27 @@ describe("gitView store", () => {
     });
     await refreshRepo("/a");
     expect(worktreeSelection.current).toBeNull();
+  });
+
+  it("a single-repo refresh only bumps detail refresh for the selected worktree", async () => {
+    wire({ list: [listingWithWorktree("/a", "/a/wt"), listingWithWorktree("/b", "/b/wt")] });
+    await refreshAll();
+    selectWorktree("/a/wt", "main");
+    const before = gitRefresh.revision;
+
+    invokeMock.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "read_tracked_repo") return Promise.resolve(listingWithWorktree("/b", "/b/wt"));
+      return Promise.resolve(listing(String(args?.path)));
+    });
+    await refreshRepo("/b");
+    expect(gitRefresh.revision).toBe(before);
+
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "read_tracked_repo") return Promise.resolve(listingWithWorktree("/a", "/a/wt"));
+      return Promise.resolve(null);
+    });
+    await refreshRepo("/a");
+    expect(gitRefresh.revision).toBe(before + 1);
   });
 
   it("loadProjectRepo skips a redundant read when the repo was just read", async () => {

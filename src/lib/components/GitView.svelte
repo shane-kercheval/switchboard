@@ -25,6 +25,7 @@
     addRepo,
     worktreeSelection,
     clearWorktreeSelection,
+    gitRefresh,
   } from "$lib/state/gitView.svelte";
   import { pickDirectory } from "$lib/native";
 
@@ -237,6 +238,7 @@
         <WorktreeDetailPanel
           path={panel.path}
           label={panel.label}
+          refreshRevision={gitRefresh.revision}
           onClose={clearWorktreeSelection}
         />
       </div>

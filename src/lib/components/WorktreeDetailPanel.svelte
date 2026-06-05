@@ -3,6 +3,7 @@
   /// leaving Switchboard. Header (branch label + clickable path + layout toggle +
   /// close), a changed-files list, and the selected file's read-only diff. Loads
   /// are guarded against path/file races (a newer selection's result always wins).
+  import { untrack } from "svelte";
   import { cn, basename } from "$lib/utils";
   import EmptyState from "$lib/components/ui/EmptyState.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
@@ -19,7 +20,12 @@
   import { preferences, updatePreferences } from "$lib/preferences.svelte";
   import type { ChangedFile, ChangeKind, DiffStyle, FileDiff } from "$lib/types";
 
-  let { path, label, onClose }: { path: string; label: string; onClose: () => void } = $props();
+  let {
+    path,
+    label,
+    refreshRevision = 0,
+    onClose,
+  }: { path: string; label: string; refreshRevision?: number; onClose: () => void } = $props();
 
   let files = $state<ChangedFile[] | null>(null);
   let filesError = $state<string | null>(null);
@@ -33,50 +39,72 @@
   // resolved) is discarded rather than clobbering the current selection.
   let filesToken = 0;
   let diffToken = 0;
+  let filesPath: string | null = null;
+  let diffPath: string | null = null;
+  let diffFile: string | null = null;
 
-  // (Re)load the file list whenever the worktree path changes. Auto-selects the
-  // first file so the panel opens showing a diff, not an empty pane.
+  // (Re)load the file list whenever the worktree path or refresh revision
+  // changes. A path change clears immediately; a same-path refresh updates in
+  // place so the panel doesn't flash empty while the re-read is in flight.
   $effect(() => {
     const token = ++filesToken;
     const wt = path;
-    files = null;
+    const revision = refreshRevision;
+    const previousFile = untrack(() => selectedFile);
+    const pathChanged = filesPath !== wt;
+    if (pathChanged) {
+      files = null;
+      selectedFile = null;
+      diff = null;
+    }
     filesError = null;
-    selectedFile = null;
-    diff = null;
     void changedFiles(wt)
       .then((result) => {
-        if (token !== filesToken) return;
+        if (token !== filesToken || revision !== refreshRevision) return;
+        filesPath = wt;
         files = result;
-        selectedFile = result[0]?.path ?? null;
+        selectedFile = result.some((file) => file.path === previousFile)
+          ? previousFile
+          : (result[0]?.path ?? null);
       })
       .catch((e: unknown) => {
-        if (token !== filesToken) return;
+        if (token !== filesToken || revision !== refreshRevision) return;
+        filesPath = wt;
         files = [];
         filesError = e instanceof Error ? e.message : String(e);
       });
   });
 
-  // Load the selected file's diff. Keyed on both path and file so switching either
-  // refetches; the token guard drops a superseded result.
+  // Load the selected file's diff. Keyed on path, file, and refresh revision.
+  // Same-file refreshes keep the current diff visible until replacement content
+  // arrives; path/file switches show the loading state.
   $effect(() => {
     const file = selectedFile;
     const wt = path;
+    const revision = refreshRevision;
     if (file === null) {
       diff = null;
       return;
     }
     const token = ++diffToken;
-    diffLoading = true;
+    const sameTarget = diffPath === wt && diffFile === file && diff !== null;
+    if (!sameTarget) {
+      diffLoading = true;
+    }
     diffError = null;
     void fileDiff(wt, file)
       .then((result) => {
-        if (token !== diffToken) return;
+        if (token !== diffToken || revision !== refreshRevision) return;
+        diffPath = wt;
+        diffFile = file;
         diff = result;
         diffLoading = false;
       })
       .catch((e: unknown) => {
-        if (token !== diffToken) return;
+        if (token !== diffToken || revision !== refreshRevision) return;
         diff = null;
+        diffPath = null;
+        diffFile = null;
         diffError = e instanceof Error ? e.message : String(e);
         diffLoading = false;
       });

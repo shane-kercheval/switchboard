@@ -166,18 +166,19 @@ pub fn read_yaml<T: DeserializeOwned>(path: &Path) -> Result<T> {
     })
 }
 
-/// Atomic-ish YAML write: serialize, write to `<path>.tmp` in the *same
-/// directory* as the target, then `rename` over the target. Same-filesystem
-/// rename is atomic on POSIX/Windows; a cross-filesystem temp dir would
-/// degrade to copy+delete and defeat the purpose, so we stay adjacent.
+/// Atomic YAML write: serialize, write to `<path>.tmp` in the *same directory*
+/// as the target, then `rename` over the target. Same-filesystem rename is
+/// atomic on POSIX/Windows; a cross-filesystem temp dir would degrade to
+/// copy+delete and defeat the purpose, so we stay adjacent.
 ///
-/// **Known durability gap (tracked follow-up).** Unlike `write_jsonl` /
-/// `append_jsonl`, this does *not* `sync_data` the tmp before rename nor fsync
-/// the parent dir after — so a power loss can leave a partial/stale file. Lower
-/// frequency than the registry, but it persists `workspace.yaml` (the user's
-/// whole cross-directory project list) and `config.yaml`, so the gap isn't
-/// trivial. Hardening it the way `write_jsonl` does is a deliberate follow-up,
-/// out of the milestone that added `write_jsonl`.
+/// **Durability matches `write_jsonl`** (see its doc for the full rationale):
+/// `sync_data` the tmp before the rename (else a power loss after the rename
+/// reaches disk but the data didn't leaves an empty/partial file), and fsync the
+/// parent directory after the rename (a rename is a directory-entry change, not
+/// durable until the dir is synced — else the write can silently revert on power
+/// loss). This matters because `write_yaml` persists `workspace.yaml` (the user's
+/// whole cross-directory project list) and the shared `config.yaml`. Unix-only
+/// parent-dir fsync (no portable Windows equivalent), matching `write_jsonl`.
 pub fn write_yaml<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let yaml = serde_norway::to_string(value).map_err(|source| CoreError::CorruptYaml {
         path: path.to_owned(),
@@ -185,10 +186,27 @@ pub fn write_yaml<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     })?;
 
     let tmp = tmp_path(path);
-    std::fs::write(&tmp, yaml).map_err(|e| CoreError::io(&tmp, e))?;
+    {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)
+            .map_err(|e| CoreError::io(&tmp, e))?;
+        file.write_all(yaml.as_bytes())
+            .map_err(|e| CoreError::io(&tmp, e))?;
+        file.flush().map_err(|e| CoreError::io(&tmp, e))?;
+        file.sync_data().map_err(|e| CoreError::io(&tmp, e))?;
+    }
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(CoreError::io(path, e));
+    }
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| CoreError::io(parent, e))?;
     }
     Ok(())
 }
@@ -270,6 +288,41 @@ mod tests {
 
     fn s(text: &str) -> Value {
         Value::String(text.to_owned())
+    }
+
+    #[test]
+    fn write_yaml_round_trips_and_overwrites_without_leaving_a_tmp() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+
+        let mut first = serde_norway::Mapping::new();
+        first.insert(s("editor_command"), s("cursor"));
+        write_yaml(&path, &Value::Mapping(first)).unwrap();
+        assert_eq!(
+            read_yaml::<Value>(&path)
+                .unwrap()
+                .as_mapping()
+                .unwrap()
+                .get(s("editor_command")),
+            Some(&s("cursor"))
+        );
+
+        // A second write fully replaces the first, and the atomic-rename tmp is
+        // gone (cleaned up by the successful rename, not orphaned beside it).
+        let mut second = serde_norway::Mapping::new();
+        second.insert(s("terminal_app"), s("iTerm"));
+        write_yaml(&path, &Value::Mapping(second)).unwrap();
+        let reread = read_yaml::<Value>(&path).unwrap();
+        let map = reread.as_mapping().unwrap();
+        assert_eq!(map.get(s("terminal_app")), Some(&s("iTerm")));
+        assert!(
+            !map.contains_key(s("editor_command")),
+            "second write replaces the first"
+        );
+        assert!(
+            !tmp_path(&path).exists(),
+            "the temp file must not be left behind"
+        );
     }
 
     #[test]

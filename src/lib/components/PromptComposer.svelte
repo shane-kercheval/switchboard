@@ -29,6 +29,7 @@
     onremove,
     send,
     focusFirstField = false,
+    busy = false,
   }: {
     prompt: Prompt;
     args: Record<string, string>;
@@ -40,6 +41,7 @@
     /// Focuses the first editable prompt field when a user explicitly selects a
     /// prompt from the picker. Saved/restored prompt drafts leave focus alone.
     focusFirstField?: boolean;
+    busy?: boolean;
   } = $props();
 
   type PreviewState =
@@ -97,6 +99,7 @@
   });
 
   function openPreview(): void {
+    if (busy) return;
     previewOpen = true;
     void runPreview();
   }
@@ -117,106 +120,137 @@
 </script>
 
 <div
-  class="flex max-h-[min(56dvh,34rem)] min-h-0 flex-col gap-3 overflow-hidden"
+  class="relative flex max-h-[min(56dvh,34rem)] min-h-0 flex-col overflow-hidden"
   data-testid="prompt-composer"
+  aria-busy={busy}
 >
-  <div class="flex items-center gap-1.5">
-    <div
-      class="border-border bg-panel inline-flex h-7 min-w-0 items-center gap-1.5 rounded-full border px-3"
-      data-testid="prompt-selector"
-    >
-      <span class="text-fg truncate text-sm font-medium">{promptDisplayName(prompt)}</span>
-      <span class="text-muted shrink-0 font-mono text-[11px]">{prompt.provider}</span>
-    </div>
-    <button
-      type="button"
-      class="text-muted hover:bg-panel hover:text-status-failed inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full transition-colors"
-      data-testid="prompt-remove"
-      aria-label="Remove prompt"
-      onclick={onremove}
-    >
-      <svg
-        width="16"
-        height="16"
-        viewBox="0 0 24 24"
-        fill="none"
-        stroke="currentColor"
-        stroke-width="2"
-        stroke-linecap="round"
-        stroke-linejoin="round"
-        aria-hidden="true"
-      >
-        <path d="M18 6 6 18M6 6l12 12" />
-      </svg>
-    </button>
-  </div>
-
-  {#if prompt.description}
-    <p class="text-muted text-xs">{prompt.description}</p>
-  {/if}
-
   <div
-    class="min-h-0 [scrollbar-gutter:stable] space-y-3 overflow-y-auto py-1 pr-3 pl-1"
-    data-testid="prompt-fields-scroll"
+    class={cn(
+      "flex min-h-0 flex-col gap-3 transition-[filter,opacity]",
+      busy ? "opacity-55 blur-[1px]" : "",
+    )}
+    data-testid="prompt-composer-content"
   >
-    {#each prompt.arguments as arg (arg.name)}
-      {@const isMissing = missing.includes(arg.name)}
-      <div class="flex flex-col gap-1">
-        <label
-          class="text-fg flex items-baseline gap-1.5 text-xs font-medium"
-          for={`prompt-arg-${arg.name}`}
+    <div class="flex items-center gap-1.5">
+      <div
+        class="border-border bg-panel inline-flex h-7 min-w-0 items-center gap-1.5 rounded-full border px-3"
+        data-testid="prompt-selector"
+      >
+        <span class="text-fg truncate text-sm font-medium">{promptDisplayName(prompt)}</span>
+        <span class="text-muted shrink-0 font-mono text-[11px]">{prompt.provider}</span>
+      </div>
+      <button
+        type="button"
+        class="text-muted hover:bg-panel hover:text-status-failed inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full transition-colors"
+        data-testid="prompt-remove"
+        aria-label="Remove prompt"
+        disabled={busy}
+        onclick={() => {
+          if (!busy) onremove();
+        }}
+        class:cursor-not-allowed={busy}
+        class:opacity-50={busy}
+      >
+        <svg
+          width="16"
+          height="16"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          aria-hidden="true"
         >
-          <span>{arg.name}</span>
-          {#if arg.required}
-            <span class="text-status-failed" data-testid={`prompt-arg-required-${arg.name}`}
-              >required</span
-            >
-          {:else}
-            <span class="text-muted font-normal">optional</span>
+          <path d="M18 6 6 18M6 6l12 12" />
+        </svg>
+      </button>
+    </div>
+
+    {#if prompt.description}
+      <p class="text-muted text-xs">{prompt.description}</p>
+    {/if}
+
+    <div
+      class="min-h-0 [scrollbar-gutter:stable] space-y-3 overflow-y-auto py-1 pr-3 pl-1"
+      data-testid="prompt-fields-scroll"
+    >
+      {#each prompt.arguments as arg (arg.name)}
+        {@const isMissing = missing.includes(arg.name)}
+        <div class="flex flex-col gap-1">
+          <label
+            class="text-fg flex items-baseline gap-1.5 text-xs font-medium"
+            for={`prompt-arg-${arg.name}`}
+          >
+            <span>{arg.name}</span>
+            {#if arg.required}
+              <span class="text-status-failed" data-testid={`prompt-arg-required-${arg.name}`}
+                >required</span
+              >
+            {:else}
+              <span class="text-muted font-normal">optional</span>
+            {/if}
+          </label>
+          {#if arg.description}
+            <p class="text-muted text-[11px]">{arg.description}</p>
           {/if}
-        </label>
-        {#if arg.description}
-          <p class="text-muted text-[11px]">{arg.description}</p>
-        {/if}
+          <Textarea
+            id={`prompt-arg-${arg.name}`}
+            data-testid={`prompt-arg-${arg.name}`}
+            rows={2}
+            bind:ref={argRefs[arg.name]}
+            bind:value={args[arg.name]}
+            oninput={resizeInput}
+            disabled={busy}
+            class={cn("max-h-40 min-h-9 text-sm", isMissing ? "border-status-failed" : "")}
+          />
+        </div>
+      {/each}
+
+      <div class="flex flex-col gap-1">
+        <label class="text-fg text-xs font-medium" for="prompt-appended">Appended text</label>
         <Textarea
-          id={`prompt-arg-${arg.name}`}
-          data-testid={`prompt-arg-${arg.name}`}
+          id="prompt-appended"
+          data-testid="prompt-appended"
           rows={2}
-          bind:ref={argRefs[arg.name]}
-          bind:value={args[arg.name]}
+          placeholder="Optional text appended after the prompt…"
+          bind:ref={appendedRef}
+          bind:value={appendedText}
           oninput={resizeInput}
-          class={cn("max-h-40 min-h-9 text-sm", isMissing ? "border-status-failed" : "")}
+          disabled={busy}
+          class="max-h-40 min-h-9 text-sm"
         />
       </div>
-    {/each}
+    </div>
 
-    <div class="flex flex-col gap-1">
-      <label class="text-fg text-xs font-medium" for="prompt-appended">Appended text</label>
-      <Textarea
-        id="prompt-appended"
-        data-testid="prompt-appended"
-        rows={2}
-        placeholder="Optional text appended after the prompt…"
-        bind:ref={appendedRef}
-        bind:value={appendedText}
-        oninput={resizeInput}
-        class="max-h-40 min-h-9 text-sm"
-      />
+    <div class="flex items-center justify-between gap-2">
+      <Button
+        variant="secondary"
+        size="sm"
+        data-testid="prompt-preview-button"
+        disabled={busy || missing.length > 0}
+        onclick={openPreview}
+      >
+        Preview
+      </Button>
+      {@render send?.()}
     </div>
   </div>
 
-  <div class="flex items-center justify-between gap-2">
-    <Button
-      variant="secondary"
-      size="sm"
-      data-testid="prompt-preview-button"
-      disabled={missing.length > 0}
-      onclick={openPreview}
+  {#if busy}
+    <div
+      class="bg-raised/70 absolute inset-0 z-10 flex items-center justify-center rounded-lg backdrop-blur-[1px]"
+      data-testid="prompt-rendering"
+      role="status"
     >
-      Preview
-    </Button>
-    {@render send?.()}
-  </div>
+      <div
+        class="border-border bg-raised text-fg flex items-center gap-2 rounded-full border px-3 py-2 text-sm shadow-lg"
+      >
+        <Spinner class="h-4 w-4 shrink-0" />
+        <span>Rendering prompt…</span>
+      </div>
+    </div>
+  {/if}
 </div>
 
 <Dialog

@@ -258,7 +258,7 @@
         } else if (menuOpen) {
           menuOpen = false;
           e.preventDefault();
-        } else if (selectedIds.length > 0) {
+        } else if (!sending && selectedIds.length > 0) {
           selectedIds = [];
           e.preventDefault();
         }
@@ -275,6 +275,7 @@
       if (e.shiftKey) {
         if (e.key.toLowerCase() === "a") {
           e.preventDefault();
+          if (sending) return;
           selectedIds = agents.map((a) => a.id);
         }
         return;
@@ -283,6 +284,7 @@
       const agent = agents[Number(e.key) - 1];
       if (agent === undefined) return;
       e.preventDefault();
+      if (sending) return;
       toggleRecipient(agent.id);
     }
     window.addEventListener("keydown", onKeydown);
@@ -418,6 +420,7 @@
   const primaryDisabled = $derived(showStop ? false : sendDisabled);
 
   function toggleRecipient(id: AgentId): void {
+    if (sending) return;
     selectedIds = selectedIds.includes(id)
       ? selectedIds.filter((x) => x !== id)
       : [...selectedIds, id];
@@ -702,6 +705,8 @@
       const renderArgs = buildRenderArgs(prompt, promptArgs);
       const appended = appendedText;
       const targets = [...selectedAgents];
+      promptMenuOpen = false;
+      closeMentionMenu();
       sending = true;
       let finalText: string;
       try {
@@ -713,11 +718,8 @@
         return;
       }
       sending = false;
-      // The user may have backed out during the render: removed/swapped the
-      // prompt, or deselected a chosen recipient. Honor that — abort without
-      // dispatching and without resetting their new composer state. (Adding a
-      // recipient mid-render is not an abort: the send commits to the recipients
-      // chosen at click time; a newly-added one wasn't part of this send.)
+      // If the composer state changed outside the locked UI while rendering,
+      // avoid dispatching text into a now-different prompt/recipient context.
       const stillSelected = new Set(selectedIds);
       if (selectedPrompt !== prompt || targets.some((t) => !stillSelected.has(t.id))) return;
       dispatchToRecipients(finalText, targets);
@@ -920,10 +922,12 @@
                     selected
                       ? "bg-accent-soft text-fg border-transparent"
                       : "border-panel bg-panel text-muted hover:bg-raised hover:text-fg",
+                    sending ? "cursor-not-allowed opacity-60" : "",
                   )}
                   data-testid={`recipient-chip-${agent.id}`}
                   data-selected={selected}
                   aria-pressed={selected}
+                  disabled={sending}
                   onclick={() => toggleRecipient(agent.id)}
                 >
                   <HarnessIcon harness={agent.harness} size="sm" class="h-3.5 w-3.5" />
@@ -941,7 +945,10 @@
                   class="text-muted hover:text-fg hover:bg-panel ml-0.5 flex h-6 w-6 items-center justify-center rounded-full transition-colors"
                   data-testid="recipient-clear"
                   aria-label="Clear recipients"
-                  onclick={() => (selectedIds = [])}
+                  disabled={sending}
+                  onclick={() => {
+                    if (!sending) selectedIds = [];
+                  }}
                 >
                   <svg
                     viewBox="0 0 24 24"
@@ -969,10 +976,21 @@
             <button
               {...props}
               type="button"
-              class="text-muted hover:text-fg hover:bg-panel focus-visible:ring-accent flex h-7 items-center gap-1 rounded-full border border-transparent px-2 text-xs transition-colors focus-visible:ring-2 focus-visible:outline-none"
+              class={cn(
+                "text-muted hover:text-fg hover:bg-panel focus-visible:ring-accent flex h-7 items-center gap-1 rounded-full border border-transparent px-2 text-xs transition-colors focus-visible:ring-2 focus-visible:outline-none",
+                sending ? "cursor-not-allowed opacity-60" : "",
+              )}
               data-testid="compose-prompt-button"
               aria-label="Insert a prompt"
-              onclick={() => (promptMenuOpen ? (promptMenuOpen = false) : openPromptMenu())}
+              disabled={sending}
+              onclick={() => {
+                if (sending) return;
+                if (promptMenuOpen) {
+                  promptMenuOpen = false;
+                } else {
+                  openPromptMenu();
+                }
+              }}
             >
               <svg
                 viewBox="0 0 24 24"
@@ -1014,6 +1032,7 @@
           bind:appendedText
           focusFirstField={focusPromptFieldOnMount}
           onremove={removePrompt}
+          busy={sending}
           send={sendButton}
         />
       </div>

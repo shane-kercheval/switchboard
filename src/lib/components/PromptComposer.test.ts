@@ -21,10 +21,10 @@ const PROMPT: Prompt = {
   tags: [],
 };
 
-function setup(args: Record<string, string>, appendedText = "") {
+function setup(args: Record<string, string>, appendedText = "", busy = false) {
   const onremove = vi.fn();
   render(PromptComposer, {
-    props: { prompt: PROMPT, args, appendedText, onremove },
+    props: { prompt: PROMPT, args, appendedText, onremove, busy },
   });
   return { onremove };
 }
@@ -141,6 +141,25 @@ describe("PromptComposer", () => {
   it("disables Preview until required arguments are filled", async () => {
     setup({ focus: "", tone: "" });
     expect((screen.getByTestId("prompt-preview-button") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("locks prompt controls and shows status while busy", async () => {
+    const { onremove } = setup({ focus: "tests", tone: "" }, "tail", true);
+
+    expect(screen.getByTestId("prompt-composer")).toHaveAttribute("aria-busy", "true");
+    expect((screen.getByTestId("prompt-arg-focus") as HTMLTextAreaElement).disabled).toBe(true);
+    expect((screen.getByTestId("prompt-arg-tone") as HTMLTextAreaElement).disabled).toBe(true);
+    expect((screen.getByTestId("prompt-appended") as HTMLTextAreaElement).disabled).toBe(true);
+    expect((screen.getByTestId("prompt-preview-button") as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByTestId("prompt-remove") as HTMLButtonElement).disabled).toBe(true);
+
+    const status = screen.getByTestId("prompt-rendering");
+    expect(status).toHaveTextContent("Rendering prompt");
+    expect(status).toHaveClass("absolute", "inset-0", "backdrop-blur-[1px]");
+    expect(screen.getByTestId("prompt-composer-content")).toHaveClass("opacity-55", "blur-[1px]");
+    expect(status.querySelector(".animate-spin")).not.toBeNull();
+    await fireEvent.click(screen.getByTestId("prompt-remove"));
+    expect(onremove).not.toHaveBeenCalled();
   });
 
   it("surfaces a preview render failure inline", async () => {

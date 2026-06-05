@@ -19,6 +19,7 @@ const {
   addRepo,
   removeRepo,
   selectBranch,
+  selectUncommitted,
   branchSelection,
   branchCommits,
   diffTarget,
@@ -248,6 +249,79 @@ describe("gitView store", () => {
 
     await refreshRepo("/a"); // selected target's repo → bump
     expect(gitRefresh.revision).toBe(before + 1);
+  });
+
+  it("falls back to the latest commit when a selected branch loses its worktree", async () => {
+    // A recent range with one commit, so the fallback has something to select.
+    const ranges = [
+      {
+        kind: "recent",
+        label: "Recent commits",
+        truncated: false,
+        commits: [
+          {
+            oid: "fa11bac0",
+            short_oid: "fa11bac",
+            subject: "tip",
+            author_name: "T",
+            author_email: null,
+            authored_at: null,
+          },
+        ],
+      },
+    ];
+    // `main` keeps existing after refresh, but its worktree is removed.
+    const mainNoWorktree = (): RepoListing => {
+      const l = listing("/a");
+      l.repo.local_branches = [
+        {
+          name: "main",
+          upstream: null,
+          sync: { kind: "local_only" },
+          behind_base: null,
+          merged: null,
+          dangling: false,
+          worktree: null,
+        },
+      ];
+      return l;
+    };
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "list_tracked_repos")
+        return Promise.resolve([listingWithWorktree("/a", "/a/wt")]);
+      if (cmd === "branch_commits") return Promise.resolve(ranges);
+      if (cmd === "read_tracked_repo") return Promise.resolve(mainNoWorktree());
+      return Promise.resolve(null);
+    });
+    await refreshAll();
+    await selectBranch(mainRef(), dirtyOpts);
+    expect(diffTarget.current?.kind).toBe("uncommitted");
+
+    await refreshRepo("/a"); // branch stays, worktree gone
+    expect(diffTarget.current).toMatchObject({ kind: "commit", oid: "fa11bac0" });
+    expect(branchSelection.current?.name).toBe("main"); // branch stays selected
+  });
+
+  it("closes the panel when a selected detached worktree is pruned", async () => {
+    const withDetached = (): RepoListing => {
+      const l = listing("/a");
+      l.repo.detached_worktrees = [
+        { path: "/a/dt", dirty: true, untracked: false, detached_hash: "abc1234", warning: null },
+      ];
+      return l;
+    };
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "list_tracked_repos") return Promise.resolve([withDetached()]);
+      if (cmd === "read_tracked_repo") return Promise.resolve(listing("/a")); // detached gone
+      return Promise.resolve(null);
+    });
+    await refreshAll();
+    // A detached worktree is selected directly (no branch), as GitRepoNode does.
+    selectUncommitted("/a", "/a/dt", "~/dt");
+    expect(diffTarget.current?.kind).toBe("uncommitted");
+
+    await refreshRepo("/a"); // the detached worktree is no longer present
+    expect(diffTarget.current).toBeNull();
   });
 
   it("loadProjectRepo skips a redundant read when the repo was just read", async () => {

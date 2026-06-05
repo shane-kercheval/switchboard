@@ -939,7 +939,9 @@ fn commit_changed_files_lists_files_against_first_parent() {
     commit_all(dir.path(), "second");
     let head = git(dir.path(), &["rev-parse", "HEAD"]);
 
-    let files = commit_changed_files(dir.path(), &head).unwrap();
+    let changes = commit_changed_files(dir.path(), &head).unwrap();
+    assert!(changes.found);
+    let files = &changes.files;
     let kind = |name: &str| files.iter().find(|f| f.path == name).map(|f| f.change);
     assert_eq!(kind("added.txt"), Some(ChangeKind::Added));
     assert_eq!(kind("README.md"), Some(ChangeKind::Modified));
@@ -952,10 +954,11 @@ fn commit_changed_files_for_root_commit_lists_all_as_added() {
     let dir = repo_with_main();
     let root = git(dir.path(), &["rev-parse", "HEAD"]); // the only (root) commit
 
-    let files = commit_changed_files(dir.path(), &root).unwrap();
-    assert_eq!(files.len(), 1);
-    assert_eq!(files[0].path, "README.md");
-    assert_eq!(files[0].change, ChangeKind::Added);
+    let changes = commit_changed_files(dir.path(), &root).unwrap();
+    assert!(changes.found);
+    assert_eq!(changes.files.len(), 1);
+    assert_eq!(changes.files[0].path, "README.md");
+    assert_eq!(changes.files[0].change, ChangeKind::Added);
 }
 
 #[test]
@@ -988,13 +991,86 @@ fn commit_file_diff_returns_hunks_for_a_committed_change() {
 }
 
 #[test]
-fn commit_diffs_for_invalid_or_unknown_oid_degrade_to_empty() {
+fn commit_diffs_for_invalid_or_unknown_oid_report_not_found() {
     let dir = repo_with_main();
-    // Garbage oid (unparseable) and a well-formed but absent oid.
+    // Garbage oid (unparseable) and a well-formed but absent oid both report
+    // `found: false` — distinct from a real commit that changed no files.
     let absent = "0".repeat(40);
     for oid in ["not-a-hash", absent.as_str()] {
-        assert!(commit_changed_files(dir.path(), oid).unwrap().is_empty());
+        let changes = commit_changed_files(dir.path(), oid).unwrap();
+        assert!(!changes.found, "absent oid {oid:?} must report not-found");
+        assert!(changes.files.is_empty());
         let diff = commit_file_diff(dir.path(), oid, "README.md").unwrap();
         assert!(diff.hunks.is_empty());
     }
+}
+
+#[test]
+fn commit_changed_files_reports_found_for_a_real_empty_commit() {
+    // A genuine empty commit (changed no files) is `found: true` with no files —
+    // distinct from a vanished commit.
+    let dir = repo_with_main();
+    git(
+        dir.path(),
+        &["commit", "-q", "--allow-empty", "-m", "empty"],
+    );
+    let head = git(dir.path(), &["rev-parse", "HEAD"]);
+
+    let changes = commit_changed_files(dir.path(), &head).unwrap();
+    assert!(changes.found);
+    assert!(changes.files.is_empty());
+}
+
+#[test]
+fn commit_file_diff_renders_a_rename_with_edit_as_its_real_edit() {
+    // A file renamed *and* edited in one commit must show the actual edit, not the
+    // whole file as added (the find_similar-aware path), and the list agrees it's
+    // a rename.
+    let dir = repo_with_main();
+    write(dir.path(), "old.txt", "one\ntwo\nthree\n");
+    commit_all(dir.path(), "add old");
+    std::fs::rename(dir.path().join("old.txt"), dir.path().join("new.txt")).unwrap();
+    write(dir.path(), "new.txt", "one\nTWO\nthree\n");
+    commit_all(dir.path(), "rename and edit");
+    let head = git(dir.path(), &["rev-parse", "HEAD"]);
+
+    let changes = commit_changed_files(dir.path(), &head).unwrap();
+    let renamed = changes.files.iter().find(|f| f.path == "new.txt").unwrap();
+    assert_eq!(renamed.change, ChangeKind::Renamed);
+
+    let diff = commit_file_diff(dir.path(), &head, "new.txt").unwrap();
+    let added: Vec<_> = diff
+        .hunks
+        .iter()
+        .flat_map(|h| &h.lines)
+        .filter(|l| l.origin == DiffLineKind::Added)
+        .map(|l| l.content.as_str())
+        .collect();
+    // Only the edited line is added — not the whole file (which would include the
+    // unchanged "one"/"three" lines as additions).
+    assert!(added.contains(&"TWO"), "the real edit shows: {added:?}");
+    assert!(
+        !added.contains(&"one"),
+        "unchanged lines are not re-added: {added:?}"
+    );
+    assert!(
+        !added.contains(&"three"),
+        "unchanged lines are not re-added: {added:?}"
+    );
+}
+
+#[test]
+fn commit_file_diff_for_a_pure_rename_has_no_content_hunks() {
+    // A pure rename (no edit) shows no content changes — honest, and pairs with
+    // the "R" label, rather than rendering the whole file as added.
+    let dir = repo_with_main();
+    write(dir.path(), "old.txt", "stable\ncontent\n");
+    commit_all(dir.path(), "add old");
+    std::fs::rename(dir.path().join("old.txt"), dir.path().join("new.txt")).unwrap();
+    commit_all(dir.path(), "pure rename");
+    let head = git(dir.path(), &["rev-parse", "HEAD"]);
+
+    let diff = commit_file_diff(dir.path(), &head, "new.txt").unwrap();
+    let content_lines: usize = diff.hunks.iter().map(|h| h.lines.len()).sum();
+    assert_eq!(content_lines, 0, "a pure rename has no content lines");
 }

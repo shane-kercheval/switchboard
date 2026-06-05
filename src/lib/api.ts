@@ -7,6 +7,7 @@ import type {
   AgentRecord,
   BranchKind,
   ChangedFile,
+  CommitChanges,
   DirectoryInfo,
   FileDiff,
   GitCommitRange,
@@ -143,9 +144,10 @@ export async function branchCommits(
 }
 
 // The files one commit changed (vs. its first parent). No worktree needed, so it
-// serves branches with no local folder and remote-only branches.
-export async function commitChangedFiles(repoRoot: string, oid: string): Promise<ChangedFile[]> {
-  return await invoke<ChangedFile[]>("commit_changed_files", { repoRoot, oid });
+// serves branches with no local folder and remote-only branches. `found: false`
+// means the commit no longer resolves (gc'd / branch force-updated).
+export async function commitChangedFiles(repoRoot: string, oid: string): Promise<CommitChanges> {
+  return await invoke<CommitChanges>("commit_changed_files", { repoRoot, oid });
 }
 
 // The structured diff of one file within one commit (vs. its first parent).

@@ -74,7 +74,8 @@ const repo = (over: Partial<RepoListing["repo"]> = {}): RepoListing => ({
 function wire(list: RepoListing[]) {
   invokeMock.mockImplementation((cmd: string) => {
     if (cmd === "list_tracked_repos") return Promise.resolve(list);
-    if (cmd === "changed_files" || cmd === "commit_changed_files") return Promise.resolve([]);
+    if (cmd === "changed_files") return Promise.resolve([]);
+    if (cmd === "commit_changed_files") return Promise.resolve({ found: true, files: [] });
     if (cmd === "file_diff" || cmd === "commit_file_diff")
       return Promise.resolve({ path: "", binary: false, truncated: false, hunks: [] });
     if (cmd === "branch_commits")

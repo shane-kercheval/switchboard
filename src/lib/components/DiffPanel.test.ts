@@ -59,10 +59,13 @@ const commitTarget = (over: Partial<Extract<DiffTarget, { kind: "commit" }>> = {
 // Both the worktree reads (changed_files/file_diff) and the commit reads
 // (commit_changed_files/commit_file_diff) are wired, so a test can assert which
 // pair the panel used for a given target kind.
-function wire(opts: { files?: ChangedFile[]; diff?: FileDiff } = {}) {
+function wire(opts: { files?: ChangedFile[]; diff?: FileDiff; commitFound?: boolean } = {}) {
+  const files = opts.files ?? [{ path: "code.ts", change: "modified" }];
   invokeMock.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
-    if (cmd === "changed_files" || cmd === "commit_changed_files")
-      return Promise.resolve(opts.files ?? [{ path: "code.ts", change: "modified" }]);
+    if (cmd === "changed_files") return Promise.resolve(files);
+    // The commit read returns the `{ found, files }` shape.
+    if (cmd === "commit_changed_files")
+      return Promise.resolve({ found: opts.commitFound ?? true, files });
     if (cmd === "file_diff" || cmd === "commit_file_diff")
       return Promise.resolve(opts.diff ?? diffFixture({ path: String(args?.file) }));
     if (cmd === "set_preferences") return Promise.resolve(null);
@@ -286,9 +289,19 @@ describe("DiffPanel (commit target)", () => {
   });
 
   it("shows a calm empty state for a commit that changed no files", async () => {
-    wire({ files: [] });
+    wire({ files: [], commitFound: true });
     render(DiffPanel, { props: { target: commitTarget(), onClose: noop } });
     await waitFor(() => expect(screen.getByTestId("detail-no-changes")).toBeInTheDocument());
     expect(screen.getByTestId("detail-no-changes")).toHaveTextContent("changed no files");
+  });
+
+  it("distinguishes a vanished commit from an empty one", async () => {
+    // A gc'd / force-updated commit reports found: false → a distinct "no longer
+    // available" state, not the "changed no files" message.
+    wire({ files: [], commitFound: false });
+    render(DiffPanel, { props: { target: commitTarget(), onClose: noop } });
+    await waitFor(() => expect(screen.getByTestId("detail-commit-missing")).toBeInTheDocument());
+    expect(screen.getByTestId("detail-commit-missing")).toHaveTextContent("no longer available");
+    expect(screen.queryByTestId("detail-no-changes")).not.toBeInTheDocument();
   });
 });

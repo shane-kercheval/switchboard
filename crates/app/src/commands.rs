@@ -660,7 +660,7 @@ pub fn commit_changed_files_impl(
     roots: &[PathBuf],
     repo_root: &str,
     oid: &str,
-) -> Result<Vec<switchboard_git::ChangedFile>, AppError> {
+) -> Result<switchboard_git::CommitChanges, AppError> {
     if !is_tracked_repo(roots, repo_root) {
         return Err(AppError::RepoNotTracked {
             root: repo_root.to_owned(),
@@ -9911,11 +9911,12 @@ mod tests {
         git(repo.path(), &["commit", "-q", "-m", "change code"]);
         let head = head_oid(repo.path());
 
-        let files =
+        let changes =
             commit_changed_files_impl(&roots_of(&repo), repo.path().to_str().unwrap(), &head)
                 .unwrap();
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].path, "code.txt");
+        assert!(changes.found);
+        assert_eq!(changes.files.len(), 1);
+        assert_eq!(changes.files[0].path, "code.txt");
 
         let diff = commit_file_diff_impl(
             &roots_of(&repo),
@@ -9961,7 +9962,7 @@ mod tests {
     fn commit_reads_handle_missing_refs_without_a_worktree() {
         // A tracked repo, but the branch/oid don't resolve (a stale frontend
         // reference). Commits need no worktree, so this must degrade cleanly:
-        // ranges/files empty, diff empty — not an error.
+        // ranges empty, changes report `found: false`, diff empty — not an error.
         let repo = TempDir::new().unwrap();
         init_git_repo(repo.path());
         let root = repo.path().to_str().unwrap();
@@ -9976,11 +9977,11 @@ mod tests {
         .unwrap();
         assert!(ranges.is_empty());
 
-        assert!(
-            commit_changed_files_impl(&roots_of(&repo), root, &absent_oid)
-                .unwrap()
-                .is_empty()
-        );
+        // A vanished commit is reported as not-found (distinct from a real empty
+        // commit), calmly — not an error.
+        let changes = commit_changed_files_impl(&roots_of(&repo), root, &absent_oid).unwrap();
+        assert!(!changes.found);
+        assert!(changes.files.is_empty());
         assert!(
             commit_file_diff_impl(&roots_of(&repo), root, &absent_oid, "README.md")
                 .unwrap()

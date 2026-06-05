@@ -13,9 +13,9 @@ use chrono::{FixedOffset, LocalResult, TimeZone};
 
 use crate::error::{GitError, Result};
 use crate::model::{
-    BranchView, ChangeKind, ChangedFile, CommitRangeKind, DiffHunk, DiffLine, DiffLineKind,
-    FileDiff, GitCommitRange, GitCommitSummary, RemoteBranchView, RepoView, SyncState,
-    WorktreeView, WorktreeWarning,
+    BranchView, ChangeKind, ChangedFile, CommitChanges, CommitRangeKind, DiffHunk, DiffLine,
+    DiffLineKind, FileDiff, GitCommitRange, GitCommitSummary, RemoteBranchView, RepoView,
+    SyncState, WorktreeView, WorktreeWarning,
 };
 
 /// Resolve any path inside (or at) a git repo to the canonical **main-worktree /
@@ -121,7 +121,7 @@ pub fn file_diff(path: &Path, file: &str) -> Result<FileDiff> {
     }
     .map_err(|e| GitError::read(path, e))?;
 
-    collect_file_diff(&diff, file).map_err(|e| GitError::read(path, e))
+    collect_file_diff(&diff, file, false).map_err(|e| GitError::read(path, e))
 }
 
 /// Whether a [`commit_ranges`] target names a local branch (`refs/heads/*`) or a
@@ -184,30 +184,43 @@ pub fn commit_ranges(path: &Path, kind: BranchKind, name: &str) -> Result<Vec<Gi
 /// local folder or a remote-only branch.
 ///
 /// `oid` is the full hex id from a [`GitCommitSummary`]. An unparseable or
-/// unknown id (a stale reference) yields an empty `Vec` rather than an error.
-pub fn commit_changed_files(path: &Path, oid: &str) -> Result<Vec<ChangedFile>> {
+/// no-longer-present id (a stale reference) yields [`CommitChanges`] with
+/// `found: false` — calm, not an error, but distinguishable from a real commit
+/// that changed nothing (`found: true`, empty `files`).
+pub fn commit_changed_files(path: &Path, oid: &str) -> Result<CommitChanges> {
     let repo = match Repository::open(path) {
         Ok(repo) => repo,
-        Err(e) if is_not_found(&e) => return Ok(Vec::new()),
+        Err(e) if is_not_found(&e) => return Ok(CommitChanges::missing()),
         Err(e) => return Err(GitError::read(path, e)),
     };
     let mut opts = DiffOptions::new();
     let Some(mut diff) =
         commit_tree_diff(&repo, oid, &mut opts).map_err(|e| GitError::read(path, e))?
     else {
-        return Ok(Vec::new());
+        return Ok(CommitChanges::missing());
     };
     // Coalesce add+delete pairs into renames for a cleaner list (matches the
     // worktree read's rename handling).
     diff.find_similar(None)
         .map_err(|e| GitError::read(path, e))?;
-    Ok(changed_files_from_diff(&diff))
+    Ok(CommitChanges {
+        found: true,
+        files: changed_files_from_diff(&diff),
+    })
 }
 
 /// The structured diff of a single `file` within one commit, relative to its
 /// first parent (empty tree for a root commit). The committed-history analogue of
 /// [`file_diff`]; same [`FileDiff`] shape and same truncation cap. An unparseable
 /// or unknown `oid` yields an empty [`FileDiff`].
+///
+/// Unlike [`file_diff`], this does **not** pathspec the read: rename detection
+/// needs both the old and new path present in the diff to pair them, so we diff
+/// the whole commit, run `find_similar`, then collect only this file's delta. A
+/// renamed-and-edited file then shows its real edit (not the whole file as added,
+/// which a pathspec'd add/delete view would show); a pure rename shows no content
+/// hunks, matching the `R` label in the file list. The extra cost is bounded by
+/// the commit's own change set and only paid on a click.
 pub fn commit_file_diff(path: &Path, oid: &str, file: &str) -> Result<FileDiff> {
     let repo = match Repository::open(path) {
         Ok(repo) => repo,
@@ -215,14 +228,14 @@ pub fn commit_file_diff(path: &Path, oid: &str, file: &str) -> Result<FileDiff> 
         Err(e) => return Err(GitError::read(path, e)),
     };
     let mut opts = DiffOptions::new();
-    // Match `file` literally, not as a glob — same reasoning as `file_diff`.
-    opts.disable_pathspec_match(true).pathspec(file);
-    let Some(diff) =
+    let Some(mut diff) =
         commit_tree_diff(&repo, oid, &mut opts).map_err(|e| GitError::read(path, e))?
     else {
         return Ok(FileDiff::empty(file));
     };
-    collect_file_diff(&diff, file).map_err(|e| GitError::read(path, e))
+    diff.find_similar(None)
+        .map_err(|e| GitError::read(path, e))?;
+    collect_file_diff(&diff, file, true).map_err(|e| GitError::read(path, e))
 }
 
 // --- internals -------------------------------------------------------------
@@ -782,13 +795,23 @@ const MAX_DIFF_LINES: usize = 5_000;
 /// same `print` traversal as the rest of this module, but collects structured
 /// lines instead of flattening to unified text — the frontend renders from this
 /// directly. A traversal failure (corrupt blob, mid-read I/O) is propagated.
-fn collect_file_diff(diff: &Diff<'_>, file: &str) -> std::result::Result<FileDiff, git2::Error> {
+///
+/// When `filter_to_file` is set, only deltas whose path equals `file` are
+/// collected — used when the diff spans the whole commit (so rename detection can
+/// pair the old and new paths) and we want just this file's hunks. When unset the
+/// diff is already pathspec-scoped to `file`, so every delta is collected.
+fn collect_file_diff(
+    diff: &Diff<'_>,
+    file: &str,
+    filter_to_file: bool,
+) -> std::result::Result<FileDiff, git2::Error> {
     let mut hunks: Vec<DiffHunk> = Vec::new();
     let mut binary = false;
     let mut truncated = false;
     let mut lines = 0usize;
+    let target = std::path::Path::new(file);
 
-    diff.print(DiffFormat::Patch, |_delta, hunk, line| {
+    diff.print(DiffFormat::Patch, |delta, hunk, line| {
         // Past the cap, append nothing more — not content *and not hunk headers*
         // (otherwise a huge file leaves a tail of empty hunks). We keep returning
         // `true`: returning `false` aborts `print` as a `GIT_EUSER` error that the
@@ -797,6 +820,14 @@ fn collect_file_diff(diff: &Diff<'_>, file: &str) -> std::result::Result<FileDif
         // finishing the (now no-op) iteration is cheap.
         if truncated {
             return true;
+        }
+        // Skip lines belonging to other files' deltas when collecting one file
+        // out of a whole-commit diff (a rename delta's path is its new name).
+        if filter_to_file {
+            let delta_path = delta.new_file().path().or_else(|| delta.old_file().path());
+            if delta_path != Some(target) {
+                return true;
+            }
         }
         match line.origin() {
             // Binary content: libgit2 emits a marker line, no body. Record the
@@ -876,11 +907,16 @@ fn commit_tree_diff<'r>(
     };
     let commit_tree = commit.tree()?;
     // First parent only: a merge commit diffs against its first parent, the
-    // mainline view. A root commit has no parent → diff against the empty tree,
-    // so every file reads as added.
-    let parent_tree = match commit.parent(0) {
-        Ok(parent) => Some(parent.tree()?),
-        Err(_) => None,
+    // mainline view. A *true* root commit (no parents) diffs against the empty
+    // tree, so every file reads as added. Decide root by `parent_count` — which
+    // reads the already-loaded commit header, no object lookup — so a non-root
+    // commit whose parent object is genuinely missing (a corrupt repo, or a
+    // shallow clone's boundary commit) surfaces as a read error instead of being
+    // silently rendered as an all-added "root".
+    let parent_tree = if commit.parent_count() == 0 {
+        None
+    } else {
+        Some(commit.parent(0)?.tree()?)
     };
     let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&commit_tree), Some(opts))?;
     Ok(Some(diff))

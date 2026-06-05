@@ -51,7 +51,7 @@ use crate::preferences::Preferences;
 use crate::state::AppState;
 
 use switchboard_core::{AgentRecord, HarnessKind, ProjectSummary};
-use switchboard_git::{BranchKind, ChangedFile, FileDiff, GitCommitRange};
+use switchboard_git::{BranchKind, ChangedFile, CommitChanges, FileDiff, GitCommitRange};
 use switchboard_prompts::{McpProviderInfo, Prompt, RenderedPrompt};
 
 #[tauri::command]
@@ -301,7 +301,7 @@ async fn commit_changed_files(
     state: State<'_, AppState>,
     repo_root: String,
     oid: String,
-) -> Result<Vec<ChangedFile>, String> {
+) -> Result<CommitChanges, String> {
     let roots = tracked_roots(state.inner());
     tauri::async_runtime::spawn_blocking(move || {
         commit_changed_files_impl(&roots, &repo_root, &oid)

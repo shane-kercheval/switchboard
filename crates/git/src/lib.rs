@@ -49,9 +49,9 @@ mod read;
 
 pub use error::{GitError, Result};
 pub use model::{
-    BranchView, ChangeKind, ChangedFile, CommitRangeKind, DiffHunk, DiffLine, DiffLineKind,
-    FileDiff, GitCommitRange, GitCommitSummary, RemoteBranchView, RepoView, SyncState,
-    WorktreeView, WorktreeWarning,
+    BranchView, ChangeKind, ChangedFile, CommitChanges, CommitRangeKind, DiffHunk, DiffLine,
+    DiffLineKind, FileDiff, GitCommitRange, GitCommitSummary, RemoteBranchView, RepoView,
+    SyncState, WorktreeView, WorktreeWarning,
 };
 pub use read::{
     BranchKind, changed_files, commit_changed_files, commit_file_diff, commit_ranges, file_diff,

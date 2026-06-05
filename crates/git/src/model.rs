@@ -155,6 +155,33 @@ pub enum WorktreeWarning {
     Prunable,
 }
 
+/// The result of reading one commit's changed files. `found` distinguishes a
+/// commit that genuinely changed nothing (valid, empty history — e.g. an empty
+/// merge or `--allow-empty`) from a commit that no longer resolves (garbage
+/// collected, or the branch was force-updated since the commit list was read).
+/// Both yield no files, but the UI explains them differently — "changed no files"
+/// vs. "no longer available, refresh." A vanished commit is a calm, non-error
+/// state (matching the rest of this layer's "absent is not a failure" stance),
+/// just a distinguishable one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CommitChanges {
+    /// `false` when the commit oid is unparseable or no longer in the object
+    /// store; `files` is then empty.
+    pub found: bool,
+    pub files: Vec<ChangedFile>,
+}
+
+impl CommitChanges {
+    /// The "this commit no longer resolves" result — `found: false`, no files.
+    #[must_use]
+    pub fn missing() -> Self {
+        Self {
+            found: false,
+            files: Vec::new(),
+        }
+    }
+}
+
 /// One changed file in a worktree (consumed by the M5 diff panel).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ChangedFile {

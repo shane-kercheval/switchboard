@@ -436,6 +436,15 @@ export type ChangedFile = {
   change: ChangeKind;
 };
 
+// Mirror of Rust `CommitChanges` — one commit's changed files plus whether the
+// commit still resolved. `found: false` (with empty `files`) means the commit is
+// gone (gc'd / branch force-updated), distinct from a real commit that changed
+// nothing.
+export type CommitChanges = {
+  found: boolean;
+  files: ChangedFile[];
+};
+
 // Mirror of Rust `FileDiff` / `DiffHunk` / `DiffLine` / `DiffLineKind` — a file's
 // working-tree diff as structured hunks (built from libgit2's structured diff, not
 // parsed from unified text). The frontend renders rows directly from this.

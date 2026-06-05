@@ -38,6 +38,9 @@
   let files = $state<ChangedFile[] | null>(null);
   let filesError = $state<string | null>(null);
   let selectedFile = $state<string | null>(null);
+  // For a commit target, whether the commit still resolved. `false` (gc'd /
+  // force-updated) is shown distinctly from a commit that changed nothing.
+  let commitFound = $state(true);
 
   let diff = $state<FileDiff | null>(null);
   let diffError = $state<string | null>(null);
@@ -61,9 +64,12 @@
       : `c:${target.repoRoot}:${target.oid}`,
   );
 
-  function loadFiles(t: DiffTarget): Promise<ChangedFile[]> {
+  // Normalized to `{ found, files }` for both target kinds: a worktree read
+  // always "found" (its absence is handled upstream by reconciliation), a commit
+  // read carries the backend's found flag.
+  function loadFiles(t: DiffTarget): Promise<{ found: boolean; files: ChangedFile[] }> {
     return t.kind === "uncommitted"
-      ? changedFiles(t.worktreePath)
+      ? changedFiles(t.worktreePath).then((files) => ({ found: true, files }))
       : commitChangedFiles(t.repoRoot, t.oid);
   }
 
@@ -86,16 +92,18 @@
       files = null;
       selectedFile = null;
       diff = null;
+      commitFound = true;
     }
     filesError = null;
     void loadFiles(t)
       .then((result) => {
         if (token !== filesToken || revision !== refreshRevision) return;
         filesKey = key;
-        files = result;
-        selectedFile = result.some((file) => file.path === previousFile)
+        commitFound = result.found;
+        files = result.files;
+        selectedFile = result.files.some((file) => file.path === previousFile)
           ? previousFile
-          : (result[0]?.path ?? null);
+          : (result.files[0]?.path ?? null);
       })
       .catch((e: unknown) => {
         if (token !== filesToken || revision !== refreshRevision) return;
@@ -273,6 +281,12 @@
       tone="error"
       title="Couldn't read changes."
       description={filesError}
+    />
+  {:else if !commitFound}
+    <EmptyState
+      testid="detail-commit-missing"
+      title="This commit is no longer available."
+      description="It may have been garbage-collected or the branch was updated. Refresh the branch."
     />
   {:else if files.length === 0}
     {#if target.kind === "uncommitted"}

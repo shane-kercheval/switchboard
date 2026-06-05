@@ -476,16 +476,36 @@ function afterRefresh(repos: RepoListing[], fullList: boolean): void {
       void reloadSelectedCommits();
     }
   }
-  // A worktree's uncommitted diff is the only mutable target; bump so the panel
-  // re-reads it. A commit's diff is immutable, so it needs no refresh.
+  // Reconcile an open uncommitted diff target against the refreshed repo. (A
+  // commit target is immutable and its branch is handled above, so it needs no
+  // worktree check.)
   const target = diffTarget.current;
-  if (
-    target !== null &&
-    target.kind === "uncommitted" &&
-    repos.some((r) => r.repo.root === target.repoRoot)
-  ) {
+  if (target === null || target.kind !== "uncommitted") return;
+  const listing = repos.find((r) => r.repo.root === target.repoRoot);
+  if (listing === undefined) return; // the target's repo wasn't in this refresh
+  if (worktreeExists(listing, target.worktreePath)) {
+    // Still checked out → its working-tree content may have changed; re-read it.
     gitRefresh.revision += 1;
+  } else if (branchSelection.current !== null) {
+    // The selected branch lost its folder but still exists — fall back to its
+    // latest commit so the panel doesn't dangle over a gone path. (Uses the
+    // current ranges; a worktree removal doesn't rewrite history.)
+    const latest = firstCommit(branchCommits.ranges);
+    if (latest !== undefined) selectCommit(target.repoRoot, latest);
+    else diffTarget.current = null;
+  } else {
+    // A detached worktree (no branch selected) was pruned → close the panel.
+    diffTarget.current = null;
   }
+}
+
+/// Whether a worktree path is still checked out in a listing — a branch's folder
+/// or a detached worktree.
+function worktreeExists(listing: RepoListing, path: string): boolean {
+  return (
+    listing.repo.local_branches.some((b) => b.worktree?.path === path) ||
+    listing.repo.detached_worktrees.some((w) => w.path === path)
+  );
 }
 
 function branchExists(listing: RepoListing, ref: SelectedRef): boolean {

@@ -74,9 +74,27 @@ const repo = (over: Partial<RepoListing["repo"]> = {}): RepoListing => ({
 function wire(list: RepoListing[]) {
   invokeMock.mockImplementation((cmd: string) => {
     if (cmd === "list_tracked_repos") return Promise.resolve(list);
-    if (cmd === "changed_files") return Promise.resolve([]);
-    if (cmd === "file_diff")
+    if (cmd === "changed_files" || cmd === "commit_changed_files") return Promise.resolve([]);
+    if (cmd === "file_diff" || cmd === "commit_file_diff")
       return Promise.resolve({ path: "", binary: false, truncated: false, hunks: [] });
+    if (cmd === "branch_commits")
+      return Promise.resolve([
+        {
+          kind: "recent",
+          label: "Recent commits",
+          truncated: false,
+          commits: [
+            {
+              oid: "c0ffee1234",
+              short_oid: "c0ffee1",
+              subject: "first commit",
+              author_name: "T",
+              author_email: null,
+              authored_at: null,
+            },
+          ],
+        },
+      ]);
     if (cmd === "read_tracked_repo") return Promise.resolve(list[0] ?? repo());
     return Promise.resolve(null); // fetch_repo
   });
@@ -184,28 +202,86 @@ describe("GitView", () => {
     await waitFor(() => expect(screen.getByTestId("git-repo")).toBeInTheDocument());
   });
 
-  it("clicking a worktree opens the detail panel (right inspector); closing it returns to the full tree", async () => {
+  it("clicking a branch opens the diff panel, lists its commits, and closing it returns to the full tree", async () => {
     wire([repo()]);
     await refreshAll();
     render(GitView);
     await waitFor(() => expect(screen.getByTestId("git-repo")).toBeInTheDocument());
 
-    // No panel until a worktree is selected.
-    expect(screen.queryByTestId("worktree-detail-panel")).not.toBeInTheDocument();
+    // No panel until a branch is selected.
+    expect(screen.queryByTestId("diff-panel")).not.toBeInTheDocument();
     expect(screen.queryByTestId("git-detail-sidebar")).not.toBeInTheDocument();
 
-    // The `main` branch has a worktree → its row is selectable.
-    await fireEvent.click(screen.getByTestId("worktree-select"));
+    // Click the `main` branch row (dirty worktree → defaults to its uncommitted
+    // changes, and expands its commit list).
+    const mainRow = document.querySelector(
+      '[data-testid="git-branch"][data-branch="main"]',
+    ) as HTMLElement;
+    await fireEvent.click(within(mainRow).getByTestId("branch-select"));
 
-    await waitFor(() => expect(screen.getByTestId("worktree-detail-panel")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByTestId("diff-panel")).toBeInTheDocument());
     expect(screen.getByTestId("git-detail-sidebar")).toBeInTheDocument();
     expect(screen.getByTestId("git-detail-resizer")).toBeInTheDocument();
-    expect(screen.getByTestId("detail-branch")).toHaveTextContent("main");
+    // Dirty branch → the panel opens on uncommitted changes…
+    expect(screen.getByTestId("detail-title")).toHaveTextContent("Uncommitted changes");
+    // …and the branch's commits load into the tree.
+    await waitFor(() => expect(screen.getByTestId("commit-row")).toBeInTheDocument());
+    expect(screen.getByTestId("commit-row")).toHaveTextContent("first commit");
 
     await fireEvent.click(screen.getByTestId("detail-close"));
+    await waitFor(() => expect(screen.queryByTestId("diff-panel")).not.toBeInTheDocument());
+  });
+
+  it("clicking a remote-only branch opens the panel on its latest commit (no worktree)", async () => {
+    wire([repo()]);
+    await refreshAll();
+    render(GitView);
+    await waitFor(() => expect(screen.getByTestId("git-remote-branch")).toBeInTheDocument());
+
+    // A remote-only branch has no folder, so it has no uncommitted changes — the
+    // panel opens on its latest commit instead.
+    const remoteRow = screen.getByTestId("git-remote-branch");
+    await fireEvent.click(within(remoteRow).getByTestId("branch-select"));
+
+    await waitFor(() => expect(screen.getByTestId("diff-panel")).toBeInTheDocument());
     await waitFor(() =>
-      expect(screen.queryByTestId("worktree-detail-panel")).not.toBeInTheDocument(),
+      expect(screen.getByTestId("detail-title")).toHaveTextContent("first commit"),
     );
+    // The branch's commits are requested by repo root + remote ref kind.
+    const commitsCall = invokeMock.mock.calls.find((c) => c[0] === "branch_commits");
+    expect(commitsCall?.[1]).toMatchObject({ kind: "remote", name: "origin/remote-only" });
+  });
+
+  it("clicking a detached worktree opens its uncommitted changes, with no commit history", async () => {
+    wire([
+      repo({
+        detached_worktrees: [
+          {
+            path: "/repos/app/wt",
+            dirty: true,
+            untracked: false,
+            detached_hash: "abc1234",
+            warning: null,
+          },
+        ],
+      }),
+    ]);
+    await refreshAll();
+    render(GitView);
+    await waitFor(() => expect(screen.getByTestId("git-detached-worktree")).toBeInTheDocument());
+
+    const detachedRow = screen.getByTestId("git-detached-worktree");
+    await fireEvent.click(within(detachedRow).getByTestId("worktree-select"));
+
+    await waitFor(() => expect(screen.getByTestId("diff-panel")).toBeInTheDocument());
+    expect(screen.getByTestId("detail-title")).toHaveTextContent("Uncommitted changes");
+    // A detached worktree has no branch → no commit history is requested, and no
+    // commit list renders.
+    expect(invokeMock.mock.calls.some((c) => c[0] === "branch_commits")).toBe(false);
+    expect(screen.queryByTestId("commit-list")).not.toBeInTheDocument();
+    // The changes are read from the worktree path.
+    const filesCall = invokeMock.mock.calls.find((c) => c[0] === "changed_files");
+    expect(filesCall?.[1]).toMatchObject({ path: "/repos/app/wt" });
   });
 
   it("Add Repo: cancelling the picker adds nothing", async () => {

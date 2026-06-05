@@ -10,7 +10,7 @@
   import EmptyState from "$lib/components/ui/EmptyState.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
   import GitRepoNode from "$lib/components/GitRepoNode.svelte";
-  import WorktreeDetailPanel from "$lib/components/WorktreeDetailPanel.svelte";
+  import DiffPanel from "$lib/components/DiffPanel.svelte";
   import {
     SEGMENTED_MAIN_CONTAINER_CLASS,
     SEGMENTED_MAIN_ITEM_ACTIVE_CLASS,
@@ -23,8 +23,8 @@
     refreshAll,
     fetchAll,
     addRepo,
-    worktreeSelection,
-    clearWorktreeSelection,
+    diffTarget,
+    clearBranchSelection,
     gitRefresh,
   } from "$lib/state/gitView.svelte";
   import { pickDirectory } from "$lib/native";
@@ -35,8 +35,9 @@
   let adding = $state(false);
   let addError = $state<string | null>(null);
 
-  // The open detail panel (a worktree), or null. Drives the right inspector.
-  const panel = $derived(worktreeSelection.current);
+  // The open diff target (a commit or a worktree's uncommitted changes), or null.
+  // Drives the right inspector.
+  const panel = $derived(diffTarget.current);
   let splitEl = $state<HTMLDivElement | null>(null);
   let detailWidth = $state<number | null>(null);
   let resizingDetail = false;
@@ -222,7 +223,7 @@
         class="border-border/60 bg-panel hover:bg-raised w-1.5 shrink-0 cursor-col-resize border-x transition-colors"
         role="separator"
         aria-orientation="vertical"
-        aria-label="Resize worktree detail panel"
+        aria-label="Resize diff panel"
         data-testid="git-detail-resizer"
         onpointerdown={startDetailResize}
       ></div>
@@ -234,11 +235,10 @@
         style={detailWidth !== null ? `width: ${detailWidth}px` : undefined}
         data-testid="git-detail-sidebar"
       >
-        <WorktreeDetailPanel
-          path={panel.path}
-          label={panel.label}
+        <DiffPanel
+          target={panel}
           refreshRevision={gitRefresh.revision}
-          onClose={clearWorktreeSelection}
+          onClose={clearBranchSelection}
         />
       </aside>
     {/if}

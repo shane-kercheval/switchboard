@@ -5,9 +5,11 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AgentId,
   AgentRecord,
+  BranchKind,
   ChangedFile,
   DirectoryInfo,
   FileDiff,
+  GitCommitRange,
   HarnessInstallStatus,
   HarnessKind,
   LoadedTranscript,
@@ -128,6 +130,31 @@ export async function changedFiles(path: string): Promise<ChangedFile[]> {
 // clean file; `binary: true` for binary content; `truncated: true` when capped.
 export async function fileDiff(path: string, file: string): Promise<FileDiff> {
   return await invoke<FileDiff>("file_diff", { path, file });
+}
+
+// Capped commit-summary ranges for one branch (read on demand, never fetches).
+// `kind` selects the local vs. remote-tracking ref; rejects an untracked repo.
+export async function branchCommits(
+  repoRoot: string,
+  kind: BranchKind,
+  name: string,
+): Promise<GitCommitRange[]> {
+  return await invoke<GitCommitRange[]>("branch_commits", { repoRoot, kind, name });
+}
+
+// The files one commit changed (vs. its first parent). No worktree needed, so it
+// serves branches with no local folder and remote-only branches.
+export async function commitChangedFiles(repoRoot: string, oid: string): Promise<ChangedFile[]> {
+  return await invoke<ChangedFile[]>("commit_changed_files", { repoRoot, oid });
+}
+
+// The structured diff of one file within one commit (vs. its first parent).
+export async function commitFileDiff(
+  repoRoot: string,
+  oid: string,
+  file: string,
+): Promise<FileDiff> {
+  return await invoke<FileDiff>("commit_file_diff", { repoRoot, oid, file });
 }
 
 // Open a worktree folder in the user's configured editor (`editor_command`), or

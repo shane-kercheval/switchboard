@@ -33,7 +33,8 @@ use crate::commands::{
     attach_agent_impl, cancel_agent_impl, cancel_send_impl, cancel_turn_impl, changed_files_impl,
     check_antigravity_auth_impl, check_antigravity_binary_impl, check_claude_auth_impl,
     check_claude_binary_impl, check_codex_auth_impl, check_codex_binary_impl,
-    check_gemini_auth_impl, check_gemini_binary_impl, create_agent_impl, create_project_impl,
+    check_gemini_auth_impl, check_gemini_binary_impl, commit_changed_files_impl,
+    commit_file_diff_impl, commit_ranges_impl, create_agent_impl, create_project_impl,
     delete_project_impl, editor_open_argv, fetch_repo_impl, file_diff_impl,
     get_harness_install_status_impl, get_preferences_impl, init_directory_impl, list_agents_impl,
     list_mcp_providers_impl, list_projects_impl, list_prompts_impl, list_tracked_repos_from_inputs,
@@ -50,7 +51,7 @@ use crate::preferences::Preferences;
 use crate::state::AppState;
 
 use switchboard_core::{AgentRecord, HarnessKind, ProjectSummary};
-use switchboard_git::{ChangedFile, FileDiff};
+use switchboard_git::{BranchKind, ChangedFile, FileDiff, GitCommitRange};
 use switchboard_prompts::{McpProviderInfo, Prompt, RenderedPrompt};
 
 #[tauri::command]
@@ -277,6 +278,53 @@ async fn file_diff(
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn branch_commits(
+    state: State<'_, AppState>,
+    repo_root: String,
+    kind: BranchKind,
+    name: String,
+) -> Result<Vec<GitCommitRange>, String> {
+    let roots = tracked_roots(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        commit_ranges_impl(&roots, &repo_root, kind, &name)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn commit_changed_files(
+    state: State<'_, AppState>,
+    repo_root: String,
+    oid: String,
+) -> Result<Vec<ChangedFile>, String> {
+    let roots = tracked_roots(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        commit_changed_files_impl(&roots, &repo_root, &oid)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn commit_file_diff(
+    state: State<'_, AppState>,
+    repo_root: String,
+    oid: String,
+    file: String,
+) -> Result<FileDiff, String> {
+    let roots = tracked_roots(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        commit_file_diff_impl(&roots, &repo_root, &oid, &file)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -804,6 +852,10 @@ fn with_persistence_paths(state: AppState) -> AppState {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "length is dominated by the flat `generate_handler!` command registry, which reads better as one list than split across helpers"
+)]
 pub fn run() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
@@ -891,6 +943,9 @@ pub fn run() {
             fetch_repo,
             changed_files,
             file_diff,
+            branch_commits,
+            commit_changed_files,
+            commit_file_diff,
             get_preferences,
             set_preferences,
             list_prompts,

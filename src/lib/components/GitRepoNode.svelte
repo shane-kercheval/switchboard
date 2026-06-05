@@ -14,14 +14,19 @@
   import DropdownMenuItem from "$lib/components/ui/DropdownMenuItem.svelte";
   import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
   import { localBranchBadges, remoteBranchBadges, remoteOnlyBadge } from "$lib/gitBadges";
-  import type { BranchView, RepoListing, WorktreeView } from "$lib/types";
+  import type { BranchView, RemoteBranchView, RepoListing, WorktreeView } from "$lib/types";
   import type { FetchState } from "$lib/state/gitView.svelte";
   import {
     refreshRepo,
     fetchRepo,
     removeRepo,
-    selectWorktree,
-    worktreeSelection,
+    selectBranch,
+    selectCommit,
+    selectUncommitted,
+    clearBranchSelection,
+    branchSelection,
+    branchCommits,
+    diffTarget,
   } from "$lib/state/gitView.svelte";
   import { openInEditor, openInTerminal, revealInFinder } from "$lib/api";
   import { copyText } from "$lib/native";
@@ -106,6 +111,52 @@
     void action.catch((e: unknown) => {
       console.error("[switchboard] git view open action failed", e);
     });
+  }
+
+  function branchHasChanges(branch: BranchView): boolean {
+    return branch.worktree !== null && (branch.worktree.dirty || branch.worktree.untracked);
+  }
+
+  // Selection predicates read the shared stores so a row highlights when it (or
+  // its commit / uncommitted entry) is the active selection.
+  function isLocalSelected(name: string): boolean {
+    const s = branchSelection.current;
+    return s !== null && s.repoRoot === repo.root && s.kind === "local" && s.name === name;
+  }
+  function isRemoteSelected(name: string): boolean {
+    const s = branchSelection.current;
+    return s !== null && s.repoRoot === repo.root && s.kind === "remote" && s.name === name;
+  }
+  function isCommitSelected(oid: string): boolean {
+    const t = diffTarget.current;
+    return t !== null && t.kind === "commit" && t.oid === oid;
+  }
+  function isUncommittedSelected(path: string): boolean {
+    const t = diffTarget.current;
+    return t !== null && t.kind === "uncommitted" && t.worktreePath === path;
+  }
+
+  function onSelectLocal(branch: BranchView): void {
+    void selectBranch(
+      { repoRoot: repo.root, kind: "local", name: branch.name },
+      {
+        worktreePath: branch.worktree?.path ?? null,
+        hasChanges: branchHasChanges(branch),
+        worktreeSubtitle: branch.worktree ? displayPath(branch.worktree.path) : "",
+      },
+    );
+  }
+  function onSelectRemote(name: string): void {
+    void selectBranch(
+      { repoRoot: repo.root, kind: "remote", name },
+      { worktreePath: null, hasChanges: false, worktreeSubtitle: "" },
+    );
+  }
+  // A detached worktree has no branch (so no commit history): selecting it just
+  // shows its uncommitted changes, collapsing any expanded branch.
+  function onSelectDetached(wt: WorktreeView): void {
+    clearBranchSelection();
+    selectUncommitted(repo.root, wt.path, displayPath(wt.path));
   }
 </script>
 
@@ -228,32 +279,31 @@
         </p>
       {:else}
         {#each localBranches as branch (branch.name)}
-          {@const selected =
-            branch.worktree !== null && worktreeSelection.current?.path === branch.worktree.path}
+          {@const selected = isLocalSelected(branch.name)}
           <div
             class={cn(
               "group flex min-h-8 items-center gap-2 rounded-md px-2 py-1.5 transition-colors",
               branch.worktree === null && "opacity-60",
-              branch.worktree !== null && "hover:bg-panel",
+              "hover:bg-panel",
               selected && "bg-raised hover:bg-raised",
             )}
             data-testid="git-branch"
             data-branch={branch.name}
           >
+            <!-- Clicking the row selects the branch: it expands to show commits
+                 and the panel opens on a default target. The actions menu is a
+                 sibling button so the two clicks don't nest. -->
+            <button
+              type="button"
+              class="flex min-w-0 flex-1 items-center gap-2 text-left"
+              data-testid="branch-select"
+              data-selected={selected}
+              onclick={() => onSelectLocal(branch)}
+            >
+              {@render branchInner(branch)}
+            </button>
             {#if branch.worktree}
               {@const worktreePath = branch.worktree.path}
-              <!-- Clicking the row (but not the actions menu) opens the diff
-                   panel for this branch's local folder; the menu is a sibling
-                   button so the two clicks don't nest. -->
-              <button
-                type="button"
-                class="flex min-w-0 flex-1 items-center gap-2 text-left"
-                data-testid="worktree-select"
-                data-selected={selected}
-                onclick={() => selectWorktree(worktreePath, branch.name)}
-              >
-                {@render branchInner(branch)}
-              </button>
               <DropdownMenu
                 triggerLabel={`Actions for ${branch.name}`}
                 triggerTestid="worktree-actions-trigger"
@@ -301,38 +351,36 @@
                   Copy branch name
                 </DropdownMenuItem>
               </DropdownMenu>
-            {:else}
-              <!-- No local folder → not openable; render the same content inert. -->
-              <div class="flex min-w-0 flex-1 items-center gap-2">
-                {@render branchInner(branch)}
-              </div>
             {/if}
           </div>
+          {#if selected}
+            {@render commitList(branch.worktree?.path ?? null, branchHasChanges(branch))}
+          {/if}
         {/each}
 
         {#each visibleRemoteOnlyBranches as branch (branch.name)}
+          {@const selected = isRemoteSelected(branch.name)}
           <div
-            class="flex min-h-8 items-center gap-2 rounded-md px-2 py-1.5 opacity-65"
+            class={cn(
+              "hover:bg-panel flex min-h-8 items-center gap-2 rounded-md px-2 py-1.5 opacity-80 transition-colors",
+              selected && "bg-raised hover:bg-raised",
+            )}
             data-testid="git-remote-branch"
             data-branch={branch.name}
           >
-            <div class="min-w-0 flex-1">
-              <div class="flex min-w-0 items-center gap-1.5">
-                <span class="text-muted truncate text-[13px] leading-5" title={branch.name}>
-                  {branch.name}
-                </span>
-                <div class="flex shrink-0 items-center gap-1">
-                  <GitBadge badge={remoteOnlyBadge(branch.name)} />
-                </div>
-              </div>
-              <div class="text-muted truncate text-[11px] leading-4">No local folder</div>
-            </div>
-            <div class="flex shrink-0 items-center gap-1">
-              {#each remoteBranchBadges(branch, repo.default_branch) as badge (badge.key)}
-                <GitBadge {badge} />
-              {/each}
-            </div>
+            <button
+              type="button"
+              class="flex min-w-0 flex-1 items-center gap-2 text-left"
+              data-testid="branch-select"
+              data-selected={selected}
+              onclick={() => onSelectRemote(branch.name)}
+            >
+              {@render remoteInner(branch)}
+            </button>
           </div>
+          {#if selected}
+            {@render commitList(null, false)}
+          {/if}
         {/each}
 
         {#if localBranches.length === 0 && visibleRemoteOnlyBranches.length === 0}
@@ -349,7 +397,7 @@
 
         {#if branchFilter !== "remote"}
           {#each repo.detached_worktrees as wt (wt.path)}
-            {@const dselected = worktreeSelection.current?.path === wt.path}
+            {@const dselected = isUncommittedSelected(wt.path)}
             <div
               class={cn(
                 "flex min-h-8 items-center gap-2 rounded-md px-2 py-1.5 transition-colors",
@@ -369,7 +417,7 @@
                   class="flex min-w-0 flex-1 items-center gap-2 text-left"
                   data-testid="worktree-select"
                   data-selected={dselected}
-                  onclick={() => selectWorktree(wt.path, wt.detached_hash ?? "detached")}
+                  onclick={() => onSelectDetached(wt)}
                 >
                   {@render detachedInner(wt)}
                 </button>
@@ -381,6 +429,86 @@
     </div>
   {/if}
 </div>
+
+{#snippet commitList(worktreePath: string | null, hasChanges: boolean)}
+  <div class="border-border/50 mb-1 ml-4 border-l pl-2" data-testid="commit-list">
+    {#if worktreePath !== null && hasChanges}
+      {@const uSel = isUncommittedSelected(worktreePath)}
+      <button
+        type="button"
+        class={cn(
+          "flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-xs transition-colors",
+          uSel ? "bg-raised text-fg" : "text-muted hover:bg-panel",
+        )}
+        data-testid="uncommitted-row"
+        data-selected={uSel}
+        onclick={() => selectUncommitted(repo.root, worktreePath, displayPath(worktreePath))}
+      >
+        <span class="text-warning shrink-0" aria-hidden="true">●</span>
+        <span class="text-fg min-w-0 flex-1 truncate">Uncommitted changes</span>
+      </button>
+    {/if}
+
+    {#if branchCommits.status === "loading"}
+      <div class="text-muted flex items-center gap-2 px-2 py-1.5 text-xs">
+        <Spinner class="h-3.5 w-3.5" /> Loading commits…
+      </div>
+    {:else if branchCommits.status === "failed"}
+      <p class="text-muted px-2 py-1.5 text-xs">Couldn't load commits.</p>
+    {:else if branchCommits.ranges.every((range) => range.commits.length === 0)}
+      <p class="text-muted px-2 py-1.5 text-xs">No commits.</p>
+    {:else}
+      {#each branchCommits.ranges as range (range.kind)}
+        {#if range.commits.length > 0}
+          <div
+            class="text-muted/80 px-2 pt-1.5 pb-0.5 text-[10px] font-semibold tracking-wide uppercase"
+          >
+            {range.label}
+          </div>
+          {#each range.commits as commit (commit.oid)}
+            {@const cSel = isCommitSelected(commit.oid)}
+            <button
+              type="button"
+              class={cn(
+                "flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-xs transition-colors",
+                cSel ? "bg-raised text-fg" : "text-muted hover:bg-panel",
+              )}
+              data-testid="commit-row"
+              data-oid={commit.oid}
+              data-selected={cSel}
+              onclick={() => selectCommit(repo.root, commit)}
+            >
+              <span class="text-muted shrink-0 font-mono text-[11px]">{commit.short_oid}</span>
+              <span class="min-w-0 flex-1 truncate" title={commit.subject}>{commit.subject}</span>
+            </button>
+          {/each}
+          {#if range.truncated}
+            <p class="text-muted/70 px-2 py-1 text-[10px]">…older commits not shown</p>
+          {/if}
+        {/if}
+      {/each}
+    {/if}
+  </div>
+{/snippet}
+
+{#snippet remoteInner(branch: RemoteBranchView)}
+  <div class="min-w-0 flex-1">
+    <div class="flex min-w-0 items-center gap-1.5">
+      <span class="text-muted truncate text-[13px] leading-5" title={branch.name}>
+        {branch.name}
+      </span>
+      <div class="flex shrink-0 items-center gap-1">
+        <GitBadge badge={remoteOnlyBadge(branch.name)} />
+      </div>
+    </div>
+    <div class="text-muted truncate text-[11px] leading-4">No local folder</div>
+  </div>
+  <div class="flex shrink-0 items-center gap-1">
+    {#each remoteBranchBadges(branch, repo.default_branch) as badge (badge.key)}
+      <GitBadge {badge} />
+    {/each}
+  </div>
+{/snippet}
 
 {#snippet branchInner(branch: BranchView)}
   <div class="min-w-0 flex-1">

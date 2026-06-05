@@ -18,8 +18,10 @@ const {
   fetchAll,
   addRepo,
   removeRepo,
-  selectWorktree,
-  worktreeSelection,
+  selectBranch,
+  branchSelection,
+  branchCommits,
+  diffTarget,
   gitRefresh,
   loadProjectRepo,
   projectBranch,
@@ -70,17 +72,23 @@ const listingWithProject = (root: string, wtPath: string, projectId: string): Re
   return l;
 };
 
-/// Route invoke by command; default list/read/fetch all succeed.
+/// Route invoke by command; default list/read/fetch all succeed, and the commit
+/// read returns an empty range set unless a test overrides it.
 function wire(opts: { list?: RepoListing[]; fetchRejects?: boolean } = {}) {
   invokeMock.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
     if (cmd === "list_tracked_repos") return Promise.resolve(opts.list ?? []);
     if (cmd === "read_tracked_repo") return Promise.resolve(listing(String(args?.path)));
+    if (cmd === "branch_commits") return Promise.resolve([]);
     if (cmd === "fetch_repo") {
       return opts.fetchRejects ? Promise.reject(new Error("no remote")) : Promise.resolve(null);
     }
     return Promise.resolve(null);
   });
 }
+
+/// A `SelectedRef` for `main` in `/a`, the common selection-test target.
+const mainRef = (root = "/a") => ({ repoRoot: root, kind: "local" as const, name: "main" });
+const dirtyOpts = { worktreePath: "/a/wt", hasChanges: true, worktreeSubtitle: "~/wt" };
 
 describe("gitView store", () => {
   it("enterGitView loads repos and sets git mode", async () => {
@@ -136,39 +144,109 @@ describe("gitView store", () => {
     expect(gitView.repos.map((r) => r.repo.root).sort()).toEqual(["/a", "/b", "/c"]);
   });
 
-  it("a single-repo refresh clears a now-missing worktree selection", async () => {
+  it("selectBranch defaults to uncommitted changes when the worktree is dirty", async () => {
+    wire({ list: [listingWithWorktree("/a", "/a/wt")] }); // dirty: true
+    await refreshAll();
+    await selectBranch(mainRef(), dirtyOpts);
+    expect(diffTarget.current).toMatchObject({ kind: "uncommitted", worktreePath: "/a/wt" });
+  });
+
+  it("selectBranch loads commits and auto-selects the latest when the branch is clean", async () => {
+    const clean = listing("/a");
+    clean.repo.local_branches = [
+      {
+        name: "main",
+        upstream: null,
+        sync: { kind: "local_only" },
+        behind_base: null,
+        merged: null,
+        dangling: false,
+        worktree: {
+          path: "/a/wt",
+          dirty: false,
+          untracked: false,
+          detached_hash: null,
+          warning: null,
+        },
+      },
+    ];
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "list_tracked_repos") return Promise.resolve([clean]);
+      if (cmd === "branch_commits")
+        return Promise.resolve([
+          {
+            kind: "recent",
+            label: "Recent commits",
+            truncated: false,
+            commits: [
+              {
+                oid: "abc123def456",
+                short_oid: "abc123d",
+                subject: "latest",
+                author_name: "T",
+                author_email: null,
+                authored_at: null,
+              },
+            ],
+          },
+        ]);
+      return Promise.resolve(null);
+    });
+    await refreshAll();
+    await selectBranch(mainRef(), {
+      worktreePath: "/a/wt",
+      hasChanges: false,
+      worktreeSubtitle: "~/wt",
+    });
+    expect(branchCommits.ranges[0]?.commits[0]?.subject).toBe("latest");
+    expect(diffTarget.current).toMatchObject({ kind: "commit", oid: "abc123def456" });
+  });
+
+  it("re-selecting the same branch collapses it", async () => {
     wire({ list: [listingWithWorktree("/a", "/a/wt")] });
     await refreshAll();
-    selectWorktree("/a/wt", "main");
-    expect(worktreeSelection.current?.path).toBe("/a/wt");
+    await selectBranch(mainRef(), dirtyOpts);
+    expect(branchSelection.current).not.toBeNull();
+    await selectBranch(mainRef(), dirtyOpts);
+    expect(branchSelection.current).toBeNull();
+    expect(diffTarget.current).toBeNull();
+  });
 
-    // A per-repo refresh of /a returns it without that worktree.
+  it("a single-repo refresh clears a selection whose branch disappears", async () => {
+    wire({ list: [listingWithWorktree("/a", "/a/wt")] });
+    await refreshAll();
+    await selectBranch(mainRef(), dirtyOpts);
+    expect(branchSelection.current?.name).toBe("main");
+
+    // A per-repo refresh of /a returns it without the `main` branch.
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === "read_tracked_repo") return Promise.resolve(listing("/a"));
+      if (cmd === "branch_commits") return Promise.resolve([]);
       return Promise.resolve(null);
     });
     await refreshRepo("/a");
-    expect(worktreeSelection.current).toBeNull();
+    expect(branchSelection.current).toBeNull();
+    expect(diffTarget.current).toBeNull();
   });
 
-  it("a single-repo refresh only bumps detail refresh for the selected worktree", async () => {
+  it("bumps the diff refresh only when the selected target's repo is re-read", async () => {
     wire({ list: [listingWithWorktree("/a", "/a/wt"), listingWithWorktree("/b", "/b/wt")] });
     await refreshAll();
-    selectWorktree("/a/wt", "main");
+    await selectBranch(mainRef(), dirtyOpts); // uncommitted target on /a/wt
     const before = gitRefresh.revision;
 
     invokeMock.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
-      if (cmd === "read_tracked_repo") return Promise.resolve(listingWithWorktree("/b", "/b/wt"));
-      return Promise.resolve(listing(String(args?.path)));
-    });
-    await refreshRepo("/b");
-    expect(gitRefresh.revision).toBe(before);
-
-    invokeMock.mockImplementation((cmd: string) => {
-      if (cmd === "read_tracked_repo") return Promise.resolve(listingWithWorktree("/a", "/a/wt"));
+      if (cmd === "read_tracked_repo") {
+        const root = String(args?.path);
+        return Promise.resolve(listingWithWorktree(root, `${root}/wt`));
+      }
+      if (cmd === "branch_commits") return Promise.resolve([]);
       return Promise.resolve(null);
     });
-    await refreshRepo("/a");
+    await refreshRepo("/b"); // not the selected repo → no bump
+    expect(gitRefresh.revision).toBe(before);
+
+    await refreshRepo("/a"); // selected target's repo → bump
     expect(gitRefresh.revision).toBe(before + 1);
   });
 
@@ -286,26 +364,27 @@ describe("gitView store", () => {
     await expect(addRepo("/a")).rejects.toThrow("read boom");
   });
 
-  it("clears an open worktree selection when its worktree disappears from the tree", async () => {
+  it("clears the selection when its repo disappears from the tree", async () => {
     wire({ list: [listingWithWorktree("/a", "/a/wt")] });
     await refreshAll();
-    selectWorktree("/a/wt", "main");
-    expect(worktreeSelection.current?.path).toBe("/a/wt");
+    await selectBranch(mainRef(), dirtyOpts);
+    expect(diffTarget.current).not.toBeNull();
 
-    // A refresh where /a no longer reports that worktree (e.g. repo removed).
+    // A refresh where /a is gone entirely (e.g. repo removed).
     wire({ list: [] });
     await refreshAll();
-    expect(worktreeSelection.current).toBeNull();
+    expect(branchSelection.current).toBeNull();
+    expect(diffTarget.current).toBeNull();
   });
 
-  it("keeps a worktree selection that is still present after a refresh", async () => {
+  it("keeps the selection when its branch is still present after a refresh", async () => {
     wire({ list: [listingWithWorktree("/a", "/a/wt")] });
     await refreshAll();
-    selectWorktree("/a/wt", "main");
+    await selectBranch(mainRef(), dirtyOpts);
 
     wire({ list: [listingWithWorktree("/a", "/a/wt")] });
     await refreshAll();
-    expect(worktreeSelection.current?.path).toBe("/a/wt");
+    expect(branchSelection.current?.name).toBe("main");
   });
 
   it("removeRepo untracks the repo and re-reads without it", async () => {

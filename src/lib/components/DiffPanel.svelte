@@ -1,8 +1,10 @@
 <script lang="ts">
-  /// The worktree detail panel: a file's working-tree changes, inspected without
-  /// leaving Switchboard. Header (branch label + clickable path + layout toggle +
-  /// close), a changed-files list, and the selected file's read-only diff. Loads
-  /// are guarded against path/file races (a newer selection's result always wins).
+  /// The right-hand diff panel: the changed files + read-only diff for the
+  /// selected [`DiffTarget`] — either a worktree's uncommitted changes or one
+  /// commit's diff (vs. its first parent). One panel serves both because a commit
+  /// diff needs no worktree, so a branch with no local folder (or a remote-only
+  /// ref) still shows real content. Loads are guarded against target/file races
+  /// (a newer selection's result always wins).
   import { untrack } from "svelte";
   import { cn, basename } from "$lib/utils";
   import EmptyState from "$lib/components/ui/EmptyState.svelte";
@@ -15,17 +17,23 @@
     SEGMENTED_MAIN_ITEM_ACTIVE_CLASS,
     SEGMENTED_MAIN_ITEM_INACTIVE_CLASS,
   } from "$lib/components/ui/segmentedControl";
-  import { changedFiles, fileDiff, revealInFinder } from "$lib/api";
+  import {
+    changedFiles,
+    fileDiff,
+    commitChangedFiles,
+    commitFileDiff,
+    revealInFinder,
+  } from "$lib/api";
   import { languageForPath } from "$lib/diff";
   import { preferences, updatePreferences } from "$lib/preferences.svelte";
   import type { ChangedFile, ChangeKind, DiffStyle, FileDiff } from "$lib/types";
+  import type { DiffTarget } from "$lib/state/gitView.svelte";
 
   let {
-    path,
-    label,
+    target,
     refreshRevision = 0,
     onClose,
-  }: { path: string; label: string; refreshRevision?: number; onClose: () => void } = $props();
+  }: { target: DiffTarget; refreshRevision?: number; onClose: () => void } = $props();
 
   let files = $state<ChangedFile[] | null>(null);
   let filesError = $state<string | null>(null);
@@ -35,36 +43,55 @@
   let diffError = $state<string | null>(null);
   let diffLoading = $state(false);
 
-  // Monotonic tokens: a stale async result (the worktree/file changed before it
+  // Monotonic tokens: a stale async result (the target/file changed before it
   // resolved) is discarded rather than clobbering the current selection.
   let filesToken = 0;
   let diffToken = 0;
-  let filesPath: string | null = null;
-  let diffPath: string | null = null;
-  let diffFile: string | null = null;
+  let filesKey: string | null = null;
+  let diffKey: string | null = null;
   let bodyEl = $state<HTMLDivElement | null>(null);
   let fileListWidth = $state(256);
   let resizingFiles = false;
 
-  // (Re)load the file list whenever the worktree path or refresh revision
-  // changes. A path change clears immediately; a same-path refresh updates in
-  // place so the panel doesn't flash empty while the re-read is in flight.
+  // Stable identity for the selected target — changes when the user picks a
+  // different commit or worktree, the signal the load effects key on.
+  const targetKey = $derived(
+    target.kind === "uncommitted"
+      ? `wt:${target.worktreePath}`
+      : `c:${target.repoRoot}:${target.oid}`,
+  );
+
+  function loadFiles(t: DiffTarget): Promise<ChangedFile[]> {
+    return t.kind === "uncommitted"
+      ? changedFiles(t.worktreePath)
+      : commitChangedFiles(t.repoRoot, t.oid);
+  }
+
+  function loadDiff(t: DiffTarget, file: string): Promise<FileDiff> {
+    return t.kind === "uncommitted"
+      ? fileDiff(t.worktreePath, file)
+      : commitFileDiff(t.repoRoot, t.oid, file);
+  }
+
+  // (Re)load the file list whenever the target or refresh revision changes. A
+  // target change clears immediately; a same-target refresh updates in place so
+  // the panel doesn't flash empty while the re-read is in flight.
   $effect(() => {
     const token = ++filesToken;
-    const wt = path;
+    const t = target;
+    const key = targetKey;
     const revision = refreshRevision;
     const previousFile = untrack(() => selectedFile);
-    const pathChanged = filesPath !== wt;
-    if (pathChanged) {
+    if (filesKey !== key) {
       files = null;
       selectedFile = null;
       diff = null;
     }
     filesError = null;
-    void changedFiles(wt)
+    void loadFiles(t)
       .then((result) => {
         if (token !== filesToken || revision !== refreshRevision) return;
-        filesPath = wt;
+        filesKey = key;
         files = result;
         selectedFile = result.some((file) => file.path === previousFile)
           ? previousFile
@@ -72,42 +99,41 @@
       })
       .catch((e: unknown) => {
         if (token !== filesToken || revision !== refreshRevision) return;
-        filesPath = wt;
+        filesKey = key;
         files = [];
         filesError = e instanceof Error ? e.message : String(e);
       });
   });
 
-  // Load the selected file's diff. Keyed on path, file, and refresh revision.
+  // Load the selected file's diff. Keyed on target, file, and refresh revision.
   // Same-file refreshes keep the current diff visible until replacement content
-  // arrives; path/file switches show the loading state.
+  // arrives; target/file switches show the loading state.
   $effect(() => {
     const file = selectedFile;
-    const wt = path;
+    const t = target;
+    const key = targetKey;
     const revision = refreshRevision;
     if (file === null) {
       diff = null;
       return;
     }
     const token = ++diffToken;
-    const sameTarget = diffPath === wt && diffFile === file && diff !== null;
+    const sameTarget = diffKey === `${key}::${file}` && diff !== null;
     if (!sameTarget) {
       diffLoading = true;
     }
     diffError = null;
-    void fileDiff(wt, file)
+    void loadDiff(t, file)
       .then((result) => {
         if (token !== diffToken || revision !== refreshRevision) return;
-        diffPath = wt;
-        diffFile = file;
+        diffKey = `${key}::${file}`;
         diff = result;
         diffLoading = false;
       })
       .catch((e: unknown) => {
         if (token !== diffToken || revision !== refreshRevision) return;
         diff = null;
-        diffPath = null;
-        diffFile = null;
+        diffKey = null;
         diffError = e instanceof Error ? e.message : String(e);
         diffLoading = false;
       });
@@ -139,7 +165,10 @@
     return i >= 0 ? filePath.slice(0, i) : "";
   }
 
-  function revealWorktree(): void {
+  // Only a worktree path is revealable in Finder; a commit has no folder.
+  function revealTarget(): void {
+    if (target.kind !== "uncommitted") return;
+    const path = target.worktreePath;
     void revealInFinder(path).catch((e: unknown) => {
       console.error("[switchboard] reveal worktree failed", e);
     });
@@ -162,22 +191,31 @@
   }
 </script>
 
-<div class="flex min-h-0 flex-1 flex-col overflow-hidden" data-testid="worktree-detail-panel">
+<div class="flex min-h-0 flex-1 flex-col overflow-hidden" data-testid="diff-panel">
   <!-- Header -->
   <div class="border-border/60 bg-raised flex min-h-11 items-center gap-3 border-b px-3 py-2">
     <div class="min-w-0 flex-1">
-      <div class="text-fg truncate text-sm leading-5 font-semibold" data-testid="detail-branch">
-        {label}
+      <div class="text-fg truncate text-sm leading-5 font-semibold" data-testid="detail-title">
+        {target.title}
       </div>
-      <button
-        type="button"
-        class="text-muted hover:text-fg block max-w-full min-w-0 truncate text-left font-mono text-[11px] leading-4"
-        title={`${path} — reveal in Finder`}
-        data-testid="detail-path"
-        onclick={revealWorktree}
-      >
-        {path}
-      </button>
+      {#if target.kind === "uncommitted"}
+        <button
+          type="button"
+          class="text-muted hover:text-fg block max-w-full min-w-0 truncate text-left font-mono text-[11px] leading-4"
+          title={`${target.subtitle} — reveal in Finder`}
+          data-testid="detail-subtitle"
+          onclick={revealTarget}
+        >
+          {target.subtitle}
+        </button>
+      {:else}
+        <div
+          class="text-muted truncate font-mono text-[11px] leading-4"
+          data-testid="detail-subtitle"
+        >
+          {target.subtitle}
+        </div>
+      {/if}
     </div>
 
     <div
@@ -237,7 +275,15 @@
       description={filesError}
     />
   {:else if files.length === 0}
-    <EmptyState testid="detail-no-changes" title="No changes in this worktree." />
+    {#if target.kind === "uncommitted"}
+      <EmptyState
+        testid="detail-no-changes"
+        title="No uncommitted changes."
+        description="This folder matches its last commit."
+      />
+    {:else}
+      <EmptyState testid="detail-no-changes" title="This commit changed no files." />
+    {/if}
   {:else}
     <div class="flex min-h-0 flex-1 overflow-hidden" bind:this={bodyEl}>
       <!-- Changed-files list -->

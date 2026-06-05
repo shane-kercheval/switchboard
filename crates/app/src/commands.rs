@@ -620,6 +620,83 @@ pub fn file_diff_impl(
     })
 }
 
+/// Whether `repo_root` is a tracked repo root. Same resolution as
+/// [`is_tracked_worktree`] (a root resolves to itself), named for the commit
+/// reads, which key on a repo root rather than a worktree path.
+fn is_tracked_repo(roots: &[PathBuf], repo_root: &str) -> bool {
+    is_tracked_worktree(roots, repo_root)
+}
+
+/// Capped commit-summary ranges for one branch (the branch commit list). Unlike
+/// the worktree reads, an untracked repo root is **rejected** ([`AppError::RepoNotTracked`])
+/// rather than served empty: this command is invoked deliberately for a branch in
+/// a tracked repo, so an untracked root means a stale frontend reference, not a
+/// clean-empty case. Synchronous `git2`; the shim runs it on a blocking worker.
+pub fn commit_ranges_impl(
+    roots: &[PathBuf],
+    repo_root: &str,
+    kind: switchboard_git::BranchKind,
+    name: &str,
+) -> Result<Vec<switchboard_git::GitCommitRange>, AppError> {
+    if !is_tracked_repo(roots, repo_root) {
+        return Err(AppError::RepoNotTracked {
+            root: repo_root.to_owned(),
+        });
+    }
+    switchboard_git::commit_ranges(Path::new(repo_root), kind, name).map_err(|e| {
+        AppError::GitRead {
+            path: repo_root.to_owned(),
+            message: e.to_string(),
+        }
+    })
+}
+
+/// The files one commit changed (vs. its first parent), for the detail panel's
+/// file list when a commit — rather than the worktree — is selected. Needs no
+/// worktree, so it serves branches with no local folder and remote-only branches.
+/// Untracked root → rejected; an unknown/invalid `oid` → empty (handled in the
+/// read layer). Synchronous `git2`; runs on a blocking worker.
+pub fn commit_changed_files_impl(
+    roots: &[PathBuf],
+    repo_root: &str,
+    oid: &str,
+) -> Result<Vec<switchboard_git::ChangedFile>, AppError> {
+    if !is_tracked_repo(roots, repo_root) {
+        return Err(AppError::RepoNotTracked {
+            root: repo_root.to_owned(),
+        });
+    }
+    switchboard_git::commit_changed_files(Path::new(repo_root), oid).map_err(|e| {
+        AppError::GitRead {
+            path: repo_root.to_owned(),
+            message: e.to_string(),
+        }
+    })
+}
+
+/// The structured diff of one `file` within one commit (vs. its first parent).
+/// The committed-history analogue of [`file_diff_impl`]. Untracked root →
+/// rejected; unknown/invalid `oid` or clean file → empty [`switchboard_git::FileDiff`].
+/// Synchronous `git2`; runs on a blocking worker.
+pub fn commit_file_diff_impl(
+    roots: &[PathBuf],
+    repo_root: &str,
+    oid: &str,
+    file: &str,
+) -> Result<switchboard_git::FileDiff, AppError> {
+    if !is_tracked_repo(roots, repo_root) {
+        return Err(AppError::RepoNotTracked {
+            root: repo_root.to_owned(),
+        });
+    }
+    switchboard_git::commit_file_diff(Path::new(repo_root), oid, file).map_err(|e| {
+        AppError::GitRead {
+            path: repo_root.to_owned(),
+            message: e.to_string(),
+        }
+    })
+}
+
 /// The `AppState`-derived inputs a Git-view read needs, snapshotted so the
 /// `git2` work can move onto a blocking thread. Cheap to build (registry paths +
 /// the flat project list); the expensive part is the git reads that consume it.
@@ -9527,6 +9604,16 @@ mod tests {
         );
     }
 
+    /// The full HEAD commit id of a git repo (for the commit-read tests).
+    fn head_oid(dir: &Path) -> String {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    }
+
     /// A git repo with one commit on `main`, hermetic config.
     fn init_git_repo(dir: &Path) {
         git(dir, &["init", "-q", "-b", "main"]);
@@ -9784,6 +9871,121 @@ mod tests {
         assert!(
             diff.hunks.is_empty() && !diff.binary,
             "untracked repo yields an empty diff"
+        );
+    }
+
+    #[test]
+    fn branch_commits_returns_ranges_through_the_command_layer() {
+        let repo = TempDir::new().unwrap();
+        init_git_repo(repo.path()); // "init" on main, no upstream → recent
+        std::fs::write(repo.path().join("a.txt"), "a\n").unwrap();
+        git(repo.path(), &["add", "-A"]);
+        git(repo.path(), &["commit", "-q", "-m", "second"]);
+
+        let ranges = commit_ranges_impl(
+            &roots_of(&repo),
+            repo.path().to_str().unwrap(),
+            switchboard_git::BranchKind::Local,
+            "main",
+        )
+        .unwrap();
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].kind, switchboard_git::CommitRangeKind::Recent);
+        let subjects: Vec<_> = ranges[0]
+            .commits
+            .iter()
+            .map(|c| c.subject.as_str())
+            .collect();
+        assert_eq!(subjects, vec!["second", "init"]);
+    }
+
+    #[test]
+    fn commit_changed_files_and_diff_through_the_command_layer() {
+        let repo = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        std::fs::write(repo.path().join("code.txt"), "a\nb\n").unwrap();
+        git(repo.path(), &["add", "-A"]);
+        git(repo.path(), &["commit", "-q", "-m", "add code"]);
+        std::fs::write(repo.path().join("code.txt"), "a\nB\n").unwrap();
+        git(repo.path(), &["add", "-A"]);
+        git(repo.path(), &["commit", "-q", "-m", "change code"]);
+        let head = head_oid(repo.path());
+
+        let files =
+            commit_changed_files_impl(&roots_of(&repo), repo.path().to_str().unwrap(), &head)
+                .unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "code.txt");
+
+        let diff = commit_file_diff_impl(
+            &roots_of(&repo),
+            repo.path().to_str().unwrap(),
+            &head,
+            "code.txt",
+        )
+        .unwrap();
+        let lines: Vec<_> = diff.hunks.iter().flat_map(|h| &h.lines).collect();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.content == "B" && l.origin == switchboard_git::DiffLineKind::Added)
+        );
+    }
+
+    #[test]
+    fn commit_reads_reject_an_untracked_repo() {
+        // Unlike the worktree reads (which degrade to empty), the commit reads are
+        // invoked deliberately for a tracked branch, so an untracked root is a
+        // stale reference and is rejected.
+        let repo = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        let head = head_oid(repo.path());
+        let untracked: &[PathBuf] = &[];
+        let root = repo.path().to_str().unwrap();
+
+        assert!(matches!(
+            commit_ranges_impl(untracked, root, switchboard_git::BranchKind::Local, "main"),
+            Err(AppError::RepoNotTracked { .. })
+        ));
+        assert!(matches!(
+            commit_changed_files_impl(untracked, root, &head),
+            Err(AppError::RepoNotTracked { .. })
+        ));
+        assert!(matches!(
+            commit_file_diff_impl(untracked, root, &head, "README.md"),
+            Err(AppError::RepoNotTracked { .. })
+        ));
+    }
+
+    #[test]
+    fn commit_reads_handle_missing_refs_without_a_worktree() {
+        // A tracked repo, but the branch/oid don't resolve (a stale frontend
+        // reference). Commits need no worktree, so this must degrade cleanly:
+        // ranges/files empty, diff empty — not an error.
+        let repo = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        let root = repo.path().to_str().unwrap();
+        let absent_oid = "0".repeat(40);
+
+        let ranges = commit_ranges_impl(
+            &roots_of(&repo),
+            root,
+            switchboard_git::BranchKind::Local,
+            "no-such-branch",
+        )
+        .unwrap();
+        assert!(ranges.is_empty());
+
+        assert!(
+            commit_changed_files_impl(&roots_of(&repo), root, &absent_oid)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            commit_file_diff_impl(&roots_of(&repo), root, &absent_oid, "README.md")
+                .unwrap()
+                .hunks
+                .is_empty()
         );
     }
 

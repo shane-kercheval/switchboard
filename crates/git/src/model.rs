@@ -238,3 +238,52 @@ pub enum DiffLineKind {
     Added,
     Removed,
 }
+
+/// One commit's summary line for the branch commit list — identity, subject, and
+/// authorship. Deliberately *not* part of [`RepoView`]: commits are read on
+/// demand for the one selected branch, so a normal Git-view refresh never pays
+/// for a history walk across every branch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GitCommitSummary {
+    /// Full hex object id — the stable identity used to load the commit's diff.
+    pub oid: String,
+    /// Abbreviated id for display (7 chars, matching the rest of this module).
+    pub short_oid: String,
+    /// First line of the commit message; empty for a commit with no message.
+    pub subject: String,
+    /// `None` when the commit's author identity has no (UTF-8) name/email.
+    pub author_name: Option<String>,
+    pub author_email: Option<String>,
+    /// Author timestamp as RFC-3339 (the wire convention for instants). `None`
+    /// when the stored time can't be represented (defensive — real commits have
+    /// a valid time).
+    pub authored_at: Option<String>,
+}
+
+/// Which slice of history a [`GitCommitRange`] holds. Serializes to a bare
+/// `snake_case` string (`"recent"`, …), so the field reads as `kind: "recent"`
+/// on the wire — not a tagged object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommitRangeKind {
+    /// Most recent commits on the ref (in-sync, local-only, or remote-only).
+    Recent,
+    /// Local commits the upstream doesn't have yet ("not pushed").
+    Unpushed,
+    /// Upstream commits the local branch doesn't have yet ("not pulled").
+    Incoming,
+}
+
+/// A capped, labelled slice of a branch's history. A branch yields one range
+/// (recent) when in sync / local-only / remote-only, and up to two
+/// (unpushed + incoming) when it diverges from its upstream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GitCommitRange {
+    pub kind: CommitRangeKind,
+    /// Human label for the section header (e.g. "Recent commits").
+    pub label: String,
+    /// Newest first, capped (see `MAX_COMMITS` in `read`).
+    pub commits: Vec<GitCommitSummary>,
+    /// More commits existed past the cap, so the UI can say the list is partial.
+    pub truncated: bool,
+}

@@ -4000,6 +4000,7 @@ dependencies = [
 name = "switchboard-git"
 version = "0.0.1"
 dependencies = [
+ "chrono",
  "git2",
  "serde",
  "tempfile",

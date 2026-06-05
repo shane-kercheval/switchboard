@@ -464,6 +464,33 @@ export type FileDiff = {
   hunks: DiffHunk[];
 };
 
+// Mirror of Rust `GitCommitSummary` — one commit's summary line for the branch
+// commit list. `null` fields are the Rust `Option::None` wire form (e.g. a
+// non-UTF-8 author identity). `authored_at` is RFC-3339.
+export type GitCommitSummary = {
+  oid: string;
+  short_oid: string;
+  subject: string;
+  author_name: string | null;
+  author_email: string | null;
+  authored_at: string | null;
+};
+
+// Mirror of Rust `CommitRangeKind` (a bare snake_case string on the wire).
+export type CommitRangeKind = "recent" | "unpushed" | "incoming";
+
+// Mirror of Rust `GitCommitRange` — a capped, labelled slice of a branch's
+// history (recent, or unpushed/incoming when diverged from upstream).
+export type GitCommitRange = {
+  kind: CommitRangeKind;
+  label: string;
+  commits: GitCommitSummary[];
+  truncated: boolean;
+};
+
+// Mirror of Rust `BranchKind` — which ref namespace a commit read targets.
+export type BranchKind = "local" | "remote";
+
 // How the diff panel lays out a file's changes. Persisted in `config.yaml`.
 export type DiffStyle = "side_by_side" | "unified";
 

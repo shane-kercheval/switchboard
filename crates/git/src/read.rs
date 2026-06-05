@@ -9,10 +9,13 @@ use git2::{
     StatusOptions,
 };
 
+use chrono::{FixedOffset, LocalResult, TimeZone};
+
 use crate::error::{GitError, Result};
 use crate::model::{
-    BranchView, ChangeKind, ChangedFile, DiffHunk, DiffLine, DiffLineKind, FileDiff,
-    RemoteBranchView, RepoView, SyncState, WorktreeView, WorktreeWarning,
+    BranchView, ChangeKind, ChangedFile, CommitRangeKind, DiffHunk, DiffLine, DiffLineKind,
+    FileDiff, GitCommitRange, GitCommitSummary, RemoteBranchView, RepoView, SyncState,
+    WorktreeView, WorktreeWarning,
 };
 
 /// Resolve any path inside (or at) a git repo to the canonical **main-worktree /
@@ -118,6 +121,107 @@ pub fn file_diff(path: &Path, file: &str) -> Result<FileDiff> {
     }
     .map_err(|e| GitError::read(path, e))?;
 
+    collect_file_diff(&diff, file).map_err(|e| GitError::read(path, e))
+}
+
+/// Whether a [`commit_ranges`] target names a local branch (`refs/heads/*`) or a
+/// remote-tracking branch (`refs/remotes/*`). The caller knows which from the row
+/// the user clicked; we resolve the ref accordingly. `Deserialize` so it crosses
+/// the IPC boundary directly as `"local"` / `"remote"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BranchKind {
+    Local,
+    Remote,
+}
+
+/// Capped commit-summary ranges for one branch, read on demand (a revwalk, never
+/// a fetch — like every read here, it sees only what's already local).
+///
+/// The ranges mirror the branch's relationship to its upstream:
+/// - **Local, diverged-or-ahead/behind**: `unpushed` (local not in upstream)
+///   and/or `incoming` (upstream not in local) — whichever sides are non-empty.
+/// - **Local, in sync or no upstream**, and **any remote branch**: `recent`
+///   commits walked back from the tip.
+///
+/// A ref that no longer resolves (deleted between listing and click) or an empty
+/// branch yields an empty `Vec` rather than an error — the same "absent is not a
+/// failure" stance as [`changed_files`]/[`file_diff`]. Newest commit first.
+pub fn commit_ranges(path: &Path, kind: BranchKind, name: &str) -> Result<Vec<GitCommitRange>> {
+    let repo = match Repository::open(path) {
+        Ok(repo) => repo,
+        Err(e) if is_not_found(&e) => return Ok(Vec::new()),
+        Err(e) => return Err(GitError::read(path, e)),
+    };
+    let branch_type = match kind {
+        BranchKind::Local => BranchType::Local,
+        BranchKind::Remote => BranchType::Remote,
+    };
+    let branch = match repo.find_branch(name, branch_type) {
+        Ok(branch) => branch,
+        // The branch was deleted between the tree listing and this click — a
+        // stale reference, not a read failure. Degrade to "no commits".
+        Err(e) if is_not_found(&e) => return Ok(Vec::new()),
+        Err(e) => return Err(GitError::read(path, e)),
+    };
+    let Some(tip) = branch.get().target() else {
+        return Ok(Vec::new()); // unborn / symbolic ref with no commit
+    };
+
+    // A remote-tracking ref has no own upstream — just show its recent history.
+    let upstream = match kind {
+        BranchKind::Local => branch.upstream().ok().and_then(|u| u.get().target()),
+        BranchKind::Remote => None,
+    };
+
+    let ranges = build_commit_ranges(&repo, tip, upstream).map_err(|e| GitError::read(path, e))?;
+    Ok(ranges)
+}
+
+/// The files a single commit changed, relative to its first parent (or the empty
+/// tree for a root commit). This is the committed-history analogue of
+/// [`changed_files`]: it needs no worktree, so it works for a branch with no
+/// local folder or a remote-only branch.
+///
+/// `oid` is the full hex id from a [`GitCommitSummary`]. An unparseable or
+/// unknown id (a stale reference) yields an empty `Vec` rather than an error.
+pub fn commit_changed_files(path: &Path, oid: &str) -> Result<Vec<ChangedFile>> {
+    let repo = match Repository::open(path) {
+        Ok(repo) => repo,
+        Err(e) if is_not_found(&e) => return Ok(Vec::new()),
+        Err(e) => return Err(GitError::read(path, e)),
+    };
+    let mut opts = DiffOptions::new();
+    let Some(mut diff) =
+        commit_tree_diff(&repo, oid, &mut opts).map_err(|e| GitError::read(path, e))?
+    else {
+        return Ok(Vec::new());
+    };
+    // Coalesce add+delete pairs into renames for a cleaner list (matches the
+    // worktree read's rename handling).
+    diff.find_similar(None)
+        .map_err(|e| GitError::read(path, e))?;
+    Ok(changed_files_from_diff(&diff))
+}
+
+/// The structured diff of a single `file` within one commit, relative to its
+/// first parent (empty tree for a root commit). The committed-history analogue of
+/// [`file_diff`]; same [`FileDiff`] shape and same truncation cap. An unparseable
+/// or unknown `oid` yields an empty [`FileDiff`].
+pub fn commit_file_diff(path: &Path, oid: &str, file: &str) -> Result<FileDiff> {
+    let repo = match Repository::open(path) {
+        Ok(repo) => repo,
+        Err(e) if is_not_found(&e) => return Ok(FileDiff::empty(file)),
+        Err(e) => return Err(GitError::read(path, e)),
+    };
+    let mut opts = DiffOptions::new();
+    // Match `file` literally, not as a glob — same reasoning as `file_diff`.
+    opts.disable_pathspec_match(true).pathspec(file);
+    let Some(diff) =
+        commit_tree_diff(&repo, oid, &mut opts).map_err(|e| GitError::read(path, e))?
+    else {
+        return Ok(FileDiff::empty(file));
+    };
     collect_file_diff(&diff, file).map_err(|e| GitError::read(path, e))
 }
 
@@ -752,6 +856,207 @@ fn collect_file_diff(diff: &Diff<'_>, file: &str) -> std::result::Result<FileDif
         truncated,
         hunks,
     })
+}
+
+/// Open the tree-to-tree diff of a commit vs. its first parent (empty tree for a
+/// root commit), applying caller-provided `opts` (e.g. a pathspec). Returns
+/// `None` for an unparseable or unknown `oid` — a stale reference, not a failure.
+fn commit_tree_diff<'r>(
+    repo: &'r Repository,
+    oid: &str,
+    opts: &mut DiffOptions,
+) -> std::result::Result<Option<Diff<'r>>, git2::Error> {
+    let Ok(oid) = Oid::from_str(oid) else {
+        return Ok(None);
+    };
+    let commit = match repo.find_commit(oid) {
+        Ok(commit) => commit,
+        Err(e) if is_not_found(&e) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let commit_tree = commit.tree()?;
+    // First parent only: a merge commit diffs against its first parent, the
+    // mainline view. A root commit has no parent → diff against the empty tree,
+    // so every file reads as added.
+    let parent_tree = match commit.parent(0) {
+        Ok(parent) => Some(parent.tree()?),
+        Err(_) => None,
+    };
+    let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&commit_tree), Some(opts))?;
+    Ok(Some(diff))
+}
+
+/// Collect a tree-to-tree diff's deltas into [`ChangedFile`]s, newest path order.
+fn changed_files_from_diff(diff: &Diff<'_>) -> Vec<ChangedFile> {
+    let mut files = Vec::new();
+    for delta in diff.deltas() {
+        let Some(change) = classify_delta(delta.status()) else {
+            continue;
+        };
+        // New path normally; old path for a delete (its new side is /dev/null).
+        let file_path = delta
+            .new_file()
+            .path()
+            .or_else(|| delta.old_file().path())
+            .map(|p| p.to_string_lossy().into_owned());
+        if let Some(file_path) = file_path {
+            files.push(ChangedFile {
+                path: file_path,
+                change,
+            });
+        }
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    files
+}
+
+/// Map a tree-to-tree delta status to a [`ChangeKind`]. There is no `Untracked`
+/// in committed history (that's a worktree-only state), so it never appears here.
+fn classify_delta(status: git2::Delta) -> Option<ChangeKind> {
+    use git2::Delta;
+    match status {
+        Delta::Added | Delta::Copied => Some(ChangeKind::Added),
+        Delta::Deleted => Some(ChangeKind::Deleted),
+        Delta::Modified | Delta::Typechange => Some(ChangeKind::Modified),
+        Delta::Renamed => Some(ChangeKind::Renamed),
+        _ => None,
+    }
+}
+
+/// Cap on commits returned per range. The branch commit list is a navigation
+/// aid, not a full `git log`; past this we stop walking and flag `truncated`.
+const MAX_COMMITS: usize = 50;
+
+/// Assemble the commit ranges for a resolved branch tip and its optional
+/// upstream tip. See [`commit_ranges`] for the range semantics.
+fn build_commit_ranges(
+    repo: &Repository,
+    tip: Oid,
+    upstream: Option<Oid>,
+) -> std::result::Result<Vec<GitCommitRange>, git2::Error> {
+    let Some(upstream) = upstream else {
+        // No upstream (local-only branch, or a remote ref): recent history.
+        return Ok(vec![commit_range(
+            repo,
+            CommitRangeKind::Recent,
+            "Recent commits",
+            tip,
+            None,
+        )?]);
+    };
+
+    let (ahead, behind) = repo.graph_ahead_behind(tip, upstream).unwrap_or((0, 0));
+    // In sync: no unpushed/incoming split to make — show recent history.
+    if ahead == 0 && behind == 0 {
+        return Ok(vec![commit_range(
+            repo,
+            CommitRangeKind::Recent,
+            "Recent commits",
+            tip,
+            None,
+        )?]);
+    }
+
+    let mut ranges = Vec::new();
+    if ahead > 0 {
+        // Commits reachable from the local tip but not the upstream.
+        ranges.push(commit_range(
+            repo,
+            CommitRangeKind::Unpushed,
+            "Unpushed commits",
+            tip,
+            Some(upstream),
+        )?);
+    }
+    if behind > 0 {
+        // Commits reachable from the upstream but not the local tip.
+        ranges.push(commit_range(
+            repo,
+            CommitRangeKind::Incoming,
+            "Incoming commits",
+            upstream,
+            Some(tip),
+        )?);
+    }
+    Ok(ranges)
+}
+
+/// One range: walk from `push`, optionally hiding everything reachable from
+/// `hide`, capping at [`MAX_COMMITS`].
+fn commit_range(
+    repo: &Repository,
+    kind: CommitRangeKind,
+    label: &str,
+    push: Oid,
+    hide: Option<Oid>,
+) -> std::result::Result<GitCommitRange, git2::Error> {
+    let (commits, truncated) = walk_commits(repo, push, hide)?;
+    Ok(GitCommitRange {
+        kind,
+        label: label.to_owned(),
+        commits,
+        truncated,
+    })
+}
+
+/// Revwalk newest-first from `push` (hiding `hide`'s history when given),
+/// collecting up to [`MAX_COMMITS`] summaries. `truncated` is `true` when at
+/// least one more commit existed past the cap.
+fn walk_commits(
+    repo: &Repository,
+    push: Oid,
+    hide: Option<Oid>,
+) -> std::result::Result<(Vec<GitCommitSummary>, bool), git2::Error> {
+    let mut walk = repo.revwalk()?;
+    // Topological (child before parent) with time as the tiebreak. Commit times
+    // have 1-second resolution, so same-second commits tie under a pure time
+    // sort and fall out in a non-linear order; topological keeps the list a
+    // stable newest-first walk regardless.
+    walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)?;
+    walk.push(push)?;
+    if let Some(hide) = hide {
+        walk.hide(hide)?;
+    }
+
+    let mut commits = Vec::new();
+    let mut truncated = false;
+    for oid in walk {
+        if commits.len() == MAX_COMMITS {
+            truncated = true;
+            break;
+        }
+        let commit = repo.find_commit(oid?)?;
+        commits.push(commit_summary(&commit));
+    }
+    Ok((commits, truncated))
+}
+
+fn commit_summary(commit: &git2::Commit<'_>) -> GitCommitSummary {
+    let author = commit.author();
+    GitCommitSummary {
+        oid: commit.id().to_string(),
+        short_oid: short_hash(commit.id()),
+        subject: commit
+            .summary()
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+            .to_owned(),
+        author_name: author.name().ok().map(str::to_owned),
+        author_email: author.email().ok().map(str::to_owned),
+        authored_at: format_commit_time(author.when()),
+    }
+}
+
+/// git2's `Time` (epoch seconds + a per-commit UTC offset in minutes) → RFC-3339,
+/// preserving the author's recorded offset. `None` if the stored values don't
+/// form a valid instant (defensive).
+fn format_commit_time(time: git2::Time) -> Option<String> {
+    let offset = FixedOffset::east_opt(time.offset_minutes() * 60)?;
+    match offset.timestamp_opt(time.seconds(), 0) {
+        LocalResult::Single(dt) => Some(dt.to_rfc3339()),
+        _ => None,
+    }
 }
 
 fn short_hash(oid: Oid) -> String {

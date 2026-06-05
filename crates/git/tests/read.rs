@@ -8,7 +8,8 @@ use std::path::Path;
 use std::process::Command;
 
 use switchboard_git::{
-    ChangeKind, DiffLineKind, SyncState, WorktreeWarning, changed_files, file_diff, read_repo,
+    BranchKind, ChangeKind, CommitRangeKind, DiffLineKind, SyncState, WorktreeWarning,
+    changed_files, commit_changed_files, commit_file_diff, commit_ranges, file_diff, read_repo,
     resolve_repo_root,
 };
 use tempfile::TempDir;
@@ -786,4 +787,214 @@ fn changed_files_errors_on_unreadable_status() {
     let repo = repo_with_main();
     corrupt_index(repo.path());
     assert!(changed_files(repo.path()).is_err());
+}
+
+// --- commit ranges ---------------------------------------------------------
+
+/// A fresh clone of `bare` with hermetic identity — used to push commits/branches
+/// to the shared remote so a sibling clone sees them as incoming / remote-only.
+fn fresh_clone(bare: &Path) -> TempDir {
+    let dir = TempDir::new().unwrap();
+    git(dir.path(), &["clone", "-q", bare.to_str().unwrap(), "."]);
+    git(dir.path(), &["config", "user.email", "t@e.com"]);
+    git(dir.path(), &["config", "user.name", "T"]);
+    git(dir.path(), &["config", "commit.gpgsign", "false"]);
+    dir
+}
+
+fn subjects(range: &switchboard_git::GitCommitRange) -> Vec<&str> {
+    range.commits.iter().map(|c| c.subject.as_str()).collect()
+}
+
+#[test]
+fn commit_ranges_unpushed_for_ahead_branch() {
+    let (_bare, clone) = cloned_repo();
+    write(clone.path(), "a.txt", "a\n");
+    commit_all(clone.path(), "local 1");
+    write(clone.path(), "b.txt", "b\n");
+    commit_all(clone.path(), "local 2");
+
+    let ranges = commit_ranges(clone.path(), BranchKind::Local, "main").unwrap();
+    assert_eq!(ranges.len(), 1);
+    assert_eq!(ranges[0].kind, CommitRangeKind::Unpushed);
+    // Newest first, and only the two unpushed commits (not the pushed "initial").
+    assert_eq!(subjects(&ranges[0]), vec!["local 2", "local 1"]);
+    assert!(!ranges[0].truncated);
+}
+
+#[test]
+fn commit_ranges_incoming_for_behind_branch() {
+    let (bare, clone) = cloned_repo();
+    let pusher = fresh_clone(bare.path());
+    write(pusher.path(), "r.txt", "r\n");
+    commit_all(pusher.path(), "remote 1");
+    git(pusher.path(), &["push", "-q", "origin", "main"]);
+    // The read layer never fetches; the test brings the remote ref local.
+    git(clone.path(), &["fetch", "-q", "origin"]);
+
+    let ranges = commit_ranges(clone.path(), BranchKind::Local, "main").unwrap();
+    assert_eq!(ranges.len(), 1);
+    assert_eq!(ranges[0].kind, CommitRangeKind::Incoming);
+    assert_eq!(subjects(&ranges[0]), vec!["remote 1"]);
+}
+
+#[test]
+fn commit_ranges_both_for_diverged_branch() {
+    let (bare, clone) = cloned_repo();
+    write(clone.path(), "a.txt", "a\n");
+    commit_all(clone.path(), "local 1");
+    let pusher = fresh_clone(bare.path());
+    write(pusher.path(), "r.txt", "r\n");
+    commit_all(pusher.path(), "remote 1");
+    git(pusher.path(), &["push", "-q", "origin", "main"]);
+    git(clone.path(), &["fetch", "-q", "origin"]);
+
+    let ranges = commit_ranges(clone.path(), BranchKind::Local, "main").unwrap();
+    let kinds: Vec<_> = ranges.iter().map(|r| r.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![CommitRangeKind::Unpushed, CommitRangeKind::Incoming]
+    );
+    assert_eq!(subjects(&ranges[0]), vec!["local 1"]);
+    assert_eq!(subjects(&ranges[1]), vec!["remote 1"]);
+}
+
+#[test]
+fn commit_ranges_recent_for_local_only_branch() {
+    let dir = repo_with_main();
+    git(dir.path(), &["checkout", "-q", "-b", "feature"]);
+    write(dir.path(), "f1.txt", "1\n");
+    commit_all(dir.path(), "feat 1");
+    write(dir.path(), "f2.txt", "2\n");
+    commit_all(dir.path(), "feat 2");
+
+    let ranges = commit_ranges(dir.path(), BranchKind::Local, "feature").unwrap();
+    assert_eq!(ranges.len(), 1);
+    assert_eq!(ranges[0].kind, CommitRangeKind::Recent);
+    // Recent history newest-first, including the base commit.
+    assert_eq!(subjects(&ranges[0]), vec!["feat 2", "feat 1", "initial"]);
+}
+
+#[test]
+fn commit_ranges_recent_for_remote_only_branch() {
+    let (bare, clone) = cloned_repo();
+    let pusher = fresh_clone(bare.path());
+    git(pusher.path(), &["checkout", "-q", "-b", "feature"]);
+    write(pusher.path(), "f.txt", "f\n");
+    commit_all(pusher.path(), "feature work");
+    git(pusher.path(), &["push", "-q", "origin", "feature"]);
+    git(clone.path(), &["fetch", "-q", "origin"]);
+
+    // No local `feature`; only the remote-tracking ref exists.
+    let ranges = commit_ranges(clone.path(), BranchKind::Remote, "origin/feature").unwrap();
+    assert_eq!(ranges.len(), 1);
+    assert_eq!(ranges[0].kind, CommitRangeKind::Recent);
+    assert_eq!(ranges[0].commits[0].subject, "feature work");
+}
+
+#[test]
+fn commit_ranges_caps_and_reports_truncated() {
+    let dir = repo_with_main(); // 1 commit ("initial")
+    for i in 0..55 {
+        write(dir.path(), "f.txt", &format!("{i}\n"));
+        commit_all(dir.path(), &format!("c{i}"));
+    }
+    // `main` has no upstream → a single recent range, capped at 50.
+    let ranges = commit_ranges(dir.path(), BranchKind::Local, "main").unwrap();
+    assert_eq!(ranges.len(), 1);
+    assert_eq!(ranges[0].kind, CommitRangeKind::Recent);
+    assert_eq!(ranges[0].commits.len(), 50);
+    assert!(ranges[0].truncated);
+}
+
+#[test]
+fn commit_ranges_missing_branch_is_empty() {
+    let dir = repo_with_main();
+    // A stale reference (branch deleted since the tree was listed) is not an
+    // error — it degrades to no commits.
+    let ranges = commit_ranges(dir.path(), BranchKind::Local, "nonexistent").unwrap();
+    assert!(ranges.is_empty());
+}
+
+#[test]
+fn commit_summary_carries_identity_and_authorship() {
+    let dir = repo_with_main();
+    let ranges = commit_ranges(dir.path(), BranchKind::Local, "main").unwrap();
+    let commit = &ranges[0].commits[0];
+    assert_eq!(commit.subject, "initial");
+    assert_eq!(commit.short_oid.len(), 7);
+    assert!(commit.oid.starts_with(&commit.short_oid));
+    assert_eq!(commit.author_name.as_deref(), Some("Test"));
+    assert_eq!(commit.author_email.as_deref(), Some("test@example.com"));
+    assert!(commit.authored_at.is_some());
+}
+
+// --- commit changed-files & diff -------------------------------------------
+
+#[test]
+fn commit_changed_files_lists_files_against_first_parent() {
+    let dir = repo_with_main(); // "initial" adds README.md
+    write(dir.path(), "added.txt", "new\n");
+    write(dir.path(), "README.md", "hello\nmore\n");
+    commit_all(dir.path(), "second");
+    let head = git(dir.path(), &["rev-parse", "HEAD"]);
+
+    let files = commit_changed_files(dir.path(), &head).unwrap();
+    let kind = |name: &str| files.iter().find(|f| f.path == name).map(|f| f.change);
+    assert_eq!(kind("added.txt"), Some(ChangeKind::Added));
+    assert_eq!(kind("README.md"), Some(ChangeKind::Modified));
+    // Unchanged tree entries are not listed.
+    assert_eq!(files.len(), 2);
+}
+
+#[test]
+fn commit_changed_files_for_root_commit_lists_all_as_added() {
+    let dir = repo_with_main();
+    let root = git(dir.path(), &["rev-parse", "HEAD"]); // the only (root) commit
+
+    let files = commit_changed_files(dir.path(), &root).unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].path, "README.md");
+    assert_eq!(files[0].change, ChangeKind::Added);
+}
+
+#[test]
+fn commit_file_diff_returns_hunks_for_a_committed_change() {
+    let dir = repo_with_main();
+    write(dir.path(), "code.txt", "one\ntwo\n");
+    commit_all(dir.path(), "add code");
+    write(dir.path(), "code.txt", "one\nTWO\n");
+    commit_all(dir.path(), "change code");
+    let head = git(dir.path(), &["rev-parse", "HEAD"]);
+
+    let diff = commit_file_diff(dir.path(), &head, "code.txt").unwrap();
+    assert_eq!(diff.path, "code.txt");
+    assert!(!diff.binary);
+    let kinds: Vec<_> = diff
+        .hunks
+        .iter()
+        .flat_map(|h| h.lines.iter().map(|l| l.origin))
+        .collect();
+    assert!(kinds.contains(&DiffLineKind::Added));
+    assert!(kinds.contains(&DiffLineKind::Removed));
+    let added: Vec<_> = diff
+        .hunks
+        .iter()
+        .flat_map(|h| &h.lines)
+        .filter(|l| l.origin == DiffLineKind::Added)
+        .map(|l| l.content.as_str())
+        .collect();
+    assert!(added.contains(&"TWO"));
+}
+
+#[test]
+fn commit_diffs_for_invalid_or_unknown_oid_degrade_to_empty() {
+    let dir = repo_with_main();
+    // Garbage oid (unparseable) and a well-formed but absent oid.
+    let absent = "0".repeat(40);
+    for oid in ["not-a-hash", absent.as_str()] {
+        assert!(commit_changed_files(dir.path(), oid).unwrap().is_empty());
+        let diff = commit_file_diff(dir.path(), oid, "README.md").unwrap();
+        assert!(diff.hunks.is_empty());
+    }
 }

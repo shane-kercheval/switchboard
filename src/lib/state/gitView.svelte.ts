@@ -11,7 +11,13 @@
 // this never persists. It lives here (not component-local) so it's testable.
 
 import * as api from "$lib/api";
-import type { BranchView, RepoListing } from "$lib/types";
+import type {
+  BranchKind,
+  BranchView,
+  GitCommitRange,
+  GitCommitSummary,
+  RepoListing,
+} from "$lib/types";
 
 /// Re-read a repo's local git state if its last read is older than this. The
 /// local read is cheap + offline, so a short window keeps "I just committed,
@@ -42,26 +48,172 @@ type RepoRuntime = {
 
 export const view = $state<{ mode: ViewMode }>({ mode: "projects" });
 
-/// The worktree whose diff detail panel is open, or `null` when none is selected.
-/// Session-only UI state (like `view.mode`): clicking a worktree row in the tree
-/// sets it; it drives the right-side detail panel in the Git view. `label` is
-/// the branch name (or short hash for a detached worktree) shown in the panel
-/// header; `path` is the worktree directory the diff reads from.
-export const worktreeSelection = $state<{ current: { path: string; label: string } | null }>({
-  current: null,
-});
+/// A branch (or remote-tracking ref) selected in the tree. Identifies it for the
+/// on-demand commit read; `kind` picks the local vs. remote ref namespace. When
+/// set, the tree expands this branch to show its commits.
+export type SelectedRef = {
+  repoRoot: string;
+  kind: BranchKind;
+  /// Branch shorthand for a local branch (`feature`), or the remote-tracking name
+  /// for a remote branch (`origin/feature`).
+  name: string;
+};
 
-/// Monotonic signal for secondary views derived from a selected worktree path.
-/// A repo refresh can change changed-files/diff content without changing the
-/// selected path, so the detail panel depends on this in addition to `path`.
+/// What the right-hand panel shows: either a worktree's *uncommitted* changes
+/// (needs a checked-out folder) or one *commit's* diff (committed history; no
+/// folder required, so it serves branches with no folder and remote-only refs).
+/// `title`/`subtitle` are the panel header text, resolved at selection time so the
+/// panel is pure presentation.
+export type DiffTarget =
+  | {
+      kind: "uncommitted";
+      repoRoot: string;
+      worktreePath: string;
+      title: string;
+      subtitle: string;
+    }
+  | {
+      kind: "commit";
+      repoRoot: string;
+      oid: string;
+      shortOid: string;
+      title: string;
+      subtitle: string;
+    };
+
+/// The branch whose commits are expanded in the tree, or `null`. Session-only UI
+/// state (like `view.mode`).
+export const branchSelection = $state<{ current: SelectedRef | null }>({ current: null });
+
+/// The commit ranges for the selected branch (loaded on demand). `ref` is the
+/// branch the `ranges` belong to, so a late response for a since-changed selection
+/// can be discarded.
+export const branchCommits = $state<{
+  ref: SelectedRef | null;
+  status: "loading" | "loaded" | "failed";
+  ranges: GitCommitRange[];
+}>({ ref: null, status: "loaded", ranges: [] });
+
+/// The diff shown in the right panel, or `null` when nothing is selected.
+export const diffTarget = $state<{ current: DiffTarget | null }>({ current: null });
+
+/// Monotonic signal for the diff panel: a repo refresh can change a worktree's
+/// uncommitted diff without changing the selected target, so the panel depends on
+/// this in addition to the target identity.
 export const gitRefresh = $state<{ revision: number }>({ revision: 0 });
 
-export function selectWorktree(path: string, label: string): void {
-  worktreeSelection.current = { path, label };
+function refsEqual(a: SelectedRef | null, b: SelectedRef | null): boolean {
+  return (
+    a !== null && b !== null && a.repoRoot === b.repoRoot && a.kind === b.kind && a.name === b.name
+  );
 }
 
-export function clearWorktreeSelection(): void {
-  worktreeSelection.current = null;
+/// The newest commit across a branch's ranges (ranges are newest-first), or
+/// `undefined` for an empty branch.
+function firstCommit(ranges: GitCommitRange[]): GitCommitSummary | undefined {
+  for (const range of ranges) {
+    if (range.commits.length > 0) return range.commits[0];
+  }
+  return undefined;
+}
+
+function commitSubtitle(commit: GitCommitSummary): string {
+  return commit.author_name === null
+    ? commit.short_oid
+    : `${commit.short_oid} · ${commit.author_name}`;
+}
+
+/// Select (and expand) a branch: load its commits and pick a default diff target
+/// — its uncommitted changes when the worktree is dirty, otherwise its latest
+/// commit once the list loads. Re-selecting the same branch collapses it.
+export async function selectBranch(
+  ref: SelectedRef,
+  opts: { worktreePath: string | null; hasChanges: boolean; worktreeSubtitle: string },
+): Promise<void> {
+  if (refsEqual(branchSelection.current, ref)) {
+    clearBranchSelection();
+    return;
+  }
+  branchSelection.current = ref;
+  branchCommits.ref = ref;
+  branchCommits.status = "loading";
+  branchCommits.ranges = [];
+
+  // Default target: uncommitted-if-dirty now; otherwise the latest commit, once
+  // the commit list resolves below.
+  diffTarget.current =
+    opts.worktreePath !== null && opts.hasChanges
+      ? {
+          kind: "uncommitted",
+          repoRoot: ref.repoRoot,
+          worktreePath: opts.worktreePath,
+          title: "Uncommitted changes",
+          subtitle: opts.worktreeSubtitle,
+        }
+      : null;
+
+  try {
+    const ranges = await api.branchCommits(ref.repoRoot, ref.kind, ref.name);
+    if (!refsEqual(branchCommits.ref, ref)) return; // selection moved on while loading
+    branchCommits.ranges = ranges;
+    branchCommits.status = "loaded";
+    if (diffTarget.current === null) {
+      const first = firstCommit(ranges);
+      if (first !== undefined) selectCommit(ref.repoRoot, first);
+    }
+  } catch (e) {
+    if (!refsEqual(branchCommits.ref, ref)) return;
+    console.warn("[switchboard] git view branch commits failed", { ref, error: e });
+    branchCommits.status = "failed";
+  }
+}
+
+/// Show a single commit's diff in the right panel.
+export function selectCommit(repoRoot: string, commit: GitCommitSummary): void {
+  diffTarget.current = {
+    kind: "commit",
+    repoRoot,
+    oid: commit.oid,
+    shortOid: commit.short_oid,
+    title: commit.subject.length > 0 ? commit.subject : commit.short_oid,
+    subtitle: commitSubtitle(commit),
+  };
+}
+
+/// Show a worktree's uncommitted changes in the right panel.
+export function selectUncommitted(repoRoot: string, worktreePath: string, subtitle: string): void {
+  diffTarget.current = {
+    kind: "uncommitted",
+    repoRoot,
+    worktreePath,
+    title: "Uncommitted changes",
+    subtitle,
+  };
+}
+
+/// Collapse the selected branch and close the right panel.
+export function clearBranchSelection(): void {
+  branchSelection.current = null;
+  branchCommits.ref = null;
+  branchCommits.ranges = [];
+  branchCommits.status = "loaded";
+  diffTarget.current = null;
+}
+
+/// Re-read the selected branch's commit ranges in place (after a refresh that may
+/// have added commits, e.g. a new local commit or fetched incoming commits).
+/// Keeps the current `diffTarget`; a transient failure leaves the prior list.
+async function reloadSelectedCommits(): Promise<void> {
+  const ref = branchSelection.current;
+  if (ref === null) return;
+  try {
+    const ranges = await api.branchCommits(ref.repoRoot, ref.kind, ref.name);
+    if (!refsEqual(branchSelection.current, ref)) return;
+    branchCommits.ranges = ranges;
+    branchCommits.status = "loaded";
+  } catch (e) {
+    console.warn("[switchboard] git view commit reload failed", { ref, error: e });
+  }
 }
 
 /// The tracked repos, in registry order. `status` distinguishes the first load
@@ -303,18 +455,43 @@ function applyRepos(repos: RepoListing[]): void {
       delete fetchStates[root];
     }
   }
-  reconcileWorktreeSelection(repos);
-  bumpDetailRefreshIfSelectionPresent(repos);
+  afterRefresh(repos, true);
 }
 
-/// Clear the open detail panel if its worktree is no longer in the tree — the
-/// user removed the repo, or a refresh dropped the branch/worktree. Without this
-/// the panel dangles open over a worktree the tree above no longer shows.
-function reconcileWorktreeSelection(repos: RepoListing[]): void {
-  const selected = worktreeSelection.current;
-  if (selected === null) return;
-  const present = repos.some((repo) => listingContainsWorktree(repo, selected.path));
-  if (!present) worktreeSelection.current = null;
+/// Reconcile the selection against refreshed listings and keep the open panel
+/// live. `fullList` distinguishes a whole-list replace (a missing selected repo
+/// means it was removed → clear) from a single-repo upsert (only that repo is
+/// authoritative).
+function afterRefresh(repos: RepoListing[], fullList: boolean): void {
+  const sel = branchSelection.current;
+  if (sel !== null) {
+    const listing = repos.find((r) => r.repo.root === sel.repoRoot);
+    if (fullList && listing === undefined) {
+      clearBranchSelection();
+    } else if (listing !== undefined && !branchExists(listing, sel)) {
+      // The selected branch was deleted out from under the open commit list.
+      clearBranchSelection();
+    } else if (listing !== undefined) {
+      // The selected branch's repo was re-read — its history may have changed.
+      void reloadSelectedCommits();
+    }
+  }
+  // A worktree's uncommitted diff is the only mutable target; bump so the panel
+  // re-reads it. A commit's diff is immutable, so it needs no refresh.
+  const target = diffTarget.current;
+  if (
+    target !== null &&
+    target.kind === "uncommitted" &&
+    repos.some((r) => r.repo.root === target.repoRoot)
+  ) {
+    gitRefresh.revision += 1;
+  }
+}
+
+function branchExists(listing: RepoListing, ref: SelectedRef): boolean {
+  return ref.kind === "local"
+    ? listing.repo.local_branches.some((b) => b.name === ref.name)
+    : listing.repo.remote_branches.some((b) => b.name === ref.name);
 }
 
 function upsertRepo(listing: RepoListing): void {
@@ -331,25 +508,9 @@ function upsertRepo(listing: RepoListing): void {
     fetch: existing?.fetch ?? { kind: "never" },
   });
   // A single-repo update (per-repo refresh, post-fetch re-read, project-panel
-  // load) can drop the worktree the detail panel is open on — reconcile here too,
-  // not just in the full-list `applyRepos`, so the panel never dangles.
-  reconcileWorktreeSelection(gitView.repos);
-  bumpDetailRefreshIfSelectionPresent([listing]);
-}
-
-function bumpDetailRefreshIfSelectionPresent(repos: RepoListing[]): void {
-  const selected = worktreeSelection.current;
-  if (selected === null) return;
-  if (repos.some((repo) => listingContainsWorktree(repo, selected.path))) {
-    gitRefresh.revision += 1;
-  }
-}
-
-function listingContainsWorktree(listing: RepoListing, path: string): boolean {
-  return (
-    listing.repo.local_branches.some((branch) => branch.worktree?.path === path) ||
-    listing.repo.detached_worktrees.some((worktree) => worktree.path === path)
-  );
+  // load) can drop the selected branch or change its history — reconcile here
+  // too, not just in the full-list `applyRepos`, so the panel never dangles.
+  afterRefresh([listing], false);
 }
 
 function recordFetch(root: string, state: FetchState): void {
@@ -388,7 +549,11 @@ export const _testing = {
     runtime.clear();
     inFlightFetch.clear();
     for (const k of Object.keys(fetchStates)) delete fetchStates[k];
-    worktreeSelection.current = null;
+    branchSelection.current = null;
+    branchCommits.ref = null;
+    branchCommits.ranges = [];
+    branchCommits.status = "loaded";
+    diffTarget.current = null;
     gitRefresh.revision = 0;
   },
   runtimeSize(): number {

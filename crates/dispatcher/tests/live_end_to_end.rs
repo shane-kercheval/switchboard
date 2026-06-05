@@ -217,7 +217,7 @@ async fn live_claude_full_stack_two_consecutive_turns_succeed() {
         .create_project("integration-test")
         .expect("create_project");
     let agent = project
-        .register_agent("assistant", HarnessKind::ClaudeCode)
+        .register_agent("assistant", HarnessKind::ClaudeCode, None, None)
         .expect("register_agent");
     assert!(
         agent.session_locator.is_some(),
@@ -285,7 +285,7 @@ async fn live_claude_full_stack_emits_turn_start_then_content_then_turn_end() {
     directory.init().expect("init");
     let project = directory.create_project("order-test").expect("project");
     let agent = project
-        .register_agent("assistant", HarnessKind::ClaudeCode)
+        .register_agent("assistant", HarnessKind::ClaudeCode, None, None)
         .expect("agent");
 
     let dispatcher = Arc::new(Dispatcher::new());
@@ -330,7 +330,7 @@ async fn live_claude_full_stack_paths_with_dot_components_resolve_correctly() {
     directory.init().expect("init");
     let project = directory.create_project("dot-path-test").expect("project");
     let agent = project
-        .register_agent("assistant", HarnessKind::ClaudeCode)
+        .register_agent("assistant", HarnessKind::ClaudeCode, None, None)
         .expect("agent");
 
     let dispatcher = Arc::new(Dispatcher::new());
@@ -386,7 +386,7 @@ async fn live_claude_full_stack_sees_files_in_cwd() {
     directory.init().expect("init");
     let project = directory.create_project("cwd-test").expect("project");
     let agent = project
-        .register_agent("assistant", HarnessKind::ClaudeCode)
+        .register_agent("assistant", HarnessKind::ClaudeCode, None, None)
         .expect("agent");
 
     let dispatcher = Arc::new(Dispatcher::new());
@@ -432,7 +432,7 @@ async fn live_gemini_full_stack_emits_turn_start_then_content_then_turn_end() {
         .create_project("gemini-order-test")
         .expect("project");
     let agent = project
-        .register_agent("assistant", HarnessKind::Gemini)
+        .register_agent("assistant", HarnessKind::Gemini, None, None)
         .expect("agent");
     assert!(
         agent.session_locator.is_some(),
@@ -482,7 +482,7 @@ async fn live_codex_full_stack_emits_turn_start_then_content_then_turn_end() {
         .create_project("codex-order-test")
         .expect("project");
     let agent = project
-        .register_agent("assistant", HarnessKind::Codex)
+        .register_agent("assistant", HarnessKind::Codex, None, None)
         .expect("agent");
     assert!(
         agent.session_locator.is_none(),
@@ -533,7 +533,7 @@ async fn live_antigravity_full_stack_two_turns_resume_through_dispatcher() {
         .create_project("antigravity-e2e")
         .expect("project");
     let agent = project
-        .register_agent("assistant", HarnessKind::Antigravity)
+        .register_agent("assistant", HarnessKind::Antigravity, None, None)
         .expect("agent");
     assert!(
         agent.session_locator.is_none(),
@@ -631,7 +631,7 @@ async fn live_cancel_case(harness: HarnessKind, adapter: Arc<dyn HarnessAdapter>
         .create_project("cancel-test")
         .expect("create_project");
     let agent = project
-        .register_agent("assistant", harness)
+        .register_agent("assistant", harness, None, None)
         .expect("register_agent");
 
     let dispatcher = Arc::new(Dispatcher::new());

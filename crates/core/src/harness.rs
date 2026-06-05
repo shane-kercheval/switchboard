@@ -31,6 +31,43 @@ pub enum HarnessKind {
     Antigravity,
 }
 
+impl HarnessKind {
+    /// Whether Switchboard can set this harness's model per agent (via a
+    /// per-invocation CLI flag). True for Claude (`--model`), Codex (`-m`), and
+    /// Gemini (`-m`); false for Antigravity, whose model is a global,
+    /// harness-owned config we never touch (per `harness-behavior.md` §3.3).
+    ///
+    /// The single authority for the model-selection gate — command validation,
+    /// picker visibility, and the per-agent change action all derive from this
+    /// rather than re-deriving `if harness == …`. Exhaustive (no `_` arm) so a
+    /// new harness forces a deliberate decision here.
+    #[must_use]
+    pub fn supports_model_selection(self) -> bool {
+        match self {
+            Self::ClaudeCode | Self::Codex | Self::Gemini => true,
+            Self::Antigravity => false,
+        }
+    }
+
+    /// Whether Switchboard can set this harness's reasoning-effort level per
+    /// agent. True for Claude (`--effort`) and Codex (`-c
+    /// model_reasoning_effort=`); false for Gemini (thinking is `settings.json`
+    /// config-only, no CLI flag) and Antigravity (effort is folded into the
+    /// model display name, which we can't set anyway) — per
+    /// `harness-behavior.md` §3.4.
+    ///
+    /// A *separate* axis from model selection with a *different* capability set
+    /// (Gemini has model but not effort), so it is its own gate. Same authority
+    /// role and exhaustiveness rationale as [`Self::supports_model_selection`].
+    #[must_use]
+    pub fn supports_effort_selection(self) -> bool {
+        match self {
+            Self::ClaudeCode | Self::Codex => true,
+            Self::Gemini | Self::Antigravity => false,
+        }
+    }
+}
+
 /// User-facing names. Used in `thiserror` `#[error]` format strings that
 /// surface to the frontend via Tauri (where `AppError::to_string()` is the
 /// IPC error payload). The `Debug` impl prints `ClaudeCode` without a
@@ -104,6 +141,22 @@ mod tests {
     fn antigravity_deserializes_from_snake_case() {
         let parsed: HarnessKind = serde_json::from_str("\"antigravity\"").unwrap();
         assert_eq!(parsed, HarnessKind::Antigravity);
+    }
+
+    #[test]
+    fn supports_model_selection_per_variant() {
+        assert!(HarnessKind::ClaudeCode.supports_model_selection());
+        assert!(HarnessKind::Codex.supports_model_selection());
+        assert!(HarnessKind::Gemini.supports_model_selection());
+        assert!(!HarnessKind::Antigravity.supports_model_selection());
+    }
+
+    #[test]
+    fn supports_effort_selection_per_variant() {
+        assert!(HarnessKind::ClaudeCode.supports_effort_selection());
+        assert!(HarnessKind::Codex.supports_effort_selection());
+        assert!(!HarnessKind::Gemini.supports_effort_selection());
+        assert!(!HarnessKind::Antigravity.supports_effort_selection());
     }
 
     #[test]

@@ -575,6 +575,8 @@ mod tests {
 
     fn agent_with_session(session_id: Uuid) -> AgentRecord {
         AgentRecord {
+            model: None,
+            effort: None,
             id: Uuid::now_v7(),
             project_id: Uuid::now_v7(),
             name: "g".to_owned(),
@@ -591,6 +593,8 @@ mod tests {
         let home = tempfile::TempDir::new().unwrap();
         let cwd = tempfile::TempDir::new().unwrap();
         let agent = AgentRecord {
+            model: None,
+            effort: None,
             id: Uuid::now_v7(),
             project_id: Uuid::now_v7(),
             name: "g".to_owned(),

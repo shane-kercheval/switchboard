@@ -25,6 +25,8 @@ fn fixture(name: &str) -> String {
 
 fn gemini_agent() -> AgentRecord {
     AgentRecord {
+        model: None,
+        effort: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
         name: "gemini-test".to_owned(),

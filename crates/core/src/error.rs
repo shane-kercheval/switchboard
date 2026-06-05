@@ -71,6 +71,15 @@ pub enum CoreError {
         agent_id: uuid::Uuid,
         harness: crate::harness::HarnessKind,
     },
+
+    #[error(
+        "harness {harness:?} does not support {axis} selection \
+         — refusing to persist a selection it can never apply"
+    )]
+    SelectionUnsupported {
+        harness: crate::harness::HarnessKind,
+        axis: &'static str,
+    },
 }
 
 impl CoreError {

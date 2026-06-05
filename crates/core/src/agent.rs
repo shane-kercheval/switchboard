@@ -118,6 +118,25 @@ pub struct AgentRecord {
     pub harness: HarnessKind,
     #[serde(deserialize_with = "deserialize_required_locator")]
     pub session_locator: Option<SessionLocator>,
+    /// The user-selected model this agent runs on, sent to the harness on every
+    /// dispatch when set (omitted when `None`, so the harness uses its default).
+    /// Free-text, not validated against an enum: no harness exposes a queryable
+    /// model list and some values are plan-gated, so a bad value surfaces as a
+    /// failed turn rather than a registration error. Only harnesses where
+    /// [`HarnessKind::supports_model_selection`] holds ever carry a value.
+    ///
+    /// Plain `Option` with no serde attribute: serde fills a missing field of
+    /// `Option` type with `None`, so a record written before this field existed
+    /// deserializes to `None` — the correct backward-compatible default.
+    /// (Deliberately unlike `session_locator`, which adds a custom deserializer
+    /// precisely to *defeat* that permissive default and fail loud on absence.)
+    pub model: Option<String>,
+    /// The user-selected reasoning-effort level, sent on every dispatch when set
+    /// (omitted when `None`). A closed per-harness enum at the UI boundary, but
+    /// stored as a `String` to keep this field harness-agnostic. Only harnesses
+    /// where [`HarnessKind::supports_effort_selection`] holds ever carry a
+    /// value. Same backward-compat rationale as `model`.
+    pub effort: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -147,6 +166,8 @@ mod tests {
             name: "assistant".to_owned(),
             harness: HarnessKind::ClaudeCode,
             session_locator: locator,
+            model: None,
+            effort: None,
             created_at: Utc::now(),
         }
     }
@@ -157,6 +178,43 @@ mod tests {
         let json = serde_json::to_string(&record).unwrap();
         let parsed: AgentRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, record);
+    }
+
+    #[test]
+    fn agent_record_roundtrips_with_model_and_effort() {
+        let mut record = record_with_locator(Some(SessionLocator::Uuid(Uuid::now_v7())));
+        record.model = Some("sonnet".to_owned());
+        record.effort = Some("high".to_owned());
+        let json = serde_json::to_string(&record).unwrap();
+        let parsed: AgentRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, record);
+        assert_eq!(parsed.model.as_deref(), Some("sonnet"));
+        assert_eq!(parsed.effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn agent_record_serializes_unset_model_and_effort_as_null() {
+        // Unset fields persist as explicit `null` (plain `Option`, no
+        // `skip_serializing_if`), so the on-disk record is self-describing.
+        let record = record_with_locator(Some(SessionLocator::Uuid(Uuid::now_v7())));
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains("\"model\":null"), "got: {json}");
+        assert!(json.contains("\"effort\":null"), "got: {json}");
+    }
+
+    #[test]
+    fn record_missing_model_and_effort_deserializes_as_none() {
+        // Backward-compat safeguard: a record written before these fields
+        // existed has neither key. Unlike `session_locator` (which fails loud on
+        // absence via a custom deserializer), a plain `Option` field is filled
+        // with `None` when missing — the correct default for selections that
+        // simply weren't a concept yet.
+        let json = r#"{"id":"019e2c5f-aaaa-7000-8000-000000000001","project_id":"019e2c5f-bbbb-7000-8000-000000000002","name":"legacy","harness":"claude_code","session_locator":null,"created_at":"2026-05-15T12:30:45Z"}"#;
+        let parsed: AgentRecord =
+            serde_json::from_str(json).expect("missing model/effort must default to None");
+        assert_eq!(parsed.model, None);
+        assert_eq!(parsed.effort, None);
+        assert_eq!(parsed.session_locator, None);
     }
 
     #[test]

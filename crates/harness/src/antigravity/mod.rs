@@ -1345,6 +1345,8 @@ mod tests {
     async fn dispatch_rejects_empty_prompt_before_spawn() {
         let adapter = AntigravityAdapter::with_binary_path("/nonexistent");
         let agent = AgentRecord {
+            model: None,
+            effort: None,
             id: Uuid::new_v4(),
             project_id: Uuid::new_v4(),
             name: "a".to_owned(),

@@ -88,7 +88,24 @@ impl Project {
     /// `DuplicateAgentName` because the record is visible, and the agent will
     /// appear on the next `list_agents`. There is no destructive cleanup to
     /// undo here (unlike `Directory::create_project`), so no rollback applies.
-    pub fn register_agent(&self, name: &str, harness: HarnessKind) -> Result<AgentRecord> {
+    ///
+    /// `model` / `effort` are the user-selected per-agent settings (`None` =
+    /// harness default). A selection on a harness that can't apply it (a model
+    /// on Antigravity, an effort on Gemini/Antigravity) is rejected at the
+    /// persistence boundary — see `register_agent_inner_with_id`. This generic
+    /// create path can't constrain that in its signature the way the attach
+    /// variants do (Gemini takes no effort, Antigravity takes neither), so it
+    /// relies on that shared chokepoint. The commands layer also validates
+    /// first to return a friendlier error, but `core` is the backstop that
+    /// keeps an inapplicable selection out of the registry regardless of
+    /// caller.
+    pub fn register_agent(
+        &self,
+        name: &str,
+        harness: HarnessKind,
+        model: Option<String>,
+        effort: Option<String>,
+    ) -> Result<AgentRecord> {
         // Harness-asymmetry rule (which harnesses can pre-generate their
         // session locator at registration vs. learn it at runtime):
         // - Claude Code pre-generates a UUID v7 locator; passed via
@@ -110,7 +127,14 @@ impl Project {
             HarnessKind::Gemini => Some(SessionLocator::Uuid(Uuid::new_v4())),
             HarnessKind::Codex | HarnessKind::Antigravity => None,
         };
-        self.register_agent_inner_with_id(name, harness, session_locator, Uuid::now_v7())
+        self.register_agent_inner_with_id(
+            name,
+            harness,
+            session_locator,
+            Uuid::now_v7(),
+            model,
+            effort,
+        )
     }
 
     /// Register an attached **Claude Code** agent — one that wraps an
@@ -123,12 +147,16 @@ impl Project {
         &self,
         name: &str,
         session_id: Uuid,
+        model: Option<String>,
+        effort: Option<String>,
     ) -> Result<AgentRecord> {
         self.register_agent_inner_with_id(
             name,
             HarnessKind::ClaudeCode,
             Some(SessionLocator::Uuid(session_id)),
             Uuid::now_v7(),
+            model,
+            effort,
         )
     }
 
@@ -143,6 +171,8 @@ impl Project {
         name: &str,
         thread_id: String,
         partition_date: chrono::NaiveDate,
+        model: Option<String>,
+        effort: Option<String>,
     ) -> Result<AgentRecord> {
         self.register_agent_inner_with_id(
             name,
@@ -152,6 +182,8 @@ impl Project {
                 partition_date,
             }),
             Uuid::now_v7(),
+            model,
+            effort,
         )
     }
 
@@ -161,16 +193,23 @@ impl Project {
     /// The provided `session_id` is the UUID embedded in the Gemini
     /// session-file filename's id8 prefix; the commands layer validates
     /// the file exists (and is unambiguous) before calling this method.
+    ///
+    /// Takes `model` but no `effort`: Gemini supports model selection but not
+    /// effort selection (`supports_effort_selection` is `false`), so the
+    /// capability invariant is encoded in the signature rather than asserted.
     pub fn register_attached_gemini_agent(
         &self,
         name: &str,
         session_id: Uuid,
+        model: Option<String>,
     ) -> Result<AgentRecord> {
         self.register_agent_inner_with_id(
             name,
             HarnessKind::Gemini,
             Some(SessionLocator::Uuid(session_id)),
             Uuid::now_v7(),
+            model,
+            None,
         )
     }
 
@@ -180,6 +219,10 @@ impl Project {
     /// session locator and is written straight onto the record, so there is no
     /// sidecar and no pre-generated-id ordering dance. The commands layer
     /// validates the conversation directory exists before calling this.
+    ///
+    /// Takes neither `model` nor `effort`: Antigravity supports neither (its
+    /// model is harness-owned global config, and effort is folded into the
+    /// model name), so both invariants are encoded in the signature.
     pub fn register_attached_antigravity_agent(
         &self,
         name: &str,
@@ -190,26 +233,48 @@ impl Project {
             HarnessKind::Antigravity,
             Some(SessionLocator::Uuid(conversation_id)),
             Uuid::now_v7(),
+            None,
+            None,
         )
     }
 
     /// Shared validation + JSONL append. Caller decides the `session_locator`
-    /// strategy (create vs. attach, per-harness) and the `agent_id`
-    /// (typically `Uuid::now_v7()` from the wrappers; the Codex attach flow
-    /// pre-mints to coordinate with sidecar-first writing). Private to
-    /// enforce the public surface invariants: create-path uses
-    /// `register_agent`, attach-path uses the harness-specific
-    /// `register_attached_*` methods, so a Claude attach without a
-    /// `session_locator` (or a Codex attach with one) is unrepresentable at the
-    /// API boundary.
+    /// strategy (create vs. attach, per-harness); every caller mints the
+    /// `agent_id` inline as `Uuid::now_v7()`. Private to enforce the public
+    /// surface invariants: create-path uses `register_agent`, attach-path uses
+    /// the harness-specific `register_attached_*` methods, so a Claude attach
+    /// without a `session_locator` (or a Codex attach with one) is
+    /// unrepresentable at the API boundary.
+    ///
+    /// This is also the single chokepoint that enforces the model/effort
+    /// capability invariant at the persistence boundary — mirroring
+    /// [`Self::set_session_locator`]'s `is_valid_for` guard. The attach
+    /// variants already make unsupported combinations unrepresentable in their
+    /// signatures; this catches the generic create path (and any future caller)
+    /// so an unsupported selection can never reach `registry.jsonl`, regardless
+    /// of whether a higher layer remembered to check.
     fn register_agent_inner_with_id(
         &self,
         name: &str,
         harness: HarnessKind,
         session_locator: Option<SessionLocator>,
         agent_id: Uuid,
+        model: Option<String>,
+        effort: Option<String>,
     ) -> Result<AgentRecord> {
         validate_name(name)?;
+        if model.is_some() && !harness.supports_model_selection() {
+            return Err(CoreError::SelectionUnsupported {
+                harness,
+                axis: "model",
+            });
+        }
+        if effort.is_some() && !harness.supports_effort_selection() {
+            return Err(CoreError::SelectionUnsupported {
+                harness,
+                axis: "effort",
+            });
+        }
         check_name_unique(&self.list_agents()?, name, None)?;
 
         let record = AgentRecord {
@@ -218,6 +283,8 @@ impl Project {
             name: name.to_owned(),
             harness,
             session_locator,
+            model,
+            effort,
             created_at: Utc::now(),
         };
 
@@ -419,7 +486,7 @@ mod tests {
     fn register_then_list_agent_roundtrips() {
         let (_tmp, project) = fresh_project();
         let record = project
-            .register_agent("assistant", HarnessKind::ClaudeCode)
+            .register_agent("assistant", HarnessKind::ClaudeCode, None, None)
             .unwrap();
         assert_eq!(record.name, "assistant");
         assert_eq!(record.project_id, project.id);
@@ -436,7 +503,9 @@ mod tests {
         // refactor accidentally swaps this back to `Uuid::now_v7()`,
         // concurrent dispatches in one cwd corrupt transcripts.
         let (_tmp, project) = fresh_project();
-        let record = project.register_agent("g", HarnessKind::Gemini).unwrap();
+        let record = project
+            .register_agent("g", HarnessKind::Gemini, None, None)
+            .unwrap();
         let SessionLocator::Uuid(session_id) = record
             .session_locator
             .expect("Gemini pre-generates a UUID locator")
@@ -454,7 +523,9 @@ mod tests {
     #[test]
     fn register_codex_agent_leaves_session_id_none() {
         let (_tmp, project) = fresh_project();
-        let record = project.register_agent("c", HarnessKind::Codex).unwrap();
+        let record = project
+            .register_agent("c", HarnessKind::Codex, None, None)
+            .unwrap();
         assert!(record.session_locator.is_none());
     }
 
@@ -465,7 +536,7 @@ mod tests {
         // registry record. Mirrors Codex's pattern.
         let (_tmp, project) = fresh_project();
         let record = project
-            .register_agent("a", HarnessKind::Antigravity)
+            .register_agent("a", HarnessKind::Antigravity, None, None)
             .unwrap();
         assert!(record.session_locator.is_none());
     }
@@ -481,10 +552,10 @@ mod tests {
     fn register_rejects_duplicate_verbatim() {
         let (_tmp, project) = fresh_project();
         project
-            .register_agent("assistant", HarnessKind::ClaudeCode)
+            .register_agent("assistant", HarnessKind::ClaudeCode, None, None)
             .unwrap();
         let err = project
-            .register_agent("assistant", HarnessKind::ClaudeCode)
+            .register_agent("assistant", HarnessKind::ClaudeCode, None, None)
             .unwrap_err();
         assert!(matches!(err, CoreError::DuplicateAgentName { .. }));
     }
@@ -493,11 +564,11 @@ mod tests {
     fn register_rejects_duplicate_under_hyphen_underscore_and_case() {
         let (_tmp, project) = fresh_project();
         project
-            .register_agent("agent-a", HarnessKind::ClaudeCode)
+            .register_agent("agent-a", HarnessKind::ClaudeCode, None, None)
             .unwrap();
         for collision in ["agent_a", "Agent-A", "AGENT_A"] {
             let err = project
-                .register_agent(collision, HarnessKind::ClaudeCode)
+                .register_agent(collision, HarnessKind::ClaudeCode, None, None)
                 .unwrap_err();
             assert!(
                 matches!(err, CoreError::DuplicateAgentName { .. }),
@@ -510,9 +581,11 @@ mod tests {
     fn remove_agent_drops_target_and_keeps_others() {
         let (_tmp, project) = fresh_project();
         let a = project
-            .register_agent("alpha", HarnessKind::ClaudeCode)
+            .register_agent("alpha", HarnessKind::ClaudeCode, None, None)
             .unwrap();
-        let b = project.register_agent("beta", HarnessKind::Codex).unwrap();
+        let b = project
+            .register_agent("beta", HarnessKind::Codex, None, None)
+            .unwrap();
         assert!(project.remove_agent(a.id).unwrap());
         assert_eq!(project.list_agents().unwrap(), vec![b]);
     }
@@ -521,7 +594,7 @@ mod tests {
     fn remove_agent_nonexistent_reports_not_removed() {
         let (_tmp, project) = fresh_project();
         project
-            .register_agent("alpha", HarnessKind::ClaudeCode)
+            .register_agent("alpha", HarnessKind::ClaudeCode, None, None)
             .unwrap();
         assert!(!project.remove_agent(Uuid::now_v7()).unwrap());
         assert_eq!(project.list_agents().unwrap().len(), 1);
@@ -533,11 +606,11 @@ mod tests {
         // removal lets it be registered again.
         let (_tmp, project) = fresh_project();
         let a = project
-            .register_agent("alpha", HarnessKind::ClaudeCode)
+            .register_agent("alpha", HarnessKind::ClaudeCode, None, None)
             .unwrap();
         project.remove_agent(a.id).unwrap();
         project
-            .register_agent("alpha", HarnessKind::Codex)
+            .register_agent("alpha", HarnessKind::Codex, None, None)
             .expect("name freed by removal");
     }
 
@@ -545,7 +618,7 @@ mod tests {
     fn rename_agent_changes_name_and_persists() {
         let (_tmp, project) = fresh_project();
         let a = project
-            .register_agent("alpha", HarnessKind::ClaudeCode)
+            .register_agent("alpha", HarnessKind::ClaudeCode, None, None)
             .unwrap();
         let updated = project.rename_agent(a.id, "renamed").unwrap();
         assert_eq!(updated.name, "renamed");
@@ -561,7 +634,7 @@ mod tests {
         // of the agent's own name is allowed.
         let (_tmp, project) = fresh_project();
         let a = project
-            .register_agent("agent-a", HarnessKind::ClaudeCode)
+            .register_agent("agent-a", HarnessKind::ClaudeCode, None, None)
             .unwrap();
         let updated = project.rename_agent(a.id, "Agent_A").unwrap();
         assert_eq!(updated.name, "Agent_A");
@@ -571,9 +644,11 @@ mod tests {
     fn rename_agent_rejects_canonical_collision_with_another() {
         let (_tmp, project) = fresh_project();
         let a = project
-            .register_agent("alpha", HarnessKind::ClaudeCode)
+            .register_agent("alpha", HarnessKind::ClaudeCode, None, None)
             .unwrap();
-        project.register_agent("beta", HarnessKind::Codex).unwrap();
+        project
+            .register_agent("beta", HarnessKind::Codex, None, None)
+            .unwrap();
         let err = project.rename_agent(a.id, "BETA").unwrap_err();
         assert!(matches!(err, CoreError::DuplicateAgentName { .. }));
         // The reject path leaves the registry untouched.
@@ -584,7 +659,7 @@ mod tests {
     fn rename_agent_rejects_invalid_name() {
         let (_tmp, project) = fresh_project();
         let a = project
-            .register_agent("alpha", HarnessKind::ClaudeCode)
+            .register_agent("alpha", HarnessKind::ClaudeCode, None, None)
             .unwrap();
         let err = project.rename_agent(a.id, "bad name").unwrap_err();
         assert!(matches!(err, CoreError::InvalidName { .. }));
@@ -602,11 +677,13 @@ mod tests {
         let (_tmp, project) = fresh_project();
         // Three agents in a known order; Codex starts with no locator.
         let a = project
-            .register_agent("alpha", HarnessKind::ClaudeCode)
+            .register_agent("alpha", HarnessKind::ClaudeCode, None, None)
             .unwrap();
-        let b = project.register_agent("beta", HarnessKind::Codex).unwrap();
+        let b = project
+            .register_agent("beta", HarnessKind::Codex, None, None)
+            .unwrap();
         let c = project
-            .register_agent("gamma", HarnessKind::Gemini)
+            .register_agent("gamma", HarnessKind::Gemini, None, None)
             .unwrap();
         assert!(b.session_locator.is_none());
 
@@ -635,7 +712,7 @@ mod tests {
         // Fork-and-heal shape: a locator already present is replaced.
         let (_tmp, project) = fresh_project();
         let a = project
-            .register_agent("a", HarnessKind::Antigravity)
+            .register_agent("a", HarnessKind::Antigravity, None, None)
             .unwrap();
         let first = SessionLocator::Uuid(Uuid::new_v4());
         project.set_session_locator(a.id, first).unwrap();
@@ -663,7 +740,7 @@ mod tests {
         // resume) — and the registry left untouched.
         let (_tmp, project) = fresh_project();
         let claude = project
-            .register_agent("c", HarnessKind::ClaudeCode)
+            .register_agent("c", HarnessKind::ClaudeCode, None, None)
             .unwrap();
         let before = project.list_agents().unwrap();
         let err = project
@@ -682,7 +759,9 @@ mod tests {
         assert_eq!(project.list_agents().unwrap(), before);
 
         // The inverse: a Uuid locator on a Codex agent is likewise refused.
-        let codex = project.register_agent("x", HarnessKind::Codex).unwrap();
+        let codex = project
+            .register_agent("x", HarnessKind::Codex, None, None)
+            .unwrap();
         let err = project
             .set_session_locator(codex.id, SessionLocator::Uuid(Uuid::new_v4()))
             .unwrap_err();
@@ -696,7 +775,7 @@ mod tests {
     fn register_rejects_invalid_name() {
         let (_tmp, project) = fresh_project();
         let err = project
-            .register_agent("agent.1", HarnessKind::ClaudeCode)
+            .register_agent("agent.1", HarnessKind::ClaudeCode, None, None)
             .unwrap_err();
         assert!(matches!(err, CoreError::InvalidName { .. }));
     }
@@ -706,7 +785,7 @@ mod tests {
         let (_tmp, project) = fresh_project();
         let provided = Uuid::now_v7();
         let record = project
-            .register_attached_claude_agent("attached", provided)
+            .register_attached_claude_agent("attached", provided, None, None)
             .unwrap();
         assert_eq!(record.harness, HarnessKind::ClaudeCode);
         assert_eq!(record.session_locator, Some(SessionLocator::Uuid(provided)));
@@ -716,11 +795,116 @@ mod tests {
     }
 
     #[test]
+    fn register_agent_persists_model_and_effort_in_one_step() {
+        let (_tmp, project) = fresh_project();
+        let record = project
+            .register_agent(
+                "assistant",
+                HarnessKind::ClaudeCode,
+                Some("opus".to_owned()),
+                Some("max".to_owned()),
+            )
+            .unwrap();
+        assert_eq!(record.model.as_deref(), Some("opus"));
+        assert_eq!(record.effort.as_deref(), Some("max"));
+        // Durable: the values are on the appended record, not set by a
+        // follow-up call.
+        let listed = project.list_agents().unwrap();
+        assert_eq!(listed, vec![record]);
+    }
+
+    #[test]
+    fn register_attached_claude_persists_model_and_effort() {
+        let (_tmp, project) = fresh_project();
+        let record = project
+            .register_attached_claude_agent(
+                "attached",
+                Uuid::now_v7(),
+                Some("sonnet".to_owned()),
+                Some("low".to_owned()),
+            )
+            .unwrap();
+        assert_eq!(record.model.as_deref(), Some("sonnet"));
+        assert_eq!(record.effort.as_deref(), Some("low"));
+        let listed = project.list_agents().unwrap();
+        assert_eq!(listed, vec![record]);
+    }
+
+    #[test]
+    fn register_attached_gemini_persists_model_with_no_effort() {
+        // Gemini supports model but not effort; the signature structurally
+        // forbids an effort, so the stored record always has `effort: None`.
+        let (_tmp, project) = fresh_project();
+        let record = project
+            .register_attached_gemini_agent(
+                "attached",
+                Uuid::now_v7(),
+                Some("gemini-2.5-pro".to_owned()),
+            )
+            .unwrap();
+        assert_eq!(record.model.as_deref(), Some("gemini-2.5-pro"));
+        assert_eq!(record.effort, None);
+    }
+
+    #[test]
+    fn register_attached_antigravity_carries_no_model_or_effort() {
+        // Antigravity supports neither axis; both are structurally None.
+        let (_tmp, project) = fresh_project();
+        let record = project
+            .register_attached_antigravity_agent("attached", Uuid::new_v4())
+            .unwrap();
+        assert_eq!(record.model, None);
+        assert_eq!(record.effort, None);
+    }
+
+    #[test]
+    fn register_agent_rejects_model_on_unsupporting_harness() {
+        // The generic create path is harness-agnostic, so the capability
+        // invariant is enforced at the persistence boundary (the single
+        // chokepoint), not just at the app layer. An Antigravity model never
+        // reaches the registry.
+        let (_tmp, project) = fresh_project();
+        let err = project
+            .register_agent(
+                "a",
+                HarnessKind::Antigravity,
+                Some("whatever".to_owned()),
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CoreError::SelectionUnsupported {
+                harness: HarnessKind::Antigravity,
+                axis: "model"
+            }
+        ));
+        // Rejected *before* the append — no orphan record.
+        assert!(project.list_agents().unwrap().is_empty());
+    }
+
+    #[test]
+    fn register_agent_rejects_effort_on_unsupporting_harness() {
+        let (_tmp, project) = fresh_project();
+        let err = project
+            .register_agent("g", HarnessKind::Gemini, None, Some("high".to_owned()))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CoreError::SelectionUnsupported {
+                harness: HarnessKind::Gemini,
+                axis: "effort"
+            }
+        ));
+        assert!(project.list_agents().unwrap().is_empty());
+    }
+
+    #[test]
     fn register_attached_codex_persists_thread_id_and_date() {
         let (_tmp, project) = fresh_project();
         let date = chrono::NaiveDate::from_ymd_opt(2026, 5, 16).unwrap();
         let record = project
-            .register_attached_codex_agent("attached", "thread-abc".to_owned(), date)
+            .register_attached_codex_agent("attached", "thread-abc".to_owned(), date, None, None)
             .unwrap();
         assert_eq!(record.harness, HarnessKind::Codex);
         assert_eq!(
@@ -750,10 +934,10 @@ mod tests {
     fn register_attached_enforces_name_uniqueness_across_create_and_attach() {
         let (_tmp, project) = fresh_project();
         project
-            .register_agent("agent-a", HarnessKind::ClaudeCode)
+            .register_agent("agent-a", HarnessKind::ClaudeCode, None, None)
             .unwrap();
         let err = project
-            .register_attached_claude_agent("agent_a", Uuid::now_v7())
+            .register_attached_claude_agent("agent_a", Uuid::now_v7(), None, None)
             .unwrap_err();
         assert!(matches!(err, CoreError::DuplicateAgentName { .. }));
     }
@@ -762,7 +946,7 @@ mod tests {
     fn register_attached_validates_name() {
         let (_tmp, project) = fresh_project();
         let err = project
-            .register_attached_claude_agent("bad.name", Uuid::now_v7())
+            .register_attached_claude_agent("bad.name", Uuid::now_v7(), None, None)
             .unwrap_err();
         assert!(matches!(err, CoreError::InvalidName { .. }));
     }
@@ -792,7 +976,7 @@ mod tests {
         let (_tmp, project) = fresh_project();
         // Append a valid record then a malformed line.
         project
-            .register_agent("assistant", HarnessKind::ClaudeCode)
+            .register_agent("assistant", HarnessKind::ClaudeCode, None, None)
             .unwrap();
         let mut f = std::fs::OpenOptions::new()
             .append(true)

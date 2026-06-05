@@ -32,6 +32,8 @@ const ANTIGRAVITY_TOKEN: &str = "SWITCHBOARD_TOOL_LIVE_AGY001";
 
 fn claude_agent() -> AgentRecord {
     AgentRecord {
+        model: None,
+        effort: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
         name: "tool-use-claude".to_owned(),
@@ -43,6 +45,8 @@ fn claude_agent() -> AgentRecord {
 
 fn codex_agent() -> AgentRecord {
     AgentRecord {
+        model: None,
+        effort: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
         name: "tool-use-codex".to_owned(),
@@ -133,6 +137,8 @@ async fn live_claude_emits_tool_started_and_tool_completed_for_file_read() {
 
 fn gemini_agent() -> AgentRecord {
     AgentRecord {
+        model: None,
+        effort: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
         name: "tool-use-gemini".to_owned(),
@@ -257,6 +263,8 @@ async fn live_gemini_emits_tool_started_and_tool_completed_for_file_read() {
 
 fn antigravity_agent() -> AgentRecord {
     AgentRecord {
+        model: None,
+        effort: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
         name: "tool-use-antigravity".to_owned(),

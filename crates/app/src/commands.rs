@@ -785,7 +785,7 @@ pub fn create_agent_impl(
         .get(&active)
         .cloned()
         .ok_or(AppError::ProjectNotLoaded(active))?;
-    let record = project.register_agent(name, harness)?;
+    let record = project.register_agent(name, harness, None, None)?;
     lock(&state.agents_by_id).insert(record.id, record.clone());
     Ok(record)
 }
@@ -989,7 +989,7 @@ pub fn attach_agent_impl(
                 });
             }
             check_claude_session_id_unique(state, &directory, &session_uuid)?;
-            project.register_attached_claude_agent(name, session_uuid)?
+            project.register_attached_claude_agent(name, session_uuid, None, None)?
         }
         HarnessKind::Codex => {
             let (_path, session_partition_date) =
@@ -1006,6 +1006,8 @@ pub fn attach_agent_impl(
                 name,
                 existing_session_id.to_owned(),
                 session_partition_date,
+                None,
+                None,
             )?;
             // Codex-only: force SessionMeta on subsequent dispatches until one
             // is genuinely observed. Claude/Gemini/Antigravity emit SessionMeta
@@ -1022,7 +1024,7 @@ pub fn attach_agent_impl(
                 "gemini attach: bound to candidate"
             );
             check_gemini_session_id_unique(state, &directory, &session_uuid)?;
-            project.register_attached_gemini_agent(name, session_uuid)?
+            project.register_attached_gemini_agent(name, session_uuid, None)?
         }
         HarnessKind::Antigravity => {
             let session_uuid = parse_uuid(existing_session_id)?;

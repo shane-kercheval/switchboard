@@ -29,10 +29,10 @@ fn multi_project_directory_end_to_end_with_layout_assertion() {
 
     // Same agent name in both projects must succeed — uniqueness is project-scoped.
     let agent_a = project_a
-        .register_agent("assistant", HarnessKind::ClaudeCode)
+        .register_agent("assistant", HarnessKind::ClaudeCode, None, None)
         .unwrap();
     let agent_b = project_b
-        .register_agent("assistant", HarnessKind::ClaudeCode)
+        .register_agent("assistant", HarnessKind::ClaudeCode, None, None)
         .unwrap();
     assert_ne!(agent_a.id, agent_b.id);
     // Both must be Some (Claude Code pre-generates) AND distinct. A bare
@@ -43,7 +43,7 @@ fn multi_project_directory_end_to_end_with_layout_assertion() {
 
     // Adding a second agent in project_a so we can confirm registries don't cross-pollinate.
     let reviewer_a = project_a
-        .register_agent("reviewer", HarnessKind::ClaudeCode)
+        .register_agent("reviewer", HarnessKind::ClaudeCode, None, None)
         .unwrap();
 
     // Reopen the directory and re-read everything from disk.

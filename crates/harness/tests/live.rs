@@ -17,6 +17,8 @@ use uuid::Uuid;
 
 fn live_agent() -> AgentRecord {
     AgentRecord {
+        model: None,
+        effort: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
         name: "live-test-agent".to_owned(),
@@ -367,6 +369,8 @@ async fn live_claude_resume_reuses_session() {
     let session_id = Uuid::now_v7();
 
     let agent1 = AgentRecord {
+        model: None,
+        effort: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
         name: "session-test-1".to_owned(),
@@ -401,6 +405,8 @@ async fn live_claude_resume_reuses_session() {
     // Second turn reuses the same session_id — adapter detects the session file
     // and switches to --resume automatically.
     let agent2 = AgentRecord {
+        model: None,
+        effort: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
         name: "session-test-2".to_owned(),
@@ -491,6 +497,8 @@ async fn live_claude_dash_leading_prompt_completes() {
 
 fn live_codex_agent() -> AgentRecord {
     AgentRecord {
+        model: None,
+        effort: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
         name: "live-codex-agent".to_owned(),
@@ -722,6 +730,8 @@ async fn live_codex_resume_reuses_session() {
     let (thread_id, partition_date) =
         codex_capture(&events1).expect("first dispatch emits a captured Codex locator");
     let resumed_agent = AgentRecord {
+        model: None,
+        effort: None,
         session_locator: Some(SessionLocator::Codex {
             thread_id,
             partition_date,
@@ -769,6 +779,8 @@ async fn live_codex_resume_reuses_session() {
 
 fn live_gemini_agent() -> AgentRecord {
     AgentRecord {
+        model: None,
+        effort: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
         name: "live-gemini-agent".to_owned(),
@@ -1044,6 +1056,8 @@ async fn live_gemini_dash_leading_prompt_completes() {
 
 fn live_antigravity_agent() -> AgentRecord {
     AgentRecord {
+        model: None,
+        effort: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
         name: "live-antigravity-agent".to_owned(),
@@ -1303,6 +1317,8 @@ async fn live_antigravity_resume_reuses_session() {
     let conversation_id =
         antigravity_capture(&events1).expect("first dispatch emits a captured Antigravity locator");
     let resumed_agent = AgentRecord {
+        model: None,
+        effort: None,
         session_locator: Some(SessionLocator::Uuid(conversation_id)),
         ..agent.clone()
     };

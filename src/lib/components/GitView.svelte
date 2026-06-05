@@ -29,7 +29,7 @@
   } from "$lib/state/gitView.svelte";
   import { pickDirectory } from "$lib/native";
 
-  let branchFilter = $state<"local" | "remote" | "both">("local");
+  let branchFilter = $state<"local" | "remote" | "both">("both");
   let showInactive = $state(false);
   let refreshing = $state(false);
   let adding = $state(false);
@@ -62,9 +62,9 @@
   }
 
   const filterOptions: { value: "local" | "remote" | "both"; label: string }[] = [
+    { value: "both", label: "Both" },
     { value: "local", label: "Local" },
     { value: "remote", label: "Remote" },
-    { value: "both", label: "Both" },
   ];
 
   async function onGlobalRefresh(): Promise<void> {
@@ -136,7 +136,7 @@
           bind:checked={showInactive}
           data-testid="show-inactive"
         />
-        Show inactive
+        Show branches without folders
       </label>
     </div>
 

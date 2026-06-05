@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { basename, currentIsoTimestamp, formatDuration, relativeTime } from "./utils";
+import {
+  basename,
+  currentIsoTimestamp,
+  formatDuration,
+  formatHomePath,
+  relativeTime,
+} from "./utils";
 
 describe("formatDuration", () => {
   it("formats minutes and seconds under an hour with padded seconds", () => {
@@ -33,6 +39,42 @@ describe("basename", () => {
 
   it("handles dot-prefixed components", () => {
     expect(basename("/Users/x/.switchboard")).toBe(".switchboard");
+  });
+});
+
+describe("formatHomePath", () => {
+  it("shortens POSIX paths inside the supplied home directory", () => {
+    expect(formatHomePath("/Users/shane/repos/switchboard", "/Users/shane")).toBe(
+      "~/repos/switchboard",
+    );
+    expect(formatHomePath("/home/shane/repos/switchboard", "/home/shane/")).toBe(
+      "~/repos/switchboard",
+    );
+  });
+
+  it("renders the home directory itself as tilde", () => {
+    expect(formatHomePath("/Users/shane", "/Users/shane")).toBe("~");
+  });
+
+  it("does not shorten paths outside the supplied home directory", () => {
+    expect(formatHomePath("/Volumes/work/repos/switchboard", "/Users/shane")).toBe(
+      "/Volumes/work/repos/switchboard",
+    );
+    expect(formatHomePath("/Users/shane-other/repos", "/Users/shane")).toBe(
+      "/Users/shane-other/repos",
+    );
+  });
+
+  it("shortens Windows paths case-insensitively while preserving separators", () => {
+    expect(formatHomePath("C:\\Users\\Shane\\repos\\switchboard", "c:\\users\\shane")).toBe(
+      "~\\repos\\switchboard",
+    );
+  });
+
+  it("falls back to the full path without a home directory", () => {
+    expect(formatHomePath("/Users/shane/repos/switchboard", null)).toBe(
+      "/Users/shane/repos/switchboard",
+    );
   });
 });
 

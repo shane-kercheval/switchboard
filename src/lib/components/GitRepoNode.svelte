@@ -1,9 +1,12 @@
 <script lang="ts">
-  /// One tracked repo in the Git view: a collapsible header (name, default
-  /// branch, availability, per-repo refresh + last-fetched indicator) over its
-  /// branches. Branch filtering (local/remote/inactive) is applied by the
-  /// parent and passed in, so this node is pure presentation over the data.
+  /// One tracked repo in the Git view: a collapsible header (repo name/path,
+  /// availability, per-repo refresh + last-fetched indicator) over its branches.
+  /// Branch filtering is applied by the parent and passed in, so this node is
+  /// pure presentation over the data.
+  import { onMount } from "svelte";
+  import { homeDir } from "@tauri-apps/api/path";
   import { cn, basename } from "$lib/utils";
+  import { formatHomePath } from "$lib/utils";
   import Badge from "$lib/components/ui/Badge.svelte";
   import GitBadge from "$lib/components/GitBadge.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
@@ -37,16 +40,13 @@
 
   let expanded = $state(true);
   let busy = $state(false);
+  let homePath = $state<string | null>(null);
 
   const repo = $derived(listing.repo);
-  const worktreeCount = $derived(
-    repo.local_branches.filter((branch) => branch.worktree !== null).length +
-      repo.detached_worktrees.length,
-  );
   const localBranchCount = $derived(repo.local_branches.length);
 
-  // Active = has a worktree (checked out somewhere). Inactive branches are dimmed
-  // and hidden when the toggle is off; active ones sort first.
+  // Branches with a folder are actionable and sort first. Branches without a
+  // local folder are hidden until the user asks for them.
   const localBranches = $derived(
     [...repo.local_branches]
       .filter((b) => showInactive || b.worktree !== null)
@@ -56,9 +56,28 @@
         return aActive - bActive || a.name.localeCompare(b.name);
       }),
   );
+  const remoteOnlyBranches = $derived(
+    repo.remote_branches.filter(
+      (remote) => !repo.local_branches.some((local) => local.upstream === remote.name),
+    ),
+  );
 
   const showLocal = $derived(branchFilter !== "remote");
   const showRemote = $derived(branchFilter !== "local");
+
+  onMount(() => {
+    void homeDir()
+      .then((path) => {
+        homePath = path;
+      })
+      .catch(() => {
+        homePath = null;
+      });
+  });
+
+  function displayPath(path: string): string {
+    return formatHomePath(path, homePath);
+  }
 
   function linkedProjects(worktreePath: string) {
     return listing.linked_projects[worktreePath] ?? [];
@@ -118,23 +137,20 @@
     </button>
 
     <div class="min-w-0 flex-1">
-      <div class="flex min-w-0 items-center gap-1.5">
+      <div class="flex min-w-0 items-baseline gap-1.5">
         <span class="text-fg truncate text-sm font-semibold" title={repo.root}>{repo.name}</span>
+        <span class="text-border shrink-0 text-[11px]">/</span>
+        <span class="text-muted truncate font-mono text-[11px] leading-4" title={repo.root}>
+          {displayPath(repo.root)}
+        </span>
         {#if repo.is_bare}
-          <Badge testid="repo-bare">bare</Badge>
+          <Badge testid="repo-bare" class="shrink-0">bare</Badge>
         {/if}
         {#if !repo.available}
-          <Badge testid="repo-unavailable" class="bg-warning-soft text-warning">unavailable</Badge>
+          <Badge testid="repo-unavailable" class="bg-warning-soft text-warning shrink-0">
+            unavailable
+          </Badge>
         {/if}
-      </div>
-      <div class="text-muted mt-0.5 flex min-w-0 items-center gap-1.5 text-[11px] leading-4">
-        {#if repo.default_branch}
-          <span class="shrink-0">{repo.default_branch}</span>
-          <span class="text-border shrink-0">/</span>
-        {/if}
-        <span class="shrink-0">{worktreeCount} worktree{worktreeCount === 1 ? "" : "s"}</span>
-        <span class="text-border shrink-0">/</span>
-        <span class="truncate" title={repo.root}>{repo.root}</span>
       </div>
     </div>
 
@@ -228,8 +244,8 @@
               {#if branch.worktree}
                 {@const worktreePath = branch.worktree.path}
                 <!-- Clicking the row (but not the actions menu) opens the diff
-                     panel for this worktree; the menu is a sibling button so the
-                     two clicks don't nest. -->
+                     panel for this branch's local folder; the menu is a sibling
+                     button so the two clicks don't nest. -->
                 <button
                   type="button"
                   class="flex min-w-0 flex-1 items-center gap-2 text-left"
@@ -287,7 +303,7 @@
                   </DropdownMenuItem>
                 </DropdownMenu>
               {:else}
-                <!-- No worktree → not openable; render the same content inert. -->
+                <!-- No local folder → not openable; render the same content inert. -->
                 <div class="flex min-w-0 flex-1 items-center gap-2">
                   {@render branchInner(branch)}
                 </div>
@@ -298,19 +314,26 @@
             <p class="text-muted px-2 py-1.5 text-xs">
               {showInactive && localBranchCount === 0
                 ? "No local branches."
-                : "No active branches."}
+                : "No branches with local folders."}
             </p>
           {/if}
         {/if}
 
         {#if showRemote}
-          {#each repo.remote_branches as branch (branch.name)}
+          {#each remoteOnlyBranches as branch (branch.name)}
             <div
               class="flex min-h-8 items-center gap-2 rounded-md px-2 py-1.5 opacity-65"
               data-testid="git-remote-branch"
               data-branch={branch.name}
             >
-              <span class="text-muted shrink-0 text-[13px] leading-5">{branch.name}</span>
+              <div
+                class="grid min-w-0 flex-1 grid-cols-[minmax(8rem,0.35fr)_minmax(0,1fr)] items-center gap-3"
+              >
+                <span class="text-muted truncate text-[13px] leading-5" title={branch.name}>
+                  {branch.name}
+                </span>
+                <span class="text-muted truncate text-[11px] leading-5">Remote branch</span>
+              </div>
               <div class="flex min-w-0 flex-1 flex-wrap items-center gap-1">
                 {#each remoteBranchBadges(branch, repo.default_branch) as badge (badge.key)}
                   <GitBadge {badge} />
@@ -354,15 +377,24 @@
 </div>
 
 {#snippet branchInner(branch: BranchView)}
-  <span class="text-fg shrink-0 text-[13px] leading-5">{branch.name}</span>
+  <div class="grid min-w-0 flex-1 grid-cols-[minmax(8rem,0.35fr)_minmax(0,1fr)] items-center gap-3">
+    <span class="text-fg truncate text-[13px] leading-5" title={branch.name}>{branch.name}</span>
+    {#if branch.worktree}
+      <span
+        class="text-muted truncate font-mono text-[11px] leading-5"
+        title={branch.worktree.path}
+      >
+        {displayPath(branch.worktree.path)}
+      </span>
+    {:else}
+      <span class="text-muted truncate text-[11px] leading-5">No local folder</span>
+    {/if}
+  </div>
   <div class="flex min-w-0 flex-1 flex-wrap items-center gap-1">
     {#each localBranchBadges(branch, repo.default_branch) as badge (badge.key)}
       <GitBadge {badge} />
     {/each}
     {#if branch.worktree}
-      <span class="text-muted ml-1 truncate font-mono text-[11px]" title={branch.worktree.path}>
-        {basename(branch.worktree.path)}
-      </span>
       {#each linkedProjects(branch.worktree.path) as project (project.id)}
         <Badge testid="linked-project">{project.name}</Badge>
       {/each}

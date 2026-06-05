@@ -3,11 +3,11 @@
 // D2 mapping is unit-testable on its own and reused wherever git state is shown
 // (the Git view now; the project-scoped panel in M6).
 //
-// The mapping is deliberately calm and one-tier (decision D2): clean & in-sync
-// shows NOTHING; every attention state (uncommitted, behind-base, dangling,
+// The mapping is deliberately calm and one-tier (decision D2): every attention
+// state (changes, behind-default, upstream gone,
 // orphaned, prunable) is one amber `warning`; ahead/behind/diverged counts are
-// neutral informational chips; local-only and merged are muted labels. No
-// success/green token is introduced.
+// neutral informational chips; local-only, upstream presence, and merged are
+// muted labels. No success/green token is introduced.
 
 import type { BranchView, RemoteBranchView, SyncState, WorktreeView } from "$lib/types";
 
@@ -16,7 +16,7 @@ import type { BranchView, RemoteBranchView, SyncState, WorktreeView } from "$lib
 export type BadgeTone = "warning" | "neutral" | "muted";
 
 export type GitBadge = {
-  /// Short text shown in the badge (e.g. "uncommitted", "↑3", "merged").
+  /// Short text shown in the badge (e.g. "changes", "↑3", "merged").
   label: string;
   tone: BadgeTone;
   /// Stable key for `{#each}` and test lookup.
@@ -66,17 +66,21 @@ function syncBadges(sync: SyncState): GitBadge[] {
   }
 }
 
+function remoteName(upstream: string): string {
+  return upstream.split("/", 1)[0] ?? upstream;
+}
+
 /// Worktree-level signal: any uncommitted change (dirty OR untracked) collapses
-/// to one amber "uncommitted" badge; the staged/unstaged/untracked split is only
+/// to one amber "changes" badge; the staged/unstaged/untracked split is only
 /// surfaced in the M5 diff panel, not the tree. Warnings are amber too.
 function worktreeBadges(wt: WorktreeView): GitBadge[] {
   const badges: GitBadge[] = [];
   if (wt.dirty || wt.untracked) {
     badges.push({
       key: "uncommitted",
-      label: "uncommitted",
+      label: "changes",
       tone: "warning",
-      title: "Uncommitted changes in this worktree",
+      title: "Uncommitted changes in this folder",
     });
   }
   if (wt.warning === "orphaned") {
@@ -112,7 +116,7 @@ export function localBranchBadges(branch: BranchView, defaultBranch: string | nu
   if (branch.behind_base != null && branch.behind_base > 0) {
     badges.push({
       key: "behind_base",
-      label: "out of date",
+      label: `behind ${defaultBranch ?? "default"}`,
       tone: "warning",
       title: `${branch.behind_base} commit(s) behind the default branch`,
     });
@@ -120,9 +124,17 @@ export function localBranchBadges(branch: BranchView, defaultBranch: string | nu
   if (branch.dangling) {
     badges.push({
       key: "dangling",
-      label: "dangling",
+      label: "upstream gone",
       tone: "warning",
       title: "Upstream branch was deleted on the remote",
+    });
+  }
+  if (branch.upstream != null && branch.sync.kind === "in_sync") {
+    badges.push({
+      key: "upstream",
+      label: `on ${remoteName(branch.upstream)}`,
+      tone: "muted",
+      title: `Tracks ${branch.upstream}`,
     });
   }
   badges.push(...syncBadges(branch.sync));
@@ -144,7 +156,7 @@ export function remoteBranchBadges(
   if (branch.behind_base != null && branch.behind_base > 0) {
     badges.push({
       key: "behind_base",
-      label: "out of date",
+      label: `behind ${defaultBranch ?? "default"}`,
       tone: "warning",
       title: `${branch.behind_base} commit(s) behind the default branch`,
     });

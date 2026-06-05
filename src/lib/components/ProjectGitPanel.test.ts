@@ -64,17 +64,17 @@ describe("ProjectGitPanel", () => {
 
     expect(loadProjectRepo).toHaveBeenCalledWith("/repos/alpha");
     expect(screen.getByTestId("project-git-branch")).toHaveTextContent("feature-x");
-    // A dirty worktree surfaces the uncommitted badge (same mapping as the Git view).
-    expect(screen.getByText("uncommitted")).toBeInTheDocument();
+    // A dirty folder surfaces the changes badge (same mapping as the Git view).
+    expect(screen.getByText("changes")).toBeInTheDocument();
   });
 
-  it("surfaces the behind-base 'out of date' indicator", () => {
+  it("surfaces the behind-default-branch indicator", () => {
     (projectBranch as Mock).mockReturnValue({
       branch: branch({ behind_base: 4 }),
       defaultBranch: "main",
     });
     render(ProjectGitPanel, { project });
-    expect(screen.getByText("out of date")).toBeInTheDocument();
+    expect(screen.getByText("behind main")).toBeInTheDocument();
   });
 
   it("shows a calm 'no changes' line for a clean, in-sync branch", () => {

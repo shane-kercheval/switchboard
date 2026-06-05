@@ -9,6 +9,10 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: (cmd: string, args?: Record<string, unknown>) => invokeMock(cmd, args),
 }));
 
+vi.mock("@tauri-apps/api/path", () => ({
+  homeDir: async () => "/repos",
+}));
+
 const pickDirectoryMock = vi.fn<() => Promise<string | null>>(async () => null);
 vi.mock("$lib/native", () => ({
   pickDirectory: () => pickDirectoryMock(),
@@ -57,7 +61,10 @@ const repo = (over: Partial<RepoListing["repo"]> = {}): RepoListing => ({
         worktree: null, // inactive (no worktree)
       },
     ],
-    remote_branches: [{ name: "origin/main", merged: null, behind_base: null }],
+    remote_branches: [
+      { name: "origin/main", merged: null, behind_base: null },
+      { name: "origin/remote-only", merged: null, behind_base: null },
+    ],
     detached_worktrees: [],
     ...over,
   },
@@ -85,8 +92,9 @@ describe("GitView", () => {
     // Active branch (has a worktree) shows; its linked project renders.
     expect(document.querySelector('[data-testid="git-branch"][data-branch="main"]')).not.toBeNull();
     expect(screen.getByTestId("linked-project")).toHaveTextContent("app-proj");
-    // Uncommitted badge surfaced for the dirty worktree.
-    expect(screen.getByText("uncommitted")).toBeInTheDocument();
+    await waitFor(() => expect(screen.getAllByText("~/app").length).toBeGreaterThan(0));
+    // Dirty or untracked files surface the changes badge.
+    expect(screen.getByText("changes")).toBeInTheDocument();
   });
 
   it("hides inactive branches by default and reveals them via the toggle", async () => {
@@ -95,7 +103,7 @@ describe("GitView", () => {
     render(GitView);
     await waitFor(() => expect(screen.getByTestId("git-repo")).toBeInTheDocument());
 
-    // `old-feature` has no worktree → inactive → hidden by default.
+    // `old-feature` has no local folder → hidden by default.
     expect(screen.queryByText("old-feature")).not.toBeInTheDocument();
     await fireEvent.click(screen.getByTestId("show-inactive"));
     expect(screen.getByText("old-feature")).toBeInTheDocument();
@@ -107,12 +115,16 @@ describe("GitView", () => {
     render(GitView);
     await waitFor(() => expect(screen.getByTestId("git-repo")).toBeInTheDocument());
 
-    // Default = local: the remote branch row is not shown.
+    // Default = both: local branches and remote-only branch rows are shown.
+    expect(screen.getByTestId("git-remote-branch")).toBeInTheDocument();
+    expect(screen.getByText("origin/remote-only")).toBeInTheDocument();
+    expect(screen.queryByText("origin/main")).not.toBeInTheDocument();
+    expect(document.querySelector('[data-testid="git-branch"][data-branch="main"]')).not.toBeNull();
+    await fireEvent.click(screen.getByTestId("branch-filter-local"));
     expect(screen.queryByTestId("git-remote-branch")).not.toBeInTheDocument();
     await fireEvent.click(screen.getByTestId("branch-filter-remote"));
     expect(screen.getByTestId("git-remote-branch")).toBeInTheDocument();
-    // Local branch row hidden under remote-only (the repo header's default-branch
-    // label still says "main"; assert the local branch *row* is gone).
+    // Local branch row hidden under remote-only.
     expect(document.querySelector('[data-testid="git-branch"][data-branch="main"]')).toBeNull();
   });
 

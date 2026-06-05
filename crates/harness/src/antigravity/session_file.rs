@@ -129,8 +129,15 @@ pub(crate) fn parse_antigravity_transcript_content(
 struct Reconstruction {
     agent_id: AgentId,
     turns: Vec<Turn>,
-    current: Option<AgentBuilder>,
     model: Option<String>,
+    /// Running carry-forward model for per-turn stamping. Antigravity announces
+    /// the model (a `USER_SETTINGS_CHANGE` sentence) only on the turn it
+    /// *changes*; unchanged turns inherit the last announced value. Updated
+    /// last-wins on each announcing `USER_INPUT`, stamped on every `Turn::Agent`.
+    /// Distinct from `model` (first-wins, agent-scoped `meta.model`). `None`
+    /// before the first announcement.
+    current_model: Option<String>,
+    current: Option<AgentBuilder>,
     warnings: Vec<ParseWarning>,
     /// Carried forward so a record missing `created_at` inherits the previous
     /// record's timestamp rather than the wall clock — keeping reconstruction
@@ -177,6 +184,7 @@ impl Reconstruction {
             turns: Vec::new(),
             current: None,
             model: None,
+            current_model: None,
             warnings: Vec::new(),
             last_ts: DateTime::<Utc>::default(),
         }
@@ -208,6 +216,7 @@ impl Reconstruction {
         self.last_ts
     }
 
+    #[allow(clippy::too_many_lines)]
     fn ingest(&mut self, line_number: usize, rec: &TranscriptRecord) {
         let ts = self.resolve_timestamp(line_number, rec);
         self.last_ts = ts;
@@ -230,10 +239,14 @@ impl Reconstruction {
                 started_at: ts,
                 text,
             });
-            if self.model.is_none()
-                && let Some(m) = extract_model_from_record(rec)
-            {
-                self.model = Some(m);
+            // `close_current()` above already stamped the prior turn with the
+            // old `current_model`; now fold in this turn's announcement (if any)
+            // for the turn that follows. `model` stays first-wins (meta).
+            if let Some(m) = extract_model_from_record(rec) {
+                if self.model.is_none() {
+                    self.model = Some(m.clone());
+                }
+                self.current_model = Some(m);
             }
             return;
         }
@@ -345,6 +358,11 @@ impl Reconstruction {
             status,
             items: b.items,
             usage: None,
+            // Per-turn model carried forward from the last announcement (the
+            // model name embeds Antigravity's effort tier, so there's no
+            // separate effort axis).
+            model: self.current_model.clone(),
+            effort: None,
             // Antigravity has no cost/overage and no join key (Claude-only).
             spend: None,
             stable_message_id: None,
@@ -396,6 +414,91 @@ mod tests {
             Turn::Agent { status, .. } => *status,
             other => panic!("expected agent turn, got {other:?}"),
         }
+    }
+
+    fn agent_model(turn: &Turn) -> Option<String> {
+        match turn {
+            Turn::Agent { model, .. } => model.clone(),
+            other => panic!("expected agent turn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn per_turn_model_carries_forward_across_unannounced_turns() {
+        // Turn 1 announces a model; turns 2–3 don't → inherit it; turn 4
+        // announces a change → flips. Antigravity emits the
+        // `USER_SETTINGS_CHANGE` sentence only when the model changes.
+        let user_announce = |req: &str, change: &str, ts: &str| {
+            format!(
+                r#"{{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"{ts}","content":"<USER_REQUEST>\n{req}\n</USER_REQUEST>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` {change}.</USER_SETTINGS_CHANGE>"}}"#
+            )
+        };
+        let user_plain = |req: &str, ts: &str| {
+            format!(
+                r#"{{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"{ts}","content":"<USER_REQUEST>\n{req}\n</USER_REQUEST>"}}"#
+            )
+        };
+        let model_resp = |text: &str, ts: &str| {
+            format!(
+                r#"{{"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"{ts}","content":"{text}"}}"#
+            )
+        };
+        let content = [
+            user_announce(
+                "one",
+                "from None to Gemini 3.5 Flash (High)",
+                "2026-05-19T19:00:00Z",
+            ),
+            model_resp("a", "2026-05-19T19:00:01Z"),
+            user_plain("two", "2026-05-19T19:01:00Z"),
+            model_resp("b", "2026-05-19T19:01:01Z"),
+            user_plain("three", "2026-05-19T19:02:00Z"),
+            model_resp("c", "2026-05-19T19:02:01Z"),
+            user_announce(
+                "four",
+                "from Gemini 3.5 Flash (High) to Claude Sonnet 4.6 (Thinking)",
+                "2026-05-19T19:03:00Z",
+            ),
+            model_resp("d", "2026-05-19T19:03:01Z"),
+            String::new(), // trailing newline — the parser drops a non-terminated final line
+        ]
+        .join("\n");
+
+        let t = parse_antigravity_transcript_content(&content, agent_id());
+        let models: Vec<_> = t
+            .turns
+            .iter()
+            .filter(|turn| matches!(turn, Turn::Agent { .. }))
+            .map(agent_model)
+            .collect();
+        assert_eq!(
+            models,
+            vec![
+                Some("Gemini 3.5 Flash".to_owned()),
+                Some("Gemini 3.5 Flash".to_owned()),
+                Some("Gemini 3.5 Flash".to_owned()),
+                Some("Claude Sonnet 4.6".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn per_turn_model_is_none_when_never_announced() {
+        // An attached conversation truncated before its first announcement →
+        // no model on the turn, no error.
+        let content = concat!(
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-05-19T19:00:00Z","content":"<USER_REQUEST>\nhi\n</USER_REQUEST>"}"#,
+            "\n",
+            r#"{"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-05-19T19:00:01Z","content":"ack"}"#,
+            "\n",
+        );
+        let t = parse_antigravity_transcript_content(content, agent_id());
+        let agent = t
+            .turns
+            .iter()
+            .find(|x| matches!(x, Turn::Agent { .. }))
+            .unwrap();
+        assert_eq!(agent_model(agent), None);
     }
 
     #[test]

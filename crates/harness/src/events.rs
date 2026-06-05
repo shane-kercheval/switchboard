@@ -232,6 +232,16 @@ pub enum AdapterEvent {
         /// `context_window_source`, this *is* rendered). `None` = no real-spend
         /// info for this turn.
         spend: Option<TurnSpend>,
+        /// The model this turn ran on — the live per-turn carrier, mirroring
+        /// `spend` (stamped by the adapter, carried through to the frontend).
+        /// Per harness: Claude/Gemini the most-recent `SessionMeta`/`init`; Codex
+        /// the current-turn `turn_context.model` (enrichment re-read); Antigravity
+        /// the carry-forward state. `None` when the harness exposes no model.
+        model: Option<String>,
+        /// The reasoning effort this turn ran at — **Codex only**
+        /// (`turn_context.effort`), `None` elsewhere. Live per-turn carrier; the
+        /// reopen counterpart is reconstructed from the session file.
+        effort: Option<String>,
         /// Stable per-turn join key: the final non-subagent assistant message's
         /// Anthropic `message.id`, which appears identically in the live stream
         /// and the on-disk session file (verified). The dispatcher keys the
@@ -323,6 +333,12 @@ pub enum NormalizedEvent {
         /// Per-turn real-spend attribution — gates the inline cost + overage
         /// marker on the message. `None` = show neither. See [`TurnSpend`].
         spend: Option<TurnSpend>,
+        /// The model this turn ran on, rendered per-turn in the transcript
+        /// footer (M6). `None` = render nothing. See [`AdapterEvent::TurnEnd`].
+        model: Option<String>,
+        /// The reasoning effort this turn ran at (Codex only), rendered per-turn
+        /// in the footer (M6). `None` = render nothing.
+        effort: Option<String>,
     },
     RateLimitEvent {
         agent_id: AgentId,
@@ -439,6 +455,8 @@ impl AdapterEvent {
                 ended_at,
                 usage,
                 spend,
+                model,
+                effort,
                 ..
             } => NormalizedEvent::TurnEnd {
                 turn_id,
@@ -446,6 +464,8 @@ impl AdapterEvent {
                 ended_at,
                 usage,
                 spend,
+                model,
+                effort,
             },
             // `source` is intentionally dropped — it's an internal persistence
             // discriminator the frontend doesn't need (see `RateLimitSource`).
@@ -631,6 +651,8 @@ mod tests {
             ended_at: fresh_time(),
             usage: None,
             spend: None,
+            model: None,
+            effort: None,
         };
         let value = serde_json::to_value(&event).unwrap();
         assert_eq!(value["type"], "turn_end");
@@ -661,6 +683,8 @@ mod tests {
                 is_overage: true,
                 overage_resets_at: None,
             }),
+            model: None,
+            effort: None,
         };
         let value = serde_json::to_value(&event).unwrap();
         assert_eq!(value["usage"]["input_tokens"], 100);
@@ -688,6 +712,8 @@ mod tests {
             ended_at: fresh_time(),
             usage: None,
             spend: None,
+            model: None,
+            effort: None,
         };
         let value = serde_json::to_value(&event).unwrap();
         assert_eq!(value["outcome"]["status"], "failed");
@@ -710,6 +736,8 @@ mod tests {
                 ended_at: fresh_time(),
                 usage: None,
                 spend: None,
+                model: None,
+                effort: None,
             };
             let value = serde_json::to_value(&event).unwrap();
             assert_eq!(value["outcome"]["status"], "cancelled");
@@ -730,6 +758,8 @@ mod tests {
             ended_at: fresh_time(),
             usage: None,
             spend: None,
+            model: None,
+            effort: None,
         };
         let value = serde_json::to_value(&event).unwrap();
         assert_eq!(value["outcome"]["status"], "failed");
@@ -753,6 +783,8 @@ mod tests {
             ended_at: fresh_time(),
             usage: None,
             spend: None,
+            model: None,
+            effort: None,
         };
         let value = serde_json::to_value(&event).unwrap();
         assert_eq!(value["outcome"]["kind"], "adapter_failure");
@@ -902,6 +934,8 @@ mod tests {
             context_window_source: None,
             stable_message_id: None,
             spend: None,
+            model: None,
+            effort: None,
         };
         let normalized = adapter
             .into_normalized()
@@ -917,6 +951,29 @@ mod tests {
     }
 
     #[test]
+    fn adapter_event_turn_end_carries_model_and_effort_to_normalized() {
+        let adapter = AdapterEvent::TurnEnd {
+            turn_id: fresh_turn_id(),
+            outcome: TurnOutcome::Completed,
+            ended_at: fresh_time(),
+            usage: None,
+            context_window_source: None,
+            stable_message_id: Some("msg_x".to_owned()),
+            spend: None,
+            model: Some("gpt-5.5".to_owned()),
+            effort: Some("high".to_owned()),
+        };
+        let normalized = adapter.into_normalized().expect("lifts");
+        match normalized {
+            NormalizedEvent::TurnEnd { model, effort, .. } => {
+                assert_eq!(model.as_deref(), Some("gpt-5.5"));
+                assert_eq!(effort.as_deref(), Some("high"));
+            }
+            other => panic!("expected TurnEnd, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn adapter_event_lifts_to_normalized_turn_end_failed() {
         let adapter = AdapterEvent::TurnEnd {
             turn_id: fresh_turn_id(),
@@ -929,6 +986,8 @@ mod tests {
             context_window_source: None,
             stable_message_id: None,
             spend: None,
+            model: None,
+            effort: None,
         };
         let normalized = adapter
             .into_normalized()

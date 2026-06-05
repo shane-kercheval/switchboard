@@ -312,6 +312,8 @@ async fn run_producer(
                             context_window_source: None,
                             stable_message_id: None,
                             spend: None,
+                            model: None,
+                            effort: None,
                         });
                         terminal_seen = true;
                         break;
@@ -350,6 +352,8 @@ async fn run_producer(
                     context_window_source: None,
                     stable_message_id: None,
                     spend: None,
+                    model: None,
+                    effort: None,
                 });
                 terminal_seen = true;
                 break;
@@ -428,6 +432,8 @@ fn synthesize_truncation_turn_end(
         context_window_source: None,
         stable_message_id: None,
         spend: None,
+        model: None,
+        effort: None,
     }
 }
 

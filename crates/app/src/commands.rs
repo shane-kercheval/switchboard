@@ -3886,6 +3886,8 @@ mod tests {
                     context_window_source: None,
                     stable_message_id: None,
                     spend: None,
+                    model: None,
+                    effort: None,
                 });
             });
             Ok(Box::pin(
@@ -4156,6 +4158,8 @@ mod tests {
                         context_window_source: None,
                         stable_message_id: None,
                         spend: None,
+                        model: None,
+                        effort: None,
                     });
                 });
                 Ok(Box::pin(
@@ -4276,6 +4280,8 @@ mod tests {
                         context_window_source: None,
                         stable_message_id: None,
                         spend: None,
+                        model: None,
+                        effort: None,
                     });
                 });
                 Ok(Box::pin(
@@ -5256,6 +5262,8 @@ mod tests {
                 total_cost_usd: None,
             }),
             spend: None,
+            model: None,
+            effort: None,
             stable_message_id: None,
         }
     }
@@ -5393,6 +5401,8 @@ mod tests {
                 total_cost_usd: cost,
             }),
             spend: None,
+            model: None,
+            effort: None,
             stable_message_id: message_id.map(str::to_owned),
         }
     }
@@ -8330,6 +8340,8 @@ mod tests {
             }],
             usage: None,
             spend: None,
+            model: None,
+            effort: None,
             stable_message_id: None,
         }
     }
@@ -9317,6 +9329,8 @@ mod tests {
             }],
             usage: None,
             spend: None,
+            model: None,
+            effort: None,
             stable_message_id: None,
         };
         let journal = vec![

@@ -539,6 +539,11 @@ impl GeminiReconstruction {
             status,
             items,
             usage: builder.last_usage,
+            // Per-turn model from this turn's own `gemini` record(s). Distinct
+            // from `self.model` (first-wins, agent-scoped `meta.model`). Gemini
+            // has no effort axis.
+            model: builder.last_model.clone(),
+            effort: None,
             // Gemini has no cost/overage and no join key (Claude-only feature).
             spend: None,
             stable_message_id: None,
@@ -1008,6 +1013,38 @@ mod tests {
         let t = parse_gemini_transcript_content(only_sets, agent_id());
         assert!(t.turns.is_empty());
         assert!(t.warnings.is_empty());
+    }
+
+    #[test]
+    fn hydrate_stamps_per_turn_model_from_each_record() {
+        // Two turns on different models → two agent turns whose `model` differs
+        // (verified on disk: a flash→pro switch writes the new model per record).
+        // `meta.model` stays first-wins (separate, agent-scoped).
+        let session_id = Uuid::parse_str("00000000-0000-4000-8000-0000000000ab").unwrap();
+        let body = format!(
+            r#"{{"sessionId":"{session_id}","kind":"main","startTime":"2026-05-18T00:00:00Z"}}
+{{"id":"u1","timestamp":"2026-05-18T00:00:01Z","type":"user","content":[{{"text":"hi"}}]}}
+{{"id":"g1","timestamp":"2026-05-18T00:00:02Z","type":"gemini","content":"a","thoughts":[],"tokens":{{"input":1,"output":1,"cached":0}},"model":"gemini-2.5-flash"}}
+{{"id":"u2","timestamp":"2026-05-18T00:00:03Z","type":"user","content":[{{"text":"again"}}]}}
+{{"id":"g2","timestamp":"2026-05-18T00:00:04Z","type":"gemini","content":"b","thoughts":[],"tokens":{{"input":1,"output":1,"cached":0}},"model":"gemini-2.5-pro"}}"#
+        );
+        let t = parse_gemini_transcript_content(&body, agent_id());
+        let models: Vec<_> = t
+            .turns
+            .iter()
+            .filter_map(|turn| match turn {
+                Turn::Agent { model, effort, .. } => Some((model.clone(), effort.clone())),
+                Turn::User { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            models,
+            vec![
+                (Some("gemini-2.5-flash".to_owned()), None),
+                (Some("gemini-2.5-pro".to_owned()), None),
+            ]
+        );
+        assert_eq!(t.meta.as_ref().unwrap().model, "gemini-2.5-flash");
     }
 
     #[test]

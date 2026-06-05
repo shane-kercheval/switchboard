@@ -15,6 +15,11 @@ use crate::events::{
 /// Reactive-auth posture — never advises "reload Switchboard."
 pub const CLAUDE_AUTH_MESSAGE: &str = "Claude authentication required — run `claude auth login`";
 
+// `Event(AdapterEvent)` dwarfs `Skip`/`Error(String)`, but `AdapterEvent` is the
+// whole point of the parser's hot path — boxing it would add an allocation per
+// parsed line for no real benefit (the value is consumed immediately, never
+// stored in bulk).
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum ParseOutcome {
     /// One adapter event was produced. The common case.
@@ -88,6 +93,13 @@ pub struct ParserState {
     /// durable join key that re-attaches cost/overage to the right message on
     /// reopen (the same id appears in the on-disk session file; verified).
     last_assistant_message_id: Option<String>,
+    /// The most recent assistant message's `message.model`, kept-last the same
+    /// way as the id above — so at `TurnEnd` it is the **final non-subagent**
+    /// assistant model (a subagent on a different model never reaches here).
+    /// Stamped on the live per-turn `TurnEnd.model`; the reopen counterpart
+    /// reads the same `message.model` from the session file. Claude exposes no
+    /// per-turn effort, so `TurnEnd.effort` stays `None`.
+    last_assistant_model: Option<String>,
 }
 
 /// Parse one stream-json line. Stateful: `state` accumulates text-block
@@ -315,6 +327,10 @@ fn parse_result(obj: &Value, turn_id: TurnId, state: &mut ParserState) -> ParseO
         usage,
         context_window_source,
         spend,
+        // Live per-turn model = the final non-subagent assistant model. Claude
+        // exposes no per-turn effort.
+        model: state.last_assistant_model.clone(),
+        effort: None,
         // The final assistant message's id — the durable join key for
         // re-attaching cost/overage on reopen. `take()` so a fresh dispatch's
         // state can't carry a stale id (defensive; state is per-turn anyway).
@@ -514,6 +530,15 @@ fn parse_assistant_envelope(obj: &Value, turn_id: TurnId, state: &mut ParserStat
         .and_then(Value::as_str)
     {
         state.last_assistant_message_id = Some(id.to_owned());
+    }
+    // Keep-last the assistant model the same way (final non-subagent model is
+    // the turn's model). Stamped on `TurnEnd.model`.
+    if let Some(model) = obj
+        .get("message")
+        .and_then(|m| m.get("model"))
+        .and_then(Value::as_str)
+    {
+        state.last_assistant_model = Some(model.to_owned());
     }
 
     if obj.get("error").and_then(Value::as_str) == Some("authentication_failed") {

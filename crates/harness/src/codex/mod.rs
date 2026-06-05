@@ -383,6 +383,8 @@ async fn run_producer(
                         context_window_source: None,
                         stable_message_id: None,
                         spend: None,
+                        model: None,
+                        effort: None,
                         outcome: TurnOutcome::Failed {
                             kind: FailureKind::AdapterFailure,
                             message: "Codex thread.started event missing or non-string thread_id — cannot capture session locator; resume would fail"
@@ -434,6 +436,8 @@ async fn run_producer(
                             context_window_source: None,
                             stable_message_id: None,
                             spend: None,
+                            model: None,
+                            effort: None,
                         });
                         terminal_seen = true;
                         force_kill_child = true;
@@ -475,6 +479,8 @@ async fn run_producer(
                                     context_window_source: None,
                                     stable_message_id: None,
                                     spend: None,
+                                    model: None,
+                                    effort: None,
                                 });
                                 force_kill_child = true;
                                 break 'lines;
@@ -528,6 +534,8 @@ async fn run_producer(
                     context_window_source: None,
                     stable_message_id: None,
                     spend: None,
+                    model: None,
+                    effort: None,
                 });
                 terminal_seen = true;
                 force_kill_child = true;
@@ -656,6 +664,11 @@ async fn emit_terminal_with_enrichment(
         // Codex has no cost/overage in v1 — no real-spend attribution, and no
         // join key (the durable per-turn store is Claude-only).
         spend: None,
+        // Per-turn model + effort from the current turn's `turn_context`
+        // (last-wins in the enrichment re-read), not the first-wins `model`
+        // that feeds SessionMeta.
+        model: enrichment.current_turn_model.clone(),
+        effort: enrichment.current_turn_effort.clone(),
         stable_message_id: None,
     });
 
@@ -763,6 +776,8 @@ fn synthesize_truncation_turn_end(
         context_window_source: None,
         stable_message_id: None,
         spend: None,
+        model: None,
+        effort: None,
     }
 }
 

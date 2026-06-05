@@ -20,6 +20,12 @@ use crate::events::{ContentKind, McpServerStatus, ToolKind, TurnId, TurnSpend, T
 /// One reconstructed turn. Discriminated by `role` matching the event-vocabulary
 /// convention. User turns carry just the prompt text; agent turns carry the
 /// ordered `items` stream plus per-turn usage and lifecycle status.
+// A `User` turn is tiny; an `Agent` turn carries the full per-turn payload
+// (items, usage, model/effort, spend). The asymmetry is intrinsic — boxing the
+// hot, pattern-matched-everywhere `Agent` variant would add indirection for no
+// real benefit (a `Turn` is short-lived and not stored in bulk arrays of mixed
+// variants where the size waste would matter).
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "role", rename_all = "snake_case")]
 #[non_exhaustive]
@@ -38,6 +44,19 @@ pub enum Turn {
         status: TurnStatus,
         items: Vec<TurnItem>,
         usage: Option<TurnUsage>,
+        /// The model this turn ran on, reconstructed from the harness session
+        /// file (Codex `turn_context.model`, Claude `message.model`, Gemini's
+        /// per-record `model`, Antigravity carry-forward). Per-turn *history* —
+        /// distinct from the agent's *selected* model on `AgentRecord`, and from
+        /// the agent-scoped `SessionMeta.model`. `None` when the harness exposes
+        /// no model, or before any announcement (Antigravity).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        /// The reasoning effort this turn ran at — **Codex only**
+        /// (`turn_context.effort`). `None` for Claude/Gemini/Antigravity, which
+        /// expose no per-turn effort (Claude's is sidebar-intent only).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
         /// Per-turn real-spend attribution restored on reopen. The session-file
         /// parser leaves this `None`; the app's metadata overlay fills it from
         /// the durable `turnmeta` sidecar by joining on `stable_message_id`, so
@@ -255,6 +274,8 @@ mod tests {
             ],
             usage: None,
             spend: None,
+            model: None,
+            effort: None,
             stable_message_id: None,
         };
         let value = serde_json::to_value(&turn).unwrap();

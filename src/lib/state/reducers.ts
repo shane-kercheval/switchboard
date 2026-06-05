@@ -220,6 +220,8 @@ export function transcriptReducer(
           ended_at: input.ended_at,
           usage: input.usage ?? undefined,
           spend: input.spend ?? undefined,
+          model: input.model ?? undefined,
+          effort: input.effort ?? undefined,
         });
       }
       if (input.outcome.status === "cancelled") {
@@ -229,6 +231,8 @@ export function transcriptReducer(
           ended_at: input.ended_at,
           usage: input.usage ?? undefined,
           spend: input.spend ?? undefined,
+          model: input.model ?? undefined,
+          effort: input.effort ?? undefined,
         });
       }
       return updateTurn(turns, input.turn_id, {
@@ -239,6 +243,8 @@ export function transcriptReducer(
         error_kind: input.outcome.kind,
         usage: input.usage ?? undefined,
         spend: input.spend ?? undefined,
+        model: input.model ?? undefined,
+        effort: input.effort ?? undefined,
       });
     }
 
@@ -286,6 +292,8 @@ function loadedTurnToTurn(t: LoadedTurn): Turn {
     items: t.items.map(loadedItemToItem),
     usage: t.usage ?? undefined,
     spend: t.spend ?? undefined,
+    model: t.model ?? undefined,
+    effort: t.effort ?? undefined,
   };
 }
 

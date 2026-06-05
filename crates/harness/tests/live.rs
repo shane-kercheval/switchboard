@@ -11,9 +11,34 @@ use futures::StreamExt;
 use switchboard_core::{AgentRecord, HarnessKind, SessionLocator};
 use switchboard_harness::{
     AdapterEvent, AntigravityAdapter, ClaudeCodeAdapter, CodexAdapter, ContentKind,
-    DispatchOptions, GeminiAdapter, HarnessAdapter, RateLimitSource, TurnOutcome,
+    DispatchOptions, GeminiAdapter, HarnessAdapter, RateLimitSource, Turn, TurnOutcome,
+    load_antigravity_transcript, load_claude_transcript, load_codex_transcript,
+    load_gemini_transcript,
 };
 use uuid::Uuid;
+
+/// The per-turn `(model, effort)` from the (single) `TurnEnd` in an event stream.
+fn turn_end_model_effort(events: &[AdapterEvent]) -> Option<(Option<String>, Option<String>)> {
+    events.iter().find_map(|e| match e {
+        AdapterEvent::TurnEnd { model, effort, .. } => Some((model.clone(), effort.clone())),
+        _ => None,
+    })
+}
+
+/// Per-turn `model` of every hydrated agent turn, in order.
+fn hydrated_turn_models(t: &switchboard_harness::LoadedTranscript) -> Vec<Option<String>> {
+    t.turns
+        .iter()
+        .filter_map(|turn| match turn {
+            Turn::Agent { model, .. } => Some(model.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn home_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(std::env::var("HOME").expect("HOME set"))
+}
 
 fn live_agent() -> AgentRecord {
     AgentRecord {
@@ -1598,5 +1623,421 @@ async fn live_antigravity_dash_leading_prompt_completes() {
             }
         ),
         "dash-leading prompt must complete, got: {terminal:?}"
+    );
+}
+
+// --- M4: per-turn model/effort across a mid-conversation switch ---
+//
+// Each asserts on BOTH the emitted `TurnEnd` (the live carrier) AND a real-file
+// hydration via `load_*_transcript` — because the live carrier and the hydrator
+// read different sources for some harnesses (Gemini/Claude live = stream
+// `init`/`SessionMeta`; hydrate = on-disk per-record model), so only asserting
+// the live path would let on-disk format drift ship undetected.
+
+#[tokio::test]
+#[ignore = "requires claude installed — run with: make test-live"]
+async fn live_claude_model_and_effort_change_across_turns() {
+    // Turn 1 on `sonnet` is a *tool-use* turn (Bash echo → ≥2 model calls),
+    // exercising per-turn model attribution on a multi-call turn. Turn 2 resumes
+    // on `opus`. Claude exposes **no** per-turn effort, so `TurnEnd.effort` is
+    // always `None` — we still pass `--effort` to confirm it doesn't break the
+    // turn, but assert only the model switch (live + hydrate).
+    let adapter = ClaudeCodeAdapter::new();
+    let cwd = tempfile::TempDir::new().unwrap();
+    let session_id = Uuid::now_v7();
+    let agent_id = Uuid::now_v7();
+    let mut agent = AgentRecord {
+        model: Some("sonnet".to_owned()),
+        effort: Some("low".to_owned()),
+        id: agent_id,
+        project_id: Uuid::now_v7(),
+        name: "m4-claude".to_owned(),
+        harness: HarnessKind::ClaudeCode,
+        session_locator: Some(SessionLocator::Uuid(session_id)),
+        created_at: chrono::Utc::now(),
+    };
+
+    let events1: Vec<AdapterEvent> = adapter
+        .dispatch(
+            &agent,
+            cwd.path(),
+            "Use the Bash tool to run `echo hi`, then reply with only the word: done.",
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch 1")
+        .collect()
+        .await;
+    // The multi-call assertion is only meaningful if a tool actually ran. If
+    // this fails, the prompt no longer triggers a tool call — fix the prompt,
+    // don't weaken the assertion.
+    assert!(
+        events1
+            .iter()
+            .any(|e| matches!(e, AdapterEvent::ToolStarted { .. })),
+        "turn 1 must trigger a tool call (≥2 model calls); events: {events1:?}"
+    );
+    let (m1, _) = turn_end_model_effort(&events1).expect("turn 1 TurnEnd");
+    assert!(
+        m1.as_deref().is_some_and(|m| m.contains("sonnet")),
+        "turn 1 per-turn model = sonnet; got {m1:?}"
+    );
+
+    agent.model = Some("opus".to_owned());
+    agent.effort = Some("high".to_owned());
+    let events2: Vec<AdapterEvent> = adapter
+        .dispatch(
+            &agent,
+            cwd.path(),
+            "Reply with only the word: ok.",
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch 2")
+        .collect()
+        .await;
+    let (m2, _) = turn_end_model_effort(&events2).expect("turn 2 TurnEnd");
+    assert!(
+        m2.as_deref().is_some_and(|m| m.contains("opus")),
+        "turn 2 per-turn model = opus; got {m2:?}"
+    );
+
+    // Hydration (reopen) must reconstruct the same per-turn switch from disk.
+    let hydrated =
+        load_claude_transcript(&home_dir(), cwd.path(), session_id, agent_id).expect("hydrate");
+    let models = hydrated_turn_models(&hydrated);
+    assert_eq!(models.len(), 2, "two agent turns on disk; got {models:?}");
+    assert!(
+        models[0].as_deref().is_some_and(|m| m.contains("sonnet")),
+        "hydrated turn 1 = sonnet; got {:?}",
+        models[0]
+    );
+    assert!(
+        models[1].as_deref().is_some_and(|m| m.contains("opus")),
+        "hydrated turn 2 = opus; got {:?}",
+        models[1]
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires codex installed — run with: make test-live"]
+async fn live_codex_model_and_effort_change_across_turns() {
+    // Codex model is plan-gated to `gpt-5.5`, so we vary *effort* `medium`→`high`
+    // (the readback field is `turn_context.effort`). Asserts the per-turn effort
+    // switch on the emitted `TurnEnd` AND on a real-file hydration.
+    let cwd = tempfile::TempDir::new().unwrap();
+    let adapter = CodexAdapter::new();
+    let agent_id = Uuid::now_v7();
+    let mut agent = live_codex_agent();
+    agent.id = agent_id;
+    agent.model = Some("gpt-5.5".to_owned());
+    agent.effort = Some("medium".to_owned());
+
+    let events1: Vec<AdapterEvent> = adapter
+        .dispatch(
+            &agent,
+            cwd.path(),
+            "Reply with the single word 'ack'.",
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch 1")
+        .collect()
+        .await;
+    let (_, e1) = turn_end_model_effort(&events1).expect("turn 1 TurnEnd");
+    assert_eq!(
+        e1.as_deref(),
+        Some("medium"),
+        "turn 1 per-turn effort; got {e1:?}"
+    );
+    let (thread_id, date) = codex_capture(&events1).expect("captured Codex locator");
+
+    agent.session_locator = Some(SessionLocator::Codex {
+        thread_id: thread_id.clone(),
+        partition_date: date,
+    });
+    agent.effort = Some("high".to_owned());
+    let events2: Vec<AdapterEvent> = adapter
+        .dispatch(
+            &agent,
+            cwd.path(),
+            "Reply with the single word 'ack'.",
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch 2")
+        .collect()
+        .await;
+    let (_, e2) = turn_end_model_effort(&events2).expect("turn 2 TurnEnd");
+    assert_eq!(
+        e2.as_deref(),
+        Some("high"),
+        "turn 2 per-turn effort; got {e2:?}"
+    );
+
+    let hydrated = load_codex_transcript(&home_dir(), cwd.path(), &thread_id, Some(date), agent_id)
+        .expect("hydrate");
+    let efforts: Vec<_> = hydrated
+        .turns
+        .iter()
+        .filter_map(|t| match t {
+            Turn::Agent { effort, .. } => Some(effort.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        efforts,
+        vec![Some("medium".to_owned()), Some("high".to_owned())],
+        "per-turn effort on disk; got {efforts:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires gemini installed — run with: make test-live"]
+async fn live_gemini_model_changes_across_turns() {
+    // `gemini-2.5-flash` → `-pro` per turn; no effort axis. Asserts the per-turn
+    // model switch on the emitted `TurnEnd` AND on a real-file hydration (each
+    // `gemini` record carries its own model — the reopen guard).
+    let adapter = GeminiAdapter::new();
+    let cwd = tempfile::TempDir::new().unwrap();
+    // Gemini uses UUID v4 (session-file naming embeds the first 8 hex chars).
+    let session_id = Uuid::new_v4();
+    let agent_id = Uuid::now_v7();
+    let mut agent = AgentRecord {
+        model: Some("gemini-2.5-flash".to_owned()),
+        effort: None,
+        id: agent_id,
+        project_id: Uuid::now_v7(),
+        name: "m4-gemini".to_owned(),
+        harness: HarnessKind::Gemini,
+        session_locator: Some(SessionLocator::Uuid(session_id)),
+        created_at: chrono::Utc::now(),
+    };
+
+    let events1: Vec<AdapterEvent> = adapter
+        .dispatch(
+            &agent,
+            cwd.path(),
+            "Reply with only the number 4.",
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch 1")
+        .collect()
+        .await;
+    let (m1, _) = turn_end_model_effort(&events1).expect("turn 1 TurnEnd");
+    assert!(
+        m1.as_deref().is_some_and(|m| m.contains("flash")),
+        "turn 1 per-turn model = flash; got {m1:?}"
+    );
+
+    agent.model = Some("gemini-2.5-pro".to_owned());
+    let events2: Vec<AdapterEvent> = adapter
+        .dispatch(
+            &agent,
+            cwd.path(),
+            "Reply with only the number 5.",
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch 2")
+        .collect()
+        .await;
+    let (m2, _) = turn_end_model_effort(&events2).expect("turn 2 TurnEnd");
+    assert!(
+        m2.as_deref().is_some_and(|m| m.contains("pro")),
+        "turn 2 per-turn model = pro; got {m2:?}"
+    );
+
+    let hydrated =
+        load_gemini_transcript(&home_dir(), cwd.path(), session_id, agent_id).expect("hydrate");
+    let models = hydrated_turn_models(&hydrated);
+    assert_eq!(models.len(), 2, "two agent turns on disk; got {models:?}");
+    assert!(
+        models[0].as_deref().is_some_and(|m| m.contains("flash")),
+        "hydrated turn 1 = flash; got {:?}",
+        models[0]
+    );
+    assert!(
+        models[1].as_deref().is_some_and(|m| m.contains("pro")),
+        "hydrated turn 2 = pro; got {:?}",
+        models[1]
+    );
+}
+
+/// Restores `settings.json` from a byte-for-byte backup and deletes the backup
+/// on drop — covers normal completion AND assertion-panic unwinding. See the
+/// config-mutation protocol in `live_antigravity_model_change_announced_on_resume`.
+struct AntigravitySettingsGuard {
+    path: std::path::PathBuf,
+    backup: std::path::PathBuf,
+}
+
+impl Drop for AntigravitySettingsGuard {
+    fn drop(&mut self) {
+        if !self.backup.exists() {
+            return;
+        }
+        // Delete the backup ONLY after the restore is verified to have
+        // succeeded — otherwise a failed copy would leave settings.json mutated
+        // *and* destroy the pristine copy. On failure, keep the backup and shout
+        // both paths so the next run's self-heal (or the developer) can recover.
+        match std::fs::copy(&self.backup, &self.path) {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&self.backup);
+            }
+            Err(e) => eprintln!(
+                "FAILED to restore {} from backup ({e}); backup KEPT at {} — \
+                 restore it manually (cp {} {}).",
+                self.path.display(),
+                self.backup.display(),
+                self.backup.display(),
+                self.path.display()
+            ),
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires antigravity installed — run with: make test-live"]
+#[serial_test::serial]
+async fn live_antigravity_model_change_announced_on_resume() {
+    // Antigravity's per-turn model history is a *carry-forward* of the
+    // `USER_SETTINGS_CHANGE` sentence, which `agy` emits only when the model
+    // changes. We can't set the model via a flag, so we change the **global**
+    // `~/.gemini/antigravity-cli/settings.json` `model` field between turns and
+    // assert our adapter's emitted per-turn model reflects the switch.
+    //
+    // Config-mutation safety protocol (this edits the real, harness-owned
+    // settings.json — the only workable home, since an isolated HOME re-prompts
+    // agy for OAuth): (1) byte-for-byte backup to a stable path; (2) self-heal —
+    // if the backup already exists from an interrupted run, restore from it and
+    // fail loud; (3) a `Drop` guard restores + deletes the backup on normal exit
+    // AND on assertion-panic unwind; (4) known gap — SIGKILL/crash bypasses Drop,
+    // but step 2 repairs on the next run and the pristine value survives in the
+    // backup; (5) `#[serial]` because the file is global. Mutating harness config
+    // *in a test* doesn't violate the production rule that the app never writes
+    // harness config — it's the only way to exercise the real contract.
+    let home = home_dir();
+    let settings = home.join(".gemini/antigravity-cli/settings.json");
+    let backup = home.join(".gemini/antigravity-cli/settings.json.switchboard-test-backup");
+    if !settings.exists() {
+        eprintln!("skipping: {settings:?} not present (Antigravity not configured)");
+        return;
+    }
+    // Self-heal from an interrupted prior run before doing anything else: if a
+    // backup exists, the previous run died with settings.json possibly still
+    // mutated — restore from the pristine backup, then fail loud.
+    if backup.exists() {
+        match std::fs::copy(&backup, &settings) {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&backup);
+                panic!(
+                    "self-healed: a prior run was interrupted; restored {settings:?} from its \
+                     backup and removed the backup. Re-run."
+                );
+            }
+            Err(e) => panic!(
+                "a prior run was interrupted AND the self-heal restore failed ({e}). \
+                 The pristine value is in {backup:?}; restore it manually \
+                 (cp {backup:?} {settings:?}) and delete the backup, then re-run."
+            ),
+        }
+    }
+
+    let original = std::fs::read(&settings).expect("read settings.json");
+    std::fs::write(&backup, &original).expect("write backup");
+    let _guard = AntigravitySettingsGuard {
+        path: settings.clone(),
+        backup: backup.clone(),
+    };
+
+    let set_model = |display_name: &str| {
+        let mut v: serde_json::Value =
+            serde_json::from_slice(&original).expect("settings.json is JSON");
+        v["model"] = serde_json::Value::String(display_name.to_owned());
+        std::fs::write(&settings, serde_json::to_vec_pretty(&v).unwrap()).expect("write settings");
+    };
+
+    let cwd = tempfile::TempDir::new().unwrap();
+    let adapter = AntigravityAdapter::new();
+    let agent_id = Uuid::now_v7();
+    let mut agent = AgentRecord {
+        model: None,
+        effort: None,
+        id: agent_id,
+        project_id: Uuid::now_v7(),
+        name: "m4-agy".to_owned(),
+        harness: HarnessKind::Antigravity,
+        session_locator: None,
+        created_at: chrono::Utc::now(),
+    };
+
+    // Turn 1 on model X.
+    set_model("Gemini 3.1 Pro (High)");
+    let events1: Vec<AdapterEvent> = adapter
+        .dispatch(
+            &agent,
+            cwd.path(),
+            "Reply with only the word ack.",
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch 1")
+        .collect()
+        .await;
+    let (m1, _) = turn_end_model_effort(&events1).expect("turn 1 TurnEnd");
+    assert!(
+        m1.as_deref().is_some_and(|m| m.contains("Gemini 3.1 Pro")),
+        "turn 1 per-turn model = Gemini 3.1 Pro; got {m1:?}"
+    );
+    let conversation_id = antigravity_capture(&events1).expect("captured conversation id");
+
+    // Turn 2: switch the global model to Y, resume.
+    agent.session_locator = Some(SessionLocator::Uuid(conversation_id));
+    set_model("Claude Sonnet 4.6 (Thinking)");
+    let events2: Vec<AdapterEvent> = adapter
+        .dispatch(
+            &agent,
+            cwd.path(),
+            "Reply with only the word ack.",
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch 2")
+        .collect()
+        .await;
+    let (m2, _) = turn_end_model_effort(&events2).expect("turn 2 TurnEnd");
+    assert!(
+        m2.as_deref()
+            .is_some_and(|m| m.contains("Claude Sonnet 4.6")),
+        "turn 2 per-turn model = Claude Sonnet 4.6; got {m2:?}"
+    );
+
+    // Hydration reconstructs the carry-forward from the transcript.
+    let hydrated = load_antigravity_transcript(&home, cwd.path(), Some(conversation_id), agent_id)
+        .expect("hydrate");
+    let models = hydrated_turn_models(&hydrated);
+    assert!(
+        models
+            .first()
+            .and_then(Option::as_deref)
+            .is_some_and(|m| m.contains("Gemini 3.1 Pro")),
+        "hydrated turn 1 = Gemini 3.1 Pro; got {models:?}"
+    );
+    assert!(
+        models
+            .last()
+            .and_then(Option::as_deref)
+            .is_some_and(|m| m.contains("Claude Sonnet 4.6")),
+        "hydrated last turn = Claude Sonnet 4.6; got {models:?}"
     );
 }

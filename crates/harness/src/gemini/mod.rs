@@ -338,6 +338,8 @@ async fn run_producer(
                             context_window_source: None,
                             stable_message_id: None,
                             spend: None,
+                            model: None,
+                            effort: None,
                         });
                         terminal_seen = true;
                         force_kill_child = true;
@@ -395,6 +397,8 @@ async fn run_producer(
                     context_window_source: None,
                     stable_message_id: None,
                     spend: None,
+                    model: None,
+                    effort: None,
                 });
                 terminal_seen = true;
                 force_kill_child = true;
@@ -517,6 +521,8 @@ fn synthesize_terminal_failure(
             context_window_source: None,
             stable_message_id: None,
             spend: None,
+            model: None,
+            effort: None,
         };
     }
     if exit_code == Some(42) && !actionable.is_empty() {
@@ -531,6 +537,8 @@ fn synthesize_terminal_failure(
             context_window_source: None,
             stable_message_id: None,
             spend: None,
+            model: None,
+            effort: None,
         };
     }
     let tail = crate::subprocess::format_stderr_tail(stderr_tail);
@@ -550,6 +558,8 @@ fn synthesize_terminal_failure(
         context_window_source: None,
         stable_message_id: None,
         spend: None,
+        model: None,
+        effort: None,
     }
 }
 

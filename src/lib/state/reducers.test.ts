@@ -396,6 +396,74 @@ describe("transcriptReducer", () => {
       expect(turn.spend?.is_overage).toBe(true);
     });
 
+    it("stamps per-turn model + effort from turn_end (live carrier)", () => {
+      // Proves the footer populates during streaming, not only on reopen.
+      let turns = reduce([], turnStart(TURN_1));
+      const ev: NormalizedEvent = {
+        type: "turn_end",
+        turn_id: TURN_1,
+        outcome: { status: "completed" },
+        ended_at: "2026-05-16T00:00:05Z",
+        model: "gpt-5.5",
+        effort: "high",
+      };
+      turns = reduce(turns, ev);
+      const turn = turns[0];
+      if (turn?.role !== "agent") throw new Error("unreachable");
+      expect(turn.model).toBe("gpt-5.5");
+      expect(turn.effort).toBe("high");
+    });
+
+    it("leaves model/effort undefined when turn_end omits them", () => {
+      let turns = reduce([], turnStart(TURN_1));
+      turns = reduce(turns, {
+        type: "turn_end",
+        turn_id: TURN_1,
+        outcome: { status: "completed" },
+        ended_at: "2026-05-16T00:00:05Z",
+      });
+      const turn = turns[0];
+      if (turn?.role !== "agent") throw new Error("unreachable");
+      expect(turn.model).toBeUndefined();
+      expect(turn.effort).toBeUndefined();
+    });
+
+    it("stamps model/effort on a FAILED turn (which model did it fail on)", () => {
+      // The plan's motivating case: turn_context is written at turn start, so a
+      // failed/interrupted turn still carries the model+effort it attempted.
+      let turns = reduce([], turnStart(TURN_1));
+      turns = reduce(turns, {
+        type: "turn_end",
+        turn_id: TURN_1,
+        outcome: { status: "failed", kind: "harness_error", message: "boom" },
+        ended_at: "2026-05-16T00:00:05Z",
+        model: "gpt-5.5",
+        effort: "high",
+      });
+      const turn = turns[0];
+      if (turn?.role !== "agent") throw new Error("unreachable");
+      expect(turn.status).toBe("failed");
+      expect(turn.model).toBe("gpt-5.5");
+      expect(turn.effort).toBe("high");
+    });
+
+    it("stamps model/effort on a CANCELLED turn", () => {
+      let turns = reduce([], turnStart(TURN_1));
+      turns = reduce(turns, {
+        type: "turn_end",
+        turn_id: TURN_1,
+        outcome: { status: "cancelled", source: "user" },
+        ended_at: "2026-05-16T00:00:05Z",
+        model: "gpt-5.5",
+        effort: "medium",
+      });
+      const turn = turns[0];
+      if (turn?.role !== "agent") throw new Error("unreachable");
+      expect(turn.status).toBe("cancelled");
+      expect(turn.model).toBe("gpt-5.5");
+      expect(turn.effort).toBe("medium");
+    });
+
     it("transitions to failed with error fields populated", () => {
       let turns = reduce([], turnStart(TURN_1));
       turns = reduce(turns, turnEndFailed(TURN_1, "rate limited"));

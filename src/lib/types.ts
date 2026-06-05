@@ -114,6 +114,11 @@ export type NormalizedEvent =
       ended_at: string;
       usage?: TurnUsage | null;
       spend?: TurnSpend | null;
+      // The model and reasoning effort this turn ran on, for the per-turn
+      // transcript footer (M6). `model` populated for all model-reporting
+      // harnesses; `effort` Codex-only. Absent → render nothing.
+      model?: string | null;
+      effort?: string | null;
     }
   | { type: "rate_limit_event"; agent_id: AgentId; info: unknown }
   | {
@@ -208,6 +213,11 @@ export type LoadedTurn =
       // reopen. Present only on real-spend turns that were persisted; absent
       // for normal-quota and pre-feature turns (render neither cost nor marker).
       spend?: TurnSpend | null;
+      // Per-turn model + effort reconstructed by the backend from the harness
+      // session file (not a sidecar — harness-owned). `model` for all
+      // model-reporting harnesses; `effort` Codex-only. Absent → render nothing.
+      model?: string | null;
+      effort?: string | null;
     };
 
 export type LoadedTurnItem =

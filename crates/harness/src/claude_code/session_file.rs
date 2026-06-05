@@ -181,6 +181,10 @@ struct AgentTurnBuilder {
     /// reopen. Mirrors the live parser's `last_assistant_message_id` so live
     /// and disk anchor on the same message by construction.
     last_message_id: Option<String>,
+    /// The most recent assistant record's `message.model`, kept-last so it ends
+    /// up as the turn's model. Per-turn — distinct from `first_model` (the
+    /// agent-scoped `SessionMetaInfo.model`). Claude has no per-turn effort.
+    last_model: Option<String>,
 }
 
 struct DeferredToolResult {
@@ -277,6 +281,7 @@ impl ReconstructionState {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn handle_assistant(&mut self, line_number: usize, record: &Value) {
         if self.first_model.is_none()
             && let Some(model) = record
@@ -296,6 +301,7 @@ impl ReconstructionState {
             items: Vec::new(),
             usage: None,
             last_message_id: None,
+            last_model: None,
         });
         builder.last_seen_at = timestamp;
 
@@ -315,6 +321,15 @@ impl ReconstructionState {
             .and_then(Value::as_str)
         {
             builder.last_message_id = Some(id.to_owned());
+        }
+
+        // Keep-last the per-turn model the same way (final assistant model).
+        if let Some(model) = record
+            .get("message")
+            .and_then(|m| m.get("model"))
+            .and_then(Value::as_str)
+        {
+            builder.last_model = Some(model.to_owned());
         }
 
         let Some(blocks) = record
@@ -456,6 +471,10 @@ impl ReconstructionState {
             status,
             items: builder.items,
             usage: builder.usage,
+            // Per-turn model from this turn's final assistant record. Claude
+            // exposes no per-turn effort.
+            model: builder.last_model,
+            effort: None,
             // Cost/overage are restored by the app's metadata overlay (joining
             // the turnmeta sidecar on `stable_message_id`); the parser itself
             // never reads `.switchboard/` state.
@@ -678,6 +697,43 @@ mod tests {
         }
         let meta = result.meta.unwrap();
         assert_eq!(meta.model, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn hydrate_stamps_per_turn_model_from_each_assistant_record() {
+        // Two turns on different models → two agent turns whose `model` differs.
+        // Claude exposes no per-turn effort, so `effort` is `None`. `meta.model`
+        // stays first-wins (agent-scoped).
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let agent_id = Uuid::now_v7();
+        let session_id = Uuid::now_v7();
+        let content = jsonl(&[
+            user_record("a", "2026-05-14T04:43:15Z"),
+            assistant_text_record("1", "claude-sonnet-4-6", "2026-05-14T04:43:16Z"),
+            user_record("b", "2026-05-14T04:44:15Z"),
+            assistant_text_record("2", "claude-opus-4-8", "2026-05-14T04:44:16Z"),
+        ]);
+        stage_session_file(home.path(), cwd.path(), session_id, &content);
+
+        let result = load_claude_transcript(home.path(), cwd.path(), session_id, agent_id).unwrap();
+
+        let models: Vec<_> = result
+            .turns
+            .iter()
+            .filter_map(|t| match t {
+                Turn::Agent { model, effort, .. } => Some((model.clone(), effort.clone())),
+                Turn::User { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            models,
+            vec![
+                (Some("claude-sonnet-4-6".to_owned()), None),
+                (Some("claude-opus-4-8".to_owned()), None),
+            ]
+        );
+        assert_eq!(result.meta.unwrap().model, "claude-sonnet-4-6");
     }
 
     /// Join-key parity (disk side), multi-assistant tool-use turn. A single

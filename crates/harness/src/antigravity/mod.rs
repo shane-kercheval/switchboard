@@ -421,7 +421,17 @@ async fn run_producer(ctx: ProducerCtx) {
     let mut parser_state = AntigravityParserState::default();
     let mut stdout_lines = tokio::io::BufReader::new(stdout).lines();
     let mut stdout_buf: Vec<String> = Vec::new();
-    let mut model: Option<String> = None;
+    // Seed the carry-forward model from prior turns so an unchanged resume's
+    // live `TurnEnd.model` matches the hydrator (Antigravity re-announces only
+    // on change). This dispatch's drain overwrites it last-wins if this turn
+    // announces a new model.
+    let mut model: Option<String> = if is_resume {
+        transcript_path
+            .as_deref()
+            .and_then(|p| seed_carry_forward_model(p, cursor))
+    } else {
+        None
+    };
     let mut saw_terminal_answer = false;
     let mut saw_stdout_content = false;
     let mut auth_failed = false;
@@ -692,14 +702,21 @@ async fn run_producer(ctx: ProducerCtx) {
         context_window_source: None,
         stable_message_id: None,
         spend: None,
+        // Per-turn model: this dispatch's announcement if any, else the
+        // carry-forward seeded from prior turns on resume — so an unchanged
+        // resume's footer matches the hydrator live, not only on reopen. `None`
+        // only when no announcement has ever appeared (a truncated attach). The
+        // model name embeds the effort tier, so there's no separate effort axis.
+        model: model.clone(),
+        effort: None,
     });
 
     // Post-terminal SessionMeta (mirrors Codex's enrichment ordering: flows
-    // between TurnEnd and AgentIdle). Model is best-effort from the user
-    // record's settings envelope and is empty on resume turns that didn't
-    // change the model — the reducer's empty-model-keeps-prior rule prevents
-    // that from blanking the sidebar. MCP / skills are the display-only
-    // registries loaded at dispatch time.
+    // between TurnEnd and AgentIdle). Model is the dispatch's announcement or
+    // the resume seed; empty only when no announcement has ever appeared — the
+    // reducer's empty-model-keeps-prior rule still covers that edge so the
+    // sidebar isn't blanked. MCP / skills are the display-only registries
+    // loaded at dispatch time.
     let _ = tx.send(AdapterEvent::SessionMeta {
         agent_id,
         model: model.unwrap_or_default(),
@@ -729,9 +746,9 @@ fn drain_transcript(
         if rec.is_terminal_answer() {
             *saw_terminal_answer = true;
         }
-        if model.is_none()
-            && let Some(m) = extract_model_from_record(rec)
-        {
+        // Last-wins: a new announcement this turn overwrites the resume seed
+        // (and any earlier announcement in the same drain).
+        if let Some(m) = extract_model_from_record(rec) {
             *model = Some(m);
         }
         for event in record_to_live_events(rec, turn_id, parser_state) {
@@ -965,6 +982,34 @@ fn read_records_past_cursor(path: &Path, cursor: usize) -> (Vec<TranscriptRecord
         }
     }
     (records, total)
+}
+
+/// Seed the live carry-forward model on **resume**: fold `extract_model_from_record`
+/// last-wins over the records that predate this dispatch (the first `cursor`
+/// complete lines — the same boundary [`read_records_past_cursor`] advances
+/// from). Antigravity only re-announces the model when it *changes*, so an
+/// unchanged resume's own records carry no announcement; without this seed the
+/// live `TurnEnd.model` would be `None` until reopen, disagreeing with the
+/// hydrator (which walks the same prefix). Bounding by `cursor` keeps live and
+/// hydrate reading the identical prefix, so they yield byte-identical models.
+/// `None` when no prior announcement exists (e.g. a truncated attach) — which
+/// already matches the hydrator. This dispatch's own drain overwrites it
+/// last-wins if a new announcement appears this turn.
+fn seed_carry_forward_model(path: &Path, cursor: usize) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let complete = &content[..=content.rfind('\n')?];
+    let mut model = None;
+    for line in complete.lines().take(cursor) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(rec) = serde_json::from_str::<TranscriptRecord>(line)
+            && let Some(m) = extract_model_from_record(&rec)
+        {
+            model = Some(m);
+        }
+    }
+    model
 }
 
 /// Best-effort model extraction from a `USER_INPUT` record's
@@ -1298,6 +1343,40 @@ mod tests {
             "switchboard-antigravity-probe-binary-that-definitely-does-not-exist",
         );
         assert!(matches!(result, Err(DispatchError::BinaryNotFound)));
+    }
+
+    #[test]
+    fn seed_carry_forward_model_returns_last_prefix_announcement() {
+        // The resume seed for the live carry-forward: an announcement on turn 1,
+        // an unchanged turn 2 → seed returns the carried (tier-stripped) value.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        let content = [
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-05-19T19:00:00Z","content":"<USER_REQUEST>\none\n</USER_REQUEST>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.1 Pro (High).</USER_SETTINGS_CHANGE>"}"#,
+            r#"{"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-05-19T19:00:01Z","content":"a"}"#,
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-05-19T19:01:00Z","content":"<USER_REQUEST>\ntwo\n</USER_REQUEST>"}"#,
+            "",
+        ]
+        .join("\n");
+        std::fs::write(&path, &content).unwrap();
+        let cursor = count_complete_lines(&path);
+        assert_eq!(
+            seed_carry_forward_model(&path, cursor),
+            Some("Gemini 3.1 Pro".to_owned())
+        );
+    }
+
+    #[test]
+    fn seed_carry_forward_model_is_none_without_announcement() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        let content = concat!(
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-05-19T19:00:00Z","content":"<USER_REQUEST>\nhi\n</USER_REQUEST>"}"#,
+            "\n",
+        );
+        std::fs::write(&path, content).unwrap();
+        let cursor = count_complete_lines(&path);
+        assert_eq!(seed_carry_forward_model(&path, cursor), None);
     }
 
     #[test]

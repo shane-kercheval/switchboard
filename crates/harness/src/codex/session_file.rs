@@ -94,6 +94,13 @@ pub struct Enrichment {
     /// first-turn model is the authoritative session-level snapshot for
     /// `SessionMeta`.
     pub model: Option<String>,
+    /// From the **last** `turn_context.payload.model` / `.effort` in the file —
+    /// the *current* turn's selection, used to stamp the live per-turn
+    /// `TurnEnd.{model,effort}`. Distinct from `model` (first-wins, agent-scoped
+    /// `SessionMeta`). The readback effort field is `effort`, not
+    /// `model_reasoning_effort` (verified @ codex 0.137.0).
+    pub current_turn_model: Option<String>,
+    pub current_turn_effort: Option<String>,
     /// The full `session_meta` line as JSON, with
     /// `payload.base_instructions.text` replaced by a sentinel. Used as
     /// `SessionMeta.raw`. `None` if line 1 isn't a `session_meta` record.
@@ -351,12 +358,23 @@ pub fn parse_session_content(content: &str) -> Enrichment {
                 enrichment.session_meta_raw = Some(strip_base_instructions(value));
             }
             "turn_context" => {
-                if !model_set
-                    && let Some(p) = payload
-                    && let Some(model) = p.get("model").and_then(Value::as_str)
-                {
-                    enrichment.model = Some(model.to_owned());
-                    model_set = true;
+                if let Some(p) = payload {
+                    let model = p.get("model").and_then(Value::as_str);
+                    // First-wins → agent-scoped `SessionMeta.model`.
+                    if let Some(m) = model
+                        && !model_set
+                    {
+                        enrichment.model = Some(m.to_owned());
+                        model_set = true;
+                    }
+                    // Per-turn carrier = **exactly this record's** values (reset,
+                    // not carry-until-overwritten) so a turn can never inherit a
+                    // prior turn's selection. Readback effort field is `effort`,
+                    // not `model_reasoning_effort`. Codex currently always writes
+                    // both, but absence must mean `None`, not stale.
+                    enrichment.current_turn_model = model.map(str::to_owned);
+                    enrichment.current_turn_effort =
+                        p.get("effort").and_then(Value::as_str).map(str::to_owned);
                 }
             }
             "event_msg" => {
@@ -596,6 +614,13 @@ struct CodexReconstruction {
     turns: Vec<Turn>,
     current_agent: Option<CodexAgentBuilder>,
     warnings: Vec<ParseWarning>,
+    /// Model + effort from the most-recent `turn_context` record — Codex writes
+    /// one per turn (at turn start), so when a turn closes these hold that
+    /// turn's selection. Stamped onto each `Turn::Agent`. The effort readback
+    /// field is `effort` (verified @ codex 0.137.0). Separate from the
+    /// agent-scoped first-wins model that feeds `SessionMeta`.
+    current_model: Option<String>,
+    current_effort: Option<String>,
 }
 
 struct CodexAgentBuilder {
@@ -626,6 +651,8 @@ impl CodexReconstruction {
             turns: Vec::new(),
             current_agent: None,
             warnings: Vec::new(),
+            current_model: None,
+            current_effort: None,
         }
     }
 
@@ -648,6 +675,20 @@ impl CodexReconstruction {
         match record_type {
             "event_msg" => self.handle_event_msg(line_number, payload, timestamp),
             "response_item" => self.handle_response_item(line_number, payload, timestamp),
+            // Codex writes a `turn_context` at each turn's start carrying that
+            // turn's model + effort. Reset to **exactly this record's** values
+            // (not carry-until-overwritten) so `close_current_agent` stamps the
+            // turn with its own selection and never inherits a prior turn's.
+            // Effort readback field is `effort`, not `model_reasoning_effort`
+            // (verified @ 0.137.0). Codex currently always writes both, but
+            // absence must mean `None`, not stale.
+            "turn_context" => {
+                if let Some(p) = payload {
+                    self.current_model = p.get("model").and_then(Value::as_str).map(str::to_owned);
+                    self.current_effort =
+                        p.get("effort").and_then(Value::as_str).map(str::to_owned);
+                }
+            }
             _ => {}
         }
     }
@@ -908,6 +949,10 @@ impl CodexReconstruction {
             status,
             items: builder.items,
             usage: builder.usage,
+            // Per-turn model + effort from this turn's `turn_context` (last-wins
+            // up to this close). Distinct from the first-wins `meta.model`.
+            model: self.current_model.clone(),
+            effort: self.current_effort.clone(),
             // Codex has no cost/overage and no join key (Claude-only feature).
             spend: None,
             stable_message_id: None,
@@ -1591,6 +1636,102 @@ not valid json
             "type": "turn_context",
             "payload": { "model": model }
         })
+    }
+
+    fn turn_context_with_effort(model: &str, effort: &str, ts: &str) -> Value {
+        serde_json::json!({
+            "timestamp": ts,
+            "type": "turn_context",
+            "payload": { "model": model, "effort": effort }
+        })
+    }
+
+    #[test]
+    fn hydrate_turn_without_effort_readback_is_none_not_stale() {
+        // A turn whose `turn_context` omits `effort` must hydrate `effort: None`
+        // — never inheriting the prior turn's. (Codex currently always writes
+        // `effort`, so this is a hand-crafted contract guard, not a live shape.)
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let agent_id = Uuid::now_v7();
+        let date = NaiveDate::from_ymd_opt(2026, 5, 14).unwrap();
+        let session_id = "019e27fa-ae19-7022-97a2-356e6e5f3360";
+        let content = jsonl_lines(&[
+            turn_context_with_effort("gpt-5.5", "high", "2026-05-14T19:33:20Z"),
+            task_started(session_id, "2026-05-14T19:33:20Z", 258_400),
+            agent_message("a", "2026-05-14T19:33:22Z"),
+            task_complete(session_id, "2026-05-14T19:33:23Z"),
+            // Turn 2: model present, effort omitted.
+            turn_context("gpt-5.5", "2026-05-14T19:34:20Z"),
+            task_started(session_id, "2026-05-14T19:34:20Z", 258_400),
+            agent_message("b", "2026-05-14T19:34:22Z"),
+            task_complete(session_id, "2026-05-14T19:34:23Z"),
+        ]);
+        write_session_at(home.path(), date, session_id, &content);
+
+        let result =
+            load_codex_transcript(home.path(), cwd.path(), session_id, Some(date), agent_id)
+                .unwrap();
+        let efforts: Vec<_> = result
+            .turns
+            .iter()
+            .filter_map(|t| match t {
+                Turn::Agent { effort, .. } => Some(effort.clone()),
+                Turn::User { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            efforts,
+            vec![Some("high".to_owned()), None],
+            "turn 2 omits effort → None, not the prior turn's 'high'"
+        );
+    }
+
+    #[test]
+    fn hydrate_stamps_per_turn_model_and_effort_from_turn_context() {
+        // Two turns on different model + effort → two hydrated agent turns whose
+        // values differ. The readback effort field is `effort` (verified @
+        // codex 0.137.0). SessionMeta.model stays first-wins (separate path).
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let agent_id = Uuid::now_v7();
+        let date = NaiveDate::from_ymd_opt(2026, 5, 14).unwrap();
+        let session_id = "019e27fa-ae19-7022-97a2-356e6e5f3360";
+        let content = jsonl_lines(&[
+            turn_context_with_effort("gpt-5.5", "medium", "2026-05-14T19:33:20Z"),
+            task_started(session_id, "2026-05-14T19:33:20Z", 258_400),
+            user_message("hi", "2026-05-14T19:33:21Z"),
+            agent_message("a", "2026-05-14T19:33:22Z"),
+            task_complete(session_id, "2026-05-14T19:33:23Z"),
+            turn_context_with_effort("gpt-5.6", "high", "2026-05-14T19:34:20Z"),
+            task_started(session_id, "2026-05-14T19:34:20Z", 258_400),
+            user_message("again", "2026-05-14T19:34:21Z"),
+            agent_message("b", "2026-05-14T19:34:22Z"),
+            task_complete(session_id, "2026-05-14T19:34:23Z"),
+        ]);
+        write_session_at(home.path(), date, session_id, &content);
+
+        let result =
+            load_codex_transcript(home.path(), cwd.path(), session_id, Some(date), agent_id)
+                .unwrap();
+
+        let agent_turns: Vec<_> = result
+            .turns
+            .iter()
+            .filter_map(|t| match t {
+                Turn::Agent { model, effort, .. } => Some((model.clone(), effort.clone())),
+                Turn::User { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            agent_turns,
+            vec![
+                (Some("gpt-5.5".to_owned()), Some("medium".to_owned())),
+                (Some("gpt-5.6".to_owned()), Some("high".to_owned())),
+            ]
+        );
+        // SessionMeta keeps the first model (agent-scoped representative).
+        assert_eq!(result.meta.unwrap().model, "gpt-5.5");
     }
 
     #[test]

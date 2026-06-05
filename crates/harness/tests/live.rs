@@ -217,14 +217,11 @@ async fn live_claude_thinking_emits_liveness() {
     // during thinking, this test catches it (the fixture test proves the
     // parser maps the delta; this proves the delta still arrives live).
     //
-    // COVERAGE GAP: the non-empty `Thinking` branch is NOT live-covered. This
-    // test runs on the dev default (Opus → redacted), so live runs only ever
-    // hit `Liveness`. We can't pin Sonnet because the adapter has no `--model`
-    // plumbing yet; until per-agent model selection lands
-    // (`docs/implementation_plans/2026-05-30-per-agent-model-selection.md` M2),
-    // the "real Sonnet still returns un-redacted reasoning" contract is held
-    // only by the `thinking_delta_with_text_yields_thinking_chunk` unit test
-    // plus the per-model re-probe mandate (`harness-behavior.md` §3.2).
+    // This test runs on the dev default (Opus → redacted), so it only ever
+    // exercises the `Liveness` branch. The non-empty `Thinking` branch — the
+    // "real Sonnet still returns un-redacted reasoning" contract — is covered
+    // live by `live_claude_sonnet_emits_unredacted_thinking`, which pins
+    // `--model sonnet` (possible now that per-agent model selection exists).
     let adapter = ClaudeCodeAdapter::new();
     let agent = live_agent();
     let turn_id = Uuid::now_v7();
@@ -274,6 +271,110 @@ async fn live_claude_thinking_emits_liveness() {
             }
         ),
         "expected TurnEnd(Completed), got: {terminal:?}"
+    );
+}
+
+/// The `model` of the first `SessionMeta` in an event stream, if any.
+fn session_meta_model(events: &[AdapterEvent]) -> Option<String> {
+    events.iter().find_map(|e| match e {
+        AdapterEvent::SessionMeta { model, .. } => Some(model.clone()),
+        _ => None,
+    })
+}
+
+#[tokio::test]
+#[ignore = "requires claude installed — run with: make test-live"]
+async fn live_claude_model_and_effort_dispatch() {
+    // The selected model surfaces in `SessionMeta` (proving `--model` took
+    // effect end-to-end), and dispatching with an effort set completes without
+    // error. Per-turn *effort* exposure is asserted in M4 — at M2 the effort
+    // contract is the build_args unit test plus "dispatch succeeds."
+    let adapter = ClaudeCodeAdapter::new();
+    let mut agent = live_agent();
+    agent.model = Some("sonnet".to_owned());
+    agent.effort = Some("low".to_owned());
+    let turn_id = Uuid::now_v7();
+
+    let stream = adapter
+        .dispatch(
+            &agent,
+            Path::new("/tmp"),
+            "Reply with only the number 4 and nothing else.",
+            turn_id,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed with real claude");
+    let events: Vec<AdapterEvent> = stream.collect().await;
+
+    let model = session_meta_model(&events).expect("Claude emits SessionMeta with model");
+    assert!(
+        model.contains("sonnet"),
+        "selected `--model sonnet` must surface in SessionMeta.model; got {model:?}"
+    );
+    let terminal = events
+        .iter()
+        .find(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+        .expect("terminal TurnEnd");
+    assert!(
+        matches!(
+            terminal,
+            AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        ),
+        "dispatch with model+effort must complete; got {terminal:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires claude installed — run with: make test-live"]
+async fn live_claude_sonnet_emits_unredacted_thinking() {
+    // The only automated guard that the real Sonnet CLI still returns
+    // *un-redacted* reasoning. Claude's redaction is per-model
+    // (`harness-behavior.md` §3.2): the dev default Opus redacts, Sonnet does
+    // not. Pinning `--model sonnet` (now possible) and asserting a non-empty
+    // `Thinking` `ContentChunk` is what catches a silent re-redaction upstream.
+    // Assert content *presence*, not exact text.
+    // A genuinely multi-step problem with a one-token answer: trivial prompts
+    // (e.g. "reply with 4") don't engage thinking at all on Sonnet, so the
+    // prompt must require reasoning. `--effort high` biases the model toward
+    // emitting a thinking block; the answer stays tiny per cost discipline.
+    let adapter = ClaudeCodeAdapter::new();
+    let mut agent = live_agent();
+    agent.model = Some("sonnet".to_owned());
+    agent.effort = Some("high".to_owned());
+    let turn_id = Uuid::now_v7();
+
+    let stream = adapter
+        .dispatch(
+            &agent,
+            Path::new("/tmp"),
+            "A shelf holds 3 rows of 14 books and 2 rows of 9 books. Reason step \
+             by step, then reply with only the total number of books.",
+            turn_id,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed with real claude");
+    let events: Vec<AdapterEvent> = stream.collect().await;
+
+    let thinking_text: String = events
+        .iter()
+        .filter_map(|e| match e {
+            AdapterEvent::ContentChunk {
+                kind: ContentKind::Thinking,
+                text,
+                ..
+            } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !thinking_text.trim().is_empty(),
+        "Sonnet must stream un-redacted `Thinking` content; got none. If this \
+         fails, re-probe per-model redaction (harness-behavior.md §3.2). events: {events:?}"
     );
 }
 
@@ -700,6 +801,54 @@ async fn live_codex_basic_turn_completes() {
 
 #[tokio::test]
 #[ignore = "requires codex installed — run with: make test-live"]
+async fn live_codex_model_and_effort_dispatch() {
+    // `-m <model>` is plan-gated (only the account's entitled model is
+    // accepted), so we pin the entitled `gpt-5.5` rather than switching models;
+    // the across-turns *effort* assertion lands in M4. Here we prove the flags
+    // are accepted end-to-end (dispatch completes, model surfaces in
+    // SessionMeta) — a rejected `-m`/`-c` would 400 and fail the turn.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let adapter = CodexAdapter::new();
+    let mut agent = live_codex_agent();
+    agent.model = Some("gpt-5.5".to_owned());
+    agent.effort = Some("high".to_owned());
+    let turn_id = Uuid::now_v7();
+
+    let stream = adapter
+        .dispatch(
+            &agent,
+            tmp.path(),
+            "Reply with the single word 'ack' and nothing else.",
+            turn_id,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed with real codex");
+    let events: Vec<AdapterEvent> = stream.collect().await;
+
+    let terminal = events
+        .iter()
+        .find(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+        .expect("terminal TurnEnd");
+    assert!(
+        matches!(
+            terminal,
+            AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        ),
+        "dispatch with model+effort must complete; got {terminal:?}"
+    );
+    let model = session_meta_model(&events).expect("Codex emits SessionMeta with model on turn 1");
+    assert!(
+        model.contains("gpt-5"),
+        "selected `-m gpt-5.5` must surface in SessionMeta.model; got {model:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires codex installed — run with: make test-live"]
 async fn live_codex_resume_reuses_session() {
     // Memorize-then-recall: definitive proof that resume restores prior
     // turn's context. Token-count growth would also signal "system prompts
@@ -882,6 +1031,51 @@ async fn live_gemini_basic_turn_completes() {
         }
         _ => unreachable!(),
     }
+}
+
+#[tokio::test]
+#[ignore = "requires gemini installed — run with: make test-live"]
+async fn live_gemini_model_dispatch() {
+    // The selected model surfaces in `SessionMeta` (from `init.model`), proving
+    // `--model` took effect. Gemini has no effort axis, so there is nothing
+    // effort-shaped to assert.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let adapter = GeminiAdapter::new();
+    let mut agent = live_gemini_agent();
+    agent.model = Some("gemini-2.5-flash".to_owned());
+    let turn_id = Uuid::now_v7();
+
+    let stream = adapter
+        .dispatch(
+            &agent,
+            tmp.path(),
+            "Reply with only the number 4 and nothing else.",
+            turn_id,
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("dispatch should succeed with real gemini");
+    let events: Vec<AdapterEvent> = stream.collect().await;
+
+    let model = session_meta_model(&events).expect("Gemini emits SessionMeta with model");
+    assert!(
+        model.contains("flash"),
+        "selected `--model gemini-2.5-flash` must surface in SessionMeta.model; got {model:?}"
+    );
+    let terminal = events
+        .iter()
+        .find(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+        .expect("terminal TurnEnd");
+    assert!(
+        matches!(
+            terminal,
+            AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Completed,
+                ..
+            }
+        ),
+        "dispatch with model must complete; got {terminal:?}"
+    );
 }
 
 #[tokio::test]

@@ -155,6 +155,23 @@ where
     Option::<SessionLocator>::deserialize(deserializer)
 }
 
+/// Normalize a free-text selection (`model` / `effort`): trim surrounding
+/// whitespace and treat empty/whitespace-only as "unset" (`None`).
+///
+/// Applied at **both** boundaries it can be written through — the IPC command
+/// (friendly, early) and the core persistence methods (airtight, regardless of
+/// caller) — so the registry never stores a blank selection, which would
+/// dispatch `--model ""` (or `-c model_reasoning_effort=`) on every turn and
+/// fail with a non-obvious cause. Sharing one definition keeps that
+/// dispatch-safety guard from drifting between the two layers.
+///
+/// This is footgun-normalization, not value validation: a non-blank value is
+/// never judged "valid" here (a bad model surfaces as a failed turn, by design).
+#[must_use]
+pub fn normalize_selection(value: Option<String>) -> Option<String> {
+    value.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

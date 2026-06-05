@@ -64,7 +64,7 @@ pub enum CoreError {
     MissingAppendOnlyFile { path: PathBuf },
 
     #[error(
-        "session locator shape does not match agent {agent_id}'s harness {harness:?} \
+        "session locator shape does not match agent {agent_id}'s harness {harness} \
          — refusing to persist a locator that would not resume"
     )]
     SessionLocatorHarnessMismatch {
@@ -73,12 +73,12 @@ pub enum CoreError {
     },
 
     #[error(
-        "harness {harness:?} does not support {axis} selection \
+        "{harness} does not support {axis} selection \
          — refusing to persist a selection it can never apply"
     )]
     SelectionUnsupported {
         harness: crate::harness::HarnessKind,
-        axis: &'static str,
+        axis: crate::harness::SelectionAxis,
     },
 }
 

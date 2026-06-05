@@ -68,6 +68,29 @@ impl HarnessKind {
     }
 }
 
+/// The two independent per-agent selection axes. A closed, complete set — model
+/// and effort are the whole feature; a third axis would be a new feature, not an
+/// additive variant — so this is deliberately **not** `#[non_exhaustive]`: every
+/// match site should break if the set ever changes. Used to tag which axis a
+/// [`crate::error::CoreError::SelectionUnsupported`] refers to, modeled as a
+/// type (not a string) so a mistyped axis is a compile error, consistent with
+/// the rest of the crate's closed-set-as-enum style.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionAxis {
+    Model,
+    Effort,
+}
+
+/// Lowercase wording for error messages (`"model"` / `"effort"`).
+impl fmt::Display for SelectionAxis {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Model => f.write_str("model"),
+            Self::Effort => f.write_str("effort"),
+        }
+    }
+}
+
 /// User-facing names. Used in `thiserror` `#[error]` format strings that
 /// surface to the frontend via Tauri (where `AppError::to_string()` is the
 /// IPC error payload). The `Debug` impl prints `ClaudeCode` without a
@@ -157,6 +180,12 @@ mod tests {
         assert!(HarnessKind::Codex.supports_effort_selection());
         assert!(!HarnessKind::Gemini.supports_effort_selection());
         assert!(!HarnessKind::Antigravity.supports_effort_selection());
+    }
+
+    #[test]
+    fn selection_axis_display_is_lowercase_wording() {
+        assert_eq!(SelectionAxis::Model.to_string(), "model");
+        assert_eq!(SelectionAxis::Effort.to_string(), "effort");
     }
 
     #[test]

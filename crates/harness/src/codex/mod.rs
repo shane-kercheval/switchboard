@@ -168,7 +168,7 @@ impl HarnessAdapter for CodexAdapter {
         // and passed in as dispatch input — like Claude/Gemini. `None` is the
         // first-dispatch case; the adapter captures it from the stream below.
         let prior = codex_locator(agent);
-        let args = build_args(prompt, prior.as_ref().map(|l| l.thread_id.as_str()));
+        let args = build_args(agent, prompt, prior.as_ref().map(|l| l.thread_id.as_str()));
 
         let mut command = tokio::process::Command::new(&binary);
         command
@@ -244,26 +244,28 @@ fn resolve_home_dir(override_path: Option<&Path>) -> PathBuf {
 /// finding. Positionals (session id, prompt) follow a `--` end-of-options
 /// separator so a prompt beginning with `-` is not misparsed as a flag (verified
 /// against codex-cli 0.136.0).
-fn build_args(prompt: &str, resume_thread_id: Option<&str>) -> Vec<String> {
+fn build_args(agent: &AgentRecord, prompt: &str, resume_thread_id: Option<&str>) -> Vec<String> {
     if let Some(thread_id) = resume_thread_id {
         // Resume subcommand — NO `-C` (rejected by codex 0.130.0). cwd is
         // pinned via `Command::current_dir(cwd)` instead.
-        vec![
+        let mut args = vec![
             "exec".to_owned(),
             "resume".to_owned(),
             "--json".to_owned(),
             "--skip-git-repo-check".to_owned(),
             "--dangerously-bypass-approvals-and-sandbox".to_owned(),
-            // End-of-options separator so the positionals (session id and,
-            // critically, the prompt) are never parsed as flags. Without it a
-            // prompt beginning with `-` (e.g. a markdown bullet) makes clap
-            // abort with `unexpected argument '- '`. Verified against codex 0.136.0.
-            "--".to_owned(),
-            thread_id.to_owned(),
-            prompt.to_owned(),
-        ]
+        ];
+        push_selection_flags(&mut args, agent);
+        // End-of-options separator so the positionals (session id and,
+        // critically, the prompt) are never parsed as flags. Without it a
+        // prompt beginning with `-` (e.g. a markdown bullet) makes clap
+        // abort with `unexpected argument '- '`. Verified against codex 0.136.0.
+        args.push("--".to_owned());
+        args.push(thread_id.to_owned());
+        args.push(prompt.to_owned());
+        args
     } else {
-        vec![
+        let mut args = vec![
             "exec".to_owned(),
             "--json".to_owned(),
             "--skip-git-repo-check".to_owned(),
@@ -276,11 +278,29 @@ fn build_args(prompt: &str, resume_thread_id: Option<&str>) -> Vec<String> {
             // set by Command::current_dir — "." is interpreted relative to
             // the child's pwd, which IS cwd. Avoids encoding the path twice.
             ".".to_owned(),
-            // End-of-options separator (see the resume branch) — guards the
-            // prompt positional against a leading `-`.
-            "--".to_owned(),
-            prompt.to_owned(),
-        ]
+        ];
+        push_selection_flags(&mut args, agent);
+        // End-of-options separator (see the resume branch) — guards the
+        // prompt positional against a leading `-`.
+        args.push("--".to_owned());
+        args.push(prompt.to_owned());
+        args
+    }
+}
+
+/// Append the per-agent model/effort selection flags (sent every turn when set;
+/// unset → Codex default). Both are valid on `exec` and `exec resume`, and both
+/// must precede the `--` separator so they parse as flags, not positionals.
+/// Codex has no dedicated effort flag — the reasoning level is a config override
+/// (`-c model_reasoning_effort=<level>`), recorded per turn in `turn_context`.
+fn push_selection_flags(args: &mut Vec<String>, agent: &AgentRecord) {
+    if let Some(model) = &agent.model {
+        args.push("-m".to_owned());
+        args.push(model.clone());
+    }
+    if let Some(effort) = &agent.effort {
+        args.push("-c".to_owned());
+        args.push(format!("model_reasoning_effort={effort}"));
     }
 }
 
@@ -752,9 +772,22 @@ mod tests {
 
     const RESUME_THREAD_ID: &str = "019e2c5f-aaaa-7000-8000-000000000001";
 
+    fn codex_test_agent() -> AgentRecord {
+        AgentRecord {
+            id: uuid::Uuid::now_v7(),
+            project_id: uuid::Uuid::now_v7(),
+            name: "c".to_owned(),
+            harness: switchboard_core::HarnessKind::Codex,
+            session_locator: None,
+            model: None,
+            effort: None,
+            created_at: Utc::now(),
+        }
+    }
+
     #[test]
     fn build_args_first_turn_omits_resume_and_session_id_and_includes_dash_c() {
-        let args = build_args("hello", None);
+        let args = build_args(&codex_test_agent(), "hello", None);
         assert!(args.contains(&"exec".to_owned()));
         assert!(
             !args.contains(&"resume".to_owned()),
@@ -791,7 +824,7 @@ mod tests {
     fn build_args_resume_includes_session_id_and_omits_dash_c() {
         // Verified against codex-cli 0.130.0: `codex exec resume` rejects -C.
         // This test pins the behaviour against regression.
-        let args = build_args("hello again", Some(RESUME_THREAD_ID));
+        let args = build_args(&codex_test_agent(), "hello again", Some(RESUME_THREAD_ID));
         // resume subcommand
         let exec_idx = args
             .iter()
@@ -835,7 +868,7 @@ mod tests {
         // branches, sitting after the `--` separator rather than being parsed
         // as a flag.
         for prompt in ["- the left border is cut off", "--help"] {
-            let first = build_args(prompt, None);
+            let first = build_args(&codex_test_agent(), prompt, None);
             assert_eq!(first.last(), Some(&prompt.to_owned()));
             assert_eq!(
                 first[first.len() - 2],
@@ -843,7 +876,7 @@ mod tests {
                 "prompt is preceded by the `--` separator (first turn); got {first:?}"
             );
 
-            let resume = build_args(prompt, Some(RESUME_THREAD_ID));
+            let resume = build_args(&codex_test_agent(), prompt, Some(RESUME_THREAD_ID));
             assert_eq!(resume.last(), Some(&prompt.to_owned()));
             assert_eq!(resume[resume.len() - 2], RESUME_THREAD_ID);
             assert_eq!(
@@ -852,6 +885,61 @@ mod tests {
                 "`--` separator precedes the positionals (resume); got {resume:?}"
             );
         }
+    }
+
+    #[test]
+    fn build_args_includes_model_and_effort_when_set() {
+        let mut agent = codex_test_agent();
+        agent.model = Some("gpt-5.5".to_owned());
+        agent.effort = Some("high".to_owned());
+
+        let args = build_args(&agent, "hello", None);
+
+        let model_pos = args
+            .windows(2)
+            .position(|w| w[0] == "-m" && w[1] == "gpt-5.5")
+            .expect("`-m gpt-5.5` present");
+        // Effort is a config override, not a dedicated flag.
+        let effort_pos = args
+            .windows(2)
+            .position(|w| w[0] == "-c" && w[1] == "model_reasoning_effort=high")
+            .expect("`-c model_reasoning_effort=high` present");
+        // Both must precede the `--` separator.
+        let sep = args.iter().position(|a| a == "--").unwrap();
+        assert!(model_pos < sep, "-m must precede `--`; got {args:?}");
+        assert!(effort_pos < sep, "-c must precede `--`; got {args:?}");
+    }
+
+    #[test]
+    fn build_args_omits_model_and_effort_when_unset() {
+        let args = build_args(&codex_test_agent(), "hello", None);
+        assert!(!args.iter().any(|a| a == "-m"));
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.starts_with("model_reasoning_effort="))
+        );
+    }
+
+    #[test]
+    fn build_args_carries_model_and_effort_on_resume_path() {
+        let mut agent = codex_test_agent();
+        agent.model = Some("gpt-5.5".to_owned());
+        agent.effort = Some("medium".to_owned());
+
+        let args = build_args(&agent, "hello again", Some(RESUME_THREAD_ID));
+
+        let sep = args.iter().position(|a| a == "--").unwrap();
+        let model_pos = args
+            .windows(2)
+            .position(|w| w[0] == "-m" && w[1] == "gpt-5.5")
+            .unwrap();
+        let effort_pos = args
+            .windows(2)
+            .position(|w| w[0] == "-c" && w[1] == "model_reasoning_effort=medium")
+            .unwrap();
+        assert!(model_pos < sep, "resume: -m before `--`; got {args:?}");
+        assert!(effort_pos < sep, "resume: -c before `--`; got {args:?}");
     }
 
     #[test]

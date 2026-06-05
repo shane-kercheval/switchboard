@@ -37,8 +37,8 @@ use crate::commands::{
     open_project_impl, parse_uuid, pick_directory_impl, remove_agent_impl, remove_directory_impl,
     remove_mcp_provider_impl, remove_queued_message_impl, rename_agent_impl, rename_project_impl,
     render_prompt_impl, search_project_files_in_root, search_project_files_root_impl,
-    send_message_impl, set_active_project_impl, set_project_archived_impl,
-    test_mcp_connection_impl, validate_external_url,
+    send_message_impl, set_active_project_impl, set_agent_effort_impl, set_agent_model_impl,
+    set_project_archived_impl, test_mcp_connection_impl, validate_external_url,
 };
 use crate::state::AppState;
 
@@ -256,8 +256,30 @@ async fn create_agent(
     state: State<'_, AppState>,
     name: String,
     harness: HarnessKind,
+    model: Option<String>,
+    effort: Option<String>,
 ) -> Result<AgentRecord, String> {
-    create_agent_impl(state.inner(), &name, harness).map_err(|e| e.to_string())
+    create_agent_impl(state.inner(), &name, harness, model, effort).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn set_agent_model(
+    state: State<'_, AppState>,
+    agent_id: String,
+    model: Option<String>,
+) -> Result<AgentRecord, String> {
+    let id = parse_uuid(&agent_id).map_err(|e| e.to_string())?;
+    set_agent_model_impl(state.inner(), id, model).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn set_agent_effort(
+    state: State<'_, AppState>,
+    agent_id: String,
+    effort: Option<String>,
+) -> Result<AgentRecord, String> {
+    let id = parse_uuid(&agent_id).map_err(|e| e.to_string())?;
+    set_agent_effort_impl(state.inner(), id, effort).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -284,12 +306,22 @@ async fn attach_agent(
     name: String,
     harness: HarnessKind,
     existing_session_id: String,
+    model: Option<String>,
+    effort: Option<String>,
 ) -> Result<AgentRecord, String> {
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
-    attach_agent_impl(state.inner(), &name, harness, &existing_session_id, &home)
-        .map_err(|e| e.to_string())
+    attach_agent_impl(
+        state.inner(),
+        &name,
+        harness,
+        &existing_session_id,
+        &home,
+        model,
+        effort,
+    )
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -742,6 +774,8 @@ pub fn run() {
             create_agent,
             remove_agent,
             rename_agent,
+            set_agent_model,
+            set_agent_effort,
             attach_agent,
             list_agents,
             search_project_files,

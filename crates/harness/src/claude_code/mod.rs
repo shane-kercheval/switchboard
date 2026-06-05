@@ -172,6 +172,17 @@ fn build_args(
         }
         args.push(session_id.to_string());
     }
+    // Per-agent selection (sent every turn when set; unset → harness default).
+    // `--model` takes an alias (`sonnet`/`opus`) or a full id; `--effort` takes
+    // a reasoning level. Both must go BEFORE the `--` below — see the note.
+    if let Some(model) = &agent.model {
+        args.push("--model".to_owned());
+        args.push(model.clone());
+    }
+    if let Some(effort) = &agent.effort {
+        args.push("--effort".to_owned());
+        args.push(effort.clone());
+    }
     // `claude -p` takes the prompt as a positional. Pass it last, after a `--`
     // end-of-options separator, so a prompt beginning with `-` (e.g. a markdown
     // bullet) is not parsed as an unknown flag — without it `claude` aborts with
@@ -534,6 +545,70 @@ mod tests {
 
         assert!(!args.contains(&"--session-id".to_owned()));
         assert!(!args.contains(&"--resume".to_owned()));
+    }
+
+    /// Index of `flag` immediately followed by `value` in an arg vec.
+    fn flag_value_pos(args: &[String], flag: &str, value: &str) -> Option<usize> {
+        args.windows(2).position(|w| w[0] == flag && w[1] == value)
+    }
+
+    #[test]
+    fn build_args_includes_model_and_effort_when_set() {
+        let home = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let mut agent = agent_with_session(Uuid::now_v7());
+        agent.model = Some("sonnet".to_owned());
+        agent.effort = Some("high".to_owned());
+
+        let args = build_args(&agent, "hi", project.path(), Some(home.path()));
+
+        let model_pos = flag_value_pos(&args, "--model", "sonnet").expect("--model sonnet present");
+        let effort_pos = flag_value_pos(&args, "--effort", "high").expect("--effort high present");
+        // Both must precede the `--` separator, else they'd be parsed as
+        // positionals alongside the prompt.
+        let sep = args.iter().position(|a| a == "--").unwrap();
+        assert!(model_pos < sep, "--model must precede `--`; got {args:?}");
+        assert!(effort_pos < sep, "--effort must precede `--`; got {args:?}");
+    }
+
+    #[test]
+    fn build_args_omits_model_and_effort_when_unset() {
+        let home = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let agent = agent_with_session(Uuid::now_v7());
+
+        let args = build_args(&agent, "hi", project.path(), Some(home.path()));
+
+        assert!(!args.contains(&"--model".to_owned()));
+        assert!(!args.contains(&"--effort".to_owned()));
+    }
+
+    #[test]
+    fn build_args_carries_model_and_effort_on_resume_path() {
+        // The selection rides every turn, including resumes — same flags,
+        // still before the `--` separator.
+        let home = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let session_id = Uuid::now_v7();
+        let mut agent = agent_with_session(session_id);
+        agent.model = Some("opus".to_owned());
+        agent.effort = Some("max".to_owned());
+
+        let canonical = project.path().canonicalize().unwrap();
+        let encoded = encode_cwd(&canonical);
+        let session_dir = home.path().join(".claude").join("projects").join(&encoded);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(session_dir.join(format!("{session_id}.jsonl")), "").unwrap();
+
+        let args = build_args(&agent, "hi", project.path(), Some(home.path()));
+
+        assert!(
+            args.contains(&"--resume".to_owned()),
+            "resume path: {args:?}"
+        );
+        let sep = args.iter().position(|a| a == "--").unwrap();
+        assert!(flag_value_pos(&args, "--model", "opus").unwrap() < sep);
+        assert!(flag_value_pos(&args, "--effort", "max").unwrap() < sep);
     }
 
     #[test]

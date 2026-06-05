@@ -5,9 +5,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::agent::{AgentRecord, SessionLocator};
+use crate::agent::{AgentRecord, SessionLocator, normalize_selection};
 use crate::error::{CoreError, Result};
-use crate::harness::HarnessKind;
+use crate::harness::{HarnessKind, SelectionAxis};
 use crate::io::{append_jsonl, read_jsonl, read_yaml, write_jsonl, write_yaml};
 use crate::name::{canonicalize_for_uniqueness, validate_name};
 use crate::paths::{CONFIG_FILE, JOURNAL_FILE, REGISTRY_FILE};
@@ -263,16 +263,22 @@ impl Project {
         effort: Option<String>,
     ) -> Result<AgentRecord> {
         validate_name(name)?;
+        // Normalize **before** the capability check: a blank selection means
+        // "unset," which is allowed on any harness — it must not trip the
+        // capability error (e.g. a whitespace effort on Gemini is "no effort,"
+        // not an unsupported effort).
+        let model = normalize_selection(model);
+        let effort = normalize_selection(effort);
         if model.is_some() && !harness.supports_model_selection() {
             return Err(CoreError::SelectionUnsupported {
                 harness,
-                axis: "model",
+                axis: SelectionAxis::Model,
             });
         }
         if effort.is_some() && !harness.supports_effort_selection() {
             return Err(CoreError::SelectionUnsupported {
                 harness,
-                axis: "effort",
+                axis: SelectionAxis::Effort,
             });
         }
         check_name_unique(&self.list_agents()?, name, None)?;
@@ -366,6 +372,66 @@ impl Project {
             return Err(CoreError::SessionLocatorHarnessMismatch { agent_id, harness });
         }
         agents[idx].session_locator = Some(locator);
+        let updated = agents[idx].clone();
+        write_jsonl(&self.registry_path, &agents)?;
+        Ok(updated)
+    }
+
+    /// Set (or clear, with `None`) an agent's selected `model` in place,
+    /// rewriting `registry.jsonl`. Mirrors `rename_agent` / `set_session_locator`
+    /// — same atomic full-rewrite + `registry_write`-serialized contract. The
+    /// value is normalized (blank → unset) and the model-selection capability is
+    /// re-checked at this persistence boundary, so both dispatch-safety
+    /// invariants — "no blank selection" and "no inapplicable selection" reaches
+    /// the registry — hold on the mutation path too, not just at registration.
+    /// Takes `Option<String>` so clearing back to the harness default is
+    /// expressible. Returns the updated record.
+    pub fn set_agent_model(
+        &self,
+        agent_id: crate::agent::AgentId,
+        model: Option<String>,
+    ) -> Result<AgentRecord> {
+        let model = normalize_selection(model);
+        let mut agents = self.list_agents()?;
+        let idx = agents
+            .iter()
+            .position(|a| a.id == agent_id)
+            .ok_or(CoreError::AgentNotFound(agent_id))?;
+        let harness = agents[idx].harness;
+        if model.is_some() && !harness.supports_model_selection() {
+            return Err(CoreError::SelectionUnsupported {
+                harness,
+                axis: SelectionAxis::Model,
+            });
+        }
+        agents[idx].model = model;
+        let updated = agents[idx].clone();
+        write_jsonl(&self.registry_path, &agents)?;
+        Ok(updated)
+    }
+
+    /// Set (or clear, with `None`) an agent's selected reasoning `effort` in
+    /// place. The effort-axis counterpart to [`Self::set_agent_model`]; same
+    /// contract, normalization, and capability re-check.
+    pub fn set_agent_effort(
+        &self,
+        agent_id: crate::agent::AgentId,
+        effort: Option<String>,
+    ) -> Result<AgentRecord> {
+        let effort = normalize_selection(effort);
+        let mut agents = self.list_agents()?;
+        let idx = agents
+            .iter()
+            .position(|a| a.id == agent_id)
+            .ok_or(CoreError::AgentNotFound(agent_id))?;
+        let harness = agents[idx].harness;
+        if effort.is_some() && !harness.supports_effort_selection() {
+            return Err(CoreError::SelectionUnsupported {
+                harness,
+                axis: SelectionAxis::Effort,
+            });
+        }
+        agents[idx].effort = effort;
         let updated = agents[idx].clone();
         write_jsonl(&self.registry_path, &agents)?;
         Ok(updated)
@@ -876,7 +942,7 @@ mod tests {
             err,
             CoreError::SelectionUnsupported {
                 harness: HarnessKind::Antigravity,
-                axis: "model"
+                axis: SelectionAxis::Model
             }
         ));
         // Rejected *before* the append — no orphan record.
@@ -893,10 +959,135 @@ mod tests {
             err,
             CoreError::SelectionUnsupported {
                 harness: HarnessKind::Gemini,
-                axis: "effort"
+                axis: SelectionAxis::Effort
             }
         ));
         assert!(project.list_agents().unwrap().is_empty());
+    }
+
+    #[test]
+    fn set_agent_model_and_effort_update_persist_and_clear() {
+        let (_tmp, project) = fresh_project();
+        let agent = project
+            .register_agent("a", HarnessKind::ClaudeCode, None, None)
+            .unwrap();
+
+        let updated = project
+            .set_agent_model(agent.id, Some("opus".to_owned()))
+            .unwrap();
+        assert_eq!(updated.model.as_deref(), Some("opus"));
+        project
+            .set_agent_effort(agent.id, Some("high".to_owned()))
+            .unwrap();
+        // Durable across a fresh read of the registry.
+        let reloaded = &project.list_agents().unwrap()[0];
+        assert_eq!(reloaded.model.as_deref(), Some("opus"));
+        assert_eq!(reloaded.effort.as_deref(), Some("high"));
+
+        // Clearing back to the harness default persists `None`.
+        project.set_agent_model(agent.id, None).unwrap();
+        project.set_agent_effort(agent.id, None).unwrap();
+        let cleared = &project.list_agents().unwrap()[0];
+        assert_eq!(cleared.model, None);
+        assert_eq!(cleared.effort, None);
+    }
+
+    #[test]
+    fn set_agent_model_rejects_unsupported_harness_without_mutating() {
+        let (_tmp, project) = fresh_project();
+        let agent = project
+            .register_agent("a", HarnessKind::Antigravity, None, None)
+            .unwrap();
+        let err = project
+            .set_agent_model(agent.id, Some("x".to_owned()))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CoreError::SelectionUnsupported {
+                harness: HarnessKind::Antigravity,
+                axis: SelectionAxis::Model
+            }
+        ));
+        // The rejected write left the record untouched.
+        assert_eq!(project.list_agents().unwrap()[0].model, None);
+    }
+
+    #[test]
+    fn set_agent_effort_rejects_unsupported_harness_without_mutating() {
+        let (_tmp, project) = fresh_project();
+        let agent = project
+            .register_agent("g", HarnessKind::Gemini, None, None)
+            .unwrap();
+        let err = project
+            .set_agent_effort(agent.id, Some("high".to_owned()))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CoreError::SelectionUnsupported {
+                harness: HarnessKind::Gemini,
+                axis: SelectionAxis::Effort
+            }
+        ));
+        assert_eq!(project.list_agents().unwrap()[0].effort, None);
+    }
+
+    #[test]
+    fn set_agent_model_unknown_agent_errors() {
+        let (_tmp, project) = fresh_project();
+        let err = project
+            .set_agent_model(Uuid::now_v7(), Some("x".to_owned()))
+            .unwrap_err();
+        assert!(matches!(err, CoreError::AgentNotFound(_)));
+    }
+
+    #[test]
+    fn core_normalizes_blank_selection_regardless_of_caller() {
+        // The persistence boundary, not just the IPC layer, drops a blank
+        // selection — so a direct-core caller can't persist a dispatch-breaking
+        // `Some("")` either.
+        let (_tmp, project) = fresh_project();
+        let agent = project
+            .register_agent(
+                "a",
+                HarnessKind::ClaudeCode,
+                Some("  ".to_owned()),
+                Some(String::new()),
+            )
+            .unwrap();
+        assert_eq!(agent.model, None);
+        assert_eq!(agent.effort, None);
+
+        project
+            .set_agent_model(agent.id, Some("   ".to_owned()))
+            .unwrap();
+        project
+            .set_agent_effort(agent.id, Some(" ".to_owned()))
+            .unwrap();
+        let reloaded = &project.list_agents().unwrap()[0];
+        assert_eq!(reloaded.model, None);
+        assert_eq!(reloaded.effort, None);
+    }
+
+    #[test]
+    fn blank_selection_on_unsupporting_harness_is_unset_not_an_error() {
+        // Normalize-before-capability-check: a blank value means "clear the
+        // field," which is allowed on any harness. It must NOT surface as
+        // `SelectionUnsupported` just because the harness lacks that axis —
+        // clearing an effort on Gemini is "no effort," not "illegal effort."
+        let (_tmp, project) = fresh_project();
+        let gemini = project
+            .register_agent("g", HarnessKind::Gemini, None, None)
+            .unwrap();
+        let updated = project
+            .set_agent_effort(gemini.id, Some("   ".to_owned()))
+            .expect("blank effort on Gemini is a no-op clear, not an error");
+        assert_eq!(updated.effort, None);
+
+        // Same at registration: a blank effort on Gemini registers fine.
+        let agent = project
+            .register_agent("g2", HarnessKind::Gemini, None, Some("  ".to_owned()))
+            .expect("blank effort at registration is unset, not unsupported");
+        assert_eq!(agent.effort, None);
     }
 
     #[test]

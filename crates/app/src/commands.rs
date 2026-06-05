@@ -12,7 +12,7 @@ use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use switchboard_core::{
     AgentId, AgentRecord, CoreError, Directory, HarnessKind, Project, ProjectId, ProjectSummary,
-    SendId, SessionLocator,
+    SelectionAxis, SendId, SessionLocator, normalize_selection,
 };
 use switchboard_dispatcher::{
     CancelOutcome, DispatchContextFactory, OnBusy, RemovedQueuedMessage, SendOutcome,
@@ -775,7 +775,12 @@ pub fn create_agent_impl(
     state: &AppState,
     name: &str,
     harness: HarnessKind,
+    model: Option<String>,
+    effort: Option<String>,
 ) -> Result<AgentRecord, AppError> {
+    let model = normalize_selection(model);
+    let effort = normalize_selection(effort);
+    check_selection_supported(harness, model.as_deref(), effort.as_deref())?;
     // Same TOCTOU protection as create_project_impl — register_agent has
     // an internal read-check-then-append window that two concurrent IPC
     // calls could race through.
@@ -785,9 +790,39 @@ pub fn create_agent_impl(
         .get(&active)
         .cloned()
         .ok_or(AppError::ProjectNotLoaded(active))?;
-    let record = project.register_agent(name, harness, None, None)?;
+    let record = project.register_agent(name, harness, model, effort)?;
     lock(&state.agents_by_id).insert(record.id, record.clone());
     Ok(record)
+}
+
+/// Reject a model on a harness without model support, or an effort on a harness
+/// without effort support — the capability invariant, checked at the command
+/// boundary so the caller gets a clear error before any registry work. `core`
+/// re-checks at its persistence boundary (defense in depth, [`Project`]'s
+/// registration + `set_agent_*` gates); the attach path *requires* this check
+/// because its per-harness `register_attached_*` fns can't even receive an
+/// unsupported axis. Call **after** [`normalize_selection`] so a blank selection
+/// (which means "unset," always allowed) doesn't trip the capability error.
+fn check_selection_supported(
+    harness: HarnessKind,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> Result<(), AppError> {
+    if model.is_some() && !harness.supports_model_selection() {
+        return Err(CoreError::SelectionUnsupported {
+            harness,
+            axis: SelectionAxis::Model,
+        }
+        .into());
+    }
+    if effort.is_some() && !harness.supports_effort_selection() {
+        return Err(CoreError::SelectionUnsupported {
+            harness,
+            axis: SelectionAxis::Effort,
+        }
+        .into());
+    }
+    Ok(())
 }
 
 /// Remove an agent: tear down its actor, then delete its registry record and
@@ -905,47 +940,85 @@ pub fn set_agent_session_locator_impl(
     Ok(updated)
 }
 
+/// Change (or clear, with `None`) an agent's selected model, re-persisting the
+/// registry and refreshing the cache. Mirrors `rename_agent_impl`. Empty/
+/// whitespace normalizes to "unset"; the model-selection capability is enforced
+/// by `Project::set_agent_model` (so an unsupported harness is rejected
+/// regardless of caller). The new value applies on the agent's next dispatch —
+/// no in-flight turn is touched.
+pub fn set_agent_model_impl(
+    state: &AppState,
+    agent_id: AgentId,
+    model: Option<String>,
+) -> Result<AgentRecord, AppError> {
+    let model = normalize_selection(model);
+    let _write = lock(&state.registry_write);
+    let (project, _) = lookup_agent(state, agent_id)?;
+    let updated = project.set_agent_model(agent_id, model)?;
+    lock(&state.agents_by_id).insert(agent_id, updated.clone());
+    Ok(updated)
+}
+
+/// Change (or clear, with `None`) an agent's selected reasoning effort. The
+/// effort-axis counterpart to [`set_agent_model_impl`].
+pub fn set_agent_effort_impl(
+    state: &AppState,
+    agent_id: AgentId,
+    effort: Option<String>,
+) -> Result<AgentRecord, AppError> {
+    let effort = normalize_selection(effort);
+    let _write = lock(&state.registry_write);
+    let (project, _) = lookup_agent(state, agent_id)?;
+    let updated = project.set_agent_effort(agent_id, effort)?;
+    lock(&state.agents_by_id).insert(agent_id, updated.clone());
+    Ok(updated)
+}
+
 /// Attach an existing harness session (Claude Code, Codex, Gemini, or
 /// Antigravity) as a new Switchboard agent in the active project.
 ///
-/// Validation order (all under the directory-level `registry_write` mutex
-/// so the cross-project session-id check + register form one atomic step):
-/// 1. Active project resolved.
-/// 2. `existing_session_id` parses as a UUID — Claude/Gemini/Antigravity only;
+/// Validation order:
+/// 1. Normalize the selections and capability-check them — **before** taking
+///    the lock, so an unsupported model/effort is refused without touching the
+///    registry (the per-harness `register_attached_*` methods structurally
+///    can't carry an axis they don't support, so this is the only place an
+///    unsupported axis from the IPC is rejected rather than silently dropped).
+/// 2. Take the directory-level `registry_write` mutex; the remaining steps run
+///    under it so the cross-project session-id check + register form one atomic
+///    step. Resolve the active project and its owning directory.
+/// 3. `existing_session_id` parses as a UUID — Claude/Gemini/Antigravity only;
 ///    Codex's thread-id is an arbitrary string and is used verbatim.
-/// 3. Per-harness session existence under `home_dir`. Claude / Gemini check a
+/// 4. Per-harness session existence under `home_dir`. Claude / Gemini check a
 ///    session file; Codex's discovery also returns the parsed `YYYY-MM-DD`
-///    (the sidecar's `session_partition_date`); Antigravity checks that the
-///    server-assigned conversation directory `brain/<uuid>/` exists (the
-///    transcript inside may be absent — hydration degrades gracefully).
-/// 4. Session-id collision scan (loaded or not — the scan walks projects on
+///    partition date; Antigravity checks that the server-assigned conversation
+///    directory `brain/<uuid>/` exists (the transcript inside may be absent —
+///    hydration degrades gracefully).
+/// 5. Session-id collision scan (loaded or not — the scan walks projects on
 ///    disk). Scope differs by harness: Claude and Gemini scan only the active
 ///    project's **own directory** (`enumerate_directory_projects`) because
 ///    their session ids are caller-controlled and cwd-namespaced, so a widened
 ///    scan would false-reject a legitimately-distinct same-id-different-cwd
 ///    session. Codex and Antigravity scan **all loaded directories**
 ///    (`enumerate_all_projects`) because their ids are server-assigned and
-///    globally unique. Claude, Gemini, and Antigravity scan
-///    `AgentRecord.session_locator` (the UUID lives on the record); Codex still
-///    scans every project's `sessions/<agent_id>.jsonl` sidecar (its locator
-///    moves onto the record in a later milestone). Two `AgentRecord`s pointing
-///    at the same harness session is the same-session-parallel-invocation
-///    hazard (`docs/research/same-session-parallel-invocation.md`); unloaded
-///    projects could still be opened and dispatched concurrently later, so
-///    loaded-only scope would miss the collision.
-/// 5. Register via the harness-specific `register_attached_*` method. Claude,
-///    Gemini, and Antigravity write the session UUID straight onto the record.
-/// 6. (Codex only) Append the first session-link sidecar record (it carries the
-///    discovered `session_partition_date`). Written **before** step 5 commits so
-///    a failed sidecar write leaves an orphan sidecar, never an orphan agent.
-/// 7. (Codex only) Insert the new `agent_id` into `needs_session_meta` so
-///    every dispatch up to and including the one that observes `SessionMeta`
-///    runs with `is_first_dispatch_after_attach: true` — forces `SessionMeta`
-///    emission for the Codex sidebar. The per-dispatch emitter decorator
-///    clears the flag once `session_meta` is genuinely observed on the wire.
-///    Claude and Antigravity attaches do **not** populate this set: both emit
-///    `SessionMeta` on every dispatch (Claude from `system/init`; Antigravity
-///    constructs it post-terminal each turn), so the override has nothing to do.
+///    globally unique. Every harness scans `AgentRecord.session_locator` (the
+///    locator — UUID, or Codex's thread-id — lives on the record; no sidecar).
+///    Two `AgentRecord`s pointing at the same harness session is the
+///    same-session-parallel-invocation hazard
+///    (`docs/research/same-session-parallel-invocation.md`); unloaded projects
+///    could still be opened and dispatched concurrently later, so loaded-only
+///    scope would miss the collision.
+/// 6. Register via the harness-specific `register_attached_*` method, which
+///    writes the session locator (and any model/effort) straight onto the
+///    registry record — no sidecar for any harness.
+/// 7. (Codex only) Insert the new `agent_id` into `needs_session_meta` (after
+///    registration) so every dispatch up to and including the one that observes
+///    `SessionMeta` runs with `is_first_dispatch_after_attach: true` — forces
+///    `SessionMeta` emission for the Codex sidebar. The per-dispatch emitter
+///    decorator clears the flag once `session_meta` is genuinely observed on the
+///    wire. Claude and Antigravity attaches do **not** populate this set: both
+///    emit `SessionMeta` on every dispatch (Claude from `system/init`;
+///    Antigravity constructs it post-terminal each turn), so the override has
+///    nothing to do.
 ///
 /// `home_dir` is passed in (not resolved here) so tests can stage a temp
 /// directory without mutating process-wide `$HOME`. The Tauri command shim
@@ -956,7 +1029,18 @@ pub fn attach_agent_impl(
     harness: HarnessKind,
     existing_session_id: &str,
     home_dir: &Path,
+    model: Option<String>,
+    effort: Option<String>,
 ) -> Result<AgentRecord, AppError> {
+    let model = normalize_selection(model);
+    let effort = normalize_selection(effort);
+    // Capability check first — before any session-file lookup or registry
+    // write. Load-bearing on this path (not just defense in depth): the
+    // per-harness `register_attached_*` methods structurally omit the axes they
+    // can't carry (Gemini takes no effort, Antigravity takes neither), so an
+    // unsupported axis from the IPC must be rejected here or it would be
+    // silently dropped rather than refused.
+    check_selection_supported(harness, model.as_deref(), effort.as_deref())?;
     let _write = lock(&state.registry_write);
     let active = lock(&state.active_project_id).ok_or(AppError::NoActiveProject)?;
     let project = lock(&state.projects)
@@ -989,7 +1073,7 @@ pub fn attach_agent_impl(
                 });
             }
             check_claude_session_id_unique(state, &directory, &session_uuid)?;
-            project.register_attached_claude_agent(name, session_uuid, None, None)?
+            project.register_attached_claude_agent(name, session_uuid, model, effort)?
         }
         HarnessKind::Codex => {
             let (_path, session_partition_date) =
@@ -1006,8 +1090,8 @@ pub fn attach_agent_impl(
                 name,
                 existing_session_id.to_owned(),
                 session_partition_date,
-                None,
-                None,
+                model,
+                effort,
             )?;
             // Codex-only: force SessionMeta on subsequent dispatches until one
             // is genuinely observed. Claude/Gemini/Antigravity emit SessionMeta
@@ -1024,7 +1108,9 @@ pub fn attach_agent_impl(
                 "gemini attach: bound to candidate"
             );
             check_gemini_session_id_unique(state, &directory, &session_uuid)?;
-            project.register_attached_gemini_agent(name, session_uuid, None)?
+            // Effort is already guaranteed `None` by `check_selection_supported`
+            // (Gemini lacks effort support); only `model` flows through.
+            project.register_attached_gemini_agent(name, session_uuid, model)?
         }
         HarnessKind::Antigravity => {
             let session_uuid = parse_uuid(existing_session_id)?;
@@ -3020,7 +3106,8 @@ mod tests {
             .unwrap();
         let project = create_project_in_only_dir(state, "proj");
         set_active_project_impl(state, project.id).unwrap();
-        let agent = create_agent_impl(state, "assistant", HarnessKind::ClaudeCode).unwrap();
+        let agent =
+            create_agent_impl(state, "assistant", HarnessKind::ClaudeCode, None, None).unwrap();
         (agent, project.id)
     }
 
@@ -3070,7 +3157,8 @@ mod tests {
             .unwrap();
         let proj = create_project_in_only_dir(&state, "alpha");
         set_active_project_impl(&state, proj.id).unwrap();
-        let agent = create_agent_impl(&state, "assistant", HarnessKind::ClaudeCode).unwrap();
+        let agent =
+            create_agent_impl(&state, "assistant", HarnessKind::ClaudeCode, None, None).unwrap();
 
         // Add a second directory.
         let info_b = init_directory_impl(&state, tmp_b.path().to_str().unwrap())
@@ -3152,6 +3240,8 @@ mod tests {
             &state,
             "assistant",
             switchboard_core::HarnessKind::ClaudeCode,
+            None,
+            None,
         )
         .unwrap_err();
         assert!(matches!(err, AppError::NoActiveProject));
@@ -3169,6 +3259,8 @@ mod tests {
             &state,
             "assistant",
             switchboard_core::HarnessKind::ClaudeCode,
+            None,
+            None,
         )
         .unwrap();
 
@@ -3720,9 +3812,23 @@ mod tests {
         let proj_a = create_project_in_only_dir(&state, "alpha");
         let proj_b = create_project_in_only_dir(&state, "beta");
         set_active_project_impl(&state, proj_a.id).unwrap();
-        create_agent_impl(&state, "a-agent", switchboard_core::HarnessKind::ClaudeCode).unwrap();
+        create_agent_impl(
+            &state,
+            "a-agent",
+            switchboard_core::HarnessKind::ClaudeCode,
+            None,
+            None,
+        )
+        .unwrap();
         set_active_project_impl(&state, proj_b.id).unwrap();
-        create_agent_impl(&state, "b-agent", switchboard_core::HarnessKind::ClaudeCode).unwrap();
+        create_agent_impl(
+            &state,
+            "b-agent",
+            switchboard_core::HarnessKind::ClaudeCode,
+            None,
+            None,
+        )
+        .unwrap();
 
         // Default = active project (beta).
         let agents = list_agents_impl(&state, None).unwrap();
@@ -3832,10 +3938,13 @@ mod tests {
             .unwrap();
         let proj = create_project_in_only_dir(&state, "alpha");
         set_active_project_impl(&state, proj.id).unwrap();
-        let claude_agent = create_agent_impl(&state, "c1", HarnessKind::ClaudeCode).unwrap();
-        let codex_agent = create_agent_impl(&state, "x1", HarnessKind::Codex).unwrap();
-        let gemini_agent = create_agent_impl(&state, "g1", HarnessKind::Gemini).unwrap();
-        let antigravity_agent = create_agent_impl(&state, "a1", HarnessKind::Antigravity).unwrap();
+        let claude_agent =
+            create_agent_impl(&state, "c1", HarnessKind::ClaudeCode, None, None).unwrap();
+        let codex_agent = create_agent_impl(&state, "x1", HarnessKind::Codex, None, None).unwrap();
+        let gemini_agent =
+            create_agent_impl(&state, "g1", HarnessKind::Gemini, None, None).unwrap();
+        let antigravity_agent =
+            create_agent_impl(&state, "a1", HarnessKind::Antigravity, None, None).unwrap();
 
         // Four distinct agents → four independent actors. Each
         // `send_message_impl` returns immediately; await each agent's turn
@@ -3933,7 +4042,7 @@ mod tests {
             .unwrap();
         let proj = create_project_in_only_dir(&state, "alpha");
         set_active_project_impl(&state, proj.id).unwrap();
-        let agent = create_agent_impl(&state, "a", HarnessKind::ClaudeCode).unwrap();
+        let agent = create_agent_impl(&state, "a", HarnessKind::ClaudeCode, None, None).unwrap();
         lock(&state.needs_session_meta).insert(agent.id);
 
         send_msg(&state, agent.id, "hi").await.unwrap();
@@ -3979,7 +4088,7 @@ mod tests {
             .unwrap();
         let proj = create_project_in_only_dir(&state, "alpha");
         set_active_project_impl(&state, proj.id).unwrap();
-        let agent = create_agent_impl(&state, "a", HarnessKind::ClaudeCode).unwrap();
+        let agent = create_agent_impl(&state, "a", HarnessKind::ClaudeCode, None, None).unwrap();
         lock(&state.needs_session_meta).insert(agent.id);
 
         // Routing succeeds → the send is accepted; the dispatch failure is
@@ -4073,7 +4182,8 @@ mod tests {
             .unwrap();
         let proj = create_project_in_only_dir(&state, "alpha");
         set_active_project_impl(&state, proj.id).unwrap();
-        let agent_default = create_agent_impl(&state, "a", HarnessKind::ClaudeCode).unwrap();
+        let agent_default =
+            create_agent_impl(&state, "a", HarnessKind::ClaudeCode, None, None).unwrap();
         send_msg(&state, agent_default.id, "hi").await.unwrap();
         within(
             &emitter,
@@ -4194,7 +4304,7 @@ mod tests {
             .unwrap();
         let proj = create_project_in_only_dir(&state, "alpha");
         set_active_project_impl(&state, proj.id).unwrap();
-        let agent = create_agent_impl(&state, "a", HarnessKind::Codex).unwrap();
+        let agent = create_agent_impl(&state, "a", HarnessKind::Codex, None, None).unwrap();
         // Simulate the Codex-attach state: the flag is set on a real attach,
         // but `create_agent_impl` doesn't trigger that path, so set it
         // directly to isolate the read-don't-drain behavior under test.
@@ -4250,6 +4360,8 @@ mod tests {
             &state,
             "assistant",
             switchboard_core::HarnessKind::ClaudeCode,
+            None,
+            None,
         )
         .unwrap();
         set_active_project_impl(&state, proj_b.id).unwrap();
@@ -4257,6 +4369,8 @@ mod tests {
             &state,
             "assistant",
             switchboard_core::HarnessKind::ClaudeCode,
+            None,
+            None,
         )
         .unwrap();
 
@@ -4423,6 +4537,8 @@ mod tests {
             HarnessKind::ClaudeCode,
             &session_id.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -4452,6 +4568,8 @@ mod tests {
             HarnessKind::ClaudeCode,
             &session_id.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap_err();
         match err {
@@ -4476,6 +4594,8 @@ mod tests {
             HarnessKind::ClaudeCode,
             "not-a-uuid",
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap_err();
         assert!(matches!(err, AppError::InvalidUuid { .. }));
@@ -4494,6 +4614,8 @@ mod tests {
             HarnessKind::Codex,
             &session_id.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap();
         // The thread-id + discovered partition-date are written onto the record
@@ -4527,6 +4649,8 @@ mod tests {
             HarnessKind::Codex,
             thread_id,
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -4548,6 +4672,8 @@ mod tests {
             HarnessKind::Codex,
             &session_id.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap_err();
         match err {
@@ -4578,6 +4704,8 @@ mod tests {
             HarnessKind::ClaudeCode,
             &session_id.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap();
 
@@ -4588,6 +4716,8 @@ mod tests {
             HarnessKind::ClaudeCode,
             &session_id.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap_err();
         match err {
@@ -4615,6 +4745,8 @@ mod tests {
             HarnessKind::ClaudeCode,
             &session_id.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap();
         let err = attach_agent_impl(
@@ -4623,6 +4755,8 @@ mod tests {
             HarnessKind::ClaudeCode,
             &session_id.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap_err();
         assert!(matches!(err, AppError::SessionAlreadyAttached { .. }));
@@ -4642,6 +4776,8 @@ mod tests {
             HarnessKind::Codex,
             &session_id.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap();
 
@@ -4652,6 +4788,8 @@ mod tests {
             HarnessKind::Codex,
             &session_id.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap_err();
         // Discovery (existence check) runs before the sidecar collision scan
@@ -4673,7 +4811,7 @@ mod tests {
     #[tokio::test]
     async fn attach_rejects_duplicate_name_in_active_project() {
         let (tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
-        create_agent_impl(&state, "taken", HarnessKind::ClaudeCode).unwrap();
+        create_agent_impl(&state, "taken", HarnessKind::ClaudeCode, None, None).unwrap();
         let session_id = Uuid::now_v7();
         stage_claude_session_file(tmp_home.path(), tmp_workdir.path(), &session_id);
 
@@ -4683,6 +4821,8 @@ mod tests {
             HarnessKind::ClaudeCode,
             &session_id.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap_err();
         assert!(matches!(
@@ -4713,6 +4853,8 @@ mod tests {
             HarnessKind::Codex,
             &id_str,
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap_err();
         match err {
@@ -4746,6 +4888,8 @@ mod tests {
             HarnessKind::Codex,
             &first_session.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap();
 
@@ -4759,6 +4903,8 @@ mod tests {
             HarnessKind::Codex,
             &second_session.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap_err();
         assert!(matches!(
@@ -4798,6 +4944,8 @@ mod tests {
             HarnessKind::Codex,
             &session_id.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap();
         let err = attach_agent_impl(
@@ -4806,6 +4954,8 @@ mod tests {
             HarnessKind::Codex,
             &session_id.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap_err();
         assert!(matches!(err, AppError::SessionAlreadyAttached { .. }));
@@ -4846,6 +4996,8 @@ mod tests {
                 HarnessKind::ClaudeCode,
                 &session_id.to_string(),
                 tmp_home.path(),
+                None,
+                None,
             )
             .unwrap();
         } // state_a dropped — project A's registry is persisted but no longer loaded in any AppState.
@@ -4874,6 +5026,8 @@ mod tests {
             HarnessKind::ClaudeCode,
             &session_id.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap_err();
         match err {
@@ -4916,6 +5070,8 @@ mod tests {
                 HarnessKind::Codex,
                 &session_id.to_string(),
                 tmp_home.path(),
+                None,
+                None,
             )
             .unwrap();
         }
@@ -4941,6 +5097,8 @@ mod tests {
             HarnessKind::Codex,
             &session_id.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap_err();
         match err {
@@ -4979,6 +5137,8 @@ mod tests {
             HarnessKind::ClaudeCode,
             &Uuid::now_v7().to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap_err();
         assert!(matches!(err, AppError::NoActiveProject));
@@ -4996,6 +5156,8 @@ mod tests {
             HarnessKind::ClaudeCode,
             &session_id.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap();
 
@@ -5413,6 +5575,8 @@ mod tests {
             HarnessKind::ClaudeCode,
             &session_id.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap();
 
@@ -5455,6 +5619,8 @@ mod tests {
             HarnessKind::ClaudeCode,
             &session_id.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap();
 
@@ -5492,6 +5658,8 @@ mod tests {
             HarnessKind::ClaudeCode,
             &session_id.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap();
 
@@ -5558,7 +5726,8 @@ mod tests {
         // End-to-end: a Codex thread-id with shell metacharacters is
         // single-quoted in the rendered resume command.
         let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
-        let agent = create_agent_impl(&state, "codex_evil", HarnessKind::Codex).unwrap();
+        let agent =
+            create_agent_impl(&state, "codex_evil", HarnessKind::Codex, None, None).unwrap();
         set_agent_session_locator_impl(
             &state,
             agent.id,
@@ -5581,7 +5750,8 @@ mod tests {
     async fn agent_session_info_for_never_dispatched_agent_is_empty() {
         let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
         // Codex agent with no sidecar (never dispatched) → nothing to open/resume.
-        let record = create_agent_impl(&state, "codex_one", HarnessKind::Codex).unwrap();
+        let record =
+            create_agent_impl(&state, "codex_one", HarnessKind::Codex, None, None).unwrap();
         let info = agent_session_info_impl(&state, record.id, tmp_home.path()).unwrap();
         assert_eq!(info, AgentSessionInfo::default());
     }
@@ -5591,7 +5761,7 @@ mod tests {
         // The resume id is the Codex locator's thread-id on the record. Resume
         // is offered from it even when the local session file isn't present.
         let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
-        let agent = create_agent_impl(&state, "codex_two", HarnessKind::Codex).unwrap();
+        let agent = create_agent_impl(&state, "codex_two", HarnessKind::Codex, None, None).unwrap();
         set_agent_session_locator_impl(
             &state,
             agent.id,
@@ -5617,7 +5787,8 @@ mod tests {
     async fn load_transcript_for_codex_agent_without_sidecar_returns_meta_only_empty() {
         let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
         // Create a Codex agent the normal way (no sidecar — no first dispatch).
-        let record = create_agent_impl(&state, "codex_one", HarnessKind::Codex).unwrap();
+        let record =
+            create_agent_impl(&state, "codex_one", HarnessKind::Codex, None, None).unwrap();
 
         let result = load_transcript_impl(&state, record.id, tmp_home.path()).unwrap();
         assert!(result.turns.is_empty());
@@ -5644,6 +5815,8 @@ mod tests {
             HarnessKind::Antigravity,
             &conversation_id.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -5675,6 +5848,8 @@ mod tests {
             HarnessKind::Antigravity,
             &conversation_id.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap();
 
@@ -5693,6 +5868,8 @@ mod tests {
             HarnessKind::Antigravity,
             &conversation_id.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap_err();
         match err {
@@ -5720,6 +5897,8 @@ mod tests {
             HarnessKind::Antigravity,
             &conversation_id.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap();
         let err = attach_agent_impl(
@@ -5728,6 +5907,8 @@ mod tests {
             HarnessKind::Antigravity,
             &conversation_id.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap_err();
         match err {
@@ -5745,7 +5926,8 @@ mod tests {
         // Antigravity agent never dispatched → no locator → empty turns, but
         // loader-derived registry meta still surfaces (mirrors the Codex arm)
         // so the sidebar populates the moment the agent is selected.
-        let record = create_agent_impl(&state, "agy_one", HarnessKind::Antigravity).unwrap();
+        let record =
+            create_agent_impl(&state, "agy_one", HarnessKind::Antigravity, None, None).unwrap();
         assert!(record.session_locator.is_none());
         let result = load_transcript_impl(&state, record.id, tmp_home.path()).unwrap();
         assert!(result.turns.is_empty());
@@ -5755,7 +5937,8 @@ mod tests {
     #[tokio::test]
     async fn load_transcript_for_antigravity_agent_hydrates_prior_turns() {
         let (_tmp_workdir, tmp_home, state, _proj) = fresh_state_with_active_project("alpha").await;
-        let agent = create_agent_impl(&state, "agy_hydrate", HarnessKind::Antigravity).unwrap();
+        let agent =
+            create_agent_impl(&state, "agy_hydrate", HarnessKind::Antigravity, None, None).unwrap();
 
         // The server-assigned conversation UUID now lives on the record — the
         // same path the runtime-capture sink writes. Set it directly.
@@ -5824,6 +6007,8 @@ mod tests {
             HarnessKind::Gemini,
             &session_id.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -5849,6 +6034,8 @@ mod tests {
             HarnessKind::Gemini,
             &session_id.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap_err();
         match err {
@@ -5911,6 +6098,8 @@ mod tests {
             HarnessKind::Gemini,
             &id_b.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(record.session_locator, Some(SessionLocator::Uuid(id_b)));
@@ -5936,6 +6125,8 @@ mod tests {
             HarnessKind::Gemini,
             &asked.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap_err();
         assert!(
@@ -5978,6 +6169,8 @@ mod tests {
             HarnessKind::Gemini,
             &target.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap_err();
         match err {
@@ -6005,6 +6198,8 @@ mod tests {
             HarnessKind::Gemini,
             &session_id.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap();
 
@@ -6019,6 +6214,8 @@ mod tests {
             HarnessKind::Gemini,
             &other.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap_err();
         assert!(matches!(
@@ -6038,6 +6235,8 @@ mod tests {
             HarnessKind::Gemini,
             &session_id.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap();
 
@@ -6047,6 +6246,8 @@ mod tests {
             HarnessKind::Gemini,
             &session_id.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap_err();
         match err {
@@ -6070,6 +6271,8 @@ mod tests {
             HarnessKind::Gemini,
             &session_id.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap();
 
@@ -6081,6 +6284,8 @@ mod tests {
             HarnessKind::Gemini,
             &session_id.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap_err();
         match err {
@@ -6121,6 +6326,8 @@ mod tests {
             HarnessKind::Gemini,
             &session_id.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap_err();
         // Restore mode **before** asserting so TempDir's Drop can rmdir
@@ -6150,6 +6357,8 @@ mod tests {
             HarnessKind::Gemini,
             &session_id.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap_err();
         assert!(
@@ -6213,7 +6422,8 @@ mod tests {
     #[tokio::test]
     async fn register_cache_populates_clears_on_remove_and_repopulates_on_open() {
         let (tmp_workdir, _home, state, proj) = fresh_state_with_active_project("alpha").await;
-        let agent = create_agent_impl(&state, "assistant", HarnessKind::ClaudeCode).unwrap();
+        let agent =
+            create_agent_impl(&state, "assistant", HarnessKind::ClaudeCode, None, None).unwrap();
 
         // create_agent populated the cache → lookup resolves the owning
         // project without scanning any registry from disk.
@@ -6247,7 +6457,8 @@ mod tests {
     #[tokio::test]
     async fn open_with_corrupt_registry_errors_without_wedging_the_lock() {
         let (tmp_workdir, _home, state, proj) = fresh_state_with_active_project("alpha").await;
-        let agent = create_agent_impl(&state, "assistant", HarnessKind::ClaudeCode).unwrap();
+        let agent =
+            create_agent_impl(&state, "assistant", HarnessKind::ClaudeCode, None, None).unwrap();
 
         // Simulate a fresh process that hasn't loaded this project: drop the
         // in-memory maps (clearing project_locks releases the flock).
@@ -6410,7 +6621,7 @@ mod tests {
         // is untouched.
         let (tmp, state, _) = fresh_state_with_mock();
         let (a, project_id) = project_with_agent(&state, &tmp).await;
-        let b = create_agent_impl(&state, "second", HarnessKind::ClaudeCode).unwrap();
+        let b = create_agent_impl(&state, "second", HarnessKind::ClaudeCode, None, None).unwrap();
         let sidecar_a = meta_sidecar(&tmp, project_id, a.id);
         let sidecar_b = meta_sidecar(&tmp, project_id, b.id);
         write_dummy(&sidecar_a);
@@ -6479,7 +6690,7 @@ mod tests {
     async fn rename_agent_rejects_duplicate_name() {
         let (tmp, state, _) = fresh_state_with_mock();
         let (a, _pid) = project_with_agent(&state, &tmp).await;
-        create_agent_impl(&state, "second", HarnessKind::ClaudeCode).unwrap();
+        create_agent_impl(&state, "second", HarnessKind::ClaudeCode, None, None).unwrap();
         let err = rename_agent_impl(&state, a.id, "SECOND").unwrap_err();
         assert!(matches!(
             err,
@@ -6497,6 +6708,224 @@ mod tests {
         let (_tmp, state, _) = fresh_state_with_mock();
         let err = rename_agent_impl(&state, Uuid::now_v7(), "x").unwrap_err();
         assert!(matches!(err, AppError::AgentNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn create_agent_stores_model_and_effort() {
+        let (tmp, state, _) = fresh_state_with_mock();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "alpha");
+        set_active_project_impl(&state, project.id).unwrap();
+
+        let agent = create_agent_impl(
+            &state,
+            "a",
+            HarnessKind::ClaudeCode,
+            Some("opus".to_owned()),
+            Some("high".to_owned()),
+        )
+        .unwrap();
+        assert_eq!(agent.model.as_deref(), Some("opus"));
+        assert_eq!(agent.effort.as_deref(), Some("high"));
+        // Durable on the registry, not just the returned record.
+        let reloaded = lock(&state.projects).get(&project.id).cloned().unwrap();
+        let stored = &reloaded.list_agents().unwrap()[0];
+        assert_eq!(stored.model.as_deref(), Some("opus"));
+        assert_eq!(stored.effort.as_deref(), Some("high"));
+    }
+
+    #[tokio::test]
+    async fn create_agent_normalizes_blank_selections_to_none() {
+        let (tmp, state, _) = fresh_state_with_mock();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "alpha");
+        set_active_project_impl(&state, project.id).unwrap();
+
+        // Blank/whitespace must persist as unset, never `Some("")` (which would
+        // dispatch `--model ""` / `-c model_reasoning_effort=` every turn).
+        let agent = create_agent_impl(
+            &state,
+            "a",
+            HarnessKind::ClaudeCode,
+            Some("   ".to_owned()),
+            Some(String::new()),
+        )
+        .unwrap();
+        assert_eq!(agent.model, None);
+        assert_eq!(agent.effort, None);
+    }
+
+    #[tokio::test]
+    async fn create_agent_rejects_unsupported_selection_and_persists_nothing() {
+        let (tmp, state, _) = fresh_state_with_mock();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "alpha");
+        set_active_project_impl(&state, project.id).unwrap();
+
+        let err = create_agent_impl(
+            &state,
+            "a",
+            HarnessKind::Antigravity,
+            Some("anything".to_owned()),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AppError::Core(CoreError::SelectionUnsupported {
+                harness: HarnessKind::Antigravity,
+                axis: SelectionAxis::Model
+            })
+        ));
+        let err = create_agent_impl(
+            &state,
+            "g",
+            HarnessKind::Gemini,
+            None,
+            Some("high".to_owned()),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AppError::Core(CoreError::SelectionUnsupported {
+                harness: HarnessKind::Gemini,
+                axis: SelectionAxis::Effort
+            })
+        ));
+        // No partial agent landed in the registry or cache.
+        let reloaded = lock(&state.projects).get(&project.id).cloned().unwrap();
+        assert!(reloaded.list_agents().unwrap().is_empty());
+        assert!(lock(&state.agents_by_id).is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_agent_model_and_effort_update_record_cache_and_clear() {
+        let (tmp, state, _) = fresh_state_with_mock();
+        let (agent, project_id) = project_with_agent(&state, &tmp).await;
+
+        let updated = set_agent_model_impl(&state, agent.id, Some("opus".to_owned())).unwrap();
+        assert_eq!(updated.model.as_deref(), Some("opus"));
+        set_agent_effort_impl(&state, agent.id, Some("high".to_owned())).unwrap();
+
+        // Both registry and cache reflect the change.
+        let project = lock(&state.projects).get(&project_id).cloned().unwrap();
+        let stored = &project.list_agents().unwrap()[0];
+        assert_eq!(stored.model.as_deref(), Some("opus"));
+        assert_eq!(stored.effort.as_deref(), Some("high"));
+        let cached = lock(&state.agents_by_id).get(&agent.id).cloned().unwrap();
+        assert_eq!(cached.model.as_deref(), Some("opus"));
+        assert_eq!(cached.effort.as_deref(), Some("high"));
+
+        // Clearing persists `None`.
+        let cleared = set_agent_model_impl(&state, agent.id, None).unwrap();
+        assert_eq!(cleared.model, None);
+        set_agent_effort_impl(&state, agent.id, None).unwrap();
+        let project = lock(&state.projects).get(&project_id).cloned().unwrap();
+        let stored = &project.list_agents().unwrap()[0];
+        assert_eq!(stored.model, None);
+        assert_eq!(stored.effort, None);
+    }
+
+    #[tokio::test]
+    async fn set_agent_selection_normalizes_blank_to_none() {
+        let (tmp, state, _) = fresh_state_with_mock();
+        let (agent, _pid) = project_with_agent(&state, &tmp).await;
+
+        let updated = set_agent_model_impl(&state, agent.id, Some("  ".to_owned())).unwrap();
+        assert_eq!(updated.model, None);
+        let updated = set_agent_effort_impl(&state, agent.id, Some(String::new())).unwrap();
+        assert_eq!(updated.effort, None);
+    }
+
+    #[tokio::test]
+    async fn set_agent_selection_rejects_unsupported_harness() {
+        let (tmp, state, _) = fresh_state_with_mock();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "alpha");
+        set_active_project_impl(&state, project.id).unwrap();
+        let gemini = create_agent_impl(&state, "g", HarnessKind::Gemini, None, None).unwrap();
+        let antigravity =
+            create_agent_impl(&state, "a", HarnessKind::Antigravity, None, None).unwrap();
+
+        let err = set_agent_effort_impl(&state, gemini.id, Some("high".to_owned())).unwrap_err();
+        assert!(matches!(
+            err,
+            AppError::Core(CoreError::SelectionUnsupported {
+                harness: HarnessKind::Gemini,
+                axis: SelectionAxis::Effort
+            })
+        ));
+        let err = set_agent_model_impl(&state, antigravity.id, Some("x".to_owned())).unwrap_err();
+        assert!(matches!(
+            err,
+            AppError::Core(CoreError::SelectionUnsupported {
+                harness: HarnessKind::Antigravity,
+                axis: SelectionAxis::Model
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn attach_stores_model_and_effort() {
+        let (tmp_workdir, tmp_home, state, project) =
+            fresh_state_with_active_project("alpha").await;
+        let session_id = Uuid::now_v7();
+        stage_claude_session_file(tmp_home.path(), tmp_workdir.path(), &session_id);
+
+        let record = attach_agent_impl(
+            &state,
+            "attached",
+            HarnessKind::ClaudeCode,
+            &session_id.to_string(),
+            tmp_home.path(),
+            Some("sonnet".to_owned()),
+            Some("low".to_owned()),
+        )
+        .unwrap();
+        assert_eq!(record.model.as_deref(), Some("sonnet"));
+        assert_eq!(record.effort.as_deref(), Some("low"));
+        let reloaded = lock(&state.projects).get(&project.id).cloned().unwrap();
+        let stored = &reloaded.list_agents().unwrap()[0];
+        assert_eq!(stored.model.as_deref(), Some("sonnet"));
+        assert_eq!(stored.effort.as_deref(), Some("low"));
+    }
+
+    #[tokio::test]
+    async fn attach_rejects_unsupported_selection_before_session_lookup() {
+        let (_workdir, tmp_home, state, project) = fresh_state_with_active_project("alpha").await;
+
+        // A bogus session id with no staged file: if the capability check did
+        // NOT run first, attach would fail with SessionFileNotFound. Getting
+        // SelectionUnsupported instead proves the check precedes the lookup and
+        // the registry write.
+        let err = attach_agent_impl(
+            &state,
+            "g",
+            HarnessKind::Gemini,
+            &Uuid::now_v7().to_string(),
+            tmp_home.path(),
+            None,
+            Some("high".to_owned()),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AppError::Core(CoreError::SelectionUnsupported {
+                harness: HarnessKind::Gemini,
+                axis: SelectionAxis::Effort
+            })
+        ));
+        // Nothing was registered.
+        let reloaded = lock(&state.projects).get(&project.id).cloned().unwrap();
+        assert!(reloaded.list_agents().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -6852,7 +7281,7 @@ mod tests {
         // dispatch's DispatchContext reads the captured locator.
         let (tmp, state, _) = fresh_state_with_mock();
         let (_claude, project_id) = project_with_agent(&state, &tmp).await;
-        let codex = create_agent_impl(&state, "codex1", HarnessKind::Codex).unwrap();
+        let codex = create_agent_impl(&state, "codex1", HarnessKind::Codex, None, None).unwrap();
         assert!(codex.session_locator.is_none());
 
         let locator = SessionLocator::Codex {
@@ -6904,7 +7333,7 @@ mod tests {
 
         let (tmp, state, _) = fresh_state_with_mock();
         let (_claude, project_id) = project_with_agent(&state, &tmp).await;
-        let codex = create_agent_impl(&state, "codex1", HarnessKind::Codex).unwrap();
+        let codex = create_agent_impl(&state, "codex1", HarnessKind::Codex, None, None).unwrap();
 
         let project = lock(&state.projects).get(&project_id).cloned().unwrap();
         let sink = crate::locator_sink::ProjectSessionLocatorSink::new(
@@ -6947,7 +7376,7 @@ mod tests {
 
         let (tmp, state, _) = fresh_state_with_mock();
         let (_claude, project_id) = project_with_agent(&state, &tmp).await;
-        let codex = create_agent_impl(&state, "codex1", HarnessKind::Codex).unwrap();
+        let codex = create_agent_impl(&state, "codex1", HarnessKind::Codex, None, None).unwrap();
         let project = lock(&state.projects).get(&project_id).cloned().unwrap();
         let sink = crate::locator_sink::ProjectSessionLocatorSink::new(
             project,
@@ -7028,7 +7457,8 @@ mod tests {
         let (tmp, state, emitter) =
             fresh_state_with_scenario(switchboard_harness::MockScenario::AwaitCancellation);
         let (agent_a, _project_id) = project_with_agent(&state, &tmp).await;
-        let agent_b = create_agent_impl(&state, "assistant-2", HarnessKind::ClaudeCode).unwrap();
+        let agent_b =
+            create_agent_impl(&state, "assistant-2", HarnessKind::ClaudeCode, None, None).unwrap();
 
         // One Send fanned out to both: same `send_id`, one call per recipient.
         let send_id = Uuid::now_v7();
@@ -7411,6 +7841,8 @@ mod tests {
             HarnessKind::Codex,
             &session_id.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap();
 
@@ -7426,6 +7858,8 @@ mod tests {
             HarnessKind::Codex,
             &session_id.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap_err();
         assert!(
@@ -7459,6 +7893,8 @@ mod tests {
             HarnessKind::ClaudeCode,
             &session_id.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .unwrap();
 
@@ -7473,6 +7909,8 @@ mod tests {
             HarnessKind::ClaudeCode,
             &session_id.to_string(),
             tmp_home.path(),
+            None,
+            None,
         )
         .expect("same Claude id under a different directory is a distinct session");
     }
@@ -7764,7 +8202,7 @@ mod tests {
         // create_agent / create_project are synchronous; run them on blocking
         // tasks so they truly race the async remove.
         let agent_h = tokio::task::spawn_blocking(move || {
-            create_agent_impl(&agent_state, "racer", HarnessKind::ClaudeCode)
+            create_agent_impl(&agent_state, "racer", HarnessKind::ClaudeCode, None, None)
         });
         let project_h = tokio::task::spawn_blocking(move || {
             create_project_impl(&project_state, "racer-proj", &dir_path)

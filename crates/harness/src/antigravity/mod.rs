@@ -310,6 +310,12 @@ fn resolve_home_dir(override_path: Option<&Path>) -> PathBuf {
 /// `log_file` isolates this dispatch's CLI log so the no-answer-branch outcome
 /// scan (and the conversation-id capture) read only this turn's output — never
 /// another concurrent `agy`'s log.
+///
+/// No per-agent model or effort flag: Antigravity's model is harness-owned
+/// global config (set inside Antigravity, off-limits to us) and its effort is
+/// folded into that model's display name — there is no `agy` flag for either.
+/// An Antigravity agent therefore never carries a model/effort (registration
+/// forbids it), so this takes no `&AgentRecord` and emits neither flag.
 fn build_args(prompt: &str, cwd: &Path, resume_id: Option<Uuid>, log_file: &Path) -> Vec<String> {
     let mut args = vec!["-p".to_owned(), prompt.to_owned()];
     args.push("--add-dir".to_owned());
@@ -1328,6 +1334,25 @@ mod tests {
         assert_eq!(args[idx + 1], uuid.to_string());
         // Workspace is re-established on resume too (agy is one-shot).
         assert!(args.contains(&"--add-dir".to_owned()));
+    }
+
+    #[test]
+    fn build_args_never_emits_model_or_effort_flags() {
+        // Antigravity has no per-invocation model/effort control — neither flag
+        // should ever appear, on first turn or resume.
+        let log = PathBuf::from("/tmp/x.log");
+        for resume in [None, Some(Uuid::new_v4())] {
+            let args = build_args("hello", Path::new("/work/proj"), resume, &log);
+            assert!(
+                !args.iter().any(|a| a == "-m" || a == "--model"),
+                "{args:?}"
+            );
+            assert!(!args.iter().any(|a| a == "--effort"), "{args:?}");
+            assert!(
+                !args.iter().any(|a| a.contains("reasoning")),
+                "no reasoning/effort config: {args:?}"
+            );
+        }
     }
 
     #[test]

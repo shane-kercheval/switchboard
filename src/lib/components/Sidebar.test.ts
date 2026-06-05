@@ -156,7 +156,7 @@ describe("Sidebar", () => {
 
     const resume = await screen.findByTestId("agent-action-resume");
     const open = await screen.findByTestId("agent-action-open-session");
-    expect(actions).toHaveAttribute("style", "--agent-action-width: 4.75rem;");
+    expect(actions).toHaveAttribute("style", "--agent-action-width: 5.125rem;");
     expect(resume).toHaveAttribute("tabindex", "-1");
     expect(open).toHaveAttribute("tabindex", "-1");
   });

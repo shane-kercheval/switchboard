@@ -36,9 +36,9 @@ The two surfaces never compete: the sidebar answers "what will the next turn use
 
 ### Decisions locked
 
-1. **Input mechanisms differ by axis.** **Model = hybrid** (per-harness dropdown of *suggested* models + free-text "custom…", because values aren't enumerable and are plan-dependent). **Effort = fixed enum dropdown** (the levels are a known, closed set per harness — no free-text, so no empty-string footgun). A "no selection / default" state is distinct from any explicit level; for Codex note that `none` is a *real* level (forces no reasoning) and is **not** the same as leaving effort unset (which passes no flag and uses the harness default).
+1. **Both axes are closed fixed-enum dropdowns (REVISED 2026-06-05 — was "model = hybrid free-text").** Model and effort are each a **curated per-harness dropdown**, no free-text. Rationale for the change: the product wants every agent created with a **known, displayed** model (never an opaque "we don't know what it'll run"), and free-text is error-prone. The values aren't API-enumerable, so the lists are **hardcoded from live-verified probes** (`harness-behavior.md` §3.3/§3.4) and patched when models ship/sunset. Claude's model list uses **durable aliases** (`opus`/`sonnet`/`haiku`) — "latest of family", no maintenance — and the M6 footer shows the **resolved** id per turn (intent vs. history). Codex/Gemini use ids (`gpt-5.5`/`gpt-5.4-mini`; `auto` + `gemini-*`). No free-text ⇒ no `Some("")` footgun at the form (the M3 backend normalization stays as defense). Codex `none` is still a *real* effort level distinct from "no override."
 2. **Validation: reactive.** We don't validate values server-side beyond the structural capability check (an Antigravity agent can't carry a model; a Gemini/Antigravity agent can't carry an effort). A bad/out-of-plan model surfaces as a normal failed turn with the harness's message. Effort is UI-constrained to its enum, so it has no footgun; for model, an empty/whitespace custom entry must normalize to "unset" at the form boundary, never persist as `Some("")` (which would dispatch `--model ""` and fail every turn).
-3. **Unset = harness default.** No selection → `None` → pass **no** flag → harness uses its own default. "Send every turn" applies only when a value is set.
+3. **Always pass an explicit value for capable harnesses (REVISED 2026-06-05 — was "unset = no flag").** The create form **preselects a default and always submits** a model+effort for Claude/Codex/Gemini, so `AgentRecord.{model,effort}` is always `Some` for them and the agent's model is known/displayed from creation. Passing no flag is *not* a nameable default (it's session-sticky / config-resolved / Antigravity-global — see `harness-behavior.md` §3.3), which is exactly why we don't rely on it. **Attach** preselects the **session's hydrated model** (M4 reads it) rather than a generic default. `None` now means only "no-capability" (Antigravity, which can't carry either) or a pre-feature agent. The dispatch rule (M2: "send when `Some`") is unchanged; the UI just always produces `Some` for capable harnesses. Preselected defaults: Claude `opus`/`high`, Codex `gpt-5.5`/`medium`, Gemini `auto`.
 4. **Per-turn display, every turn.** The transcript records and displays both model and effort per turn (carry-forward for Antigravity's model; blank only when genuinely unknown). For Codex both come straight from `turn_context`; for Claude the *model* is per-turn from its records, but whether the *effort* it ran at is exposed per-turn is unverified (its `init` carries model, not obviously effort) — if absent, Claude's effort is shown as selected-intent only, with no per-turn footer value (acceptable).
 5. **Change from the per-agent actions menu**, taking effect on the **next send** (never mutating an in-flight turn). Each control is absent for harnesses lacking that capability.
 
@@ -47,7 +47,7 @@ The two surfaces never compete: the sidebar answers "what will the next turn use
 - **Two capability helpers** in `crates/core` (M1): `HarnessKind::supports_model_selection()` (Claude/Codex/Gemini) and `supports_effort_selection()` (Claude/Codex). The frontend mirrors each with one capability map (M5). Every gate — command validation, picker visibility, card action — derives from these, never an ad-hoc `if harness == …`.
 - **`model` and `effort` are sibling `Option<String>` fields**, threaded identically through registration, dispatch, commands, and the per-turn `Turn`. They are two explicit fields (not a generic settings map — their value spaces and pickers differ), but they share every pattern: capability-gated, sent every turn when `Some`, displayed per turn.
 - **"Send the flag every turn when `Some`, omit when `None`"** (M2) is the dispatch rule for both axes on every model/effort-capable adapter.
-- **Two reusable pickers** (M5) — a hybrid model picker and a fixed-enum effort picker — built once and reused by the change-editors (M6).
+- **One reusable enum-select picker** (M5, REVISED) — both model and effort are closed per-harness dropdowns, so a single `{label, value}` select component serves both, reused by the M6 change-editors.
 
 ---
 
@@ -172,21 +172,24 @@ This replaces any "pick one representative value for the agent" notion — every
 ## Milestone 5 — Frontend: model + effort pickers in the create-agent form
 
 ### Goal & Outcome
-A user creating (or attaching) an agent can choose its model and effort, each gated to the harnesses that support it, with a short note where a control is unavailable.
+A user creating (or attaching) an agent picks its model and effort from **closed, curated, per-harness dropdowns** — each preselected to a sensible default and **always submitted** — so every agent is created with a **known, displayed** model (and effort, where supported). No free-text, no "unset/default" option for capable harnesses.
 
-- The form offers a hybrid **model** picker (Claude/Codex/Gemini) and a fixed-enum **effort** picker (Claude/Codex).
-- For a harness lacking a capability, that control is disabled with a short note and submits nothing for it (Antigravity: both disabled; Gemini: effort disabled, model enabled).
-- The chosen values reach the backend; an empty/whitespace custom model submits nothing, never `""`.
+- The form offers a **model** dropdown (Claude/Codex/Gemini) and an **effort** dropdown (Claude/Codex), each a fixed curated list with a preselected default.
+- For a harness lacking a capability, the control is replaced by a short **note** (Antigravity: both, with "set the model inside Antigravity"; Gemini: effort only).
+- **Create** preselects the harness default (Claude `opus`/`high`, Codex `gpt-5.5`/`medium`, Gemini `auto`); **attach** preselects the **session's hydrated model** (M4 reads it) so attaching doesn't silently switch a running session's model.
+- Both selections always reach the backend as concrete values for capable harnesses.
 
 ### Implementation Outline
 - Add two frontend capability maps to `src/lib/harnessDisplay.ts` mirroring `supports_model_selection()` and `supports_effort_selection()` (exhaustive `Record<HarnessKind, …>`).
-- Build **two reusable pickers**: a **hybrid model picker** (suggested dropdown + "custom…" free-text; value `string | undefined`; normalize empty/whitespace → `undefined` inside the component so `Some("")` can't cross the IPC boundary) and a **fixed-enum effort picker** (per-harness level list, plus an explicit "default / unset" choice = `undefined`). Built here for reuse in M6.
-- Per-harness constants: suggested models (Claude `opus`/`sonnet`/`haiku`; Gemini `gemini-2.5-pro`/`-flash` + `auto`; Codex `gpt-5.5`) — convenience-only, **comment that there is no queryable model list (no harness exposes one) and Codex values are plan-dependent, which is why this is hardcoded + free-text**; effort levels (Claude `low/medium/high/xhigh/max`; Codex `none/minimal/low/medium/high/xhigh` — note `none` is a real level distinct from unset). Confirm current aliases/levels against each CLI before finalizing.
-- Wire both into `CreateAgentForm.svelte` after the harness selector; disable+note where unsupported and omit from submit. **Mind the indirection — it's a three-layer thread, not just `api.ts`:** `CreateAgentForm.svelte` does not call the API. It emits an `AgentFormSubmit` discriminated union (`CreateAgentForm.types.ts`) to its parent (`App.svelte`'s `createOrAttachAndRegister`, reached via `handleCreateFirstAgent` / `handleAddAgent`), which then calls `createAgent`/`attachAgent`. So threading `model?: string` / `effort?: string` means extending **(1)** the `AgentFormSubmit` type, **(2)** the `App.svelte` handlers, and **(3)** the `createAgent`/`attachAgent` signatures in `api.ts`.
+- Build **one reusable enum-select component** (`{label, value}[]`, value `string`) used for *both* model and effort. No free-text branch, no empty-string handling needed (the closed list can't produce `""`); the M3 backend normalization stays as defense-in-depth.
+- **Per-harness curated lists (live-verified 2026-06-05 — see `harness-behavior.md` §3.3/§3.4; patch as models ship/sunset):**
+  - Model — **Claude** `opus`/`sonnet`/`haiku` (durable aliases; M6 footer shows the resolved id); **Codex** `gpt-5.5`, `gpt-5.4-mini`; **Gemini** `auto`, `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-2.5-flash-lite`, `gemini-3-pro-preview`, `gemini-3-flash-preview`, `gemini-3.1-pro-preview`, `gemini-3.1-flash-lite-preview`. Display friendly labels, submit the alias/id. **Antigravity** — no list; render the note. Comment: lists are hardcoded because no harness exposes a queryable list and Codex values are plan-gated (a curated entry can still fail per-account → failed turn, by design).
+  - Effort — **Claude** `low/medium/high/xhigh/max` (offer all 5; CLI silently downgrades unsupported levels per model — add a one-line caveat "higher levels may run lower on some models", *not* a model-aware matrix); **Codex** `none/minimal/low/medium/high/xhigh` (`none` is a real level). **Gemini/Antigravity** — note, no control.
+- Wire both into `CreateAgentForm.svelte` after the harness selector; preselect the default, swap the **harness-switch** to reset to that harness's default; replace unsupported controls with the note. **Mind the indirection — it's a three-layer thread, not just `api.ts`:** `CreateAgentForm.svelte` emits an `AgentFormSubmit` discriminated union (`CreateAgentForm.types.ts`) to `App.svelte`'s `createOrAttachAndRegister` (via `handleCreateFirstAgent`/`handleAddAgent`), which calls `createAgent`/`attachAgent`. Thread `model?: string` / `effort?: string` through **(1)** `AgentFormSubmit`, **(2)** the `App.svelte` handlers, **(3)** the `createAgent`/`attachAgent` signatures in `api.ts`.
 
 ### Definition of Done
-- Component tests (mock `invoke`): a suggested model, a custom model, and an effort level each produce the right payload; switching to Gemini disables effort but keeps model; switching to Antigravity disables both; untouched pickers submit nothing; **an empty/whitespace custom model submits nothing, not `""`**.
-- Both pickers are standalone components (reuse-ready for M6).
+- Component tests (mock `invoke`): create with each harness submits the **preselected default** model/effort; changing a dropdown submits the chosen value; switching harness resets to that harness's default and shows the right controls (Gemini: effort→note; Antigravity: both→note); **attach preselects the session's hydrated model**.
+- The enum-select is a standalone component (reuse-ready for M6).
 - `make check` green.
 
 ---
@@ -221,7 +224,7 @@ For a capable agent the user can change its model/effort after creation; the sid
 
 ## Out of scope (explicitly)
 
-- Enumerating or validating model values, or detecting plan-gated Codex models — reactive failure is the design.
+- *Querying* harness model lists, validating values, or detecting plan-gated Codex models — no harness exposes a list, so the dropdowns are **hardcoded curated lists** (live-verified, patched as models ship/sunset), and a curated value that's plan-gated for the user's account still fails reactively as a normal failed turn. (Curated ≠ validated.)
 - Any mechanism to set Antigravity's model or Gemini's effort (both are harness-owned config we never touch; per-`HOME`/config-dir isolation was tested and declined — §3.3). These are read-only/unavailable here and documented as user-facing limitations.
 - Changing model/effort mid-turn / interrupting an in-flight turn.
 - A global or project-level default for either — selection is strictly per-agent.

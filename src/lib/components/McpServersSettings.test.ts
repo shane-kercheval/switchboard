@@ -78,6 +78,31 @@ describe("McpServersSettings", () => {
     expect(screen.getByTestId("mcp-row-team")).toHaveTextContent("no token");
   });
 
+  it("disables sync prompts when no MCP servers are configured", async () => {
+    render(McpServersSettings);
+    await waitFor(() => expect(screen.getByTestId("mcp-empty")).toBeInTheDocument());
+
+    const sync = screen.getByTestId("mcp-sync") as HTMLButtonElement;
+    expect(sync.disabled).toBe(true);
+
+    await fireEvent.click(sync);
+    expect(invokeMock).not.toHaveBeenCalledWith("sync_prompts");
+  });
+
+  it("enables sync prompts when an MCP server is configured", async () => {
+    providers = [
+      { name: "team", url: "https://x", has_token: false, status: { state: "unknown" } },
+    ];
+    render(McpServersSettings);
+    await waitFor(() => expect(screen.getByTestId("mcp-row-team")).toBeInTheDocument());
+
+    const sync = screen.getByTestId("mcp-sync") as HTMLButtonElement;
+    expect(sync.disabled).toBe(false);
+
+    await fireEvent.click(sync);
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "sync_prompts")).toBe(true);
+  });
+
   it("rejects the reserved name `local` and blocks submit", async () => {
     render(McpServersSettings);
     await waitFor(() => expect(screen.getByTestId("mcp-empty")).toBeInTheDocument());

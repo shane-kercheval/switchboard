@@ -43,6 +43,7 @@
   });
   const urlValid = $derived(/^https?:\/\//i.test(url.trim()));
   const canSubmit = $derived(!adding && trimmedName !== "" && nameError === null && urlValid);
+  const canSync = $derived(!syncing && providers.length > 0);
 
   function bearerOrNull(): string | null {
     return bearer.trim() === "" ? null : bearer.trim();
@@ -118,6 +119,7 @@
   }
 
   async function handleSync(): Promise<void> {
+    if (!canSync) return;
     syncing = true;
     try {
       await syncPrompts();
@@ -208,7 +210,7 @@
       variant="secondary"
       size="sm"
       data-testid="mcp-sync"
-      disabled={syncing}
+      disabled={!canSync}
       onclick={handleSync}
     >
       {syncing ? "Syncing…" : "Sync prompts"}

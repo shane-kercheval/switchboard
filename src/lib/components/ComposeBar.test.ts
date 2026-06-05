@@ -223,20 +223,44 @@ describe("ComposeBar", () => {
     const bob = await screen.findByTestId(`recipient-option-${AGENT_B.id}`);
     const menu = screen.getByTestId("recipient-menu");
     const menuText = menu.textContent ?? "";
+    expect(menu).toHaveClass("inset-x-0", "bottom-full");
     expect(menuText.indexOf("Files")).toBeLessThan(menuText.indexOf("Send to"));
     expect(file).toHaveAttribute("aria-selected", "false");
     const fileLabel = file.querySelector('[data-testid="file-option-label"]');
-    expect(fileLabel).toHaveAttribute("dir", "rtl");
+    const filePath = file.querySelector('[data-testid="file-option-path"]');
+    expect(fileLabel).not.toHaveAttribute("dir");
     expect(fileLabel).not.toHaveAttribute("title");
-    expect(fileLabel).toHaveClass("min-w-0", "truncate", "text-left");
+    expect(fileLabel).toHaveTextContent("bob.md");
+    expect(fileLabel).toHaveClass("min-w-0", "truncate", "text-left", "text-xs", "font-medium");
+    expect(filePath).toHaveTextContent("docs");
+    expect(filePath).toHaveClass("truncate", "text-left", "text-[11px]");
+    expect(bob).not.toHaveClass("text-xs");
     await fireEvent.pointerEnter(file);
-    expect(await screen.findByTestId("tooltip-content")).toHaveTextContent("docs/bob.md");
+    expect(screen.queryByTestId("tooltip-content")).toBeNull();
     expect(bob).toHaveAttribute("aria-selected", "true");
 
     await fireEvent.keyDown(textarea, { key: "Enter" });
     expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "false");
     expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "true");
     expect(textarea.value).toBe("ping ");
+  });
+
+  it("@ menu closes the prompt menu before opening", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+
+    const ComposeBar = (await import("./ComposeBar.svelte")).default;
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+    await fireEvent.click(screen.getByTestId("compose-prompt-button"));
+    expect(await screen.findByTestId("prompt-menu")).toBeInTheDocument();
+
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "ping @bo" } });
+
+    expect(await screen.findByTestId("recipient-menu")).toBeInTheDocument();
+    expect(screen.queryByTestId("prompt-menu")).toBeNull();
   });
 
   it("@ menu inserts a selected README file mention without changing recipients", async () => {
@@ -1121,9 +1145,17 @@ describe("ComposeBar prompt mode", () => {
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
 
     await enterPromptMode("prompt-option-local:review");
+    const focusArg = screen.getByTestId("prompt-arg-focus");
+    expect(focusArg).toHaveFocus();
     expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(true);
-    await fireEvent.input(screen.getByTestId("prompt-arg-focus"), { target: { value: "tests" } });
+    await fireEvent.input(focusArg, { target: { value: "tests" } });
     expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(false);
+    await fireEvent.keyDown(focusArg, { key: "Enter", metaKey: true });
+
+    await waitFor(() => {
+      const sends = invokeMock.mock.calls.filter(([c]) => c === "send_message");
+      expect(sends).toHaveLength(1);
+    });
   });
 
   it("returns to the plain composer carrying appended text back on remove", async () => {
@@ -1195,30 +1227,46 @@ describe("ComposeBar prompt mode", () => {
   it("shows a pending, disabled send while the render is in flight, then dispatches", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
     let release!: (v: { text: string }) => void;
     const gate = new Promise<{ text: string }>((res) => {
       release = res;
     });
     mockPromptBackend({ prompts: [SUMMARY], render: () => gate });
     const ComposeBar = (await import("./ComposeBar.svelte")).default;
-    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
 
+    await fireEvent.click(chip(AGENT_B.id));
     await enterPromptMode("prompt-option-tiddly:summary");
     await fireEvent.click(screen.getByTestId("compose-send"));
 
-    // Render is awaiting → send is disabled (pending), no dispatch yet.
+    // Render is awaiting: controls whose values were snapshotted are locked and
+    // no dispatch happens until the MCP render returns.
     await waitFor(() =>
       expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(true),
     );
+    expect(screen.getByTestId("prompt-rendering")).toHaveTextContent("Rendering prompt");
+    expect(screen.getByTestId("prompt-rendering").querySelector(".animate-spin")).not.toBeNull();
+    expect((screen.getByTestId("prompt-appended") as HTMLTextAreaElement).disabled).toBe(true);
+    expect((screen.getByTestId("prompt-preview-button") as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByTestId("prompt-remove") as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByTestId("compose-prompt-button") as HTMLButtonElement).disabled).toBe(true);
+    expect((chip(AGENT_A.id) as HTMLButtonElement).disabled).toBe(true);
+    expect((chip(AGENT_B.id) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByTestId("recipient-clear") as HTMLButtonElement).disabled).toBe(true);
+    await fireEvent.keyDown(window, { key: "2", metaKey: true });
+    expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "true");
     expect(invokeMock.mock.calls.some(([c]) => c === "send_message")).toBe(false);
 
     release({ text: "DONE" });
-    await waitFor(() =>
-      expect(invokeMock.mock.calls.some(([c]) => c === "send_message")).toBe(true),
-    );
+    await waitFor(() => {
+      const sends = invokeMock.mock.calls.filter(([c]) => c === "send_message");
+      expect(sends).toHaveLength(2);
+    });
     // Successful send returns to the plain composer.
     await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
     expect((state.transcripts[AGENT_A.id] ?? [])[0]).toMatchObject({ text: "DONE" });
+    expect((state.transcripts[AGENT_B.id] ?? [])[0]).toMatchObject({ text: "DONE" });
   });
 
   it("restores a persisted prompt-mode draft (prompt, args, appended text)", async () => {
@@ -1311,7 +1359,7 @@ describe("ComposeBar prompt mode", () => {
     );
   });
 
-  it("a Remove during the in-flight render aborts the send", async () => {
+  it("keeps prompt removal locked while the send render is in flight", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
     let release!: (v: { text: string }) => void;
@@ -1324,19 +1372,18 @@ describe("ComposeBar prompt mode", () => {
 
     await enterPromptMode("prompt-option-tiddly:summary");
     await fireEvent.click(screen.getByTestId("compose-send"));
-    // Back out mid-render via the ✕.
+    expect((screen.getByTestId("prompt-remove") as HTMLButtonElement).disabled).toBe(true);
     await fireEvent.click(screen.getByTestId("prompt-remove"));
     release({ text: "DONE" });
-    await tick();
-    await tick();
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.some(([c]) => c === "send_message")).toBe(true),
+    );
 
-    // The send was aborted: no dispatch, no optimistic turn, composer is plain.
-    expect(invokeMock.mock.calls.some(([c]) => c === "send_message")).toBe(false);
-    expect((state.transcripts[AGENT_A.id] ?? []).length).toBe(0);
-    expect(screen.getByTestId("compose-textarea")).toBeInTheDocument();
+    expect((state.transcripts[AGENT_A.id] ?? [])[0]).toMatchObject({ text: "DONE" });
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
   });
 
-  it("a recipient deselected during the in-flight render aborts the send", async () => {
+  it("keeps recipients locked while the send render is in flight", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
@@ -1351,16 +1398,16 @@ describe("ComposeBar prompt mode", () => {
     await fireEvent.click(chip(AGENT_B.id)); // select both A + B
     await enterPromptMode("prompt-option-tiddly:summary");
     await fireEvent.click(screen.getByTestId("compose-send"));
-    // Deselect a chosen recipient while the render is in flight.
+    expect((chip(AGENT_A.id) as HTMLButtonElement).disabled).toBe(true);
     await fireEvent.click(chip(AGENT_A.id));
     release({ text: "DONE" });
-    await tick();
-    await tick();
+    await waitFor(() => {
+      const sends = invokeMock.mock.calls.filter(([c]) => c === "send_message");
+      expect(sends).toHaveLength(2);
+    });
 
-    // The mid-render deselect is honored: nothing dispatched, no optimistic turns.
-    expect(invokeMock.mock.calls.some(([c]) => c === "send_message")).toBe(false);
-    expect((state.transcripts[AGENT_A.id] ?? []).length).toBe(0);
-    expect((state.transcripts[AGENT_B.id] ?? []).length).toBe(0);
+    expect((state.transcripts[AGENT_A.id] ?? [])[0]).toMatchObject({ text: "DONE" });
+    expect((state.transcripts[AGENT_B.id] ?? [])[0]).toMatchObject({ text: "DONE" });
   });
 
   it("stamps project activity on a prompt send", async () => {

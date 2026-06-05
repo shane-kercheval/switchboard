@@ -21,10 +21,10 @@ const PROMPT: Prompt = {
   tags: [],
 };
 
-function setup(args: Record<string, string>, appendedText = "") {
+function setup(args: Record<string, string>, appendedText = "", busy = false) {
   const onremove = vi.fn();
   render(PromptComposer, {
-    props: { prompt: PROMPT, args, appendedText, onremove },
+    props: { prompt: PROMPT, args, appendedText, onremove, busy },
   });
   return { onremove };
 }
@@ -47,6 +47,61 @@ describe("PromptComposer", () => {
     setup({ focus: "", tone: "" });
     expect(screen.getByTestId("prompt-appended")).toBeInTheDocument();
     expect(screen.getByTestId("prompt-selector")).toHaveTextContent("Code Review");
+  });
+
+  it("keeps prompt fields in a capped scroll region", () => {
+    setup({ focus: "", tone: "" });
+    expect(screen.getByTestId("prompt-composer")).toHaveClass(
+      "max-h-[min(56dvh,34rem)]",
+      "overflow-hidden",
+    );
+    expect(screen.getByTestId("prompt-fields-scroll")).toHaveClass(
+      "min-h-0",
+      "overflow-y-auto",
+      "pl-1",
+      "pr-3",
+      "[scrollbar-gutter:stable]",
+    );
+  });
+
+  it("autosizes argument and appended textareas up to their max height", async () => {
+    const scrollHeight = vi.spyOn(HTMLTextAreaElement.prototype, "scrollHeight", "get");
+    const getComputedStyleSpy = vi.spyOn(window, "getComputedStyle");
+    try {
+      scrollHeight.mockImplementation(function (this: HTMLTextAreaElement): number {
+        return this.value.includes("\n") ? 220 : 60;
+      });
+      getComputedStyleSpy.mockReturnValue({ maxHeight: "160px" } as CSSStyleDeclaration);
+
+      setup({ focus: "", tone: "" });
+      const focus = screen.getByTestId("prompt-arg-focus") as HTMLTextAreaElement;
+      const appended = screen.getByTestId("prompt-appended") as HTMLTextAreaElement;
+
+      await fireEvent.input(focus, { target: { value: "one\ntwo\nthree\nfour" } });
+      expect(focus.style.height).toBe("160px");
+      expect(focus.style.overflowY).toBe("auto");
+
+      await fireEvent.input(appended, { target: { value: "short" } });
+      expect(appended.style.height).toBe("60px");
+      expect(appended.style.overflowY).toBe("hidden");
+    } finally {
+      scrollHeight.mockRestore();
+      getComputedStyleSpy.mockRestore();
+    }
+  });
+
+  it("focuses the first prompt field when requested", async () => {
+    render(PromptComposer, {
+      props: {
+        prompt: PROMPT,
+        args: { focus: "", tone: "" },
+        appendedText: "",
+        onremove: vi.fn(),
+        focusFirstField: true,
+      },
+    });
+
+    await waitFor(() => expect(screen.getByTestId("prompt-arg-focus")).toHaveFocus());
   });
 
   it("previews the combined message (rendered prompt + appended text) as markdown", async () => {
@@ -72,9 +127,39 @@ describe("PromptComposer", () => {
     expect((call?.[1] as { args: Record<string, string> }).args).not.toHaveProperty("tone");
   });
 
+  it("shows a spinner while preview rendering is pending", async () => {
+    invokeMock.mockReturnValue(new Promise(() => undefined));
+    setup({ focus: "tests", tone: "" });
+
+    await fireEvent.click(screen.getByTestId("prompt-preview-button"));
+
+    const loading = await screen.findByTestId("prompt-preview-loading");
+    expect(loading).toHaveTextContent("Rendering preview");
+    expect(loading.querySelector(".animate-spin")).not.toBeNull();
+  });
+
   it("disables Preview until required arguments are filled", async () => {
     setup({ focus: "", tone: "" });
     expect((screen.getByTestId("prompt-preview-button") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("locks prompt controls and shows status while busy", async () => {
+    const { onremove } = setup({ focus: "tests", tone: "" }, "tail", true);
+
+    expect(screen.getByTestId("prompt-composer")).toHaveAttribute("aria-busy", "true");
+    expect((screen.getByTestId("prompt-arg-focus") as HTMLTextAreaElement).disabled).toBe(true);
+    expect((screen.getByTestId("prompt-arg-tone") as HTMLTextAreaElement).disabled).toBe(true);
+    expect((screen.getByTestId("prompt-appended") as HTMLTextAreaElement).disabled).toBe(true);
+    expect((screen.getByTestId("prompt-preview-button") as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByTestId("prompt-remove") as HTMLButtonElement).disabled).toBe(true);
+
+    const status = screen.getByTestId("prompt-rendering");
+    expect(status).toHaveTextContent("Rendering prompt");
+    expect(status).toHaveClass("absolute", "inset-0", "backdrop-blur-[1px]");
+    expect(screen.getByTestId("prompt-composer-content")).toHaveClass("opacity-55", "blur-[1px]");
+    expect(status.querySelector(".animate-spin")).not.toBeNull();
+    await fireEvent.click(screen.getByTestId("prompt-remove"));
+    expect(onremove).not.toHaveBeenCalled();
   });
 
   it("surfaces a preview render failure inline", async () => {

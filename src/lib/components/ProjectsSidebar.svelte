@@ -377,14 +377,16 @@
         {@const busy = liveSends.size > 0}
         {@const completed = !busy && project.id in backgroundCompletedProjectIds}
         {@const editing = editingProjectId === project.id}
+        {@const highlighted =
+          project.id === (selection.loadingProjectId ?? selection.activeProjectId)}
         <div
           class={cn(
-            "group hover:bg-raised/70 flex w-full flex-col rounded-md transition-colors",
-            project.id === selection.activeProjectId && "bg-raised hover:bg-raised",
+            "group hover:bg-raised/70 flex w-full flex-col rounded-md",
+            highlighted && "bg-raised hover:bg-raised",
           )}
           data-testid="project-row"
           data-project-id={project.id}
-          data-active={project.id === selection.activeProjectId}
+          data-active={highlighted}
           use:disarmDeleteOnLeave={project.id}
         >
           <div class="flex w-full items-center">

@@ -20,6 +20,7 @@ vi.mock("$lib/native", () => ({
 }));
 
 const { refreshAll, _testing } = await import("$lib/state/gitView.svelte");
+const currentYear = new Date().getFullYear();
 
 afterEach(() => {
   _testing.reset();
@@ -91,7 +92,8 @@ function wire(list: RepoListing[]) {
               subject: "first commit",
               author_name: "T",
               author_email: null,
-              authored_at: null,
+              authored_at: `${currentYear}-06-05T17:14:00Z`,
+              branch_work: true,
             },
           ],
         },
@@ -203,15 +205,18 @@ describe("GitView", () => {
     await waitFor(() => expect(screen.getByTestId("git-repo")).toBeInTheDocument());
   });
 
-  it("clicking a branch opens the diff panel, lists its commits, and closing it returns to the full tree", async () => {
+  it("clicking a branch opens the diff panel, lists its commits, and closing it returns to the empty inspector", async () => {
     wire([repo()]);
     await refreshAll();
     render(GitView);
     await waitFor(() => expect(screen.getByTestId("git-repo")).toBeInTheDocument());
 
-    // No panel until a branch is selected.
+    // The inspector stays mounted so the split layout does not jump, but no
+    // diff panel renders until a branch/commit/worktree is selected.
     expect(screen.queryByTestId("diff-panel")).not.toBeInTheDocument();
-    expect(screen.queryByTestId("git-detail-sidebar")).not.toBeInTheDocument();
+    expect(screen.getByTestId("git-detail-sidebar")).toBeInTheDocument();
+    expect(screen.getByTestId("git-detail-resizer")).toBeInTheDocument();
+    expect(screen.getByTestId("git-detail-empty")).toHaveTextContent("Select a commit");
 
     // Click the `main` branch row (dirty worktree → defaults to its uncommitted
     // changes, and expands its commit list).
@@ -228,9 +233,15 @@ describe("GitView", () => {
     // …and the branch's commits load into the tree.
     await waitFor(() => expect(screen.getByTestId("commit-row")).toBeInTheDocument());
     expect(screen.getByTestId("commit-row")).toHaveTextContent("first commit");
+    expect(screen.getByTestId("commit-row")).toHaveTextContent(/06-05 \d{2}:14/);
+    expect(
+      within(screen.getByTestId("commit-row")).getByTestId("branch-work-indicator"),
+    ).toBeInTheDocument();
 
     await fireEvent.click(screen.getByTestId("detail-close"));
     await waitFor(() => expect(screen.queryByTestId("diff-panel")).not.toBeInTheDocument());
+    expect(screen.getByTestId("git-detail-sidebar")).toBeInTheDocument();
+    expect(screen.getByTestId("git-detail-empty")).toHaveTextContent("Select a commit");
   });
 
   it("clicking a remote-only branch opens the panel on its latest commit (no worktree)", async () => {
@@ -248,6 +259,7 @@ describe("GitView", () => {
     await waitFor(() =>
       expect(screen.getByTestId("detail-title")).toHaveTextContent("first commit"),
     );
+    expect(screen.getByTestId("detail-subtitle").textContent).toMatch(/c0ffee1 · .+ · T/);
     // The branch's commits are requested by repo root + remote ref kind.
     const commitsCall = invokeMock.mock.calls.find((c) => c[0] === "branch_commits");
     expect(commitsCall?.[1]).toMatchObject({ kind: "remote", name: "origin/remote-only" });

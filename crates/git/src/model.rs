@@ -285,6 +285,9 @@ pub struct GitCommitSummary {
     /// when the stored time can't be represented (defensive — real commits have
     /// a valid time).
     pub authored_at: Option<String>,
+    /// True when this commit is reachable from the selected ref and not reachable
+    /// from the repo's resolved default branch tip.
+    pub branch_work: bool,
 }
 
 /// Which slice of history a [`GitCommitRange`] holds. Serializes to a bare

@@ -8,12 +8,17 @@
   import { cn, basename } from "$lib/utils";
   import { formatHomePath } from "$lib/utils";
   import Badge from "$lib/components/ui/Badge.svelte";
-  import GitBadge from "$lib/components/GitBadge.svelte";
+  import GitStatusIcon from "$lib/components/GitStatusIcon.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
+  import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import DropdownMenu from "$lib/components/ui/DropdownMenu.svelte";
   import DropdownMenuItem from "$lib/components/ui/DropdownMenuItem.svelte";
   import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
-  import { localBranchBadges, remoteBranchBadges, remoteOnlyBadge } from "$lib/gitBadges";
+  import {
+    localBranchIndicators,
+    remoteBranchIndicators,
+    remoteOnlyIndicator,
+  } from "$lib/gitStatusIndicators";
   import type { BranchView, RemoteBranchView, RepoListing, WorktreeView } from "$lib/types";
   import type { FetchState } from "$lib/state/gitView.svelte";
   import {
@@ -158,10 +163,26 @@
     clearBranchSelection();
     selectUncommitted(repo.root, wt.path, displayPath(wt.path));
   }
+
+  // Compact fixed-width-ish format keeps dense commit rows scannable.
+  function compactCommitTimestamp(commit: {
+    authored_at: string | null;
+    short_oid: string;
+  }): string {
+    if (commit.authored_at === null) return commit.short_oid;
+    const date = new Date(commit.authored_at);
+    if (Number.isNaN(date.getTime())) return commit.short_oid;
+    const pad = (n: number): string => String(n).padStart(2, "0");
+    const monthDay = `${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+    const time = `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+    return date.getFullYear() === new Date().getFullYear()
+      ? `${monthDay} ${time}`
+      : `${date.getFullYear()}-${monthDay} ${time}`;
+  }
 </script>
 
 <div
-  class="border-border/70 bg-raised overflow-hidden rounded-md border"
+  class="border-border/70 bg-raised min-h-0 shrink-0 overflow-hidden rounded-md border"
   data-testid="git-repo"
   data-repo-root={repo.root}
 >
@@ -272,7 +293,7 @@
   </div>
 
   {#if expanded}
-    <div class="border-border/60 bg-surface border-t px-2 py-1.5" data-testid="repo-branches">
+    <div class="border-border/60 bg-panel border-t px-2 py-1.5" data-testid="repo-branches">
       {#if !repo.available}
         <p class="text-muted px-2 py-2 text-xs">
           This repository is unavailable (moved or unmounted).
@@ -284,7 +305,7 @@
             class={cn(
               "group flex min-h-8 items-center gap-2 rounded-md px-2 py-1.5 transition-colors",
               branch.worktree === null && "opacity-60",
-              "hover:bg-panel",
+              "hover:bg-raised",
               selected && "bg-raised hover:bg-raised",
             )}
             data-testid="git-branch"
@@ -362,7 +383,7 @@
           {@const selected = isRemoteSelected(branch.name)}
           <div
             class={cn(
-              "hover:bg-panel flex min-h-8 items-center gap-2 rounded-md px-2 py-1.5 opacity-80 transition-colors",
+              "hover:bg-raised flex min-h-8 items-center gap-2 rounded-md px-2 py-1.5 opacity-80 transition-colors",
               selected && "bg-raised hover:bg-raised",
             )}
             data-testid="git-remote-branch"
@@ -401,7 +422,7 @@
             <div
               class={cn(
                 "flex min-h-8 items-center gap-2 rounded-md px-2 py-1.5 transition-colors",
-                wt.warning !== "prunable" && "hover:bg-panel",
+                wt.warning !== "prunable" && "hover:bg-raised",
                 dselected && "bg-raised hover:bg-raised",
               )}
               data-testid="git-detached-worktree"
@@ -431,14 +452,14 @@
 </div>
 
 {#snippet commitList(worktreePath: string | null, hasChanges: boolean)}
-  <div class="border-border/50 mb-1 ml-4 border-l pl-2" data-testid="commit-list">
+  <div class="border-border/50 mt-1 mb-1 ml-4 border-l pl-2" data-testid="commit-list">
     {#if worktreePath !== null && hasChanges}
       {@const uSel = isUncommittedSelected(worktreePath)}
       <button
         type="button"
         class={cn(
           "flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-xs transition-colors",
-          uSel ? "bg-raised text-fg" : "text-muted hover:bg-panel",
+          uSel ? "bg-raised text-fg" : "text-muted hover:bg-raised",
         )}
         data-testid="uncommitted-row"
         data-selected={uSel}
@@ -458,6 +479,9 @@
     {:else if branchCommits.ranges.every((range) => range.commits.length === 0)}
       <p class="text-muted px-2 py-1.5 text-xs">No commits.</p>
     {:else}
+      {@const hasBranchWork = branchCommits.ranges.some((range) =>
+        range.commits.some((commit) => commit.branch_work),
+      )}
       {#each branchCommits.ranges as range (range.kind)}
         {#if range.commits.length > 0}
           <div
@@ -470,15 +494,20 @@
             <button
               type="button"
               class={cn(
-                "flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-xs transition-colors",
-                cSel ? "bg-raised text-fg" : "text-muted hover:bg-panel",
+                "flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-left text-xs transition-colors",
+                cSel ? "bg-raised text-fg" : "text-muted hover:bg-raised",
               )}
               data-testid="commit-row"
               data-oid={commit.oid}
               data-selected={cSel}
               onclick={() => selectCommit(repo.root, commit)}
             >
-              <span class="text-muted shrink-0 font-mono text-[11px]">{commit.short_oid}</span>
+              {#if hasBranchWork}
+                {@render branchWorkDot(commit.branch_work)}
+              {/if}
+              <span class="text-muted shrink-0 font-mono text-[11px]" title={commit.short_oid}>
+                {compactCommitTimestamp(commit)}
+              </span>
               <span class="min-w-0 flex-1 truncate" title={commit.subject}>{commit.subject}</span>
             </button>
           {/each}
@@ -491,6 +520,32 @@
   </div>
 {/snippet}
 
+{#snippet branchWorkDot(branchWork: boolean)}
+  <span class="inline-flex h-4 w-2 shrink-0 items-center justify-center">
+    {#if branchWork}
+      <Tooltip side="top" delayDuration={0} skipDelayDuration={0} disableHoverableContent>
+        {#snippet trigger(props)}
+          <span
+            {...props}
+            class="inline-flex h-4 w-2 items-center justify-center"
+            aria-label="Branch work"
+            data-testid="branch-work-indicator"
+          >
+            <span class="bg-primary h-1.5 w-1.5 rounded-full" aria-hidden="true"></span>
+          </span>
+        {/snippet}
+
+        <div class="max-w-56">
+          <div class="text-[13px] leading-4 font-medium">Branch work</div>
+          <div class="text-primary-fg/70 mt-1 text-xs leading-4">
+            This commit is not in the default branch.
+          </div>
+        </div>
+      </Tooltip>
+    {/if}
+  </span>
+{/snippet}
+
 {#snippet remoteInner(branch: RemoteBranchView)}
   <div class="min-w-0 flex-1">
     <div class="flex min-w-0 items-center gap-1.5">
@@ -498,14 +553,14 @@
         {branch.name}
       </span>
       <div class="flex shrink-0 items-center gap-1">
-        <GitBadge badge={remoteOnlyBadge(branch.name)} />
+        <GitStatusIcon indicator={remoteOnlyIndicator(branch.name)} />
       </div>
     </div>
     <div class="text-muted truncate text-[11px] leading-4">No local folder</div>
   </div>
   <div class="flex shrink-0 items-center gap-1">
-    {#each remoteBranchBadges(branch, repo.default_branch) as badge (badge.key)}
-      <GitBadge {badge} />
+    {#each remoteBranchIndicators(branch, repo.default_branch) as indicator (indicator.key)}
+      <GitStatusIcon {indicator} />
     {/each}
   </div>
 {/snippet}
@@ -515,8 +570,8 @@
     <div class="flex min-w-0 items-center gap-1.5">
       <span class="text-fg truncate text-[13px] leading-5" title={branch.name}>{branch.name}</span>
       <div class="flex shrink-0 items-center gap-1">
-        {#each localBranchBadges(branch, repo.default_branch) as badge (badge.key)}
-          <GitBadge {badge} />
+        {#each localBranchIndicators(branch, repo.default_branch) as indicator (indicator.key)}
+          <GitStatusIcon {indicator} />
         {/each}
       </div>
       {#if branch.worktree}
@@ -545,8 +600,8 @@
       </span>
       <div class="flex shrink-0 items-center gap-1">
         {#if wt.warning === "orphaned"}
-          <GitBadge
-            badge={{
+          <GitStatusIcon
+            indicator={{
               key: "orphaned",
               label: "orphaned",
               tone: "warning",
@@ -555,8 +610,8 @@
             }}
           />
         {:else if wt.warning === "prunable"}
-          <GitBadge
-            badge={{
+          <GitStatusIcon
+            indicator={{
               key: "prunable",
               label: "prunable",
               tone: "warning",

@@ -178,7 +178,7 @@
 
   <div class="flex min-h-0 flex-1 overflow-hidden" bind:this={splitEl} data-testid="git-split">
     <div
-      class="bg-surface flex min-w-0 flex-1 flex-col gap-2 overflow-y-auto p-3"
+      class="git-scrollbar bg-surface flex min-h-0 min-w-0 flex-1 [scrollbar-gutter:stable] flex-col gap-2 overflow-y-scroll p-3"
       data-testid="git-repo-list"
     >
       {#if gitView.status === "loading" && gitView.repos.length === 0}
@@ -218,30 +218,36 @@
       {/if}
     </div>
 
-    {#if panel !== null}
-      <div
-        class="border-border/60 bg-panel hover:bg-raised w-1.5 shrink-0 cursor-col-resize border-x transition-colors"
-        role="separator"
-        aria-orientation="vertical"
-        aria-label="Resize diff panel"
-        data-testid="git-detail-resizer"
-        onpointerdown={startDetailResize}
-      ></div>
-      <aside
-        class={cn(
-          "border-border/60 bg-raised flex min-h-0 shrink-0 flex-col border-l",
-          detailWidth === null && "w-2/3",
-        )}
-        style={detailWidth !== null ? `width: ${detailWidth}px` : undefined}
-        data-testid="git-detail-sidebar"
-      >
+    <div
+      class="border-border/60 bg-panel hover:bg-raised w-1.5 shrink-0 cursor-col-resize border-x transition-colors"
+      role="separator"
+      aria-orientation="vertical"
+      aria-label="Resize diff panel"
+      data-testid="git-detail-resizer"
+      onpointerdown={startDetailResize}
+    ></div>
+    <aside
+      class={cn(
+        "border-border/60 bg-raised flex min-h-0 shrink-0 flex-col border-l",
+        detailWidth === null && "w-2/3",
+      )}
+      style={detailWidth !== null ? `width: ${detailWidth}px` : undefined}
+      data-testid="git-detail-sidebar"
+    >
+      {#if panel !== null}
         <DiffPanel
           target={panel}
           refreshRevision={gitRefresh.revision}
           onClose={clearBranchSelection}
         />
-      </aside>
-    {/if}
+      {:else}
+        <EmptyState
+          testid="git-detail-empty"
+          title="Select a commit"
+          description="Choose a branch, commit, or uncommitted changes to inspect the diff."
+        />
+      {/if}
+    </aside>
   </div>
 </div>
 

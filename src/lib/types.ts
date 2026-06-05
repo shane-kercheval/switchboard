@@ -483,6 +483,7 @@ export type GitCommitSummary = {
   author_name: string | null;
   author_email: string | null;
   authored_at: string | null;
+  branch_work: boolean;
 };
 
 // Mirror of Rust `CommitRangeKind` (a bare snake_case string on the wire).

@@ -118,9 +118,22 @@ function firstCommit(ranges: GitCommitRange[]): GitCommitSummary | undefined {
 }
 
 function commitSubtitle(commit: GitCommitSummary): string {
-  return commit.author_name === null
-    ? commit.short_oid
-    : `${commit.short_oid} · ${commit.author_name}`;
+  return [commit.short_oid, readableCommitTimestamp(commit.authored_at), commit.author_name]
+    .filter((part): part is string => part !== null && part.length > 0)
+    .join(" · ");
+}
+
+// Locale-aware detail text reads better in the wider inspector header.
+function readableCommitTimestamp(iso: string | null): string | null {
+  if (iso === null) return null;
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
 }
 
 /// Select (and expand) a branch: load its commits and pick a default diff target

@@ -819,6 +819,10 @@ fn commit_ranges_unpushed_for_ahead_branch() {
     assert_eq!(ranges[0].kind, CommitRangeKind::Unpushed);
     // Newest first, and only the two unpushed commits (not the pushed "initial").
     assert_eq!(subjects(&ranges[0]), vec!["local 2", "local 1"]);
+    assert!(
+        ranges[0].commits.iter().all(|c| !c.branch_work),
+        "unpushed commits on the local default branch are default-branch work, not feature-branch work"
+    );
     assert!(!ranges[0].truncated);
 }
 
@@ -873,6 +877,8 @@ fn commit_ranges_recent_for_local_only_branch() {
     assert_eq!(ranges[0].kind, CommitRangeKind::Recent);
     // Recent history newest-first, including the base commit.
     assert_eq!(subjects(&ranges[0]), vec!["feat 2", "feat 1", "initial"]);
+    let branch_work: Vec<_> = ranges[0].commits.iter().map(|c| c.branch_work).collect();
+    assert_eq!(branch_work, vec![true, true, false]);
 }
 
 #[test]
@@ -927,6 +933,7 @@ fn commit_summary_carries_identity_and_authorship() {
     assert_eq!(commit.author_name.as_deref(), Some("Test"));
     assert_eq!(commit.author_email.as_deref(), Some("test@example.com"));
     assert!(commit.authored_at.is_some());
+    assert!(!commit.branch_work);
 }
 
 // --- commit changed-files & diff -------------------------------------------

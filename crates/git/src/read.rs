@@ -167,6 +167,12 @@ pub fn commit_ranges(path: &Path, kind: BranchKind, name: &str) -> Result<Vec<Gi
     let Some(tip) = branch.get().target() else {
         return Ok(Vec::new()); // unborn / symbolic ref with no commit
     };
+    let default_branch = resolve_default_branch(&repo);
+    let selected_default_branch =
+        kind == BranchKind::Local && default_branch.as_deref() == Some(name);
+    let default_tip = default_branch
+        .as_deref()
+        .and_then(|b| default_branch_tip(&repo, b));
 
     // A remote-tracking ref has no own upstream — just show its recent history.
     let upstream = match kind {
@@ -174,7 +180,8 @@ pub fn commit_ranges(path: &Path, kind: BranchKind, name: &str) -> Result<Vec<Gi
         BranchKind::Remote => None,
     };
 
-    let ranges = build_commit_ranges(&repo, tip, upstream).map_err(|e| GitError::read(path, e))?;
+    let ranges = build_commit_ranges(&repo, tip, upstream, default_tip, selected_default_branch)
+        .map_err(|e| GitError::read(path, e))?;
     Ok(ranges)
 }
 
@@ -969,6 +976,8 @@ fn build_commit_ranges(
     repo: &Repository,
     tip: Oid,
     upstream: Option<Oid>,
+    default_tip: Option<Oid>,
+    selected_default_branch: bool,
 ) -> std::result::Result<Vec<GitCommitRange>, git2::Error> {
     let Some(upstream) = upstream else {
         // No upstream (local-only branch, or a remote ref): recent history.
@@ -978,6 +987,8 @@ fn build_commit_ranges(
             "Recent commits",
             tip,
             None,
+            default_tip,
+            selected_default_branch,
         )?]);
     };
 
@@ -990,6 +1001,8 @@ fn build_commit_ranges(
             "Recent commits",
             tip,
             None,
+            default_tip,
+            selected_default_branch,
         )?]);
     }
 
@@ -1002,6 +1015,8 @@ fn build_commit_ranges(
             "Unpushed commits",
             tip,
             Some(upstream),
+            default_tip,
+            selected_default_branch,
         )?);
     }
     if behind > 0 {
@@ -1012,6 +1027,8 @@ fn build_commit_ranges(
             "Incoming commits",
             upstream,
             Some(tip),
+            default_tip,
+            selected_default_branch,
         )?);
     }
     Ok(ranges)
@@ -1025,8 +1042,11 @@ fn commit_range(
     label: &str,
     push: Oid,
     hide: Option<Oid>,
+    default_tip: Option<Oid>,
+    selected_default_branch: bool,
 ) -> std::result::Result<GitCommitRange, git2::Error> {
-    let (commits, truncated) = walk_commits(repo, push, hide)?;
+    let (commits, truncated) =
+        walk_commits(repo, push, hide, default_tip, selected_default_branch)?;
     Ok(GitCommitRange {
         kind,
         label: label.to_owned(),
@@ -1042,6 +1062,8 @@ fn walk_commits(
     repo: &Repository,
     push: Oid,
     hide: Option<Oid>,
+    default_tip: Option<Oid>,
+    selected_default_branch: bool,
 ) -> std::result::Result<(Vec<GitCommitSummary>, bool), git2::Error> {
     let mut walk = repo.revwalk()?;
     // Topological (child before parent) with time as the tiebreak. Commit times
@@ -1062,12 +1084,22 @@ fn walk_commits(
             break;
         }
         let commit = repo.find_commit(oid?)?;
-        commits.push(commit_summary(&commit));
+        commits.push(commit_summary(
+            repo,
+            &commit,
+            default_tip,
+            selected_default_branch,
+        ));
     }
     Ok((commits, truncated))
 }
 
-fn commit_summary(commit: &git2::Commit<'_>) -> GitCommitSummary {
+fn commit_summary(
+    repo: &Repository,
+    commit: &git2::Commit<'_>,
+    default_tip: Option<Oid>,
+    selected_default_branch: bool,
+) -> GitCommitSummary {
     let author = commit.author();
     GitCommitSummary {
         oid: commit.id().to_string(),
@@ -1081,7 +1113,15 @@ fn commit_summary(commit: &git2::Commit<'_>) -> GitCommitSummary {
         author_name: author.name().ok().map(str::to_owned),
         author_email: author.email().ok().map(str::to_owned),
         authored_at: format_commit_time(author.when()),
+        branch_work: !selected_default_branch && is_branch_work(repo, commit.id(), default_tip),
     }
+}
+
+fn is_branch_work(repo: &Repository, oid: Oid, default_tip: Option<Oid>) -> bool {
+    let Some(default_tip) = default_tip else {
+        return false;
+    };
+    oid != default_tip && !repo.graph_descendant_of(default_tip, oid).unwrap_or(false)
 }
 
 /// git2's `Time` (epoch seconds + a per-commit UTC offset in minutes) → RFC-3339,

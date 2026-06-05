@@ -1,24 +1,18 @@
-// Pure mapping from the M1 read-model (branch/worktree status) to the at-a-glance
-// badges the Git view renders. Kept separate from the Svelte components so the
-// D2 mapping is unit-testable on its own and reused wherever git state is shown
-// (the Git view now; the project-scoped panel in M6).
-//
-// The mapping is deliberately calm and one-tier (decision D2): every attention
-// state (changes, behind-default, upstream gone,
-// orphaned, prunable) is one amber `warning`; ahead/behind/diverged counts are
-// neutral informational chips; local-only, upstream presence, and merged are
-// muted labels. No success/green token is introduced.
+// Pure mapping from the M1 read-model (branch/worktree status) to the
+// at-a-glance status indicators the Git view renders. Kept separate from the
+// Svelte components so the mapping is unit-testable and reused wherever git
+// state is shown (the Git view now; the project-scoped panel in M6).
 
 import type { BranchView, RemoteBranchView, SyncState, WorktreeView } from "$lib/types";
 
-/// How a badge should read visually. `warning` → amber attention token;
-/// `neutral` → a plain count/info chip; `muted` → low-emphasis fact label.
-export type BadgeTone = "warning" | "neutral" | "muted";
+/// How an indicator should read visually. `warning` → attention color;
+/// `neutral` → ordinary sync/count info; `muted` → low-emphasis fact.
+export type IndicatorTone = "warning" | "neutral" | "muted";
 
-export type GitBadge = {
-  /// Short text shown in the badge (e.g. "changes", "↑3", "merged").
+export type GitStatusIndicator = {
+  /// Short accessible label for the icon (e.g. "changes", "↑3", "merged").
   label: string;
-  tone: BadgeTone;
+  tone: IndicatorTone;
   /// Stable key for `{#each}` and test lookup.
   key: string;
   /// Tooltip title; the label alone is terse by design.
@@ -27,9 +21,10 @@ export type GitBadge = {
   description: string;
 };
 
-/// The sync-vs-own-upstream signal. Counts are neutral chips (informational, not
-/// attention); `local_only` is a muted fact; `in_sync`/`unknown` show nothing.
-function syncBadges(sync: SyncState): GitBadge[] {
+/// The sync-vs-own-upstream signal. Counts are neutral informational indicators;
+/// `local_only` is a muted fact; `in_sync`/`unknown` show nothing unless an
+/// upstream relation is available.
+function syncIndicators(sync: SyncState): GitStatusIndicator[] {
   switch (sync.kind) {
     case "ahead":
       return [
@@ -81,13 +76,43 @@ function remoteName(upstream: string): string {
   return upstream.split("/", 1)[0] ?? upstream;
 }
 
+function upstreamIndicator(upstream: string): GitStatusIndicator {
+  return {
+    key: "upstream",
+    label: `on ${remoteName(upstream)}`,
+    tone: "muted",
+    title: "Tracks remote",
+    description: `Tracks ${upstream}.`,
+  };
+}
+
+function branchStateIndicators(branch: BranchView): GitStatusIndicator[] {
+  if (branch.dangling) {
+    return [
+      {
+        key: "dangling",
+        label: "upstream gone",
+        tone: "warning",
+        title: "Upstream gone",
+        description: "The upstream branch was deleted on the remote.",
+      },
+    ];
+  }
+  const sync = syncIndicators(branch.sync);
+  if (sync.length > 0) return sync;
+  if (branch.upstream != null && branch.sync.kind === "in_sync") {
+    return [upstreamIndicator(branch.upstream)];
+  }
+  return [];
+}
+
 /// Worktree-level signal: any uncommitted change (dirty OR untracked) collapses
-/// to one amber "changes" badge; the staged/unstaged/untracked split is only
-/// surfaced in the M5 diff panel, not the tree. Warnings are amber too.
-function worktreeBadges(wt: WorktreeView): GitBadge[] {
-  const badges: GitBadge[] = [];
+/// to one "changes" indicator; the staged/unstaged/untracked split is only
+/// surfaced in the M5 diff panel, not the tree.
+function worktreeIndicators(wt: WorktreeView): GitStatusIndicator[] {
+  const indicators: GitStatusIndicator[] = [];
   if (wt.dirty || wt.untracked) {
-    badges.push({
+    indicators.push({
       key: "uncommitted",
       label: "changes",
       tone: "warning",
@@ -96,7 +121,7 @@ function worktreeBadges(wt: WorktreeView): GitBadge[] {
     });
   }
   if (wt.warning === "orphaned") {
-    badges.push({
+    indicators.push({
       key: "orphaned",
       label: "orphaned",
       tone: "warning",
@@ -104,7 +129,7 @@ function worktreeBadges(wt: WorktreeView): GitBadge[] {
       description: "The branch this folder was on was deleted.",
     });
   } else if (wt.warning === "prunable") {
-    badges.push({
+    indicators.push({
       key: "prunable",
       label: "prunable",
       tone: "warning",
@@ -112,23 +137,23 @@ function worktreeBadges(wt: WorktreeView): GitBadge[] {
       description: "This folder path is gone; the git worktree record can be pruned.",
     });
   }
-  return badges;
+  return indicators;
 }
 
-/// All badges for a local branch, in render order: worktree state first (most
-/// actionable), then behind-base, dangling, sync, merged.
-///
-/// `defaultBranch` is the repo's resolved default (e.g. `main`). The `merged`
-/// cleanup badge ("safe to delete") is suppressed for the default branch itself
-/// — it's trivially an ancestor of its own tip, so M1 reports it as merged, but
-/// labeling `main` "safe to delete" is exactly wrong.
-export function localBranchBadges(branch: BranchView, defaultBranch: string | null): GitBadge[] {
-  const badges: GitBadge[] = [];
+/// All indicators for a local branch, in render order: branch relationship/state
+/// first (upstream gone, local-only, tracks remote, ahead/behind/diverged), then
+/// worktree state, behind-base, and cleanup state.
+export function localBranchIndicators(
+  branch: BranchView,
+  defaultBranch: string | null,
+): GitStatusIndicator[] {
+  const indicators: GitStatusIndicator[] = [];
+  indicators.push(...branchStateIndicators(branch));
   if (branch.worktree) {
-    badges.push(...worktreeBadges(branch.worktree));
+    indicators.push(...worktreeIndicators(branch.worktree));
   }
   if (branch.behind_base != null && branch.behind_base > 0) {
-    badges.push({
+    indicators.push({
       key: "behind_base",
       label: `behind ${defaultBranch ?? "default"}`,
       tone: "warning",
@@ -136,42 +161,20 @@ export function localBranchBadges(branch: BranchView, defaultBranch: string | nu
       description: `${branch.behind_base} commit(s) behind the default branch.`,
     });
   }
-  if (branch.dangling) {
-    badges.push({
-      key: "dangling",
-      label: "upstream gone",
-      tone: "warning",
-      title: "Upstream gone",
-      description: "The upstream branch was deleted on the remote.",
-    });
-  }
-  if (branch.upstream != null && branch.sync.kind === "in_sync") {
-    badges.push({
-      key: "upstream",
-      label: `on ${remoteName(branch.upstream)}`,
-      tone: "muted",
-      title: "Tracks remote",
-      description: `Tracks ${branch.upstream}.`,
-    });
-  }
-  badges.push(...syncBadges(branch.sync));
   if (branch.merged === true && branch.name !== defaultBranch) {
-    badges.push(mergedBadge());
+    indicators.push(mergedIndicator());
   }
-  return badges;
+  return indicators;
 }
 
-/// Badges for a remote-tracking branch — only the two cleanup signals it carries
-/// (decision 10a): behind-base (amber) and merged (muted). `merged` is suppressed
-/// for the default branch's own remote ref (`origin/<default>`), same rationale
-/// as the local default.
-export function remoteBranchBadges(
+/// Indicators for a remote-tracking branch: only the cleanup signals it carries.
+export function remoteBranchIndicators(
   branch: RemoteBranchView,
   defaultBranch: string | null,
-): GitBadge[] {
-  const badges: GitBadge[] = [];
+): GitStatusIndicator[] {
+  const indicators: GitStatusIndicator[] = [];
   if (branch.behind_base != null && branch.behind_base > 0) {
-    badges.push({
+    indicators.push({
       key: "behind_base",
       label: `behind ${defaultBranch ?? "default"}`,
       tone: "warning",
@@ -181,12 +184,12 @@ export function remoteBranchBadges(
   }
   const isDefaultRemote = defaultBranch != null && branch.name === `origin/${defaultBranch}`;
   if (branch.merged === true && !isDefaultRemote) {
-    badges.push(mergedBadge());
+    indicators.push(mergedIndicator());
   }
-  return badges;
+  return indicators;
 }
 
-function mergedBadge(): GitBadge {
+function mergedIndicator(): GitStatusIndicator {
   return {
     key: "merged",
     label: "merged",
@@ -196,7 +199,7 @@ function mergedBadge(): GitBadge {
   };
 }
 
-export function remoteOnlyBadge(name: string): GitBadge {
+export function remoteOnlyIndicator(name: string): GitStatusIndicator {
   return {
     key: "remote_only",
     label: "remote only",
@@ -206,15 +209,15 @@ export function remoteOnlyBadge(name: string): GitBadge {
   };
 }
 
-/// Tailwind classes for a tone. `warning` reuses the amber attention token;
-/// `neutral`/`muted` lean on the existing panel/muted tokens — no new hue.
-export function badgeToneClass(tone: BadgeTone): string {
+/// Tailwind classes for an unframed icon. Warning changes the stroke color;
+/// neutral and muted indicators stay quiet.
+export function indicatorToneClass(tone: IndicatorTone): string {
   switch (tone) {
     case "warning":
-      return "border-warning/40 bg-warning-soft text-warning";
+      return "text-warning";
     case "neutral":
-      return "border-border bg-panel text-fg";
+      return "text-muted";
     case "muted":
-      return "border-border bg-panel text-muted";
+      return "text-muted/80";
   }
 }

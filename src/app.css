@@ -222,6 +222,26 @@ body {
   color: var(--fg);
 }
 
+.git-scrollbar {
+  scrollbar-color: color-mix(in srgb, var(--border) 85%, var(--muted)) transparent;
+  scrollbar-width: thin;
+}
+
+.git-scrollbar::-webkit-scrollbar {
+  width: 10px;
+}
+
+.git-scrollbar::-webkit-scrollbar-thumb {
+  background-color: color-mix(in srgb, var(--border) 85%, var(--muted));
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background-clip: content-box;
+}
+
+.git-scrollbar::-webkit-scrollbar-thumb:hover {
+  background-color: var(--muted);
+}
+
 /* Window dragging is driven by the `windowDragRegion` action (and Tauri's
    `data-tauri-drag-region` handler) calling `startDragging()`, NOT by CSS:
    `-webkit-app-region`/`app-region` is a Chromium feature and is inert in

@@ -18,6 +18,8 @@
   type Common = {
     side?: "top" | "bottom" | "left" | "right";
     delayDuration?: number;
+    skipDelayDuration?: number;
+    disableHoverableContent?: boolean;
     /// Receives the bits-ui trigger props — spread them onto your element.
     trigger: Snippet<[Record<string, unknown>]>;
   };
@@ -34,11 +36,18 @@
   };
   type Props = LabelProps | ChildrenProps;
 
-  let { side = "top", delayDuration = 500, trigger, ...rest }: Props = $props();
+  let {
+    side = "top",
+    delayDuration = 500,
+    skipDelayDuration = 300,
+    disableHoverableContent = false,
+    trigger,
+    ...rest
+  }: Props = $props();
 </script>
 
-<Bits.Provider {delayDuration}>
-  <Bits.Root>
+<Bits.Provider {delayDuration} {skipDelayDuration}>
+  <Bits.Root {disableHoverableContent}>
     <Bits.Trigger>
       {#snippet child({ props })}
         {@render trigger(props)}

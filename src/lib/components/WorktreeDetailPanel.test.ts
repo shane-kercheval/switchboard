@@ -58,6 +58,7 @@ describe("WorktreeDetailPanel", () => {
     });
 
     await waitFor(() => expect(screen.getByTestId("diff-view")).toBeInTheDocument());
+    expect(screen.getByTestId("changed-files-resizer")).toBeInTheDocument();
     const text = screen.getByTestId("diff-view").textContent ?? "";
     expect(text).toContain("const OLD = 2;");
     expect(text).toContain("const NEW = 3;");

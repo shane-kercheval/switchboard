@@ -44,7 +44,7 @@ export const view = $state<{ mode: ViewMode }>({ mode: "projects" });
 
 /// The worktree whose diff detail panel is open, or `null` when none is selected.
 /// Session-only UI state (like `view.mode`): clicking a worktree row in the tree
-/// sets it; it drives the bottom-split detail panel in the Git view. `label` is
+/// sets it; it drives the right-side detail panel in the Git view. `label` is
 /// the branch name (or short hash for a detached worktree) shown in the panel
 /// header; `path` is the worktree directory the diff reads from.
 export const worktreeSelection = $state<{ current: { path: string; label: string } | null }>({

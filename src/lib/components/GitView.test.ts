@@ -94,7 +94,7 @@ describe("GitView", () => {
     expect(screen.getByTestId("linked-project")).toHaveTextContent("app-proj");
     await waitFor(() => expect(screen.getAllByText("~/app").length).toBeGreaterThan(0));
     // Dirty or untracked files surface the changes badge.
-    expect(screen.getByText("changes")).toBeInTheDocument();
+    expect(screen.getByLabelText("changes")).toBeInTheDocument();
   });
 
   it("hides inactive branches by default and reveals them via the toggle", async () => {
@@ -124,8 +124,10 @@ describe("GitView", () => {
     expect(screen.queryByTestId("git-remote-branch")).not.toBeInTheDocument();
     await fireEvent.click(screen.getByTestId("branch-filter-remote"));
     expect(screen.getByTestId("git-remote-branch")).toBeInTheDocument();
-    // Local branch row hidden under remote-only.
-    expect(document.querySelector('[data-testid="git-branch"][data-branch="main"]')).toBeNull();
+    // Branches that track a remote stay visible as the canonical row; the
+    // duplicate origin/main remote ref stays hidden.
+    expect(document.querySelector('[data-testid="git-branch"][data-branch="main"]')).not.toBeNull();
+    expect(screen.queryByText("origin/main")).not.toBeInTheDocument();
   });
 
   it("shows the empty state when no repos are tracked", async () => {
@@ -182,7 +184,7 @@ describe("GitView", () => {
     await waitFor(() => expect(screen.getByTestId("git-repo")).toBeInTheDocument());
   });
 
-  it("clicking a worktree opens the detail panel (bottom split); closing it returns to the full tree", async () => {
+  it("clicking a worktree opens the detail panel (right inspector); closing it returns to the full tree", async () => {
     wire([repo()]);
     await refreshAll();
     render(GitView);
@@ -190,13 +192,14 @@ describe("GitView", () => {
 
     // No panel until a worktree is selected.
     expect(screen.queryByTestId("worktree-detail-panel")).not.toBeInTheDocument();
-    expect(screen.queryByTestId("git-split-divider")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("git-detail-sidebar")).not.toBeInTheDocument();
 
     // The `main` branch has a worktree → its row is selectable.
     await fireEvent.click(screen.getByTestId("worktree-select"));
 
     await waitFor(() => expect(screen.getByTestId("worktree-detail-panel")).toBeInTheDocument());
-    expect(screen.getByTestId("git-split-divider")).toBeInTheDocument();
+    expect(screen.getByTestId("git-detail-sidebar")).toBeInTheDocument();
+    expect(screen.getByTestId("git-detail-resizer")).toBeInTheDocument();
     expect(screen.getByTestId("detail-branch")).toHaveTextContent("main");
 
     await fireEvent.click(screen.getByTestId("detail-close"));

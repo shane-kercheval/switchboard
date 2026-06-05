@@ -21,8 +21,10 @@ export type GitBadge = {
   tone: BadgeTone;
   /// Stable key for `{#each}` and test lookup.
   key: string;
-  /// Longer hover description; the label alone is terse by design.
+  /// Tooltip title; the label alone is terse by design.
   title: string;
+  /// Tooltip detail shown under the title.
+  description: string;
 };
 
 /// The sync-vs-own-upstream signal. Counts are neutral chips (informational, not
@@ -35,7 +37,8 @@ function syncBadges(sync: SyncState): GitBadge[] {
           key: "ahead",
           label: `↑${sync.commits}`,
           tone: "neutral",
-          title: `${sync.commits} unpushed commit(s)`,
+          title: "Ahead of upstream",
+          description: `${sync.commits} unpushed commit(s).`,
         },
       ];
     case "behind":
@@ -44,7 +47,8 @@ function syncBadges(sync: SyncState): GitBadge[] {
           key: "behind",
           label: `↓${sync.commits}`,
           tone: "neutral",
-          title: `${sync.commits} commit(s) behind upstream`,
+          title: "Behind upstream",
+          description: `${sync.commits} commit(s) behind upstream.`,
         },
       ];
     case "diverged":
@@ -53,12 +57,19 @@ function syncBadges(sync: SyncState): GitBadge[] {
           key: "diverged",
           label: `↑${sync.ahead} ↓${sync.behind}`,
           tone: "neutral",
-          title: `Diverged from upstream: ${sync.ahead} ahead, ${sync.behind} behind`,
+          title: "Diverged from upstream",
+          description: `${sync.ahead} ahead, ${sync.behind} behind.`,
         },
       ];
     case "local_only":
       return [
-        { key: "local_only", label: "local", tone: "muted", title: "No upstream — not pushed" },
+        {
+          key: "local_only",
+          label: "local",
+          tone: "muted",
+          title: "Local only",
+          description: "No upstream is configured; this branch has not been pushed.",
+        },
       ];
     case "in_sync":
     case "unknown":
@@ -80,7 +91,8 @@ function worktreeBadges(wt: WorktreeView): GitBadge[] {
       key: "uncommitted",
       label: "changes",
       tone: "warning",
-      title: "Uncommitted changes in this folder",
+      title: "Uncommitted changes",
+      description: "This folder has modified or new files.",
     });
   }
   if (wt.warning === "orphaned") {
@@ -88,14 +100,16 @@ function worktreeBadges(wt: WorktreeView): GitBadge[] {
       key: "orphaned",
       label: "orphaned",
       tone: "warning",
-      title: "The branch this worktree was on was deleted",
+      title: "Orphaned folder",
+      description: "The branch this folder was on was deleted.",
     });
   } else if (wt.warning === "prunable") {
     badges.push({
       key: "prunable",
       label: "prunable",
       tone: "warning",
-      title: "This worktree's directory is gone; the record can be pruned",
+      title: "Missing folder",
+      description: "This folder path is gone; the git worktree record can be pruned.",
     });
   }
   return badges;
@@ -118,7 +132,8 @@ export function localBranchBadges(branch: BranchView, defaultBranch: string | nu
       key: "behind_base",
       label: `behind ${defaultBranch ?? "default"}`,
       tone: "warning",
-      title: `${branch.behind_base} commit(s) behind the default branch`,
+      title: `Behind ${defaultBranch ?? "default"}`,
+      description: `${branch.behind_base} commit(s) behind the default branch.`,
     });
   }
   if (branch.dangling) {
@@ -126,7 +141,8 @@ export function localBranchBadges(branch: BranchView, defaultBranch: string | nu
       key: "dangling",
       label: "upstream gone",
       tone: "warning",
-      title: "Upstream branch was deleted on the remote",
+      title: "Upstream gone",
+      description: "The upstream branch was deleted on the remote.",
     });
   }
   if (branch.upstream != null && branch.sync.kind === "in_sync") {
@@ -134,7 +150,8 @@ export function localBranchBadges(branch: BranchView, defaultBranch: string | nu
       key: "upstream",
       label: `on ${remoteName(branch.upstream)}`,
       tone: "muted",
-      title: `Tracks ${branch.upstream}`,
+      title: "Tracks remote",
+      description: `Tracks ${branch.upstream}.`,
     });
   }
   badges.push(...syncBadges(branch.sync));
@@ -158,7 +175,8 @@ export function remoteBranchBadges(
       key: "behind_base",
       label: `behind ${defaultBranch ?? "default"}`,
       tone: "warning",
-      title: `${branch.behind_base} commit(s) behind the default branch`,
+      title: `Behind ${defaultBranch ?? "default"}`,
+      description: `${branch.behind_base} commit(s) behind the default branch.`,
     });
   }
   const isDefaultRemote = defaultBranch != null && branch.name === `origin/${defaultBranch}`;
@@ -173,7 +191,18 @@ function mergedBadge(): GitBadge {
     key: "merged",
     label: "merged",
     tone: "muted",
-    title: "Merged into the default branch — safe to delete",
+    title: "Merged",
+    description: "Merged into the default branch; safe to delete.",
+  };
+}
+
+export function remoteOnlyBadge(name: string): GitBadge {
+  return {
+    key: "remote_only",
+    label: "remote only",
+    tone: "muted",
+    title: "Remote only",
+    description: `${name} exists on the remote, but there is no local branch or folder.`,
   };
 }
 
@@ -182,10 +211,10 @@ function mergedBadge(): GitBadge {
 export function badgeToneClass(tone: BadgeTone): string {
   switch (tone) {
     case "warning":
-      return "bg-warning-soft text-warning";
+      return "border-warning/40 bg-warning-soft text-warning";
     case "neutral":
-      return "bg-panel text-fg";
+      return "border-border bg-panel text-fg";
     case "muted":
-      return "bg-panel text-muted";
+      return "border-border bg-panel text-muted";
   }
 }

@@ -65,7 +65,7 @@ describe("ProjectGitPanel", () => {
     expect(loadProjectRepo).toHaveBeenCalledWith("/repos/alpha");
     expect(screen.getByTestId("project-git-branch")).toHaveTextContent("feature-x");
     // A dirty folder surfaces the changes badge (same mapping as the Git view).
-    expect(screen.getByText("changes")).toBeInTheDocument();
+    expect(screen.getByLabelText("changes")).toBeInTheDocument();
   });
 
   it("surfaces the behind-default-branch indicator", () => {
@@ -74,7 +74,7 @@ describe("ProjectGitPanel", () => {
       defaultBranch: "main",
     });
     render(ProjectGitPanel, { project });
-    expect(screen.getByText("behind main")).toBeInTheDocument();
+    expect(screen.getByLabelText("behind main")).toBeInTheDocument();
   });
 
   it("shows a calm 'no changes' line for a clean, in-sync branch", () => {

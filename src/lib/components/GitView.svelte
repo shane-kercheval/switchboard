@@ -35,30 +35,27 @@
   let adding = $state(false);
   let addError = $state<string | null>(null);
 
-  // The open detail panel (a worktree), or null. Drives the bottom split.
+  // The open detail panel (a worktree), or null. Drives the right inspector.
   const panel = $derived(worktreeSelection.current);
-
-  // Bottom-split sizing. `splitRatio` is the tree's share of the height; the diff
-  // panel takes the rest. Session-only (decision D1) — a fresh launch resets it,
-  // like the existing sidebars. The divider drags it within sane bounds.
   let splitEl = $state<HTMLDivElement | null>(null);
-  let splitRatio = $state(0.55);
-  let dragging = false;
+  let detailWidth = $state<number | null>(null);
+  let resizingDetail = false;
 
-  function startDrag(event: PointerEvent): void {
-    dragging = true;
+  function startDetailResize(event: PointerEvent): void {
+    resizingDetail = true;
     event.preventDefault();
   }
 
-  function onDrag(event: PointerEvent): void {
-    if (!dragging || splitEl === null) return;
+  function resizeDetail(event: PointerEvent): void {
+    if (!resizingDetail || splitEl === null) return;
     const rect = splitEl.getBoundingClientRect();
-    const ratio = (event.clientY - rect.top) / rect.height;
-    splitRatio = Math.min(0.85, Math.max(0.2, ratio));
+    const max = rect.width * 0.85;
+    const width = rect.right - event.clientX;
+    detailWidth = Math.min(max, Math.max(360, width));
   }
 
-  function endDrag(): void {
-    dragging = false;
+  function endDetailResize(): void {
+    resizingDetail = false;
   }
 
   const filterOptions: { value: "local" | "remote" | "both"; label: string }[] = [
@@ -178,13 +175,9 @@
     </div>
   {/if}
 
-  <div class="flex min-h-0 flex-1 flex-col" bind:this={splitEl} data-testid="git-split">
+  <div class="flex min-h-0 flex-1 overflow-hidden" bind:this={splitEl} data-testid="git-split">
     <div
-      class={cn(
-        "bg-surface flex min-h-0 flex-col gap-2 overflow-y-auto p-3",
-        panel === null && "flex-1",
-      )}
-      style={panel !== null ? `flex: ${splitRatio} 1 0%` : undefined}
+      class="bg-surface flex min-w-0 flex-1 flex-col gap-2 overflow-y-auto p-3"
       data-testid="git-repo-list"
     >
       {#if gitView.status === "loading" && gitView.repos.length === 0}
@@ -225,25 +218,31 @@
     </div>
 
     {#if panel !== null}
-      <!-- Draggable divider: drags the tree/diff split (D1). -->
       <div
-        class="border-border/60 bg-panel hover:bg-raised h-1.5 shrink-0 cursor-row-resize border-y transition-colors"
+        class="border-border/60 bg-panel hover:bg-raised w-1.5 shrink-0 cursor-col-resize border-x transition-colors"
         role="separator"
-        aria-orientation="horizontal"
-        aria-label="Resize diff panel"
-        data-testid="git-split-divider"
-        onpointerdown={startDrag}
+        aria-orientation="vertical"
+        aria-label="Resize worktree detail panel"
+        data-testid="git-detail-resizer"
+        onpointerdown={startDetailResize}
       ></div>
-      <div class="flex min-h-0 flex-col" style={`flex: ${1 - splitRatio} 1 0%`}>
+      <aside
+        class={cn(
+          "border-border/60 bg-raised flex min-h-0 shrink-0 flex-col border-l",
+          detailWidth === null && "w-2/3",
+        )}
+        style={detailWidth !== null ? `width: ${detailWidth}px` : undefined}
+        data-testid="git-detail-sidebar"
+      >
         <WorktreeDetailPanel
           path={panel.path}
           label={panel.label}
           refreshRevision={gitRefresh.revision}
           onClose={clearWorktreeSelection}
         />
-      </div>
+      </aside>
     {/if}
   </div>
 </div>
 
-<svelte:window onpointermove={onDrag} onpointerup={endDrag} />
+<svelte:window onpointermove={resizeDetail} onpointerup={endDetailResize} />

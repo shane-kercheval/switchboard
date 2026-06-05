@@ -43,14 +43,15 @@
         >
           {status.branch.name}
         </div>
+        {#if badges.length > 0}
+          <div class="flex shrink-0 items-center gap-1" data-testid="project-git-badges">
+            {#each badges as badge (badge.key)}
+              <GitBadge {badge} />
+            {/each}
+          </div>
+        {/if}
       </div>
-      {#if badges.length > 0}
-        <div class="mt-1 flex flex-wrap items-center gap-1" data-testid="project-git-badges">
-          {#each badges as badge (badge.key)}
-            <GitBadge {badge} />
-          {/each}
-        </div>
-      {:else}
+      {#if badges.length === 0}
         <div class="text-muted mt-0.5 text-xs" data-testid="project-git-clean">
           No changes · up to date
         </div>

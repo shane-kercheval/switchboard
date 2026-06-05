@@ -42,6 +42,9 @@
   let filesPath: string | null = null;
   let diffPath: string | null = null;
   let diffFile: string | null = null;
+  let bodyEl = $state<HTMLDivElement | null>(null);
+  let fileListWidth = $state(256);
+  let resizingFiles = false;
 
   // (Re)load the file list whenever the worktree path or refresh revision
   // changes. A path change clears immediately; a same-path refresh updates in
@@ -141,6 +144,22 @@
       console.error("[switchboard] reveal worktree failed", e);
     });
   }
+
+  function startFileResize(event: PointerEvent): void {
+    resizingFiles = true;
+    event.preventDefault();
+  }
+
+  function resizeFiles(event: PointerEvent): void {
+    if (!resizingFiles || bodyEl === null) return;
+    const rect = bodyEl.getBoundingClientRect();
+    const max = Math.min(440, rect.width * 0.55);
+    fileListWidth = Math.min(max, Math.max(176, event.clientX - rect.left));
+  }
+
+  function endFileResize(): void {
+    resizingFiles = false;
+  }
 </script>
 
 <div class="flex min-h-0 flex-1 flex-col overflow-hidden" data-testid="worktree-detail-panel">
@@ -220,9 +239,12 @@
   {:else if files.length === 0}
     <EmptyState testid="detail-no-changes" title="No changes in this worktree." />
   {:else}
-    <div class="flex min-h-0 flex-1 overflow-hidden">
+    <div class="flex min-h-0 flex-1 overflow-hidden" bind:this={bodyEl}>
       <!-- Changed-files list -->
-      <div class="border-border/60 bg-surface w-64 shrink-0 overflow-hidden border-r">
+      <div
+        class="border-border/60 bg-surface shrink-0 overflow-hidden border-r"
+        style={`width: ${fileListWidth}px`}
+      >
         <div
           class="border-border/60 bg-panel/70 flex h-8 items-center justify-between border-b px-2"
         >
@@ -264,6 +286,15 @@
         </ul>
       </div>
 
+      <div
+        class="border-border/60 bg-panel hover:bg-raised w-1.5 shrink-0 cursor-col-resize border-r transition-colors"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize changed files list"
+        data-testid="changed-files-resizer"
+        onpointerdown={startFileResize}
+      ></div>
+
       <!-- Diff -->
       <div class="bg-raised min-w-0 flex-1 overflow-auto" data-testid="diff-scroll">
         {#if diffLoading}
@@ -284,3 +315,5 @@
     </div>
   {/if}
 </div>
+
+<svelte:window onpointermove={resizeFiles} onpointerup={endFileResize} />

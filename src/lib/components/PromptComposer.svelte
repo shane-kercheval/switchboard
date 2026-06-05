@@ -58,36 +58,10 @@
   const missing = $derived(missingRequiredArgs(prompt, args));
   const promptKey = $derived(`${prompt.provider}:${prompt.name}`);
 
-  function resizeTextarea(textarea: HTMLTextAreaElement | undefined, _value: string): void {
-    if (textarea == null) return;
-    textarea.style.height = "auto";
-    const naturalHeight = textarea.scrollHeight;
-    const maxHeight = Number.parseFloat(getComputedStyle(textarea).maxHeight);
-    const cappedHeight = Number.isFinite(maxHeight)
-      ? Math.min(naturalHeight, maxHeight)
-      : naturalHeight;
-    textarea.style.height = `${cappedHeight}px`;
-    textarea.style.overflowY = naturalHeight > cappedHeight ? "auto" : "hidden";
-  }
-
   function firstPromptField(): HTMLTextAreaElement | undefined {
     const firstArg = prompt.arguments[0];
     return firstArg === undefined ? appendedRef : argRefs[firstArg.name];
   }
-
-  function resizeInput(event: Event): void {
-    resizeTextarea(
-      event.currentTarget as HTMLTextAreaElement,
-      (event.currentTarget as HTMLTextAreaElement).value,
-    );
-  }
-
-  $effect(() => {
-    for (const arg of prompt.arguments) {
-      resizeTextarea(argRefs[arg.name], args[arg.name] ?? "");
-    }
-    resizeTextarea(appendedRef, appendedText);
-  });
 
   $effect(() => {
     if (!focusFirstField || focusedPromptKey === promptKey) return;
@@ -196,12 +170,12 @@
             <p class="text-muted text-[11px]">{arg.description}</p>
           {/if}
           <Textarea
+            autosize
             id={`prompt-arg-${arg.name}`}
             data-testid={`prompt-arg-${arg.name}`}
             rows={2}
             bind:ref={argRefs[arg.name]}
             bind:value={args[arg.name]}
-            oninput={resizeInput}
             disabled={busy}
             class={cn("max-h-40 min-h-9 text-sm", isMissing ? "border-status-failed" : "")}
           />
@@ -211,13 +185,13 @@
       <div class="flex flex-col gap-1">
         <label class="text-fg text-xs font-medium" for="prompt-appended">Appended text</label>
         <Textarea
+          autosize
           id="prompt-appended"
           data-testid="prompt-appended"
           rows={2}
           placeholder="Optional text appended after the prompt…"
           bind:ref={appendedRef}
           bind:value={appendedText}
-          oninput={resizeInput}
           disabled={busy}
           class="max-h-40 min-h-9 text-sm"
         />

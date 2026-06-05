@@ -144,20 +144,6 @@
       : { kind: "plain", draft };
   }
 
-  function resizeTextarea(textarea: HTMLTextAreaElement | undefined, _draft: string): void {
-    // `bind:this` resets to null (not undefined) when the textarea unmounts on
-    // entering prompt mode; guard both.
-    if (textarea == null) return;
-    textarea.style.height = "auto";
-    const naturalHeight = textarea.scrollHeight;
-    const maxHeight = Number.parseFloat(getComputedStyle(textarea).maxHeight);
-    const cappedHeight = Number.isFinite(maxHeight)
-      ? Math.min(naturalHeight, maxHeight)
-      : naturalHeight;
-    textarea.style.height = `${cappedHeight}px`;
-    textarea.style.overflowY = naturalHeight > cappedHeight ? "auto" : "hidden";
-  }
-
   // Drop any selected ids whose agent disappeared (agent removed at runtime).
   $effect(() => {
     const valid = selectedIds.filter((id) => agents.some((a) => a.id === id));
@@ -173,11 +159,6 @@
   $effect(() => {
     if (restoring) return;
     setContent(projectId, currentContent());
-  });
-  // Track both the draft and bound textarea: draft changes resize the box, and
-  // the ref change performs the initial resize once the DOM node is available.
-  $effect(() => {
-    resizeTextarea(textareaEl, draft);
   });
   // The parent unmounts this bar the moment a project loses its last agent (it
   // falls back to the roster-loading / first-agent screen), so an empty roster
@@ -1039,6 +1020,7 @@
     {:else}
       <div class="relative flex items-end gap-2">
         <Textarea
+          autosize
           data-testid="compose-textarea"
           data-shortcut-scope="composer"
           placeholder="Type a message…  (⌘+Enter to send, @ to add a recipient, / for a prompt)"

@@ -106,7 +106,7 @@
     }
   }
 
-  function submitFromName(event: KeyboardEvent): void {
+  function submitOnEnter(event: KeyboardEvent): void {
     if (event.key !== "Enter") return;
     event.preventDefault();
     handleSubmit();
@@ -250,7 +250,7 @@
       aria-invalid={!nameValidation.ok}
       aria-describedby={nameError ? "agent-name-error" : undefined}
       title={nameError ?? undefined}
-      onkeydown={submitFromName}
+      onkeydown={submitOnEnter}
     />
     {#if nameError}
       <span
@@ -272,6 +272,7 @@
         placeholder="00000000-0000-0000-0000-000000000000"
         data-testid="attach-session-id"
         class="h-8 px-2"
+        onkeydown={submitOnEnter}
       />
       {#if existingSessionId.trim() !== "" && !sessionIdValid}
         <span class="text-status-failed block text-xs" data-testid="attach-session-id-error">

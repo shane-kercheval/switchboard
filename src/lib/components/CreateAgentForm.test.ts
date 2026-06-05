@@ -93,6 +93,21 @@ describe("CreateAgentForm", () => {
     } satisfies AgentFormSubmit);
   });
 
+  it("submits attach mode when Enter is pressed in the session-id field", async () => {
+    const { onSubmit } = renderForm();
+    await fireEvent.click(screen.getByTestId("mode-attach"));
+    const sessionInput = screen.getByTestId("attach-session-id") as HTMLInputElement;
+    await fireEvent.input(sessionInput, { target: { value: VALID_UUID } });
+    await fireEvent.keyDown(sessionInput, { key: "Enter" });
+
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
+      mode: "attach",
+      name: "claude-code",
+      harness: "claude_code",
+      existingSessionId: VALID_UUID,
+    } satisfies AgentFormSubmit);
+  });
+
   it("attach mode: rejects malformed UUID — submit disabled and inline hint shown", async () => {
     renderForm();
     await fireEvent.click(screen.getByTestId("mode-attach"));

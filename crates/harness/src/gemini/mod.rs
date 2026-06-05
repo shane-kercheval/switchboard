@@ -1,5 +1,7 @@
-//! Gemini CLI adapter — spawns `gemini -p` and maps Gemini's flat
-//! stream-json vocabulary onto the normalized event model.
+//! Gemini CLI adapter — spawns `gemini` in non-interactive mode and maps
+//! Gemini's flat stream-json vocabulary onto the normalized event model. The
+//! prompt is passed in the attached `--prompt=<value>` form (not split
+//! `-p <value>`) so a leading-dash prompt isn't misparsed — see `build_args`.
 //!
 //! Pattern parallels Claude Code (caller-controlled session ID via
 //! `--session-id` / `--resume`; pre-generated at agent registration), with
@@ -226,10 +228,16 @@ fn resolve_home_dir(override_path: Option<&Path>) -> PathBuf {
 
 /// Build the `gemini` invocation. Order matches the captured fixture shape
 /// so future-CLI flag-order assertions can pin against it.
+///
+/// The prompt is passed in the attached `--prompt=<value>` form rather than as a
+/// separate `-p <value>` argument. `gemini`'s parser (yargs) otherwise rejects a
+/// value that begins with `-` (e.g. a markdown bullet) with `Not enough arguments
+/// following: p`, failing the turn before any model call. The `--` end-of-options
+/// separator does not help here because the prompt is an option *value*, not a
+/// positional. Verified against gemini 0.44.0.
 fn build_args(agent: &AgentRecord, prompt: &str, cwd: &Path, home_dir: &Path) -> Vec<String> {
     let mut args = vec![
-        "-p".to_owned(),
-        prompt.to_owned(),
+        format!("--prompt={prompt}"),
         "--output-format".to_owned(),
         "stream-json".to_owned(),
     ];
@@ -603,14 +611,31 @@ mod tests {
         let agent = agent_with_session(Uuid::new_v4());
         let args = build_args(&agent, "hi", cwd.path(), home.path());
 
-        assert_eq!(args[0], "-p");
-        assert_eq!(args[1], "hi");
-        assert_eq!(args[2], "--output-format");
-        assert_eq!(args[3], "stream-json");
+        assert_eq!(args[0], "--prompt=hi");
+        assert_eq!(args[1], "--output-format");
+        assert_eq!(args[2], "stream-json");
         assert!(args.contains(&"--session-id".to_owned()));
         assert!(!args.contains(&"--resume".to_owned()));
         assert!(args.contains(&"--yolo".to_owned()));
         assert!(args.contains(&"--skip-trust".to_owned()));
+    }
+
+    #[test]
+    fn build_args_dash_leading_prompt_uses_attached_form() {
+        // A prompt beginning with `-`/`--` must be carried in the attached
+        // `--prompt=<value>` form so yargs does not treat it as a flag. The bare
+        // `-p <value>` form fails with `Not enough arguments following: p`.
+        let home = tempfile::TempDir::new().unwrap();
+        let cwd = tempfile::TempDir::new().unwrap();
+        let agent = agent_with_session(Uuid::new_v4());
+        for prompt in ["- the left border is cut off", "--help"] {
+            let args = build_args(&agent, prompt, cwd.path(), home.path());
+            assert_eq!(args[0], format!("--prompt={prompt}"));
+            assert!(
+                !args.iter().any(|a| a == prompt),
+                "prompt must not appear as a standalone arg; got {args:?}"
+            );
+        }
     }
 
     #[test]

@@ -146,7 +146,6 @@ fn build_args(
 ) -> Vec<String> {
     let mut args = vec![
         "-p".to_owned(),
-        prompt.to_owned(),
         "--output-format".to_owned(),
         "stream-json".to_owned(),
         "--include-partial-messages".to_owned(),
@@ -173,6 +172,14 @@ fn build_args(
         }
         args.push(session_id.to_string());
     }
+    // `claude -p` takes the prompt as a positional. Pass it last, after a `--`
+    // end-of-options separator, so a prompt beginning with `-` (e.g. a markdown
+    // bullet) is not parsed as an unknown flag — without it `claude` aborts with
+    // `unknown option '- …'` before any model call. Verified against claude 2.1.162.
+    // Any flag added later must be pushed BEFORE this `--`, or it lands as a
+    // positional alongside the prompt.
+    args.push("--".to_owned());
+    args.push(prompt.to_owned());
     args
 }
 
@@ -482,6 +489,25 @@ mod tests {
 
         assert!(args.contains(&"--resume".to_owned()));
         assert!(!args.contains(&"--session-id".to_owned()));
+    }
+
+    #[test]
+    fn build_args_dash_leading_prompt_is_last_positional_after_separator() {
+        // Regression: `claude -p` takes the prompt as a positional, so a prompt
+        // beginning with `-`/`--` must trail a `--` separator or `claude` aborts
+        // with `unknown option '- …'`.
+        let home = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let agent = agent_with_session(Uuid::now_v7());
+        for prompt in ["- the left border is cut off", "--help"] {
+            let args = build_args(&agent, prompt, project.path(), Some(home.path()));
+            assert_eq!(args.last(), Some(&prompt.to_owned()));
+            assert_eq!(
+                args[args.len() - 2],
+                "--",
+                "prompt is the last positional, preceded by `--`; got {args:?}"
+            );
+        }
     }
 
     #[test]

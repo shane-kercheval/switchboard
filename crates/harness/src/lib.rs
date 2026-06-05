@@ -6,8 +6,9 @@
 //!   vocabulary to events. Separate module from Claude because Codex's vocabulary
 //!   differs structurally (no envelope wrapper; `item.started` / `item.completed`;
 //!   `thread.started` for session capture).
-//! - `GeminiAdapter` — spawns `gemini -p` and maps Gemini's flat stream-json
-//!   vocabulary to events. Pattern parallels Claude (caller-controlled session
+//! - `GeminiAdapter` — spawns `gemini` (prompt via attached `--prompt=<value>`,
+//!   not split `-p <value>`) and maps Gemini's flat stream-json vocabulary to
+//!   events. Pattern parallels Claude (caller-controlled session
 //!   ID); Gemini-specific behaviors (UUID v4 for session IDs, `--skip-trust`,
 //!   `update_topic` filtering, empty live tool output) live in the module
 //!   docstring.

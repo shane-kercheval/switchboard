@@ -39,7 +39,7 @@
      snippet) renders `highlightDiffLine` output, which is DOMPurify-sanitized
      before return (see diff.ts); raw line text never reaches the DOM. -->
 <div
-  class="diff-view min-w-0 font-mono text-xs leading-5"
+  class="diff-view bg-raised min-w-0 font-mono text-xs leading-5"
   data-testid="diff-view"
   data-style={style}
 >
@@ -51,7 +51,9 @@
     <p class="text-muted px-3 py-6 text-center text-sm" data-testid="diff-empty">No changes.</p>
   {:else}
     {#each diff.hunks as hunk, hi (hi)}
-      <div class="text-muted bg-panel/60 border-border/40 border-y px-3 py-0.5 select-none">
+      <div
+        class="text-muted bg-panel/80 border-border/40 sticky top-0 z-10 border-y px-3 py-0.5 select-none"
+      >
         {hunk.header}
       </div>
 
@@ -72,7 +74,7 @@
         {/each}
       {:else}
         {#each sideBySideHunks[hi] as row, ri (ri)}
-          <div class="grid grid-cols-2">
+          <div class="grid min-w-[48rem] grid-cols-2">
             {@render half(row.left, row.left?.old_lineno ?? null, false)}
             {@render half(row.right, row.right?.new_lineno ?? null, true)}
           </div>

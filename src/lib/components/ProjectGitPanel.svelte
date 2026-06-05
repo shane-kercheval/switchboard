@@ -29,26 +29,32 @@
 
 {#if status}
   <div class="border-border/60 shrink-0 border-b px-3 py-2" data-testid="project-git-panel">
-    <div class="text-muted mb-1 text-[11px] leading-none font-semibold tracking-wide uppercase">
-      Git
-    </div>
-    <div
-      class="text-fg truncate text-[13px] font-medium"
-      data-testid="project-git-branch"
-      title={status.branch.name}
-    >
-      {status.branch.name}
-    </div>
-    {#if badges.length > 0}
-      <div class="mt-1 flex flex-wrap items-center gap-1" data-testid="project-git-badges">
-        {#each badges as badge (badge.key)}
-          <GitBadge {badge} />
-        {/each}
+    <div class="bg-panel/70 rounded-md px-2 py-1.5">
+      <div class="flex min-w-0 items-center gap-2">
+        <div
+          class="text-muted shrink-0 text-[11px] leading-none font-semibold tracking-wide uppercase"
+        >
+          Git
+        </div>
+        <div
+          class="text-fg min-w-0 flex-1 truncate text-[13px] leading-5 font-medium"
+          data-testid="project-git-branch"
+          title={status.branch.name}
+        >
+          {status.branch.name}
+        </div>
       </div>
-    {:else}
-      <div class="text-muted mt-0.5 text-xs" data-testid="project-git-clean">
-        No changes · up to date
-      </div>
-    {/if}
+      {#if badges.length > 0}
+        <div class="mt-1 flex flex-wrap items-center gap-1" data-testid="project-git-badges">
+          {#each badges as badge (badge.key)}
+            <GitBadge {badge} />
+          {/each}
+        </div>
+      {:else}
+        <div class="text-muted mt-0.5 text-xs" data-testid="project-git-clean">
+          No changes · up to date
+        </div>
+      {/if}
+    </div>
   </div>
 {/if}

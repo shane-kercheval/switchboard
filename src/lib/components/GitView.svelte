@@ -92,38 +92,54 @@
 </script>
 
 <div class="flex min-h-0 flex-1 flex-col overflow-hidden" data-testid="git-view">
-  <div class="border-border/60 flex items-center gap-3 border-b px-4 py-2">
-    <div
-      class={cn(SEGMENTED_MAIN_CONTAINER_CLASS, "inline-grid grid-cols-3")}
-      role="radiogroup"
-      aria-label="Branch filter"
-    >
-      {#each filterOptions as option (option.value)}
-        <button
-          type="button"
-          role="radio"
-          class={cn(
-            SEGMENTED_MAIN_ITEM_CLASS,
-            "px-3",
-            branchFilter === option.value
-              ? SEGMENTED_MAIN_ITEM_ACTIVE_CLASS
-              : SEGMENTED_MAIN_ITEM_INACTIVE_CLASS,
-          )}
-          aria-checked={branchFilter === option.value}
-          data-testid={`branch-filter-${option.value}`}
-          onclick={() => (branchFilter = option.value)}
-        >
-          {option.label}
-        </button>
-      {/each}
+  <div class="border-border/60 bg-surface flex min-h-11 items-center gap-3 border-b px-4 py-2">
+    <div class="min-w-0">
+      <div class="text-fg text-sm leading-5 font-semibold">Repositories</div>
+      <div class="text-muted text-[11px] leading-4">
+        {gitView.repos.length} tracked
+      </div>
     </div>
 
-    <label class="text-muted flex cursor-pointer items-center gap-1.5 text-xs">
-      <input type="checkbox" bind:checked={showInactive} data-testid="show-inactive" />
-      Show inactive branches
-    </label>
+    <div class="flex min-w-0 flex-1 items-center gap-2">
+      <div
+        class={cn(SEGMENTED_MAIN_CONTAINER_CLASS, "inline-grid grid-cols-3")}
+        role="radiogroup"
+        aria-label="Branch filter"
+      >
+        {#each filterOptions as option (option.value)}
+          <button
+            type="button"
+            role="radio"
+            class={cn(
+              SEGMENTED_MAIN_ITEM_CLASS,
+              "px-3",
+              branchFilter === option.value
+                ? SEGMENTED_MAIN_ITEM_ACTIVE_CLASS
+                : SEGMENTED_MAIN_ITEM_INACTIVE_CLASS,
+            )}
+            aria-checked={branchFilter === option.value}
+            data-testid={`branch-filter-${option.value}`}
+            onclick={() => (branchFilter = option.value)}
+          >
+            {option.label}
+          </button>
+        {/each}
+      </div>
 
-    <div class="ml-auto flex items-center gap-2">
+      <label
+        class="text-muted hover:bg-panel flex h-6 cursor-pointer items-center gap-1.5 rounded-full px-2 text-xs transition-colors"
+      >
+        <input
+          class="accent-accent h-3.5 w-3.5"
+          type="checkbox"
+          bind:checked={showInactive}
+          data-testid="show-inactive"
+        />
+        Show inactive
+      </label>
+    </div>
+
+    <div class="flex shrink-0 items-center gap-2">
       <Button
         variant="secondary"
         size="sm"
@@ -153,17 +169,20 @@
   </div>
 
   {#if addError}
-    <p
-      class="text-status-failed border-border/60 border-b px-4 py-2 text-xs"
+    <div
+      class="border-border/60 bg-status-failed-soft text-status-failed border-b px-4 py-2 text-xs"
       data-testid="git-add-error"
     >
       {addError}
-    </p>
+    </div>
   {/if}
 
   <div class="flex min-h-0 flex-1 flex-col" bind:this={splitEl} data-testid="git-split">
     <div
-      class={cn("flex min-h-0 flex-col gap-2 overflow-y-auto p-3", panel === null && "flex-1")}
+      class={cn(
+        "bg-surface flex min-h-0 flex-col gap-2 overflow-y-auto p-3",
+        panel === null && "flex-1",
+      )}
       style={panel !== null ? `flex: ${splitRatio} 1 0%` : undefined}
       data-testid="git-repo-list"
     >
@@ -207,7 +226,7 @@
     {#if panel !== null}
       <!-- Draggable divider: drags the tree/diff split (D1). -->
       <div
-        class="border-border/60 hover:bg-accent/40 bg-panel/40 h-1.5 shrink-0 cursor-row-resize border-y transition-colors"
+        class="border-border/60 bg-panel hover:bg-raised h-1.5 shrink-0 cursor-row-resize border-y transition-colors"
         role="separator"
         aria-orientation="horizontal"
         aria-label="Resize diff panel"

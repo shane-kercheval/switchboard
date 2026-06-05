@@ -39,6 +39,11 @@
   let busy = $state(false);
 
   const repo = $derived(listing.repo);
+  const worktreeCount = $derived(
+    repo.local_branches.filter((branch) => branch.worktree !== null).length +
+      repo.detached_worktrees.length,
+  );
+  const localBranchCount = $derived(repo.local_branches.length);
 
   // Active = has a worktree (checked out somewhere). Inactive branches are dimmed
   // and hidden when the toggle is off; active ones sort first.
@@ -85,11 +90,15 @@
   }
 </script>
 
-<div class="border-border/60 rounded-md border" data-testid="git-repo" data-repo-root={repo.root}>
-  <div class="flex items-center gap-2 px-3 py-2">
+<div
+  class="border-border/70 bg-raised overflow-hidden rounded-md border"
+  data-testid="git-repo"
+  data-repo-root={repo.root}
+>
+  <div class="bg-raised flex min-h-10 items-center gap-2 px-3 py-2">
     <button
       type="button"
-      class="text-muted hover:text-fg flex h-5 w-5 shrink-0 items-center justify-center"
+      class="text-muted hover:bg-panel hover:text-fg flex h-6 w-6 shrink-0 items-center justify-center rounded-full transition-colors"
       aria-label={expanded ? "Collapse repo" : "Expand repo"}
       aria-expanded={expanded}
       onclick={() => (expanded = !expanded)}
@@ -108,19 +117,28 @@
       </svg>
     </button>
 
-    <span class="text-fg truncate text-sm font-semibold" title={repo.root}>{repo.name}</span>
+    <div class="min-w-0 flex-1">
+      <div class="flex min-w-0 items-center gap-1.5">
+        <span class="text-fg truncate text-sm font-semibold" title={repo.root}>{repo.name}</span>
+        {#if repo.is_bare}
+          <Badge testid="repo-bare">bare</Badge>
+        {/if}
+        {#if !repo.available}
+          <Badge testid="repo-unavailable" class="bg-warning-soft text-warning">unavailable</Badge>
+        {/if}
+      </div>
+      <div class="text-muted mt-0.5 flex min-w-0 items-center gap-1.5 text-[11px] leading-4">
+        {#if repo.default_branch}
+          <span class="shrink-0">{repo.default_branch}</span>
+          <span class="text-border shrink-0">/</span>
+        {/if}
+        <span class="shrink-0">{worktreeCount} worktree{worktreeCount === 1 ? "" : "s"}</span>
+        <span class="text-border shrink-0">/</span>
+        <span class="truncate" title={repo.root}>{repo.root}</span>
+      </div>
+    </div>
 
-    {#if repo.default_branch}
-      <span class="text-muted shrink-0 text-xs">{repo.default_branch}</span>
-    {/if}
-    {#if repo.is_bare}
-      <Badge testid="repo-bare">bare</Badge>
-    {/if}
-    {#if !repo.available}
-      <Badge testid="repo-unavailable">unavailable</Badge>
-    {/if}
-
-    <div class="ml-auto flex shrink-0 items-center gap-2">
+    <div class="flex shrink-0 items-center gap-2">
       <span class="text-muted text-[10px]" data-testid="repo-fetch-state"
         >{fetchLabel(fetchState)}</span
       >
@@ -187,7 +205,7 @@
   </div>
 
   {#if expanded}
-    <div class="border-border/60 border-t px-2 py-1.5" data-testid="repo-branches">
+    <div class="border-border/60 bg-surface border-t px-2 py-1.5" data-testid="repo-branches">
       {#if !repo.available}
         <p class="text-muted px-2 py-2 text-xs">
           This repository is unavailable (moved or unmounted).
@@ -199,9 +217,10 @@
               branch.worktree !== null && worktreeSelection.current?.path === branch.worktree.path}
             <div
               class={cn(
-                "flex items-start gap-2 rounded px-2 py-1.5",
+                "group flex min-h-8 items-center gap-2 rounded-md px-2 py-1.5 transition-colors",
                 branch.worktree === null && "opacity-60",
-                selected && "bg-raised",
+                branch.worktree !== null && "hover:bg-panel",
+                selected && "bg-raised hover:bg-raised",
               )}
               data-testid="git-branch"
               data-branch={branch.name}
@@ -213,7 +232,7 @@
                      two clicks don't nest. -->
                 <button
                   type="button"
-                  class="flex min-w-0 flex-1 items-start gap-2 text-left"
+                  class="flex min-w-0 flex-1 items-center gap-2 text-left"
                   data-testid="worktree-select"
                   data-selected={selected}
                   onclick={() => selectWorktree(worktreePath, branch.name)}
@@ -223,7 +242,10 @@
                 <DropdownMenu
                   triggerLabel={`Actions for ${branch.name}`}
                   triggerTestid="worktree-actions-trigger"
-                  triggerClass={cn(ICON_BUTTON_CLASS, "shrink-0")}
+                  triggerClass={cn(
+                    ICON_BUTTON_CLASS,
+                    "shrink-0 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 data-[state=open]:opacity-100",
+                  )}
                   contentTestid="worktree-actions-menu"
                 >
                   {#snippet trigger()}
@@ -266,26 +288,30 @@
                 </DropdownMenu>
               {:else}
                 <!-- No worktree → not openable; render the same content inert. -->
-                <div class="flex min-w-0 flex-1 items-start gap-2">
+                <div class="flex min-w-0 flex-1 items-center gap-2">
                   {@render branchInner(branch)}
                 </div>
               {/if}
             </div>
           {/each}
           {#if localBranches.length === 0}
-            <p class="text-muted px-2 py-1.5 text-xs">No active branches.</p>
+            <p class="text-muted px-2 py-1.5 text-xs">
+              {showInactive && localBranchCount === 0
+                ? "No local branches."
+                : "No active branches."}
+            </p>
           {/if}
         {/if}
 
         {#if showRemote}
           {#each repo.remote_branches as branch (branch.name)}
             <div
-              class="flex items-start gap-2 rounded px-2 py-1.5 opacity-60"
+              class="flex min-h-8 items-center gap-2 rounded-md px-2 py-1.5 opacity-65"
               data-testid="git-remote-branch"
               data-branch={branch.name}
             >
-              <span class="text-muted mt-0.5 shrink-0 text-[13px]">{branch.name}</span>
-              <div class="flex flex-1 flex-wrap items-center gap-1">
+              <span class="text-muted shrink-0 text-[13px] leading-5">{branch.name}</span>
+              <div class="flex min-w-0 flex-1 flex-wrap items-center gap-1">
                 {#each remoteBranchBadges(branch, repo.default_branch) as badge (badge.key)}
                   <GitBadge {badge} />
                 {/each}
@@ -297,18 +323,22 @@
         {#each repo.detached_worktrees as wt (wt.path)}
           {@const dselected = worktreeSelection.current?.path === wt.path}
           <div
-            class={cn("flex items-start gap-2 rounded px-2 py-1.5", dselected && "bg-raised")}
+            class={cn(
+              "flex min-h-8 items-center gap-2 rounded-md px-2 py-1.5 transition-colors",
+              wt.warning !== "prunable" && "hover:bg-panel",
+              dselected && "bg-raised hover:bg-raised",
+            )}
             data-testid="git-detached-worktree"
           >
             {#if wt.warning === "prunable"}
               <!-- Directory is gone — nothing to inspect, so not openable. -->
-              <div class="flex min-w-0 flex-1 items-start gap-2">
+              <div class="flex min-w-0 flex-1 items-center gap-2">
                 {@render detachedInner(wt)}
               </div>
             {:else}
               <button
                 type="button"
-                class="flex min-w-0 flex-1 items-start gap-2 text-left"
+                class="flex min-w-0 flex-1 items-center gap-2 text-left"
                 data-testid="worktree-select"
                 data-selected={dselected}
                 onclick={() => selectWorktree(wt.path, wt.detached_hash ?? "detached")}
@@ -324,8 +354,8 @@
 </div>
 
 {#snippet branchInner(branch: BranchView)}
-  <span class="text-fg mt-0.5 shrink-0 text-[13px]">{branch.name}</span>
-  <div class="flex flex-1 flex-wrap items-center gap-1">
+  <span class="text-fg shrink-0 text-[13px] leading-5">{branch.name}</span>
+  <div class="flex min-w-0 flex-1 flex-wrap items-center gap-1">
     {#each localBranchBadges(branch, repo.default_branch) as badge (badge.key)}
       <GitBadge {badge} />
     {/each}
@@ -341,10 +371,10 @@
 {/snippet}
 
 {#snippet detachedInner(wt: WorktreeView)}
-  <span class="text-muted mt-0.5 shrink-0 font-mono text-[11px]">
+  <span class="text-muted shrink-0 font-mono text-[11px] leading-5">
     {wt.detached_hash ?? "detached"}
   </span>
-  <div class="flex flex-1 flex-wrap items-center gap-1">
+  <div class="flex min-w-0 flex-1 flex-wrap items-center gap-1">
     {#if wt.warning === "orphaned"}
       <GitBadge
         badge={{ key: "orphaned", label: "orphaned", tone: "warning", title: "Branch deleted" }}

@@ -103,6 +103,11 @@
     }
   }
 
+  function directoryLabel(filePath: string): string {
+    const i = filePath.lastIndexOf("/");
+    return i >= 0 ? filePath.slice(0, i) : "";
+  }
+
   function revealWorktree(): void {
     void revealInFinder(path).catch((e: unknown) => {
       console.error("[switchboard] reveal worktree failed", e);
@@ -112,20 +117,24 @@
 
 <div class="flex min-h-0 flex-1 flex-col overflow-hidden" data-testid="worktree-detail-panel">
   <!-- Header -->
-  <div class="border-border/60 flex items-center gap-2 border-b px-3 py-1.5">
-    <span class="text-fg shrink-0 text-sm font-semibold" data-testid="detail-branch">{label}</span>
-    <button
-      type="button"
-      class="text-muted hover:text-fg min-w-0 truncate text-left font-mono text-[11px]"
-      title={`${path} — reveal in Finder`}
-      data-testid="detail-path"
-      onclick={revealWorktree}
-    >
-      {path}
-    </button>
+  <div class="border-border/60 bg-raised flex min-h-11 items-center gap-3 border-b px-3 py-2">
+    <div class="min-w-0 flex-1">
+      <div class="text-fg truncate text-sm leading-5 font-semibold" data-testid="detail-branch">
+        {label}
+      </div>
+      <button
+        type="button"
+        class="text-muted hover:text-fg block max-w-full min-w-0 truncate text-left font-mono text-[11px] leading-4"
+        title={`${path} — reveal in Finder`}
+        data-testid="detail-path"
+        onclick={revealWorktree}
+      >
+        {path}
+      </button>
+    </div>
 
     <div
-      class={cn(SEGMENTED_MAIN_CONTAINER_CLASS, "ml-auto flex shrink-0")}
+      class={cn(SEGMENTED_MAIN_CONTAINER_CLASS, "flex shrink-0")}
       role="radiogroup"
       aria-label="Diff layout"
     >
@@ -185,34 +194,50 @@
   {:else}
     <div class="flex min-h-0 flex-1 overflow-hidden">
       <!-- Changed-files list -->
-      <ul
-        class="border-border/60 w-56 shrink-0 overflow-y-auto border-r py-1"
-        data-testid="changed-files"
-      >
-        {#each files as file (file.path)}
-          {@const badge = changeBadge(file.change)}
-          <li>
-            <button
-              type="button"
-              class={cn(
-                "flex w-full items-center gap-2 px-2 py-1 text-left text-xs",
-                file.path === selectedFile ? "bg-raised text-fg" : "text-muted hover:bg-panel",
-              )}
-              data-testid="changed-file"
-              data-selected={file.path === selectedFile}
-              onclick={() => (selectedFile = file.path)}
-            >
-              <span class={cn("w-3 shrink-0 text-center font-mono", badge.class)}
-                >{badge.letter}</span
+      <div class="border-border/60 bg-surface w-64 shrink-0 overflow-hidden border-r">
+        <div
+          class="border-border/60 bg-panel/70 flex h-8 items-center justify-between border-b px-2"
+        >
+          <span class="text-muted text-[11px] font-semibold tracking-wide uppercase">
+            Changed files
+          </span>
+          <span class="text-muted font-mono text-[11px]">{files.length}</span>
+        </div>
+        <ul class="h-[calc(100%-2rem)] overflow-y-auto py-1" data-testid="changed-files">
+          {#each files as file (file.path)}
+            {@const badge = changeBadge(file.change)}
+            {@const directory = directoryLabel(file.path)}
+            <li>
+              <button
+                type="button"
+                class={cn(
+                  "flex w-full items-start gap-2 rounded-none px-2 py-1.5 text-left text-xs transition-colors",
+                  file.path === selectedFile ? "bg-raised text-fg" : "text-muted hover:bg-panel",
+                )}
+                data-testid="changed-file"
+                data-selected={file.path === selectedFile}
+                onclick={() => (selectedFile = file.path)}
               >
-              <span class="truncate" title={file.path}>{basename(file.path)}</span>
-            </button>
-          </li>
-        {/each}
-      </ul>
+                <span
+                  class={cn("mt-0.5 w-4 shrink-0 text-center font-mono text-[11px]", badge.class)}
+                  >{badge.letter}</span
+                >
+                <span class="min-w-0 flex-1">
+                  <span class="block truncate" title={file.path}>{basename(file.path)}</span>
+                  {#if directory}
+                    <span class="text-muted/80 block truncate font-mono text-[10px] leading-4">
+                      {directory}
+                    </span>
+                  {/if}
+                </span>
+              </button>
+            </li>
+          {/each}
+        </ul>
+      </div>
 
       <!-- Diff -->
-      <div class="min-w-0 flex-1 overflow-auto" data-testid="diff-scroll">
+      <div class="bg-raised min-w-0 flex-1 overflow-auto" data-testid="diff-scroll">
         {#if diffLoading}
           <div class="flex items-center justify-center py-6">
             <Spinner class="h-4 w-4" />

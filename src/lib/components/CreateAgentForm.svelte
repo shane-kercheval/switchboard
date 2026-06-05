@@ -92,6 +92,7 @@
   const canSubmit = $derived(!busy && nameValidation.ok && sessionIdValid && selectedSelectable);
 
   function handleSubmit(): void {
+    if (!canSubmit) return;
     const trimmedName = normalizeAgentName(name);
     if (mode === "create") {
       onSubmit({ mode: "create", name: trimmedName, harness });
@@ -103,6 +104,12 @@
         existingSessionId: existingSessionId.trim(),
       });
     }
+  }
+
+  function submitOnEnter(event: KeyboardEvent): void {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    handleSubmit();
   }
 
   /// Drop the cross-mode field when toggling so a stale, invalid session-id
@@ -243,6 +250,7 @@
       aria-invalid={!nameValidation.ok}
       aria-describedby={nameError ? "agent-name-error" : undefined}
       title={nameError ?? undefined}
+      onkeydown={submitOnEnter}
     />
     {#if nameError}
       <span
@@ -264,6 +272,7 @@
         placeholder="00000000-0000-0000-0000-000000000000"
         data-testid="attach-session-id"
         class="h-8 px-2"
+        onkeydown={submitOnEnter}
       />
       {#if existingSessionId.trim() !== "" && !sessionIdValid}
         <span class="text-status-failed block text-xs" data-testid="attach-session-id-error">

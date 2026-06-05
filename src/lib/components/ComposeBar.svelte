@@ -26,7 +26,7 @@
   import PromptMenu from "$lib/components/PromptMenu.svelte";
   import PromptComposer from "$lib/components/PromptComposer.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
-  import { cn, currentIsoTimestamp } from "$lib/utils";
+  import { basename, cn, currentIsoTimestamp } from "$lib/utils";
   import { shortcut } from "$lib/platform";
   import { onDestroy, onMount, untrack } from "svelte";
   import { listen } from "@tauri-apps/api/event";
@@ -47,7 +47,6 @@
   let draft = $state<string>(saved.content.kind === "plain" ? saved.content.draft : "");
   let sendError = $state<string | null>(null);
   let composeEl = $state<HTMLDivElement | undefined>(undefined);
-  let inputWrapEl = $state<HTMLDivElement | undefined>(undefined);
   let textareaEl = $state<HTMLTextAreaElement | undefined>(undefined);
 
   // ── Prompt mode ────────────────────────────────────────────────────────────
@@ -60,6 +59,7 @@
   let promptMenuOpen = $state(false);
   let promptMenuWrapEl = $state<HTMLDivElement | undefined>(undefined);
   let prompts = $state<Prompt[]>([]);
+  let focusPromptFieldOnMount = $state(false);
   // Whether the cache has been read at least once, so the picker can show a
   // "loading" row instead of momentarily claiming there are no prompts.
   let promptsLoaded = $state(false);
@@ -144,20 +144,6 @@
       : { kind: "plain", draft };
   }
 
-  function resizeTextarea(textarea: HTMLTextAreaElement | undefined, _draft: string): void {
-    // `bind:this` resets to null (not undefined) when the textarea unmounts on
-    // entering prompt mode; guard both.
-    if (textarea == null) return;
-    textarea.style.height = "auto";
-    const naturalHeight = textarea.scrollHeight;
-    const maxHeight = Number.parseFloat(getComputedStyle(textarea).maxHeight);
-    const cappedHeight = Number.isFinite(maxHeight)
-      ? Math.min(naturalHeight, maxHeight)
-      : naturalHeight;
-    textarea.style.height = `${cappedHeight}px`;
-    textarea.style.overflowY = naturalHeight > cappedHeight ? "auto" : "hidden";
-  }
-
   // Drop any selected ids whose agent disappeared (agent removed at runtime).
   $effect(() => {
     const valid = selectedIds.filter((id) => agents.some((a) => a.id === id));
@@ -173,11 +159,6 @@
   $effect(() => {
     if (restoring) return;
     setContent(projectId, currentContent());
-  });
-  // Track both the draft and bound textarea: draft changes resize the box, and
-  // the ref change performs the initial resize once the DOM node is available.
-  $effect(() => {
-    resizeTextarea(textareaEl, draft);
   });
   // The parent unmounts this bar the moment a project loses its last agent (it
   // falls back to the roster-loading / first-agent screen), so an empty roster
@@ -258,7 +239,7 @@
         } else if (menuOpen) {
           menuOpen = false;
           e.preventDefault();
-        } else if (selectedIds.length > 0) {
+        } else if (!sending && selectedIds.length > 0) {
           selectedIds = [];
           e.preventDefault();
         }
@@ -275,6 +256,7 @@
       if (e.shiftKey) {
         if (e.key.toLowerCase() === "a") {
           e.preventDefault();
+          if (sending) return;
           selectedIds = agents.map((a) => a.id);
         }
         return;
@@ -283,6 +265,7 @@
       const agent = agents[Number(e.key) - 1];
       if (agent === undefined) return;
       e.preventDefault();
+      if (sending) return;
       toggleRecipient(agent.id);
     }
     window.addEventListener("keydown", onKeydown);
@@ -306,12 +289,10 @@
   // Non-reactive cancellation state: it only invalidates pending async file searches.
   let fileSearchToken = 0;
   let fileSearchTimer: ReturnType<typeof setTimeout> | undefined = undefined;
-  let menuAnchor = $state<{ left: number; top: number } | null>(null);
   let highlighted = $state(0);
   const AT_TOKEN = /(^|\s)@([^\s]*)$/;
   const FILE_MATCH_LIMIT = 12;
   const FILE_SEARCH_DEBOUNCE_MS = 180;
-  const MENU_WIDTH = 256;
 
   const agentCandidates = $derived(
     menuOpen ? agents.filter((a) => a.name.toLowerCase().includes(menuQuery.toLowerCase())) : [],
@@ -322,7 +303,13 @@
   /// everyone is selected and its keyword matches the query; **Clear** only when
   /// something is selected and its keyword matches. Even though files render
   /// first, keyboard selection prefers a matched agent when one exists.
-  type FileMenuItem = { kind: "file"; key: string; path: string };
+  type FileMenuItem = {
+    kind: "file";
+    key: string;
+    path: string;
+    label: string;
+    parent: string | null;
+  };
   type RecipientMenuItem =
     | { kind: "all"; key: string }
     | { kind: "clear"; key: string }
@@ -334,6 +321,8 @@
           kind: "file",
           key: `file:${path}`,
           path,
+          label: basename(path),
+          parent: parentPath(path),
         }))
       : [],
   );
@@ -412,6 +401,7 @@
   const primaryDisabled = $derived(showStop ? false : sendDisabled);
 
   function toggleRecipient(id: AgentId): void {
+    if (sending) return;
     selectedIds = selectedIds.includes(id)
       ? selectedIds.filter((x) => x !== id)
       : [...selectedIds, id];
@@ -427,7 +417,15 @@
       kind: "file",
       key: `file:${path}`,
       path,
+      label: basename(path),
+      parent: parentPath(path),
     }));
+  }
+
+  function parentPath(path: string): string | null {
+    const trimmed = path.endsWith("/") ? path.slice(0, -1) : path;
+    const i = trimmed.lastIndexOf("/");
+    return i > 0 ? trimmed.slice(0, i) : null;
   }
 
   function stripAtToken(): void {
@@ -486,7 +484,6 @@
     menuOpen = false;
     fileMatches = [];
     fileSearchState = "idle";
-    menuAnchor = null;
     clearFileSearchTimer();
     fileSearchToken += 1;
   }
@@ -511,49 +508,11 @@
     }
   }
 
-  function activeAtToken(text: string): { query: string; atIndex: number } | null {
+  function activeAtToken(text: string): { query: string } | null {
     const match = AT_TOKEN.exec(text);
     if (!match) return null;
     return {
       query: match[2] ?? "",
-      atIndex: match.index + (match[1]?.length ?? 0),
-    };
-  }
-
-  function updateMenuAnchor(atIndex: number): void {
-    if (textareaEl === undefined || inputWrapEl === undefined) {
-      menuAnchor = null;
-      return;
-    }
-
-    const style = getComputedStyle(textareaEl);
-    const mirror = document.createElement("div");
-    mirror.style.position = "absolute";
-    mirror.style.visibility = "hidden";
-    mirror.style.pointerEvents = "none";
-    mirror.style.whiteSpace = "pre-wrap";
-    mirror.style.overflowWrap = "break-word";
-    mirror.style.boxSizing = style.boxSizing;
-    mirror.style.width = `${textareaEl.clientWidth}px`;
-    mirror.style.font = style.font;
-    mirror.style.letterSpacing = style.letterSpacing;
-    mirror.style.lineHeight = style.lineHeight;
-    mirror.style.padding = style.padding;
-    mirror.style.border = style.border;
-
-    const marker = document.createElement("span");
-    marker.textContent = "@";
-    mirror.append(document.createTextNode(draft.slice(0, atIndex)), marker);
-    // eslint-disable-next-line svelte/no-dom-manipulating -- textarea caret measurement needs an off-tree mirror that Svelte does not own
-    inputWrapEl.append(mirror);
-
-    const left = textareaEl.offsetLeft + marker.offsetLeft - textareaEl.scrollLeft;
-    const top = textareaEl.offsetTop + marker.offsetTop - textareaEl.scrollTop;
-    mirror.remove();
-
-    menuAnchor = {
-      left: Math.max(0, Math.min(left, Math.max(0, inputWrapEl.clientWidth - MENU_WIDTH))),
-      top: Math.max(0, top),
     };
   }
 
@@ -591,9 +550,9 @@
     const shouldSearchFiles = hasAtToken && (token.query.length > 0 || agents.length === 1);
     const shouldOpenMenu = hasAtToken && (hasRecipientOptions || shouldSearchFiles);
     if (token !== null && shouldOpenMenu) {
+      promptMenuOpen = false;
       menuQuery = token.query;
       menuOpen = true;
-      updateMenuAnchor(token.atIndex);
       if (shouldSearchFiles) {
         const q = token.query.toLowerCase();
         const retainedFileMatches = fileMatches.filter((path) => path.toLowerCase().includes(q));
@@ -662,6 +621,7 @@
     selectedPrompt = prompt;
     promptArgs = Object.fromEntries(prompt.arguments.map((a) => [a.name, ""]));
     appendedText = carried;
+    focusPromptFieldOnMount = true;
     draft = "";
     mode = "prompt";
     promptMenuOpen = false;
@@ -673,6 +633,7 @@
     mode = "plain";
     selectedPrompt = null;
     promptArgs = {};
+    focusPromptFieldOnMount = false;
     appendedText = "";
   }
 
@@ -725,6 +686,8 @@
       const renderArgs = buildRenderArgs(prompt, promptArgs);
       const appended = appendedText;
       const targets = [...selectedAgents];
+      promptMenuOpen = false;
+      closeMentionMenu();
       sending = true;
       let finalText: string;
       try {
@@ -736,11 +699,8 @@
         return;
       }
       sending = false;
-      // The user may have backed out during the render: removed/swapped the
-      // prompt, or deselected a chosen recipient. Honor that — abort without
-      // dispatching and without resetting their new composer state. (Adding a
-      // recipient mid-render is not an abort: the send commits to the recipients
-      // chosen at click time; a newly-added one wasn't part of this send.)
+      // If the composer state changed outside the locked UI while rendering,
+      // avoid dispatching text into a now-different prompt/recipient context.
       const stillSelected = new Set(selectedIds);
       if (selectedPrompt !== prompt || targets.some((t) => !stillSelected.has(t.id))) return;
       dispatchToRecipients(finalText, targets);
@@ -749,6 +709,7 @@
       // carried back.
       selectedPrompt = null;
       promptArgs = {};
+      focusPromptFieldOnMount = false;
       appendedText = "";
       draft = "";
       mode = "plain";
@@ -786,6 +747,142 @@
         onclose={() => (promptMenuOpen = false)}
       />
     {/if}
+    {#if menuOpen && hasMenuContent}
+      <!-- Full compose-box width, matching the prompt menu's placement. The
+           menu opens upward from the compose box instead of following the @
+           caret, which keeps file paths readable without side tooltips. -->
+      <div
+        class="border-border/90 bg-raised absolute inset-x-0 bottom-full z-20 mb-1 overflow-hidden rounded-lg border p-1 text-[13px] shadow-[0_10px_28px_rgba(0,0,0,0.10)]"
+        data-testid="recipient-menu"
+        role="listbox"
+        bind:this={menuEl}
+      >
+        {#if showFileSection}
+          <div
+            class="text-muted px-2.5 py-0.5 text-[11px] font-medium tracking-wide uppercase select-none"
+          >
+            Files
+          </div>
+        {/if}
+        <div class="max-h-48 overflow-y-auto" data-testid="file-options-scroll">
+          {#each fileItems as item (item.key)}
+            {@const i = menuItems.findIndex((candidate) => candidate.key === item.key)}
+            <button
+              type="button"
+              class={"hover:bg-panel/80 flex w-full cursor-pointer items-start gap-2 rounded-md px-2.5 py-1.5 text-left leading-5 outline-none select-none " +
+                (i === highlighted ? "bg-panel/80" : "")}
+              data-testid={`file-option-${item.path}`}
+              role="option"
+              aria-selected={i === highlighted}
+              onclick={() => pickItem(item)}
+            >
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.8"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                class="text-muted h-4 w-4 shrink-0"
+                aria-hidden="true"
+              >
+                <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
+                <path d="M14 3v5h5" />
+              </svg>
+              <span class="flex min-w-0 flex-col">
+                <span
+                  class="text-fg min-w-0 truncate text-left text-xs font-medium"
+                  data-testid="file-option-label">{item.label}</span
+                >
+                {#if item.parent !== null}
+                  <span
+                    class="text-muted truncate text-left text-[11px]"
+                    data-testid="file-option-path"
+                  >
+                    {item.parent}
+                  </span>
+                {/if}
+              </span>
+            </button>
+          {/each}
+          {#if fileStatusText !== null}
+            <div
+              class="text-muted flex min-h-7 items-center px-2.5 py-1 text-left leading-5 select-none"
+              data-testid="file-options-status"
+            >
+              {fileStatusText}
+            </div>
+          {/if}
+        </div>
+
+        {#if recipientItems.length > 0}
+          <div
+            class={cn(
+              "text-muted px-2.5 py-0.5 text-[11px] font-medium tracking-wide uppercase select-none",
+              fileItems.length > 0 ? "mt-1" : "",
+            )}
+          >
+            Send to
+          </div>
+        {/if}
+        {#each recipientItems as item (item.key)}
+          {@const i = menuItems.findIndex((candidate) => candidate.key === item.key)}
+          <button
+            type="button"
+            class={"hover:bg-panel/80 flex w-full cursor-pointer items-center gap-2 rounded-md px-2.5 py-1 text-left leading-5 outline-none select-none " +
+              (i === highlighted ? "bg-panel/80" : "")}
+            data-testid={`recipient-option-${item.key}`}
+            role="option"
+            aria-selected={i === highlighted}
+            onclick={() => pickItem(item)}
+          >
+            {#if item.kind === "all"}
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                class="text-accent h-4 w-4"
+                aria-hidden="true"
+              >
+                <circle cx="12" cy="12" r="9" />
+                <path d="m8.5 12 2.5 2.5 4.5-5" />
+              </svg>
+              <span class="text-fg">All agents</span>
+              <span class="text-muted ml-auto font-mono text-[13px]">
+                {shortcut("mod", "shift", "A")}
+              </span>
+            {:else if item.kind === "clear"}
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                class="text-muted h-4 w-4"
+                aria-hidden="true"
+              >
+                <circle cx="12" cy="12" r="9" />
+                <path d="m5.6 5.6 12.8 12.8" />
+              </svg>
+              <span class="text-fg">Clear</span>
+              <span class="text-muted ml-auto font-mono text-[13px]">{shortcut("esc")}</span>
+            {:else if item.kind === "agent"}
+              {@const agentIndex = agents.findIndex((a) => a.id === item.agent.id)}
+              <HarnessIcon harness={item.agent.harness} size="sm" class="h-4 w-4" />
+              <span class="text-fg">{item.agent.name}</span>
+              {#if agentIndex >= 0 && agentIndex < 9}
+                <span class="text-muted ml-auto font-mono text-[13px]">
+                  {shortcut("mod", String(agentIndex + 1))}
+                </span>
+              {/if}
+            {/if}
+          </button>
+        {/each}
+      </div>
+    {/if}
     <div class="mb-1.5 flex items-start justify-between gap-2">
       {#if agents.length > 1}
         <div class="flex flex-wrap items-center gap-1.5 text-xs" data-testid="recipient-field">
@@ -806,10 +903,12 @@
                     selected
                       ? "bg-accent-soft text-fg border-transparent"
                       : "border-panel bg-panel text-muted hover:bg-raised hover:text-fg",
+                    sending ? "cursor-not-allowed opacity-60" : "",
                   )}
                   data-testid={`recipient-chip-${agent.id}`}
                   data-selected={selected}
                   aria-pressed={selected}
+                  disabled={sending}
                   onclick={() => toggleRecipient(agent.id)}
                 >
                   <HarnessIcon harness={agent.harness} size="sm" class="h-3.5 w-3.5" />
@@ -827,7 +926,10 @@
                   class="text-muted hover:text-fg hover:bg-panel ml-0.5 flex h-6 w-6 items-center justify-center rounded-full transition-colors"
                   data-testid="recipient-clear"
                   aria-label="Clear recipients"
-                  onclick={() => (selectedIds = [])}
+                  disabled={sending}
+                  onclick={() => {
+                    if (!sending) selectedIds = [];
+                  }}
                 >
                   <svg
                     viewBox="0 0 24 24"
@@ -855,10 +957,21 @@
             <button
               {...props}
               type="button"
-              class="text-muted hover:text-fg hover:bg-panel focus-visible:ring-accent flex h-7 items-center gap-1 rounded-full border border-transparent px-2 text-xs transition-colors focus-visible:ring-2 focus-visible:outline-none"
+              class={cn(
+                "text-muted hover:text-fg hover:bg-panel focus-visible:ring-accent flex h-7 items-center gap-1 rounded-full border border-transparent px-2 text-xs transition-colors focus-visible:ring-2 focus-visible:outline-none",
+                sending ? "cursor-not-allowed opacity-60" : "",
+              )}
               data-testid="compose-prompt-button"
               aria-label="Insert a prompt"
-              onclick={() => (promptMenuOpen ? (promptMenuOpen = false) : openPromptMenu())}
+              disabled={sending}
+              onclick={() => {
+                if (sending) return;
+                if (promptMenuOpen) {
+                  promptMenuOpen = false;
+                } else {
+                  openPromptMenu();
+                }
+              }}
             >
               <svg
                 viewBox="0 0 24 24"
@@ -898,145 +1011,16 @@
           prompt={selectedPrompt}
           bind:args={promptArgs}
           bind:appendedText
+          focusFirstField={focusPromptFieldOnMount}
           onremove={removePrompt}
+          busy={sending}
           send={sendButton}
         />
       </div>
     {:else}
-      <div class="relative flex items-end gap-2" bind:this={inputWrapEl}>
-        {#if menuOpen && hasMenuContent}
-          <div
-            class="border-border/90 bg-raised absolute z-10 w-64 overflow-hidden rounded-lg border p-1 text-[13px] shadow-[0_10px_28px_rgba(0,0,0,0.10)]"
-            style={menuAnchor === null
-              ? undefined
-              : `left: ${menuAnchor.left}px; top: ${menuAnchor.top}px; transform: translateY(calc(-100% - 0.25rem));`}
-            data-testid="recipient-menu"
-            role="listbox"
-            bind:this={menuEl}
-          >
-            {#if showFileSection}
-              <div
-                class="text-muted px-2.5 py-0.5 text-[11px] font-medium tracking-wide uppercase select-none"
-              >
-                Files
-              </div>
-            {/if}
-            <div class="max-h-48 overflow-y-auto" data-testid="file-options-scroll">
-              {#each fileItems as item (item.key)}
-                {@const i = menuItems.findIndex((candidate) => candidate.key === item.key)}
-                <Tooltip label={item.path} side="right" delayDuration={0}>
-                  {#snippet trigger(props)}
-                    <button
-                      {...props}
-                      type="button"
-                      class={"hover:bg-panel/80 flex w-full cursor-pointer items-center gap-2 rounded-md px-2.5 py-1 text-left leading-5 outline-none select-none " +
-                        (i === highlighted ? "bg-panel/80" : "")}
-                      data-testid={`file-option-${item.path}`}
-                      role="option"
-                      aria-selected={i === highlighted}
-                      onclick={() => pickItem(item)}
-                    >
-                      <svg
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        stroke-width="1.8"
-                        stroke-linecap="round"
-                        stroke-linejoin="round"
-                        class="text-muted h-4 w-4 shrink-0"
-                        aria-hidden="true"
-                      >
-                        <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
-                        <path d="M14 3v5h5" />
-                      </svg>
-                      <span
-                        class="text-fg min-w-0 truncate text-left"
-                        dir="rtl"
-                        data-testid="file-option-label">{item.path}</span
-                      >
-                    </button>
-                  {/snippet}
-                </Tooltip>
-              {/each}
-              {#if fileStatusText !== null}
-                <div
-                  class="text-muted flex min-h-7 items-center px-2.5 py-1 text-left leading-5 select-none"
-                  data-testid="file-options-status"
-                >
-                  {fileStatusText}
-                </div>
-              {/if}
-            </div>
-
-            {#if recipientItems.length > 0}
-              <div
-                class={cn(
-                  "text-muted px-2.5 py-0.5 text-[11px] font-medium tracking-wide uppercase select-none",
-                  fileItems.length > 0 ? "mt-1" : "",
-                )}
-              >
-                Send to
-              </div>
-            {/if}
-            {#each recipientItems as item (item.key)}
-              {@const i = menuItems.findIndex((candidate) => candidate.key === item.key)}
-              <button
-                type="button"
-                class={"hover:bg-panel/80 flex w-full cursor-pointer items-center gap-2 rounded-md px-2.5 py-1 text-left leading-5 outline-none select-none " +
-                  (i === highlighted ? "bg-panel/80" : "")}
-                data-testid={`recipient-option-${item.key}`}
-                role="option"
-                aria-selected={i === highlighted}
-                onclick={() => pickItem(item)}
-              >
-                {#if item.kind === "all"}
-                  <svg
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="2"
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                    class="text-accent h-4 w-4"
-                    aria-hidden="true"
-                  >
-                    <circle cx="12" cy="12" r="9" />
-                    <path d="m8.5 12 2.5 2.5 4.5-5" />
-                  </svg>
-                  <span class="text-fg">All agents</span>
-                  <span class="text-muted ml-auto font-mono text-[13px]">
-                    {shortcut("mod", "shift", "A")}
-                  </span>
-                {:else if item.kind === "clear"}
-                  <svg
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="2"
-                    stroke-linecap="round"
-                    class="text-muted h-4 w-4"
-                    aria-hidden="true"
-                  >
-                    <circle cx="12" cy="12" r="9" />
-                    <path d="m5.6 5.6 12.8 12.8" />
-                  </svg>
-                  <span class="text-fg">Clear</span>
-                  <span class="text-muted ml-auto font-mono text-[13px]">{shortcut("esc")}</span>
-                {:else if item.kind === "agent"}
-                  {@const agentIndex = agents.findIndex((a) => a.id === item.agent.id)}
-                  <HarnessIcon harness={item.agent.harness} size="sm" class="h-4 w-4" />
-                  <span class="text-fg">{item.agent.name}</span>
-                  {#if agentIndex >= 0 && agentIndex < 9}
-                    <span class="text-muted ml-auto font-mono text-[13px]">
-                      {shortcut("mod", String(agentIndex + 1))}
-                    </span>
-                  {/if}
-                {/if}
-              </button>
-            {/each}
-          </div>
-        {/if}
+      <div class="relative flex items-end gap-2">
         <Textarea
+          autosize
           data-testid="compose-textarea"
           data-shortcut-scope="composer"
           placeholder="Type a message…  (⌘+Enter to send, @ to add a recipient, / for a prompt)"

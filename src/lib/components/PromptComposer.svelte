@@ -122,6 +122,7 @@
 <div
   class="relative flex max-h-[min(56dvh,34rem)] min-h-0 flex-col overflow-hidden"
   data-testid="prompt-composer"
+  data-shortcut-scope="composer"
   aria-busy={busy}
 >
   <div

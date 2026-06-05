@@ -33,7 +33,7 @@
 <button
   type="button"
   class={cn(
-    "flex h-6 w-6 items-center justify-center rounded-full border border-transparent transition-colors",
+    "flex h-[26px] w-[26px] items-center justify-center rounded-full border border-transparent transition-colors",
     copied ? "text-accent bg-panel" : "text-muted hover:text-fg hover:bg-border/60",
     className,
   )}

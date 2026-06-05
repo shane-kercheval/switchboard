@@ -39,9 +39,11 @@
   }
 
   const agentActionClass =
-    "text-muted hover:bg-raised hover:text-fg focus-visible:ring-accent focus-visible:bg-raised focus-visible:text-fg inline-flex h-6 w-6 items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none";
+    "text-muted hover:bg-raised hover:text-fg focus-visible:ring-accent focus-visible:bg-raised focus-visible:text-fg inline-flex h-[26px] w-[26px] items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none";
   const agentDangerActionClass =
-    "text-muted hover:bg-raised hover:text-status-failed focus-visible:ring-accent focus-visible:bg-raised focus-visible:text-status-failed inline-flex h-6 w-6 items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none";
+    "border-transparent text-muted hover:border-status-failed/60 hover:bg-status-failed-soft/70 hover:text-status-failed focus-visible:ring-accent focus-visible:border-status-failed/60 focus-visible:bg-status-failed-soft/70 focus-visible:text-status-failed inline-flex h-[26px] w-[26px] items-center justify-center rounded-full border-[0.5px] transition-colors focus-visible:ring-2 focus-visible:outline-none";
+  const agentStopActionClass =
+    "border-muted/40 text-muted hover:border-status-failed/60 hover:bg-status-failed-soft/70 hover:text-status-failed focus-visible:ring-accent focus-visible:border-status-failed/60 focus-visible:bg-status-failed-soft/70 focus-visible:text-status-failed inline-flex h-[26px] w-[26px] items-center justify-center rounded-full border-[0.5px] transition-colors focus-visible:ring-2 focus-visible:outline-none";
   const AGENT_ACTION_DELAY_MS = 500;
 
   /// `onAddAgent` is the "+ Add agent" entry point in the sidebar header.
@@ -102,7 +104,7 @@
 
   function agentActionWidth(count: number): string {
     const visibleCount = Math.max(count, 1);
-    const iconWidthRem = 1.5;
+    const iconWidthRem = 1.625;
     const gapRem = 0.125;
     const width = visibleCount * iconWidthRem + Math.max(visibleCount - 1, 0) * gapRem;
     return `${Math.max(width, 2)}rem`;
@@ -667,13 +669,13 @@
                           <button
                             {...props}
                             type="button"
-                            class={agentDangerActionClass}
+                            class={agentStopActionClass}
                             aria-label="Stop agent"
                             tabindex="-1"
                             data-testid="agent-action-stop"
                             onclick={() => stopAgent(agent.id)}
                           >
-                            <StopIcon class="h-4 w-4" />
+                            <StopIcon class="h-5 w-5" />
                           </button>
                         {/snippet}
                       </Tooltip>

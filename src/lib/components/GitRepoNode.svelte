@@ -98,7 +98,7 @@
   <div class="bg-raised flex min-h-10 items-center gap-2 px-3 py-2">
     <button
       type="button"
-      class="text-muted hover:bg-panel hover:text-fg flex h-6 w-6 shrink-0 items-center justify-center rounded-full transition-colors"
+      class="text-muted hover:bg-panel hover:text-fg flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-full transition-colors"
       aria-label={expanded ? "Collapse repo" : "Expand repo"}
       aria-expanded={expanded}
       onclick={() => (expanded = !expanded)}

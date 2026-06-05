@@ -934,7 +934,7 @@
                 <button
                   {...props}
                   type="button"
-                  class="text-muted hover:text-fg hover:bg-panel ml-0.5 flex h-6 w-6 items-center justify-center rounded-full transition-colors"
+                  class="text-muted hover:text-fg hover:bg-panel ml-0.5 flex h-[26px] w-[26px] items-center justify-center rounded-full transition-colors"
                   data-testid="recipient-clear"
                   aria-label="Clear recipients"
                   disabled={sending}
@@ -969,7 +969,7 @@
               {...props}
               type="button"
               class={cn(
-                "text-muted hover:text-fg hover:bg-panel focus-visible:ring-accent flex h-7 items-center gap-1 rounded-full border border-transparent px-2 text-xs transition-colors focus-visible:ring-2 focus-visible:outline-none",
+                "text-muted hover:text-fg hover:bg-panel focus-visible:ring-accent flex h-6 items-center gap-1 rounded-full border border-transparent px-2 text-xs transition-colors focus-visible:ring-2 focus-visible:outline-none",
                 sending ? "cursor-not-allowed opacity-60" : "",
               )}
               data-testid="compose-prompt-button"

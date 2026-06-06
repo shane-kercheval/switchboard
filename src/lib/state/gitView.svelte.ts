@@ -40,6 +40,12 @@ export type FetchState =
   | { kind: "failed"; at: number }
   | { kind: "ok"; at: number };
 
+export type RevealProjectBranchResult =
+  | { kind: "revealed" }
+  | { kind: "unresolved" }
+  | { kind: "superseded" }
+  | { kind: "failed"; message: string };
+
 type RepoRuntime = {
   /// Monotonic ms (performance.now) of the last successful local read.
   lastRead: number;
@@ -246,6 +252,7 @@ const runtime = new Map<string, RepoRuntime>();
 /// resolve once the real fetch (and its follow-up re-read) is done.
 // eslint-disable-next-line svelte/prefer-svelte-reactivity
 const inFlightFetch = new Map<string, Promise<void>>();
+let gitRevealSeq = 0;
 
 /// Per-repo fetch state for the UI failure indicator. Reactive so the indicator
 /// updates when a background fetch resolves.
@@ -334,13 +341,18 @@ export async function refreshStale(): Promise<void> {
 }
 
 /// Force a single repo's local re-read (per-repo refresh button / staleness).
-/// Returns the listing it read (also upserted into `gitView.repos`), or `null`
-/// on failure — callers that need the resolved root (e.g. the project panel) use
-/// it; the fire-and-forget callers ignore it.
-export async function refreshRepo(root: string): Promise<RepoListing | null> {
+/// Returns the listing it read, or `null` on failure. Normal refreshes upsert
+/// the result into `gitView.repos`; project-only probes can skip unavailable
+/// rows so non-git directories don't appear in the shared Git cache.
+export async function refreshRepo(
+  root: string,
+  opts: { upsertUnavailable?: boolean } = {},
+): Promise<RepoListing | null> {
   try {
     const listing = await api.readTrackedRepo(root);
-    upsertRepo(listing);
+    if (listing.repo.available || opts.upsertUnavailable !== false) {
+      upsertRepo(listing);
+    }
     return listing;
   } catch (e) {
     console.warn("[switchboard] git view refreshRepo failed", { root, error: e });
@@ -401,20 +413,24 @@ export async function fetchAll(): Promise<void> {
   await runBounded(roots, FETCH_CONCURRENCY, fetchRepo);
 }
 
-/// Load the repo a project lives in, for the Projects-side git status panel
-/// (M6). Reuses the Git view's read + fetch + dedup (shared `gitView.repos`
-/// cache, no new fetch machinery): the panel `$effect` remounts on every sidebar
-/// toggle, so the read is **read-staleness-gated** like the Git view — a repo
-/// already read within the local window is served from cache rather than
-/// re-hitting the backend. A genuinely stale (or never-loaded) repo is re-read.
-/// Either way a fetch-stale repo gets a background fetch. `path` is the project's
-/// worktree directory; it resolves to the repo root.
-export async function loadProjectRepo(path: string): Promise<void> {
+/// Load the repo a project lives in for project→Git navigation. Reuses the Git
+/// view's read + fetch + dedup (shared `gitView.repos` cache, no new fetch
+/// machinery): a repo already read within the local window is served from cache
+/// rather than re-hitting the backend. A genuinely stale (or never-loaded) repo
+/// is re-read. Either way a fetch-stale repo gets a background fetch. `path` is
+/// the project's worktree directory; it resolves to the repo root when tracked.
+export async function loadProjectRepo(path: string): Promise<RepoListing | null> {
   const cached = loadedRepoForWorktree(path);
-  const listing = cached && !isReadStale(cached.repo.root) ? cached : await refreshRepo(path);
+  const listing =
+    cached && !isReadStale(cached.repo.root)
+      ? cached
+      : await refreshRepo(cached?.repo.root ?? path, {
+          upsertUnavailable: cached !== undefined,
+        });
   if (listing?.repo.available && isFetchStale(listing.repo.root)) {
     void fetchRepo(listing.repo.root);
   }
+  return listing;
 }
 
 /// The already-loaded repo whose worktree set includes `path`, or `undefined`.
@@ -428,24 +444,102 @@ function loadedRepoForWorktree(path: string): RepoListing | undefined {
   );
 }
 
-/// The `BranchView` for the worktree a project lives in, plus that repo's default
-/// branch (for badge computation), or `null` when not resolvable yet — the repo
-/// isn't loaded, the project's worktree is detached (no branch), or the directory
-/// isn't a tracked git repo. Matches on the backend-computed project↔worktree
-/// linking (robust against path-spelling differences), reading from the reactive
-/// `gitView.repos`, so a caller in a `$derived` re-runs as repos load/refresh.
-export function projectBranch(
-  projectId: string,
-): { branch: BranchView; defaultBranch: string | null } | null {
+/// The `BranchView` for the worktree a project lives in, plus that repo's
+/// identity, or `null` when not resolvable yet — the repo isn't loaded, the
+/// project's worktree is detached (no branch), or the directory isn't a tracked
+/// git repo. Matches on the backend-computed project↔worktree linking, which is
+/// robust against path-spelling differences.
+type ProjectBranchTarget = {
+  repoRoot: string;
+  branch: BranchView;
+  defaultBranch: string | null;
+  worktreePath: string;
+};
+
+type ProjectBranchResolveResult =
+  | { kind: "resolved"; target: ProjectBranchTarget }
+  | { kind: "unresolved" }
+  | { kind: "failed"; message: string };
+
+function projectBranchTarget(projectId: string): ProjectBranchTarget | null {
   for (const listing of gitView.repos) {
     const worktreePath = Object.keys(listing.linked_projects).find((p) =>
       listing.linked_projects[p]?.some((lp) => lp.id === projectId),
     );
     if (worktreePath === undefined) continue;
     const branch = listing.repo.local_branches.find((b) => b.worktree?.path === worktreePath);
-    if (branch) return { branch, defaultBranch: listing.repo.default_branch };
+    if (branch) {
+      return {
+        repoRoot: listing.repo.root,
+        branch,
+        defaultBranch: listing.repo.default_branch,
+        worktreePath,
+      };
+    }
   }
   return null;
+}
+
+async function resolveProjectBranchTarget(
+  projectId: string,
+  directory: string,
+): Promise<ProjectBranchResolveResult> {
+  const listing = await loadProjectRepo(directory);
+  let target = projectBranchTarget(projectId);
+  if (target !== null) return { kind: "resolved", target };
+
+  if (listing?.repo.available) return { kind: "unresolved" };
+
+  try {
+    await addRepo(directory);
+  } catch (e) {
+    console.warn("[switchboard] git view reveal addRepo failed", { directory, error: e });
+    return { kind: "failed", message: e instanceof Error ? e.message : String(e) };
+  }
+  target = projectBranchTarget(projectId);
+  return target === null ? { kind: "unresolved" } : { kind: "resolved", target };
+}
+
+async function selectProjectBranchTarget(target: ProjectBranchTarget): Promise<void> {
+  view.mode = "git";
+  const ref: SelectedRef = { repoRoot: target.repoRoot, kind: "local", name: target.branch.name };
+  if (refsEqual(branchSelection.current, ref)) return;
+  await selectBranch(ref, {
+    worktreePath: target.worktreePath,
+    hasChanges:
+      target.branch.worktree?.dirty === true || target.branch.worktree?.untracked === true,
+    worktreeSubtitle: target.worktreePath,
+  });
+}
+
+/// Switch to Git view and select the local branch/worktree linked to a project.
+/// If the project directory is inside a git repo that is not tracked yet, the
+/// repo is added to Git view and then resolved. Returns `unresolved` when no
+/// resolvable linked branch exists (for example a non-git directory, a detached
+/// worktree, or a project in a subfolder rather than the worktree root).
+export async function revealProjectBranch(
+  projectId: string,
+  directory: string,
+): Promise<RevealProjectBranchResult> {
+  const seq = ++gitRevealSeq;
+  const resolved = await resolveProjectBranchTarget(projectId, directory);
+  if (seq !== gitRevealSeq) return { kind: "superseded" };
+  if (resolved.kind !== "resolved") return resolved;
+
+  if (gitView.status !== "complete") {
+    try {
+      await loadTrackedRepos();
+    } catch (e) {
+      console.warn("[switchboard] git view reveal loadTrackedRepos failed", { error: e });
+      return { kind: "failed", message: e instanceof Error ? e.message : String(e) };
+    }
+    if (seq !== gitRevealSeq) return { kind: "superseded" };
+  }
+
+  const target = projectBranchTarget(projectId);
+  if (target === null) return { kind: "unresolved" };
+  await selectProjectBranchTarget(target);
+  return seq === gitRevealSeq ? { kind: "revealed" } : { kind: "superseded" };
 }
 
 // --- internals --------------------------------------------------------------
@@ -581,6 +675,7 @@ export const _testing = {
     gitView.status = "pending";
     runtime.clear();
     inFlightFetch.clear();
+    gitRevealSeq = 0;
     for (const k of Object.keys(fetchStates)) delete fetchStates[k];
     branchSelection.current = null;
     branchCommits.ref = null;

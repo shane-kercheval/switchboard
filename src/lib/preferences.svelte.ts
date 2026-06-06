@@ -13,9 +13,9 @@ import * as api from "$lib/api";
 import type { Preferences } from "$lib/types";
 
 const DEFAULTS: Preferences = {
-  editor_command: null,
+  editor_command: "code",
   terminal_app: "Terminal",
-  diff_style: "side_by_side",
+  diff_style: "unified",
 };
 
 export const preferences = $state<Preferences>({ ...DEFAULTS });

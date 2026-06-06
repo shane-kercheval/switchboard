@@ -39,8 +39,9 @@ use crate::commands::{
     get_harness_install_status_impl, get_preferences_impl, init_directory_impl, list_agents_impl,
     list_mcp_providers_impl, list_projects_impl, list_prompts_impl, list_tracked_repos_from_inputs,
     list_workspace_directories_impl, load_project_conversation_impl, load_transcript_impl,
-    open_project_impl, parse_uuid, pick_directory_impl, read_tracked_repo_from_inputs,
-    remove_agent_impl, remove_directory_impl, remove_mcp_provider_impl, remove_queued_message_impl,
+    open_commit_file_difftool_impl, open_project_impl, open_worktree_file_difftool_impl,
+    parse_uuid, pick_directory_impl, read_tracked_repo_from_inputs, remove_agent_impl,
+    remove_directory_impl, remove_mcp_provider_impl, remove_queued_message_impl,
     remove_tracked_repo_impl, rename_agent_impl, rename_project_impl, render_prompt_impl,
     reveal_in_finder_argv, search_project_files_in_root, search_project_files_root_impl,
     send_message_impl, set_active_project_impl, set_preferences_impl, set_project_archived_impl,
@@ -51,7 +52,9 @@ use crate::preferences::Preferences;
 use crate::state::AppState;
 
 use switchboard_core::{AgentRecord, HarnessKind, ProjectSummary};
-use switchboard_git::{BranchKind, ChangedFile, CommitChanges, FileDiff, GitCommitRange};
+use switchboard_git::{
+    BranchKind, ChangeKind, ChangedFile, CommitChanges, FileDiff, GitCommitRange,
+};
 use switchboard_prompts::{McpProviderInfo, Prompt, RenderedPrompt};
 
 #[tauri::command]
@@ -649,6 +652,42 @@ async fn reveal_in_finder(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn local_prompts_dir() -> Result<String, String> {
+    local_prompts_dir_path().map(|path| path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+async fn open_local_prompts_dir() -> Result<(), String> {
+    let path = local_prompts_dir_path()?;
+    std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
+    run_open_argv(vec!["open".to_owned(), path.to_string_lossy().into_owned()]).await
+}
+
+#[tauri::command]
+async fn open_worktree_file_difftool(
+    state: State<'_, AppState>,
+    worktree_path: String,
+    file: String,
+    change: ChangeKind,
+) -> Result<(), String> {
+    open_worktree_file_difftool_impl(state.inner(), &worktree_path, &file, change)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn open_commit_file_difftool(
+    state: State<'_, AppState>,
+    repo_root: String,
+    oid: String,
+    file: String,
+) -> Result<(), String> {
+    open_commit_file_difftool_impl(state.inner(), &repo_root, &oid, &file)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn load_project_conversation(
     state: State<'_, AppState>,
     project_id: String,
@@ -777,6 +816,12 @@ fn git_registry_config_path() -> Option<std::path::PathBuf> {
 /// others' keys on write (see `preferences::save`), so they coexist in one file.
 fn preferences_config_path() -> Option<std::path::PathBuf> {
     config_dir().map(|dir| dir.join("config.yaml"))
+}
+
+fn local_prompts_dir_path() -> Result<std::path::PathBuf, String> {
+    config_dir()
+        .map(|dir| dir.join("prompts"))
+        .ok_or_else(|| "prompt providers are not configured (no config path)".to_owned())
 }
 
 /// Build the prompt service from the user-global config dir, seeding the example
@@ -946,6 +991,8 @@ pub fn run() {
             branch_commits,
             commit_changed_files,
             commit_file_diff,
+            open_worktree_file_difftool,
+            open_commit_file_difftool,
             get_preferences,
             set_preferences,
             list_prompts,
@@ -955,6 +1002,8 @@ pub fn run() {
             add_mcp_provider,
             remove_mcp_provider,
             test_mcp_connection,
+            local_prompts_dir,
+            open_local_prompts_dir,
             create_project,
             rename_project,
             delete_project,

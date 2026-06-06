@@ -14,6 +14,8 @@ import { _testing as prefsTesting } from "$lib/preferences.svelte";
 const defaultInvoke = async (cmd: string, _args?: Record<string, unknown>): Promise<unknown> => {
   if (cmd === "get_harness_install_status") return { installed: true, version: "1.0.0" };
   if (cmd === "list_mcp_providers") return []; // embedded McpServersSettings loads on mount
+  if (cmd === "local_prompts_dir")
+    return "/Users/test/Library/Application Support/switchboard/prompts";
   return null; // auth probes resolve = authenticated
 };
 const invokeMock = vi.fn(defaultInvoke);
@@ -110,9 +112,11 @@ describe("SettingsView", () => {
     expect(fullAnswer).toHaveAttribute("aria-checked", "true");
   });
 
-  it("git-view editor preference persists via set_preferences (blank → null)", async () => {
+  it("git-view editor preference defaults to code and persists edits", async () => {
     render(SettingsView, { props: { onClose: vi.fn() } });
-    const editor = screen.getByTestId("git-editor-command");
+    const editor = screen.getByTestId("git-editor-command") as HTMLInputElement;
+
+    expect(editor.value).toBe("code");
 
     await fireEvent.input(editor, { target: { value: "cursor" } });
     await fireEvent.change(editor);
@@ -121,7 +125,7 @@ describe("SettingsView", () => {
         preferences: {
           editor_command: "cursor",
           terminal_app: "Terminal",
-          diff_style: "side_by_side",
+          diff_style: "unified",
         },
       }),
     );
@@ -132,7 +136,7 @@ describe("SettingsView", () => {
     await fireEvent.change(editor);
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
-        preferences: { editor_command: null, terminal_app: "Terminal", diff_style: "side_by_side" },
+        preferences: { editor_command: null, terminal_app: "Terminal", diff_style: "unified" },
       }),
     );
   });
@@ -145,7 +149,7 @@ describe("SettingsView", () => {
     await fireEvent.change(terminal);
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
-        preferences: { editor_command: null, terminal_app: "iTerm", diff_style: "side_by_side" },
+        preferences: { editor_command: "code", terminal_app: "iTerm", diff_style: "unified" },
       }),
     );
 
@@ -154,7 +158,7 @@ describe("SettingsView", () => {
     await fireEvent.change(terminal);
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
-        preferences: { editor_command: null, terminal_app: "Terminal", diff_style: "side_by_side" },
+        preferences: { editor_command: "code", terminal_app: "Terminal", diff_style: "unified" },
       }),
     );
   });
@@ -182,8 +186,23 @@ describe("SettingsView", () => {
   it("shortcuts section lists expected keyboard shortcuts", () => {
     render(SettingsView, { props: { onClose: vi.fn() } });
     expect(screen.getByText("Focus message box")).toBeInTheDocument();
+    expect(screen.getByText("Expand or restore Git details panel")).toBeInTheDocument();
     expect(screen.getByText("Toggle projects sidebar")).toBeInTheDocument();
     expect(screen.getByText("Toggle agents sidebar")).toBeInTheDocument();
     expect(screen.getByText("Toggle settings")).toBeInTheDocument();
+  });
+
+  it("shows the local prompts folder and opens it in Finder", async () => {
+    render(SettingsView, { props: { onClose: vi.fn() } });
+
+    await waitFor(() =>
+      expect(screen.getByTestId("local-prompts-dir")).toHaveTextContent(
+        "/Users/test/Library/Application Support/switchboard/prompts",
+      ),
+    );
+
+    await fireEvent.click(screen.getByTestId("local-prompts-open"));
+
+    expect(invokeMock).toHaveBeenCalledWith("open_local_prompts_dir", undefined);
   });
 });

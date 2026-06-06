@@ -40,6 +40,7 @@
   const panel = $derived(diffTarget.current);
   let splitEl = $state<HTMLDivElement | null>(null);
   let detailWidth = $state<number | null>(null);
+  let detailExpanded = $state(false);
   let resizingDetail = false;
 
   function startDetailResize(event: PointerEvent): void {
@@ -58,6 +59,41 @@
   function endDetailResize(): void {
     resizingDetail = false;
   }
+
+  function isEditableShortcutTarget(target: EventTarget | null): boolean {
+    return (
+      target instanceof HTMLElement &&
+      (target.isContentEditable ||
+        target.tagName === "INPUT" ||
+        target.tagName === "TEXTAREA" ||
+        target.tagName === "SELECT")
+    );
+  }
+
+  function handleKeydown(event: KeyboardEvent): void {
+    if (isEditableShortcutTarget(event.target)) return;
+    const command = event.metaKey || event.ctrlKey;
+    if (!command || !event.shiftKey || event.altKey || event.key.toLowerCase() !== "d") return;
+    if (panel === null) return;
+    event.preventDefault();
+    toggleDetailExpanded();
+  }
+
+  function toggleDetailExpanded(): void {
+    resizingDetail = false;
+    detailExpanded = !detailExpanded;
+  }
+
+  $effect(() => {
+    if (panel === null) {
+      detailExpanded = false;
+    }
+  });
+
+  $effect(() => {
+    window.addEventListener("keydown", handleKeydown);
+    return () => window.removeEventListener("keydown", handleKeydown);
+  });
 
   const filterOptions: { value: "local" | "remote" | "both"; label: string }[] = [
     { value: "both", label: "Both" },
@@ -91,154 +127,162 @@
 </script>
 
 <div class="flex min-h-0 flex-1 flex-col overflow-hidden" data-testid="git-view">
-  <div class="border-border/60 bg-surface flex min-h-11 items-center gap-3 border-b px-4 py-2">
-    <div class="min-w-0">
-      <div class="text-fg text-sm leading-5 font-semibold">Repositories</div>
-      <div class="text-muted text-[11px] leading-4">
-        {gitView.repos.length} tracked
+  {#if !detailExpanded}
+    <div class="border-border/60 bg-surface flex min-h-11 items-center gap-3 border-b px-4 py-2">
+      <div class="min-w-0">
+        <div class="text-fg text-sm leading-5 font-semibold">Repositories</div>
+        <div class="text-muted text-[11px] leading-4">
+          {gitView.repos.length} tracked
+        </div>
+      </div>
+
+      <div class="flex min-w-0 flex-1 items-center gap-2">
+        <div
+          class={cn(SEGMENTED_MAIN_CONTAINER_CLASS, "inline-grid grid-cols-3")}
+          role="radiogroup"
+          aria-label="Branch filter"
+        >
+          {#each filterOptions as option (option.value)}
+            <button
+              type="button"
+              role="radio"
+              class={cn(
+                SEGMENTED_MAIN_ITEM_CLASS,
+                "px-3",
+                branchFilter === option.value
+                  ? SEGMENTED_MAIN_ITEM_ACTIVE_CLASS
+                  : SEGMENTED_MAIN_ITEM_INACTIVE_CLASS,
+              )}
+              aria-checked={branchFilter === option.value}
+              data-testid={`branch-filter-${option.value}`}
+              onclick={() => (branchFilter = option.value)}
+            >
+              {option.label}
+            </button>
+          {/each}
+        </div>
+
+        <label
+          class="text-muted hover:bg-panel flex h-6 cursor-pointer items-center gap-1.5 rounded-full px-2 text-xs transition-colors"
+        >
+          <input
+            class="accent-accent h-3.5 w-3.5"
+            type="checkbox"
+            bind:checked={showInactive}
+            data-testid="show-inactive"
+          />
+          Show branches without folders
+        </label>
+      </div>
+
+      <div class="flex shrink-0 items-center gap-2">
+        <Button
+          variant="secondary"
+          size="sm"
+          data-testid="git-add-repo"
+          disabled={adding}
+          onclick={onAddRepo}
+        >
+          {#if adding}
+            <Spinner class="mr-1.5 h-3.5 w-3.5" />
+          {/if}
+          Add Repo
+        </Button>
+
+        <Button
+          variant="secondary"
+          size="sm"
+          data-testid="git-refresh-all"
+          disabled={refreshing}
+          onclick={onGlobalRefresh}
+        >
+          {#if refreshing}
+            <Spinner class="mr-1.5 h-3.5 w-3.5" />
+          {/if}
+          Refresh
+        </Button>
       </div>
     </div>
 
-    <div class="flex min-w-0 flex-1 items-center gap-2">
+    {#if addError}
       <div
-        class={cn(SEGMENTED_MAIN_CONTAINER_CLASS, "inline-grid grid-cols-3")}
-        role="radiogroup"
-        aria-label="Branch filter"
+        class="border-border/60 bg-status-failed-soft text-status-failed border-b px-4 py-2 text-xs"
+        data-testid="git-add-error"
       >
-        {#each filterOptions as option (option.value)}
-          <button
-            type="button"
-            role="radio"
-            class={cn(
-              SEGMENTED_MAIN_ITEM_CLASS,
-              "px-3",
-              branchFilter === option.value
-                ? SEGMENTED_MAIN_ITEM_ACTIVE_CLASS
-                : SEGMENTED_MAIN_ITEM_INACTIVE_CLASS,
-            )}
-            aria-checked={branchFilter === option.value}
-            data-testid={`branch-filter-${option.value}`}
-            onclick={() => (branchFilter = option.value)}
-          >
-            {option.label}
-          </button>
-        {/each}
+        {addError}
       </div>
-
-      <label
-        class="text-muted hover:bg-panel flex h-6 cursor-pointer items-center gap-1.5 rounded-full px-2 text-xs transition-colors"
-      >
-        <input
-          class="accent-accent h-3.5 w-3.5"
-          type="checkbox"
-          bind:checked={showInactive}
-          data-testid="show-inactive"
-        />
-        Show branches without folders
-      </label>
-    </div>
-
-    <div class="flex shrink-0 items-center gap-2">
-      <Button
-        variant="secondary"
-        size="sm"
-        data-testid="git-add-repo"
-        disabled={adding}
-        onclick={onAddRepo}
-      >
-        {#if adding}
-          <Spinner class="mr-1.5 h-3.5 w-3.5" />
-        {/if}
-        Add Repo
-      </Button>
-
-      <Button
-        variant="secondary"
-        size="sm"
-        data-testid="git-refresh-all"
-        disabled={refreshing}
-        onclick={onGlobalRefresh}
-      >
-        {#if refreshing}
-          <Spinner class="mr-1.5 h-3.5 w-3.5" />
-        {/if}
-        Refresh
-      </Button>
-    </div>
-  </div>
-
-  {#if addError}
-    <div
-      class="border-border/60 bg-status-failed-soft text-status-failed border-b px-4 py-2 text-xs"
-      data-testid="git-add-error"
-    >
-      {addError}
-    </div>
+    {/if}
   {/if}
 
   <div class="flex min-h-0 flex-1 overflow-hidden" bind:this={splitEl} data-testid="git-split">
-    <div
-      class="git-scrollbar bg-surface flex min-h-0 min-w-0 flex-1 [scrollbar-gutter:stable] flex-col gap-2 overflow-y-scroll p-3"
-      data-testid="git-repo-list"
-    >
-      {#if gitView.status === "loading" && gitView.repos.length === 0}
-        <EmptyState testid="git-loading" title="Loading repositories…" />
-      {:else if gitView.status === "failed" && gitView.repos.length === 0}
-        <EmptyState
-          testid="git-failed"
-          tone="error"
-          title="Couldn't load repositories."
-          description="Try refreshing."
-        >
-          {#snippet action()}
-            <Button variant="secondary" size="sm" onclick={onGlobalRefresh}>Retry</Button>
-          {/snippet}
-        </EmptyState>
-      {:else if gitView.repos.length === 0}
-        <EmptyState
-          testid="git-empty"
-          title="No repositories tracked yet."
-          description="Repositories are tracked automatically when you add a project that lives in a git repo, or add one with Add Repo."
-        >
-          {#snippet action()}
-            <Button variant="secondary" size="sm" disabled={adding} onclick={onAddRepo}>
-              Add Repo
-            </Button>
-          {/snippet}
-        </EmptyState>
-      {:else}
-        {#each gitView.repos as listing (listing.repo.root)}
-          <GitRepoNode
-            {listing}
-            {branchFilter}
-            {showInactive}
-            fetchState={fetchStates[listing.repo.root]}
-          />
-        {/each}
-      {/if}
-    </div>
+    {#if !detailExpanded}
+      <div
+        class="git-scrollbar bg-surface flex min-h-0 min-w-0 flex-1 [scrollbar-gutter:stable] flex-col gap-2 overflow-y-scroll p-3"
+        data-testid="git-repo-list"
+      >
+        {#if gitView.status === "loading" && gitView.repos.length === 0}
+          <EmptyState testid="git-loading" title="Loading repositories…" />
+        {:else if gitView.status === "failed" && gitView.repos.length === 0}
+          <EmptyState
+            testid="git-failed"
+            tone="error"
+            title="Couldn't load repositories."
+            description="Try refreshing."
+          >
+            {#snippet action()}
+              <Button variant="secondary" size="sm" onclick={onGlobalRefresh}>Retry</Button>
+            {/snippet}
+          </EmptyState>
+        {:else if gitView.repos.length === 0}
+          <EmptyState
+            testid="git-empty"
+            title="No repositories tracked yet."
+            description="Repositories are tracked automatically when you add a project that lives in a git repo, or add one with Add Repo."
+          >
+            {#snippet action()}
+              <Button variant="secondary" size="sm" disabled={adding} onclick={onAddRepo}>
+                Add Repo
+              </Button>
+            {/snippet}
+          </EmptyState>
+        {:else}
+          {#each gitView.repos as listing (listing.repo.root)}
+            <GitRepoNode
+              {listing}
+              {branchFilter}
+              {showInactive}
+              fetchState={fetchStates[listing.repo.root]}
+            />
+          {/each}
+        {/if}
+      </div>
 
-    <div
-      class="border-border/60 bg-panel hover:bg-raised w-1.5 shrink-0 cursor-col-resize border-x transition-colors"
-      role="separator"
-      aria-orientation="vertical"
-      aria-label="Resize diff panel"
-      data-testid="git-detail-resizer"
-      onpointerdown={startDetailResize}
-    ></div>
+      <div
+        class="border-border/60 bg-panel hover:bg-raised w-1.5 shrink-0 cursor-col-resize border-x transition-colors"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize diff panel"
+        data-testid="git-detail-resizer"
+        onpointerdown={startDetailResize}
+      ></div>
+    {/if}
     <aside
       class={cn(
-        "border-border/60 bg-raised flex min-h-0 shrink-0 flex-col border-l",
-        detailWidth === null && "w-2/3",
+        "border-border/60 bg-raised flex min-h-0 flex-col border-l",
+        detailExpanded ? "min-w-0 flex-1 border-l-0" : "shrink-0",
+        !detailExpanded && detailWidth === null && "w-2/3",
       )}
-      style={detailWidth !== null ? `width: ${detailWidth}px` : undefined}
+      style={!detailExpanded && detailWidth !== null ? `width: ${detailWidth}px` : undefined}
       data-testid="git-detail-sidebar"
+      data-expanded={detailExpanded}
     >
       {#if panel !== null}
         <DiffPanel
           target={panel}
           refreshRevision={gitRefresh.revision}
           onClose={clearBranchSelection}
+          {detailExpanded}
+          onToggleDetailExpanded={toggleDetailExpanded}
         />
       {:else}
         <EmptyState

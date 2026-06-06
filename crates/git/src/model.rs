@@ -15,7 +15,7 @@
 
 use std::path::PathBuf;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// One tracked repository's full read-model.
 ///
@@ -146,7 +146,7 @@ pub struct WorktreeView {
 
 /// The two worktree warning states the tree surfaces (but offers no destructive
 /// remedy for in v1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorktreeWarning {
     /// The worktree's directory is on disk but its branch was deleted.
@@ -191,7 +191,7 @@ pub struct ChangedFile {
 }
 
 /// The kind of change to a file in the working tree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChangeKind {
     Modified,

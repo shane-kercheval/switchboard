@@ -20,6 +20,7 @@
   import { indicatorToneClass, type GitStatusIndicator } from "$lib/gitStatusIndicators";
 
   const GIT_ICON_SIZE = 16;
+  const GIT_PENCIL_ICON_SIZE = 14;
   const GIT_ICON_STROKE = 1.8;
 
   let { indicator, testid }: { indicator: GitStatusIndicator; testid?: string } = $props();
@@ -39,7 +40,7 @@
       data-indicator-key={indicator.key}
     >
       {#if indicator.key === "uncommitted"}
-        <PencilLine size={GIT_ICON_SIZE} strokeWidth={GIT_ICON_STROKE} aria-hidden="true" />
+        <PencilLine size={GIT_PENCIL_ICON_SIZE} strokeWidth={GIT_ICON_STROKE} aria-hidden="true" />
       {:else if indicator.key === "behind_base" || indicator.key === "behind"}
         <ArrowDown size={GIT_ICON_SIZE} strokeWidth={GIT_ICON_STROKE} aria-hidden="true" />
       {:else if indicator.key === "ahead"}

@@ -33,8 +33,8 @@ const FETCH_CONCURRENCY = 4;
 export type ViewMode = "projects" | "git";
 
 /// Per-repo fetch state, mirroring the backend model: never fetched, last fetch
-/// failed, or succeeded at a time. Drives the quiet "last fetched"/"fetch
-/// failed" label — fetch failure is shown, never thrown as a toast.
+/// failed, or succeeded at a time. Drives the quiet fetch-failure indicator —
+/// fetch failure is shown, never thrown as a toast.
 export type FetchState =
   | { kind: "never" }
   | { kind: "failed"; at: number }
@@ -247,8 +247,8 @@ const runtime = new Map<string, RepoRuntime>();
 // eslint-disable-next-line svelte/prefer-svelte-reactivity
 const inFlightFetch = new Map<string, Promise<void>>();
 
-/// Per-repo "last fetched" / "fetch failed" state for the UI label. Reactive so
-/// the indicator updates when a background fetch resolves.
+/// Per-repo fetch state for the UI failure indicator. Reactive so the indicator
+/// updates when a background fetch resolves.
 export const fetchStates = $state<Record<string, FetchState>>({});
 
 export function setViewMode(mode: ViewMode): void {

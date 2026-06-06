@@ -838,6 +838,152 @@ pub async fn fetch_repo_impl(state: &AppState, path: &str) -> Result<(), AppErro
     }
 }
 
+const EMPTY_TREE_OID: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+#[must_use]
+pub fn worktree_difftool_argv(
+    worktree_path: &str,
+    file: &str,
+    change: switchboard_git::ChangeKind,
+) -> Vec<String> {
+    if change == switchboard_git::ChangeKind::Untracked {
+        vec![
+            "-C".to_owned(),
+            worktree_path.to_owned(),
+            "difftool".to_owned(),
+            "--no-prompt".to_owned(),
+            "--no-index".to_owned(),
+            "--".to_owned(),
+            "/dev/null".to_owned(),
+            file.to_owned(),
+        ]
+    } else {
+        vec![
+            "-C".to_owned(),
+            worktree_path.to_owned(),
+            "difftool".to_owned(),
+            "--no-prompt".to_owned(),
+            "HEAD".to_owned(),
+            "--".to_owned(),
+            file.to_owned(),
+        ]
+    }
+}
+
+#[must_use]
+pub fn commit_difftool_argv(repo_root: &str, base_oid: &str, oid: &str, file: &str) -> Vec<String> {
+    vec![
+        "-C".to_owned(),
+        repo_root.to_owned(),
+        "difftool".to_owned(),
+        "--no-prompt".to_owned(),
+        base_oid.to_owned(),
+        oid.to_owned(),
+        "--".to_owned(),
+        file.to_owned(),
+    ]
+}
+
+fn git_output_message(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if stderr.is_empty() {
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    } else {
+        stderr
+    }
+}
+
+async fn commit_first_parent_or_empty_tree(
+    repo_root: &Path,
+    oid: &str,
+) -> Result<String, AppError> {
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .arg("rev-list")
+        .arg("--parents")
+        .arg("-n")
+        .arg("1")
+        .arg(oid)
+        .output()
+        .await
+        .map_err(|source| AppError::GitDifftool {
+            root: repo_root.to_string_lossy().into_owned(),
+            message: source.to_string(),
+        })?;
+    if !output.status.success() {
+        return Err(AppError::GitDifftool {
+            root: repo_root.to_string_lossy().into_owned(),
+            message: git_output_message(&output),
+        });
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut parts = stdout.split_whitespace();
+    let Some(_commit) = parts.next() else {
+        return Err(AppError::GitDifftool {
+            root: repo_root.to_string_lossy().into_owned(),
+            message: "git rev-list returned no commit".to_owned(),
+        });
+    };
+    Ok(parts.next().unwrap_or(EMPTY_TREE_OID).to_owned())
+}
+
+async fn run_git_difftool(root: &Path, argv: Vec<String>) -> Result<(), AppError> {
+    let output = tokio::process::Command::new("git")
+        .args(argv)
+        .output()
+        .await
+        .map_err(|source| AppError::GitDifftool {
+            root: root.to_string_lossy().into_owned(),
+            message: source.to_string(),
+        })?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(AppError::GitDifftool {
+            root: root.to_string_lossy().into_owned(),
+            message: git_output_message(&output),
+        })
+    }
+}
+
+pub async fn open_worktree_file_difftool_impl(
+    state: &AppState,
+    worktree_path: &str,
+    file: &str,
+    change: switchboard_git::ChangeKind,
+) -> Result<(), AppError> {
+    let root = switchboard_git::resolve_repo_root(Path::new(worktree_path))
+        .unwrap_or_else(|| canonicalize_boundary(worktree_path));
+    if !lock(&state.git_registry).contains(&root) {
+        return Err(AppError::RepoNotTracked {
+            root: root.to_string_lossy().into_owned(),
+        });
+    }
+    run_git_difftool(&root, worktree_difftool_argv(worktree_path, file, change)).await
+}
+
+pub async fn open_commit_file_difftool_impl(
+    state: &AppState,
+    repo_root: &str,
+    oid: &str,
+    file: &str,
+) -> Result<(), AppError> {
+    let root = switchboard_git::resolve_repo_root(Path::new(repo_root))
+        .unwrap_or_else(|| canonicalize_boundary(repo_root));
+    if !lock(&state.git_registry).contains(&root) {
+        return Err(AppError::RepoNotTracked {
+            root: root.to_string_lossy().into_owned(),
+        });
+    }
+    let base_oid = commit_first_parent_or_empty_tree(&root, oid).await?;
+    run_git_difftool(
+        &root,
+        commit_difftool_argv(&root.to_string_lossy(), &base_oid, oid, file),
+    )
+    .await
+}
+
 // --- Git-view open actions --------------------------------------------------
 
 /// The macOS argv for opening a worktree folder in an external editor: the
@@ -9801,6 +9947,143 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn worktree_difftool_argv_matches_worktree_diff_for_tracked_changes() {
+        assert_eq!(
+            worktree_difftool_argv(
+                "/repo/wt",
+                "src/main.rs",
+                switchboard_git::ChangeKind::Modified
+            ),
+            vec![
+                "-C",
+                "/repo/wt",
+                "difftool",
+                "--no-prompt",
+                "HEAD",
+                "--",
+                "src/main.rs",
+            ]
+        );
+    }
+
+    #[test]
+    fn worktree_difftool_argv_uses_no_index_for_untracked_files() {
+        assert_eq!(
+            worktree_difftool_argv(
+                "/repo/wt",
+                "new.txt",
+                switchboard_git::ChangeKind::Untracked
+            ),
+            vec![
+                "-C",
+                "/repo/wt",
+                "difftool",
+                "--no-prompt",
+                "--no-index",
+                "--",
+                "/dev/null",
+                "new.txt",
+            ]
+        );
+    }
+
+    #[test]
+    fn commit_difftool_argv_compares_parent_to_commit_for_one_file() {
+        assert_eq!(
+            commit_difftool_argv("/repo", "parent", "commit", "src/main.rs"),
+            vec![
+                "-C",
+                "/repo",
+                "difftool",
+                "--no-prompt",
+                "parent",
+                "commit",
+                "--",
+                "src/main.rs",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn difftool_refuses_untracked_paths_before_running_git() {
+        let (_cfg, state) = state_with_registries();
+        let repo = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+
+        let worktree_err = open_worktree_file_difftool_impl(
+            &state,
+            repo.path().to_str().unwrap(),
+            "README.md",
+            switchboard_git::ChangeKind::Modified,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(worktree_err, AppError::RepoNotTracked { .. }));
+
+        let oid = head_oid(repo.path());
+        let commit_err = open_commit_file_difftool_impl(
+            &state,
+            repo.path().to_str().unwrap(),
+            &oid,
+            "README.md",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(commit_err, AppError::RepoNotTracked { .. }));
+    }
+
+    #[tokio::test]
+    async fn commit_difftool_parent_resolution_handles_root_and_child_commits() {
+        let repo = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        let root = head_oid(repo.path());
+        assert_eq!(
+            commit_first_parent_or_empty_tree(repo.path(), &root)
+                .await
+                .unwrap(),
+            EMPTY_TREE_OID
+        );
+
+        std::fs::write(repo.path().join("README.md"), "second\n").unwrap();
+        git(repo.path(), &["add", "-A"]);
+        git(repo.path(), &["commit", "-q", "-m", "second"]);
+        let child = head_oid(repo.path());
+        assert_eq!(
+            commit_first_parent_or_empty_tree(repo.path(), &child)
+                .await
+                .unwrap(),
+            root
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_difftool_parent_resolution_surfaces_invalid_commit() {
+        let repo = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+
+        let err = commit_first_parent_or_empty_tree(repo.path(), "not-a-commit")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::GitDifftool { .. }));
+    }
+
+    #[tokio::test]
+    async fn git_difftool_failure_maps_stderr_to_app_error() {
+        let repo = TempDir::new().unwrap();
+        init_git_repo(repo.path());
+
+        let err = run_git_difftool(repo.path(), vec!["not-a-real-git-subcommand".to_owned()])
+            .await
+            .unwrap_err();
+        match err {
+            AppError::GitDifftool { message, .. } => {
+                assert!(message.contains("not-a-real-git-subcommand"));
+            }
+            other => panic!("expected GitDifftool, got {other:?}"),
+        }
+    }
+
     /// The tracked-root set for a repo, as the command layer would snapshot it.
     fn roots_of(repo: &TempDir) -> Vec<PathBuf> {
         vec![repo.path().canonicalize().unwrap()]
@@ -10158,7 +10441,7 @@ mod tests {
 
         // Defaults until set.
         let defaults = get_preferences_impl(&state);
-        assert_eq!(defaults.editor_command, None);
+        assert_eq!(defaults.editor_command.as_deref(), Some("code"));
         assert_eq!(defaults.terminal_app, "Terminal");
 
         let prefs = Preferences {

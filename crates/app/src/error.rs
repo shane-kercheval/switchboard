@@ -213,6 +213,12 @@ pub enum AppError {
     #[error("{root} is not a tracked repository")]
     RepoNotTracked { root: String },
 
+    /// `git difftool` for a tracked repo/worktree failed. Carries git's stderr
+    /// verbatim so the frontend can surface setup problems from the user's Git
+    /// difftool configuration.
+    #[error("git difftool failed for {root}: {message}")]
+    GitDifftool { root: String, message: String },
+
     /// A genuine mid-read failure reading a worktree's changed files or a file's
     /// diff (corrupt object, I/O fault) — distinct from the non-error empty
     /// results those reads return for a clean or unreadable path. Carries git's

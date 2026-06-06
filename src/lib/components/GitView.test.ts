@@ -19,7 +19,7 @@ vi.mock("$lib/native", () => ({
   copyText: vi.fn(async () => {}),
 }));
 
-const { refreshAll, _testing } = await import("$lib/state/gitView.svelte");
+const { refreshAll, fetchStates, _testing } = await import("$lib/state/gitView.svelte");
 const currentYear = new Date().getFullYear();
 
 afterEach(() => {
@@ -116,6 +116,43 @@ describe("GitView", () => {
     await waitFor(() => expect(screen.getAllByText("~/app").length).toBeGreaterThan(0));
     // Dirty or untracked files surface the changes badge.
     expect(screen.getByLabelText("changes")).toBeInTheDocument();
+    expect(screen.queryByTestId("repo-fetch-failed")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("repo-actions-trigger")).not.toBeInTheDocument();
+    expect(screen.getByTestId("repo-action-reveal")).toBeInTheDocument();
+    expect(screen.getByTestId("repo-action-copy-path")).toBeInTheDocument();
+    expect(screen.getByTestId("repo-action-remove")).toBeInTheDocument();
+    expect(screen.getByTestId("repo-refresh")).not.toHaveAttribute("tabindex", "-1");
+    expect(screen.getByTestId("repo-action-remove")).not.toHaveAttribute("tabindex", "-1");
+    screen.getByTestId("repo-action-remove").focus();
+    expect(screen.getByTestId("repo-action-remove")).toHaveFocus();
+  });
+
+  it("surfaces repo action failures inline", async () => {
+    wire([repo()]);
+    await refreshAll();
+    render(GitView);
+    await waitFor(() => expect(screen.getByTestId("git-repo")).toBeInTheDocument());
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "reveal_in_finder") return Promise.reject(new Error("open failed"));
+      return Promise.resolve(null);
+    });
+
+    await fireEvent.click(screen.getByTestId("repo-action-reveal"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("repo-action-error")).toHaveTextContent("open failed"),
+    );
+  });
+
+  it("shows a fetch failure icon only when the repo fetch failed", async () => {
+    wire([repo()]);
+    await refreshAll();
+    fetchStates["/repos/app"] = { kind: "failed", at: 0 };
+    render(GitView);
+
+    await waitFor(() => expect(screen.getByTestId("repo-fetch-failed")).toBeInTheDocument());
+    expect(screen.getByLabelText("Fetch failed")).toBeInTheDocument();
+    expect(screen.queryByTestId("repo-fetch-state")).not.toBeInTheDocument();
   });
 
   it("hides inactive branches by default and reveals them via the toggle", async () => {
@@ -128,6 +165,48 @@ describe("GitView", () => {
     expect(screen.queryByText("old-feature")).not.toBeInTheDocument();
     await fireEvent.click(screen.getByTestId("show-inactive"));
     expect(screen.getByText("old-feature")).toBeInTheDocument();
+  });
+
+  it("always shows the default branch first even without a local folder", async () => {
+    wire([
+      repo({
+        local_branches: [
+          {
+            name: "feature",
+            upstream: null,
+            sync: { kind: "local_only" },
+            behind_base: null,
+            merged: null,
+            dangling: false,
+            worktree: {
+              path: "/repos/app-feature",
+              dirty: false,
+              untracked: false,
+              detached_hash: null,
+              warning: null,
+            },
+          },
+          {
+            name: "main",
+            upstream: "origin/main",
+            sync: { kind: "in_sync" },
+            behind_base: null,
+            merged: null,
+            dangling: false,
+            worktree: null,
+          },
+        ],
+      }),
+    ]);
+    await refreshAll();
+    render(GitView);
+    await waitFor(() => expect(screen.getByTestId("git-repo")).toBeInTheDocument());
+
+    const branches = Array.from(document.querySelectorAll('[data-testid="git-branch"]'));
+    expect(branches.map((branch) => branch.getAttribute("data-branch"))).toEqual([
+      "main",
+      "feature",
+    ]);
   });
 
   it("the branch filter switches between local, remote, and both", async () => {
@@ -237,6 +316,21 @@ describe("GitView", () => {
     expect(
       within(screen.getByTestId("commit-row")).getByTestId("branch-work-indicator"),
     ).toBeInTheDocument();
+
+    await fireEvent.click(screen.getByTestId("detail-expand-toggle"));
+    expect(screen.getByTestId("git-detail-sidebar")).toHaveAttribute("data-expanded", "true");
+    expect(screen.queryByTestId("git-repo-list")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("git-detail-resizer")).not.toBeInTheDocument();
+
+    await fireEvent.keyDown(window, { key: "D", metaKey: true, shiftKey: true });
+    expect(screen.getByTestId("git-detail-sidebar")).toHaveAttribute("data-expanded", "false");
+    expect(screen.getByTestId("git-repo-list")).toBeInTheDocument();
+    expect(screen.getByTestId("git-detail-resizer")).toBeInTheDocument();
+
+    await fireEvent.keyDown(window, { key: "d", ctrlKey: true, shiftKey: true });
+    expect(screen.getByTestId("git-detail-sidebar")).toHaveAttribute("data-expanded", "true");
+    await fireEvent.click(screen.getByTestId("detail-expand-toggle"));
+    expect(screen.getByTestId("git-detail-sidebar")).toHaveAttribute("data-expanded", "false");
 
     await fireEvent.click(screen.getByTestId("detail-close"));
     await waitFor(() => expect(screen.queryByTestId("diff-panel")).not.toBeInTheDocument());

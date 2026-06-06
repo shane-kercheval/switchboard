@@ -33,11 +33,11 @@ fn default_terminal_app() -> String {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum DiffStyle {
-    /// Old and new content in two columns. Default — the diff panel is a wide
-    /// bottom split, so side-by-side reads well.
-    #[default]
+    /// Old and new content in two columns.
     SideBySide,
-    /// One column with interleaved removed/added lines.
+    /// One column with interleaved removed/added lines. Default — it keeps the
+    /// diff readable in the fixed-width Git details pane.
+    #[default]
     Unified,
 }
 
@@ -46,23 +46,23 @@ pub enum DiffStyle {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Preferences {
-    /// Command used to open a worktree folder in an external editor, e.g. `code`,
-    /// `cursor`, `zed`. Run as `<command> <path>`. Empty/absent → fall back to the
-    /// OS folder-open (`open <path>` on macOS), so it works with zero config.
+    /// Command used to open a worktree folder in an external editor. Defaults
+    /// to `code`; blank → fall back to the OS folder-open (`open <path>` on
+    /// macOS).
     pub editor_command: Option<String>,
 
     /// Name of the terminal application the "open in terminal" action launches
     /// (`open -a <name> <path>` on macOS). Defaults to `Terminal`.
     pub terminal_app: String,
 
-    /// Diff panel layout. Defaults to side-by-side.
+    /// Diff panel layout. Defaults to unified.
     pub diff_style: DiffStyle,
 }
 
 impl Default for Preferences {
     fn default() -> Self {
         Self {
-            editor_command: None,
+            editor_command: Some("code".to_owned()),
             terminal_app: default_terminal_app(),
             diff_style: DiffStyle::default(),
         }
@@ -167,11 +167,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_has_no_editor_and_terminal_app() {
+    fn default_has_code_editor_and_terminal_app() {
         let p = Preferences::default();
-        assert_eq!(p.editor_command, None);
+        assert_eq!(p.editor_command.as_deref(), Some("code"));
         assert_eq!(p.terminal_app, "Terminal");
-        assert_eq!(p.diff_style, DiffStyle::SideBySide);
+        assert_eq!(p.diff_style, DiffStyle::Unified);
     }
 
     #[test]

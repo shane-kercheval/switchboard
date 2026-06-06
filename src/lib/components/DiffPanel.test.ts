@@ -101,20 +101,49 @@ describe("DiffPanel (uncommitted target)", () => {
     expect(used).not.toContain("commit_file_diff");
   });
 
-  it("switching the layout toggle changes the diff style and persists it", async () => {
+  it("opens the selected worktree file in git difftool", async () => {
     wire();
     render(DiffPanel, { props: { target: wtTarget(), onClose: noop } });
     await waitFor(() => expect(screen.getByTestId("diff-view")).toBeInTheDocument());
-    expect(screen.getByTestId("diff-view")).toHaveAttribute("data-style", "side_by_side");
 
-    await fireEvent.click(screen.getByTestId("diff-style-unified"));
+    await fireEvent.click(screen.getByLabelText("Open code.ts in difftool"));
+
+    expect(invokeMock).toHaveBeenCalledWith("open_worktree_file_difftool", {
+      worktreePath: "/wt",
+      file: "code.ts",
+      change: "modified",
+    });
+  });
+
+  it("surfaces git difftool failures inline", async () => {
+    wire();
+    render(DiffPanel, { props: { target: wtTarget(), onClose: noop } });
+    await waitFor(() => expect(screen.getByTestId("diff-view")).toBeInTheDocument());
+    invokeMock.mockRejectedValueOnce(new Error("git difftool is not configured"));
+
+    await fireEvent.click(screen.getByLabelText("Open code.ts in difftool"));
 
     await waitFor(() =>
-      expect(screen.getByTestId("diff-view")).toHaveAttribute("data-style", "unified"),
+      expect(screen.getByTestId("diff-external-error")).toHaveTextContent(
+        "git difftool is not configured",
+      ),
+    );
+  });
+
+  it("defaults to unified layout and persists layout changes", async () => {
+    wire();
+    render(DiffPanel, { props: { target: wtTarget(), onClose: noop } });
+    await waitFor(() => expect(screen.getByTestId("diff-view")).toBeInTheDocument());
+    expect(screen.getByTestId("diff-view")).toHaveAttribute("data-style", "unified");
+
+    await fireEvent.click(screen.getByTestId("diff-style-side_by_side"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("diff-view")).toHaveAttribute("data-style", "side_by_side"),
     );
     const saved = invokeMock.mock.calls.find((c) => c[0] === "set_preferences");
     expect((saved?.[1] as { preferences: { diff_style: string } }).preferences.diff_style).toBe(
-      "unified",
+      "side_by_side",
     );
   });
 
@@ -286,6 +315,20 @@ describe("DiffPanel (commit target)", () => {
     // The commit commands carry the repo root + oid, not a worktree path.
     const filesCall = invokeMock.mock.calls.find((c) => c[0] === "commit_changed_files");
     expect(filesCall?.[1]).toMatchObject({ repoRoot: "/repo", oid: "abc123def456" });
+  });
+
+  it("opens the selected commit file in git difftool", async () => {
+    wire({ files: [{ path: "code.ts", change: "modified" }] });
+    render(DiffPanel, { props: { target: commitTarget(), onClose: noop } });
+    await waitFor(() => expect(screen.getByTestId("diff-view")).toBeInTheDocument());
+
+    await fireEvent.click(screen.getByLabelText("Open code.ts in difftool"));
+
+    expect(invokeMock).toHaveBeenCalledWith("open_commit_file_difftool", {
+      repoRoot: "/repo",
+      oid: "abc123def456",
+      file: "code.ts",
+    });
   });
 
   it("shows a calm empty state for a commit that changed no files", async () => {

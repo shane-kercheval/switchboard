@@ -1,10 +1,20 @@
 <script lang="ts">
   /// One tracked repo in the Git view: a collapsible header (repo name/path,
-  /// availability, per-repo refresh + last-fetched indicator) over its branches.
+  /// availability, per-repo refresh + fetch-failure indicator) over its branches.
   /// Branch filtering is applied by the parent and passed in, so this node is
   /// pure presentation over the data.
   import { onMount } from "svelte";
   import { homeDir } from "@tauri-apps/api/path";
+  import {
+    Code2,
+    Copy,
+    FolderOpen,
+    GitBranch,
+    MoreHorizontal,
+    Terminal,
+    Trash2,
+    TriangleAlert,
+  } from "@lucide/svelte";
   import { cn, basename } from "$lib/utils";
   import { formatHomePath } from "$lib/utils";
   import Badge from "$lib/components/ui/Badge.svelte";
@@ -51,21 +61,27 @@
   let expanded = $state(true);
   let busy = $state(false);
   let homePath = $state<string | null>(null);
+  let actionError = $state<string | null>(null);
 
   const repo = $derived(listing.repo);
   const localBranchCount = $derived(repo.local_branches.length);
 
-  // Branches with a folder are actionable and sort first. Branches without a
-  // local folder are hidden until the user asks for them.
+  // The default branch anchors the branch list even when it has no local folder.
+  // Other folderless branches stay hidden until the user asks for inactive ones.
   const localBranches = $derived(
     [...repo.local_branches]
-      .filter((b) =>
-        branchFilter === "remote" ? b.upstream !== null : showInactive || b.worktree !== null,
-      )
+      .filter((b) => {
+        const isDefault = b.name === repo.default_branch;
+        return branchFilter === "remote"
+          ? b.upstream !== null
+          : isDefault || showInactive || b.worktree !== null;
+      })
       .sort((a, b) => {
+        const aDefault = a.name === repo.default_branch ? 0 : 1;
+        const bDefault = b.name === repo.default_branch ? 0 : 1;
         const aActive = a.worktree !== null ? 0 : 1;
         const bActive = b.worktree !== null ? 0 : 1;
-        return aActive - bActive || a.name.localeCompare(b.name);
+        return aDefault - bDefault || aActive - bActive || a.name.localeCompare(b.name);
       }),
   );
   const remoteOnlyBranches = $derived(
@@ -93,12 +109,6 @@
     return listing.linked_projects[worktreePath] ?? [];
   }
 
-  function fetchLabel(state: FetchState | undefined): string {
-    if (state === undefined || state.kind === "never") return "not fetched";
-    if (state.kind === "failed") return "fetch failed";
-    return "fetched";
-  }
-
   async function onRefresh(): Promise<void> {
     busy = true;
     try {
@@ -109,11 +119,10 @@
     }
   }
 
-  // Open actions fire-and-forget: a silently-swallowed failure looks like
-  // "nothing happened," so surface it to the console (the path is opened
-  // backend-side). Copy actions go straight to the clipboard.
   function runAction(action: Promise<void>): void {
+    actionError = null;
     void action.catch((e: unknown) => {
+      actionError = e instanceof Error ? e.message : String(e);
       console.error("[switchboard] git view open action failed", e);
     });
   }
@@ -186,10 +195,10 @@
   data-testid="git-repo"
   data-repo-root={repo.root}
 >
-  <div class="bg-raised flex min-h-10 items-center gap-2 px-3 py-2">
+  <div class="group bg-raised flex min-h-10 items-center gap-2 px-3 py-2">
     <button
       type="button"
-      class="text-muted hover:bg-panel hover:text-fg flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-full transition-colors"
+      class="text-muted hover:bg-border/60 hover:text-fg flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-full transition-colors"
       aria-label={expanded ? "Collapse repo" : "Expand repo"}
       aria-expanded={expanded}
       onclick={() => (expanded = !expanded)}
@@ -208,89 +217,141 @@
       </svg>
     </button>
 
-    <div class="min-w-0 flex-1">
-      <div class="flex min-w-0 items-baseline gap-1.5">
-        <span class="text-fg truncate text-sm font-semibold" title={repo.root}>{repo.name}</span>
+    <div class="flex min-w-0 flex-1 items-baseline gap-1.5">
+      <span class="text-fg max-w-[65%] shrink-0 truncate text-sm font-semibold" title={repo.root}
+        >{repo.name}</span
+      >
+      <span class="flex max-w-full min-w-0 flex-1 items-baseline gap-1.5 overflow-hidden">
         <span class="text-border shrink-0 text-[11px]">/</span>
-        <span class="text-muted truncate font-mono text-[11px] leading-4" title={repo.root}>
+        <span class="text-muted min-w-0 truncate font-mono text-[11px] leading-4" title={repo.root}>
           {displayPath(repo.root)}
         </span>
-        {#if repo.is_bare}
-          <Badge testid="repo-bare" class="shrink-0">bare</Badge>
-        {/if}
-        {#if !repo.available}
-          <Badge testid="repo-unavailable" class="bg-warning-soft text-warning shrink-0">
-            unavailable
-          </Badge>
-        {/if}
+      </span>
+      {#if repo.is_bare}
+        <Badge testid="repo-bare" class="shrink-0">bare</Badge>
+      {/if}
+      {#if !repo.available}
+        <Badge testid="repo-unavailable" class="bg-warning-soft text-warning shrink-0">
+          unavailable
+        </Badge>
+      {/if}
+    </div>
+
+    <div class="flex shrink-0 items-center gap-0.5">
+      {#if fetchState?.kind === "failed"}
+        <Tooltip side="top" delayDuration={0} skipDelayDuration={0} disableHoverableContent>
+          {#snippet trigger(props)}
+            <span
+              {...props}
+              class="text-warning hover:bg-border/60 inline-flex h-[26px] w-[26px] items-center justify-center rounded-full transition-colors"
+              aria-label="Fetch failed"
+              data-testid="repo-fetch-failed"
+            >
+              <TriangleAlert size={14} strokeWidth={1.8} aria-hidden="true" />
+            </span>
+          {/snippet}
+
+          <div class="max-w-56">
+            <div class="text-[13px] leading-4 font-medium">Fetch failed</div>
+            <div class="text-primary-fg/70 mt-1 text-xs leading-4">
+              Remote branches could not be refreshed. Try refreshing this repository.
+            </div>
+          </div>
+        </Tooltip>
+      {/if}
+      <div
+        class={cn(
+          "flex shrink-0 items-center gap-0.5 overflow-hidden transition-[max-width,opacity]",
+          busy
+            ? "pointer-events-auto max-w-[112px] opacity-100"
+            : "pointer-events-none max-w-0 opacity-0 group-focus-within:pointer-events-auto group-focus-within:max-w-[112px] group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:max-w-[112px] group-hover:opacity-100",
+        )}
+      >
+        <button
+          type="button"
+          class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0 disabled:opacity-50")}
+          aria-label="Refresh repo"
+          data-testid="repo-refresh"
+          disabled={busy}
+          onclick={onRefresh}
+        >
+          {#if busy}
+            <Spinner class="h-4 w-4" />
+          {:else}
+            <svg
+              viewBox="0 0 24 24"
+              class="h-4 w-4"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.5"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6" />
+            </svg>
+          {/if}
+        </button>
+
+        <Tooltip label="Reveal in Finder" side="top">
+          {#snippet trigger(props)}
+            <button
+              {...props}
+              type="button"
+              class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
+              aria-label="Reveal repo in Finder"
+              data-testid="repo-action-reveal"
+              onclick={() => runAction(revealInFinder(repo.root))}
+            >
+              <FolderOpen size={14} strokeWidth={1.8} aria-hidden="true" />
+            </button>
+          {/snippet}
+        </Tooltip>
+
+        <Tooltip label="Copy path" side="top">
+          {#snippet trigger(props)}
+            <button
+              {...props}
+              type="button"
+              class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
+              aria-label="Copy repo path"
+              data-testid="repo-action-copy-path"
+              onclick={() => runAction(copyText(repo.root))}
+            >
+              <Copy size={14} strokeWidth={1.8} aria-hidden="true" />
+            </button>
+          {/snippet}
+        </Tooltip>
+
+        <Tooltip label="Remove from view" side="top">
+          {#snippet trigger(props)}
+            <button
+              {...props}
+              type="button"
+              class={cn(
+                ICON_BUTTON_CLASS,
+                "hover:bg-status-failed-soft hover:text-status-failed shrink-0",
+              )}
+              aria-label="Remove repo from view"
+              data-testid="repo-action-remove"
+              onclick={() => runAction(removeRepo(repo.root))}
+            >
+              <Trash2 size={14} strokeWidth={1.8} aria-hidden="true" />
+            </button>
+          {/snippet}
+        </Tooltip>
       </div>
     </div>
-
-    <div class="flex shrink-0 items-center gap-2">
-      <span class="text-muted text-[10px]" data-testid="repo-fetch-state"
-        >{fetchLabel(fetchState)}</span
-      >
-      <button
-        type="button"
-        class={cn(ICON_BUTTON_CLASS, "disabled:opacity-50")}
-        aria-label="Refresh repo"
-        data-testid="repo-refresh"
-        disabled={busy}
-        onclick={onRefresh}
-      >
-        {#if busy}
-          <Spinner class="h-4 w-4" />
-        {:else}
-          <svg
-            viewBox="0 0 24 24"
-            class="h-4 w-4"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.5"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            aria-hidden="true"
-          >
-            <path d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6" />
-          </svg>
-        {/if}
-      </button>
-
-      <DropdownMenu
-        triggerLabel={`Actions for ${repo.name}`}
-        triggerTestid="repo-actions-trigger"
-        triggerClass={cn(ICON_BUTTON_CLASS)}
-        contentTestid="repo-actions-menu"
-      >
-        {#snippet trigger()}
-          <svg viewBox="0 0 24 24" fill="currentColor" class="h-4 w-4" aria-hidden="true">
-            <circle cx="12" cy="5" r="1.6" />
-            <circle cx="12" cy="12" r="1.6" />
-            <circle cx="12" cy="19" r="1.6" />
-          </svg>
-        {/snippet}
-        <DropdownMenuItem
-          onSelect={() => runAction(revealInFinder(repo.root))}
-          data-testid="repo-action-reveal"
-        >
-          Reveal in Finder
-        </DropdownMenuItem>
-        <DropdownMenuItem
-          onSelect={() => runAction(copyText(repo.root))}
-          data-testid="repo-action-copy-path"
-        >
-          Copy path
-        </DropdownMenuItem>
-        <DropdownMenuItem
-          onSelect={() => runAction(removeRepo(repo.root))}
-          class="text-status-failed"
-          data-testid="repo-action-remove"
-        >
-          Remove from view
-        </DropdownMenuItem>
-      </DropdownMenu>
-    </div>
   </div>
+
+  {#if actionError}
+    <p
+      class="border-border/60 text-status-failed border-t px-3 py-1.5 text-xs"
+      data-testid="repo-action-error"
+    >
+      {actionError}
+    </p>
+  {/if}
 
   {#if expanded}
     <div class="border-border/60 bg-panel border-t px-2 py-1.5" data-testid="repo-branches">
@@ -330,45 +391,76 @@
                 triggerTestid="worktree-actions-trigger"
                 triggerClass={cn(
                   ICON_BUTTON_CLASS,
-                  "shrink-0 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 data-[state=open]:opacity-100",
+                  "hover:bg-border/60 shrink-0 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 data-[state=open]:opacity-100",
                 )}
                 contentTestid="worktree-actions-menu"
               >
                 {#snippet trigger()}
-                  <svg viewBox="0 0 24 24" fill="currentColor" class="h-4 w-4" aria-hidden="true">
-                    <circle cx="12" cy="5" r="1.6" />
-                    <circle cx="12" cy="12" r="1.6" />
-                    <circle cx="12" cy="19" r="1.6" />
-                  </svg>
+                  <MoreHorizontal size={14} strokeWidth={1.8} aria-hidden="true" />
                 {/snippet}
                 <DropdownMenuItem
                   onSelect={() => runAction(openInEditor(worktreePath))}
+                  class="gap-2"
                   data-testid="worktree-action-editor"
                 >
+                  <Code2
+                    size={14}
+                    strokeWidth={1.8}
+                    class="text-muted shrink-0"
+                    aria-hidden="true"
+                  />
                   Open in editor
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   onSelect={() => runAction(openInTerminal(worktreePath))}
+                  class="gap-2"
                   data-testid="worktree-action-terminal"
                 >
+                  <Terminal
+                    size={14}
+                    strokeWidth={1.8}
+                    class="text-muted shrink-0"
+                    aria-hidden="true"
+                  />
                   Open in terminal
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   onSelect={() => runAction(revealInFinder(worktreePath))}
+                  class="gap-2"
                   data-testid="worktree-action-reveal"
                 >
+                  <FolderOpen
+                    size={14}
+                    strokeWidth={1.8}
+                    class="text-muted shrink-0"
+                    aria-hidden="true"
+                  />
                   Reveal in Finder
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   onSelect={() => runAction(copyText(worktreePath))}
+                  class="gap-2"
                   data-testid="worktree-action-copy-path"
                 >
+                  <Copy
+                    size={14}
+                    strokeWidth={1.8}
+                    class="text-muted shrink-0"
+                    aria-hidden="true"
+                  />
                   Copy path
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   onSelect={() => runAction(copyText(branch.name))}
+                  class="gap-2"
                   data-testid="worktree-action-copy-branch"
                 >
+                  <GitBranch
+                    size={14}
+                    strokeWidth={1.8}
+                    class="text-muted shrink-0"
+                    aria-hidden="true"
+                  />
                   Copy branch name
                 </DropdownMenuItem>
               </DropdownMenu>
@@ -452,7 +544,7 @@
 </div>
 
 {#snippet commitList(worktreePath: string | null, hasChanges: boolean)}
-  <div class="border-border/50 mt-1 mb-1 ml-4 border-l pl-2" data-testid="commit-list">
+  <div class="border-border mt-1 mb-1 ml-4 border-l pl-2" data-testid="commit-list">
     {#if worktreePath !== null && hasChanges}
       {@const uSel = isUncommittedSelected(worktreePath)}
       <button

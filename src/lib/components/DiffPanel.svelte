@@ -6,10 +6,12 @@
   /// ref) still shows real content. Loads are guarded against target/file races
   /// (a newer selection's result always wins).
   import { untrack } from "svelte";
+  import { ExternalLink, Maximize2, Minimize2 } from "@lucide/svelte";
   import { cn, basename } from "$lib/utils";
   import EmptyState from "$lib/components/ui/EmptyState.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
   import DiffView from "$lib/components/DiffView.svelte";
+  import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
   import {
     SEGMENTED_MAIN_CONTAINER_CLASS,
@@ -22,9 +24,12 @@
     fileDiff,
     commitChangedFiles,
     commitFileDiff,
+    openCommitFileDifftool,
+    openWorktreeFileDifftool,
     revealInFinder,
   } from "$lib/api";
   import { languageForPath } from "$lib/diff";
+  import { shortcut } from "$lib/platform";
   import { preferences, updatePreferences } from "$lib/preferences.svelte";
   import type { ChangedFile, ChangeKind, DiffStyle, FileDiff } from "$lib/types";
   import type { DiffTarget } from "$lib/state/gitView.svelte";
@@ -33,7 +38,15 @@
     target,
     refreshRevision = 0,
     onClose,
-  }: { target: DiffTarget; refreshRevision?: number; onClose: () => void } = $props();
+    detailExpanded = false,
+    onToggleDetailExpanded,
+  }: {
+    target: DiffTarget;
+    refreshRevision?: number;
+    onClose: () => void;
+    detailExpanded?: boolean;
+    onToggleDetailExpanded?: () => void;
+  } = $props();
 
   let files = $state<ChangedFile[] | null>(null);
   let filesError = $state<string | null>(null);
@@ -44,6 +57,7 @@
 
   let diff = $state<FileDiff | null>(null);
   let diffError = $state<string | null>(null);
+  let externalActionError = $state<string | null>(null);
   let diffLoading = $state(false);
 
   // Monotonic tokens: a stale async result (the target/file changed before it
@@ -182,6 +196,23 @@
     });
   }
 
+  function openFileDifftool(file: ChangedFile, event: MouseEvent): void {
+    // Mouse clicks should not leave the hover-revealed action pinned visible;
+    // keyboard activation keeps focus for accessibility.
+    if (event.detail > 0) {
+      (event.currentTarget as HTMLButtonElement).blur();
+    }
+    externalActionError = null;
+    const action =
+      target.kind === "uncommitted"
+        ? openWorktreeFileDifftool(target.worktreePath, file.path, file.change)
+        : openCommitFileDifftool(target.repoRoot, target.oid, file.path);
+    void action.catch((e: unknown) => {
+      externalActionError = e instanceof Error ? e.message : String(e);
+      console.error("[switchboard] git difftool failed", e);
+    });
+  }
+
   function startFileResize(event: PointerEvent): void {
     resizingFiles = true;
     event.preventDefault();
@@ -250,9 +281,34 @@
       {/each}
     </div>
 
+    {#if onToggleDetailExpanded}
+      <Tooltip
+        label={detailExpanded ? "Restore Git details panel" : "Expand Git details panel"}
+        shortcut={shortcut("mod", "shift", "D")}
+        side="bottom"
+      >
+        {#snippet trigger(props)}
+          <button
+            {...props}
+            type="button"
+            class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
+            aria-label={detailExpanded ? "Restore Git details panel" : "Expand Git details panel"}
+            data-testid="detail-expand-toggle"
+            onclick={onToggleDetailExpanded}
+          >
+            {#if detailExpanded}
+              <Minimize2 size={14} strokeWidth={1.8} aria-hidden="true" />
+            {:else}
+              <Maximize2 size={14} strokeWidth={1.8} aria-hidden="true" />
+            {/if}
+          </button>
+        {/snippet}
+      </Tooltip>
+    {/if}
+
     <button
       type="button"
-      class={cn(ICON_BUTTON_CLASS, "shrink-0")}
+      class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
       aria-label="Close diff panel"
       data-testid="detail-close"
       onclick={onClose}
@@ -271,6 +327,15 @@
       </svg>
     </button>
   </div>
+
+  {#if externalActionError}
+    <p
+      class="border-border/60 text-status-failed border-b px-3 py-1.5 text-xs"
+      data-testid="diff-external-error"
+    >
+      {externalActionError}
+    </p>
+  {/if}
 
   <!-- Body: file list + diff -->
   {#if files === null}
@@ -302,11 +367,11 @@
     <div class="flex min-h-0 flex-1 overflow-hidden" bind:this={bodyEl}>
       <!-- Changed-files list -->
       <div
-        class="border-border/60 bg-surface shrink-0 overflow-hidden border-r"
+        class="border-border/60 bg-panel shrink-0 overflow-hidden border-r"
         style={`width: ${fileListWidth}px`}
       >
         <div
-          class="border-border/60 bg-panel/70 flex h-8 items-center justify-between border-b px-2"
+          class="border-border/60 bg-surface flex h-8 items-center justify-between border-b px-2"
         >
           <span class="text-muted text-[11px] font-semibold tracking-wide uppercase">
             Changed files
@@ -318,29 +383,50 @@
             {@const badge = changeBadge(file.change)}
             {@const directory = directoryLabel(file.path)}
             <li>
-              <button
-                type="button"
+              <div
                 class={cn(
-                  "flex w-full items-start gap-2 rounded-none px-2 py-1.5 text-left text-xs transition-colors",
-                  file.path === selectedFile ? "bg-raised text-fg" : "text-muted hover:bg-panel",
+                  "group flex w-full items-start gap-1 rounded-none px-2 py-1.5 text-xs transition-colors",
+                  file.path === selectedFile ? "bg-raised text-fg" : "text-muted hover:bg-raised",
                 )}
-                data-testid="changed-file"
-                data-selected={file.path === selectedFile}
-                onclick={() => (selectedFile = file.path)}
               >
-                <span
-                  class={cn("mt-0.5 w-4 shrink-0 text-center font-mono text-[11px]", badge.class)}
-                  >{badge.letter}</span
+                <button
+                  type="button"
+                  class="flex min-w-0 flex-1 items-start gap-2 text-left"
+                  data-testid="changed-file"
+                  data-selected={file.path === selectedFile}
+                  onclick={() => (selectedFile = file.path)}
                 >
-                <span class="min-w-0 flex-1">
-                  <span class="block truncate" title={file.path}>{basename(file.path)}</span>
-                  {#if directory}
-                    <span class="text-muted/80 block truncate font-mono text-[10px] leading-4">
-                      {directory}
-                    </span>
-                  {/if}
-                </span>
-              </button>
+                  <span
+                    class={cn("mt-0.5 w-4 shrink-0 text-center font-mono text-[11px]", badge.class)}
+                    >{badge.letter}</span
+                  >
+                  <span class="min-w-0 flex-1">
+                    <span class="block truncate" title={file.path}>{basename(file.path)}</span>
+                    {#if directory}
+                      <span class="text-muted/80 block truncate font-mono text-[10px] leading-4">
+                        {directory}
+                      </span>
+                    {/if}
+                  </span>
+                </button>
+                <Tooltip label="Open in difftool" side="left">
+                  {#snippet trigger(props)}
+                    <button
+                      {...props}
+                      type="button"
+                      class={cn(
+                        ICON_BUTTON_CLASS,
+                        "hover:bg-border/60 h-6 w-6 shrink-0 self-center opacity-0 transition-opacity group-focus-within:opacity-100 group-hover:opacity-100",
+                      )}
+                      aria-label={`Open ${file.path} in difftool`}
+                      data-testid="changed-file-difftool"
+                      onclick={(event) => openFileDifftool(file, event)}
+                    >
+                      <ExternalLink size={14} strokeWidth={1.8} aria-hidden="true" />
+                    </button>
+                  {/snippet}
+                </Tooltip>
+              </div>
             </li>
           {/each}
         </ul>

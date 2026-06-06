@@ -6,6 +6,7 @@ import type {
   AgentId,
   AgentRecord,
   BranchKind,
+  ChangeKind,
   ChangedFile,
   CommitChanges,
   DirectoryInfo,
@@ -174,6 +175,22 @@ export async function openInTerminal(path: string): Promise<void> {
 // Reveal a path in Finder (selects the item in its containing folder).
 export async function revealInFinder(path: string): Promise<void> {
   await invoke("reveal_in_finder", { path });
+}
+
+export async function openWorktreeFileDifftool(
+  worktreePath: string,
+  file: string,
+  change: ChangeKind,
+): Promise<void> {
+  await invoke("open_worktree_file_difftool", { worktreePath, file, change });
+}
+
+export async function openCommitFileDifftool(
+  repoRoot: string,
+  oid: string,
+  file: string,
+): Promise<void> {
+  await invoke("open_commit_file_difftool", { repoRoot, oid, file });
 }
 
 // Backend-owned personal preferences (`config.yaml`). `getPreferences` always
@@ -359,6 +376,14 @@ export async function removeMcpProvider(name: string): Promise<void> {
 /// rejects with an actionable error.
 export async function testMcpConnection(url: string, bearer: string | null): Promise<number> {
   return await invoke<number>("test_mcp_connection", { url, bearer });
+}
+
+export async function localPromptsDir(): Promise<string> {
+  return await invoke<string>("local_prompts_dir");
+}
+
+export async function openLocalPromptsDir(): Promise<void> {
+  await invoke("open_local_prompts_dir");
 }
 
 /// Rebuild the cached prompt list from all providers (the Settings "Sync" action).

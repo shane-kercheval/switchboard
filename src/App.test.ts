@@ -1,6 +1,6 @@
 import { vi, describe, it, expect, beforeEach, afterEach } from "vitest";
 import "@testing-library/jest-dom/vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import type {
   AgentRecord,
   NormalizedEvent,
@@ -8,8 +8,15 @@ import type {
   ProjectConversation,
   ProjectListing,
   ProjectSummary,
+  RepoListing,
 } from "$lib/types";
 import { ALL_HARNESSES } from "$lib/harnessDisplay";
+// Static import so App.svelte's (large) component-tree transform happens at
+// module collection, not inside the first test that calls `mountApp`. `vi.mock`
+// is hoisted above all imports, so the mocked IPC/event/dialog modules still
+// apply. Importing it lazily charged the cold transform (~8s locally, more on
+// CI) to the first test's 15s budget, which intermittently timed it out.
+import App from "./App.svelte";
 
 // App.svelte tests focus on the workspace-level orchestration: eager registry
 // load, lazy per-project activation (roster + hydration), display-only project
@@ -68,6 +75,8 @@ type Backend = {
   failOpenFor: Set<string>;
   failConvoFor: Set<string>;
   failPickFor: Set<string>;
+  // Git-view tracked repos returned by `list_tracked_repos` / `read_tracked_repo`.
+  trackedRepos: RepoListing[];
   prompts: Prompt[];
 };
 let backend: Backend;
@@ -93,6 +102,7 @@ function freshBackend(): Backend {
     failOpenFor: new Set(),
     failConvoFor: new Set(),
     failPickFor: new Set(),
+    trackedRepos: [],
     prompts: [],
   };
 }
@@ -224,6 +234,19 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
       const installed = !backend.notInstalled.has(args?.harness as string);
       return { installed, version: installed ? "1.0.0" : null };
     }
+    case "get_preferences":
+      return { editor_command: null, terminal_app: "Terminal", diff_style: "side_by_side" };
+    case "add_tracked_repo":
+    case "remove_tracked_repo":
+      return null;
+    case "list_tracked_repos":
+      return backend.trackedRepos;
+    case "read_tracked_repo": {
+      const root = args?.path as string;
+      return backend.trackedRepos.find((r) => r.repo.root === root) ?? backend.trackedRepos[0];
+    }
+    case "fetch_repo":
+      return null;
     default:
       throw new Error(`unexpected invoke call: ${cmd}`);
   }
@@ -291,8 +314,7 @@ function seedProject(opts: {
   if (opts.conversation !== undefined) backend.conversations.set(opts.projectId, opts.conversation);
 }
 
-async function mountApp() {
-  const App = (await import("./App.svelte")).default;
+function mountApp() {
   return render(App);
 }
 
@@ -339,6 +361,13 @@ describe("App", () => {
   });
 
   afterEach(async () => {
+    // Unmount the rendered App *before* resetting the global stores. Auto-cleanup
+    // runs last (LIFO: it registers at import, this hook registers later), so
+    // without an explicit unmount here the store resets fire while the tree is
+    // still live — its `$derived`/`$effect`s then churn against torn-down state
+    // (empty repos, null install status), which destabilizes the reactive
+    // runtime and intermittently hangs the next test's mount on slow CI.
+    cleanup();
     const idx = await import("$lib/state/index.svelte");
     idx._testing.reset();
     const ws = await import("$lib/state/workspace.svelte");
@@ -347,6 +376,8 @@ describe("App", () => {
     ha._testing.reset();
     const compose = await import("$lib/state/composeStore");
     compose._testing.reset();
+    const gv = await import("$lib/state/gitView.svelte");
+    gv._testing.reset();
   });
 
   // --- harness availability banners (workspace empty → welcome) ---
@@ -1629,5 +1660,46 @@ describe("App", () => {
     await fireEvent.keyDown(input, { key: ",", metaKey: true });
     expect(screen.queryByTestId("settings-view")).not.toBeInTheDocument();
     input.remove();
+  });
+
+  // --- Git view toggle (M3 commit B) ---
+
+  it("toggles to the Git view (center takeover, sidebar hidden) and back", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    backend.trackedRepos = [
+      {
+        repo: {
+          root: DIR_A,
+          name: "alpha-repo",
+          default_branch: "main",
+          available: true,
+          is_bare: false,
+          local_branches: [],
+          remote_branches: [],
+          detached_worktrees: [],
+        },
+        linked_projects: {},
+      } satisfies RepoListing,
+    ];
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+
+    // Toggle to Git: the view takes over the center pane and the Projects
+    // sidebar hides (full-width takeover, decision D1).
+    await fireEvent.click(screen.getByTestId("view-toggle-git"));
+    await waitFor(() => expect(screen.getByTestId("git-view")).toBeInTheDocument());
+    expect(screen.queryByTestId("projects-sidebar")).not.toBeInTheDocument();
+    // The tracked repo loaded via list_tracked_repos.
+    await waitFor(() => expect(screen.getByTestId("git-repo")).toBeInTheDocument());
+
+    // Toggle back to Projects: the view is gone, the sidebar returns.
+    await fireEvent.click(screen.getByTestId("view-toggle-projects"));
+    await waitFor(() => expect(screen.queryByTestId("git-view")).not.toBeInTheDocument());
+    expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument();
   });
 });

@@ -41,8 +41,10 @@ function escapeHtml(text: string): string {
 // `Prism.highlight` is undefined-behavior (and throws on some builds) when the
 // grammar is missing, so guard on `Prism.languages[lang]` and fall back to
 // escaped plain text — an unknown or unlabeled fence renders as monospace,
-// never an error mid-stream.
-function highlightCode(code: string, lang: string): string {
+// never an error mid-stream. Exported so the diff renderer highlights each diff
+// line through the *same* Prism path (one highlighter, consistent colors); the
+// output is HTML token spans the caller must sanitize before `{@html}`.
+export function highlightCode(code: string, lang: string): string {
   const grammar = lang ? Prism.languages[lang] : undefined;
   if (grammar) {
     return Prism.highlight(code, grammar, lang);

@@ -11,6 +11,8 @@ use switchboard_dispatcher::{Dispatcher, EventEmitter};
 use switchboard_harness::HarnessAdapter;
 use switchboard_prompts::PromptService;
 
+use crate::git_registry::{self, GitRegistry};
+use crate::preferences::{self, Preferences};
 use crate::workspace::{self, Workspace};
 
 /// The single piece of state managed by Tauri. Multi-project and
@@ -19,15 +21,20 @@ use crate::workspace::{self, Workspace};
 /// `Directory` handle by its canonical path.
 ///
 /// **Lock-order convention** (when more than one of these mutexes is held
-/// at the same time): `workspace` → `registry_write` → `directories` →
-/// `projects` → `active_project_id` → `needs_session_meta` →
+/// at the same time): `workspace` → `registry_write` → `git_registry` →
+/// `directories` → `projects` → `active_project_id` → `needs_session_meta` →
 /// `project_locks` → `agents_by_id`. Always acquire in this order. `workspace`
 /// is at the head because it is the app-owned user-global registry that sits
-/// above any single directory's state; today it is only ever acquired alone
-/// (no nesting yet), but placing it first keeps a future nesting compliant.
+/// above any single directory's state; in practice it is taken either standalone
+/// (`list_projects`, the workspace switcher) or nested *under* `registry_write`
+/// in `init_directory` (which holds `registry_write` for its whole body) — never
+/// the inverse. `git_registry` (the Git-view tracked-repo list) follows the same
+/// shape: standalone for the Git-view read/add/remove commands, and nested under
+/// `registry_write` during `init_directory`'s auto-sync hook — so it sorts after
+/// `registry_write` here. **No path may acquire `registry_write` while holding
+/// `git_registry`** (the inverse order is the deadlock this convention forbids).
 /// `directories` holds every loaded directory keyed by canonical path; it sits
-/// below `registry_write` (which serializes its mutating add/remove) and above
-/// the per-project maps. Violating the order can
+/// below the registries and above the per-project maps. Violating the order can
 /// deadlock under concurrent access. Single-lock acquisitions (which most
 /// callers do) are unaffected — the convention only matters when nesting.
 /// `needs_session_meta` is the tail because both `attach_agent_impl` (under
@@ -37,6 +44,13 @@ use crate::workspace::{self, Workspace};
 /// `registry_write` is held during open/create/remove — which precedes them in
 /// the order, so those nestings are compliant.
 /// When nesting them, follow the documented tail order.
+///
+/// `preferences` is a **standalone leaf**: it is only ever acquired by
+/// `get_preferences` / `set_preferences`, never nested with another state lock.
+/// `set_preferences_impl` deliberately holds it **across its `config.yaml`
+/// write** to serialize saves (the temp file is a fixed path, so concurrent
+/// unserialized writes would corrupt it). Because it's a leaf taken alone, no
+/// other lock may be acquired while holding it — keep it that way.
 ///
 /// `registry_write` serializes append-only-log mutations
 /// (`create_project`, `register_agent`, `init_directory`).
@@ -166,6 +180,28 @@ pub struct AppState {
     /// is a no-op while this is `None`, so tests never touch user-global state.
     pub workspace_path: Option<PathBuf>,
 
+    /// User-global Git-view tracked-repo registry — the ordered set of repo roots
+    /// the Git view shows (see `crate::git_registry`). A superset of the
+    /// directories that host projects: stores paths only, never git state.
+    /// Defaults to empty; production hydrates it from `git-view.yaml` via
+    /// [`AppState::with_git_registry`].
+    pub git_registry: Mutex<GitRegistry>,
+
+    /// Resolved path of `git-view.yaml`, or `None` when unresolved (tests, exotic
+    /// host) or when the existing file couldn't be read this session.
+    /// `persist_git_registry` is a no-op while this is `None`.
+    pub git_registry_path: Option<PathBuf>,
+
+    /// User-global personal preferences (see `crate::preferences`). Backend-owned
+    /// `config.yaml`; the first backend-persisted settings (theme stays
+    /// frontend-only). Defaults until hydrated via [`AppState::with_preferences`].
+    pub preferences: Mutex<Preferences>,
+
+    /// Resolved path of `config.yaml`, or `None` when no global location was
+    /// resolved (tests, exotic host). `set_preferences` errors-as-noop persist
+    /// while this is `None`, so tests never touch user-global state.
+    pub preferences_path: Option<PathBuf>,
+
     /// User-global prompt resolution (local file providers; MCP later). Read-only
     /// after construction — the command shims call `list`/`render` through it.
     /// Defaults to an inert (disabled) service; production injects the configured
@@ -198,6 +234,10 @@ impl AppState {
             agents_by_id: Arc::new(Mutex::new(HashMap::new())),
             workspace: Mutex::new(Workspace::default()),
             workspace_path: None,
+            git_registry: Mutex::new(GitRegistry::default()),
+            git_registry_path: None,
+            preferences: Mutex::new(Preferences::default()),
+            preferences_path: None,
             prompts: PromptService::disabled(),
         }
     }
@@ -223,6 +263,28 @@ impl AppState {
         // `workspace_path` None so a later save never overwrites a registry we
         // failed to load (see `workspace::LoadOutcome`).
         self.workspace_path = outcome.persistable.then_some(path);
+        self
+    }
+
+    /// Builder step that loads the Git-view tracked-repo registry from `path`.
+    /// Same persistability contract as [`with_workspace`](Self::with_workspace):
+    /// an unreadable existing file disables persistence so it's never clobbered.
+    #[must_use]
+    pub fn with_git_registry(mut self, path: PathBuf) -> Self {
+        let outcome = git_registry::load(&path);
+        self.git_registry = Mutex::new(outcome.registry);
+        self.git_registry_path = outcome.persistable.then_some(path);
+        self
+    }
+
+    /// Builder step that loads personal preferences from `path` and records the
+    /// path for later saves. Unlike the registries there is no persistability
+    /// gate: preferences are written only on explicit user save, so a corrupt
+    /// file simply yields defaults this session and the next save replaces it.
+    #[must_use]
+    pub fn with_preferences(mut self, path: PathBuf) -> Self {
+        self.preferences = Mutex::new(preferences::load(&path));
+        self.preferences_path = Some(path);
         self
     }
 }
@@ -287,6 +349,23 @@ pub(crate) fn persist_workspace(state: &AppState) {
             path = %path.display(),
             error = %e,
             "failed to persist workspace registry"
+        );
+    }
+}
+
+/// Persist the Git-view tracked-repo registry to disk if a `git_registry_path`
+/// is configured. Best-effort, same as [`persist_workspace`]: a `None` path is a
+/// no-op (tests), and a save failure is logged rather than propagated.
+pub(crate) fn persist_git_registry(state: &AppState) {
+    let Some(path) = state.git_registry_path.as_ref() else {
+        return;
+    };
+    let snapshot = lock(&state.git_registry).clone();
+    if let Err(e) = git_registry::save(path, &snapshot) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %e,
+            "failed to persist git-view registry"
         );
     }
 }

@@ -166,18 +166,19 @@ pub fn read_yaml<T: DeserializeOwned>(path: &Path) -> Result<T> {
     })
 }
 
-/// Atomic-ish YAML write: serialize, write to `<path>.tmp` in the *same
-/// directory* as the target, then `rename` over the target. Same-filesystem
-/// rename is atomic on POSIX/Windows; a cross-filesystem temp dir would
-/// degrade to copy+delete and defeat the purpose, so we stay adjacent.
+/// Atomic YAML write: serialize, write to `<path>.tmp` in the *same directory*
+/// as the target, then `rename` over the target. Same-filesystem rename is
+/// atomic on POSIX/Windows; a cross-filesystem temp dir would degrade to
+/// copy+delete and defeat the purpose, so we stay adjacent.
 ///
-/// **Known durability gap (tracked follow-up).** Unlike `write_jsonl` /
-/// `append_jsonl`, this does *not* `sync_data` the tmp before rename nor fsync
-/// the parent dir after — so a power loss can leave a partial/stale file. Lower
-/// frequency than the registry, but it persists `workspace.yaml` (the user's
-/// whole cross-directory project list) and `config.yaml`, so the gap isn't
-/// trivial. Hardening it the way `write_jsonl` does is a deliberate follow-up,
-/// out of the milestone that added `write_jsonl`.
+/// **Durability matches `write_jsonl`** (see its doc for the full rationale):
+/// `sync_data` the tmp before the rename (else a power loss after the rename
+/// reaches disk but the data didn't leaves an empty/partial file), and fsync the
+/// parent directory after the rename (a rename is a directory-entry change, not
+/// durable until the dir is synced — else the write can silently revert on power
+/// loss). This matters because `write_yaml` persists `workspace.yaml` (the user's
+/// whole cross-directory project list) and the shared `config.yaml`. Unix-only
+/// parent-dir fsync (no portable Windows equivalent), matching `write_jsonl`.
 pub fn write_yaml<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let yaml = serde_norway::to_string(value).map_err(|source| CoreError::CorruptYaml {
         path: path.to_owned(),
@@ -185,12 +186,87 @@ pub fn write_yaml<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     })?;
 
     let tmp = tmp_path(path);
-    std::fs::write(&tmp, yaml).map_err(|e| CoreError::io(&tmp, e))?;
+    {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)
+            .map_err(|e| CoreError::io(&tmp, e))?;
+        file.write_all(yaml.as_bytes())
+            .map_err(|e| CoreError::io(&tmp, e))?;
+        file.flush().map_err(|e| CoreError::io(&tmp, e))?;
+        file.sync_data().map_err(|e| CoreError::io(&tmp, e))?;
+    }
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(CoreError::io(path, e));
     }
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| CoreError::io(parent, e))?;
+    }
     Ok(())
+}
+
+/// Serializes every `edit_yaml_mapping` call process-wide. A shared YAML config
+/// (notably `config.yaml`, written by *both* the prompt providers and personal
+/// preferences) is read-modify-written by independent subsystems; without one
+/// gate their reads and writes interleave and silently drop each other's keys —
+/// worsened by `write_yaml`'s fixed temp path, which two concurrent writes would
+/// collide on. One process-wide lock is sufficient and correct here: the app is
+/// single-process (the per-project instance lock), config writes are rare, and
+/// only this helper edits the shared file. (Per-file locking would avoid
+/// serializing edits to *different* files, but nothing needs that today.)
+static YAML_EDIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Read a YAML file as a top-level mapping, apply `edit`, and write it back —
+/// atomic against other `edit_yaml_mapping` calls. Every key the closure doesn't
+/// touch is preserved, so subsystems that share one file (each owning different
+/// keys) never clobber each other's sections.
+///
+/// Missing / empty / `null` → a fresh mapping (first write seeds the file). A
+/// file that parses to a non-mapping is refused with [`CoreError::NotAMapping`]
+/// rather than overwritten. The closure is infallible by design: do any
+/// fallible work (e.g. serializing the value to insert) *before* calling this, so
+/// the lock is held only across the read-modify-write.
+pub fn edit_yaml_mapping<F>(path: &Path, edit: F) -> Result<()>
+where
+    F: FnOnce(&mut serde_norway::Mapping),
+{
+    let _guard = YAML_EDIT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut root = read_yaml_mapping(path)?;
+    edit(&mut root);
+    write_yaml(path, &serde_norway::Value::Mapping(root))
+}
+
+/// Read a YAML file as a top-level mapping for an in-place edit. Absent / empty /
+/// `null` → a fresh mapping; a non-mapping or unparseable file is an error so a
+/// caller never clobbers a config it can't safely round-trip.
+fn read_yaml_mapping(path: &Path) -> Result<serde_norway::Mapping> {
+    use serde_norway::Value;
+    if !path.exists() {
+        return Ok(serde_norway::Mapping::new());
+    }
+    let bytes = std::fs::read(path).map_err(|e| CoreError::io(path, e))?;
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return Ok(serde_norway::Mapping::new());
+    }
+    match serde_norway::from_slice::<Value>(&bytes) {
+        Ok(Value::Mapping(mapping)) => Ok(mapping),
+        Ok(Value::Null) => Ok(serde_norway::Mapping::new()),
+        Ok(_) => Err(CoreError::NotAMapping {
+            path: path.to_owned(),
+        }),
+        Err(source) => Err(CoreError::CorruptYaml {
+            path: path.to_owned(),
+            source,
+        }),
+    }
 }
 
 fn tmp_path(target: &Path) -> std::path::PathBuf {
@@ -202,4 +278,157 @@ fn tmp_path(target: &Path) -> std::path::PathBuf {
     target
         .parent()
         .map_or_else(|| std::path::PathBuf::from(&name), |p| p.join(&name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_norway::Value;
+    use tempfile::tempdir;
+
+    fn s(text: &str) -> Value {
+        Value::String(text.to_owned())
+    }
+
+    #[test]
+    fn write_yaml_round_trips_and_overwrites_without_leaving_a_tmp() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+
+        let mut first = serde_norway::Mapping::new();
+        first.insert(s("editor_command"), s("cursor"));
+        write_yaml(&path, &Value::Mapping(first)).unwrap();
+        assert_eq!(
+            read_yaml::<Value>(&path)
+                .unwrap()
+                .as_mapping()
+                .unwrap()
+                .get(s("editor_command")),
+            Some(&s("cursor"))
+        );
+
+        // A second write fully replaces the first, and the atomic-rename tmp is
+        // gone (cleaned up by the successful rename, not orphaned beside it).
+        let mut second = serde_norway::Mapping::new();
+        second.insert(s("terminal_app"), s("iTerm"));
+        write_yaml(&path, &Value::Mapping(second)).unwrap();
+        let reread = read_yaml::<Value>(&path).unwrap();
+        let map = reread.as_mapping().unwrap();
+        assert_eq!(map.get(s("terminal_app")), Some(&s("iTerm")));
+        assert!(
+            !map.contains_key(s("editor_command")),
+            "second write replaces the first"
+        );
+        assert!(
+            !tmp_path(&path).exists(),
+            "the temp file must not be left behind"
+        );
+    }
+
+    #[test]
+    fn edit_seeds_a_missing_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+
+        edit_yaml_mapping(&path, |root| {
+            root.insert(s("editor_command"), s("cursor"));
+        })
+        .unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("editor_command") && raw.contains("cursor"));
+    }
+
+    #[test]
+    fn edit_preserves_keys_the_closure_does_not_touch() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            "mcp_providers:\n  - name: team\nterminal_app: iTerm\n",
+        )
+        .unwrap();
+
+        edit_yaml_mapping(&path, |root| {
+            root.insert(s("editor_command"), s("zed"));
+        })
+        .unwrap();
+
+        let reread: Value = read_yaml(&path).unwrap();
+        let map = reread.as_mapping().unwrap();
+        assert!(
+            map.contains_key(s("mcp_providers")),
+            "untouched key survives"
+        );
+        assert_eq!(map.get(s("terminal_app")), Some(&s("iTerm")));
+        assert_eq!(map.get(s("editor_command")), Some(&s("zed")));
+    }
+
+    #[test]
+    fn edit_refuses_a_non_mapping_and_leaves_it_untouched() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "just a scalar, not a mapping\n").unwrap();
+
+        let result = edit_yaml_mapping(&path, |root| {
+            root.insert(s("editor_command"), s("cursor"));
+        });
+        assert!(matches!(result, Err(CoreError::NotAMapping { .. })));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "just a scalar, not a mapping\n",
+            "the original file must not be overwritten"
+        );
+    }
+
+    #[test]
+    fn empty_and_null_files_are_treated_as_empty_mappings() {
+        let dir = tempdir().unwrap();
+        for (name, contents) in [("blank.yaml", "   \n"), ("null.yaml", "null\n")] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, contents).unwrap();
+            edit_yaml_mapping(&path, |root| {
+                root.insert(s("k"), s("v"));
+            })
+            .unwrap();
+            let reread: Value = read_yaml(&path).unwrap();
+            assert_eq!(reread.as_mapping().unwrap().get(s("k")), Some(&s("v")));
+        }
+    }
+
+    #[test]
+    fn concurrent_edits_from_two_subsystems_both_survive() {
+        // The whole reason this helper exists: two independent writers doing
+        // read-modify-write on the same shared config must not drop each other's
+        // keys. Hammer it from many threads — each adds its own key — and assert
+        // every key landed.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, "{}\n").unwrap();
+
+        let threads: Vec<_> = (0..16)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    edit_yaml_mapping(&path, |root| {
+                        root.insert(s(&format!("key{i}")), Value::from(i));
+                    })
+                    .unwrap();
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        let reread: Value = read_yaml(&path).unwrap();
+        let map = reread.as_mapping().unwrap();
+        for i in 0..16 {
+            assert_eq!(
+                map.get(s(&format!("key{i}"))),
+                Some(&Value::from(i)),
+                "key{i} must survive concurrent writes"
+            );
+        }
+    }
 }

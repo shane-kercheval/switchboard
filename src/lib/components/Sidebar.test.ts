@@ -2,6 +2,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/svelte";
 import type { AgentRecord, NormalizedEvent } from "$lib/types";
+// Static import so the component-tree transform happens at module collection,
+// not inside the first test's timeout (cold CI transforms have no vite cache).
+// `vi.mock` is hoisted above imports, so the mocks below still apply.
+import Sidebar from "./Sidebar.svelte";
 
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(async () => vi.fn()),
@@ -75,7 +79,6 @@ describe("Sidebar", () => {
     await state.registerAgent(CLAUDE_AGENT);
     await state.registerAgent(CODEX_AGENT);
 
-    const Sidebar = (await import("./Sidebar.svelte")).default;
     render(Sidebar, { props: { agents: [CLAUDE_AGENT, CODEX_AGENT] } });
 
     const rows = screen.getAllByTestId("sidebar-agent");
@@ -89,7 +92,6 @@ describe("Sidebar", () => {
   });
 
   it("renders empty-state message when no agents", async () => {
-    const Sidebar = (await import("./Sidebar.svelte")).default;
     render(Sidebar, { props: { agents: [] } });
     expect(screen.queryAllByTestId("sidebar-agent")).toHaveLength(0);
     expect(screen.getByText(/no agents/i)).toBeInTheDocument();
@@ -122,7 +124,6 @@ describe("Sidebar", () => {
       },
     ];
 
-    const Sidebar = (await import("./Sidebar.svelte")).default;
     render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
 
     // Expanded by default → details (the context bar) are visible.
@@ -146,7 +147,6 @@ describe("Sidebar", () => {
       resume_command: "cd '/proj' && claude --resume abc --dangerously-skip-permissions",
     });
 
-    const Sidebar = (await import("./Sidebar.svelte")).default;
     render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
 
     expect(screen.getByTestId("agent-harness-icon")).toBeInTheDocument();
@@ -156,7 +156,7 @@ describe("Sidebar", () => {
 
     const resume = await screen.findByTestId("agent-action-resume");
     const open = await screen.findByTestId("agent-action-open-session");
-    expect(actions).toHaveAttribute("style", "--agent-action-width: 4.75rem;");
+    expect(actions).toHaveAttribute("style", "--agent-action-width: 5.125rem;");
     expect(resume).toHaveAttribute("tabindex", "-1");
     expect(open).toHaveAttribute("tabindex", "-1");
   });
@@ -170,7 +170,6 @@ describe("Sidebar", () => {
       resume_command: "cd '/proj' && claude --resume abc --dangerously-skip-permissions",
     });
 
-    const Sidebar = (await import("./Sidebar.svelte")).default;
     render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
 
     expect(screen.getByTestId("agent-action-stop")).toBeInTheDocument();
@@ -187,7 +186,6 @@ describe("Sidebar", () => {
       resume_command: "cd '/proj' && claude --resume abc --dangerously-skip-permissions",
     });
 
-    const Sidebar = (await import("./Sidebar.svelte")).default;
     render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
 
     await fireEvent.click(await screen.findByTestId("agent-action-open-session"));
@@ -208,7 +206,6 @@ describe("Sidebar", () => {
     await state.registerAgent(CLAUDE_AGENT);
     agentSessionInfoMock.mockResolvedValue({ session_file: null, resume_command: null });
 
-    const Sidebar = (await import("./Sidebar.svelte")).default;
     render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
 
     await waitFor(() => expect(agentSessionInfoMock).toHaveBeenCalledWith(CLAUDE_AGENT.id));
@@ -227,7 +224,6 @@ describe("Sidebar", () => {
         resume_command: "cd '/proj' && claude --resume abc --dangerously-skip-permissions",
       });
 
-    const Sidebar = (await import("./Sidebar.svelte")).default;
     render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
 
     await waitFor(() => expect(agentSessionInfoMock).toHaveBeenCalledTimes(1));
@@ -245,7 +241,6 @@ describe("Sidebar", () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
 
-    const Sidebar = (await import("./Sidebar.svelte")).default;
     render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
 
     await fireEvent.click(screen.getByTestId("agent-action-remove"));
@@ -266,7 +261,6 @@ describe("Sidebar", () => {
       const state = await loadState();
       await state.registerAgent(CLAUDE_AGENT);
 
-      const Sidebar = (await import("./Sidebar.svelte")).default;
       render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
 
       await fireEvent.pointerEnter(screen.getByTestId("agent-action-remove"));
@@ -287,7 +281,6 @@ describe("Sidebar", () => {
     await state.registerAgent(CLAUDE_AGENT);
     removeAgentMock.mockRejectedValueOnce(new Error("registry locked"));
 
-    const Sidebar = (await import("./Sidebar.svelte")).default;
     render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
 
     await fireEvent.click(screen.getByTestId("agent-action-remove"));
@@ -321,7 +314,6 @@ describe("Sidebar", () => {
       },
     ];
 
-    const Sidebar = (await import("./Sidebar.svelte")).default;
     render(Sidebar, { props: { agents: [CLAUDE_AGENT, CODEX_AGENT] } });
 
     expect(screen.getByTestId("agent-context-bar")).toBeInTheDocument();
@@ -354,7 +346,6 @@ describe("Sidebar", () => {
       },
     ];
 
-    const Sidebar = (await import("./Sidebar.svelte")).default;
     render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
 
     expect(screen.queryByTestId("agent-cost")).toBeNull();
@@ -370,7 +361,6 @@ describe("Sidebar", () => {
       last_rate_limit: { primary: { used_percent: 42.5 } },
     };
 
-    const Sidebar = (await import("./Sidebar.svelte")).default;
     render(Sidebar, { props: { agents: [CODEX_AGENT] } });
 
     expect(screen.getByTestId("agent-rate-limit")).toHaveTextContent("quota used: 43%");
@@ -401,7 +391,6 @@ describe("Sidebar", () => {
       },
     ];
 
-    const Sidebar = (await import("./Sidebar.svelte")).default;
     render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
 
     // (130000 + 10000) / 200000 = 0.70 → "70%" (NOT the ~8% the old
@@ -435,7 +424,6 @@ describe("Sidebar", () => {
       },
     ];
 
-    const Sidebar = (await import("./Sidebar.svelte")).default;
     render(Sidebar, { props: { agents: [CODEX_AGENT] } });
 
     // (80000 + 20000) / 200000 = 0.50 → "50%". Re-adding cached would give
@@ -466,7 +454,6 @@ describe("Sidebar", () => {
       },
     ];
 
-    const Sidebar = (await import("./Sidebar.svelte")).default;
     render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
 
     expect(screen.queryByTestId("agent-context-bar")).toBeNull();
@@ -488,7 +475,6 @@ describe("Sidebar", () => {
       },
     };
 
-    const Sidebar = (await import("./Sidebar.svelte")).default;
     render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
 
     const meta = screen.getByTestId("agent-meta");
@@ -521,7 +507,6 @@ async function renderClaudeWithRateLimit(info: unknown, asOf: string | null): Pr
     last_rate_limit: info,
     last_rate_limit_as_of: asOf,
   };
-  const Sidebar = (await import("./Sidebar.svelte")).default;
   render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
 }
 
@@ -632,7 +617,6 @@ describe("Sidebar Claude rate-limit surface", () => {
         overageResetsAt: epochFromNow(6 * 86400),
       },
     };
-    const Sidebar = (await import("./Sidebar.svelte")).default;
     render(Sidebar, { props: { agents: [CODEX_AGENT] } });
     expect(screen.queryByTestId("agent-rate-window")).toBeNull();
     expect(screen.queryByTestId("agent-overage")).toBeNull();
@@ -692,7 +676,6 @@ async function renderCodexWithRateLimit(info: unknown): Promise<void> {
   const runtime = state.runtimes[CODEX_AGENT.id];
   if (runtime === undefined) throw new Error("unreachable");
   state.runtimes[CODEX_AGENT.id] = { ...runtime, last_rate_limit: info };
-  const Sidebar = (await import("./Sidebar.svelte")).default;
   render(Sidebar, { props: { agents: [CODEX_AGENT] } });
 }
 
@@ -777,7 +760,6 @@ describe("Sidebar clean-hide for absent metadata", () => {
         usage: { input_tokens: 100, output_tokens: 20, total_cost_usd: null },
       },
     ];
-    const Sidebar = (await import("./Sidebar.svelte")).default;
     render(Sidebar, { props: { agents: [CODEX_AGENT] } });
     expect(screen.queryByTestId("agent-cost")).toBeNull();
   });
@@ -787,7 +769,6 @@ describe("Sidebar clean-hide for absent metadata", () => {
     // value-gated cell must be absent, not blank.
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
-    const Sidebar = (await import("./Sidebar.svelte")).default;
     render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
     expect(screen.queryByTestId("agent-cost")).toBeNull();
     expect(screen.queryByTestId("agent-rate-limit")).toBeNull();
@@ -828,7 +809,6 @@ describe("Sidebar agent-parse-warnings tooltip", () => {
       ],
     };
 
-    const Sidebar = (await import("./Sidebar.svelte")).default;
     render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
 
     const indicator = screen.getByTestId("agent-parse-warnings");
@@ -870,7 +850,6 @@ describe("Sidebar agent-parse-warnings tooltip", () => {
       })),
     };
 
-    const Sidebar = (await import("./Sidebar.svelte")).default;
     render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
 
     // Indicator reflects the full count (not the cap).
@@ -895,7 +874,6 @@ describe("Sidebar agent-scoped event tolerance", () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
 
-    const Sidebar = (await import("./Sidebar.svelte")).default;
     render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
 
     // The state-module listener is mocked-but-existing; fire events
@@ -939,7 +917,6 @@ describe("Sidebar inline rename", () => {
   async function enterEditViaDoubleClick(agent: AgentRecord): Promise<HTMLInputElement> {
     const state = await loadState();
     await state.registerAgent(agent);
-    const Sidebar = (await import("./Sidebar.svelte")).default;
     render(Sidebar, { props: { agents: [agent] } });
     const toggle = screen.getByTestId("agent-name").closest("button");
     if (!toggle) throw new Error("expected the agent name to sit in a toggle button");
@@ -1030,7 +1007,6 @@ describe("Sidebar inline rename", () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     await state.registerAgent(CODEX_AGENT);
-    const Sidebar = (await import("./Sidebar.svelte")).default;
     render(Sidebar, { props: { agents: [CLAUDE_AGENT, CODEX_AGENT] } });
 
     const [firstName] = screen.getAllByTestId("agent-name");

@@ -26,7 +26,12 @@
   import Spinner from "$lib/components/ui/Spinner.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
-  import { SEGMENTED_CONTAINER_CLASS } from "$lib/components/ui/segmentedControl";
+  import {
+    SEGMENTED_CONTAINER_CLASS,
+    SEGMENTED_ITEM_INACTIVE_CLASS,
+    SEGMENTED_MAIN_ITEM_ACTIVE_CLASS,
+    SEGMENTED_MAIN_ITEM_CLASS,
+  } from "$lib/components/ui/segmentedControl";
   import { windowDragRegion } from "$lib/windowDrag";
 
   let {
@@ -77,19 +82,17 @@
       (p) => p.name.toLowerCase().includes(q) || basename(p.directory).toLowerCase().includes(q),
     );
   });
-  // Filled selected pill, but a lightened medium-gray fill (`bg-muted/65`)
-  // rather than the near-black `bg-primary` the dialog toggles use — softer for
-  // a control that lives in the main view. `text-primary-fg` is the contrasting
-  // label in both themes.
   const segmentClass = (selected: boolean): string =>
     cn(
-      "flex h-4 items-center rounded-full px-2 text-[11px] font-medium transition-colors",
-      selected ? "bg-muted/65 text-primary-fg" : "text-muted hover:bg-raised",
+      SEGMENTED_MAIN_ITEM_CLASS,
+      selected ? SEGMENTED_MAIN_ITEM_ACTIVE_CLASS : SEGMENTED_ITEM_INACTIVE_CLASS,
     );
   const projectActionClass =
-    "text-muted hover:bg-border/60 hover:text-fg focus-visible:ring-accent focus-visible:bg-border/60 focus-visible:text-fg inline-flex h-6 w-6 items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none";
+    "text-muted hover:bg-border/60 hover:text-fg focus-visible:ring-accent focus-visible:bg-border/60 focus-visible:text-fg inline-flex h-[26px] w-[26px] items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none";
   const projectDeleteClass =
-    "text-muted hover:bg-status-failed-soft/70 hover:text-status-failed focus-visible:ring-accent focus-visible:bg-status-failed-soft/70 focus-visible:text-status-failed inline-flex h-6 w-6 items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50";
+    "text-muted hover:bg-status-failed-soft/70 hover:text-status-failed focus-visible:ring-accent focus-visible:bg-status-failed-soft/70 focus-visible:text-status-failed inline-flex h-[26px] w-[26px] items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50";
+  const addProjectClass =
+    "text-muted hover:bg-raised hover:text-fg focus-visible:ring-accent focus-visible:bg-raised focus-visible:text-fg inline-flex h-[26px] w-[26px] items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none";
 
   /// Inline rename editor (mirrors the agent-card rename in `Sidebar.svelte`).
   /// Only one row edits at a time, so a single `editingProjectId` + `draftName`
@@ -309,7 +312,7 @@
         </div>
         <button
           type="button"
-          class={ICON_BUTTON_CLASS}
+          class={addProjectClass}
           aria-label="Add a project"
           data-testid="add-project"
           onclick={onAddProject}
@@ -488,7 +491,7 @@
               <div class="flex shrink-0 items-center gap-0.5 pr-1.5">
                 {#if !busy && !completed}
                   <div
-                    class="pointer-events-none flex max-w-0 items-center gap-0.5 overflow-hidden opacity-0 transition-[max-width,opacity] group-hover:pointer-events-auto group-hover:max-w-[3.25rem] group-hover:opacity-100"
+                    class="pointer-events-none flex max-w-0 items-center gap-0.5 overflow-hidden opacity-0 transition-[max-width,opacity] group-hover:pointer-events-auto group-hover:max-w-[54px] group-hover:opacity-100"
                   >
                     {#if deleteConfirmProjectId === project.id}
                       <Tooltip label="Cancel delete" delayDuration={1000}>
@@ -522,7 +525,7 @@
                           <button
                             {...props}
                             type="button"
-                            class="text-status-failed hover:bg-status-failed-soft/70 focus-visible:ring-accent focus-visible:bg-status-failed-soft/70 inline-flex h-6 w-6 items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+                            class="text-status-failed hover:bg-status-failed-soft/70 focus-visible:ring-accent focus-visible:bg-status-failed-soft/70 inline-flex h-[26px] w-[26px] items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50"
                             disabled={deletingProjectId === project.id}
                             aria-label="Confirm delete"
                             tabindex="-1"
@@ -635,7 +638,7 @@
                 {#if busy}
                   <button
                     type="button"
-                    class="group/cancel text-muted hover:bg-status-failed-soft/70 hover:text-status-failed focus-visible:ring-accent focus-visible:bg-status-failed-soft/70 focus-visible:text-status-failed inline-flex h-6 w-6 items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none"
+                    class="group/cancel text-muted hover:bg-status-failed-soft/70 hover:text-status-failed focus-visible:ring-accent focus-visible:bg-status-failed-soft/70 focus-visible:text-status-failed inline-flex h-[26px] w-[26px] items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none"
                     aria-label="Cancel all running agents"
                     data-testid="project-cancel"
                     onclick={() => cancelAllForProject(project.id)}

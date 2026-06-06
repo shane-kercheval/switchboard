@@ -27,6 +27,14 @@ const status = $state<Record<HarnessKind, HarnessInstallStatus | null>>({
   antigravity: null,
 });
 
+/// Bumped by `_testing.reset()`. A refresh snapshots this at start and drops any
+/// per-key write whose snapshot is stale, so a probe that resolves *after* a
+/// reset can't repollute the freshly-cleared store. Without this, an un-awaited
+/// startup probe from one test outlives it and leaks "missing" status into the
+/// next test (a phantom banner → timeout → cascade). Production never resets, so
+/// the epoch stays `0` and this guard is inert there.
+let epoch = 0;
+
 function deriveBinary(s: HarnessInstallStatus | null): BinaryState {
   if (s === null) return "checking";
   return s.installed ? "available" : "missing";
@@ -66,13 +74,15 @@ export const harnessAvailability = {
 /// no locking is needed. This holds only while the probe stays side-effect-free
 /// and stable; if it ever becomes non-idempotent, revisit.
 export async function refreshHarnessAvailability(): Promise<void> {
+  const started = epoch;
   await Promise.all(
     ALL_HARNESSES.map(async (harness) => {
       try {
-        status[harness] = await api.getHarnessInstallStatus(harness);
+        const result = await api.getHarnessInstallStatus(harness);
+        if (started === epoch) status[harness] = result;
       } catch (err) {
         console.warn(`[switchboard] harness install probe failed for ${harness}:`, err);
-        status[harness] = { installed: false, version: null };
+        if (started === epoch) status[harness] = { installed: false, version: null };
       }
     }),
   );
@@ -81,6 +91,7 @@ export async function refreshHarnessAvailability(): Promise<void> {
 /// Test-only reset so suites don't leak probed state across cases.
 export const _testing = {
   reset(): void {
+    epoch += 1;
     for (const harness of ALL_HARNESSES) status[harness] = null;
   },
 };

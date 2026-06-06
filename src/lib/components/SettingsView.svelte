@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { onMount } from "svelte";
+  import { FolderOpen } from "@lucide/svelte";
   import { theme, type ThemeMode } from "$lib/theme.svelte";
   import { agentCopy } from "$lib/agentCopy.svelte";
   import type { AgentCopyMode } from "$lib/agentCopyMode";
@@ -11,9 +13,15 @@
     SEGMENTED_ITEM_INACTIVE_CLASS,
   } from "$lib/components/ui/segmentedControl";
   import HarnessStatusList from "$lib/components/HarnessStatusList.svelte";
+  import Input from "$lib/components/ui/Input.svelte";
+  import Tooltip from "$lib/components/ui/Tooltip.svelte";
+  import { preferences, saveStatus, updatePreferences } from "$lib/preferences.svelte";
   import McpServersSettings from "$lib/components/McpServersSettings.svelte";
+  import { localPromptsDir, openLocalPromptsDir } from "$lib/api";
 
   let { onClose }: { onClose: () => void } = $props();
+  let promptsDir = $state<string | null>(null);
+  let promptsDirError = $state<string | null>(null);
 
   const themeOptions: { mode: ThemeMode; label: string }[] = [
     { mode: "system", label: "System" },
@@ -26,16 +34,45 @@
     { mode: "full_answer", label: "Entire Response" },
   ];
 
-  const shortcuts = [
+  // `note` adds a parenthetical clarifier rendered after the action — used where
+  // the key isn't literal (the compose-bar number keys map to a chip's position,
+  // not a fixed digit).
+  const shortcuts: { action: string; keys: string[]; note?: string }[] = [
     { action: "Focus message box", keys: ["⌘", "K"] },
+    { action: "Toggle Projects / Git view", keys: ["⌘", "⇧", "G"] },
+    { action: "Expand or restore Git details panel", keys: ["⌘", "⇧", "D"] },
     { action: "Toggle projects sidebar", keys: ["⌘", "B"] },
     { action: "Toggle agents sidebar", keys: ["⌘", "⇧", "B"] },
     { action: "Toggle both sidebars", keys: ["⌘", "⌥", "B"] },
     { action: "Toggle settings", keys: ["⌘", ","] },
+    {
+      action: "Toggle a compose recipient",
+      keys: ["⌘", "1–9"],
+      note: "by chip position",
+    },
+    { action: "Select all compose recipients", keys: ["⌘", "⇧", "A"] },
   ];
 
   const sectionClass = "border-border space-y-3 border-t pt-5";
   const sectionHeadingClass = "text-fg text-base font-semibold";
+
+  onMount(() => {
+    void localPromptsDir()
+      .then((path) => {
+        promptsDir = path;
+        promptsDirError = null;
+      })
+      .catch((e: unknown) => {
+        promptsDir = null;
+        promptsDirError = e instanceof Error ? e.message : String(e);
+      });
+  });
+
+  function openPromptsDir(): void {
+    void openLocalPromptsDir().catch((e: unknown) => {
+      console.error("[switchboard] open local prompts folder failed", e);
+    });
+  }
 </script>
 
 <div class="flex flex-1 overflow-y-auto px-8 pb-7" data-testid="settings-view">
@@ -129,13 +166,68 @@
       </div>
     </section>
 
+    <section class={cn(sectionClass, "mt-7")} data-testid="git-view-prefs">
+      <div>
+        <h2 class={sectionHeadingClass}>Git View</h2>
+        <p class="text-muted mt-1 text-sm leading-relaxed">
+          How the Git view opens a worktree's folder. Defaults to VS Code's `code` command; leave
+          blank to use your system's default folder handler.
+        </p>
+      </div>
+
+      <div class="space-y-1.5">
+        <label for="git-editor-command" class="text-muted block text-xs">Editor command</label>
+        <Input
+          id="git-editor-command"
+          data-testid="git-editor-command"
+          placeholder="code"
+          value={preferences.editor_command ?? ""}
+          onchange={(e: Event) => {
+            const v = (e.currentTarget as HTMLInputElement).value.trim();
+            void updatePreferences({ editor_command: v === "" ? null : v });
+          }}
+        />
+      </div>
+
+      <div class="space-y-1.5">
+        <label for="git-terminal-app" class="text-muted block text-xs">Terminal app</label>
+        <Input
+          id="git-terminal-app"
+          data-testid="git-terminal-app"
+          placeholder="Terminal"
+          value={preferences.terminal_app}
+          onchange={(e: Event) => {
+            const v = (e.currentTarget as HTMLInputElement).value.trim();
+            void updatePreferences({ terminal_app: v === "" ? "Terminal" : v });
+          }}
+        />
+      </div>
+
+      <p class="text-muted text-xs leading-relaxed">
+        File-level external diffs use your GUI Git difftool configuration. Set it with
+        <code class="font-mono">git config --global diff.tool &lt;tool&gt;</code> and the matching
+        <code class="font-mono">difftool.&lt;tool&gt;</code> options.
+      </p>
+
+      {#if saveStatus.error}
+        <p class="text-status-failed text-xs leading-relaxed" data-testid="git-prefs-save-error">
+          Couldn't save your preferences ({saveStatus.error}). The change applies for now but may
+          not survive a restart.
+        </p>
+      {/if}
+    </section>
+
     <section class={cn(sectionClass, "mt-7")}>
       <h2 class={sectionHeadingClass}>Shortcuts</h2>
 
       <div>
         {#each shortcuts as shortcut (shortcut.action)}
           <div class="flex min-h-11 items-center justify-between gap-4 py-2">
-            <div class="text-fg text-sm">{shortcut.action}</div>
+            <div class="text-fg text-sm">
+              {shortcut.action}{#if shortcut.note}<span class="text-muted ml-1 text-xs"
+                  >({shortcut.note})</span
+                >{/if}
+            </div>
             <div class="flex items-center gap-1">
               {#each shortcut.keys as key, index (`${shortcut.action}-${index}`)}
                 <kbd
@@ -167,6 +259,43 @@
           Add MCP servers that expose prompts (e.g. Tiddly). Their prompts become available to every
           agent via the compose bar. Bearer tokens are stored in your OS keychain, never in config.
         </p>
+      </div>
+      <div
+        class="border-border bg-panel flex min-h-12 items-center gap-2 rounded-md border px-2.5 py-2"
+      >
+        <div class="min-w-0 flex-1">
+          <div class="text-muted text-xs leading-4">Local prompts folder</div>
+          {#if promptsDir}
+            <div
+              class="text-fg truncate font-mono text-[11px] leading-4"
+              title={promptsDir}
+              data-testid="local-prompts-dir"
+            >
+              {promptsDir}
+            </div>
+          {:else if promptsDirError}
+            <div class="text-status-failed truncate text-xs leading-4" title={promptsDirError}>
+              {promptsDirError}
+            </div>
+          {:else}
+            <div class="text-muted truncate text-xs leading-4">Loading…</div>
+          {/if}
+        </div>
+        <Tooltip label="Open local prompts folder in Finder" side="top">
+          {#snippet trigger(props)}
+            <button
+              {...props}
+              type="button"
+              class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
+              aria-label="Open local prompts folder in Finder"
+              data-testid="local-prompts-open"
+              disabled={promptsDir === null}
+              onclick={openPromptsDir}
+            >
+              <FolderOpen size={14} strokeWidth={1.8} aria-hidden="true" />
+            </button>
+          {/snippet}
+        </Tooltip>
       </div>
       <McpServersSettings />
     </section>

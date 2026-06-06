@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { AgentRecord, AgentId } from "$lib/types";
+  import type { AgentRecord, AgentId, ProjectListing } from "$lib/types";
   import { retryAgentHydration, runtimes, stopAgent, transcripts } from "$lib/state/index.svelte";
   import { removeAgent, renameAgent } from "$lib/state/workspace.svelte";
   import {
@@ -18,6 +18,7 @@
   import ErrorDetailsDialog from "$lib/components/ui/ErrorDetailsDialog.svelte";
   import CopyButton from "$lib/components/ui/CopyButton.svelte";
   import StopIcon from "$lib/components/ui/StopIcon.svelte";
+  import ProjectGitPanel from "$lib/components/ProjectGitPanel.svelte";
   import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
 
   /// Cap the per-tooltip warning rows so a session with a long tail
@@ -39,15 +40,23 @@
   }
 
   const agentActionClass =
-    "text-muted hover:bg-raised hover:text-fg focus-visible:ring-accent focus-visible:bg-raised focus-visible:text-fg inline-flex h-6 w-6 items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none";
+    "text-muted hover:bg-raised hover:text-fg focus-visible:ring-accent focus-visible:bg-raised focus-visible:text-fg inline-flex h-[26px] w-[26px] items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none";
   const agentDangerActionClass =
-    "text-muted hover:bg-raised hover:text-status-failed focus-visible:ring-accent focus-visible:bg-raised focus-visible:text-status-failed inline-flex h-6 w-6 items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none";
+    "border-transparent text-muted hover:border-status-failed/60 hover:bg-status-failed-soft/70 hover:text-status-failed focus-visible:ring-accent focus-visible:border-status-failed/60 focus-visible:bg-status-failed-soft/70 focus-visible:text-status-failed inline-flex h-[26px] w-[26px] items-center justify-center rounded-full border-[0.5px] transition-colors focus-visible:ring-2 focus-visible:outline-none";
+  const agentStopActionClass =
+    "border-muted/40 text-muted hover:border-status-failed/60 hover:bg-status-failed-soft/70 hover:text-status-failed focus-visible:ring-accent focus-visible:border-status-failed/60 focus-visible:bg-status-failed-soft/70 focus-visible:text-status-failed inline-flex h-[26px] w-[26px] items-center justify-center rounded-full border-[0.5px] transition-colors focus-visible:ring-2 focus-visible:outline-none";
   const AGENT_ACTION_DELAY_MS = 500;
 
   /// `onAddAgent` is the "+ Add agent" entry point in the sidebar header.
   /// Optional so existing callers + tests that don't pass it continue
   /// rendering; when absent, the button isn't shown.
-  let { agents, onAddAgent }: { agents: AgentRecord[]; onAddAgent?: () => void } = $props();
+  /// `project` (the active project) drives the compact git-status block above the
+  /// agents list. Optional so callers/tests that don't pass it still render.
+  let {
+    agents,
+    onAddAgent,
+    project,
+  }: { agents: AgentRecord[]; onAddAgent?: () => void; project?: ProjectListing } = $props();
 
   let sessionInfoByAgent = $state<Record<AgentId, AgentSessionInfo | null>>({});
   let sessionInfoStarted = $state<Record<AgentId, boolean>>({});
@@ -102,7 +111,7 @@
 
   function agentActionWidth(count: number): string {
     const visibleCount = Math.max(count, 1);
-    const iconWidthRem = 1.5;
+    const iconWidthRem = 1.625;
     const gapRem = 0.125;
     const width = visibleCount * iconWidthRem + Math.max(visibleCount - 1, 0) * gapRem;
     return `${Math.max(width, 2)}rem`;
@@ -429,6 +438,9 @@
 </script>
 
 <SidebarPanel side="right" width="w-60" testid="sidebar">
+  {#if project}
+    <ProjectGitPanel {project} />
+  {/if}
   <SidebarSection title="Agents">
     {#snippet action()}
       <div class="flex items-center gap-0.5">
@@ -448,7 +460,7 @@
               stroke-width="1.5"
               stroke-linecap="round"
               stroke-linejoin="round"
-              class="h-[18px] w-[18px]"
+              class="h-4 w-4"
               aria-hidden="true"
             >
               {#if allExpanded}
@@ -664,13 +676,13 @@
                           <button
                             {...props}
                             type="button"
-                            class={agentDangerActionClass}
+                            class={agentStopActionClass}
                             aria-label="Stop agent"
                             tabindex="-1"
                             data-testid="agent-action-stop"
                             onclick={() => stopAgent(agent.id)}
                           >
-                            <StopIcon class="h-4 w-4" />
+                            <StopIcon class="h-5 w-5" />
                           </button>
                         {/snippet}
                       </Tooltip>

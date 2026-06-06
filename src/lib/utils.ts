@@ -16,6 +16,37 @@ export function basename(path: string): string {
   return i >= 0 ? trimmed.slice(i + 1) : trimmed;
 }
 
+function trimTrailingPathSeparators(path: string): string {
+  return path.replace(/[\\/]+$/, "");
+}
+
+function isLikelyWindowsPath(path: string): boolean {
+  return /^[a-z]:[\\/]/i.test(path) || path.includes("\\");
+}
+
+/// Display a path relative to the user's home directory when possible. The home
+/// directory is supplied by the platform layer (`homeDir()` in Tauri), so this
+/// remains portable across macOS, Linux, and Windows without hard-coded prefixes.
+export function formatHomePath(path: string, home: string | null | undefined): string {
+  if (home == null || home === "") return path;
+
+  const normalizedHome = trimTrailingPathSeparators(home);
+  if (normalizedHome === "") return path;
+
+  const windows = isLikelyWindowsPath(path) || isLikelyWindowsPath(normalizedHome);
+  const comparablePath = windows ? path.toLowerCase() : path;
+  const comparableHome = windows ? normalizedHome.toLowerCase() : normalizedHome;
+
+  if (comparablePath === comparableHome) return "~";
+
+  const next = path.charAt(normalizedHome.length);
+  if (comparablePath.startsWith(comparableHome) && (next === "/" || next === "\\")) {
+    return `~${path.slice(normalizedHome.length)}`;
+  }
+
+  return path;
+}
+
 // Compact elapsed-duration label ("2m 03s" / "1h 04m"), used by the transcript
 // footer's "No response (…)" silence counter. Seconds-precision under an hour;
 // minute-precision past one hour. Negative/NaN inputs clamp to "0m 00s".

@@ -104,16 +104,20 @@ function wire(list: RepoListing[]) {
 }
 
 describe("GitView", () => {
-  it("renders tracked repos with their active branches and linked projects", async () => {
+  it("renders tracked repos with their active branches and linked project actions", async () => {
     wire([repo()]);
     await refreshAll();
     render(GitView);
 
     await waitFor(() => expect(screen.getByTestId("git-repo")).toBeInTheDocument());
-    // Active branch (has a worktree) shows; its linked project renders.
+    // Active branch (has a worktree) shows; linked projects stay out of the row.
     expect(document.querySelector('[data-testid="git-branch"][data-branch="main"]')).not.toBeNull();
-    expect(screen.getByTestId("linked-project")).toHaveTextContent("app-proj");
+    expect(screen.queryByTestId("linked-project")).not.toBeInTheDocument();
     await waitFor(() => expect(screen.getAllByText("~/app").length).toBeGreaterThan(0));
+    await fireEvent.click(screen.getByTestId("worktree-actions-trigger"));
+    expect(screen.getByTestId("worktree-action-open-project")).toHaveTextContent(
+      "Open Project: app-proj",
+    );
     // Dirty or untracked files surface the changes badge.
     expect(screen.getByLabelText("changes")).toBeInTheDocument();
     expect(screen.queryByTestId("repo-fetch-failed")).not.toBeInTheDocument();

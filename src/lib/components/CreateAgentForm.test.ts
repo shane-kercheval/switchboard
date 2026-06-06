@@ -42,6 +42,8 @@ describe("CreateAgentForm", () => {
       mode: "create",
       name: "claude-code",
       harness: "claude_code",
+      model: "opus",
+      effort: "high",
     } satisfies AgentFormSubmit);
   });
 
@@ -55,6 +57,8 @@ describe("CreateAgentForm", () => {
       mode: "create",
       name: "my-agent",
       harness: "claude_code",
+      model: "opus",
+      effort: "high",
     } satisfies AgentFormSubmit);
   });
 
@@ -75,6 +79,8 @@ describe("CreateAgentForm", () => {
       mode: "create",
       name: "codex",
       harness: "codex",
+      model: "gpt-5.5",
+      effort: "medium",
     } satisfies AgentFormSubmit);
   });
 
@@ -161,6 +167,7 @@ describe("CreateAgentForm", () => {
       mode: "create",
       name: "gemini",
       harness: "gemini",
+      model: "auto",
     } satisfies AgentFormSubmit);
   });
 
@@ -210,6 +217,40 @@ describe("CreateAgentForm", () => {
     } satisfies AgentFormSubmit);
   });
 
+  it("attach + Codex: a non-UUID thread id is accepted and submitted", async () => {
+    const { onSubmit } = renderForm();
+    await fireEvent.click(screen.getByTestId("harness-codex"));
+    await fireEvent.click(screen.getByTestId("mode-attach"));
+    const sessionInput = screen.getByTestId("attach-session-id") as HTMLInputElement;
+    await fireEvent.input(sessionInput, { target: { value: "my-codex-thread-123" } });
+    // No UUID error, submit enabled.
+    expect(screen.queryByTestId("attach-session-id-error")).not.toBeInTheDocument();
+    expect((screen.getByTestId("confirm-create-agent") as HTMLButtonElement).disabled).toBe(false);
+    await fireEvent.click(screen.getByTestId("confirm-create-agent"));
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
+      mode: "attach",
+      name: "codex",
+      harness: "codex",
+      existingSessionId: "my-codex-thread-123",
+    } satisfies AgentFormSubmit);
+  });
+
+  it("attach + Codex: an empty session id keeps submit disabled", async () => {
+    renderForm();
+    await fireEvent.click(screen.getByTestId("harness-codex"));
+    await fireEvent.click(screen.getByTestId("mode-attach"));
+    expect((screen.getByTestId("confirm-create-agent") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("attach + Claude: a non-UUID id is still rejected (UUID error, submit disabled)", async () => {
+    renderForm();
+    await fireEvent.click(screen.getByTestId("mode-attach"));
+    const sessionInput = screen.getByTestId("attach-session-id") as HTMLInputElement;
+    await fireEvent.input(sessionInput, { target: { value: "my-codex-thread-123" } });
+    expect(screen.getByTestId("attach-session-id-error")).toBeInTheDocument();
+    expect((screen.getByTestId("confirm-create-agent") as HTMLButtonElement).disabled).toBe(true);
+  });
+
   it("whitespace-only name keeps submit disabled (even with valid attach UUID)", async () => {
     renderForm();
     const nameInput = screen.getByTestId("agent-name") as HTMLInputElement;
@@ -240,6 +281,8 @@ describe("CreateAgentForm", () => {
       mode: "create",
       name: "claude-code",
       harness: "claude_code",
+      model: "opus",
+      effort: "high",
     } satisfies AgentFormSubmit);
   });
 
@@ -387,6 +430,8 @@ describe("CreateAgentForm", () => {
       mode: "create",
       name: "my-agent",
       harness: "claude_code",
+      model: "opus",
+      effort: "high",
     } satisfies AgentFormSubmit);
   });
 
@@ -402,6 +447,122 @@ describe("CreateAgentForm", () => {
     expect(screen.queryByTestId("attach-session-id-error")).not.toBeInTheDocument();
     expect(screen.getByTestId("agent-name-error")).toBeInTheDocument();
     expect((screen.getByTestId("confirm-create-agent") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  // --- Model + effort pickers ------------------------------------------------
+
+  it("create + Claude: model and effort pickers preselect the harness defaults", () => {
+    renderForm();
+    expect((screen.getByTestId("model-select") as HTMLSelectElement).value).toBe("opus");
+    expect((screen.getByTestId("effort-select") as HTMLSelectElement).value).toBe("high");
+    // No unsupported-capability notes for a fully-capable harness.
+    expect(screen.queryByTestId("model-note")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("effort-note")).not.toBeInTheDocument();
+  });
+
+  it("create + Codex: pickers preselect gpt-5.5 / medium", async () => {
+    renderForm();
+    await fireEvent.click(screen.getByTestId("harness-codex"));
+    expect((screen.getByTestId("model-select") as HTMLSelectElement).value).toBe("gpt-5.5");
+    expect((screen.getByTestId("effort-select") as HTMLSelectElement).value).toBe("medium");
+  });
+
+  it("create + Gemini: model picker present (auto), effort replaced by a note", async () => {
+    renderForm();
+    await fireEvent.click(screen.getByTestId("harness-gemini"));
+    expect((screen.getByTestId("model-select") as HTMLSelectElement).value).toBe("auto");
+    expect(screen.queryByTestId("effort-select")).not.toBeInTheDocument();
+    expect(screen.getByTestId("effort-note")).toHaveTextContent("Gemini's reasoning effort");
+  });
+
+  it("create + Antigravity: both controls replaced by notes; submit carries no model/effort", async () => {
+    const { onSubmit } = renderForm();
+    await fireEvent.click(screen.getByTestId("harness-antigravity"));
+    expect(screen.queryByTestId("model-select")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("effort-select")).not.toBeInTheDocument();
+    expect(screen.getByTestId("model-note")).toBeInTheDocument();
+    expect(screen.getByTestId("effort-note")).toBeInTheDocument();
+    await fireEvent.click(screen.getByTestId("confirm-create-agent"));
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
+      mode: "create",
+      name: "antigravity",
+      harness: "antigravity",
+    } satisfies AgentFormSubmit);
+  });
+
+  it("changing the model and effort dropdowns submits the chosen values", async () => {
+    const { onSubmit } = renderForm();
+    await fireEvent.change(screen.getByTestId("model-select"), { target: { value: "sonnet" } });
+    await fireEvent.change(screen.getByTestId("effort-select"), { target: { value: "max" } });
+    await fireEvent.click(screen.getByTestId("confirm-create-agent"));
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
+      mode: "create",
+      name: "claude-code",
+      harness: "claude_code",
+      model: "sonnet",
+      effort: "max",
+    } satisfies AgentFormSubmit);
+  });
+
+  it("switching harness resets a changed picker to the new harness default", async () => {
+    const { onSubmit } = renderForm();
+    // Change Claude's model away from the default, then switch to Codex.
+    await fireEvent.change(screen.getByTestId("model-select"), { target: { value: "haiku" } });
+    await fireEvent.click(screen.getByTestId("harness-codex"));
+    // The stale Claude value is gone — Codex shows its own default.
+    expect((screen.getByTestId("model-select") as HTMLSelectElement).value).toBe("gpt-5.5");
+    await fireEvent.click(screen.getByTestId("confirm-create-agent"));
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
+      mode: "create",
+      name: "codex",
+      harness: "codex",
+      model: "gpt-5.5",
+      effort: "medium",
+    } satisfies AgentFormSubmit);
+  });
+
+  it("attach defaults to 'keep current' → submits no model/effort (session preserved)", async () => {
+    const { onSubmit } = renderForm();
+    await fireEvent.click(screen.getByTestId("mode-attach"));
+    // The picker's default is the keep-current sentinel (empty value).
+    expect((screen.getByTestId("model-select") as HTMLSelectElement).value).toBe("");
+    expect((screen.getByTestId("effort-select") as HTMLSelectElement).value).toBe("");
+    const sessionInput = screen.getByTestId("attach-session-id") as HTMLInputElement;
+    await fireEvent.input(sessionInput, { target: { value: VALID_UUID } });
+    await fireEvent.click(screen.getByTestId("confirm-create-agent"));
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
+      mode: "attach",
+      name: "claude-code",
+      harness: "claude_code",
+      existingSessionId: VALID_UUID,
+    } satisfies AgentFormSubmit);
+  });
+
+  it("attach with a deliberately chosen model/effort submits them", async () => {
+    const { onSubmit } = renderForm();
+    await fireEvent.click(screen.getByTestId("mode-attach"));
+    await fireEvent.change(screen.getByTestId("model-select"), { target: { value: "sonnet" } });
+    await fireEvent.change(screen.getByTestId("effort-select"), { target: { value: "low" } });
+    const sessionInput = screen.getByTestId("attach-session-id") as HTMLInputElement;
+    await fireEvent.input(sessionInput, { target: { value: VALID_UUID } });
+    await fireEvent.click(screen.getByTestId("confirm-create-agent"));
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
+      mode: "attach",
+      name: "claude-code",
+      harness: "claude_code",
+      existingSessionId: VALID_UUID,
+      model: "sonnet",
+      effort: "low",
+    } satisfies AgentFormSubmit);
+  });
+
+  it("toggling attach → create restores the concrete harness default", async () => {
+    renderForm();
+    await fireEvent.click(screen.getByTestId("mode-attach"));
+    expect((screen.getByTestId("model-select") as HTMLSelectElement).value).toBe("");
+    await fireEvent.click(screen.getByTestId("mode-create"));
+    expect((screen.getByTestId("model-select") as HTMLSelectElement).value).toBe("opus");
+    expect((screen.getByTestId("effort-select") as HTMLSelectElement).value).toBe("high");
   });
 
   it("aria-invalid tracks validity (incl. empty); aria-describedby links the message only when shown", async () => {

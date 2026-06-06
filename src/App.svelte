@@ -230,8 +230,19 @@
   async function createOrAttachAndRegister(submission: AgentFormSubmit): Promise<void> {
     const agent =
       submission.mode === "create"
-        ? await api.createAgent(submission.name, submission.harness)
-        : await api.attachAgent(submission.name, submission.harness, submission.existingSessionId);
+        ? await api.createAgent(
+            submission.name,
+            submission.harness,
+            submission.model,
+            submission.effort,
+          )
+        : await api.attachAgent(
+            submission.name,
+            submission.harness,
+            submission.existingSessionId,
+            submission.model,
+            submission.effort,
+          );
     await registerAgent(agent);
     addAgentToActiveProject(agent);
     if (submission.mode === "attach") {

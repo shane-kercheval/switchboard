@@ -333,6 +333,11 @@ export type AgentRecord = {
   harness: HarnessKind;
   session_locator: SessionLocator | null;
   created_at: string;
+  // The user's selected model + reasoning effort (intent), shown in the sidebar
+  // (M6). `null`/absent for a no-capability harness (Antigravity carries
+  // neither; Gemini carries no effort) or a pre-feature agent.
+  model?: string | null;
+  effort?: string | null;
 };
 
 export type ProjectSummary = {

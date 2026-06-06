@@ -260,8 +260,13 @@ export async function setActiveProject(projectId: ProjectId): Promise<void> {
   await invoke<null>("set_active_project", { projectId });
 }
 
-export async function createAgent(name: string, harness: HarnessKind): Promise<AgentRecord> {
-  return await invoke<AgentRecord>("create_agent", { name, harness });
+export async function createAgent(
+  name: string,
+  harness: HarnessKind,
+  model?: string,
+  effort?: string,
+): Promise<AgentRecord> {
+  return await invoke<AgentRecord>("create_agent", { name, harness, model, effort });
 }
 
 /// Remove an agent: tears down its actor (cancelling any in-flight turn) and
@@ -281,11 +286,15 @@ export async function attachAgent(
   name: string,
   harness: HarnessKind,
   existingSessionId: string,
+  model?: string,
+  effort?: string,
 ): Promise<AgentRecord> {
   return await invoke<AgentRecord>("attach_agent", {
     name,
     harness,
     existingSessionId,
+    model,
+    effort,
   });
 }
 

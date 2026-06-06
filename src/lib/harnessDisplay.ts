@@ -64,6 +64,33 @@ export const HARNESS_LOGIN_HINT: Record<HarnessKind, string> = {
   antigravity: "run `agy` to authenticate",
 };
 
+/// Frontend mirror of `HarnessKind::supports_model_selection()` (Rust,
+/// `crates/core/src/harness.rs`) — the single authority for the model-picker
+/// gate (picker shown vs. replaced by a note). True for Claude/Codex/Gemini
+/// (each has a per-invocation `--model`/`-m` flag); false for Antigravity,
+/// whose model is global, harness-owned config we never touch. Kept in sync
+/// with the Rust helper by hand (no shared source crosses the IPC boundary);
+/// the exhaustive `Record<HarnessKind, …>` makes a missing harness a
+/// type error, the same discipline the Rust match enforces.
+export const SUPPORTS_MODEL_SELECTION: Record<HarnessKind, boolean> = {
+  claude_code: true,
+  codex: true,
+  gemini: true,
+  antigravity: false,
+};
+
+/// Frontend mirror of `HarnessKind::supports_effort_selection()`. A *separate*
+/// axis with a *different* set: true for Claude (`--effort`) and Codex
+/// (`-c model_reasoning_effort=`); false for Gemini (thinking is config-only)
+/// and Antigravity (effort is folded into the model name we can't set). Same
+/// sync + exhaustiveness rationale as [`SUPPORTS_MODEL_SELECTION`].
+export const SUPPORTS_EFFORT_SELECTION: Record<HarnessKind, boolean> = {
+  claude_code: true,
+  codex: true,
+  gemini: false,
+  antigravity: false,
+};
+
 /// Default agent name for a harness — the pre-filled name in the create form
 /// and the name each auto-created agent gets on a new project. A **direct**
 /// slug map, deliberately not derived from a display label: these are

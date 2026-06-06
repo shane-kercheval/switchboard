@@ -2,10 +2,24 @@
   import type { AgentRecord, HarnessAvailability, HarnessKind } from "$lib/types";
   import type { AgentFormSubmit } from "./CreateAgentForm.types";
   import { harnessUnavailableReason, isHarnessSelectable } from "$lib/harnessAvailability";
-  import { ALL_HARNESSES, HARNESS_DEFAULT_AGENT_NAME, HARNESS_LABEL } from "$lib/harnessDisplay";
+  import {
+    ALL_HARNESSES,
+    HARNESS_DEFAULT_AGENT_NAME,
+    HARNESS_LABEL,
+    SUPPORTS_EFFORT_SELECTION,
+    SUPPORTS_MODEL_SELECTION,
+  } from "$lib/harnessDisplay";
+  import {
+    DEFAULT_EFFORT,
+    DEFAULT_MODEL,
+    EFFORT_OPTIONS,
+    MODEL_OPTIONS,
+    type SelectOption,
+  } from "$lib/agentSelection";
   import { normalizeAgentName, validateAgentName } from "$lib/agentName";
   import Button from "$lib/components/ui/Button.svelte";
   import Input from "$lib/components/ui/Input.svelte";
+  import Select from "$lib/components/ui/Select.svelte";
   import { cn } from "$lib/utils";
   import {
     SEGMENTED_CONTAINER_CLASS,
@@ -50,6 +64,46 @@
   let mode = $state<"create" | "attach">("create");
   let existingSessionId = $state<string>("");
 
+  /// Model + effort selection. The empty string is the "keep current" sentinel
+  /// (attach default) and maps to `undefined` on submit — i.e. send no
+  /// flag and leave the attached session's existing model/effort untouched.
+  /// **Create and attach have different correct defaults:** create preselects
+  /// the harness default and submits it concretely (a new agent has no session
+  /// to preserve); attach defaults to "keep current" because Claude is
+  /// session-sticky — overriding would silently switch a running session's
+  /// model. The user can still pick a concrete value in attach mode to switch
+  /// deliberately.
+  const KEEP_CURRENT = "";
+  function defaultModelFor(forMode: "create" | "attach", kind: HarnessKind): string {
+    if (forMode === "attach") return KEEP_CURRENT;
+    return DEFAULT_MODEL[kind] ?? KEEP_CURRENT;
+  }
+  function defaultEffortFor(forMode: "create" | "attach", kind: HarnessKind): string {
+    if (forMode === "attach") return KEEP_CURRENT;
+    return DEFAULT_EFFORT[kind] ?? KEEP_CURRENT;
+  }
+  let model = $state<string>(defaultModelFor("create", "claude_code"));
+  let effort = $state<string>(defaultEffortFor("create", "claude_code"));
+
+  const modelSupported = $derived(SUPPORTS_MODEL_SELECTION[harness]);
+  const effortSupported = $derived(SUPPORTS_EFFORT_SELECTION[harness]);
+  /// Attach prepends the "no override" sentinel so leaving the picker alone
+  /// sends no flag; create offers only concrete values. The label is "No
+  /// override" rather than "keep current" because omitting the flag only
+  /// *preserves* the session's model on the sticky harness (Claude) — Gemini
+  /// reverts to its default and Codex resolves its config default. "No
+  /// override" describes what Switchboard does (send nothing) for all three.
+  const modelOptions = $derived<SelectOption[]>(
+    mode === "attach"
+      ? [{ label: "No override", value: KEEP_CURRENT }, ...MODEL_OPTIONS[harness]]
+      : MODEL_OPTIONS[harness],
+  );
+  const effortOptions = $derived<SelectOption[]>(
+    mode === "attach"
+      ? [{ label: "No override", value: KEEP_CURRENT }, ...EFFORT_OPTIONS[harness]]
+      : EFFORT_OPTIONS[harness],
+  );
+
   /// Per-harness gate, looked up by kind (no per-harness branches). Missing
   /// availability defaults to "available". Two predicates from
   /// `harnessAvailability`:
@@ -77,7 +131,19 @@
   const UUID_PATTERN =
     /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
-  const sessionIdValid = $derived(mode !== "attach" || UUID_PATTERN.test(existingSessionId.trim()));
+  /// Attach-id validation is harness-aware, matching the backend contract:
+  /// Claude/Gemini/Antigravity identify a session by a UUID (`parse_uuid`),
+  /// but a Codex thread-id is an arbitrary string used verbatim — so the form
+  /// must accept a non-UUID Codex id (a garbage value simply matches no
+  /// session file and the backend rejects it). Non-empty is the right floor;
+  /// the authoritative check is the backend's file lookup.
+  const sessionIdRequiresUuid = $derived(harness !== "codex");
+  const sessionIdValid = $derived(
+    mode !== "attach" ||
+      (sessionIdRequiresUuid
+        ? UUID_PATTERN.test(existingSessionId.trim())
+        : existingSessionId.trim().length > 0),
+  );
 
   /// Live name validation against the format rules and the roster (shared with
   /// the backend's authoritative check via `$lib/agentName`). `nameError` is
@@ -94,14 +160,24 @@
   function handleSubmit(): void {
     if (!canSubmit) return;
     const trimmedName = normalizeAgentName(name);
+    // The "keep current" sentinel (and any unsupported-capability empty value)
+    // collapses to `undefined` → the backend sends no flag. The M3 backend
+    // normalization is the real trust boundary; this is the UX layer.
+    const selectedModel = model === KEEP_CURRENT ? undefined : model;
+    const selectedEffort = effort === KEEP_CURRENT ? undefined : effort;
+    const selection = {
+      ...(selectedModel !== undefined ? { model: selectedModel } : {}),
+      ...(selectedEffort !== undefined ? { effort: selectedEffort } : {}),
+    };
     if (mode === "create") {
-      onSubmit({ mode: "create", name: trimmedName, harness });
+      onSubmit({ mode: "create", name: trimmedName, harness, ...selection });
     } else {
       onSubmit({
         mode: "attach",
         name: trimmedName,
         harness,
         existingSessionId: existingSessionId.trim(),
+        ...selection,
       });
     }
   }
@@ -122,6 +198,10 @@
       name = HARNESS_DEFAULT_AGENT_NAME[kind];
     }
     harness = kind;
+    // Reset the pickers to the new harness's default so a stale, out-of-list
+    // value (e.g. a Codex model carried over to Gemini) can't be submitted.
+    model = defaultModelFor(mode, kind);
+    effort = defaultEffortFor(mode, kind);
   }
 
   function selectMode(next: "create" | "attach"): void {
@@ -130,6 +210,10 @@
     if (next === "create") {
       existingSessionId = "";
     }
+    // Create and attach have different correct defaults (concrete vs. "keep
+    // current"), so re-seed on the toggle.
+    model = defaultModelFor(next, harness);
+    effort = defaultEffortFor(next, harness);
   }
 
   // Visual classes for a harness option (a native radio styled as a segmented
@@ -240,6 +324,55 @@
     {/if}
   </fieldset>
 
+  <!-- Model: a curated per-harness dropdown where the harness supports it, a
+       short note where it doesn't (Antigravity's model is set inside
+       Antigravity). -->
+  {#if modelSupported}
+    <label class="block space-y-1">
+      <span class="text-muted text-xs">Model</span>
+      <Select
+        bind:value={model}
+        options={modelOptions}
+        disabled={busy}
+        data-testid="model-select"
+        aria-label="Model"
+      />
+    </label>
+  {:else}
+    <p class="text-muted text-xs leading-relaxed" data-testid="model-note">
+      {HARNESS_LABEL[harness]}'s model is selected inside {HARNESS_LABEL[harness]} — it can't be set from
+      Switchboard.
+    </p>
+  {/if}
+
+  <!-- Effort: a curated dropdown for Claude/Codex, a note for Gemini (config
+       only) and Antigravity (folded into the model). -->
+  {#if effortSupported}
+    <label class="block space-y-1">
+      <span class="text-muted text-xs">Reasoning effort</span>
+      <Select
+        bind:value={effort}
+        options={effortOptions}
+        disabled={busy}
+        data-testid="effort-select"
+        aria-label="Reasoning effort"
+      />
+      {#if harness === "claude_code"}
+        <span class="text-muted block text-xs">
+          Higher levels may run at a lower effort on some models.
+        </span>
+      {/if}
+    </label>
+  {:else if harness === "gemini"}
+    <p class="text-muted text-xs leading-relaxed" data-testid="effort-note">
+      Gemini's reasoning effort is set in Gemini's own config, not from Switchboard.
+    </p>
+  {:else}
+    <p class="text-muted text-xs leading-relaxed" data-testid="effort-note">
+      Antigravity folds reasoning effort into the model you pick inside Antigravity.
+    </p>
+  {/if}
+
   <label class="block space-y-1">
     <span class="text-muted text-xs">Agent name</span>
     <Input
@@ -265,16 +398,22 @@
 
   {#if mode === "attach"}
     <label class="block space-y-1">
-      <span class="text-muted text-xs"> Existing session UUID </span>
+      <!-- Codex identifies a session by an arbitrary thread-id string; the
+           other harnesses use a UUID. Label/validate accordingly. -->
+      <span class="text-muted text-xs">
+        {sessionIdRequiresUuid ? "Existing session UUID" : "Existing session ID"}
+      </span>
       <Input
         bind:value={existingSessionId}
         disabled={busy}
-        placeholder="00000000-0000-0000-0000-000000000000"
+        placeholder={sessionIdRequiresUuid
+          ? "00000000-0000-0000-0000-000000000000"
+          : "the session's thread id"}
         data-testid="attach-session-id"
         class="h-8 px-2"
         onkeydown={submitOnEnter}
       />
-      {#if existingSessionId.trim() !== "" && !sessionIdValid}
+      {#if sessionIdRequiresUuid && existingSessionId.trim() !== "" && !sessionIdValid}
         <span class="text-status-failed block text-xs" data-testid="attach-session-id-error">
           Must be a UUID (8-4-4-4-12 hex characters).
         </span>

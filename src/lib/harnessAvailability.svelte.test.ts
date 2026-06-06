@@ -73,6 +73,28 @@ describe("harnessAvailability store", () => {
     expect(harnessAvailability.availability("codex").binary).toBe("missing");
   });
 
+  it("drops in-flight probe writes once reset has run (no cross-test leak)", async () => {
+    // Model an un-awaited startup probe (as App.svelte fires on mount) that
+    // resolves only *after* the owning test has torn down via `reset()`. Without
+    // the epoch guard the late write repollutes the freshly-cleared store, which
+    // is what flaked App.test.ts on slower CI runners.
+    let release!: (value: { installed: boolean; version: null }) => void;
+    const pending = new Promise<{ installed: boolean; version: null }>((resolve) => {
+      release = resolve;
+    });
+    invokeMock.mockReturnValue(pending);
+
+    const inFlight = refreshHarnessAvailability();
+    _testing.reset();
+    release({ installed: false, version: null });
+    await inFlight;
+
+    for (const harness of ALL) {
+      expect(harnessAvailability.status(harness)).toBeNull();
+      expect(harnessAvailability.availability(harness).binary).toBe("checking");
+    }
+  });
+
   it("updates a previously-cached value on a later refresh", async () => {
     invokeMock.mockResolvedValue({ installed: false, version: null });
     await refreshHarnessAvailability();

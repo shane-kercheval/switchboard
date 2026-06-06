@@ -547,8 +547,13 @@ impl GeminiReconstruction {
             // has no effort axis.
             model: builder.last_model.clone(),
             effort: None,
-            // Gemini has no cost/overage and no join key (Claude-only feature).
+            // Gemini has no cost/overage and no Claude-style `stable_message_id`,
+            // but its records carry a stable `id` (`g1`/`g2`…). The turn's first
+            // record id is a re-parse-stable hydration key (Q1). Live-stream
+            // parity (Q2 → M3 refresh) is unprobed, so the live `TurnEnd` leaves
+            // `hydration_key: None` for now.
             spend: None,
+            hydration_key: builder.records.first().map(|r| r.id.clone()),
             stable_message_id: None,
         });
     }
@@ -857,6 +862,41 @@ mod tests {
         let path = chats.join(filename);
         std::fs::write(&path, body).unwrap();
         path
+    }
+
+    #[test]
+    fn hydration_key_is_stable_across_reparses_from_record_id() {
+        // Re-parsing the same content yields an agent turn whose `hydration_key`
+        // — the turn's first `gemini` record `id` — is identical across parses,
+        // while our own `turn_id` is freshly minted each parse. The merge dedups
+        // on the stable key so a re-read never duplicates the turn.
+        let aid = agent_id();
+        let parse = || {
+            parse_gemini_transcript_content(HAPPY_PATH_FIXTURE, aid)
+                .turns
+                .into_iter()
+                .find_map(|t| match t {
+                    Turn::Agent {
+                        turn_id,
+                        hydration_key,
+                        ..
+                    } => Some((turn_id, hydration_key)),
+                    Turn::User { .. } => None,
+                })
+                .expect("one agent turn")
+        };
+        let (turn_id_a, key_a) = parse();
+        let (turn_id_b, key_b) = parse();
+        assert_eq!(
+            key_a.as_deref(),
+            Some("e630834b-c0b6-48b8-8426-8cc27c8a303b"),
+            "the hydration key is the turn's first `gemini` record id"
+        );
+        assert_eq!(key_a, key_b, "hydration_key must be parse-invariant");
+        assert_ne!(
+            turn_id_a, turn_id_b,
+            "our turn_id is freshly minted each parse"
+        );
     }
 
     #[test]

@@ -479,6 +479,10 @@ impl ReconstructionState {
             // the turnmeta sidecar on `stable_message_id`); the parser itself
             // never reads `.switchboard/` state.
             spend: None,
+            // The final assistant `message.id` is both the cost-join key and the
+            // stable hydration key (it round-trips identically to the live
+            // `TurnEnd`), so Claude turns are live-matched and reopen-stable.
+            hydration_key: builder.last_message_id.clone(),
             stable_message_id: builder.last_message_id,
         });
     }
@@ -804,6 +808,60 @@ mod tests {
             ),
             _ => unreachable!(),
         }
+    }
+
+    /// Parsing the same session file twice yields turns whose `hydration_key`
+    /// is **identical** across both parses, even though `turn_id` is freshly
+    /// minted each parse. This is the regression guard the M2 idempotent merge
+    /// rests on: `turn_id` alone would differ and look like a new turn on a
+    /// re-read; the stable key recognizes it. For Claude the key is the final
+    /// assistant `message.id`.
+    #[test]
+    fn hydration_key_is_stable_across_reparses_and_equals_final_message_id() {
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let session_id = Uuid::now_v7();
+        let agent_id = Uuid::now_v7();
+        let content = jsonl(&[
+            user_record("hello", "2026-05-14T04:43:15Z"),
+            json!({
+                "type": "assistant",
+                "message": {
+                    "id": "msg_final01",
+                    "model": "claude-sonnet-4-6",
+                    "role": "assistant",
+                    "content": [{ "type": "text", "text": "hi" }],
+                    "usage": { "input_tokens": 10, "output_tokens": 5 }
+                },
+                "timestamp": "2026-05-14T04:43:16Z",
+            }),
+        ]);
+        stage_session_file(home.path(), cwd.path(), session_id, &content);
+
+        let parse = || {
+            load_claude_transcript(home.path(), cwd.path(), session_id, agent_id)
+                .unwrap()
+                .turns
+                .into_iter()
+                .find_map(|t| match t {
+                    Turn::Agent {
+                        turn_id,
+                        hydration_key,
+                        ..
+                    } => Some((turn_id, hydration_key)),
+                    _ => None,
+                })
+                .expect("one agent turn")
+        };
+        let (turn_id_a, key_a) = parse();
+        let (turn_id_b, key_b) = parse();
+
+        assert_eq!(key_a.as_deref(), Some("msg_final01"));
+        assert_eq!(key_a, key_b, "hydration_key must be parse-invariant");
+        assert_ne!(
+            turn_id_a, turn_id_b,
+            "turn_id IS freshly minted each parse — the reason a stable key is needed"
+        );
     }
 
     /// A non-empty `thinking` block followed by a `text` block reconstructs

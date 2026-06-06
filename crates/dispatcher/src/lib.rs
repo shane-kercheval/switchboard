@@ -1063,6 +1063,8 @@ async fn drain_turn(
                                     spend: None,
                                     model: None,
                                     effort: None,
+                                    // Synthesized failure — no harness turn id.
+                                    hydration_key: None,
                                 },
                                 agent_id,
                             );
@@ -1246,6 +1248,8 @@ async fn drain_turn(
                 spend: None,
                 model: None,
                 effort: None,
+                // Synthesized cancelled terminal — no harness turn id.
+                hydration_key: None,
             },
             agent_id,
         );

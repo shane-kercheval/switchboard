@@ -119,6 +119,11 @@ export type NormalizedEvent =
       // harnesses; `effort` Codex-only. Absent → render nothing.
       model?: string | null;
       effort?: string | null;
+      // Live-matched stable hydration key — the same per-turn id this turn will
+      // carry on disk, so the hydrate merge can recognize a turn that streamed
+      // live and is later re-read as one turn. Populated only for live-matched
+      // harnesses (Claude's final assistant message.id); absent otherwise.
+      hydration_key?: string | null;
     }
   | { type: "rate_limit_event"; agent_id: AgentId; info: unknown }
   | {
@@ -218,6 +223,10 @@ export type LoadedTurn =
       // model-reporting harnesses; `effort` Codex-only. Absent → render nothing.
       model?: string | null;
       effort?: string | null;
+      // Stable hydration key (re-parse-invariant): the hydrate merge dedups on
+      // it so re-reading a session file never duplicates this turn. Absent for
+      // keyless harnesses (Antigravity) — the merge falls back to `turn_id`.
+      hydration_key?: string | null;
     };
 
 export type LoadedTurnItem =
@@ -402,6 +411,8 @@ export type ConversationItem =
       // Per-turn cost/overage re-joined from the turn-metadata sidecar on
       // reopen — same source + meaning as `LoadedTurn.spend`.
       spend?: TurnSpend | null;
+      // Stable hydration key — same source + meaning as `LoadedTurn.hydration_key`.
+      hydration_key?: string | null;
     }
   | {
       kind: "outcome";

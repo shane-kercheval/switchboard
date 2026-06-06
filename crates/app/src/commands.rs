@@ -2154,6 +2154,11 @@ pub enum ConversationItem {
         /// the message then renders no cost and no "using credits" marker.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         spend: Option<switchboard_harness::TurnSpend>,
+        /// The turn's stable hydration key (see [`switchboard_harness::Turn`]),
+        /// carried through so the frontend merge can dedup this turn against an
+        /// already-loaded copy. `None` for keyless harnesses (Antigravity).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hydration_key: Option<String>,
     },
     /// A non-completed-turn marker (failed or cancelled), sourced from the
     /// journal. Carries no agent content; `reason` is a best-effort
@@ -2382,6 +2387,7 @@ fn merge_project_conversation(
                     items: t_items,
                     usage,
                     spend,
+                    hydration_key,
                     ..
                 } => {
                     let send_id = if agent_seen >= turn_offset {
@@ -2399,6 +2405,7 @@ fn merge_project_conversation(
                         items: t_items,
                         usage,
                         spend,
+                        hydration_key,
                     });
                     agent_seen += 1;
                 }
@@ -5264,6 +5271,7 @@ mod tests {
             spend: None,
             model: None,
             effort: None,
+            hydration_key: None,
             stable_message_id: None,
         }
     }
@@ -5403,6 +5411,7 @@ mod tests {
             spend: None,
             model: None,
             effort: None,
+            hydration_key: None,
             stable_message_id: message_id.map(str::to_owned),
         }
     }
@@ -8342,6 +8351,7 @@ mod tests {
             spend: None,
             model: None,
             effort: None,
+            hydration_key: None,
             stable_message_id: None,
         }
     }
@@ -8363,6 +8373,44 @@ mod tests {
             last_rate_limit_as_of: None,
             warnings: Vec::new(),
         }
+    }
+
+    #[test]
+    fn merge_carries_hydration_key_onto_agent_turn_and_serializes_it() {
+        // The stable hydration key must survive the project-conversation merge
+        // AND reach the IPC wire — a parser-only implementation would pass the
+        // per-agent serialization test while the project path silently dropped
+        // it. Guards that trap.
+        let agent = Uuid::now_v7();
+        let turn_id = Uuid::now_v7();
+        let mut turn = agent_turn(turn_id, agent, "hi", 2);
+        if let Turn::Agent { hydration_key, .. } = &mut turn {
+            *hydration_key = Some("msg_disk01".to_owned());
+        }
+        let merged =
+            merge_project_conversation(vec![], vec![(agent, transcript_of(vec![turn]), None)]);
+
+        let key = merged
+            .items
+            .iter()
+            .find_map(|i| match i {
+                ConversationItem::AgentTurn { hydration_key, .. } => Some(hydration_key.clone()),
+                _ => None,
+            })
+            .expect("an agent turn");
+        assert_eq!(key.as_deref(), Some("msg_disk01"), "merge carries the key");
+
+        let value = serde_json::to_value(&merged).unwrap();
+        let item = value["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["kind"] == "agent_turn")
+            .expect("agent_turn on the wire");
+        assert_eq!(
+            item["hydration_key"], "msg_disk01",
+            "hydration_key must be present on the project-conversation wire shape"
+        );
     }
 
     #[test]
@@ -9331,6 +9379,7 @@ mod tests {
             spend: None,
             model: None,
             effort: None,
+            hydration_key: None,
             stable_message_id: None,
         };
         let journal = vec![

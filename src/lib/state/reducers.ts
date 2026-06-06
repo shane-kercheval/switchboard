@@ -213,6 +213,11 @@ export function transcriptReducer(
       const existing = findTurn(turns, input.turn_id);
       if (existing === undefined || existing.role !== "agent") return turns;
       if (existing.status !== "streaming") return turns;
+      // Stamp the live-matched hydration key (Claude only) onto the completing
+      // turn so a later disk re-read of the same turn dedups against it instead
+      // of appending a second copy (see the `hydrate` merge). `undefined` for
+      // harnesses whose live stream carries no disk-matching id.
+      const hydration_key = input.hydration_key ?? undefined;
       if (input.outcome.status === "completed") {
         return updateTurn(turns, input.turn_id, {
           ...existing,
@@ -222,6 +227,7 @@ export function transcriptReducer(
           spend: input.spend ?? undefined,
           model: input.model ?? undefined,
           effort: input.effort ?? undefined,
+          hydration_key,
         });
       }
       if (input.outcome.status === "cancelled") {
@@ -233,6 +239,7 @@ export function transcriptReducer(
           spend: input.spend ?? undefined,
           model: input.model ?? undefined,
           effort: input.effort ?? undefined,
+          hydration_key,
         });
       }
       return updateTurn(turns, input.turn_id, {
@@ -245,18 +252,35 @@ export function transcriptReducer(
         spend: input.spend ?? undefined,
         model: input.model ?? undefined,
         effort: input.effort ?? undefined,
+        hydration_key,
       });
     }
 
     case "hydrate": {
-      // Per-agent scope. Live in-flight turns take precedence: any turn_id
-      // already in the slice is preserved verbatim. New (disk-derived) turns
-      // append. Order: hydrated turns appear in the order the parser
-      // produced them, then any pre-existing live turns the listener
-      // appended (which is the typical case — hydrate fires AFTER project
-      // open, in-flight live turns may have already arrived).
-      const existingIds = new Set(turns.map((t) => t.turn_id));
-      const fromDisk = input.turns.filter((t) => !existingIds.has(t.turn_id)).map(loadedTurnToTurn);
+      // Per-agent scope. Dedup on the **stable hydration key** when a turn has
+      // one, falling back to `turn_id` for keyless turns. Keying on `turn_id`
+      // alone is unsafe for re-reads: a parser mints a *fresh* `turn_id` every
+      // parse, so the same on-disk turn would look new on a second read and
+      // duplicate — the stable key is parse-invariant and recognizes it. Live
+      // in-flight turns take precedence: a disk turn whose key (or turn_id)
+      // matches one already in the slice is dropped, never overwriting the live
+      // one. Order: deduped disk turns first, then the pre-existing live turns.
+      //
+      // **Scope of the no-duplicate guarantee: keyed AGENT turns only.** Only
+      // agent turns from key-bearing harnesses carry a `hydration_key`; user
+      // turns (and keyless harnesses) fall back to `turn_id`, which is fresh per
+      // parse — so re-reading them over an already-populated slice would NOT
+      // dedup. This path is safe today because user content reaching a slice is
+      // applied once. A future re-read of an already-loaded file must therefore
+      // re-merge only agent turns here; user content stays owned by the journal
+      // overlay (which is replaced wholesale, so it is dup-safe) and must not be
+      // re-merged into a per-agent slice.
+      const dedupKey = (t: { hydration_key?: string | null; turn_id: TurnId }): string =>
+        t.hydration_key ?? t.turn_id;
+      const existingKeys = new Set(turns.map(dedupKey));
+      const fromDisk = input.turns
+        .map(loadedTurnToTurn)
+        .filter((t) => !existingKeys.has(dedupKey(t)));
       return [...fromDisk, ...turns];
     }
 
@@ -294,6 +318,7 @@ function loadedTurnToTurn(t: LoadedTurn): Turn {
     spend: t.spend ?? undefined,
     model: t.model ?? undefined,
     effort: t.effort ?? undefined,
+    hydration_key: t.hydration_key ?? undefined,
   };
 }
 

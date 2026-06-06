@@ -363,8 +363,12 @@ impl Reconstruction {
             // separate effort axis).
             model: self.current_model.clone(),
             effort: None,
-            // Antigravity has no cost/overage and no join key (Claude-only).
+            // Antigravity has no cost/overage, no `stable_message_id`, and no
+            // native per-turn id at all — so no hydration key. The merge falls
+            // back to `turn_id` for keyless turns; it's the one never-M3-eligible
+            // harness.
             spend: None,
+            hydration_key: None,
             stable_message_id: None,
         });
     }

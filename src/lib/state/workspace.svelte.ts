@@ -532,6 +532,9 @@ export async function hydrateProject(projectId: ProjectId): Promise<void> {
           items: item.items,
           usage: item.usage ?? null,
           spend: item.spend ?? null,
+          // Thread the stable hydration key through this hand-built remap — the
+          // merge dedups on it, and a field not copied here is silently dropped.
+          hydration_key: item.hydration_key ?? null,
         });
         turnsByAgent.set(item.agent_id, arr);
       } else {

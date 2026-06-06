@@ -690,6 +690,88 @@ describe("transcriptReducer", () => {
       expect(item.output).toBe("ok");
       expect(item.is_error).toBe(false);
     });
+
+    it("re-applying the same batch re-parsed (fresh turn_ids, same hydration_key) does not duplicate", () => {
+      // Re-reading a session file mints fresh `turn_id`s but the stable
+      // `hydration_key` is parse-invariant — the merge must recognize the turn
+      // and not append a second copy. This is the core M2 idempotency guard.
+      const diskTurn = (turnId: string) => ({
+        type: "hydrate" as const,
+        agent_id: AGENT_A,
+        turns: [
+          {
+            role: "agent" as const,
+            turn_id: turnId,
+            agent_id: AGENT_A,
+            started_at: "2026-05-14T00:00:02Z",
+            status: "complete" as const,
+            items: [{ item_kind: "text" as const, kind: "text" as const, text: "answer" }],
+            hydration_key: "msg_stable01",
+          },
+        ],
+      });
+      let turns = reduce([], diskTurn(TURN_1));
+      expect(turns).toHaveLength(1);
+      // Second parse: different turn_id, SAME hydration_key.
+      turns = reduce(turns, diskTurn(TURN_2));
+      expect(turns).toHaveLength(1);
+      expect(turns[0]?.turn_id).toBe(TURN_1); // the first-loaded turn is kept
+    });
+
+    it("a live completed turn and the same turn from disk (matching hydration_key) merge to one, live preserved", () => {
+      // Live turn streams and completes, carrying the live-matched key.
+      let turns = reduce([], turnStart(TURN_1));
+      turns = reduce(turns, {
+        type: "turn_end",
+        turn_id: TURN_1,
+        outcome: { status: "completed" },
+        ended_at: "2026-05-16T00:00:05Z",
+        hydration_key: "msg_live01",
+      });
+      expect(turns).toHaveLength(1);
+      // Disk re-read of the same turn: different turn_id, same hydration_key.
+      const merged = reduce(turns, {
+        type: "hydrate",
+        agent_id: AGENT_A,
+        turns: [
+          {
+            role: "agent",
+            turn_id: TURN_2,
+            agent_id: AGENT_A,
+            started_at: "2026-05-16T00:00:00Z",
+            status: "complete",
+            items: [{ item_kind: "text", kind: "text", text: "from disk" }],
+            hydration_key: "msg_live01",
+          },
+        ],
+      });
+      expect(merged).toHaveLength(1);
+      // The live turn (its turn_id) is the one kept — disk never overwrites it.
+      expect(merged[0]?.turn_id).toBe(TURN_1);
+    });
+
+    it("turns lacking a hydration_key still dedup via the turn_id fallback", () => {
+      // Antigravity (and any keyless turn) carries no hydration_key — the merge
+      // must fall back to turn_id so a live turn isn't duplicated by its disk copy.
+      const livePrior = reduce([], turnStart(TURN_1));
+      const merged = reduce(livePrior, {
+        type: "hydrate",
+        agent_id: AGENT_A,
+        turns: [
+          {
+            role: "agent",
+            turn_id: TURN_1,
+            agent_id: AGENT_A,
+            started_at: "2026-05-16T00:00:00Z",
+            status: "complete",
+            items: [{ item_kind: "text", kind: "text", text: "from disk" }],
+            // no hydration_key
+          },
+        ],
+      });
+      expect(merged).toHaveLength(1);
+      expect(merged[0]?.turn_id).toBe(TURN_1);
+    });
   });
 
   describe("agent-scoped + unknown events", () => {

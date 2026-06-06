@@ -64,6 +64,25 @@ pub enum Turn {
         /// non-real-spend turns and pre-feature turns (no backfill).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         spend: Option<TurnSpend>,
+        /// **Stable hydration key** — a per-turn identity that survives
+        /// re-parsing the *same* session file (byte-identical across repeated
+        /// parses), so re-reading a file never duplicates this agent turn (user
+        /// turns are keyless and dedup by `turn_id`). This is the
+        /// frontend-facing sibling of `stable_message_id`: it is **serialized
+        /// onto the IPC wire** (the merge on the other side dedups by it), and it
+        /// carries a deliberately broader contract.
+        ///
+        /// Per harness: Claude the final assistant `message.id` (so it equals
+        /// `stable_message_id` *and* matches the live `TurnEnd`); Codex the
+        /// `event_msg/task_started.turn_id`; Gemini the turn's first `gemini`
+        /// record `id`. `None` for Antigravity (no native per-turn id) — the
+        /// merge falls back to `turn_id` for keyless turns.
+        ///
+        /// **Not** `stable_message_id`: that one stays private (`skip_serializing`,
+        /// Claude-only cost-join). The two coincide *in value* for Claude but
+        /// gate different things — do not collapse them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hydration_key: Option<String>,
         /// The final assistant message's Anthropic `message.id` (Claude only) —
         /// the join key the overlay uses to look up this turn's persisted
         /// cost/overage. Internal plumbing: set by the session-file parser,
@@ -285,6 +304,7 @@ mod tests {
             spend: None,
             model: None,
             effort: None,
+            hydration_key: Some("msg_anchor01".to_owned()),
             stable_message_id: None,
         };
         let value = serde_json::to_value(&turn).unwrap();
@@ -293,6 +313,10 @@ mod tests {
         assert_eq!(value["items"][0]["item_kind"], "text");
         assert_eq!(value["items"][1]["item_kind"], "tool");
         assert_eq!(value["items"][1]["tool_use_id"], "tool_1");
+        // The hydration key serializes onto the wire (the frontend merge dedups
+        // on it); the private cost-join `stable_message_id` does not.
+        assert_eq!(value["hydration_key"], "msg_anchor01");
+        assert!(value.get("stable_message_id").is_none());
         let parsed: Turn = serde_json::from_value(value).unwrap();
         assert_eq!(parsed, turn);
     }

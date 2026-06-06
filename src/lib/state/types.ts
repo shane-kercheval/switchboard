@@ -84,6 +84,11 @@ export type Turn =
       /// → render nothing.
       model?: string;
       effort?: string;
+      /// Stable hydration key — the dedup identity the `hydrate` merge keys on
+      /// (falling back to `turn_id` when absent). Stamped at turn end from the
+      /// live event (live-matched harnesses only) and carried from disk on
+      /// hydrate. Load-bearing for idempotent re-reads; not rendered.
+      hydration_key?: string;
       /// Populated when status = "failed". Preserved so retry UX can distinguish
       /// recoverable from non-recoverable failures (HarnessError → suggest retry;
       /// AdapterFailure → suggest "report bug"; AuthFailure → "run claude auth login").

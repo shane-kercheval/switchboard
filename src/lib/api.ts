@@ -5,7 +5,13 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AgentId,
   AgentRecord,
+  BranchKind,
+  ChangeKind,
+  ChangedFile,
+  CommitChanges,
   DirectoryInfo,
+  FileDiff,
+  GitCommitRange,
   HarnessInstallStatus,
   HarnessKind,
   LoadedTranscript,
@@ -13,10 +19,12 @@ import type {
   MessageId,
   ProjectConversation,
   ProjectId,
+  Preferences,
   ProjectListing,
   ProjectSummary,
   Prompt,
   RenderedPrompt,
+  RepoListing,
   SendId,
   WorkspaceDirectories,
 } from "./types";
@@ -79,6 +87,121 @@ export async function listWorkspaceDirectories(): Promise<WorkspaceDirectories> 
 
 export async function createProject(name: string, directory: string): Promise<ProjectSummary> {
   return await invoke<ProjectSummary>("create_project", { name, directory });
+}
+
+// --- Git view ---------------------------------------------------------------
+
+// Track a repo in the Git view. Accepts any path inside a git repo (a
+// subdirectory or linked worktree resolves to the same canonical root and
+// dedups); rejects a non-git path so the caller can show an inline error.
+export async function addTrackedRepo(path: string): Promise<void> {
+  await invoke<null>("add_tracked_repo", { path });
+}
+
+// Untrack a repo. Registry-only — never touches files or the workspace.
+export async function removeTrackedRepo(path: string): Promise<void> {
+  await invoke<null>("remove_tracked_repo", { path });
+}
+
+// The aggregate Git-view read: every tracked repo's git read-model plus the
+// Switchboard projects linked to each worktree. One unreadable repo degrades to
+// an `available: false` row rather than failing the whole call.
+export async function listTrackedRepos(): Promise<RepoListing[]> {
+  return await invoke<RepoListing[]>("list_tracked_repos");
+}
+
+// Re-read a single tracked repo (per-repo refresh) without re-walking the rest.
+export async function readTrackedRepo(path: string): Promise<RepoListing> {
+  return await invoke<RepoListing>("read_tracked_repo", { path });
+}
+
+// Shell out `git fetch` for a tracked repo to refresh its remote-tracking refs.
+// Best-effort: rejects with git's error on failure (no remote, no network, auth),
+// which the caller records as a "fetch failed" state — never a fatal error.
+export async function fetchRepo(path: string): Promise<void> {
+  await invoke("fetch_repo", { path });
+}
+
+// The changed files in a worktree (working-tree changes vs. HEAD — staged,
+// unstaged, untracked). Empty for a clean or unreadable worktree.
+export async function changedFiles(path: string): Promise<ChangedFile[]> {
+  return await invoke<ChangedFile[]>("changed_files", { path });
+}
+
+// The structured working-tree diff for one file in a worktree. Empty hunks for a
+// clean file; `binary: true` for binary content; `truncated: true` when capped.
+export async function fileDiff(path: string, file: string): Promise<FileDiff> {
+  return await invoke<FileDiff>("file_diff", { path, file });
+}
+
+// Capped commit-summary ranges for one branch (read on demand, never fetches).
+// `kind` selects the local vs. remote-tracking ref; rejects an untracked repo.
+export async function branchCommits(
+  repoRoot: string,
+  kind: BranchKind,
+  name: string,
+): Promise<GitCommitRange[]> {
+  return await invoke<GitCommitRange[]>("branch_commits", { repoRoot, kind, name });
+}
+
+// The files one commit changed (vs. its first parent). No worktree needed, so it
+// serves branches with no local folder and remote-only branches. `found: false`
+// means the commit no longer resolves (gc'd / branch force-updated).
+export async function commitChangedFiles(repoRoot: string, oid: string): Promise<CommitChanges> {
+  return await invoke<CommitChanges>("commit_changed_files", { repoRoot, oid });
+}
+
+// The structured diff of one file within one commit (vs. its first parent).
+export async function commitFileDiff(
+  repoRoot: string,
+  oid: string,
+  file: string,
+): Promise<FileDiff> {
+  return await invoke<FileDiff>("commit_file_diff", { repoRoot, oid, file });
+}
+
+// Open a worktree folder in the user's configured editor (`editor_command`), or
+// the OS folder-open when no editor command is set. Rejects with the opener's
+// error on failure.
+export async function openInEditor(path: string): Promise<void> {
+  await invoke("open_in_editor", { path });
+}
+
+// Open a path in the user's configured terminal app.
+export async function openInTerminal(path: string): Promise<void> {
+  await invoke("open_in_terminal", { path });
+}
+
+// Reveal a path in Finder (selects the item in its containing folder).
+export async function revealInFinder(path: string): Promise<void> {
+  await invoke("reveal_in_finder", { path });
+}
+
+export async function openWorktreeFileDifftool(
+  worktreePath: string,
+  file: string,
+  change: ChangeKind,
+): Promise<void> {
+  await invoke("open_worktree_file_difftool", { worktreePath, file, change });
+}
+
+export async function openCommitFileDifftool(
+  repoRoot: string,
+  oid: string,
+  file: string,
+): Promise<void> {
+  await invoke("open_commit_file_difftool", { repoRoot, oid, file });
+}
+
+// Backend-owned personal preferences (`config.yaml`). `getPreferences` always
+// returns a value (defaults if unset); `setPreferences` replaces the whole
+// object and persists it, surfacing a write failure.
+export async function getPreferences(): Promise<Preferences> {
+  return await invoke<Preferences>("get_preferences");
+}
+
+export async function setPreferences(preferences: Preferences): Promise<void> {
+  await invoke("set_preferences", { preferences });
 }
 
 /// Rename a project. The backend re-validates format + per-directory uniqueness
@@ -253,6 +376,14 @@ export async function removeMcpProvider(name: string): Promise<void> {
 /// rejects with an actionable error.
 export async function testMcpConnection(url: string, bearer: string | null): Promise<number> {
   return await invoke<number>("test_mcp_connection", { url, bearer });
+}
+
+export async function localPromptsDir(): Promise<string> {
+  return await invoke<string>("local_prompts_dir");
+}
+
+export async function openLocalPromptsDir(): Promise<void> {
+  await invoke("open_local_prompts_dir");
 }
 
 /// Rebuild the cached prompt list from all providers (the Settings "Sync" action).

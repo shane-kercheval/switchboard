@@ -3,6 +3,10 @@ import "@testing-library/jest-dom/vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/svelte";
 import { tick } from "svelte";
 import type { AgentRecord, NormalizedEvent, Prompt } from "$lib/types";
+// Static import so the component-tree transform happens at module collection,
+// not inside the first test's timeout (cold CI transforms have no vite cache).
+// `vi.mock` is hoisted above imports, so the mocks below still apply.
+import ComposeBar from "./ComposeBar.svelte";
 
 const invokeMock = vi.fn(
   async (_cmd: string, _args?: Record<string, unknown>): Promise<unknown> => null,
@@ -81,7 +85,6 @@ describe("ComposeBar", () => {
     await state.registerAgent(AGENT_A);
     invokeMock.mockResolvedValueOnce("msg-1");
 
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
 
     expect(screen.queryByTestId("recipient-field")).toBeNull();
@@ -105,7 +108,6 @@ describe("ComposeBar", () => {
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
 
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
 
     expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "true");
@@ -125,7 +127,6 @@ describe("ComposeBar", () => {
         if (this.value === "short again") return 72;
         return 96;
       });
-      const ComposeBar = (await import("./ComposeBar.svelte")).default;
       render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
       await tick();
       const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
@@ -152,7 +153,6 @@ describe("ComposeBar", () => {
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
 
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
 
     await fireEvent.click(chip(AGENT_B.id));
@@ -168,7 +168,6 @@ describe("ComposeBar", () => {
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
 
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
 
     const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
@@ -188,7 +187,6 @@ describe("ComposeBar", () => {
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
 
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
 
     await fireEvent.click(chip(AGENT_B.id)); // alice + bob selected
@@ -213,7 +211,6 @@ describe("ComposeBar", () => {
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
 
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
 
     const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
@@ -250,7 +247,6 @@ describe("ComposeBar", () => {
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
 
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
 
     await fireEvent.click(screen.getByTestId("compose-prompt-button"));
@@ -272,7 +268,6 @@ describe("ComposeBar", () => {
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
 
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
 
     const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
@@ -299,7 +294,6 @@ describe("ComposeBar", () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
 
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
 
     const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
@@ -320,7 +314,6 @@ describe("ComposeBar", () => {
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
 
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
 
     const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
@@ -340,7 +333,6 @@ describe("ComposeBar", () => {
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
 
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
 
     const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
@@ -362,7 +354,6 @@ describe("ComposeBar", () => {
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
 
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
 
     const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
@@ -388,7 +379,6 @@ describe("ComposeBar", () => {
       await state.registerAgent(AGENT_A);
       await state.registerAgent(AGENT_B);
 
-      const ComposeBar = (await import("./ComposeBar.svelte")).default;
       render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
 
       const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
@@ -423,7 +413,6 @@ describe("ComposeBar", () => {
       await state.registerAgent(AGENT_A);
       await state.registerAgent(AGENT_B);
 
-      const ComposeBar = (await import("./ComposeBar.svelte")).default;
       const { unmount } = render(ComposeBar, {
         props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] },
       });
@@ -453,7 +442,6 @@ describe("ComposeBar", () => {
       await state.registerAgent(AGENT_A);
       await state.registerAgent(AGENT_B);
 
-      const ComposeBar = (await import("./ComposeBar.svelte")).default;
       render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
 
       const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
@@ -481,7 +469,6 @@ describe("ComposeBar", () => {
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
 
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
 
     const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
@@ -502,7 +489,6 @@ describe("ComposeBar", () => {
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
 
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
 
     const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
@@ -528,7 +514,6 @@ describe("ComposeBar", () => {
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
 
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
     const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
 
@@ -550,7 +535,6 @@ describe("ComposeBar", () => {
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
 
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
     // alice (index 0) selected by default; bob not.
     expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "false");
@@ -567,7 +551,6 @@ describe("ComposeBar", () => {
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
 
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
 
     await fireEvent.keyDown(document.body, { key: "a", metaKey: true, shiftKey: true });
@@ -579,7 +562,6 @@ describe("ComposeBar", () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
 
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
 
     const outside = document.createElement("button");
@@ -597,7 +579,6 @@ describe("ComposeBar", () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
 
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
 
     const input = document.createElement("input");
@@ -615,7 +596,6 @@ describe("ComposeBar", () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
 
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
 
     const alertDialog = document.createElement("div");
@@ -639,7 +619,6 @@ describe("ComposeBar", () => {
     await state.registerAgent(AGENT_B);
     invokeMock.mockResolvedValue("msg-x");
 
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
 
     await fireEvent.click(chip(AGENT_B.id)); // select both
@@ -681,7 +660,6 @@ describe("ComposeBar", () => {
       ];
       invokeMock.mockResolvedValue("msg-1");
 
-      const ComposeBar = (await import("./ComposeBar.svelte")).default;
       render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
 
       const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
@@ -704,7 +682,6 @@ describe("ComposeBar", () => {
     await state.registerAgent(AGENT_B);
     invokeMock.mockResolvedValue("msg-x");
 
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
 
     await fireEvent.click(chip(AGENT_B.id));
@@ -729,7 +706,6 @@ describe("ComposeBar", () => {
     await state.registerAgent(AGENT_B);
     invokeMock.mockResolvedValue("msg-x");
 
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
     const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
 
@@ -762,7 +738,6 @@ describe("ComposeBar", () => {
     await state.registerAgent(AGENT_A);
     invokeMock.mockResolvedValue("msg-1");
 
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
 
     const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
@@ -784,7 +759,6 @@ describe("ComposeBar", () => {
     await state.registerAgent(AGENT_A);
     invokeMock.mockResolvedValue("msg-1");
 
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
 
     const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
@@ -810,7 +784,6 @@ describe("ComposeBar", () => {
     // Dispatch order is selection order: alice (default) then bob.
     invokeMock.mockResolvedValueOnce("msg-a").mockRejectedValueOnce(new Error("bob exploded"));
 
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
     await fireEvent.click(chip(AGENT_B.id));
 
@@ -837,7 +810,6 @@ describe("ComposeBar", () => {
     await state.registerAgent(AGENT_A);
     invokeMock.mockResolvedValue("msg-1");
 
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
 
     const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
@@ -853,7 +825,6 @@ describe("ComposeBar", () => {
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
 
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
     expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "true");
 
@@ -874,7 +845,6 @@ describe("ComposeBar", () => {
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
 
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
     expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "true");
 
@@ -895,7 +865,6 @@ describe("ComposeBar persistence", () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
 
     const first = render(ComposeBar, {
       props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] },
@@ -923,7 +892,6 @@ describe("ComposeBar persistence", () => {
     store.setSelection(PROJECT_ID, [AGENT_B.id]);
     store._testing.reloadFromStorage(); // drop in-memory copy; re-read localStorage
 
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
     expect((screen.getByTestId("compose-textarea") as HTMLTextAreaElement).value).toBe(
       "from last time",
@@ -936,7 +904,6 @@ describe("ComposeBar persistence", () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
     invokeMock.mockResolvedValue("msg-1");
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
 
     const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
@@ -953,7 +920,6 @@ describe("ComposeBar persistence", () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
 
     const first = render(ComposeBar, {
       props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] },
@@ -977,7 +943,6 @@ describe("ComposeBar persistence", () => {
     store.setSelection(PROJECT_ID, ["00000000-0000-7000-8000-00000000dead", AGENT_A.id]);
     store._testing.reloadFromStorage();
 
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
     expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "true");
     expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "false");
@@ -988,7 +953,6 @@ describe("ComposeBar persistence", () => {
   it("keeps drafts isolated per project", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     const OTHER_PROJECT = "00000000-0000-7000-8000-0000000000ee";
 
     const first = render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
@@ -1012,7 +976,6 @@ describe("ComposeBar persistence", () => {
     store.setSelection(PROJECT_ID, [AGENT_B.id]);
     store._testing.reloadFromStorage();
 
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
 
     expect(screen.queryByTestId("recipient-field")).toBeNull(); // no chips for one agent
@@ -1038,7 +1001,6 @@ describe("ComposeBar persistence", () => {
     ]);
     store._testing.reloadFromStorage();
 
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
     // All saved ids are gone → default to the first agent rather than empty.
     expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "true");
@@ -1049,7 +1011,6 @@ describe("ComposeBar persistence", () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     const store = await loadComposeStore();
 
     const { rerender } = render(ComposeBar, {
@@ -1110,7 +1071,6 @@ describe("ComposeBar prompt mode", () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
     mockPromptBackend({ prompts: [REVIEW, SUMMARY] });
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
 
     await fireEvent.click(screen.getByTestId("compose-prompt-button"));
@@ -1125,7 +1085,6 @@ describe("ComposeBar prompt mode", () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
     mockPromptBackend({ prompts: [SUMMARY] });
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
 
     await fireEvent.input(screen.getByTestId("compose-textarea"), {
@@ -1141,7 +1100,6 @@ describe("ComposeBar prompt mode", () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
     mockPromptBackend({ prompts: [REVIEW] });
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
 
     await enterPromptMode("prompt-option-local:review");
@@ -1162,7 +1120,6 @@ describe("ComposeBar prompt mode", () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
     mockPromptBackend({ prompts: [SUMMARY] });
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
 
     await fireEvent.input(screen.getByTestId("compose-textarea"), { target: { value: "keep me" } });
@@ -1179,7 +1136,6 @@ describe("ComposeBar prompt mode", () => {
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
     mockPromptBackend({ prompts: [SUMMARY] });
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
 
     await fireEvent.click(chip(AGENT_B.id)); // select both
@@ -1209,7 +1165,6 @@ describe("ComposeBar prompt mode", () => {
       prompts: [SUMMARY],
       render: () => Promise.reject(new Error("render boom")),
     });
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
 
     await enterPromptMode("prompt-option-tiddly:summary");
@@ -1233,7 +1188,6 @@ describe("ComposeBar prompt mode", () => {
       release = res;
     });
     mockPromptBackend({ prompts: [SUMMARY], render: () => gate });
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
 
     await fireEvent.click(chip(AGENT_B.id));
@@ -1283,7 +1237,6 @@ describe("ComposeBar prompt mode", () => {
     store._testing.reloadFromStorage();
     mockPromptBackend({ prompts: [REVIEW] });
 
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
 
     await waitFor(() => expect(screen.getByTestId("prompt-composer")).toBeInTheDocument());
@@ -1313,7 +1266,6 @@ describe("ComposeBar prompt mode", () => {
       return null;
     });
 
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
 
     // Cold: shows the restoring placeholder (not plain), and must NOT clobber the
@@ -1347,7 +1299,6 @@ describe("ComposeBar prompt mode", () => {
     store._testing.reloadFromStorage();
     mockPromptBackend({ prompts: [] }); // prompt never appears, even after sync
 
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
 
     await waitFor(() => expect(screen.getByTestId("compose-restoring")).toBeInTheDocument());
@@ -1367,7 +1318,6 @@ describe("ComposeBar prompt mode", () => {
       release = res;
     });
     mockPromptBackend({ prompts: [SUMMARY], render: () => gate });
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
 
     await enterPromptMode("prompt-option-tiddly:summary");
@@ -1392,7 +1342,6 @@ describe("ComposeBar prompt mode", () => {
       release = res;
     });
     mockPromptBackend({ prompts: [SUMMARY], render: () => gate });
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
 
     await fireEvent.click(chip(AGENT_B.id)); // select both A + B
@@ -1426,7 +1375,6 @@ describe("ComposeBar prompt mode", () => {
       },
     ];
     mockPromptBackend({ prompts: [SUMMARY] });
-    const ComposeBar = (await import("./ComposeBar.svelte")).default;
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
 
     await enterPromptMode("prompt-option-tiddly:summary");

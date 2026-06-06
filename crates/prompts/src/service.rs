@@ -455,54 +455,34 @@ impl PromptService {
     /// preserved when a server is added or removed from Settings.
     fn write_mcp_providers(&self, configs: &[McpProviderConfig]) -> Result<(), PromptError> {
         let path = self.config_path()?;
-        let mut root = read_config_mapping(path)?;
         let key = serde_norway::Value::String("mcp_providers".to_owned());
-        if configs.is_empty() {
-            root.remove(&key);
+        // Serialize before the edit so the closure stays infallible (and the
+        // shared config lock inside `edit_yaml_mapping` is held only across the
+        // read-modify-write). `edit_yaml_mapping` preserves every other top-level
+        // key (`local_prompt_dirs`, personal prefs) and serializes against the
+        // preferences writer, so the two subsystems can't clobber the shared file.
+        let value = if configs.is_empty() {
+            None
         } else {
-            let value = serde_norway::to_value(configs).map_err(|e| PromptError::ConfigWrite {
-                path: path.to_owned(),
-                message: e.to_string(),
-            })?;
-            root.insert(key, value);
-        }
-        switchboard_core::write_yaml(path, &serde_norway::Value::Mapping(root)).map_err(|e| {
-            PromptError::ConfigWrite {
-                path: path.to_owned(),
-                message: e.to_string(),
+            Some(
+                serde_norway::to_value(configs).map_err(|e| PromptError::ConfigWrite {
+                    path: path.to_owned(),
+                    message: e.to_string(),
+                })?,
+            )
+        };
+        switchboard_core::edit_yaml_mapping(path, move |root| match value {
+            Some(value) => {
+                root.insert(key, value);
+            }
+            None => {
+                root.remove(&key);
             }
         })
-    }
-}
-
-/// Read `config.yaml` as a generic YAML mapping for an in-place key edit. Absent,
-/// empty, or null → a fresh mapping. A non-mapping or unparseable file is an
-/// error: we will not clobber a config we can't safely round-trip.
-fn read_config_mapping(path: &Path) -> Result<serde_norway::Mapping, PromptError> {
-    use serde_norway::Value;
-    if !path.exists() {
-        return Ok(serde_norway::Mapping::new());
-    }
-    let bytes = std::fs::read(path).map_err(|e| PromptError::ConfigWrite {
-        path: path.to_owned(),
-        message: e.to_string(),
-    })?;
-    if bytes.iter().all(u8::is_ascii_whitespace) {
-        return Ok(serde_norway::Mapping::new());
-    }
-    match serde_norway::from_slice::<Value>(&bytes) {
-        Ok(Value::Mapping(mapping)) => Ok(mapping),
-        Ok(Value::Null) => Ok(serde_norway::Mapping::new()),
-        Ok(_) => Err(PromptError::ConfigWrite {
+        .map_err(|e| PromptError::ConfigWrite {
             path: path.to_owned(),
-            message: "config.yaml is not a YAML mapping; refusing to overwrite it".to_owned(),
-        }),
-        Err(e) => Err(PromptError::ConfigWrite {
-            path: path.to_owned(),
-            message: format!(
-                "config.yaml is not valid YAML ({e}); fix it before editing providers from Settings"
-            ),
-        }),
+            message: e.to_string(),
+        })
     }
 }
 

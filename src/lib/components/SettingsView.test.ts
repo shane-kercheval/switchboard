@@ -6,13 +6,19 @@ import SettingsView from "./SettingsView.svelte";
 import { theme } from "$lib/theme.svelte";
 import { agentCopy } from "$lib/agentCopy.svelte";
 import { _testing as availabilityTesting } from "$lib/harnessAvailability.svelte";
+import { _testing as prefsTesting } from "$lib/preferences.svelte";
 
-// SettingsView embeds HarnessStatusList, which probes install/auth on mount.
-const invokeMock = vi.fn(async (cmd: string, _args?: Record<string, unknown>) => {
+// SettingsView embeds HarnessStatusList (probes install/auth on mount) and
+// McpServersSettings (loads providers on mount). Tests that override the mock
+// must keep these baseline stubs, so it's a named default restored per test.
+const defaultInvoke = async (cmd: string, _args?: Record<string, unknown>): Promise<unknown> => {
   if (cmd === "get_harness_install_status") return { installed: true, version: "1.0.0" };
   if (cmd === "list_mcp_providers") return []; // embedded McpServersSettings loads on mount
+  if (cmd === "local_prompts_dir")
+    return "/Users/test/Library/Application Support/switchboard/prompts";
   return null; // auth probes resolve = authenticated
-});
+};
+const invokeMock = vi.fn(defaultInvoke);
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: (cmd: string, args?: Record<string, unknown>) => invokeMock(cmd, args),
 }));
@@ -24,10 +30,14 @@ vi.mock("@tauri-apps/api/event", () => ({
 beforeEach(() => {
   theme.set("system");
   agentCopy.set("last_answer_block");
-  invokeMock.mockClear();
+  // Restore the baseline impl so an override in one test can't leak into the next
+  // (the embedded McpServersSettings loads on every mount).
+  invokeMock.mockReset();
+  invokeMock.mockImplementation(defaultInvoke);
   // The embedded HarnessStatusList reads the shared singleton store; reset it
   // so probed values don't leak across tests.
   availabilityTesting.reset();
+  prefsTesting.reset();
 });
 
 afterEach(() => {
@@ -102,11 +112,97 @@ describe("SettingsView", () => {
     expect(fullAnswer).toHaveAttribute("aria-checked", "true");
   });
 
+  it("git-view editor preference defaults to code and persists edits", async () => {
+    render(SettingsView, { props: { onClose: vi.fn() } });
+    const editor = screen.getByTestId("git-editor-command") as HTMLInputElement;
+
+    expect(editor.value).toBe("code");
+
+    await fireEvent.input(editor, { target: { value: "cursor" } });
+    await fireEvent.change(editor);
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
+        preferences: {
+          editor_command: "cursor",
+          terminal_app: "Terminal",
+          diff_style: "unified",
+        },
+      }),
+    );
+
+    // Clearing the field persists null (fall back to OS default), not "".
+    invokeMock.mockClear();
+    await fireEvent.input(editor, { target: { value: "  " } });
+    await fireEvent.change(editor);
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
+        preferences: { editor_command: null, terminal_app: "Terminal", diff_style: "unified" },
+      }),
+    );
+  });
+
+  it("git-view terminal preference persists, defaulting a blank to Terminal", async () => {
+    render(SettingsView, { props: { onClose: vi.fn() } });
+    const terminal = screen.getByTestId("git-terminal-app");
+
+    await fireEvent.input(terminal, { target: { value: "iTerm" } });
+    await fireEvent.change(terminal);
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
+        preferences: { editor_command: "code", terminal_app: "iTerm", diff_style: "unified" },
+      }),
+    );
+
+    invokeMock.mockClear();
+    await fireEvent.input(terminal, { target: { value: "" } });
+    await fireEvent.change(terminal);
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_preferences", {
+        preferences: { editor_command: "code", terminal_app: "Terminal", diff_style: "unified" },
+      }),
+    );
+  });
+
+  it("surfaces an inline error when a preference save fails, keeping the value", async () => {
+    // A failed config.yaml write must not be silent: the user sees an error and
+    // the typed value stays (surface-and-keep, not revert).
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "get_harness_install_status") return { installed: true, version: "1.0.0" };
+      if (cmd === "list_mcp_providers") return [];
+      if (cmd === "set_preferences") throw new Error("disk full");
+      return null;
+    });
+    render(SettingsView, { props: { onClose: vi.fn() } });
+    const editor = screen.getByTestId("git-editor-command") as HTMLInputElement;
+
+    await fireEvent.input(editor, { target: { value: "cursor" } });
+    await fireEvent.change(editor);
+
+    await waitFor(() => expect(screen.getByTestId("git-prefs-save-error")).toBeInTheDocument());
+    // Value is kept, not reverted.
+    expect(editor.value).toBe("cursor");
+  });
+
   it("shortcuts section lists expected keyboard shortcuts", () => {
     render(SettingsView, { props: { onClose: vi.fn() } });
     expect(screen.getByText("Focus message box")).toBeInTheDocument();
+    expect(screen.getByText("Expand or restore Git details panel")).toBeInTheDocument();
     expect(screen.getByText("Toggle projects sidebar")).toBeInTheDocument();
     expect(screen.getByText("Toggle agents sidebar")).toBeInTheDocument();
     expect(screen.getByText("Toggle settings")).toBeInTheDocument();
+  });
+
+  it("shows the local prompts folder and opens it in Finder", async () => {
+    render(SettingsView, { props: { onClose: vi.fn() } });
+
+    await waitFor(() =>
+      expect(screen.getByTestId("local-prompts-dir")).toHaveTextContent(
+        "/Users/test/Library/Application Support/switchboard/prompts",
+      ),
+    );
+
+    await fireEvent.click(screen.getByTestId("local-prompts-open"));
+
+    expect(invokeMock).toHaveBeenCalledWith("open_local_prompts_dir", undefined);
   });
 });

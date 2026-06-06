@@ -5,6 +5,10 @@ import { tick } from "svelte";
 import type { AgentRecord, NormalizedEvent } from "$lib/types";
 import { HEARTBEAT_TIMEOUT_MS } from "$lib/types";
 import { agentCopy } from "$lib/agentCopy.svelte";
+// Static import so the component-tree transform happens at module collection,
+// not inside the first test's timeout (cold CI transforms have no vite cache).
+// `vi.mock` is hoisted above imports, so the mocks below still apply.
+import UnifiedTranscript from "./UnifiedTranscript.svelte";
 
 const listeners = new Map<string, (e: { payload: NormalizedEvent }) => void>();
 vi.mock("@tauri-apps/api/event", () => ({
@@ -71,7 +75,6 @@ describe("UnifiedTranscript", () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
 
-    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
 
     expect(screen.getByText(/no messages yet/i)).toBeInTheDocument();
@@ -119,7 +122,6 @@ describe("UnifiedTranscript", () => {
       },
     ];
 
-    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT, CODEX_AGENT] } });
 
     const turns = screen.getAllByTestId("turn");
@@ -161,7 +163,6 @@ describe("UnifiedTranscript", () => {
       },
     ];
 
-    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
 
     const turns = screen.getAllByTestId("turn");
@@ -190,7 +191,6 @@ describe("UnifiedTranscript", () => {
       },
     ];
 
-    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CODEX_AGENT] } });
 
     const turn = screen.getByTestId("turn");
@@ -226,7 +226,6 @@ describe("UnifiedTranscript", () => {
       },
     ];
 
-    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
 
     const turn = screen.getByTestId("turn");
@@ -272,7 +271,6 @@ describe("UnifiedTranscript", () => {
       },
     ];
 
-    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
 
     const tool = screen.getByTestId("turn-tool");
@@ -311,7 +309,6 @@ describe("UnifiedTranscript", () => {
       },
     ];
 
-    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
 
     const tool = screen.getByTestId("turn-tool");
@@ -349,7 +346,6 @@ describe("UnifiedTranscript", () => {
       },
     ];
 
-    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
 
     const tool = screen.getByTestId("turn-tool");
@@ -380,7 +376,6 @@ describe("UnifiedTranscript", () => {
       },
     ];
 
-    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
 
     const tool = screen.getByTestId("turn-tool");
@@ -402,7 +397,6 @@ describe("UnifiedTranscript", () => {
       },
     ];
 
-    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CODEX_AGENT] } });
 
     expect(screen.getByTestId("turn-working")).toHaveTextContent("Working...");
@@ -422,7 +416,6 @@ describe("UnifiedTranscript", () => {
       },
     ];
 
-    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CODEX_AGENT] } });
 
     expect(screen.getByTestId("turn")).toHaveTextContent("ack");
@@ -448,7 +441,6 @@ describe("UnifiedTranscript", () => {
       in_flight_turn_id: "agent-1",
     };
 
-    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CODEX_AGENT] } });
 
     const footer = screen.getByTestId("turn-working");
@@ -478,7 +470,6 @@ describe("UnifiedTranscript", () => {
       in_flight_turn_id: "some-other-turn",
     };
 
-    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CODEX_AGENT] } });
 
     const footer = screen.getByTestId("turn-working");
@@ -495,7 +486,6 @@ describe("UnifiedTranscript", () => {
       const state = await loadState();
       await state.registerAgent(CODEX_AGENT);
 
-      const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
       render(UnifiedTranscript, { props: { agents: [CODEX_AGENT] } });
 
       fireTo(`agent:${CODEX_AGENT.id}`, {
@@ -535,7 +525,6 @@ describe("UnifiedTranscript", () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
 
-    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
 
     fireTo(`agent:${CLAUDE_AGENT.id}`, {
@@ -584,7 +573,6 @@ describe("UnifiedTranscript", () => {
       },
     ];
 
-    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
 
     // Cancel is send-scoped (TOCTOU-safe), not turn-scoped: it targets the
@@ -605,7 +593,6 @@ describe("UnifiedTranscript", () => {
     state.dispatchUserTurn(CLAUDE_AGENT.id, "user-1", "later", "send-q", "2026-05-16T00:00:00Z");
     state.recordSendAccepted(CLAUDE_AGENT.id, "user-1", "msg-q");
 
-    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
 
     expect(screen.getByTestId("turn-queued")).toHaveTextContent("Queued...");
@@ -631,7 +618,6 @@ describe("UnifiedTranscript", () => {
       },
     ];
 
-    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
 
     expect(screen.queryByTestId("turn-live-control")).toBeNull();
@@ -654,7 +640,6 @@ describe("UnifiedTranscript", () => {
       },
     ];
 
-    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
 
     expect(screen.getByTestId("turn-error")).toHaveTextContent("rate limited");
@@ -729,7 +714,6 @@ describe("UnifiedTranscript — fan-out groups", () => {
       { status: "complete", text: "bob reply" },
     );
 
-    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT, CODEX_AGENT] } });
 
     expect(screen.getByTestId("fanout-group")).toBeInTheDocument();
@@ -756,7 +740,6 @@ describe("UnifiedTranscript — fan-out groups", () => {
     // Alice responded; bob is still queued (busy agent).
     seedFanout(state, { status: "complete", text: "alice reply" }, null);
 
-    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT, CODEX_AGENT] } });
 
     expect(screen.getByTestId("fanout-queued")).toHaveTextContent("Queued...");
@@ -771,7 +754,6 @@ describe("UnifiedTranscript — fan-out groups", () => {
     // Alice streaming, bob queued → group is live.
     seedFanout(state, { status: "streaming", text: "thinking" }, null);
 
-    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT, CODEX_AGENT] } });
 
     const queuedCancel = screen.getByTestId("fanout-card-cancel");
@@ -799,7 +781,6 @@ describe("UnifiedTranscript — fan-out groups", () => {
     await state.registerAgent(CODEX_AGENT);
     seedFanout(state, { status: "complete", text: "a" }, { status: "complete", text: "b" });
 
-    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT, CODEX_AGENT] } });
 
     expect(screen.queryByTestId("fanout-card-cancel")).toBeNull();
@@ -828,7 +809,6 @@ describe("UnifiedTranscript — fan-out groups", () => {
       },
     ];
 
-    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
 
     expect(screen.queryByTestId("fanout-group")).toBeNull();
@@ -865,7 +845,6 @@ describe("UnifiedTranscript — markdown rendering", () => {
       },
     ];
 
-    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
 
     const turn = screen.getByTestId("turn");
@@ -893,7 +872,6 @@ describe("UnifiedTranscript — markdown rendering", () => {
       },
     ];
 
-    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
 
     const turn = screen.getByTestId("turn");
@@ -944,7 +922,6 @@ describe("UnifiedTranscript — markdown rendering", () => {
       },
     ];
 
-    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT, CODEX_AGENT] } });
 
     const columns = screen.getAllByTestId("fanout-column");
@@ -956,7 +933,6 @@ describe("UnifiedTranscript — markdown rendering", () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
 
-    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
 
     fireTo(`agent:${CLAUDE_AGENT.id}`, {
@@ -996,7 +972,6 @@ describe("UnifiedTranscript — markdown rendering", () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
 
-    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
 
     const container = screen.getByTestId("unified-transcript");
@@ -1043,7 +1018,6 @@ describe("UnifiedTranscript — markdown rendering", () => {
       },
     ];
 
-    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
 
     const link = screen.getByTestId("turn").querySelector("a");
@@ -1072,7 +1046,6 @@ describe("UnifiedTranscript — per-message copy", () => {
       },
     ];
 
-    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
     copyTextMock.mockClear();
 
@@ -1112,7 +1085,6 @@ describe("UnifiedTranscript — per-message copy", () => {
       },
     ];
 
-    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
     copyTextMock.mockClear();
 
@@ -1154,7 +1126,6 @@ describe("UnifiedTranscript — per-message copy", () => {
       },
     ];
 
-    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
     copyTextMock.mockClear();
 
@@ -1184,7 +1155,6 @@ describe("UnifiedTranscript — per-message copy", () => {
       },
     ];
 
-    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
 
     // Both render, via distinct containers.
@@ -1222,7 +1192,6 @@ describe("UnifiedTranscript — per-message copy", () => {
       },
     ];
 
-    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
     copyTextMock.mockClear();
 
@@ -1249,7 +1218,6 @@ describe("UnifiedTranscript — per-message copy", () => {
       },
     ];
 
-    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
 
     const time = screen.getByTestId("turn").querySelector('[data-testid="message-time"]');
@@ -1284,7 +1252,6 @@ describe("UnifiedTranscript — per-message copy", () => {
       },
     ];
 
-    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
 
     expect(screen.getByTestId("turn").querySelector('[data-testid="message-copy"]')).toBeNull();
@@ -1336,7 +1303,6 @@ describe("UnifiedTranscript — per-message copy", () => {
       },
     ];
 
-    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT, CODEX_AGENT] } });
     copyTextMock.mockClear();
 
@@ -1366,7 +1332,6 @@ describe("UnifiedTranscript — per-message cost + overage", () => {
       },
     ];
 
-    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
 
     expect(screen.getByTestId("message-cost")).toHaveTextContent("$0.0125");
@@ -1391,7 +1356,6 @@ describe("UnifiedTranscript — per-message cost + overage", () => {
       },
     ];
 
-    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
 
     expect(screen.queryByTestId("message-cost")).toBeNull();
@@ -1414,7 +1378,6 @@ describe("UnifiedTranscript — per-message cost + overage", () => {
       },
     ];
 
-    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, { props: { agents: [CODEX_AGENT] } });
 
     expect(screen.queryByTestId("message-cost")).toBeNull();

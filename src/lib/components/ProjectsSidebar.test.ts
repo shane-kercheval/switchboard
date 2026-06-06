@@ -3,6 +3,10 @@ import "@testing-library/jest-dom/vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/svelte";
 import { tick } from "svelte";
 import type { AgentRecord, ProjectListing } from "$lib/types";
+// Static import so the component-tree transform happens at module collection,
+// not inside the first test's timeout (cold CI transforms have no vite cache).
+// `vi.mock` is hoisted above imports, so the mocks below still apply.
+import ProjectsSidebar from "./ProjectsSidebar.svelte";
 
 const invokeMock = vi.fn<(cmd: string, args?: Record<string, unknown>) => Promise<unknown>>(
   async () => undefined,
@@ -91,7 +95,6 @@ async function seedBusyProject(projectId: string): Promise<void> {
 describe("ProjectsSidebar — background activity", () => {
   it("shows a cancel control for a project with live sends", async () => {
     await seedBusyProject(PROJECT_1);
-    const ProjectsSidebar = (await import("./ProjectsSidebar.svelte")).default;
     render(ProjectsSidebar, { props: noopProps });
 
     expect(screen.getByTestId("project-cancel")).toBeInTheDocument();
@@ -105,7 +108,6 @@ describe("ProjectsSidebar — background activity", () => {
     // un-accepted entry would defer until recordSendAccepted).
     state.recordSendAccepted(AGENT_1, "user-1", "msg-1");
 
-    const ProjectsSidebar = (await import("./ProjectsSidebar.svelte")).default;
     render(ProjectsSidebar, { props: noopProps });
 
     await fireEvent.click(screen.getByTestId("project-cancel"));
@@ -123,7 +125,6 @@ describe("ProjectsSidebar — background activity", () => {
     ws.selection.activeProjectId = PROJECT_2; // PROJECT_1 is not being viewed
 
     await startActivityObserver();
-    const ProjectsSidebar = (await import("./ProjectsSidebar.svelte")).default;
     render(ProjectsSidebar, { props: noopProps });
     await tick(); // let the effect record PROJECT_1 as busy
 
@@ -159,7 +160,6 @@ describe("ProjectsSidebar — background activity", () => {
     state.runtimes[AGENT_1] = { ...rt, run_status: "idle", pending_sends: undefined };
     await tick();
 
-    const ProjectsSidebar = (await import("./ProjectsSidebar.svelte")).default;
     render(ProjectsSidebar, { props: noopProps });
     await tick();
 
@@ -179,7 +179,6 @@ describe("ProjectsSidebar — background activity", () => {
     ws.selection.activeProjectId = PROJECT_2;
 
     await startActivityObserver();
-    const ProjectsSidebar = (await import("./ProjectsSidebar.svelte")).default;
     render(ProjectsSidebar, { props: noopProps });
     await tick();
     const rt = state.runtimes[AGENT_1];
@@ -201,7 +200,6 @@ describe("ProjectsSidebar — background activity", () => {
     ws.selection.activeProjectId = PROJECT_2;
 
     await startActivityObserver();
-    const ProjectsSidebar = (await import("./ProjectsSidebar.svelte")).default;
     render(ProjectsSidebar, { props: noopProps });
     await tick();
     const rt = state.runtimes[AGENT_1];
@@ -228,7 +226,6 @@ describe("ProjectsSidebar — background activity", () => {
     ws.selection.activeProjectId = PROJECT_1; // the user is viewing it
 
     await startActivityObserver();
-    const ProjectsSidebar = (await import("./ProjectsSidebar.svelte")).default;
     render(ProjectsSidebar, { props: noopProps });
     await tick();
     const rt = state.runtimes[AGENT_1];
@@ -271,7 +268,6 @@ function mockRenameEchoes(): void {
 async function renderWith(list: ProjectListing[]) {
   const ws = await loadWorkspace();
   ws.projects.list = list;
-  const ProjectsSidebar = (await import("./ProjectsSidebar.svelte")).default;
   render(ProjectsSidebar, { props: noopProps });
 }
 
@@ -456,7 +452,6 @@ describe("ProjectsSidebar — rename", () => {
 
   it("omits project action icons while the project is busy so the cancel control owns the right slot", async () => {
     await seedBusyProject(PROJECT_1);
-    const ProjectsSidebar = (await import("./ProjectsSidebar.svelte")).default;
     render(ProjectsSidebar, { props: noopProps });
 
     expect(screen.getByTestId("project-cancel")).toBeInTheDocument();

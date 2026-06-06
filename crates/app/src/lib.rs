@@ -7,9 +7,11 @@ mod commands;
 mod dispatch_context;
 mod emitter;
 mod error;
+mod git_registry;
 mod journal;
 mod locator_sink;
 mod metadata;
+mod preferences;
 mod prompts_setup;
 mod secret_store;
 mod state;
@@ -26,23 +28,33 @@ use tauri::{Emitter, Manager, State};
 
 use crate::commands::ProjectConversation;
 use crate::commands::{
-    AgentSessionInfo, DirectoryInfo, HarnessInstallStatus, ProjectListing, WorkspaceDirectories,
-    add_mcp_provider_impl, agent_session_info_impl, attach_agent_impl, cancel_agent_impl,
-    cancel_send_impl, cancel_turn_impl, check_antigravity_auth_impl, check_antigravity_binary_impl,
-    check_claude_auth_impl, check_claude_binary_impl, check_codex_auth_impl,
-    check_codex_binary_impl, check_gemini_auth_impl, check_gemini_binary_impl, create_agent_impl,
-    create_project_impl, delete_project_impl, get_harness_install_status_impl, init_directory_impl,
-    list_agents_impl, list_mcp_providers_impl, list_projects_impl, list_prompts_impl,
+    AgentSessionInfo, DirectoryInfo, HarnessInstallStatus, ProjectListing, RepoListing,
+    WorkspaceDirectories, add_mcp_provider_impl, add_tracked_repo_impl, agent_session_info_impl,
+    attach_agent_impl, cancel_agent_impl, cancel_send_impl, cancel_turn_impl, changed_files_impl,
+    check_antigravity_auth_impl, check_antigravity_binary_impl, check_claude_auth_impl,
+    check_claude_binary_impl, check_codex_auth_impl, check_codex_binary_impl,
+    check_gemini_auth_impl, check_gemini_binary_impl, commit_changed_files_impl,
+    commit_file_diff_impl, commit_ranges_impl, create_agent_impl, create_project_impl,
+    delete_project_impl, editor_open_argv, fetch_repo_impl, file_diff_impl,
+    get_harness_install_status_impl, get_preferences_impl, init_directory_impl, list_agents_impl,
+    list_mcp_providers_impl, list_projects_impl, list_prompts_impl, list_tracked_repos_from_inputs,
     list_workspace_directories_impl, load_project_conversation_impl, load_transcript_impl,
-    open_project_impl, parse_uuid, pick_directory_impl, remove_agent_impl, remove_directory_impl,
-    remove_mcp_provider_impl, remove_queued_message_impl, rename_agent_impl, rename_project_impl,
-    render_prompt_impl, search_project_files_in_root, search_project_files_root_impl,
-    send_message_impl, set_active_project_impl, set_project_archived_impl,
-    test_mcp_connection_impl, validate_external_url,
+    open_commit_file_difftool_impl, open_project_impl, open_worktree_file_difftool_impl,
+    parse_uuid, pick_directory_impl, read_tracked_repo_from_inputs, remove_agent_impl,
+    remove_directory_impl, remove_mcp_provider_impl, remove_queued_message_impl,
+    remove_tracked_repo_impl, rename_agent_impl, rename_project_impl, render_prompt_impl,
+    reveal_in_finder_argv, search_project_files_in_root, search_project_files_root_impl,
+    send_message_impl, set_active_project_impl, set_preferences_impl, set_project_archived_impl,
+    sync_prompts_and_notify, terminal_open_argv, test_mcp_connection_impl, tracked_repos_inputs,
+    tracked_roots, validate_external_url,
 };
+use crate::preferences::Preferences;
 use crate::state::AppState;
 
 use switchboard_core::{AgentRecord, HarnessKind, ProjectSummary};
+use switchboard_git::{
+    BranchKind, ChangeKind, ChangedFile, CommitChanges, FileDiff, GitCommitRange,
+};
 use switchboard_prompts::{McpProviderInfo, Prompt, RenderedPrompt};
 
 #[tauri::command]
@@ -159,7 +171,8 @@ async fn render_prompt(
 /// Settings "Sync" button; used to pick up prompts edited on a server mid-session.
 #[tauri::command]
 async fn sync_prompts(state: State<'_, AppState>) -> Result<(), String> {
-    state.inner().prompts.sync().await;
+    let state = state.inner();
+    sync_prompts_and_notify(state.prompts.clone(), Arc::clone(&state.emitter)).await;
     Ok(())
 }
 
@@ -197,6 +210,137 @@ async fn test_mcp_connection(
     test_mcp_connection_impl(state.inner(), &url, bearer)
         .await
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn add_tracked_repo(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    add_tracked_repo_impl(state.inner(), &path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn remove_tracked_repo(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    // Infallible by design — `Result` matches the idempotent-ack convention of
+    // the `cancel_*` commands. Registry persistence is best-effort and logged in
+    // `persist_git_registry`, deliberately not surfaced here.
+    remove_tracked_repo_impl(state.inner(), &path);
+    Ok(())
+}
+
+#[tauri::command]
+async fn list_tracked_repos(state: State<'_, AppState>) -> Result<Vec<RepoListing>, String> {
+    // Snapshot the cheap state-derived inputs on the async thread, then run the
+    // synchronous `git2` reads on a blocking worker (decision 8) so they don't
+    // stall the async runtime.
+    let inputs = tracked_repos_inputs(state.inner());
+    tauri::async_runtime::spawn_blocking(move || list_tracked_repos_from_inputs(&inputs))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn read_tracked_repo(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<RepoListing, String> {
+    let inputs = tracked_repos_inputs(state.inner());
+    tauri::async_runtime::spawn_blocking(move || read_tracked_repo_from_inputs(&path, &inputs))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn fetch_repo(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    fetch_repo_impl(state.inner(), &path)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn changed_files(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<Vec<ChangedFile>, String> {
+    // Snapshot tracked roots on the async thread, then run the synchronous `git2`
+    // read on a blocking worker — consistent with the other Git-view reads, and
+    // gated on the tracked set so an untracked path returns empty, not live data.
+    let roots = tracked_roots(state.inner());
+    tauri::async_runtime::spawn_blocking(move || changed_files_impl(&roots, &path))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn file_diff(
+    state: State<'_, AppState>,
+    path: String,
+    file: String,
+) -> Result<FileDiff, String> {
+    let roots = tracked_roots(state.inner());
+    tauri::async_runtime::spawn_blocking(move || file_diff_impl(&roots, &path, &file))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn branch_commits(
+    state: State<'_, AppState>,
+    repo_root: String,
+    kind: BranchKind,
+    name: String,
+) -> Result<Vec<GitCommitRange>, String> {
+    let roots = tracked_roots(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        commit_ranges_impl(&roots, &repo_root, kind, &name)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn commit_changed_files(
+    state: State<'_, AppState>,
+    repo_root: String,
+    oid: String,
+) -> Result<CommitChanges, String> {
+    let roots = tracked_roots(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        commit_changed_files_impl(&roots, &repo_root, &oid)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn commit_file_diff(
+    state: State<'_, AppState>,
+    repo_root: String,
+    oid: String,
+    file: String,
+) -> Result<FileDiff, String> {
+    let roots = tracked_roots(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        commit_file_diff_impl(&roots, &repo_root, &oid, &file)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_preferences(state: State<'_, AppState>) -> Result<Preferences, String> {
+    Ok(get_preferences_impl(state.inner()))
+}
+
+#[tauri::command]
+async fn set_preferences(
+    state: State<'_, AppState>,
+    preferences: Preferences,
+) -> Result<(), String> {
+    set_preferences_impl(state.inner(), &preferences).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -473,6 +617,76 @@ async fn open_external_url(url: String) -> Result<(), String> {
     }
 }
 
+/// Spawn a macOS opener argv (program in `argv[0]`, args in the rest) and map a
+/// spawn failure / non-zero exit to a flat error string. Shared by the Git-view
+/// open actions, which differ only in how they build the argv.
+async fn run_open_argv(argv: Vec<String>) -> Result<(), String> {
+    let (program, rest) = argv.split_first().ok_or("empty open command")?;
+    let status = tokio::process::Command::new(program)
+        .args(rest)
+        .status()
+        .await
+        .map_err(|e| e.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("`{program}` failed (exit {status})"))
+    }
+}
+
+#[tauri::command]
+async fn open_in_editor(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    let editor = get_preferences_impl(state.inner()).editor_command;
+    run_open_argv(editor_open_argv(editor.as_deref(), &path)).await
+}
+
+#[tauri::command]
+async fn open_in_terminal(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    let terminal = get_preferences_impl(state.inner()).terminal_app;
+    run_open_argv(terminal_open_argv(&terminal, &path)).await
+}
+
+#[tauri::command]
+async fn reveal_in_finder(path: String) -> Result<(), String> {
+    run_open_argv(reveal_in_finder_argv(&path)).await
+}
+
+#[tauri::command]
+fn local_prompts_dir() -> Result<String, String> {
+    local_prompts_dir_path().map(|path| path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+async fn open_local_prompts_dir() -> Result<(), String> {
+    let path = local_prompts_dir_path()?;
+    std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
+    run_open_argv(vec!["open".to_owned(), path.to_string_lossy().into_owned()]).await
+}
+
+#[tauri::command]
+async fn open_worktree_file_difftool(
+    state: State<'_, AppState>,
+    worktree_path: String,
+    file: String,
+    change: ChangeKind,
+) -> Result<(), String> {
+    open_worktree_file_difftool_impl(state.inner(), &worktree_path, &file, change)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn open_commit_file_difftool(
+    state: State<'_, AppState>,
+    repo_root: String,
+    oid: String,
+    file: String,
+) -> Result<(), String> {
+    open_commit_file_difftool_impl(state.inner(), &repo_root, &oid, &file)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn load_project_conversation(
     state: State<'_, AppState>,
@@ -590,6 +804,26 @@ fn workspace_config_path() -> Option<std::path::PathBuf> {
     config_dir().map(|dir| dir.join("workspace.yaml"))
 }
 
+/// The Git-view tracked-repo registry (`git-view.yaml`) — a sibling of
+/// `workspace.yaml` in the same user-global config dir, so both move together
+/// (the debug `SWITCHBOARD_CONFIG_DIR` override relocates both at once).
+fn git_registry_config_path() -> Option<std::path::PathBuf> {
+    config_dir().map(|dir| dir.join("git-view.yaml"))
+}
+
+/// Personal preferences live in `config.yaml` — the **shared** personal-config
+/// file that also holds the prompt providers. Each subsystem round-trips the
+/// others' keys on write (see `preferences::save`), so they coexist in one file.
+fn preferences_config_path() -> Option<std::path::PathBuf> {
+    config_dir().map(|dir| dir.join("config.yaml"))
+}
+
+fn local_prompts_dir_path() -> Result<std::path::PathBuf, String> {
+    config_dir()
+        .map(|dir| dir.join("prompts"))
+        .ok_or_else(|| "prompt providers are not configured (no config path)".to_owned())
+}
+
 /// Build the prompt service from the user-global config dir, seeding the example
 /// prompts on first run. The pure `crates/prompts` never touches `directories`;
 /// the app resolves and injects the config path, default prompts dir, home, and
@@ -637,6 +871,36 @@ fn keyring_service() -> &'static str {
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+/// Attach the user-global persistence locations to a fresh `AppState`. Each is
+/// independently optional: if a location can't be resolved (exotic host with no
+/// home dir), that registry/preferences set stays in-memory only and its persist
+/// is a no-op — safe because all three are convenience state, never load-bearing.
+fn with_persistence_paths(state: AppState) -> AppState {
+    // `workspace.yaml` — the cross-directory project registry.
+    let state = if let Some(path) = workspace_config_path() {
+        state.with_workspace(path)
+    } else {
+        tracing::warn!("no home directory resolved — workspace registry persistence disabled");
+        state
+    };
+    // `git-view.yaml` — the Git-view tracked-repo registry.
+    let state = if let Some(path) = git_registry_config_path() {
+        state.with_git_registry(path)
+    } else {
+        state
+    };
+    // `config.yaml` — personal preferences.
+    if let Some(path) = preferences_config_path() {
+        state.with_preferences(path)
+    } else {
+        state
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "length is dominated by the flat `generate_handler!` command registry, which reads better as one list than split across helpers"
+)]
 pub fn run() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
@@ -679,18 +943,9 @@ pub fn run() {
                 Arc::clone(&antigravity_adapter),
                 emitter,
             );
-            // Resolve the user-global `workspace.yaml` location. If no home
-            // directory is resolvable (exotic host), skip workspace persistence
-            // entirely — the registry stays empty and `persist_workspace` is a
-            // no-op, which is safe since the registry is convenience state.
-            let state = if let Some(path) = workspace_config_path() {
-                state.with_workspace(path)
-            } else {
-                tracing::warn!(
-                    "no home directory resolved — workspace registry persistence disabled"
-                );
-                state
-            };
+            // Attach all user-global persistence locations (workspace.yaml,
+            // git-view.yaml, config.yaml) — see `with_persistence_paths`.
+            let state = with_persistence_paths(state);
             // Resolve and inject the user-global prompt config + default prompts
             // store (seeding the example prompts on first run).
             let prompts = build_prompt_service();
@@ -698,10 +953,10 @@ pub fn run() {
             // never blocks startup. `PromptService` is cheaply cloneable and
             // shares its cache `Arc`, so the clone the task syncs is the same
             // cache the managed state reads.
-            let prompts_for_build = prompts.clone();
-            tauri::async_runtime::spawn(async move {
-                prompts_for_build.sync().await;
-            });
+            tauri::async_runtime::spawn(sync_prompts_and_notify(
+                prompts.clone(),
+                Arc::clone(&state.emitter),
+            ));
             let state = state.with_prompts(prompts);
             // Cold start: open a `Directory` handle for every workspace entry so
             // restored directories report `available: true` and participate in
@@ -726,6 +981,20 @@ pub fn run() {
             remove_directory,
             list_projects,
             list_workspace_directories,
+            add_tracked_repo,
+            remove_tracked_repo,
+            list_tracked_repos,
+            read_tracked_repo,
+            fetch_repo,
+            changed_files,
+            file_diff,
+            branch_commits,
+            commit_changed_files,
+            commit_file_diff,
+            open_worktree_file_difftool,
+            open_commit_file_difftool,
+            get_preferences,
+            set_preferences,
             list_prompts,
             render_prompt,
             sync_prompts,
@@ -733,6 +1002,8 @@ pub fn run() {
             add_mcp_provider,
             remove_mcp_provider,
             test_mcp_connection,
+            local_prompts_dir,
+            open_local_prompts_dir,
             create_project,
             rename_project,
             delete_project,
@@ -753,6 +1024,9 @@ pub fn run() {
             agent_session_info,
             open_session_file,
             open_external_url,
+            open_in_editor,
+            open_in_terminal,
+            reveal_in_finder,
             load_transcript,
             load_project_conversation,
         ])

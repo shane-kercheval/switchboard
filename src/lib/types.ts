@@ -355,6 +355,166 @@ export type WorkspaceDirectories = {
   persistable: boolean;
 };
 
+// --- Git view (mirror of `switchboard_git` model + `crates/app` RepoListing) --
+// Branch-primary, two-level status (see the crate docs): branch-level signals on
+// BranchView/RemoteBranchView, worktree-level on WorktreeView. `null` fields are
+// the Rust `Option::None` ("couldn't determine") wire form.
+
+// Mirror of Rust `SyncState` (`#[serde(tag = "kind", rename_all = "snake_case")]`)
+// — a branch's position vs. its own upstream. `local_only` (never pushed) is
+// deliberately distinct from `unknown` (couldn't compute).
+export type SyncState =
+  | { kind: "in_sync" }
+  | { kind: "ahead"; commits: number }
+  | { kind: "behind"; commits: number }
+  | { kind: "diverged"; ahead: number; behind: number }
+  | { kind: "local_only" }
+  | { kind: "unknown" };
+
+export type WorktreeWarning = "orphaned" | "prunable";
+
+export type WorktreeView = {
+  path: string;
+  dirty: boolean;
+  untracked: boolean;
+  detached_hash: string | null;
+  warning: WorktreeWarning | null;
+};
+
+export type BranchView = {
+  name: string;
+  upstream: string | null;
+  sync: SyncState;
+  behind_base: number | null;
+  merged: boolean | null;
+  dangling: boolean;
+  worktree: WorktreeView | null;
+};
+
+// Remote branches carry only the cleanup signals (merged, behind_base) — the
+// local-branch fields are meaningless for a remote-tracking ref.
+export type RemoteBranchView = {
+  name: string;
+  merged: boolean | null;
+  behind_base: number | null;
+};
+
+export type RepoView = {
+  root: string;
+  name: string;
+  default_branch: string | null;
+  available: boolean;
+  is_bare: boolean;
+  local_branches: BranchView[];
+  remote_branches: RemoteBranchView[];
+  detached_worktrees: WorktreeView[];
+};
+
+// Mirror of Rust `LinkedProject` — a Switchboard project linked to a worktree by
+// exact path-match.
+export type LinkedProject = {
+  id: ProjectId;
+  name: string;
+  directory: string;
+};
+
+// Mirror of Rust `RepoListing`. `repo` is the git read-model verbatim;
+// `linked_projects` is a worktree-path → projects map joined at render time
+// (linking is computed on the backend, kept alongside rather than nested into
+// `RepoView`).
+export type RepoListing = {
+  repo: RepoView;
+  linked_projects: Record<string, LinkedProject[]>;
+};
+
+// Mirror of Rust `ChangeKind` / `ChangedFile` — one changed file in a worktree,
+// for the diff panel's file list.
+export type ChangeKind = "modified" | "added" | "deleted" | "renamed" | "untracked";
+
+export type ChangedFile = {
+  path: string;
+  change: ChangeKind;
+};
+
+// Mirror of Rust `CommitChanges` — one commit's changed files plus whether the
+// commit still resolved. `found: false` (with empty `files`) means the commit is
+// gone (gc'd / branch force-updated), distinct from a real commit that changed
+// nothing.
+export type CommitChanges = {
+  found: boolean;
+  files: ChangedFile[];
+};
+
+// Mirror of Rust `FileDiff` / `DiffHunk` / `DiffLine` / `DiffLineKind` — a file's
+// working-tree diff as structured hunks (built from libgit2's structured diff, not
+// parsed from unified text). The frontend renders rows directly from this.
+export type DiffLineKind = "context" | "added" | "removed";
+
+export type DiffLine = {
+  origin: DiffLineKind;
+  // Present only on the side where the line exists (added → old null; removed → new null).
+  old_lineno: number | null;
+  new_lineno: number | null;
+  // Line text, without the +/-/space marker and without the trailing newline.
+  content: string;
+};
+
+export type DiffHunk = {
+  header: string;
+  lines: DiffLine[];
+};
+
+export type FileDiff = {
+  path: string;
+  // Binary change: `hunks` is empty; the UI shows a placeholder instead of a body.
+  binary: boolean;
+  // The diff exceeded the render cap and was cut off.
+  truncated: boolean;
+  hunks: DiffHunk[];
+};
+
+// Mirror of Rust `GitCommitSummary` — one commit's summary line for the branch
+// commit list. `null` fields are the Rust `Option::None` wire form (e.g. a
+// non-UTF-8 author identity). `authored_at` is RFC-3339.
+export type GitCommitSummary = {
+  oid: string;
+  short_oid: string;
+  subject: string;
+  author_name: string | null;
+  author_email: string | null;
+  authored_at: string | null;
+  branch_work: boolean;
+};
+
+// Mirror of Rust `CommitRangeKind` (a bare snake_case string on the wire).
+export type CommitRangeKind = "recent" | "unpushed" | "incoming";
+
+// Mirror of Rust `GitCommitRange` — a capped, labelled slice of a branch's
+// history (recent, or unpushed/incoming when diverged from upstream).
+export type GitCommitRange = {
+  kind: CommitRangeKind;
+  label: string;
+  commits: GitCommitSummary[];
+  truncated: boolean;
+};
+
+// Mirror of Rust `BranchKind` — which ref namespace a commit read targets.
+export type BranchKind = "local" | "remote";
+
+// How the diff panel lays out a file's changes. Persisted in `config.yaml`.
+export type DiffStyle = "side_by_side" | "unified";
+
+// Mirror of Rust `Preferences` (`crates/app/src/preferences.rs`) — backend-owned
+// `config.yaml`. `editor_command` defaults to "code"; null → OS default
+// folder-open. `terminal_app` defaults to "Terminal"; `diff_style` defaults to
+// "unified".
+// Theme is NOT here — it stays in frontend localStorage (a device-local concern).
+export type Preferences = {
+  editor_command: string | null;
+  terminal_app: string;
+  diff_style: DiffStyle;
+};
+
 // Mirror of Rust `ProjectConversation` / `ConversationItem` / `OutcomeStatus` /
 // `AgentConversationMeta` (`crates/app/src/commands.rs`). The post-restart
 // unified history: the three `ConversationItem` kinds are disjoint sources

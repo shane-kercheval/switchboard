@@ -169,6 +169,62 @@ pub enum AppError {
         #[source]
         source: ignore::Error,
     },
+
+    /// Git-view "Add Repo": the chosen path isn't inside any git repository, so
+    /// it can't be resolved to a repo root to track. The frontend surfaces this
+    /// inline ("not a git repository") on the add affordance.
+    #[error("{path} is not inside a git repository")]
+    NotAGitRepo { path: String },
+
+    /// Persisting the Git-view tracked-repo registry (`git-view.yaml`) failed.
+    /// Best-effort like [`WorkspacePersist`](Self::WorkspacePersist) — callers log
+    /// rather than abort — but a distinct variant so diagnostics name the right
+    /// file instead of mislabeling it as the workspace registry.
+    #[error("failed to persist git-view registry at {path}: {source}")]
+    GitRegistryPersist {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// Persisting user preferences (`config.yaml`) failed. Unlike the registries
+    /// this surfaces to the caller (the `set_preferences` command), since a
+    /// failed explicit save is something the user just asked for and should hear
+    /// about — not silent best-effort state.
+    #[error("failed to persist preferences at {path}: {source}")]
+    PreferencesPersist {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// `git fetch` for a tracked repo failed (no network, no remote, auth, or
+    /// `git` not on PATH). Carries git's stderr verbatim. Best-effort at the call
+    /// site — the Git view records a "fetch failed" state and degrades to a stale
+    /// read rather than treating this as fatal.
+    #[error("git fetch failed for {root}: {message}")]
+    GitFetch { root: String, message: String },
+
+    /// `fetch_repo` was asked to fetch a path that doesn't resolve to a tracked
+    /// repo root — a stale frontend reference, or a fetch racing a remove. Refuse
+    /// rather than shell `git fetch` against an arbitrary caller-supplied path:
+    /// fetch is the one Git-view command that runs a subprocess, so it only acts
+    /// on roots the user has explicitly tracked.
+    #[error("{root} is not a tracked repository")]
+    RepoNotTracked { root: String },
+
+    /// `git difftool` for a tracked repo/worktree failed. Carries git's stderr
+    /// verbatim so the frontend can surface setup problems from the user's Git
+    /// difftool configuration.
+    #[error("git difftool failed for {root}: {message}")]
+    GitDifftool { root: String, message: String },
+
+    /// A genuine mid-read failure reading a worktree's changed files or a file's
+    /// diff (corrupt object, I/O fault) — distinct from the non-error empty
+    /// results those reads return for a clean or unreadable path. Carries git's
+    /// message so the diff panel can surface why it couldn't load.
+    #[error("failed to read git changes for {path}: {message}")]
+    GitRead { path: String, message: String },
 }
 
 impl AppError {

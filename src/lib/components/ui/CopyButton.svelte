@@ -33,7 +33,7 @@
 <button
   type="button"
   class={cn(
-    "flex h-7 w-7 items-center justify-center rounded-full border border-transparent transition-colors",
+    "flex h-[26px] w-[26px] items-center justify-center rounded-full border border-transparent transition-colors",
     copied ? "text-accent bg-panel" : "text-muted hover:text-fg hover:bg-border/60",
     className,
   )}
@@ -50,7 +50,7 @@
       stroke-width="2.5"
       stroke-linecap="round"
       stroke-linejoin="round"
-      class="h-[17px] w-[17px]"
+      class="h-4 w-4"
       aria-hidden="true"
     >
       <path d="M20 6 9 17l-5-5" />
@@ -63,7 +63,7 @@
       stroke-width="1.5"
       stroke-linecap="round"
       stroke-linejoin="round"
-      class="h-[17px] w-[17px]"
+      class="h-4 w-4"
       aria-hidden="true"
     >
       <rect x="9" y="9" width="11" height="11" rx="2.5" />

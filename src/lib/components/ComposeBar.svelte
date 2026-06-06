@@ -911,6 +911,17 @@
                   disabled={sending}
                   onclick={() => toggleRecipient(agent.id)}
                 >
+                  {#if i < 9}
+                    <!-- Leading position number makes the ⌘1–9 toggle shortcut
+                         discoverable at a glance (it maps to chip position, not a
+                         fixed agent). -->
+                    <span
+                      class="text-muted/80 font-mono text-[10px] tabular-nums"
+                      aria-hidden="true"
+                    >
+                      {i + 1}
+                    </span>
+                  {/if}
                   <HarnessIcon harness={agent.harness} size="sm" class="h-3.5 w-3.5" />
                   {agent.name}
                 </button>
@@ -923,7 +934,7 @@
                 <button
                   {...props}
                   type="button"
-                  class="text-muted hover:text-fg hover:bg-panel ml-0.5 flex h-6 w-6 items-center justify-center rounded-full transition-colors"
+                  class="text-muted hover:text-fg hover:bg-panel ml-0.5 flex h-[26px] w-[26px] items-center justify-center rounded-full transition-colors"
                   data-testid="recipient-clear"
                   aria-label="Clear recipients"
                   disabled={sending}
@@ -958,7 +969,7 @@
               {...props}
               type="button"
               class={cn(
-                "text-muted hover:text-fg hover:bg-panel focus-visible:ring-accent flex h-7 items-center gap-1 rounded-full border border-transparent px-2 text-xs transition-colors focus-visible:ring-2 focus-visible:outline-none",
+                "text-muted hover:text-fg hover:bg-panel focus-visible:ring-accent flex h-6 items-center gap-1 rounded-full border border-transparent px-2 text-xs transition-colors focus-visible:ring-2 focus-visible:outline-none",
                 sending ? "cursor-not-allowed opacity-60" : "",
               )}
               data-testid="compose-prompt-button"
@@ -1056,7 +1067,7 @@
         disabled={primaryDisabled}
         aria-label={showStop ? (liveSends.size > 1 ? "Cancel all sends" : "Cancel send") : "Send"}
         class={cn(
-          "flex h-8 w-8 shrink-0 items-center justify-center rounded-full transition-colors",
+          "flex h-7 w-7 shrink-0 items-center justify-center rounded-full transition-colors",
           showStop
             ? "bg-border text-muted hover:bg-status-failed-soft/70 hover:text-status-failed"
             : sendDisabled
@@ -1065,14 +1076,14 @@
         )}
       >
         {#if showStop}
-          <StopIcon class="size-6" />
+          <StopIcon class="size-5" />
         {:else if sending}
           <svg
             viewBox="0 0 24 24"
             fill="none"
             stroke="currentColor"
             stroke-width="2.25"
-            class="h-4 w-4 animate-spin"
+            class="h-3.5 w-3.5 animate-spin"
             aria-hidden="true"
           >
             <path d="M21 12a9 9 0 1 1-6.2-8.6" stroke-linecap="round" />
@@ -1085,7 +1096,7 @@
             stroke-width="2.25"
             stroke-linecap="round"
             stroke-linejoin="round"
-            class="h-4 w-4"
+            class="h-3.5 w-3.5"
             aria-hidden="true"
           >
             <path d="M12 19V5M5 12l7-7 7 7" />

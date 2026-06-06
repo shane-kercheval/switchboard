@@ -38,6 +38,16 @@
   import { bannerCopy, bannerTestid } from "$lib/harnessAvailability";
   import { ALL_HARNESSES, HARNESS_LABEL } from "$lib/harnessDisplay";
   import { harnessAvailability, refreshHarnessAvailability } from "$lib/harnessAvailability.svelte";
+  import { loadPreferences } from "$lib/preferences.svelte";
+  import GitView from "$lib/components/GitView.svelte";
+  import { view, setViewMode, enterGitView } from "$lib/state/gitView.svelte";
+  import {
+    SEGMENTED_MAIN_CONTAINER_CLASS,
+    SEGMENTED_MAIN_ITEM_ACTIVE_CLASS,
+    SEGMENTED_MAIN_ITEM_CLASS,
+    SEGMENTED_MAIN_ITEM_INACTIVE_CLASS,
+  } from "$lib/components/ui/segmentedControl";
+  import { cn } from "$lib/utils";
 
   // One availability map keyed by harness, derived from the shared
   // `harnessAvailability` store (one probe also feeding the Supported-CLIs
@@ -97,6 +107,10 @@
     if (key === "," && !event.shiftKey) {
       event.preventDefault();
       toggleSettings();
+    } else if (key === "g" && event.shiftKey) {
+      // ⌘⇧G toggles the top-level Projects ↔ Git view.
+      event.preventDefault();
+      selectView(view.mode === "git" ? "projects" : "git");
     } else if (key === "b" && event.shiftKey) {
       event.preventDefault();
       agentsSidebarOpen = !agentsSidebarOpen;
@@ -122,6 +136,18 @@
     }
   }
 
+  // Switch the top-level view. Entering Git runs the staleness-gated refresh;
+  // Settings is closed so the toggle always lands on the chosen view. Session-
+  // only — never persisted (the app always opens to Projects).
+  function selectView(mode: "projects" | "git"): void {
+    settingsOpen = false;
+    if (mode === "git") {
+      void enterGitView();
+    } else {
+      setViewMode("projects");
+    }
+  }
+
   // Startup: kick off the harness install probe (the store writes each slice as
   // it resolves — no barrier) and eagerly load the workspace registry
   // (directory list + flat project list). Per-project rosters/hydration stay
@@ -130,6 +156,7 @@
   onMount(() => {
     const stopProjectActivityObserver = startProjectActivityObserver();
     void refreshHarnessAvailability();
+    void loadPreferences();
     void loadWorkspace().catch((err) => {
       dirError = err instanceof Error ? err.message : String(err);
     });
@@ -167,7 +194,11 @@
   // sidebar, so keep it visible when that needs surfacing even with no
   // projects.
   const projectsSidebarHasContent = $derived(projects.list.length > 0 || !workspace.persistable);
-  const projectsSidebarVisible = $derived(projectsSidebarOpen && projectsSidebarHasContent);
+  // The Git view is a full-width center-pane takeover (decision D1) — the
+  // Projects sidebar hides while it's active and returns on toggle back.
+  const projectsSidebarVisible = $derived(
+    projectsSidebarOpen && projectsSidebarHasContent && view.mode !== "git",
+  );
 
   function retryActivation(): void {
     if (selection.activeProjectId !== null) void activateProject(selection.activeProjectId);
@@ -262,6 +293,7 @@
     {#snippet center()}
       {@const showAgentsToggle =
         !settingsOpen &&
+        view.mode !== "git" &&
         selection.activeProjectId !== null &&
         rosterLoaded &&
         activeAgents.length > 0}
@@ -306,6 +338,10 @@
           <div class="flex min-w-0 flex-1 items-center gap-2" data-testid="breadcrumb">
             <div class="text-fg truncate text-sm font-semibold">Settings</div>
           </div>
+        {:else if view.mode === "git"}
+          <div class="flex min-w-0 flex-1 items-center gap-2" data-testid="breadcrumb">
+            <div class="text-fg truncate text-sm font-semibold">Git</div>
+          </div>
         {:else if activeProject}
           <div class="flex min-w-0 flex-1 items-center gap-2" data-testid="breadcrumb">
             <div class="text-fg truncate text-sm font-semibold">{activeProject.name}</div>
@@ -317,6 +353,47 @@
         {:else}
           <div class="flex-1"></div>
         {/if}
+
+        <!-- Top-level view toggle: Projects | Git (⌘⇧G). Session-only; settings
+             is a modal-over, so its toggle press lands on the chosen view. -->
+        <div
+          class={cn(SEGMENTED_MAIN_CONTAINER_CLASS, "flex shrink-0")}
+          role="radiogroup"
+          aria-label="View"
+        >
+          <button
+            type="button"
+            role="radio"
+            class={cn(
+              SEGMENTED_MAIN_ITEM_CLASS,
+              !settingsOpen && view.mode === "projects"
+                ? SEGMENTED_MAIN_ITEM_ACTIVE_CLASS
+                : SEGMENTED_MAIN_ITEM_INACTIVE_CLASS,
+            )}
+            aria-checked={!settingsOpen && view.mode === "projects"}
+            data-testid="view-toggle-projects"
+            title="Projects (⌘⇧G)"
+            onclick={() => selectView("projects")}
+          >
+            Projects
+          </button>
+          <button
+            type="button"
+            role="radio"
+            class={cn(
+              SEGMENTED_MAIN_ITEM_CLASS,
+              !settingsOpen && view.mode === "git"
+                ? SEGMENTED_MAIN_ITEM_ACTIVE_CLASS
+                : SEGMENTED_MAIN_ITEM_INACTIVE_CLASS,
+            )}
+            aria-checked={!settingsOpen && view.mode === "git"}
+            data-testid="view-toggle-git"
+            title="Git (⌘⇧G)"
+            onclick={() => selectView("git")}
+          >
+            Git
+          </button>
+        </div>
         {#if showAgentsToggle}
           <SidebarToggleButton
             side="right"
@@ -344,6 +421,8 @@
       <div class="flex min-h-0 flex-1 flex-col overflow-hidden">
         {#if settingsOpen}
           <SettingsView onClose={closeSettings} />
+        {:else if view.mode === "git"}
+          <GitView />
         {:else if selection.activeProjectId === null}
           <!-- Every no-project state shows the same orientation surface
                (what Switchboard is, the project/agent explainer, the CTAs, and
@@ -400,7 +479,11 @@
               {/key}
             </div>
             {#if agentsSidebarOpen}
-              <Sidebar agents={activeAgents} onAddAgent={openAddAgent} />
+              <Sidebar
+                agents={activeAgents}
+                project={activeProject ?? undefined}
+                onAddAgent={openAddAgent}
+              />
             {/if}
           </div>
         {/if}

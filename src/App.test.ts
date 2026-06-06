@@ -1,6 +1,6 @@
 import { vi, describe, it, expect, beforeEach, afterEach } from "vitest";
 import "@testing-library/jest-dom/vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import type {
   AgentRecord,
   NormalizedEvent,
@@ -356,6 +356,13 @@ describe("App", () => {
   });
 
   afterEach(async () => {
+    // Unmount the rendered App *before* resetting the global stores. Auto-cleanup
+    // runs last (LIFO: it registers at import, this hook registers later), so
+    // without an explicit unmount here the store resets fire while the tree is
+    // still live — its `$derived`/`$effect`s then churn against torn-down state
+    // (empty repos, null install status), which destabilizes the reactive
+    // runtime and intermittently hangs the next test's mount on slow CI.
+    cleanup();
     const idx = await import("$lib/state/index.svelte");
     idx._testing.reset();
     const ws = await import("$lib/state/workspace.svelte");

@@ -1,7 +1,18 @@
 <script lang="ts">
   import type { AgentRecord, AgentId } from "$lib/types";
   import { retryAgentHydration, runtimes, stopAgent, transcripts } from "$lib/state/index.svelte";
-  import { removeAgent, renameAgent } from "$lib/state/workspace.svelte";
+  import {
+    removeAgent,
+    renameAgent,
+    setAgentModel,
+    setAgentEffort,
+  } from "$lib/state/workspace.svelte";
+  import { SUPPORTS_EFFORT_SELECTION, SUPPORTS_MODEL_SELECTION } from "$lib/harnessDisplay";
+  import { EFFORT_OPTIONS, MODEL_OPTIONS, type SelectOption } from "$lib/agentSelection";
+  import DropdownMenu from "$lib/components/ui/DropdownMenu.svelte";
+  import DropdownMenuItem from "$lib/components/ui/DropdownMenuItem.svelte";
+  import Select from "$lib/components/ui/Select.svelte";
+  import Button from "$lib/components/ui/Button.svelte";
   import {
     agentSessionInfo,
     openSessionFile as apiOpenSessionFile,
@@ -67,6 +78,89 @@
   let removingAgentId = $state<AgentId | null>(null);
   let removeError = $state<{ agentId: AgentId; message: string } | null>(null);
 
+  /// Per-agent model/effort change editor. `editing` names which agent + axis is
+  /// open; `editValue` is the picker's current value (the "No override" sentinel
+  /// `""` clears the override on submit). Mirrors the resume/rename editors —
+  /// errors surface inline and keep the dialog open.
+  const NO_OVERRIDE = "";
+  let editing = $state<{ agentId: AgentId; axis: "model" | "effort" } | null>(null);
+  let editValue = $state<string>(NO_OVERRIDE);
+  let editBusy = $state<boolean>(false);
+  let editError = $state<string | null>(null);
+
+  const editingAgent = $derived(
+    editing === null ? null : (agents.find((a) => a.id === editing!.agentId) ?? null),
+  );
+  function withCurrentOption(
+    options: SelectOption[],
+    current: string | null | undefined,
+  ): SelectOption[] {
+    if (current == null || current === "" || options.some((o) => o.value === current))
+      return options;
+    return [{ label: current, value: current }, ...options];
+  }
+
+  /// The curated list for the axis being edited, prefixed with the "No override"
+  /// sentinel so clearing back to the harness default is reachable. If the agent
+  /// already carries a value that is no longer in the curated list, keep that
+  /// value selectable so the dialog honestly reflects persisted state.
+  const editOptions = $derived<SelectOption[]>(
+    editing === null || editingAgent === null
+      ? []
+      : [
+          { label: "No override", value: NO_OVERRIDE },
+          ...withCurrentOption(
+            editing.axis === "model"
+              ? MODEL_OPTIONS[editingAgent.harness]
+              : EFFORT_OPTIONS[editingAgent.harness],
+            editing.axis === "model" ? editingAgent.model : editingAgent.effort,
+          ),
+        ],
+  );
+
+  function canChangeModel(agent: AgentRecord): boolean {
+    return SUPPORTS_MODEL_SELECTION[agent.harness];
+  }
+  function canChangeEffort(agent: AgentRecord): boolean {
+    return SUPPORTS_EFFORT_SELECTION[agent.harness];
+  }
+
+  function openChange(agent: AgentRecord, axis: "model" | "effort"): void {
+    editing = { agentId: agent.id, axis };
+    editValue = (axis === "model" ? agent.model : agent.effort) ?? NO_OVERRIDE;
+    editError = null;
+    editBusy = false;
+  }
+
+  function closeChange(): void {
+    editing = null;
+    editError = null;
+    editBusy = false;
+  }
+
+  async function submitChange(): Promise<void> {
+    if (editing === null) return;
+    const { agentId, axis } = editing;
+    const value = editValue === NO_OVERRIDE ? undefined : editValue;
+    const stillEditingSubmittedTarget = (): boolean =>
+      editing?.agentId === agentId && editing.axis === axis;
+    editBusy = true;
+    editError = null;
+    try {
+      if (axis === "model") {
+        await setAgentModel(agentId, value);
+      } else {
+        await setAgentEffort(agentId, value);
+      }
+      if (stillEditingSubmittedTarget()) closeChange();
+    } catch (err) {
+      if (stillEditingSubmittedTarget()) {
+        editError = err instanceof Error ? err.message : String(err);
+        editBusy = false;
+      }
+    }
+  }
+
   const resumeAgent = $derived(
     resumeAgentId === null ? null : (agents.find((agent) => agent.id === resumeAgentId) ?? null),
   );
@@ -131,6 +225,7 @@
       resumeAgentId = null;
       resumeOpen = false;
     }
+    if (editing !== null && !ids.has(editing.agentId)) closeChange();
   });
 
   function openSessionFile(agent: AgentRecord): void {
@@ -500,11 +595,13 @@
         {@const active = isActive(agent.id)}
         {@const sessionInfo = sessionInfoByAgent[agent.id]}
         {@const confirmingRemove = removeConfirmAgentId === agent.id}
+        {@const canChange = canChangeModel(agent) || canChangeEffort(agent)}
         {@const actionCount = confirmingRemove
           ? 2
           : (active ? 1 : 0) +
             (sessionInfo?.resume_command ? 1 : 0) +
             (sessionInfo?.session_file ? 1 : 0) +
+            (canChange ? 1 : 0) +
             (!active ? 1 : 0)}
         <div
           class="group bg-raised/90 hover:bg-border/40 rounded-md px-2.5 py-2 transition-colors"
@@ -741,6 +838,46 @@
                         {/snippet}
                       </Tooltip>
                     {/if}
+                    {#if canChange}
+                      <!-- "More" menu hosts the model/effort change actions —
+                           a menu fits a growing, label-only action set better
+                           than another glyph in the inline strip. -->
+                      <DropdownMenu
+                        triggerClass={agentActionClass}
+                        triggerLabel="More actions"
+                        triggerTestid="agent-action-more"
+                        contentTestid="agent-more-menu"
+                      >
+                        {#snippet trigger()}
+                          <svg
+                            viewBox="0 0 24 24"
+                            fill="currentColor"
+                            class="h-4 w-4"
+                            aria-hidden="true"
+                          >
+                            <circle cx="5" cy="12" r="1.6" />
+                            <circle cx="12" cy="12" r="1.6" />
+                            <circle cx="19" cy="12" r="1.6" />
+                          </svg>
+                        {/snippet}
+                        {#if canChangeModel(agent)}
+                          <DropdownMenuItem
+                            onSelect={() => openChange(agent, "model")}
+                            data-testid="agent-change-model"
+                          >
+                            Change model
+                          </DropdownMenuItem>
+                        {/if}
+                        {#if canChangeEffort(agent)}
+                          <DropdownMenuItem
+                            onSelect={() => openChange(agent, "effort")}
+                            data-testid="agent-change-effort"
+                          >
+                            Change effort
+                          </DropdownMenuItem>
+                        {/if}
+                      </DropdownMenu>
+                    {/if}
                     {#if !active}
                       <Tooltip delayDuration={AGENT_ACTION_DELAY_MS}>
                         {#snippet trigger(props)}
@@ -875,11 +1012,40 @@
                 </ul>
               </Tooltip>
             {/if}
-            {#if runtime?.meta}
+            <!-- Selected model/effort (intent), shown first. When the user
+                 hasn't chosen a model (Antigravity, or an attached agent left at
+                 "No override") we fall back to the harness-observed
+                 model from `runtime.meta` so the line isn't blank when a model
+                 is known. Effort is selection-only — no observed source. The
+                 per-turn transcript footer carries the actual runtime history
+                 (which may show a resolved id even when intent is an alias). -->
+            {#if agent.model || runtime?.meta?.model || agent.effort}
+              <div
+                class="text-muted mt-1.5 space-y-0.5 text-xs leading-4"
+                data-testid="agent-selection"
+              >
+                {#if agent.model}
+                  <div class="truncate" title={agent.model} data-testid="agent-selected-model">
+                    model: <span class="font-mono">{agent.model}</span>
+                  </div>
+                {:else if runtime?.meta?.model}
+                  <div
+                    class="truncate"
+                    title={runtime.meta.model}
+                    data-testid="agent-observed-model"
+                  >
+                    observed: <span class="font-mono">{runtime.meta.model}</span>
+                  </div>
+                {/if}
+                {#if agent.effort}
+                  <div class="truncate" data-testid="agent-selected-effort">
+                    effort: <span class="font-mono">{agent.effort}</span>
+                  </div>
+                {/if}
+              </div>
+            {/if}
+            {#if runtime?.meta && (runtime.meta.mcp_servers.length > 0 || runtime.meta.skills.length > 0)}
               <div class="text-muted mt-1.5 space-y-0.5 text-xs leading-4" data-testid="agent-meta">
-                <div class="truncate" title={runtime.meta.model}>
-                  model: <span class="font-mono">{runtime.meta.model}</span>
-                </div>
                 {#if runtime.meta.mcp_servers.length > 0}
                   <div>mcp: {runtime.meta.mcp_servers.length}</div>
                 {/if}
@@ -1058,3 +1224,56 @@
   message="This agent's history failed to load. The exact error is below — copy it into a bug report."
   details={hydrationDetailsError}
 />
+
+<!-- Change model / effort. Reuses the shared selection picker; the "No override" option
+     clears the selection back to `None`. Applies on the agent's next send. -->
+<Dialog
+  open={editing !== null}
+  onClose={closeChange}
+  title={editing?.axis === "effort" ? "Change effort" : "Change model"}
+  contentClass="max-w-sm"
+  dismissible={!editBusy}
+>
+  <div class="space-y-3" data-testid="change-selection-panel">
+    <label class="block space-y-1">
+      <span class="text-muted text-xs">
+        {editing?.axis === "effort" ? "Reasoning effort" : "Model"}
+      </span>
+      <Select
+        bind:value={editValue}
+        options={editOptions}
+        disabled={editBusy}
+        data-testid="change-select"
+        aria-label={editing?.axis === "effort" ? "Reasoning effort" : "Model"}
+      />
+    </label>
+    <p class="text-muted text-xs leading-relaxed">
+      “No override” clears Switchboard's selection — the harness then runs on whatever it would on
+      its own. Takes effect on the next message.
+    </p>
+    {#if editError}
+      <p class="text-status-failed text-xs" data-testid="change-error">{editError}</p>
+    {/if}
+    <div class="flex justify-end gap-2">
+      <Button
+        variant="secondary"
+        size="sm"
+        class="w-24"
+        data-testid="change-cancel"
+        disabled={editBusy}
+        onclick={closeChange}
+      >
+        Cancel
+      </Button>
+      <Button
+        size="sm"
+        class="w-24"
+        data-testid="change-save"
+        disabled={editBusy}
+        onclick={() => void submitChange()}
+      >
+        {editBusy ? "Saving…" : "Save"}
+      </Button>
+    </div>
+  </div>
+</Dialog>

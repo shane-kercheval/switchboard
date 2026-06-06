@@ -3,8 +3,8 @@
   import { cn } from "$lib/utils";
 
   /// Closed enum-select over a `{label, value}[]` list — the curated-dropdown
-  /// primitive for both the model and effort pickers (and the M6 change
-  /// editors). A native `<select>` deliberately: real keyboard/ARIA/screen-reader
+  /// primitive for model and effort selection. A native `<select>` deliberately:
+  /// real keyboard/ARIA/screen-reader
   /// semantics for free, no open-state to manage, and the value space is a fixed
   /// curated set, so there is no free-text branch to support.
   ///

@@ -147,6 +147,24 @@
     return "";
   }
 
+  /// A fan-out column's runtime selection footer: latest agent turn wins, matching
+  /// `columnAt` and the copy aggregation's "column owns its agent rows" contract.
+  function columnModel(colRows: NonUserRow[]): string | undefined {
+    for (let i = colRows.length - 1; i >= 0; i--) {
+      const r = colRows[i]!;
+      if (r.kind === "agent") return r.turn.model;
+    }
+    return undefined;
+  }
+
+  function columnEffort(colRows: NonUserRow[]): string | undefined {
+    for (let i = colRows.length - 1; i >= 0; i--) {
+      const r = colRows[i]!;
+      if (r.kind === "agent") return r.turn.effort;
+    }
+    return undefined;
+  }
+
   function formatTime(iso: string): string {
     const d = new Date(iso);
     if (Number.isNaN(d.getTime())) return "";
@@ -355,6 +373,8 @@
   mt = "mt-1",
   spend: AgentTurn["spend"] = undefined,
   costUsd: number | null | undefined = undefined,
+  model: string | undefined = undefined,
+  effort: string | undefined = undefined,
 )}
   <!-- `justify-between` pins the always-visible spend group to the LEFT and the
        hover-revealed timestamp/copy to the RIGHT. The left group is always
@@ -384,10 +404,19 @@
         <span class="text-muted text-xs" data-testid="message-cost">${costUsd.toFixed(4)}</span>
       {/if}
     </div>
-    <!-- Right: timestamp + copy stay hover/focus-revealed (unchanged). -->
+    <!-- Right: per-turn model/effort (history — what this turn actually ran on,
+         resolved id and all), timestamp, and copy. All hover/focus-revealed and
+         subtle; the model/effort here are runtime history, distinct from the
+         sidebar's selected-intent value. -->
     <div
       class="flex items-center gap-2 opacity-0 group-focus-within:opacity-100 group-hover:opacity-100"
     >
+      {#if model}
+        <span class="text-muted text-xs" data-testid="message-model">{model}</span>
+      {/if}
+      {#if effort}
+        <span class="text-muted text-xs" data-testid="message-effort">{effort}</span>
+      {/if}
       {#if at}
         <time class="text-muted text-xs" datetime={at} title={at} data-testid="message-time"
           >{formatTime(at)}</time
@@ -469,6 +498,8 @@
       "mt-1",
       turn.spend,
       turn.usage?.total_cost_usd,
+      turn.model,
+      turn.effort,
     )}
   </div>
 {/snippet}
@@ -585,6 +616,11 @@
                   columnAt(col.rows),
                   colCopyable,
                   `Copy ${agentName(col.agent_id)}'s message`,
+                  "mt-1",
+                  undefined,
+                  undefined,
+                  columnModel(col.rows),
+                  columnEffort(col.rows),
                 )}
               </div>
             {/each}

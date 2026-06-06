@@ -649,8 +649,18 @@ describe("UnifiedTranscript", () => {
 describe("UnifiedTranscript — fan-out groups", () => {
   function seedFanout(
     state: Awaited<ReturnType<typeof loadState>>,
-    aliceResponse: { status: "streaming" | "complete"; text?: string } | null,
-    bobResponse: { status: "streaming" | "complete"; text?: string } | null,
+    aliceResponse: {
+      status: "streaming" | "complete";
+      text?: string;
+      model?: string;
+      effort?: string;
+    } | null,
+    bobResponse: {
+      status: "streaming" | "complete";
+      text?: string;
+      model?: string;
+      effort?: string;
+    } | null,
   ): void {
     state.transcripts[CLAUDE_AGENT.id] = [
       {
@@ -673,6 +683,8 @@ describe("UnifiedTranscript — fan-out groups", () => {
               items: aliceResponse.text
                 ? [{ item_kind: "text" as const, kind: "text" as const, text: aliceResponse.text }]
                 : [],
+              model: aliceResponse.model,
+              effort: aliceResponse.effort,
             },
           ]
         : []),
@@ -698,6 +710,8 @@ describe("UnifiedTranscript — fan-out groups", () => {
               items: bobResponse.text
                 ? [{ item_kind: "text" as const, kind: "text" as const, text: bobResponse.text }]
                 : [],
+              model: bobResponse.model,
+              effort: bobResponse.effort,
             },
           ]
         : []),
@@ -731,6 +745,28 @@ describe("UnifiedTranscript — fan-out groups", () => {
     expect(columns[0]).toHaveTextContent("alice reply");
     expect(columns[1]).toHaveAttribute("data-agent-id", CODEX_AGENT.id);
     expect(columns[1]).toHaveTextContent("bob reply");
+  });
+
+  it("renders each fan-out column's own model and effort in the footer", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    seedFanout(
+      state,
+      { status: "complete", text: "alice reply", model: "claude-opus-4-8" },
+      { status: "complete", text: "bob reply", model: "gpt-5.5", effort: "high" },
+    );
+
+    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT, CODEX_AGENT] } });
+
+    const columns = screen.getAllByTestId("fanout-column");
+    expect(columns[0]).toHaveTextContent("claude-opus-4-8");
+    expect(columns[0]!.querySelector('[data-testid="message-model"]')).toHaveTextContent(
+      "claude-opus-4-8",
+    );
+    expect(columns[0]!.querySelector('[data-testid="message-effort"]')).toBeNull();
+    expect(columns[1]!.querySelector('[data-testid="message-model"]')).toHaveTextContent("gpt-5.5");
+    expect(columns[1]!.querySelector('[data-testid="message-effort"]')).toHaveTextContent("high");
   });
 
   it("shows a queued indicator for a recipient with no response yet", async () => {
@@ -1527,5 +1563,69 @@ describe("UnifiedTranscript hydration failures", () => {
     );
     expect(screen.getByTestId("agent-hydration-failed")).toBeInTheDocument();
     warnSpy.mockRestore();
+  });
+
+  // --- Per-turn model/effort footer (history, independent of the sidebar) -----
+
+  it("agent-turn footer renders the turn's model and effort", async () => {
+    const state = await loadState();
+    state.transcripts[CODEX_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "agent-1",
+        agent_id: CODEX_AGENT.id,
+        started_at: "2026-05-16T00:00:01Z",
+        status: "complete",
+        items: [{ item_kind: "text", kind: "text", text: "hi" }],
+        model: "gpt-5.5",
+        effort: "high",
+      },
+    ];
+
+    render(UnifiedTranscript, { props: { agents: [CODEX_AGENT] } });
+
+    expect(screen.getByTestId("message-model")).toHaveTextContent("gpt-5.5");
+    expect(screen.getByTestId("message-effort")).toHaveTextContent("high");
+  });
+
+  it("agent-turn footer shows model with no effort when the turn has only a model", async () => {
+    const state = await loadState();
+    // The Claude case: per-turn model is exposed, per-turn effort is not.
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "agent-1",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:01Z",
+        status: "complete",
+        items: [{ item_kind: "text", kind: "text", text: "hi" }],
+        model: "claude-opus-4-8",
+      },
+    ];
+
+    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+
+    expect(screen.getByTestId("message-model")).toHaveTextContent("claude-opus-4-8");
+    expect(screen.queryByTestId("message-effort")).toBeNull();
+  });
+
+  it("agent-turn footer omits model/effort when the turn carries neither", async () => {
+    const state = await loadState();
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "agent-1",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:01Z",
+        status: "complete",
+        items: [{ item_kind: "text", kind: "text", text: "hi" }],
+      },
+    ];
+
+    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+
+    expect(screen.getByTestId("turn")).toBeInTheDocument();
+    expect(screen.queryByTestId("message-model")).toBeNull();
+    expect(screen.queryByTestId("message-effort")).toBeNull();
   });
 });

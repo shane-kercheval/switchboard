@@ -160,8 +160,8 @@
   function handleSubmit(): void {
     if (!canSubmit) return;
     const trimmedName = normalizeAgentName(name);
-    // The "keep current" sentinel (and any unsupported-capability empty value)
-    // collapses to `undefined` → the backend sends no flag. The M3 backend
+    // The "No override" sentinel (and any unsupported-capability empty value)
+    // collapses to `undefined` → the backend sends no flag. Backend
     // normalization is the real trust boundary; this is the UX layer.
     const selectedModel = model === KEEP_CURRENT ? undefined : model;
     const selectedEffort = effort === KEEP_CURRENT ? undefined : effort;

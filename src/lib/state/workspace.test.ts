@@ -637,3 +637,42 @@ describe("project staleness refresh", () => {
     expect(state.transcripts[AGENT_1]?.length).toBe(2);
   });
 });
+
+describe("agent model/effort selection", () => {
+  it("setAgentModel calls the backend and replaces the record in its roster", async () => {
+    const ws = await loadWorkspaceState();
+    const a = agent(AGENT_1, PROJECT_1);
+    ws.agentsByProject[PROJECT_1] = [a, agent(AGENT_2, PROJECT_1)];
+    const updated: AgentRecord = { ...a, model: "sonnet" };
+    invokeMock.mockImplementation(async (cmd) => (cmd === "set_agent_model" ? updated : undefined));
+
+    await ws.setAgentModel(AGENT_1, "sonnet");
+
+    expect(invokeMock).toHaveBeenCalledWith("set_agent_model", {
+      agentId: AGENT_1,
+      model: "sonnet",
+    });
+    // The record is replaced in place — the sidebar (which renders this roster)
+    // reflects the new intent immediately; the sibling agent is untouched.
+    expect(ws.agentsByProject[PROJECT_1]?.find((r) => r.id === AGENT_1)?.model).toBe("sonnet");
+    expect(ws.agentsByProject[PROJECT_1]?.find((r) => r.id === AGENT_2)?.model).toBeUndefined();
+  });
+
+  it("setAgentEffort clears the override (passes undefined; persists the cleared record)", async () => {
+    const ws = await loadWorkspaceState();
+    const a: AgentRecord = { ...agent(AGENT_1, PROJECT_1), effort: "high" };
+    ws.agentsByProject[PROJECT_1] = [a];
+    const cleared: AgentRecord = { ...a, effort: null };
+    invokeMock.mockImplementation(async (cmd) =>
+      cmd === "set_agent_effort" ? cleared : undefined,
+    );
+
+    await ws.setAgentEffort(AGENT_1, undefined);
+
+    expect(invokeMock).toHaveBeenCalledWith("set_agent_effort", {
+      agentId: AGENT_1,
+      effort: undefined,
+    });
+    expect(ws.agentsByProject[PROJECT_1]?.[0]?.effort).toBeNull();
+  });
+});

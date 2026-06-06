@@ -145,6 +145,8 @@ Distinct from the `thoughts`/`reasoning` **token buckets** in the §3 table (tho
 
 ### 3.3 Model selection — can we set the model on a turn?
 
+> **Status: shipped (per-agent model & effort selection, M1–M6).** Model is a per-agent selection sent every turn when set (`HarnessKind::supports_model_selection` — Claude/Codex/Gemini; Antigravity unavailable). Picked from a curated per-harness dropdown at create and changed from the agent's actions menu; recorded per turn on the transcript (Antigravity via carry-forward of its announced model). The sidebar shows the selected model, falling back to the harness-observed model (this section's `SessionMeta`/`init` value) when no selection exists (Antigravity always; an attached agent until the user sets one).
+
 Distinct from the **Model** metadata row in §3 (which is what the harness *reports* it ran). This is the *input* question: can Switchboard tell a harness which model to use, and can it change it mid-conversation? Verified empirically 2026-05-30 (claude 2.1.158, codex 0.134.0, gemini 0.44.0, agy 1.0.3); model read back from each harness's own `init` event / session file.
 
 | Harness | How to set | Change on resume | Persistence / caveats |
@@ -161,6 +163,8 @@ Distinct from the **Model** metadata row in §3 (which is what the harness *repo
 *Display, however, is recoverable per turn.* Antigravity announces the model in a `USER_SETTINGS_CHANGE` transcript sentence both on turn 1 (`from None to X`) and on any later turn where the model **changes** — verified 2026-05-30: a resume after editing `settings.json` wrote `from Gemini 3.1 Pro (High) to Claude Sonnet 4.6 (Thinking)`. Unchanged resumes emit no sentence, so the per-turn model is reconstructed by **carrying the last announced model forward**. This works **live** (the sentence rides the turn's own record, so it lands at turn-end; hold the running value in per-agent state) and **on reopen** (walk the transcript chronologically). So Antigravity's per-turn model *history* is accurate even though its model *selection* is not ours to drive.
 
 ### 3.4 Reasoning effort — can we set the thinking level on a turn?
+
+> **Status: shipped (M1–M6).** Effort is a per-agent selection sent every turn when set (`HarnessKind::supports_effort_selection` — Claude/Codex only; Gemini config-only and Antigravity model-name-folded are both unavailable). Per-turn effort is recorded on the transcript for **Codex only** (`turn_context.payload.effort`); **Claude exposes no per-turn effort**, so Claude's effort is shown as sidebar selected-intent only, never in the transcript footer.
 
 A *separate* axis from model (§3.3), with a **different capability set**. Verified empirically 2026-05-30 (claude 2.1.158, codex 0.134.0, gemini 0.44.0, agy 1.0.3), supplemented by docs where no CLI surface exists.
 

@@ -453,6 +453,28 @@ export async function removeAgent(agentId: AgentId): Promise<void> {
 /// surfaces them and stays in edit mode).
 export async function renameAgent(agentId: AgentId, newName: string): Promise<void> {
   const updated = await api.renameAgent(agentId, newName);
+  replaceAgentRecord(agentId, updated);
+}
+
+/// Change (or clear) an agent's selected model. Mirrors `renameAgent`: the
+/// backend re-persists and returns the updated record, which replaces the old
+/// one in whichever project roster holds it — so the sidebar reflects the new
+/// intent immediately, before any turn runs. `model` undefined clears the
+/// override. Errors propagate to the caller (the editor surfaces them).
+export async function setAgentModel(agentId: AgentId, model?: string): Promise<void> {
+  const updated = await api.setAgentModel(agentId, model);
+  replaceAgentRecord(agentId, updated);
+}
+
+/// Change (or clear) an agent's selected reasoning effort. See `setAgentModel`.
+export async function setAgentEffort(agentId: AgentId, effort?: string): Promise<void> {
+  const updated = await api.setAgentEffort(agentId, effort);
+  replaceAgentRecord(agentId, updated);
+}
+
+/// Replace an agent's record across whichever project roster holds it — located
+/// across all rosters rather than assumed active, matching `renameAgent`.
+function replaceAgentRecord(agentId: AgentId, updated: AgentRecord): void {
   for (const [projectId, agents] of Object.entries(agentsByProject)) {
     if (agents.some((a) => a.id === agentId)) {
       agentsByProject[projectId] = agents.map((a) => (a.id === agentId ? updated : a));

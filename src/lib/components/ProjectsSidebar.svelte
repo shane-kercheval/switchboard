@@ -275,11 +275,16 @@
     archiveError = null;
     deleteError = null;
     gitRevealError = null;
-    const revealed = await revealProjectBranch(project.id, project.directory);
-    if (!revealed) {
+    const result = await revealProjectBranch(project.id, project.directory);
+    if (result.kind === "unresolved") {
       gitRevealError = {
         projectId: project.id,
         message: "This project does not have a tracked local git branch.",
+      };
+    } else if (result.kind === "failed") {
+      gitRevealError = {
+        projectId: project.id,
+        message: result.message,
       };
     }
   }

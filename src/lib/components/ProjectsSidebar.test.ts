@@ -17,9 +17,15 @@ vi.mock("@tauri-apps/api/core", () => ({
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(async () => vi.fn()),
 }));
-const revealProjectBranchMock = vi.fn<(projectId: string, directory: string) => Promise<boolean>>(
-  async () => true,
-);
+type RevealProjectBranchResult =
+  | { kind: "revealed" }
+  | { kind: "unresolved" }
+  | { kind: "superseded" }
+  | { kind: "failed"; message: string };
+
+const revealProjectBranchMock = vi.fn<
+  (projectId: string, directory: string) => Promise<RevealProjectBranchResult>
+>(async () => ({ kind: "revealed" }));
 vi.mock("$lib/state/gitView.svelte", () => ({
   revealProjectBranch: (projectId: string, directory: string) =>
     revealProjectBranchMock(projectId, directory),
@@ -79,7 +85,7 @@ beforeEach(() => {
   invokeMock.mockReset();
   invokeMock.mockResolvedValue(undefined);
   revealProjectBranchMock.mockReset();
-  revealProjectBranchMock.mockResolvedValue(true);
+  revealProjectBranchMock.mockResolvedValue({ kind: "revealed" });
 });
 
 afterEach(async () => {
@@ -595,7 +601,7 @@ describe("ProjectsSidebar — Git navigation", () => {
   });
 
   it("show git action reports an unresolved project branch", async () => {
-    revealProjectBranchMock.mockResolvedValue(false);
+    revealProjectBranchMock.mockResolvedValue({ kind: "unresolved" });
     await renderWith([projectIn(G1, "alpha", "/work/a")]);
 
     await fireEvent.click(screen.getByTestId("project-action-show-git"));
@@ -607,8 +613,29 @@ describe("ProjectsSidebar — Git navigation", () => {
     );
   });
 
+  it("show git action reports a failed reveal", async () => {
+    revealProjectBranchMock.mockResolvedValue({ kind: "failed", message: "IPC unavailable" });
+    await renderWith([projectIn(G1, "alpha", "/work/a")]);
+
+    await fireEvent.click(screen.getByTestId("project-action-show-git"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("project-git-error")).toHaveTextContent("IPC unavailable"),
+    );
+  });
+
+  it("show git action ignores a superseded reveal", async () => {
+    revealProjectBranchMock.mockResolvedValue({ kind: "superseded" });
+    await renderWith([projectIn(G1, "alpha", "/work/a")]);
+
+    await fireEvent.click(screen.getByTestId("project-action-show-git"));
+
+    await waitFor(() => expect(revealProjectBranchMock).toHaveBeenCalled());
+    expect(screen.queryByTestId("project-git-error")).not.toBeInTheDocument();
+  });
+
   it("clears a git navigation error when another project is selected", async () => {
-    revealProjectBranchMock.mockResolvedValue(false);
+    revealProjectBranchMock.mockResolvedValue({ kind: "unresolved" });
     await renderWith([projectIn(G1, "alpha", "/work/a"), projectIn(G2, "beta", "/work/b")]);
 
     await fireEvent.click(screen.getAllByTestId("project-action-show-git")[0]!);

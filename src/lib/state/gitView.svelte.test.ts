@@ -105,6 +105,20 @@ function wire(opts: { list?: RepoListing[]; fetchRejects?: boolean } = {}) {
 const mainRef = (root = "/a") => ({ repoRoot: root, kind: "local" as const, name: "main" });
 const dirtyOpts = { worktreePath: "/a/wt", hasChanges: true, worktreeSubtitle: "~/wt" };
 
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T | PromiseLike<T>) => void;
+  reject: (reason?: unknown) => void;
+} {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 describe("gitView store", () => {
   it("enterGitView loads repos and sets git mode", async () => {
     wire({ list: [listing("/a"), listing("/b")] });
@@ -358,7 +372,7 @@ describe("gitView store", () => {
     expect(invokeMock.mock.calls.filter((c) => c[0] === "read_tracked_repo").length).toBe(1);
   });
 
-  it("revealProjectBranch is false for a project linked to a detached worktree", async () => {
+  it("revealProjectBranch is unresolved for a project linked to a detached worktree", async () => {
     const detached = listing("/a");
     detached.repo.detached_worktrees = [
       { path: "/a/dt", dirty: true, untracked: false, detached_hash: "abc1234", warning: null },
@@ -368,7 +382,7 @@ describe("gitView store", () => {
     await refreshAll();
 
     // Linked, but the worktree is detached → no `local_branches` row.
-    await expect(revealProjectBranch("p1", "/a/dt")).resolves.toBe(false);
+    await expect(revealProjectBranch("p1", "/a/dt")).resolves.toEqual({ kind: "unresolved" });
   });
 
   it("a failed fetch records a 'failed' state, never throws", async () => {
@@ -527,11 +541,13 @@ describe("gitView store", () => {
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === "read_tracked_repo")
         return Promise.resolve(listingWithProject("/a", "/a/wt", "p1"));
+      if (cmd === "list_tracked_repos")
+        return Promise.resolve([listingWithProject("/a", "/a/wt", "p1")]);
       if (cmd === "branch_commits") return Promise.resolve([]);
       return Promise.resolve(null);
     });
 
-    await expect(revealProjectBranch("p1", "/a/wt")).resolves.toBe(true);
+    await expect(revealProjectBranch("p1", "/a/wt")).resolves.toEqual({ kind: "revealed" });
 
     expect(view.mode).toBe("git");
     expect(branchSelection.current).toEqual({ repoRoot: "/a", kind: "local", name: "main" });
@@ -542,16 +558,63 @@ describe("gitView store", () => {
     });
   });
 
-  it("revealProjectBranch does not collapse an already selected branch", async () => {
+  it("revealProjectBranch loads the full repo aggregate before opening Git view", async () => {
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === "read_tracked_repo")
         return Promise.resolve(listingWithProject("/a", "/a/wt", "p1"));
+      if (cmd === "list_tracked_repos")
+        return Promise.resolve([listingWithProject("/a", "/a/wt", "p1"), listing("/b")]);
       if (cmd === "branch_commits") return Promise.resolve([]);
       return Promise.resolve(null);
     });
 
-    await revealProjectBranch("p1", "/a/wt");
-    await revealProjectBranch("p1", "/a/wt");
+    await expect(revealProjectBranch("p1", "/a/wt")).resolves.toEqual({ kind: "revealed" });
+
+    expect(view.mode).toBe("git");
+    expect(gitView.status).toBe("complete");
+    expect(gitView.repos.map((r) => r.repo.root).sort()).toEqual(["/a", "/b"]);
+    expect(branchSelection.current).toEqual({ repoRoot: "/a", kind: "local", name: "main" });
+  });
+
+  it("revealProjectBranch ignores out-of-order results from superseded requests", async () => {
+    const firstRead = deferred<RepoListing>();
+    invokeMock.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "read_tracked_repo") {
+        if (args?.path === "/a/wt") return firstRead.promise;
+        if (args?.path === "/b/wt") return Promise.resolve(listingWithProject("/b", "/b/wt", "p2"));
+      }
+      if (cmd === "list_tracked_repos")
+        return Promise.resolve([
+          listingWithProject("/a", "/a/wt", "p1"),
+          listingWithProject("/b", "/b/wt", "p2"),
+        ]);
+      if (cmd === "branch_commits") return Promise.resolve([]);
+      return Promise.resolve(null);
+    });
+
+    const first = revealProjectBranch("p1", "/a/wt");
+    const second = revealProjectBranch("p2", "/b/wt");
+
+    await expect(second).resolves.toEqual({ kind: "revealed" });
+    expect(branchSelection.current).toEqual({ repoRoot: "/b", kind: "local", name: "main" });
+
+    firstRead.resolve(listingWithProject("/a", "/a/wt", "p1"));
+    await expect(first).resolves.toEqual({ kind: "superseded" });
+    expect(branchSelection.current).toEqual({ repoRoot: "/b", kind: "local", name: "main" });
+  });
+
+  it("revealProjectBranch does not collapse an already selected branch", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "read_tracked_repo")
+        return Promise.resolve(listingWithProject("/a", "/a/wt", "p1"));
+      if (cmd === "list_tracked_repos")
+        return Promise.resolve([listingWithProject("/a", "/a/wt", "p1")]);
+      if (cmd === "branch_commits") return Promise.resolve([]);
+      return Promise.resolve(null);
+    });
+
+    await expect(revealProjectBranch("p1", "/a/wt")).resolves.toEqual({ kind: "revealed" });
+    await expect(revealProjectBranch("p1", "/a/wt")).resolves.toEqual({ kind: "revealed" });
 
     expect(view.mode).toBe("git");
     expect(branchSelection.current).toEqual({ repoRoot: "/a", kind: "local", name: "main" });
@@ -575,20 +638,50 @@ describe("gitView store", () => {
       return Promise.resolve(null);
     });
 
-    await expect(revealProjectBranch("p1", "/a/wt")).resolves.toBe(true);
+    await expect(revealProjectBranch("p1", "/a/wt")).resolves.toEqual({ kind: "revealed" });
 
     expect(invokeMock).toHaveBeenCalledWith("add_tracked_repo", { path: "/a/wt" });
     expect(view.mode).toBe("git");
     expect(branchSelection.current).toEqual({ repoRoot: "/a", kind: "local", name: "main" });
   });
 
-  it("revealProjectBranch returns false when no linked branch resolves", async () => {
+  it("revealProjectBranch does not add an already tracked repo with no linked branch", async () => {
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === "read_tracked_repo") return Promise.resolve(listingWithWorktree("/a", "/a/wt"));
       return Promise.resolve(null);
     });
 
-    await expect(revealProjectBranch("missing", "/a/wt")).resolves.toBe(false);
+    await expect(revealProjectBranch("missing", "/a/wt")).resolves.toEqual({ kind: "unresolved" });
+
+    expect(invokeMock.mock.calls.some((c) => c[0] === "add_tracked_repo")).toBe(false);
+    expect(gitView.repos.map((r) => r.repo.root)).toEqual(["/a"]);
+    expect(view.mode).toBe("projects");
+  });
+
+  it("revealProjectBranch does not keep an unavailable probe row after add fails", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "read_tracked_repo") return Promise.resolve(unavailableListing("/not-git"));
+      if (cmd === "add_tracked_repo") return Promise.reject(new Error("not a git repo"));
+      return Promise.resolve(null);
+    });
+
+    await expect(revealProjectBranch("p1", "/not-git")).resolves.toEqual({
+      kind: "failed",
+      message: "not a git repo",
+    });
+
+    expect(invokeMock.mock.calls.some((c) => c[0] === "add_tracked_repo")).toBe(true);
+    expect(gitView.repos).toEqual([]);
+    expect(view.mode).toBe("projects");
+  });
+
+  it("revealProjectBranch returns unresolved when no linked branch resolves", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "read_tracked_repo") return Promise.resolve(listingWithWorktree("/a", "/a/wt"));
+      return Promise.resolve(null);
+    });
+
+    await expect(revealProjectBranch("missing", "/a/wt")).resolves.toEqual({ kind: "unresolved" });
 
     expect(view.mode).toBe("projects");
     expect(branchSelection.current).toBeNull();

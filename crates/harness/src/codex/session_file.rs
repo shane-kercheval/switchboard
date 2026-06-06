@@ -565,7 +565,8 @@ pub fn load_codex_transcript(
         });
     };
 
-    let content = std::fs::read_to_string(&path)?;
+    let content =
+        std::fs::read_to_string(&path).map_err(|e| LoadTranscriptError::Io { path, source: e })?;
 
     let mut transcript = parse_codex_transcript_content(&content, agent_id);
     transcript.meta = Some(merge_meta_with_loaders(

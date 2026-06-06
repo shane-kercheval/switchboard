@@ -229,7 +229,10 @@ pub fn load_gemini_transcript(
     // anything real.
     let mut merged = String::new();
     for path in &candidates {
-        let content = std::fs::read_to_string(path)?;
+        let content = std::fs::read_to_string(path).map_err(|e| LoadTranscriptError::Io {
+            path: path.clone(),
+            source: e,
+        })?;
         match classify_candidate(&content, session_id) {
             CandidateMatch::NoTarget => {}
             CandidateMatch::Ambiguous => return Ok(ambiguous_session_warning()),

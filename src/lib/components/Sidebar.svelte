@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { AgentRecord, AgentId } from "$lib/types";
-  import { runtimes, stopAgent, transcripts } from "$lib/state/index.svelte";
+  import { retryAgentHydration, runtimes, stopAgent, transcripts } from "$lib/state/index.svelte";
   import { removeAgent, renameAgent } from "$lib/state/workspace.svelte";
   import {
     agentSessionInfo,
@@ -15,6 +15,7 @@
   import PlusIcon from "$lib/components/ui/PlusIcon.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import Dialog from "$lib/components/ui/Dialog.svelte";
+  import ErrorDetailsDialog from "$lib/components/ui/ErrorDetailsDialog.svelte";
   import CopyButton from "$lib/components/ui/CopyButton.svelte";
   import StopIcon from "$lib/components/ui/StopIcon.svelte";
   import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
@@ -54,6 +55,12 @@
   let sessionInfoError = $state<{ agentId: AgentId; message: string } | null>(null);
   let resumeAgentId = $state<AgentId | null>(null);
   let resumeOpen = $state(false);
+  /// Verbatim hydration-error dialog (per-agent "history failed to load"). The
+  /// failure lives on `runtime.hydration_error`; this just tracks which agent's
+  /// error is currently shown.
+  let hydrationDetailsOpen = $state(false);
+  let hydrationDetailsName = $state("");
+  let hydrationDetailsError = $state("");
   let removeConfirmAgentId = $state<AgentId | null>(null);
   let removingAgentId = $state<AgentId | null>(null);
   let removeError = $state<{ agentId: AgentId; message: string } | null>(null);
@@ -791,8 +798,37 @@
           {/if}
           {#if !isCollapsed}
             {#if runtime?.hydration_error}
-              <div class="text-status-failed mt-1 text-xs" data-testid="agent-hydration-error">
-                history failed to load: {runtime.hydration_error}
+              <div class="mt-1 space-y-1" data-testid="agent-hydration-error">
+                <!-- Clamp the inline reason to two lines: it keeps an
+                     at-a-glance "why" without a long path-bearing error (the
+                     `LoadTranscriptError::Io` message now names the session
+                     file) ballooning the narrow card. The full verbatim text
+                     stays available via Details. -->
+                <div class="text-status-failed line-clamp-2 text-xs break-words">
+                  history failed to load: {runtime.hydration_error}
+                </div>
+                <div class="flex items-center gap-3 text-xs">
+                  <button
+                    type="button"
+                    class="text-accent hover:underline"
+                    data-testid="agent-hydration-retry"
+                    onclick={() => void retryAgentHydration(agent.id)}
+                  >
+                    Retry
+                  </button>
+                  <button
+                    type="button"
+                    class="text-muted hover:text-fg hover:underline"
+                    data-testid="agent-hydration-details"
+                    onclick={() => {
+                      hydrationDetailsName = agent.name;
+                      hydrationDetailsError = runtime.hydration_error ?? "";
+                      hydrationDetailsOpen = true;
+                    }}
+                  >
+                    Details
+                  </button>
+                </div>
               </div>
             {/if}
             {#if runtime?.parse_warnings && runtime.parse_warnings.length > 0}
@@ -1013,3 +1049,10 @@
     {/if}
   </div>
 </Dialog>
+
+<ErrorDetailsDialog
+  bind:open={hydrationDetailsOpen}
+  title={`Couldn't load ${hydrationDetailsName}'s history`}
+  message="This agent's history failed to load. The exact error is below — copy it into a bug report."
+  details={hydrationDetailsError}
+/>

@@ -59,6 +59,11 @@ import {
 export type ProjectConversationState = {
   items: ConversationItem[];
   status: "pending" | "loading" | "complete" | "failed";
+  /// Verbatim error text when `status === "failed"` (the merged-conversation
+  /// load rejected outright). Retained — not just logged — so the transcript
+  /// region can surface it with a copyable Details affordance and a Retry.
+  /// Absent in every non-failed state.
+  error?: string;
 };
 
 export type ActivationResult = "activated" | "superseded" | "failed";
@@ -573,9 +578,27 @@ export async function hydrateProject(projectId: ProjectId): Promise<void> {
 
     conversations[projectId] = { items: overlay, status: "complete" };
   } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
     console.warn("[switchboard] hydrateProject failed", { project_id: projectId, error: e });
-    conversations[projectId] = { items: [], status: "failed" };
+    conversations[projectId] = { items: [], status: "failed", error: message };
   }
+}
+
+/// Re-attempt a project's conversation hydration after an outright load
+/// failure. Clears the sticky `hydrationStarted` guard so `hydrateProject`
+/// re-runs (the `loadStarted` open/roster guard is untouched — open succeeded;
+/// only the conversation merge failed). A failed load applied nothing, so the
+/// re-attempt cannot duplicate content.
+export async function retryProjectHydration(projectId: ProjectId): Promise<void> {
+  // Re-entrancy guard, mirroring `retryAgentHydration`. `hydrateProject` also
+  // feeds each agent's turns through the per-agent append-merge
+  // (`applyAgentHydrate`), so two concurrent project retries duplicate agent
+  // turns just like the per-agent path — not only the `conversations` overlay
+  // (which is last-write-wins and would be fine). `hydrateProject` sets status
+  // `"loading"` synchronously before its await, so a racing retry sees it here.
+  if (conversations[projectId]?.status === "loading") return;
+  hydrationStarted.delete(projectId);
+  await hydrateProject(projectId);
 }
 
 /// Append a freshly created/attached agent to the active project's roster so

@@ -16,6 +16,7 @@
   import Button from "$lib/components/ui/Button.svelte";
   import AppShell from "$lib/components/ui/AppShell.svelte";
   import EmptyState from "$lib/components/ui/EmptyState.svelte";
+  import ErrorDetailsDialog from "$lib/components/ui/ErrorDetailsDialog.svelte";
   import SettingsButton from "$lib/components/ui/SettingsButton.svelte";
   import SidebarToggleButton from "$lib/components/ui/SidebarToggleButton.svelte";
   import DevIndicator from "$lib/components/ui/DevIndicator.svelte";
@@ -30,6 +31,7 @@
     dismissAgentCreationFailure,
     loadWorkspace,
     projects,
+    retryProjectHydration,
     selection,
     startProjectActivityObserver,
     workspace,
@@ -172,6 +174,12 @@
   function retryActivation(): void {
     if (selection.activeProjectId !== null) void activateProject(selection.activeProjectId);
   }
+
+  // Verbatim-error dialog for the project-open failure (the center-pane
+  // activation-error state). Mirrors the in-transcript Details affordance so a
+  // user can copy the exact error into a bug report regardless of which
+  // failure surface they hit.
+  let activationDetailsOpen = $state<boolean>(false);
 
   // "Add project" dialog. The form (`CreateProjectForm`) owns both modes' state
   // and commits; App only tracks open/close and a `busy` flag the form drives so
@@ -362,14 +370,24 @@
             description={selection.activationError}
           >
             {#snippet action()}
-              <Button
-                variant="secondary"
-                size="sm"
-                data-testid="activation-retry"
-                onclick={retryActivation}
-              >
-                Retry
-              </Button>
+              <div class="flex items-center gap-2">
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  data-testid="activation-retry"
+                  onclick={retryActivation}
+                >
+                  Retry
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  data-testid="activation-details"
+                  onclick={() => (activationDetailsOpen = true)}
+                >
+                  Details
+                </Button>
+              </div>
             {/snippet}
           </EmptyState>
         {:else if projectSwitching || !rosterLoaded}
@@ -391,6 +409,11 @@
                 agents={activeAgents}
                 overlay={activeConvo?.items ?? []}
                 loadStatus={activeConvo?.status ?? "complete"}
+                loadError={activeConvo?.error}
+                onRetryLoad={() => {
+                  if (selection.activeProjectId !== null)
+                    void retryProjectHydration(selection.activeProjectId);
+                }}
               />
               <!-- Remount per project: besides re-seeding the per-project
                    draft/recipient state, this resets sendError, the @-menu, and
@@ -435,5 +458,12 @@
     {availability}
     onSubmit={handleAddAgent}
     onCancel={handleAddAgentCancel}
+  />
+
+  <ErrorDetailsDialog
+    bind:open={activationDetailsOpen}
+    title="Couldn't open this project"
+    message="Opening this project failed. The exact error is below — copy it into a bug report."
+    details={selection.activationError ?? "No error detail was reported."}
   />
 </main>

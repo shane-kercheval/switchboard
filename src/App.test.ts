@@ -1356,6 +1356,12 @@ describe("App", () => {
     await waitFor(() =>
       expect(screen.getByTestId("agent-hydration-error")).toHaveTextContent("corrupt sidecar"),
     );
+    // The same per-agent failure also surfaces as pinned transcript-region
+    // chrome (where the user is looking), naming the agent — without blanking
+    // the healthy agent's history.
+    expect(screen.getByTestId("agent-hydration-failed")).toHaveTextContent(
+      "Couldn't load broken's history",
+    );
   });
 
   // --- sidebar collapse / expand ---

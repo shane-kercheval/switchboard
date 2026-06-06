@@ -96,7 +96,7 @@ pub fn load_claude_transcript(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok(LoadedTranscript::default());
         }
-        Err(e) => return Err(LoadTranscriptError::Io(e)),
+        Err(e) => return Err(LoadTranscriptError::Io { path, source: e }),
     };
 
     let mut state = ReconstructionState::new(agent_id);

@@ -81,7 +81,7 @@ pub fn load_antigravity_transcript(
                 ..LoadedTranscript::default()
             });
         }
-        Err(e) => return Err(LoadTranscriptError::Io(e)),
+        Err(e) => return Err(LoadTranscriptError::Io { path, source: e }),
     };
 
     let mut transcript = parse_antigravity_transcript_content(&content, agent_id);

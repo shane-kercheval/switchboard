@@ -204,6 +204,102 @@ describe("workspace project activity", () => {
     expect(ws.backgroundCompletedProjectIds[PROJECT_1]).toBeUndefined();
   });
 
+  it("retains the error text on the conversation state when hydration fails", async () => {
+    const ws = await loadWorkspaceState();
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "load_project_conversation") throw new Error("journal read failed");
+      return undefined;
+    });
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await ws.hydrateProject(PROJECT_1);
+
+    expect(ws.conversations[PROJECT_1]?.status).toBe("failed");
+    expect(ws.conversations[PROJECT_1]?.error).toBe("journal read failed");
+    warnSpy.mockRestore();
+  });
+
+  it("is sticky on failure; retryProjectHydration clears the guard and re-runs", async () => {
+    const ws = await loadWorkspaceState();
+    let calls = 0;
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "load_project_conversation") {
+        calls += 1;
+        throw new Error("still broken");
+      }
+      return undefined;
+    });
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await ws.hydrateProject(PROJECT_1);
+    // Second call is a no-op — the per-project guard is sticky across failure.
+    await ws.hydrateProject(PROJECT_1);
+    expect(calls).toBe(1);
+
+    // Retry clears the guard so the load actually re-runs.
+    await ws.retryProjectHydration(PROJECT_1);
+    expect(calls).toBe(2);
+    expect(ws.conversations[PROJECT_1]?.status).toBe("failed");
+    warnSpy.mockRestore();
+  });
+
+  it("ignores a concurrent project retry while one is already in flight", async () => {
+    const ws = await loadWorkspaceState();
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "load_project_conversation") throw new Error("boom");
+      return undefined;
+    });
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await ws.hydrateProject(PROJECT_1);
+    expect(ws.conversations[PROJECT_1]?.status).toBe("failed");
+
+    // Slow success; fire two retries before it resolves. The second must see
+    // the in-flight "loading" status and no-op — `hydrateProject` feeds agent
+    // turns through the per-agent append-merge, so a second concurrent run
+    // would duplicate them.
+    let resolveLoad: (v: unknown) => void = () => {};
+    invokeMock.mockImplementation((cmd: string): Promise<unknown> => {
+      if (cmd === "load_project_conversation") {
+        return new Promise((r) => {
+          resolveLoad = r;
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+    const p1 = ws.retryProjectHydration(PROJECT_1);
+    const p2 = ws.retryProjectHydration(PROJECT_1);
+    resolveLoad({ items: [], agents: [] });
+    await Promise.all([p1, p2]);
+
+    const convoCalls = invokeMock.mock.calls.filter((c) => c[0] === "load_project_conversation");
+    // Initial failed load + exactly one retry load = 2 (not 3).
+    expect(convoCalls).toHaveLength(2);
+    expect(ws.conversations[PROJECT_1]?.status).toBe("complete");
+    warnSpy.mockRestore();
+  });
+
+  it("retry that succeeds clears the failed state and applies the overlay", async () => {
+    const ws = await loadWorkspaceState();
+    let attempt = 0;
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "load_project_conversation") {
+        attempt += 1;
+        if (attempt === 1) throw new Error("boom");
+        return { items: [], agents: [] };
+      }
+      return undefined;
+    });
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await ws.hydrateProject(PROJECT_1);
+    expect(ws.conversations[PROJECT_1]?.status).toBe("failed");
+
+    await ws.retryProjectHydration(PROJECT_1);
+    expect(ws.conversations[PROJECT_1]?.status).toBe("complete");
+    expect(ws.conversations[PROJECT_1]?.error).toBeUndefined();
+    warnSpy.mockRestore();
+  });
+
   it("removing a busy project clears activity observer memory and local markers", async () => {
     const state = await loadAgentState();
     const ws = await loadWorkspaceState();

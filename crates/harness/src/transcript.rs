@@ -172,8 +172,17 @@ pub struct ParseWarning {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum LoadTranscriptError {
-    #[error("I/O error reading session file: {0}")]
-    Io(#[from] std::io::Error),
+    /// Reading a session file that exists failed (permissions, mid-rotation,
+    /// FS error). The `path` is included so the surfaced message names the file
+    /// the user (or a bug report) can investigate — the OS error alone omits
+    /// it. There is no `#[from] std::io::Error`: callers must attach the path
+    /// at the read site, which is the whole point.
+    #[error("I/O error reading session file {}: {source}", path.display())]
+    Io {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Build a `ParseWarning` for a stale-sidecar case (sidecar exists, session
@@ -296,6 +305,23 @@ mod tests {
         assert!(value["meta"].is_null());
         assert!(value["last_rate_limit"].is_null());
         assert_eq!(value["warnings"], json!([]));
+    }
+
+    #[test]
+    fn io_error_display_names_the_path_and_os_error() {
+        let err = LoadTranscriptError::Io {
+            path: std::path::PathBuf::from("/tmp/sessions/abc.jsonl"),
+            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("/tmp/sessions/abc.jsonl"),
+            "message must name the session file path for a bug report: {msg}"
+        );
+        assert!(
+            msg.contains("permission denied"),
+            "message must carry the underlying OS error: {msg}"
+        );
     }
 
     #[test]

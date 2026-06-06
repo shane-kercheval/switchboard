@@ -11,6 +11,12 @@ import type {
   RepoListing,
 } from "$lib/types";
 import { ALL_HARNESSES } from "$lib/harnessDisplay";
+// Static import so App.svelte's (large) component-tree transform happens at
+// module collection, not inside the first test that calls `mountApp`. `vi.mock`
+// is hoisted above all imports, so the mocked IPC/event/dialog modules still
+// apply. Importing it lazily charged the cold transform (~8s locally, more on
+// CI) to the first test's 15s budget, which intermittently timed it out.
+import App from "./App.svelte";
 
 // App.svelte tests focus on the workspace-level orchestration: eager registry
 // load, lazy per-project activation (roster + hydration), display-only project
@@ -308,8 +314,7 @@ function seedProject(opts: {
   if (opts.conversation !== undefined) backend.conversations.set(opts.projectId, opts.conversation);
 }
 
-async function mountApp() {
-  const App = (await import("./App.svelte")).default;
+function mountApp() {
   return render(App);
 }
 

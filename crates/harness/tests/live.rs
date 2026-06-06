@@ -25,6 +25,17 @@ fn turn_end_model_effort(events: &[AdapterEvent]) -> Option<(Option<String>, Opt
     })
 }
 
+/// The `hydration_key` of every hydrated agent turn that has one, in order.
+fn agent_hydration_keys(t: &switchboard_harness::LoadedTranscript) -> Vec<String> {
+    t.turns
+        .iter()
+        .filter_map(|turn| match turn {
+            Turn::Agent { hydration_key, .. } => hydration_key.clone(),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Per-turn `model` of every hydrated agent turn, in order.
 fn hydrated_turn_models(t: &switchboard_harness::LoadedTranscript) -> Vec<Option<String>> {
     t.turns
@@ -623,6 +634,81 @@ async fn live_claude_resume_reuses_session() {
     assert!(
         completed2,
         "second turn with same session_id should complete"
+    );
+}
+
+/// The backend contract the staleness refresh stands on: continuing a session
+/// (a second turn appended to the file, exactly as a TUI continuation does)
+/// makes a re-read return the new turn with a **new, distinct** `hydration_key`
+/// while the first turn's key stays **identical** — so the frontend keyed merge
+/// adds the new turn exactly once and never re-duplicates the existing one. A
+/// CLI bump that reused an id across turns, or changed an existing turn's id on
+/// resume, would silently break refresh (drop or duplicate turns); this catches
+/// it live.
+#[tokio::test]
+#[ignore = "requires claude installed — run with: make test-live"]
+async fn live_claude_refresh_picks_up_appended_turn() {
+    let adapter = ClaudeCodeAdapter::new();
+    let session_id = Uuid::now_v7();
+    let agent_id = Uuid::now_v7();
+    let agent = AgentRecord {
+        model: None,
+        effort: None,
+        id: agent_id,
+        project_id: Uuid::now_v7(),
+        name: "refresh-test".to_owned(),
+        harness: HarnessKind::ClaudeCode,
+        session_locator: Some(SessionLocator::Uuid(session_id)),
+        created_at: chrono::Utc::now(),
+    };
+
+    let _: Vec<AdapterEvent> = adapter
+        .dispatch(
+            &agent,
+            Path::new("/tmp"),
+            "Say ACK",
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("first dispatch should succeed")
+        .collect()
+        .await;
+    let after_one = load_claude_transcript(&home_dir(), Path::new("/tmp"), session_id, agent_id)
+        .expect("hydrate after the first turn");
+    let keys_one = agent_hydration_keys(&after_one);
+    assert_eq!(keys_one.len(), 1, "one agent turn after the first dispatch");
+
+    // Second turn resumes the same session → appends to the same file, like a TUI
+    // continuation the refresh exists to pick up.
+    let _: Vec<AdapterEvent> = adapter
+        .dispatch(
+            &agent,
+            Path::new("/tmp"),
+            "Say ACK again",
+            Uuid::now_v7(),
+            DispatchOptions::default(),
+        )
+        .await
+        .expect("second dispatch should succeed")
+        .collect()
+        .await;
+    let after_two = load_claude_transcript(&home_dir(), Path::new("/tmp"), session_id, agent_id)
+        .expect("hydrate after the second turn");
+    let keys_two = agent_hydration_keys(&after_two);
+
+    assert_eq!(
+        keys_two.len(),
+        2,
+        "two agent turns after the second dispatch"
+    );
+    assert_eq!(
+        keys_two[0], keys_one[0],
+        "the first turn's key is unchanged across the re-read (no spurious dup on refresh)"
+    );
+    assert_ne!(
+        keys_two[0], keys_two[1],
+        "the appended turn carries a new, distinct key (merge adds it exactly once)"
     );
 }
 

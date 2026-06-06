@@ -66,6 +66,27 @@ impl HarnessKind {
             Self::Gemini | Self::Antigravity => false,
         }
     }
+
+    /// Whether Switchboard may re-read this harness's session file to pick up
+    /// turns the user added by continuing the session in the harness's own TUI
+    /// (staleness refresh on project re-activation).
+    ///
+    /// This is the **live-matched** capability: only true when the live stream's
+    /// per-turn id equals the one the session file stores, so a turn that
+    /// streamed live *and* is on disk dedups as one. Without it, re-reading a
+    /// file that already contains a turn we streamed live would duplicate that
+    /// turn (the disk copy's hydration key wouldn't match the live turn's). Only
+    /// Claude is confirmed (final assistant `message.id` round-trips live↔disk);
+    /// Codex/Gemini have a re-parse-stable disk key but their live-stream parity
+    /// is unprobed, so they stay once-per-session; Antigravity has no per-turn id
+    /// at all. Same authority + exhaustiveness role as the two siblings above.
+    #[must_use]
+    pub fn supports_refresh(self) -> bool {
+        match self {
+            Self::ClaudeCode => true,
+            Self::Codex | Self::Gemini | Self::Antigravity => false,
+        }
+    }
 }
 
 /// The two independent per-agent selection axes. A closed, complete set — model
@@ -180,6 +201,14 @@ mod tests {
         assert!(HarnessKind::Codex.supports_effort_selection());
         assert!(!HarnessKind::Gemini.supports_effort_selection());
         assert!(!HarnessKind::Antigravity.supports_effort_selection());
+    }
+
+    #[test]
+    fn supports_refresh_is_claude_only() {
+        assert!(HarnessKind::ClaudeCode.supports_refresh());
+        assert!(!HarnessKind::Codex.supports_refresh());
+        assert!(!HarnessKind::Gemini.supports_refresh());
+        assert!(!HarnessKind::Antigravity.supports_refresh());
     }
 
     #[test]

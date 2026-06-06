@@ -1946,6 +1946,123 @@ pub struct AgentSessionInfo {
     pub resume_command: Option<String>,
 }
 
+/// Resolve an agent's on-disk session-file path, or `None` when the agent has
+/// no locator / no file yet (or a harness we don't resolve). The single
+/// per-harness path-resolution authority — both [`agent_session_info_impl`] and
+/// [`project_session_fingerprints_impl`] go through here so the freshness check
+/// reads the *same* file transcript loading does, with no second copy of the
+/// resolution logic to drift.
+fn resolve_session_file(agent: &AgentRecord, directory: &Path, home_dir: &Path) -> Option<PathBuf> {
+    match agent.harness {
+        HarnessKind::ClaudeCode => {
+            let sid = locator_uuid(agent)?;
+            let path = switchboard_harness::claude_session_file_path(home_dir, directory, &sid);
+            path.exists().then_some(path)
+        }
+        HarnessKind::Gemini => {
+            let sid = locator_uuid(agent)?;
+            let mut candidates =
+                switchboard_harness::gemini_session_file_candidates(home_dir, directory, &sid);
+            candidates.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+            candidates.pop()
+        }
+        HarnessKind::Codex => {
+            let (thread_id, partition_date) = agent
+                .session_locator
+                .as_ref()
+                .and_then(SessionLocator::as_codex)?;
+            switchboard_harness::codex::session_file::locate_session_file(
+                home_dir,
+                partition_date,
+                thread_id,
+            )
+        }
+        HarnessKind::Antigravity => {
+            let conversation_id = locator_uuid(agent)?;
+            let path =
+                switchboard_harness::antigravity::paths::transcript_path(home_dir, conversation_id);
+            path.exists().then_some(path)
+        }
+        _ => None,
+    }
+}
+
+/// A session file's freshness fingerprint — the inputs to "did this file change
+/// since we last read it." Gated on `(source_path, modified_at, byte_len)`
+/// together: `byte_len` is a near-free, more reliable signal than mtime alone
+/// for an append-only JSONL (and the offset baseline if incremental re-read is
+/// ever added), and `source_path` catches a file that moved (e.g. Gemini's
+/// candidate selection picking a different file).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SessionFingerprint {
+    pub source_path: String,
+    pub modified_at: chrono::DateTime<chrono::Utc>,
+    pub byte_len: u64,
+}
+
+/// Per-agent freshness record for the staleness-refresh gate.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AgentSessionFingerprint {
+    pub agent_id: AgentId,
+    /// Whether this agent's harness may be refreshed at all (the live-matched
+    /// capability — see [`HarnessKind::supports_refresh`]). The frontend only
+    /// acts on a changed fingerprint when this is true.
+    pub refresh_capable: bool,
+    /// The current fingerprint, or `None` when refresh is unsupported (we don't
+    /// stat a file that can never trigger a refresh) or no session file exists.
+    pub fingerprint: Option<SessionFingerprint>,
+}
+
+fn fingerprint_of(path: &Path) -> Option<SessionFingerprint> {
+    let meta = std::fs::metadata(path).ok()?;
+    let modified_at: chrono::DateTime<chrono::Utc> = meta.modified().ok()?.into();
+    Some(SessionFingerprint {
+        source_path: path.to_string_lossy().into_owned(),
+        modified_at,
+        byte_len: meta.len(),
+    })
+}
+
+/// Cheap freshness check for a project's agents: resolve + `stat` each
+/// refresh-capable agent's session file (no parse), returning a fingerprint the
+/// frontend diffs against the value it stored at last hydration to decide
+/// whether to re-read. Non-refresh-capable agents return
+/// `refresh_capable: false` with no fingerprint — they can never trigger a
+/// refresh, so statting them would be wasted I/O. This is the gate that keeps an
+/// unchanged file from ever being re-parsed: the (expensive) transcript load is
+/// only invoked when this (cheap) check shows movement.
+///
+/// `home_dir` is injected for testability; the Tauri shim reads `$HOME`.
+pub fn project_session_fingerprints_impl(
+    state: &AppState,
+    project_id: ProjectId,
+    home_dir: &Path,
+) -> Result<Vec<AgentSessionFingerprint>, AppError> {
+    let project = match lock(&state.projects).get(&project_id).cloned() {
+        Some(loaded) => loaded,
+        None => find_project_in_directories(state, project_id)?,
+    };
+    let directory = project.directory.clone();
+    let agents = project.list_agents()?;
+    Ok(agents
+        .into_iter()
+        .map(|agent| {
+            let refresh_capable = agent.harness.supports_refresh();
+            let fingerprint = refresh_capable
+                .then(|| {
+                    resolve_session_file(&agent, &directory, home_dir)
+                        .and_then(|p| fingerprint_of(&p))
+                })
+                .flatten();
+            AgentSessionFingerprint {
+                agent_id: agent.id,
+                refresh_capable,
+                fingerprint,
+            }
+        })
+        .collect())
+}
+
 /// Resolve the per-agent session actions ([`AgentSessionInfo`]). Mirrors
 /// [`load_agent_transcript`]'s per-harness session-id resolution
 /// (Claude/Gemini/Antigravity from `AgentRecord.session_locator`; Codex from its
@@ -1960,55 +2077,21 @@ pub fn agent_session_info_impl(
     let (project, agent) = lookup_agent(state, agent_id)?;
     let directory = project.directory.clone();
 
-    // (session file if it exists, resume identifier if the agent can be resumed)
-    let (session_file, resume_ref): (Option<PathBuf>, Option<String>) = match agent.harness {
-        HarnessKind::ClaudeCode => match locator_uuid(&agent) {
-            Some(sid) => {
-                let path =
-                    switchboard_harness::claude_session_file_path(home_dir, &directory, &sid);
-                let file = path.exists().then_some(path);
-                let resume = file.as_ref().map(|_| sid.to_string());
-                (file, resume)
-            }
-            None => (None, None),
-        },
-        HarnessKind::Gemini => match locator_uuid(&agent) {
-            Some(sid) => {
-                let mut candidates =
-                    switchboard_harness::gemini_session_file_candidates(home_dir, &directory, &sid);
-                candidates.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
-                let file = candidates.pop();
-                let resume = file.as_ref().map(|_| sid.to_string());
-                (file, resume)
-            }
-            None => (None, None),
-        },
-        HarnessKind::Codex => match agent
+    let session_file = resolve_session_file(&agent, &directory, home_dir);
+    // Resume identifier (only when the agent can be resumed): Claude/Gemini by
+    // session uuid but only once a file exists; Codex/Antigravity by their
+    // locator regardless. Shares the file resolution above; this match only
+    // covers the identifier (and the unsupported-harness guard).
+    let resume_ref: Option<String> = match agent.harness {
+        HarnessKind::ClaudeCode | HarnessKind::Gemini => locator_uuid(&agent)
+            .filter(|_| session_file.is_some())
+            .map(|sid| sid.to_string()),
+        HarnessKind::Codex => agent
             .session_locator
             .as_ref()
             .and_then(SessionLocator::as_codex)
-        {
-            Some((thread_id, partition_date)) => {
-                let file = switchboard_harness::codex::session_file::locate_session_file(
-                    home_dir,
-                    partition_date,
-                    thread_id,
-                );
-                (file, Some(thread_id.to_owned()))
-            }
-            None => (None, None),
-        },
-        HarnessKind::Antigravity => match locator_uuid(&agent) {
-            Some(conversation_id) => {
-                let path = switchboard_harness::antigravity::paths::transcript_path(
-                    home_dir,
-                    conversation_id,
-                );
-                let file = path.exists().then_some(path);
-                (file, Some(conversation_id.to_string()))
-            }
-            None => (None, None),
-        },
+            .map(|(thread_id, _)| thread_id.to_owned()),
+        HarnessKind::Antigravity => locator_uuid(&agent).map(|c| c.to_string()),
         _ => return Err(AppError::UnsupportedHarness),
     };
 
@@ -5180,6 +5263,61 @@ mod tests {
         // No metadata sidecar staged → both rate-limit fields stay None.
         assert!(result.last_rate_limit.is_none());
         assert!(result.last_rate_limit_as_of.is_none());
+    }
+
+    #[tokio::test]
+    async fn project_session_fingerprints_marks_claude_capable_with_file_and_codex_incapable() {
+        let (tmp_workdir, tmp_home, state, proj) = fresh_state_with_active_project("alpha").await;
+
+        // Claude agent with a staged session file → refresh-capable, fingerprint present.
+        let session_id = Uuid::now_v7();
+        let staged = stage_claude_session_file(tmp_home.path(), tmp_workdir.path(), &session_id);
+        let claude = attach_agent_impl(
+            &state,
+            "claude",
+            HarnessKind::ClaudeCode,
+            &session_id.to_string(),
+            tmp_home.path(),
+            None,
+            None,
+        )
+        .unwrap();
+        // Codex agent (no dispatch yet) → not refresh-capable.
+        let codex = create_agent_impl(&state, "codex", HarnessKind::Codex, None, None).unwrap();
+
+        let fps = project_session_fingerprints_impl(&state, proj.id, tmp_home.path()).unwrap();
+
+        let claude_fp = fps.iter().find(|f| f.agent_id == claude.id).unwrap();
+        assert!(
+            claude_fp.refresh_capable,
+            "Claude is the live-matched harness"
+        );
+        let fp = claude_fp
+            .fingerprint
+            .as_ref()
+            .expect("a staged Claude file yields a fingerprint");
+        assert_eq!(fp.source_path, staged.to_string_lossy());
+        assert_eq!(fp.byte_len, 3, "the staged `{{}}\\n` is 3 bytes");
+
+        let codex_fp = fps.iter().find(|f| f.agent_id == codex.id).unwrap();
+        assert!(!codex_fp.refresh_capable);
+        assert!(
+            codex_fp.fingerprint.is_none(),
+            "non-refresh-capable agents are not statted"
+        );
+    }
+
+    #[tokio::test]
+    async fn project_session_fingerprints_claude_without_file_is_capable_but_unfingerprinted() {
+        let (_tmp_workdir, tmp_home, state, proj) = fresh_state_with_active_project("alpha").await;
+        // Claude agent, no session file on disk → refresh-capable but no fingerprint.
+        let claude =
+            create_agent_impl(&state, "claude", HarnessKind::ClaudeCode, None, None).unwrap();
+
+        let fps = project_session_fingerprints_impl(&state, proj.id, tmp_home.path()).unwrap();
+        let f = fps.iter().find(|f| f.agent_id == claude.id).unwrap();
+        assert!(f.refresh_capable);
+        assert!(f.fingerprint.is_none(), "no file yet → no fingerprint");
     }
 
     #[test]

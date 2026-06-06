@@ -26,19 +26,21 @@ use tauri::{Emitter, Manager, State};
 
 use crate::commands::ProjectConversation;
 use crate::commands::{
-    AgentSessionInfo, DirectoryInfo, HarnessInstallStatus, ProjectListing, WorkspaceDirectories,
-    add_mcp_provider_impl, agent_session_info_impl, attach_agent_impl, cancel_agent_impl,
-    cancel_send_impl, cancel_turn_impl, check_antigravity_auth_impl, check_antigravity_binary_impl,
-    check_claude_auth_impl, check_claude_binary_impl, check_codex_auth_impl,
-    check_codex_binary_impl, check_gemini_auth_impl, check_gemini_binary_impl, create_agent_impl,
-    create_project_impl, delete_project_impl, get_harness_install_status_impl, init_directory_impl,
-    list_agents_impl, list_mcp_providers_impl, list_projects_impl, list_prompts_impl,
+    AgentSessionFingerprint, AgentSessionInfo, DirectoryInfo, HarnessInstallStatus, ProjectListing,
+    WorkspaceDirectories, add_mcp_provider_impl, agent_session_info_impl, attach_agent_impl,
+    cancel_agent_impl, cancel_send_impl, cancel_turn_impl, check_antigravity_auth_impl,
+    check_antigravity_binary_impl, check_claude_auth_impl, check_claude_binary_impl,
+    check_codex_auth_impl, check_codex_binary_impl, check_gemini_auth_impl,
+    check_gemini_binary_impl, create_agent_impl, create_project_impl, delete_project_impl,
+    get_harness_install_status_impl, init_directory_impl, list_agents_impl,
+    list_mcp_providers_impl, list_projects_impl, list_prompts_impl,
     list_workspace_directories_impl, load_project_conversation_impl, load_transcript_impl,
-    open_project_impl, parse_uuid, pick_directory_impl, remove_agent_impl, remove_directory_impl,
-    remove_mcp_provider_impl, remove_queued_message_impl, rename_agent_impl, rename_project_impl,
-    render_prompt_impl, search_project_files_in_root, search_project_files_root_impl,
-    send_message_impl, set_active_project_impl, set_agent_effort_impl, set_agent_model_impl,
-    set_project_archived_impl, test_mcp_connection_impl, validate_external_url,
+    open_project_impl, parse_uuid, pick_directory_impl, project_session_fingerprints_impl,
+    remove_agent_impl, remove_directory_impl, remove_mcp_provider_impl, remove_queued_message_impl,
+    rename_agent_impl, rename_project_impl, render_prompt_impl, search_project_files_in_root,
+    search_project_files_root_impl, send_message_impl, set_active_project_impl,
+    set_agent_effort_impl, set_agent_model_impl, set_project_archived_impl,
+    test_mcp_connection_impl, validate_external_url,
 };
 use crate::state::AppState;
 
@@ -519,6 +521,18 @@ async fn load_project_conversation(
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn project_session_fingerprints(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<Vec<AgentSessionFingerprint>, String> {
+    let id = parse_uuid(&project_id).map_err(|e| e.to_string())?;
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    project_session_fingerprints_impl(state.inner(), id, &home).map_err(|e| e.to_string())
+}
+
 /// Bridges the dispatcher's `EventEmitter` abstraction onto Tauri's
 /// `AppHandle::emit`. Emit failures are logged — Tauri's `emit` returns
 /// `Err` when payload serialization fails, which can't happen for our
@@ -789,6 +803,7 @@ pub fn run() {
             open_external_url,
             load_transcript,
             load_project_conversation,
+            project_session_fingerprints,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

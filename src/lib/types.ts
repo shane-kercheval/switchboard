@@ -445,6 +445,27 @@ export type ProjectConversation = {
   agents: AgentConversationMeta[];
 };
 
+// Mirror of Rust `SessionFingerprint` / `AgentSessionFingerprint`
+// (`crates/app/src/commands.rs`). The staleness-refresh gate: a cheap per-agent
+// stat (no parse) the frontend diffs against the value stored at last hydration
+// to decide whether to re-read a session file the user may have continued in the
+// harness's own TUI.
+export type SessionFingerprint = {
+  source_path: string;
+  // ISO-8601 instant of the file's last modification.
+  modified_at: string;
+  byte_len: number;
+};
+
+export type AgentSessionFingerprint = {
+  agent_id: AgentId;
+  // Whether this agent's harness may be refreshed at all (the live-matched
+  // capability). The frontend only acts on a changed fingerprint when true.
+  refresh_capable: boolean;
+  // Absent when refresh is unsupported (not statted) or no session file exists.
+  fingerprint?: SessionFingerprint | null;
+};
+
 export type DirectoryInfo = {
   path: string;
   has_switchboard: boolean;

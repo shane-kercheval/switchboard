@@ -3,6 +3,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  AgentSessionFingerprint,
   AgentId,
   AgentRecord,
   DirectoryInfo,
@@ -118,6 +119,14 @@ export async function removeDirectory(path: string): Promise<void> {
 // `loadTranscript` for the unified view.
 export async function loadProjectConversation(projectId: ProjectId): Promise<ProjectConversation> {
   return await invoke<ProjectConversation>("load_project_conversation", { projectId });
+}
+
+// Cheap per-agent session-file freshness check (stat only, no parse) that gates
+// the staleness re-read on project re-activation.
+export async function projectSessionFingerprints(
+  projectId: ProjectId,
+): Promise<AgentSessionFingerprint[]> {
+  return await invoke<AgentSessionFingerprint[]>("project_session_fingerprints", { projectId });
 }
 
 export async function openProject(projectId: ProjectId): Promise<ProjectSummary> {

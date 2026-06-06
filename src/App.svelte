@@ -40,7 +40,7 @@
   import { harnessAvailability, refreshHarnessAvailability } from "$lib/harnessAvailability.svelte";
   import { loadPreferences } from "$lib/preferences.svelte";
   import GitView from "$lib/components/GitView.svelte";
-  import { view, setViewMode, enterGitView } from "$lib/state/gitView.svelte";
+  import { view, setViewMode, enterGitView, revealProjectBranch } from "$lib/state/gitView.svelte";
   import {
     SEGMENTED_MAIN_CONTAINER_CLASS,
     SEGMENTED_MAIN_ITEM_ACTIVE_CLASS,
@@ -111,6 +111,9 @@
       // ⌘⇧G toggles the top-level Projects ↔ Git view.
       event.preventDefault();
       selectView(view.mode === "git" ? "projects" : "git");
+    } else if (key === "f" && event.shiftKey) {
+      event.preventDefault();
+      void openActiveProjectInGit();
     } else if (key === "b" && event.shiftKey) {
       event.preventDefault();
       agentsSidebarOpen = !agentsSidebarOpen;
@@ -145,6 +148,17 @@
       void enterGitView();
     } else {
       setViewMode("projects");
+    }
+  }
+
+  async function openActiveProjectInGit(): Promise<void> {
+    if (activeProject === null) return;
+    settingsOpen = false;
+    const result = await revealProjectBranch(activeProject.id, activeProject.directory);
+    if (result.kind === "failed") {
+      console.warn("[switchboard] project git shortcut failed", result.message);
+    } else if (result.kind === "unresolved") {
+      console.warn("[switchboard] project git shortcut could not resolve a local branch");
     }
   }
 

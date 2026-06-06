@@ -1,5 +1,13 @@
 <script lang="ts">
-  import { GitBranch } from "@lucide/svelte";
+  import {
+    Archive,
+    ArchiveRestore,
+    Check,
+    GitBranch,
+    MoreHorizontal,
+    Trash2,
+    X,
+  } from "@lucide/svelte";
   import {
     activateProject,
     backgroundCompletedProjectIds,
@@ -26,7 +34,8 @@
   import PlusIcon from "$lib/components/ui/PlusIcon.svelte";
   import StopIcon from "$lib/components/ui/StopIcon.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
-  import Tooltip from "$lib/components/ui/Tooltip.svelte";
+  import DropdownMenu from "$lib/components/ui/DropdownMenu.svelte";
+  import DropdownMenuItem from "$lib/components/ui/DropdownMenuItem.svelte";
   import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
   import {
     SEGMENTED_CONTAINER_CLASS,
@@ -61,6 +70,7 @@
   let archiveError = $state<{ projectId: ProjectId; message: string } | null>(null);
   let deleteError = $state<{ projectId: ProjectId; message: string } | null>(null);
   let gitRevealError = $state<{ projectId: ProjectId; message: string } | null>(null);
+  let openProjectActionsId = $state<ProjectId | null>(null);
   let relativeNow = $state(Date.now());
 
   /// `Active | Archived` view filter. Default `Active`. A true either/or split:
@@ -90,10 +100,6 @@
       SEGMENTED_MAIN_ITEM_CLASS,
       selected ? SEGMENTED_MAIN_ITEM_ACTIVE_CLASS : SEGMENTED_ITEM_INACTIVE_CLASS,
     );
-  const projectActionClass =
-    "text-muted hover:bg-border/60 hover:text-fg focus-visible:ring-accent focus-visible:bg-border/60 focus-visible:text-fg inline-flex h-[26px] w-[26px] items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none";
-  const projectDeleteClass =
-    "text-muted hover:bg-status-failed-soft/70 hover:text-status-failed focus-visible:ring-accent focus-visible:bg-status-failed-soft/70 focus-visible:text-status-failed inline-flex h-[26px] w-[26px] items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50";
   const addProjectClass =
     "text-muted hover:bg-raised hover:text-fg focus-visible:ring-accent focus-visible:bg-raised focus-visible:text-fg inline-flex h-[26px] w-[26px] items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none";
 
@@ -191,9 +197,20 @@
   }
 
   $effect(() => {
+    if (openProjectActionsId !== null) {
+      const openProject = visibleProjects.find((project) => project.id === openProjectActionsId);
+      const openProjectCompleted =
+        openProject !== undefined &&
+        liveProjectSends(openProject.id).size === 0 &&
+        openProject.id in backgroundCompletedProjectIds;
+      if (openProject === undefined || openProjectCompleted) {
+        openProjectActionsId = null;
+      }
+    }
     if (
       deleteConfirmProjectId !== null &&
-      !visibleProjects.some((project) => project.id === deleteConfirmProjectId)
+      (!visibleProjects.some((project) => project.id === deleteConfirmProjectId) ||
+        openProjectActionsId !== deleteConfirmProjectId)
     ) {
       deleteConfirmProjectId = null;
     }
@@ -244,14 +261,6 @@
 
   function cancelDelete(projectId: ProjectId): void {
     if (deleteConfirmProjectId === projectId) deleteConfirmProjectId = null;
-  }
-
-  function disarmDeleteOnLeave(node: HTMLElement, projectId: ProjectId): { destroy: () => void } {
-    const handlePointerLeave = (): void => cancelDelete(projectId);
-    node.addEventListener("pointerleave", handlePointerLeave);
-    return {
-      destroy: () => node.removeEventListener("pointerleave", handlePointerLeave),
-    };
   }
 
   async function confirmDelete(project: ProjectListing): Promise<void> {
@@ -417,15 +426,16 @@
         {@const editing = editingProjectId === project.id}
         {@const highlighted =
           project.id === (selection.loadingProjectId ?? selection.activeProjectId)}
+        {@const actionsOpen = openProjectActionsId === project.id}
         <div
           class={cn(
             "group hover:bg-raised/70 flex w-full flex-col rounded-md",
-            highlighted && "bg-raised hover:bg-raised",
+            (highlighted || actionsOpen) && "bg-raised hover:bg-raised",
           )}
           data-testid="project-row"
           data-project-id={project.id}
           data-active={highlighted}
-          use:disarmDeleteOnLeave={project.id}
+          data-actions-open={actionsOpen}
         >
           <div class="flex w-full items-center">
             {#if editing}
@@ -521,165 +531,106 @@
                 </div>
               </button>
               <div class="flex shrink-0 items-center gap-0.5 pr-1.5">
-                {#if !busy && !completed}
+                {#if !completed}
                   <div
-                    class="pointer-events-none flex max-w-0 items-center gap-0.5 overflow-hidden opacity-0 transition-[max-width,opacity] group-hover:pointer-events-auto group-hover:max-w-[82px] group-hover:opacity-100"
+                    class={cn(
+                      "pointer-events-none flex max-w-0 items-center gap-0.5 overflow-hidden opacity-0 transition-[max-width,opacity] group-focus-within:pointer-events-auto group-focus-within:max-w-[28px] group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:max-w-[28px] group-hover:opacity-100",
+                      actionsOpen && "pointer-events-auto max-w-[28px] opacity-100",
+                    )}
                   >
-                    {#if deleteConfirmProjectId === project.id}
-                      <Tooltip label="Cancel delete" delayDuration={1000}>
-                        {#snippet trigger(props)}
-                          <button
-                            {...props}
-                            type="button"
-                            class={projectActionClass}
-                            aria-label="Cancel delete"
-                            tabindex="-1"
-                            data-testid="project-delete-cancel"
-                            onclick={() => cancelDelete(project.id)}
-                          >
-                            <svg
-                              viewBox="0 0 24 24"
-                              fill="none"
-                              stroke="currentColor"
-                              stroke-width="2"
-                              stroke-linecap="round"
-                              stroke-linejoin="round"
-                              class="h-4 w-4"
+                    <DropdownMenu
+                      open={actionsOpen}
+                      onOpenChange={(open) => {
+                        openProjectActionsId = open
+                          ? project.id
+                          : openProjectActionsId === project.id
+                            ? null
+                            : openProjectActionsId;
+                      }}
+                      triggerLabel={`Actions for ${project.name}`}
+                      triggerTestid="project-actions-trigger"
+                      triggerTabindex={-1}
+                      triggerClass={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
+                      contentTestid="project-actions-menu"
+                    >
+                      {#snippet trigger()}
+                        <MoreHorizontal size={14} strokeWidth={1.8} aria-hidden="true" />
+                      {/snippet}
+                      {#if deleteConfirmProjectId === project.id}
+                        <DropdownMenuItem
+                          onSelect={() => cancelDelete(project.id)}
+                          closeOnSelect={false}
+                          class="gap-2"
+                          data-testid="project-delete-cancel"
+                        >
+                          <X
+                            size={14}
+                            strokeWidth={1.8}
+                            class="text-muted shrink-0"
+                            aria-hidden="true"
+                          />
+                          Cancel delete
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          onSelect={() => void confirmDelete(project)}
+                          disabled={deletingProjectId === project.id}
+                          class="text-status-failed gap-2"
+                          data-testid="project-delete-confirm"
+                        >
+                          <Check size={14} strokeWidth={1.8} class="shrink-0" aria-hidden="true" />
+                          Confirm delete
+                        </DropdownMenuItem>
+                      {:else}
+                        <DropdownMenuItem
+                          onSelect={() => void showProjectInGit(project)}
+                          class="gap-2"
+                          data-testid="project-action-show-git"
+                        >
+                          <GitBranch
+                            size={14}
+                            strokeWidth={1.8}
+                            class="text-muted shrink-0"
+                            aria-hidden="true"
+                          />
+                          Show in Git view
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          onSelect={() => void toggleArchive(project)}
+                          disabled={busy}
+                          class="gap-2"
+                          data-testid="project-action-archive"
+                        >
+                          {#if project.archived}
+                            <ArchiveRestore
+                              size={14}
+                              strokeWidth={1.8}
+                              class="text-muted shrink-0"
                               aria-hidden="true"
-                            >
-                              <path d="M18 6 6 18M6 6l12 12" />
-                            </svg>
-                          </button>
-                        {/snippet}
-                      </Tooltip>
-                      <Tooltip label="Confirm delete" delayDuration={1000}>
-                        {#snippet trigger(props)}
-                          <button
-                            {...props}
-                            type="button"
-                            class="text-status-failed hover:bg-status-failed-soft/70 focus-visible:ring-accent focus-visible:bg-status-failed-soft/70 inline-flex h-[26px] w-[26px] items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50"
-                            disabled={deletingProjectId === project.id}
-                            aria-label="Confirm delete"
-                            tabindex="-1"
-                            data-testid="project-delete-confirm"
-                            onclick={() => void confirmDelete(project)}
-                          >
-                            <svg
-                              viewBox="0 0 24 24"
-                              fill="none"
-                              stroke="currentColor"
-                              stroke-width="2"
-                              stroke-linecap="round"
-                              stroke-linejoin="round"
-                              class="h-4 w-4"
+                            />
+                            Unarchive project
+                          {:else}
+                            <Archive
+                              size={14}
+                              strokeWidth={1.8}
+                              class="text-muted shrink-0"
                               aria-hidden="true"
-                            >
-                              <path d="M20 6 9 17l-5-5" />
-                            </svg>
-                          </button>
-                        {/snippet}
-                      </Tooltip>
-                    {:else}
-                      <Tooltip label="Show in Git view" delayDuration={1000}>
-                        {#snippet trigger(props)}
-                          <button
-                            {...props}
-                            type="button"
-                            class={projectActionClass}
-                            aria-label="Show project in Git view"
-                            tabindex="-1"
-                            data-testid="project-action-show-git"
-                            onclick={() => void showProjectInGit(project)}
-                          >
-                            <GitBranch size={14} strokeWidth={1.8} aria-hidden="true" />
-                          </button>
-                        {/snippet}
-                      </Tooltip>
-                      <Tooltip
-                        label={project.archived ? "Unarchive project" : "Archive project"}
-                        delayDuration={1000}
-                      >
-                        {#snippet trigger(props)}
-                          <button
-                            {...props}
-                            type="button"
-                            class={projectActionClass}
-                            aria-label={project.archived ? "Unarchive project" : "Archive project"}
-                            tabindex="-1"
-                            data-testid="project-action-archive"
-                            onclick={() => void toggleArchive(project)}
-                          >
-                            {#if project.archived}
-                              <svg
-                                viewBox="0 0 24 24"
-                                fill="none"
-                                stroke="currentColor"
-                                stroke-width="1.8"
-                                stroke-linecap="round"
-                                stroke-linejoin="round"
-                                class="h-4 w-4"
-                                aria-hidden="true"
-                              >
-                                <path d="M9 14 4 9l5-5" />
-                                <path d="M4 9h10a6 6 0 0 1 0 12h-2" />
-                              </svg>
-                            {:else}
-                              <svg
-                                viewBox="0 0 24 24"
-                                fill="none"
-                                stroke="currentColor"
-                                stroke-width="1.8"
-                                stroke-linecap="round"
-                                stroke-linejoin="round"
-                                class="h-4 w-4"
-                                aria-hidden="true"
-                              >
-                                <rect x="3" y="4" width="18" height="4" rx="1" />
-                                <path d="M5 8v10a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8" />
-                                <path d="M10 12h4" />
-                              </svg>
-                            {/if}
-                          </button>
-                        {/snippet}
-                      </Tooltip>
-                      <Tooltip delayDuration={1000}>
-                        {#snippet trigger(props)}
-                          <button
-                            {...props}
-                            type="button"
-                            class={projectDeleteClass}
-                            disabled={!project.available}
-                            aria-label="Delete project"
-                            tabindex="-1"
-                            data-testid="project-action-delete"
-                            onclick={() => startDelete(project)}
-                          >
-                            <svg
-                              viewBox="0 0 24 24"
-                              fill="none"
-                              stroke="currentColor"
-                              stroke-width="1.8"
-                              stroke-linecap="round"
-                              stroke-linejoin="round"
-                              class="h-4 w-4"
-                              aria-hidden="true"
-                            >
-                              <path d="M3 6h18" />
-                              <path d="M8 6V4h8v2" />
-                              <path d="M19 6 18 20H6L5 6" />
-                              <path d="M10 11v5M14 11v5" />
-                            </svg>
-                          </button>
-                        {/snippet}
-                        <div class="max-w-56">
-                          <div class="text-[13px] font-medium">Delete project</div>
-                          <div class="text-primary-fg/75 mt-1 text-xs leading-4">
-                            Removes Switchboard's files for this project; your code and agent
-                            session files are kept.
-                          </div>
-                        </div>
-                      </Tooltip>
-                    {/if}
+                            />
+                            Archive project
+                          {/if}
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          onSelect={() => startDelete(project)}
+                          closeOnSelect={false}
+                          disabled={busy || !project.available}
+                          class="text-status-failed gap-2"
+                          data-testid="project-action-delete"
+                          title="Removes Switchboard's files for this project; your code and agent session files are kept."
+                        >
+                          <Trash2 size={14} strokeWidth={1.8} class="shrink-0" aria-hidden="true" />
+                          Delete project
+                        </DropdownMenuItem>
+                      {/if}
+                    </DropdownMenu>
                   </div>
                 {/if}
                 {#if busy}

@@ -247,6 +247,8 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
     }
     case "fetch_repo":
       return null;
+    case "branch_commits":
+      return [];
     default:
       throw new Error(`unexpected invoke call: ${cmd}`);
   }
@@ -1695,5 +1697,66 @@ describe("App", () => {
     await fireEvent.click(screen.getByTestId("view-toggle-projects"));
     await waitFor(() => expect(screen.queryByTestId("git-view")).not.toBeInTheDocument());
     expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument();
+  });
+
+  it("opens the active project in Git view with the project shortcut", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    backend.trackedRepos = [
+      {
+        repo: {
+          root: DIR_A,
+          name: "alpha-repo",
+          default_branch: "main",
+          available: true,
+          is_bare: false,
+          local_branches: [
+            {
+              name: "main",
+              upstream: "origin/main",
+              sync: { kind: "in_sync" },
+              behind_base: null,
+              merged: null,
+              dangling: false,
+              worktree: {
+                path: DIR_A,
+                dirty: false,
+                untracked: false,
+                detached_hash: null,
+                warning: null,
+              },
+            },
+          ],
+          remote_branches: [{ name: "origin/main", merged: null, behind_base: null }],
+          detached_worktrees: [],
+        },
+        linked_projects: {
+          [DIR_A]: [{ id: "p-a", name: "alpha", directory: DIR_A }],
+        },
+      } satisfies RepoListing,
+    ];
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+
+    const rowButton = projectRowByName("alpha").querySelector("button");
+    if (rowButton === null) throw new Error("expected project row button");
+    await fireEvent.click(rowButton);
+    await waitFor(() => expect(backend.activeProjectId).toBe("p-a"));
+
+    await fireEvent.keyDown(window, { key: "f", code: "KeyF", metaKey: true, shiftKey: true });
+
+    await waitFor(() => expect(screen.getByTestId("git-view")).toBeInTheDocument());
+    const branch = await waitFor(() =>
+      document.querySelector('[data-testid="git-branch"][data-branch="main"]'),
+    );
+    expect(branch).not.toBeNull();
+    expect(within(branch as HTMLElement).getByTestId("branch-select")).toHaveAttribute(
+      "data-selected",
+      "true",
+    );
   });
 });

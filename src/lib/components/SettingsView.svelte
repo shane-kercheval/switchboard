@@ -40,6 +40,7 @@
   const shortcuts: { action: string; keys: string[]; note?: string }[] = [
     { action: "Focus message box", keys: ["⌘", "K"] },
     { action: "Toggle Projects / Git view", keys: ["⌘", "⇧", "G"] },
+    { action: "Show current project in Git view", keys: ["⌘", "⇧", "F"] },
     { action: "Expand or restore Git details panel", keys: ["⌘", "⇧", "D"] },
     { action: "Toggle projects sidebar", keys: ["⌘", "B"] },
     { action: "Toggle agents sidebar", keys: ["⌘", "⇧", "B"] },

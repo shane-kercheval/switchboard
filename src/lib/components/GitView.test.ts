@@ -131,6 +131,64 @@ describe("GitView", () => {
     expect(screen.getByTestId("repo-action-remove")).toHaveFocus();
   });
 
+  it("keeps a branch row highlighted and its ellipsis visible while the action menu is open", async () => {
+    wire([repo()]);
+    await refreshAll();
+    render(GitView);
+
+    await waitFor(() => expect(screen.getByTestId("git-repo")).toBeInTheDocument());
+    const mainRow = document.querySelector(
+      '[data-testid="git-branch"][data-branch="main"]',
+    ) as HTMLElement;
+    const trigger = within(mainRow).getByTestId("worktree-actions-trigger");
+
+    expect(mainRow).toHaveAttribute("data-actions-open", "false");
+    await fireEvent.click(trigger);
+
+    expect(mainRow).toHaveAttribute("data-actions-open", "true");
+    expect(mainRow.className).toContain("bg-raised");
+    expect(trigger.className).toContain("opacity-100");
+
+    await fireEvent.keyDown(screen.getByTestId("worktree-action-editor"), { key: "Escape" });
+
+    await waitFor(() => expect(mainRow).toHaveAttribute("data-actions-open", "false"));
+  });
+
+  it("does not restore a stale open worktree menu after worktree actions unmount", async () => {
+    const withWorktree = repo();
+    wire([withWorktree]);
+    await refreshAll();
+    render(GitView);
+
+    await waitFor(() => expect(screen.getByTestId("git-repo")).toBeInTheDocument());
+    let mainRow = document.querySelector(
+      '[data-testid="git-branch"][data-branch="main"]',
+    ) as HTMLElement;
+    await fireEvent.click(within(mainRow).getByTestId("worktree-actions-trigger"));
+    expect(mainRow).toHaveAttribute("data-actions-open", "true");
+
+    wire([
+      repo({
+        local_branches: withWorktree.repo.local_branches.map((branch) =>
+          branch.name === "main" ? { ...branch, worktree: null } : branch,
+        ),
+      }),
+    ]);
+    await refreshAll();
+    await waitFor(() =>
+      expect(within(mainRow).queryByTestId("worktree-actions-trigger")).not.toBeInTheDocument(),
+    );
+
+    wire([withWorktree]);
+    await refreshAll();
+    mainRow = (await waitFor(() =>
+      document.querySelector('[data-testid="git-branch"][data-branch="main"]'),
+    )) as HTMLElement;
+
+    expect(within(mainRow).getByTestId("worktree-actions-trigger")).toBeInTheDocument();
+    expect(mainRow).toHaveAttribute("data-actions-open", "false");
+  });
+
   it("surfaces repo action failures inline", async () => {
     wire([repo()]);
     await refreshAll();

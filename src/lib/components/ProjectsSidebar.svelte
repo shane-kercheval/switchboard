@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { GitBranch } from "@lucide/svelte";
   import {
     activateProject,
     backgroundCompletedProjectIds,
@@ -10,6 +11,7 @@
     setProjectArchived,
     workspace,
   } from "$lib/state/workspace.svelte";
+  import { revealProjectBranch } from "$lib/state/gitView.svelte";
   import { cancelSend } from "$lib/state/index.svelte";
   import type { ProjectId, ProjectListing } from "$lib/types";
   import { validateProjectName, normalizeProjectName } from "$lib/projectName";
@@ -58,6 +60,7 @@
   let deletingProjectId = $state<ProjectId | null>(null);
   let archiveError = $state<{ projectId: ProjectId; message: string } | null>(null);
   let deleteError = $state<{ projectId: ProjectId; message: string } | null>(null);
+  let gitRevealError = $state<{ projectId: ProjectId; message: string } | null>(null);
   let relativeNow = $state(Date.now());
 
   /// `Active | Archived` view filter. Default `Active`. A true either/or split:
@@ -140,6 +143,12 @@
     renameError = null;
   }
 
+  function selectProject(project: ProjectListing): void {
+    gitRevealError = null;
+    onProjectSelect();
+    void activateProject(project.id);
+  }
+
   /// Commit the draft. An unchanged verbatim name skips the round-trip. On
   /// success the row updates and we leave edit mode; on a backend rejection we
   /// stay in edit mode and surface it.
@@ -188,6 +197,12 @@
     ) {
       deleteConfirmProjectId = null;
     }
+    if (
+      gitRevealError !== null &&
+      !visibleProjects.some((project) => project.id === gitRevealError?.projectId)
+    ) {
+      gitRevealError = null;
+    }
   });
 
   $effect(() => {
@@ -208,6 +223,7 @@
   async function toggleArchive(project: ProjectListing): Promise<void> {
     archiveError = null;
     deleteError = null;
+    gitRevealError = null;
     try {
       await setProjectArchived(project.id, !project.archived);
       if (deleteConfirmProjectId === project.id) deleteConfirmProjectId = null;
@@ -222,6 +238,7 @@
   function startDelete(project: ProjectListing): void {
     archiveError = null;
     deleteError = null;
+    gitRevealError = null;
     deleteConfirmProjectId = project.id;
   }
 
@@ -251,6 +268,19 @@
       };
     } finally {
       deletingProjectId = null;
+    }
+  }
+
+  async function showProjectInGit(project: ProjectListing): Promise<void> {
+    archiveError = null;
+    deleteError = null;
+    gitRevealError = null;
+    const revealed = await revealProjectBranch(project.id, project.directory);
+    if (!revealed) {
+      gitRevealError = {
+        projectId: project.id,
+        message: "This project does not have a tracked local git branch.",
+      };
     }
   }
 </script>
@@ -464,10 +494,7 @@
               <button
                 type="button"
                 class="flex min-w-0 flex-1 flex-col items-start gap-0.5 px-2.5 py-2 text-left"
-                onclick={() => {
-                  onProjectSelect();
-                  void activateProject(project.id);
-                }}
+                onclick={() => selectProject(project)}
                 ondblclick={() => startEdit(project)}
               >
                 <div class="flex w-full items-center gap-2">
@@ -491,7 +518,7 @@
               <div class="flex shrink-0 items-center gap-0.5 pr-1.5">
                 {#if !busy && !completed}
                   <div
-                    class="pointer-events-none flex max-w-0 items-center gap-0.5 overflow-hidden opacity-0 transition-[max-width,opacity] group-hover:pointer-events-auto group-hover:max-w-[54px] group-hover:opacity-100"
+                    class="pointer-events-none flex max-w-0 items-center gap-0.5 overflow-hidden opacity-0 transition-[max-width,opacity] group-hover:pointer-events-auto group-hover:max-w-[82px] group-hover:opacity-100"
                   >
                     {#if deleteConfirmProjectId === project.id}
                       <Tooltip label="Cancel delete" delayDuration={1000}>
@@ -548,6 +575,21 @@
                         {/snippet}
                       </Tooltip>
                     {:else}
+                      <Tooltip label="Show in Git view" delayDuration={1000}>
+                        {#snippet trigger(props)}
+                          <button
+                            {...props}
+                            type="button"
+                            class={projectActionClass}
+                            aria-label="Show project in Git view"
+                            tabindex="-1"
+                            data-testid="project-action-show-git"
+                            onclick={() => void showProjectInGit(project)}
+                          >
+                            <GitBranch size={14} strokeWidth={1.8} aria-hidden="true" />
+                          </button>
+                        {/snippet}
+                      </Tooltip>
                       <Tooltip
                         label={project.archived ? "Unarchive project" : "Archive project"}
                         delayDuration={1000}
@@ -678,6 +720,11 @@
           {#if deleteError?.projectId === project.id}
             <div class="text-status-failed px-2.5 pb-2 text-xs" data-testid="project-delete-error">
               Couldn't delete project: {deleteError.message}
+            </div>
+          {/if}
+          {#if gitRevealError?.projectId === project.id}
+            <div class="text-status-failed px-2.5 pb-2 text-xs" data-testid="project-git-error">
+              Couldn't open Git view: {gitRevealError.message}
             </div>
           {/if}
         </div>

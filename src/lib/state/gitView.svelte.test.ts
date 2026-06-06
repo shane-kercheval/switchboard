@@ -25,7 +25,7 @@ const {
   diffTarget,
   gitRefresh,
   loadProjectRepo,
-  projectBranch,
+  revealProjectBranch,
   _testing,
 } = await import("./gitView.svelte");
 
@@ -64,6 +64,20 @@ const listingWithWorktree = (root: string, wtPath: string): RepoListing => {
   ];
   return l;
 };
+
+const unavailableListing = (root: string): RepoListing => ({
+  repo: {
+    root,
+    name: root.split("/").pop() ?? root,
+    default_branch: null,
+    available: false,
+    is_bare: false,
+    local_branches: [],
+    remote_branches: [],
+    detached_worktrees: [],
+  },
+  linked_projects: {},
+});
 
 /// A listing whose `main` worktree at `wtPath` is linked to `projectId`, for the
 /// project-panel lookup.
@@ -344,7 +358,7 @@ describe("gitView store", () => {
     expect(invokeMock.mock.calls.filter((c) => c[0] === "read_tracked_repo").length).toBe(1);
   });
 
-  it("projectBranch is null for a project linked to a detached worktree (no branch)", async () => {
+  it("revealProjectBranch is false for a project linked to a detached worktree", async () => {
     const detached = listing("/a");
     detached.repo.detached_worktrees = [
       { path: "/a/dt", dirty: true, untracked: false, detached_hash: "abc1234", warning: null },
@@ -353,8 +367,8 @@ describe("gitView store", () => {
     wire({ list: [detached] });
     await refreshAll();
 
-    // Linked, but the worktree is detached → no `local_branches` row → null.
-    expect(projectBranch("p1")).toBeNull();
+    // Linked, but the worktree is detached → no `local_branches` row.
+    await expect(revealProjectBranch("p1", "/a/dt")).resolves.toBe(false);
   });
 
   it("a failed fetch records a 'failed' state, never throws", async () => {
@@ -509,15 +523,75 @@ describe("gitView store", () => {
     expect(_testing.runtimeSize()).toBe(0);
   });
 
-  it("projectBranch resolves the branch for a project's worktree via the linking", async () => {
-    wire({ list: [listingWithProject("/a", "/a/wt", "p1")] });
-    await refreshAll();
+  it("revealProjectBranch opens Git view and selects the linked branch", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "read_tracked_repo")
+        return Promise.resolve(listingWithProject("/a", "/a/wt", "p1"));
+      if (cmd === "branch_commits") return Promise.resolve([]);
+      return Promise.resolve(null);
+    });
 
-    const found = projectBranch("p1");
-    expect(found?.branch.name).toBe("main");
-    expect(found?.defaultBranch).toBe("main");
-    // A project with no linked worktree resolves to null (graceful).
-    expect(projectBranch("nope")).toBeNull();
+    await expect(revealProjectBranch("p1", "/a/wt")).resolves.toBe(true);
+
+    expect(view.mode).toBe("git");
+    expect(branchSelection.current).toEqual({ repoRoot: "/a", kind: "local", name: "main" });
+    expect(diffTarget.current).toMatchObject({
+      kind: "uncommitted",
+      repoRoot: "/a",
+      worktreePath: "/a/wt",
+    });
+  });
+
+  it("revealProjectBranch does not collapse an already selected branch", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "read_tracked_repo")
+        return Promise.resolve(listingWithProject("/a", "/a/wt", "p1"));
+      if (cmd === "branch_commits") return Promise.resolve([]);
+      return Promise.resolve(null);
+    });
+
+    await revealProjectBranch("p1", "/a/wt");
+    await revealProjectBranch("p1", "/a/wt");
+
+    expect(view.mode).toBe("git");
+    expect(branchSelection.current).toEqual({ repoRoot: "/a", kind: "local", name: "main" });
+    expect(diffTarget.current?.kind).toBe("uncommitted");
+  });
+
+  it("revealProjectBranch adds an untracked project repo before selecting it", async () => {
+    let tracked = false;
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "read_tracked_repo")
+        return Promise.resolve(
+          tracked ? listingWithProject("/a", "/a/wt", "p1") : unavailableListing("/a"),
+        );
+      if (cmd === "add_tracked_repo") {
+        tracked = true;
+        return Promise.resolve(null);
+      }
+      if (cmd === "list_tracked_repos")
+        return Promise.resolve([listingWithProject("/a", "/a/wt", "p1")]);
+      if (cmd === "branch_commits") return Promise.resolve([]);
+      return Promise.resolve(null);
+    });
+
+    await expect(revealProjectBranch("p1", "/a/wt")).resolves.toBe(true);
+
+    expect(invokeMock).toHaveBeenCalledWith("add_tracked_repo", { path: "/a/wt" });
+    expect(view.mode).toBe("git");
+    expect(branchSelection.current).toEqual({ repoRoot: "/a", kind: "local", name: "main" });
+  });
+
+  it("revealProjectBranch returns false when no linked branch resolves", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "read_tracked_repo") return Promise.resolve(listingWithWorktree("/a", "/a/wt"));
+      return Promise.resolve(null);
+    });
+
+    await expect(revealProjectBranch("missing", "/a/wt")).resolves.toBe(false);
+
+    expect(view.mode).toBe("projects");
+    expect(branchSelection.current).toBeNull();
   });
 
   it("loadProjectRepo reads the project's repo and fetches it when stale", async () => {
@@ -529,9 +603,8 @@ describe("gitView store", () => {
 
     await loadProjectRepo("/a/wt");
 
-    // The repo is read (and upserted, so projectBranch can resolve it)…
+    // The repo is read and upserted for later linked-project navigation…
     expect(invokeMock.mock.calls.some((c) => c[0] === "read_tracked_repo")).toBe(true);
-    expect(projectBranch("p1")?.branch.name).toBe("main");
     // …and a never-fetched repo is stale, so a background fetch is kicked.
     await vi.waitFor(() =>
       expect(invokeMock.mock.calls.some((c) => c[0] === "fetch_repo")).toBe(true),

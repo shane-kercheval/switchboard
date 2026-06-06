@@ -29,7 +29,13 @@
     remoteBranchIndicators,
     remoteOnlyIndicator,
   } from "$lib/gitStatusIndicators";
-  import type { BranchView, RemoteBranchView, RepoListing, WorktreeView } from "$lib/types";
+  import type {
+    BranchView,
+    LinkedProject,
+    RemoteBranchView,
+    RepoListing,
+    WorktreeView,
+  } from "$lib/types";
   import type { FetchState } from "$lib/state/gitView.svelte";
   import {
     refreshRepo,
@@ -42,7 +48,9 @@
     branchSelection,
     branchCommits,
     diffTarget,
+    setViewMode,
   } from "$lib/state/gitView.svelte";
+  import { activateProject } from "$lib/state/workspace.svelte";
   import { openInEditor, openInTerminal, revealInFinder } from "$lib/api";
   import { copyText } from "$lib/native";
 
@@ -125,6 +133,11 @@
       actionError = e instanceof Error ? e.message : String(e);
       console.error("[switchboard] git view open action failed", e);
     });
+  }
+
+  async function openLinkedProject(project: LinkedProject): Promise<void> {
+    setViewMode("projects");
+    await activateProject(project.id);
   }
 
   function branchHasChanges(branch: BranchView): boolean {
@@ -463,6 +476,22 @@
                   />
                   Copy branch name
                 </DropdownMenuItem>
+                {#each linkedProjects(worktreePath) as project (project.id)}
+                  <DropdownMenuItem
+                    onSelect={() => runAction(openLinkedProject(project))}
+                    class="gap-2"
+                    data-testid="worktree-action-open-project"
+                    title={project.name}
+                  >
+                    <FolderOpen
+                      size={14}
+                      strokeWidth={1.8}
+                      class="text-muted shrink-0"
+                      aria-hidden="true"
+                    />
+                    <span class="min-w-0 truncate">Open Project: {project.name}</span>
+                  </DropdownMenuItem>
+                {/each}
               </DropdownMenu>
             {/if}
           </div>
@@ -666,13 +695,6 @@
           <GitStatusIcon {indicator} />
         {/each}
       </div>
-      {#if branch.worktree}
-        <div class="flex min-w-0 items-center gap-1">
-          {#each linkedProjects(branch.worktree.path) as project (project.id)}
-            <Badge testid="linked-project">{project.name}</Badge>
-          {/each}
-        </div>
-      {/if}
     </div>
     {#if branch.worktree}
       <div class="text-muted truncate font-mono text-[11px] leading-4" title={branch.worktree.path}>

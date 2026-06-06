@@ -401,14 +401,12 @@ export async function fetchAll(): Promise<void> {
   await runBounded(roots, FETCH_CONCURRENCY, fetchRepo);
 }
 
-/// Load the repo a project lives in, for the Projects-side git status panel
-/// (M6). Reuses the Git view's read + fetch + dedup (shared `gitView.repos`
-/// cache, no new fetch machinery): the panel `$effect` remounts on every sidebar
-/// toggle, so the read is **read-staleness-gated** like the Git view — a repo
-/// already read within the local window is served from cache rather than
-/// re-hitting the backend. A genuinely stale (or never-loaded) repo is re-read.
-/// Either way a fetch-stale repo gets a background fetch. `path` is the project's
-/// worktree directory; it resolves to the repo root.
+/// Load the repo a project lives in for project→Git navigation. Reuses the Git
+/// view's read + fetch + dedup (shared `gitView.repos` cache, no new fetch
+/// machinery): a repo already read within the local window is served from cache
+/// rather than re-hitting the backend. A genuinely stale (or never-loaded) repo
+/// is re-read. Either way a fetch-stale repo gets a background fetch. `path` is
+/// the project's worktree directory; it resolves to the repo root when tracked.
 export async function loadProjectRepo(path: string): Promise<void> {
   const cached = loadedRepoForWorktree(path);
   const listing = cached && !isReadStale(cached.repo.root) ? cached : await refreshRepo(path);
@@ -428,24 +426,76 @@ function loadedRepoForWorktree(path: string): RepoListing | undefined {
   );
 }
 
-/// The `BranchView` for the worktree a project lives in, plus that repo's default
-/// branch (for badge computation), or `null` when not resolvable yet — the repo
-/// isn't loaded, the project's worktree is detached (no branch), or the directory
-/// isn't a tracked git repo. Matches on the backend-computed project↔worktree
-/// linking (robust against path-spelling differences), reading from the reactive
-/// `gitView.repos`, so a caller in a `$derived` re-runs as repos load/refresh.
-export function projectBranch(
-  projectId: string,
-): { branch: BranchView; defaultBranch: string | null } | null {
+/// The `BranchView` for the worktree a project lives in, plus that repo's
+/// identity, or `null` when not resolvable yet — the repo isn't loaded, the
+/// project's worktree is detached (no branch), or the directory isn't a tracked
+/// git repo. Matches on the backend-computed project↔worktree linking, which is
+/// robust against path-spelling differences.
+type ProjectBranchTarget = {
+  repoRoot: string;
+  branch: BranchView;
+  defaultBranch: string | null;
+  worktreePath: string;
+};
+
+function projectBranchTarget(projectId: string): ProjectBranchTarget | null {
   for (const listing of gitView.repos) {
     const worktreePath = Object.keys(listing.linked_projects).find((p) =>
       listing.linked_projects[p]?.some((lp) => lp.id === projectId),
     );
     if (worktreePath === undefined) continue;
     const branch = listing.repo.local_branches.find((b) => b.worktree?.path === worktreePath);
-    if (branch) return { branch, defaultBranch: listing.repo.default_branch };
+    if (branch) {
+      return {
+        repoRoot: listing.repo.root,
+        branch,
+        defaultBranch: listing.repo.default_branch,
+        worktreePath,
+      };
+    }
   }
   return null;
+}
+
+async function resolveProjectBranchTarget(
+  projectId: string,
+  directory: string,
+): Promise<ProjectBranchTarget | null> {
+  await loadProjectRepo(directory);
+  let target = projectBranchTarget(projectId);
+  if (target !== null) return target;
+
+  try {
+    await addRepo(directory);
+  } catch {
+    return null;
+  }
+  target = projectBranchTarget(projectId);
+  return target;
+}
+
+async function selectProjectBranchTarget(target: ProjectBranchTarget): Promise<void> {
+  view.mode = "git";
+  const ref: SelectedRef = { repoRoot: target.repoRoot, kind: "local", name: target.branch.name };
+  if (refsEqual(branchSelection.current, ref)) return;
+  await selectBranch(ref, {
+    worktreePath: target.worktreePath,
+    hasChanges:
+      target.branch.worktree?.dirty === true || target.branch.worktree?.untracked === true,
+    worktreeSubtitle: target.worktreePath,
+  });
+}
+
+/// Switch to Git view and select the local branch/worktree linked to a project.
+/// If the project directory is inside a git repo that is not tracked yet, the
+/// repo is added to Git view and then resolved. Returns false when no resolvable
+/// linked branch exists (for example a non-git directory, a detached worktree, or
+/// a project in a subfolder rather than the worktree root).
+export async function revealProjectBranch(projectId: string, directory: string): Promise<boolean> {
+  const target = await resolveProjectBranchTarget(projectId, directory);
+  if (target === null) return false;
+  await selectProjectBranchTarget(target);
+  return true;
 }
 
 // --- internals --------------------------------------------------------------

@@ -432,6 +432,99 @@ describe("transcriptReducer", () => {
       expect(turn.error).toBeUndefined();
       expect(turn.error_kind).toBeUndefined();
     });
+
+    it("marks only still-running tools as cancelled when the turn is cancelled", () => {
+      let turns = reduce([], turnStart(TURN_1));
+      turns = reduce(turns, {
+        type: "tool_started",
+        turn_id: TURN_1,
+        tool_use_id: "tool-done",
+        kind: "builtin",
+        name: "Bash",
+        input: { command: "true" },
+      });
+      turns = reduce(turns, {
+        type: "tool_completed",
+        turn_id: TURN_1,
+        tool_use_id: "tool-done",
+        output: "ok",
+        is_error: false,
+      });
+      turns = reduce(turns, {
+        type: "tool_started",
+        turn_id: TURN_1,
+        tool_use_id: "tool-pending",
+        kind: "builtin",
+        name: "Bash",
+        input: { command: "sleep 10" },
+      });
+      turns = reduce(turns, {
+        type: "turn_end",
+        turn_id: TURN_1,
+        outcome: { status: "cancelled", source: "user" },
+        ended_at: "2026-05-16T00:00:05Z",
+      });
+
+      const turn = turns[0];
+      if (turn?.role !== "agent") throw new Error("unreachable");
+      const done = turn.items.find(
+        (item): item is ToolCall => item.item_kind === "tool" && item.tool_use_id === "tool-done",
+      );
+      const pending = turn.items.find(
+        (item): item is ToolCall =>
+          item.item_kind === "tool" && item.tool_use_id === "tool-pending",
+      );
+      expect(done?.completed_at).toBe(RECEIVED_AT);
+      expect(done?.stopped_at).toBeUndefined();
+      expect(done?.stop_reason).toBeUndefined();
+      expect(pending?.completed_at).toBeUndefined();
+      expect(pending?.stopped_at).toBe("2026-05-16T00:00:05Z");
+      expect(pending?.stop_reason).toBe("cancelled");
+    });
+
+    it("marks only still-running tools as failed when the turn fails", () => {
+      let turns = reduce([], turnStart(TURN_1));
+      turns = reduce(turns, {
+        type: "tool_started",
+        turn_id: TURN_1,
+        tool_use_id: "tool-done",
+        kind: "builtin",
+        name: "Bash",
+        input: { command: "true" },
+      });
+      turns = reduce(turns, {
+        type: "tool_completed",
+        turn_id: TURN_1,
+        tool_use_id: "tool-done",
+        output: "ok",
+        is_error: false,
+      });
+      turns = reduce(turns, {
+        type: "tool_started",
+        turn_id: TURN_1,
+        tool_use_id: "tool-pending",
+        kind: "builtin",
+        name: "Bash",
+        input: { command: "sleep 10" },
+      });
+      turns = reduce(turns, turnEndFailed(TURN_1, "adapter crashed"));
+
+      const turn = turns[0];
+      if (turn?.role !== "agent") throw new Error("unreachable");
+      const done = turn.items.find(
+        (item): item is ToolCall => item.item_kind === "tool" && item.tool_use_id === "tool-done",
+      );
+      const pending = turn.items.find(
+        (item): item is ToolCall =>
+          item.item_kind === "tool" && item.tool_use_id === "tool-pending",
+      );
+      expect(done?.completed_at).toBe(RECEIVED_AT);
+      expect(done?.stopped_at).toBeUndefined();
+      expect(done?.stop_reason).toBeUndefined();
+      expect(pending?.completed_at).toBeUndefined();
+      expect(pending?.stopped_at).toBe("2026-05-16T00:00:05Z");
+      expect(pending?.stop_reason).toBe("failed");
+    });
   });
 
   describe("heartbeat_timeout", () => {

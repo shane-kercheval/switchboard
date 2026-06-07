@@ -17,9 +17,11 @@
     triggerClass?: string;
     triggerLabel?: string;
     triggerTestid?: string;
+    triggerTabindex?: number;
     contentClass?: string;
     contentTestid?: string;
     align?: "start" | "center" | "end";
+    onOpenChange?: (open: boolean) => void;
   };
 
   let {
@@ -29,14 +31,29 @@
     triggerClass,
     triggerLabel,
     triggerTestid,
+    triggerTabindex,
     contentClass,
     contentTestid,
     align = "end",
+    onOpenChange,
   }: Props = $props();
+
+  let previousOpen = $state(open);
+
+  $effect(() => {
+    if (open === previousOpen) return;
+    previousOpen = open;
+    onOpenChange?.(open);
+  });
 </script>
 
 <Bits.Root bind:open>
-  <Bits.Trigger class={triggerClass} aria-label={triggerLabel} data-testid={triggerTestid}>
+  <Bits.Trigger
+    class={triggerClass}
+    aria-label={triggerLabel}
+    data-testid={triggerTestid}
+    tabindex={triggerTabindex}
+  >
     {@render trigger()}
   </Bits.Trigger>
   <Bits.Portal>

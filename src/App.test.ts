@@ -247,6 +247,8 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
     }
     case "fetch_repo":
       return null;
+    case "branch_commits":
+      return [];
     default:
       throw new Error(`unexpected invoke call: ${cmd}`);
   }
@@ -917,6 +919,133 @@ describe("App", () => {
 
     expect(backend.activeProjectId).toBe("p-b");
     expect(betaRow).toHaveAttribute("data-active", "true");
+  });
+
+  it("Cmd+G selects the oldest unread completed project", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-a", project_id: "p-a", name: "alpha-agent" })],
+      lastActivity: "2026-05-20T09:45:00Z",
+    });
+    seedProject({
+      projectId: "p-b",
+      directory: DIR_B,
+      name: "beta",
+      agents: [agent({ id: "ag-b", project_id: "p-b", name: "beta-agent" })],
+      lastActivity: "2026-05-20T09:46:00Z",
+    });
+    seedProject({
+      projectId: "p-c",
+      directory: "/tmp/sw-c",
+      name: "charlie",
+      agents: [agent({ id: "ag-c", project_id: "p-c", name: "charlie-agent" })],
+      lastActivity: "2026-05-20T09:47:00Z",
+    });
+    seedProject({
+      projectId: "p-d",
+      directory: "/tmp/sw-d",
+      name: "delta",
+      agents: [agent({ id: "ag-d", project_id: "p-d", name: "delta-agent" })],
+      lastActivity: "2026-05-20T09:48:00Z",
+    });
+    seedProject({
+      projectId: "p-e",
+      directory: "/tmp/sw-e",
+      name: "echo",
+      agents: [agent({ id: "ag-e", project_id: "p-e", name: "echo-agent" })],
+      lastActivity: "2026-05-20T09:49:00Z",
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getAllByTestId("project-row")).toHaveLength(5));
+    await fireEvent.click(screen.getByText("echo"));
+    await waitFor(() => expect(backend.activeProjectId).toBe("p-e"));
+
+    const ws = await import("$lib/state/workspace.svelte");
+    ws.backgroundCompletedProjectIds["p-a"] = true;
+    ws.backgroundCompletedProjectIds["p-b"] = true;
+    ws.backgroundCompletedProjectIds["p-c"] = true;
+    await waitFor(() => expect(projectRowByName("alpha")).toHaveTextContent("alpha"));
+
+    await fireEvent.keyDown(window, { key: "g", metaKey: true });
+
+    await waitFor(() => expect(backend.activeProjectId).toBe("p-a"));
+    expect(projectRowByName("alpha")).toHaveAttribute("data-active", "true");
+    expect(screen.queryAllByTestId("project-completed")).toHaveLength(2);
+  });
+
+  it("Cmd+G does nothing when no project has an unread completed response", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-a", project_id: "p-a", name: "alpha-agent" })],
+    });
+    seedProject({
+      projectId: "p-b",
+      directory: DIR_B,
+      name: "beta",
+      agents: [agent({ id: "ag-b", project_id: "p-b", name: "beta-agent" })],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getAllByTestId("project-row")).toHaveLength(2));
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(backend.activeProjectId).toBe("p-a"));
+
+    await fireEvent.keyDown(window, { key: "g", metaKey: true });
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(backend.activeProjectId).toBe("p-a");
+    expect(projectRowByName("alpha")).toHaveAttribute("data-active", "true");
+  });
+
+  it("Cmd+G exits Git view before jumping to the unread project", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-a", project_id: "p-a", name: "alpha-agent" })],
+      lastActivity: "2026-05-20T09:45:00Z",
+    });
+    seedProject({
+      projectId: "p-b",
+      directory: DIR_B,
+      name: "beta",
+      agents: [agent({ id: "ag-b", project_id: "p-b", name: "beta-agent" })],
+      lastActivity: "2026-05-20T09:46:00Z",
+    });
+    backend.trackedRepos = [
+      {
+        repo: {
+          root: DIR_B,
+          name: "beta-repo",
+          default_branch: "main",
+          available: true,
+          is_bare: false,
+          local_branches: [],
+          remote_branches: [],
+          detached_worktrees: [],
+        },
+        linked_projects: {},
+      } satisfies RepoListing,
+    ];
+    await mountApp();
+    await waitFor(() => expect(screen.getAllByTestId("project-row")).toHaveLength(2));
+    await fireEvent.click(screen.getByText("beta"));
+    await waitFor(() => expect(backend.activeProjectId).toBe("p-b"));
+
+    await fireEvent.click(screen.getByTestId("view-toggle-git"));
+    await waitFor(() => expect(screen.getByTestId("git-view")).toBeInTheDocument());
+
+    const ws = await import("$lib/state/workspace.svelte");
+    ws.backgroundCompletedProjectIds["p-a"] = true;
+
+    await fireEvent.keyDown(window, { key: "g", metaKey: true });
+
+    await waitFor(() => expect(backend.activeProjectId).toBe("p-a"));
+    expect(screen.queryByTestId("git-view")).not.toBeInTheDocument();
+    expect(projectRowByName("alpha")).toHaveAttribute("data-active", "true");
   });
 
   it("switching projects is display-only: a backgrounded agent's listener still updates state", async () => {
@@ -1695,5 +1824,103 @@ describe("App", () => {
     await fireEvent.click(screen.getByTestId("view-toggle-projects"));
     await waitFor(() => expect(screen.queryByTestId("git-view")).not.toBeInTheDocument());
     expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument();
+  });
+
+  it("shows project loading immediately when returning from Git view to an active project", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    backend.trackedRepos = [
+      {
+        repo: {
+          root: DIR_A,
+          name: "alpha-repo",
+          default_branch: "main",
+          available: true,
+          is_bare: false,
+          local_branches: [],
+          remote_branches: [],
+          detached_worktrees: [],
+        },
+        linked_projects: {},
+      } satisfies RepoListing,
+    ];
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+
+    await fireEvent.click(screen.getByTestId("view-toggle-git"));
+    await waitFor(() => expect(screen.getByTestId("git-view")).toBeInTheDocument());
+
+    await fireEvent.click(screen.getByTestId("view-toggle-projects"));
+
+    expect(screen.queryByTestId("git-view")).not.toBeInTheDocument();
+    expect(screen.getByTestId("project-loading")).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+  });
+
+  it("opens the active project in Git view with the project shortcut", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    backend.trackedRepos = [
+      {
+        repo: {
+          root: DIR_A,
+          name: "alpha-repo",
+          default_branch: "main",
+          available: true,
+          is_bare: false,
+          local_branches: [
+            {
+              name: "main",
+              upstream: "origin/main",
+              sync: { kind: "in_sync" },
+              behind_base: null,
+              merged: null,
+              dangling: false,
+              worktree: {
+                path: DIR_A,
+                dirty: false,
+                untracked: false,
+                detached_hash: null,
+                warning: null,
+              },
+            },
+          ],
+          remote_branches: [{ name: "origin/main", merged: null, behind_base: null }],
+          detached_worktrees: [],
+        },
+        linked_projects: {
+          [DIR_A]: [{ id: "p-a", name: "alpha", directory: DIR_A }],
+        },
+      } satisfies RepoListing,
+    ];
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+
+    const rowButton = projectRowByName("alpha").querySelector("button");
+    if (rowButton === null) throw new Error("expected project row button");
+    await fireEvent.click(rowButton);
+    await waitFor(() => expect(backend.activeProjectId).toBe("p-a"));
+
+    await fireEvent.keyDown(window, { key: "f", code: "KeyF", metaKey: true, shiftKey: true });
+
+    await waitFor(() => expect(screen.getByTestId("git-view")).toBeInTheDocument());
+    const branch = await waitFor(() =>
+      document.querySelector('[data-testid="git-branch"][data-branch="main"]'),
+    );
+    expect(branch).not.toBeNull();
+    expect(within(branch as HTMLElement).getByTestId("branch-select")).toHaveAttribute(
+      "data-selected",
+      "true",
+    );
   });
 });

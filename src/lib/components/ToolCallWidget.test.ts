@@ -18,6 +18,16 @@ const done: ToolCall = {
   is_error: false,
   completed_at: "2026-05-16T00:00:02Z",
 };
+const cancelled: ToolCall = {
+  ...running,
+  stopped_at: "2026-05-16T00:00:02Z",
+  stop_reason: "cancelled",
+};
+const stoppedFailed: ToolCall = {
+  ...running,
+  stopped_at: "2026-05-16T00:00:02Z",
+  stop_reason: "failed",
+};
 
 function summaryOf(el: HTMLElement): HTMLElement {
   const summary = el.querySelector("summary");
@@ -53,5 +63,19 @@ describe("ToolCallWidget disclosure", () => {
 
     await fireEvent.click(summaryOf(tool));
     expect(tool).toHaveAttribute("open");
+  });
+
+  it("shows a cancelled icon for a tool that was pending when the turn stopped", () => {
+    const { getByTestId, queryByTestId } = render(ToolCallWidget, { tool: cancelled });
+    expect(queryByTestId("tool-running")).toBeNull();
+    expect(getByTestId("tool-cancelled")).toBeInTheDocument();
+    expect(getByTestId("turn-tool")).not.toHaveAttribute("open");
+  });
+
+  it("shows a failed icon for a tool that was pending when the turn failed", () => {
+    const { getByTestId, queryByTestId } = render(ToolCallWidget, { tool: stoppedFailed });
+    expect(queryByTestId("tool-running")).toBeNull();
+    expect(getByTestId("tool-error")).toBeInTheDocument();
+    expect(getByTestId("turn-tool")).not.toHaveAttribute("open");
   });
 });

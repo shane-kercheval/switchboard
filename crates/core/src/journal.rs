@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::agent::AgentId;
+use crate::attachment::Attachment;
 use crate::error::Result;
 use crate::io::{append_jsonl, read_jsonl};
 
@@ -60,6 +61,11 @@ pub enum JournalRecord {
         turn_id: Uuid,
         agent_id: AgentId,
         prompt: String,
+        /// Files attached to this send (empty for a plain text send). Defaults to
+        /// empty on deserialize so journals written before attachments existed —
+        /// `Send` lines with no `attachments` key — still parse.
+        #[serde(default)]
+        attachments: Vec<Attachment>,
         at: DateTime<Utc>,
     },
     /// Written on a **non-completed** terminal (failed or cancelled) — never
@@ -105,6 +111,7 @@ mod tests {
             turn_id: Uuid::now_v7(),
             agent_id,
             prompt: prompt.to_owned(),
+            attachments: Vec::new(),
             at: Utc::now(),
         }
     }
@@ -156,6 +163,64 @@ mod tests {
             .filter(|r| matches!(r, JournalRecord::Send { send_id, .. } if *send_id == shared))
             .count();
         assert_eq!(shared_count, 2, "both fan-out recipients share one send_id");
+    }
+
+    #[test]
+    fn send_with_attachments_round_trips() {
+        use crate::attachment::{Attachment, AttachmentKind};
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.jsonl");
+        let record = JournalRecord::Send {
+            send_id: Uuid::now_v7(),
+            turn_id: Uuid::now_v7(),
+            agent_id: Uuid::now_v7(),
+            prompt: "read this".to_owned(),
+            attachments: vec![Attachment {
+                label: "image-1".to_owned(),
+                kind: AttachmentKind::Image,
+                path: "/p/.switchboard/projects/x/attachments/u__diagram.png".to_owned(),
+                original_name: "diagram.png".to_owned(),
+            }],
+            at: Utc::now(),
+        };
+        append_record(&path, &record).unwrap();
+        assert_eq!(read_records(&path).unwrap(), vec![record]);
+    }
+
+    #[test]
+    fn old_send_without_attachments_field_defaults_to_empty() {
+        // A journal written before attachments existed: a Send line with no
+        // `attachments` key must still parse (to an empty list), not fail loud.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.jsonl");
+        let line = format!(
+            "{}\n",
+            json!({
+                "type": "send",
+                "send_id": Uuid::now_v7(),
+                "turn_id": Uuid::now_v7(),
+                "agent_id": Uuid::now_v7(),
+                "prompt": "legacy",
+                "at": "2026-05-14T04:43:19Z",
+            })
+        );
+        std::fs::write(&path, line).unwrap();
+
+        let read = read_records(&path).unwrap();
+        match read.as_slice() {
+            [
+                JournalRecord::Send {
+                    prompt,
+                    attachments,
+                    ..
+                },
+            ] => {
+                assert_eq!(prompt, "legacy");
+                assert!(attachments.is_empty());
+            }
+            other => panic!("expected one Send, got {other:?}"),
+        }
     }
 
     #[test]

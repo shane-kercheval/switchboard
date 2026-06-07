@@ -9111,6 +9111,7 @@ mod tests {
             turn_id,
             agent_id,
             prompt: prompt.to_owned(),
+            attachments: Vec::new(),
             at: at(t),
         }
     }
@@ -9470,6 +9471,7 @@ mod tests {
             turn_id: Uuid::now_v7(),
             agent_id: agent,
             prompt: "now add tests".to_owned(),
+            attachments: Vec::new(),
             at: "2026-05-14T04:43:19Z".parse().unwrap(),
         }];
 

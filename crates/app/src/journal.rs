@@ -50,6 +50,7 @@ impl ConversationJournal for ProjectJournal {
             turn_id,
             agent_id,
             prompt: prompt.to_owned(),
+            attachments: Vec::new(),
             at,
         };
         // Fail-closed: propagate the error so the dispatcher refuses to start

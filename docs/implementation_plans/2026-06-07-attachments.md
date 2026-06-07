@@ -108,7 +108,11 @@ and frontend. Later milestones must not invent parallel shapes.
    - `label: String` — the user-facing reference, e.g. `image-1` (assigned by
      the **frontend**; see below).
    - `kind` — enum `image | text | file` (the classification that drives the
-     label prefix).
+     label prefix), plus an `unknown` deserialize-only fallback so a kind written
+     by a newer build never fails an older build's journal load (a display-only
+     hint must not brick history). The frontend only ever emits the three real
+     kinds; `unknown` appears only on cross-version reads and renders as a generic
+     file.
    - `path: String` — absolute path to the staged file under the project's
      `attachments/` dir.
    - `original_name: String` — the dropped file's basename, for display.
@@ -358,8 +362,9 @@ Outcomes:
   attachment-parsing change.
 - **Transcript rendering:** the `user_message` `ConversationItem` (TS, mirroring
   the Rust change) gains `attachments`. Render them as chips under the message
-  text; for `kind: image`, show a thumbnail from the staged path. Reuse `ui/`
-  primitives and semantic tokens per `ui-conventions.md`.
+  text; for `kind: image`, show a thumbnail from the staged path; any unrecognized
+  kind (the `unknown` cross-version fallback) renders as a generic file chip, not
+  a thumbnail. Reuse `ui/` primitives and semantic tokens per `ui-conventions.md`.
 - **Wire type:** add the `attachments` field to the `user_message` arm in
   `src/lib/types.ts` and the `sendMessage` payload; degrade gracefully if absent
   (default `[]`), per the additive-variant convention.

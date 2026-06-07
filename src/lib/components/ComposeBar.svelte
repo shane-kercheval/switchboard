@@ -131,22 +131,12 @@
     }
   }
 
-  /// Whether a window-global drag-drop physical point falls over this compose
-  /// box. Tauri reports physical pixels; the element rect is CSS pixels, so scale
-  /// by the device pixel ratio. The drag-drop event is window-wide, so this
-  /// hit-test is what scopes drops to the compose area.
-  function isOverCompose(position: { x: number; y: number }): boolean {
-    if (composeEl === undefined) return false;
-    const rect = composeEl.getBoundingClientRect();
-    const dpr = window.devicePixelRatio || 1;
-    const x = position.x / dpr;
-    const y = position.y / dpr;
-    return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
-  }
-
   // OS file drops do NOT raise HTML5 `drop` events while Tauri's `dragDropEnabled`
   // is on, so the webview drag-drop event is the only signal. It is window-global,
-  // hence the per-phase position hit-test against the compose box.
+  // but the compose bar is the only file-drop target in the app, so a drop
+  // anywhere in the window attaches — no position hit-test (its physical↔CSS
+  // coordinate mapping is platform/DPR-fragile and bought nothing for a single
+  // drop target).
   onMount(() => {
     // Guarded: `getCurrentWebview()` throws outside a Tauri webview (tests, any
     // non-Tauri host), where drag-drop simply isn't available.
@@ -155,18 +145,17 @@
       dropSub = getCurrentWebview().onDragDropEvent((event) => {
         const payload = event.payload;
         if (payload.type === "enter" || payload.type === "over") {
-          dragOver = isOverCompose(payload.position);
+          dragOver = true;
         } else if (payload.type === "leave") {
           dragOver = false;
         } else if (payload.type === "drop") {
-          const inside = isOverCompose(payload.position);
           dragOver = false;
           // Ignore drops while a send is rendering: the attachment set is frozen
           // for that send (see the `sending`-gated remove button too).
-          if (inside && !sending) void stageDroppedPaths(payload.paths);
+          if (!sending) void stageDroppedPaths(payload.paths);
         }
       });
-      void dropSub.catch(() => {});
+      void dropSub.catch((e) => console.error("[attachments] onDragDropEvent failed", e));
     } catch {
       dropSub = undefined;
     }
@@ -1232,7 +1221,10 @@
             data-testid={`attachment-chip-${chip.label}`}
             data-kind={chip.kind}
           >
-            <span class="text-muted font-mono text-[10px]" aria-hidden="true">{chip.label}</span>
+            <span
+              class="text-muted shrink-0 font-mono text-[10px] whitespace-nowrap"
+              aria-hidden="true">{chip.label}</span
+            >
             <span class="truncate" title={chip.original_name}>{chip.original_name}</span>
             <button
               type="button"

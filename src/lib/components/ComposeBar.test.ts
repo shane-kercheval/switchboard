@@ -50,8 +50,8 @@ vi.mock("@tauri-apps/api/webview", () => ({
 
 function fireDrop(paths: string[]): void {
   if (dragDropCb === undefined) throw new Error("no drag-drop subscription");
-  // Position {0,0} lands inside jsdom's zeroed compose-box rect (inclusive
-  // bounds), so the hit-test accepts the drop without stubbing layout.
+  // Position is carried by the event but unused — a drop anywhere in the window
+  // attaches (the compose bar is the only drop target).
   dragDropCb({ payload: { type: "drop", paths, position: { x: 0, y: 0 } } });
 }
 

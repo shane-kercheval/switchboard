@@ -421,6 +421,49 @@ describe("GitView", () => {
     );
   });
 
+  it("⌘N adds a repo and ⌘R refreshes all repos", async () => {
+    wire([repo()]);
+    await refreshAll();
+    render(GitView);
+    await waitFor(() => expect(screen.getByTestId("git-repo")).toBeInTheDocument());
+
+    // ⌘N runs Add Repo (picks a folder, then tracks it).
+    pickDirectoryMock.mockResolvedValueOnce("/repos/new");
+    invokeMock.mockClear();
+    await fireEvent.keyDown(window, { key: "n", metaKey: true });
+    await waitFor(() =>
+      expect(
+        invokeMock.mock.calls.some(
+          (c) => c[0] === "add_tracked_repo" && (c[1] as { path: string }).path === "/repos/new",
+        ),
+      ).toBe(true),
+    );
+
+    // ⌘R re-reads every tracked repo.
+    invokeMock.mockClear();
+    await fireEvent.keyDown(window, { key: "r", metaKey: true });
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.some((c) => c[0] === "list_tracked_repos")).toBe(true),
+    );
+  });
+
+  it("⌘N and ⌘R are suppressed while the palette is open", async () => {
+    wire([repo()]);
+    await refreshAll();
+    render(GitView);
+    await waitFor(() => expect(screen.getByTestId("git-repo")).toBeInTheDocument());
+
+    openPalette();
+    pickDirectoryMock.mockResolvedValueOnce("/repos/new");
+    invokeMock.mockClear();
+    await fireEvent.keyDown(window, { key: "n", metaKey: true });
+    await fireEvent.keyDown(window, { key: "r", metaKey: true });
+    await tick();
+    expect(invokeMock.mock.calls.some((c) => c[0] === "add_tracked_repo")).toBe(false);
+    expect(invokeMock.mock.calls.some((c) => c[0] === "list_tracked_repos")).toBe(false);
+    closePalette();
+  });
+
   it("Add Repo: a chosen folder is added and the list re-read", async () => {
     wire([]);
     await refreshAll();

@@ -80,10 +80,23 @@
     if (palette.open) return;
     if (isEditableShortcutTarget(event.target)) return;
     const command = event.metaKey || event.ctrlKey;
-    if (!command || !event.shiftKey || event.altKey || event.key.toLowerCase() !== "d") return;
-    if (panel === null) return;
-    event.preventDefault();
-    toggleDetailExpanded();
+    if (!command || event.altKey) return;
+    const key = event.key.toLowerCase();
+    if (key === "d" && event.shiftKey) {
+      if (panel === null) return;
+      event.preventDefault();
+      toggleDetailExpanded();
+    } else if (key === "n" && !event.shiftKey) {
+      // Contextual ⌘N: in the Git view it adds a repo (App handles Add project
+      // for the other views).
+      event.preventDefault();
+      void onAddRepo();
+    } else if (key === "r" && !event.shiftKey) {
+      // ⌘R refreshes every tracked repo. preventDefault suppresses the webview's
+      // default reload accelerator.
+      event.preventDefault();
+      void onGlobalRefresh();
+    }
   }
 
   function toggleDetailExpanded(): void {
@@ -161,6 +174,7 @@
         id: "git.add-repo",
         title: "Add repository",
         group: "Git",
+        shortcut: ["mod", "N"],
         keywords: "track repo",
         run: () => void onAddRepo(),
       },
@@ -168,6 +182,7 @@
         id: "git.refresh-all",
         title: "Refresh all repositories",
         group: "Git",
+        shortcut: ["mod", "R"],
         keywords: "fetch reload",
         run: () => void onGlobalRefresh(),
       },

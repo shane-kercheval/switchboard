@@ -1821,6 +1821,16 @@ describe("App", () => {
     await waitFor(() => expect(backend.activeProjectId).toBe("p-b"));
   });
 
+  it("opens the palette from the header button", async () => {
+    seedProject({ projectId: "p-a", directory: DIR_A, name: "alpha" });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("command-palette-button")).toBeInTheDocument());
+
+    expect(screen.queryByTestId("command-palette")).toBeNull();
+    await fireEvent.click(screen.getByTestId("command-palette-button"));
+    await waitFor(() => expect(screen.getByTestId("command-palette")).toBeInTheDocument());
+  });
+
   it("suppresses other window shortcuts while the palette is open", async () => {
     seedProject({
       projectId: "p-a",
@@ -1855,6 +1865,35 @@ describe("App", () => {
 
     await fireEvent.keyDown(window, { key: "n", metaKey: true });
     await waitFor(() => expect(screen.getByTestId("new-project-form")).toBeInTheDocument());
+  });
+
+  it("⌘N does not open the add-project dialog while the Git view is showing", async () => {
+    seedProject({ projectId: "p-a", directory: DIR_A, name: "alpha" });
+    backend.trackedRepos = [
+      {
+        repo: {
+          root: DIR_A,
+          name: "alpha-repo",
+          default_branch: "main",
+          available: true,
+          is_bare: false,
+          local_branches: [],
+          remote_branches: [],
+          detached_worktrees: [],
+        },
+        linked_projects: {},
+      } satisfies RepoListing,
+    ];
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("view-toggle-git"));
+    await waitFor(() => expect(screen.getByTestId("git-view")).toBeInTheDocument());
+
+    // In the Git view ⌘N is Add-repo (handled by GitView), so App must NOT open
+    // the add-project dialog.
+    await fireEvent.keyDown(window, { key: "n", metaKey: true });
+    await Promise.resolve();
+    expect(screen.queryByTestId("new-project-form")).toBeNull();
   });
 
   it("⌘⇧N opens the add-agent modal when a project is active, and no-ops otherwise", async () => {

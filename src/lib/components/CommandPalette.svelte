@@ -24,6 +24,7 @@
   let query = $state("");
   let highlighted = $state(0);
   let searchEl = $state<HTMLInputElement | undefined>(undefined);
+  let listEl = $state<HTMLDivElement | undefined>(undefined);
 
   const filtered = $derived.by(() => {
     const q = query.trim().toLowerCase();
@@ -65,12 +66,17 @@
     return -1;
   }
 
-  // Reset the query whenever the palette opens. The Dialog unmounts its body on
-  // close, so the input remounts on each open; the query lives here (parent
-  // stays mounted), so reset it. Focus is handled by `onOpenAutoFocus` on the
-  // Dialog (bits-ui would otherwise focus the header ✕).
+  // Reset the query and selection whenever the palette opens, so each open
+  // starts on the first item. The Dialog unmounts its body on close, so the
+  // input remounts on each open; the query/highlight live here (parent stays
+  // mounted), so reset them. (The keep-highlight-enabled effect below nudges to
+  // the first *enabled* row if index 0 is disabled.) Focus is handled by
+  // `onOpenAutoFocus` on the Dialog (bits-ui would otherwise focus the header ✕).
   $effect(() => {
-    if (open) query = "";
+    if (open) {
+      query = "";
+      highlighted = 0;
+    }
   });
 
   function focusSearch(event: Event): void {
@@ -82,6 +88,19 @@
   $effect(() => {
     void filtered;
     if (!isEnabled(highlighted)) highlighted = firstEnabled();
+  });
+
+  // Keep the highlighted row visible while navigating by keyboard. `block:
+  // "nearest"` is a no-op when the row is already fully in view, so mouse-hover
+  // highlight changes don't trigger any scrolling.
+  $effect(() => {
+    const id = filtered[highlighted]?.id;
+    if (id === undefined || listEl === undefined) return;
+    void tick().then(() => {
+      listEl
+        ?.querySelector<HTMLElement>(`[data-testid="command-option-${id}"]`)
+        ?.scrollIntoView({ block: "nearest" });
+    });
   });
 
   function step(direction: 1 | -1): void {
@@ -138,11 +157,16 @@
       class="border-border bg-panel text-fg placeholder:text-muted focus-visible:ring-accent w-full rounded-md border px-2.5 py-1.5 text-sm focus-visible:ring-2 focus-visible:outline-none"
     />
 
-    <div class="mt-2 max-h-80 overflow-y-auto" data-testid="command-palette-list" role="listbox">
+    <div
+      bind:this={listEl}
+      class="mt-2 max-h-80 overflow-y-auto"
+      data-testid="command-palette-list"
+      role="listbox"
+    >
       {#each groups as group (group.name)}
         <div role="group" aria-label={group.name}>
           <div
-            class="text-muted px-2.5 pt-2 pb-1 text-[11px] font-medium tracking-wide uppercase select-none"
+            class="text-muted px-2.5 pt-1.5 pb-0.5 text-[11px] font-medium tracking-wide uppercase select-none"
             aria-hidden="true"
           >
             {group.name}
@@ -151,7 +175,7 @@
             <button
               type="button"
               class={cn(
-                "flex w-full items-center justify-between gap-3 rounded-md px-2.5 py-1.5 text-left outline-none select-none",
+                "flex w-full items-center justify-between gap-3 rounded-md px-2.5 py-1 text-left outline-none select-none",
                 command.disabled ? "cursor-default opacity-40" : "cursor-pointer",
                 index === highlighted && !command.disabled ? "bg-panel/80" : "",
               )}

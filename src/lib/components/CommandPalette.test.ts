@@ -105,4 +105,40 @@ describe("CommandPalette", () => {
     setup(COMMANDS);
     await waitFor(() => expect(screen.getByTestId("command-palette-search")).toHaveFocus());
   });
+
+  it("resets the selection to the first item each time it opens", async () => {
+    const { rerender } = render(CommandPalette, { props: { open: true, commands: COMMANDS } });
+
+    // Move the highlight off the first row.
+    await fireEvent.keyDown(screen.getByTestId("command-palette-search"), { key: "ArrowDown" });
+    expect(screen.getByTestId("command-option-add-project")).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+
+    // Close and reopen — the first row is highlighted again.
+    await rerender({ open: false, commands: COMMANDS });
+    await rerender({ open: true, commands: COMMANDS });
+    await waitFor(() =>
+      expect(screen.getByTestId("command-option-toggle-view")).toHaveAttribute(
+        "aria-selected",
+        "true",
+      ),
+    );
+  });
+
+  it("scrolls the highlighted row into view when navigating by keyboard", async () => {
+    const scrollSpy = vi.spyOn(Element.prototype, "scrollIntoView");
+    try {
+      setup(COMMANDS);
+      scrollSpy.mockClear(); // ignore the on-open highlight scroll
+      await fireEvent.keyDown(screen.getByTestId("command-palette-search"), { key: "ArrowDown" });
+      await waitFor(() => expect(scrollSpy).toHaveBeenCalledWith({ block: "nearest" }));
+      // The scrolled element is the newly-highlighted row.
+      const target = scrollSpy.mock.instances.at(-1) as HTMLElement;
+      expect(target).toBe(screen.getByTestId("command-option-add-project"));
+    } finally {
+      scrollSpy.mockRestore();
+    }
+  });
 });

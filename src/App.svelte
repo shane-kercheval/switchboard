@@ -19,6 +19,7 @@
   import EmptyState from "$lib/components/ui/EmptyState.svelte";
   import ErrorDetailsDialog from "$lib/components/ui/ErrorDetailsDialog.svelte";
   import SettingsButton from "$lib/components/ui/SettingsButton.svelte";
+  import CommandPaletteButton from "$lib/components/ui/CommandPaletteButton.svelte";
   import SidebarToggleButton from "$lib/components/ui/SidebarToggleButton.svelte";
   import DevIndicator from "$lib/components/ui/DevIndicator.svelte";
   import { windowDragRegion } from "$lib/windowDrag";
@@ -154,8 +155,12 @@
       event.preventDefault();
       if (hasActiveProject) openAddAgent();
     } else if (key === "n") {
-      event.preventDefault();
-      openProjectDialog();
+      // ⌘N is contextual. While the Git view is showing it adds a repo (handled
+      // by GitView's own keydown handler); everywhere else it adds a project.
+      if (!(view.mode === "git" && !settingsOpen)) {
+        event.preventDefault();
+        openProjectDialog();
+      }
     }
   }
 
@@ -674,6 +679,11 @@
             Git
           </button>
         </div>
+        <CommandPaletteButton
+          testid="command-palette-button"
+          onclick={() => togglePalette()}
+          class="hover:bg-panel"
+        />
         {#if showAgentsToggle}
           <SidebarToggleButton
             side="right"

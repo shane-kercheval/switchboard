@@ -185,7 +185,13 @@ describe("SettingsView", () => {
 
   it("shortcuts section lists expected keyboard shortcuts", () => {
     render(SettingsView, { props: { onClose: vi.fn() } });
+    // The command palette is listed first.
+    const actions = screen.getAllByTestId("shortcut-action");
+    expect(actions[0]).toHaveTextContent("Open command palette");
     expect(screen.getByText("Focus message box")).toBeInTheDocument();
+    expect(screen.getByText("Add project")).toBeInTheDocument();
+    expect(screen.getByText("Add repository")).toBeInTheDocument();
+    expect(screen.getByText("Refresh all repositories")).toBeInTheDocument();
     expect(screen.getByText("Jump to next unread project")).toBeInTheDocument();
     expect(screen.getByText("Show current project in Git view")).toBeInTheDocument();
     expect(screen.getByText("Open selection in editor")).toBeInTheDocument();

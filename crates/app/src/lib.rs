@@ -655,15 +655,24 @@ async fn open_external_url(url: String) -> Result<(), String> {
 /// open actions, which differ only in how they build the argv.
 async fn run_open_argv(argv: Vec<String>) -> Result<(), String> {
     let (program, rest) = argv.split_first().ok_or("empty open command")?;
-    let status = tokio::process::Command::new(program)
+    let output = tokio::process::Command::new(program)
         .args(rest)
-        .status()
+        .output()
         .await
-        .map_err(|e| e.to_string())?;
-    if status.success() {
+        .map_err(|e| format!("failed to spawn `{program}`: {e}"))?;
+    if output.status.success() {
         Ok(())
     } else {
-        Err(format!("`{program}` failed (exit {status})"))
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        if detail.is_empty() {
+            Err(format!("`{program}` failed (exit {})", output.status))
+        } else {
+            Err(format!(
+                "`{program}` failed (exit {}): {detail}",
+                output.status
+            ))
+        }
     }
 }
 
@@ -1086,7 +1095,7 @@ pub fn run() {
 // builds; `cargo test --release` turns those off and the symbol away.
 #[cfg(all(test, debug_assertions))]
 mod tests {
-    use super::debug_config_dir;
+    use super::{debug_config_dir, run_open_argv};
     use std::path::PathBuf;
 
     #[test]
@@ -1104,5 +1113,19 @@ mod tests {
         if let Some(path) = debug_config_dir(None) {
             assert!(path.ends_with("switchboard-dev"));
         }
+    }
+
+    #[tokio::test]
+    async fn open_argv_failure_includes_stderr() {
+        let err = run_open_argv(vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "echo missing editor >&2; exit 7".to_owned(),
+        ])
+        .await
+        .unwrap_err();
+
+        assert!(err.contains("`/bin/sh` failed"));
+        assert!(err.contains("missing editor"));
     }
 }

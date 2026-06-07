@@ -987,7 +987,8 @@ pub async fn open_commit_file_difftool_impl(
 // --- Git-view open actions --------------------------------------------------
 
 /// The macOS argv for opening a worktree folder in an external editor: the
-/// user's configured `editor_command` run against the path, or the OS
+/// user's configured `editor_command` run against the path via the user's
+/// login shell, or the OS
 /// folder-open (`open <path>`) when no editor command is set. The blank-command
 /// fallback means open-in-editor works with zero config. argv[0] is the program;
 /// the rest are its arguments.
@@ -997,7 +998,10 @@ pub async fn open_commit_file_difftool_impl(
 /// token and forwards the rest as arguments, rather than treating the whole
 /// string as one impossible binary name. A command that splits to nothing
 /// (malformed quoting) falls back to the OS folder-open so the action still does
-/// something useful instead of silently failing.
+/// something useful instead of silently failing. The split command is then
+/// passed as positional args to `zsh -lc 'exec "$@"'`, which lets macOS GUI
+/// launches use login-shell PATH setup (`.zprofile`, `/etc/paths`, and
+/// `/etc/paths.d`) without interpolating the worktree path into shell source.
 #[must_use]
 pub fn editor_open_argv(editor_command: Option<&str>, path: &str) -> Vec<String> {
     let Some(cmd) = editor_command else {
@@ -1006,6 +1010,15 @@ pub fn editor_open_argv(editor_command: Option<&str>, path: &str) -> Vec<String>
     match shlex::split(cmd) {
         Some(mut tokens) if !tokens.is_empty() => {
             tokens.push(path.to_owned());
+            tokens.splice(
+                0..0,
+                [
+                    "/bin/zsh".to_owned(),
+                    "-lc".to_owned(),
+                    "exec \"$@\"".to_owned(),
+                    "switchboard-editor".to_owned(),
+                ],
+            );
             tokens
         }
         _ => vec!["open".to_owned(), path.to_owned()],
@@ -10919,12 +10932,27 @@ mod tests {
         // A bare editor command runs against the path…
         assert_eq!(
             editor_open_argv(Some("cursor"), "/repo/wt"),
-            vec!["cursor", "/repo/wt"]
+            vec![
+                "/bin/zsh",
+                "-lc",
+                "exec \"$@\"",
+                "switchboard-editor",
+                "cursor",
+                "/repo/wt"
+            ]
         );
         // …a command with flags is shell-split into program + args + path…
         assert_eq!(
             editor_open_argv(Some("code --reuse-window"), "/repo/wt"),
-            vec!["code", "--reuse-window", "/repo/wt"]
+            vec![
+                "/bin/zsh",
+                "-lc",
+                "exec \"$@\"",
+                "switchboard-editor",
+                "code",
+                "--reuse-window",
+                "/repo/wt"
+            ]
         );
         // …an absent command falls back to the OS folder-open…
         assert_eq!(editor_open_argv(None, "/repo/wt"), vec!["open", "/repo/wt"]);
@@ -10933,6 +10961,51 @@ mod tests {
         assert_eq!(
             editor_open_argv(Some("\"unterminated"), "/repo/wt"),
             vec!["open", "/repo/wt"]
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn editor_open_argv_resolves_command_from_login_shell_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        let zdot_dir = tmp.path().join("zdot");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::create_dir_all(&zdot_dir).unwrap();
+
+        let editor = bin_dir.join("fake-editor");
+        let args_file = tmp.path().join("args.txt");
+        std::fs::write(
+            &editor,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$SWITCHBOARD_FAKE_EDITOR_ARGS\"\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&editor).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&editor, permissions).unwrap();
+        std::fs::write(
+            zdot_dir.join(".zprofile"),
+            format!("export PATH=\"{}:$PATH\"\n", bin_dir.display()),
+        )
+        .unwrap();
+
+        let argv = editor_open_argv(Some("fake-editor --reuse-window"), "/repo/work tree");
+        let (program, rest) = argv.split_first().unwrap();
+        let status = std::process::Command::new(program)
+            .args(rest)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .env("ZDOTDIR", &zdot_dir)
+            .env("SWITCHBOARD_FAKE_EDITOR_ARGS", &args_file)
+            .status()
+            .unwrap();
+
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(args_file).unwrap(),
+            "--reuse-window\n/repo/work tree\n"
         );
     }
 

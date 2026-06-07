@@ -28,7 +28,15 @@ Add a project-scoped compact transcript mode that makes long conversations easie
 
 ## User experience
 
-When a project is open in Projects view, the title bar shows a compact transcript icon near the right side, next to the agents-sidebar toggle. It does not render in Settings, Git view, no-project, loading, or no-agent states. Toggling it affects only the active project.
+When a project is open in Projects view, the title bar shows a compact transcript icon near the right side, next to the agents-sidebar toggle. It does not render in Settings, Git view, no-project, loading, or no-agent states. The header control affects only the active project.
+
+The header control is a normalize/toggle action:
+
+- Expanded with no manual overrides: enable compact mode.
+- Compact with no manual overrides: disable compact mode.
+- Any state with manual overrides: enable compact mode and clear that project's overrides.
+
+This gives the user a reliable reset after manually opening or closing several transcript units. "Compact mode" still honors the latest-response exception: older eligible transcript units collapse, while the latest completed agent response stays expanded by default.
 
 When compact mode is off, completed transcript content behaves as it does today.
 
@@ -83,19 +91,22 @@ Expose helpers rather than encouraging direct mutation:
 - `isCompact(projectId: ProjectId, key: string, defaultCompact: boolean): boolean`
 - `toggleKey(projectId: ProjectId, key: string, defaultCompact: boolean): void`
 - `setProjectCompact(projectId: ProjectId, enabled: boolean): void`
+- `normalizeProjectCompact(projectId: ProjectId): void`
+- `hasOverrides(projectId: ProjectId): boolean`
 - `setManyOverrides(projectId: ProjectId, keys: string[], compact: boolean): void`
 - `clearProjectOverrides(projectId: ProjectId): void`
 - `_testing.reset(): void`
 
-`setProjectCompact` should clear that project's overrides. Project switching should not clear state; state is intentionally project-scoped. App restart resets everything because the state is in-memory only.
+`setProjectCompact` should set the requested project mode and clear that project's overrides. `normalizeProjectCompact` should implement the header action: if the project has any overrides, set `enabled = true` and clear overrides; otherwise invert `enabled` and clear overrides. Project switching should not clear state; state is intentionally project-scoped. App restart resets everything because the state is in-memory only.
 
 ### Definition of done
 
 - Compact state is keyed by `ProjectId`.
 - Toggling one project does not affect another project.
 - Per-key overrides are scoped to their project.
+- `normalizeProjectCompact` enables compact mode and clears overrides whenever overrides are present.
 - `_testing.reset()` clears all preview state.
-- Unit tests cover project isolation and override reset.
+- Unit tests cover project isolation, override reset, and header-normalize behavior.
 
 ## Milestone 2 - Completed transcript compact UI
 
@@ -121,7 +132,7 @@ Determine default compactness per visible unit:
 - Streaming rows do not use completed-preview compactness.
 - Queued rows and outcome-only rows do not get compact toggles.
 
-The "latest completed agent response set" is the last completed agent response in the rendered active-project transcript. For a fan-out send, treat all completed agent columns in that latest fan-out group as the latest set.
+The "latest completed agent response set" is based on completion recency, not rendered transcript order. Among agent turns with `status === "complete"`, choose the turn with the greatest `ended_at ?? started_at`. If that turn has a `send_id` that belongs to a fan-out group, treat all completed agent columns in that fan-out group as the latest set. Failed, cancelled, queued, and streaming rows do not qualify as latest completed responses. While a newer send is still streaming, the previous latest completed response remains expanded and the streaming response uses the live cap.
 
 Add compact controls to `messageMeta`:
 
@@ -130,6 +141,7 @@ Add compact controls to `messageMeta`:
 - Use lucide icons from `@lucide/svelte` where possible.
 - Keep the control hover/focus-revealed like existing meta actions.
 - Use `data-testid="turn-preview-toggle"` for individual message/column controls.
+- Make the compact control opt-in at each `messageMeta` call site. User rows, completed standalone agent rows, and fan-out agent columns pass a control; outcome-only and queued rows do not.
 
 Add completed-preview body styling:
 
@@ -147,9 +159,10 @@ Tool call behavior in compact completed turns:
 ### Definition of done
 
 - Header compact mode collapses older completed messages/responses only for the active project.
-- Latest completed standalone agent response stays expanded by default.
-- Latest completed fan-out response columns stay expanded by default.
+- Latest completed standalone agent response, selected by terminal recency, stays expanded by default.
+- Latest completed fan-out response columns, selected from the latest completed turn's `send_id`, stay expanded by default.
 - Manual individual toggles override the default for their message/column.
+- Outcome-only and queued rows do not render compact toggles.
 - Tool calls and thinking widgets are absent from compact completed responses.
 - Tool-only compact responses show a hidden-tools placeholder.
 - Copy behavior remains unchanged.
@@ -162,12 +175,16 @@ Streaming responses remain visible without taking over the transcript. The live 
 
 ### Implementation outline
 
-Add a live-body wrapper for streaming agent responses:
+Split streaming rendering into a capped content region and a sibling live footer. Do not wrap the existing whole `turnBody` snippet with the live cap, because `workingFooter` currently includes the working/quiet label and cancel control. The cap applies only to streamed text/tool content; `workingFooter` renders outside the scrollable region for both standalone rows and fan-out columns.
+
+Add a live content wrapper for streaming agent responses:
 
 - `max-height: min(600px, 60vh)` or a nearby value that feels right in the app.
 - `overflow-y: auto`.
-- Bottom-pin the internal live body when new content arrives, similar in spirit to the transcript-level auto-pin behavior.
-- Keep `workingFooter` and live cancel controls visible outside the scrollable capped body or otherwise reachable without scrolling through all live output.
+- `data-testid="turn-live-scroll"` for focused tests and browser inspection.
+- Bottom-pin each internal live body when new content arrives.
+
+Each capped live region needs independent pinning state keyed by its streaming unit. The existing outer transcript auto-pin still keeps the transcript near the active rows, but once live content is capped the outer container stops growing with every streamed token/tool update; the inner live region's bottom-pin is therefore required for latest activity to remain visible.
 
 For fan-out, apply the live cap per streaming column so one verbose agent does not distort the whole group.
 
@@ -178,7 +195,7 @@ Do not apply completed-preview fade or completed tool suppression to streaming c
 - Streaming standalone responses are height-capped while streaming.
 - Streaming fan-out columns are height-capped independently.
 - New streamed content remains visible near the bottom of the capped region.
-- Cancel/working/quiet affordances remain visible and usable.
+- Cancel/working/quiet affordances render outside `turn-live-scroll` and remain visible and usable.
 - On completion, the live cap is removed and the response is expanded as the latest completed response.
 
 ## Milestone 4 - Fan-out group controls
@@ -226,6 +243,12 @@ In `App.svelte`, render the compact transcript button only when:
 
 Place it near the existing right-side title-bar controls, before the agents-sidebar toggle. Wrap with `Tooltip`; use `data-testid="transcript-compact-toggle"` and `data-tauri-no-drag`.
 
+The button should call `normalizeProjectCompact(projectId)`, not blindly invert the boolean. Tooltip and aria label should reflect the action:
+
+- Has overrides: `Reset compact transcript`
+- Compact off, no overrides: `Compact transcript`
+- Compact on, no overrides: `Expand transcript`
+
 Icon recommendation:
 
 - Prefer lucide `Rows3`, `ListCollapse`, `Minimize2`, or `Maximize2` depending on available exports and visual fit.
@@ -236,17 +259,28 @@ Icon recommendation:
 Tests should cover:
 
 - Project-scoped compact state isolation.
-- Header toggle affects only the active project.
-- Header toggle clears that project's per-key overrides.
+- Header control affects only the active project.
+- Header control clears that project's per-key overrides.
+- Header control enables compact mode, rather than expanding, when overrides are present.
 - Older completed messages compact when enabled.
-- Latest completed standalone response stays expanded.
-- Latest completed fan-out response columns stay expanded.
+- Latest completed standalone response is selected by completion recency, not rendered order.
+- Latest completed fan-out response columns are selected from the latest completed turn's `send_id`.
+- A slow earlier-anchored send that finishes after a later rendered send stays expanded.
 - Individual message/column toggle affects only that unit.
+- Outcome-only and queued rows do not show compact toggles.
 - Fan-out group toggle expands/collapses only that fan-out's agent columns.
 - Compact completed responses hide tool calls and thinking widgets.
 - Tool-only compact responses show a hidden-tools placeholder.
 - Streaming responses use live cap, not completed preview.
+- `turn-working` renders outside `turn-live-scroll`.
 - Streaming completion removes the live cap and leaves the latest response expanded.
+
+Because the riskiest behavior is visual layout and real scroll behavior, do not rely only on jsdom component tests. Before considering the feature done, run the app and verify in a real browser/in-app browser with:
+
+- Long completed text: compact preview fades and clips without fading short messages.
+- Tool-only completed response: compact placeholder is visible.
+- Long streaming standalone response: live content is capped, bottom-pinned, and cancel/working controls stay visible.
+- Long streaming fan-out responses: each column caps and bottom-pins independently.
 
 Run the focused frontend tests first, then the broader checks required for the touched surface:
 
@@ -254,4 +288,3 @@ Run the focused frontend tests first, then the broader checks required for the t
 - `pnpm test -- App`
 - `pnpm test -- transcriptPreview`
 - `make lint`
-

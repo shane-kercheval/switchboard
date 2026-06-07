@@ -157,7 +157,7 @@ describe("workspace project activity", () => {
     const a = agent(AGENT_1, PROJECT_1);
     ws.agentsByProject[PROJECT_1] = [a];
     await state.registerAgent(a);
-    state.dispatchUserTurn(AGENT_1, "user-1", "go", "send-1", staleBackground.last_activity);
+    state.dispatchUserTurn(AGENT_1, "user-1", "go", [], "send-1", staleBackground.last_activity);
     observerStops.push(ws.startProjectActivityObserver(() => "2026-05-25T12:00:00.000Z"));
     await tick();
     const rt = state.runtimes[AGENT_1];
@@ -192,8 +192,8 @@ describe("workspace project activity", () => {
     ws.agentsByProject[PROJECT_1] = [agentA, agentB];
     await state.registerAgent(agentA);
     await state.registerAgent(agentB);
-    state.dispatchUserTurn(AGENT_1, "user-1", "go", "send-1", p.last_activity);
-    state.dispatchUserTurn(AGENT_2, "user-2", "go", "send-2", p.last_activity);
+    state.dispatchUserTurn(AGENT_1, "user-1", "go", [], "send-1", p.last_activity);
+    state.dispatchUserTurn(AGENT_2, "user-2", "go", [], "send-2", p.last_activity);
     observerStops.push(ws.startProjectActivityObserver(() => "2026-05-25T12:00:00.000Z"));
     await tick();
 
@@ -322,7 +322,7 @@ describe("workspace project activity", () => {
     const a = agent(AGENT_1, PROJECT_1);
     ws.agentsByProject[PROJECT_1] = [a];
     await state.registerAgent(a);
-    state.dispatchUserTurn(AGENT_1, "user-1", "go", "send-1", busyProject.last_activity);
+    state.dispatchUserTurn(AGENT_1, "user-1", "go", [], "send-1", busyProject.last_activity);
     observerStops.push(ws.startProjectActivityObserver(() => "2026-05-25T12:00:00.000Z"));
     await tick();
     invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
@@ -570,7 +570,7 @@ describe("project staleness refresh", () => {
     await vi.waitFor(() => expect(ws.conversations[PROJECT_1]?.status).toBe("complete"));
 
     // Dispatch a send THIS session → a user turn lands in the slice with send_id.
-    state.dispatchUserTurn(AGENT_1, "u-live", "hi there", "send-L", "2026-05-20T00:03:00Z");
+    state.dispatchUserTurn(AGENT_1, "u-live", "hi there", [], "send-L", "2026-05-20T00:03:00Z");
 
     // The re-read journal now also carries that send. After refresh, the overlay
     // must NOT contain its user_message — it renders from the live slice instead.

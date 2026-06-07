@@ -242,7 +242,7 @@ describe("Sidebar", () => {
   it("shows only currently available menu actions", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
-    state.dispatchUserTurn(CLAUDE_AGENT.id, "user-1", "go", "send-1", "2026-05-16T00:00:00Z");
+    state.dispatchUserTurn(CLAUDE_AGENT.id, "user-1", "go", [], "send-1", "2026-05-16T00:00:00Z");
     agentSessionInfoMock.mockResolvedValue({
       session_file: "/sessions/alice.jsonl",
       resume_command: "cd '/proj' && claude --resume abc --dangerously-skip-permissions",

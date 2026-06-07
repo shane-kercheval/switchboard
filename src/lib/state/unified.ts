@@ -24,7 +24,7 @@
 // failed/cancelled marker *above* the prompt that caused it. Ranks: user (0) <
 // agent (1) < outcome (2).
 
-import type { AgentId, ConversationItem, OutcomeStatus, TurnId } from "$lib/types";
+import type { AgentId, Attachment, ConversationItem, OutcomeStatus, TurnId } from "$lib/types";
 import type { AgentCopyMode } from "$lib/agentCopyMode";
 import type { Turn } from "./types";
 
@@ -100,6 +100,7 @@ export type UnifiedRow =
       send_id?: string;
       agent_ids: AgentId[];
       text: string;
+      attachments: Attachment[];
       // True for this-session sends (built from per-agent transcripts), false
       // for journal-sourced history (the overlay). A live fan-out groups even
       // before any recipient responds — so all-busy sends show their per-recipient
@@ -173,7 +174,13 @@ export function buildUnifiedRows(
   // Two passes so the returned row objects are never mutated after creation:
   // accumulate group metadata first (a plain scratch map), then build each user
   // row exactly once.
-  type UserGroup = { send_id?: string; agent_ids: AgentId[]; text: string; at: string };
+  type UserGroup = {
+    send_id?: string;
+    agent_ids: AgentId[];
+    text: string;
+    attachments: Attachment[];
+    at: string;
+  };
   const groups = new Map<string, UserGroup>();
   const groupOrder: string[] = [];
   for (const turn of turns) {
@@ -185,6 +192,9 @@ export function buildUnifiedRows(
           send_id: turn.send_id,
           agent_ids: [turn.agent_id],
           text: turn.text,
+          // Identical across a fan-out's recipients (the compose bar shares one
+          // list), so the first turn's attachments stand for the group.
+          attachments: turn.attachments ?? [],
           at: turn.started_at,
         });
         groupOrder.push(groupKey);
@@ -214,6 +224,7 @@ export function buildUnifiedRows(
       send_id: g.send_id,
       agent_ids: g.agent_ids,
       text: g.text,
+      attachments: g.attachments,
       live: true,
     });
   }
@@ -230,6 +241,7 @@ export function buildUnifiedRows(
         send_id: item.send_id ?? undefined,
         agent_ids: item.agent_ids,
         text: item.text,
+        attachments: item.attachments ?? [],
         live: false,
       });
     } else if (item.kind === "outcome") {

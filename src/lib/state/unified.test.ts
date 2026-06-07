@@ -30,6 +30,7 @@ function userTurn(
     send_id: sendId,
     started_at: startedAt,
     text,
+    attachments: [],
   };
 }
 

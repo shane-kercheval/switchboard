@@ -42,6 +42,7 @@ import {
 import type {
   AgentId,
   AgentRecord,
+  Attachment,
   FailureKind,
   Hydrate,
   MessageId,
@@ -300,6 +301,7 @@ export function dispatchUserTurn(
   agentId: AgentId,
   userTurnId: TurnId,
   text: string,
+  attachments: Attachment[],
   sendId: SendId,
   // Timestamp generation, not reactive state.
   // eslint-disable-next-line svelte/prefer-svelte-reactivity
@@ -318,6 +320,7 @@ export function dispatchUserTurn(
     agentId,
     userTurnId,
     text,
+    attachments,
     startedAt,
     sendId,
   );

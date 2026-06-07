@@ -17,6 +17,7 @@ mod secret_store;
 mod state;
 mod workspace;
 
+use std::path::Path;
 use std::sync::Arc;
 
 use switchboard_dispatcher::EventEmitter;
@@ -29,9 +30,9 @@ use tauri::{Emitter, Manager, State};
 use crate::commands::ProjectConversation;
 use crate::commands::{
     AgentSessionFingerprint, AgentSessionInfo, DirectoryInfo, HarnessInstallStatus, ProjectListing,
-    RepoListing, WorkspaceDirectories, add_mcp_provider_impl, add_tracked_repo_impl,
-    agent_session_info_impl, attach_agent_impl, cancel_agent_impl, cancel_send_impl,
-    cancel_turn_impl, changed_files_impl, check_antigravity_auth_impl,
+    RepoListing, StagedAttachment, WorkspaceDirectories, add_mcp_provider_impl,
+    add_tracked_repo_impl, agent_session_info_impl, attach_agent_impl, cancel_agent_impl,
+    cancel_send_impl, cancel_turn_impl, changed_files_impl, check_antigravity_auth_impl,
     check_antigravity_binary_impl, check_claude_auth_impl, check_claude_binary_impl,
     check_codex_auth_impl, check_codex_binary_impl, check_gemini_auth_impl,
     check_gemini_binary_impl, commit_changed_files_impl, commit_file_diff_impl, commit_ranges_impl,
@@ -46,13 +47,14 @@ use crate::commands::{
     remove_tracked_repo_impl, rename_agent_impl, rename_project_impl, render_prompt_impl,
     reveal_in_finder_argv, search_project_files_in_root, search_project_files_root_impl,
     send_message_impl, set_active_project_impl, set_agent_effort_impl, set_agent_model_impl,
-    set_preferences_impl, set_project_archived_impl, sync_prompts_and_notify, terminal_open_argv,
-    test_mcp_connection_impl, tracked_repos_inputs, tracked_roots, validate_external_url,
+    set_preferences_impl, set_project_archived_impl, stage_attachment_impl,
+    sync_prompts_and_notify, terminal_open_argv, test_mcp_connection_impl, tracked_repos_inputs,
+    tracked_roots, validate_external_url,
 };
 use crate::preferences::Preferences;
 use crate::state::AppState;
 
-use switchboard_core::{AgentRecord, HarnessKind, ProjectSummary};
+use switchboard_core::{AgentRecord, Attachment, HarnessKind, ProjectSummary};
 use switchboard_git::{
     BranchKind, ChangeKind, ChangedFile, CommitChanges, FileDiff, GitCommitRange,
 };
@@ -501,21 +503,39 @@ async fn send_message(
     state: State<'_, AppState>,
     agent_id: String,
     prompt: String,
+    attachments: Vec<Attachment>,
     send_id: String,
 ) -> Result<String, String> {
     let id = parse_uuid(&agent_id).map_err(|e| e.to_string())?;
     // The frontend mints one `send_id` per Send and passes it on every
     // per-recipient call, so a fan-out's turns share it (hydration groups the
-    // user's message once).
+    // user's message once). The same goes for `attachments`: the compose bar
+    // sends one snapshotted list to every recipient, so the staged file is
+    // shared and the grouped user message renders its chips once.
     let sid = parse_uuid(&send_id).map_err(|e| e.to_string())?;
     // Returns the minted `message_id` immediately (the send is accepted, not
     // necessarily started). The turn's `turn_id` and lifecycle flow over the
     // per-agent event channel; the correlated `TurnStart` carries this
     // `message_id`, and a pre-`TurnStart` failure surfaces as `MessageFailed`.
-    let message_id = send_message_impl(state.inner(), id, &prompt, sid)
+    let message_id = send_message_impl(state.inner(), id, &prompt, attachments, sid)
         .await
         .map_err(|e| e.to_string())?;
     Ok(message_id.to_string())
+}
+
+#[tauri::command]
+async fn stage_attachment(
+    state: State<'_, AppState>,
+    project_id: String,
+    source_path: String,
+) -> Result<StagedAttachment, String> {
+    let pid = parse_uuid(&project_id).map_err(|e| e.to_string())?;
+    // Copies the dropped file under the project's attachments dir (on the
+    // blocking pool) and returns the staged absolute path the frontend stores on
+    // the chip and later sends.
+    stage_attachment_impl(state.inner(), pid, Path::new(&source_path))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -533,16 +553,18 @@ async fn remove_queued_message(
         agent_id: removed.agent_id.to_string(),
         send_id: removed.send_id.to_string(),
         prompt: removed.prompt,
+        attachments: removed.attachments,
     })
 }
 
 /// Wire result of `remove_queued_message` — the removed message's payload, so
-/// the compose bar can restore the text the user had queued.
+/// the compose bar can restore the text and attachment chips the user had queued.
 #[derive(serde::Serialize)]
 struct RemovedQueued {
     agent_id: String,
     send_id: String,
     prompt: String,
+    attachments: Vec<Attachment>,
 }
 
 #[tauri::command]
@@ -1073,6 +1095,7 @@ pub fn run() {
             list_agents,
             search_project_files,
             send_message,
+            stage_attachment,
             remove_queued_message,
             cancel_turn,
             cancel_agent,

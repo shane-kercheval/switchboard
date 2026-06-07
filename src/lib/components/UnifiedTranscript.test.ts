@@ -23,6 +23,7 @@ const invokeMock = vi.fn(
 );
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: (cmd: string, args?: Record<string, unknown>) => invokeMock(cmd, args),
+  convertFileSrc: (path: string) => `asset://localhost/${path}`,
 }));
 
 const copyTextMock = vi.fn(async (_t: string): Promise<void> => undefined);
@@ -590,7 +591,14 @@ describe("UnifiedTranscript", () => {
     // A dispatched-but-not-started send: optimistic user turn + pending entry,
     // backend-accepted (message_id recorded) but no turn_start yet (queued
     // behind some other work).
-    state.dispatchUserTurn(CLAUDE_AGENT.id, "user-1", "later", "send-q", "2026-05-16T00:00:00Z");
+    state.dispatchUserTurn(
+      CLAUDE_AGENT.id,
+      "user-1",
+      "later",
+      [],
+      "send-q",
+      "2026-05-16T00:00:00Z",
+    );
     state.recordSendAccepted(CLAUDE_AGENT.id, "user-1", "msg-q");
 
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
@@ -1627,5 +1635,40 @@ describe("UnifiedTranscript hydration failures", () => {
     expect(screen.getByTestId("turn")).toBeInTheDocument();
     expect(screen.queryByTestId("message-model")).toBeNull();
     expect(screen.queryByTestId("message-effort")).toBeNull();
+  });
+});
+
+describe("UnifiedTranscript — attachments", () => {
+  it("renders an image thumbnail and a file chip under a user message, never a raw path", async () => {
+    const state = await loadState();
+    await state.registerAgent(CODEX_AGENT);
+    const imgPath = "/proj/.switchboard/projects/p/attachments/uuid__diagram.png";
+    const filePath = "/proj/.switchboard/projects/p/attachments/uuid__data.bin";
+    state.transcripts[CODEX_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "user-1",
+        agent_id: CODEX_AGENT.id,
+        started_at: "2026-05-16T00:00:00Z",
+        text: "compare these",
+        attachments: [
+          { label: "image-1", kind: "image", path: imgPath, original_name: "diagram.png" },
+          { label: "file-1", kind: "file", path: filePath, original_name: "data.bin" },
+        ],
+      },
+    ];
+
+    render(UnifiedTranscript, { props: { agents: [CODEX_AGENT] } });
+
+    const thumb = (await screen.findByTestId("attachment-thumb-image-1")) as HTMLImageElement;
+    // The thumbnail uses convertFileSrc (asset:// URL), not the raw filesystem path.
+    expect(thumb.getAttribute("src")).toContain("asset://");
+    expect(thumb.getAttribute("src")).not.toBe(imgPath);
+    expect(screen.getByTestId("attachment-file-file-1")).toHaveTextContent("data.bin");
+
+    // The user bubble shows the prose + display names, never the staged paths.
+    const turn = screen.getByTestId("turn");
+    expect(turn.textContent).not.toContain(imgPath);
+    expect(turn.textContent).not.toContain(filePath);
   });
 });

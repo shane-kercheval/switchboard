@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use switchboard_core::{AgentId, AgentRecord, HarnessKind, SendId, SessionLocator};
+use switchboard_core::{AgentId, AgentRecord, Attachment, HarnessKind, SendId, SessionLocator};
 use switchboard_dispatcher::{
     CancelOutcome, ConversationJournal, DispatchContext, DispatchContextFactory, Dispatcher,
     EventEmitter, JournalError, MetadataCache, NoopJournal, NoopMetadataCache,
@@ -186,7 +186,7 @@ impl DispatchContextFactory for TestFactory {
 /// (send at turn-start for every turn; outcome only for non-completed turns).
 #[derive(Default)]
 struct RecordingJournal {
-    sends: Mutex<Vec<(TurnId, String)>>,
+    sends: Mutex<Vec<(TurnId, String, Vec<Attachment>)>>,
     outcomes: Mutex<Vec<(TurnId, TurnOutcome)>>,
 }
 
@@ -196,12 +196,13 @@ impl ConversationJournal for RecordingJournal {
         turn_id: TurnId,
         _agent_id: AgentId,
         prompt: &str,
+        attachments: &[Attachment],
         _at: DateTime<Utc>,
     ) -> Result<(), JournalError> {
         self.sends
             .lock()
             .unwrap()
-            .push((turn_id, prompt.to_owned()));
+            .push((turn_id, prompt.to_owned(), attachments.to_vec()));
         Ok(())
     }
     fn record_outcome(
@@ -287,6 +288,7 @@ impl ConversationJournal for FailingJournal {
         _turn_id: TurnId,
         _agent_id: AgentId,
         _prompt: &str,
+        _attachments: &[Attachment],
         _at: DateTime<Utc>,
     ) -> Result<(), JournalError> {
         Err(JournalError("disk on fire".into()))
@@ -389,7 +391,14 @@ async fn send_message_emits_turn_start_before_content_chunks() {
 
     let message_id = accepted(
         dispatcher
-            .send_message(agent.id, "hello", Uuid::now_v7(), factory, OnBusy::Enqueue)
+            .send_message(
+                agent.id,
+                "hello",
+                vec![],
+                Uuid::now_v7(),
+                factory,
+                OnBusy::Enqueue,
+            )
             .await,
     );
 
@@ -460,6 +469,7 @@ async fn second_send_to_busy_agent_enqueues_and_auto_dispatches() {
             .send_message(
                 agent.id,
                 "first",
+                vec![],
                 Uuid::now_v7(),
                 Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
                 OnBusy::Enqueue,
@@ -468,7 +478,14 @@ async fn second_send_to_busy_agent_enqueues_and_auto_dispatches() {
     );
     let second = accepted(
         dispatcher
-            .send_message(agent.id, "second", Uuid::now_v7(), factory, OnBusy::Enqueue)
+            .send_message(
+                agent.id,
+                "second",
+                vec![],
+                Uuid::now_v7(),
+                factory,
+                OnBusy::Enqueue,
+            )
             .await,
     );
 
@@ -518,6 +535,7 @@ async fn concurrent_send_to_different_agents_both_succeed() {
         .send_message(
             agent_a.id,
             "A's prompt",
+            vec![],
             Uuid::now_v7(),
             factory_a,
             OnBusy::Enqueue,
@@ -527,6 +545,7 @@ async fn concurrent_send_to_different_agents_both_succeed() {
         .send_message(
             agent_b.id,
             "B's prompt",
+            vec![],
             Uuid::now_v7(),
             factory_b,
             OnBusy::Enqueue,
@@ -579,6 +598,7 @@ async fn panic_in_producer_recovers_and_a_later_send_completes() {
         .send_message(
             agent.id,
             "will panic",
+            vec![],
             Uuid::now_v7(),
             Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
             OnBusy::Enqueue,
@@ -607,6 +627,7 @@ async fn panic_in_producer_recovers_and_a_later_send_completes() {
         .send_message(
             agent.id,
             "now works",
+            vec![],
             Uuid::now_v7(),
             factory,
             OnBusy::Enqueue,
@@ -641,7 +662,14 @@ async fn truncated_stream_without_turn_end_returns_to_idle() {
     );
 
     dispatcher
-        .send_message(agent.id, "prompt", Uuid::now_v7(), factory, OnBusy::Enqueue)
+        .send_message(
+            agent.id,
+            "prompt",
+            vec![],
+            Uuid::now_v7(),
+            factory,
+            OnBusy::Enqueue,
+        )
         .await;
     within(
         &emitter,
@@ -682,6 +710,7 @@ async fn dispatch_failure_emits_message_failed_no_turn_start_and_stays_usable() 
             .send_message(
                 agent.id,
                 "won't dispatch",
+                vec![],
                 Uuid::now_v7(),
                 Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
                 OnBusy::Enqueue,
@@ -724,6 +753,7 @@ async fn dispatch_failure_emits_message_failed_no_turn_start_and_stays_usable() 
         .send_message(
             agent.id,
             "now works",
+            vec![],
             Uuid::now_v7(),
             factory,
             OnBusy::Enqueue,
@@ -761,6 +791,7 @@ async fn agent_idle_is_last_event_and_unblocks_next_send() {
         .send_message(
             agent.id,
             "first",
+            vec![],
             Uuid::now_v7(),
             Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
             OnBusy::Enqueue,
@@ -797,7 +828,14 @@ async fn agent_idle_is_last_event_and_unblocks_next_send() {
 
     // A fresh send to the same agent runs to a second idle.
     dispatcher
-        .send_message(agent.id, "second", Uuid::now_v7(), factory, OnBusy::Enqueue)
+        .send_message(
+            agent.id,
+            "second",
+            vec![],
+            Uuid::now_v7(),
+            factory,
+            OnBusy::Enqueue,
+        )
         .await;
     within(
         &emitter,
@@ -822,7 +860,14 @@ async fn agent_idle_is_last_after_codex_post_terminal_enrichment_sequence() {
     );
 
     dispatcher
-        .send_message(agent.id, "hello", Uuid::now_v7(), factory, OnBusy::Enqueue)
+        .send_message(
+            agent.id,
+            "hello",
+            vec![],
+            Uuid::now_v7(),
+            factory,
+            OnBusy::Enqueue,
+        )
         .await;
     within(
         &emitter,
@@ -877,7 +922,14 @@ async fn stream_only_rate_limit_is_persisted_to_metadata_cache() {
     );
 
     dispatcher
-        .send_message(agent.id, "hello", Uuid::now_v7(), factory, OnBusy::Enqueue)
+        .send_message(
+            agent.id,
+            "hello",
+            vec![],
+            Uuid::now_v7(),
+            factory,
+            OnBusy::Enqueue,
+        )
         .await;
     within(
         &emitter,
@@ -922,7 +974,14 @@ async fn session_file_backed_rate_limit_is_not_persisted() {
     );
 
     dispatcher
-        .send_message(agent.id, "hello", Uuid::now_v7(), factory, OnBusy::Enqueue)
+        .send_message(
+            agent.id,
+            "hello",
+            vec![],
+            Uuid::now_v7(),
+            factory,
+            OnBusy::Enqueue,
+        )
         .await;
     within(
         &emitter,
@@ -968,7 +1027,14 @@ async fn stream_only_context_window_is_persisted_to_metadata_cache() {
     );
 
     dispatcher
-        .send_message(agent.id, "hello", Uuid::now_v7(), factory, OnBusy::Enqueue)
+        .send_message(
+            agent.id,
+            "hello",
+            vec![],
+            Uuid::now_v7(),
+            factory,
+            OnBusy::Enqueue,
+        )
         .await;
     within(
         &emitter,
@@ -1014,7 +1080,14 @@ async fn session_file_backed_context_window_is_not_persisted() {
     );
 
     dispatcher
-        .send_message(agent.id, "hello", Uuid::now_v7(), factory, OnBusy::Enqueue)
+        .send_message(
+            agent.id,
+            "hello",
+            vec![],
+            Uuid::now_v7(),
+            factory,
+            OnBusy::Enqueue,
+        )
         .await;
     within(
         &emitter,
@@ -1057,7 +1130,14 @@ async fn real_spend_turn_with_message_id_is_persisted_to_metadata_cache() {
     );
 
     dispatcher
-        .send_message(agent.id, "hello", Uuid::now_v7(), factory, OnBusy::Enqueue)
+        .send_message(
+            agent.id,
+            "hello",
+            vec![],
+            Uuid::now_v7(),
+            factory,
+            OnBusy::Enqueue,
+        )
         .await;
     within(
         &emitter,
@@ -1111,7 +1191,14 @@ async fn non_real_spend_turn_is_not_persisted() {
     );
 
     dispatcher
-        .send_message(agent.id, "hello", Uuid::now_v7(), factory, OnBusy::Enqueue)
+        .send_message(
+            agent.id,
+            "hello",
+            vec![],
+            Uuid::now_v7(),
+            factory,
+            OnBusy::Enqueue,
+        )
         .await;
     within(
         &emitter,
@@ -1152,7 +1239,14 @@ async fn real_spend_turn_without_message_id_is_not_persisted() {
     );
 
     dispatcher
-        .send_message(agent.id, "hello", Uuid::now_v7(), factory, OnBusy::Enqueue)
+        .send_message(
+            agent.id,
+            "hello",
+            vec![],
+            Uuid::now_v7(),
+            factory,
+            OnBusy::Enqueue,
+        )
         .await;
     within(
         &emitter,
@@ -1187,6 +1281,7 @@ async fn cancel_in_flight_synthesizes_cancelled_then_idle_and_unblocks_next_send
         .send_message(
             agent.id,
             "long task",
+            vec![],
             Uuid::now_v7(),
             Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
             OnBusy::Enqueue,
@@ -1228,7 +1323,14 @@ async fn cancel_in_flight_synthesizes_cancelled_then_idle_and_unblocks_next_send
 
     // Re-promptable immediately: a fresh send runs to a second idle.
     dispatcher
-        .send_message(agent.id, "next", Uuid::now_v7(), factory, OnBusy::Enqueue)
+        .send_message(
+            agent.id,
+            "next",
+            vec![],
+            Uuid::now_v7(),
+            factory,
+            OnBusy::Enqueue,
+        )
         .await;
     within(
         &emitter,
@@ -1262,7 +1364,14 @@ async fn cancel_when_not_in_flight_emits_no_cancelled_terminal() {
         noop_journal(),
     );
     dispatcher
-        .send_message(agent.id, "hi", Uuid::now_v7(), factory, OnBusy::Enqueue)
+        .send_message(
+            agent.id,
+            "hi",
+            vec![],
+            Uuid::now_v7(),
+            factory,
+            OnBusy::Enqueue,
+        )
         .await;
     within(
         &emitter,
@@ -1298,7 +1407,14 @@ async fn cancel_after_terminal_is_a_no_op_and_emits_no_extra_cancelled() {
     );
 
     dispatcher
-        .send_message(agent.id, "hi", Uuid::now_v7(), factory, OnBusy::Enqueue)
+        .send_message(
+            agent.id,
+            "hi",
+            vec![],
+            Uuid::now_v7(),
+            factory,
+            OnBusy::Enqueue,
+        )
         .await;
     within(
         &emitter,
@@ -1336,6 +1452,7 @@ async fn completed_turn_journals_send_but_no_outcome() {
         .send_message(
             agent.id,
             "hello world",
+            vec![],
             Uuid::now_v7(),
             factory,
             OnBusy::Enqueue,
@@ -1383,6 +1500,7 @@ async fn cancelled_turn_journals_send_and_a_cancelled_outcome() {
         .send_message(
             agent.id,
             "long task",
+            vec![],
             Uuid::now_v7(),
             factory,
             OnBusy::Enqueue,
@@ -1444,6 +1562,7 @@ async fn failed_turn_journals_send_and_a_failed_outcome() {
         .send_message(
             agent.id,
             "will fail",
+            vec![],
             Uuid::now_v7(),
             factory,
             OnBusy::Enqueue,
@@ -1494,6 +1613,7 @@ async fn cancellation_latches_and_drops_a_late_real_terminal() {
         .send_message(
             agent.id,
             "racing turn",
+            vec![],
             Uuid::now_v7(),
             factory,
             OnBusy::Enqueue,
@@ -1566,6 +1686,7 @@ async fn send_record_failure_aborts_the_turn_without_starting_it() {
             .send_message(
                 agent.id,
                 "unpersistable",
+                vec![],
                 Uuid::now_v7(),
                 factory,
                 OnBusy::Enqueue,
@@ -1621,6 +1742,7 @@ async fn dispatch_failure_after_send_journals_a_failed_outcome() {
             .send_message(
                 agent.id,
                 "send then fail to start",
+                vec![],
                 Uuid::now_v7(),
                 factory,
                 OnBusy::Enqueue,
@@ -1692,6 +1814,7 @@ async fn fifo_multiple_sends_to_busy_agent_dispatch_in_order() {
                 .send_message(
                     agent.id,
                     prompt,
+                    vec![],
                     Uuid::now_v7(),
                     Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
                     OnBusy::Enqueue,
@@ -1754,6 +1877,7 @@ async fn auto_dispatch_after_first(first_scenario: MockScenario, cancel_first: b
         .send_message(
             agent.id,
             "first",
+            vec![],
             Uuid::now_v7(),
             Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
             OnBusy::Enqueue,
@@ -1761,7 +1885,14 @@ async fn auto_dispatch_after_first(first_scenario: MockScenario, cancel_first: b
         .await;
     let second = accepted(
         dispatcher
-            .send_message(agent.id, "second", Uuid::now_v7(), factory, OnBusy::Enqueue)
+            .send_message(
+                agent.id,
+                "second",
+                vec![],
+                Uuid::now_v7(),
+                factory,
+                OnBusy::Enqueue,
+            )
             .await,
     );
 
@@ -1835,6 +1966,7 @@ async fn remove_queued_message_prevents_dispatch_and_returns_payload() {
         .send_message(
             agent.id,
             "blocker",
+            vec![],
             Uuid::now_v7(),
             blocker,
             OnBusy::Enqueue,
@@ -1856,7 +1988,14 @@ async fn remove_queued_message_prevents_dispatch_and_returns_payload() {
     );
     let queued_id = accepted(
         dispatcher
-            .send_message(agent.id, "queued", queued_send_id, queued, OnBusy::Enqueue)
+            .send_message(
+                agent.id,
+                "queued",
+                vec![],
+                queued_send_id,
+                queued,
+                OnBusy::Enqueue,
+            )
             .await,
     );
 
@@ -1921,6 +2060,7 @@ async fn cancelling_in_flight_turn_leaves_backlog_intact() {
         .send_message(
             agent.id,
             "running",
+            vec![],
             Uuid::now_v7(),
             Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
             OnBusy::Enqueue,
@@ -1935,7 +2075,14 @@ async fn cancelling_in_flight_turn_leaves_backlog_intact() {
 
     let queued_id = accepted(
         dispatcher
-            .send_message(agent.id, "queued", Uuid::now_v7(), factory, OnBusy::Enqueue)
+            .send_message(
+                agent.id,
+                "queued",
+                vec![],
+                Uuid::now_v7(),
+                factory,
+                OnBusy::Enqueue,
+            )
             .await,
     );
 
@@ -1987,6 +2134,7 @@ async fn cancel_fires_token_mid_turn_without_waiting_for_natural_finish() {
         .send_message(
             agent.id,
             "parks forever",
+            vec![],
             Uuid::now_v7(),
             factory,
             OnBusy::Enqueue,
@@ -2034,6 +2182,7 @@ async fn shutdown_agent_abandons_queued_message() {
         .send_message(
             agent.id,
             "running",
+            vec![],
             Uuid::now_v7(),
             running,
             OnBusy::Enqueue,
@@ -2053,7 +2202,14 @@ async fn shutdown_agent_abandons_queued_message() {
         noop_journal(),
     );
     dispatcher
-        .send_message(agent.id, "queued", Uuid::now_v7(), queued, OnBusy::Enqueue)
+        .send_message(
+            agent.id,
+            "queued",
+            vec![],
+            Uuid::now_v7(),
+            queued,
+            OnBusy::Enqueue,
+        )
         .await;
 
     // shutdown_agent returns once the actor has fully stopped.
@@ -2095,6 +2251,7 @@ async fn send_racing_shutdown_is_not_resurrected() {
         .send_message(
             agent.id,
             "running",
+            vec![],
             Uuid::now_v7(),
             running,
             OnBusy::Enqueue,
@@ -2116,7 +2273,14 @@ async fn send_racing_shutdown_is_not_resurrected() {
         noop_journal(),
     );
     let shutdown = dispatcher.shutdown_agent(agent.id, CancelSource::Shutdown);
-    let send = dispatcher.send_message(agent.id, "racer", Uuid::now_v7(), racer, OnBusy::Enqueue);
+    let send = dispatcher.send_message(
+        agent.id,
+        "racer",
+        vec![],
+        Uuid::now_v7(),
+        racer,
+        OnBusy::Enqueue,
+    );
     let ((), _) = tokio::join!(
         async {
             tokio::time::timeout(WAIT, shutdown)
@@ -2172,6 +2336,7 @@ async fn exactly_one_agent_idle_for_a_two_deep_queue() {
             .send_message(
                 agent.id,
                 prompt,
+                vec![],
                 Uuid::now_v7(),
                 Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
                 OnBusy::Enqueue,
@@ -2224,7 +2389,14 @@ async fn send_message_id_equals_correlated_turn_start_message_id() {
 
     let message_id = accepted(
         dispatcher
-            .send_message(agent.id, "hello", Uuid::now_v7(), factory, OnBusy::Enqueue)
+            .send_message(
+                agent.id,
+                "hello",
+                vec![],
+                Uuid::now_v7(),
+                factory,
+                OnBusy::Enqueue,
+            )
             .await,
     );
     within(
@@ -2266,6 +2438,7 @@ async fn mid_turn_enqueue_chains_without_interleaved_agent_idle() {
         .send_message(
             agent.id,
             "first",
+            vec![],
             Uuid::now_v7(),
             Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
             OnBusy::Enqueue,
@@ -2283,6 +2456,7 @@ async fn mid_turn_enqueue_chains_without_interleaved_agent_idle() {
         .send_message(
             agent.id,
             "second",
+            vec![],
             Uuid::now_v7(),
             Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
             OnBusy::Enqueue,
@@ -2342,7 +2516,14 @@ async fn cancel_after_completed_turn_writes_no_cancelled_outcome() {
     );
 
     dispatcher
-        .send_message(agent.id, "hello", Uuid::now_v7(), factory, OnBusy::Enqueue)
+        .send_message(
+            agent.id,
+            "hello",
+            vec![],
+            Uuid::now_v7(),
+            factory,
+            OnBusy::Enqueue,
+        )
         .await;
     within(
         &emitter,
@@ -2424,6 +2605,7 @@ async fn cancel_send_cancels_every_in_flight_turn_of_the_send() {
         .send_message(
             agent_a.id,
             "to A and B",
+            vec![],
             send_id,
             factory_a as Arc<dyn DispatchContextFactory>,
             OnBusy::Enqueue,
@@ -2433,6 +2615,7 @@ async fn cancel_send_cancels_every_in_flight_turn_of_the_send() {
         .send_message(
             agent_b.id,
             "to A and B",
+            vec![],
             send_id,
             factory_b as Arc<dyn DispatchContextFactory>,
             OnBusy::Enqueue,
@@ -2509,6 +2692,7 @@ async fn cancel_send_is_scoped_and_spares_a_later_unrelated_turn() {
         .send_message(
             agent_a.id,
             "the send",
+            vec![],
             send_id,
             factory_a.clone() as Arc<dyn DispatchContextFactory>,
             OnBusy::Enqueue,
@@ -2525,6 +2709,7 @@ async fn cancel_send_is_scoped_and_spares_a_later_unrelated_turn() {
         .send_message(
             agent_a.id,
             "unrelated follow-up",
+            vec![],
             later_send_id,
             factory_a as Arc<dyn DispatchContextFactory>,
             OnBusy::Enqueue,
@@ -2541,6 +2726,7 @@ async fn cancel_send_is_scoped_and_spares_a_later_unrelated_turn() {
         .send_message(
             agent_b.id,
             "the send",
+            vec![],
             send_id,
             factory_b as Arc<dyn DispatchContextFactory>,
             OnBusy::Enqueue,
@@ -2624,6 +2810,7 @@ async fn cancel_send_cancels_in_flight_and_removes_a_queued_recipient_of_the_sen
         .send_message(
             agent_y.id,
             "Y unrelated",
+            vec![],
             unrelated_send_id,
             factory_y as Arc<dyn DispatchContextFactory>,
             OnBusy::Enqueue,
@@ -2640,6 +2827,7 @@ async fn cancel_send_cancels_in_flight_and_removes_a_queued_recipient_of_the_sen
         .send_message(
             agent_y.id,
             "the send",
+            vec![],
             send_id,
             // Factory ignored — Y's actor already exists and owns its builder.
             TestFactory::new(
@@ -2655,6 +2843,7 @@ async fn cancel_send_cancels_in_flight_and_removes_a_queued_recipient_of_the_sen
         .send_message(
             agent_x.id,
             "the send",
+            vec![],
             send_id,
             factory_x as Arc<dyn DispatchContextFactory>,
             OnBusy::Enqueue,
@@ -2713,7 +2902,7 @@ async fn cancel_send_for_a_completed_send_is_a_noop() {
 
     let send_id = Uuid::now_v7();
     dispatcher
-        .send_message(agent.id, "quick", send_id, factory, OnBusy::Enqueue)
+        .send_message(agent.id, "quick", vec![], send_id, factory, OnBusy::Enqueue)
         .await;
     within(
         &emitter,
@@ -2732,6 +2921,7 @@ async fn cancel_send_for_a_completed_send_is_a_noop() {
         .send_message(
             agent.id,
             "next",
+            vec![],
             Uuid::now_v7(),
             TestFactory::new(
                 MockScenario::Streaming,
@@ -2778,6 +2968,7 @@ async fn cancel_agent_cancels_in_flight_clears_backlog_and_stays_alive() {
         .send_message(
             agent.id,
             "first",
+            vec![],
             Uuid::now_v7(),
             factory as Arc<dyn DispatchContextFactory>,
             OnBusy::Enqueue,
@@ -2794,6 +2985,7 @@ async fn cancel_agent_cancels_in_flight_clears_backlog_and_stays_alive() {
         .send_message(
             agent.id,
             "queued",
+            vec![],
             Uuid::now_v7(),
             TestFactory::new(
                 MockScenario::Streaming,
@@ -2834,6 +3026,7 @@ async fn cancel_agent_cancels_in_flight_clears_backlog_and_stays_alive() {
         .send_message(
             agent.id,
             "after stop",
+            vec![],
             Uuid::now_v7(),
             TestFactory::new(
                 MockScenario::Streaming,
@@ -2872,7 +3065,14 @@ async fn captured_locator_is_persisted_and_turn_completes() {
     );
 
     dispatcher
-        .send_message(agent.id, "hello", Uuid::now_v7(), factory, OnBusy::Enqueue)
+        .send_message(
+            agent.id,
+            "hello",
+            vec![],
+            Uuid::now_v7(),
+            factory,
+            OnBusy::Enqueue,
+        )
         .await;
     within(
         &emitter,
@@ -2929,7 +3129,14 @@ async fn codex_variant_capture_flows_through_the_same_sink() {
     );
 
     dispatcher
-        .send_message(agent.id, "hello", Uuid::now_v7(), factory, OnBusy::Enqueue)
+        .send_message(
+            agent.id,
+            "hello",
+            vec![],
+            Uuid::now_v7(),
+            factory,
+            OnBusy::Enqueue,
+        )
         .await;
     within(
         &emitter,
@@ -2963,7 +3170,14 @@ async fn capture_persist_failure_fails_the_turn() {
     );
 
     dispatcher
-        .send_message(agent.id, "hello", Uuid::now_v7(), factory, OnBusy::Enqueue)
+        .send_message(
+            agent.id,
+            "hello",
+            vec![],
+            Uuid::now_v7(),
+            factory,
+            OnBusy::Enqueue,
+        )
         .await;
     within(
         &emitter,
@@ -3012,7 +3226,14 @@ async fn capture_persist_failure_suppresses_subsequent_stream_events() {
     );
 
     dispatcher
-        .send_message(agent.id, "hello", Uuid::now_v7(), factory, OnBusy::Enqueue)
+        .send_message(
+            agent.id,
+            "hello",
+            vec![],
+            Uuid::now_v7(),
+            factory,
+            OnBusy::Enqueue,
+        )
         .await;
     within(
         &emitter,
@@ -3067,6 +3288,7 @@ async fn repeated_capture_events_each_persist_and_are_not_deduped() {
             .send_message(
                 agent.id,
                 "hello",
+                vec![],
                 Uuid::now_v7(),
                 Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
                 OnBusy::Enqueue,

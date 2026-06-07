@@ -34,6 +34,7 @@
 
 import type {
   AgentId,
+  Attachment,
   FailureKind,
   LoadedTurn,
   LoadedTurnItem,
@@ -599,6 +600,7 @@ function appendUserTurnImpl(
   agentId: AgentId,
   turnId: TurnId,
   text: string,
+  attachments: Attachment[],
   startedAt: string,
   sendId?: SendId,
 ): Turn[] {
@@ -611,6 +613,7 @@ function appendUserTurnImpl(
       send_id: sendId,
       started_at: startedAt,
       text,
+      attachments,
     },
   ];
 }

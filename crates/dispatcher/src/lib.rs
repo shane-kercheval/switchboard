@@ -48,7 +48,9 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
-use switchboard_core::{AgentId, AgentRecord, SendId, SessionLocator};
+use switchboard_core::{
+    AgentId, AgentRecord, Attachment, SendId, SessionLocator, render_prompt_with_attachments,
+};
 use switchboard_harness::{
     AdapterEvent, CancelSource, ContextWindowSource, DispatchOptions, EventStream, FailureKind,
     HarnessAdapter, MessageId, NormalizedEvent, RateLimitSource, TurnId, TurnOutcome, TurnSpend,
@@ -66,7 +68,11 @@ use uuid::Uuid;
 struct WorkItem {
     message_id: MessageId,
     send_id: SendId,
+    /// The **clean** prompt (no attachment footer). The agent-facing footer is
+    /// rendered from `attachments` at dispatch time, so the queued item stays
+    /// the user's literal text.
     prompt: String,
+    attachments: Vec<Attachment>,
 }
 
 /// What `send_message` should do when the agent already has a turn in flight.
@@ -110,6 +116,9 @@ pub struct RemovedQueuedMessage {
     pub agent_id: AgentId,
     pub send_id: SendId,
     pub prompt: String,
+    /// Attachments of the removed send, returned so the compose bar can restore
+    /// the chips alongside the text (consistent with restoring the prompt).
+    pub attachments: Vec<Attachment>,
 }
 
 /// `remove_queued_message` found no such queued message — already
@@ -287,6 +296,7 @@ pub trait ConversationJournal: Send + Sync {
         turn_id: TurnId,
         agent_id: AgentId,
         prompt: &str,
+        attachments: &[Attachment],
         at: DateTime<Utc>,
     ) -> Result<(), JournalError>;
 
@@ -419,6 +429,7 @@ impl ConversationJournal for NoopJournal {
         _: TurnId,
         _: AgentId,
         _: &str,
+        _: &[Attachment],
         _: DateTime<Utc>,
     ) -> Result<(), JournalError> {
         Ok(())
@@ -504,6 +515,7 @@ impl Dispatcher {
         &self,
         agent_id: AgentId,
         prompt: &str,
+        attachments: Vec<Attachment>,
         send_id: SendId,
         factory: Arc<dyn DispatchContextFactory>,
         on_busy: OnBusy,
@@ -513,6 +525,7 @@ impl Dispatcher {
             message_id,
             send_id,
             prompt: prompt.to_owned(),
+            attachments,
         };
         // `None` ⇒ the agent is `Closing` (mid-teardown): reject rather than
         // resurrect it with a fresh actor.
@@ -910,7 +923,13 @@ async fn run_turn(
     // Fail-closed: journal the send before spawning. On failure, no turn starts,
     // no outcome marker (the journal is what's broken — a marker would orphan),
     // and we surface MessageFailed. Advance the backlog regardless.
-    if let Err(e) = journal.record_send(turn_id, agent_id, &item.prompt, started_at) {
+    if let Err(e) = journal.record_send(
+        turn_id,
+        agent_id,
+        &item.prompt,
+        &item.attachments,
+        started_at,
+    ) {
         emit_message_failed(
             emitter.as_ref(),
             channel,
@@ -923,8 +942,13 @@ async fn run_turn(
 
     let token = CancellationToken::new();
     options.cancel_token = token.clone();
+    // Clean prompt is journaled (above) and queued; the agent-facing footer of
+    // `label: <absolute path>` lines is appended only here, at the dispatch
+    // boundary, so adapters stay attachment-unaware. Empty attachments → the
+    // prompt is returned unchanged.
+    let dispatch_prompt = render_prompt_with_attachments(&item.prompt, &item.attachments);
     let stream = match adapter
-        .dispatch(&agent, &cwd, &item.prompt, turn_id, options)
+        .dispatch(&agent, &cwd, &dispatch_prompt, turn_id, options)
         .await
     {
         Ok(stream) => stream,
@@ -1289,6 +1313,7 @@ fn remove_from_backlog(
         agent_id,
         send_id: item.send_id,
         prompt: item.prompt,
+        attachments: item.attachments,
     })
 }
 

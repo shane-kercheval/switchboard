@@ -70,6 +70,7 @@
   let busy = $state(false);
   let homePath = $state<string | null>(null);
   let actionError = $state<string | null>(null);
+  let openWorktreeActionsPath = $state<string | null>(null);
 
   const repo = $derived(listing.repo);
   const localBranchCount = $derived(repo.local_branches.length);
@@ -107,6 +108,15 @@
       .catch(() => {
         homePath = null;
       });
+  });
+
+  $effect(() => {
+    if (
+      openWorktreeActionsPath !== null &&
+      !localBranches.some((branch) => branch.worktree?.path === openWorktreeActionsPath)
+    ) {
+      openWorktreeActionsPath = null;
+    }
   });
 
   function displayPath(path: string): string {
@@ -375,15 +385,18 @@
       {:else}
         {#each localBranches as branch (branch.name)}
           {@const selected = isLocalSelected(branch.name)}
+          {@const worktreePath = branch.worktree?.path ?? null}
+          {@const actionsOpen = worktreePath !== null && openWorktreeActionsPath === worktreePath}
           <div
             class={cn(
               "group flex min-h-8 items-center gap-2 rounded-md px-2 py-1.5 transition-colors",
               branch.worktree === null && "opacity-60",
               "hover:bg-raised",
-              selected && "bg-raised hover:bg-raised",
+              (selected || actionsOpen) && "bg-raised hover:bg-raised",
             )}
             data-testid="git-branch"
             data-branch={branch.name}
+            data-actions-open={actionsOpen}
           >
             <!-- Clicking the row selects the branch: it expands to show commits
                  and the panel opens on a default target. The actions menu is a
@@ -397,14 +410,22 @@
             >
               {@render branchInner(branch)}
             </button>
-            {#if branch.worktree}
-              {@const worktreePath = branch.worktree.path}
+            {#if worktreePath !== null}
               <DropdownMenu
+                open={actionsOpen}
+                onOpenChange={(open) => {
+                  openWorktreeActionsPath = open
+                    ? worktreePath
+                    : openWorktreeActionsPath === worktreePath
+                      ? null
+                      : openWorktreeActionsPath;
+                }}
                 triggerLabel={`Actions for ${branch.name}`}
                 triggerTestid="worktree-actions-trigger"
                 triggerClass={cn(
                   ICON_BUTTON_CLASS,
                   "hover:bg-border/60 shrink-0 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 data-[state=open]:opacity-100",
+                  actionsOpen && "opacity-100",
                 )}
                 contentTestid="worktree-actions-menu"
               >

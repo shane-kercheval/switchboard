@@ -7,7 +7,7 @@
 
   let { tool }: { tool: ToolCall } = $props();
 
-  const isRunning = $derived(tool.completed_at === undefined);
+  const isRunning = $derived(tool.completed_at === undefined && tool.stopped_at === undefined);
   const hasOutput = $derived(tool.output !== undefined && tool.output !== "");
 
   // Open while running (so streaming output is visible) and collapsed once done.
@@ -43,6 +43,40 @@
       <span class="ml-auto shrink-0" role="status" aria-label="running" data-testid="tool-running">
         <Spinner class="h-3.5 w-3.5" />
       </span>
+    {:else if tool.stop_reason === "cancelled"}
+      <svg
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.5"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        class="text-status-cancelled ml-auto h-4 w-4 shrink-0"
+        role="img"
+        aria-label="cancelled"
+        data-testid="tool-cancelled"
+      >
+        <circle cx="12" cy="12" r="9" />
+        <path d="M9 9l6 6" />
+        <path d="m15 9-6 6" />
+      </svg>
+    {:else if tool.stop_reason === "failed"}
+      <svg
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="1.5"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        class="text-status-failed ml-auto h-4 w-4 shrink-0"
+        role="img"
+        aria-label="failed"
+        data-testid="tool-error"
+      >
+        <circle cx="12" cy="12" r="9" />
+        <path d="M12 8v4.5" />
+        <path d="M12 16h.01" />
+      </svg>
     {:else if tool.is_error}
       <svg
         viewBox="0 0 24 24"

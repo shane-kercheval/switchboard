@@ -114,7 +114,9 @@ export type TextChunk = {
 
 /// One tool call attached to an agent turn. Lifecycle: `ToolStarted` appends
 /// an entry with `output`/`is_error`/`completed_at` undefined; `ToolCompleted`
-/// fills those in by matching `tool_use_id`.
+/// fills those in by matching `tool_use_id`. If the enclosing turn terminates
+/// before a tool completes, `stopped_at` / `stop_reason` mark that pending tool
+/// terminal so the UI does not leave it spinning.
 ///
 /// `input` is `unknown` because the harnesses emit arbitrary JSON
 /// (`command_execution.command`, `mcp_tool_call.arguments`, Claude's per-tool
@@ -131,6 +133,8 @@ export type ToolCall = {
   is_error?: boolean;
   started_at: string;
   completed_at?: string;
+  stopped_at?: string;
+  stop_reason?: "cancelled" | "failed";
 };
 
 /// One optimistic send awaiting its `turn_start`. `user_turn_id` keys the

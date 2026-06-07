@@ -218,41 +218,34 @@ export function transcriptReducer(
       // of appending a second copy (see the `hydrate` merge). `undefined` for
       // harnesses whose live stream carries no disk-matching id.
       const hydration_key = input.hydration_key ?? undefined;
-      if (input.outcome.status === "completed") {
-        return updateTurn(turns, input.turn_id, {
-          ...existing,
-          status: "complete",
-          ended_at: input.ended_at,
-          usage: input.usage ?? undefined,
-          spend: input.spend ?? undefined,
-          model: input.model ?? undefined,
-          effort: input.effort ?? undefined,
-          hydration_key,
-        });
-      }
-      if (input.outcome.status === "cancelled") {
-        return updateTurn(turns, input.turn_id, {
-          ...existing,
-          status: "cancelled",
-          ended_at: input.ended_at,
-          usage: input.usage ?? undefined,
-          spend: input.spend ?? undefined,
-          model: input.model ?? undefined,
-          effort: input.effort ?? undefined,
-          hydration_key,
-        });
-      }
-      return updateTurn(turns, input.turn_id, {
+      const baseUpdate = {
         ...existing,
-        status: "failed",
         ended_at: input.ended_at,
-        error: input.outcome.message,
-        error_kind: input.outcome.kind,
         usage: input.usage ?? undefined,
         spend: input.spend ?? undefined,
         model: input.model ?? undefined,
         effort: input.effort ?? undefined,
         hydration_key,
+      };
+      if (input.outcome.status === "completed") {
+        return updateTurn(turns, input.turn_id, {
+          ...baseUpdate,
+          status: "complete",
+        });
+      }
+      if (input.outcome.status === "cancelled") {
+        return updateTurn(turns, input.turn_id, {
+          ...baseUpdate,
+          status: "cancelled",
+          items: stopPendingTools(existing.items, input.ended_at, "cancelled"),
+        });
+      }
+      return updateTurn(turns, input.turn_id, {
+        ...baseUpdate,
+        status: "failed",
+        error: input.outcome.message,
+        error_kind: input.outcome.kind,
+        items: stopPendingTools(existing.items, input.ended_at, "failed"),
       });
     }
 
@@ -293,6 +286,18 @@ export function transcriptReducer(
     default:
       return turns;
   }
+}
+
+function stopPendingTools(
+  items: TurnItem[],
+  stoppedAt: string,
+  stopReason: "cancelled" | "failed",
+): TurnItem[] {
+  return items.map((item) => {
+    if (item.item_kind !== "tool") return item;
+    if (item.completed_at !== undefined) return item;
+    return { ...item, stopped_at: stoppedAt, stop_reason: stopReason };
+  });
 }
 
 function loadedTurnToTurn(t: LoadedTurn): Turn {

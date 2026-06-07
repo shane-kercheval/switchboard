@@ -30,6 +30,7 @@
     conversations,
     dismissAgentCreationFailure,
     loadWorkspace,
+    nextUnreadCompletedProjectId,
     projects,
     retryProjectHydration,
     selection,
@@ -42,7 +43,7 @@
   import { harnessAvailability, refreshHarnessAvailability } from "$lib/harnessAvailability.svelte";
   import { loadPreferences } from "$lib/preferences.svelte";
   import GitView from "$lib/components/GitView.svelte";
-  import { view, setViewMode, enterGitView } from "$lib/state/gitView.svelte";
+  import { view, setViewMode, enterGitView, revealProjectBranch } from "$lib/state/gitView.svelte";
   import {
     SEGMENTED_MAIN_CONTAINER_CLASS,
     SEGMENTED_MAIN_ITEM_ACTIVE_CLASS,
@@ -73,6 +74,8 @@
   let projectsSidebarOpen = $state<boolean>(true);
   let agentsSidebarOpen = $state<boolean>(true);
   let settingsOpen = $state<boolean>(false);
+  let projectViewResumePending = $state<boolean>(false);
+  let projectViewResumeSeq = 0;
 
   function isEditableShortcutTarget(target: EventTarget | null): boolean {
     if (!(target instanceof HTMLElement)) return false;
@@ -113,6 +116,12 @@
       // ⌘⇧G toggles the top-level Projects ↔ Git view.
       event.preventDefault();
       selectView(view.mode === "git" ? "projects" : "git");
+    } else if (key === "g") {
+      event.preventDefault();
+      selectNextUnreadCompletedProject();
+    } else if (key === "f" && event.shiftKey) {
+      event.preventDefault();
+      void openActiveProjectInGit();
     } else if (key === "b" && event.shiftKey) {
       event.preventDefault();
       agentsSidebarOpen = !agentsSidebarOpen;
@@ -120,6 +129,14 @@
       event.preventDefault();
       projectsSidebarOpen = !projectsSidebarOpen;
     }
+  }
+
+  function selectNextUnreadCompletedProject(): void {
+    const projectId = nextUnreadCompletedProjectId();
+    if (projectId === null) return;
+    settingsOpen = false;
+    if (view.mode === "git") selectView("projects");
+    void activateProject(projectId);
   }
 
   function openSettings(): void {
@@ -144,9 +161,37 @@
   function selectView(mode: "projects" | "git"): void {
     settingsOpen = false;
     if (mode === "git") {
+      projectViewResumePending = false;
       void enterGitView();
     } else {
+      if (view.mode === "git" && selection.activeProjectId !== null) {
+        showProjectViewLoadingForNextPaint();
+      }
       setViewMode("projects");
+    }
+  }
+
+  function showProjectViewLoadingForNextPaint(): void {
+    const seq = ++projectViewResumeSeq;
+    projectViewResumePending = true;
+    const clear = (): void => {
+      if (seq === projectViewResumeSeq) projectViewResumePending = false;
+    };
+    if (typeof requestAnimationFrame !== "function") {
+      setTimeout(clear, 0);
+      return;
+    }
+    requestAnimationFrame(() => setTimeout(clear, 0));
+  }
+
+  async function openActiveProjectInGit(): Promise<void> {
+    if (activeProject === null) return;
+    settingsOpen = false;
+    const result = await revealProjectBranch(activeProject.id, activeProject.directory);
+    if (result.kind === "failed") {
+      console.warn("[switchboard] project git shortcut failed", result.message);
+    } else if (result.kind === "unresolved") {
+      console.warn("[switchboard] project git shortcut could not resolve a local branch");
     }
   }
 
@@ -480,7 +525,7 @@
               </div>
             {/snippet}
           </EmptyState>
-        {:else if projectSwitching || !rosterLoaded}
+        {:else if projectViewResumePending || projectSwitching || !rosterLoaded}
           <EmptyState testid="project-loading" title="Loading project…" />
         {:else if activeAgents.length === 0}
           <div class="flex flex-1 flex-col overflow-y-auto">

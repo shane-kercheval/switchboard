@@ -2,16 +2,6 @@
   import type { HTMLSelectAttributes } from "svelte/elements";
   import { cn } from "$lib/utils";
 
-  /// Closed enum-select over a `{label, value}[]` list — the curated-dropdown
-  /// primitive for model and effort selection. A native `<select>` deliberately:
-  /// real keyboard/ARIA/screen-reader
-  /// semantics for free, no open-state to manage, and the value space is a fixed
-  /// curated set, so there is no free-text branch to support.
-  ///
-  /// The option shape is defined locally — a `ui/` primitive stays
-  /// domain-agnostic, so feature lists (e.g. `agentSelection`'s) are accepted
-  /// structurally rather than via an import that points the dependency the
-  /// wrong way.
   type Option = { label: string; value: string };
   type Props = HTMLSelectAttributes & {
     value?: string;

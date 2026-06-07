@@ -8,10 +8,10 @@
     setAgentEffort,
   } from "$lib/state/workspace.svelte";
   import { SUPPORTS_EFFORT_SELECTION, SUPPORTS_MODEL_SELECTION } from "$lib/harnessDisplay";
-  import { EFFORT_OPTIONS, MODEL_OPTIONS, type SelectOption } from "$lib/agentSelection";
+  import { EFFORT_OPTIONS, MODEL_OPTIONS, type SelectionOption } from "$lib/agentSelection";
   import DropdownMenu from "$lib/components/ui/DropdownMenu.svelte";
   import DropdownMenuItem from "$lib/components/ui/DropdownMenuItem.svelte";
-  import Select from "$lib/components/ui/Select.svelte";
+  import SelectionPicker from "$lib/components/ui/SelectionPicker.svelte";
   import Button from "$lib/components/ui/Button.svelte";
   import {
     agentSessionInfo,
@@ -92,9 +92,9 @@
     editing === null ? null : (agents.find((a) => a.id === editing!.agentId) ?? null),
   );
   function withCurrentOption(
-    options: SelectOption[],
+    options: SelectionOption[],
     current: string | null | undefined,
-  ): SelectOption[] {
+  ): SelectionOption[] {
     if (current == null || current === "" || options.some((o) => o.value === current))
       return options;
     return [{ label: current, value: current }, ...options];
@@ -104,7 +104,7 @@
   /// sentinel so clearing back to the harness default is reachable. If the agent
   /// already carries a value that is no longer in the curated list, keep that
   /// value selectable so the dialog honestly reflects persisted state.
-  const editOptions = $derived<SelectOption[]>(
+  const editOptions = $derived<SelectionOption[]>(
     editing === null || editingAgent === null
       ? []
       : [
@@ -1239,12 +1239,13 @@
       <span class="text-muted text-xs">
         {editing?.axis === "effort" ? "Reasoning effort" : "Model"}
       </span>
-      <Select
+      <SelectionPicker
         bind:value={editValue}
         options={editOptions}
         disabled={editBusy}
-        data-testid="change-select"
-        aria-label={editing?.axis === "effort" ? "Reasoning effort" : "Model"}
+        testid="change-select"
+        ariaLabel={editing?.axis === "effort" ? "Reasoning effort" : "Model"}
+        presentation={editing?.axis === "effort" ? "segmented" : "auto"}
       />
     </label>
     <p class="text-muted text-xs leading-relaxed">

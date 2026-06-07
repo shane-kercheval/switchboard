@@ -14,12 +14,12 @@
     DEFAULT_MODEL,
     EFFORT_OPTIONS,
     MODEL_OPTIONS,
-    type SelectOption,
+    type SelectionOption,
   } from "$lib/agentSelection";
   import { normalizeAgentName, validateAgentName } from "$lib/agentName";
   import Button from "$lib/components/ui/Button.svelte";
   import Input from "$lib/components/ui/Input.svelte";
-  import Select from "$lib/components/ui/Select.svelte";
+  import SelectionPicker from "$lib/components/ui/SelectionPicker.svelte";
   import { cn } from "$lib/utils";
   import {
     SEGMENTED_CONTAINER_CLASS,
@@ -93,12 +93,12 @@
   /// *preserves* the session's model on the sticky harness (Claude) — Gemini
   /// reverts to its default and Codex resolves its config default. "No
   /// override" describes what Switchboard does (send nothing) for all three.
-  const modelOptions = $derived<SelectOption[]>(
+  const modelOptions = $derived<SelectionOption[]>(
     mode === "attach"
       ? [{ label: "No override", value: KEEP_CURRENT }, ...MODEL_OPTIONS[harness]]
       : MODEL_OPTIONS[harness],
   );
-  const effortOptions = $derived<SelectOption[]>(
+  const effortOptions = $derived<SelectionOption[]>(
     mode === "attach"
       ? [{ label: "No override", value: KEEP_CURRENT }, ...EFFORT_OPTIONS[harness]]
       : EFFORT_OPTIONS[harness],
@@ -324,18 +324,18 @@
     {/if}
   </fieldset>
 
-  <!-- Model: a curated per-harness dropdown where the harness supports it, a
+  <!-- Model: a curated per-harness picker where the harness supports it, a
        short note where it doesn't (Antigravity's model is set inside
        Antigravity). -->
   {#if modelSupported}
     <label class="block space-y-1">
       <span class="text-muted text-xs">Model</span>
-      <Select
+      <SelectionPicker
         bind:value={model}
         options={modelOptions}
         disabled={busy}
-        data-testid="model-select"
-        aria-label="Model"
+        testid="model-select"
+        ariaLabel="Model"
       />
     </label>
   {:else}
@@ -345,17 +345,18 @@
     </p>
   {/if}
 
-  <!-- Effort: a curated dropdown for Claude/Codex, a note for Gemini (config
+  <!-- Effort: a curated picker for Claude/Codex, a note for Gemini (config
        only) and Antigravity (folded into the model). -->
   {#if effortSupported}
     <label class="block space-y-1">
       <span class="text-muted text-xs">Reasoning effort</span>
-      <Select
+      <SelectionPicker
         bind:value={effort}
         options={effortOptions}
         disabled={busy}
-        data-testid="effort-select"
-        aria-label="Reasoning effort"
+        testid="effort-select"
+        ariaLabel="Reasoning effort"
+        presentation="segmented"
       />
       {#if harness === "claude_code"}
         <span class="text-muted block text-xs">

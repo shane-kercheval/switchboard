@@ -53,6 +53,30 @@ async function loadState() {
   return await import("$lib/state/index.svelte");
 }
 
+function pickerValue(testId: string): string {
+  const el = screen.getByTestId(testId);
+  return el instanceof HTMLSelectElement ? el.value : (el.getAttribute("data-value") ?? "");
+}
+
+async function choosePicker(testId: string, value: string): Promise<void> {
+  const el = screen.getByTestId(testId);
+  if (el instanceof HTMLSelectElement) {
+    await fireEvent.change(el, { target: { value } });
+  } else {
+    await fireEvent.click(
+      screen.getByTestId(`${testId}-option-${value === "" ? "no-override" : value}`),
+    );
+  }
+}
+
+function pickerHasOption(testId: string, value: string): boolean {
+  const el = screen.getByTestId(testId);
+  if (el instanceof HTMLSelectElement) {
+    return Array.from(el.options).some((option) => option.value === value);
+  }
+  return screen.queryByTestId(`${testId}-option-${value === "" ? "no-override" : value}`) !== null;
+}
+
 const CLAUDE_AGENT: AgentRecord = {
   id: "00000000-0000-7000-8000-000000000aaa",
   project_id: "00000000-0000-7000-8000-0000000000ff",
@@ -559,9 +583,9 @@ describe("Sidebar", () => {
     await waitFor(() => expect(screen.getByTestId("agent-change-model")).toBeInTheDocument());
     await fireEvent.click(screen.getByTestId("agent-change-model"));
 
-    const select = (await screen.findByTestId("change-select")) as HTMLSelectElement;
-    expect(select.value).toBe("opus"); // preselected to the current selection
-    await fireEvent.change(select, { target: { value: "sonnet" } });
+    await screen.findByTestId("change-select");
+    expect(pickerValue("change-select")).toBe("opus");
+    await choosePicker("change-select", "sonnet");
     await fireEvent.click(screen.getByTestId("change-save"));
 
     expect(setAgentModelMock).toHaveBeenCalledExactlyOnceWith(agent.id, "sonnet");
@@ -577,8 +601,8 @@ describe("Sidebar", () => {
     await waitFor(() => expect(screen.getByTestId("agent-change-model")).toBeInTheDocument());
     await fireEvent.click(screen.getByTestId("agent-change-model"));
 
-    const select = (await screen.findByTestId("change-select")) as HTMLSelectElement;
-    await fireEvent.change(select, { target: { value: "" } }); // the "No override" sentinel
+    await screen.findByTestId("change-select");
+    await choosePicker("change-select", "");
     await fireEvent.click(screen.getByTestId("change-save"));
 
     expect(setAgentModelMock).toHaveBeenCalledExactlyOnceWith(agent.id, undefined);
@@ -594,9 +618,9 @@ describe("Sidebar", () => {
     await waitFor(() => expect(screen.getByTestId("agent-change-model")).toBeInTheDocument());
     await fireEvent.click(screen.getByTestId("agent-change-model"));
 
-    const select = (await screen.findByTestId("change-select")) as HTMLSelectElement;
-    expect(select.value).toBe("future-opus");
-    expect(Array.from(select.options).some((option) => option.value === "future-opus")).toBe(true);
+    await screen.findByTestId("change-select");
+    expect(pickerValue("change-select")).toBe("future-opus");
+    expect(pickerHasOption("change-select", "future-opus")).toBe(true);
     await fireEvent.click(screen.getByTestId("change-save"));
 
     expect(setAgentModelMock).toHaveBeenCalledExactlyOnceWith(agent.id, "future-opus");

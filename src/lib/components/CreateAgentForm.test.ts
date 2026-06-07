@@ -34,6 +34,22 @@ function renderForm(): {
   return { onSubmit };
 }
 
+function pickerValue(testId: string): string {
+  const el = screen.getByTestId(testId);
+  return el instanceof HTMLSelectElement ? el.value : (el.getAttribute("data-value") ?? "");
+}
+
+async function choosePicker(testId: string, value: string): Promise<void> {
+  const el = screen.getByTestId(testId);
+  if (el instanceof HTMLSelectElement) {
+    await fireEvent.change(el, { target: { value } });
+  } else {
+    await fireEvent.click(
+      screen.getByTestId(`${testId}-option-${value === "" ? "no-override" : value}`),
+    );
+  }
+}
+
 describe("CreateAgentForm", () => {
   it("create mode + Claude default: submits {mode:create, harness:claude_code}", async () => {
     const { onSubmit } = renderForm();
@@ -453,8 +469,8 @@ describe("CreateAgentForm", () => {
 
   it("create + Claude: model and effort pickers preselect the harness defaults", () => {
     renderForm();
-    expect((screen.getByTestId("model-select") as HTMLSelectElement).value).toBe("opus");
-    expect((screen.getByTestId("effort-select") as HTMLSelectElement).value).toBe("high");
+    expect(pickerValue("model-select")).toBe("opus");
+    expect(pickerValue("effort-select")).toBe("high");
     // No unsupported-capability notes for a fully-capable harness.
     expect(screen.queryByTestId("model-note")).not.toBeInTheDocument();
     expect(screen.queryByTestId("effort-note")).not.toBeInTheDocument();
@@ -463,14 +479,14 @@ describe("CreateAgentForm", () => {
   it("create + Codex: pickers preselect gpt-5.5 / medium", async () => {
     renderForm();
     await fireEvent.click(screen.getByTestId("harness-codex"));
-    expect((screen.getByTestId("model-select") as HTMLSelectElement).value).toBe("gpt-5.5");
-    expect((screen.getByTestId("effort-select") as HTMLSelectElement).value).toBe("medium");
+    expect(pickerValue("model-select")).toBe("gpt-5.5");
+    expect(pickerValue("effort-select")).toBe("medium");
   });
 
   it("create + Gemini: model picker present (auto), effort replaced by a note", async () => {
     renderForm();
     await fireEvent.click(screen.getByTestId("harness-gemini"));
-    expect((screen.getByTestId("model-select") as HTMLSelectElement).value).toBe("auto");
+    expect(pickerValue("model-select")).toBe("auto");
     expect(screen.queryByTestId("effort-select")).not.toBeInTheDocument();
     expect(screen.getByTestId("effort-note")).toHaveTextContent("Gemini's reasoning effort");
   });
@@ -490,10 +506,10 @@ describe("CreateAgentForm", () => {
     } satisfies AgentFormSubmit);
   });
 
-  it("changing the model and effort dropdowns submits the chosen values", async () => {
+  it("changing the model and effort pickers submits the chosen values", async () => {
     const { onSubmit } = renderForm();
-    await fireEvent.change(screen.getByTestId("model-select"), { target: { value: "sonnet" } });
-    await fireEvent.change(screen.getByTestId("effort-select"), { target: { value: "max" } });
+    await choosePicker("model-select", "sonnet");
+    await choosePicker("effort-select", "max");
     await fireEvent.click(screen.getByTestId("confirm-create-agent"));
     expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
       mode: "create",
@@ -507,10 +523,10 @@ describe("CreateAgentForm", () => {
   it("switching harness resets a changed picker to the new harness default", async () => {
     const { onSubmit } = renderForm();
     // Change Claude's model away from the default, then switch to Codex.
-    await fireEvent.change(screen.getByTestId("model-select"), { target: { value: "haiku" } });
+    await choosePicker("model-select", "haiku");
     await fireEvent.click(screen.getByTestId("harness-codex"));
     // The stale Claude value is gone — Codex shows its own default.
-    expect((screen.getByTestId("model-select") as HTMLSelectElement).value).toBe("gpt-5.5");
+    expect(pickerValue("model-select")).toBe("gpt-5.5");
     await fireEvent.click(screen.getByTestId("confirm-create-agent"));
     expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
       mode: "create",
@@ -525,8 +541,8 @@ describe("CreateAgentForm", () => {
     const { onSubmit } = renderForm();
     await fireEvent.click(screen.getByTestId("mode-attach"));
     // The picker's default is the keep-current sentinel (empty value).
-    expect((screen.getByTestId("model-select") as HTMLSelectElement).value).toBe("");
-    expect((screen.getByTestId("effort-select") as HTMLSelectElement).value).toBe("");
+    expect(pickerValue("model-select")).toBe("");
+    expect(pickerValue("effort-select")).toBe("");
     const sessionInput = screen.getByTestId("attach-session-id") as HTMLInputElement;
     await fireEvent.input(sessionInput, { target: { value: VALID_UUID } });
     await fireEvent.click(screen.getByTestId("confirm-create-agent"));
@@ -541,8 +557,8 @@ describe("CreateAgentForm", () => {
   it("attach with a deliberately chosen model/effort submits them", async () => {
     const { onSubmit } = renderForm();
     await fireEvent.click(screen.getByTestId("mode-attach"));
-    await fireEvent.change(screen.getByTestId("model-select"), { target: { value: "sonnet" } });
-    await fireEvent.change(screen.getByTestId("effort-select"), { target: { value: "low" } });
+    await choosePicker("model-select", "sonnet");
+    await choosePicker("effort-select", "low");
     const sessionInput = screen.getByTestId("attach-session-id") as HTMLInputElement;
     await fireEvent.input(sessionInput, { target: { value: VALID_UUID } });
     await fireEvent.click(screen.getByTestId("confirm-create-agent"));
@@ -559,10 +575,10 @@ describe("CreateAgentForm", () => {
   it("toggling attach → create restores the concrete harness default", async () => {
     renderForm();
     await fireEvent.click(screen.getByTestId("mode-attach"));
-    expect((screen.getByTestId("model-select") as HTMLSelectElement).value).toBe("");
+    expect(pickerValue("model-select")).toBe("");
     await fireEvent.click(screen.getByTestId("mode-create"));
-    expect((screen.getByTestId("model-select") as HTMLSelectElement).value).toBe("opus");
-    expect((screen.getByTestId("effort-select") as HTMLSelectElement).value).toBe("high");
+    expect(pickerValue("model-select")).toBe("opus");
+    expect(pickerValue("effort-select")).toBe("high");
   });
 
   it("aria-invalid tracks validity (incl. empty); aria-describedby links the message only when shown", async () => {

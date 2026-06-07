@@ -16,13 +16,13 @@
 
 import type { HarnessKind } from "./types";
 
-/// One `<option>`: `value` is the alias/id submitted to the backend, `label`
-/// the friendlier display text.
-export type SelectOption = { label: string; value: string };
+/// One picker option: `value` is the alias/id submitted to the backend,
+/// `label` the friendlier display text.
+export type SelectionOption = { label: string; value: string };
 
 /// Per-harness model options. Empty for Antigravity (model is harness-owned
 /// config we can't set — the form renders a note instead).
-export const MODEL_OPTIONS: Record<HarnessKind, SelectOption[]> = {
+export const MODEL_OPTIONS: Record<HarnessKind, SelectionOption[]> = {
   claude_code: [
     { label: "Opus", value: "opus" },
     { label: "Sonnet", value: "sonnet" },
@@ -48,7 +48,7 @@ export const MODEL_OPTIONS: Record<HarnessKind, SelectOption[]> = {
 /// Per-harness effort options. Empty for Gemini (config-only) and Antigravity
 /// (folded into the model name). Codex `none` is a *real* level (forces no
 /// extended reasoning), distinct from leaving effort unset.
-export const EFFORT_OPTIONS: Record<HarnessKind, SelectOption[]> = {
+export const EFFORT_OPTIONS: Record<HarnessKind, SelectionOption[]> = {
   claude_code: [
     { label: "Low", value: "low" },
     { label: "Medium", value: "medium" },

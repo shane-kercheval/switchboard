@@ -254,27 +254,53 @@ export function transcriptReducer(
       // one, falling back to `turn_id` for keyless turns. Keying on `turn_id`
       // alone is unsafe for re-reads: a parser mints a *fresh* `turn_id` every
       // parse, so the same on-disk turn would look new on a second read and
-      // duplicate — the stable key is parse-invariant and recognizes it. Live
-      // in-flight turns take precedence: a disk turn whose key (or turn_id)
-      // matches one already in the slice is dropped, never overwriting the live
-      // one. Order: deduped disk turns first, then the pre-existing live turns.
+      // duplicate — the stable key is parse-invariant and recognizes it.
       //
-      // **Scope of the no-duplicate guarantee: keyed AGENT turns only.** Only
-      // agent turns from key-bearing harnesses carry a `hydration_key`; user
-      // turns (and keyless harnesses) fall back to `turn_id`, which is fresh per
-      // parse — so re-reading them over an already-populated slice would NOT
-      // dedup. This path is safe today because user content reaching a slice is
-      // applied once. A future re-read of an already-loaded file must therefore
-      // re-merge only agent turns here; user content stays owned by the journal
-      // overlay (which is replaced wholesale, so it is dup-safe) and must not be
-      // re-merged into a per-agent slice.
+      // **Collision handling is upsert-by-precedence, not first-write-wins.**
+      // When a disk turn collides with a resident:
+      //   - **Real `hydration_key` match** (both AGENT turns carry the same key):
+      //     resolve by terminality (`resolveTurnCollision`). A terminal disk turn
+      //     *supersedes* a still-`streaming` resident — this is the stranded
+      //     mid-flight partial (e.g. a switch-back/reopen re-read that caught the
+      //     turn before it finished) being replaced by its completed copy; the
+      //     resident's live-only fields are merged in. Otherwise the resident is
+      //     kept. This is what makes the merge converge instead of stacking a
+      //     "complete-looking turn with a spinning tool."
+      //   - **`turn_id` fallback match** (either side lacks a key): keep the
+      //     resident, drop the disk turn. This is the "don't clobber a live
+      //     in-flight turn" path — a live turn has *no* `hydration_key` until it
+      //     ends, so it only ever matches via `turn_id`. Superseding it would
+      //     also change its `turn_id` and orphan its still-arriving live events.
+      //
+      // **Scope: keyed AGENT turns only.** User turns (and keyless harnesses)
+      // fall back to `turn_id`, fresh per parse, so they never dedup across
+      // re-reads — user content stays owned by the journal overlay (replaced
+      // wholesale, dup-safe) and must not be re-merged into a per-agent slice.
       const dedupKey = (t: { hydration_key?: string | null; turn_id: TurnId }): string =>
         t.hydration_key ?? t.turn_id;
-      const existingKeys = new Set(turns.map(dedupKey));
-      const fromDisk = input.turns
-        .map(loadedTurnToTurn)
-        .filter((t) => !existingKeys.has(dedupKey(t)));
-      return [...fromDisk, ...turns];
+      const residentByKey = new Map(turns.map((t) => [dedupKey(t), t]));
+      const disk = input.turns.map(loadedTurnToTurn);
+
+      // Resident replacements (in place, preserving order) for key-matched
+      // collisions; brand-new disk turns are prepended (disk-order, as before).
+      const replacements = new Map<string, Turn>();
+      const fresh: Turn[] = [];
+      for (const d of disk) {
+        const resident = residentByKey.get(dedupKey(d));
+        if (resident === undefined) {
+          fresh.push(d);
+        } else if (
+          d.role === "agent" &&
+          resident.role === "agent" &&
+          d.hydration_key !== undefined &&
+          d.hydration_key === resident.hydration_key
+        ) {
+          replacements.set(dedupKey(d), resolveTurnCollision(resident, d));
+        }
+        // else: turn_id-fallback collision → keep the resident, drop `d`.
+      }
+      const merged = turns.map((t) => replacements.get(dedupKey(t)) ?? t);
+      return [...fresh, ...merged];
     }
 
     // Agent-scoped events (rate_limit_event, session_meta, agent_idle),
@@ -298,6 +324,47 @@ function stopPendingTools(
     if (item.completed_at !== undefined) return item;
     return { ...item, stopped_at: stoppedAt, stop_reason: stopReason };
   });
+}
+
+type AgentTurn = Extract<Turn, { role: "agent" }>;
+
+/// Resolve two agent turns that share a dedup identity into the single turn to
+/// keep. **Precedence: a finished turn supersedes a still-`streaming` one.**
+/// `incoming` wins only when `existing` is `streaming` and `incoming` is
+/// terminal (complete/failed/cancelled); otherwise `existing` wins (ties and
+/// "don't clobber a more-complete resident"). The survivor absorbs the loser's
+/// **live-only fields** — the optional enrichments a disk parse can't recover
+/// (cost/overage `spend`, the `usage` window, model/effort, failure detail) —
+/// so superseding a partial never blanks a field the loser already had. Content
+/// (`items`, `status`, `turn_id`, timestamps) always comes from the winner.
+///
+/// This is the **hydrate-merge** primitive (resident vs. disk). It is safe there
+/// because a live in-flight turn is keyless while streaming, so it never reaches
+/// this rule — only disk-vs-disk and finished-live-vs-disk collisions do.
+///
+/// **Not yet a general resident-vs-resident primitive.** Once M4 stamps a live
+/// turn's `hydration_key` *while it is still streaming*, a terminal disk re-read
+/// could key-match that active turn and supersede it here — which would change
+/// its `turn_id` and orphan its remaining live events (the unknown-`turn_id`
+/// guards drop them). Before reusing this for M4's anchor-event reconciliation,
+/// the caller must protect an actively-streaming live turn (a liveness/source
+/// signal in state); this rule alone can't tell "stranded disk partial" (safe to
+/// supersede) from "active live turn" (must not be). See the M4 plan.
+function resolveTurnCollision(existing: AgentTurn, incoming: AgentTurn): AgentTurn {
+  const incomingSupersedes = existing.status === "streaming" && incoming.status !== "streaming";
+  const [winner, loser] = incomingSupersedes ? [incoming, existing] : [existing, incoming];
+  return {
+    ...winner,
+    send_id: winner.send_id ?? loser.send_id,
+    ended_at: winner.ended_at ?? loser.ended_at,
+    usage: winner.usage ?? loser.usage,
+    spend: winner.spend ?? loser.spend,
+    model: winner.model ?? loser.model,
+    effort: winner.effort ?? loser.effort,
+    error: winner.error ?? loser.error,
+    error_kind: winner.error_kind ?? loser.error_kind,
+    hydration_key: winner.hydration_key ?? loser.hydration_key,
+  };
 }
 
 function loadedTurnToTurn(t: LoadedTurn): Turn {

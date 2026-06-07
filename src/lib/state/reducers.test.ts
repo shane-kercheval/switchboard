@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { NormalizedEvent, ReducerInput } from "$lib/types";
 import { _internal, freshRuntime, runtimeReducer, transcriptReducer } from "./reducers";
+import { buildUnifiedRows } from "./unified";
 import type { AgentRuntime, TextChunk, ToolCall, Turn } from "./types";
 
 const AGENT_A = "00000000-0000-7000-8000-000000000aaa";
@@ -864,6 +865,134 @@ describe("transcriptReducer", () => {
       });
       expect(merged).toHaveLength(1);
       expect(merged[0]?.turn_id).toBe(TURN_1);
+    });
+  });
+
+  describe("hydrate — completeness-ranked supersession", () => {
+    const TURN_3 = "00000000-0000-7000-8000-000000000003";
+    const streamingPartial = (turnId: string, key: string): ReducerInput => ({
+      type: "hydrate",
+      agent_id: AGENT_A,
+      turns: [
+        {
+          role: "agent",
+          turn_id: turnId,
+          agent_id: AGENT_A,
+          started_at: "2026-05-14T00:00:02Z",
+          status: "streaming",
+          items: [{ item_kind: "text", kind: "text", text: "working" }],
+          hydration_key: key,
+        },
+      ],
+    });
+    const completed = (turnId: string, key: string): ReducerInput => ({
+      type: "hydrate",
+      agent_id: AGENT_A,
+      turns: [
+        {
+          role: "agent",
+          turn_id: turnId,
+          agent_id: AGENT_A,
+          started_at: "2026-05-14T00:00:02Z",
+          status: "complete",
+          items: [{ item_kind: "text", kind: "text", text: "done" }],
+          hydration_key: key,
+        },
+      ],
+    });
+
+    it("a completed disk turn supersedes a stranded Streaming partial of the same key", () => {
+      // The reload/switch-back bug: a re-read caught the turn mid-flight
+      // (Streaming), then a later re-read sees it finished. The complete turn
+      // must REPLACE the partial, not stack beside it as a stuck spinner.
+      let turns = reduce([], streamingPartial(TURN_1, "msg_x"));
+      expect(turns).toHaveLength(1);
+      expect(turns[0]).toMatchObject({ role: "agent", status: "streaming" });
+
+      turns = reduce(turns, completed(TURN_2, "msg_x"));
+      expect(turns).toHaveLength(1);
+      const turn = turns[0];
+      expect(turn?.role).toBe("agent");
+      if (turn?.role === "agent") {
+        expect(turn.status).toBe("complete");
+        expect(turn.turn_id).toBe(TURN_2);
+      }
+    });
+
+    it("two Streaming turns with the same key collapse to one, resident kept", () => {
+      // The non-supersession branch made explicit: neither side is terminal, so
+      // the resident (the earlier snapshot) wins and the count stays one.
+      let turns = reduce([], streamingPartial(TURN_1, "msg_x"));
+      turns = reduce(turns, streamingPartial(TURN_2, "msg_x"));
+      expect(turns).toHaveLength(1);
+      const turn = turns[0];
+      if (turn?.role === "agent") {
+        expect(turn.status).toBe("streaming");
+        expect(turn.turn_id).toBe(TURN_1); // resident kept, not replaced
+      }
+    });
+
+    it("a Streaming disk turn does NOT supersede a Complete resident of the same key", () => {
+      let turns = reduce([], completed(TURN_1, "msg_x"));
+      turns = reduce(turns, streamingPartial(TURN_2, "msg_x"));
+      expect(turns).toHaveLength(1);
+      const turn = turns[0];
+      if (turn?.role === "agent") {
+        expect(turn.status).toBe("complete");
+        expect(turn.turn_id).toBe(TURN_1); // resident kept
+      }
+    });
+
+    it("superseding preserves the resident's live-only fields the disk turn lacks", () => {
+      // Hand-built Streaming resident carrying a live-only `spend` (a disk parse
+      // can't recover it). The completed disk turn that supersedes it has none;
+      // the merge must carry the resident's spend forward, not blank it.
+      const residentWithSpend: Turn = {
+        role: "agent",
+        turn_id: TURN_1,
+        agent_id: AGENT_A,
+        started_at: "2026-05-14T00:00:02Z",
+        status: "streaming",
+        items: [{ item_kind: "text", kind: "text", text: "working" }],
+        spend: { real_spend: true, is_overage: true, overage_resets_at: null },
+        hydration_key: "msg_x",
+      };
+      const merged = reduce([residentWithSpend], completed(TURN_2, "msg_x"));
+      expect(merged).toHaveLength(1);
+      const turn = merged[0];
+      if (turn?.role === "agent") {
+        expect(turn.status).toBe("complete");
+        expect(turn.spend?.real_spend).toBe(true);
+      }
+    });
+
+    it("repeated re-hydrations of an advancing in-flight turn stay one row (switch-back)", () => {
+      // The maybeRefreshProject path: each switch-back re-reads the growing file
+      // and catches a later Streaming snapshot of the SAME turn (same key, fresh
+      // turn_id per parse). With first-id identity these all share a key, so
+      // they collapse to one row instead of accumulating one block per switch.
+      let turns = reduce([], streamingPartial(TURN_1, "msg_x"));
+      turns = reduce(turns, streamingPartial(TURN_2, "msg_x"));
+      turns = reduce(turns, streamingPartial(TURN_3, "msg_x"));
+      expect(turns).toHaveLength(1);
+
+      turns = reduce(turns, completed(TURN_2, "msg_x"));
+      expect(turns).toHaveLength(1);
+      if (turns[0]?.role === "agent") expect(turns[0].status).toBe("complete");
+    });
+
+    it("the superseded slice renders exactly one agent row, complete (no stuck spinner)", () => {
+      // Bridge to the render layer: after the mid-flight→complete sequence, the
+      // unified view must show one agent row in the `complete` state.
+      let turns = reduce([], streamingPartial(TURN_1, "msg_x"));
+      turns = reduce(turns, completed(TURN_2, "msg_x"));
+      const rows = buildUnifiedRows(turns, []);
+      const agentRows = rows.filter((r) => r.kind === "agent");
+      expect(agentRows).toHaveLength(1);
+      expect(agentRows[0]).toMatchObject({ kind: "agent" });
+      if (agentRows[0]?.kind === "agent") {
+        expect(agentRows[0].turn.status).toBe("complete");
+      }
     });
   });
 

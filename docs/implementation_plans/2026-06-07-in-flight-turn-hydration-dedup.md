@@ -480,6 +480,22 @@ milestone gets that id to the reducer **early** and stamps it.
 - **No refresh-path guard is added.** The dedup now holds by identity, so the
   switch-back re-merge collides on a shared key and the reconciliation resolves
   it.
+- **Protect the actively-streaming live turn from supersession (the new hazard
+  M4 itself introduces).** Stamping a live turn's key *while it streams* makes it
+  reachable by the hydrate arm's key-match branch — so a terminal disk re-read
+  that lands in the brief window where disk shows the turn finished but the live
+  `turn_end` hasn't been processed would *supersede the active live turn*,
+  changing its `turn_id` and orphaning its remaining live events (dropped by the
+  unknown-`turn_id` guards) — losing the turn-end-only enrichments (`spend`,
+  final `usage`/context window) and reopening the race this milestone closes.
+  M3's `resolveTurnCollision` alone cannot prevent this: by status it can't tell
+  a *stranded disk partial* (safe to supersede) from an *active live turn* (must
+  not be). M4 must therefore carry a **liveness/source signal** in state — mark a
+  turn that is currently owned by a running dispatcher turn (`run_status ===
+  "processing"` / a matching `in_flight_turn_id`) — and gate **both** the hydrate
+  supersession and this reconciliation so an active live turn is never the loser.
+  This is the one place the M3 helper is *not* a drop-in reuse; extend the gate,
+  not the precedence rule.
 - **Race note (why reconciliation is required — the stamp alone is not enough):**
   the live turn and the on-disk copy of the same turn become available at almost
   the same instant — both derive from the same first assistant message. A refresh
@@ -510,6 +526,12 @@ consumes the now-shared key).
   switch-back refresh re-hydration of the same in-flight turn, yields exactly one
   rendered row; still one row after the turn completes and a further switch-back
   re-hydrates.
+- **Active-live-turn protection test (guards the hazard M4 introduces):** a live
+  streaming turn that has already been stamped with an early `hydration_key`,
+  then a *terminal* disk re-read of the same key, must **not** supersede the live
+  turn — the live turn (its `turn_id`) is kept, and a subsequent live `turn_end`
+  still lands on it (not dropped as an unknown turn). This pins the liveness gate
+  that distinguishes an active live turn from a stranded disk partial.
 - **Graceful degradation test:** with the anchor event absent, behavior matches
   M1 (dedup at `TurnEnd`) — no regression.
 - Project-open and reload paths unaffected (existing tests green).

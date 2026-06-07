@@ -568,6 +568,11 @@ export type ConversationItem =
       send_id?: string | null;
       agent_ids: AgentId[];
       text: string;
+      // Files attached to this send, from the grouped journal `Send` (identical
+      // across a fan-out's recipients). The backend always sends this (possibly
+      // empty); optional here to match the additive-field style of this union and
+      // tolerate pre-feature fixtures/blobs. Absent for an imported prompt.
+      attachments?: Attachment[];
       at: string;
     }
   | {

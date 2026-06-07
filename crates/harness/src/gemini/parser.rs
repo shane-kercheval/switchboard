@@ -95,6 +95,11 @@ pub struct GeminiParserState {
     /// event one line earlier. `parse_result` falls back to it so a failed turn
     /// surfaces a real message.
     last_error_message: Option<String>,
+    /// Model from this invocation's `init.model`, retained so `parse_result`
+    /// can stamp it on the live per-turn `TurnEnd` (Gemini re-sends `init`
+    /// every invocation, so this is the current turn's model). `None` until
+    /// `init` is seen.
+    current_model: Option<String>,
 }
 
 /// Return `true` if a Gemini error message is the known-benign
@@ -135,7 +140,7 @@ pub fn parse_line(
     };
 
     match value.get("type").and_then(Value::as_str) {
-        Some("init") => parse_init(&value, agent_id),
+        Some("init") => parse_init(&value, agent_id, state),
         Some("message") => parse_message(&value, turn_id, state),
         Some("tool_use") => parse_tool_use(&value, turn_id, state),
         Some("tool_result") => parse_tool_result(&value, turn_id, state),
@@ -152,12 +157,16 @@ pub fn parse_line(
     }
 }
 
-fn parse_init(obj: &Value, agent_id: AgentId) -> ParseOutcome {
+fn parse_init(obj: &Value, agent_id: AgentId, state: &mut GeminiParserState) -> ParseOutcome {
     let model = obj
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_owned();
+    // Retain for the live per-turn `TurnEnd` stamp (this invocation's model).
+    if !model.is_empty() {
+        state.current_model = Some(model.clone());
+    }
     // `harness_version` is filled in by the adapter (lazy `gemini --version`
     // fetch via `OnceLock`); the parser doesn't know it.
     ParseOutcome::Event(AdapterEvent::SessionMeta {
@@ -285,6 +294,10 @@ fn parse_result(obj: &Value, turn_id: TurnId, state: &GeminiParserState) -> Pars
         context_window_source: None,
         stable_message_id: None,
         spend: None,
+        // Live per-turn model from this invocation's `init`; Gemini has no
+        // effort axis.
+        model: state.current_model.clone(),
+        effort: None,
     })
 }
 

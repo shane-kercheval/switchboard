@@ -114,6 +114,16 @@ export type NormalizedEvent =
       ended_at: string;
       usage?: TurnUsage | null;
       spend?: TurnSpend | null;
+      // The model and reasoning effort this turn ran on, for the per-turn
+      // transcript footer (M6). `model` populated for all model-reporting
+      // harnesses; `effort` Codex-only. Absent → render nothing.
+      model?: string | null;
+      effort?: string | null;
+      // Live-matched stable hydration key — the same per-turn id this turn will
+      // carry on disk, so the hydrate merge can recognize a turn that streamed
+      // live and is later re-read as one turn. Populated only for live-matched
+      // harnesses (Claude's final assistant message.id); absent otherwise.
+      hydration_key?: string | null;
     }
   | { type: "rate_limit_event"; agent_id: AgentId; info: unknown }
   | {
@@ -208,6 +218,15 @@ export type LoadedTurn =
       // reopen. Present only on real-spend turns that were persisted; absent
       // for normal-quota and pre-feature turns (render neither cost nor marker).
       spend?: TurnSpend | null;
+      // Per-turn model + effort reconstructed by the backend from the harness
+      // session file (not a sidecar — harness-owned). `model` for all
+      // model-reporting harnesses; `effort` Codex-only. Absent → render nothing.
+      model?: string | null;
+      effort?: string | null;
+      // Stable hydration key (re-parse-invariant): the hydrate merge dedups on
+      // it so re-reading a session file never duplicates this turn. Absent for
+      // keyless harnesses (Antigravity) — the merge falls back to `turn_id`.
+      hydration_key?: string | null;
     };
 
 export type LoadedTurnItem =
@@ -314,6 +333,11 @@ export type AgentRecord = {
   harness: HarnessKind;
   session_locator: SessionLocator | null;
   created_at: string;
+  // The user's selected model + reasoning effort (intent), shown in the sidebar
+  // (M6). `null`/absent for a no-capability harness (Antigravity carries
+  // neither; Gemini carries no effort) or a pre-feature agent.
+  model?: string | null;
+  effort?: string | null;
 };
 
 export type ProjectSummary = {
@@ -552,6 +576,8 @@ export type ConversationItem =
       // Per-turn cost/overage re-joined from the turn-metadata sidecar on
       // reopen — same source + meaning as `LoadedTurn.spend`.
       spend?: TurnSpend | null;
+      // Stable hydration key — same source + meaning as `LoadedTurn.hydration_key`.
+      hydration_key?: string | null;
     }
   | {
       kind: "outcome";
@@ -582,6 +608,27 @@ export type AgentConversationMeta = {
 export type ProjectConversation = {
   items: ConversationItem[];
   agents: AgentConversationMeta[];
+};
+
+// Mirror of Rust `SessionFingerprint` / `AgentSessionFingerprint`
+// (`crates/app/src/commands.rs`). The staleness-refresh gate: a cheap per-agent
+// stat (no parse) the frontend diffs against the value stored at last hydration
+// to decide whether to re-read a session file the user may have continued in the
+// harness's own TUI.
+export type SessionFingerprint = {
+  source_path: string;
+  // ISO-8601 instant of the file's last modification.
+  modified_at: string;
+  byte_len: number;
+};
+
+export type AgentSessionFingerprint = {
+  agent_id: AgentId;
+  // Whether this agent's harness may be refreshed at all (the live-matched
+  // capability). The frontend only acts on a changed fingerprint when true.
+  refresh_capable: boolean;
+  // Absent when refresh is unsupported (not statted) or no session file exists.
+  fingerprint?: SessionFingerprint | null;
 };
 
 export type DirectoryInfo = {

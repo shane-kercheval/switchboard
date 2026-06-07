@@ -232,6 +232,16 @@ pub enum AdapterEvent {
         /// `context_window_source`, this *is* rendered). `None` = no real-spend
         /// info for this turn.
         spend: Option<TurnSpend>,
+        /// The model this turn ran on — the live per-turn carrier, mirroring
+        /// `spend` (stamped by the adapter, carried through to the frontend).
+        /// Per harness: Claude/Gemini the most-recent `SessionMeta`/`init`; Codex
+        /// the current-turn `turn_context.model` (enrichment re-read); Antigravity
+        /// the carry-forward state. `None` when the harness exposes no model.
+        model: Option<String>,
+        /// The reasoning effort this turn ran at — **Codex only**
+        /// (`turn_context.effort`), `None` elsewhere. Live per-turn carrier; the
+        /// reopen counterpart is reconstructed from the session file.
+        effort: Option<String>,
         /// Stable per-turn join key: the final non-subagent assistant message's
         /// Anthropic `message.id`, which appears identically in the live stream
         /// and the on-disk session file (verified). The dispatcher keys the
@@ -323,6 +333,22 @@ pub enum NormalizedEvent {
         /// Per-turn real-spend attribution — gates the inline cost + overage
         /// marker on the message. `None` = show neither. See [`TurnSpend`].
         spend: Option<TurnSpend>,
+        /// The model this turn ran on, rendered per-turn in the transcript
+        /// footer (M6). `None` = render nothing. See [`AdapterEvent::TurnEnd`].
+        model: Option<String>,
+        /// The reasoning effort this turn ran at (Codex only), rendered per-turn
+        /// in the footer (M6). `None` = render nothing.
+        effort: Option<String>,
+        /// **Live-matched** stable hydration key — the same per-turn id this
+        /// turn will carry on disk, so a turn that streamed live *and* is later
+        /// re-read from the session file is recognized as one turn (the merge
+        /// dedups on it). Populated only for harnesses whose live stream carries
+        /// a disk-matching id: Claude's final assistant `message.id`. `None`
+        /// elsewhere (Codex/Gemini unprobed; Antigravity has none) — those turns
+        /// dedup by `turn_id` until a probe confirms parity. Frontend-facing;
+        /// the internal cost-join `stable_message_id` stays dropped at this
+        /// boundary.
+        hydration_key: Option<String>,
     },
     RateLimitEvent {
         agent_id: AgentId,
@@ -429,16 +455,24 @@ impl AdapterEvent {
                 output,
                 is_error,
             },
-            // `context_window_source` and `stable_message_id` are intentionally
-            // dropped (the `..`) — internal persistence/join plumbing the
-            // frontend doesn't need (mirrors the `RateLimitEvent` source drop
-            // below). `spend` *is* carried through — it's rendered on the message.
+            // `context_window_source` is intentionally dropped (the `..`) —
+            // internal persistence plumbing the frontend doesn't need. `spend`
+            // *is* carried through — it's rendered on the message. The internal
+            // `stable_message_id` (Claude's cost-join key) is read here only to
+            // populate the frontend-facing `hydration_key`: the two coincide in
+            // value for Claude (the final assistant `message.id`, round-trip
+            // verified vs disk), so passing it through is exactly the
+            // live-matched key the merge needs — *not* an overload of the
+            // private field, which itself stays off the wire.
             AdapterEvent::TurnEnd {
                 turn_id,
                 outcome,
                 ended_at,
                 usage,
                 spend,
+                model,
+                effort,
+                stable_message_id,
                 ..
             } => NormalizedEvent::TurnEnd {
                 turn_id,
@@ -446,6 +480,9 @@ impl AdapterEvent {
                 ended_at,
                 usage,
                 spend,
+                model,
+                effort,
+                hydration_key: stable_message_id,
             },
             // `source` is intentionally dropped — it's an internal persistence
             // discriminator the frontend doesn't need (see `RateLimitSource`).
@@ -631,6 +668,9 @@ mod tests {
             ended_at: fresh_time(),
             usage: None,
             spend: None,
+            model: None,
+            effort: None,
+            hydration_key: None,
         };
         let value = serde_json::to_value(&event).unwrap();
         assert_eq!(value["type"], "turn_end");
@@ -661,8 +701,14 @@ mod tests {
                 is_overage: true,
                 overage_resets_at: None,
             }),
+            model: None,
+            effort: None,
+            hydration_key: Some("msg_live01".to_owned()),
         };
         let value = serde_json::to_value(&event).unwrap();
+        // The live-matched key is frontend-facing — it must serialize onto the
+        // wire (the per-agent merge dedups on it).
+        assert_eq!(value["hydration_key"], "msg_live01");
         assert_eq!(value["usage"]["input_tokens"], 100);
         assert_eq!(value["usage"]["output_tokens"], 25);
         assert_eq!(value["usage"]["cached_input_tokens"], 50);
@@ -688,6 +734,9 @@ mod tests {
             ended_at: fresh_time(),
             usage: None,
             spend: None,
+            model: None,
+            effort: None,
+            hydration_key: None,
         };
         let value = serde_json::to_value(&event).unwrap();
         assert_eq!(value["outcome"]["status"], "failed");
@@ -710,6 +759,9 @@ mod tests {
                 ended_at: fresh_time(),
                 usage: None,
                 spend: None,
+                model: None,
+                effort: None,
+                hydration_key: None,
             };
             let value = serde_json::to_value(&event).unwrap();
             assert_eq!(value["outcome"]["status"], "cancelled");
@@ -730,6 +782,9 @@ mod tests {
             ended_at: fresh_time(),
             usage: None,
             spend: None,
+            model: None,
+            effort: None,
+            hydration_key: None,
         };
         let value = serde_json::to_value(&event).unwrap();
         assert_eq!(value["outcome"]["status"], "failed");
@@ -753,6 +808,9 @@ mod tests {
             ended_at: fresh_time(),
             usage: None,
             spend: None,
+            model: None,
+            effort: None,
+            hydration_key: None,
         };
         let value = serde_json::to_value(&event).unwrap();
         assert_eq!(value["outcome"]["kind"], "adapter_failure");
@@ -902,6 +960,8 @@ mod tests {
             context_window_source: None,
             stable_message_id: None,
             spend: None,
+            model: None,
+            effort: None,
         };
         let normalized = adapter
             .into_normalized()
@@ -917,6 +977,37 @@ mod tests {
     }
 
     #[test]
+    fn adapter_event_turn_end_carries_model_and_effort_to_normalized() {
+        let adapter = AdapterEvent::TurnEnd {
+            turn_id: fresh_turn_id(),
+            outcome: TurnOutcome::Completed,
+            ended_at: fresh_time(),
+            usage: None,
+            context_window_source: None,
+            stable_message_id: Some("msg_x".to_owned()),
+            spend: None,
+            model: Some("gpt-5.5".to_owned()),
+            effort: Some("high".to_owned()),
+        };
+        let normalized = adapter.into_normalized().expect("lifts");
+        match normalized {
+            NormalizedEvent::TurnEnd {
+                model,
+                effort,
+                hydration_key,
+                ..
+            } => {
+                assert_eq!(model.as_deref(), Some("gpt-5.5"));
+                assert_eq!(effort.as_deref(), Some("high"));
+                // The frontend-facing live key is populated from the internal
+                // `stable_message_id` (they coincide in value for Claude).
+                assert_eq!(hydration_key.as_deref(), Some("msg_x"));
+            }
+            other => panic!("expected TurnEnd, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn adapter_event_lifts_to_normalized_turn_end_failed() {
         let adapter = AdapterEvent::TurnEnd {
             turn_id: fresh_turn_id(),
@@ -929,6 +1020,8 @@ mod tests {
             context_window_source: None,
             stable_message_id: None,
             spend: None,
+            model: None,
+            effort: None,
         };
         let normalized = adapter
             .into_normalized()

@@ -345,11 +345,16 @@ function projectRowByName(name: string): HTMLElement {
   return row;
 }
 
-// create_agent calls (name + harness pairs) in invocation order.
+// create_agent calls (name + harness pairs) in invocation order. Projects just
+// the two identity fields so seed-order assertions don't couple to the
+// model/effort defaults each call also carries (covered by a dedicated test).
 function createAgentCalls(): { name: string; harness: string }[] {
   return invokeMock.mock.calls
     .filter(([c]) => c === "create_agent")
-    .map(([, a]) => a as { name: string; harness: string });
+    .map(([, a]) => {
+      const args = a as { name: string; harness: string };
+      return { name: args.name, harness: args.harness };
+    });
 }
 
 describe("App", () => {
@@ -578,6 +583,18 @@ describe("App", () => {
     // Auto-seeded → the roster is populated, not the empty first-agent prompt.
     await waitFor(() => expect(screen.getAllByTestId("sidebar-agent")).toHaveLength(4));
     expect(screen.queryByTestId("confirm-create-agent")).not.toBeInTheDocument();
+
+    // Each seeded agent is born with its harness's default model/effort
+    // (Antigravity carries neither; Gemini carries no effort).
+    const seededArgs = invokeMock.mock.calls
+      .filter(([c]) => c === "create_agent")
+      .map(([, a]) => a as { name: string; harness: string; model?: string; effort?: string });
+    expect(seededArgs).toEqual([
+      { name: "claude-code", harness: "claude_code", model: "opus", effort: "high" },
+      { name: "codex", harness: "codex", model: "gpt-5.5", effort: "medium" },
+      { name: "gemini", harness: "gemini", model: "auto", effort: undefined },
+      { name: "antigravity", harness: "antigravity", model: undefined, effort: undefined },
+    ]);
   });
 
   it("new project: seeds agents only for installed harnesses", async () => {
@@ -1107,7 +1124,13 @@ describe("App", () => {
     });
     const createCalls = invokeMock.mock.calls.filter(([c]) => c === "create_agent");
     expect(createCalls).toHaveLength(1);
-    expect(createCalls[0]?.[1]).toEqual({ name: "claude-code", harness: "claude_code" });
+    // The form preselects and submits Claude's defaults.
+    expect(createCalls[0]?.[1]).toEqual({
+      name: "claude-code",
+      harness: "claude_code",
+      model: "opus",
+      effort: "high",
+    });
   });
 
   it("add agent via the sidebar modal registers a listener and appends to the roster", async () => {
@@ -1515,6 +1538,12 @@ describe("App", () => {
     );
     await waitFor(() =>
       expect(screen.getByTestId("agent-hydration-error")).toHaveTextContent("corrupt sidecar"),
+    );
+    // The same per-agent failure also surfaces as pinned transcript-region
+    // chrome (where the user is looking), naming the agent — without blanking
+    // the healthy agent's history.
+    expect(screen.getByTestId("agent-hydration-failed")).toHaveTextContent(
+      "Couldn't load broken's history",
     );
   });
 

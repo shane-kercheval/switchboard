@@ -249,6 +249,14 @@ fn build_args(agent: &AgentRecord, prompt: &str, cwd: &Path, home_dir: &Path) ->
         }
         args.push(session_id.to_string());
     }
+    // Per-agent model selection (sent every turn when set; Gemini reverts to
+    // its default without the flag). There is no effort flag for Gemini —
+    // thinking is `settings.json`-only config we never touch — so an effort, if
+    // one were ever set, has nothing to emit here (registration forbids it).
+    if let Some(model) = &agent.model {
+        args.push("--model".to_owned());
+        args.push(model.clone());
+    }
     args.push("--yolo".to_owned());
     args.push("--skip-trust".to_owned());
     args
@@ -330,6 +338,8 @@ async fn run_producer(
                             context_window_source: None,
                             stable_message_id: None,
                             spend: None,
+                            model: None,
+                            effort: None,
                         });
                         terminal_seen = true;
                         force_kill_child = true;
@@ -387,6 +397,8 @@ async fn run_producer(
                     context_window_source: None,
                     stable_message_id: None,
                     spend: None,
+                    model: None,
+                    effort: None,
                 });
                 terminal_seen = true;
                 force_kill_child = true;
@@ -509,6 +521,8 @@ fn synthesize_terminal_failure(
             context_window_source: None,
             stable_message_id: None,
             spend: None,
+            model: None,
+            effort: None,
         };
     }
     if exit_code == Some(42) && !actionable.is_empty() {
@@ -523,6 +537,8 @@ fn synthesize_terminal_failure(
             context_window_source: None,
             stable_message_id: None,
             spend: None,
+            model: None,
+            effort: None,
         };
     }
     let tail = crate::subprocess::format_stderr_tail(stderr_tail);
@@ -542,6 +558,8 @@ fn synthesize_terminal_failure(
         context_window_source: None,
         stable_message_id: None,
         spend: None,
+        model: None,
+        effort: None,
     }
 }
 
@@ -575,6 +593,8 @@ mod tests {
 
     fn agent_with_session(session_id: Uuid) -> AgentRecord {
         AgentRecord {
+            model: None,
+            effort: None,
             id: Uuid::now_v7(),
             project_id: Uuid::now_v7(),
             name: "g".to_owned(),
@@ -591,6 +611,8 @@ mod tests {
         let home = tempfile::TempDir::new().unwrap();
         let cwd = tempfile::TempDir::new().unwrap();
         let agent = AgentRecord {
+            model: None,
+            effort: None,
             id: Uuid::now_v7(),
             project_id: Uuid::now_v7(),
             name: "g".to_owned(),
@@ -618,6 +640,43 @@ mod tests {
         assert!(!args.contains(&"--resume".to_owned()));
         assert!(args.contains(&"--yolo".to_owned()));
         assert!(args.contains(&"--skip-trust".to_owned()));
+    }
+
+    #[test]
+    fn build_args_includes_model_but_never_effort() {
+        // Gemini has a model flag but no effort flag. Even with an effort set on
+        // the record (which registration forbids, but `build_args` is pure), no
+        // effort flag is ever emitted.
+        let home = tempfile::TempDir::new().unwrap();
+        let cwd = tempfile::TempDir::new().unwrap();
+        let mut agent = agent_with_session(Uuid::new_v4());
+        agent.model = Some("gemini-2.5-pro".to_owned());
+        agent.effort = Some("high".to_owned());
+
+        let args = build_args(&agent, "hi", cwd.path(), home.path());
+
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--model" && w[1] == "gemini-2.5-pro"),
+            "expected `--model gemini-2.5-pro`; got {args:?}"
+        );
+        assert!(
+            !args.contains(&"--effort".to_owned()),
+            "no effort flag: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a.contains("reasoning")),
+            "no reasoning/effort config: {args:?}"
+        );
+    }
+
+    #[test]
+    fn build_args_omits_model_when_unset() {
+        let home = tempfile::TempDir::new().unwrap();
+        let cwd = tempfile::TempDir::new().unwrap();
+        let agent = agent_with_session(Uuid::new_v4());
+        let args = build_args(&agent, "hi", cwd.path(), home.path());
+        assert!(!args.contains(&"--model".to_owned()));
     }
 
     #[test]

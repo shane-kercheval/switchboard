@@ -1070,18 +1070,23 @@ describe("hydrateAgent", () => {
     expect(state.transcripts[AGENT_A]).toHaveLength(1);
   });
 
-  it("flips to failed on IPC rejection", async () => {
+  it("flips to failed and retains the error text on IPC rejection", async () => {
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));
     const r = state.runtimes[AGENT_A];
     if (r === undefined) throw new Error("runtime missing");
     state.runtimes[AGENT_A] = { ...r, hydration_status: "pending" };
 
-    invokeMock.mockRejectedValueOnce("path resolution failed");
+    invokeMock.mockRejectedValueOnce(new Error("I/O error reading session file /x.jsonl"));
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 
     await state.hydrateAgent(AGENT_A);
     expect(state.runtimes[AGENT_A]?.hydration_status).toBe("failed");
+    // The error is retained on the runtime (not just console.warn'd) so the
+    // transcript-region banner and the sidebar line can surface it verbatim.
+    expect(state.runtimes[AGENT_A]?.hydration_error).toBe(
+      "I/O error reading session file /x.jsonl",
+    );
 
     warnSpy.mockRestore();
   });
@@ -1171,5 +1176,104 @@ describe("hydrateAgent", () => {
     await state.hydrateAgent(AGENT_A);
     expect(invokeMock).toHaveBeenCalledTimes(1);
     expect(state.runtimes[AGENT_A]?.hydration_status).toBe("complete");
+  });
+});
+
+describe("retryAgentHydration", () => {
+  it("clears the sticky guard and re-runs, rendering turns and clearing the failure on success", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+
+    // First attempt fails.
+    invokeMock.mockRejectedValueOnce(new Error("permission denied"));
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await state.hydrateAgent(AGENT_A);
+    expect(state.runtimes[AGENT_A]?.hydration_status).toBe("failed");
+    expect(state.runtimes[AGENT_A]?.hydration_error).toBe("permission denied");
+
+    // Retry succeeds: clears the guard, re-invokes, renders turns, clears error.
+    invokeMock.mockResolvedValueOnce({
+      turns: [
+        {
+          role: "user",
+          turn_id: TURN_1,
+          agent_id: AGENT_A,
+          started_at: "2026-05-14T00:00:00Z",
+          text: "remember PURPLE",
+        },
+      ],
+      meta: null,
+      last_rate_limit: null,
+      warnings: [],
+    });
+    await state.retryAgentHydration(AGENT_A);
+
+    expect(invokeMock).toHaveBeenCalledTimes(2);
+    expect(state.runtimes[AGENT_A]?.hydration_status).toBe("complete");
+    expect(state.runtimes[AGENT_A]?.hydration_error).toBeUndefined();
+    expect(state.transcripts[AGENT_A]).toHaveLength(1);
+    warnSpy.mockRestore();
+  });
+
+  it("ignores a concurrent retry while one is already in flight (no second load, no dup)", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+
+    // First attempt fails.
+    invokeMock.mockRejectedValueOnce(new Error("boom"));
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await state.hydrateAgent(AGENT_A);
+    expect(state.runtimes[AGENT_A]?.hydration_status).toBe("failed");
+
+    // Stage a slow success and fire two retries before it resolves: the second
+    // must observe the in-flight "loading" status and no-op, so only one
+    // `load_transcript` runs and the turn is not applied twice.
+    let resolveLoad: (v: unknown) => void = () => {};
+    invokeMock.mockImplementationOnce(
+      () =>
+        new Promise((r) => {
+          resolveLoad = r;
+        }),
+    );
+    const p1 = state.retryAgentHydration(AGENT_A);
+    const p2 = state.retryAgentHydration(AGENT_A);
+    resolveLoad({
+      turns: [
+        {
+          role: "user",
+          turn_id: TURN_1,
+          agent_id: AGENT_A,
+          started_at: "2026-05-14T00:00:00Z",
+          text: "hi",
+        },
+      ],
+      meta: null,
+      last_rate_limit: null,
+      warnings: [],
+    });
+    await Promise.all([p1, p2]);
+
+    // Initial failed load + exactly one retry load = 2 invokes (not 3).
+    expect(invokeMock).toHaveBeenCalledTimes(2);
+    expect(state.transcripts[AGENT_A]).toHaveLength(1);
+    expect(state.runtimes[AGENT_A]?.hydration_status).toBe("complete");
+    warnSpy.mockRestore();
+  });
+
+  it("keeps the failed state when the retry also fails", async () => {
+    const state = await loadState();
+    await state.registerAgent(agentRecord(AGENT_A));
+
+    invokeMock.mockRejectedValueOnce(new Error("first error"));
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await state.hydrateAgent(AGENT_A);
+
+    invokeMock.mockRejectedValueOnce(new Error("still broken"));
+    await state.retryAgentHydration(AGENT_A);
+
+    expect(invokeMock).toHaveBeenCalledTimes(2);
+    expect(state.runtimes[AGENT_A]?.hydration_status).toBe("failed");
+    expect(state.runtimes[AGENT_A]?.hydration_error).toBe("still broken");
+    warnSpy.mockRestore();
   });
 });

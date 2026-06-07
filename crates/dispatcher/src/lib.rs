@@ -1061,6 +1061,10 @@ async fn drain_turn(
                                     ended_at,
                                     usage: None,
                                     spend: None,
+                                    model: None,
+                                    effort: None,
+                                    // Synthesized failure — no harness turn id.
+                                    hydration_key: None,
                                 },
                                 agent_id,
                             );
@@ -1242,6 +1246,10 @@ async fn drain_turn(
                 usage: None,
                 // A cancelled turn never completed — no cost/overage to attribute.
                 spend: None,
+                model: None,
+                effort: None,
+                // Synthesized cancelled terminal — no harness turn id.
+                hydration_key: None,
             },
             agent_id,
         );

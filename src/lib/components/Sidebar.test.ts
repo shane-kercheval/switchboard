@@ -17,9 +17,13 @@ vi.mock("@tauri-apps/api/event", () => ({
 // mocks are orthogonal.
 const renameAgentMock = vi.fn<(id: string, name: string) => Promise<void>>();
 const removeAgentMock = vi.fn<(id: string) => Promise<void>>();
+const setAgentModelMock = vi.fn<(id: string, model?: string) => Promise<void>>();
+const setAgentEffortMock = vi.fn<(id: string, effort?: string) => Promise<void>>();
 vi.mock("$lib/state/workspace.svelte", () => ({
   renameAgent: (id: string, name: string) => renameAgentMock(id, name),
   removeAgent: (id: string) => removeAgentMock(id),
+  setAgentModel: (id: string, model?: string) => setAgentModelMock(id, model),
+  setAgentEffort: (id: string, effort?: string) => setAgentEffortMock(id, effort),
 }));
 
 const agentSessionInfoMock = vi.fn();
@@ -37,8 +41,40 @@ vi.mock("$lib/native", () => ({
   copyText: (t: string) => copyTextMock(t),
 }));
 
+function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
 async function loadState() {
   return await import("$lib/state/index.svelte");
+}
+
+function pickerValue(testId: string): string {
+  const el = screen.getByTestId(testId);
+  return el instanceof HTMLSelectElement ? el.value : (el.getAttribute("data-value") ?? "");
+}
+
+async function choosePicker(testId: string, value: string): Promise<void> {
+  const el = screen.getByTestId(testId);
+  if (el instanceof HTMLSelectElement) {
+    await fireEvent.change(el, { target: { value } });
+  } else {
+    await fireEvent.click(
+      screen.getByTestId(`${testId}-option-${value === "" ? "no-override" : value}`),
+    );
+  }
+}
+
+function pickerHasOption(testId: string, value: string): boolean {
+  const el = screen.getByTestId(testId);
+  if (el instanceof HTMLSelectElement) {
+    return Array.from(el.options).some((option) => option.value === value);
+  }
+  return screen.queryByTestId(`${testId}-option-${value === "" ? "no-override" : value}`) !== null;
 }
 
 const CLAUDE_AGENT: AgentRecord = {
@@ -58,10 +94,29 @@ const CODEX_AGENT: AgentRecord = {
   created_at: "2026-05-16T00:00:01Z",
 };
 
+const GEMINI_AGENT: AgentRecord = {
+  id: "00000000-0000-7000-8000-000000000ccc",
+  project_id: "00000000-0000-7000-8000-0000000000ff",
+  name: "gwen",
+  harness: "gemini",
+  session_locator: { uuid: "00000000-0000-7000-8000-000000000002" },
+  created_at: "2026-05-16T00:00:02Z",
+};
+const ANTIGRAVITY_AGENT: AgentRecord = {
+  id: "00000000-0000-7000-8000-000000000ddd",
+  project_id: "00000000-0000-7000-8000-0000000000ff",
+  name: "ada",
+  harness: "antigravity",
+  session_locator: { uuid: "00000000-0000-7000-8000-000000000003" },
+  created_at: "2026-05-16T00:00:03Z",
+};
+
 beforeEach(() => {
   vi.clearAllMocks();
   renameAgentMock.mockResolvedValue(undefined);
   removeAgentMock.mockResolvedValue(undefined);
+  setAgentModelMock.mockResolvedValue(undefined);
+  setAgentEffortMock.mockResolvedValue(undefined);
   agentSessionInfoMock.mockResolvedValue({ session_file: null, resume_command: null });
   openSessionFileMock.mockReset();
   copyTextMock.mockReset();
@@ -156,7 +211,10 @@ describe("Sidebar", () => {
 
     const resume = await screen.findByTestId("agent-action-resume");
     const open = await screen.findByTestId("agent-action-open-session");
-    expect(actions).toHaveAttribute("style", "--agent-action-width: 5.125rem;");
+    // Claude supports model+effort, so the "more" actions menu is present and
+    // contributes to the strip width (resume + open + more + delete = 4).
+    expect(screen.getByTestId("agent-action-more")).toBeInTheDocument();
+    expect(actions).toHaveAttribute("style", "--agent-action-width: 6.875rem;");
     expect(resume).toHaveAttribute("tabindex", "-1");
     expect(open).toHaveAttribute("tabindex", "-1");
   });
@@ -477,10 +535,177 @@ describe("Sidebar", () => {
 
     render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
 
+    // No selected model on this agent → the SessionMeta model shows as the
+    // observed fallback; mcp/skills counts stay in the meta block.
+    expect(screen.getByTestId("agent-observed-model")).toHaveTextContent("claude-sonnet-4-6");
     const meta = screen.getByTestId("agent-meta");
-    expect(meta).toHaveTextContent("claude-sonnet-4-6");
     expect(meta).toHaveTextContent("mcp: 1");
     expect(meta).toHaveTextContent("skills: 1");
+  });
+
+  // --- Model / effort: change actions + intent display -----------------------
+
+  it("Claude exposes both Change model and Change effort actions", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+
+    await fireEvent.click(screen.getByTestId("agent-action-more"));
+    await waitFor(() => expect(screen.getByTestId("agent-change-model")).toBeInTheDocument());
+    expect(screen.getByTestId("agent-change-effort")).toBeInTheDocument();
+  });
+
+  it("Gemini exposes Change model only (no effort capability)", async () => {
+    const state = await loadState();
+    await state.registerAgent(GEMINI_AGENT);
+    render(Sidebar, { props: { agents: [GEMINI_AGENT] } });
+
+    await fireEvent.click(screen.getByTestId("agent-action-more"));
+    await waitFor(() => expect(screen.getByTestId("agent-change-model")).toBeInTheDocument());
+    expect(screen.queryByTestId("agent-change-effort")).toBeNull();
+  });
+
+  it("Antigravity exposes no change actions (the more menu is absent)", async () => {
+    const state = await loadState();
+    await state.registerAgent(ANTIGRAVITY_AGENT);
+    render(Sidebar, { props: { agents: [ANTIGRAVITY_AGENT] } });
+
+    expect(screen.queryByTestId("agent-action-more")).toBeNull();
+  });
+
+  it("Change model opus → sonnet preselects the current value and calls setAgentModel", async () => {
+    const state = await loadState();
+    const agent = { ...CLAUDE_AGENT, model: "opus" };
+    await state.registerAgent(agent);
+    render(Sidebar, { props: { agents: [agent] } });
+
+    await fireEvent.click(screen.getByTestId("agent-action-more"));
+    await waitFor(() => expect(screen.getByTestId("agent-change-model")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("agent-change-model"));
+
+    await screen.findByTestId("change-select");
+    expect(pickerValue("change-select")).toBe("opus");
+    await choosePicker("change-select", "sonnet");
+    await fireEvent.click(screen.getByTestId("change-save"));
+
+    expect(setAgentModelMock).toHaveBeenCalledExactlyOnceWith(agent.id, "sonnet");
+  });
+
+  it("Change model 'No override' clears the selection (calls setAgentModel with undefined)", async () => {
+    const state = await loadState();
+    const agent = { ...CLAUDE_AGENT, model: "opus" };
+    await state.registerAgent(agent);
+    render(Sidebar, { props: { agents: [agent] } });
+
+    await fireEvent.click(screen.getByTestId("agent-action-more"));
+    await waitFor(() => expect(screen.getByTestId("agent-change-model")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("agent-change-model"));
+
+    await screen.findByTestId("change-select");
+    await choosePicker("change-select", "");
+    await fireEvent.click(screen.getByTestId("change-save"));
+
+    expect(setAgentModelMock).toHaveBeenCalledExactlyOnceWith(agent.id, undefined);
+  });
+
+  it("Change model includes an unknown persisted value so Save preserves it", async () => {
+    const state = await loadState();
+    const agent = { ...CLAUDE_AGENT, model: "future-opus" };
+    await state.registerAgent(agent);
+    render(Sidebar, { props: { agents: [agent] } });
+
+    await fireEvent.click(screen.getByTestId("agent-action-more"));
+    await waitFor(() => expect(screen.getByTestId("agent-change-model")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("agent-change-model"));
+
+    await screen.findByTestId("change-select");
+    expect(pickerValue("change-select")).toBe("future-opus");
+    expect(pickerHasOption("change-select", "future-opus")).toBe(true);
+    await fireEvent.click(screen.getByTestId("change-save"));
+
+    expect(setAgentModelMock).toHaveBeenCalledExactlyOnceWith(agent.id, "future-opus");
+  });
+
+  it("keeps the change dialog open and non-dismissible while saving", async () => {
+    const state = await loadState();
+    const agent = { ...CLAUDE_AGENT, model: "opus" };
+    await state.registerAgent(agent);
+    const pending = deferred();
+    setAgentModelMock.mockReturnValueOnce(pending.promise);
+    render(Sidebar, { props: { agents: [agent] } });
+
+    await fireEvent.click(screen.getByTestId("agent-action-more"));
+    await waitFor(() => expect(screen.getByTestId("agent-change-model")).toBeInTheDocument());
+    await fireEvent.click(screen.getByTestId("agent-change-model"));
+    await fireEvent.click(screen.getByTestId("change-save"));
+
+    expect(screen.getByTestId("change-selection-panel")).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByTestId("dialog-close")).toBeNull());
+
+    pending.resolve(undefined);
+    await waitFor(() => expect(screen.queryByTestId("change-selection-panel")).toBeNull());
+  });
+
+  it("sidebar shows the SELECTED model even when the observed model differs (post-turn state)", async () => {
+    const state = await loadState();
+    const agent = { ...CLAUDE_AGENT, model: "opus" };
+    await state.registerAgent(agent);
+    const runtime = state.runtimes[agent.id];
+    if (runtime === undefined) throw new Error("unreachable");
+    // A turn has run, so the harness reported a (resolved) observed model that
+    // differs from the durable-alias selection.
+    state.runtimes[agent.id] = {
+      ...runtime,
+      meta: {
+        model: "claude-opus-4-8",
+        harness_version: "2.1.140",
+        tools: [],
+        mcp_servers: [],
+        skills: [],
+      },
+    };
+
+    render(Sidebar, { props: { agents: [agent] } });
+
+    expect(screen.getByTestId("agent-selected-model")).toHaveTextContent("opus");
+    // The selection wins — the observed line is not shown when intent exists.
+    expect(screen.queryByTestId("agent-observed-model")).toBeNull();
+  });
+
+  it("sidebar falls back to the observed model when no model is selected, and hides when neither exists", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT); // no selected model
+    const runtime = state.runtimes[CLAUDE_AGENT.id];
+    if (runtime === undefined) throw new Error("unreachable");
+    state.runtimes[CLAUDE_AGENT.id] = {
+      ...runtime,
+      meta: {
+        model: "claude-sonnet-4-6",
+        harness_version: "2.1.140",
+        tools: [],
+        mcp_servers: [],
+        skills: [],
+      },
+    };
+
+    const { rerender } = render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+    expect(screen.getByTestId("agent-observed-model")).toHaveTextContent("claude-sonnet-4-6");
+    expect(screen.queryByTestId("agent-selected-model")).toBeNull();
+
+    // Drop the observed model too → the whole line clean-hides.
+    state.runtimes[CLAUDE_AGENT.id] = { ...runtime, meta: undefined };
+    await rerender({ agents: [CLAUDE_AGENT] });
+    await waitFor(() => expect(screen.queryByTestId("agent-observed-model")).toBeNull());
+    expect(screen.queryByTestId("agent-selected-model")).toBeNull();
+  });
+
+  it("sidebar shows the selected effort", async () => {
+    const state = await loadState();
+    const agent = { ...CLAUDE_AGENT, model: "opus", effort: "high" };
+    await state.registerAgent(agent);
+    render(Sidebar, { props: { agents: [agent] } });
+
+    expect(screen.getByTestId("agent-selected-effort")).toHaveTextContent("high");
   });
 });
 
@@ -901,9 +1126,10 @@ describe("Sidebar agent-scoped event tolerance", () => {
         skills: meta.skills,
       },
     };
-    // Component still rendered correctly with the new meta.
+    // Component still rendered correctly with the new meta — the model shows as
+    // the observed fallback (this agent has no selected model).
     await waitFor(() => {
-      expect(screen.getByTestId("agent-meta")).toHaveTextContent("claude-sonnet-4-6");
+      expect(screen.getByTestId("agent-observed-model")).toHaveTextContent("claude-sonnet-4-6");
     });
   });
 });

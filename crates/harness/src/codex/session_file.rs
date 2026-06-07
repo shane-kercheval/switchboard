@@ -94,6 +94,13 @@ pub struct Enrichment {
     /// first-turn model is the authoritative session-level snapshot for
     /// `SessionMeta`.
     pub model: Option<String>,
+    /// From the **last** `turn_context.payload.model` / `.effort` in the file —
+    /// the *current* turn's selection, used to stamp the live per-turn
+    /// `TurnEnd.{model,effort}`. Distinct from `model` (first-wins, agent-scoped
+    /// `SessionMeta`). The readback effort field is `effort`, not
+    /// `model_reasoning_effort` (verified @ codex 0.137.0).
+    pub current_turn_model: Option<String>,
+    pub current_turn_effort: Option<String>,
     /// The full `session_meta` line as JSON, with
     /// `payload.base_instructions.text` replaced by a sentinel. Used as
     /// `SessionMeta.raw`. `None` if line 1 isn't a `session_meta` record.
@@ -351,12 +358,23 @@ pub fn parse_session_content(content: &str) -> Enrichment {
                 enrichment.session_meta_raw = Some(strip_base_instructions(value));
             }
             "turn_context" => {
-                if !model_set
-                    && let Some(p) = payload
-                    && let Some(model) = p.get("model").and_then(Value::as_str)
-                {
-                    enrichment.model = Some(model.to_owned());
-                    model_set = true;
+                if let Some(p) = payload {
+                    let model = p.get("model").and_then(Value::as_str);
+                    // First-wins → agent-scoped `SessionMeta.model`.
+                    if let Some(m) = model
+                        && !model_set
+                    {
+                        enrichment.model = Some(m.to_owned());
+                        model_set = true;
+                    }
+                    // Per-turn carrier = **exactly this record's** values (reset,
+                    // not carry-until-overwritten) so a turn can never inherit a
+                    // prior turn's selection. Readback effort field is `effort`,
+                    // not `model_reasoning_effort`. Codex currently always writes
+                    // both, but absence must mean `None`, not stale.
+                    enrichment.current_turn_model = model.map(str::to_owned);
+                    enrichment.current_turn_effort =
+                        p.get("effort").and_then(Value::as_str).map(str::to_owned);
                 }
             }
             "event_msg" => {
@@ -547,7 +565,8 @@ pub fn load_codex_transcript(
         });
     };
 
-    let content = std::fs::read_to_string(&path)?;
+    let content =
+        std::fs::read_to_string(&path).map_err(|e| LoadTranscriptError::Io { path, source: e })?;
 
     let mut transcript = parse_codex_transcript_content(&content, agent_id);
     transcript.meta = Some(merge_meta_with_loaders(
@@ -596,6 +615,13 @@ struct CodexReconstruction {
     turns: Vec<Turn>,
     current_agent: Option<CodexAgentBuilder>,
     warnings: Vec<ParseWarning>,
+    /// Model + effort from the most-recent `turn_context` record — Codex writes
+    /// one per turn (at turn start), so when a turn closes these hold that
+    /// turn's selection. Stamped onto each `Turn::Agent`. The effort readback
+    /// field is `effort` (verified @ codex 0.137.0). Separate from the
+    /// agent-scoped first-wins model that feeds `SessionMeta`.
+    current_model: Option<String>,
+    current_effort: Option<String>,
 }
 
 struct CodexAgentBuilder {
@@ -607,6 +633,11 @@ struct CodexAgentBuilder {
     usage: Option<TurnUsage>,
     context_window: Option<u32>,
     pending_mcp_results: HashMap<String, McpResult>,
+    /// Codex's harness-local per-turn id from this turn's `turn_context.turn_id`
+    /// — re-parse-stable, so it serves as the hydration key (distinct from our
+    /// own `turn_id`, minted fresh each parse). Set when the turn's
+    /// `turn_context` arrives; `None` for a turn that writes none.
+    hydration_key: Option<String>,
 }
 
 /// Captured `mcp_tool_call_end` payload — applied to the matching
@@ -626,6 +657,8 @@ impl CodexReconstruction {
             turns: Vec::new(),
             current_agent: None,
             warnings: Vec::new(),
+            current_model: None,
+            current_effort: None,
         }
     }
 
@@ -648,6 +681,32 @@ impl CodexReconstruction {
         match record_type {
             "event_msg" => self.handle_event_msg(line_number, payload, timestamp),
             "response_item" => self.handle_response_item(line_number, payload, timestamp),
+            // Codex writes a `turn_context` at each turn's start carrying that
+            // turn's model + effort. Reset to **exactly this record's** values
+            // (not carry-until-overwritten) so `close_current_agent` stamps the
+            // turn with its own selection and never inherits a prior turn's.
+            // Effort readback field is `effort`, not `model_reasoning_effort`
+            // (verified @ 0.137.0). Codex currently always writes both, but
+            // absence must mean `None`, not stale.
+            //
+            // `turn_context.turn_id` is the per-turn id (the observed shape
+            // annotates it the turn UUID); it is the stable hydration key,
+            // captured onto *this turn's* builder rather than from
+            // `task_started.turn_id`, whose per-turn-uniqueness is unconfirmed —
+            // a non-unique dedup key drops new turns silently (see the builder
+            // field). Whether the *live* stream carries the same id (refresh
+            // eligibility) is still unprobed.
+            "turn_context" => {
+                if let Some(p) = payload {
+                    self.current_model = p.get("model").and_then(Value::as_str).map(str::to_owned);
+                    self.current_effort =
+                        p.get("effort").and_then(Value::as_str).map(str::to_owned);
+                    if let Some(builder) = self.current_agent.as_mut() {
+                        builder.hydration_key =
+                            p.get("turn_id").and_then(Value::as_str).map(str::to_owned);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -680,6 +739,14 @@ impl CodexReconstruction {
                     usage: None,
                     context_window,
                     pending_mcp_results: HashMap::new(),
+                    // Set when this turn's `turn_context` arrives (below). A fresh
+                    // builder per turn means the key is reset by construction —
+                    // it can never inherit a prior turn's id. That matters more
+                    // than for model/effort: a *stale* dedup key is non-unique
+                    // across turns, and the merge would then silently drop a
+                    // genuinely-new turn as "already seen" (lost output), which
+                    // is worse than the duplication this key exists to prevent.
+                    hydration_key: None,
                 });
             }
             "task_complete" => {
@@ -908,8 +975,17 @@ impl CodexReconstruction {
             status,
             items: builder.items,
             usage: builder.usage,
-            // Codex has no cost/overage and no join key (Claude-only feature).
+            // Per-turn model + effort from this turn's `turn_context` (last-wins
+            // up to this close). Distinct from the first-wins `meta.model`.
+            model: self.current_model.clone(),
+            effort: self.current_effort.clone(),
+            // Codex has no cost/overage and no Claude-style `stable_message_id`
+            // cost-join key, but its `turn_context.turn_id` is a re-parse-stable
+            // per-turn hydration key. Whether the *live* stream carries the same
+            // id (refresh eligibility) is unprobed, so the live `TurnEnd` leaves
+            // `hydration_key: None` for now.
             spend: None,
+            hydration_key: builder.hydration_key,
             stable_message_id: None,
         });
     }
@@ -1591,6 +1667,225 @@ not valid json
             "type": "turn_context",
             "payload": { "model": model }
         })
+    }
+
+    fn turn_context_with_effort(model: &str, effort: &str, ts: &str) -> Value {
+        serde_json::json!({
+            "timestamp": ts,
+            "type": "turn_context",
+            "payload": { "model": model, "effort": effort }
+        })
+    }
+
+    fn turn_context_with_turn_id(model: &str, turn_id: &str, ts: &str) -> Value {
+        serde_json::json!({
+            "timestamp": ts,
+            "type": "turn_context",
+            "payload": { "model": model, "turn_id": turn_id }
+        })
+    }
+
+    fn hydration_keys(content: &str, agent_id: AgentId) -> Vec<Option<String>> {
+        parse_codex_transcript_content(content, agent_id)
+            .turns
+            .into_iter()
+            .filter_map(|t| match t {
+                Turn::Agent { hydration_key, .. } => Some(hydration_key),
+                Turn::User { .. } => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hydration_key_is_stable_across_reparses_from_turn_context_turn_id() {
+        // Re-parsing the same content yields a turn whose `hydration_key` is
+        // identical across parses (Codex's `turn_context.turn_id`), even though
+        // our own `turn_id` is freshly minted each parse. The merge dedups on
+        // the stable key so a re-read never duplicates the turn.
+        let agent_id = Uuid::now_v7();
+        let content = jsonl_lines(&[
+            task_started("thread", "2026-05-14T19:33:20Z", 258_400),
+            turn_context_with_turn_id("gpt-5.5", "codex-turn-7", "2026-05-14T19:33:20Z"),
+            agent_message("hi", "2026-05-14T19:33:22Z"),
+            task_complete("thread", "2026-05-14T19:33:23Z"),
+        ]);
+        let parse = || {
+            parse_codex_transcript_content(&content, agent_id)
+                .turns
+                .into_iter()
+                .find_map(|t| match t {
+                    Turn::Agent {
+                        turn_id,
+                        hydration_key,
+                        ..
+                    } => Some((turn_id, hydration_key)),
+                    Turn::User { .. } => None,
+                })
+                .expect("one agent turn")
+        };
+        let (turn_id_a, key_a) = parse();
+        let (turn_id_b, key_b) = parse();
+        assert_eq!(
+            key_a.as_deref(),
+            Some("codex-turn-7"),
+            "the hydration key is the per-turn turn_context.turn_id"
+        );
+        assert_eq!(key_a, key_b, "hydration_key must be parse-invariant");
+        assert_ne!(
+            turn_id_a, turn_id_b,
+            "our turn_id is freshly minted each parse"
+        );
+    }
+
+    #[test]
+    fn hydration_keys_are_distinct_across_two_turns() {
+        // The dedup key must be per-turn-*unique*, not merely stable: two
+        // distinct turns whose `turn_context` carries distinct `turn_id`s must
+        // yield distinct keys (and stable across reparse). Both `task_started`
+        // records here reuse the SAME id ("thread") — so a key sourced from
+        // `task_started.turn_id` would collide the two turns and the merge would
+        // silently drop the second on a re-read; the `turn_context`-sourced key
+        // does not. (A handcrafted fixture proves the *parser* keys per-turn;
+        // that real Codex varies `turn_context.turn_id` per turn, and that the
+        // live stream carries the same id, is confirmed by the live multi-turn
+        // probe, not here — Codex refresh stays gated until then.)
+        let agent_id = Uuid::now_v7();
+        let content = jsonl_lines(&[
+            task_started("thread", "2026-05-14T19:33:20Z", 258_400),
+            turn_context_with_turn_id("gpt-5.5", "codex-turn-1", "2026-05-14T19:33:20Z"),
+            agent_message("a", "2026-05-14T19:33:22Z"),
+            task_complete("thread", "2026-05-14T19:33:23Z"),
+            task_started("thread", "2026-05-14T19:34:20Z", 258_400),
+            turn_context_with_turn_id("gpt-5.5", "codex-turn-2", "2026-05-14T19:34:20Z"),
+            agent_message("b", "2026-05-14T19:34:22Z"),
+            task_complete("thread", "2026-05-14T19:34:23Z"),
+        ]);
+        let keys = hydration_keys(&content, agent_id);
+        assert_eq!(
+            keys,
+            vec![
+                Some("codex-turn-1".to_owned()),
+                Some("codex-turn-2".to_owned()),
+            ],
+            "distinct turns get distinct per-turn keys"
+        );
+        assert_eq!(
+            hydration_keys(&content, agent_id),
+            keys,
+            "and the keys are identical on re-parse"
+        );
+    }
+
+    #[test]
+    fn hydration_key_is_none_for_a_turn_with_no_turn_context() {
+        // A turn that writes no `turn_context` has no per-turn id → `None` (the
+        // merge falls back to `turn_id`). Crucially it must NOT inherit the
+        // prior turn's key — that non-uniqueness is the silent-drop bug. The
+        // builder is fresh per turn, so this holds by construction.
+        let agent_id = Uuid::now_v7();
+        let content = jsonl_lines(&[
+            task_started("thread", "2026-05-14T19:33:20Z", 258_400),
+            turn_context_with_turn_id("gpt-5.5", "codex-turn-1", "2026-05-14T19:33:20Z"),
+            agent_message("a", "2026-05-14T19:33:22Z"),
+            task_complete("thread", "2026-05-14T19:33:23Z"),
+            // Turn 2: no turn_context at all.
+            task_started("thread", "2026-05-14T19:34:20Z", 258_400),
+            agent_message("b", "2026-05-14T19:34:22Z"),
+            task_complete("thread", "2026-05-14T19:34:23Z"),
+        ]);
+        assert_eq!(
+            hydration_keys(&content, agent_id),
+            vec![Some("codex-turn-1".to_owned()), None],
+            "turn 2 has no turn_context → None, never the prior turn's id"
+        );
+    }
+
+    #[test]
+    fn hydrate_turn_without_effort_readback_is_none_not_stale() {
+        // A turn whose `turn_context` omits `effort` must hydrate `effort: None`
+        // — never inheriting the prior turn's. (Codex currently always writes
+        // `effort`, so this is a hand-crafted contract guard, not a live shape.)
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let agent_id = Uuid::now_v7();
+        let date = NaiveDate::from_ymd_opt(2026, 5, 14).unwrap();
+        let session_id = "019e27fa-ae19-7022-97a2-356e6e5f3360";
+        let content = jsonl_lines(&[
+            turn_context_with_effort("gpt-5.5", "high", "2026-05-14T19:33:20Z"),
+            task_started(session_id, "2026-05-14T19:33:20Z", 258_400),
+            agent_message("a", "2026-05-14T19:33:22Z"),
+            task_complete(session_id, "2026-05-14T19:33:23Z"),
+            // Turn 2: model present, effort omitted.
+            turn_context("gpt-5.5", "2026-05-14T19:34:20Z"),
+            task_started(session_id, "2026-05-14T19:34:20Z", 258_400),
+            agent_message("b", "2026-05-14T19:34:22Z"),
+            task_complete(session_id, "2026-05-14T19:34:23Z"),
+        ]);
+        write_session_at(home.path(), date, session_id, &content);
+
+        let result =
+            load_codex_transcript(home.path(), cwd.path(), session_id, Some(date), agent_id)
+                .unwrap();
+        let efforts: Vec<_> = result
+            .turns
+            .iter()
+            .filter_map(|t| match t {
+                Turn::Agent { effort, .. } => Some(effort.clone()),
+                Turn::User { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            efforts,
+            vec![Some("high".to_owned()), None],
+            "turn 2 omits effort → None, not the prior turn's 'high'"
+        );
+    }
+
+    #[test]
+    fn hydrate_stamps_per_turn_model_and_effort_from_turn_context() {
+        // Two turns on different model + effort → two hydrated agent turns whose
+        // values differ. The readback effort field is `effort` (verified @
+        // codex 0.137.0). SessionMeta.model stays first-wins (separate path).
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let agent_id = Uuid::now_v7();
+        let date = NaiveDate::from_ymd_opt(2026, 5, 14).unwrap();
+        let session_id = "019e27fa-ae19-7022-97a2-356e6e5f3360";
+        let content = jsonl_lines(&[
+            turn_context_with_effort("gpt-5.5", "medium", "2026-05-14T19:33:20Z"),
+            task_started(session_id, "2026-05-14T19:33:20Z", 258_400),
+            user_message("hi", "2026-05-14T19:33:21Z"),
+            agent_message("a", "2026-05-14T19:33:22Z"),
+            task_complete(session_id, "2026-05-14T19:33:23Z"),
+            turn_context_with_effort("gpt-5.6", "high", "2026-05-14T19:34:20Z"),
+            task_started(session_id, "2026-05-14T19:34:20Z", 258_400),
+            user_message("again", "2026-05-14T19:34:21Z"),
+            agent_message("b", "2026-05-14T19:34:22Z"),
+            task_complete(session_id, "2026-05-14T19:34:23Z"),
+        ]);
+        write_session_at(home.path(), date, session_id, &content);
+
+        let result =
+            load_codex_transcript(home.path(), cwd.path(), session_id, Some(date), agent_id)
+                .unwrap();
+
+        let agent_turns: Vec<_> = result
+            .turns
+            .iter()
+            .filter_map(|t| match t {
+                Turn::Agent { model, effort, .. } => Some((model.clone(), effort.clone())),
+                Turn::User { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            agent_turns,
+            vec![
+                (Some("gpt-5.5".to_owned()), Some("medium".to_owned())),
+                (Some("gpt-5.6".to_owned()), Some("high".to_owned())),
+            ]
+        );
+        // SessionMeta keeps the first model (agent-scoped representative).
+        assert_eq!(result.meta.unwrap().model, "gpt-5.5");
     }
 
     #[test]

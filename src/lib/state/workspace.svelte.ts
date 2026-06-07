@@ -30,17 +30,20 @@ import * as api from "$lib/api";
 import type {
   AgentId,
   AgentRecord,
+  AgentSessionFingerprint,
   ConversationItem,
   HarnessKind,
   LoadedTurn,
   ProjectId,
   ProjectListing,
   SendId,
+  SessionFingerprint,
   WorkspaceDirectoryInfo,
 } from "$lib/types";
 import { tick, untrack } from "svelte";
 import { harnessAvailability, refreshHarnessAvailability } from "$lib/harnessAvailability.svelte";
 import { HARNESS_DEFAULT_AGENT_NAME } from "$lib/harnessDisplay";
+import { DEFAULT_EFFORT, DEFAULT_MODEL } from "$lib/agentSelection";
 import { currentIsoTimestamp } from "$lib/utils";
 import { buildLiveSendsMap } from "$lib/state/liveSends";
 import {
@@ -59,6 +62,11 @@ import {
 export type ProjectConversationState = {
   items: ConversationItem[];
   status: "pending" | "loading" | "complete" | "failed";
+  /// Verbatim error text when `status === "failed"` (the merged-conversation
+  /// load rejected outright). Retained — not just logged — so the transcript
+  /// region can surface it with a copyable Details affordance and a Retry.
+  /// Absent in every non-failed state.
+  error?: string;
 };
 
 export type ActivationResult = "activated" | "superseded" | "failed";
@@ -125,6 +133,65 @@ const loadStarted = new Map<ProjectId, Promise<void>>();
 /// per-agent `hydrationAttempted` set).
 // eslint-disable-next-line svelte/prefer-svelte-reactivity
 const hydrationStarted = new Set<ProjectId>();
+
+/// Per-project session-file fingerprints captured at last hydration — the
+/// baseline the staleness-refresh check diffs against to decide whether a
+/// refresh-capable agent's file changed (the user continued the session in the
+/// harness's own TUI). Non-reactive bookkeeping, like the guards above.
+// eslint-disable-next-line svelte/prefer-svelte-reactivity
+const sessionFingerprintBaseline = new Map<ProjectId, AgentSessionFingerprint[]>();
+
+/// Projects with a staleness refresh in flight. `maybeRefreshProject` clears the
+/// hydration guard before re-reading, so it can't rely on that guard for
+/// re-entry protection; this self-guard keeps a second refresh from kicking off
+/// a redundant concurrent re-read. Defense-in-depth — the sole caller is
+/// `seq`-guarded and the M2 keyed merge already makes a concurrent re-read
+/// dup-safe — but it keeps the function safe for any future caller.
+// eslint-disable-next-line svelte/prefer-svelte-reactivity
+const refreshInFlight = new Set<ProjectId>();
+
+/// Every `send_id` of a *this-session* send, taken from the **user** turns in
+/// the per-agent slices. Used to keep the overlay to not-live-this-session
+/// content: a re-read of the journal would otherwise re-surface a
+/// `user_message`/`outcome` row for a live send, doubling the row the slice
+/// already renders (`buildUnifiedRows` draws user rows from both the slices and
+/// the overlay with no cross-source dedup).
+///
+/// **Must read user turns only.** Project hydration routes historical user
+/// content to the *overlay* and only agent turns into slices — and those agent
+/// turns carry the journal-joined `send_id` of the *historical* send they
+/// answered. So a user turn in a slice can only have come from this-session
+/// `dispatchUserTurn`; keying on `role === "user"` is the clean discriminator
+/// between live and hydrated-historical sends. Collecting from agent turns too
+/// would sweep up historical send ids and delete legitimate overlay prompts on
+/// refresh. Empty on first hydrate (no live user turns), so this is a no-op
+/// there and load-bearing only on refresh.
+function liveSliceSendIds(projectId: ProjectId): Set<SendId> {
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity
+  const ids = new Set<SendId>();
+  for (const agent of agentsByProject[projectId] ?? []) {
+    for (const turn of transcripts[agent.id] ?? []) {
+      if (turn.role === "user" && turn.send_id !== undefined) ids.add(turn.send_id);
+    }
+  }
+  return ids;
+}
+
+/// Whether a session file changed between two fingerprints. Gated on
+/// `(source_path, modified_at, byte_len)` together — a moved file (Gemini's
+/// candidate selection), a touched mtime, or an appended byte length each count
+/// as changed; absence on one side but not the other (file appeared/vanished) is
+/// also a change.
+function fingerprintChanged(
+  a: SessionFingerprint | null | undefined,
+  b: SessionFingerprint | null | undefined,
+): boolean {
+  if (a == null && b == null) return false;
+  if (a == null || b == null) return true;
+  return (
+    a.source_path !== b.source_path || a.modified_at !== b.modified_at || a.byte_len !== b.byte_len
+  );
+}
 
 function sortByActivity(list: ProjectListing[]): ProjectListing[] {
   return [...list].sort((a, b) => b.last_activity.localeCompare(a.last_activity));
@@ -284,6 +351,8 @@ export async function removeDirectory(path: string): Promise<void> {
     delete projectActivityOverrides[id];
     loadStarted.delete(id);
     hydrationStarted.delete(id);
+    sessionFingerprintBaseline.delete(id);
+    refreshInFlight.delete(id);
   }
   previousLiveProjectSendPairs = previousLiveProjectSendPairs.filter(
     (pair) => !removedProjectIds.includes(pair.projectId),
@@ -342,7 +411,15 @@ async function seedAgentsForInstalledHarnesses(projectId: ProjectId): Promise<vo
   for (const harness of harnessAvailability.installed()) {
     if (selection.activeProjectId !== projectId) break;
     try {
-      const agent = await api.createAgent(HARNESS_DEFAULT_AGENT_NAME[harness], harness);
+      // Seed the same harness defaults the create form preselects, so every
+      // auto-created agent is born with a known, displayed model/effort
+      // (`undefined` for a no-capability harness → backend stores `None`).
+      const agent = await api.createAgent(
+        HARNESS_DEFAULT_AGENT_NAME[harness],
+        harness,
+        DEFAULT_MODEL[harness],
+        DEFAULT_EFFORT[harness],
+      );
       if (selection.activeProjectId !== projectId) break;
       await registerAgent(agent);
       if (selection.activeProjectId !== projectId) break;
@@ -387,6 +464,28 @@ export async function removeAgent(agentId: AgentId): Promise<void> {
 /// surfaces them and stays in edit mode).
 export async function renameAgent(agentId: AgentId, newName: string): Promise<void> {
   const updated = await api.renameAgent(agentId, newName);
+  replaceAgentRecord(agentId, updated);
+}
+
+/// Change (or clear) an agent's selected model. Mirrors `renameAgent`: the
+/// backend re-persists and returns the updated record, which replaces the old
+/// one in whichever project roster holds it — so the sidebar reflects the new
+/// intent immediately, before any turn runs. `model` undefined clears the
+/// override. Errors propagate to the caller (the editor surfaces them).
+export async function setAgentModel(agentId: AgentId, model?: string): Promise<void> {
+  const updated = await api.setAgentModel(agentId, model);
+  replaceAgentRecord(agentId, updated);
+}
+
+/// Change (or clear) an agent's selected reasoning effort. See `setAgentModel`.
+export async function setAgentEffort(agentId: AgentId, effort?: string): Promise<void> {
+  const updated = await api.setAgentEffort(agentId, effort);
+  replaceAgentRecord(agentId, updated);
+}
+
+/// Replace an agent's record across whichever project roster holds it — located
+/// across all rosters rather than assumed active, matching `renameAgent`.
+function replaceAgentRecord(agentId: AgentId, updated: AgentRecord): void {
   for (const [projectId, agents] of Object.entries(agentsByProject)) {
     if (agents.some((a) => a.id === agentId)) {
       agentsByProject[projectId] = agents.map((a) => (a.id === agentId ? updated : a));
@@ -427,6 +526,8 @@ export async function deleteProject(projectId: ProjectId): Promise<void> {
   delete projectActivityOverrides[projectId];
   loadStarted.delete(projectId);
   hydrationStarted.delete(projectId);
+  sessionFingerprintBaseline.delete(projectId);
+  refreshInFlight.delete(projectId);
   previousLiveProjectSendPairs = previousLiveProjectSendPairs.filter(
     (pair) => pair.projectId !== projectId,
   );
@@ -471,6 +572,9 @@ export async function activateProject(projectId: ProjectId): Promise<ActivationR
   // re-activating) clears the banner. `createProjectAndActivate` seeds *after*
   // this, so its failures survive.
   agentCreationFailures.length = 0;
+  // A re-activation is a switch back to a project whose load already ran — the
+  // only time a staleness refresh applies (first activation hydrates fresh).
+  const isReactivation = loadStarted.has(projectId);
   await afterNextPaint();
   if (seq !== activationSeq || selection.activeProjectId !== projectId) return "superseded";
   try {
@@ -479,6 +583,14 @@ export async function activateProject(projectId: ProjectId): Promise<ActivationR
     await api.setActiveProject(projectId);
     if (seq !== activationSeq || selection.activeProjectId !== projectId) return "superseded";
     selection.loadingProjectId = null;
+    // Pick up TUI-continued turns on switch-back. Inside the `seq` guard so a
+    // superseded activation can't kick off a refresh for a project the user has
+    // already navigated away from. Awaited so the refreshed turns are applied
+    // before the activation resolves (tests and callers can rely on it).
+    if (isReactivation) {
+      await maybeRefreshProject(projectId);
+      if (seq !== activationSeq || selection.activeProjectId !== projectId) return "superseded";
+    }
     return "activated";
   } catch (err) {
     if (seq !== activationSeq || selection.activeProjectId !== projectId) return "superseded";
@@ -511,12 +623,52 @@ function ensureProjectLoaded(projectId: ProjectId): Promise<void> {
 /// existing per-agent hydrate path). Per-agent `load_error` marks just that
 /// agent's hydration failed; the rest of the project still renders. Idempotent
 /// + sticky via `hydrationStarted`.
-export async function hydrateProject(projectId: ProjectId): Promise<void> {
+///
+/// **`agentTurnFilter`** scopes which agents' *agent turns* are (re-)applied —
+/// supplied only on a staleness **refresh** (`maybeRefreshProject`), set to the
+/// refresh-capable agents. The whole project is re-read (the journal-join that
+/// classifies imported-vs-journaled user content needs all agents), but agent
+/// turns are merged only for refresh-capable agents: a non-refresh-capable agent
+/// that ran a turn in Switchboard this session already advanced its own file,
+/// and its live turn's key is `None`, so re-merging its disk copy would
+/// *duplicate* the live turn (the live-vs-disk hazard the per-harness gate
+/// exists to prevent). On first hydrate the filter is absent → all agents apply
+/// (safe: no live turns exist at project open).
+export async function hydrateProject(
+  projectId: ProjectId,
+  agentTurnFilter?: ReadonlySet<AgentId>,
+): Promise<void> {
   if (hydrationStarted.has(projectId)) return;
   hydrationStarted.add(projectId);
-  conversations[projectId] = { items: [], status: "loading" };
+  // A refresh (the only caller passing `agentTurnFilter`) re-reads over a
+  // known-good loaded view, so it must be non-destructive: keep the current
+  // conversation displayed while re-reading, and on failure leave it (and the
+  // baseline) untouched — a best-effort switch-back refresh must never turn a
+  // working view into a blank/error one for a transient hiccup. First
+  // hydration/retry still show the loading state and surface failures.
+  const isRefresh = agentTurnFilter !== undefined;
+  if (!isRefresh) conversations[projectId] = { items: [], status: "loading" };
+  // Capture the freshness baseline BEFORE the parse, best-effort: a file written
+  // between this stat and the parse leaves the baseline behind the parsed state,
+  // so the next refresh re-reads (a benign deduped no-op) rather than missing the
+  // change. A failed fingerprint fetch just means no refresh baseline (full
+  // reload still works) — it must not fail the hydration.
+  let baseline: AgentSessionFingerprint[] | undefined;
+  try {
+    baseline = await api.projectSessionFingerprints(projectId);
+  } catch (e) {
+    console.warn("[switchboard] projectSessionFingerprints failed", {
+      project_id: projectId,
+      error: e,
+    });
+  }
   try {
     const convo = await api.loadProjectConversation(projectId);
+
+    // Sends represented live in the slices this session own their rendering
+    // there; drop the journal's copy of them from the overlay to avoid a doubled
+    // user/outcome row. No-op on first hydrate; load-bearing on refresh.
+    const liveSends = liveSliceSendIds(projectId);
 
     const overlay: ConversationItem[] = [];
     // Function-local computation scratch — recreated each call, never observed
@@ -538,10 +690,16 @@ export async function hydrateProject(projectId: ProjectId): Promise<void> {
           items: item.items,
           usage: item.usage ?? null,
           spend: item.spend ?? null,
+          // Thread the stable hydration key through this hand-built remap — the
+          // merge dedups on it, and a field not copied here is silently dropped.
+          hydration_key: item.hydration_key ?? null,
         });
         turnsByAgent.set(item.agent_id, arr);
       } else {
-        // user_message | outcome — the project-level overlay.
+        // user_message | outcome — the project-level overlay. Skip a journaled
+        // row (has a `send_id`) whose send is already live in a slice; imported
+        // prompts (`send_id` null) have no live counterpart and pass through.
+        if (item.send_id != null && liveSends.has(item.send_id)) continue;
         overlay.push(item);
       }
     }
@@ -554,6 +712,9 @@ export async function hydrateProject(projectId: ProjectId): Promise<void> {
       ...convo.agents.map((a) => a.agent_id),
     ]);
     for (const agentId of agentIds) {
+      // On refresh, leave non-refresh-capable agents' content frozen (see the
+      // doc above) — their slice and prior state are untouched.
+      if (agentTurnFilter !== undefined && !agentTurnFilter.has(agentId)) continue;
       // Hydrating through `applyAgentHydrate` (or recording the failure) counts
       // as this agent's one hydration for the session — mark it so the
       // per-agent `hydrateAgent` path won't later re-parse and duplicate turns.
@@ -583,10 +744,78 @@ export async function hydrateProject(projectId: ProjectId): Promise<void> {
     }
 
     conversations[projectId] = { items: overlay, status: "complete" };
+    if (baseline !== undefined) sessionFingerprintBaseline.set(projectId, baseline);
   } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
     console.warn("[switchboard] hydrateProject failed", { project_id: projectId, error: e });
-    conversations[projectId] = { items: [], status: "failed" };
+    // A failed refresh keeps the prior loaded conversation (and its baseline)
+    // intact — log only, so the next switch-back retries. A failed first
+    // hydration/retry surfaces the error (there is no good view to protect).
+    if (!isRefresh) {
+      conversations[projectId] = { items: [], status: "failed", error: message };
+    }
   }
+}
+
+/// On re-activation of an already-loaded project, re-read its conversation if a
+/// **refresh-capable** agent's session file changed since last hydration (the
+/// user continued it in the harness's own TUI). The cheap `stat`-only fingerprint
+/// check gates the expensive parse: when nothing changed, `loadProjectConversation`
+/// is never called. The re-read merges agent turns only for refresh-capable
+/// agents and is dup-safe via the M2 stable key (see `hydrateProject`). A failed
+/// fingerprint check degrades to "no refresh" (the displayed history just isn't
+/// updated until the next switch).
+async function maybeRefreshProject(projectId: ProjectId): Promise<void> {
+  const baseline = sessionFingerprintBaseline.get(projectId);
+  if (baseline === undefined) return; // not yet hydrated → nothing to refresh
+  if (refreshInFlight.has(projectId)) return; // a refresh is already running
+  refreshInFlight.add(projectId);
+  try {
+    let current: AgentSessionFingerprint[];
+    try {
+      current = await api.projectSessionFingerprints(projectId);
+    } catch (e) {
+      console.warn("[switchboard] refresh freshness check failed", {
+        project_id: projectId,
+        error: e,
+      });
+      return;
+    }
+    const baseByAgent = new Map(baseline.map((f) => [f.agent_id, f]));
+    // eslint-disable-next-line svelte/prefer-svelte-reactivity
+    const refreshCapable = new Set<AgentId>();
+    let anyStale = false;
+    for (const f of current) {
+      if (!f.refresh_capable) continue;
+      refreshCapable.add(f.agent_id);
+      if (fingerprintChanged(baseByAgent.get(f.agent_id)?.fingerprint, f.fingerprint)) {
+        anyStale = true;
+      }
+    }
+    // Unchanged → do NOT re-read (the parse path stays uncalled).
+    if (!anyStale) return;
+    hydrationStarted.delete(projectId);
+    await hydrateProject(projectId, refreshCapable);
+  } finally {
+    refreshInFlight.delete(projectId);
+  }
+}
+
+/// Re-attempt a project's conversation hydration after an outright load
+/// failure. Clears the sticky `hydrationStarted` guard so `hydrateProject`
+/// re-runs (the `loadStarted` open/roster guard is untouched — open succeeded;
+/// only the conversation merge failed). A failed load applied nothing, so the
+/// re-attempt cannot duplicate content.
+export async function retryProjectHydration(projectId: ProjectId): Promise<void> {
+  // Re-entrancy guard, mirroring `retryAgentHydration`. `hydrateProject` also
+  // feeds each agent's turns through the per-agent append-merge
+  // (`applyAgentHydrate`), so two concurrent project retries duplicate agent
+  // turns just like the per-agent path — not only the `conversations` overlay
+  // (which is last-write-wins and would be fine). `hydrateProject` sets status
+  // `"loading"` synchronously before its await, so a racing retry sees it here.
+  if (conversations[projectId]?.status === "loading") return;
+  hydrationStarted.delete(projectId);
+  await hydrateProject(projectId);
 }
 
 /// Append a freshly created/attached agent to the active project's roster so
@@ -615,6 +844,8 @@ export const _testing = {
     activationSeq = 0;
     loadStarted.clear();
     hydrationStarted.clear();
+    sessionFingerprintBaseline.clear();
+    refreshInFlight.clear();
     for (const key of Object.keys(agentsByProject)) delete agentsByProject[key];
     for (const key of Object.keys(conversations)) delete conversations[key];
     for (const key of Object.keys(backgroundCompletedProjectIds))

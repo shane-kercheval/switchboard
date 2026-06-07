@@ -3,6 +3,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  AgentSessionFingerprint,
   AgentId,
   AgentRecord,
   BranchKind,
@@ -243,6 +244,14 @@ export async function loadProjectConversation(projectId: ProjectId): Promise<Pro
   return await invoke<ProjectConversation>("load_project_conversation", { projectId });
 }
 
+// Cheap per-agent session-file freshness check (stat only, no parse) that gates
+// the staleness re-read on project re-activation.
+export async function projectSessionFingerprints(
+  projectId: ProjectId,
+): Promise<AgentSessionFingerprint[]> {
+  return await invoke<AgentSessionFingerprint[]>("project_session_fingerprints", { projectId });
+}
+
 export async function openProject(projectId: ProjectId): Promise<ProjectSummary> {
   return await invoke<ProjectSummary>("open_project", { projectId });
 }
@@ -251,8 +260,13 @@ export async function setActiveProject(projectId: ProjectId): Promise<void> {
   await invoke<null>("set_active_project", { projectId });
 }
 
-export async function createAgent(name: string, harness: HarnessKind): Promise<AgentRecord> {
-  return await invoke<AgentRecord>("create_agent", { name, harness });
+export async function createAgent(
+  name: string,
+  harness: HarnessKind,
+  model?: string,
+  effort?: string,
+): Promise<AgentRecord> {
+  return await invoke<AgentRecord>("create_agent", { name, harness, model, effort });
 }
 
 /// Remove an agent: tears down its actor (cancelling any in-flight turn) and
@@ -268,15 +282,32 @@ export async function renameAgent(agentId: AgentId, newName: string): Promise<Ag
   return await invoke<AgentRecord>("rename_agent", { agentId, newName });
 }
 
+/// Change (or clear) an agent's selected model. `model` undefined clears the
+/// override back to `None`. The backend re-validates harness capability and
+/// returns the updated record (or rejects for an unsupported harness). Takes
+/// effect on the agent's next dispatch — never an in-flight turn.
+export async function setAgentModel(agentId: AgentId, model?: string): Promise<AgentRecord> {
+  return await invoke<AgentRecord>("set_agent_model", { agentId, model });
+}
+
+/// Change (or clear) an agent's selected reasoning effort. See `setAgentModel`.
+export async function setAgentEffort(agentId: AgentId, effort?: string): Promise<AgentRecord> {
+  return await invoke<AgentRecord>("set_agent_effort", { agentId, effort });
+}
+
 export async function attachAgent(
   name: string,
   harness: HarnessKind,
   existingSessionId: string,
+  model?: string,
+  effort?: string,
 ): Promise<AgentRecord> {
   return await invoke<AgentRecord>("attach_agent", {
     name,
     harness,
     existingSessionId,
+    model,
+    effort,
   });
 }
 

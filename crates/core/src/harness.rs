@@ -31,6 +31,87 @@ pub enum HarnessKind {
     Antigravity,
 }
 
+impl HarnessKind {
+    /// Whether Switchboard can set this harness's model per agent (via a
+    /// per-invocation CLI flag). True for Claude (`--model`), Codex (`-m`), and
+    /// Gemini (`-m`); false for Antigravity, whose model is a global,
+    /// harness-owned config we never touch (per `harness-behavior.md` §3.3).
+    ///
+    /// The single authority for the model-selection gate — command validation,
+    /// picker visibility, and the per-agent change action all derive from this
+    /// rather than re-deriving `if harness == …`. Exhaustive (no `_` arm) so a
+    /// new harness forces a deliberate decision here.
+    #[must_use]
+    pub fn supports_model_selection(self) -> bool {
+        match self {
+            Self::ClaudeCode | Self::Codex | Self::Gemini => true,
+            Self::Antigravity => false,
+        }
+    }
+
+    /// Whether Switchboard can set this harness's reasoning-effort level per
+    /// agent. True for Claude (`--effort`) and Codex (`-c
+    /// model_reasoning_effort=`); false for Gemini (thinking is `settings.json`
+    /// config-only, no CLI flag) and Antigravity (effort is folded into the
+    /// model display name, which we can't set anyway) — per
+    /// `harness-behavior.md` §3.4.
+    ///
+    /// A *separate* axis from model selection with a *different* capability set
+    /// (Gemini has model but not effort), so it is its own gate. Same authority
+    /// role and exhaustiveness rationale as [`Self::supports_model_selection`].
+    #[must_use]
+    pub fn supports_effort_selection(self) -> bool {
+        match self {
+            Self::ClaudeCode | Self::Codex => true,
+            Self::Gemini | Self::Antigravity => false,
+        }
+    }
+
+    /// Whether Switchboard may re-read this harness's session file to pick up
+    /// turns the user added by continuing the session in the harness's own TUI
+    /// (staleness refresh on project re-activation).
+    ///
+    /// This is the **live-matched** capability: only true when the live stream's
+    /// per-turn id equals the one the session file stores, so a turn that
+    /// streamed live *and* is on disk dedups as one. Without it, re-reading a
+    /// file that already contains a turn we streamed live would duplicate that
+    /// turn (the disk copy's hydration key wouldn't match the live turn's). Only
+    /// Claude is confirmed (final assistant `message.id` round-trips live↔disk);
+    /// Codex/Gemini have a re-parse-stable disk key but their live-stream parity
+    /// is unprobed, so they stay once-per-session; Antigravity has no per-turn id
+    /// at all. Same authority + exhaustiveness role as the two siblings above.
+    #[must_use]
+    pub fn supports_refresh(self) -> bool {
+        match self {
+            Self::ClaudeCode => true,
+            Self::Codex | Self::Gemini | Self::Antigravity => false,
+        }
+    }
+}
+
+/// The two independent per-agent selection axes. A closed, complete set — model
+/// and effort are the whole feature; a third axis would be a new feature, not an
+/// additive variant — so this is deliberately **not** `#[non_exhaustive]`: every
+/// match site should break if the set ever changes. Used to tag which axis a
+/// [`crate::error::CoreError::SelectionUnsupported`] refers to, modeled as a
+/// type (not a string) so a mistyped axis is a compile error, consistent with
+/// the rest of the crate's closed-set-as-enum style.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionAxis {
+    Model,
+    Effort,
+}
+
+/// Lowercase wording for error messages (`"model"` / `"effort"`).
+impl fmt::Display for SelectionAxis {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Model => f.write_str("model"),
+            Self::Effort => f.write_str("effort"),
+        }
+    }
+}
+
 /// User-facing names. Used in `thiserror` `#[error]` format strings that
 /// surface to the frontend via Tauri (where `AppError::to_string()` is the
 /// IPC error payload). The `Debug` impl prints `ClaudeCode` without a
@@ -104,6 +185,36 @@ mod tests {
     fn antigravity_deserializes_from_snake_case() {
         let parsed: HarnessKind = serde_json::from_str("\"antigravity\"").unwrap();
         assert_eq!(parsed, HarnessKind::Antigravity);
+    }
+
+    #[test]
+    fn supports_model_selection_per_variant() {
+        assert!(HarnessKind::ClaudeCode.supports_model_selection());
+        assert!(HarnessKind::Codex.supports_model_selection());
+        assert!(HarnessKind::Gemini.supports_model_selection());
+        assert!(!HarnessKind::Antigravity.supports_model_selection());
+    }
+
+    #[test]
+    fn supports_effort_selection_per_variant() {
+        assert!(HarnessKind::ClaudeCode.supports_effort_selection());
+        assert!(HarnessKind::Codex.supports_effort_selection());
+        assert!(!HarnessKind::Gemini.supports_effort_selection());
+        assert!(!HarnessKind::Antigravity.supports_effort_selection());
+    }
+
+    #[test]
+    fn supports_refresh_is_claude_only() {
+        assert!(HarnessKind::ClaudeCode.supports_refresh());
+        assert!(!HarnessKind::Codex.supports_refresh());
+        assert!(!HarnessKind::Gemini.supports_refresh());
+        assert!(!HarnessKind::Antigravity.supports_refresh());
+    }
+
+    #[test]
+    fn selection_axis_display_is_lowercase_wording() {
+        assert_eq!(SelectionAxis::Model.to_string(), "model");
+        assert_eq!(SelectionAxis::Effort.to_string(), "effort");
     }
 
     #[test]

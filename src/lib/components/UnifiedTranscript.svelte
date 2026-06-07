@@ -2,7 +2,13 @@
   import type { AgentRecord, ConversationItem } from "$lib/types";
   import { HEARTBEAT_TIMEOUT_MS } from "$lib/types";
   import { formatDuration } from "$lib/utils";
-  import { cancelSend, runtimes, transcripts, type Turn } from "$lib/state/index.svelte";
+  import {
+    cancelSend,
+    retryAgentHydration,
+    runtimes,
+    transcripts,
+    type Turn,
+  } from "$lib/state/index.svelte";
   import {
     buildUnifiedRows,
     copyTextOf,
@@ -19,6 +25,8 @@
   import StopIcon from "$lib/components/ui/StopIcon.svelte";
   import ToolCallWidget from "$lib/components/ToolCallWidget.svelte";
   import ThinkingWidget from "$lib/components/ThinkingWidget.svelte";
+  import ErrorDetailsDialog from "$lib/components/ui/ErrorDetailsDialog.svelte";
+  import Button from "$lib/components/ui/Button.svelte";
 
   type AgentTurn = Extract<Turn, { role: "agent" }>;
   type NonUserRow = Exclude<UnifiedRow, { kind: "user" }>;
@@ -31,11 +39,42 @@
     agents,
     overlay = [],
     loadStatus = "complete",
+    loadError,
+    onRetryLoad,
   }: {
     agents: AgentRecord[];
     overlay?: ConversationItem[];
     loadStatus?: "pending" | "loading" | "complete" | "failed";
+    /// Verbatim error when `loadStatus === "failed"` (the whole-project
+    /// conversation load rejected). Drives the Details affordance on the
+    /// project-load-failed block.
+    loadError?: string;
+    /// Re-attempt the project conversation load. Supplied by the parent (which
+    /// owns the project id). Absent → no Retry button rendered.
+    onRetryLoad?: () => void;
   } = $props();
+
+  /// Roster agents whose *own* history failed to load (the per-agent
+  /// `hydration_error`), independent of the whole-project load. Surfaced as
+  /// pinned transcript-region chrome — not interleaved turns — because a failed
+  /// agent contributes no turns to anchor against, and "silently missing
+  /// history" is the exact trust gap this surface closes.
+  const failedAgents = $derived(agents.filter((a) => runtimes[a.id]?.hydration_error != null));
+
+  /// Verbatim-error dialog state, shared by the project-load and per-agent
+  /// failure affordances. The failure itself lives on agent/project state; this
+  /// only holds which message is currently being shown.
+  let detailsOpen = $state(false);
+  let detailsTitle = $state("");
+  let detailsMessage = $state("");
+  let detailsText = $state("");
+
+  function openDetails(title: string, message: string, details: string): void {
+    detailsTitle = title;
+    detailsMessage = message;
+    detailsText = details;
+    detailsOpen = true;
+  }
 
   const agentById = $derived.by(() => {
     const map: Record<string, AgentRecord> = {};
@@ -106,6 +145,24 @@
       if (r.kind === "agent") return r.turn.started_at;
     }
     return "";
+  }
+
+  /// A fan-out column's runtime selection footer: latest agent turn wins, matching
+  /// `columnAt` and the copy aggregation's "column owns its agent rows" contract.
+  function columnModel(colRows: NonUserRow[]): string | undefined {
+    for (let i = colRows.length - 1; i >= 0; i--) {
+      const r = colRows[i]!;
+      if (r.kind === "agent") return r.turn.model;
+    }
+    return undefined;
+  }
+
+  function columnEffort(colRows: NonUserRow[]): string | undefined {
+    for (let i = colRows.length - 1; i >= 0; i--) {
+      const r = colRows[i]!;
+      if (r.kind === "agent") return r.turn.effort;
+    }
+    return undefined;
   }
 
   function formatTime(iso: string): string {
@@ -197,6 +254,30 @@
     }
   });
 </script>
+
+{#snippet failureBanner(
+  testid: string,
+  message: string,
+  onRetry: (() => void) | undefined,
+  onDetails: () => void,
+)}
+  <div
+    class="border-status-failed/40 bg-status-failed-soft/40 mb-3 flex items-center justify-between gap-3 rounded-md border px-3 py-2"
+    data-testid={testid}
+  >
+    <span class="text-status-failed text-xs">{message}</span>
+    <div class="flex shrink-0 items-center gap-2">
+      {#if onRetry}
+        <Button variant="secondary" size="sm" data-testid={`${testid}-retry`} onclick={onRetry}>
+          Retry
+        </Button>
+      {/if}
+      <Button variant="ghost" size="sm" data-testid={`${testid}-details`} onclick={onDetails}>
+        Details
+      </Button>
+    </div>
+  </div>
+{/snippet}
 
 {#snippet turnBody(turn: AgentTurn)}
   {#each turn.items as item, i (i)}
@@ -292,6 +373,8 @@
   mt = "mt-1",
   spend: AgentTurn["spend"] = undefined,
   costUsd: number | null | undefined = undefined,
+  model: string | undefined = undefined,
+  effort: string | undefined = undefined,
 )}
   <!-- `justify-between` pins the always-visible spend group to the LEFT and the
        hover-revealed timestamp/copy to the RIGHT. The left group is always
@@ -321,10 +404,19 @@
         <span class="text-muted text-xs" data-testid="message-cost">${costUsd.toFixed(4)}</span>
       {/if}
     </div>
-    <!-- Right: timestamp + copy stay hover/focus-revealed (unchanged). -->
+    <!-- Right: per-turn model/effort (history — what this turn actually ran on,
+         resolved id and all), timestamp, and copy. All hover/focus-revealed and
+         subtle; the model/effort here are runtime history, distinct from the
+         sidebar's selected-intent value. -->
     <div
       class="flex items-center gap-2 opacity-0 group-focus-within:opacity-100 group-hover:opacity-100"
     >
+      {#if model}
+        <span class="text-muted text-xs" data-testid="message-model">{model}</span>
+      {/if}
+      {#if effort}
+        <span class="text-muted text-xs" data-testid="message-effort">{effort}</span>
+      {/if}
       {#if at}
         <time class="text-muted text-xs" datetime={at} title={at} data-testid="message-time"
           >{formatTime(at)}</time
@@ -406,6 +498,8 @@
       "mt-1",
       turn.spend,
       turn.usage?.total_cost_usd,
+      turn.model,
+      turn.effort,
     )}
   </div>
 {/snippet}
@@ -419,12 +513,38 @@
   {#if loadStatus === "loading"}
     <p class="text-muted mb-3 text-xs italic" data-testid="transcript-loading">Loading history…</p>
   {:else if loadStatus === "failed"}
-    <p class="text-status-failed mb-3 text-xs" data-testid="transcript-load-failed">
-      Couldn't load this project's conversation history.
-    </p>
+    {@render failureBanner(
+      "transcript-load-failed",
+      "Couldn't load this project's conversation history.",
+      onRetryLoad,
+      () =>
+        openDetails(
+          "Couldn't load conversation history",
+          "The project's conversation history failed to load. The exact error is below — copy it into a bug report.",
+          loadError ?? "No error detail was reported.",
+        ),
+    )}
   {/if}
 
-  {#if rows.length === 0 && loadStatus !== "loading"}
+  <!-- Per-agent history failures: pinned chrome (not interleaved turns), one
+       per failing roster agent. A failed agent contributes no turns to anchor
+       against, so this lives at the top of the stream where the user is looking
+       rather than mid-conversation. -->
+  {#each failedAgents as agent (agent.id)}
+    {@render failureBanner(
+      "agent-hydration-failed",
+      `Couldn't load ${agent.name}'s history.`,
+      () => void retryAgentHydration(agent.id),
+      () =>
+        openDetails(
+          `Couldn't load ${agent.name}'s history`,
+          "This agent's history failed to load. The exact error is below — copy it into a bug report.",
+          runtimes[agent.id]?.hydration_error ?? "No error detail was reported.",
+        ),
+    )}
+  {/each}
+
+  {#if rows.length === 0 && loadStatus === "complete" && failedAgents.length === 0}
     <p class="text-muted text-sm">No messages yet. Type a prompt below.</p>
   {/if}
 
@@ -496,6 +616,11 @@
                   columnAt(col.rows),
                   colCopyable,
                   `Copy ${agentName(col.agent_id)}'s message`,
+                  "mt-1",
+                  undefined,
+                  undefined,
+                  columnModel(col.rows),
+                  columnEffort(col.rows),
                 )}
               </div>
             {/each}
@@ -505,3 +630,10 @@
     {/each}
   </div>
 </div>
+
+<ErrorDetailsDialog
+  bind:open={detailsOpen}
+  title={detailsTitle}
+  message={detailsMessage}
+  details={detailsText}
+/>

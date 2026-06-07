@@ -24,6 +24,8 @@ fn fixture(name: &str) -> String {
 
 fn fake_agent() -> AgentRecord {
     AgentRecord {
+        model: None,
+        effort: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
         name: "test-agent".to_owned(),

@@ -14,10 +14,10 @@ pub mod name;
 mod paths;
 pub mod project;
 
-pub use agent::{AgentId, AgentRecord, SessionLocator};
+pub use agent::{AgentId, AgentRecord, SessionLocator, normalize_selection};
 pub use directory::{Directory, DirectoryConfig};
 pub use error::{CoreError, Result};
-pub use harness::HarnessKind;
+pub use harness::{HarnessKind, SelectionAxis};
 pub use io::{edit_yaml_mapping, read_yaml, write_yaml};
 pub use journal::{JournalRecord, SendId};
 pub use project::{Project, ProjectConfig, ProjectId, ProjectSummary};

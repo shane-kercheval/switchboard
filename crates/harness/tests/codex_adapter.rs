@@ -28,6 +28,8 @@ fn fixture(name: &str) -> String {
 
 fn codex_agent() -> AgentRecord {
     AgentRecord {
+        model: None,
+        effort: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
         name: "test-codex".to_owned(),
@@ -43,6 +45,8 @@ fn codex_agent() -> AgentRecord {
 /// capture).
 fn codex_agent_resuming(thread_id: &str, partition_date: chrono::NaiveDate) -> AgentRecord {
     AgentRecord {
+        model: None,
+        effort: None,
         session_locator: Some(SessionLocator::Codex {
             thread_id: thread_id.to_owned(),
             partition_date,

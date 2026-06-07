@@ -149,12 +149,48 @@ export async function hydrateAgent(agentId: AgentId): Promise<void> {
     const loaded = await loadTranscript(agentId);
     applyAgentHydrate(agentId, loaded);
   } catch (e) {
+    // Retain the error text on the runtime (not just `console.warn` it) so the
+    // failure is surfaced where the user is looking — the transcript-region
+    // banner and the sidebar line read the same `hydration_error` field. This
+    // mirrors the project-batch path (`workspace.svelte.ts`), which already
+    // sets `hydration_error` from the backend's per-agent `load_error`.
+    const message = e instanceof Error ? e.message : String(e);
     console.warn("[switchboard] hydrateAgent failed", { agent_id: agentId, error: e });
     const after = runtimes[agentId];
     if (after !== undefined) {
-      runtimes[agentId] = { ...after, hydration_status: "failed" };
+      runtimes[agentId] = { ...after, hydration_status: "failed", hydration_error: message };
     }
   }
+}
+
+/// Re-attempt an agent's hydration after a failure. Clears the sticky
+/// `hydrationAttempted` guard (so `hydrateAgent` actually re-runs) and drops the
+/// prior `hydration_error` (so the UI shows the loading state, not a stale
+/// failure, during the re-attempt). Safe even before M2's idempotent merge: a
+/// failed hydration applies *nothing* (the load is all-or-nothing at the IPC
+/// boundary — `loadTranscript` either returns a complete value that is then
+/// applied, or throws and applies nothing), so a retry-after-failure cannot
+/// duplicate turns. Shared by the transcript-region and sidebar retry
+/// affordances.
+export async function retryAgentHydration(agentId: AgentId): Promise<void> {
+  const current = runtimes[agentId];
+  if (current === undefined) {
+    console.error("[switchboard] retryAgentHydration called for unregistered agent", {
+      agent_id: agentId,
+    });
+    return;
+  }
+  // Re-entrancy guard: a hydration is already in flight. Without this, a second
+  // retry would `hydrationAttempted.delete` the guard the first call just
+  // re-added and start a *second* concurrent `load_transcript`; both would
+  // resolve and both apply, and since each parse mints fresh `turn_id`s the
+  // pre-M2 merge can't dedup them — duplicating the agent's history.
+  // `hydrateAgent` sets `"loading"` synchronously before its await, so a
+  // racing retry observes it here.
+  if (current.hydration_status === "loading") return;
+  hydrationAttempted.delete(agentId);
+  runtimes[agentId] = { ...current, hydration_error: undefined };
+  await hydrateAgent(agentId);
 }
 
 /// Apply a resolved hydration payload to an agent's transcript + runtime via

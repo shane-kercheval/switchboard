@@ -20,6 +20,12 @@ use crate::events::{ContentKind, McpServerStatus, ToolKind, TurnId, TurnSpend, T
 /// One reconstructed turn. Discriminated by `role` matching the event-vocabulary
 /// convention. User turns carry just the prompt text; agent turns carry the
 /// ordered `items` stream plus per-turn usage and lifecycle status.
+// A `User` turn is tiny; an `Agent` turn carries the full per-turn payload
+// (items, usage, model/effort, spend). The asymmetry is intrinsic — boxing the
+// hot, pattern-matched-everywhere `Agent` variant would add indirection for no
+// real benefit (a `Turn` is short-lived and not stored in bulk arrays of mixed
+// variants where the size waste would matter).
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "role", rename_all = "snake_case")]
 #[non_exhaustive]
@@ -38,6 +44,19 @@ pub enum Turn {
         status: TurnStatus,
         items: Vec<TurnItem>,
         usage: Option<TurnUsage>,
+        /// The model this turn ran on, reconstructed from the harness session
+        /// file (Codex `turn_context.model`, Claude `message.model`, Gemini's
+        /// per-record `model`, Antigravity carry-forward). Per-turn *history* —
+        /// distinct from the agent's *selected* model on `AgentRecord`, and from
+        /// the agent-scoped `SessionMeta.model`. `None` when the harness exposes
+        /// no model, or before any announcement (Antigravity).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        /// The reasoning effort this turn ran at — **Codex only**
+        /// (`turn_context.effort`). `None` for Claude/Gemini/Antigravity, which
+        /// expose no per-turn effort (Claude's is sidebar-intent only).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
         /// Per-turn real-spend attribution restored on reopen. The session-file
         /// parser leaves this `None`; the app's metadata overlay fills it from
         /// the durable `turnmeta` sidecar by joining on `stable_message_id`, so
@@ -45,6 +64,25 @@ pub enum Turn {
         /// non-real-spend turns and pre-feature turns (no backfill).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         spend: Option<TurnSpend>,
+        /// **Stable hydration key** — a per-turn identity that survives
+        /// re-parsing the *same* session file (byte-identical across repeated
+        /// parses), so re-reading a file never duplicates this agent turn (user
+        /// turns are keyless and dedup by `turn_id`). This is the
+        /// frontend-facing sibling of `stable_message_id`: it is **serialized
+        /// onto the IPC wire** (the merge on the other side dedups by it), and it
+        /// carries a deliberately broader contract.
+        ///
+        /// Per harness: Claude the final assistant `message.id` (so it equals
+        /// `stable_message_id` *and* matches the live `TurnEnd`); Codex the
+        /// `event_msg/task_started.turn_id`; Gemini the turn's first `gemini`
+        /// record `id`. `None` for Antigravity (no native per-turn id) — the
+        /// merge falls back to `turn_id` for keyless turns.
+        ///
+        /// **Not** `stable_message_id`: that one stays private (`skip_serializing`,
+        /// Claude-only cost-join). The two coincide *in value* for Claude but
+        /// gate different things — do not collapse them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hydration_key: Option<String>,
         /// The final assistant message's Anthropic `message.id` (Claude only) —
         /// the join key the overlay uses to look up this turn's persisted
         /// cost/overage. Internal plumbing: set by the session-file parser,
@@ -153,8 +191,17 @@ pub struct ParseWarning {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum LoadTranscriptError {
-    #[error("I/O error reading session file: {0}")]
-    Io(#[from] std::io::Error),
+    /// Reading a session file that exists failed (permissions, mid-rotation,
+    /// FS error). The `path` is included so the surfaced message names the file
+    /// the user (or a bug report) can investigate — the OS error alone omits
+    /// it. There is no `#[from] std::io::Error`: callers must attach the path
+    /// at the read site, which is the whole point.
+    #[error("I/O error reading session file {}: {source}", path.display())]
+    Io {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Build a `ParseWarning` for a stale-sidecar case (sidecar exists, session
@@ -255,6 +302,9 @@ mod tests {
             ],
             usage: None,
             spend: None,
+            model: None,
+            effort: None,
+            hydration_key: Some("msg_anchor01".to_owned()),
             stable_message_id: None,
         };
         let value = serde_json::to_value(&turn).unwrap();
@@ -263,6 +313,10 @@ mod tests {
         assert_eq!(value["items"][0]["item_kind"], "text");
         assert_eq!(value["items"][1]["item_kind"], "tool");
         assert_eq!(value["items"][1]["tool_use_id"], "tool_1");
+        // The hydration key serializes onto the wire (the frontend merge dedups
+        // on it); the private cost-join `stable_message_id` does not.
+        assert_eq!(value["hydration_key"], "msg_anchor01");
+        assert!(value.get("stable_message_id").is_none());
         let parsed: Turn = serde_json::from_value(value).unwrap();
         assert_eq!(parsed, turn);
     }
@@ -275,6 +329,23 @@ mod tests {
         assert!(value["meta"].is_null());
         assert!(value["last_rate_limit"].is_null());
         assert_eq!(value["warnings"], json!([]));
+    }
+
+    #[test]
+    fn io_error_display_names_the_path_and_os_error() {
+        let err = LoadTranscriptError::Io {
+            path: std::path::PathBuf::from("/tmp/sessions/abc.jsonl"),
+            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("/tmp/sessions/abc.jsonl"),
+            "message must name the session file path for a bug report: {msg}"
+        );
+        assert!(
+            msg.contains("permission denied"),
+            "message must carry the underlying OS error: {msg}"
+        );
     }
 
     #[test]

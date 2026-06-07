@@ -10,6 +10,8 @@ use uuid::Uuid;
 
 fn fake_agent() -> AgentRecord {
     AgentRecord {
+        model: None,
+        effort: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
         name: "mock-test-agent".to_owned(),
@@ -198,6 +200,8 @@ async fn failed_turn_outcome_wire_shape_roundtrips() {
         context_window_source: None,
         stable_message_id: None,
         spend: None,
+        model: None,
+        effort: None,
     };
 
     let normalized = event

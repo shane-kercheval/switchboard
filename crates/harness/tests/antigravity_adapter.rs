@@ -24,6 +24,8 @@ const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/anti
 
 fn agy_agent() -> AgentRecord {
     AgentRecord {
+        model: None,
+        effort: None,
         id: Uuid::now_v7(),
         project_id: Uuid::now_v7(),
         name: "test-agy".to_owned(),
@@ -37,6 +39,8 @@ fn agy_agent() -> AgentRecord {
 /// record (as the dispatcher's live-read factory would supply it).
 fn agy_agent_resuming(conversation_id: Uuid) -> AgentRecord {
     AgentRecord {
+        model: None,
+        effort: None,
         session_locator: Some(SessionLocator::Uuid(conversation_id)),
         ..agy_agent()
     }

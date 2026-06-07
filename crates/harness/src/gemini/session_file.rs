@@ -229,7 +229,10 @@ pub fn load_gemini_transcript(
     // anything real.
     let mut merged = String::new();
     for path in &candidates {
-        let content = std::fs::read_to_string(path)?;
+        let content = std::fs::read_to_string(path).map_err(|e| LoadTranscriptError::Io {
+            path: path.clone(),
+            source: e,
+        })?;
         match classify_candidate(&content, session_id) {
             CandidateMatch::NoTarget => {}
             CandidateMatch::Ambiguous => return Ok(ambiguous_session_warning()),
@@ -539,8 +542,18 @@ impl GeminiReconstruction {
             status,
             items,
             usage: builder.last_usage,
-            // Gemini has no cost/overage and no join key (Claude-only feature).
+            // Per-turn model from this turn's own `gemini` record(s). Distinct
+            // from `self.model` (first-wins, agent-scoped `meta.model`). Gemini
+            // has no effort axis.
+            model: builder.last_model.clone(),
+            effort: None,
+            // Gemini has no cost/overage and no Claude-style `stable_message_id`,
+            // but its records carry a stable `id` (`g1`/`g2`…). The turn's first
+            // record id is a re-parse-stable hydration key (Q1). Live-stream
+            // parity (Q2 → M3 refresh) is unprobed, so the live `TurnEnd` leaves
+            // `hydration_key: None` for now.
             spend: None,
+            hydration_key: builder.records.first().map(|r| r.id.clone()),
             stable_message_id: None,
         });
     }
@@ -852,6 +865,41 @@ mod tests {
     }
 
     #[test]
+    fn hydration_key_is_stable_across_reparses_from_record_id() {
+        // Re-parsing the same content yields an agent turn whose `hydration_key`
+        // — the turn's first `gemini` record `id` — is identical across parses,
+        // while our own `turn_id` is freshly minted each parse. The merge dedups
+        // on the stable key so a re-read never duplicates the turn.
+        let aid = agent_id();
+        let parse = || {
+            parse_gemini_transcript_content(HAPPY_PATH_FIXTURE, aid)
+                .turns
+                .into_iter()
+                .find_map(|t| match t {
+                    Turn::Agent {
+                        turn_id,
+                        hydration_key,
+                        ..
+                    } => Some((turn_id, hydration_key)),
+                    Turn::User { .. } => None,
+                })
+                .expect("one agent turn")
+        };
+        let (turn_id_a, key_a) = parse();
+        let (turn_id_b, key_b) = parse();
+        assert_eq!(
+            key_a.as_deref(),
+            Some("e630834b-c0b6-48b8-8426-8cc27c8a303b"),
+            "the hydration key is the turn's first `gemini` record id"
+        );
+        assert_eq!(key_a, key_b, "hydration_key must be parse-invariant");
+        assert_ne!(
+            turn_id_a, turn_id_b,
+            "our turn_id is freshly minted each parse"
+        );
+    }
+
+    #[test]
     fn parse_happy_path_fixture_round_trips_user_and_agent_turns() {
         let aid = agent_id();
         let t = parse_gemini_transcript_content(HAPPY_PATH_FIXTURE, aid);
@@ -1008,6 +1056,38 @@ mod tests {
         let t = parse_gemini_transcript_content(only_sets, agent_id());
         assert!(t.turns.is_empty());
         assert!(t.warnings.is_empty());
+    }
+
+    #[test]
+    fn hydrate_stamps_per_turn_model_from_each_record() {
+        // Two turns on different models → two agent turns whose `model` differs
+        // (verified on disk: a flash→pro switch writes the new model per record).
+        // `meta.model` stays first-wins (separate, agent-scoped).
+        let session_id = Uuid::parse_str("00000000-0000-4000-8000-0000000000ab").unwrap();
+        let body = format!(
+            r#"{{"sessionId":"{session_id}","kind":"main","startTime":"2026-05-18T00:00:00Z"}}
+{{"id":"u1","timestamp":"2026-05-18T00:00:01Z","type":"user","content":[{{"text":"hi"}}]}}
+{{"id":"g1","timestamp":"2026-05-18T00:00:02Z","type":"gemini","content":"a","thoughts":[],"tokens":{{"input":1,"output":1,"cached":0}},"model":"gemini-2.5-flash"}}
+{{"id":"u2","timestamp":"2026-05-18T00:00:03Z","type":"user","content":[{{"text":"again"}}]}}
+{{"id":"g2","timestamp":"2026-05-18T00:00:04Z","type":"gemini","content":"b","thoughts":[],"tokens":{{"input":1,"output":1,"cached":0}},"model":"gemini-2.5-pro"}}"#
+        );
+        let t = parse_gemini_transcript_content(&body, agent_id());
+        let models: Vec<_> = t
+            .turns
+            .iter()
+            .filter_map(|turn| match turn {
+                Turn::Agent { model, effort, .. } => Some((model.clone(), effort.clone())),
+                Turn::User { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            models,
+            vec![
+                (Some("gemini-2.5-flash".to_owned()), None),
+                (Some("gemini-2.5-pro".to_owned()), None),
+            ]
+        );
+        assert_eq!(t.meta.as_ref().unwrap().model, "gemini-2.5-flash");
     }
 
     #[test]

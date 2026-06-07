@@ -152,6 +152,17 @@ export function recordProjectsActivityLocally(projectIds: ProjectId[], at: strin
   if (changed) projects.list = applyActivityOverrides(projects.list);
 }
 
+export function nextUnreadCompletedProjectId(): ProjectId | null {
+  const activeId = selection.activeProjectId;
+  const unread = projects.list.filter(
+    (project) => project.id !== activeId && project.id in backgroundCompletedProjectIds,
+  );
+  if (unread.length === 0) return null;
+  return unread.reduce((oldest, project) =>
+    project.last_activity < oldest.last_activity ? project : oldest,
+  ).id;
+}
+
 export function liveProjectSends(projectId: ProjectId): Map<SendId, AgentId[]> {
   return buildLiveSendsMap(agentsByProject[projectId] ?? [], runtimes, transcripts);
 }

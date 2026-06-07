@@ -29,6 +29,7 @@
     conversations,
     dismissAgentCreationFailure,
     loadWorkspace,
+    nextUnreadCompletedProjectId,
     projects,
     selection,
     startProjectActivityObserver,
@@ -111,6 +112,9 @@
       // ⌘⇧G toggles the top-level Projects ↔ Git view.
       event.preventDefault();
       selectView(view.mode === "git" ? "projects" : "git");
+    } else if (key === "g") {
+      event.preventDefault();
+      selectNextUnreadCompletedProject();
     } else if (key === "f" && event.shiftKey) {
       event.preventDefault();
       void openActiveProjectInGit();
@@ -121,6 +125,14 @@
       event.preventDefault();
       projectsSidebarOpen = !projectsSidebarOpen;
     }
+  }
+
+  function selectNextUnreadCompletedProject(): void {
+    const projectId = nextUnreadCompletedProjectId();
+    if (projectId === null) return;
+    settingsOpen = false;
+    if (view.mode === "git") selectView("projects");
+    void activateProject(projectId);
   }
 
   function openSettings(): void {

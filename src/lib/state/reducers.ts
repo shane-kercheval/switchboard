@@ -213,32 +213,31 @@ export function transcriptReducer(
       const existing = findTurn(turns, input.turn_id);
       if (existing === undefined || existing.role !== "agent") return turns;
       if (existing.status !== "streaming") return turns;
+      const baseUpdate = {
+        ...existing,
+        ended_at: input.ended_at,
+        usage: input.usage ?? undefined,
+        spend: input.spend ?? undefined,
+      };
       if (input.outcome.status === "completed") {
         return updateTurn(turns, input.turn_id, {
-          ...existing,
+          ...baseUpdate,
           status: "complete",
-          ended_at: input.ended_at,
-          usage: input.usage ?? undefined,
-          spend: input.spend ?? undefined,
         });
       }
       if (input.outcome.status === "cancelled") {
         return updateTurn(turns, input.turn_id, {
-          ...existing,
+          ...baseUpdate,
           status: "cancelled",
-          ended_at: input.ended_at,
-          usage: input.usage ?? undefined,
-          spend: input.spend ?? undefined,
+          items: stopPendingTools(existing.items, input.ended_at, "cancelled"),
         });
       }
       return updateTurn(turns, input.turn_id, {
-        ...existing,
+        ...baseUpdate,
         status: "failed",
-        ended_at: input.ended_at,
         error: input.outcome.message,
         error_kind: input.outcome.kind,
-        usage: input.usage ?? undefined,
-        spend: input.spend ?? undefined,
+        items: stopPendingTools(existing.items, input.ended_at, "failed"),
       });
     }
 
@@ -263,6 +262,18 @@ export function transcriptReducer(
     default:
       return turns;
   }
+}
+
+function stopPendingTools(
+  items: TurnItem[],
+  stoppedAt: string,
+  stopReason: "cancelled" | "failed",
+): TurnItem[] {
+  return items.map((item) => {
+    if (item.item_kind !== "tool") return item;
+    if (item.completed_at !== undefined) return item;
+    return { ...item, stopped_at: stoppedAt, stop_reason: stopReason };
+  });
 }
 
 function loadedTurnToTurn(t: LoadedTurn): Turn {

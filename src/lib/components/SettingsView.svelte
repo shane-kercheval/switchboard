@@ -39,6 +39,7 @@
   // not a fixed digit).
   const shortcuts: { action: string; keys: string[]; note?: string }[] = [
     { action: "Focus message box", keys: ["⌘", "K"] },
+    { action: "Jump to next unread project", keys: ["⌘", "G"] },
     { action: "Toggle Projects / Git view", keys: ["⌘", "⇧", "G"] },
     { action: "Show current project in Git view", keys: ["⌘", "⇧", "F"] },
     { action: "Expand or restore Git details panel", keys: ["⌘", "⇧", "D"] },

@@ -85,6 +85,20 @@ async function openProjectActions(index = 0): Promise<HTMLElement> {
   return menu;
 }
 
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T | PromiseLike<T>) => void;
+  reject: (reason?: unknown) => void;
+} {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 const noopProps = {
   onAddProject: () => {},
   onOpenSettings: () => {},
@@ -634,6 +648,68 @@ describe("ProjectsSidebar — delete", () => {
 describe("ProjectsSidebar — Git navigation", () => {
   const G1 = "00000000-0000-7000-8000-0000000000d1";
   const G2 = "00000000-0000-7000-8000-0000000000d2";
+
+  it("opens a project directory in editor, terminal, or Finder from the actions menu", async () => {
+    await renderWith([projectIn(G1, "alpha", "/work/a")]);
+
+    const menu = await openProjectActions();
+    expect(
+      Array.from(menu.querySelectorAll('[role="menuitem"]')).map((item) =>
+        item.textContent?.trim(),
+      ),
+    ).toEqual([
+      "Show in Git view",
+      "Open in editor",
+      "Open in terminal",
+      "Reveal in Finder",
+      "Archive project",
+      "Delete project",
+    ]);
+    await fireEvent.click(screen.getByTestId("project-action-editor"));
+    expect(invokeMock).toHaveBeenCalledWith("open_in_editor", { path: "/work/a" });
+
+    await openProjectActions();
+    await fireEvent.click(screen.getByTestId("project-action-terminal"));
+    expect(invokeMock).toHaveBeenCalledWith("open_in_terminal", { path: "/work/a" });
+
+    await openProjectActions();
+    await fireEvent.click(screen.getByTestId("project-action-reveal"));
+    expect(invokeMock).toHaveBeenCalledWith("reveal_in_finder", { path: "/work/a" });
+  });
+
+  it("reports project open action failures", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "open_in_editor") throw new Error("editor missing");
+      return undefined;
+    });
+    await renderWith([projectIn(G1, "alpha", "/work/a")]);
+
+    await openProjectActions();
+    await fireEvent.click(screen.getByTestId("project-action-editor"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("project-open-error")).toHaveTextContent("editor missing"),
+    );
+  });
+
+  it("ignores stale project open action failures after a newer action succeeds", async () => {
+    const editor = deferred<unknown>();
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "open_in_editor") return editor.promise;
+      return Promise.resolve(undefined);
+    });
+    await renderWith([projectIn(G1, "alpha", "/work/a")]);
+
+    await openProjectActions();
+    await fireEvent.click(screen.getByTestId("project-action-editor"));
+    await openProjectActions();
+    await fireEvent.click(screen.getByTestId("project-action-reveal"));
+
+    editor.reject(new Error("editor missing"));
+    await tick();
+
+    expect(screen.queryByTestId("project-open-error")).not.toBeInTheDocument();
+  });
 
   it("show git action reveals the project's linked branch", async () => {
     await renderWith([projectIn(G1, "alpha", "/work/a")]);

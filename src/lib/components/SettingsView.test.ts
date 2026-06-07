@@ -188,6 +188,7 @@ describe("SettingsView", () => {
     expect(screen.getByText("Focus message box")).toBeInTheDocument();
     expect(screen.getByText("Jump to next unread project")).toBeInTheDocument();
     expect(screen.getByText("Show current project in Git view")).toBeInTheDocument();
+    expect(screen.getByText("Open selection in editor")).toBeInTheDocument();
     expect(screen.getByText("Expand or restore Git details panel")).toBeInTheDocument();
     expect(screen.getByText("Toggle projects sidebar")).toBeInTheDocument();
     expect(screen.getByText("Toggle agents sidebar")).toBeInTheDocument();

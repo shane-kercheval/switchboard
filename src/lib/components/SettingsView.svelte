@@ -42,6 +42,7 @@
     { action: "Jump to next unread project", keys: ["⌘", "G"] },
     { action: "Toggle Projects / Git view", keys: ["⌘", "⇧", "G"] },
     { action: "Show current project in Git view", keys: ["⌘", "⇧", "F"] },
+    { action: "Open selection in editor", keys: ["⌘", "⇧", "E"] },
     { action: "Expand or restore Git details panel", keys: ["⌘", "⇧", "D"] },
     { action: "Toggle projects sidebar", keys: ["⌘", "B"] },
     { action: "Toggle agents sidebar", keys: ["⌘", "⇧", "B"] },

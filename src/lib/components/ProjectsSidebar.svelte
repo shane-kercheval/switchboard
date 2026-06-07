@@ -3,8 +3,11 @@
     Archive,
     ArchiveRestore,
     Check,
+    Code2,
+    FolderOpen,
     GitBranch,
     MoreHorizontal,
+    Terminal,
     Trash2,
     X,
   } from "@lucide/svelte";
@@ -37,6 +40,7 @@
   import DropdownMenu from "$lib/components/ui/DropdownMenu.svelte";
   import DropdownMenuItem from "$lib/components/ui/DropdownMenuItem.svelte";
   import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
+  import { openInEditor, openInTerminal, revealInFinder } from "$lib/api";
   import {
     SEGMENTED_CONTAINER_CLASS,
     SEGMENTED_ITEM_INACTIVE_CLASS,
@@ -70,7 +74,9 @@
   let archiveError = $state<{ projectId: ProjectId; message: string } | null>(null);
   let deleteError = $state<{ projectId: ProjectId; message: string } | null>(null);
   let gitRevealError = $state<{ projectId: ProjectId; message: string } | null>(null);
+  let openActionError = $state<{ projectId: ProjectId; message: string } | null>(null);
   let openProjectActionsId = $state<ProjectId | null>(null);
+  let openActionSeq = 0;
   let relativeNow = $state(Date.now());
 
   /// `Active | Archived` view filter. Default `Active`. A true either/or split:
@@ -284,6 +290,7 @@
     archiveError = null;
     deleteError = null;
     gitRevealError = null;
+    openActionError = null;
     const result = await revealProjectBranch(project.id, project.directory);
     if (result.kind === "unresolved") {
       gitRevealError = {
@@ -296,6 +303,22 @@
         message: result.message,
       };
     }
+  }
+
+  function runProjectOpenAction(project: ProjectListing, action: () => Promise<void>): void {
+    archiveError = null;
+    deleteError = null;
+    gitRevealError = null;
+    openActionError = null;
+    const seq = ++openActionSeq;
+    void action().catch((e: unknown) => {
+      if (seq !== openActionSeq) return;
+      openActionError = {
+        projectId: project.id,
+        message: e instanceof Error ? e.message : String(e),
+      };
+      console.error("[switchboard] project open action failed", e);
+    });
   }
 </script>
 
@@ -595,6 +618,48 @@
                           Show in Git view
                         </DropdownMenuItem>
                         <DropdownMenuItem
+                          onSelect={() =>
+                            runProjectOpenAction(project, () => openInEditor(project.directory))}
+                          class="gap-2"
+                          data-testid="project-action-editor"
+                        >
+                          <Code2
+                            size={14}
+                            strokeWidth={1.8}
+                            class="text-muted shrink-0"
+                            aria-hidden="true"
+                          />
+                          Open in editor
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          onSelect={() =>
+                            runProjectOpenAction(project, () => openInTerminal(project.directory))}
+                          class="gap-2"
+                          data-testid="project-action-terminal"
+                        >
+                          <Terminal
+                            size={14}
+                            strokeWidth={1.8}
+                            class="text-muted shrink-0"
+                            aria-hidden="true"
+                          />
+                          Open in terminal
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          onSelect={() =>
+                            runProjectOpenAction(project, () => revealInFinder(project.directory))}
+                          class="gap-2"
+                          data-testid="project-action-reveal"
+                        >
+                          <FolderOpen
+                            size={14}
+                            strokeWidth={1.8}
+                            class="text-muted shrink-0"
+                            aria-hidden="true"
+                          />
+                          Reveal in Finder
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
                           onSelect={() => void toggleArchive(project)}
                           disabled={busy}
                           class="gap-2"
@@ -681,6 +746,11 @@
           {#if gitRevealError?.projectId === project.id}
             <div class="text-status-failed px-2.5 pb-2 text-xs" data-testid="project-git-error">
               Couldn't open Git view: {gitRevealError.message}
+            </div>
+          {/if}
+          {#if openActionError?.projectId === project.id}
+            <div class="text-status-failed px-2.5 pb-2 text-xs" data-testid="project-open-error">
+              Couldn't open project: {openActionError.message}
             </div>
           {/if}
         </div>

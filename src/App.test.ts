@@ -77,6 +77,8 @@ type Backend = {
   failPickFor: Set<string>;
   // Git-view tracked repos returned by `list_tracked_repos` / `read_tracked_repo`.
   trackedRepos: RepoListing[];
+  openEditorFailure: string | null;
+  openEditorQueue: Promise<unknown>[];
   prompts: Prompt[];
 };
 let backend: Backend;
@@ -103,6 +105,8 @@ function freshBackend(): Backend {
     failConvoFor: new Set(),
     failPickFor: new Set(),
     trackedRepos: [],
+    openEditorFailure: null,
+    openEditorQueue: [],
     prompts: [],
   };
 }
@@ -249,6 +253,17 @@ const invokeMock = vi.fn(async (cmd: string, args?: Record<string, unknown>): Pr
       return null;
     case "branch_commits":
       return [];
+    case "changed_files":
+      return [];
+    case "commit_changed_files":
+      return { found: true, files: [] };
+    case "file_diff":
+    case "commit_file_diff":
+      return { path: "", binary: false, truncated: false, hunks: [] };
+    case "open_in_editor":
+      if (backend.openEditorQueue.length > 0) return await backend.openEditorQueue.shift();
+      if (backend.openEditorFailure !== null) throw new Error(backend.openEditorFailure);
+      return null;
     default:
       throw new Error(`unexpected invoke call: ${cmd}`);
   }
@@ -355,6 +370,20 @@ function createAgentCalls(): { name: string; harness: string }[] {
       const args = a as { name: string; harness: string };
       return { name: args.name, harness: args.harness };
     });
+}
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T | PromiseLike<T>) => void;
+  reject: (reason?: unknown) => void;
+} {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
 }
 
 describe("App", () => {
@@ -1721,6 +1750,105 @@ describe("App", () => {
     expect(screen.getByTestId("compose-textarea")).toBeInTheDocument();
   });
 
+  it("opens the active project in the editor with the editor shortcut", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+
+    const rowButton = projectRowByName("alpha").querySelector("button");
+    if (rowButton === null) throw new Error("expected project row button");
+    await fireEvent.click(rowButton);
+    await waitFor(() => expect(backend.activeProjectId).toBe("p-a"));
+
+    await fireEvent.keyDown(window, { key: "E", code: "KeyE", metaKey: true, shiftKey: true });
+
+    expect(invokeMock).toHaveBeenCalledWith("open_in_editor", { path: DIR_A });
+  });
+
+  it("shows a visible error when the editor shortcut fails", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    backend.openEditorFailure = "editor missing";
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+
+    const rowButton = projectRowByName("alpha").querySelector("button");
+    if (rowButton === null) throw new Error("expected project row button");
+    await fireEvent.click(rowButton);
+    await waitFor(() => expect(backend.activeProjectId).toBe("p-a"));
+
+    await fireEvent.keyDown(window, { key: "E", code: "KeyE", metaKey: true, shiftKey: true });
+
+    await waitFor(() =>
+      expect(screen.getByTestId("banner-open-editor-failed")).toHaveTextContent("editor missing"),
+    );
+    await fireEvent.click(screen.getByTestId("banner-open-editor-failed-dismiss"));
+    expect(screen.queryByTestId("banner-open-editor-failed")).not.toBeInTheDocument();
+  });
+
+  it("clears the editor shortcut error after a later successful shortcut", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    backend.openEditorFailure = "editor missing";
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+
+    const rowButton = projectRowByName("alpha").querySelector("button");
+    if (rowButton === null) throw new Error("expected project row button");
+    await fireEvent.click(rowButton);
+    await waitFor(() => expect(backend.activeProjectId).toBe("p-a"));
+
+    await fireEvent.keyDown(window, { key: "E", code: "KeyE", metaKey: true, shiftKey: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("banner-open-editor-failed")).toBeInTheDocument(),
+    );
+
+    backend.openEditorFailure = null;
+    await fireEvent.keyDown(window, { key: "E", code: "KeyE", metaKey: true, shiftKey: true });
+
+    await waitFor(() =>
+      expect(screen.queryByTestId("banner-open-editor-failed")).not.toBeInTheDocument(),
+    );
+  });
+
+  it("ignores stale editor shortcut failures after a newer shortcut succeeds", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    const firstOpen = deferred<unknown>();
+    backend.openEditorQueue = [firstOpen.promise, Promise.resolve(null)];
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+
+    const rowButton = projectRowByName("alpha").querySelector("button");
+    if (rowButton === null) throw new Error("expected project row button");
+    await fireEvent.click(rowButton);
+    await waitFor(() => expect(backend.activeProjectId).toBe("p-a"));
+
+    await fireEvent.keyDown(window, { key: "E", code: "KeyE", metaKey: true, shiftKey: true });
+    await fireEvent.keyDown(window, { key: "E", code: "KeyE", metaKey: true, shiftKey: true });
+    firstOpen.reject(new Error("editor missing"));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(screen.queryByTestId("banner-open-editor-failed")).not.toBeInTheDocument();
+  });
+
   it("global shortcuts work when focus is inside the compose box", async () => {
     seedProject({
       projectId: "p-a",
@@ -1952,5 +2080,118 @@ describe("App", () => {
       "data-selected",
       "true",
     );
+  });
+
+  it("opens the selected Git branch worktree in the editor with the editor shortcut", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    backend.trackedRepos = [
+      {
+        repo: {
+          root: DIR_A,
+          name: "alpha-repo",
+          default_branch: "main",
+          available: true,
+          is_bare: false,
+          local_branches: [
+            {
+              name: "main",
+              upstream: "origin/main",
+              sync: { kind: "in_sync" },
+              behind_base: null,
+              merged: null,
+              dangling: false,
+              worktree: {
+                path: DIR_A,
+                dirty: false,
+                untracked: false,
+                detached_hash: null,
+                warning: null,
+              },
+            },
+          ],
+          remote_branches: [{ name: "origin/main", merged: null, behind_base: null }],
+          detached_worktrees: [],
+        },
+        linked_projects: {
+          [DIR_A]: [{ id: "p-a", name: "alpha", directory: DIR_A }],
+        },
+      } satisfies RepoListing,
+    ];
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+
+    const rowButton = projectRowByName("alpha").querySelector("button");
+    if (rowButton === null) throw new Error("expected project row button");
+    await fireEvent.click(rowButton);
+    await waitFor(() => expect(backend.activeProjectId).toBe("p-a"));
+
+    await fireEvent.keyDown(window, { key: "f", code: "KeyF", metaKey: true, shiftKey: true });
+    await waitFor(() => expect(screen.getByTestId("git-view")).toBeInTheDocument());
+    await waitFor(() =>
+      expect(
+        document
+          .querySelector('[data-testid="git-branch"][data-branch="main"]')
+          ?.querySelector('[data-testid="branch-select"]'),
+      ).toHaveAttribute("data-selected", "true"),
+    );
+
+    await fireEvent.keyDown(window, { key: "E", code: "KeyE", metaKey: true, shiftKey: true });
+
+    expect(invokeMock).toHaveBeenCalledWith("open_in_editor", { path: DIR_A });
+  });
+
+  it("opens the selected detached Git worktree in the editor with the editor shortcut", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    const detachedPath = `${DIR_A}/detached`;
+    backend.trackedRepos = [
+      {
+        repo: {
+          root: DIR_A,
+          name: "alpha-repo",
+          default_branch: "main",
+          available: true,
+          is_bare: false,
+          local_branches: [],
+          remote_branches: [],
+          detached_worktrees: [
+            {
+              path: detachedPath,
+              dirty: true,
+              untracked: false,
+              detached_hash: "abc1234",
+              warning: null,
+            },
+          ],
+        },
+        linked_projects: {},
+      } satisfies RepoListing,
+    ];
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+
+    await fireEvent.click(screen.getByTestId("view-toggle-git"));
+    await waitFor(() => expect(screen.getByTestId("git-view")).toBeInTheDocument());
+    const detachedRow = await screen.findByTestId("git-detached-worktree");
+    await fireEvent.click(within(detachedRow).getByTestId("worktree-select"));
+    await waitFor(() =>
+      expect(within(detachedRow).getByTestId("worktree-select")).toHaveAttribute(
+        "data-selected",
+        "true",
+      ),
+    );
+
+    await fireEvent.keyDown(window, { key: "E", code: "KeyE", metaKey: true, shiftKey: true });
+
+    expect(invokeMock).toHaveBeenCalledWith("open_in_editor", { path: detachedPath });
   });
 });

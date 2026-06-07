@@ -42,7 +42,13 @@
   import { harnessAvailability, refreshHarnessAvailability } from "$lib/harnessAvailability.svelte";
   import { loadPreferences } from "$lib/preferences.svelte";
   import GitView from "$lib/components/GitView.svelte";
-  import { view, setViewMode, enterGitView, revealProjectBranch } from "$lib/state/gitView.svelte";
+  import {
+    view,
+    setViewMode,
+    enterGitView,
+    revealProjectBranch,
+    selectedWorktreePathForEditor,
+  } from "$lib/state/gitView.svelte";
   import {
     SEGMENTED_MAIN_CONTAINER_CLASS,
     SEGMENTED_MAIN_ITEM_ACTIVE_CLASS,
@@ -67,6 +73,8 @@
   let projectsSidebarOpen = $state<boolean>(true);
   let agentsSidebarOpen = $state<boolean>(true);
   let settingsOpen = $state<boolean>(false);
+  let editorShortcutError = $state<string | null>(null);
+  let editorShortcutSeq = 0;
   let projectViewResumePending = $state<boolean>(false);
   let projectViewResumeSeq = 0;
 
@@ -115,12 +123,30 @@
     } else if (key === "f" && event.shiftKey) {
       event.preventDefault();
       void openActiveProjectInGit();
+    } else if (key === "e" && event.shiftKey) {
+      event.preventDefault();
+      void openSelectionInEditor();
     } else if (key === "b" && event.shiftKey) {
       event.preventDefault();
       agentsSidebarOpen = !agentsSidebarOpen;
     } else if (key === "b") {
       event.preventDefault();
       projectsSidebarOpen = !projectsSidebarOpen;
+    }
+  }
+
+  async function openSelectionInEditor(): Promise<void> {
+    const seq = ++editorShortcutSeq;
+    editorShortcutError = null;
+    const path =
+      view.mode === "git" ? selectedWorktreePathForEditor() : (activeProject?.directory ?? null);
+    if (path === null) return;
+    try {
+      await api.openInEditor(path);
+    } catch (e) {
+      if (seq !== editorShortcutSeq) return;
+      editorShortcutError = e instanceof Error ? e.message : String(e);
+      console.warn("[switchboard] open in editor shortcut failed", e);
     }
   }
 
@@ -470,6 +496,13 @@
           onDismiss={() => dismissAgentCreationFailure(failure.harness)}
         />
       {/each}
+      {#if editorShortcutError !== null}
+        <Banner
+          message={`Couldn't open editor: ${editorShortcutError}`}
+          testid="banner-open-editor-failed"
+          onDismiss={() => (editorShortcutError = null)}
+        />
+      {/if}
 
       <div class="flex min-h-0 flex-1 flex-col overflow-hidden">
         {#if settingsOpen}

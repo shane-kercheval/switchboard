@@ -210,6 +210,17 @@ export function selectUncommitted(repoRoot: string, worktreePath: string, subtit
   };
 }
 
+export function selectedWorktreePathForEditor(): string | null {
+  const target = diffTarget.current;
+  if (target?.kind === "uncommitted") return target.worktreePath;
+
+  const selected = branchSelection.current;
+  if (selected === null || selected.kind !== "local") return null;
+  const listing = gitView.repos.find((repo) => repo.repo.root === selected.repoRoot);
+  const branch = listing?.repo.local_branches.find((candidate) => candidate.name === selected.name);
+  return branch?.worktree?.path ?? null;
+}
+
 /// Collapse the selected branch and close the right panel.
 export function clearBranchSelection(): void {
   branchSelection.current = null;

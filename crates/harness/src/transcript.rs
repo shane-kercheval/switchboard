@@ -99,10 +99,14 @@ pub enum Turn {
 
 /// Lifecycle state for an agent turn reconstructed from disk.
 ///
-/// `Streaming` is reserved for the live path (in-flight turn); hydrated
-/// transcripts never carry `Streaming`. `Failed` covers both genuine
-/// harness-reported failures and truncated-mid-turn disk content (no terminal
-/// event observed before EOF).
+/// `Streaming` means the turn was **still in flight** when the file was read —
+/// emitted live for an in-flight turn, and on disk for the EOF tail turn whose
+/// last assistant `stop_reason` shows the model owed a continuation (Claude;
+/// see `claude_code/session_file.rs::eof_tail_status`). A hydrated transcript
+/// *can* therefore carry `Streaming` for its final turn; do not assume disk
+/// turns are always terminal. `Failed` covers genuine harness-reported failures
+/// and, for harnesses with a per-turn completion marker (Codex), truncated
+/// mid-turn disk content where that marker is absent.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnStatus {

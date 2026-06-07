@@ -1350,6 +1350,7 @@ describe("_internal.appendUserTurn", () => {
       AGENT_A,
       "user-1",
       "hi there",
+      [],
       "2026-05-16T00:00:00Z",
     );
     expect(turns).toHaveLength(1);
@@ -1359,6 +1360,7 @@ describe("_internal.appendUserTurn", () => {
       agent_id: AGENT_A,
       started_at: "2026-05-16T00:00:00Z",
       text: "hi there",
+      attachments: [],
     });
   });
 
@@ -1379,6 +1381,7 @@ describe("_internal.appendUserTurn", () => {
       AGENT_A,
       "user-1",
       "follow-up",
+      [],
       "2026-05-16T00:00:10Z",
     );
     expect(next).not.toBe(prev);

@@ -91,6 +91,11 @@ export type NormalizedEvent =
   // produced no renderable content (e.g. Claude Opus 4.8's redacted thinking
   // deltas). Re-arms the per-turn heartbeat; renders nothing.
   | { type: "liveness"; turn_id: TurnId }
+  // Early dedup identity for the in-flight turn (Claude). The reducer stamps
+  // `hydration_key` onto the live turn so a concurrent disk re-read collapses
+  // against it instead of duplicating. `hydration_key` is the first assistant
+  // message id — the same value `turn_end` carries.
+  | { type: "turn_identity"; turn_id: TurnId; hydration_key: string }
   | {
       type: "tool_started";
       turn_id: TurnId;

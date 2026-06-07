@@ -54,6 +54,11 @@ export function transcriptReducer(
   // (popped from the agent's pending-send FIFO). Stamped onto the new agent
   // turn so a fan-out's live responses group like its historical ones.
   sendId?: SendId,
+  // The agent's currently in-flight turn_id (from runtime), supplied so the
+  // `hydrate` merge never supersedes an actively-streaming live turn with a disk
+  // re-read once that turn carries an early `hydration_key`. See
+  // `resolveTurnCollision`'s `protectedTurnId`.
+  inFlightTurnId?: TurnId,
 ): Turn[] {
   switch (input.type) {
     case "turn_start": {
@@ -75,6 +80,38 @@ export function transcriptReducer(
           items: [],
         },
       ];
+    }
+
+    case "turn_identity": {
+      // The live turn's dedup identity, stamped **early** (first assistant
+      // message) so a concurrent disk re-read collapses against it instead of
+      // duplicating. Two steps:
+      //   1. Stamp `hydration_key` onto the live turn (idempotent on re-delivery).
+      //   2. Reconcile: collapse any OTHER resident that already carries this key
+      //      — a disk copy a refresh inserted before this event landed — INTO the
+      //      live turn, which is `protectedTurnId` (`input.turn_id`) so it always
+      //      survives, absorbing the disk copy's fields.
+      // A stray event (unknown turn_id) is a no-op; absent entirely, dedup falls
+      // back to the `turn_end` stamp (graceful degradation to M1 behavior).
+      const existing = findTurn(turns, input.turn_id);
+      if (existing === undefined || existing.role !== "agent") return turns;
+      const key = input.hydration_key;
+      const liveStamped: AgentTurn =
+        existing.hydration_key === undefined ? { ...existing, hydration_key: key } : existing;
+
+      let live = liveStamped;
+      const collapsed = new Set<TurnId>();
+      for (const t of turns) {
+        if (t.turn_id === input.turn_id || t.role !== "agent") continue;
+        if (t.hydration_key === key) {
+          live = resolveTurnCollision(live, t, input.turn_id);
+          collapsed.add(t.turn_id);
+        }
+      }
+      if (liveStamped === existing && collapsed.size === 0) return turns;
+      return turns
+        .filter((t) => !collapsed.has(t.turn_id))
+        .map((t) => (t.turn_id === input.turn_id ? live : t));
     }
 
     case "message_cancelled": {
@@ -215,9 +252,15 @@ export function transcriptReducer(
       if (existing.status !== "streaming") return turns;
       // Stamp the live-matched hydration key (Claude only) onto the completing
       // turn so a later disk re-read of the same turn dedups against it instead
-      // of appending a second copy (see the `hydrate` merge). `undefined` for
-      // harnesses whose live stream carries no disk-matching id.
-      const hydration_key = input.hydration_key ?? undefined;
+      // of appending a second copy (see the `hydrate` merge). **Preserve an
+      // early key when the terminal carries none**: an in-flight turn may
+      // already hold a `hydration_key` from the `turn_identity` event, and a
+      // *synthesized* terminal (a cancelled turn's `TurnEnd`, built by the
+      // dispatcher) carries `hydration_key: None` — clearing it would leave the
+      // cancelled turn keyless and duplicate it against its keyed disk copy. For
+      // parser-emitted terminals `input.hydration_key` is present and equals the
+      // early key, so this is a no-op there.
+      const hydration_key = input.hydration_key ?? existing.hydration_key;
       const baseUpdate = {
         ...existing,
         ended_at: input.ended_at,
@@ -295,7 +338,7 @@ export function transcriptReducer(
           d.hydration_key !== undefined &&
           d.hydration_key === resident.hydration_key
         ) {
-          replacements.set(dedupKey(d), resolveTurnCollision(resident, d));
+          replacements.set(dedupKey(d), resolveTurnCollision(resident, d, inFlightTurnId));
         }
         // else: turn_id-fallback collision → keep the resident, drop `d`.
       }
@@ -338,21 +381,35 @@ type AgentTurn = Extract<Turn, { role: "agent" }>;
 /// so superseding a partial never blanks a field the loser already had. Content
 /// (`items`, `status`, `turn_id`, timestamps) always comes from the winner.
 ///
-/// This is the **hydrate-merge** primitive (resident vs. disk). It is safe there
-/// because a live in-flight turn is keyless while streaming, so it never reaches
-/// this rule — only disk-vs-disk and finished-live-vs-disk collisions do.
-///
-/// **Not yet a general resident-vs-resident primitive.** Once M4 stamps a live
-/// turn's `hydration_key` *while it is still streaming*, a terminal disk re-read
-/// could key-match that active turn and supersede it here — which would change
-/// its `turn_id` and orphan its remaining live events (the unknown-`turn_id`
-/// guards drop them). Before reusing this for M4's anchor-event reconciliation,
-/// the caller must protect an actively-streaming live turn (a liveness/source
-/// signal in state); this rule alone can't tell "stranded disk partial" (safe to
-/// supersede) from "active live turn" (must not be). See the M4 plan.
-function resolveTurnCollision(existing: AgentTurn, incoming: AgentTurn): AgentTurn {
-  const incomingSupersedes = existing.status === "streaming" && incoming.status !== "streaming";
+/// `protectedTurnId`, when given, is the turn_id of the **actively-streaming
+/// live turn** — it is never the loser, even against a terminal incoming. This
+/// is load-bearing once a live turn carries a `hydration_key` while streaming
+/// (the early `turn_identity` stamp): without it, a terminal disk re-read could
+/// key-match the active turn and supersede it here, changing its `turn_id` and
+/// orphaning its still-arriving events (the unknown-`turn_id` guards drop them).
+/// Status alone can't tell a *stranded disk partial* (safe to supersede) from an
+/// *active live turn* (must not be) — both are `streaming` — so the caller
+/// supplies the in-flight turn_id. Omit it (the hydrate path with no live turn,
+/// or pre-stamp) for pure terminality precedence.
+function resolveTurnCollision(
+  existing: AgentTurn,
+  incoming: AgentTurn,
+  protectedTurnId?: TurnId,
+): AgentTurn {
+  let incomingSupersedes: boolean;
+  if (existing.turn_id === protectedTurnId) {
+    incomingSupersedes = false;
+  } else if (incoming.turn_id === protectedTurnId) {
+    incomingSupersedes = true;
+  } else {
+    incomingSupersedes = existing.status === "streaming" && incoming.status !== "streaming";
+  }
   const [winner, loser] = incomingSupersedes ? [incoming, existing] : [existing, incoming];
+  // Note: when a protected *streaming* live turn wins over a *terminal* loser,
+  // it absorbs the loser's `ended_at` (and usage/spend) while keeping
+  // `status: "streaming"` — so a streaming turn can briefly carry an `ended_at`.
+  // This is load-bearing: completion must be read from `status`, never from
+  // `ended_at` being set. (`turn_end` overwrites all of it moments later.)
   return {
     ...winner,
     send_id: winner.send_id ?? loser.send_id,
@@ -532,6 +589,7 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
 
     case "content_chunk":
     case "liveness":
+    case "turn_identity":
     case "tool_started":
     case "tool_completed":
       // Any sign of life clears the quiet marker for the turn the heartbeat is

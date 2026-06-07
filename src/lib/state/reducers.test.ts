@@ -46,8 +46,13 @@ function turnEndFailed(turnId: string, message: string): NormalizedEvent {
   };
 }
 
-function reduce(turns: Turn[], input: ReducerInput, agentId: string = AGENT_A): Turn[] {
-  return transcriptReducer(turns, input, agentId, RECEIVED_AT);
+function reduce(
+  turns: Turn[],
+  input: ReducerInput,
+  agentId: string = AGENT_A,
+  inFlightTurnId?: string,
+): Turn[] {
+  return transcriptReducer(turns, input, agentId, RECEIVED_AT, undefined, inFlightTurnId);
 }
 
 describe("transcriptReducer", () => {
@@ -993,6 +998,135 @@ describe("transcriptReducer", () => {
       if (agentRows[0]?.kind === "agent") {
         expect(agentRows[0].turn.status).toBe("complete");
       }
+    });
+  });
+
+  describe("turn_identity — early live identity", () => {
+    const identity = (turnId: string, key: string): NormalizedEvent => ({
+      type: "turn_identity",
+      turn_id: turnId,
+      hydration_key: key,
+    });
+    const diskComplete = (turnId: string, key: string): ReducerInput => ({
+      type: "hydrate",
+      agent_id: AGENT_A,
+      turns: [
+        {
+          role: "agent",
+          turn_id: turnId,
+          agent_id: AGENT_A,
+          started_at: "2026-05-14T00:00:02Z",
+          status: "complete",
+          items: [{ item_kind: "text", kind: "text", text: "from disk" }],
+          hydration_key: key,
+        },
+      ],
+    });
+
+    it("stamps hydration_key onto the live in-flight turn", () => {
+      let turns = reduce([], turnStart(TURN_1));
+      turns = reduce(turns, identity(TURN_1, "msg_x"));
+      const turn = turns.find((t) => t.turn_id === TURN_1);
+      expect(turn?.role).toBe("agent");
+      if (turn?.role === "agent") {
+        expect(turn.hydration_key).toBe("msg_x");
+        expect(turn.status).toBe("streaming"); // still live, just identified
+      }
+    });
+
+    it("collapses a disk copy that raced ahead of the identity event into the live turn", () => {
+      // A refresh inserted a disk copy (key msg_x) while the live turn was still
+      // keyless, so the two briefly coexist (no key to match on).
+      let turns = reduce([], turnStart(TURN_1));
+      turns = reduce(turns, diskComplete(TURN_2, "msg_x"));
+      expect(turns).toHaveLength(2);
+      // The anchor event stamps the live turn and collapses the disk copy in.
+      turns = reduce(turns, identity(TURN_1, "msg_x"));
+      expect(turns).toHaveLength(1);
+      const turn = turns[0];
+      if (turn?.role === "agent") {
+        expect(turn.turn_id).toBe(TURN_1); // the live turn survives
+        expect(turn.hydration_key).toBe("msg_x");
+        expect(turn.status).toBe("streaming"); // live stream stays authoritative
+      }
+    });
+
+    it("a terminal disk re-read does NOT supersede an actively-streaming live turn", () => {
+      // The hazard M4 introduces: once the live turn carries an early key, a
+      // refresh that catches the turn "complete" on disk in the brief window
+      // before the live turn_end is processed must NOT replace it (that would
+      // orphan the remaining live events).
+      let turns = reduce([], turnStart(TURN_1));
+      turns = reduce(turns, identity(TURN_1, "msg_x")); // live, key msg_x, streaming
+      turns = reduce(turns, diskComplete(TURN_2, "msg_x"), AGENT_A, TURN_1 /* in-flight */);
+      expect(turns).toHaveLength(1);
+      const turn = turns[0];
+      if (turn?.role === "agent") {
+        expect(turn.turn_id).toBe(TURN_1); // preserved, not superseded
+        expect(turn.status).toBe("streaming");
+      }
+      // The subsequent live turn_end still lands on the live turn (not dropped).
+      turns = reduce(turns, turnEndCompleted(TURN_1));
+      const ended = turns.find((t) => t.turn_id === TURN_1);
+      expect(ended?.role).toBe("agent");
+      if (ended?.role === "agent") expect(ended.status).toBe("complete");
+    });
+
+    it("re-delivered turn_identity is a no-op (idempotent)", () => {
+      let turns = reduce([], turnStart(TURN_1));
+      turns = reduce(turns, identity(TURN_1, "msg_x"));
+      const afterFirst = turns;
+      turns = reduce(turns, identity(TURN_1, "msg_x"));
+      expect(turns).toBe(afterFirst); // same reference → unchanged
+    });
+
+    it("turn_identity for an unknown turn_id is a no-op", () => {
+      const turns = reduce([], turnStart(TURN_1));
+      const after = reduce(turns, identity(TURN_2, "msg_x"));
+      expect(after).toBe(turns);
+    });
+
+    const turnEndCancelled = (turnId: string): NormalizedEvent => ({
+      type: "turn_end",
+      turn_id: turnId,
+      outcome: { status: "cancelled", source: "user" },
+      ended_at: "2026-05-16T00:00:05Z",
+      // no hydration_key — a cancelled turn's TurnEnd is synthesized by the
+      // dispatcher and carries none.
+    });
+
+    it("turn_end preserves the early key when the terminal carries none", () => {
+      let turns = reduce([], turnStart(TURN_1));
+      turns = reduce(turns, identity(TURN_1, "msg_x"));
+      turns = reduce(turns, turnEndCompleted(TURN_1)); // helper omits hydration_key
+      const turn = turns.find((t) => t.turn_id === TURN_1);
+      if (turn?.role === "agent") {
+        expect(turn.status).toBe("complete");
+        expect(turn.hydration_key).toBe("msg_x"); // not wiped by the keyless terminal
+      }
+    });
+
+    it("a cancelled turn keeps its early key (synthesized terminal carries none)", () => {
+      let turns = reduce([], turnStart(TURN_1));
+      turns = reduce(turns, identity(TURN_1, "msg_x"));
+      turns = reduce(turns, turnEndCancelled(TURN_1));
+      const turn = turns.find((t) => t.turn_id === TURN_1);
+      if (turn?.role === "agent") {
+        expect(turn.status).toBe("cancelled");
+        expect(turn.hydration_key).toBe("msg_x");
+      }
+    });
+
+    it("a cancelled turn does not duplicate against its keyed disk copy", () => {
+      // End-to-end of the bug: the turn streams (identity), is cancelled, then a
+      // switch-back refresh re-reads the keyed disk copy. The preserved key
+      // dedups → one row. Without key preservation the cancelled row goes keyless
+      // and the disk copy appends → two rows for one turn.
+      let turns = reduce([], turnStart(TURN_1));
+      turns = reduce(turns, identity(TURN_1, "msg_x"));
+      turns = reduce(turns, turnEndCancelled(TURN_1));
+      turns = reduce(turns, diskComplete(TURN_2, "msg_x"));
+      expect(turns).toHaveLength(1);
     });
   });
 

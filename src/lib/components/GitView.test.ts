@@ -20,10 +20,24 @@ vi.mock("$lib/native", () => ({
 }));
 
 const { refreshAll, fetchStates, _testing } = await import("$lib/state/gitView.svelte");
+const {
+  contributedCommands,
+  openPalette,
+  closePalette,
+  _testing: paletteTesting,
+} = await import("$lib/state/commandPalette.svelte");
+const { tick } = await import("svelte");
 const currentYear = new Date().getFullYear();
+
+function gitCommand(id: string) {
+  const found = contributedCommands().find((c) => c.id === id);
+  if (found === undefined) throw new Error(`missing git command ${id}`);
+  return found;
+}
 
 afterEach(() => {
   _testing.reset();
+  paletteTesting.reset();
   invokeMock.mockReset();
   pickDirectoryMock.mockReset();
   pickDirectoryMock.mockResolvedValue(null);
@@ -129,6 +143,89 @@ describe("GitView", () => {
     expect(screen.getByTestId("repo-action-remove")).not.toHaveAttribute("tabindex", "-1");
     screen.getByTestId("repo-action-remove").focus();
     expect(screen.getByTestId("repo-action-remove")).toHaveFocus();
+  });
+
+  it("contributes git commands to the palette while mounted and clears them on unmount", async () => {
+    wire([repo()]);
+    await refreshAll();
+    const { unmount } = render(GitView);
+    await waitFor(() => expect(screen.getByTestId("git-repo")).toBeInTheDocument());
+
+    const ids = contributedCommands().map((c) => c.id);
+    expect(ids).toContain("git.add-repo");
+    expect(ids).toContain("git.refresh-all");
+    expect(ids).toContain("git.toggle-detail");
+
+    unmount();
+    expect(contributedCommands()).toEqual([]);
+  });
+
+  it("git.toggle-detail runs, and ⌘⇧D is suppressed while the palette is open", async () => {
+    wire([repo()]);
+    await refreshAll();
+    render(GitView);
+    await waitFor(() => expect(screen.getByTestId("git-repo")).toBeInTheDocument());
+
+    // Open a diff panel so the detail toggle is meaningful.
+    const mainRow = document.querySelector(
+      '[data-testid="git-branch"][data-branch="main"]',
+    ) as HTMLElement;
+    await fireEvent.click(within(mainRow).getByTestId("branch-select"));
+    await waitFor(() => expect(screen.getByTestId("diff-panel")).toBeInTheDocument());
+    expect(screen.getByTestId("git-detail-sidebar")).toHaveAttribute("data-expanded", "false");
+
+    // While the palette owns the keyboard, ⌘⇧D must not toggle the panel.
+    openPalette();
+    await fireEvent.keyDown(window, { key: "D", code: "KeyD", metaKey: true, shiftKey: true });
+    await tick();
+    expect(screen.getByTestId("git-detail-sidebar")).toHaveAttribute("data-expanded", "false");
+
+    // Running the command directly (the palette path) does toggle it.
+    closePalette();
+    await gitCommand("git.toggle-detail").run();
+    await waitFor(() =>
+      expect(screen.getByTestId("git-detail-sidebar")).toHaveAttribute("data-expanded", "true"),
+    );
+  });
+
+  it("git.remove-repo is disabled with no selection and enabled once a branch is selected", async () => {
+    wire([repo()]);
+    await refreshAll();
+    render(GitView);
+    await waitFor(() => expect(screen.getByTestId("git-repo")).toBeInTheDocument());
+
+    expect(gitCommand("git.remove-repo").disabled).toBe(true);
+    expect(gitCommand("git.open-editor").disabled).toBe(true);
+
+    const mainRow = document.querySelector(
+      '[data-testid="git-branch"][data-branch="main"]',
+    ) as HTMLElement;
+    await fireEvent.click(within(mainRow).getByTestId("branch-select"));
+    await waitFor(() => expect(gitCommand("git.remove-repo").disabled).toBe(false));
+    // `main` has a checked-out worktree, so editor/terminal/reveal become enabled too.
+    expect(gitCommand("git.open-editor").disabled).toBe(false);
+  });
+
+  it("surfaces a visible banner when a palette action fails", async () => {
+    wire([repo()]);
+    await refreshAll();
+    render(GitView);
+    await waitFor(() => expect(screen.getByTestId("git-repo")).toBeInTheDocument());
+
+    const mainRow = document.querySelector(
+      '[data-testid="git-branch"][data-branch="main"]',
+    ) as HTMLElement;
+    await fireEvent.click(within(mainRow).getByTestId("branch-select"));
+    await waitFor(() => expect(gitCommand("git.open-editor").disabled).toBe(false));
+
+    invokeMock.mockImplementationOnce((cmd: string) => {
+      if (cmd === "open_in_editor") return Promise.reject(new Error("no editor on PATH"));
+      return Promise.resolve(null);
+    });
+    await gitCommand("git.open-editor").run();
+    await waitFor(() =>
+      expect(screen.getByTestId("git-command-error")).toHaveTextContent("no editor on PATH"),
+    );
   });
 
   it("keeps a branch row highlighted and its ellipsis visible while the action menu is open", async () => {

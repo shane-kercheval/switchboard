@@ -546,6 +546,25 @@ describe("ComposeBar", () => {
     expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "false");
   });
 
+  it("Mod+N does not toggle recipients while a dialog (e.g. the command palette) is open", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "false");
+
+    const dialog = document.createElement("div");
+    dialog.setAttribute("role", "dialog");
+    document.body.appendChild(dialog);
+
+    // The chord would normally select bob; with a dialog open it's suppressed.
+    await fireEvent.keyDown(document.body, { key: "2", metaKey: true });
+    expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "false");
+
+    dialog.remove();
+  });
+
   it("Mod+Shift+A selects every agent", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);

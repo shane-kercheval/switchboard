@@ -5,6 +5,7 @@
   ///
   /// No polling — `enterGitView` (called by App on toggle) runs the staleness-
   /// gated entry refresh; the global refresh button forces a re-read + fetch.
+  import { untrack } from "svelte";
   import { cn } from "$lib/utils";
   import Button from "$lib/components/ui/Button.svelte";
   import EmptyState from "$lib/components/ui/EmptyState.svelte";
@@ -24,16 +25,31 @@
     fetchAll,
     addRepo,
     diffTarget,
+    branchSelection,
     clearBranchSelection,
+    selectedWorktreePathForEditor,
+    removeRepo,
     gitRefresh,
   } from "$lib/state/gitView.svelte";
-  import { pickDirectory } from "$lib/native";
+  import {
+    setCommandSource,
+    clearCommandSource,
+    palette,
+    type Command,
+  } from "$lib/state/commandPalette.svelte";
+  import * as api from "$lib/api";
+  import { pickDirectory, copyText } from "$lib/native";
+  import { isEditableShortcutTarget } from "$lib/keyboard";
 
   let branchFilter = $state<"local" | "remote" | "both">("both");
   let showInactive = $state(false);
   let refreshing = $state(false);
   let adding = $state(false);
   let addError = $state<string | null>(null);
+  // Visible failure surface for palette-triggered repo/worktree actions, so they
+  // report errors the way the row action menu (`GitRepoNode`) and the Projects
+  // palette already do — never a silent `console.warn`.
+  let commandError = $state<string | null>(null);
 
   // The open diff target (a commit or a worktree's uncommitted changes), or null.
   // Drives the right inspector.
@@ -60,17 +76,8 @@
     resizingDetail = false;
   }
 
-  function isEditableShortcutTarget(target: EventTarget | null): boolean {
-    return (
-      target instanceof HTMLElement &&
-      (target.isContentEditable ||
-        target.tagName === "INPUT" ||
-        target.tagName === "TEXTAREA" ||
-        target.tagName === "SELECT")
-    );
-  }
-
   function handleKeydown(event: KeyboardEvent): void {
+    if (palette.open) return;
     if (isEditableShortcutTarget(event.target)) return;
     const command = event.metaKey || event.ctrlKey;
     if (!command || !event.shiftKey || event.altKey || event.key.toLowerCase() !== "d") return;
@@ -124,6 +131,138 @@
       adding = false;
     }
   }
+
+  // Run a palette-triggered action that can fail, surfacing any rejection in the
+  // visible `commandError` banner (same posture as the row action menu) rather
+  // than swallowing it. `null` path/selection is a no-op (the command is also
+  // `disabled` in that state).
+  function runPaletteAction(action: () => Promise<void>): void {
+    commandError = null;
+    void action().catch((e) => {
+      commandError = e instanceof Error ? e.message : String(e);
+    });
+  }
+
+  function openWorktree(action: (path: string) => Promise<void>, path: string | null): void {
+    if (path === null) return;
+    runPaletteAction(() => action(path));
+  }
+
+  // Contribute the Git view's commands to the palette while this view is
+  // mounted. Re-runs whenever the state the commands close over (filters,
+  // selection, open diff) changes, so `disabled`/title stay current; the
+  // separate no-dep effect clears the source on unmount.
+  $effect(() => {
+    const worktreePath = selectedWorktreePathForEditor();
+    const branchName = branchSelection.current?.name ?? null;
+    const repoRoot = branchSelection.current?.repoRoot ?? null;
+    const cmds: Command[] = [
+      {
+        id: "git.add-repo",
+        title: "Add repository",
+        group: "Git",
+        keywords: "track repo",
+        run: () => void onAddRepo(),
+      },
+      {
+        id: "git.refresh-all",
+        title: "Refresh all repositories",
+        group: "Git",
+        keywords: "fetch reload",
+        run: () => void onGlobalRefresh(),
+      },
+      {
+        id: "git.filter-both",
+        title: "Branch filter: Both",
+        group: "Git",
+        disabled: branchFilter === "both",
+        run: () => {
+          branchFilter = "both";
+        },
+      },
+      {
+        id: "git.filter-local",
+        title: "Branch filter: Local",
+        group: "Git",
+        disabled: branchFilter === "local",
+        run: () => {
+          branchFilter = "local";
+        },
+      },
+      {
+        id: "git.filter-remote",
+        title: "Branch filter: Remote",
+        group: "Git",
+        disabled: branchFilter === "remote",
+        run: () => {
+          branchFilter = "remote";
+        },
+      },
+      {
+        id: "git.toggle-inactive",
+        title: showInactive ? "Hide branches without folders" : "Show branches without folders",
+        group: "Git",
+        run: () => {
+          showInactive = !showInactive;
+        },
+      },
+      {
+        id: "git.toggle-detail",
+        title: detailExpanded ? "Collapse diff panel" : "Expand diff panel",
+        group: "Git",
+        shortcut: ["mod", "shift", "D"],
+        disabled: panel === null,
+        run: () => toggleDetailExpanded(),
+      },
+      {
+        id: "git.open-editor",
+        title: "Open selected worktree in editor",
+        group: "Git",
+        shortcut: ["mod", "shift", "E"],
+        disabled: worktreePath === null,
+        run: () => openWorktree(api.openInEditor, worktreePath),
+      },
+      {
+        id: "git.open-terminal",
+        title: "Open selected worktree in terminal",
+        group: "Git",
+        disabled: worktreePath === null,
+        run: () => openWorktree(api.openInTerminal, worktreePath),
+      },
+      {
+        id: "git.reveal-finder",
+        title: "Reveal selected worktree in Finder",
+        group: "Git",
+        disabled: worktreePath === null,
+        run: () => openWorktree(api.revealInFinder, worktreePath),
+      },
+      {
+        id: "git.copy-branch",
+        title: "Copy selected branch name",
+        group: "Git",
+        disabled: branchName === null,
+        run: () => {
+          if (branchName !== null) runPaletteAction(() => copyText(branchName));
+        },
+      },
+      {
+        id: "git.remove-repo",
+        title: "Remove selected repository from view",
+        group: "Git",
+        keywords: "untrack",
+        disabled: repoRoot === null,
+        run: () => {
+          if (repoRoot !== null) runPaletteAction(() => removeRepo(repoRoot));
+        },
+      },
+    ];
+    // `setCommandSource` reads the registry to find/replace this source's slot;
+    // untrack it so this effect doesn't take a dependency on the state it writes
+    // (which would be a read-and-write-same-state loop).
+    untrack(() => setCommandSource("git", cmds));
+  });
+
+  $effect(() => () => clearCommandSource("git"));
 </script>
 
 <div class="flex min-h-0 flex-1 flex-col overflow-hidden" data-testid="git-view">
@@ -212,6 +351,22 @@
         {addError}
       </div>
     {/if}
+  {/if}
+
+  {#if commandError}
+    <div
+      class="border-border/60 bg-status-failed-soft text-status-failed flex items-start justify-between gap-3 border-b px-4 py-2 text-xs"
+      data-testid="git-command-error"
+    >
+      <span>{commandError}</span>
+      <button
+        type="button"
+        class="text-status-failed shrink-0 underline"
+        onclick={() => (commandError = null)}
+      >
+        Dismiss
+      </button>
+    </div>
   {/if}
 
   <div class="flex min-h-0 flex-1 overflow-hidden" bind:this={splitEl} data-testid="git-split">

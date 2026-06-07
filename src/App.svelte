@@ -7,6 +7,7 @@
   import CreateAgentForm from "$lib/components/CreateAgentForm.svelte";
   import type { AgentFormSubmit } from "$lib/components/CreateAgentForm.types";
   import CreateProjectForm from "$lib/components/CreateProjectForm.svelte";
+  import CommandPalette from "$lib/components/CommandPalette.svelte";
   import ProjectsSidebar from "$lib/components/ProjectsSidebar.svelte";
   import SettingsView from "$lib/components/SettingsView.svelte";
   import Sidebar from "$lib/components/Sidebar.svelte";
@@ -34,10 +35,17 @@
     projects,
     retryProjectHydration,
     selection,
+    setProjectArchived,
     startProjectActivityObserver,
     workspace,
   } from "$lib/state/workspace.svelte";
-  import type { AgentRecord, HarnessAvailability, HarnessKind } from "$lib/types";
+  import {
+    contributedCommands,
+    palette,
+    togglePalette,
+    type Command,
+  } from "$lib/state/commandPalette.svelte";
+  import type { AgentRecord, HarnessAvailability, HarnessKind, ProjectId } from "$lib/types";
   import { ALL_HARNESSES, HARNESS_LABEL } from "$lib/harnessDisplay";
   import { harnessAvailability, refreshHarnessAvailability } from "$lib/harnessAvailability.svelte";
   import { loadPreferences } from "$lib/preferences.svelte";
@@ -56,6 +64,7 @@
     SEGMENTED_MAIN_ITEM_INACTIVE_CLASS,
   } from "$lib/components/ui/segmentedControl";
   import { cn } from "$lib/utils";
+  import { isEditableShortcutTarget } from "$lib/keyboard";
 
   // One availability map keyed by harness, derived from the shared
   // `harnessAvailability` store (one probe also feeding the Supported-CLIs
@@ -75,18 +84,9 @@
   let settingsOpen = $state<boolean>(false);
   let editorShortcutError = $state<string | null>(null);
   let editorShortcutSeq = 0;
+  let commandError = $state<string | null>(null);
   let projectViewResumePending = $state<boolean>(false);
   let projectViewResumeSeq = 0;
-
-  function isEditableShortcutTarget(target: EventTarget | null): boolean {
-    if (!(target instanceof HTMLElement)) return false;
-    return (
-      target.isContentEditable ||
-      target.tagName === "INPUT" ||
-      target.tagName === "TEXTAREA" ||
-      target.tagName === "SELECT"
-    );
-  }
 
   function isComposerShortcutTarget(target: EventTarget | null): boolean {
     return (
@@ -95,6 +95,24 @@
   }
 
   function handleGlobalKeydown(event: KeyboardEvent): void {
+    // ⌘⇧P opens/closes the command palette from anywhere, including inside an
+    // input — it's the one shortcut that must override the editable-target guard
+    // so it's always reachable.
+    if (
+      (event.metaKey || event.ctrlKey) &&
+      event.shiftKey &&
+      !event.altKey &&
+      event.key.toLowerCase() === "p"
+    ) {
+      event.preventDefault();
+      togglePalette();
+      return;
+    }
+    // While the palette is open it owns the keyboard (its own input handles
+    // navigation/Escape); suppress every other window-level shortcut so a chord
+    // typed into the palette doesn't also fire its global action.
+    if (palette.open) return;
+
     if (isEditableShortcutTarget(event.target) && !isComposerShortcutTarget(event.target)) return;
 
     const command = event.metaKey || event.ctrlKey;
@@ -132,6 +150,12 @@
     } else if (key === "b") {
       event.preventDefault();
       projectsSidebarOpen = !projectsSidebarOpen;
+    } else if (key === "n" && event.shiftKey) {
+      event.preventDefault();
+      if (hasActiveProject) openAddAgent();
+    } else if (key === "n") {
+      event.preventDefault();
+      openProjectDialog();
     }
   }
 
@@ -148,6 +172,42 @@
       editorShortcutError = e instanceof Error ? e.message : String(e);
       console.warn("[switchboard] open in editor shortcut failed", e);
     }
+  }
+
+  async function openActiveProjectInTerminal(): Promise<void> {
+    if (activeProject === null) return;
+    commandError = null;
+    try {
+      await api.openInTerminal(activeProject.directory);
+    } catch (e) {
+      commandError = e instanceof Error ? e.message : String(e);
+    }
+  }
+
+  async function revealActiveProjectInFinder(): Promise<void> {
+    if (activeProject === null) return;
+    commandError = null;
+    try {
+      await api.revealInFinder(activeProject.directory);
+    } catch (e) {
+      commandError = e instanceof Error ? e.message : String(e);
+    }
+  }
+
+  async function toggleArchiveActiveProject(): Promise<void> {
+    if (activeProject === null) return;
+    commandError = null;
+    try {
+      await setProjectArchived(activeProject.id, !activeProject.archived);
+    } catch (e) {
+      commandError = e instanceof Error ? e.message : String(e);
+    }
+  }
+
+  function switchToProject(projectId: ProjectId): void {
+    settingsOpen = false;
+    if (view.mode === "git") selectView("projects");
+    void activateProject(projectId);
   }
 
   function selectNextUnreadCompletedProject(): void {
@@ -250,6 +310,12 @@
   const activeProject = $derived(
     projects.list.find((p) => p.id === selection.activeProjectId) ?? null,
   );
+  // Single enablement predicate shared by the ⌘⇧N keyboard guard and the
+  // "Add agent" palette command's `disabled`, so the two can't disagree on
+  // whether the action is available. (The command registry and the keyboard
+  // handler remain parallel dispatch paths for now — undecided whether the
+  // registry becomes the canonical dispatch surface later.)
+  const hasActiveProject = $derived(activeProject !== null);
   const projectSwitching = $derived(
     selection.activeProjectId !== null && selection.loadingProjectId === selection.activeProjectId,
   );
@@ -357,6 +423,137 @@
     addAgentOpen = false;
     addAgentError = null;
   }
+
+  // The context-aware command list for the palette: always-available navigation,
+  // active-project actions while in the Projects view, the flat project switcher,
+  // and whatever the active view contributed (the Git view registers its own).
+  //
+  // This rebuilds on its reactive deps even while the palette is closed (the
+  // palette is always mounted). It's cheap and fires only on app-state changes,
+  // not in a hot path — if it ever shows up in a profile, gate construction on
+  // `palette.open` (the keyboard shortcuts don't read this list, so that's safe).
+  const paletteCommands = $derived.by<Command[]>(() => {
+    const cmds: Command[] = [];
+    const inProjects = view.mode === "projects" && !settingsOpen;
+    const hasActive = hasActiveProject;
+
+    cmds.push({
+      id: "nav.toggle-view",
+      title: view.mode === "git" ? "Switch to Projects view" : "Switch to Git view",
+      group: "Navigation",
+      shortcut: ["mod", "shift", "G"],
+      keywords: "projects git toggle view",
+      run: () => selectView(view.mode === "git" ? "projects" : "git"),
+    });
+    cmds.push({
+      id: "nav.settings",
+      title: settingsOpen ? "Close settings" : "Open settings",
+      group: "Navigation",
+      shortcut: ["mod", ","],
+      keywords: "preferences",
+      run: () => toggleSettings(),
+    });
+    cmds.push({
+      id: "nav.toggle-projects-sidebar",
+      title: projectsSidebarOpen ? "Hide projects sidebar" : "Show projects sidebar",
+      group: "Navigation",
+      shortcut: ["mod", "B"],
+      run: () => {
+        projectsSidebarOpen = !projectsSidebarOpen;
+      },
+    });
+    cmds.push({
+      id: "nav.toggle-agents-sidebar",
+      title: agentsSidebarOpen ? "Hide agents sidebar" : "Show agents sidebar",
+      group: "Navigation",
+      shortcut: ["mod", "shift", "B"],
+      run: () => {
+        agentsSidebarOpen = !agentsSidebarOpen;
+      },
+    });
+    cmds.push({
+      id: "nav.add-project",
+      title: "Add project",
+      group: "Navigation",
+      shortcut: ["mod", "N"],
+      keywords: "new create",
+      run: () => openProjectDialog(),
+    });
+
+    if (inProjects) {
+      cmds.push({
+        id: "project.next-ready",
+        title: "Switch to next ready project",
+        group: "Project",
+        shortcut: ["mod", "G"],
+        keywords: "next ready completed unread",
+        disabled: nextUnreadCompletedProjectId() === null,
+        run: () => selectNextUnreadCompletedProject(),
+      });
+      cmds.push({
+        id: "project.add-agent",
+        title: "Add agent",
+        group: "Project",
+        shortcut: ["mod", "shift", "N"],
+        keywords: "new harness",
+        disabled: !hasActive,
+        run: () => openAddAgent(),
+      });
+      cmds.push({
+        id: "project.open-editor",
+        title: "Open project in editor",
+        group: "Project",
+        shortcut: ["mod", "shift", "E"],
+        disabled: !hasActive,
+        run: () => void openSelectionInEditor(),
+      });
+      cmds.push({
+        id: "project.open-terminal",
+        title: "Open project in terminal",
+        group: "Project",
+        disabled: !hasActive,
+        run: () => void openActiveProjectInTerminal(),
+      });
+      cmds.push({
+        id: "project.reveal-finder",
+        title: "Reveal project in Finder",
+        group: "Project",
+        disabled: !hasActive,
+        run: () => void revealActiveProjectInFinder(),
+      });
+      cmds.push({
+        id: "project.show-in-git",
+        title: "Show project in Git view",
+        group: "Project",
+        shortcut: ["mod", "shift", "F"],
+        keywords: "git branch reveal",
+        disabled: !hasActive,
+        run: () => void openActiveProjectInGit(),
+      });
+      cmds.push({
+        id: "project.archive",
+        title: activeProject?.archived === true ? "Unarchive project" : "Archive project",
+        group: "Project",
+        disabled: !hasActive,
+        run: () => void toggleArchiveActiveProject(),
+      });
+    }
+
+    for (const project of projects.list) {
+      const isActive =
+        project.id === selection.activeProjectId && view.mode === "projects" && !settingsOpen;
+      cmds.push({
+        id: `switch.${project.id}`,
+        title: project.name,
+        group: "Switch to project",
+        keywords: `${project.directory}${project.archived ? " archived" : ""}`,
+        disabled: isActive,
+        run: () => switchToProject(project.id),
+      });
+    }
+
+    return [...cmds, ...contributedCommands()];
+  });
 </script>
 
 <main class="bg-surface text-fg flex h-full flex-col">
@@ -503,6 +700,13 @@
           onDismiss={() => (editorShortcutError = null)}
         />
       {/if}
+      {#if commandError !== null}
+        <Banner
+          message={commandError}
+          testid="banner-command-failed"
+          onDismiss={() => (commandError = null)}
+        />
+      {/if}
 
       <div class="flex min-h-0 flex-1 flex-col overflow-hidden">
         {#if settingsOpen}
@@ -627,4 +831,6 @@
     message="Opening this project failed. The exact error is below — copy it into a bug report."
     details={selection.activationError ?? "No error detail was reported."}
   />
+
+  <CommandPalette bind:open={palette.open} commands={paletteCommands} />
 </main>

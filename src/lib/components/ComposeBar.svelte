@@ -28,6 +28,7 @@
   import Spinner from "$lib/components/ui/Spinner.svelte";
   import { basename, cn, currentIsoTimestamp } from "$lib/utils";
   import { shortcut } from "$lib/platform";
+  import { isEditableShortcutTarget } from "$lib/keyboard";
   import { onDestroy, onMount, untrack } from "svelte";
   import { listen } from "@tauri-apps/api/event";
 
@@ -210,16 +211,6 @@
   // Mod+K (focus the message box) ignores the chord while a dialog is open or
   // while another editable element is focused, so it only ever pulls focus to
   // this composer's textarea.
-  function isEditableShortcutTarget(target: EventTarget | null): boolean {
-    if (!(target instanceof HTMLElement)) return false;
-    return (
-      target.isContentEditable ||
-      target.tagName === "INPUT" ||
-      target.tagName === "TEXTAREA" ||
-      target.tagName === "SELECT"
-    );
-  }
-
   function hasOpenDialog(): boolean {
     return document.querySelector('[role="dialog"], [role="alertdialog"]') !== null;
   }
@@ -261,6 +252,10 @@
         return;
       }
       if (!mod || e.altKey) return;
+      // An open dialog (e.g. the command palette) owns the keyboard — don't let
+      // a chord typed into it also toggle recipients or send. Mirrors the ⌘K
+      // guard above.
+      if (hasOpenDialog()) return;
       if (e.key === "Enter") {
         if (mode === "prompt" && composeEl?.contains(document.activeElement)) {
           e.preventDefault();

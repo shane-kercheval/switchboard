@@ -418,6 +418,8 @@ describe("App", () => {
     compose._testing.reset();
     const gv = await import("$lib/state/gitView.svelte");
     gv._testing.reset();
+    const cp = await import("$lib/state/commandPalette.svelte");
+    cp._testing.reset();
   });
 
   // --- harness availability banners (workspace empty → welcome) ---
@@ -1777,6 +1779,107 @@ describe("App", () => {
     await fireEvent.keyDown(window, { key: ",", metaKey: true });
     await waitFor(() => expect(screen.queryByTestId("settings-view")).not.toBeInTheDocument());
     expect(screen.getByTestId("compose-textarea")).toBeInTheDocument();
+  });
+
+  it("opens the command palette with ⌘⇧P and runs a palette action", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+
+    // Closed by default; ⌘⇧P opens it even though the welcome/sidebar own focus.
+    expect(screen.queryByTestId("command-palette")).toBeNull();
+    await fireEvent.keyDown(window, { key: "P", code: "KeyP", metaKey: true, shiftKey: true });
+    await waitFor(() => expect(screen.getByTestId("command-palette")).toBeInTheDocument());
+
+    // Filter to the projects-sidebar toggle and run it; the sidebar hides.
+    await fireEvent.input(screen.getByTestId("command-palette-search"), {
+      target: { value: "projects sidebar" },
+    });
+    await fireEvent.click(screen.getByTestId("command-option-nav.toggle-projects-sidebar"));
+    await waitFor(() => expect(screen.queryByTestId("command-palette")).toBeNull());
+    await waitFor(() => expect(screen.queryByTestId("projects-sidebar")).not.toBeInTheDocument());
+  });
+
+  it("switches projects from the command palette", async () => {
+    seedProject({ projectId: "p-a", directory: DIR_A, name: "alpha" });
+    seedProject({ projectId: "p-b", directory: DIR_B, name: "beta" });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+
+    await fireEvent.keyDown(window, { key: "P", code: "KeyP", metaKey: true, shiftKey: true });
+    await waitFor(() => expect(screen.getByTestId("command-palette")).toBeInTheDocument());
+
+    await fireEvent.input(screen.getByTestId("command-palette-search"), {
+      target: { value: "beta" },
+    });
+    await fireEvent.click(screen.getByTestId("command-option-switch.p-b"));
+    await waitFor(() => expect(backend.activeProjectId).toBe("p-b"));
+  });
+
+  it("suppresses other window shortcuts while the palette is open", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+
+    await fireEvent.keyDown(window, { key: "P", code: "KeyP", metaKey: true, shiftKey: true });
+    await waitFor(() => expect(screen.getByTestId("command-palette")).toBeInTheDocument());
+
+    // ⌘B would normally toggle the projects sidebar; while the palette owns the
+    // keyboard it must be a no-op.
+    await fireEvent.keyDown(window, { key: "b", metaKey: true });
+    await Promise.resolve();
+    expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument();
+    expect(screen.getByTestId("command-palette")).toBeInTheDocument();
+
+    // ⌘⇧P closes it again, and the suppressed shortcut works normally afterward.
+    await fireEvent.keyDown(window, { key: "P", code: "KeyP", metaKey: true, shiftKey: true });
+    await waitFor(() => expect(screen.queryByTestId("command-palette")).toBeNull());
+    await fireEvent.keyDown(window, { key: "b", metaKey: true });
+    await waitFor(() => expect(screen.queryByTestId("projects-sidebar")).not.toBeInTheDocument());
+  });
+
+  it("⌘N opens the add-project dialog", async () => {
+    seedProject({ projectId: "p-a", directory: DIR_A, name: "alpha" });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+
+    await fireEvent.keyDown(window, { key: "n", metaKey: true });
+    await waitFor(() => expect(screen.getByTestId("new-project-form")).toBeInTheDocument());
+  });
+
+  it("⌘⇧N opens the add-agent modal when a project is active, and no-ops otherwise", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+
+    // No active project yet → ⌘⇧N does nothing.
+    await fireEvent.keyDown(window, { key: "N", code: "KeyN", metaKey: true, shiftKey: true });
+    await Promise.resolve();
+    expect(screen.queryByTestId("dialog-content")).toBeNull();
+
+    // Activate the project, then ⌘⇧N opens the add-agent modal.
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("sidebar")).toBeInTheDocument());
+    await fireEvent.keyDown(window, { key: "N", code: "KeyN", metaKey: true, shiftKey: true });
+    await waitFor(() => expect(screen.getByTestId("dialog-content")).toBeInTheDocument());
+    expect(
+      within(screen.getByTestId("dialog-content")).getByTestId("agent-name"),
+    ).toBeInTheDocument();
   });
 
   it("opens the active project in the editor with the editor shortcut", async () => {

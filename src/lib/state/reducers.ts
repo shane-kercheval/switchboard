@@ -92,7 +92,7 @@ export function transcriptReducer(
       //      live turn, which is `protectedTurnId` (`input.turn_id`) so it always
       //      survives, absorbing the disk copy's fields.
       // A stray event (unknown turn_id) is a no-op; absent entirely, dedup falls
-      // back to the `turn_end` stamp (graceful degradation to M1 behavior).
+      // back to the `turn_end` stamp (graceful degradation to the turn-end key).
       const existing = findTurn(turns, input.turn_id);
       if (existing === undefined || existing.role !== "agent") return turns;
       const key = input.hydration_key;
@@ -410,6 +410,13 @@ function resolveTurnCollision(
   // `status: "streaming"` — so a streaming turn can briefly carry an `ended_at`.
   // This is load-bearing: completion must be read from `status`, never from
   // `ended_at` being set. (`turn_end` overwrites all of it moments later.)
+  //
+  // Fields fill at the **top level** (`usage`/`spend` are taken whole, not
+  // sub-merged): a winner whose `usage` lacks a nested `context_window` does NOT
+  // inherit the loser's. Safe today because the only superseded loser is a
+  // *non-terminal* resident (terminal-over-streaming, or a protected live turn
+  // that's the winner), which carries no end-of-turn `usage` yet. Revisit the
+  // sub-field merge only if supersession ever broadens to terminal-over-terminal.
   return {
     ...winner,
     send_id: winner.send_id ?? loser.send_id,

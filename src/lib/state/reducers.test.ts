@@ -1052,7 +1052,7 @@ describe("transcriptReducer", () => {
     });
 
     it("a terminal disk re-read does NOT supersede an actively-streaming live turn", () => {
-      // The hazard M4 introduces: once the live turn carries an early key, a
+      // The hazard early identity introduces: once the live turn carries an early key, a
       // refresh that catches the turn "complete" on disk in the brief window
       // before the live turn_end is processed must NOT replace it (that would
       // orphan the remaining live events).

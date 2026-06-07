@@ -194,7 +194,7 @@ async fn live_claude_basic_turn_completes() {
     }
 }
 
-/// Q2 drift guard (promoted from the M2 probe): the dedup identity the live
+/// Live-matched-key drift guard: the dedup identity the live
 /// `TurnEnd` carries — `first_message_id`, surfaced to the frontend as
 /// `hydration_key` — must equal the `hydration_key` the session-file parser
 /// reconstructs for the same turn. That equality is exactly what makes Claude

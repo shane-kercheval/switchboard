@@ -818,7 +818,7 @@ mod tests {
         }
     }
 
-    /// The highest-value M2 case: the tool round is *balanced* (the `tool_use`
+    /// The highest-value case: the tool round is *balanced* (the `tool_use`
     /// has its `tool_result`), so a naive "open tool ⇒ unfinished" heuristic
     /// sees nothing — but the model owed a continuation that was never written
     /// (the file ends in the gap between the result and the next assistant

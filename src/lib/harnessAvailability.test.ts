@@ -1,11 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { HarnessAvailability, HarnessBanner } from "./types";
-import {
-  bannerCopy,
-  bannerTestid,
-  harnessUnavailableReason,
-  isHarnessSelectable,
-} from "./harnessAvailability";
+import type { HarnessAvailability } from "./types";
+import { harnessUnavailableReason, isHarnessSelectable } from "./harnessAvailability";
 
 const CLAUDE_AVAILABLE: HarnessAvailability = { harness: "claude_code", binary: "available" };
 const CLAUDE_CHECKING: HarnessAvailability = { harness: "claude_code", binary: "checking" };
@@ -20,60 +15,29 @@ const ANTIGRAVITY_BINARY_MISSING: HarnessAvailability = {
   binary: "missing",
 };
 
-// **Verbatim-alignment contract**: `bannerCopy` and
-// `harnessUnavailableReason` must return identical strings for the same
-// binary-missing gap. Tests assert this equality so a future divergent
-// edit fails loudly here instead of silently producing inconsistent UX
-// text across banner and tooltip.
-describe("bannerCopy", () => {
-  it("Claude binary_missing surfaces install link", () => {
-    const banner: HarnessBanner = { kind: "binary_missing", harness: "claude_code" };
-    expect(bannerCopy(banner)).toBe(
+describe("harnessUnavailableReason", () => {
+  it("Claude binary missing returns Claude install copy", () => {
+    expect(harnessUnavailableReason(CLAUDE_BINARY_MISSING)).toBe(
       "Claude Code not found on PATH. Install from https://code.claude.com/docs/en/quickstart",
     );
   });
 
-  it("Codex binary_missing surfaces install link", () => {
-    const banner: HarnessBanner = { kind: "binary_missing", harness: "codex" };
-    expect(bannerCopy(banner)).toBe(
+  it("Codex binary missing returns Codex install copy", () => {
+    expect(harnessUnavailableReason(CODEX_BINARY_MISSING)).toBe(
       "Codex not found on PATH. Install from https://developers.openai.com/codex/cli",
     );
   });
 
-  it("Gemini binary_missing surfaces install link", () => {
-    const banner: HarnessBanner = { kind: "binary_missing", harness: "gemini" };
-    expect(bannerCopy(banner)).toBe(
+  it("Gemini binary missing returns Gemini install copy", () => {
+    expect(harnessUnavailableReason(GEMINI_BINARY_MISSING)).toBe(
       "Gemini CLI not found on PATH. Install from https://geminicli.com/docs/get-started/installation/",
     );
   });
 
-  it("Antigravity binary_missing surfaces install link", () => {
-    const banner: HarnessBanner = { kind: "binary_missing", harness: "antigravity" };
-    expect(bannerCopy(banner)).toBe(
+  it("Antigravity binary missing returns install copy", () => {
+    expect(harnessUnavailableReason(ANTIGRAVITY_BINARY_MISSING)).toBe(
       "Antigravity CLI (agy) not found on PATH. Install from https://antigravity.google/docs/cli-install",
     );
-  });
-});
-
-describe("harnessUnavailableReason", () => {
-  it("Claude binary missing returns Claude install copy (matches banner verbatim)", () => {
-    const reason = harnessUnavailableReason(CLAUDE_BINARY_MISSING);
-    expect(reason).toBe(bannerCopy({ kind: "binary_missing", harness: "claude_code" }));
-  });
-
-  it("Codex binary missing returns Codex install copy (matches banner verbatim)", () => {
-    const reason = harnessUnavailableReason(CODEX_BINARY_MISSING);
-    expect(reason).toBe(bannerCopy({ kind: "binary_missing", harness: "codex" }));
-  });
-
-  it("Gemini binary missing returns Gemini install copy (matches banner verbatim)", () => {
-    const reason = harnessUnavailableReason(GEMINI_BINARY_MISSING);
-    expect(reason).toBe(bannerCopy({ kind: "binary_missing", harness: "gemini" }));
-  });
-
-  it("Antigravity binary missing returns install copy (matches banner verbatim)", () => {
-    const reason = harnessUnavailableReason(ANTIGRAVITY_BINARY_MISSING);
-    expect(reason).toBe(bannerCopy({ kind: "binary_missing", harness: "antigravity" }));
   });
 
   it("available state returns null", () => {
@@ -105,16 +69,5 @@ describe("isHarnessSelectable", () => {
     expect(isHarnessSelectable(CODEX_BINARY_MISSING)).toBe(false);
     expect(isHarnessSelectable(GEMINI_BINARY_MISSING)).toBe(false);
     expect(isHarnessSelectable(ANTIGRAVITY_BINARY_MISSING)).toBe(false);
-  });
-});
-
-describe("bannerTestid", () => {
-  it("composes kind + harness for stable test selectors", () => {
-    expect(bannerTestid({ kind: "binary_missing", harness: "claude_code" })).toBe(
-      "banner-binary_missing-claude_code",
-    );
-    expect(bannerTestid({ kind: "binary_missing", harness: "codex" })).toBe(
-      "banner-binary_missing-codex",
-    );
   });
 });

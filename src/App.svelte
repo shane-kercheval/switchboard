@@ -37,8 +37,7 @@
     startProjectActivityObserver,
     workspace,
   } from "$lib/state/workspace.svelte";
-  import type { AgentRecord, HarnessAvailability, HarnessBanner, HarnessKind } from "$lib/types";
-  import { bannerCopy, bannerTestid } from "$lib/harnessAvailability";
+  import type { AgentRecord, HarnessAvailability, HarnessKind } from "$lib/types";
   import { ALL_HARNESSES, HARNESS_LABEL } from "$lib/harnessDisplay";
   import { harnessAvailability, refreshHarnessAvailability } from "$lib/harnessAvailability.svelte";
   import { loadPreferences } from "$lib/preferences.svelte";
@@ -54,20 +53,14 @@
 
   // One availability map keyed by harness, derived from the shared
   // `harnessAvailability` store (one probe also feeding the Supported-CLIs
-  // list), so the banner stack and the create-form gating read the same source
-  // — and a new harness needs no per-harness wiring here, just its entry in
+  // list), so the status list and create-form gating read the same source — and
+  // a new harness needs no per-harness wiring here, just its entry in
   // `ALL_HARNESSES`. Auth is deliberately not tracked here: a logged-out harness
   // is discovered reactively on send, surfaced as an actionable transcript turn.
   const availability = $derived(
     Object.fromEntries(
       ALL_HARNESSES.map((h) => [h, harnessAvailability.availability(h)]),
     ) as Record<HarnessKind, HarnessAvailability>,
-  );
-
-  const banners = $derived.by((): HarnessBanner[] =>
-    ALL_HARNESSES.map((h) => availability[h])
-      .filter((a) => a.binary === "missing")
-      .map((a) => ({ kind: "binary_missing" as const, harness: a.harness })),
   );
 
   let dirError = $state<string | null>(null);
@@ -469,10 +462,6 @@
           />
         {/if}
       </div>
-
-      {#each banners as banner (bannerTestid(banner))}
-        <Banner message={bannerCopy(banner)} testid={bannerTestid(banner)} />
-      {/each}
 
       {#each agentCreationFailures as failure (failure.harness)}
         <Banner

@@ -1,7 +1,7 @@
 /// Single source of truth for harness install status (presence on PATH +
-/// best-effort version), shared by the binary-missing banner stack, the
-/// create-form gating, the Settings + blank-state "Supported CLIs" list, and
-/// auto-create. Fetched once at startup and refreshed at natural moments
+/// best-effort version), shared by create-form gating, the Settings +
+/// blank-state "Supported CLIs" list, and auto-create. Fetched once at startup
+/// and refreshed at natural moments
 /// (settings/blank-state mount, window re-focus) so every surface agrees by
 /// construction instead of each probing the backend independently.
 ///

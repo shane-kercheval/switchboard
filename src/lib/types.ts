@@ -278,8 +278,7 @@ export type HarnessKind = "claude_code" | "codex" | "gemini" | "antigravity";
 ///   "Checking…" copy) so a user racing the probe can't submit before
 ///   the result lands. Fail-closed by type, not by polite hope.
 /// - `"available"`: probe completed positively.
-/// - `"missing"`: probe completed negatively. Banner copy is actionable
-///   (install link).
+/// - `"missing"`: probe completed negatively.
 export type BinaryState = "available" | "missing" | "checking";
 
 /// Frontend availability surface. Tracks binary presence only — auth is
@@ -294,16 +293,6 @@ export type BinaryState = "available" | "missing" | "checking";
 export type HarnessAvailability = {
   harness: HarnessKind;
   binary: BinaryState;
-};
-
-/// Structured banner shape. The only banner variant is the
-/// binary-missing case — a missing CLI is a real install problem the
-/// user needs to act on before sends will work at all. Auth has no
-/// banner: a logged-out harness is surfaced reactively in the transcript
-/// when the user sends.
-export type HarnessBanner = {
-  kind: "binary_missing";
-  harness: HarnessKind;
 };
 
 /// Install status of a harness CLI for the getting-started surface.

@@ -1,10 +1,7 @@
 <script lang="ts">
-  /// Single banner row. The `testid` is structured so multiple banners can
-  /// coexist (binary-missing per harness + auth-missing for Codex) and
-  /// component tests can target them individually. When `onDismiss` is
-  /// provided the banner is dismissible (a trailing ✕) — used for transient,
-  /// event-driven notices (e.g. an agent that failed to auto-create); the
-  /// reactive binary-missing banners omit it and clear themselves.
+  /// Single banner row. The `testid` lets component tests target transient,
+  /// event-driven notices individually. When `onDismiss` is provided the banner
+  /// is dismissible.
   let { message, testid, onDismiss }: { message: string; testid: string; onDismiss?: () => void } =
     $props();
 </script>

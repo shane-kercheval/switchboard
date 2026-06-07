@@ -53,7 +53,7 @@ type Backend = {
   activeProjectId: string | null;
   probeFailures: Set<string>;
   // Harnesses `get_harness_install_status` should report as not-installed
-  // (keyed by HarnessKind). Drives the binary-missing banner tests.
+  // (keyed by HarnessKind). Drives the Supported CLIs install-status tests.
   notInstalled: Set<string>;
   // Harnesses whose `create_agent` should reject (keyed by HarnessKind).
   // Drives the partial-auto-create-failure test.
@@ -400,13 +400,13 @@ describe("App", () => {
     await waitFor(() => expect(screen.queryByTestId(/^banner-/)).not.toBeInTheDocument());
   });
 
-  it("renders a Claude binary-missing banner when only the Claude probe fails", async () => {
+  it("shows a missing Claude CLI in the welcome status list without a global banner", async () => {
     backend.notInstalled.add("claude_code");
     await mountApp();
     await waitFor(() =>
-      expect(screen.getByTestId("banner-binary_missing-claude_code")).toBeInTheDocument(),
+      expect(screen.getByTestId("harness-install-claude_code")).toHaveTextContent("Not installed"),
     );
-    expect(screen.queryByTestId("banner-binary_missing-codex")).not.toBeInTheDocument();
+    expect(screen.queryByTestId(/^banner-binary_missing-/)).not.toBeInTheDocument();
   });
 
   it("probes auth in the no-project getting-started surface, but renders no auth banner", async () => {
@@ -432,14 +432,15 @@ describe("App", () => {
     expect(screen.queryByTestId(/^banner-auth_missing-/)).not.toBeInTheDocument();
   });
 
-  it("renders two binary banners simultaneously when two binaries are missing", async () => {
+  it("keeps missing CLI status out of global banners", async () => {
     backend.notInstalled.add("claude_code");
     backend.notInstalled.add("codex");
     await mountApp();
     await waitFor(() => {
-      expect(screen.getByTestId("banner-binary_missing-claude_code")).toBeInTheDocument();
-      expect(screen.getByTestId("banner-binary_missing-codex")).toBeInTheDocument();
+      expect(screen.getByTestId("harness-install-claude_code")).toHaveTextContent("Not installed");
+      expect(screen.getByTestId("harness-install-codex")).toHaveTextContent("Not installed");
     });
+    expect(screen.queryByTestId(/^banner-binary_missing-/)).not.toBeInTheDocument();
   });
 
   // --- adding projects ---
@@ -1369,7 +1370,7 @@ describe("App", () => {
         "Codex authentication required — run `codex login`",
       ),
     );
-    // And the auth-banner posture is preserved: nothing in the banner stack.
+    // And the auth-banner posture is preserved: auth failures render in the transcript only.
     expect(screen.queryByTestId(/^banner-auth_missing-/)).not.toBeInTheDocument();
   });
 

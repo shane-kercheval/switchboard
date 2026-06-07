@@ -43,9 +43,9 @@ export const HARNESS_COLOR: Record<HarnessKind, string> = {
 };
 
 /// Official setup/install docs for each harness CLI. The single source for
-/// these URLs: the getting-started panel links to them, and
-/// `harnessAvailability`'s binary-missing copy is built from them — so a
-/// moved docs page is a one-line change here, not a hunt across the frontend.
+/// these URLs: the getting-started panel links to them, and the create-agent
+/// unavailable copy is built from them — so a moved docs page is a one-line
+/// change here, not a hunt across the frontend.
 export const HARNESS_SETUP_URL: Record<HarnessKind, string> = {
   claude_code: "https://code.claude.com/docs/en/quickstart",
   codex: "https://developers.openai.com/codex/cli",

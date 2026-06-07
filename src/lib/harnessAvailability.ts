@@ -1,17 +1,12 @@
-/// Pure helpers for rendering harness-availability state. Shared between
-/// `App.svelte`'s banner stack and `CreateAgentForm`'s radio gating —
-/// keeping the copy in one place enforces the "tooltip text matches
-/// banner copy verbatim" design at the module level rather than relying
-/// on developer discipline.
+/// Pure helpers for rendering harness-availability state in the agent picker.
 ///
 /// **Auth is out of scope here.** v1 surfaces auth failures reactively
 /// (a logged-out harness is discovered when the user sends; the failed
 /// turn carries the adapter-authored message). No proactive auth banner,
 /// no picker gate. The only availability dimension the frontend tracks
-/// is binary presence — a missing CLI is a real install problem that
-/// must be surfaced before any send can succeed.
+/// is binary presence — a missing CLI disables that harness in creation flows.
 
-import type { HarnessAvailability, HarnessBanner, HarnessKind } from "./types";
+import type { HarnessAvailability, HarnessKind } from "./types";
 import { HARNESS_SETUP_URL } from "./harnessDisplay";
 
 /// CLI name as it appears in the binary-missing message (distinct from the
@@ -35,11 +30,6 @@ const BINARY_COPY: Record<HarnessKind, string> = {
 
 function binaryMissingCopy(harness: HarnessKind): string {
   return `${BINARY_PROSE_NAME[harness]} not found on PATH. Install from ${HARNESS_SETUP_URL[harness]}`;
-}
-
-/// The user-facing string for a given banner.
-export function bannerCopy(banner: HarnessBanner): string {
-  return BINARY_COPY[banner.harness];
 }
 
 /// The inline message shown next to the harness picker when the selected
@@ -67,11 +57,4 @@ export function harnessUnavailableReason(a: HarnessAvailability): string | null 
 /// intentional — see that function's docstring.
 export function isHarnessSelectable(a: HarnessAvailability): boolean {
   return a.binary === "available";
-}
-
-/// Stable `data-testid` for a banner so component tests can find each
-/// one independently when the stack renders multiple at once. Co-located
-/// with the copy so testid + copy stay aligned in one place.
-export function bannerTestid(banner: HarnessBanner): string {
-  return `banner-${banner.kind}-${banner.harness}`;
 }

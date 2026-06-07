@@ -72,15 +72,18 @@ pub enum Turn {
         /// onto the IPC wire** (the merge on the other side dedups by it), and it
         /// carries a deliberately broader contract.
         ///
-        /// Per harness: Claude the final assistant `message.id` (so it equals
-        /// `stable_message_id` *and* matches the live `TurnEnd`); Codex the
-        /// `event_msg/task_started.turn_id`; Gemini the turn's first `gemini`
-        /// record `id`. `None` for Antigravity (no native per-turn id) — the
-        /// merge falls back to `turn_id` for keyless turns.
+        /// Per harness: Claude the **first** non-subagent assistant `message.id`
+        /// (matches the live `TurnEnd`); Codex the `event_msg/task_started.turn_id`;
+        /// Gemini the turn's first `gemini` record `id`. `None` for Antigravity
+        /// (no native per-turn id) — the merge falls back to `turn_id` for
+        /// keyless turns.
         ///
         /// **Not** `stable_message_id`: that one stays private (`skip_serializing`,
-        /// Claude-only cost-join). The two coincide *in value* for Claude but
-        /// gate different things — do not collapse them.
+        /// Claude-only cost-join) and is the **final** assistant `message.id`.
+        /// The two **differ** for Claude on multi-assistant/tool-use turns by
+        /// design — the first id is parse-invariant (stable from the turn's first
+        /// output, so a mid-flight re-read dedups correctly) while the final id
+        /// moves until the turn ends. Do not collapse them.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hydration_key: Option<String>,
         /// The final assistant message's Anthropic `message.id` (Claude only) —

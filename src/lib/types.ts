@@ -122,7 +122,9 @@ export type NormalizedEvent =
       // Live-matched stable hydration key — the same per-turn id this turn will
       // carry on disk, so the hydrate merge can recognize a turn that streamed
       // live and is later re-read as one turn. Populated only for live-matched
-      // harnesses (Claude's final assistant message.id); absent otherwise.
+      // harnesses (Claude's *first* non-subagent assistant message.id — distinct
+      // from the cost-join's final id, parse-invariant so a mid-flight re-read
+      // dedups correctly); absent otherwise.
       hydration_key?: string | null;
     }
   | { type: "rate_limit_event"; agent_id: AgentId; info: unknown }

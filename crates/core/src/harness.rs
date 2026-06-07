@@ -76,10 +76,13 @@ impl HarnessKind {
     /// streamed live *and* is on disk dedups as one. Without it, re-reading a
     /// file that already contains a turn we streamed live would duplicate that
     /// turn (the disk copy's hydration key wouldn't match the live turn's). Only
-    /// Claude is confirmed (final assistant `message.id` round-trips live↔disk);
-    /// Codex/Gemini have a re-parse-stable disk key but their live-stream parity
-    /// is unprobed, so they stay once-per-session; Antigravity has no per-turn id
-    /// at all. Same authority + exhaustiveness role as the two siblings above.
+    /// Claude is confirmed: the **first** assistant `message.id` round-trips
+    /// live↔disk and is the dedup `hydration_key` — it is parse-invariant across
+    /// a mid-flight vs completed read, unlike the final id (which the cost-join
+    /// `stable_message_id` uses). Codex/Gemini have a re-parse-stable disk key
+    /// but their live-stream parity is unprobed, so they stay once-per-session;
+    /// Antigravity has no per-turn id at all. Same authority + exhaustiveness
+    /// role as the two siblings above.
     #[must_use]
     pub fn supports_refresh(self) -> bool {
         match self {

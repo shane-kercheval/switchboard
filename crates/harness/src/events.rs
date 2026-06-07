@@ -242,7 +242,7 @@ pub enum AdapterEvent {
         /// (`turn_context.effort`), `None` elsewhere. Live per-turn carrier; the
         /// reopen counterpart is reconstructed from the session file.
         effort: Option<String>,
-        /// Stable per-turn join key: the final non-subagent assistant message's
+        /// Cost-join key: the **final** non-subagent assistant message's
         /// Anthropic `message.id`, which appears identically in the live stream
         /// and the on-disk session file (verified). The dispatcher keys the
         /// durable per-turn metadata (`turnmeta` sidecar) on it so cost/overage
@@ -250,6 +250,18 @@ pub enum AdapterEvent {
         /// the `NormalizedEvent` boundary (the frontend never sees it). `None`
         /// when the harness has no such id (non-Claude) or no assistant message.
         stable_message_id: Option<String>,
+        /// Live↔disk dedup identity: the **first** non-subagent assistant
+        /// message's Anthropic `message.id`. Distinct from `stable_message_id`
+        /// on purpose — the first id is *stable from the turn's first output*
+        /// (a turn spans multiple assistant messages; the last one is a moving
+        /// target until the turn ends, so anchoring dedup on it makes a
+        /// mid-flight re-read mint a different key than the completed turn). The
+        /// first id is identical between a partial and a complete parse, so it
+        /// is what the hydrate merge dedups on. Routed to
+        /// `NormalizedEvent::TurnEnd.hydration_key`. `None` for non-Claude
+        /// (their live↔disk parity is unprobed; they stay `turn_id`-keyed) or
+        /// when the turn produced no assistant message.
+        first_message_id: Option<String>,
     },
     RateLimitEvent {
         agent_id: AgentId,
@@ -339,11 +351,14 @@ pub enum NormalizedEvent {
         /// The reasoning effort this turn ran at (Codex only), rendered per-turn
         /// in the footer (M6). `None` = render nothing.
         effort: Option<String>,
-        /// **Live-matched** stable hydration key — the same per-turn id this
-        /// turn will carry on disk, so a turn that streamed live *and* is later
-        /// re-read from the session file is recognized as one turn (the merge
-        /// dedups on it). Populated only for harnesses whose live stream carries
-        /// a disk-matching id: Claude's final assistant `message.id`. `None`
+        /// **Live-matched** hydration key — the same per-turn id this turn will
+        /// carry on disk, so a turn that streamed live *and* is later re-read
+        /// from the session file is recognized as one turn (the merge dedups on
+        /// it). This is the **first** non-subagent assistant `message.id`:
+        /// stable from the turn's first output and identical between a partial
+        /// and a complete parse (the final id moves until the turn ends, so it
+        /// can't anchor a mid-flight re-read). Populated only for harnesses
+        /// whose live stream carries a disk-matching id (Claude). `None`
         /// elsewhere (Codex/Gemini unprobed; Antigravity has none) — those turns
         /// dedup by `turn_id` until a probe confirms parity. Frontend-facing;
         /// the internal cost-join `stable_message_id` stays dropped at this
@@ -455,15 +470,16 @@ impl AdapterEvent {
                 output,
                 is_error,
             },
-            // `context_window_source` is intentionally dropped (the `..`) —
-            // internal persistence plumbing the frontend doesn't need. `spend`
-            // *is* carried through — it's rendered on the message. The internal
-            // `stable_message_id` (Claude's cost-join key) is read here only to
-            // populate the frontend-facing `hydration_key`: the two coincide in
-            // value for Claude (the final assistant `message.id`, round-trip
-            // verified vs disk), so passing it through is exactly the
-            // live-matched key the merge needs — *not* an overload of the
-            // private field, which itself stays off the wire.
+            // `context_window_source` and `stable_message_id` are intentionally
+            // dropped (the `..`) — internal plumbing the frontend doesn't need
+            // (`stable_message_id`, the cost-join key, is consumed by the
+            // dispatcher off the `AdapterEvent` before this conversion). `spend`
+            // *is* carried through — it's rendered on the message. The
+            // frontend-facing `hydration_key` is populated from the **first**
+            // assistant `message.id` (`first_message_id`), the parse-invariant
+            // dedup identity — deliberately *not* `stable_message_id` (the final
+            // id), which moves until the turn ends and so can't anchor a
+            // mid-flight re-read.
             AdapterEvent::TurnEnd {
                 turn_id,
                 outcome,
@@ -472,7 +488,7 @@ impl AdapterEvent {
                 spend,
                 model,
                 effort,
-                stable_message_id,
+                first_message_id,
                 ..
             } => NormalizedEvent::TurnEnd {
                 turn_id,
@@ -482,7 +498,10 @@ impl AdapterEvent {
                 spend,
                 model,
                 effort,
-                hydration_key: stable_message_id,
+                // The dedup key is the *first* assistant message id (parse-
+                // invariant), not `stable_message_id` (the final id, consumed by
+                // the dispatcher for the cost-join before this conversion).
+                hydration_key: first_message_id,
             },
             // `source` is intentionally dropped — it's an internal persistence
             // discriminator the frontend doesn't need (see `RateLimitSource`).
@@ -959,6 +978,7 @@ mod tests {
             usage: None,
             context_window_source: None,
             stable_message_id: None,
+            first_message_id: None,
             spend: None,
             model: None,
             effort: None,
@@ -977,14 +997,18 @@ mod tests {
     }
 
     #[test]
-    fn adapter_event_turn_end_carries_model_and_effort_to_normalized() {
+    fn adapter_event_turn_end_carries_model_effort_and_first_id_as_hydration_key() {
+        // Distinct first/last ids prove `hydration_key` is routed from the
+        // *first* id (the dedup identity), not `stable_message_id` (the final id,
+        // which stays internal/dropped at this boundary).
         let adapter = AdapterEvent::TurnEnd {
             turn_id: fresh_turn_id(),
             outcome: TurnOutcome::Completed,
             ended_at: fresh_time(),
             usage: None,
             context_window_source: None,
-            stable_message_id: Some("msg_x".to_owned()),
+            stable_message_id: Some("msg_final".to_owned()),
+            first_message_id: Some("msg_first".to_owned()),
             spend: None,
             model: Some("gpt-5.5".to_owned()),
             effort: Some("high".to_owned()),
@@ -999,9 +1023,7 @@ mod tests {
             } => {
                 assert_eq!(model.as_deref(), Some("gpt-5.5"));
                 assert_eq!(effort.as_deref(), Some("high"));
-                // The frontend-facing live key is populated from the internal
-                // `stable_message_id` (they coincide in value for Claude).
-                assert_eq!(hydration_key.as_deref(), Some("msg_x"));
+                assert_eq!(hydration_key.as_deref(), Some("msg_first"));
             }
             other => panic!("expected TurnEnd, got {other:?}"),
         }
@@ -1019,6 +1041,7 @@ mod tests {
             usage: None,
             context_window_source: None,
             stable_message_id: None,
+            first_message_id: None,
             spend: None,
             model: None,
             effort: None,

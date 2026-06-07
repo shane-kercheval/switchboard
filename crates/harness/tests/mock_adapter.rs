@@ -199,6 +199,7 @@ async fn failed_turn_outcome_wire_shape_roundtrips() {
         usage: None,
         context_window_source: None,
         stable_message_id: None,
+        first_message_id: None,
         spend: None,
         model: None,
         effort: None,

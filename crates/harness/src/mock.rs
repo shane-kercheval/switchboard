@@ -196,6 +196,7 @@ impl HarnessAdapter for MockHarnessAdapter {
                         usage: None,
                         context_window_source: None,
                         stable_message_id: None,
+                        first_message_id: None,
                         spend: None,
                         model: None,
                         effort: None,
@@ -244,6 +245,7 @@ impl HarnessAdapter for MockHarnessAdapter {
                         usage: None,
                         context_window_source: None,
                         stable_message_id: None,
+                        first_message_id: None,
                         spend: None,
                         model: None,
                         effort: None,
@@ -297,6 +299,7 @@ impl HarnessAdapter for MockHarnessAdapter {
                         usage: None,
                         context_window_source: None,
                         stable_message_id: None,
+                        first_message_id: None,
                         spend: None,
                         model: None,
                         effort: None,
@@ -317,6 +320,7 @@ impl HarnessAdapter for MockHarnessAdapter {
                         usage: None,
                         context_window_source: None,
                         stable_message_id: None,
+                        first_message_id: None,
                         spend: None,
                         model: None,
                         effort: None,
@@ -355,6 +359,7 @@ impl HarnessAdapter for MockHarnessAdapter {
                         usage: None,
                         context_window_source: None,
                         stable_message_id: None,
+                        first_message_id: None,
                         spend: None,
                         model: None,
                         effort: None,
@@ -395,6 +400,7 @@ impl HarnessAdapter for MockHarnessAdapter {
                         model: None,
                         effort: None,
                         stable_message_id: None,
+                        first_message_id: None,
                     });
                 });
             }
@@ -430,6 +436,7 @@ impl HarnessAdapter for MockHarnessAdapter {
                         model: None,
                         effort: None,
                         stable_message_id,
+                        first_message_id: None,
                     });
                 });
             }
@@ -449,6 +456,7 @@ impl HarnessAdapter for MockHarnessAdapter {
                         usage: None,
                         context_window_source: None,
                         stable_message_id: None,
+                        first_message_id: None,
                         spend: None,
                         model: None,
                         effort: None,
@@ -471,6 +479,7 @@ impl HarnessAdapter for MockHarnessAdapter {
                         usage: None,
                         context_window_source: None,
                         stable_message_id: None,
+                        first_message_id: None,
                         spend: None,
                         model: None,
                         effort: None,

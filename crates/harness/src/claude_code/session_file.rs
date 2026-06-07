@@ -176,11 +176,18 @@ struct AgentTurnBuilder {
     items: Vec<TurnItem>,
     usage: Option<TurnUsage>,
     /// The most recent assistant record's `message.id`, overwritten per record
-    /// so it ends up as the turn's *final* assistant message id — the durable
-    /// join key the app overlay uses to re-attach persisted cost/overage on
-    /// reopen. Mirrors the live parser's `last_assistant_message_id` so live
-    /// and disk anchor on the same message by construction.
+    /// so it ends up as the turn's *final* assistant message id — the cost-join
+    /// key the app overlay uses to re-attach persisted cost/overage on reopen.
+    /// Mirrors the live parser's `last_assistant_message_id`.
     last_message_id: Option<String>,
+    /// The *first* assistant record's `message.id`, set once per turn (never
+    /// overwritten). This is the turn's `hydration_key` — the live↔disk dedup
+    /// identity. Unlike the last id, it is invariant across a partial vs a
+    /// complete parse of the same turn (the last id moves as the turn streams),
+    /// so a mid-flight re-read dedups against the completed turn instead of
+    /// minting a second copy. Mirrors the live parser's
+    /// `first_assistant_message_id`.
+    first_message_id: Option<String>,
     /// The most recent assistant record's `message.model`, kept-last so it ends
     /// up as the turn's model. Per-turn — distinct from `first_model` (the
     /// agent-scoped `SessionMetaInfo.model`). Claude has no per-turn effort.
@@ -301,6 +308,7 @@ impl ReconstructionState {
             items: Vec::new(),
             usage: None,
             last_message_id: None,
+            first_message_id: None,
             last_model: None,
         });
         builder.last_seen_at = timestamp;
@@ -313,14 +321,19 @@ impl ReconstructionState {
             builder.usage = Some(parse_usage(usage));
         }
 
-        // Track the message id (keep last → final assistant message of the
-        // turn), the join key for re-attaching persisted cost/overage.
+        // Track the message id: keep-last for the cost-join `stable_message_id`
+        // (final assistant message), keep-first for the `hydration_key` dedup
+        // identity (first assistant message — invariant across partial vs
+        // complete parses, unlike the moving last id).
         if let Some(id) = record
             .get("message")
             .and_then(|m| m.get("id"))
             .and_then(Value::as_str)
         {
             builder.last_message_id = Some(id.to_owned());
+            builder
+                .first_message_id
+                .get_or_insert_with(|| id.to_owned());
         }
 
         // Keep-last the per-turn model the same way (final assistant model).
@@ -479,10 +492,14 @@ impl ReconstructionState {
             // the turnmeta sidecar on `stable_message_id`); the parser itself
             // never reads `.switchboard/` state.
             spend: None,
-            // The final assistant `message.id` is both the cost-join key and the
-            // stable hydration key (it round-trips identically to the live
-            // `TurnEnd`), so Claude turns are live-matched and reopen-stable.
-            hydration_key: builder.last_message_id.clone(),
+            // Two distinct anchors, by design (see `AgentTurnBuilder`):
+            // `hydration_key` is the *first* assistant `message.id` — the dedup
+            // identity, parse-invariant across a mid-flight vs completed read so
+            // a partial re-read collapses into the completed turn instead of
+            // duplicating it. `stable_message_id` is the *final* assistant
+            // `message.id` — the cost-join key (cost lives on the final record).
+            // Both round-trip identically to the live `TurnEnd`.
+            hydration_key: builder.first_message_id,
             stable_message_id: builder.last_message_id,
         });
     }
@@ -740,18 +757,22 @@ mod tests {
         assert_eq!(result.meta.unwrap().model, "claude-sonnet-4-6");
     }
 
-    /// Join-key parity (disk side), multi-assistant tool-use turn. A single
-    /// agent turn spans two assistant records — `msg_test02` (`tool_use`) and
-    /// `msg_test03` (final answer) — separated by a `tool_result` user record
-    /// (array content, which does NOT close the turn). `stable_message_id` must
-    /// anchor on the **final** assistant message (`msg_test03`), matching the
-    /// live side
-    /// (`parser.rs::tool_use_turn_anchors_stable_id_on_final_assistant_message`)
-    /// so the M4 overlay's join holds across reopen. The two paths derive the
-    /// key independently (keep-last here vs. keep-last live); this pins them to
-    /// the same value for the shape most able to expose a divergence.
+    /// The two anchors on a multi-assistant tool-use turn. A single agent turn
+    /// spans two assistant records — `msg_test02` (`tool_use`) and `msg_test03`
+    /// (final answer) — separated by a `tool_result` user record (array content,
+    /// which does NOT close the turn). The keys must split:
+    /// - `stable_message_id` (cost-join) anchors on the **final** message
+    ///   (`msg_test03`) — cost lives on the final record; matches the live side
+    ///   (`parser.rs::tool_use_turn_anchors_keys_first_and_final`).
+    /// - `hydration_key` (dedup identity) anchors on the **first** message
+    ///   (`msg_test02`) — invariant across a mid-flight vs completed parse, so a
+    ///   partial re-read collapses into the completed turn.
+    ///
+    /// This is the canonical shape that exposes a first/final divergence; a
+    /// regression that collapsed them back to one id (the original bug) fails
+    /// here.
     #[test]
-    fn hydrated_tool_use_turn_anchors_stable_id_on_final_assistant() {
+    fn hydrated_tool_use_turn_anchors_keys_first_and_final() {
         let home = TempDir::new().unwrap();
         let cwd = TempDir::new().unwrap();
         let session_id = Uuid::now_v7();
@@ -800,24 +821,117 @@ mod tests {
             .expect("one agent turn spanning both assistant records");
         match agent_turn {
             Turn::Agent {
-                stable_message_id, ..
-            } => assert_eq!(
-                stable_message_id.as_deref(),
-                Some("msg_test03"),
-                "the final assistant message's id must be the join key (not msg_test02)"
-            ),
+                stable_message_id,
+                hydration_key,
+                ..
+            } => {
+                assert_eq!(
+                    stable_message_id.as_deref(),
+                    Some("msg_test03"),
+                    "cost-join key must be the final assistant message id"
+                );
+                assert_eq!(
+                    hydration_key.as_deref(),
+                    Some("msg_test02"),
+                    "dedup identity must be the first assistant message id"
+                );
+            }
             _ => unreachable!(),
         }
     }
 
+    /// The bug this milestone fixes, at the parser level: the SAME turn parsed
+    /// mid-flight (file truncated before the tool result / final answer) and
+    /// complete must produce the **same** `hydration_key` (so a switch-back or
+    /// reopen re-read collapses into the live/completed turn instead of stacking
+    /// a duplicate). `stable_message_id`, by contrast, legitimately moves with
+    /// the final message — proving the two anchors are genuinely decoupled.
+    #[test]
+    fn hydration_key_is_identical_mid_flight_and_complete() {
+        let user = user_record("run a tool then answer", "2026-05-14T04:43:15Z");
+        let first_assistant = json!({
+            "type": "assistant",
+            "message": {
+                "id": "msg_first",
+                "model": "claude-sonnet-4-6",
+                "role": "assistant",
+                "content": [{ "type": "tool_use", "id": "t1", "name": "Bash", "input": {} }],
+                "usage": { "input_tokens": 10, "output_tokens": 5 }
+            },
+            "timestamp": "2026-05-14T04:43:16Z",
+        });
+        let tool_result = json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{ "type": "tool_result", "tool_use_id": "t1", "content": "ok" }]
+            },
+            "timestamp": "2026-05-14T04:43:17Z",
+        });
+        let final_assistant = json!({
+            "type": "assistant",
+            "message": {
+                "id": "msg_final",
+                "model": "claude-sonnet-4-6",
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "done" }],
+                "usage": { "input_tokens": 12, "output_tokens": 8 }
+            },
+            "timestamp": "2026-05-14T04:43:18Z",
+        });
+
+        let anchors = |records: &[Value]| {
+            let home = TempDir::new().unwrap();
+            let cwd = TempDir::new().unwrap();
+            let session_id = Uuid::now_v7();
+            let agent_id = Uuid::now_v7();
+            stage_session_file(home.path(), cwd.path(), session_id, &jsonl(records));
+            load_claude_transcript(home.path(), cwd.path(), session_id, agent_id)
+                .unwrap()
+                .turns
+                .into_iter()
+                .find_map(|t| match t {
+                    Turn::Agent {
+                        hydration_key,
+                        stable_message_id,
+                        ..
+                    } => Some((hydration_key, stable_message_id)),
+                    _ => None,
+                })
+                .expect("one agent turn")
+        };
+
+        let (mid_key, mid_stable) = anchors(&[user.clone(), first_assistant.clone()]);
+        let (full_key, full_stable) =
+            anchors(&[user, first_assistant, tool_result, final_assistant]);
+
+        assert_eq!(
+            mid_key.as_deref(),
+            Some("msg_first"),
+            "mid-flight dedup identity is the first assistant message"
+        );
+        assert_eq!(
+            mid_key, full_key,
+            "hydration_key MUST be identical mid-flight vs complete — the whole fix"
+        );
+        assert_eq!(mid_stable.as_deref(), Some("msg_first"));
+        assert_eq!(full_stable.as_deref(), Some("msg_final"));
+        assert_ne!(
+            mid_stable, full_stable,
+            "stable_message_id (cost-join) does move with the final message — anchors are decoupled"
+        );
+    }
+
     /// Parsing the same session file twice yields turns whose `hydration_key`
     /// is **identical** across both parses, even though `turn_id` is freshly
-    /// minted each parse. This is the regression guard the M2 idempotent merge
+    /// minted each parse. This is the regression guard the idempotent merge
     /// rests on: `turn_id` alone would differ and look like a new turn on a
-    /// re-read; the stable key recognizes it. For Claude the key is the final
-    /// assistant `message.id`.
+    /// re-read; the stable key recognizes it. For Claude the key is the *first*
+    /// assistant `message.id` (here the turn has one assistant message, so first
+    /// == last; the first-vs-last distinction is pinned by
+    /// `hydrated_tool_use_turn_anchors_keys_first_and_final`).
     #[test]
-    fn hydration_key_is_stable_across_reparses_and_equals_final_message_id() {
+    fn hydration_key_is_stable_across_reparses() {
         let home = TempDir::new().unwrap();
         let cwd = TempDir::new().unwrap();
         let session_id = Uuid::now_v7();
@@ -827,7 +941,7 @@ mod tests {
             json!({
                 "type": "assistant",
                 "message": {
-                    "id": "msg_final01",
+                    "id": "msg_a01",
                     "model": "claude-sonnet-4-6",
                     "role": "assistant",
                     "content": [{ "type": "text", "text": "hi" }],
@@ -856,7 +970,7 @@ mod tests {
         let (turn_id_a, key_a) = parse();
         let (turn_id_b, key_b) = parse();
 
-        assert_eq!(key_a.as_deref(), Some("msg_final01"));
+        assert_eq!(key_a.as_deref(), Some("msg_a01"));
         assert_eq!(key_a, key_b, "hydration_key must be parse-invariant");
         assert_ne!(
             turn_id_a, turn_id_b,

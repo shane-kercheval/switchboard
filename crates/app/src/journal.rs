@@ -16,7 +16,7 @@
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
-use switchboard_core::{AgentId, JournalRecord, SendId};
+use switchboard_core::{AgentId, Attachment, JournalRecord, SendId};
 use switchboard_dispatcher::{ConversationJournal, JournalError};
 use switchboard_harness::{TurnId, TurnOutcome};
 
@@ -43,6 +43,7 @@ impl ConversationJournal for ProjectJournal {
         turn_id: TurnId,
         agent_id: AgentId,
         prompt: &str,
+        attachments: &[Attachment],
         at: DateTime<Utc>,
     ) -> Result<(), JournalError> {
         let record = JournalRecord::Send {
@@ -50,7 +51,7 @@ impl ConversationJournal for ProjectJournal {
             turn_id,
             agent_id,
             prompt: prompt.to_owned(),
-            attachments: Vec::new(),
+            attachments: attachments.to_vec(),
             at,
         };
         // Fail-closed: propagate the error so the dispatcher refuses to start

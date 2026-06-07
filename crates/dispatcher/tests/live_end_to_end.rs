@@ -42,7 +42,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use switchboard_core::{AgentRecord, Directory, HarnessKind, SendId};
+use switchboard_core::{AgentRecord, Attachment, AttachmentKind, Directory, HarnessKind, SendId};
 use switchboard_dispatcher::{
     ConversationJournal, DispatchContext, DispatchContextFactory, Dispatcher, EventEmitter,
     NoopJournal, NoopMetadataCache, NoopSessionLocatorSink, OnBusy, RecordingEmitter, SendOutcome,
@@ -241,6 +241,7 @@ async fn live_claude_full_stack_two_consecutive_turns_succeed() {
             .send_message(
                 agent.id,
                 "Reply with exactly the word: ack",
+                vec![],
                 Uuid::now_v7(),
                 Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
                 OnBusy::Enqueue,
@@ -259,6 +260,7 @@ async fn live_claude_full_stack_two_consecutive_turns_succeed() {
             .send_message(
                 agent.id,
                 "And again, exactly: ack",
+                vec![],
                 Uuid::now_v7(),
                 factory,
                 OnBusy::Enqueue,
@@ -304,6 +306,7 @@ async fn live_claude_full_stack_emits_turn_start_then_content_then_turn_end() {
             .send_message(
                 agent.id,
                 "Reply with exactly: hi",
+                vec![],
                 Uuid::now_v7(),
                 factory,
                 OnBusy::Enqueue,
@@ -352,6 +355,7 @@ async fn live_claude_full_stack_paths_with_dot_components_resolve_correctly() {
                 .send_message(
                     agent.id,
                     prompt,
+                    vec![],
                     Uuid::now_v7(),
                     Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
                     OnBusy::Enqueue,
@@ -405,6 +409,7 @@ async fn live_claude_full_stack_sees_files_in_cwd() {
             .send_message(
                 agent.id,
                 "Read the file MARKER.txt in the current directory and tell me what string it contains. Reply with just the string, nothing else.",
+                vec![],
                 Uuid::now_v7(),
                 factory,
                 OnBusy::Enqueue,
@@ -455,6 +460,7 @@ async fn live_gemini_full_stack_emits_turn_start_then_content_then_turn_end() {
             .send_message(
                 agent.id,
                 "Reply with exactly: hi",
+                vec![],
                 Uuid::now_v7(),
                 factory,
                 OnBusy::Enqueue,
@@ -505,6 +511,7 @@ async fn live_codex_full_stack_emits_turn_start_then_content_then_turn_end() {
             .send_message(
                 agent.id,
                 "Reply with exactly: hi",
+                vec![],
                 Uuid::now_v7(),
                 factory,
                 OnBusy::Enqueue,
@@ -556,6 +563,7 @@ async fn live_antigravity_full_stack_two_turns_resume_through_dispatcher() {
             .send_message(
                 agent.id,
                 "Reply with exactly the word: ack",
+                vec![],
                 Uuid::now_v7(),
                 Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
                 OnBusy::Enqueue,
@@ -584,6 +592,7 @@ async fn live_antigravity_full_stack_two_turns_resume_through_dispatcher() {
             .send_message(
                 agent.id,
                 "And again, exactly: ack",
+                vec![],
                 Uuid::now_v7(),
                 factory,
                 OnBusy::Enqueue,
@@ -649,6 +658,7 @@ async fn live_cancel_case(harness: HarnessKind, adapter: Arc<dyn HarnessAdapter>
             .send_message(
                 agent.id,
                 "Count slowly to one hundred, one number per line.",
+                vec![],
                 Uuid::now_v7(),
                 factory,
                 OnBusy::Enqueue,
@@ -717,6 +727,100 @@ async fn live_gemini_cancel_terminates_and_synthesizes_cancelled() {
 #[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
 async fn live_antigravity_cancel_terminates_and_synthesizes_cancelled() {
     live_cancel_case(
+        HarnessKind::Antigravity,
+        Arc::new(AntigravityAdapter::new()),
+    )
+    .await;
+}
+
+/// Shared body for the per-harness attachment readability tests. Stages a file
+/// under `<cwd>/.switchboard/projects/<id>/attachments/` (where
+/// `stage_attachment` puts dropped files) and sends it via the dispatcher's
+/// attachment path, asserting the real CLI reads it. This proves the load-bearing
+/// assumption of the whole feature: the staging location resolves under each
+/// harness's sandbox. If a harness fails here, record the gap in
+/// `docs/research/harness-behavior.md` and the README's harness-limitations.
+async fn live_attachment_case(harness: HarnessKind, adapter: Arc<dyn HarnessAdapter>) {
+    let tmp = TempDir::new().expect("tempdir");
+    let directory = Directory::at(tmp.path()).expect("Directory::at");
+    directory.init().expect("init .switchboard/");
+    let project = directory
+        .create_project("attachment-test")
+        .expect("create_project");
+    let agent = project
+        .register_agent("assistant", harness, None, None)
+        .expect("register_agent");
+
+    // Mirror what `stage_attachment` does: place the file in the project's
+    // attachments dir and reference it by absolute path.
+    let token = "SWITCHBOARD_LIVE_ATTACHMENT_TOKEN_C4D77B";
+    let dir = project.attachments_dir();
+    std::fs::create_dir_all(&dir).expect("create attachments dir");
+    let staged = dir.join("note.txt");
+    std::fs::write(&staged, token).expect("write staged attachment");
+    let attachment = Attachment {
+        label: "text-1".to_owned(),
+        kind: AttachmentKind::Text,
+        path: staged.to_string_lossy().into_owned(),
+        original_name: "note.txt".to_owned(),
+    };
+
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let channel = format!("agent:{}", agent.id);
+    let factory = LiveFactory::new(
+        adapter,
+        project.directory.clone(),
+        agent.clone(),
+        Arc::clone(&emitter),
+    );
+
+    expect_accepted(
+        dispatcher
+            .send_message(
+                agent.id,
+                "Read the attached file and reply with just the string it contains, nothing else.",
+                vec![attachment],
+                Uuid::now_v7(),
+                factory,
+                OnBusy::Enqueue,
+            )
+            .await,
+        "send",
+    );
+    wait_for_idles(&emitter, 1).await;
+
+    let text = agent_text(&emitter, &channel);
+    assert!(
+        text.contains(token),
+        "{harness:?}: response must contain the token from the staged attachment \
+         (proves a file under <cwd>/.switchboard/projects/<id>/attachments/ is readable \
+         under this harness's sandbox); got: {text:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires claude installed and authenticated — run with: make test-live"]
+async fn live_claude_attachment_in_project_dir_is_readable() {
+    live_attachment_case(HarnessKind::ClaudeCode, Arc::new(ClaudeCodeAdapter::new())).await;
+}
+
+#[tokio::test]
+#[ignore = "requires codex installed and authenticated — run with: make test-live"]
+async fn live_codex_attachment_in_project_dir_is_readable() {
+    live_attachment_case(HarnessKind::Codex, Arc::new(CodexAdapter::new())).await;
+}
+
+#[tokio::test]
+#[ignore = "requires gemini installed and authenticated — run with: make test-live"]
+async fn live_gemini_attachment_in_project_dir_is_readable() {
+    live_attachment_case(HarnessKind::Gemini, Arc::new(GeminiAdapter::new())).await;
+}
+
+#[tokio::test]
+#[ignore = "requires agy authenticated (run `agy`) — run with: make test-live"]
+async fn live_antigravity_attachment_in_project_dir_is_readable() {
+    live_attachment_case(
         HarnessKind::Antigravity,
         Arc::new(AntigravityAdapter::new()),
     )

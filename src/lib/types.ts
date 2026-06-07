@@ -84,6 +84,27 @@ export type MessageId = string;
 // scoped to it).
 export type SendId = string;
 
+// One staged file attached to a send. Mirrors the Rust `switchboard_core::Attachment`
+// wire shape. `kind` drives the chip label prefix and thumbnail-vs-filename
+// rendering; `"unknown"` is the cross-version fallback for a kind a newer build
+// wrote that this build doesn't recognize (renders as a generic file).
+export type AttachmentKind = "image" | "text" | "file" | "unknown";
+
+export type Attachment = {
+  label: string;
+  kind: AttachmentKind;
+  path: string;
+  original_name: string;
+};
+
+// Result of staging a dropped file (`stage_attachment`): the staged absolute
+// path plus the original basename. The frontend assigns `label`/`kind` and
+// builds the full `Attachment` from these.
+export type StagedAttachment = {
+  path: string;
+  original_name: string;
+};
+
 export type NormalizedEvent =
   | { type: "turn_start"; turn_id: TurnId; message_id: MessageId; started_at: string }
   | { type: "content_chunk"; turn_id: TurnId; kind: ContentKind; text: string }

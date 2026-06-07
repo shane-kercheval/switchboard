@@ -1,7 +1,8 @@
 <script lang="ts">
-  import type { AgentRecord, ConversationItem } from "$lib/types";
+  import type { AgentRecord, Attachment, ConversationItem } from "$lib/types";
   import { HEARTBEAT_TIMEOUT_MS } from "$lib/types";
   import { formatDuration } from "$lib/utils";
+  import { convertFileSrc } from "@tauri-apps/api/core";
   import {
     cancelSend,
     retryAgentHydration,
@@ -429,10 +430,53 @@
   </div>
 {/snippet}
 
+{#snippet attachmentList(attachments: Attachment[])}
+  <div class="mt-1.5 flex flex-wrap gap-1.5" data-testid="user-attachments">
+    {#each attachments as attachment (attachment.path)}
+      {#if attachment.kind === "image"}
+        <!-- `convertFileSrc` turns the absolute staged path into an `asset://`
+             URL the webview can load (a raw filesystem path can't be an <img
+             src>); the asset protocol is enabled + scoped in tauri.conf.json. -->
+        <img
+          src={convertFileSrc(attachment.path)}
+          alt={attachment.original_name}
+          title={attachment.original_name}
+          data-testid={`attachment-thumb-${attachment.label}`}
+          class="border-border h-16 w-16 rounded-md border object-cover"
+        />
+      {:else}
+        <span
+          class="border-border bg-panel text-fg inline-flex max-w-[14rem] items-center gap-1.5 rounded-full border px-2 py-px text-xs"
+          data-testid={`attachment-file-${attachment.label}`}
+          data-kind={attachment.kind}
+        >
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.8"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            class="text-muted h-3.5 w-3.5 shrink-0"
+            aria-hidden="true"
+          >
+            <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
+            <path d="M14 3v5h5" />
+          </svg>
+          <span class="truncate" title={attachment.original_name}>{attachment.original_name}</span>
+        </span>
+      {/if}
+    {/each}
+  </div>
+{/snippet}
+
 {#snippet userMessage(row: Extract<UnifiedRow, { kind: "user" }>)}
   <div class="group min-w-0 flex-1" data-testid="turn" data-role="user">
     <div class="-mx-3 rounded-md bg-blue-100/20 px-3 py-2">
       <Markdown text={row.text} />
+      {#if row.attachments.length > 0}
+        {@render attachmentList(row.attachments)}
+      {/if}
     </div>
     {@render messageMeta(row.at, row.text, "Copy message")}
   </div>

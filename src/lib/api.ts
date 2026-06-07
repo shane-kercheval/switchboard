@@ -6,6 +6,7 @@ import type {
   AgentSessionFingerprint,
   AgentId,
   AgentRecord,
+  Attachment,
   BranchKind,
   ChangeKind,
   ChangedFile,
@@ -27,6 +28,7 @@ import type {
   RenderedPrompt,
   RepoListing,
   SendId,
+  StagedAttachment,
   WorkspaceDirectories,
 } from "./types";
 
@@ -333,8 +335,19 @@ export async function sendMessage(
   agentId: string,
   prompt: string,
   sendId: SendId,
+  attachments: Attachment[] = [],
 ): Promise<MessageId> {
-  return await invoke<MessageId>("send_message", { agentId, prompt, sendId });
+  return await invoke<MessageId>("send_message", { agentId, prompt, attachments, sendId });
+}
+
+// Copy a dropped file into the project's attachments dir, returning its staged
+// absolute path and original basename. The frontend then assigns the chip's
+// `label`/`kind` and builds the full `Attachment` for the send.
+export async function stageAttachment(
+  projectId: ProjectId,
+  sourcePath: string,
+): Promise<StagedAttachment> {
+  return await invoke<StagedAttachment>("stage_attachment", { projectId, sourcePath });
 }
 
 // Cancel a whole send across its recipients (send-scoped, actor-decided): each

@@ -225,6 +225,17 @@ pub enum AppError {
     /// message so the diff panel can surface why it couldn't load.
     #[error("failed to read git changes for {path}: {message}")]
     GitRead { path: String, message: String },
+
+    /// Staging a dropped attachment failed — creating the project's
+    /// `attachments/` dir, or copying the source file into it (the dropped file
+    /// is gone, unreadable, or the metadata dir is unwritable). Carries the
+    /// source path so the user can see which drop failed.
+    #[error("failed to stage attachment from {source_path}: {source}")]
+    AttachmentStage {
+        source_path: String,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 impl AppError {

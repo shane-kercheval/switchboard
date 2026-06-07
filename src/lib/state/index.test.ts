@@ -401,7 +401,7 @@ describe("dispatchUserTurn", () => {
   it("synchronously appends a user-role turn before any event arrives", async () => {
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));
-    state.dispatchUserTurn(AGENT_A, "user-1", "hello", "s1", "2026-05-16T00:00:00Z");
+    state.dispatchUserTurn(AGENT_A, "user-1", "hello", [], "s1", "2026-05-16T00:00:00Z");
     const turns = state.transcripts[AGENT_A] ?? [];
     expect(turns).toHaveLength(1);
     expect(turns[0]?.role).toBe("user");
@@ -413,7 +413,7 @@ describe("dispatchUserTurn", () => {
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));
     expect(state.runtimes[AGENT_A]?.run_status).toBe("idle");
-    state.dispatchUserTurn(AGENT_A, "user-1", "hello", "s1", "2026-05-16T00:00:00Z");
+    state.dispatchUserTurn(AGENT_A, "user-1", "hello", [], "s1", "2026-05-16T00:00:00Z");
     expect(state.runtimes[AGENT_A]?.run_status).toBe("starting");
   });
 
@@ -430,7 +430,7 @@ describe("dispatchUserTurn", () => {
       ...before,
       last_error: { message: "old failure", kind: "harness_error" },
     };
-    state.dispatchUserTurn(AGENT_A, "user-1", "retry", "s1", "2026-05-16T00:00:00Z");
+    state.dispatchUserTurn(AGENT_A, "user-1", "retry", [], "s1", "2026-05-16T00:00:00Z");
     expect(state.runtimes[AGENT_A]?.last_error).toBeUndefined();
   });
 
@@ -438,7 +438,7 @@ describe("dispatchUserTurn", () => {
     const state = await loadState();
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     // No registerAgent call — runtime doesn't exist.
-    state.dispatchUserTurn(AGENT_A, "user-1", "hello", "s1", "2026-05-16T00:00:00Z");
+    state.dispatchUserTurn(AGENT_A, "user-1", "hello", [], "s1", "2026-05-16T00:00:00Z");
     expect(errSpy).toHaveBeenCalledWith(
       "[switchboard] dispatchUserTurn called for unregistered agent",
       expect.objectContaining({ agent_id: AGENT_A }),
@@ -455,8 +455,8 @@ describe("dispatchUserTurn", () => {
     const state = await loadState();
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     await state.registerAgent(agentRecord(AGENT_A));
-    state.dispatchUserTurn(AGENT_A, "user-1", "first", "send-1", "2026-05-16T00:00:00Z");
-    state.dispatchUserTurn(AGENT_A, "user-2", "second", "send-2", "2026-05-16T00:00:01Z");
+    state.dispatchUserTurn(AGENT_A, "user-1", "first", [], "send-1", "2026-05-16T00:00:00Z");
+    state.dispatchUserTurn(AGENT_A, "user-2", "second", [], "send-2", "2026-05-16T00:00:01Z");
 
     // No "not idle" rejection — both sends are accepted.
     expect(errSpy).not.toHaveBeenCalled();
@@ -476,7 +476,7 @@ describe("failSendStart", () => {
   it("flips starting → idle and records the error", async () => {
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));
-    state.dispatchUserTurn(AGENT_A, "user-1", "hello", "s1", "2026-05-16T00:00:00Z");
+    state.dispatchUserTurn(AGENT_A, "user-1", "hello", [], "s1", "2026-05-16T00:00:00Z");
     expect(state.runtimes[AGENT_A]?.run_status).toBe("starting");
 
     state.failSendStart(AGENT_A, "user-1", {
@@ -494,7 +494,7 @@ describe("failSendStart", () => {
   it("keeps the optimistic user turn and appends a failed agent turn beneath it", async () => {
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));
-    state.dispatchUserTurn(AGENT_A, "user-1", "hello", "s1", "2026-05-16T00:00:00Z");
+    state.dispatchUserTurn(AGENT_A, "user-1", "hello", [], "s1", "2026-05-16T00:00:00Z");
     state.failSendStart(AGENT_A, "user-1", { message: "boom", kind: "adapter_failure" });
     const turns = state.transcripts[AGENT_A] ?? [];
     expect(turns).toHaveLength(2);
@@ -509,7 +509,7 @@ describe("failSendStart", () => {
   it("does not append a failed agent turn when it no-ops (TurnStart raced ahead)", async () => {
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));
-    state.dispatchUserTurn(AGENT_A, "user-1", "hello", "s1", "2026-05-16T00:00:00Z");
+    state.dispatchUserTurn(AGENT_A, "user-1", "hello", [], "s1", "2026-05-16T00:00:00Z");
     state.recordSendAccepted(AGENT_A, "user-1", MESSAGE_1);
     fireTo(`agent:${AGENT_A}`, {
       type: "turn_start",
@@ -534,7 +534,7 @@ describe("failSendStart", () => {
     // must not stomp the genuine "processing" state.
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));
-    state.dispatchUserTurn(AGENT_A, "user-1", "hello", "s1", "2026-05-16T00:00:00Z");
+    state.dispatchUserTurn(AGENT_A, "user-1", "hello", [], "s1", "2026-05-16T00:00:00Z");
     fireTo(`agent:${AGENT_A}`, {
       type: "turn_start",
       turn_id: TURN_1,
@@ -574,7 +574,7 @@ describe("message_failed event → transcript", () => {
   it("renders a failed agent turn for a pre-start failure (entry still pending)", async () => {
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));
-    state.dispatchUserTurn(AGENT_A, "user-1", "hello", "send-1", "2026-05-16T00:00:00Z");
+    state.dispatchUserTurn(AGENT_A, "user-1", "hello", [], "send-1", "2026-05-16T00:00:00Z");
     state.recordSendAccepted(AGENT_A, "user-1", MESSAGE_1);
 
     fireTo(`agent:${AGENT_A}`, {
@@ -600,7 +600,7 @@ describe("message_failed event → transcript", () => {
     // stay on the same entry.
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));
-    state.dispatchUserTurn(AGENT_A, "user-1", "hello", "send-1", "2026-05-16T00:00:00Z");
+    state.dispatchUserTurn(AGENT_A, "user-1", "hello", [], "send-1", "2026-05-16T00:00:00Z");
 
     fireTo(`agent:${AGENT_A}`, {
       type: "message_failed",
@@ -623,7 +623,7 @@ describe("message_failed event → transcript", () => {
   it("does not double-render when the failure is post-start (turn already streaming)", async () => {
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));
-    state.dispatchUserTurn(AGENT_A, "user-1", "hello", "send-1", "2026-05-16T00:00:00Z");
+    state.dispatchUserTurn(AGENT_A, "user-1", "hello", [], "send-1", "2026-05-16T00:00:00Z");
     state.recordSendAccepted(AGENT_A, "user-1", MESSAGE_1);
     fireTo(`agent:${AGENT_A}`, {
       type: "turn_start",
@@ -661,8 +661,8 @@ describe("stopAgent", () => {
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));
     // Two queued sends, both backend-accepted (message_id recorded).
-    state.dispatchUserTurn(AGENT_A, "user-1", "first", "send-1", "2026-05-16T00:00:00Z");
-    state.dispatchUserTurn(AGENT_A, "user-2", "second", "send-2", "2026-05-16T00:00:01Z");
+    state.dispatchUserTurn(AGENT_A, "user-1", "first", [], "send-1", "2026-05-16T00:00:00Z");
+    state.dispatchUserTurn(AGENT_A, "user-2", "second", [], "send-2", "2026-05-16T00:00:01Z");
     state.recordSendAccepted(AGENT_A, "user-1", "msg-1");
     state.recordSendAccepted(AGENT_A, "user-2", "msg-2");
     invokeMock.mockClear();
@@ -693,7 +693,7 @@ describe("stopAgent", () => {
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));
     // send-1 running (turn_start popped its pending entry).
-    state.dispatchUserTurn(AGENT_A, "user-1", "running", "send-1", "2026-05-16T00:00:00Z");
+    state.dispatchUserTurn(AGENT_A, "user-1", "running", [], "send-1", "2026-05-16T00:00:00Z");
     state.recordSendAccepted(AGENT_A, "user-1", MESSAGE_1);
     fireTo(`agent:${AGENT_A}`, {
       type: "turn_start",
@@ -702,7 +702,7 @@ describe("stopAgent", () => {
       started_at: "2026-05-16T00:00:00Z",
     });
     // send-2 queued behind it, accepted.
-    state.dispatchUserTurn(AGENT_A, "user-2", "queued", "send-2", "2026-05-16T00:00:01Z");
+    state.dispatchUserTurn(AGENT_A, "user-2", "queued", [], "send-2", "2026-05-16T00:00:01Z");
     state.recordSendAccepted(AGENT_A, "user-2", "msg-2");
     invokeMock.mockClear();
 
@@ -731,7 +731,7 @@ describe("stopAgent", () => {
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));
     // Dispatched but no message_id yet (send_message IPC still in flight).
-    state.dispatchUserTurn(AGENT_A, "user-1", "racing", "send-1", "2026-05-16T00:00:00Z");
+    state.dispatchUserTurn(AGENT_A, "user-1", "racing", [], "send-1", "2026-05-16T00:00:00Z");
     invokeMock.mockClear();
 
     state.stopAgent(AGENT_A);
@@ -764,7 +764,7 @@ describe("cancelSend pre-accept race", () => {
   it("defers the backend cancel until the send is accepted", async () => {
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));
-    state.dispatchUserTurn(AGENT_A, "user-1", "racing", "send-1", "2026-05-16T00:00:00Z");
+    state.dispatchUserTurn(AGENT_A, "user-1", "racing", [], "send-1", "2026-05-16T00:00:00Z");
     invokeMock.mockClear();
 
     state.cancelSend("send-1", [AGENT_A]);
@@ -782,7 +782,7 @@ describe("cancelSend pre-accept race", () => {
   it("fires the deferred cancel if the turn starts before acceptance is recorded", async () => {
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));
-    state.dispatchUserTurn(AGENT_A, "user-1", "racing", "send-1", "2026-05-16T00:00:00Z");
+    state.dispatchUserTurn(AGENT_A, "user-1", "racing", [], "send-1", "2026-05-16T00:00:00Z");
     state.cancelSend("send-1", [AGENT_A]);
     invokeMock.mockClear();
 
@@ -803,7 +803,7 @@ describe("cancelSend pre-accept race", () => {
   it("fires cancel immediately once accepted; the message_cancelled event renders it", async () => {
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));
-    state.dispatchUserTurn(AGENT_A, "user-1", "queued", "send-1", "2026-05-16T00:00:00Z");
+    state.dispatchUserTurn(AGENT_A, "user-1", "queued", [], "send-1", "2026-05-16T00:00:00Z");
     state.recordSendAccepted(AGENT_A, "user-1", MESSAGE_1);
     invokeMock.mockClear();
 
@@ -833,12 +833,12 @@ describe("pending-send pruning (fan-out / queue correctness)", () => {
     // would stamp the retry's response with the failed send's send_id.
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));
-    state.dispatchUserTurn(AGENT_A, "u1", "first", "send-A", "2026-05-16T00:00:00Z");
+    state.dispatchUserTurn(AGENT_A, "u1", "first", [], "send-A", "2026-05-16T00:00:00Z");
     state.failSendStart(AGENT_A, "u1", { message: "ipc down", kind: "adapter_failure" });
     expect(state.runtimes[AGENT_A]?.pending_sends).toBeUndefined();
 
     // Retry succeeds; its turn_start must stamp the retry's send_id.
-    state.dispatchUserTurn(AGENT_A, "u2", "retry", "send-B", "2026-05-16T00:00:01Z");
+    state.dispatchUserTurn(AGENT_A, "u2", "retry", [], "send-B", "2026-05-16T00:00:01Z");
     state.recordSendAccepted(AGENT_A, "u2", MESSAGE_1);
     fireTo(`agent:${AGENT_A}`, {
       type: "turn_start",
@@ -860,7 +860,7 @@ describe("pending-send pruning (fan-out / queue correctness)", () => {
     // surface the error, but leave run_status === "processing" untouched.
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));
-    state.dispatchUserTurn(AGENT_A, "u1", "running", "send-A", "2026-05-16T00:00:00Z");
+    state.dispatchUserTurn(AGENT_A, "u1", "running", [], "send-A", "2026-05-16T00:00:00Z");
     state.recordSendAccepted(AGENT_A, "u1", MESSAGE_1);
     fireTo(`agent:${AGENT_A}`, {
       type: "turn_start",
@@ -871,7 +871,7 @@ describe("pending-send pruning (fan-out / queue correctness)", () => {
     expect(state.runtimes[AGENT_A]?.run_status).toBe("processing");
 
     // Queue a second send while busy, then its IPC fails.
-    state.dispatchUserTurn(AGENT_A, "u2", "queued", "send-B", "2026-05-16T00:00:02Z");
+    state.dispatchUserTurn(AGENT_A, "u2", "queued", [], "send-B", "2026-05-16T00:00:02Z");
     expect(state.runtimes[AGENT_A]?.pending_sends?.map((p) => p.send_id)).toEqual(["send-B"]);
     state.failSendStart(AGENT_A, "u2", { message: "queue ipc down", kind: "adapter_failure" });
 
@@ -887,7 +887,7 @@ describe("state machine — starting → processing transition", () => {
     // accepts and emits TurnStart → processing.
     const state = await loadState();
     await state.registerAgent(agentRecord(AGENT_A));
-    state.dispatchUserTurn(AGENT_A, "user-1", "hello", "s1", "2026-05-16T00:00:00Z");
+    state.dispatchUserTurn(AGENT_A, "user-1", "hello", [], "s1", "2026-05-16T00:00:00Z");
     expect(state.runtimes[AGENT_A]?.run_status).toBe("starting");
 
     fireTo(`agent:${AGENT_A}`, {

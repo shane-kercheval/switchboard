@@ -5,6 +5,7 @@
 //! `docs/system-design.md` §3 for the canonical spec.
 
 pub mod agent;
+pub mod attachment;
 pub mod directory;
 pub mod error;
 pub mod harness;
@@ -15,6 +16,7 @@ mod paths;
 pub mod project;
 
 pub use agent::{AgentId, AgentRecord, SessionLocator, normalize_selection};
+pub use attachment::{Attachment, AttachmentKind, render_prompt_with_attachments};
 pub use directory::{Directory, DirectoryConfig};
 pub use error::{CoreError, Result};
 pub use harness::{HarnessKind, SelectionAxis};

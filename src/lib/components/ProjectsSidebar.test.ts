@@ -115,7 +115,7 @@ async function seedBusyProject(projectId: string): Promise<void> {
   const a = agent(AGENT_1, projectId);
   ws.agentsByProject[projectId] = [a];
   await state.registerAgent(a);
-  state.dispatchUserTurn(AGENT_1, "user-1", "go", "send-1", "2026-05-16T00:00:00Z");
+  state.dispatchUserTurn(AGENT_1, "user-1", "go", [], "send-1", "2026-05-16T00:00:00Z");
 }
 
 describe("ProjectsSidebar — background activity", () => {
@@ -175,7 +175,7 @@ describe("ProjectsSidebar — background activity", () => {
     const a = agent(AGENT_1, PROJECT_1);
     ws.agentsByProject[PROJECT_1] = [a];
     await state.registerAgent(a);
-    state.dispatchUserTurn(AGENT_1, "user-1", "go", "send-1", background.last_activity);
+    state.dispatchUserTurn(AGENT_1, "user-1", "go", [], "send-1", background.last_activity);
     ws.selection.activeProjectId = PROJECT_2;
 
     await startActivityObserver();

@@ -13,6 +13,7 @@
 
 import type {
   AgentId,
+  Attachment,
   ContentKind,
   FailureKind,
   McpServerStatus,
@@ -47,6 +48,11 @@ export type Turn =
       send_id?: SendId;
       started_at: string;
       text: string;
+      /// Files attached to this send. Carried on the live user turn so chips and
+      /// image thumbnails render immediately (not only after reload/hydration);
+      /// shared across a fan-out's per-recipient turns. Absent/empty for a plain
+      /// send (optional like the other additive turn fields here).
+      attachments?: Attachment[];
     }
   | {
       role: "agent";

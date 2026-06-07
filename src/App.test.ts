@@ -1826,6 +1826,43 @@ describe("App", () => {
     expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument();
   });
 
+  it("shows project loading immediately when returning from Git view to an active project", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    backend.trackedRepos = [
+      {
+        repo: {
+          root: DIR_A,
+          name: "alpha-repo",
+          default_branch: "main",
+          available: true,
+          is_bare: false,
+          local_branches: [],
+          remote_branches: [],
+          detached_worktrees: [],
+        },
+        linked_projects: {},
+      } satisfies RepoListing,
+    ];
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+
+    await fireEvent.click(screen.getByTestId("view-toggle-git"));
+    await waitFor(() => expect(screen.getByTestId("git-view")).toBeInTheDocument());
+
+    await fireEvent.click(screen.getByTestId("view-toggle-projects"));
+
+    expect(screen.queryByTestId("git-view")).not.toBeInTheDocument();
+    expect(screen.getByTestId("project-loading")).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+  });
+
   it("opens the active project in Git view with the project shortcut", async () => {
     seedProject({
       projectId: "p-a",

@@ -72,6 +72,8 @@
   let projectsSidebarOpen = $state<boolean>(true);
   let agentsSidebarOpen = $state<boolean>(true);
   let settingsOpen = $state<boolean>(false);
+  let projectViewResumePending = $state<boolean>(false);
+  let projectViewResumeSeq = 0;
 
   function isEditableShortcutTarget(target: EventTarget | null): boolean {
     if (!(target instanceof HTMLElement)) return false;
@@ -157,10 +159,27 @@
   function selectView(mode: "projects" | "git"): void {
     settingsOpen = false;
     if (mode === "git") {
+      projectViewResumePending = false;
       void enterGitView();
     } else {
+      if (view.mode === "git" && selection.activeProjectId !== null) {
+        showProjectViewLoadingForNextPaint();
+      }
       setViewMode("projects");
     }
+  }
+
+  function showProjectViewLoadingForNextPaint(): void {
+    const seq = ++projectViewResumeSeq;
+    projectViewResumePending = true;
+    const clear = (): void => {
+      if (seq === projectViewResumeSeq) projectViewResumePending = false;
+    };
+    if (typeof requestAnimationFrame !== "function") {
+      setTimeout(clear, 0);
+      return;
+    }
+    requestAnimationFrame(() => setTimeout(clear, 0));
   }
 
   async function openActiveProjectInGit(): Promise<void> {
@@ -477,7 +496,7 @@
               </Button>
             {/snippet}
           </EmptyState>
-        {:else if projectSwitching || !rosterLoaded}
+        {:else if projectViewResumePending || projectSwitching || !rosterLoaded}
           <EmptyState testid="project-loading" title="Loading project…" />
         {:else if activeAgents.length === 0}
           <div class="flex flex-1 flex-col overflow-y-auto">

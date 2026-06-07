@@ -31,7 +31,11 @@
   import { onDestroy, onMount, untrack } from "svelte";
   import { listen } from "@tauri-apps/api/event";
 
-  let { projectId, agents }: { projectId: ProjectId; agents: AgentRecord[] } = $props();
+  let {
+    projectId,
+    agents,
+    focusOnMount = false,
+  }: { projectId: ProjectId; agents: AgentRecord[]; focusOnMount?: boolean } = $props();
 
   // The compose bar is remounted per project (App.svelte's `{#key}`), and the
   // parent only mounts it once the roster is loaded and non-empty — so the
@@ -100,6 +104,15 @@
     return () => void unlisten.then((u) => u());
   });
 
+  onMount(() => {
+    if (!focusOnMount) return;
+    if (pendingRestore === null) {
+      requestAnimationFrame(() => textareaEl?.focus());
+    } else {
+      focusPromptFieldOnMount = true;
+    }
+  });
+
   /// Resolve a saved prompt-mode draft against the loaded cache. If the prompt
   /// is present, re-enter prompt mode with the saved argument values. If it's
   /// absent, only downgrade to plain once `syncSettled` — a completed sync proves
@@ -115,6 +128,7 @@
         found.arguments.map((a) => [a.name, snapshot.args[a.name] ?? ""]),
       );
       appendedText = snapshot.appendedText;
+      focusPromptFieldOnMount = focusPromptFieldOnMount || focusOnMount;
       mode = "prompt";
       pendingRestore = null;
       restoring = false;
@@ -127,6 +141,7 @@
       mode = "plain";
       pendingRestore = null;
       restoring = false;
+      if (focusOnMount) requestAnimationFrame(() => textareaEl?.focus());
     }
   }
 

@@ -576,7 +576,11 @@
                    draft/recipient state, this resets sendError, the @-menu, and
                    focus so one project's compose state can't bleed into another. -->
               {#key selection.activeProjectId}
-                <ComposeBar projectId={selection.activeProjectId!} agents={activeAgents} />
+                <ComposeBar
+                  projectId={selection.activeProjectId!}
+                  agents={activeAgents}
+                  focusOnMount={true}
+                />
               {/key}
             </div>
             {#if agentsSidebarOpen}

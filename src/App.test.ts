@@ -360,6 +360,10 @@ function projectRowByName(name: string): HTMLElement {
   return row;
 }
 
+async function expectComposeFocused(): Promise<void> {
+  await waitFor(() => expect(document.activeElement).toBe(screen.getByTestId("compose-textarea")));
+}
+
 // create_agent calls (name + harness pairs) in invocation order. Projects just
 // the two identity fields so seed-order assertions don't couple to the
 // model/effort defaults each call also carries (covered by a dedicated test).
@@ -854,6 +858,31 @@ describe("App", () => {
     await fireEvent.click(screen.getByText("alpha"));
     await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
     expect(backend.loadConvoCalls.filter((p) => p === "p-a")).toHaveLength(1);
+  });
+
+  it("focuses the compose box after switching projects", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    seedProject({
+      projectId: "p-b",
+      directory: DIR_B,
+      name: "beta",
+      agents: [agent({ id: "ag-2", project_id: "p-b", name: "helper" })],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getAllByTestId("project-row")).toHaveLength(2));
+
+    await fireEvent.click(within(projectRowByName("alpha")).getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+    await expectComposeFocused();
+
+    await fireEvent.click(within(projectRowByName("beta")).getByText("beta"));
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+    await expectComposeFocused();
   });
 
   it("selects a project row and clears the center pane while activation is pending", async () => {
@@ -2019,6 +2048,7 @@ describe("App", () => {
     expect(screen.queryByTestId("git-view")).not.toBeInTheDocument();
     expect(screen.getByTestId("project-loading")).toBeInTheDocument();
     await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+    await expectComposeFocused();
   });
 
   it("opens the active project in Git view with the project shortcut", async () => {

@@ -1987,17 +1987,21 @@ describe("UnifiedTranscript compact mode", () => {
     return screen.getAllByTestId("turn").filter((el) => el.getAttribute("data-role") === "agent");
   }
 
-  it("collapses an older completed response but keeps the latest expanded", async () => {
+  it("renders an agent's latest response as the last block and an older one clipped", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     state.transcripts[CLAUDE_AGENT.id] = [
       user(CLAUDE_AGENT, "send-a", "u-a", "2026-05-16T00:00:00Z"),
       done(CLAUDE_AGENT, "send-a", "a-a", "2026-05-16T00:00:01Z", "2026-05-16T00:00:02Z", [
-        ANSWER("older"),
+        ANSWER("old first"),
+        TOOL("t1"),
+        ANSWER("old last"),
       ]),
       user(CLAUDE_AGENT, "send-b", "u-b", "2026-05-16T00:00:10Z"),
       done(CLAUDE_AGENT, "send-b", "a-b", "2026-05-16T00:00:11Z", "2026-05-16T00:00:12Z", [
-        ANSWER("latest"),
+        ANSWER("new first"),
+        TOOL("t2"),
+        ANSWER("new last"),
       ]),
     ];
     setProjectCompact(PROJECT_ID, true);
@@ -2005,52 +2009,36 @@ describe("UnifiedTranscript compact mode", () => {
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     const [older, latest] = agentTurns();
-    expect(toggleLabel(older!)).toBe("Expand"); // compact
-    expect(toggleLabel(latest!)).toBe("Collapse"); // expanded
+    // Latest → last-block: only the final answer block, tools hidden.
+    expect(within(latest!).getByText("new last")).toBeInTheDocument();
+    expect(within(latest!).queryByText("new first")).toBeNull();
+    // Older → clipped preview: all answer text, tools hidden.
+    expect(within(older!).getByText("old first")).toBeInTheDocument();
+    expect(within(older!).getByText("old last")).toBeInTheDocument();
+    expect(screen.queryByTestId("tool-done")).toBeNull();
+    // Both are collapsed by default now.
+    expect(toggleLabel(older!)).toBe("Expand");
+    expect(toggleLabel(latest!)).toBe("Expand");
   });
 
-  it("selects the latest completed response by completion recency, not rendered order", async () => {
-    const state = await loadState();
-    await state.registerAgent(CLAUDE_AGENT);
-    // send-a is anchored earlier (renders first) but finishes LAST (ended t5).
-    state.transcripts[CLAUDE_AGENT.id] = [
-      user(CLAUDE_AGENT, "send-a", "u-a", "2026-05-16T00:00:00Z"),
-      done(CLAUDE_AGENT, "send-a", "a-a", "2026-05-16T00:00:01Z", "2026-05-16T00:00:05Z", [
-        ANSWER("slow"),
-      ]),
-      user(CLAUDE_AGENT, "send-b", "u-b", "2026-05-16T00:00:02Z"),
-      done(CLAUDE_AGENT, "send-b", "a-b", "2026-05-16T00:00:03Z", "2026-05-16T00:00:04Z", [
-        ANSWER("fast"),
-      ]),
-    ];
-    setProjectCompact(PROJECT_ID, true);
-
-    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
-
-    const [first, second] = agentTurns();
-    expect(toggleLabel(first!)).toBe("Collapse"); // the slow-but-latest one stays expanded
-    expect(toggleLabel(second!)).toBe("Expand");
-  });
-
-  it("keeps the latest fan-out group's completed columns expanded", async () => {
+  it("keeps each agent's most-recent response as last-block even when another agent replied later", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     await state.registerAgent(CODEX_AGENT);
-    // Earlier standalone send, then a later fan-out (the latest completed set).
+    // CLAUDE's only response is globally older than CODEX's, but it is still
+    // CLAUDE's latest → it gets the last-block treatment, not a clipped preview.
     state.transcripts[CLAUDE_AGENT.id] = [
-      user(CLAUDE_AGENT, "send-a", "u-a", "2026-05-16T00:00:00Z"),
-      done(CLAUDE_AGENT, "send-a", "a-a", "2026-05-16T00:00:01Z", "2026-05-16T00:00:02Z", [
-        ANSWER("solo"),
-      ]),
-      user(CLAUDE_AGENT, "send-b", "u-bc", "2026-05-16T00:00:10Z"),
-      done(CLAUDE_AGENT, "send-b", "a-bc", "2026-05-16T00:00:11Z", "2026-05-16T00:00:13Z", [
-        ANSWER("alice"),
+      user(CLAUDE_AGENT, "send-1", "u-1", "2026-05-16T00:00:00Z"),
+      done(CLAUDE_AGENT, "send-1", "a-1", "2026-05-16T00:00:01Z", "2026-05-16T00:00:02Z", [
+        ANSWER("claude first"),
+        ANSWER("claude last"),
       ]),
     ];
     state.transcripts[CODEX_AGENT.id] = [
-      user(CODEX_AGENT, "send-b", "u-bx", "2026-05-16T00:00:10Z"),
-      done(CODEX_AGENT, "send-b", "a-bx", "2026-05-16T00:00:11Z", "2026-05-16T00:00:12Z", [
-        ANSWER("bob"),
+      user(CODEX_AGENT, "send-2", "u-2", "2026-05-16T00:00:09Z"),
+      done(CODEX_AGENT, "send-2", "a-2", "2026-05-16T00:00:10Z", "2026-05-16T00:00:11Z", [
+        ANSWER("codex first"),
+        ANSWER("codex last"),
       ]),
     ];
     setProjectCompact(PROJECT_ID, true);
@@ -2059,14 +2047,84 @@ describe("UnifiedTranscript compact mode", () => {
       props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] },
     });
 
-    for (const col of screen.getAllByTestId("fanout-column")) {
-      expect(toggleLabel(col)).toBe("Collapse"); // both latest columns expanded
-    }
-    const solo = agentTurns()[0]; // the one standalone (non-fan-out) agent turn
-    expect(toggleLabel(solo!)).toBe("Expand"); // older standalone collapsed
+    const [claudeTurn, codexTurn] = agentTurns();
+    expect(within(claudeTurn!).getByText("claude last")).toBeInTheDocument();
+    expect(within(claudeTurn!).queryByText("claude first")).toBeNull();
+    expect(within(codexTurn!).getByText("codex last")).toBeInTheDocument();
+    expect(within(codexTurn!).queryByText("codex first")).toBeNull();
   });
 
-  it("lets a manual toggle override the default for only that unit", async () => {
+  it("picks each agent's last-block response by completion recency, not rendered order", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    // send-a is anchored earlier (renders first) but finishes LAST (ended t5).
+    state.transcripts[CLAUDE_AGENT.id] = [
+      user(CLAUDE_AGENT, "send-a", "u-a", "2026-05-16T00:00:00Z"),
+      done(CLAUDE_AGENT, "send-a", "a-a", "2026-05-16T00:00:01Z", "2026-05-16T00:00:05Z", [
+        ANSWER("a first"),
+        ANSWER("a last"),
+      ]),
+      user(CLAUDE_AGENT, "send-b", "u-b", "2026-05-16T00:00:02Z"),
+      done(CLAUDE_AGENT, "send-b", "a-b", "2026-05-16T00:00:03Z", "2026-05-16T00:00:04Z", [
+        ANSWER("b first"),
+        ANSWER("b last"),
+      ]),
+    ];
+    setProjectCompact(PROJECT_ID, true);
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const [first, second] = agentTurns();
+    // send-a is the latest by recency → last-block (only its final block).
+    expect(within(first!).getByText("a last")).toBeInTheDocument();
+    expect(within(first!).queryByText("a first")).toBeNull();
+    // send-b is older → clipped preview (all its answer text).
+    expect(within(second!).getByText("b first")).toBeInTheDocument();
+    expect(within(second!).getByText("b last")).toBeInTheDocument();
+  });
+
+  it("renders each latest fan-out column as its last block", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    // Earlier standalone send, then a later fan-out (each agent's latest).
+    state.transcripts[CLAUDE_AGENT.id] = [
+      user(CLAUDE_AGENT, "send-a", "u-a", "2026-05-16T00:00:00Z"),
+      done(CLAUDE_AGENT, "send-a", "a-a", "2026-05-16T00:00:01Z", "2026-05-16T00:00:02Z", [
+        ANSWER("solo first"),
+        ANSWER("solo last"),
+      ]),
+      user(CLAUDE_AGENT, "send-b", "u-bc", "2026-05-16T00:00:10Z"),
+      done(CLAUDE_AGENT, "send-b", "a-bc", "2026-05-16T00:00:11Z", "2026-05-16T00:00:13Z", [
+        ANSWER("alice first"),
+        ANSWER("alice last"),
+      ]),
+    ];
+    state.transcripts[CODEX_AGENT.id] = [
+      user(CODEX_AGENT, "send-b", "u-bx", "2026-05-16T00:00:10Z"),
+      done(CODEX_AGENT, "send-b", "a-bx", "2026-05-16T00:00:11Z", "2026-05-16T00:00:12Z", [
+        ANSWER("bob first"),
+        ANSWER("bob last"),
+      ]),
+    ];
+    setProjectCompact(PROJECT_ID, true);
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] },
+    });
+
+    const [aliceCol, bobCol] = screen.getAllByTestId("fanout-column");
+    expect(within(aliceCol!).getByText("alice last")).toBeInTheDocument();
+    expect(within(aliceCol!).queryByText("alice first")).toBeNull();
+    expect(within(bobCol!).getByText("bob last")).toBeInTheDocument();
+    expect(within(bobCol!).queryByText("bob first")).toBeNull();
+    // Older standalone → clipped preview (all answer text).
+    const solo = agentTurns()[0];
+    expect(within(solo!).getByText("solo first")).toBeInTheDocument();
+    expect(within(solo!).getByText("solo last")).toBeInTheDocument();
+  });
+
+  it("lets a manual toggle expand only that unit", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     state.transcripts[CLAUDE_AGENT.id] = [
@@ -2088,11 +2146,14 @@ describe("UnifiedTranscript compact mode", () => {
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     const [a, b, c] = agentTurns();
+    // Everything is collapsed by default.
     expect(toggleLabel(a!)).toBe("Expand");
+    expect(toggleLabel(b!)).toBe("Expand");
+    expect(toggleLabel(c!)).toBe("Expand");
     await fireEvent.click(a!.querySelector('[data-testid="turn-preview-toggle"]')!);
     expect(toggleLabel(a!)).toBe("Collapse"); // now expanded
     expect(toggleLabel(b!)).toBe("Expand"); // unchanged
-    expect(toggleLabel(c!)).toBe("Collapse"); // still the latest, expanded
+    expect(toggleLabel(c!)).toBe("Expand"); // unchanged
   });
 
   it("renders no compact toggle on a queued row", async () => {
@@ -2428,11 +2489,11 @@ describe("UnifiedTranscript fan-out group control", () => {
     expect(groupToggle(group)).toBeInTheDocument();
   });
 
-  it("collapses all columns when any is expanded, and expands all when none is", async () => {
+  it("expands all columns when none is, and collapses all when any is", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     await state.registerAgent(CODEX_AGENT);
-    // A single fan-out (the latest completed set) → both columns start expanded.
+    // A single fan-out → both columns start collapsed (each agent's last block).
     state.transcripts[CLAUDE_AGENT.id] = [
       u(CLAUDE_AGENT, "send-f", "u-a", "2026-05-16T00:00:00Z"),
       a(CLAUDE_AGENT, "send-f", "a-a", "2026-05-16T00:00:01Z", "2026-05-16T00:00:03Z"),
@@ -2447,15 +2508,15 @@ describe("UnifiedTranscript fan-out group control", () => {
     });
 
     const group = screen.getByTestId("fanout-group");
-    expect(columnLabels(group)).toEqual(["Collapse", "Collapse"]); // both expanded
-    expect(groupToggle(group)).toHaveAttribute("aria-label", "Collapse all responses");
-
-    await fireEvent.click(groupToggle(group));
-    expect(columnLabels(group)).toEqual(["Expand", "Expand"]); // all collapsed
+    expect(columnLabels(group)).toEqual(["Expand", "Expand"]); // both collapsed
     expect(groupToggle(group)).toHaveAttribute("aria-label", "Expand all responses");
 
     await fireEvent.click(groupToggle(group));
-    expect(columnLabels(group)).toEqual(["Collapse", "Collapse"]); // all expanded again
+    expect(columnLabels(group)).toEqual(["Collapse", "Collapse"]); // all expanded
+    expect(groupToggle(group)).toHaveAttribute("aria-label", "Collapse all responses");
+
+    await fireEvent.click(groupToggle(group));
+    expect(columnLabels(group)).toEqual(["Expand", "Expand"]); // all collapsed again
   });
 
   it("affects only its own fan-out group", async () => {
@@ -2526,15 +2587,17 @@ describe("UnifiedTranscript fan-out group control", () => {
     });
 
     const group = screen.getByTestId("fanout-group");
-    await fireEvent.click(groupToggle(group)); // collapse both
-    expect(columnLabels(group)).toEqual(["Expand", "Expand"]);
+    expect(columnLabels(group)).toEqual(["Expand", "Expand"]); // both collapsed by default
+    await fireEvent.click(groupToggle(group)); // expand both
+    expect(columnLabels(group)).toEqual(["Collapse", "Collapse"]);
 
-    // Re-expand just the first column individually.
+    // Collapse just the first column individually — the group toggle wrote
+    // per-column overrides, so each column is still independently controllable.
     const firstColToggle = group
       .querySelectorAll('[data-testid="fanout-column"]')[0]!
       .querySelector('[data-testid="turn-preview-toggle"]')!;
     await fireEvent.click(firstColToggle);
-    expect(columnLabels(group)).toEqual(["Collapse", "Expand"]);
+    expect(columnLabels(group)).toEqual(["Expand", "Collapse"]);
   });
 });
 
@@ -2576,12 +2639,12 @@ describe("UnifiedTranscript terminal-response collapse", () => {
     // Previously a cancelled response had no toggle and never collapsed.
     const toggle = agentTurnEl().querySelector('[data-testid="turn-preview-toggle"]');
     expect(toggle).not.toBeNull();
-    expect(toggle).toHaveAttribute("aria-label", "Collapse"); // latest → expanded, but collapsible
+    expect(toggle).toHaveAttribute("aria-label", "Expand"); // collapsed by default (its last block)
     await fireEvent.click(toggle!);
     expect(agentTurnEl().querySelector('[data-testid="turn-preview-toggle"]')).toHaveAttribute(
       "aria-label",
-      "Expand",
-    ); // now collapsed
+      "Collapse",
+    ); // now expanded
   });
 
   it("collapses a dangling streaming-on-disk turn closed by an outcome marker", async () => {

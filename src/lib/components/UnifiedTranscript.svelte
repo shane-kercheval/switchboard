@@ -144,51 +144,49 @@
     return colRows.some((r) => r.kind === "agent" && r.turn.items.length > 0);
   }
 
-  /// Preview keys of the latest response set — the exception to compact mode that
-  /// stays expanded by default. Chosen by completion recency (`ended_at ??
-  /// started_at`) across all terminal agent turns, not rendered order, so a slow
-  /// earlier-anchored send that finishes last still wins. When the latest turn
-  /// belongs to a fan-out, every collapsible column in that group is included.
-  const latestExpandedKeys = $derived.by(() => {
+  /// The render key for a turn — matches the key its render site uses, so
+  /// `lastBlockKeys` membership lines up there. A turn whose send fans out
+  /// renders as a column (`fanout:…`); otherwise a standalone row.
+  function previewKeyForTurn(turn: AgentTurn): string {
+    if (
+      turn.send_id !== undefined &&
+      blocks.some((b) => b.kind === "fanout" && b.send_id === turn.send_id)
+    ) {
+      return `fanout:${turn.send_id}:${turn.agent_id}`;
+    }
+    return `agent:${turn.turn_id}`;
+  }
+
+  /// Preview keys of each agent's most-recent collapsible response. When compact,
+  /// these render the "last block" view — the final answer (the block the copy
+  /// button copies), in full, with tool calls and reasoning hidden — instead of
+  /// the height-clipped preview. Per agent and by recency (`ended_at ??
+  /// started_at`), so an agent's latest reply keeps this treatment even when
+  /// other agents' replies sit below it.
+  const lastBlockKeys = $derived.by(() => {
     // eslint-disable-next-line svelte/prefer-svelte-reactivity
-    const keys = new Set<string>();
-    let latest: AgentTurn | undefined;
-    let latestAt = "";
+    const latestPerAgent = new Map<string, { at: string; key: string }>();
     for (const row of rows) {
       if (row.kind !== "agent" || !isCollapsibleResponse(row.turn)) continue;
-      const at = row.turn.ended_at ?? row.turn.started_at;
-      if (latest === undefined || at.localeCompare(latestAt) > 0) {
-        latest = row.turn;
-        latestAt = at;
+      const turn = row.turn;
+      const at = turn.ended_at ?? turn.started_at;
+      const prev = latestPerAgent.get(turn.agent_id);
+      if (prev === undefined || at.localeCompare(prev.at) > 0) {
+        latestPerAgent.set(turn.agent_id, { at, key: previewKeyForTurn(turn) });
       }
     }
-    if (latest === undefined) return keys;
-    const group =
-      latest.send_id !== undefined
-        ? blocks.find((b) => b.kind === "fanout" && b.send_id === latest!.send_id)
-        : undefined;
-    if (group !== undefined && group.kind === "fanout") {
-      for (const col of group.columns) {
-        if (isCollapsibleColumn(col.rows)) keys.add(`fanout:${group.send_id}:${col.agent_id}`);
-      }
-    } else {
-      keys.add(`agent:${latest.turn_id}`);
-    }
+    // eslint-disable-next-line svelte/prefer-svelte-reactivity
+    const keys = new Set<string>();
+    for (const v of latestPerAgent.values()) keys.add(v.key);
     return keys;
   });
 
-  /// A unit's default compactness: compact when the mode is on, unless it is in
-  /// the latest-expanded set. User keys are never in that set, so user messages
-  /// simply follow the mode.
-  function defaultCompactFor(key: string): boolean {
-    return compactEnabled && !latestExpandedKeys.has(key);
-  }
-
-  /// Clip + bottom-fade for a compact completed unit. Absolute stops (not
-  /// percentages) so a short message that fits within the cap never fades. The
-  /// `-webkit-` mask is explicit because the app runs in WebKit (Tauri/macOS).
+  /// Clip + bottom-fade for a height-clipped preview. Absolute stops (not
+  /// percentages) so a short message never fades; the fade starts around the
+  /// halfway mark so "there's more below" is unmistakable. The `-webkit-` mask is
+  /// explicit because the app runs in WebKit (Tauri/macOS).
   const PREVIEW_CLIP =
-    "max-h-[7rem] overflow-hidden [mask-image:linear-gradient(to_bottom,black_5.5rem,transparent_7rem)] [-webkit-mask-image:linear-gradient(to_bottom,black_5.5rem,transparent_7rem)]";
+    "max-h-[14rem] overflow-hidden [mask-image:linear-gradient(to_bottom,black_7rem,transparent_14rem)] [-webkit-mask-image:linear-gradient(to_bottom,black_7rem,transparent_14rem)]";
 
   /// Shared footprint for the in-transcript meta-row icon buttons (preview
   /// toggle, fan-out toggle-all). Intentionally mirrors `CopyButton` — the
@@ -461,25 +459,48 @@
   {/each}
 {/snippet}
 
-{#snippet turnBody(turn: AgentTurn, live: boolean = true, compact: boolean = false)}
-  {#if compact}
-    <!-- Compact completed preview: only the answer prose renders (tool calls and
-         model reasoning are suppressed). A response that is all tools and no
-         answer shows a muted count placeholder so it isn't a blank preview. -->
+{#snippet hiddenToolsPlaceholder(turn: AgentTurn)}
+  {@const hiddenTools = turn.items.filter((i) => i.item_kind === "tool").length}
+  {#if hiddenTools > 0}
+    <div class="text-muted text-xs italic" data-testid="hidden-tools-placeholder">
+      {hiddenTools} hidden tool {hiddenTools === 1 ? "call" : "calls"}
+    </div>
+  {/if}
+{/snippet}
+
+<!-- `mode` selects how a response renders:
+     - `"full"` — everything (text, reasoning, tool calls); the streaming `live`
+       cap or the static completed view.
+     - `"answer"` — answer prose only, for the height-clipped preview of an older
+       response (tool calls + reasoning suppressed).
+     - `"last"` — the final answer block in full (what the copy button copies),
+       for an agent's most-recent response; tool calls + reasoning hidden, no clip.
+     `live` gates the streaming "Working…" footer (a fan-out column passes false
+     when an outcome marker has closed a streaming-on-disk turn). -->
+{#snippet turnBody(
+  turn: AgentTurn,
+  live: boolean = true,
+  mode: "full" | "answer" | "last" = "full",
+)}
+  {#if mode === "last"}
+    {@const answer = copyTextOf(turn, agentCopy.mode)}
+    {#if answer.length > 0}
+      <Markdown text={answer} />
+    {:else}
+      {@render hiddenToolsPlaceholder(turn)}
+    {/if}
+  {:else if mode === "answer"}
     {@const answerCount = turn.items.filter(
       (i) => i.item_kind === "text" && i.kind === "text",
     ).length}
-    {@const hiddenTools = turn.items.filter((i) => i.item_kind === "tool").length}
     {#if answerCount > 0}
       {#each turn.items as item, i (i)}
         {#if item.item_kind === "text" && item.kind === "text"}
           <Markdown text={item.text} />
         {/if}
       {/each}
-    {:else if hiddenTools > 0}
-      <div class="text-muted text-xs italic" data-testid="hidden-tools-placeholder">
-        {hiddenTools} hidden tool {hiddenTools === 1 ? "call" : "calls"}
-      </div>
+    {:else}
+      {@render hiddenToolsPlaceholder(turn)}
     {/if}
   {:else if turn.status === "streaming" && live}
     <!-- Live cap: streamed content scrolls inside a bounded region (so several
@@ -571,24 +592,26 @@
 
 {#snippet previewToggle(key: string, defaultCompact: boolean)}
   {@const compact = isCompact(projectId, key, defaultCompact)}
-  <Tooltip label={compact ? "Expand" : "Collapse"} side="bottom">
-    {#snippet trigger(props)}
-      <button
-        {...props}
-        type="button"
-        class={META_ICON_BUTTON}
-        data-testid="turn-preview-toggle"
-        aria-label={compact ? "Expand" : "Collapse"}
-        onclick={() => toggleKey(projectId, key, defaultCompact)}
-      >
-        {#if compact}
-          <ChevronDown class="h-4 w-4" aria-hidden="true" />
-        {:else}
-          <ChevronUp class="h-4 w-4" aria-hidden="true" />
-        {/if}
-      </button>
-    {/snippet}
-  </Tooltip>
+  {@const label = compact ? "Expand" : "Collapse"}
+  <!-- Always visible while collapsed (sits centered under the clip/last-block as
+       the "there's more" affordance); hover/focus-revealed once expanded. -->
+  <button
+    type="button"
+    class={cn(
+      "text-muted hover:text-fg hover:bg-border/60 inline-flex items-center gap-1 rounded-full border border-transparent px-2 py-0.5 text-xs transition-colors",
+      compact ? "opacity-100" : "opacity-0 group-focus-within:opacity-100 group-hover:opacity-100",
+    )}
+    data-testid="turn-preview-toggle"
+    aria-label={label}
+    onclick={() => toggleKey(projectId, key, defaultCompact)}
+  >
+    {#if compact}
+      <ChevronDown class="h-3.5 w-3.5" aria-hidden="true" />
+    {:else}
+      <ChevronUp class="h-3.5 w-3.5" aria-hidden="true" />
+    {/if}
+    <span>{label}</span>
+  </button>
 {/snippet}
 
 <!-- Group control for a fan-out: collapses all its response columns when any is
@@ -596,7 +619,7 @@
      can still be toggled individually afterwards) and only touches this group's
      columns. -->
 {#snippet fanoutToggleAll(keys: string[])}
-  {@const anyExpanded = keys.some((k) => !isCompact(projectId, k, defaultCompactFor(k)))}
+  {@const anyExpanded = keys.some((k) => !isCompact(projectId, k, compactEnabled))}
   {@const label = anyExpanded ? "Collapse all responses" : "Expand all responses"}
   <Tooltip {label} side="bottom">
     {#snippet trigger(props)}
@@ -633,12 +656,12 @@
   previewKey: string | undefined = undefined,
   previewDefaultCompact: boolean = false,
 )}
-  <!-- `justify-between` pins the always-visible spend group to the LEFT and the
-       hover-revealed timestamp/copy to the RIGHT. The left group is always
-       rendered (empty when not real-spend) so a no-spend row still keeps
-       timestamp/copy right-aligned — and the spend never floats mid-row when
-       nothing is hovered. -->
-  <div class={`${mt} flex items-center justify-between gap-2`} data-testid="message-meta">
+  <!-- Three zones: spend pinned LEFT (always visible), the preview toggle
+       CENTERED (the per-message expand/collapse affordance), and the
+       hover-revealed model/timestamp/copy pinned RIGHT. The left/right zones are
+       `flex-1` so the toggle stays centered under the message regardless of how
+       much each side holds. -->
+  <div class={`${mt} flex items-center gap-2`} data-testid="message-meta">
     <!-- Left: cost + overage marker, always visible. Two distinct gates (no
          `match harness`): the **cost** shows on `spend.real_spend` (the turn
          cost real money — for subscription Claude that's overage, since
@@ -647,7 +670,7 @@
          a future pay-per-use harness would set `real_spend` without `is_overage`
          → cost shows, marker correctly stays hidden. Caller passes `spend`/
          `costUsd` only at agent-turn sites; a real-money signal isn't hover-hidden. -->
-    <div class="flex items-center gap-2">
+    <div class="flex flex-1 items-center gap-2">
       {#if spend?.is_overage}
         <span
           class="text-warning text-xs"
@@ -661,12 +684,18 @@
         <span class="text-muted text-xs" data-testid="message-cost">${costUsd.toFixed(4)}</span>
       {/if}
     </div>
+    <!-- Center: per-message expand/collapse. -->
+    <div class="flex shrink-0 items-center justify-center">
+      {#if previewKey !== undefined}
+        {@render previewToggle(previewKey, previewDefaultCompact)}
+      {/if}
+    </div>
     <!-- Right: per-turn model/effort (history — what this turn actually ran on,
          resolved id and all), timestamp, and copy. All hover/focus-revealed and
          subtle; the model/effort here are runtime history, distinct from the
          sidebar's selected-intent value. -->
     <div
-      class="flex items-center gap-2 opacity-0 group-focus-within:opacity-100 group-hover:opacity-100"
+      class="flex flex-1 items-center justify-end gap-2 opacity-0 group-focus-within:opacity-100 group-hover:opacity-100"
     >
       {#if model}
         <span class="text-muted text-xs" data-testid="message-model">{model}</span>
@@ -681,9 +710,6 @@
       {/if}
       {#if copyable}
         <CopyButton text={copyable} {label} testid="message-copy" />
-      {/if}
-      {#if previewKey !== undefined}
-        {@render previewToggle(previewKey, previewDefaultCompact)}
       {/if}
     </div>
   </div>
@@ -731,7 +757,7 @@
 
 {#snippet userMessage(row: Extract<UnifiedRow, { kind: "user" }>)}
   {@const key = `user:${row.key}`}
-  {@const defaultCompact = defaultCompactFor(key)}
+  {@const defaultCompact = compactEnabled}
   <div class="group min-w-0 flex-1" data-testid="turn" data-role="user">
     <div class="-mx-3 rounded-md bg-blue-100/20 px-3 py-2">
       <!-- Clip wraps the content inside the bubble (not the bubble itself) so the
@@ -810,8 +836,9 @@
        a genuinely-live streaming turn is excluded — it uses M3's live cap. -->
   {@const previewEligible = isCollapsibleResponse(turn)}
   {@const key = `agent:${turn.turn_id}`}
-  {@const defaultCompact = defaultCompactFor(key)}
+  {@const defaultCompact = compactEnabled}
   {@const compact = previewEligible && isCompact(projectId, key, defaultCompact)}
+  {@const lastBlock = lastBlockKeys.has(key)}
   <div class="group space-y-1.5" data-testid="turn" data-role="agent">
     <div class="flex items-center gap-2 text-xs font-semibold tracking-wide uppercase">
       <span class="text-fg" data-testid="turn-agent-name">{agentName(turn.agent_id)}</span>
@@ -822,8 +849,10 @@
       style:border-left-color={agentBorderColor(turn.agent_id)}
     >
       {#if !ownedByOutcome}{@render turnStatusLabel(turn.status)}{/if}
-      {#if compact}
-        <div class={cn("space-y-1.5", PREVIEW_CLIP)}>{@render turnBody(turn, false, true)}</div>
+      {#if compact && lastBlock}
+        {@render turnBody(turn, false, "last")}
+      {:else if compact}
+        <div class={cn("space-y-1.5", PREVIEW_CLIP)}>{@render turnBody(turn, false, "answer")}</div>
       {:else}
         {@render turnBody(turn, !ownedByOutcome)}
       {/if}
@@ -933,8 +962,9 @@
                 {@const colHasOutcome = col.rows.some((r) => r.kind === "outcome")}
                 {@const colKey = `fanout:${block.send_id}:${col.agent_id}`}
                 {@const colEligible = isCollapsibleColumn(col.rows)}
-                {@const colDefaultCompact = defaultCompactFor(colKey)}
+                {@const colDefaultCompact = compactEnabled}
                 {@const colCompact = colEligible && isCompact(projectId, colKey, colDefaultCompact)}
+                {@const colLastBlock = lastBlockKeys.has(colKey)}
                 <div
                   class="group space-y-1.5"
                   data-testid="fanout-column"
@@ -975,11 +1005,17 @@
                           {#if r.reason}<span class="text-muted text-xs"> — {r.reason}</span>{/if}
                         {/if}
                       {/each}
-                      <div class={cn("space-y-1.5", PREVIEW_CLIP)}>
+                      {#if colLastBlock}
                         {#each col.rows as r (r.key)}
-                          {#if r.kind === "agent"}{@render turnBody(r.turn, false, true)}{/if}
+                          {#if r.kind === "agent"}{@render turnBody(r.turn, false, "last")}{/if}
                         {/each}
-                      </div>
+                      {:else}
+                        <div class={cn("space-y-1.5", PREVIEW_CLIP)}>
+                          {#each col.rows as r (r.key)}
+                            {#if r.kind === "agent"}{@render turnBody(r.turn, false, "answer")}{/if}
+                          {/each}
+                        </div>
+                      {/if}
                     {:else}
                       {#each col.rows as r (r.key)}
                         {#if r.kind === "agent"}

@@ -228,6 +228,111 @@ describe("ComposeBar", () => {
     expect(textarea.value).toBe("ping ");
   });
 
+  it("@ menu opens for an @ token in the middle of a message and splices the mention at the caret", async () => {
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "search_project_files") return ["docs/bob.md"];
+      return null;
+    });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    // "@bo" sits in the middle, with text after it; caret right after "@bo".
+    textarea.value = "ping @bo world";
+    textarea.setSelectionRange(8, 8);
+    await fireEvent.input(textarea);
+
+    // The menu opens for the mid-message token (the bug: it only opened at the
+    // end of the text before this fix).
+    await screen.findByTestId(`recipient-option-${AGENT_B.id}`);
+
+    // Picking a file mention splices at the caret and preserves the trailing text.
+    await fireEvent.click(await screen.findByTestId("file-option-docs/bob.md"));
+    await waitFor(() => expect(textarea.value).toBe("ping `docs/bob.md` world"));
+  });
+
+  it("picks the menu's token even when the caret moved off it (arrow keys) while open", async () => {
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "search_project_files") return ["docs/bob.md"];
+      return null;
+    });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    textarea.value = "ping @bo world";
+    textarea.setSelectionRange(8, 8);
+    await fireEvent.input(textarea);
+    await screen.findByTestId("file-option-docs/bob.md");
+
+    // Simulate ArrowLeft moving the caret into the middle of the token while the
+    // menu stays open. The pick must still splice the captured token, not the
+    // moved caret — otherwise the draft is corrupted (the regression this guards).
+    textarea.setSelectionRange(7, 7);
+    await fireEvent.keyDown(textarea, { key: "ArrowLeft" });
+    await fireEvent.click(screen.getByTestId("file-option-docs/bob.md"));
+    await waitFor(() => expect(textarea.value).toBe("ping `docs/bob.md` world"));
+  });
+
+  it("stripping a recipient @token mid-message collapses the redundant space", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    textarea.value = "ping @bob world";
+    textarea.setSelectionRange(9, 9); // caret right after "@bob"
+    await fireEvent.input(textarea);
+
+    await fireEvent.click(await screen.findByTestId(`recipient-option-${AGENT_B.id}`));
+    await waitFor(() => expect(textarea.value).toBe("ping world"));
+    expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "true");
+  });
+
+  it("adds a trailing space when a mid-message mention is not already followed by one", async () => {
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "search_project_files") return ["docs/bob.md"];
+      return null;
+    });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    // Caret after "@bo", immediately followed by "hi" (no space) → mention gets one.
+    textarea.value = "ping @bohi";
+    textarea.setSelectionRange(8, 8);
+    await fireEvent.input(textarea);
+
+    await fireEvent.click(await screen.findByTestId("file-option-docs/bob.md"));
+    await waitFor(() => expect(textarea.value).toBe("ping `docs/bob.md` hi"));
+  });
+
+  it("a non-collapsed selection does not open the @ menu", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    textarea.value = "ping @bo world";
+    textarea.setSelectionRange(5, 8); // selection spanning "@bo", not a typing caret
+    await fireEvent.input(textarea);
+    await tick();
+    expect(screen.queryByTestId("recipient-menu")).toBeNull();
+  });
+
   it("@ menu includes already-selected agents because picking one makes it the sole recipient", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);

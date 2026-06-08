@@ -38,7 +38,7 @@
   import { basename, cn, currentIsoTimestamp } from "$lib/utils";
   import { shortcut } from "$lib/platform";
   import { isEditableShortcutTarget } from "$lib/keyboard";
-  import { onDestroy, onMount, untrack } from "svelte";
+  import { onDestroy, onMount, tick, untrack } from "svelte";
   import { listen } from "@tauri-apps/api/event";
 
   let {
@@ -416,6 +416,11 @@
   // Non-reactive cancellation state: it only invalidates pending async file searches.
   let fileSearchToken = 0;
   let fileSearchTimer: ReturnType<typeof setTimeout> | undefined = undefined;
+  // The `@token` span the open menu is showing, captured at detection time so a
+  // pick splices exactly what the menu offered — not whatever the live caret
+  // points at (arrow keys can move the caret out of the token while the menu
+  // stays open). Non-reactive: only read at pick time. `null` when no menu.
+  let menuTokenSpan: { start: number; end: number } | null = null;
   let highlighted = $state(0);
   const AT_TOKEN = /(^|\s)@([^\s]*)$/;
   const FILE_MATCH_LIMIT = 12;
@@ -573,8 +578,38 @@
     return i > 0 ? trimmed.slice(0, i) : null;
   }
 
+  /// Replace the active `@token` (at the caret, anywhere in the text) with
+  /// `insert`, fixing up spacing and moving the caret to just after the inserted
+  /// text. `insert === ""` strips the token (recipient picks); a non-empty
+  /// `insert` is a mention and gets exactly one trailing space before any
+  /// following word. No-op if there's no active token (e.g. the caret moved away
+  /// before the pick landed).
+  function replaceAtToken(insert: string): void {
+    const span = menuTokenSpan;
+    if (span === null) return;
+    // Splice the span the menu actually captured, but only if the text there
+    // still spells `@<menuQuery>` — guards against the caret/text drifting out
+    // from under the open menu (e.g. arrow keys) producing a garbled splice.
+    if (draft.slice(span.start, span.end) !== `@${menuQuery}`) return;
+    const before = draft.slice(0, span.start);
+    let after = draft.slice(span.end);
+    let text = insert;
+    if (insert === "") {
+      // Removing a token that sat between two spaces would leave a double space.
+      if (/\s$/.test(before) && /^\s/.test(after)) after = after.slice(1);
+    } else if (after.length === 0 || !/^\s/.test(after)) {
+      text = `${insert} `;
+    }
+    draft = `${before}${text}${after}`;
+    const caret = before.length + text.length;
+    void tick().then(() => {
+      textareaEl?.focus();
+      textareaEl?.setSelectionRange(caret, caret);
+    });
+  }
+
   function stripAtToken(): void {
-    draft = draft.replace(AT_TOKEN, "$1");
+    replaceAtToken("");
   }
 
   function markdownCodeSpan(text: string): string {
@@ -588,9 +623,7 @@
   }
 
   function insertFileMention(path: string): void {
-    draft = draft.replace(AT_TOKEN, (_match, prefix: string) => {
-      return `${prefix}${markdownCodeSpan(path)} `;
-    });
+    replaceAtToken(markdownCodeSpan(path));
   }
 
   function pickItem(item: MenuItem): void {
@@ -632,6 +665,7 @@
 
   function closeMentionMenu(): void {
     menuOpen = false;
+    menuTokenSpan = null;
     fileMatches = [];
     fileSearchState = "idle";
     clearFileSearchTimer();
@@ -664,12 +698,20 @@
     }
   }
 
-  function activeAtToken(text: string): { query: string } | null {
-    const match = AT_TOKEN.exec(text);
+  /// The `@token` immediately to the left of the caret, or `null`. Caret-aware
+  /// (not anchored to end-of-text) so `@` works in the middle of a message: the
+  /// token is `@` + non-whitespace chars ending exactly at the caret, with the
+  /// `@` at the start of the text or after whitespace. `start` is the `@`'s
+  /// index; `end` is the caret. A non-collapsed selection isn't a typing caret,
+  /// so it yields `null`.
+  function activeAtToken(): { query: string; start: number; end: number } | null {
+    const el = textareaEl;
+    if (el !== undefined && el.selectionStart !== el.selectionEnd) return null;
+    const caret = el?.selectionStart ?? draft.length;
+    const match = AT_TOKEN.exec(draft.slice(0, caret));
     if (!match) return null;
-    return {
-      query: match[2] ?? "",
-    };
+    const query = match[2] ?? "";
+    return { query, start: caret - query.length - 1, end: caret };
   }
 
   $effect(() => {
@@ -700,7 +742,7 @@
   });
 
   function onInput(): void {
-    const token = activeAtToken(draft);
+    const token = activeAtToken();
     const hasAtToken = token !== null;
     const hasRecipientOptions = agents.length > 1;
     const hasAttachments = attachmentChips.length > 0;
@@ -710,6 +752,7 @@
     if (token !== null && shouldOpenMenu) {
       promptMenuOpen = false;
       menuQuery = token.query;
+      menuTokenSpan = { start: token.start, end: token.end };
       menuOpen = true;
       if (shouldSearchFiles) {
         const q = token.query.toLowerCase();

@@ -311,6 +311,9 @@ async fn run_producer(
                             usage: None,
                             context_window_source: None,
                             stable_message_id: None,
+                            first_message_id: parser_state
+                                .first_assistant_message_id()
+                                .map(str::to_owned),
                             spend: None,
                             model: None,
                             effort: None,
@@ -351,6 +354,7 @@ async fn run_producer(
                     usage: None,
                     context_window_source: None,
                     stable_message_id: None,
+                    first_message_id: parser_state.first_assistant_message_id().map(str::to_owned),
                     spend: None,
                     model: None,
                     effort: None,
@@ -381,7 +385,11 @@ async fn run_producer(
     // failure message includes the tail of stderr so the consumer can see
     // why the subprocess exited silently (auth error, flag rejection, etc.).
     if !terminal_seen {
-        let _ = tx.send(synthesize_truncation_turn_end(turn_id, &stderr_tail));
+        let _ = tx.send(synthesize_truncation_turn_end(
+            turn_id,
+            &stderr_tail,
+            parser_state.first_assistant_message_id().map(str::to_owned),
+        ));
     }
 
     // Reap subprocess. If the parser observed Completed but the exit code is
@@ -414,6 +422,7 @@ async fn run_producer(
 fn synthesize_truncation_turn_end(
     turn_id: TurnId,
     stderr_tail: &Mutex<VecDeque<String>>,
+    first_message_id: Option<String>,
 ) -> AdapterEvent {
     let stderr_msg = crate::subprocess::format_stderr_tail(stderr_tail);
     let message = if stderr_msg.is_empty() {
@@ -431,6 +440,9 @@ fn synthesize_truncation_turn_end(
         usage: None,
         context_window_source: None,
         stable_message_id: None,
+        // Carry the dedup identity if the turn produced any assistant message
+        // before crashing — so its `Failed` row matches the on-disk copy.
+        first_message_id,
         spend: None,
         model: None,
         effort: None,
@@ -702,6 +714,36 @@ mod tests {
             !args.contains(&"--session-id".to_owned()),
             "must not pass --session-id when the session already exists"
         );
+    }
+
+    #[test]
+    fn synthesized_truncation_carries_dedup_identity_when_present() {
+        // A crash mid-turn must still tag its `Failed` TurnEnd with the dedup
+        // identity (the first assistant message id seen before the crash) so it
+        // collapses against the on-disk copy instead of rendering a duplicate.
+        let stderr: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+        let turn_id = Uuid::now_v7();
+
+        let with_id =
+            synthesize_truncation_turn_end(turn_id, &stderr, Some("msg_first".to_owned()));
+        match with_id {
+            AdapterEvent::TurnEnd {
+                outcome: TurnOutcome::Failed { .. },
+                first_message_id,
+                ..
+            } => assert_eq!(first_message_id.as_deref(), Some("msg_first")),
+            other => panic!("expected Failed TurnEnd, got {other:?}"),
+        }
+
+        // No assistant message before the crash → no identity (dedup falls back
+        // to turn_id, as before).
+        let without_id = synthesize_truncation_turn_end(turn_id, &stderr, None);
+        match without_id {
+            AdapterEvent::TurnEnd {
+                first_message_id, ..
+            } => assert_eq!(first_message_id, None),
+            other => panic!("expected TurnEnd, got {other:?}"),
+        }
     }
 
     #[test]

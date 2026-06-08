@@ -85,6 +85,20 @@ async function openProjectActions(index = 0): Promise<HTMLElement> {
   return menu;
 }
 
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T | PromiseLike<T>) => void;
+  reject: (reason?: unknown) => void;
+} {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 const noopProps = {
   onAddProject: () => {},
   onOpenSettings: () => {},
@@ -115,7 +129,7 @@ async function seedBusyProject(projectId: string): Promise<void> {
   const a = agent(AGENT_1, projectId);
   ws.agentsByProject[projectId] = [a];
   await state.registerAgent(a);
-  state.dispatchUserTurn(AGENT_1, "user-1", "go", "send-1", "2026-05-16T00:00:00Z");
+  state.dispatchUserTurn(AGENT_1, "user-1", "go", [], "send-1", "2026-05-16T00:00:00Z");
 }
 
 describe("ProjectsSidebar — background activity", () => {
@@ -175,7 +189,7 @@ describe("ProjectsSidebar — background activity", () => {
     const a = agent(AGENT_1, PROJECT_1);
     ws.agentsByProject[PROJECT_1] = [a];
     await state.registerAgent(a);
-    state.dispatchUserTurn(AGENT_1, "user-1", "go", "send-1", background.last_activity);
+    state.dispatchUserTurn(AGENT_1, "user-1", "go", [], "send-1", background.last_activity);
     ws.selection.activeProjectId = PROJECT_2;
 
     await startActivityObserver();
@@ -626,7 +640,24 @@ describe("ProjectsSidebar — delete", () => {
 
     expect(screen.getByTestId("project-action-delete")).toHaveAttribute(
       "title",
-      "Removes Switchboard's files for this project; your code and agent session files are kept.",
+      "Removes Switchboard's files for this project; your code and agent session files are kept. Works even if the project's folder no longer exists.",
+    );
+  });
+
+  it("allows deleting an unavailable project (folder gone)", async () => {
+    const unavailable: ProjectListing = { ...projectIn(A1, "alpha", "/work/a"), available: false };
+    await renderWith([unavailable]);
+    await openProjectActions();
+
+    // Delete is actionable even though the project's directory is gone — it's
+    // the only way to clear a stale unavailable row.
+    const del = screen.getByTestId("project-action-delete");
+    expect(del).not.toHaveAttribute("aria-disabled", "true");
+
+    await fireEvent.click(del);
+    await fireEvent.click(screen.getByTestId("project-delete-confirm"));
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.some((c) => c[0] === "delete_project")).toBe(true),
     );
   });
 });
@@ -634,6 +665,68 @@ describe("ProjectsSidebar — delete", () => {
 describe("ProjectsSidebar — Git navigation", () => {
   const G1 = "00000000-0000-7000-8000-0000000000d1";
   const G2 = "00000000-0000-7000-8000-0000000000d2";
+
+  it("opens a project directory in editor, terminal, or Finder from the actions menu", async () => {
+    await renderWith([projectIn(G1, "alpha", "/work/a")]);
+
+    const menu = await openProjectActions();
+    expect(
+      Array.from(menu.querySelectorAll('[role="menuitem"]')).map((item) =>
+        item.textContent?.trim(),
+      ),
+    ).toEqual([
+      "Show in Git view",
+      "Open in editor",
+      "Open in terminal",
+      "Reveal in Finder",
+      "Archive project",
+      "Delete project",
+    ]);
+    await fireEvent.click(screen.getByTestId("project-action-editor"));
+    expect(invokeMock).toHaveBeenCalledWith("open_in_editor", { path: "/work/a" });
+
+    await openProjectActions();
+    await fireEvent.click(screen.getByTestId("project-action-terminal"));
+    expect(invokeMock).toHaveBeenCalledWith("open_in_terminal", { path: "/work/a" });
+
+    await openProjectActions();
+    await fireEvent.click(screen.getByTestId("project-action-reveal"));
+    expect(invokeMock).toHaveBeenCalledWith("reveal_in_finder", { path: "/work/a" });
+  });
+
+  it("reports project open action failures", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "open_in_editor") throw new Error("editor missing");
+      return undefined;
+    });
+    await renderWith([projectIn(G1, "alpha", "/work/a")]);
+
+    await openProjectActions();
+    await fireEvent.click(screen.getByTestId("project-action-editor"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("project-open-error")).toHaveTextContent("editor missing"),
+    );
+  });
+
+  it("ignores stale project open action failures after a newer action succeeds", async () => {
+    const editor = deferred<unknown>();
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "open_in_editor") return editor.promise;
+      return Promise.resolve(undefined);
+    });
+    await renderWith([projectIn(G1, "alpha", "/work/a")]);
+
+    await openProjectActions();
+    await fireEvent.click(screen.getByTestId("project-action-editor"));
+    await openProjectActions();
+    await fireEvent.click(screen.getByTestId("project-action-reveal"));
+
+    editor.reject(new Error("editor missing"));
+    await tick();
+
+    expect(screen.queryByTestId("project-open-error")).not.toBeInTheDocument();
+  });
 
   it("show git action reveals the project's linked branch", async () => {
     await renderWith([projectIn(G1, "alpha", "/work/a")]);
@@ -752,7 +845,7 @@ describe("ProjectsSidebar — archive + view toggle", () => {
     });
   });
 
-  it("on an unavailable row Archive stays enabled and Delete is disabled", async () => {
+  it("on an unavailable row both Archive and Delete stay enabled", async () => {
     await renderWith([{ ...projectIn(A1, "alpha", "/work/a"), available: false }]);
 
     await openProjectActions();
@@ -760,7 +853,12 @@ describe("ProjectsSidebar — archive + view toggle", () => {
       "aria-disabled",
       "true",
     );
-    expect(screen.getByTestId("project-action-delete")).toHaveAttribute("aria-disabled", "true");
+    // Delete must work for unavailable rows — it's the only way to clear a
+    // project whose folder no longer exists.
+    expect(screen.getByTestId("project-action-delete")).not.toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
   });
 });
 

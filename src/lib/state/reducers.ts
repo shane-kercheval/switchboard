@@ -34,6 +34,7 @@
 
 import type {
   AgentId,
+  Attachment,
   FailureKind,
   LoadedTurn,
   LoadedTurnItem,
@@ -54,6 +55,11 @@ export function transcriptReducer(
   // (popped from the agent's pending-send FIFO). Stamped onto the new agent
   // turn so a fan-out's live responses group like its historical ones.
   sendId?: SendId,
+  // The agent's currently in-flight turn_id (from runtime), supplied so the
+  // `hydrate` merge never supersedes an actively-streaming live turn with a disk
+  // re-read once that turn carries an early `hydration_key`. See
+  // `resolveTurnCollision`'s `protectedTurnId`.
+  inFlightTurnId?: TurnId,
 ): Turn[] {
   switch (input.type) {
     case "turn_start": {
@@ -75,6 +81,38 @@ export function transcriptReducer(
           items: [],
         },
       ];
+    }
+
+    case "turn_identity": {
+      // The live turn's dedup identity, stamped **early** (first assistant
+      // message) so a concurrent disk re-read collapses against it instead of
+      // duplicating. Two steps:
+      //   1. Stamp `hydration_key` onto the live turn (idempotent on re-delivery).
+      //   2. Reconcile: collapse any OTHER resident that already carries this key
+      //      — a disk copy a refresh inserted before this event landed — INTO the
+      //      live turn, which is `protectedTurnId` (`input.turn_id`) so it always
+      //      survives, absorbing the disk copy's fields.
+      // A stray event (unknown turn_id) is a no-op; absent entirely, dedup falls
+      // back to the `turn_end` stamp (graceful degradation to the turn-end key).
+      const existing = findTurn(turns, input.turn_id);
+      if (existing === undefined || existing.role !== "agent") return turns;
+      const key = input.hydration_key;
+      const liveStamped: AgentTurn =
+        existing.hydration_key === undefined ? { ...existing, hydration_key: key } : existing;
+
+      let live = liveStamped;
+      const collapsed = new Set<TurnId>();
+      for (const t of turns) {
+        if (t.turn_id === input.turn_id || t.role !== "agent") continue;
+        if (t.hydration_key === key) {
+          live = resolveTurnCollision(live, t, input.turn_id);
+          collapsed.add(t.turn_id);
+        }
+      }
+      if (liveStamped === existing && collapsed.size === 0) return turns;
+      return turns
+        .filter((t) => !collapsed.has(t.turn_id))
+        .map((t) => (t.turn_id === input.turn_id ? live : t));
     }
 
     case "message_cancelled": {
@@ -215,9 +253,15 @@ export function transcriptReducer(
       if (existing.status !== "streaming") return turns;
       // Stamp the live-matched hydration key (Claude only) onto the completing
       // turn so a later disk re-read of the same turn dedups against it instead
-      // of appending a second copy (see the `hydrate` merge). `undefined` for
-      // harnesses whose live stream carries no disk-matching id.
-      const hydration_key = input.hydration_key ?? undefined;
+      // of appending a second copy (see the `hydrate` merge). **Preserve an
+      // early key when the terminal carries none**: an in-flight turn may
+      // already hold a `hydration_key` from the `turn_identity` event, and a
+      // *synthesized* terminal (a cancelled turn's `TurnEnd`, built by the
+      // dispatcher) carries `hydration_key: None` — clearing it would leave the
+      // cancelled turn keyless and duplicate it against its keyed disk copy. For
+      // parser-emitted terminals `input.hydration_key` is present and equals the
+      // early key, so this is a no-op there.
+      const hydration_key = input.hydration_key ?? existing.hydration_key;
       const baseUpdate = {
         ...existing,
         ended_at: input.ended_at,
@@ -254,27 +298,53 @@ export function transcriptReducer(
       // one, falling back to `turn_id` for keyless turns. Keying on `turn_id`
       // alone is unsafe for re-reads: a parser mints a *fresh* `turn_id` every
       // parse, so the same on-disk turn would look new on a second read and
-      // duplicate — the stable key is parse-invariant and recognizes it. Live
-      // in-flight turns take precedence: a disk turn whose key (or turn_id)
-      // matches one already in the slice is dropped, never overwriting the live
-      // one. Order: deduped disk turns first, then the pre-existing live turns.
+      // duplicate — the stable key is parse-invariant and recognizes it.
       //
-      // **Scope of the no-duplicate guarantee: keyed AGENT turns only.** Only
-      // agent turns from key-bearing harnesses carry a `hydration_key`; user
-      // turns (and keyless harnesses) fall back to `turn_id`, which is fresh per
-      // parse — so re-reading them over an already-populated slice would NOT
-      // dedup. This path is safe today because user content reaching a slice is
-      // applied once. A future re-read of an already-loaded file must therefore
-      // re-merge only agent turns here; user content stays owned by the journal
-      // overlay (which is replaced wholesale, so it is dup-safe) and must not be
-      // re-merged into a per-agent slice.
+      // **Collision handling is upsert-by-precedence, not first-write-wins.**
+      // When a disk turn collides with a resident:
+      //   - **Real `hydration_key` match** (both AGENT turns carry the same key):
+      //     resolve by terminality (`resolveTurnCollision`). A terminal disk turn
+      //     *supersedes* a still-`streaming` resident — this is the stranded
+      //     mid-flight partial (e.g. a switch-back/reopen re-read that caught the
+      //     turn before it finished) being replaced by its completed copy; the
+      //     resident's live-only fields are merged in. Otherwise the resident is
+      //     kept. This is what makes the merge converge instead of stacking a
+      //     "complete-looking turn with a spinning tool."
+      //   - **`turn_id` fallback match** (either side lacks a key): keep the
+      //     resident, drop the disk turn. This is the "don't clobber a live
+      //     in-flight turn" path — a live turn has *no* `hydration_key` until it
+      //     ends, so it only ever matches via `turn_id`. Superseding it would
+      //     also change its `turn_id` and orphan its still-arriving live events.
+      //
+      // **Scope: keyed AGENT turns only.** User turns (and keyless harnesses)
+      // fall back to `turn_id`, fresh per parse, so they never dedup across
+      // re-reads — user content stays owned by the journal overlay (replaced
+      // wholesale, dup-safe) and must not be re-merged into a per-agent slice.
       const dedupKey = (t: { hydration_key?: string | null; turn_id: TurnId }): string =>
         t.hydration_key ?? t.turn_id;
-      const existingKeys = new Set(turns.map(dedupKey));
-      const fromDisk = input.turns
-        .map(loadedTurnToTurn)
-        .filter((t) => !existingKeys.has(dedupKey(t)));
-      return [...fromDisk, ...turns];
+      const residentByKey = new Map(turns.map((t) => [dedupKey(t), t]));
+      const disk = input.turns.map(loadedTurnToTurn);
+
+      // Resident replacements (in place, preserving order) for key-matched
+      // collisions; brand-new disk turns are prepended (disk-order, as before).
+      const replacements = new Map<string, Turn>();
+      const fresh: Turn[] = [];
+      for (const d of disk) {
+        const resident = residentByKey.get(dedupKey(d));
+        if (resident === undefined) {
+          fresh.push(d);
+        } else if (
+          d.role === "agent" &&
+          resident.role === "agent" &&
+          d.hydration_key !== undefined &&
+          d.hydration_key === resident.hydration_key
+        ) {
+          replacements.set(dedupKey(d), resolveTurnCollision(resident, d, inFlightTurnId));
+        }
+        // else: turn_id-fallback collision → keep the resident, drop `d`.
+      }
+      const merged = turns.map((t) => replacements.get(dedupKey(t)) ?? t);
+      return [...fresh, ...merged];
     }
 
     // Agent-scoped events (rate_limit_event, session_meta, agent_idle),
@@ -298,6 +368,68 @@ function stopPendingTools(
     if (item.completed_at !== undefined) return item;
     return { ...item, stopped_at: stoppedAt, stop_reason: stopReason };
   });
+}
+
+type AgentTurn = Extract<Turn, { role: "agent" }>;
+
+/// Resolve two agent turns that share a dedup identity into the single turn to
+/// keep. **Precedence: a finished turn supersedes a still-`streaming` one.**
+/// `incoming` wins only when `existing` is `streaming` and `incoming` is
+/// terminal (complete/failed/cancelled); otherwise `existing` wins (ties and
+/// "don't clobber a more-complete resident"). The survivor absorbs the loser's
+/// **live-only fields** — the optional enrichments a disk parse can't recover
+/// (cost/overage `spend`, the `usage` window, model/effort, failure detail) —
+/// so superseding a partial never blanks a field the loser already had. Content
+/// (`items`, `status`, `turn_id`, timestamps) always comes from the winner.
+///
+/// `protectedTurnId`, when given, is the turn_id of the **actively-streaming
+/// live turn** — it is never the loser, even against a terminal incoming. This
+/// is load-bearing once a live turn carries a `hydration_key` while streaming
+/// (the early `turn_identity` stamp): without it, a terminal disk re-read could
+/// key-match the active turn and supersede it here, changing its `turn_id` and
+/// orphaning its still-arriving events (the unknown-`turn_id` guards drop them).
+/// Status alone can't tell a *stranded disk partial* (safe to supersede) from an
+/// *active live turn* (must not be) — both are `streaming` — so the caller
+/// supplies the in-flight turn_id. Omit it (the hydrate path with no live turn,
+/// or pre-stamp) for pure terminality precedence.
+function resolveTurnCollision(
+  existing: AgentTurn,
+  incoming: AgentTurn,
+  protectedTurnId?: TurnId,
+): AgentTurn {
+  let incomingSupersedes: boolean;
+  if (existing.turn_id === protectedTurnId) {
+    incomingSupersedes = false;
+  } else if (incoming.turn_id === protectedTurnId) {
+    incomingSupersedes = true;
+  } else {
+    incomingSupersedes = existing.status === "streaming" && incoming.status !== "streaming";
+  }
+  const [winner, loser] = incomingSupersedes ? [incoming, existing] : [existing, incoming];
+  // Note: when a protected *streaming* live turn wins over a *terminal* loser,
+  // it absorbs the loser's `ended_at` (and usage/spend) while keeping
+  // `status: "streaming"` — so a streaming turn can briefly carry an `ended_at`.
+  // This is load-bearing: completion must be read from `status`, never from
+  // `ended_at` being set. (`turn_end` overwrites all of it moments later.)
+  //
+  // Fields fill at the **top level** (`usage`/`spend` are taken whole, not
+  // sub-merged): a winner whose `usage` lacks a nested `context_window` does NOT
+  // inherit the loser's. Safe today because the only superseded loser is a
+  // *non-terminal* resident (terminal-over-streaming, or a protected live turn
+  // that's the winner), which carries no end-of-turn `usage` yet. Revisit the
+  // sub-field merge only if supersession ever broadens to terminal-over-terminal.
+  return {
+    ...winner,
+    send_id: winner.send_id ?? loser.send_id,
+    ended_at: winner.ended_at ?? loser.ended_at,
+    usage: winner.usage ?? loser.usage,
+    spend: winner.spend ?? loser.spend,
+    model: winner.model ?? loser.model,
+    effort: winner.effort ?? loser.effort,
+    error: winner.error ?? loser.error,
+    error_kind: winner.error_kind ?? loser.error_kind,
+    hydration_key: winner.hydration_key ?? loser.hydration_key,
+  };
 }
 
 function loadedTurnToTurn(t: LoadedTurn): Turn {
@@ -465,6 +597,7 @@ export function runtimeReducer(runtime: AgentRuntime, input: ReducerInput): Agen
 
     case "content_chunk":
     case "liveness":
+    case "turn_identity":
     case "tool_started":
     case "tool_completed":
       // Any sign of life clears the quiet marker for the turn the heartbeat is
@@ -599,6 +732,7 @@ function appendUserTurnImpl(
   agentId: AgentId,
   turnId: TurnId,
   text: string,
+  attachments: Attachment[],
   startedAt: string,
   sendId?: SendId,
 ): Turn[] {
@@ -611,6 +745,7 @@ function appendUserTurnImpl(
       send_id: sendId,
       started_at: startedAt,
       text,
+      attachments,
     },
   ];
 }

@@ -176,15 +176,29 @@ struct AgentTurnBuilder {
     items: Vec<TurnItem>,
     usage: Option<TurnUsage>,
     /// The most recent assistant record's `message.id`, overwritten per record
-    /// so it ends up as the turn's *final* assistant message id — the durable
-    /// join key the app overlay uses to re-attach persisted cost/overage on
-    /// reopen. Mirrors the live parser's `last_assistant_message_id` so live
-    /// and disk anchor on the same message by construction.
+    /// so it ends up as the turn's *final* assistant message id — the cost-join
+    /// key the app overlay uses to re-attach persisted cost/overage on reopen.
+    /// Mirrors the live parser's `last_assistant_message_id`.
     last_message_id: Option<String>,
+    /// The *first* assistant record's `message.id`, set once per turn (never
+    /// overwritten). This is the turn's `hydration_key` — the live↔disk dedup
+    /// identity. Unlike the last id, it is invariant across a partial vs a
+    /// complete parse of the same turn (the last id moves as the turn streams),
+    /// so a mid-flight re-read dedups against the completed turn instead of
+    /// minting a second copy. Mirrors the live parser's
+    /// `first_assistant_message_id`.
+    first_message_id: Option<String>,
     /// The most recent assistant record's `message.model`, kept-last so it ends
     /// up as the turn's model. Per-turn — distinct from `first_model` (the
     /// agent-scoped `SessionMetaInfo.model`). Claude has no per-turn effort.
     last_model: Option<String>,
+    /// The most recent assistant record's `message.stop_reason`, kept-last.
+    /// At EOF it answers "did the model owe a continuation?": `tool_use` /
+    /// `pause_turn` (or unknown/absent) mean the turn was still in flight when
+    /// the file was read, so it is marked `Streaming` rather than falsely
+    /// `Complete`. Only consulted for the EOF tail turn — a turn closed by a
+    /// following user prompt is definitively `Complete`. See `eof_tail_status`.
+    last_stop_reason: Option<String>,
 }
 
 struct DeferredToolResult {
@@ -301,7 +315,9 @@ impl ReconstructionState {
             items: Vec::new(),
             usage: None,
             last_message_id: None,
+            first_message_id: None,
             last_model: None,
+            last_stop_reason: None,
         });
         builder.last_seen_at = timestamp;
 
@@ -313,14 +329,19 @@ impl ReconstructionState {
             builder.usage = Some(parse_usage(usage));
         }
 
-        // Track the message id (keep last → final assistant message of the
-        // turn), the join key for re-attaching persisted cost/overage.
+        // Track the message id: keep-last for the cost-join `stable_message_id`
+        // (final assistant message), keep-first for the `hydration_key` dedup
+        // identity (first assistant message — invariant across partial vs
+        // complete parses, unlike the moving last id).
         if let Some(id) = record
             .get("message")
             .and_then(|m| m.get("id"))
             .and_then(Value::as_str)
         {
             builder.last_message_id = Some(id.to_owned());
+            builder
+                .first_message_id
+                .get_or_insert_with(|| id.to_owned());
         }
 
         // Keep-last the per-turn model the same way (final assistant model).
@@ -330,6 +351,20 @@ impl ReconstructionState {
             .and_then(Value::as_str)
         {
             builder.last_model = Some(model.to_owned());
+        }
+
+        // Track the stop_reason — at EOF it decides whether the tail turn was
+        // still in flight (`Streaming`) or finished (`Complete`). Distinguish
+        // *absent* from *present-but-unusable*: a record that omits the field
+        // asserts nothing, so keep the last record that actually reported a
+        // reason (keep-last); a record carrying an explicit `null` (or any
+        // non-string) asserts a non-reason, so it clears the signal and the
+        // tail defaults toward `Streaming`. Current Claude always writes a
+        // string, so this only guards schema drift.
+        match record.get("message").and_then(|m| m.get("stop_reason")) {
+            Some(Value::String(reason)) => builder.last_stop_reason = Some(reason.clone()),
+            Some(_) => builder.last_stop_reason = None,
+            None => {}
         }
 
         let Some(blocks) = record
@@ -479,21 +514,27 @@ impl ReconstructionState {
             // the turnmeta sidecar on `stable_message_id`); the parser itself
             // never reads `.switchboard/` state.
             spend: None,
-            // The final assistant `message.id` is both the cost-join key and the
-            // stable hydration key (it round-trips identically to the live
-            // `TurnEnd`), so Claude turns are live-matched and reopen-stable.
-            hydration_key: builder.last_message_id.clone(),
+            // Two distinct anchors, by design (see `AgentTurnBuilder`):
+            // `hydration_key` is the *first* assistant `message.id` — the dedup
+            // identity, parse-invariant across a mid-flight vs completed read so
+            // a partial re-read collapses into the completed turn instead of
+            // duplicating it. `stable_message_id` is the *final* assistant
+            // `message.id` — the cost-join key (cost lives on the final record).
+            // Both round-trip identically to the live `TurnEnd`.
+            hydration_key: builder.first_message_id,
             stable_message_id: builder.last_message_id,
         });
     }
 
     fn finalize(mut self) -> LoadedTranscript {
-        // Any in-progress agent turn at EOF defaults to `Complete`. Claude's
-        // session-file format has no per-turn terminal marker — the only
-        // signal a turn finished is the next user prompt arriving. That
-        // makes "truncated mid-turn" and "completed-but-no-next-prompt-yet"
-        // indistinguishable from disk state alone. Conservatively defaulting
-        // to Complete matches the typical "session ended cleanly" case.
+        // The EOF tail turn is the only turn that can still be in flight — every
+        // earlier turn was closed `Complete` by a following user prompt. Its
+        // status is derived from the last assistant `stop_reason`
+        // (`eof_tail_status`): a turn the model hadn't finished (trailing
+        // `tool_use`/`pause_turn`, or an open tool) is `Streaming`, not falsely
+        // `Complete`. This is what lets a mid-flight re-read render the tail as
+        // in-progress (and, with the hydrate merge, dedup against the live turn)
+        // instead of stacking a "complete-looking turn with a spinning tool."
         //
         // **Asymmetric with Codex on purpose**: Codex emits
         // `event_msg/task_complete` per turn, so its `finalize` defaults to
@@ -506,7 +547,11 @@ impl ReconstructionState {
         // `close_current_agent`, so by this point any remaining deferreds
         // are genuinely unmatched (the matching `tool_use` never appeared
         // in the final turn's records).
-        self.close_current_agent(TurnStatus::Complete);
+        let status = self
+            .current_agent
+            .as_ref()
+            .map_or(TurnStatus::Complete, eof_tail_status);
+        self.close_current_agent(status);
         self.flush_deferred_as_warnings();
         let meta = self.first_model.map(|model| SessionMetaInfo {
             model,
@@ -522,6 +567,48 @@ impl ReconstructionState {
             last_rate_limit_as_of: None,
             warnings: self.warnings,
         }
+    }
+}
+
+/// Terminal status of the EOF tail turn, from its last assistant `stop_reason`.
+///
+/// **Positive allowlist, deliberately.** Only the documented *final* reasons
+/// mark a turn `Complete`; the continuation reasons (`tool_use`, `pause_turn`)
+/// and anything unrecognized or absent fall through to `Streaming`. A negative
+/// check ("anything but `tool_use` is done") would mark the *unsafe* state —
+/// finished — as the default for every present and future value, and would
+/// mis-classify `pause_turn` (a long-running server-tool continuation) as
+/// complete. Defaulting the *unknown* to `Streaming` keeps the parser
+/// forward-compatible: a new `stop_reason` errs toward "still running," never
+/// "falsely finished." (The known terminal set must stay complete, though —
+/// omitting a documented terminal reason renders a finished turn as a permanent
+/// spinner; see the Anthropic stop-reason reference for the canonical list.)
+///
+/// An open tool (a `tool_use` with no bound result — `output: None`) also forces
+/// `Streaming` as a belt-and-suspenders check: `stop_reason: tool_use` already
+/// covers it, but a malformed file with a terminal reason yet an unfinished tool
+/// is not complete. Keyed on `output`, not `completed_at`: `output` is set the
+/// moment a `tool_result` binds (even an empty/error result), whereas
+/// `completed_at` is optional timestamp metadata that can be `None` on a
+/// genuinely-bound result.
+fn eof_tail_status(builder: &AgentTurnBuilder) -> TurnStatus {
+    let has_open_tool = builder
+        .items
+        .iter()
+        .any(|item| matches!(item, TurnItem::Tool { output: None, .. }));
+    if has_open_tool {
+        return TurnStatus::Streaming;
+    }
+    match builder.last_stop_reason.as_deref() {
+        Some(
+            "end_turn"
+            | "max_tokens"
+            | "stop_sequence"
+            | "refusal"
+            | "model_context_window_exceeded",
+        ) => TurnStatus::Complete,
+        // `tool_use`, `pause_turn`, unknown, or absent → still in flight.
+        _ => TurnStatus::Streaming,
     }
 }
 
@@ -622,6 +709,10 @@ mod tests {
                 "model": model,
                 "role": "assistant",
                 "content": [{ "type": "text", "text": text }],
+                // A finished text answer carries `stop_reason: end_turn` in real
+                // session files; the disk parser now reads it to mark the EOF
+                // tail turn `Complete` (vs. `Streaming` for a mid-flight tail).
+                "stop_reason": "end_turn",
                 "usage": {
                     "input_tokens": 10,
                     "output_tokens": 5,
@@ -639,6 +730,262 @@ mod tests {
             .map(|r| serde_json::to_string(r).unwrap())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Assistant record with an explicit `stop_reason` (omitted when `None`) and
+    /// arbitrary content blocks — the lever the EOF tail-status tests pull.
+    fn assistant_with_stop(
+        id: &str,
+        content: &Value,
+        stop_reason: Option<&str>,
+        ts: &str,
+    ) -> Value {
+        let mut message = json!({
+            "id": id,
+            "model": "claude-sonnet-4-6",
+            "role": "assistant",
+            "content": content,
+            "usage": { "input_tokens": 10, "output_tokens": 5 }
+        });
+        if let Some(reason) = stop_reason {
+            message["stop_reason"] = json!(reason);
+        }
+        json!({ "type": "assistant", "message": message, "timestamp": ts })
+    }
+
+    fn tool_use_block(id: &str) -> Value {
+        json!([{ "type": "tool_use", "id": id, "name": "Bash", "input": {} }])
+    }
+
+    fn tool_result_record(tool_use_id: &str, ts: &str) -> Value {
+        json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{ "type": "tool_result", "tool_use_id": tool_use_id, "content": "ok" }]
+            },
+            "timestamp": ts,
+        })
+    }
+
+    fn agent_statuses(records: &[Value]) -> Vec<TurnStatus> {
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let session_id = Uuid::now_v7();
+        let agent_id = Uuid::now_v7();
+        stage_session_file(home.path(), cwd.path(), session_id, &jsonl(records));
+        load_claude_transcript(home.path(), cwd.path(), session_id, agent_id)
+            .unwrap()
+            .turns
+            .into_iter()
+            .filter_map(|t| match t {
+                Turn::Agent { status, .. } => Some(status),
+                Turn::User { .. } => None,
+            })
+            .collect()
+    }
+
+    fn tail_status(records: &[Value]) -> TurnStatus {
+        *agent_statuses(records).last().expect("an agent turn")
+    }
+
+    #[test]
+    fn tail_terminal_stop_reasons_hydrate_complete() {
+        // The full documented terminal set — `refusal` and
+        // `model_context_window_exceeded` are finished states too (a refused or
+        // context-limited response is complete, just declined/truncated), so
+        // omitting them would render a finished turn as a permanent spinner.
+        for reason in [
+            "end_turn",
+            "max_tokens",
+            "stop_sequence",
+            "refusal",
+            "model_context_window_exceeded",
+        ] {
+            let status = tail_status(&[
+                user_record("hi", "2026-05-14T04:43:15Z"),
+                assistant_with_stop(
+                    "m1",
+                    &json!([{ "type": "text", "text": "done" }]),
+                    Some(reason),
+                    "2026-05-14T04:43:16Z",
+                ),
+            ]);
+            assert!(
+                matches!(status, TurnStatus::Complete),
+                "stop_reason {reason} must hydrate Complete, got {status:?}"
+            );
+        }
+    }
+
+    /// The highest-value case: the tool round is *balanced* (the `tool_use`
+    /// has its `tool_result`), so a naive "open tool ⇒ unfinished" heuristic
+    /// sees nothing — but the model owed a continuation that was never written
+    /// (the file ends in the gap between the result and the next assistant
+    /// message). The trailing `stop_reason: tool_use` is the only signal, and it
+    /// must yield `Streaming`.
+    #[test]
+    fn balanced_tools_with_trailing_tool_use_hydrate_streaming() {
+        let status = tail_status(&[
+            user_record("run a tool", "2026-05-14T04:43:15Z"),
+            assistant_with_stop(
+                "m1",
+                &tool_use_block("t1"),
+                Some("tool_use"),
+                "2026-05-14T04:43:16Z",
+            ),
+            tool_result_record("t1", "2026-05-14T04:43:17Z"),
+        ]);
+        assert!(
+            matches!(status, TurnStatus::Streaming),
+            "balanced tools + trailing tool_use must hydrate Streaming, got {status:?}"
+        );
+    }
+
+    /// Positive-allowlist guard: a continuation reason (`pause_turn`) and any
+    /// unknown/absent reason default to `Streaming`. A negative "not `tool_use`
+    /// ⇒ done" implementation would mis-mark `pause_turn` Complete and fails
+    /// here; so would treating an unrecognized future reason as terminal.
+    #[test]
+    fn pause_turn_and_unknown_stop_reasons_hydrate_streaming() {
+        for reason in [Some("pause_turn"), Some("some_future_reason"), None] {
+            let status = tail_status(&[
+                user_record("hi", "2026-05-14T04:43:15Z"),
+                assistant_with_stop(
+                    "m1",
+                    &json!([{ "type": "text", "text": "partial" }]),
+                    reason,
+                    "2026-05-14T04:43:16Z",
+                ),
+            ]);
+            assert!(
+                matches!(status, TurnStatus::Streaming),
+                "stop_reason {reason:?} must hydrate Streaming, got {status:?}"
+            );
+        }
+    }
+
+    /// Belt-and-suspenders: an open tool (a `tool_use` with no bound result)
+    /// forces `Streaming` even on a malformed record that claims a terminal
+    /// `stop_reason` — an unfinished tool round is not complete.
+    #[test]
+    fn open_tool_forces_streaming_even_with_terminal_stop_reason() {
+        let status = tail_status(&[
+            user_record("run a tool", "2026-05-14T04:43:15Z"),
+            assistant_with_stop(
+                "m1",
+                &tool_use_block("t1"),
+                Some("end_turn"),
+                "2026-05-14T04:43:16Z",
+            ),
+        ]);
+        assert!(
+            matches!(status, TurnStatus::Streaming),
+            "open tool must force Streaming despite a terminal stop_reason, got {status:?}"
+        );
+    }
+
+    /// A turn ending on `tool_use` that is **not** the tail — a following user
+    /// prompt closed it — stays `Complete`. The new prompt is definitive proof
+    /// the prior turn ended; only the EOF tail consults `stop_reason`.
+    #[test]
+    fn non_tail_tool_use_turn_closed_by_prompt_is_complete() {
+        let statuses = agent_statuses(&[
+            user_record("first", "2026-05-14T04:43:15Z"),
+            assistant_with_stop(
+                "m1",
+                &tool_use_block("t1"),
+                Some("tool_use"),
+                "2026-05-14T04:43:16Z",
+            ),
+            tool_result_record("t1", "2026-05-14T04:43:17Z"),
+            user_record("second", "2026-05-14T04:43:18Z"),
+            assistant_with_stop(
+                "m2",
+                &json!([{ "type": "text", "text": "done" }]),
+                Some("end_turn"),
+                "2026-05-14T04:43:19Z",
+            ),
+        ]);
+        assert_eq!(statuses.len(), 2);
+        assert!(
+            matches!(statuses[0], TurnStatus::Complete),
+            "a tool_use turn closed by the next prompt is Complete, got {:?}",
+            statuses[0]
+        );
+        assert!(matches!(statuses[1], TurnStatus::Complete));
+    }
+
+    /// Open-tool detection keys on `output` (the result-observed bit), not the
+    /// optional `completed_at` timestamp. A `tool_result` whose record omits a
+    /// (parseable) timestamp still binds its `output`, so the tool is closed —
+    /// a terminal tail with such a result must hydrate `Complete`, not get stuck
+    /// `Streaming` on missing metadata.
+    #[test]
+    fn bound_tool_result_without_timestamp_hydrates_complete() {
+        let tool_result_no_ts = json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{ "type": "tool_result", "tool_use_id": "t1", "content": "ok" }]
+            },
+            // deliberately no "timestamp" → completed_at parses to None
+        });
+        let status = tail_status(&[
+            user_record("run a tool", "2026-05-14T04:43:15Z"),
+            assistant_with_stop(
+                "m1",
+                &tool_use_block("t1"),
+                Some("tool_use"),
+                "2026-05-14T04:43:16Z",
+            ),
+            tool_result_no_ts,
+            assistant_with_stop(
+                "m2",
+                &json!([{ "type": "text", "text": "done" }]),
+                Some("end_turn"),
+                "2026-05-14T04:43:18Z",
+            ),
+        ]);
+        assert!(
+            matches!(status, TurnStatus::Complete),
+            "a bound tool_result with no timestamp must not force Streaming, got {status:?}"
+        );
+    }
+
+    /// An explicit `null` (or non-string) `stop_reason` on the final record is a
+    /// *present-but-unusable* signal: it clears any prior reason so the tail
+    /// defaults to `Streaming`, rather than silently inheriting an earlier
+    /// record's terminal reason. (Absent — field omitted — keeps-last instead;
+    /// current Claude always writes a string, so this guards schema drift.)
+    #[test]
+    fn explicit_null_stop_reason_clears_prior_terminal() {
+        let final_null = json!({
+            "type": "assistant",
+            "message": {
+                "id": "m2",
+                "model": "claude-sonnet-4-6",
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "more" }],
+                "stop_reason": null,
+                "usage": { "input_tokens": 1, "output_tokens": 1 }
+            },
+            "timestamp": "2026-05-14T04:43:17Z",
+        });
+        let status = tail_status(&[
+            user_record("hi", "2026-05-14T04:43:15Z"),
+            assistant_with_stop(
+                "m1",
+                &json!([{ "type": "text", "text": "partial" }]),
+                Some("end_turn"),
+                "2026-05-14T04:43:16Z",
+            ),
+            final_null,
+        ]);
+        assert!(
+            matches!(status, TurnStatus::Streaming),
+            "a final null stop_reason must clear the prior end_turn → Streaming, got {status:?}"
+        );
     }
 
     #[test]
@@ -740,18 +1087,22 @@ mod tests {
         assert_eq!(result.meta.unwrap().model, "claude-sonnet-4-6");
     }
 
-    /// Join-key parity (disk side), multi-assistant tool-use turn. A single
-    /// agent turn spans two assistant records — `msg_test02` (`tool_use`) and
-    /// `msg_test03` (final answer) — separated by a `tool_result` user record
-    /// (array content, which does NOT close the turn). `stable_message_id` must
-    /// anchor on the **final** assistant message (`msg_test03`), matching the
-    /// live side
-    /// (`parser.rs::tool_use_turn_anchors_stable_id_on_final_assistant_message`)
-    /// so the M4 overlay's join holds across reopen. The two paths derive the
-    /// key independently (keep-last here vs. keep-last live); this pins them to
-    /// the same value for the shape most able to expose a divergence.
+    /// The two anchors on a multi-assistant tool-use turn. A single agent turn
+    /// spans two assistant records — `msg_test02` (`tool_use`) and `msg_test03`
+    /// (final answer) — separated by a `tool_result` user record (array content,
+    /// which does NOT close the turn). The keys must split:
+    /// - `stable_message_id` (cost-join) anchors on the **final** message
+    ///   (`msg_test03`) — cost lives on the final record; matches the live side
+    ///   (`parser.rs::tool_use_turn_anchors_keys_first_and_final`).
+    /// - `hydration_key` (dedup identity) anchors on the **first** message
+    ///   (`msg_test02`) — invariant across a mid-flight vs completed parse, so a
+    ///   partial re-read collapses into the completed turn.
+    ///
+    /// This is the canonical shape that exposes a first/final divergence; a
+    /// regression that collapsed them back to one id (the original bug) fails
+    /// here.
     #[test]
-    fn hydrated_tool_use_turn_anchors_stable_id_on_final_assistant() {
+    fn hydrated_tool_use_turn_anchors_keys_first_and_final() {
         let home = TempDir::new().unwrap();
         let cwd = TempDir::new().unwrap();
         let session_id = Uuid::now_v7();
@@ -784,6 +1135,7 @@ mod tests {
                     "model": "claude-sonnet-4-6",
                     "role": "assistant",
                     "content": [{ "type": "text", "text": "done" }],
+                    "stop_reason": "end_turn",
                     "usage": { "input_tokens": 12, "output_tokens": 8 }
                 },
                 "timestamp": "2026-05-14T04:43:18Z",
@@ -800,24 +1152,118 @@ mod tests {
             .expect("one agent turn spanning both assistant records");
         match agent_turn {
             Turn::Agent {
-                stable_message_id, ..
-            } => assert_eq!(
-                stable_message_id.as_deref(),
-                Some("msg_test03"),
-                "the final assistant message's id must be the join key (not msg_test02)"
-            ),
+                stable_message_id,
+                hydration_key,
+                ..
+            } => {
+                assert_eq!(
+                    stable_message_id.as_deref(),
+                    Some("msg_test03"),
+                    "cost-join key must be the final assistant message id"
+                );
+                assert_eq!(
+                    hydration_key.as_deref(),
+                    Some("msg_test02"),
+                    "dedup identity must be the first assistant message id"
+                );
+            }
             _ => unreachable!(),
         }
     }
 
+    /// The bug this milestone fixes, at the parser level: the SAME turn parsed
+    /// mid-flight (file truncated before the tool result / final answer) and
+    /// complete must produce the **same** `hydration_key` (so a switch-back or
+    /// reopen re-read collapses into the live/completed turn instead of stacking
+    /// a duplicate). `stable_message_id`, by contrast, legitimately moves with
+    /// the final message — proving the two anchors are genuinely decoupled.
+    #[test]
+    fn hydration_key_is_identical_mid_flight_and_complete() {
+        let user = user_record("run a tool then answer", "2026-05-14T04:43:15Z");
+        let first_assistant = json!({
+            "type": "assistant",
+            "message": {
+                "id": "msg_first",
+                "model": "claude-sonnet-4-6",
+                "role": "assistant",
+                "content": [{ "type": "tool_use", "id": "t1", "name": "Bash", "input": {} }],
+                "usage": { "input_tokens": 10, "output_tokens": 5 }
+            },
+            "timestamp": "2026-05-14T04:43:16Z",
+        });
+        let tool_result = json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{ "type": "tool_result", "tool_use_id": "t1", "content": "ok" }]
+            },
+            "timestamp": "2026-05-14T04:43:17Z",
+        });
+        let final_assistant = json!({
+            "type": "assistant",
+            "message": {
+                "id": "msg_final",
+                "model": "claude-sonnet-4-6",
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "done" }],
+                "stop_reason": "end_turn",
+                "usage": { "input_tokens": 12, "output_tokens": 8 }
+            },
+            "timestamp": "2026-05-14T04:43:18Z",
+        });
+
+        let anchors = |records: &[Value]| {
+            let home = TempDir::new().unwrap();
+            let cwd = TempDir::new().unwrap();
+            let session_id = Uuid::now_v7();
+            let agent_id = Uuid::now_v7();
+            stage_session_file(home.path(), cwd.path(), session_id, &jsonl(records));
+            load_claude_transcript(home.path(), cwd.path(), session_id, agent_id)
+                .unwrap()
+                .turns
+                .into_iter()
+                .find_map(|t| match t {
+                    Turn::Agent {
+                        hydration_key,
+                        stable_message_id,
+                        ..
+                    } => Some((hydration_key, stable_message_id)),
+                    _ => None,
+                })
+                .expect("one agent turn")
+        };
+
+        let (mid_key, mid_stable) = anchors(&[user.clone(), first_assistant.clone()]);
+        let (full_key, full_stable) =
+            anchors(&[user, first_assistant, tool_result, final_assistant]);
+
+        assert_eq!(
+            mid_key.as_deref(),
+            Some("msg_first"),
+            "mid-flight dedup identity is the first assistant message"
+        );
+        assert_eq!(
+            mid_key, full_key,
+            "hydration_key MUST be identical mid-flight vs complete — the whole fix"
+        );
+        assert_eq!(mid_stable.as_deref(), Some("msg_first"));
+        assert_eq!(full_stable.as_deref(), Some("msg_final"));
+        assert_ne!(
+            mid_stable, full_stable,
+            "stable_message_id (cost-join) does move with the final message — anchors are decoupled"
+        );
+    }
+
     /// Parsing the same session file twice yields turns whose `hydration_key`
     /// is **identical** across both parses, even though `turn_id` is freshly
-    /// minted each parse. This is the regression guard the M2 idempotent merge
+    /// minted each parse. This is the regression guard the idempotent merge
     /// rests on: `turn_id` alone would differ and look like a new turn on a
-    /// re-read; the stable key recognizes it. For Claude the key is the final
-    /// assistant `message.id`.
+    /// re-read; the stable key recognizes it. For Claude the key is the *first*
+    /// assistant `message.id` (here the turn has one assistant message, so first
+    /// == last; the first-vs-last distinction is pinned by
+    /// `hydrated_tool_use_turn_anchors_keys_first_and_final`).
     #[test]
-    fn hydration_key_is_stable_across_reparses_and_equals_final_message_id() {
+    fn hydration_key_is_stable_across_reparses() {
         let home = TempDir::new().unwrap();
         let cwd = TempDir::new().unwrap();
         let session_id = Uuid::now_v7();
@@ -827,7 +1273,7 @@ mod tests {
             json!({
                 "type": "assistant",
                 "message": {
-                    "id": "msg_final01",
+                    "id": "msg_a01",
                     "model": "claude-sonnet-4-6",
                     "role": "assistant",
                     "content": [{ "type": "text", "text": "hi" }],
@@ -856,7 +1302,7 @@ mod tests {
         let (turn_id_a, key_a) = parse();
         let (turn_id_b, key_b) = parse();
 
-        assert_eq!(key_a.as_deref(), Some("msg_final01"));
+        assert_eq!(key_a.as_deref(), Some("msg_a01"));
         assert_eq!(key_a, key_b, "hydration_key must be parse-invariant");
         assert_ne!(
             turn_id_a, turn_id_b,

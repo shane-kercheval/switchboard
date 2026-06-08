@@ -17,7 +17,16 @@
   } from "$lib/state/composeStore";
   import { recordProjectsActivityLocally } from "$lib/state/workspace.svelte";
   import * as api from "$lib/api";
-  import type { AgentId, AgentRecord, ProjectId, Prompt } from "$lib/types";
+  import type {
+    AgentId,
+    AgentRecord,
+    Attachment,
+    AttachmentKind,
+    ProjectId,
+    Prompt,
+  } from "$lib/types";
+  import { classifyKind } from "$lib/attachments";
+  import { getCurrentWebview } from "@tauri-apps/api/webview";
   import { buildRenderArgs, combinePromptMessage, missingRequiredArgs } from "$lib/prompt";
   import Textarea from "$lib/components/ui/Textarea.svelte";
   import StopIcon from "$lib/components/ui/StopIcon.svelte";
@@ -28,10 +37,15 @@
   import Spinner from "$lib/components/ui/Spinner.svelte";
   import { basename, cn, currentIsoTimestamp } from "$lib/utils";
   import { shortcut } from "$lib/platform";
-  import { onDestroy, onMount, untrack } from "svelte";
+  import { isEditableShortcutTarget } from "$lib/keyboard";
+  import { onDestroy, onMount, tick, untrack } from "svelte";
   import { listen } from "@tauri-apps/api/event";
 
-  let { projectId, agents }: { projectId: ProjectId; agents: AgentRecord[] } = $props();
+  let {
+    projectId,
+    agents,
+    focusOnMount = false,
+  }: { projectId: ProjectId; agents: AgentRecord[]; focusOnMount?: boolean } = $props();
 
   // The compose bar is remounted per project (App.svelte's `{#key}`), and the
   // parent only mounts it once the roster is loaded and non-empty — so the
@@ -48,6 +62,114 @@
   let sendError = $state<string | null>(null);
   let composeEl = $state<HTMLDivElement | undefined>(undefined);
   let textareaEl = $state<HTMLTextAreaElement | undefined>(undefined);
+
+  // ── Attachments ─────────────────────────────────────────────────────────────
+  // Dropped files staged on the backend; each chip carries the wire `Attachment`
+  // fields plus a local `id` for list keying / removal. Chips are **session-only**
+  // (deliberately not persisted in the compose snapshot): the load-time GC
+  // reclaims any staged-but-unsent file, so a restored chip would dangle at a
+  // deleted path — re-drop to re-attach.
+  type AttachmentChip = Attachment & { id: string };
+  let attachmentChips = $state<AttachmentChip[]>([]);
+  let dragOver = $state(false);
+  // Per-kind label counters. Monotonic across a compose session: removing a chip
+  // never renumbers the survivors, so a label always refers to the same file.
+  const attachmentCounters: Record<AttachmentKind, number> = {
+    image: 0,
+    text: 0,
+    file: 0,
+    unknown: 0,
+  };
+  // Bumped whenever the chip set is committed (send) or abandoned (unmount).
+  // A staging result captures the generation it began under and is discarded if
+  // the generation has since moved on — so a slow copy can't land a chip in a
+  // composer that was already cleared. Plain, not `$state`: never rendered.
+  let composeGeneration = 0;
+
+  function addAttachmentChip(staged: { path: string; original_name: string }): void {
+    const kind = classifyKind(staged.original_name);
+    attachmentCounters[kind] += 1;
+    attachmentChips = [
+      ...attachmentChips,
+      {
+        id: crypto.randomUUID(),
+        label: `${kind}-${attachmentCounters[kind]}`,
+        kind,
+        path: staged.path,
+        original_name: staged.original_name,
+      },
+    ];
+  }
+
+  function removeAttachmentChip(id: string): void {
+    attachmentChips = attachmentChips.filter((chip) => chip.id !== id);
+  }
+
+  /// The current chips as the `Attachment` wire shape (drops the local `id`),
+  /// snapshotted once per send so every fan-out recipient gets the same list.
+  function snapshotAttachments(): Attachment[] {
+    return attachmentChips.map((chip) => ({
+      label: chip.label,
+      kind: chip.kind,
+      path: chip.path,
+      original_name: chip.original_name,
+    }));
+  }
+
+  /// Stage each dropped OS file path on the backend (copy into the project's
+  /// attachments dir) and add a chip for it. A per-file failure surfaces in the
+  /// send-error line and skips that file rather than aborting the rest.
+  async function stageDroppedPaths(paths: string[]): Promise<void> {
+    const gen = composeGeneration;
+    for (const path of paths) {
+      try {
+        const staged = await api.stageAttachment(projectId, path);
+        // The drop's compose session may have been sent or torn down while the
+        // copy was in flight; if so, discard the result rather than resurrecting
+        // a chip into a now-cleared (or different) composer.
+        if (gen !== composeGeneration) return;
+        addAttachmentChip(staged);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        sendError = `Couldn't attach ${basename(path)}: ${message}`;
+      }
+    }
+  }
+
+  // OS file drops do NOT raise HTML5 `drop` events while Tauri's `dragDropEnabled`
+  // is on, so the webview drag-drop event is the only signal. It is window-global,
+  // but the compose bar is the only file-drop target in the app, so a drop
+  // anywhere in the window attaches — no position hit-test (its physical↔CSS
+  // coordinate mapping is platform/DPR-fragile and bought nothing for a single
+  // drop target).
+  onMount(() => {
+    // Guarded: `getCurrentWebview()` throws outside a Tauri webview (tests, any
+    // non-Tauri host), where drag-drop simply isn't available.
+    let dropSub: Promise<() => void> | undefined;
+    try {
+      dropSub = getCurrentWebview().onDragDropEvent((event) => {
+        const payload = event.payload;
+        if (payload.type === "enter" || payload.type === "over") {
+          dragOver = true;
+        } else if (payload.type === "leave") {
+          dragOver = false;
+        } else if (payload.type === "drop") {
+          dragOver = false;
+          // Ignore drops while a send is rendering: the attachment set is frozen
+          // for that send (see the `sending`-gated remove button too).
+          if (!sending) void stageDroppedPaths(payload.paths);
+        }
+      });
+      void dropSub.catch((e) => console.error("[attachments] onDragDropEvent failed", e));
+    } catch {
+      dropSub = undefined;
+    }
+    // Await the subscription promise before unlistening, so an unmount that beats
+    // the promise still tears the listener down (matching the `prompts:synced`
+    // cleanup below). A bare `unlisten?.()` would no-op in that race and leak a
+    // global listener that keeps staging into a stale project context.
+    return () => void dropSub?.then((u) => u()).catch(() => {});
+  });
 
   // ── Prompt mode ────────────────────────────────────────────────────────────
   // `mode` swaps the compose area between the plain textarea and the structured
@@ -100,6 +222,15 @@
     return () => void unlisten.then((u) => u());
   });
 
+  onMount(() => {
+    if (!focusOnMount) return;
+    if (pendingRestore === null) {
+      requestAnimationFrame(() => textareaEl?.focus());
+    } else {
+      focusPromptFieldOnMount = true;
+    }
+  });
+
   /// Resolve a saved prompt-mode draft against the loaded cache. If the prompt
   /// is present, re-enter prompt mode with the saved argument values. If it's
   /// absent, only downgrade to plain once `syncSettled` — a completed sync proves
@@ -115,6 +246,7 @@
         found.arguments.map((a) => [a.name, snapshot.args[a.name] ?? ""]),
       );
       appendedText = snapshot.appendedText;
+      focusPromptFieldOnMount = focusPromptFieldOnMount || focusOnMount;
       mode = "prompt";
       pendingRestore = null;
       restoring = false;
@@ -127,6 +259,7 @@
       mode = "plain";
       pendingRestore = null;
       restoring = false;
+      if (focusOnMount) requestAnimationFrame(() => textareaEl?.focus());
     }
   }
 
@@ -195,16 +328,6 @@
   // Mod+K (focus the message box) ignores the chord while a dialog is open or
   // while another editable element is focused, so it only ever pulls focus to
   // this composer's textarea.
-  function isEditableShortcutTarget(target: EventTarget | null): boolean {
-    if (!(target instanceof HTMLElement)) return false;
-    return (
-      target.isContentEditable ||
-      target.tagName === "INPUT" ||
-      target.tagName === "TEXTAREA" ||
-      target.tagName === "SELECT"
-    );
-  }
-
   function hasOpenDialog(): boolean {
     return document.querySelector('[role="dialog"], [role="alertdialog"]') !== null;
   }
@@ -246,6 +369,10 @@
         return;
       }
       if (!mod || e.altKey) return;
+      // An open dialog (e.g. the command palette) owns the keyboard — don't let
+      // a chord typed into it also toggle recipients or send. Mirrors the ⌘K
+      // guard above.
+      if (hasOpenDialog()) return;
       if (e.key === "Enter") {
         if (mode === "prompt" && composeEl?.contains(document.activeElement)) {
           e.preventDefault();
@@ -289,6 +416,11 @@
   // Non-reactive cancellation state: it only invalidates pending async file searches.
   let fileSearchToken = 0;
   let fileSearchTimer: ReturnType<typeof setTimeout> | undefined = undefined;
+  // The `@token` span the open menu is showing, captured at detection time so a
+  // pick splices exactly what the menu offered — not whatever the live caret
+  // points at (arrow keys can move the caret out of the token while the menu
+  // stays open). Non-reactive: only read at pick time. `null` when no menu.
+  let menuTokenSpan: { start: number; end: number } | null = null;
   let highlighted = $state(0);
   const AT_TOKEN = /(^|\s)@([^\s]*)$/;
   const FILE_MATCH_LIMIT = 12;
@@ -314,7 +446,23 @@
     | { kind: "all"; key: string }
     | { kind: "clear"; key: string }
     | { kind: "agent"; key: string; agent: AgentRecord };
-  type MenuItem = FileMenuItem | RecipientMenuItem;
+  type AttachmentMenuItem = { kind: "attachment"; key: string; chipId: string; label: string };
+  type MenuItem = FileMenuItem | AttachmentMenuItem | RecipientMenuItem;
+  // Current chips as menu rows, filtered by the `@`-query on their label (e.g.
+  // `@image` narrows to `image-*`), consistent with how the file and recipient
+  // sections filter.
+  const attachmentItems = $derived.by<AttachmentMenuItem[]>(() => {
+    if (!menuOpen || attachmentChips.length === 0) return [];
+    const q = menuQuery.toLowerCase();
+    return attachmentChips
+      .filter((chip) => chip.label.toLowerCase().includes(q))
+      .map((chip) => ({
+        kind: "attachment" as const,
+        key: `attachment:${chip.id}`,
+        chipId: chip.id,
+        label: chip.label,
+      }));
+  });
   const fileItems = $derived<FileMenuItem[]>(
     menuOpen
       ? fileMatches.map((path) => ({
@@ -349,7 +497,7 @@
   });
   const menuItems = $derived.by<MenuItem[]>(() => {
     if (!menuOpen) return [];
-    return [...fileItems, ...recipientItems];
+    return [...fileItems, ...attachmentItems, ...recipientItems];
   });
   const fileStatusText = $derived.by<string | null>(() => {
     if (fileItems.length > 0) return null;
@@ -385,7 +533,7 @@
   const sendDisabled = $derived(
     mode === "prompt"
       ? selectedPrompt === null || missingRequired.length > 0 || sending || !allRecipientsHydrated
-      : draft.trim() === "" || !allRecipientsHydrated,
+      : (draft.trim() === "" && attachmentChips.length === 0) || !allRecipientsHydrated,
   );
 
   // Every live send across this project's agents, mapped to the agents it's
@@ -397,7 +545,9 @@
   // The stop-morph is a plain-mode affordance: an empty textarea means the
   // primary action is "stop the live send" rather than "send". Prompt mode never
   // morphs — its primary action is always send.
-  const showStop = $derived(mode === "plain" && liveSends.size > 0 && draft.trim() === "");
+  const showStop = $derived(
+    mode === "plain" && liveSends.size > 0 && draft.trim() === "" && attachmentChips.length === 0,
+  );
   const primaryDisabled = $derived(showStop ? false : sendDisabled);
 
   function toggleRecipient(id: AgentId): void {
@@ -428,8 +578,38 @@
     return i > 0 ? trimmed.slice(0, i) : null;
   }
 
+  /// Replace the active `@token` (at the caret, anywhere in the text) with
+  /// `insert`, fixing up spacing and moving the caret to just after the inserted
+  /// text. `insert === ""` strips the token (recipient picks); a non-empty
+  /// `insert` is a mention and gets exactly one trailing space before any
+  /// following word. No-op if there's no active token (e.g. the caret moved away
+  /// before the pick landed).
+  function replaceAtToken(insert: string): void {
+    const span = menuTokenSpan;
+    if (span === null) return;
+    // Splice the span the menu actually captured, but only if the text there
+    // still spells `@<menuQuery>` — guards against the caret/text drifting out
+    // from under the open menu (e.g. arrow keys) producing a garbled splice.
+    if (draft.slice(span.start, span.end) !== `@${menuQuery}`) return;
+    const before = draft.slice(0, span.start);
+    let after = draft.slice(span.end);
+    let text = insert;
+    if (insert === "") {
+      // Removing a token that sat between two spaces would leave a double space.
+      if (/\s$/.test(before) && /^\s/.test(after)) after = after.slice(1);
+    } else if (after.length === 0 || !/^\s/.test(after)) {
+      text = `${insert} `;
+    }
+    draft = `${before}${text}${after}`;
+    const caret = before.length + text.length;
+    void tick().then(() => {
+      textareaEl?.focus();
+      textareaEl?.setSelectionRange(caret, caret);
+    });
+  }
+
   function stripAtToken(): void {
-    draft = draft.replace(AT_TOKEN, "$1");
+    replaceAtToken("");
   }
 
   function markdownCodeSpan(text: string): string {
@@ -443,14 +623,17 @@
   }
 
   function insertFileMention(path: string): void {
-    draft = draft.replace(AT_TOKEN, (_match, prefix: string) => {
-      return `${prefix}${markdownCodeSpan(path)} `;
-    });
+    replaceAtToken(markdownCodeSpan(path));
   }
 
   function pickItem(item: MenuItem): void {
     if (item.kind === "file") {
       insertFileMention(item.path);
+    } else if (item.kind === "attachment") {
+      // Insert the chip's reference token (`` `image-1` ``) via the same
+      // mechanism as a file mention — the chip set is what's sent; this just
+      // lets the user write prose referring to it.
+      insertFileMention(item.label);
     } else if (item.kind === "all") {
       selectedIds = agents.map((a) => a.id);
       stripAtToken();
@@ -482,6 +665,7 @@
 
   function closeMentionMenu(): void {
     menuOpen = false;
+    menuTokenSpan = null;
     fileMatches = [];
     fileSearchState = "idle";
     clearFileSearchTimer();
@@ -491,6 +675,8 @@
   onDestroy(() => {
     clearFileSearchTimer();
     fileSearchToken += 1;
+    // Abandon any in-flight staging for this (now unmounting) compose session.
+    composeGeneration += 1;
   });
 
   async function refreshFileMatches(query: string, token: number): Promise<void> {
@@ -499,21 +685,33 @@
       if (token !== fileSearchToken || !menuOpen || menuQuery !== query) return;
       fileMatches = matches;
       fileSearchState = "ready";
-      highlighted = preferredHighlightIndex([...fileMenuItemsFor(matches), ...recipientItems]);
+      highlighted = preferredHighlightIndex([
+        ...fileMenuItemsFor(matches),
+        ...attachmentItems,
+        ...recipientItems,
+      ]);
     } catch {
       if (token !== fileSearchToken || !menuOpen || menuQuery !== query) return;
       fileMatches = [];
       fileSearchState = "error";
-      highlighted = preferredHighlightIndex(recipientItems);
+      highlighted = preferredHighlightIndex([...attachmentItems, ...recipientItems]);
     }
   }
 
-  function activeAtToken(text: string): { query: string } | null {
-    const match = AT_TOKEN.exec(text);
+  /// The `@token` immediately to the left of the caret, or `null`. Caret-aware
+  /// (not anchored to end-of-text) so `@` works in the middle of a message: the
+  /// token is `@` + non-whitespace chars ending exactly at the caret, with the
+  /// `@` at the start of the text or after whitespace. `start` is the `@`'s
+  /// index; `end` is the caret. A non-collapsed selection isn't a typing caret,
+  /// so it yields `null`.
+  function activeAtToken(): { query: string; start: number; end: number } | null {
+    const el = textareaEl;
+    if (el !== undefined && el.selectionStart !== el.selectionEnd) return null;
+    const caret = el?.selectionStart ?? draft.length;
+    const match = AT_TOKEN.exec(draft.slice(0, caret));
     if (!match) return null;
-    return {
-      query: match[2] ?? "",
-    };
+    const query = match[2] ?? "";
+    return { query, start: caret - query.length - 1, end: caret };
   }
 
   $effect(() => {
@@ -544,14 +742,17 @@
   });
 
   function onInput(): void {
-    const token = activeAtToken(draft);
+    const token = activeAtToken();
     const hasAtToken = token !== null;
     const hasRecipientOptions = agents.length > 1;
+    const hasAttachments = attachmentChips.length > 0;
     const shouldSearchFiles = hasAtToken && (token.query.length > 0 || agents.length === 1);
-    const shouldOpenMenu = hasAtToken && (hasRecipientOptions || shouldSearchFiles);
+    const shouldOpenMenu =
+      hasAtToken && (hasRecipientOptions || shouldSearchFiles || hasAttachments);
     if (token !== null && shouldOpenMenu) {
       promptMenuOpen = false;
       menuQuery = token.query;
+      menuTokenSpan = { start: token.start, end: token.end };
       menuOpen = true;
       if (shouldSearchFiles) {
         const q = token.query.toLowerCase();
@@ -559,12 +760,13 @@
         fileMatches = retainedFileMatches;
         highlighted = preferredHighlightIndex([
           ...fileMenuItemsFor(retainedFileMatches),
+          ...attachmentItems,
           ...recipientItems,
         ]);
         scheduleFileMatchRefresh(token.query);
       } else {
         fileMatches = [];
-        highlighted = preferredHighlightIndex(recipientItems);
+        highlighted = preferredHighlightIndex([...attachmentItems, ...recipientItems]);
         clearFileSearchTimer();
         fileSearchState = "idle";
         fileSearchToken += 1;
@@ -649,23 +851,30 @@
   /// prompt paths — the prompt path renders first, then calls this with the
   /// finished text and the recipients captured at click time (so toggling chips
   /// mid-render can't redirect the send).
-  function dispatchToRecipients(text: string, targets: AgentRecord[]): void {
+  function dispatchToRecipients(
+    text: string,
+    attachments: Attachment[],
+    targets: AgentRecord[],
+  ): void {
     const sendId = crypto.randomUUID();
     // Bump this project's local last-activity so it sorts/reads as active right
     // away, before any turn event round-trips. Once per send action.
     recordProjectsActivityLocally([projectId], currentIsoTimestamp());
     for (const agent of targets) {
       const userTurnId = crypto.randomUUID();
-      dispatchUserTurn(agent.id, userTurnId, text, sendId);
+      // Every recipient gets the SAME snapshotted attachment list (one shared
+      // staged file per attachment), so hydration groups the fan-out's chips
+      // once and no recipient can drift to a different set.
+      dispatchUserTurn(agent.id, userTurnId, text, attachments, sendId);
       // Per-recipient, fire-and-forget: an idle recipient starts immediately, a
       // busy one queues. A single recipient's IPC failure fails only its bubble.
       void (async () => {
         try {
-          const messageId = await api.sendMessage(agent.id, text, sendId);
+          const messageId = await api.sendMessage(agent.id, text, sendId, attachments);
           recordSendAccepted(agent.id, userTurnId, messageId);
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
-          sendError = message;
+          sendError = `Send failed: ${message}`;
           failSendStart(agent.id, userTurnId, { message, kind: "adapter_failure" });
         }
       })();
@@ -675,6 +884,10 @@
   async function handleSubmit(): Promise<void> {
     if (sendDisabled) return;
     sendError = null;
+    // Snapshot the whole chip set once, up front (before any await), so a
+    // mid-render chip edit can't change what gets sent — same discipline as the
+    // prompt/recipient snapshots below.
+    const attachments = snapshotAttachments();
 
     if (mode === "prompt" && selectedPrompt !== null) {
       // Render once, before any optimistic turn or journal write: a render
@@ -694,7 +907,7 @@
         const rendered = await api.renderPrompt(prompt.provider, prompt.name, renderArgs);
         finalText = combinePromptMessage(rendered.text, appended);
       } catch (err) {
-        sendError = err instanceof Error ? err.message : String(err);
+        sendError = `Send failed: ${err instanceof Error ? err.message : String(err)}`;
         sending = false;
         return;
       }
@@ -703,7 +916,7 @@
       // avoid dispatching text into a now-different prompt/recipient context.
       const stillSelected = new Set(selectedIds);
       if (selectedPrompt !== prompt || targets.some((t) => !stillSelected.has(t.id))) return;
-      dispatchToRecipients(finalText, targets);
+      dispatchToRecipients(finalText, attachments, targets);
       // Prompt selection is not sticky: a successful send returns to the plain
       // composer (recipients stay selected). Appended text is consumed, not
       // carried back.
@@ -712,15 +925,22 @@
       focusPromptFieldOnMount = false;
       appendedText = "";
       draft = "";
+      // Chips clear optimistically with the text (the optimistic user turn already
+      // renders them); the staged files persist on disk for the send.
+      attachmentChips = [];
+      composeGeneration += 1;
       mode = "plain";
       persistContentNow();
       return;
     }
 
-    dispatchToRecipients(draft.trim(), [...selectedAgents]);
+    dispatchToRecipients(draft.trim(), attachments, [...selectedAgents]);
     // The optimistic user turns are now in the transcript; clear for the next
-    // message (recipients stay selected — sticky).
+    // message (recipients stay selected — sticky). Chips clear with the text;
+    // their staged files persist on disk for the send.
     draft = "";
+    attachmentChips = [];
+    composeGeneration += 1;
     persistContentNow();
   }
 
@@ -734,7 +954,12 @@
 
 <div class="bg-raised px-4 pt-2 pb-4" bind:this={composeEl}>
   <div
-    class="border-border bg-raised relative rounded-xl border p-2.5 shadow-[0_10px_32px_rgba(0,0,0,0.08)]"
+    class={cn(
+      "border-border bg-raised relative rounded-xl border p-2.5 shadow-[0_10px_32px_rgba(0,0,0,0.08)] transition-colors",
+      dragOver ? "ring-accent border-accent ring-2" : "",
+    )}
+    data-testid="compose-box"
+    data-drag-over={dragOver}
     bind:this={promptMenuWrapEl}
   >
     {#if promptMenuOpen}
@@ -815,11 +1040,50 @@
           {/if}
         </div>
 
-        {#if recipientItems.length > 0}
+        {#if attachmentItems.length > 0}
           <div
             class={cn(
               "text-muted px-2.5 py-0.5 text-[11px] font-medium tracking-wide uppercase select-none",
               fileItems.length > 0 ? "mt-1" : "",
+            )}
+          >
+            Attachments
+          </div>
+          {#each attachmentItems as item (item.key)}
+            {@const i = menuItems.findIndex((candidate) => candidate.key === item.key)}
+            <button
+              type="button"
+              class={"hover:bg-panel/80 flex w-full cursor-pointer items-center gap-2 rounded-md px-2.5 py-1 text-left leading-5 outline-none select-none " +
+                (i === highlighted ? "bg-panel/80" : "")}
+              data-testid={`attachment-option-${item.label}`}
+              role="option"
+              aria-selected={i === highlighted}
+              onclick={() => pickItem(item)}
+            >
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.8"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                class="text-muted h-4 w-4 shrink-0"
+                aria-hidden="true"
+              >
+                <path
+                  d="M21.44 11.05 12 20.5a5.5 5.5 0 0 1-7.78-7.78l8.49-8.49a3.5 3.5 0 1 1 4.95 4.95l-8.49 8.49a1.5 1.5 0 0 1-2.12-2.12l7.78-7.78"
+                />
+              </svg>
+              <span class="text-fg font-mono text-xs">{item.label}</span>
+            </button>
+          {/each}
+        {/if}
+
+        {#if recipientItems.length > 0}
+          <div
+            class={cn(
+              "text-muted px-2.5 py-0.5 text-[11px] font-medium tracking-wide uppercase select-none",
+              fileItems.length > 0 || attachmentItems.length > 0 ? "mt-1" : "",
             )}
           >
             Send to
@@ -1002,6 +1266,44 @@
       </div>
     </div>
 
+    {#if attachmentChips.length > 0}
+      <div class="mb-1.5 flex flex-wrap gap-1.5" data-testid="attachment-chips">
+        {#each attachmentChips as chip (chip.id)}
+          <span
+            class="border-border bg-panel text-fg inline-flex max-w-[14rem] items-center gap-1.5 rounded-full border py-px pr-1 pl-2 text-xs"
+            data-testid={`attachment-chip-${chip.label}`}
+            data-kind={chip.kind}
+          >
+            <span
+              class="text-muted shrink-0 font-mono text-[10px] whitespace-nowrap"
+              aria-hidden="true">{chip.label}</span
+            >
+            <span class="truncate" title={chip.original_name}>{chip.original_name}</span>
+            <button
+              type="button"
+              class="text-muted hover:text-fg hover:bg-raised flex h-4 w-4 shrink-0 items-center justify-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+              data-testid={`attachment-chip-remove-${chip.label}`}
+              aria-label={`Remove ${chip.original_name}`}
+              disabled={sending}
+              onclick={() => removeAttachmentChip(chip.id)}
+            >
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                class="h-3 w-3"
+                aria-hidden="true"
+              >
+                <path d="m6 6 12 12M18 6 6 18" />
+              </svg>
+            </button>
+          </span>
+        {/each}
+      </div>
+    {/if}
+
     {#if restoring}
       <!-- A saved prompt-mode draft is still resolving against the (possibly
            cold) cache. Show a neutral placeholder rather than the plain textarea
@@ -1048,7 +1350,7 @@
   </div>
   {#if sendError}
     <p class="text-status-failed mt-2 text-xs" data-testid="compose-send-error">
-      Send failed: {sendError}
+      {sendError}
     </p>
   {/if}
 </div>

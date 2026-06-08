@@ -11,8 +11,8 @@ use std::sync::Arc;
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use switchboard_core::{
-    AgentId, AgentRecord, CoreError, Directory, HarnessKind, Project, ProjectId, ProjectSummary,
-    SelectionAxis, SendId, SessionLocator, normalize_selection,
+    AgentId, AgentRecord, Attachment, CoreError, Directory, HarnessKind, Project, ProjectId,
+    ProjectSummary, SelectionAxis, SendId, SessionLocator, normalize_selection,
 };
 use switchboard_dispatcher::{
     CancelOutcome, DispatchContextFactory, EventEmitter, OnBusy, RemovedQueuedMessage, SendOutcome,
@@ -987,7 +987,8 @@ pub async fn open_commit_file_difftool_impl(
 // --- Git-view open actions --------------------------------------------------
 
 /// The macOS argv for opening a worktree folder in an external editor: the
-/// user's configured `editor_command` run against the path, or the OS
+/// user's configured `editor_command` run against the path via the user's
+/// login shell, or the OS
 /// folder-open (`open <path>`) when no editor command is set. The blank-command
 /// fallback means open-in-editor works with zero config. argv[0] is the program;
 /// the rest are its arguments.
@@ -997,7 +998,10 @@ pub async fn open_commit_file_difftool_impl(
 /// token and forwards the rest as arguments, rather than treating the whole
 /// string as one impossible binary name. A command that splits to nothing
 /// (malformed quoting) falls back to the OS folder-open so the action still does
-/// something useful instead of silently failing.
+/// something useful instead of silently failing. The split command is then
+/// passed as positional args to `zsh -lc 'exec "$@"'`, which lets macOS GUI
+/// launches use login-shell PATH setup (`.zprofile`, `/etc/paths`, and
+/// `/etc/paths.d`) without interpolating the worktree path into shell source.
 #[must_use]
 pub fn editor_open_argv(editor_command: Option<&str>, path: &str) -> Vec<String> {
     let Some(cmd) = editor_command else {
@@ -1006,6 +1010,15 @@ pub fn editor_open_argv(editor_command: Option<&str>, path: &str) -> Vec<String>
     match shlex::split(cmd) {
         Some(mut tokens) if !tokens.is_empty() => {
             tokens.push(path.to_owned());
+            tokens.splice(
+                0..0,
+                [
+                    "/bin/zsh".to_owned(),
+                    "-lc".to_owned(),
+                    "exec \"$@\"".to_owned(),
+                    "switchboard-editor".to_owned(),
+                ],
+            );
             tokens
         }
         _ => vec!["open".to_owned(), path.to_owned()],
@@ -1358,6 +1371,16 @@ pub async fn delete_project_impl(state: &AppState, project_id: ProjectId) -> Res
                 lock(&state.workspace).remove_cached_project(&directory.path, project_id);
             }
         }
+    } else {
+        // No reachable directory (its folder/volume is gone): the on-disk index
+        // can't be touched, so this prunes the project from the workspace
+        // *listing* only. Dropping its cached snapshot in `workspace.yaml` stops
+        // the row from resurrecting while the directory stays gone — which is the
+        // bug being fixed. Accepted limit: if that directory is later
+        // reconnected/re-added, its surviving on-disk index re-lists the project.
+        // That's an unavoidable consequence of deleting an offline project (we
+        // can't unlink files on an absent volume), not a leak this can close.
+        lock(&state.workspace).remove_cached_project_by_id(project_id);
     }
     persist_workspace(state);
     Ok(())
@@ -2204,10 +2227,103 @@ pub fn search_project_files_in_root(
 /// starts surfaces as a `MessageFailed` event. The `Result` carries only
 /// **routing** failures (unknown agent, unsupported harness), resolved here
 /// before the dispatcher is touched.
+/// The result of staging one dropped file: where it now lives and the original
+/// basename for display. The frontend assigns the `label`/`kind` (it owns the
+/// extension→kind mapping per the M1 contract) and builds the full
+/// [`Attachment`] from these two values.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StagedAttachment {
+    pub path: String,
+    pub original_name: String,
+}
+
+/// Strip a dropped file's basename down to a safe filename component: no path
+/// separators or control characters, and never the relative `.`/`..` names.
+/// Falls back to `file` for an empty/degenerate name. Collision-safety is the
+/// caller's `<uuid>__` prefix; this only keeps a crafted name from escaping the
+/// attachments dir.
+fn sanitize_basename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c == '/' || c == '\\' || std::path::is_separator(c) || c.is_control() {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        "file".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+/// Pure, synchronous file-staging I/O: copy `source_path` into `attachments_dir`
+/// as `<uuid>__<sanitized-basename>`, returning the staged **absolute** path (the
+/// dir is canonical, so the join is absolute). Self-contained so it runs on the
+/// blocking pool and is unit-testable directly; the `<uuid>__` prefix makes
+/// concurrent stages of the same filename collision-safe.
+fn stage_attachment_io(
+    attachments_dir: &Path,
+    source_path: &Path,
+) -> Result<StagedAttachment, AppError> {
+    let original_name = source_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map_or_else(|| "file".to_owned(), str::to_owned);
+    let stage_err = |source: std::io::Error| AppError::AttachmentStage {
+        source_path: source_path.to_string_lossy().into_owned(),
+        source,
+    };
+    std::fs::create_dir_all(attachments_dir).map_err(stage_err)?;
+    let dest = attachments_dir.join(format!(
+        "{}__{}",
+        Uuid::now_v7(),
+        sanitize_basename(&original_name)
+    ));
+    std::fs::copy(source_path, &dest).map_err(stage_err)?;
+    Ok(StagedAttachment {
+        path: dest.to_string_lossy().into_owned(),
+        original_name,
+    })
+}
+
+/// Copy a dropped file into the project's `attachments/` dir and return its
+/// staged absolute path. The copy runs in Rust (no frontend fs-plugin
+/// permission) **on the blocking pool**: a user can drop an arbitrarily large
+/// file (the feature has no size cap), so the copy must not sit on the async
+/// command thread and stall unrelated IPC / event handling. Resolving the
+/// project is a cheap lock lookup, kept on the async side; only the file copy is
+/// offloaded — matching how `load_project_conversation_impl` offloads transcript
+/// parsing. Classification/labeling is the frontend's job (M1 contract).
+pub async fn stage_attachment_impl(
+    state: &AppState,
+    project_id: ProjectId,
+    source_path: &Path,
+) -> Result<StagedAttachment, AppError> {
+    let project = match lock(&state.projects).get(&project_id).cloned() {
+        Some(loaded) => loaded,
+        None => find_project_in_directories(state, project_id)?,
+    };
+    let attachments_dir = project.attachments_dir();
+    let source_path = source_path.to_path_buf();
+    let source_display = source_path.to_string_lossy().into_owned();
+    tokio::task::spawn_blocking(move || stage_attachment_io(&attachments_dir, &source_path))
+        .await
+        .map_err(|join_err| AppError::AttachmentStage {
+            source_path: source_display,
+            source: std::io::Error::other(join_err.to_string()),
+        })?
+}
+
 pub async fn send_message_impl(
     state: &AppState,
     agent_id: AgentId,
     prompt: &str,
+    attachments: Vec<Attachment>,
     send_id: SendId,
 ) -> Result<MessageId, AppError> {
     let (project, agent) = lookup_agent(state, agent_id)?;
@@ -2252,7 +2368,14 @@ pub async fn send_message_impl(
     // trivially-grouped 1-element fan-out with its own id.
     match state
         .dispatcher
-        .send_message(agent_id, prompt, send_id, factory, OnBusy::Enqueue)
+        .send_message(
+            agent_id,
+            prompt,
+            attachments,
+            send_id,
+            factory,
+            OnBusy::Enqueue,
+        )
         .await
     {
         SendOutcome::Accepted(message_id) => Ok(message_id),
@@ -2867,6 +2990,10 @@ pub enum ConversationItem {
         send_id: Option<SendId>,
         agent_ids: Vec<AgentId>,
         text: String,
+        /// Files attached to this send, taken from the grouped `Send` (identical
+        /// across a fan-out's recipients). Empty for an imported prompt (no
+        /// journal `Send` to carry them) and for any pre-attachments send.
+        attachments: Vec<Attachment>,
         at: chrono::DateTime<chrono::Utc>,
     },
     /// One agent's completed (or harness-failed) turn content, sourced from the
@@ -2947,6 +3074,16 @@ pub struct AgentConversationMeta {
     pub load_error: Option<String>,
 }
 
+/// Accumulator for one grouped user message during the merge: `(send_id,
+/// recipients in first-seen order, prompt, attachments, earliest `at`)`.
+type UserMessageGroup = (
+    SendId,
+    Vec<AgentId>,
+    String,
+    Vec<Attachment>,
+    chrono::DateTime<chrono::Utc>,
+);
+
 /// Pure merge of the two conversation sources into the unified transcript. No
 /// I/O — the testable core. See [`ProjectConversation`] for the disjoint-source
 /// contract and system-design §7 for the worked scenarios this implements.
@@ -2970,27 +3107,28 @@ fn merge_project_conversation(
     // `index_of` maps a send_id to its slot in `user_messages`, preserving
     // first-appearance order without a separate removal pass.
     let mut index_of: HashMap<SendId, usize> = HashMap::new();
-    let mut user_messages: Vec<(SendId, Vec<AgentId>, String, chrono::DateTime<chrono::Utc>)> =
-        Vec::new();
+    let mut user_messages: Vec<UserMessageGroup> = Vec::new();
     // The journal's `turn_id` is the dispatcher's, distinct from the harness
     // session file's own turn ids, so they can't be joined directly. Instead we
-    // correlate each agent's harness turns to its sends by ORDER: the Nth
-    // *completed* agent turn answers the Nth completed send dispatched to it
-    // (the dispatcher runs an agent's turns FIFO and journals in that order).
-    // `agent_sends` is each agent's sends in order; `non_completed` is the
-    // (agent, send) pairs that failed/cancelled — those leave no clean harness
-    // turn (only an Outcome marker, which already carries its own send_id), so
-    // they're excluded from the order-zip below to keep it aligned.
+    // correlate each agent's harness turns to its sends by ORDER: the Nth harness
+    // agent turn answers the Nth send dispatched to it (the dispatcher runs an
+    // agent's turns FIFO and journals in that order). `agent_sends` is each
+    // agent's sends in dispatch order — **all** of them, completed and not: a
+    // send cancelled/failed *after* the agent wrote content leaves a partial
+    // harness turn that must be paired (excluding non-completed sends here is the
+    // bug that double-rendered the prompt). A non-completed send's cancelled/failed
+    // badge comes from its Outcome marker, which renders alongside the turn
+    // (`ProjectConversation` render-both contract).
     let mut agent_sends: HashMap<AgentId, Vec<SendId>> = HashMap::new();
-    let mut non_completed: HashMap<AgentId, std::collections::HashSet<SendId>> = HashMap::new();
     for record in journal {
         match record {
             switchboard_core::JournalRecord::Send {
                 send_id,
+                turn_id: _,
                 agent_id,
                 prompt,
+                attachments,
                 at,
-                ..
             } => {
                 agent_sends.entry(agent_id).or_default().push(send_id);
                 if let Some(&i) = index_of.get(&send_id) {
@@ -2998,15 +3136,17 @@ fn merge_project_conversation(
                     if !entry.1.contains(&agent_id) {
                         entry.1.push(agent_id);
                     }
-                    if at < entry.3 {
-                        entry.3 = at;
+                    if at < entry.4 {
+                        entry.4 = at;
                     }
                 } else {
-                    // The prompt is shared across a fan-out's recipients (M4.2),
-                    // so taking the first record's prompt is correct for M4; M6
-                    // templated per-recipient prompts will need this revisited.
+                    // Prompt and attachments are shared across a fan-out's
+                    // recipients (the compose bar snapshots one attachment list
+                    // and sends it to every recipient), so taking the first
+                    // record's is correct; M6 templated per-recipient prompts
+                    // will need this revisited.
                     index_of.insert(send_id, user_messages.len());
-                    user_messages.push((send_id, vec![agent_id], prompt, at));
+                    user_messages.push((send_id, vec![agent_id], prompt, attachments, at));
                 }
             }
             switchboard_core::JournalRecord::Outcome {
@@ -3017,7 +3157,6 @@ fn merge_project_conversation(
                 started_at,
                 ..
             } => {
-                non_completed.entry(agent_id).or_default().insert(send_id);
                 let (status, reason) = parse_outcome(&outcome);
                 items.push(ConversationItem::Outcome {
                     turn_id,
@@ -3033,27 +3172,15 @@ fn merge_project_conversation(
             _ => {}
         }
     }
-    for (send_id, agent_ids, text, at) in user_messages {
+    for (send_id, agent_ids, text, attachments, at) in user_messages {
         items.push(ConversationItem::UserMessage {
             id: send_id,
             send_id: Some(send_id),
             agent_ids,
             text,
+            attachments,
             at,
         });
-    }
-
-    // Per-agent FIFO of *completed* sends (non-completed excluded — they leave
-    // no clean harness turn), drained in order to stamp each harness turn with
-    // the send it answered.
-    let mut sends_by_agent: HashMap<AgentId, Vec<SendId>> = HashMap::new();
-    for (agent_id, sends) in agent_sends {
-        let excluded = non_completed.get(&agent_id);
-        let kept: Vec<SendId> = sends
-            .into_iter()
-            .filter(|s| !excluded.is_some_and(|e| e.contains(s)))
-            .collect();
-        sends_by_agent.insert(agent_id, kept);
     }
 
     // Agent content ← each agent's harness transcript. Warnings and any load
@@ -3066,12 +3193,27 @@ fn merge_project_conversation(
         // Correlate harness turns to journaled sends by ORDER (the journal's
         // turn_id is the dispatcher's, unrelated to the harness file's).
         //
-        // Agent turns end-align: extra agent turns at the FRONT are pre-journaling
-        // history (older than the first journaled send — typically an attached
-        // session predating Switchboard) and get no send_id (rendered un-grouped);
-        // the most-recent ones pair with completed sends. Extra completed sends at
-        // the BACK are in-flight (a send whose turn has no harness content yet) and
-        // are dropped here rather than mislabeling a completed turn.
+        // Front-aligned against **all** sends (`agent_sends`, not completed-only):
+        // extra agent turns at the FRONT are pre-journaling history (older than the
+        // first journaled send — typically an attached session predating
+        // Switchboard) and get no send_id (rendered un-grouped); the rest pair with
+        // sends in order. Extra sends at the BACK have no harness turn — an
+        // in-flight send (turn still running) or a cancelled-before-output send —
+        // and are dropped here rather than mislabeling a completed turn.
+        //
+        // The offset is on the **turn** side (`turn_offset`), not the send side:
+        // do NOT skip leading sends (tail-anchoring), which would pair the last
+        // completed turn with a trailing in-flight send — see
+        // `merge_in_flight_send_does_not_mislabel_completed_turns`. Pairing against
+        // all sends is what lets a cancel-mid turn claim its own send (so its
+        // prompt drops); its cancelled status comes from the coexisting Outcome
+        // marker, not from this correlation. Residual: a cancelled-before-output
+        // send positioned *before* a content-bearing turn shifts subsequent labels
+        // by one (content mis-grouping, not prompt duplication — the journal still
+        // owns the prompt). User-visible symptom: a completed answer can render
+        // under a `cancelled` badge (wrong *status* on a real answer), not a
+        // duplicated or missing prompt. Pinned by characterization tests below;
+        // the deferred durable key-join (plan doc) dissolves it.
         //
         // User turns are classified by their REPLY, not by a suffix count — so a
         // non-journaled prompt that lands *after* journaled history (e.g. the user
@@ -3081,11 +3223,11 @@ fn merge_project_conversation(
         // the journal owns it) exactly when it corresponds to a send:
         //   - A user turn WITH a following reply is journaled iff that reply is
         //     journaled (`agent_seen >= turn_offset`).
-        //   - A *dangling* user turn (no reply — a failed/cancelled send, an
-        //     in-flight one, or an imported prompt with no reply yet) is journaled
-        //     while sends that produced no completed agent turn remain to account
-        //     for it (`dangling_journaled` of them = non-completed + in-flight);
-        //     beyond that it's imported and rendered.
+        //   - A *dangling* user turn (no reply — a cancelled-before-output send or
+        //     an in-flight one, or an imported prompt with no reply yet) is
+        //     journaled while sends that produced no harness turn remain to account
+        //     for it (`dangling_journaled` of them = trailing send-excess); beyond
+        //     that it's imported and rendered.
         // This needs 1:1 prompt/reply alternation in the file (true for Claude and
         // Codex — tool results fold into the agent turn). Two edges remain, BOTH
         // confined to the already-discouraged pattern of running the bare CLI on a
@@ -3102,19 +3244,16 @@ fn merge_project_conversation(
         //     and the journaled one duplicated. Order alone can't disambiguate
         //     interleaved dangling sources — a timestamp join could, but would be
         //     inconsistent with the order-based agent-side correlation above.
-        // Both mirror the order assumptions the agent-side end-alignment already
+        // Both mirror the order assumptions the agent-side front-alignment already
         // makes.
         let agent_turn_count = turns
             .iter()
             .filter(|t| matches!(t, switchboard_harness::Turn::Agent { .. }))
             .count();
-        let completed = sends_by_agent.get(&agent_id).map_or(&[][..], Vec::as_slice);
-        let non_completed_count = non_completed
-            .get(&agent_id)
-            .map_or(0, std::collections::HashSet::len);
-        let pairs = agent_turn_count.min(completed.len());
+        let all_sends = agent_sends.get(&agent_id).map_or(&[][..], Vec::as_slice);
+        let pairs = agent_turn_count.min(all_sends.len());
         let turn_offset = agent_turn_count - pairs;
-        let dangling_journaled = (completed.len() + non_completed_count).saturating_sub(pairs);
+        let dangling_journaled = all_sends.len() - pairs;
         let mut agent_seen = 0usize;
         let mut dangling_seen = 0usize;
         for turn in turns {
@@ -3132,7 +3271,7 @@ fn merge_project_conversation(
                     ..
                 } => {
                     let send_id = if agent_seen >= turn_offset {
-                        completed.get(agent_seen - turn_offset).copied()
+                        all_sends.get(agent_seen - turn_offset).copied()
                     } else {
                         None
                     };
@@ -3176,6 +3315,7 @@ fn merge_project_conversation(
                             send_id: None,
                             agent_ids: vec![a_id],
                             text,
+                            attachments: Vec::new(),
                             at: started_at,
                         });
                     }
@@ -3268,6 +3408,54 @@ fn parse_outcome(outcome: &serde_json::Value) -> (OutcomeStatus, Option<String>)
 /// `home_dir` is passed in (not resolved here) so tests can stage a temp
 /// directory without mutating process-wide `$HOME`; the Tauri command shim
 /// reads `$HOME` and forwards.
+/// The set of staged attachment paths still referenced by a `Send` record —
+/// everything GC must keep. Absolute paths, exactly as stored at stage time.
+fn collect_referenced_attachment_paths(
+    journal: &[switchboard_core::JournalRecord],
+) -> HashSet<PathBuf> {
+    journal
+        .iter()
+        .filter_map(|record| match record {
+            switchboard_core::JournalRecord::Send { attachments, .. } => Some(attachments),
+            _ => None,
+        })
+        .flatten()
+        .map(|attachment| PathBuf::from(&attachment.path))
+        .collect()
+}
+
+/// Delete every file in `attachments_dir` not in `referenced`. Best-effort: a
+/// missing dir is a no-op (nothing staged yet), and a failed unlink logs a
+/// warning rather than failing the project load (mirrors the registry
+/// "degrade with a warning" posture). The only place attachments are deleted.
+fn gc_unreferenced_attachments(attachments_dir: &Path, referenced: &HashSet<PathBuf>) {
+    let entries = match std::fs::read_dir(attachments_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            tracing::warn!(
+                dir = %attachments_dir.display(),
+                error = %e,
+                "could not read attachments dir for GC — skipping cleanup this load"
+            );
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if referenced.contains(&path) {
+            continue;
+        }
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "failed to remove unreferenced attachment — leaving it in place"
+            );
+        }
+    }
+}
+
 pub async fn load_project_conversation_impl(
     state: &AppState,
     project_id: ProjectId,
@@ -3282,6 +3470,16 @@ pub async fn load_project_conversation_impl(
         None => find_project_in_directories(state, project_id)?,
     };
     let journal = switchboard_core::journal::read_records(&project.journal_path())?;
+
+    // Reclaim disk on load: delete any staged file no longer referenced by a
+    // `Send` record — orphans from a staged-but-unsent drop, or files whose
+    // conversation was removed. Pure function of on-disk state, so it's
+    // crash-safe (just re-runs next load) and needs no completion signal.
+    gc_unreferenced_attachments(
+        &project.attachments_dir(),
+        &collect_referenced_attachment_paths(&journal),
+    );
+
     let agents = project.list_agents()?;
 
     // Parse each agent's transcript in parallel on the blocking pool. A
@@ -3867,7 +4065,7 @@ mod tests {
         agent_id: AgentId,
         prompt: &str,
     ) -> Result<MessageId, AppError> {
-        send_message_impl(state, agent_id, prompt, Uuid::now_v7()).await
+        send_message_impl(state, agent_id, prompt, Vec::new(), Uuid::now_v7()).await
     }
 
     #[tokio::test]
@@ -4633,6 +4831,7 @@ mod tests {
                     usage: None,
                     context_window_source: None,
                     stable_message_id: None,
+                    first_message_id: None,
                     spend: None,
                     model: None,
                     effort: None,
@@ -4905,6 +5104,7 @@ mod tests {
                         usage: None,
                         context_window_source: None,
                         stable_message_id: None,
+                        first_message_id: None,
                         spend: None,
                         model: None,
                         effort: None,
@@ -5027,6 +5227,7 @@ mod tests {
                         usage: None,
                         context_window_source: None,
                         stable_message_id: None,
+                        first_message_id: None,
                         spend: None,
                         model: None,
                         effort: None,
@@ -8089,6 +8290,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_project_removes_unavailable_project_and_does_not_resurrect_from_cache() {
+        // The user-facing bug: a project whose directory is gone shows as an
+        // unavailable cached row, and deleting it must drop it for good — both
+        // from the listing and from the persisted workspace cache that serves
+        // unavailable rows (otherwise it resurrects on the next list / restart).
+        let (tmp, state, _) = fresh_state_with_mock();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "alpha");
+        // Prime the workspace cache so the project can be served as a row.
+        let _ = list_projects_impl(&state).unwrap();
+
+        // Simulate the directory becoming unreachable (folder/volume gone): drop
+        // the loaded handle + lock and the loaded directory registry, leaving only
+        // the persisted cache — exactly how an unavailable row is served.
+        lock(&state.projects).remove(&project.id);
+        lock(&state.project_locks).remove(&project.id);
+        lock(&state.directories).clear();
+
+        // Precondition: it lists as an unavailable row, so delete is meaningful.
+        let before = list_projects_impl(&state).unwrap();
+        let row = before.iter().find(|p| p.id == project.id).unwrap();
+        assert!(!row.available, "expected an unavailable cached row");
+
+        delete_project_impl(&state, project.id).await.unwrap();
+
+        // Gone from the listing and from the workspace cache (no resurrection).
+        assert!(
+            list_projects_impl(&state)
+                .unwrap()
+                .iter()
+                .all(|p| p.id != project.id)
+        );
+        assert!(!lock(&state.workspace).knows_project(project.id));
+    }
+
+    #[tokio::test]
+    async fn deleting_an_offline_project_leaves_disk_so_reconnecting_relists_it() {
+        // Accepted best-effort limit (engineer-approved): deleting a project
+        // whose directory is offline removes the listing row but cannot delete
+        // the on-disk files. If that directory is reconnected (re-init reads the
+        // surviving index), the project legitimately reappears. Pinned here so
+        // the behavior is a conscious choice, not a silent surprise.
+        let (tmp, state, _) = fresh_state_with_mock();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "alpha");
+        let _ = list_projects_impl(&state).unwrap();
+
+        // Go offline: drop the loaded handle/lock/registry, leaving the on-disk
+        // index intact.
+        lock(&state.projects).remove(&project.id);
+        lock(&state.project_locks).remove(&project.id);
+        lock(&state.directories).clear();
+
+        delete_project_impl(&state, project.id).await.unwrap();
+        assert!(
+            list_projects_impl(&state)
+                .unwrap()
+                .iter()
+                .all(|p| p.id != project.id),
+            "delete clears the offline listing row"
+        );
+
+        // Reconnect: re-init the same on-disk directory. Its index still lists the
+        // project (delete never reached disk), so it comes back as available.
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let row = list_projects_impl(&state)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.id == project.id)
+            .expect("offline-deleted project relists after the directory reconnects");
+        assert!(row.available);
+    }
+
+    #[tokio::test]
     async fn set_session_locator_persists_to_registry_and_cache() {
         // The runtime-capture mechanism (M1 plumbing, wired to the M2 sink): a
         // Codex agent starts with no locator; setting one must land both on
@@ -8277,10 +8558,10 @@ mod tests {
 
         // One Send fanned out to both: same `send_id`, one call per recipient.
         let send_id = Uuid::now_v7();
-        send_message_impl(&state, agent_a.id, "fan-out", send_id)
+        send_message_impl(&state, agent_a.id, "fan-out", Vec::new(), send_id)
             .await
             .unwrap();
-        send_message_impl(&state, agent_b.id, "fan-out", send_id)
+        send_message_impl(&state, agent_b.id, "fan-out", Vec::new(), send_id)
             .await
             .unwrap();
         within(
@@ -8392,6 +8673,222 @@ mod tests {
             }
             other => panic!("expected a send record, got {other:?}"),
         }
+    }
+
+    fn test_attachment(
+        label: &str,
+        kind: switchboard_core::AttachmentKind,
+        path: &str,
+    ) -> Attachment {
+        Attachment {
+            label: label.to_owned(),
+            kind,
+            path: path.to_owned(),
+            original_name: "orig".to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn stage_attachment_copies_into_project_dir_and_returns_absolute_path() {
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        let (_agent, project_id) = project_with_agent(&state, &tmp).await;
+
+        let source = tmp.path().join("diagram.png");
+        std::fs::write(&source, b"PNG-BYTES").unwrap();
+
+        let staged = stage_attachment_impl(&state, project_id, &source)
+            .await
+            .unwrap();
+
+        let staged_path = Path::new(&staged.path);
+        assert!(staged_path.is_absolute(), "staged path is absolute");
+        assert_eq!(std::fs::read(staged_path).unwrap(), b"PNG-BYTES");
+        assert_eq!(staged.original_name, "diagram.png");
+        let project = lock(&state.projects).get(&project_id).cloned().unwrap();
+        assert!(
+            staged_path.starts_with(project.attachments_dir()),
+            "staged under the project attachments dir"
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_attachment_is_collision_safe_for_same_filename() {
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        let (_agent, project_id) = project_with_agent(&state, &tmp).await;
+        let source = tmp.path().join("notes.txt");
+
+        std::fs::write(&source, b"one").unwrap();
+        let first = stage_attachment_impl(&state, project_id, &source)
+            .await
+            .unwrap();
+        std::fs::write(&source, b"two").unwrap();
+        let second = stage_attachment_impl(&state, project_id, &source)
+            .await
+            .unwrap();
+
+        assert_ne!(
+            first.path, second.path,
+            "same basename stages to distinct files"
+        );
+        assert_eq!(std::fs::read(&first.path).unwrap(), b"one");
+        assert_eq!(std::fs::read(&second.path).unwrap(), b"two");
+    }
+
+    #[test]
+    fn sanitize_basename_strips_separators_and_dot_names() {
+        assert_eq!(sanitize_basename("clean.png"), "clean.png");
+        assert_eq!(sanitize_basename("a/b\\c"), "a_b_c");
+        assert_eq!(sanitize_basename("with\nctrl"), "with_ctrl");
+        assert_eq!(sanitize_basename(".."), "file");
+        assert_eq!(sanitize_basename("."), "file");
+        assert_eq!(sanitize_basename("   "), "file");
+    }
+
+    #[tokio::test]
+    async fn send_with_attachments_footers_adapter_prompt_and_journals_clean_text() {
+        let (tmp, state, emitter) = fresh_state_with_mock();
+        let (agent, project_id) = project_with_agent(&state, &tmp).await;
+
+        let attachment = test_attachment(
+            "image-1",
+            switchboard_core::AttachmentKind::Image,
+            "/abs/attachments/u__diagram.png",
+        );
+        send_message_impl(
+            &state,
+            agent.id,
+            "look at this",
+            vec![attachment.clone()],
+            Uuid::now_v7(),
+        )
+        .await
+        .unwrap();
+        within(
+            &emitter,
+            "agent_idle",
+            emitter.wait_for_type("agent_idle", 1),
+        )
+        .await;
+
+        // The mock echoes the dispatched prompt into a content_chunk, so the
+        // footer the adapter actually received is observable on the wire.
+        let channel = format!("agent:{}", agent.id);
+        let footered = emitter.snapshot().into_iter().any(|(name, v)| {
+            name == channel
+                && v["type"] == "content_chunk"
+                && v["text"].as_str().is_some_and(|t| {
+                    t.contains("Attached files (read them):")
+                        && t.contains("image-1: /abs/attachments/u__diagram.png")
+                })
+        });
+        assert!(footered, "the adapter received the attachment footer");
+
+        // The journal stores the CLEAN prompt + the structured attachment — never
+        // the footer or raw paths in the prompt text.
+        let project = lock(&state.projects).get(&project_id).cloned().unwrap();
+        let records = switchboard_core::journal::read_records(&project.journal_path()).unwrap();
+        match records.as_slice() {
+            [
+                switchboard_core::JournalRecord::Send {
+                    prompt,
+                    attachments,
+                    ..
+                },
+            ] => {
+                assert_eq!(prompt, "look at this", "journal keeps the clean prompt");
+                assert_eq!(attachments, &vec![attachment]);
+            }
+            other => panic!("expected one clean Send, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_queued_message_round_trips_attachments() {
+        let (tmp, state, emitter) =
+            fresh_state_with_scenario(switchboard_harness::MockScenario::AwaitCancellation);
+        let (agent, _project_id) = project_with_agent(&state, &tmp).await;
+
+        // First send parks in flight (AwaitCancellation); the second queues behind it.
+        send_msg(&state, agent.id, "in flight").await.unwrap();
+        within(
+            &emitter,
+            "turn_start",
+            emitter.wait_for_type("turn_start", 1),
+        )
+        .await;
+
+        let attachment = test_attachment(
+            "text-1",
+            switchboard_core::AttachmentKind::Text,
+            "/abs/attachments/u__notes.txt",
+        );
+        let queued = send_message_impl(
+            &state,
+            agent.id,
+            "queued",
+            vec![attachment.clone()],
+            Uuid::now_v7(),
+        )
+        .await
+        .unwrap();
+
+        let removed = remove_queued_message_impl(&state, agent.id, queued)
+            .await
+            .unwrap();
+        assert_eq!(removed.prompt, "queued");
+        assert_eq!(
+            removed.attachments,
+            vec![attachment],
+            "dequeue restores the chips alongside the text"
+        );
+    }
+
+    #[test]
+    fn gc_removes_unreferenced_and_keeps_referenced() {
+        let dir = TempDir::new().unwrap();
+        let kept = dir.path().join("kept.png");
+        let orphan = dir.path().join("orphan.png");
+        std::fs::write(&kept, b"k").unwrap();
+        std::fs::write(&orphan, b"o").unwrap();
+        let referenced: HashSet<PathBuf> = [kept.clone()].into_iter().collect();
+
+        gc_unreferenced_attachments(dir.path(), &referenced);
+
+        assert!(kept.exists(), "referenced file survives");
+        assert!(
+            !orphan.exists(),
+            "unreferenced (orphan drop) file is deleted"
+        );
+    }
+
+    #[test]
+    fn gc_missing_dir_is_a_noop() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("attachments");
+        gc_unreferenced_attachments(&missing, &HashSet::new());
+        assert!(
+            !missing.exists(),
+            "GC does not create the dir it didn't find"
+        );
+    }
+
+    #[test]
+    fn collect_referenced_paths_reads_send_attachments() {
+        let path = "/abs/attachments/u__a.png";
+        let journal = vec![switchboard_core::JournalRecord::Send {
+            send_id: Uuid::now_v7(),
+            turn_id: Uuid::now_v7(),
+            agent_id: Uuid::now_v7(),
+            prompt: "p".to_owned(),
+            attachments: vec![test_attachment(
+                "image-1",
+                switchboard_core::AttachmentKind::Image,
+                path,
+            )],
+            at: chrono::Utc::now(),
+        }];
+        let refs = collect_referenced_attachment_paths(&journal);
+        assert!(refs.contains(&PathBuf::from(path)));
     }
 
     #[tokio::test]
@@ -9111,6 +9608,7 @@ mod tests {
             turn_id,
             agent_id,
             prompt: prompt.to_owned(),
+            attachments: Vec::new(),
             at: at(t),
         }
     }
@@ -9244,6 +9742,51 @@ mod tests {
             .filter(|i| matches!(i, ConversationItem::UserMessage { .. }))
             .count();
         assert_eq!(user_count, 1, "harness user-role turn never duplicates it");
+    }
+
+    #[test]
+    fn merge_fan_out_exposes_shared_attachment_once() {
+        // One Send fanned out to two recipients references the SAME staged file
+        // in both Send records (the compose bar snapshots one attachment list).
+        // The grouped user message must surface that attachment exactly once.
+        let send_id = Uuid::now_v7();
+        let b = Uuid::now_v7();
+        let c = Uuid::now_v7();
+        let attachment = Attachment {
+            label: "image-1".to_owned(),
+            kind: switchboard_core::AttachmentKind::Image,
+            path: "/abs/attachments/u__shared.png".to_owned(),
+            original_name: "shared.png".to_owned(),
+        };
+        let send = |agent: AgentId| JournalRecord::Send {
+            send_id,
+            turn_id: Uuid::now_v7(),
+            agent_id: agent,
+            prompt: "compare".to_owned(),
+            attachments: vec![attachment.clone()],
+            at: at(0),
+        };
+        let merged = merge_project_conversation(vec![send(b), send(c)], vec![]);
+
+        let users: Vec<(Vec<AgentId>, Vec<Attachment>)> = merged
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                ConversationItem::UserMessage {
+                    agent_ids,
+                    attachments,
+                    ..
+                } => Some((agent_ids.clone(), attachments.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(users.len(), 1, "fan-out renders one grouped user message");
+        assert_eq!(users[0].0, vec![b, c], "both recipients grouped");
+        assert_eq!(
+            users[0].1,
+            vec![attachment],
+            "the shared attachment surfaces exactly once"
+        );
     }
 
     #[test]
@@ -9470,6 +10013,7 @@ mod tests {
             turn_id: Uuid::now_v7(),
             agent_id: agent,
             prompt: "now add tests".to_owned(),
+            attachments: Vec::new(),
             at: "2026-05-14T04:43:19Z".parse().unwrap(),
         }];
 
@@ -10028,6 +10572,461 @@ mod tests {
         assert!(
             matches!(&merged.items[2], ConversationItem::Outcome { agent_id, status, .. } if *agent_id == c && *status == OutcomeStatus::Cancelled),
             "C's cancel marker last"
+        );
+    }
+
+    /// An agent turn with an explicit status + a preceding shape — for the
+    /// cancelled/failed-mid-turn fixtures where the harness persisted a partial
+    /// turn (`Streaming` for Claude, `Failed` for Codex/Gemini/Antigravity) or,
+    /// in the cancel-after-end race, a `Complete` one.
+    fn agent_turn_status(
+        turn_id: Uuid,
+        agent_id: AgentId,
+        text: &str,
+        t: i64,
+        status: TurnStatus,
+    ) -> Turn {
+        match agent_turn(turn_id, agent_id, text, t) {
+            Turn::Agent {
+                turn_id,
+                agent_id,
+                started_at,
+                ended_at,
+                items,
+                usage,
+                spend,
+                model,
+                effort,
+                hydration_key,
+                stable_message_id,
+                ..
+            } => Turn::Agent {
+                turn_id,
+                agent_id,
+                started_at,
+                ended_at,
+                status,
+                items,
+                usage,
+                spend,
+                model,
+                effort,
+                hydration_key,
+                stable_message_id,
+            },
+            other => other,
+        }
+    }
+
+    fn user_messages(merged: &ProjectConversation) -> Vec<&ConversationItem> {
+        merged
+            .items
+            .iter()
+            .filter(|i| matches!(i, ConversationItem::UserMessage { .. }))
+            .collect()
+    }
+
+    /// The headline bug: a send cancelled *after* the agent wrote content leaves a
+    /// partial harness turn. Correlating against all sends (not completed-only)
+    /// pairs that turn with its send, so its harness `Turn::User` prompt drops
+    /// (the journal owns it) — no duplicate — and the turn groups under the send.
+    /// The cancelled badge rides on the coexisting Outcome marker (render-both).
+    #[test]
+    fn merge_cancel_mid_turn_with_content_drops_prompt_and_groups() {
+        let send_id = Uuid::now_v7();
+        let dispatch_turn = Uuid::now_v7();
+        let disk_turn = Uuid::now_v7();
+        let disk_prompt = Uuid::now_v7();
+        let agent = Uuid::now_v7();
+        let journal = vec![
+            send_record(send_id, dispatch_turn, agent, "explore the repo", 0),
+            outcome_record(
+                send_id,
+                dispatch_turn,
+                agent,
+                serde_json::json!({"status": "cancelled", "source": "user"}),
+                3,
+            ),
+        ];
+        // Disk: the prompt + a partial (Streaming) agent turn the cancel left.
+        let transcript = transcript_of(vec![
+            user_turn(disk_prompt, agent, "explore the repo", 0),
+            agent_turn_status(
+                disk_turn,
+                agent,
+                "starting to look…",
+                1,
+                TurnStatus::Streaming,
+            ),
+        ]);
+
+        let merged = merge_project_conversation(journal, vec![(agent, transcript, None)]);
+
+        // Exactly one user message — the journal's, NOT an imported duplicate.
+        let users = user_messages(&merged);
+        assert_eq!(
+            users.len(),
+            1,
+            "no duplicate/imported prompt, got {users:?}"
+        );
+        assert!(
+            matches!(users[0], ConversationItem::UserMessage { send_id: Some(s), .. } if *s == send_id),
+            "the surviving prompt is the journaled (grouped) one"
+        );
+        // The partial turn is grouped under the send (not orphaned send_id: None).
+        assert!(
+            merged.items.iter().any(|i| matches!(
+                i,
+                ConversationItem::AgentTurn { send_id: Some(s), .. } if *s == send_id
+            )),
+            "the cancelled partial turn groups under its send"
+        );
+        // The cancelled badge is carried by the coexisting Outcome marker.
+        assert!(
+            merged.items.iter().any(|i| matches!(
+                i,
+                ConversationItem::Outcome {
+                    status: OutcomeStatus::Cancelled,
+                    ..
+                }
+            )),
+            "render-both: the Outcome marker is preserved"
+        );
+    }
+
+    /// The cancel-after-end race: the model finished writing (disk turn reads
+    /// `Complete`) before the kill, so the journal records cancelled. Status-blind
+    /// correlation still pairs the `Complete` turn with its cancelled send — no
+    /// duplicate prompt, no orphan. (This is the case a disk-status partition got
+    /// wrong.)
+    #[test]
+    fn merge_cancel_after_end_turn_complete_on_disk_still_groups() {
+        let send_id = Uuid::now_v7();
+        let dispatch_turn = Uuid::now_v7();
+        let agent = Uuid::now_v7();
+        let journal = vec![
+            send_record(send_id, dispatch_turn, agent, "summarize", 0),
+            outcome_record(
+                send_id,
+                dispatch_turn,
+                agent,
+                serde_json::json!({"status": "cancelled", "source": "user"}),
+                3,
+            ),
+        ];
+        let transcript = transcript_of(vec![
+            user_turn(Uuid::now_v7(), agent, "summarize", 0),
+            agent_turn_status(
+                Uuid::now_v7(),
+                agent,
+                "the full answer",
+                1,
+                TurnStatus::Complete,
+            ),
+        ]);
+
+        let merged = merge_project_conversation(journal, vec![(agent, transcript, None)]);
+
+        assert_eq!(user_messages(&merged).len(), 1, "no duplicate prompt");
+        assert!(
+            merged.items.iter().any(|i| matches!(
+                i,
+                ConversationItem::AgentTurn { send_id: Some(s), .. } if *s == send_id
+            )),
+            "the Complete-on-disk cancelled turn groups under its send"
+        );
+    }
+
+    /// Cancel-then-retry on one agent: `[cancelled(partial), completed]`. Each turn
+    /// pairs with its own send; both prompts drop; one user message per send.
+    #[test]
+    fn merge_cancel_then_retry_pairs_each_turn_to_its_send() {
+        let s0 = Uuid::now_v7();
+        let s1 = Uuid::now_v7();
+        let agent = Uuid::now_v7();
+        let journal = vec![
+            send_record(s0, Uuid::now_v7(), agent, "first try", 0),
+            outcome_record(
+                s0,
+                Uuid::now_v7(),
+                agent,
+                serde_json::json!({"status": "cancelled", "source": "user"}),
+                2,
+            ),
+            send_record(s1, Uuid::now_v7(), agent, "second try", 3),
+        ];
+        let transcript = transcript_of(vec![
+            user_turn(Uuid::now_v7(), agent, "first try", 0),
+            agent_turn_status(Uuid::now_v7(), agent, "partial", 1, TurnStatus::Streaming),
+            user_turn(Uuid::now_v7(), agent, "second try", 3),
+            agent_turn(Uuid::now_v7(), agent, "done", 4),
+        ]);
+
+        let merged = merge_project_conversation(journal, vec![(agent, transcript, None)]);
+
+        // Two grouped prompts (s0, s1), no imported duplicates.
+        let users = user_messages(&merged);
+        assert_eq!(users.len(), 2, "one prompt per send, no duplicates");
+        assert!(
+            users.iter().all(|u| matches!(
+                u,
+                ConversationItem::UserMessage {
+                    send_id: Some(_),
+                    ..
+                }
+            )),
+            "both prompts journaled"
+        );
+        let agent_sends: Vec<Option<SendId>> = merged
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                ConversationItem::AgentTurn { send_id, .. } => Some(*send_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            agent_sends,
+            vec![Some(s0), Some(s1)],
+            "turns pair to their own sends in order"
+        );
+    }
+
+    /// Cancelled-before-output but the harness *did* record the prompt (a dangling
+    /// user turn, no reply): the prompt still drops (journal owns it), the bare
+    /// cancelled marker renders, no duplicate. The prompt-drop half's subtle shape.
+    #[test]
+    fn merge_cancel_before_output_with_recorded_prompt_drops_it() {
+        let send_id = Uuid::now_v7();
+        let agent = Uuid::now_v7();
+        let journal = vec![
+            send_record(send_id, Uuid::now_v7(), agent, "do the thing", 0),
+            outcome_record(
+                send_id,
+                Uuid::now_v7(),
+                agent,
+                serde_json::json!({"status": "cancelled", "source": "user"}),
+                2,
+            ),
+        ];
+        // Prompt recorded, no agent turn (cancelled before any output).
+        let transcript = transcript_of(vec![user_turn(Uuid::now_v7(), agent, "do the thing", 0)]);
+
+        let merged = merge_project_conversation(journal, vec![(agent, transcript, None)]);
+
+        assert_eq!(
+            user_messages(&merged).len(),
+            1,
+            "the recorded prompt drops; only the journal's remains"
+        );
+        assert!(
+            !merged
+                .items
+                .iter()
+                .any(|i| matches!(i, ConversationItem::AgentTurn { .. })),
+            "no agent turn (nothing produced)"
+        );
+        assert!(
+            merged.items.iter().any(|i| matches!(
+                i,
+                ConversationItem::Outcome {
+                    status: OutcomeStatus::Cancelled,
+                    ..
+                }
+            )),
+            "bare cancelled marker renders"
+        );
+    }
+
+    /// Documented residual (NOT a correctness assertion): a cancelled-before-output
+    /// send positioned *before* a content-bearing send shifts labels by one — the
+    /// completed answer lands under the cancelled send's `send_id` (content
+    /// mis-grouping). The prompt is still journal-owned (no duplication). Pins the
+    /// known-bound so a future change to it is a conscious decision.
+    #[test]
+    fn merge_residual_leading_cancel_before_output_misgroups() {
+        let s0 = Uuid::now_v7(); // cancelled before output (prompt recorded)
+        let s1 = Uuid::now_v7(); // completed
+        let agent = Uuid::now_v7();
+        let journal = vec![
+            send_record(s0, Uuid::now_v7(), agent, "p0", 0),
+            outcome_record(
+                s0,
+                Uuid::now_v7(),
+                agent,
+                serde_json::json!({"status": "cancelled", "source": "user"}),
+                1,
+            ),
+            send_record(s1, Uuid::now_v7(), agent, "p1", 2),
+        ];
+        let transcript = transcript_of(vec![
+            user_turn(Uuid::now_v7(), agent, "p0", 0),
+            user_turn(Uuid::now_v7(), agent, "p1", 2),
+            agent_turn(Uuid::now_v7(), agent, "answer to p1", 3),
+        ]);
+
+        let merged = merge_project_conversation(journal, vec![(agent, transcript, None)]);
+
+        // No duplicated prompt (both journal-owned).
+        let users = user_messages(&merged);
+        assert!(
+            users.iter().all(|u| matches!(
+                u,
+                ConversationItem::UserMessage {
+                    send_id: Some(_),
+                    ..
+                }
+            )),
+            "no imported duplicate prompt"
+        );
+        // The residual: s1's answer is mis-grouped under s0.
+        let answer = merged
+            .items
+            .iter()
+            .find_map(|i| match i {
+                ConversationItem::AgentTurn { send_id, .. } => Some(*send_id),
+                _ => None,
+            })
+            .expect("one agent turn");
+        assert_eq!(
+            answer,
+            Some(s0),
+            "documented residual: leading cancel-before-output mis-groups the answer onto s0"
+        );
+    }
+
+    /// Trailing interleave `[completed, cancel-after-end]` — both turns read
+    /// `Complete` on disk (the second's process was killed only after the model
+    /// finished writing). All-sends order-pairing crosses the completed/cancelled
+    /// boundary correctly: the first `Complete` turn → completed send, the second
+    /// `Complete` turn → cancelled send. A disk-status partition would route both
+    /// to the completed bucket and reproduce the duplicate-prompt bug.
+    #[test]
+    fn merge_completed_then_cancel_after_end_pairs_across_the_boundary() {
+        let s0 = Uuid::now_v7(); // completed
+        let s1 = Uuid::now_v7(); // cancelled after end_turn (Complete on disk)
+        let agent = Uuid::now_v7();
+        let journal = vec![
+            send_record(s0, Uuid::now_v7(), agent, "first", 0),
+            send_record(s1, Uuid::now_v7(), agent, "second", 2),
+            outcome_record(
+                s1,
+                Uuid::now_v7(),
+                agent,
+                serde_json::json!({"status": "cancelled", "source": "user"}),
+                4,
+            ),
+        ];
+        let transcript = transcript_of(vec![
+            user_turn(Uuid::now_v7(), agent, "first", 0),
+            agent_turn_status(
+                Uuid::now_v7(),
+                agent,
+                "first answer",
+                1,
+                TurnStatus::Complete,
+            ),
+            user_turn(Uuid::now_v7(), agent, "second", 2),
+            agent_turn_status(
+                Uuid::now_v7(),
+                agent,
+                "second answer",
+                3,
+                TurnStatus::Complete,
+            ),
+        ]);
+
+        let merged = merge_project_conversation(journal, vec![(agent, transcript, None)]);
+
+        assert_eq!(user_messages(&merged).len(), 2, "one prompt per send");
+        let agent_sends: Vec<Option<SendId>> = merged
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                ConversationItem::AgentTurn { send_id, .. } => Some(*send_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            agent_sends,
+            vec![Some(s0), Some(s1)],
+            "completed turn → completed send, Complete-on-disk cancelled turn → cancelled send"
+        );
+    }
+
+    /// A *completed* send whose last disk turn reads `Streaming` (the M2
+    /// `eof_tail_status` running-vs-finished limitation: no `end_turn` written)
+    /// with **no** Outcome marker. Order-pairing keys off the all-sends list, not
+    /// the harness status, so the turn still pairs to its completed send — a
+    /// disk-status partition would strand it in the non-completed bucket. Asserts
+    /// **grouping** only; the residual `streaming` badge is out of scope here.
+    #[test]
+    fn merge_streaming_completed_tail_pairs_to_its_send() {
+        let s0 = Uuid::now_v7();
+        let agent = Uuid::now_v7();
+        let journal = vec![send_record(s0, Uuid::now_v7(), agent, "do it", 0)];
+        let transcript = transcript_of(vec![
+            user_turn(Uuid::now_v7(), agent, "do it", 0),
+            agent_turn_status(
+                Uuid::now_v7(),
+                agent,
+                "the answer",
+                1,
+                TurnStatus::Streaming,
+            ),
+        ]);
+
+        let merged = merge_project_conversation(journal, vec![(agent, transcript, None)]);
+
+        assert_eq!(user_messages(&merged).len(), 1, "no duplicate prompt");
+        assert!(
+            merged.items.iter().any(|i| matches!(
+                i,
+                ConversationItem::AgentTurn { send_id: Some(s), .. } if *s == s0
+            )),
+            "the Streaming-on-disk completed tail groups under its send"
+        );
+    }
+
+    /// Switch-back re-runs the merge over the *same* disk state. The merge is a
+    /// pure function of its inputs, so a second pass yields byte-identical items —
+    /// no compounding duplicate prompts or stray user rows (the reported symptom
+    /// was growth on every switch). Guards against any accidental statefulness.
+    #[test]
+    fn merge_cancel_mid_turn_is_idempotent_across_reopen() {
+        let send_id = Uuid::now_v7();
+        let agent = Uuid::now_v7();
+        // Build the disk state once; both passes read the *same* records (a
+        // switch-back does not regenerate the journal/session files).
+        let journal = vec![
+            send_record(send_id, Uuid::now_v7(), agent, "summarize", 0),
+            outcome_record(
+                send_id,
+                Uuid::now_v7(),
+                agent,
+                serde_json::json!({"status": "cancelled", "source": "user"}),
+                3,
+            ),
+        ];
+        let turns = vec![
+            user_turn(Uuid::now_v7(), agent, "summarize", 0),
+            agent_turn_status(Uuid::now_v7(), agent, "partial", 1, TurnStatus::Streaming),
+        ];
+
+        let first = merge_project_conversation(
+            journal.clone(),
+            vec![(agent, transcript_of(turns.clone()), None)],
+        );
+        let second = merge_project_conversation(journal, vec![(agent, transcript_of(turns), None)]);
+
+        assert_eq!(
+            first.items, second.items,
+            "re-merge on switch-back yields identical items — no compounding"
+        );
+        assert_eq!(
+            user_messages(&first).len(),
+            1,
+            "exactly one prompt, every pass"
         );
     }
 
@@ -10919,12 +11918,27 @@ mod tests {
         // A bare editor command runs against the path…
         assert_eq!(
             editor_open_argv(Some("cursor"), "/repo/wt"),
-            vec!["cursor", "/repo/wt"]
+            vec![
+                "/bin/zsh",
+                "-lc",
+                "exec \"$@\"",
+                "switchboard-editor",
+                "cursor",
+                "/repo/wt"
+            ]
         );
         // …a command with flags is shell-split into program + args + path…
         assert_eq!(
             editor_open_argv(Some("code --reuse-window"), "/repo/wt"),
-            vec!["code", "--reuse-window", "/repo/wt"]
+            vec![
+                "/bin/zsh",
+                "-lc",
+                "exec \"$@\"",
+                "switchboard-editor",
+                "code",
+                "--reuse-window",
+                "/repo/wt"
+            ]
         );
         // …an absent command falls back to the OS folder-open…
         assert_eq!(editor_open_argv(None, "/repo/wt"), vec!["open", "/repo/wt"]);
@@ -10933,6 +11947,51 @@ mod tests {
         assert_eq!(
             editor_open_argv(Some("\"unterminated"), "/repo/wt"),
             vec!["open", "/repo/wt"]
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn editor_open_argv_resolves_command_from_login_shell_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        let zdot_dir = tmp.path().join("zdot");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::create_dir_all(&zdot_dir).unwrap();
+
+        let editor = bin_dir.join("fake-editor");
+        let args_file = tmp.path().join("args.txt");
+        std::fs::write(
+            &editor,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$SWITCHBOARD_FAKE_EDITOR_ARGS\"\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&editor).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&editor, permissions).unwrap();
+        std::fs::write(
+            zdot_dir.join(".zprofile"),
+            format!("export PATH=\"{}:$PATH\"\n", bin_dir.display()),
+        )
+        .unwrap();
+
+        let argv = editor_open_argv(Some("fake-editor --reuse-window"), "/repo/work tree");
+        let (program, rest) = argv.split_first().unwrap();
+        let status = std::process::Command::new(program)
+            .args(rest)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .env("ZDOTDIR", &zdot_dir)
+            .env("SWITCHBOARD_FAKE_EDITOR_ARGS", &args_file)
+            .status()
+            .unwrap();
+
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(args_file).unwrap(),
+            "--reuse-window\n/repo/work tree\n"
         );
     }
 

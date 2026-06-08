@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { NormalizedEvent, ReducerInput } from "$lib/types";
 import { _internal, freshRuntime, runtimeReducer, transcriptReducer } from "./reducers";
+import { buildUnifiedRows } from "./unified";
 import type { AgentRuntime, TextChunk, ToolCall, Turn } from "./types";
 
 const AGENT_A = "00000000-0000-7000-8000-000000000aaa";
@@ -45,8 +46,13 @@ function turnEndFailed(turnId: string, message: string): NormalizedEvent {
   };
 }
 
-function reduce(turns: Turn[], input: ReducerInput, agentId: string = AGENT_A): Turn[] {
-  return transcriptReducer(turns, input, agentId, RECEIVED_AT);
+function reduce(
+  turns: Turn[],
+  input: ReducerInput,
+  agentId: string = AGENT_A,
+  inFlightTurnId?: string,
+): Turn[] {
+  return transcriptReducer(turns, input, agentId, RECEIVED_AT, undefined, inFlightTurnId);
 }
 
 describe("transcriptReducer", () => {
@@ -867,6 +873,263 @@ describe("transcriptReducer", () => {
     });
   });
 
+  describe("hydrate — completeness-ranked supersession", () => {
+    const TURN_3 = "00000000-0000-7000-8000-000000000003";
+    const streamingPartial = (turnId: string, key: string): ReducerInput => ({
+      type: "hydrate",
+      agent_id: AGENT_A,
+      turns: [
+        {
+          role: "agent",
+          turn_id: turnId,
+          agent_id: AGENT_A,
+          started_at: "2026-05-14T00:00:02Z",
+          status: "streaming",
+          items: [{ item_kind: "text", kind: "text", text: "working" }],
+          hydration_key: key,
+        },
+      ],
+    });
+    const completed = (turnId: string, key: string): ReducerInput => ({
+      type: "hydrate",
+      agent_id: AGENT_A,
+      turns: [
+        {
+          role: "agent",
+          turn_id: turnId,
+          agent_id: AGENT_A,
+          started_at: "2026-05-14T00:00:02Z",
+          status: "complete",
+          items: [{ item_kind: "text", kind: "text", text: "done" }],
+          hydration_key: key,
+        },
+      ],
+    });
+
+    it("a completed disk turn supersedes a stranded Streaming partial of the same key", () => {
+      // The reload/switch-back bug: a re-read caught the turn mid-flight
+      // (Streaming), then a later re-read sees it finished. The complete turn
+      // must REPLACE the partial, not stack beside it as a stuck spinner.
+      let turns = reduce([], streamingPartial(TURN_1, "msg_x"));
+      expect(turns).toHaveLength(1);
+      expect(turns[0]).toMatchObject({ role: "agent", status: "streaming" });
+
+      turns = reduce(turns, completed(TURN_2, "msg_x"));
+      expect(turns).toHaveLength(1);
+      const turn = turns[0];
+      expect(turn?.role).toBe("agent");
+      if (turn?.role === "agent") {
+        expect(turn.status).toBe("complete");
+        expect(turn.turn_id).toBe(TURN_2);
+      }
+    });
+
+    it("two Streaming turns with the same key collapse to one, resident kept", () => {
+      // The non-supersession branch made explicit: neither side is terminal, so
+      // the resident (the earlier snapshot) wins and the count stays one.
+      let turns = reduce([], streamingPartial(TURN_1, "msg_x"));
+      turns = reduce(turns, streamingPartial(TURN_2, "msg_x"));
+      expect(turns).toHaveLength(1);
+      const turn = turns[0];
+      if (turn?.role === "agent") {
+        expect(turn.status).toBe("streaming");
+        expect(turn.turn_id).toBe(TURN_1); // resident kept, not replaced
+      }
+    });
+
+    it("a Streaming disk turn does NOT supersede a Complete resident of the same key", () => {
+      let turns = reduce([], completed(TURN_1, "msg_x"));
+      turns = reduce(turns, streamingPartial(TURN_2, "msg_x"));
+      expect(turns).toHaveLength(1);
+      const turn = turns[0];
+      if (turn?.role === "agent") {
+        expect(turn.status).toBe("complete");
+        expect(turn.turn_id).toBe(TURN_1); // resident kept
+      }
+    });
+
+    it("superseding preserves the resident's live-only fields the disk turn lacks", () => {
+      // Hand-built Streaming resident carrying a live-only `spend` (a disk parse
+      // can't recover it). The completed disk turn that supersedes it has none;
+      // the merge must carry the resident's spend forward, not blank it.
+      const residentWithSpend: Turn = {
+        role: "agent",
+        turn_id: TURN_1,
+        agent_id: AGENT_A,
+        started_at: "2026-05-14T00:00:02Z",
+        status: "streaming",
+        items: [{ item_kind: "text", kind: "text", text: "working" }],
+        spend: { real_spend: true, is_overage: true, overage_resets_at: null },
+        hydration_key: "msg_x",
+      };
+      const merged = reduce([residentWithSpend], completed(TURN_2, "msg_x"));
+      expect(merged).toHaveLength(1);
+      const turn = merged[0];
+      if (turn?.role === "agent") {
+        expect(turn.status).toBe("complete");
+        expect(turn.spend?.real_spend).toBe(true);
+      }
+    });
+
+    it("repeated re-hydrations of an advancing in-flight turn stay one row (switch-back)", () => {
+      // The maybeRefreshProject path: each switch-back re-reads the growing file
+      // and catches a later Streaming snapshot of the SAME turn (same key, fresh
+      // turn_id per parse). With first-id identity these all share a key, so
+      // they collapse to one row instead of accumulating one block per switch.
+      let turns = reduce([], streamingPartial(TURN_1, "msg_x"));
+      turns = reduce(turns, streamingPartial(TURN_2, "msg_x"));
+      turns = reduce(turns, streamingPartial(TURN_3, "msg_x"));
+      expect(turns).toHaveLength(1);
+
+      turns = reduce(turns, completed(TURN_2, "msg_x"));
+      expect(turns).toHaveLength(1);
+      if (turns[0]?.role === "agent") expect(turns[0].status).toBe("complete");
+    });
+
+    it("the superseded slice renders exactly one agent row, complete (no stuck spinner)", () => {
+      // Bridge to the render layer: after the mid-flight→complete sequence, the
+      // unified view must show one agent row in the `complete` state.
+      let turns = reduce([], streamingPartial(TURN_1, "msg_x"));
+      turns = reduce(turns, completed(TURN_2, "msg_x"));
+      const rows = buildUnifiedRows(turns, []);
+      const agentRows = rows.filter((r) => r.kind === "agent");
+      expect(agentRows).toHaveLength(1);
+      expect(agentRows[0]).toMatchObject({ kind: "agent" });
+      if (agentRows[0]?.kind === "agent") {
+        expect(agentRows[0].turn.status).toBe("complete");
+      }
+    });
+  });
+
+  describe("turn_identity — early live identity", () => {
+    const identity = (turnId: string, key: string): NormalizedEvent => ({
+      type: "turn_identity",
+      turn_id: turnId,
+      hydration_key: key,
+    });
+    const diskComplete = (turnId: string, key: string): ReducerInput => ({
+      type: "hydrate",
+      agent_id: AGENT_A,
+      turns: [
+        {
+          role: "agent",
+          turn_id: turnId,
+          agent_id: AGENT_A,
+          started_at: "2026-05-14T00:00:02Z",
+          status: "complete",
+          items: [{ item_kind: "text", kind: "text", text: "from disk" }],
+          hydration_key: key,
+        },
+      ],
+    });
+
+    it("stamps hydration_key onto the live in-flight turn", () => {
+      let turns = reduce([], turnStart(TURN_1));
+      turns = reduce(turns, identity(TURN_1, "msg_x"));
+      const turn = turns.find((t) => t.turn_id === TURN_1);
+      expect(turn?.role).toBe("agent");
+      if (turn?.role === "agent") {
+        expect(turn.hydration_key).toBe("msg_x");
+        expect(turn.status).toBe("streaming"); // still live, just identified
+      }
+    });
+
+    it("collapses a disk copy that raced ahead of the identity event into the live turn", () => {
+      // A refresh inserted a disk copy (key msg_x) while the live turn was still
+      // keyless, so the two briefly coexist (no key to match on).
+      let turns = reduce([], turnStart(TURN_1));
+      turns = reduce(turns, diskComplete(TURN_2, "msg_x"));
+      expect(turns).toHaveLength(2);
+      // The anchor event stamps the live turn and collapses the disk copy in.
+      turns = reduce(turns, identity(TURN_1, "msg_x"));
+      expect(turns).toHaveLength(1);
+      const turn = turns[0];
+      if (turn?.role === "agent") {
+        expect(turn.turn_id).toBe(TURN_1); // the live turn survives
+        expect(turn.hydration_key).toBe("msg_x");
+        expect(turn.status).toBe("streaming"); // live stream stays authoritative
+      }
+    });
+
+    it("a terminal disk re-read does NOT supersede an actively-streaming live turn", () => {
+      // The hazard early identity introduces: once the live turn carries an early key, a
+      // refresh that catches the turn "complete" on disk in the brief window
+      // before the live turn_end is processed must NOT replace it (that would
+      // orphan the remaining live events).
+      let turns = reduce([], turnStart(TURN_1));
+      turns = reduce(turns, identity(TURN_1, "msg_x")); // live, key msg_x, streaming
+      turns = reduce(turns, diskComplete(TURN_2, "msg_x"), AGENT_A, TURN_1 /* in-flight */);
+      expect(turns).toHaveLength(1);
+      const turn = turns[0];
+      if (turn?.role === "agent") {
+        expect(turn.turn_id).toBe(TURN_1); // preserved, not superseded
+        expect(turn.status).toBe("streaming");
+      }
+      // The subsequent live turn_end still lands on the live turn (not dropped).
+      turns = reduce(turns, turnEndCompleted(TURN_1));
+      const ended = turns.find((t) => t.turn_id === TURN_1);
+      expect(ended?.role).toBe("agent");
+      if (ended?.role === "agent") expect(ended.status).toBe("complete");
+    });
+
+    it("re-delivered turn_identity is a no-op (idempotent)", () => {
+      let turns = reduce([], turnStart(TURN_1));
+      turns = reduce(turns, identity(TURN_1, "msg_x"));
+      const afterFirst = turns;
+      turns = reduce(turns, identity(TURN_1, "msg_x"));
+      expect(turns).toBe(afterFirst); // same reference → unchanged
+    });
+
+    it("turn_identity for an unknown turn_id is a no-op", () => {
+      const turns = reduce([], turnStart(TURN_1));
+      const after = reduce(turns, identity(TURN_2, "msg_x"));
+      expect(after).toBe(turns);
+    });
+
+    const turnEndCancelled = (turnId: string): NormalizedEvent => ({
+      type: "turn_end",
+      turn_id: turnId,
+      outcome: { status: "cancelled", source: "user" },
+      ended_at: "2026-05-16T00:00:05Z",
+      // no hydration_key — a cancelled turn's TurnEnd is synthesized by the
+      // dispatcher and carries none.
+    });
+
+    it("turn_end preserves the early key when the terminal carries none", () => {
+      let turns = reduce([], turnStart(TURN_1));
+      turns = reduce(turns, identity(TURN_1, "msg_x"));
+      turns = reduce(turns, turnEndCompleted(TURN_1)); // helper omits hydration_key
+      const turn = turns.find((t) => t.turn_id === TURN_1);
+      if (turn?.role === "agent") {
+        expect(turn.status).toBe("complete");
+        expect(turn.hydration_key).toBe("msg_x"); // not wiped by the keyless terminal
+      }
+    });
+
+    it("a cancelled turn keeps its early key (synthesized terminal carries none)", () => {
+      let turns = reduce([], turnStart(TURN_1));
+      turns = reduce(turns, identity(TURN_1, "msg_x"));
+      turns = reduce(turns, turnEndCancelled(TURN_1));
+      const turn = turns.find((t) => t.turn_id === TURN_1);
+      if (turn?.role === "agent") {
+        expect(turn.status).toBe("cancelled");
+        expect(turn.hydration_key).toBe("msg_x");
+      }
+    });
+
+    it("a cancelled turn does not duplicate against its keyed disk copy", () => {
+      // End-to-end of the bug: the turn streams (identity), is cancelled, then a
+      // switch-back refresh re-reads the keyed disk copy. The preserved key
+      // dedups → one row. Without key preservation the cancelled row goes keyless
+      // and the disk copy appends → two rows for one turn.
+      let turns = reduce([], turnStart(TURN_1));
+      turns = reduce(turns, identity(TURN_1, "msg_x"));
+      turns = reduce(turns, turnEndCancelled(TURN_1));
+      turns = reduce(turns, diskComplete(TURN_2, "msg_x"));
+      expect(turns).toHaveLength(1);
+    });
+  });
+
   describe("agent-scoped + unknown events", () => {
     it("ignores rate_limit_event (transcript doesn't change)", () => {
       const prev = reduce([], turnStart(TURN_1));
@@ -1350,6 +1613,7 @@ describe("_internal.appendUserTurn", () => {
       AGENT_A,
       "user-1",
       "hi there",
+      [],
       "2026-05-16T00:00:00Z",
     );
     expect(turns).toHaveLength(1);
@@ -1359,6 +1623,7 @@ describe("_internal.appendUserTurn", () => {
       agent_id: AGENT_A,
       started_at: "2026-05-16T00:00:00Z",
       text: "hi there",
+      attachments: [],
     });
   });
 
@@ -1379,6 +1644,7 @@ describe("_internal.appendUserTurn", () => {
       AGENT_A,
       "user-1",
       "follow-up",
+      [],
       "2026-05-16T00:00:10Z",
     );
     expect(next).not.toBe(prev);

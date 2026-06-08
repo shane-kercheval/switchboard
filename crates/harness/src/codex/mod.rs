@@ -382,6 +382,7 @@ async fn run_producer(
                         turn_id,
                         context_window_source: None,
                         stable_message_id: None,
+                        first_message_id: None,
                         spend: None,
                         model: None,
                         effort: None,
@@ -435,6 +436,7 @@ async fn run_producer(
                             usage: None,
                             context_window_source: None,
                             stable_message_id: None,
+                            first_message_id: None,
                             spend: None,
                             model: None,
                             effort: None,
@@ -478,6 +480,7 @@ async fn run_producer(
                                     usage: None,
                                     context_window_source: None,
                                     stable_message_id: None,
+                                    first_message_id: None,
                                     spend: None,
                                     model: None,
                                     effort: None,
@@ -533,6 +536,7 @@ async fn run_producer(
                     usage: None,
                     context_window_source: None,
                     stable_message_id: None,
+                    first_message_id: None,
                     spend: None,
                     model: None,
                     effort: None,
@@ -670,6 +674,7 @@ async fn emit_terminal_with_enrichment(
         model: enrichment.current_turn_model.clone(),
         effort: enrichment.current_turn_effort.clone(),
         stable_message_id: None,
+        first_message_id: None,
     });
 
     // Step 4: emit RateLimitEvent if rate-limit info was found. Codex's
@@ -775,6 +780,7 @@ fn synthesize_truncation_turn_end(
         usage: None,
         context_window_source: None,
         stable_message_id: None,
+        first_message_id: None,
         spend: None,
         model: None,
         effort: None,

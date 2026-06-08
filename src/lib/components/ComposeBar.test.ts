@@ -24,6 +24,37 @@ vi.mock("@tauri-apps/api/event", () => ({
   }),
 }));
 
+type DragDropPayload =
+  | { type: "enter"; paths: string[]; position: { x: number; y: number } }
+  | { type: "over"; position: { x: number; y: number } }
+  | { type: "drop"; paths: string[]; position: { x: number; y: number } }
+  | { type: "leave" };
+
+// Capture the compose bar's drag-drop subscription so tests can drive OS file
+// drops (the webview event Tauri raises instead of an HTML5 `drop`). The
+// subscription promise is deferred — `resolveDropSub()` resolves it with the
+// tracked `dropUnlisten`, letting a test exercise the unmount-beats-promise race.
+let dragDropCb: ((e: { payload: DragDropPayload }) => void) | undefined;
+const dropUnlisten = vi.fn();
+let resolveDropSub: (() => void) | undefined;
+vi.mock("@tauri-apps/api/webview", () => ({
+  getCurrentWebview: () => ({
+    onDragDropEvent: (cb: (e: { payload: DragDropPayload }) => void) => {
+      dragDropCb = cb;
+      return new Promise<() => void>((resolve) => {
+        resolveDropSub = () => resolve(dropUnlisten);
+      });
+    },
+  }),
+}));
+
+function fireDrop(paths: string[]): void {
+  if (dragDropCb === undefined) throw new Error("no drag-drop subscription");
+  // Position is carried by the event but unused — a drop anywhere in the window
+  // attaches (the compose bar is the only drop target).
+  dragDropCb({ payload: { type: "drop", paths, position: { x: 0, y: 0 } } });
+}
+
 async function loadState() {
   return await import("$lib/state/index.svelte");
 }
@@ -65,11 +96,26 @@ const chip = (id: string) => screen.getByTestId(`recipient-chip-${id}`);
 
 beforeEach(() => {
   listeners.clear();
+  dragDropCb = undefined;
+  resolveDropSub = undefined;
+  dropUnlisten.mockClear();
   invokeMock.mockReset();
-  invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
-    if (cmd === "search_project_files") return [];
-    return null;
-  });
+  invokeMock.mockImplementation(
+    async (cmd: string, args?: Record<string, unknown>): Promise<unknown> => {
+      if (cmd === "search_project_files") return [];
+      // Echo a staged attachment back for a dropped source path: the basename
+      // becomes `original_name`, and a staged path is returned.
+      if (cmd === "stage_attachment") {
+        const source = String((args as { sourcePath?: unknown })?.sourcePath ?? "drop");
+        const name = source.split("/").pop() ?? source;
+        return {
+          path: `/proj/.switchboard/projects/p/attachments/uuid__${name}`,
+          original_name: name,
+        };
+      }
+      return null;
+    },
+  );
 });
 
 afterEach(async () => {
@@ -180,6 +226,111 @@ describe("ComposeBar", () => {
     expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "true");
     // The "@bo" token is stripped; the text typed before it (with its space) stays.
     expect(textarea.value).toBe("ping ");
+  });
+
+  it("@ menu opens for an @ token in the middle of a message and splices the mention at the caret", async () => {
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "search_project_files") return ["docs/bob.md"];
+      return null;
+    });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    // "@bo" sits in the middle, with text after it; caret right after "@bo".
+    textarea.value = "ping @bo world";
+    textarea.setSelectionRange(8, 8);
+    await fireEvent.input(textarea);
+
+    // The menu opens for the mid-message token (the bug: it only opened at the
+    // end of the text before this fix).
+    await screen.findByTestId(`recipient-option-${AGENT_B.id}`);
+
+    // Picking a file mention splices at the caret and preserves the trailing text.
+    await fireEvent.click(await screen.findByTestId("file-option-docs/bob.md"));
+    await waitFor(() => expect(textarea.value).toBe("ping `docs/bob.md` world"));
+  });
+
+  it("picks the menu's token even when the caret moved off it (arrow keys) while open", async () => {
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "search_project_files") return ["docs/bob.md"];
+      return null;
+    });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    textarea.value = "ping @bo world";
+    textarea.setSelectionRange(8, 8);
+    await fireEvent.input(textarea);
+    await screen.findByTestId("file-option-docs/bob.md");
+
+    // Simulate ArrowLeft moving the caret into the middle of the token while the
+    // menu stays open. The pick must still splice the captured token, not the
+    // moved caret — otherwise the draft is corrupted (the regression this guards).
+    textarea.setSelectionRange(7, 7);
+    await fireEvent.keyDown(textarea, { key: "ArrowLeft" });
+    await fireEvent.click(screen.getByTestId("file-option-docs/bob.md"));
+    await waitFor(() => expect(textarea.value).toBe("ping `docs/bob.md` world"));
+  });
+
+  it("stripping a recipient @token mid-message collapses the redundant space", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    textarea.value = "ping @bob world";
+    textarea.setSelectionRange(9, 9); // caret right after "@bob"
+    await fireEvent.input(textarea);
+
+    await fireEvent.click(await screen.findByTestId(`recipient-option-${AGENT_B.id}`));
+    await waitFor(() => expect(textarea.value).toBe("ping world"));
+    expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "true");
+  });
+
+  it("adds a trailing space when a mid-message mention is not already followed by one", async () => {
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "search_project_files") return ["docs/bob.md"];
+      return null;
+    });
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    // Caret after "@bo", immediately followed by "hi" (no space) → mention gets one.
+    textarea.value = "ping @bohi";
+    textarea.setSelectionRange(8, 8);
+    await fireEvent.input(textarea);
+
+    await fireEvent.click(await screen.findByTestId("file-option-docs/bob.md"));
+    await waitFor(() => expect(textarea.value).toBe("ping `docs/bob.md` hi"));
+  });
+
+  it("a non-collapsed selection does not open the @ menu", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    textarea.value = "ping @bo world";
+    textarea.setSelectionRange(5, 8); // selection spanning "@bo", not a typing caret
+    await fireEvent.input(textarea);
+    await tick();
+    expect(screen.queryByTestId("recipient-menu")).toBeNull();
   });
 
   it("@ menu includes already-selected agents because picking one makes it the sole recipient", async () => {
@@ -544,6 +695,25 @@ describe("ComposeBar", () => {
     expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "true");
     await fireEvent.keyDown(document.body, { key: "1", metaKey: true });
     expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "false");
+  });
+
+  it("Mod+N does not toggle recipients while a dialog (e.g. the command palette) is open", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "false");
+
+    const dialog = document.createElement("div");
+    dialog.setAttribute("role", "dialog");
+    document.body.appendChild(dialog);
+
+    // The chord would normally select bob; with a dialog open it's suppressed.
+    await fireEvent.keyDown(document.body, { key: "2", metaKey: true });
+    expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "false");
+
+    dialog.remove();
   });
 
   it("Mod+Shift+A selects every agent", async () => {
@@ -1384,5 +1554,158 @@ describe("ComposeBar prompt mode", () => {
     );
     // The shared dispatch path stamps activity once for the prompt send too.
     expect(ws.projectActivityOverrides[PROJECT_ID]).toBeDefined();
+  });
+});
+
+describe("ComposeBar — attachments", () => {
+  it("stages dropped files and renders a labeled chip per file (by extension)", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    fireDrop(["/a/diagram.png", "/a/notes.txt", "/a/data.bin", "/a/shot.jpg"]);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("attachment-chip-image-1")).toBeInTheDocument();
+      expect(screen.getByTestId("attachment-chip-text-1")).toBeInTheDocument();
+      expect(screen.getByTestId("attachment-chip-file-1")).toBeInTheDocument();
+      expect(screen.getByTestId("attachment-chip-image-2")).toBeInTheDocument();
+    });
+    // The staged command was called once per dropped path.
+    expect(invokeMock.mock.calls.filter(([c]) => c === "stage_attachment")).toHaveLength(4);
+  });
+
+  it("removing a chip does not renumber the survivors", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    fireDrop(["/a/one.png"]);
+    fireDrop(["/a/two.png"]);
+    await screen.findByTestId("attachment-chip-image-2");
+
+    await fireEvent.click(screen.getByTestId("attachment-chip-remove-image-1"));
+
+    // image-2 stays image-2 (no renumber); image-1 is gone.
+    expect(screen.queryByTestId("attachment-chip-image-1")).toBeNull();
+    expect(screen.getByTestId("attachment-chip-image-2")).toBeInTheDocument();
+  });
+
+  it("inserts a chip's reference token from the @ menu", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    fireDrop(["/a/diagram.png"]);
+    await screen.findByTestId("attachment-chip-image-1");
+
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "look at @image" } });
+    await fireEvent.click(await screen.findByTestId("attachment-option-image-1"));
+
+    expect(textarea.value).toContain("`image-1`");
+  });
+
+  it("sends the attachment list with the clean text and clears chips on success", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    fireDrop(["/a/diagram.png"]);
+    await screen.findByTestId("attachment-chip-image-1");
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "compare this" } });
+    invokeMock.mockResolvedValueOnce("msg-1"); // the send_message receipt
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    await waitFor(() => {
+      const calls = invokeMock.mock.calls.filter(([c]) => c === "send_message");
+      expect(calls).toHaveLength(1);
+      const args = calls[0]?.[1] as { prompt?: string; attachments?: unknown[] };
+      expect(args.prompt).toBe("compare this");
+      expect(args.attachments).toHaveLength(1);
+      expect(args.attachments?.[0]).toMatchObject({ label: "image-1", kind: "image" });
+    });
+    // Chips clear with the text on a send.
+    await waitFor(() => expect(screen.queryByTestId("attachment-chips")).toBeNull());
+  });
+
+  it("can send attachments with empty text", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    fireDrop(["/a/diagram.png"]);
+    await screen.findByTestId("attachment-chip-image-1");
+    // No text typed — the send button is enabled purely by the attachment.
+    expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(false);
+  });
+});
+
+describe("ComposeBar — attachment lifecycle", () => {
+  it("discards a staging result that resolves after the message was sent", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    // Gate stage_attachment so the drop's copy is still in flight at send time.
+    let releaseStage: (() => void) | undefined;
+    const staged = new Promise<void>((r) => (releaseStage = r));
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "stage_attachment") {
+        await staged;
+        return { path: "/p/attachments/uuid__late.png", original_name: "late.png" };
+      }
+      if (cmd === "send_message") return "msg-1";
+      return null;
+    });
+
+    fireDrop(["/a/late.png"]);
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "go" } });
+    await fireEvent.click(screen.getByTestId("compose-send"));
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.some(([c]) => c === "send_message")).toBe(true),
+    );
+
+    // The staging finishes only now — after the send cleared the composer. Its
+    // chip must NOT resurrect into the next compose session.
+    releaseStage?.();
+    await tick();
+    await tick();
+    expect(screen.queryByTestId("attachment-chip-image-1")).toBeNull();
+  });
+
+  it("unregisters the drag-drop listener even when it resolves after unmount", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const { unmount } = render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    // Unmount before the subscription promise resolves (the leak-prone race).
+    unmount();
+    resolveDropSub?.();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(dropUnlisten).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows an error and adds no chip when staging rejects", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "stage_attachment") throw new Error("disk full");
+      return null;
+    });
+
+    fireDrop(["/a/diagram.png"]);
+
+    const err = await screen.findByTestId("compose-send-error");
+    // A staging failure reads as an attach error, not a misleading "Send failed".
+    expect(err.textContent).toContain("Couldn't attach");
+    expect(err.textContent).toContain("diagram.png");
+    expect(screen.queryByTestId("attachment-chip-image-1")).toBeNull();
   });
 });

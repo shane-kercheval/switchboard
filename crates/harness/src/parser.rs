@@ -93,6 +93,13 @@ pub struct ParserState {
     /// durable join key that re-attaches cost/overage to the right message on
     /// reopen (the same id appears in the on-disk session file; verified).
     last_assistant_message_id: Option<String>,
+    /// The **first** assistant message's Anthropic `message.id`, kept-first
+    /// (set once per turn, never overwritten). Emitted as the turn's
+    /// `first_message_id` → the frontend `hydration_key`. Unlike the last id,
+    /// this is stable from the turn's first assistant message, so a live turn and a
+    /// mid-flight or completed disk re-read of it all dedup to the same key.
+    /// See `AdapterEvent::TurnEnd::first_message_id`.
+    first_assistant_message_id: Option<String>,
     /// The most recent assistant message's `message.model`, kept-last the same
     /// way as the id above — so at `TurnEnd` it is the **final non-subagent**
     /// assistant model (a subagent on a different model never reaches here).
@@ -100,6 +107,20 @@ pub struct ParserState {
     /// reads the same `message.model` from the session file. Claude exposes no
     /// per-turn effort, so `TurnEnd.effort` stays `None`.
     last_assistant_model: Option<String>,
+}
+
+impl ParserState {
+    /// The turn's dedup identity so far: the first non-subagent assistant
+    /// `message.id` seen this turn, or `None` if no assistant message has been
+    /// parsed yet. Read by the adapter to stamp the *same* `hydration_key` onto
+    /// a synthesized **failure** `TurnEnd` (crash/truncation) that the happy
+    /// path emits — so a crashed multi-message turn's live `Failed` row dedups
+    /// against its on-disk copy instead of rendering a duplicate. Read-only:
+    /// the field is private to this module, and a failure path must not mutate
+    /// parser state.
+    pub(crate) fn first_assistant_message_id(&self) -> Option<&str> {
+        self.first_assistant_message_id.as_deref()
+    }
 }
 
 /// Parse one stream-json line. Stateful: `state` accumulates text-block
@@ -335,6 +356,8 @@ fn parse_result(obj: &Value, turn_id: TurnId, state: &mut ParserState) -> ParseO
         // re-attaching cost/overage on reopen. `take()` so a fresh dispatch's
         // state can't carry a stale id (defensive; state is per-turn anyway).
         stable_message_id: state.last_assistant_message_id.take(),
+        // The first assistant message's id — the live↔disk dedup identity.
+        first_message_id: state.first_assistant_message_id.take(),
     })
 }
 
@@ -524,12 +547,25 @@ fn parse_assistant_envelope(obj: &Value, turn_id: TurnId, state: &mut ParserStat
     // discipline as the occupancy above; subagent envelopes never reach here
     // (skipped on `parent_tool_use_id`), so this is the final *non-subagent*
     // message by construction.
+    // Announce the turn's dedup identity the first time we see an assistant
+    // message id, so a live turn carries its `hydration_key` while streaming.
+    let mut identity_event: Option<AdapterEvent> = None;
     if let Some(id) = obj
         .get("message")
         .and_then(|m| m.get("id"))
         .and_then(Value::as_str)
     {
         state.last_assistant_message_id = Some(id.to_owned());
+        // Keep-*first* (set once): the dedup identity must be the turn's first
+        // assistant message, which is invariant across partial vs complete
+        // parses — see the field doc.
+        if state.first_assistant_message_id.is_none() {
+            state.first_assistant_message_id = Some(id.to_owned());
+            identity_event = Some(AdapterEvent::TurnIdentity {
+                turn_id,
+                message_id: id.to_owned(),
+            });
+        }
     }
     // Keep-last the assistant model the same way (final non-subagent model is
     // the turn's model). Stamped on `TurnEnd.model`.
@@ -555,29 +591,31 @@ fn parse_assistant_envelope(obj: &Value, turn_id: TurnId, state: &mut ParserStat
         // here would silently drop them if a future shape change adds any.
     }
 
-    let Some(content) = obj
+    // The identity event leads; tool_use blocks follow. A first assistant
+    // envelope with no content array still emits the identity (it's decoupled
+    // from content) rather than being dropped by an early `Skip`.
+    let mut events = Vec::new();
+    events.extend(identity_event);
+    if let Some(content) = obj
         .get("message")
         .and_then(|m| m.get("content"))
         .and_then(Value::as_array)
-    else {
-        return ParseOutcome::Skip;
-    };
-
-    let mut events = Vec::new();
-    for block in content {
-        if block.get("type").and_then(Value::as_str) == Some("tool_use") {
-            let Some(id) = block.get("id").and_then(Value::as_str) else {
-                continue;
-            };
-            let name = block.get("name").and_then(Value::as_str).unwrap_or("");
-            let input = block.get("input").cloned().unwrap_or(Value::Null);
-            events.push(AdapterEvent::ToolStarted {
-                turn_id,
-                tool_use_id: id.to_owned(),
-                kind: classify_claude_tool_kind(name),
-                name: name.to_owned(),
-                input,
-            });
+    {
+        for block in content {
+            if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                let Some(id) = block.get("id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let name = block.get("name").and_then(Value::as_str).unwrap_or("");
+                let input = block.get("input").cloned().unwrap_or(Value::Null);
+                events.push(AdapterEvent::ToolStarted {
+                    turn_id,
+                    tool_use_id: id.to_owned(),
+                    kind: classify_claude_tool_kind(name),
+                    name: name.to_owned(),
+                    input,
+                });
+            }
         }
     }
 
@@ -730,6 +768,34 @@ mod tests {
     fn parse_one_with_agent(line: &str, turn_id: TurnId, agent_id: AgentId) -> ParseOutcome {
         let mut state = ParserState::default();
         parse_line(line, turn_id, agent_id, &mut state)
+    }
+
+    /// The accessor the adapter reads to stamp the dedup identity onto a
+    /// synthesized **failure** `TurnEnd`: `None` before any assistant message,
+    /// then the *first* assistant `message.id` (keep-first, not overwritten by
+    /// later messages). This is what lets a crashed multi-message turn's
+    /// `Failed` row dedup against its on-disk copy.
+    #[test]
+    fn first_assistant_message_id_accessor_is_keep_first() {
+        let mut state = ParserState::default();
+        let turn_id = tid();
+        assert_eq!(
+            state.first_assistant_message_id(),
+            None,
+            "no identity before any assistant message"
+        );
+
+        let first = r#"{"type":"assistant","message":{"id":"msg_first","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}}"#;
+        let _ = parse_line(first, turn_id, aid(), &mut state);
+        assert_eq!(state.first_assistant_message_id(), Some("msg_first"));
+
+        let second = r#"{"type":"assistant","message":{"id":"msg_second","content":[{"type":"text","text":"done"}]}}"#;
+        let _ = parse_line(second, turn_id, aid(), &mut state);
+        assert_eq!(
+            state.first_assistant_message_id(),
+            Some("msg_first"),
+            "later assistant messages must not overwrite the first id"
+        );
     }
 
     #[test]
@@ -1573,21 +1639,89 @@ mod tests {
         })?
     }
 
-    /// Join-key parity (live side), multi-assistant tool-use turn. The turn has
+    fn turn_end_first_id(events: &[AdapterEvent]) -> Option<String> {
+        events.iter().find_map(|e| match e {
+            AdapterEvent::TurnEnd {
+                first_message_id, ..
+            } => Some(first_message_id.clone()),
+            _ => None,
+        })?
+    }
+
+    /// `TurnIdentity` is emitted **once**, at the first assistant message,
+    /// carrying the first non-subagent `message.id` — the same value `TurnEnd`
+    /// carries — and it precedes the terminal `TurnEnd`. This is what lets the
+    /// frontend stamp a live turn's `hydration_key` while it is still streaming.
+    #[test]
+    fn emits_turn_identity_once_before_turn_end() {
+        let events = replay_fixture(include_str!("../tests/fixtures/claude/tool-use.jsonl"));
+        let identities: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                AdapterEvent::TurnIdentity { message_id, .. } => Some(message_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            identities,
+            vec!["msg_test02"],
+            "exactly one identity, the first assistant message id"
+        );
+
+        let identity_pos = events
+            .iter()
+            .position(|e| matches!(e, AdapterEvent::TurnIdentity { .. }))
+            .expect("a TurnIdentity event");
+        let end_pos = events
+            .iter()
+            .position(|e| matches!(e, AdapterEvent::TurnEnd { .. }))
+            .expect("a terminal TurnEnd");
+        assert!(
+            identity_pos < end_pos,
+            "identity is announced before turn end"
+        );
+
+        // The early identity and the turn-end key are the same value.
+        assert_eq!(turn_end_first_id(&events).as_deref(), Some("msg_test02"));
+    }
+
+    /// The production-common shape: a plain *text* assistant envelope that
+    /// carries a `message.id` emits `TurnIdentity` (and no `ToolStarted`). The
+    /// identity is decoupled from tool content — the existing "no tool event"
+    /// test uses an envelope *without* an id, so it `Skip`s and doesn't exercise
+    /// this path that the parser refactor introduced.
+    #[test]
+    fn text_only_assistant_envelope_with_id_emits_turn_identity() {
+        let line = r#"{"type":"assistant","message":{"id":"msg_abc","content":[{"type":"text","text":"hello"}]}}"#;
+        match parse_one(line, tid()) {
+            ParseOutcome::Event(AdapterEvent::TurnIdentity { message_id, .. }) => {
+                assert_eq!(message_id, "msg_abc");
+            }
+            other => panic!("expected a single TurnIdentity event, got {other:?}"),
+        }
+    }
+
+    /// The two anchors (live side), multi-assistant tool-use turn. The turn has
     /// two non-subagent assistant messages — `msg_test02` (`tool_use`) then
     /// `msg_test03` (final answer) — and cost arrives on the terminal `result`.
-    /// `stable_message_id` must anchor on the **final** assistant message, so
-    /// the M4 overlay re-attaches cost to the right message. Pairs with the
-    /// session-file side
-    /// (`session_file.rs::hydrated_tool_use_turn_anchors_stable_id_on_final_assistant`):
-    /// both paths must land on `msg_test03` for the join to hold on reopen.
+    /// `stable_message_id` (cost-join) anchors on the **final** message;
+    /// `first_message_id` (dedup identity → `hydration_key`) anchors on the
+    /// **first**. Pairs with the session-file side
+    /// (`session_file.rs::hydrated_tool_use_turn_anchors_keys_first_and_final`):
+    /// both paths must agree on each anchor for live↔disk dedup and the cost
+    /// join to hold on reopen.
     #[test]
-    fn tool_use_turn_anchors_stable_id_on_final_assistant_message() {
+    fn tool_use_turn_anchors_keys_first_and_final() {
         let events = replay_fixture(include_str!("../tests/fixtures/claude/tool-use.jsonl"));
         assert_eq!(
             turn_end_stable_id(&events),
             Some("msg_test03".to_owned()),
-            "the final non-subagent assistant message's id must be the join key (not msg_test02)"
+            "cost-join key must be the final non-subagent assistant message (not msg_test02)"
+        );
+        assert_eq!(
+            turn_end_first_id(&events),
+            Some("msg_test02".to_owned()),
+            "dedup identity must be the first non-subagent assistant message (not msg_test03)"
         );
     }
 

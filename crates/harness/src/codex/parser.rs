@@ -273,6 +273,7 @@ fn parse_turn_completed(obj: &Value, turn_id: TurnId) -> ParseOutcome {
         // session-file enrichment adds it and tags it `SessionFileBacked`.
         context_window_source: None,
         stable_message_id: None,
+        first_message_id: None,
         spend: None,
         model: None,
         effort: None,
@@ -347,6 +348,7 @@ fn parse_turn_failed(obj: &Value, turn_id: TurnId, state: &mut CodexParserState)
         usage: None,
         context_window_source: None,
         stable_message_id: None,
+        first_message_id: None,
         spend: None,
         model: None,
         effort: None,

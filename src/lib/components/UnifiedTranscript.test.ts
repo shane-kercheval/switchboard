@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/svelte";
 import { tick } from "svelte";
-import type { AgentRecord, NormalizedEvent } from "$lib/types";
+import type { AgentRecord, ConversationItem, NormalizedEvent } from "$lib/types";
 import { HEARTBEAT_TIMEOUT_MS } from "$lib/types";
 import { agentCopy } from "$lib/agentCopy.svelte";
 // Static import so the component-tree transform happens at module collection,
@@ -23,6 +23,7 @@ const invokeMock = vi.fn(
 );
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: (cmd: string, args?: Record<string, unknown>) => invokeMock(cmd, args),
+  convertFileSrc: (path: string) => `asset://localhost/${path}`,
 }));
 
 const copyTextMock = vi.fn(async (_t: string): Promise<void> => undefined);
@@ -590,7 +591,14 @@ describe("UnifiedTranscript", () => {
     // A dispatched-but-not-started send: optimistic user turn + pending entry,
     // backend-accepted (message_id recorded) but no turn_start yet (queued
     // behind some other work).
-    state.dispatchUserTurn(CLAUDE_AGENT.id, "user-1", "later", "send-q", "2026-05-16T00:00:00Z");
+    state.dispatchUserTurn(
+      CLAUDE_AGENT.id,
+      "user-1",
+      "later",
+      [],
+      "send-q",
+      "2026-05-16T00:00:00Z",
+    );
     state.recordSendAccepted(CLAUDE_AGENT.id, "user-1", "msg-q");
 
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
@@ -650,13 +658,13 @@ describe("UnifiedTranscript — fan-out groups", () => {
   function seedFanout(
     state: Awaited<ReturnType<typeof loadState>>,
     aliceResponse: {
-      status: "streaming" | "complete";
+      status: "streaming" | "complete" | "failed";
       text?: string;
       model?: string;
       effort?: string;
     } | null,
     bobResponse: {
-      status: "streaming" | "complete";
+      status: "streaming" | "complete" | "failed";
       text?: string;
       model?: string;
       effort?: string;
@@ -822,6 +830,129 @@ describe("UnifiedTranscript — fan-out groups", () => {
     expect(screen.queryByTestId("fanout-card-cancel")).toBeNull();
   });
 
+  // A turn cancelled after it produced output reopens with its partial content
+  // and, for Claude, a `streaming` disk status (no terminal stop_reason). The
+  // journal's cancelled Outcome marker is authoritative: the column reads
+  // `cancelled` and shows none of the live affordances a `streaming` turn would
+  // otherwise render (no "Working…", no live cancel button).
+  it("reads a reopened cancelled-mid-turn column as cancelled with no live affordances", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    // Alice cancelled after partial output (disk `streaming`); bob completed.
+    seedFanout(
+      state,
+      { status: "streaming", text: "partial work" },
+      { status: "complete", text: "bob reply" },
+    );
+
+    render(UnifiedTranscript, {
+      props: {
+        agents: [CLAUDE_AGENT, CODEX_AGENT],
+        overlay: [
+          {
+            kind: "outcome",
+            turn_id: "o-alice",
+            send_id: SEND_1,
+            agent_id: CLAUDE_AGENT.id,
+            status: "cancelled",
+            reason: null,
+            at: "2026-05-16T00:00:05Z",
+          },
+        ],
+      },
+    });
+
+    const columns = screen.getAllByTestId("fanout-column");
+    expect(columns[0]).toHaveAttribute("data-agent-id", CLAUDE_AGENT.id);
+    expect(columns[0]).toHaveAttribute("data-state", "cancelled");
+    // Partial content is preserved (reopen mirrors live), labelled cancelled…
+    expect(columns[0]).toHaveTextContent("partial work");
+    expect(screen.getByTestId("outcome-cancelled")).toBeInTheDocument();
+    // …and the dead turn shows no live spinner or live cancel control.
+    expect(screen.queryByTestId("turn-working")).toBeNull();
+    expect(screen.queryByTestId("turn-live-control")).toBeNull();
+    expect(screen.queryByTestId("fanout-card-cancel")).toBeNull();
+  });
+
+  // Codex/Gemini/Antigravity persist a cancelled-mid turn as `failed`, not
+  // `streaming`. The cancelled marker still wins, so the column reads cancelled
+  // rather than the mislabelled "failed" the bare disk status would give.
+  it("reads a reopened cancelled column cancelled even when the disk turn is failed", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    // The cancelled-mid recipient is the Codex agent — Codex (like Gemini /
+    // Antigravity) persists a killed turn as `failed`, so this is the harness
+    // shape where the marker must override a `failed` disk status.
+    seedFanout(
+      state,
+      { status: "complete", text: "alice reply" },
+      { status: "failed", text: "partial work" },
+    );
+
+    render(UnifiedTranscript, {
+      props: {
+        agents: [CLAUDE_AGENT, CODEX_AGENT],
+        overlay: [
+          {
+            kind: "outcome",
+            turn_id: "o-bob",
+            send_id: SEND_1,
+            agent_id: CODEX_AGENT.id,
+            status: "cancelled",
+            reason: null,
+            at: "2026-05-16T00:00:05Z",
+          },
+        ],
+      },
+    });
+
+    const columns = screen.getAllByTestId("fanout-column");
+    expect(columns[1]).toHaveAttribute("data-agent-id", CODEX_AGENT.id);
+    expect(columns[1]).toHaveAttribute("data-state", "cancelled");
+    expect(screen.getByTestId("outcome-cancelled")).toBeInTheDocument();
+    expect(screen.queryByTestId("outcome-failed")).toBeNull();
+    // The marker is authoritative: the turn's own "failed" status chip is
+    // suppressed so it doesn't contradict the "cancelled" marker.
+    expect(columns[1]).not.toHaveTextContent(/failed/i);
+  });
+
+  // A genuinely failed turn keeps its failed marker and its reason — the marker
+  // is authoritative but not suppressed, so failure detail still surfaces.
+  it("preserves a failed marker's reason on a reopened failed-mid-turn column", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    seedFanout(
+      state,
+      { status: "failed", text: "partial work" },
+      { status: "complete", text: "bob reply" },
+    );
+
+    render(UnifiedTranscript, {
+      props: {
+        agents: [CLAUDE_AGENT, CODEX_AGENT],
+        overlay: [
+          {
+            kind: "outcome",
+            turn_id: "o-alice",
+            send_id: SEND_1,
+            agent_id: CLAUDE_AGENT.id,
+            status: "failed",
+            reason: "process exited 1",
+            at: "2026-05-16T00:00:05Z",
+          },
+        ],
+      },
+    });
+
+    const columns = screen.getAllByTestId("fanout-column");
+    expect(columns[0]).toHaveAttribute("data-state", "failed");
+    expect(screen.getByTestId("outcome-failed")).toBeInTheDocument();
+    expect(columns[0]).toHaveTextContent("process exited 1");
+  });
+
   it("renders a single-recipient send as a normal row, not a fan-out group", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
@@ -849,6 +980,92 @@ describe("UnifiedTranscript — fan-out groups", () => {
 
     expect(screen.queryByTestId("fanout-group")).toBeNull();
     expect(screen.getAllByTestId("turn")).toHaveLength(2);
+  });
+});
+
+describe("UnifiedTranscript — standalone cancelled turns", () => {
+  // The single-recipient (non-fan-out) analog of the fan-out column fixes: a
+  // cancelled-mid turn reopens as a standalone agent row plus a sibling
+  // cancelled outcome marker. The marker is authoritative, so the dead turn must
+  // not show the live "Working…" footer (Claude persists cancelled-mid as
+  // `streaming`) and, for harnesses that persist it as `failed`, must not show a
+  // contradictory `failed` chip beside the `cancelled` marker.
+  function seedSolo(
+    state: Awaited<ReturnType<typeof loadState>>,
+    agent: AgentRecord,
+    status: "streaming" | "failed",
+  ): void {
+    state.transcripts[agent.id] = [
+      {
+        role: "user",
+        turn_id: "u-1",
+        agent_id: agent.id,
+        send_id: SEND_1,
+        started_at: "2026-05-16T00:00:00Z",
+        text: "do it",
+      },
+      {
+        role: "agent",
+        turn_id: "a-1",
+        agent_id: agent.id,
+        send_id: SEND_1,
+        started_at: "2026-05-16T00:00:01Z",
+        status,
+        items: [{ item_kind: "text", kind: "text", text: "partial work" }],
+      },
+    ];
+  }
+
+  function cancelledOverlay(agent: AgentRecord): ConversationItem[] {
+    return [
+      {
+        kind: "outcome",
+        turn_id: "o-1",
+        send_id: SEND_1,
+        agent_id: agent.id,
+        status: "cancelled",
+        reason: null,
+        at: "2026-05-16T00:00:05Z",
+      },
+    ];
+  }
+
+  it("shows no phantom live footer on a reopened streaming-on-disk cancelled turn", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    seedSolo(state, CLAUDE_AGENT, "streaming");
+
+    render(UnifiedTranscript, {
+      props: { agents: [CLAUDE_AGENT], overlay: cancelledOverlay(CLAUDE_AGENT) },
+    });
+
+    expect(screen.queryByTestId("fanout-group")).toBeNull();
+    expect(screen.getByText("partial work")).toBeInTheDocument();
+    expect(screen.getByTestId("outcome-cancelled")).toBeInTheDocument();
+    // The dead turn shows no live spinner and no live cancel control.
+    expect(screen.queryByTestId("turn-working")).toBeNull();
+    expect(screen.queryByTestId("turn-live-control")).toBeNull();
+  });
+
+  it("shows no contradictory failed chip on a reopened failed-on-disk cancelled turn", async () => {
+    const state = await loadState();
+    // CODEX_AGENT stands in for a harness that persists a killed turn as `failed`.
+    await state.registerAgent(CODEX_AGENT);
+    seedSolo(state, CODEX_AGENT, "failed");
+
+    render(UnifiedTranscript, {
+      props: { agents: [CODEX_AGENT], overlay: cancelledOverlay(CODEX_AGENT) },
+    });
+
+    expect(screen.getByTestId("outcome-cancelled")).toBeInTheDocument();
+    expect(screen.queryByTestId("outcome-failed")).toBeNull();
+    // The agent row's own `failed` chip is suppressed — only the marker's
+    // `cancelled` badge remains, no double/contradictory status.
+    const agentTurn = screen
+      .getAllByTestId("turn")
+      .find((el) => el.getAttribute("data-role") === "agent");
+    expect(agentTurn).toBeDefined();
+    expect(agentTurn).not.toHaveTextContent(/failed/i);
   });
 });
 
@@ -1627,5 +1844,40 @@ describe("UnifiedTranscript hydration failures", () => {
     expect(screen.getByTestId("turn")).toBeInTheDocument();
     expect(screen.queryByTestId("message-model")).toBeNull();
     expect(screen.queryByTestId("message-effort")).toBeNull();
+  });
+});
+
+describe("UnifiedTranscript — attachments", () => {
+  it("renders an image thumbnail and a file chip under a user message, never a raw path", async () => {
+    const state = await loadState();
+    await state.registerAgent(CODEX_AGENT);
+    const imgPath = "/proj/.switchboard/projects/p/attachments/uuid__diagram.png";
+    const filePath = "/proj/.switchboard/projects/p/attachments/uuid__data.bin";
+    state.transcripts[CODEX_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "user-1",
+        agent_id: CODEX_AGENT.id,
+        started_at: "2026-05-16T00:00:00Z",
+        text: "compare these",
+        attachments: [
+          { label: "image-1", kind: "image", path: imgPath, original_name: "diagram.png" },
+          { label: "file-1", kind: "file", path: filePath, original_name: "data.bin" },
+        ],
+      },
+    ];
+
+    render(UnifiedTranscript, { props: { agents: [CODEX_AGENT] } });
+
+    const thumb = (await screen.findByTestId("attachment-thumb-image-1")) as HTMLImageElement;
+    // The thumbnail uses convertFileSrc (asset:// URL), not the raw filesystem path.
+    expect(thumb.getAttribute("src")).toContain("asset://");
+    expect(thumb.getAttribute("src")).not.toBe(imgPath);
+    expect(screen.getByTestId("attachment-file-file-1")).toHaveTextContent("data.bin");
+
+    // The user bubble shows the prose + display names, never the staged paths.
+    const turn = screen.getByTestId("turn");
+    expect(turn.textContent).not.toContain(imgPath);
+    expect(turn.textContent).not.toContain(filePath);
   });
 });

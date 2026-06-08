@@ -701,6 +701,7 @@ async fn run_producer(ctx: ProducerCtx) {
         // Antigravity reports no token/window data — nothing to persist.
         context_window_source: None,
         stable_message_id: None,
+        first_message_id: None,
         spend: None,
         // Per-turn model: this dispatch's announcement if any, else the
         // carry-forward seeded from prior turns on resume — so an unchanged

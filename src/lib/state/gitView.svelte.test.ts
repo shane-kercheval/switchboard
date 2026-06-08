@@ -20,6 +20,7 @@ const {
   removeRepo,
   selectBranch,
   selectUncommitted,
+  selectedWorktreePathForEditor,
   branchSelection,
   branchCommits,
   diffTarget,
@@ -178,6 +179,33 @@ describe("gitView store", () => {
     await refreshAll();
     await selectBranch(mainRef(), dirtyOpts);
     expect(diffTarget.current).toMatchObject({ kind: "uncommitted", worktreePath: "/a/wt" });
+  });
+
+  it("selectedWorktreePathForEditor prefers the open uncommitted target", async () => {
+    gitView.repos = [listingWithWorktree("/a", "/a/wt")];
+    branchSelection.current = mainRef();
+    selectUncommitted("/a", "/a/detached", "~/detached");
+
+    expect(selectedWorktreePathForEditor()).toBe("/a/detached");
+  });
+
+  it("selectedWorktreePathForEditor falls back to the selected local branch worktree", () => {
+    gitView.repos = [listingWithWorktree("/a", "/a/wt")];
+    branchSelection.current = mainRef();
+
+    expect(selectedWorktreePathForEditor()).toBe("/a/wt");
+  });
+
+  it("selectedWorktreePathForEditor returns null for refs without a worktree", () => {
+    gitView.repos = [listing("/a")];
+    branchSelection.current = mainRef();
+    expect(selectedWorktreePathForEditor()).toBeNull();
+
+    branchSelection.current = { repoRoot: "/a", kind: "remote", name: "origin/main" };
+    expect(selectedWorktreePathForEditor()).toBeNull();
+
+    branchSelection.current = mainRef("/missing");
+    expect(selectedWorktreePathForEditor()).toBeNull();
   });
 
   it("selectBranch loads commits and auto-selects the latest when the branch is clean", async () => {

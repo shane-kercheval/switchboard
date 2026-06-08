@@ -42,6 +42,7 @@ import {
 import type {
   AgentId,
   AgentRecord,
+  Attachment,
   FailureKind,
   Hydrate,
   MessageId,
@@ -221,7 +222,17 @@ export function applyAgentHydrate(
     warnings: loaded.warnings,
   };
   const priorTurns = transcripts[agentId] ?? [];
-  transcripts[agentId] = transcriptReducer(priorTurns, hydrate, agentId, "");
+  // Pass the in-flight turn_id so a refresh re-read can't supersede an
+  // actively-streaming live turn (which now carries an early `hydration_key`).
+  const inFlightTurnId = runtimes[agentId]?.in_flight_turn_id;
+  transcripts[agentId] = transcriptReducer(
+    priorTurns,
+    hydrate,
+    agentId,
+    "",
+    undefined,
+    inFlightTurnId,
+  );
   const priorRuntime = runtimes[agentId];
   if (priorRuntime !== undefined) {
     runtimes[agentId] = runtimeReducer(priorRuntime, hydrate);
@@ -300,6 +311,7 @@ export function dispatchUserTurn(
   agentId: AgentId,
   userTurnId: TurnId,
   text: string,
+  attachments: Attachment[],
   sendId: SendId,
   // Timestamp generation, not reactive state.
   // eslint-disable-next-line svelte/prefer-svelte-reactivity
@@ -318,6 +330,7 @@ export function dispatchUserTurn(
     agentId,
     userTurnId,
     text,
+    attachments,
     startedAt,
     sendId,
   );
@@ -578,7 +591,14 @@ function handleEvent(agentId: AgentId, event: NormalizedEvent): void {
       ? pendingEntryFor(priorRuntime, event.message_id)?.send_id
       : undefined;
   const sendId = startEntry?.send_id ?? cancelledSendId ?? failedSendId;
-  transcripts[agentId] = transcriptReducer(priorTurns, event, agentId, receivedAt, sendId);
+  transcripts[agentId] = transcriptReducer(
+    priorTurns,
+    event,
+    agentId,
+    receivedAt,
+    sendId,
+    priorRuntime?.in_flight_turn_id,
+  );
   runtimes[agentId] = runtimeReducer(priorRuntime, event);
   manageHeartbeat(agentId, event);
 

@@ -10,7 +10,7 @@ use crate::error::{CoreError, Result};
 use crate::harness::{HarnessKind, SelectionAxis};
 use crate::io::{append_jsonl, read_jsonl, read_yaml, write_jsonl, write_yaml};
 use crate::name::{canonicalize_for_uniqueness, validate_name};
-use crate::paths::{CONFIG_FILE, JOURNAL_FILE, REGISTRY_FILE};
+use crate::paths::{ATTACHMENTS_DIR, CONFIG_FILE, JOURNAL_FILE, REGISTRY_FILE};
 
 pub type ProjectId = Uuid;
 
@@ -63,6 +63,15 @@ impl Project {
     /// `projects/`.
     pub fn journal_path(&self) -> PathBuf {
         self.root.join(JOURNAL_FILE)
+    }
+
+    /// Directory holding this project's staged attachment files
+    /// (`projects/<id>/attachments/`). Sited inside the per-project metadata dir
+    /// so a staged file resolves under every harness's sandbox (the dir is under
+    /// the user's working tree). Runtime data; `.gitignore`d like the rest of
+    /// `projects/`. Created lazily on first stage; absent until then.
+    pub fn attachments_dir(&self) -> PathBuf {
+        self.root.join(ATTACHMENTS_DIR)
     }
 
     /// Append a new agent to this project's registry. Validates the name (regex +

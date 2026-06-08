@@ -84,6 +84,27 @@ export type MessageId = string;
 // scoped to it).
 export type SendId = string;
 
+// One staged file attached to a send. Mirrors the Rust `switchboard_core::Attachment`
+// wire shape. `kind` drives the chip label prefix and thumbnail-vs-filename
+// rendering; `"unknown"` is the cross-version fallback for a kind a newer build
+// wrote that this build doesn't recognize (renders as a generic file).
+export type AttachmentKind = "image" | "text" | "file" | "unknown";
+
+export type Attachment = {
+  label: string;
+  kind: AttachmentKind;
+  path: string;
+  original_name: string;
+};
+
+// Result of staging a dropped file (`stage_attachment`): the staged absolute
+// path plus the original basename. The frontend assigns `label`/`kind` and
+// builds the full `Attachment` from these.
+export type StagedAttachment = {
+  path: string;
+  original_name: string;
+};
+
 export type NormalizedEvent =
   | { type: "turn_start"; turn_id: TurnId; message_id: MessageId; started_at: string }
   | { type: "content_chunk"; turn_id: TurnId; kind: ContentKind; text: string }
@@ -91,6 +112,11 @@ export type NormalizedEvent =
   // produced no renderable content (e.g. Claude Opus 4.8's redacted thinking
   // deltas). Re-arms the per-turn heartbeat; renders nothing.
   | { type: "liveness"; turn_id: TurnId }
+  // Early dedup identity for the in-flight turn (Claude). The reducer stamps
+  // `hydration_key` onto the live turn so a concurrent disk re-read collapses
+  // against it instead of duplicating. `hydration_key` is the first assistant
+  // message id — the same value `turn_end` carries.
+  | { type: "turn_identity"; turn_id: TurnId; hydration_key: string }
   | {
       type: "tool_started";
       turn_id: TurnId;
@@ -122,7 +148,9 @@ export type NormalizedEvent =
       // Live-matched stable hydration key — the same per-turn id this turn will
       // carry on disk, so the hydrate merge can recognize a turn that streamed
       // live and is later re-read as one turn. Populated only for live-matched
-      // harnesses (Claude's final assistant message.id); absent otherwise.
+      // harnesses (Claude's *first* non-subagent assistant message.id — distinct
+      // from the cost-join's final id, parse-invariant so a mid-flight re-read
+      // dedups correctly); absent otherwise.
       hydration_key?: string | null;
     }
   | { type: "rate_limit_event"; agent_id: AgentId; info: unknown }
@@ -547,6 +575,11 @@ export type ConversationItem =
       send_id?: string | null;
       agent_ids: AgentId[];
       text: string;
+      // Files attached to this send, from the grouped journal `Send` (identical
+      // across a fan-out's recipients). The backend always sends this (possibly
+      // empty); optional here to match the additive-field style of this union and
+      // tolerate pre-feature fixtures/blobs. Absent for an imported prompt.
+      attachments?: Attachment[];
       at: string;
     }
   | {

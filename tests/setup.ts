@@ -28,3 +28,10 @@ if (typeof window !== "undefined" && !window.ResizeObserver) {
     disconnect(): void {}
   } as unknown as typeof ResizeObserver;
 }
+
+// jsdom doesn't implement layout, so `Element.scrollIntoView` is absent; the
+// command palette calls it to keep the highlighted row visible during keyboard
+// navigation. No-op polyfill is enough — tests don't assert scroll position.
+if (typeof Element !== "undefined" && !Element.prototype.scrollIntoView) {
+  Element.prototype.scrollIntoView = function (): void {};
+}

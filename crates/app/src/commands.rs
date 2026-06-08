@@ -3187,7 +3187,10 @@ fn merge_project_conversation(
         // marker, not from this correlation. Residual: a cancelled-before-output
         // send positioned *before* a content-bearing turn shifts subsequent labels
         // by one (content mis-grouping, not prompt duplication — the journal still
-        // owns the prompt); pinned by characterization tests below.
+        // owns the prompt). User-visible symptom: a completed answer can render
+        // under a `cancelled` badge (wrong *status* on a real answer), not a
+        // duplicated or missing prompt. Pinned by characterization tests below;
+        // the deferred durable key-join (plan doc) dissolves it.
         //
         // User turns are classified by their REPLY, not by a suffix count — so a
         // non-journaled prompt that lands *after* journaled history (e.g. the user

@@ -120,6 +120,30 @@
     return set;
   });
 
+  /// `${agent_id}:${send_id}` keys of turns owned by a non-completed Outcome
+  /// marker (cancelled/failed). The marker is the authority for a non-completed
+  /// turn's status (the journal owns non-completed outcomes), so a standalone
+  /// agent row whose turn is in this set must not render the live "Working…"
+  /// footer (its harness status can read `streaming` for a cancelled-mid Claude
+  /// turn) nor its own status chip (which would contradict the marker — e.g. a
+  /// `failed`-on-disk Codex turn beside a `cancelled` marker). This is the
+  /// single-recipient analog of the fan-out column's `colHasOutcome`; the
+  /// backend stamps `send_id` on both the turn and its marker, so the join is
+  /// exact. Turns with no `send_id` (pre-journaling/imported) are never in the
+  /// set and render unchanged.
+  const turnsWithOutcome = $derived.by(() => {
+    // eslint-disable-next-line svelte/prefer-svelte-reactivity
+    const set = new Set<string>();
+    for (const row of rows) {
+      if (row.kind === "outcome") set.add(`${row.agent_id}:${row.send_id}`);
+    }
+    return set;
+  });
+
+  function hasOutcomeFor(turn: AgentTurn): boolean {
+    return turn.send_id !== undefined && turnsWithOutcome.has(`${turn.agent_id}:${turn.send_id}`);
+  }
+
   function agentName(agentId: string): string {
     return agentById[agentId]?.name ?? "unknown";
   }
@@ -537,6 +561,12 @@
 {#snippet agentRow(turn: AgentTurn)}
   {@const harness = agentById[turn.agent_id]?.harness}
   {@const copyable = copyTextOf(turn, agentCopy.mode)}
+  <!-- A non-completed Outcome marker (rendered as a sibling `outcomeRow`) is
+       authoritative for this turn's status, mirroring the fan-out column. When
+       present, suppress the turn's own status chip and the live footer so a
+       cancelled-mid turn doesn't reopen with a phantom spinner (Claude
+       `streaming`) or a contradictory `failed` chip (Codex/Gemini/Antigravity). -->
+  {@const ownedByOutcome = hasOutcomeFor(turn)}
   <div class="group space-y-1.5" data-testid="turn" data-role="agent">
     <div class="flex items-center gap-2 text-xs font-semibold tracking-wide uppercase">
       <span class="text-fg" data-testid="turn-agent-name">{agentName(turn.agent_id)}</span>
@@ -546,8 +576,8 @@
       class="space-y-1.5 border-l-[0.5px] pl-3"
       style:border-left-color={agentBorderColor(turn.agent_id)}
     >
-      {@render turnStatusLabel(turn.status)}
-      {@render turnBody(turn)}
+      {#if !ownedByOutcome}{@render turnStatusLabel(turn.status)}{/if}
+      {@render turnBody(turn, !ownedByOutcome)}
     </div>
     {@render messageMeta(
       turn.started_at,

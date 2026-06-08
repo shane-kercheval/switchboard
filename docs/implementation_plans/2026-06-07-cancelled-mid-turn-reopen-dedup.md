@@ -130,9 +130,12 @@ edges (`:3089-3106`; the existing `merge_cancel_before_harness_flush_overcounts�
 test at `:10151` already characterizes a neighbor). Crucially, this residual is a
 **content mis-grouping** (a turn lands in the wrong column / gets the wrong
 `send_id`), **not** prompt duplication — the journal still owns the prompt, so the
-headline bug stays fixed. It is strictly narrower than the in-flight breakage
-tail-anchoring would cause, and it is the precise trigger for the deferred
-key-join (below).
+headline bug stays fixed. Its **user-visible symptom** is a *completed answer
+rendered under a `cancelled` badge* (wrong status on a real answer) — not a
+duplicated or missing prompt; worth knowing because "wrong status" is more
+alarming than "mis-grouped" sounds. It is strictly narrower than the in-flight
+breakage tail-anchoring would cause, and it is the precise trigger for the
+deferred key-join (below).
 
 ### 2. Frontend — make the journal marker authoritative for the cancelled badge (`columnState`)
 
@@ -167,9 +170,17 @@ the whole split-source design; failed turns already carry a `failed` marker, so
   shows a phantom spinner on a dead turn. Gate `turnBody`'s streaming footer on a
   `live` flag and pass `live = (columnState === "streaming")` at the column site,
   so the live affordance only renders when the column is *genuinely* live (no
-  authoritative non-completed marker). Standalone (non-fan-out) rows pass the
-  default `live = true` and are unchanged — the single-recipient reopen path is
-  out of scope here (its outcome is a sibling row, not a same-scope marker).
+  authoritative non-completed marker).
+- **Single-recipient (standalone) path — fixed too** (initially deferred, then
+  pulled in: the deferral's premise was wrong). A single-agent cancelled-mid turn
+  reopens as a standalone `agentRow` plus a sibling `outcomeRow`, hitting the same
+  two bugs (phantom footer for Claude `streaming`; `failed`+`cancelled` double
+  badge otherwise) on the *more common* path. The authority signal is already
+  available — the backend stamps `send_id` on both the turn and the marker — so a
+  render-time `Set<${agent_id}:${send_id}>` of marker-owned turns (`hasOutcomeFor`)
+  gates the standalone `turnBody` footer and `turnStatusLabel`, mirroring
+  `colHasOutcome`/the column gate. Turns with no `send_id` (pre-journaling/
+  imported) are never in the set and render unchanged.
 
 ## Tests
 

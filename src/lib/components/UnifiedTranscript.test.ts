@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/svelte";
 import { tick } from "svelte";
-import type { AgentRecord, NormalizedEvent } from "$lib/types";
+import type { AgentRecord, ConversationItem, NormalizedEvent } from "$lib/types";
 import { HEARTBEAT_TIMEOUT_MS } from "$lib/types";
 import { agentCopy } from "$lib/agentCopy.svelte";
 // Static import so the component-tree transform happens at module collection,
@@ -882,10 +882,13 @@ describe("UnifiedTranscript — fan-out groups", () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     await state.registerAgent(CODEX_AGENT);
+    // The cancelled-mid recipient is the Codex agent — Codex (like Gemini /
+    // Antigravity) persists a killed turn as `failed`, so this is the harness
+    // shape where the marker must override a `failed` disk status.
     seedFanout(
       state,
+      { status: "complete", text: "alice reply" },
       { status: "failed", text: "partial work" },
-      { status: "complete", text: "bob reply" },
     );
 
     render(UnifiedTranscript, {
@@ -894,9 +897,9 @@ describe("UnifiedTranscript — fan-out groups", () => {
         overlay: [
           {
             kind: "outcome",
-            turn_id: "o-alice",
+            turn_id: "o-bob",
             send_id: SEND_1,
-            agent_id: CLAUDE_AGENT.id,
+            agent_id: CODEX_AGENT.id,
             status: "cancelled",
             reason: null,
             at: "2026-05-16T00:00:05Z",
@@ -906,12 +909,13 @@ describe("UnifiedTranscript — fan-out groups", () => {
     });
 
     const columns = screen.getAllByTestId("fanout-column");
-    expect(columns[0]).toHaveAttribute("data-state", "cancelled");
+    expect(columns[1]).toHaveAttribute("data-agent-id", CODEX_AGENT.id);
+    expect(columns[1]).toHaveAttribute("data-state", "cancelled");
     expect(screen.getByTestId("outcome-cancelled")).toBeInTheDocument();
     expect(screen.queryByTestId("outcome-failed")).toBeNull();
     // The marker is authoritative: the turn's own "failed" status chip is
     // suppressed so it doesn't contradict the "cancelled" marker.
-    expect(columns[0]).not.toHaveTextContent(/failed/i);
+    expect(columns[1]).not.toHaveTextContent(/failed/i);
   });
 
   // A genuinely failed turn keeps its failed marker and its reason — the marker
@@ -976,6 +980,92 @@ describe("UnifiedTranscript — fan-out groups", () => {
 
     expect(screen.queryByTestId("fanout-group")).toBeNull();
     expect(screen.getAllByTestId("turn")).toHaveLength(2);
+  });
+});
+
+describe("UnifiedTranscript — standalone cancelled turns", () => {
+  // The single-recipient (non-fan-out) analog of the fan-out column fixes: a
+  // cancelled-mid turn reopens as a standalone agent row plus a sibling
+  // cancelled outcome marker. The marker is authoritative, so the dead turn must
+  // not show the live "Working…" footer (Claude persists cancelled-mid as
+  // `streaming`) and, for harnesses that persist it as `failed`, must not show a
+  // contradictory `failed` chip beside the `cancelled` marker.
+  function seedSolo(
+    state: Awaited<ReturnType<typeof loadState>>,
+    agent: AgentRecord,
+    status: "streaming" | "failed",
+  ): void {
+    state.transcripts[agent.id] = [
+      {
+        role: "user",
+        turn_id: "u-1",
+        agent_id: agent.id,
+        send_id: SEND_1,
+        started_at: "2026-05-16T00:00:00Z",
+        text: "do it",
+      },
+      {
+        role: "agent",
+        turn_id: "a-1",
+        agent_id: agent.id,
+        send_id: SEND_1,
+        started_at: "2026-05-16T00:00:01Z",
+        status,
+        items: [{ item_kind: "text", kind: "text", text: "partial work" }],
+      },
+    ];
+  }
+
+  function cancelledOverlay(agent: AgentRecord): ConversationItem[] {
+    return [
+      {
+        kind: "outcome",
+        turn_id: "o-1",
+        send_id: SEND_1,
+        agent_id: agent.id,
+        status: "cancelled",
+        reason: null,
+        at: "2026-05-16T00:00:05Z",
+      },
+    ];
+  }
+
+  it("shows no phantom live footer on a reopened streaming-on-disk cancelled turn", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    seedSolo(state, CLAUDE_AGENT, "streaming");
+
+    render(UnifiedTranscript, {
+      props: { agents: [CLAUDE_AGENT], overlay: cancelledOverlay(CLAUDE_AGENT) },
+    });
+
+    expect(screen.queryByTestId("fanout-group")).toBeNull();
+    expect(screen.getByText("partial work")).toBeInTheDocument();
+    expect(screen.getByTestId("outcome-cancelled")).toBeInTheDocument();
+    // The dead turn shows no live spinner and no live cancel control.
+    expect(screen.queryByTestId("turn-working")).toBeNull();
+    expect(screen.queryByTestId("turn-live-control")).toBeNull();
+  });
+
+  it("shows no contradictory failed chip on a reopened failed-on-disk cancelled turn", async () => {
+    const state = await loadState();
+    // CODEX_AGENT stands in for a harness that persists a killed turn as `failed`.
+    await state.registerAgent(CODEX_AGENT);
+    seedSolo(state, CODEX_AGENT, "failed");
+
+    render(UnifiedTranscript, {
+      props: { agents: [CODEX_AGENT], overlay: cancelledOverlay(CODEX_AGENT) },
+    });
+
+    expect(screen.getByTestId("outcome-cancelled")).toBeInTheDocument();
+    expect(screen.queryByTestId("outcome-failed")).toBeNull();
+    // The agent row's own `failed` chip is suppressed — only the marker's
+    // `cancelled` badge remains, no double/contradictory status.
+    const agentTurn = screen
+      .getAllByTestId("turn")
+      .find((el) => el.getAttribute("data-role") === "agent");
+    expect(agentTurn).toBeDefined();
+    expect(agentTurn).not.toHaveTextContent(/failed/i);
   });
 });
 

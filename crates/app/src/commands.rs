@@ -3110,15 +3110,16 @@ fn merge_project_conversation(
     let mut user_messages: Vec<UserMessageGroup> = Vec::new();
     // The journal's `turn_id` is the dispatcher's, distinct from the harness
     // session file's own turn ids, so they can't be joined directly. Instead we
-    // correlate each agent's harness turns to its sends by ORDER: the Nth
-    // *completed* agent turn answers the Nth completed send dispatched to it
-    // (the dispatcher runs an agent's turns FIFO and journals in that order).
-    // `agent_sends` is each agent's sends in order; `non_completed` is the
-    // (agent, send) pairs that failed/cancelled — those leave no clean harness
-    // turn (only an Outcome marker, which already carries its own send_id), so
-    // they're excluded from the order-zip below to keep it aligned.
+    // correlate each agent's harness turns to its sends by ORDER: the Nth harness
+    // agent turn answers the Nth send dispatched to it (the dispatcher runs an
+    // agent's turns FIFO and journals in that order). `agent_sends` is each
+    // agent's sends in dispatch order — **all** of them, completed and not: a
+    // send cancelled/failed *after* the agent wrote content leaves a partial
+    // harness turn that must be paired (excluding non-completed sends here is the
+    // bug that double-rendered the prompt). A non-completed send's cancelled/failed
+    // badge comes from its Outcome marker, which renders alongside the turn
+    // (`ProjectConversation` render-both contract).
     let mut agent_sends: HashMap<AgentId, Vec<SendId>> = HashMap::new();
-    let mut non_completed: HashMap<AgentId, std::collections::HashSet<SendId>> = HashMap::new();
     for record in journal {
         match record {
             switchboard_core::JournalRecord::Send {
@@ -3156,7 +3157,6 @@ fn merge_project_conversation(
                 started_at,
                 ..
             } => {
-                non_completed.entry(agent_id).or_default().insert(send_id);
                 let (status, reason) = parse_outcome(&outcome);
                 items.push(ConversationItem::Outcome {
                     turn_id,
@@ -3183,19 +3183,6 @@ fn merge_project_conversation(
         });
     }
 
-    // Per-agent FIFO of *completed* sends (non-completed excluded — they leave
-    // no clean harness turn), drained in order to stamp each harness turn with
-    // the send it answered.
-    let mut sends_by_agent: HashMap<AgentId, Vec<SendId>> = HashMap::new();
-    for (agent_id, sends) in agent_sends {
-        let excluded = non_completed.get(&agent_id);
-        let kept: Vec<SendId> = sends
-            .into_iter()
-            .filter(|s| !excluded.is_some_and(|e| e.contains(s)))
-            .collect();
-        sends_by_agent.insert(agent_id, kept);
-    }
-
     // Agent content ← each agent's harness transcript. Warnings and any load
     // error are agent-scoped: attach them to this transcript's
     // `AgentConversationMeta` so the unified view can attribute them (one bad
@@ -3206,12 +3193,27 @@ fn merge_project_conversation(
         // Correlate harness turns to journaled sends by ORDER (the journal's
         // turn_id is the dispatcher's, unrelated to the harness file's).
         //
-        // Agent turns end-align: extra agent turns at the FRONT are pre-journaling
-        // history (older than the first journaled send — typically an attached
-        // session predating Switchboard) and get no send_id (rendered un-grouped);
-        // the most-recent ones pair with completed sends. Extra completed sends at
-        // the BACK are in-flight (a send whose turn has no harness content yet) and
-        // are dropped here rather than mislabeling a completed turn.
+        // Front-aligned against **all** sends (`agent_sends`, not completed-only):
+        // extra agent turns at the FRONT are pre-journaling history (older than the
+        // first journaled send — typically an attached session predating
+        // Switchboard) and get no send_id (rendered un-grouped); the rest pair with
+        // sends in order. Extra sends at the BACK have no harness turn — an
+        // in-flight send (turn still running) or a cancelled-before-output send —
+        // and are dropped here rather than mislabeling a completed turn.
+        //
+        // The offset is on the **turn** side (`turn_offset`), not the send side:
+        // do NOT skip leading sends (tail-anchoring), which would pair the last
+        // completed turn with a trailing in-flight send — see
+        // `merge_in_flight_send_does_not_mislabel_completed_turns`. Pairing against
+        // all sends is what lets a cancel-mid turn claim its own send (so its
+        // prompt drops); its cancelled status comes from the coexisting Outcome
+        // marker, not from this correlation. Residual: a cancelled-before-output
+        // send positioned *before* a content-bearing turn shifts subsequent labels
+        // by one (content mis-grouping, not prompt duplication — the journal still
+        // owns the prompt). User-visible symptom: a completed answer can render
+        // under a `cancelled` badge (wrong *status* on a real answer), not a
+        // duplicated or missing prompt. Pinned by characterization tests below;
+        // the deferred durable key-join (plan doc) dissolves it.
         //
         // User turns are classified by their REPLY, not by a suffix count — so a
         // non-journaled prompt that lands *after* journaled history (e.g. the user
@@ -3221,11 +3223,11 @@ fn merge_project_conversation(
         // the journal owns it) exactly when it corresponds to a send:
         //   - A user turn WITH a following reply is journaled iff that reply is
         //     journaled (`agent_seen >= turn_offset`).
-        //   - A *dangling* user turn (no reply — a failed/cancelled send, an
-        //     in-flight one, or an imported prompt with no reply yet) is journaled
-        //     while sends that produced no completed agent turn remain to account
-        //     for it (`dangling_journaled` of them = non-completed + in-flight);
-        //     beyond that it's imported and rendered.
+        //   - A *dangling* user turn (no reply — a cancelled-before-output send or
+        //     an in-flight one, or an imported prompt with no reply yet) is
+        //     journaled while sends that produced no harness turn remain to account
+        //     for it (`dangling_journaled` of them = trailing send-excess); beyond
+        //     that it's imported and rendered.
         // This needs 1:1 prompt/reply alternation in the file (true for Claude and
         // Codex — tool results fold into the agent turn). Two edges remain, BOTH
         // confined to the already-discouraged pattern of running the bare CLI on a
@@ -3242,19 +3244,16 @@ fn merge_project_conversation(
         //     and the journaled one duplicated. Order alone can't disambiguate
         //     interleaved dangling sources — a timestamp join could, but would be
         //     inconsistent with the order-based agent-side correlation above.
-        // Both mirror the order assumptions the agent-side end-alignment already
+        // Both mirror the order assumptions the agent-side front-alignment already
         // makes.
         let agent_turn_count = turns
             .iter()
             .filter(|t| matches!(t, switchboard_harness::Turn::Agent { .. }))
             .count();
-        let completed = sends_by_agent.get(&agent_id).map_or(&[][..], Vec::as_slice);
-        let non_completed_count = non_completed
-            .get(&agent_id)
-            .map_or(0, std::collections::HashSet::len);
-        let pairs = agent_turn_count.min(completed.len());
+        let all_sends = agent_sends.get(&agent_id).map_or(&[][..], Vec::as_slice);
+        let pairs = agent_turn_count.min(all_sends.len());
         let turn_offset = agent_turn_count - pairs;
-        let dangling_journaled = (completed.len() + non_completed_count).saturating_sub(pairs);
+        let dangling_journaled = all_sends.len() - pairs;
         let mut agent_seen = 0usize;
         let mut dangling_seen = 0usize;
         for turn in turns {
@@ -3272,7 +3271,7 @@ fn merge_project_conversation(
                     ..
                 } => {
                     let send_id = if agent_seen >= turn_offset {
-                        completed.get(agent_seen - turn_offset).copied()
+                        all_sends.get(agent_seen - turn_offset).copied()
                     } else {
                         None
                     };
@@ -4832,6 +4831,7 @@ mod tests {
                     usage: None,
                     context_window_source: None,
                     stable_message_id: None,
+                    first_message_id: None,
                     spend: None,
                     model: None,
                     effort: None,
@@ -5104,6 +5104,7 @@ mod tests {
                         usage: None,
                         context_window_source: None,
                         stable_message_id: None,
+                        first_message_id: None,
                         spend: None,
                         model: None,
                         effort: None,
@@ -5226,6 +5227,7 @@ mod tests {
                         usage: None,
                         context_window_source: None,
                         stable_message_id: None,
+                        first_message_id: None,
                         spend: None,
                         model: None,
                         effort: None,
@@ -10570,6 +10572,461 @@ mod tests {
         assert!(
             matches!(&merged.items[2], ConversationItem::Outcome { agent_id, status, .. } if *agent_id == c && *status == OutcomeStatus::Cancelled),
             "C's cancel marker last"
+        );
+    }
+
+    /// An agent turn with an explicit status + a preceding shape — for the
+    /// cancelled/failed-mid-turn fixtures where the harness persisted a partial
+    /// turn (`Streaming` for Claude, `Failed` for Codex/Gemini/Antigravity) or,
+    /// in the cancel-after-end race, a `Complete` one.
+    fn agent_turn_status(
+        turn_id: Uuid,
+        agent_id: AgentId,
+        text: &str,
+        t: i64,
+        status: TurnStatus,
+    ) -> Turn {
+        match agent_turn(turn_id, agent_id, text, t) {
+            Turn::Agent {
+                turn_id,
+                agent_id,
+                started_at,
+                ended_at,
+                items,
+                usage,
+                spend,
+                model,
+                effort,
+                hydration_key,
+                stable_message_id,
+                ..
+            } => Turn::Agent {
+                turn_id,
+                agent_id,
+                started_at,
+                ended_at,
+                status,
+                items,
+                usage,
+                spend,
+                model,
+                effort,
+                hydration_key,
+                stable_message_id,
+            },
+            other => other,
+        }
+    }
+
+    fn user_messages(merged: &ProjectConversation) -> Vec<&ConversationItem> {
+        merged
+            .items
+            .iter()
+            .filter(|i| matches!(i, ConversationItem::UserMessage { .. }))
+            .collect()
+    }
+
+    /// The headline bug: a send cancelled *after* the agent wrote content leaves a
+    /// partial harness turn. Correlating against all sends (not completed-only)
+    /// pairs that turn with its send, so its harness `Turn::User` prompt drops
+    /// (the journal owns it) — no duplicate — and the turn groups under the send.
+    /// The cancelled badge rides on the coexisting Outcome marker (render-both).
+    #[test]
+    fn merge_cancel_mid_turn_with_content_drops_prompt_and_groups() {
+        let send_id = Uuid::now_v7();
+        let dispatch_turn = Uuid::now_v7();
+        let disk_turn = Uuid::now_v7();
+        let disk_prompt = Uuid::now_v7();
+        let agent = Uuid::now_v7();
+        let journal = vec![
+            send_record(send_id, dispatch_turn, agent, "explore the repo", 0),
+            outcome_record(
+                send_id,
+                dispatch_turn,
+                agent,
+                serde_json::json!({"status": "cancelled", "source": "user"}),
+                3,
+            ),
+        ];
+        // Disk: the prompt + a partial (Streaming) agent turn the cancel left.
+        let transcript = transcript_of(vec![
+            user_turn(disk_prompt, agent, "explore the repo", 0),
+            agent_turn_status(
+                disk_turn,
+                agent,
+                "starting to look…",
+                1,
+                TurnStatus::Streaming,
+            ),
+        ]);
+
+        let merged = merge_project_conversation(journal, vec![(agent, transcript, None)]);
+
+        // Exactly one user message — the journal's, NOT an imported duplicate.
+        let users = user_messages(&merged);
+        assert_eq!(
+            users.len(),
+            1,
+            "no duplicate/imported prompt, got {users:?}"
+        );
+        assert!(
+            matches!(users[0], ConversationItem::UserMessage { send_id: Some(s), .. } if *s == send_id),
+            "the surviving prompt is the journaled (grouped) one"
+        );
+        // The partial turn is grouped under the send (not orphaned send_id: None).
+        assert!(
+            merged.items.iter().any(|i| matches!(
+                i,
+                ConversationItem::AgentTurn { send_id: Some(s), .. } if *s == send_id
+            )),
+            "the cancelled partial turn groups under its send"
+        );
+        // The cancelled badge is carried by the coexisting Outcome marker.
+        assert!(
+            merged.items.iter().any(|i| matches!(
+                i,
+                ConversationItem::Outcome {
+                    status: OutcomeStatus::Cancelled,
+                    ..
+                }
+            )),
+            "render-both: the Outcome marker is preserved"
+        );
+    }
+
+    /// The cancel-after-end race: the model finished writing (disk turn reads
+    /// `Complete`) before the kill, so the journal records cancelled. Status-blind
+    /// correlation still pairs the `Complete` turn with its cancelled send — no
+    /// duplicate prompt, no orphan. (This is the case a disk-status partition got
+    /// wrong.)
+    #[test]
+    fn merge_cancel_after_end_turn_complete_on_disk_still_groups() {
+        let send_id = Uuid::now_v7();
+        let dispatch_turn = Uuid::now_v7();
+        let agent = Uuid::now_v7();
+        let journal = vec![
+            send_record(send_id, dispatch_turn, agent, "summarize", 0),
+            outcome_record(
+                send_id,
+                dispatch_turn,
+                agent,
+                serde_json::json!({"status": "cancelled", "source": "user"}),
+                3,
+            ),
+        ];
+        let transcript = transcript_of(vec![
+            user_turn(Uuid::now_v7(), agent, "summarize", 0),
+            agent_turn_status(
+                Uuid::now_v7(),
+                agent,
+                "the full answer",
+                1,
+                TurnStatus::Complete,
+            ),
+        ]);
+
+        let merged = merge_project_conversation(journal, vec![(agent, transcript, None)]);
+
+        assert_eq!(user_messages(&merged).len(), 1, "no duplicate prompt");
+        assert!(
+            merged.items.iter().any(|i| matches!(
+                i,
+                ConversationItem::AgentTurn { send_id: Some(s), .. } if *s == send_id
+            )),
+            "the Complete-on-disk cancelled turn groups under its send"
+        );
+    }
+
+    /// Cancel-then-retry on one agent: `[cancelled(partial), completed]`. Each turn
+    /// pairs with its own send; both prompts drop; one user message per send.
+    #[test]
+    fn merge_cancel_then_retry_pairs_each_turn_to_its_send() {
+        let s0 = Uuid::now_v7();
+        let s1 = Uuid::now_v7();
+        let agent = Uuid::now_v7();
+        let journal = vec![
+            send_record(s0, Uuid::now_v7(), agent, "first try", 0),
+            outcome_record(
+                s0,
+                Uuid::now_v7(),
+                agent,
+                serde_json::json!({"status": "cancelled", "source": "user"}),
+                2,
+            ),
+            send_record(s1, Uuid::now_v7(), agent, "second try", 3),
+        ];
+        let transcript = transcript_of(vec![
+            user_turn(Uuid::now_v7(), agent, "first try", 0),
+            agent_turn_status(Uuid::now_v7(), agent, "partial", 1, TurnStatus::Streaming),
+            user_turn(Uuid::now_v7(), agent, "second try", 3),
+            agent_turn(Uuid::now_v7(), agent, "done", 4),
+        ]);
+
+        let merged = merge_project_conversation(journal, vec![(agent, transcript, None)]);
+
+        // Two grouped prompts (s0, s1), no imported duplicates.
+        let users = user_messages(&merged);
+        assert_eq!(users.len(), 2, "one prompt per send, no duplicates");
+        assert!(
+            users.iter().all(|u| matches!(
+                u,
+                ConversationItem::UserMessage {
+                    send_id: Some(_),
+                    ..
+                }
+            )),
+            "both prompts journaled"
+        );
+        let agent_sends: Vec<Option<SendId>> = merged
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                ConversationItem::AgentTurn { send_id, .. } => Some(*send_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            agent_sends,
+            vec![Some(s0), Some(s1)],
+            "turns pair to their own sends in order"
+        );
+    }
+
+    /// Cancelled-before-output but the harness *did* record the prompt (a dangling
+    /// user turn, no reply): the prompt still drops (journal owns it), the bare
+    /// cancelled marker renders, no duplicate. The prompt-drop half's subtle shape.
+    #[test]
+    fn merge_cancel_before_output_with_recorded_prompt_drops_it() {
+        let send_id = Uuid::now_v7();
+        let agent = Uuid::now_v7();
+        let journal = vec![
+            send_record(send_id, Uuid::now_v7(), agent, "do the thing", 0),
+            outcome_record(
+                send_id,
+                Uuid::now_v7(),
+                agent,
+                serde_json::json!({"status": "cancelled", "source": "user"}),
+                2,
+            ),
+        ];
+        // Prompt recorded, no agent turn (cancelled before any output).
+        let transcript = transcript_of(vec![user_turn(Uuid::now_v7(), agent, "do the thing", 0)]);
+
+        let merged = merge_project_conversation(journal, vec![(agent, transcript, None)]);
+
+        assert_eq!(
+            user_messages(&merged).len(),
+            1,
+            "the recorded prompt drops; only the journal's remains"
+        );
+        assert!(
+            !merged
+                .items
+                .iter()
+                .any(|i| matches!(i, ConversationItem::AgentTurn { .. })),
+            "no agent turn (nothing produced)"
+        );
+        assert!(
+            merged.items.iter().any(|i| matches!(
+                i,
+                ConversationItem::Outcome {
+                    status: OutcomeStatus::Cancelled,
+                    ..
+                }
+            )),
+            "bare cancelled marker renders"
+        );
+    }
+
+    /// Documented residual (NOT a correctness assertion): a cancelled-before-output
+    /// send positioned *before* a content-bearing send shifts labels by one — the
+    /// completed answer lands under the cancelled send's `send_id` (content
+    /// mis-grouping). The prompt is still journal-owned (no duplication). Pins the
+    /// known-bound so a future change to it is a conscious decision.
+    #[test]
+    fn merge_residual_leading_cancel_before_output_misgroups() {
+        let s0 = Uuid::now_v7(); // cancelled before output (prompt recorded)
+        let s1 = Uuid::now_v7(); // completed
+        let agent = Uuid::now_v7();
+        let journal = vec![
+            send_record(s0, Uuid::now_v7(), agent, "p0", 0),
+            outcome_record(
+                s0,
+                Uuid::now_v7(),
+                agent,
+                serde_json::json!({"status": "cancelled", "source": "user"}),
+                1,
+            ),
+            send_record(s1, Uuid::now_v7(), agent, "p1", 2),
+        ];
+        let transcript = transcript_of(vec![
+            user_turn(Uuid::now_v7(), agent, "p0", 0),
+            user_turn(Uuid::now_v7(), agent, "p1", 2),
+            agent_turn(Uuid::now_v7(), agent, "answer to p1", 3),
+        ]);
+
+        let merged = merge_project_conversation(journal, vec![(agent, transcript, None)]);
+
+        // No duplicated prompt (both journal-owned).
+        let users = user_messages(&merged);
+        assert!(
+            users.iter().all(|u| matches!(
+                u,
+                ConversationItem::UserMessage {
+                    send_id: Some(_),
+                    ..
+                }
+            )),
+            "no imported duplicate prompt"
+        );
+        // The residual: s1's answer is mis-grouped under s0.
+        let answer = merged
+            .items
+            .iter()
+            .find_map(|i| match i {
+                ConversationItem::AgentTurn { send_id, .. } => Some(*send_id),
+                _ => None,
+            })
+            .expect("one agent turn");
+        assert_eq!(
+            answer,
+            Some(s0),
+            "documented residual: leading cancel-before-output mis-groups the answer onto s0"
+        );
+    }
+
+    /// Trailing interleave `[completed, cancel-after-end]` — both turns read
+    /// `Complete` on disk (the second's process was killed only after the model
+    /// finished writing). All-sends order-pairing crosses the completed/cancelled
+    /// boundary correctly: the first `Complete` turn → completed send, the second
+    /// `Complete` turn → cancelled send. A disk-status partition would route both
+    /// to the completed bucket and reproduce the duplicate-prompt bug.
+    #[test]
+    fn merge_completed_then_cancel_after_end_pairs_across_the_boundary() {
+        let s0 = Uuid::now_v7(); // completed
+        let s1 = Uuid::now_v7(); // cancelled after end_turn (Complete on disk)
+        let agent = Uuid::now_v7();
+        let journal = vec![
+            send_record(s0, Uuid::now_v7(), agent, "first", 0),
+            send_record(s1, Uuid::now_v7(), agent, "second", 2),
+            outcome_record(
+                s1,
+                Uuid::now_v7(),
+                agent,
+                serde_json::json!({"status": "cancelled", "source": "user"}),
+                4,
+            ),
+        ];
+        let transcript = transcript_of(vec![
+            user_turn(Uuid::now_v7(), agent, "first", 0),
+            agent_turn_status(
+                Uuid::now_v7(),
+                agent,
+                "first answer",
+                1,
+                TurnStatus::Complete,
+            ),
+            user_turn(Uuid::now_v7(), agent, "second", 2),
+            agent_turn_status(
+                Uuid::now_v7(),
+                agent,
+                "second answer",
+                3,
+                TurnStatus::Complete,
+            ),
+        ]);
+
+        let merged = merge_project_conversation(journal, vec![(agent, transcript, None)]);
+
+        assert_eq!(user_messages(&merged).len(), 2, "one prompt per send");
+        let agent_sends: Vec<Option<SendId>> = merged
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                ConversationItem::AgentTurn { send_id, .. } => Some(*send_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            agent_sends,
+            vec![Some(s0), Some(s1)],
+            "completed turn → completed send, Complete-on-disk cancelled turn → cancelled send"
+        );
+    }
+
+    /// A *completed* send whose last disk turn reads `Streaming` (the M2
+    /// `eof_tail_status` running-vs-finished limitation: no `end_turn` written)
+    /// with **no** Outcome marker. Order-pairing keys off the all-sends list, not
+    /// the harness status, so the turn still pairs to its completed send — a
+    /// disk-status partition would strand it in the non-completed bucket. Asserts
+    /// **grouping** only; the residual `streaming` badge is out of scope here.
+    #[test]
+    fn merge_streaming_completed_tail_pairs_to_its_send() {
+        let s0 = Uuid::now_v7();
+        let agent = Uuid::now_v7();
+        let journal = vec![send_record(s0, Uuid::now_v7(), agent, "do it", 0)];
+        let transcript = transcript_of(vec![
+            user_turn(Uuid::now_v7(), agent, "do it", 0),
+            agent_turn_status(
+                Uuid::now_v7(),
+                agent,
+                "the answer",
+                1,
+                TurnStatus::Streaming,
+            ),
+        ]);
+
+        let merged = merge_project_conversation(journal, vec![(agent, transcript, None)]);
+
+        assert_eq!(user_messages(&merged).len(), 1, "no duplicate prompt");
+        assert!(
+            merged.items.iter().any(|i| matches!(
+                i,
+                ConversationItem::AgentTurn { send_id: Some(s), .. } if *s == s0
+            )),
+            "the Streaming-on-disk completed tail groups under its send"
+        );
+    }
+
+    /// Switch-back re-runs the merge over the *same* disk state. The merge is a
+    /// pure function of its inputs, so a second pass yields byte-identical items —
+    /// no compounding duplicate prompts or stray user rows (the reported symptom
+    /// was growth on every switch). Guards against any accidental statefulness.
+    #[test]
+    fn merge_cancel_mid_turn_is_idempotent_across_reopen() {
+        let send_id = Uuid::now_v7();
+        let agent = Uuid::now_v7();
+        // Build the disk state once; both passes read the *same* records (a
+        // switch-back does not regenerate the journal/session files).
+        let journal = vec![
+            send_record(send_id, Uuid::now_v7(), agent, "summarize", 0),
+            outcome_record(
+                send_id,
+                Uuid::now_v7(),
+                agent,
+                serde_json::json!({"status": "cancelled", "source": "user"}),
+                3,
+            ),
+        ];
+        let turns = vec![
+            user_turn(Uuid::now_v7(), agent, "summarize", 0),
+            agent_turn_status(Uuid::now_v7(), agent, "partial", 1, TurnStatus::Streaming),
+        ];
+
+        let first = merge_project_conversation(
+            journal.clone(),
+            vec![(agent, transcript_of(turns.clone()), None)],
+        );
+        let second = merge_project_conversation(journal, vec![(agent, transcript_of(turns), None)]);
+
+        assert_eq!(
+            first.items, second.items,
+            "re-merge on switch-back yields identical items — no compounding"
+        );
+        assert_eq!(
+            user_messages(&first).len(),
+            1,
+            "exactly one prompt, every pass"
         );
     }
 

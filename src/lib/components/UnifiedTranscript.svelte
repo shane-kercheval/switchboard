@@ -120,6 +120,30 @@
     return set;
   });
 
+  /// `${agent_id}:${send_id}` keys of turns owned by a non-completed Outcome
+  /// marker (cancelled/failed). The marker is the authority for a non-completed
+  /// turn's status (the journal owns non-completed outcomes), so a standalone
+  /// agent row whose turn is in this set must not render the live "Working…"
+  /// footer (its harness status can read `streaming` for a cancelled-mid Claude
+  /// turn) nor its own status chip (which would contradict the marker — e.g. a
+  /// `failed`-on-disk Codex turn beside a `cancelled` marker). This is the
+  /// single-recipient analog of the fan-out column's `colHasOutcome`; the
+  /// backend stamps `send_id` on both the turn and its marker, so the join is
+  /// exact. Turns with no `send_id` (pre-journaling/imported) are never in the
+  /// set and render unchanged.
+  const turnsWithOutcome = $derived.by(() => {
+    // eslint-disable-next-line svelte/prefer-svelte-reactivity
+    const set = new Set<string>();
+    for (const row of rows) {
+      if (row.kind === "outcome") set.add(`${row.agent_id}:${row.send_id}`);
+    }
+    return set;
+  });
+
+  function hasOutcomeFor(turn: AgentTurn): boolean {
+    return turn.send_id !== undefined && turnsWithOutcome.has(`${turn.agent_id}:${turn.send_id}`);
+  }
+
   function agentName(agentId: string): string {
     return agentById[agentId]?.name ?? "unknown";
   }
@@ -196,18 +220,26 @@
     return now - Date.parse(quietSince) + HEARTBEAT_TIMEOUT_MS;
   }
 
-  /// A fan-out column's state, derived from its rows: the response turn's status
-  /// if present, else an outcome marker's status, else "queued" (dispatched, no
-  /// turn yet). "streaming"/"queued" are *live* — they keep cancel-send active.
+  /// A fan-out column's state, derived from its rows. A non-completed **outcome
+  /// marker** (cancelled/failed, journal-sourced) is *authoritative* and outranks
+  /// the harness-derived agent status: the journal is the source of truth for
+  /// non-completed outcomes (`TurnStatus` has no `cancelled`), so a cancelled turn
+  /// that the parser persisted as `streaming`/`failed` — or `complete` in the
+  /// cancel-after-end race — still reads `cancelled`/`failed` here, not a live
+  /// spinner or a mislabel. This is safe because a fan-out column is a single
+  /// `(send_id, agent_id)` pair: the marker can only belong to *this* column's
+  /// turn (if columns ever span sends, this must become send-scoped). Otherwise
+  /// the agent turn's status, else "queued" (dispatched, no turn yet).
+  /// "streaming"/"queued" are *live* — they keep cancel-send active.
   type ColumnState = "queued" | "streaming" | "complete" | "failed" | "cancelled";
   function columnState(colRows: NonUserRow[]): ColumnState {
     for (let i = colRows.length - 1; i >= 0; i--) {
       const r = colRows[i]!;
-      if (r.kind === "agent") return r.turn.status;
+      if (r.kind === "outcome") return r.status;
     }
     for (let i = colRows.length - 1; i >= 0; i--) {
       const r = colRows[i]!;
-      if (r.kind === "outcome") return r.status;
+      if (r.kind === "agent") return r.turn.status;
     }
     return "queued";
   }
@@ -280,7 +312,13 @@
   </div>
 {/snippet}
 
-{#snippet turnBody(turn: AgentTurn)}
+<!-- `live` gates the streaming "Working…" footer (spinner + live cancel button).
+     It defaults true for standalone rows; a fan-out column passes false when an
+     authoritative non-completed Outcome marker has overridden the column to
+     cancelled/failed, so a turn the parser persisted as `streaming` (a turn
+     cancelled mid-flight) doesn't reopen with a phantom live affordance on a
+     dead turn. -->
+{#snippet turnBody(turn: AgentTurn, live: boolean = true)}
   {#each turn.items as item, i (i)}
     {#if item.item_kind === "text"}
       {#if item.kind === "thinking"}
@@ -295,7 +333,7 @@
   {#if turn.status === "failed" && turn.error}
     <div class="text-status-failed text-xs" data-testid="turn-error">{turn.error}</div>
   {/if}
-  {#if turn.status === "streaming"}
+  {#if turn.status === "streaming" && live}
     {@render workingFooter(turn)}
   {/if}
 {/snippet}
@@ -523,6 +561,12 @@
 {#snippet agentRow(turn: AgentTurn)}
   {@const harness = agentById[turn.agent_id]?.harness}
   {@const copyable = copyTextOf(turn, agentCopy.mode)}
+  <!-- A non-completed Outcome marker (rendered as a sibling `outcomeRow`) is
+       authoritative for this turn's status, mirroring the fan-out column. When
+       present, suppress the turn's own status chip and the live footer so a
+       cancelled-mid turn doesn't reopen with a phantom spinner (Claude
+       `streaming`) or a contradictory `failed` chip (Codex/Gemini/Antigravity). -->
+  {@const ownedByOutcome = hasOutcomeFor(turn)}
   <div class="group space-y-1.5" data-testid="turn" data-role="agent">
     <div class="flex items-center gap-2 text-xs font-semibold tracking-wide uppercase">
       <span class="text-fg" data-testid="turn-agent-name">{agentName(turn.agent_id)}</span>
@@ -532,8 +576,8 @@
       class="space-y-1.5 border-l-[0.5px] pl-3"
       style:border-left-color={agentBorderColor(turn.agent_id)}
     >
-      {@render turnStatusLabel(turn.status)}
-      {@render turnBody(turn)}
+      {#if !ownedByOutcome}{@render turnStatusLabel(turn.status)}{/if}
+      {@render turnBody(turn, !ownedByOutcome)}
     </div>
     {@render messageMeta(
       turn.started_at,
@@ -619,6 +663,14 @@
               {@const state = columnState(col.rows)}
               {@const harness = agentById[col.agent_id]?.harness}
               {@const colCopyable = columnText(col.rows)}
+              <!-- A non-completed Outcome marker is authoritative for the
+                   column's status and renders its own chip below; suppress the
+                   turn's own status chip so a cancelled-mid turn the harness
+                   persisted as `failed` doesn't show a contradictory `failed`
+                   chip alongside the marker's `cancelled` (nor a redundant
+                   doubled `failed`). Safe per the single-(send_id, agent_id)
+                   column invariant. -->
+              {@const colHasOutcome = col.rows.some((r) => r.kind === "outcome")}
               <div
                 class="group space-y-1.5"
                 data-testid="fanout-column"
@@ -646,8 +698,8 @@
                   {/if}
                   {#each col.rows as r (r.key)}
                     {#if r.kind === "agent"}
-                      {@render turnStatusLabel(r.turn.status)}
-                      {@render turnBody(r.turn)}
+                      {#if !colHasOutcome}{@render turnStatusLabel(r.turn.status)}{/if}
+                      {@render turnBody(r.turn, state === "streaming")}
                     {:else if r.status === "cancelled"}
                       <StatusChip status="cancelled" testid="outcome-cancelled" />
                     {:else}

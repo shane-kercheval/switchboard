@@ -293,6 +293,7 @@ fn parse_result(obj: &Value, turn_id: TurnId, state: &GeminiParserState) -> Pars
         // so there's nothing to persist.
         context_window_source: None,
         stable_message_id: None,
+        first_message_id: None,
         spend: None,
         // Live per-turn model from this invocation's `init`; Gemini has no
         // effort axis.

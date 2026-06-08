@@ -72,15 +72,18 @@ pub enum Turn {
         /// onto the IPC wire** (the merge on the other side dedups by it), and it
         /// carries a deliberately broader contract.
         ///
-        /// Per harness: Claude the final assistant `message.id` (so it equals
-        /// `stable_message_id` *and* matches the live `TurnEnd`); Codex the
-        /// `event_msg/task_started.turn_id`; Gemini the turn's first `gemini`
-        /// record `id`. `None` for Antigravity (no native per-turn id) — the
-        /// merge falls back to `turn_id` for keyless turns.
+        /// Per harness: Claude the **first** non-subagent assistant `message.id`
+        /// (matches the live `TurnEnd`); Codex the `event_msg/task_started.turn_id`;
+        /// Gemini the turn's first `gemini` record `id`. `None` for Antigravity
+        /// (no native per-turn id) — the merge falls back to `turn_id` for
+        /// keyless turns.
         ///
         /// **Not** `stable_message_id`: that one stays private (`skip_serializing`,
-        /// Claude-only cost-join). The two coincide *in value* for Claude but
-        /// gate different things — do not collapse them.
+        /// Claude-only cost-join) and is the **final** assistant `message.id`.
+        /// The two **differ** for Claude on multi-assistant/tool-use turns by
+        /// design — the first id is parse-invariant (stable from the turn's first
+        /// output, so a mid-flight re-read dedups correctly) while the final id
+        /// moves until the turn ends. Do not collapse them.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hydration_key: Option<String>,
         /// The final assistant message's Anthropic `message.id` (Claude only) —
@@ -96,10 +99,14 @@ pub enum Turn {
 
 /// Lifecycle state for an agent turn reconstructed from disk.
 ///
-/// `Streaming` is reserved for the live path (in-flight turn); hydrated
-/// transcripts never carry `Streaming`. `Failed` covers both genuine
-/// harness-reported failures and truncated-mid-turn disk content (no terminal
-/// event observed before EOF).
+/// `Streaming` means the turn was **still in flight** when the file was read —
+/// emitted live for an in-flight turn, and on disk for the EOF tail turn whose
+/// last assistant `stop_reason` shows the model owed a continuation (Claude;
+/// see `claude_code/session_file.rs::eof_tail_status`). A hydrated transcript
+/// *can* therefore carry `Streaming` for its final turn; do not assume disk
+/// turns are always terminal. `Failed` covers genuine harness-reported failures
+/// and, for harnesses with a per-turn completion marker (Codex), truncated
+/// mid-turn disk content where that marker is absent.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnStatus {

@@ -194,14 +194,19 @@ async fn live_claude_basic_turn_completes() {
     }
 }
 
-/// Q2 drift guard (promoted from the M2 probe): the id the live `TurnEnd`
-/// carries — `stable_message_id`, surfaced to the frontend as `hydration_key` —
-/// must equal the `hydration_key` the session-file parser reconstructs for the
-/// same turn. That equality is exactly what makes Claude "live-matched" and lets
-/// M3's whole-file refresh dedup a turn that streamed live against its on-disk
-/// copy. A CLI bump that diverged the streamed `message.id` from the on-disk one
-/// would silently break that dedup (re-read would duplicate the turn); this
-/// catches it before users do.
+/// Live-matched-key drift guard: the dedup identity the live
+/// `TurnEnd` carries — `first_message_id`, surfaced to the frontend as
+/// `hydration_key` — must equal the `hydration_key` the session-file parser
+/// reconstructs for the same turn. That equality is exactly what makes Claude
+/// "live-matched" and lets the whole-file refresh dedup a turn that streamed
+/// live against its on-disk copy. A CLI bump that diverged the streamed first
+/// `message.id` from the on-disk one would silently break that dedup (re-read
+/// would duplicate the turn); this catches it before users do.
+///
+/// Note: the "ack" prompt yields a single-message turn, where the first and
+/// final assistant `message.id` coincide — so this also incidentally exercises
+/// `stable_message_id` parity. The first/final *distinction* is pinned by the
+/// hermetic `tool_use_turn_anchors_keys_first_and_final` tests.
 #[tokio::test]
 #[ignore = "requires claude installed — run with: make test-live"]
 async fn live_claude_hydration_key_matches_live_turn_end() {
@@ -228,12 +233,12 @@ async fn live_claude_hydration_key_matches_live_turn_end() {
         .iter()
         .find_map(|e| match e {
             AdapterEvent::TurnEnd {
-                stable_message_id, ..
-            } => Some(stable_message_id.clone()),
+                first_message_id, ..
+            } => Some(first_message_id.clone()),
             _ => None,
         })
         .expect("a terminal TurnEnd")
-        .expect("Claude's TurnEnd must carry a stable_message_id (the live-matched key)");
+        .expect("Claude's TurnEnd must carry a first_message_id (the live-matched dedup key)");
 
     let loaded = load_claude_transcript(&home_dir(), Path::new("/tmp"), session_id, agent.id)
         .expect("loading the just-written session file should succeed");
@@ -248,7 +253,7 @@ async fn live_claude_hydration_key_matches_live_turn_end() {
 
     assert_eq!(
         live_key, disk_key,
-        "the live TurnEnd's stable id must equal the parser's reconstructed hydration_key"
+        "the live TurnEnd's first-message id must equal the parser's reconstructed hydration_key"
     );
 }
 

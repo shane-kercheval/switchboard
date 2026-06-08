@@ -77,6 +77,17 @@ function pickerHasOption(testId: string, value: string): boolean {
   return screen.queryByTestId(`${testId}-option-${value === "" ? "no-override" : value}`) !== null;
 }
 
+async function openAgentActions(index = 0): Promise<HTMLElement> {
+  const triggers = await screen.findAllByTestId("agent-actions-trigger");
+  const trigger = triggers.at(index);
+  if (trigger === undefined) throw new Error("expected agent actions trigger");
+  await fireEvent.click(trigger);
+  const menus = await screen.findAllByTestId("agent-actions-menu");
+  const menu = menus.at(-1);
+  if (menu === undefined) throw new Error("expected agent actions menu");
+  return menu;
+}
+
 const CLAUDE_AGENT: AgentRecord = {
   id: "00000000-0000-7000-8000-000000000aaa",
   project_id: "00000000-0000-7000-8000-0000000000ff",
@@ -194,7 +205,7 @@ describe("Sidebar", () => {
     expect(screen.queryByTestId("agent-context-bar")).toBeNull();
   });
 
-  it("renders the harness icon by default and keeps inline action icons hover-only", async () => {
+  it("renders the harness icon and a hover-revealed actions menu trigger", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     agentSessionInfoMock.mockResolvedValue({
@@ -205,21 +216,30 @@ describe("Sidebar", () => {
     render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
 
     expect(screen.getByTestId("agent-harness-icon")).toBeInTheDocument();
-    const actions = screen.getByTestId("agent-inline-actions");
-    expect(actions).toHaveClass("max-w-0");
-    expect(actions).toHaveClass("group-hover:max-w-[var(--agent-action-width)]");
+    const trigger = screen.getByTestId("agent-actions-trigger");
+    expect(trigger).toHaveClass("opacity-0");
+    expect(trigger).toHaveClass("group-hover:opacity-100");
 
-    const resume = await screen.findByTestId("agent-action-resume");
-    const open = await screen.findByTestId("agent-action-open-session");
-    // Claude supports model+effort, so the "more" actions menu is present and
-    // contributes to the strip width (resume + open + more + delete = 4).
-    expect(screen.getByTestId("agent-action-more")).toBeInTheDocument();
-    expect(actions).toHaveAttribute("style", "--agent-action-width: 6.875rem;");
-    expect(resume).toHaveAttribute("tabindex", "-1");
-    expect(open).toHaveAttribute("tabindex", "-1");
+    const menu = await openAgentActions();
+    expect(await screen.findByTestId("agent-action-resume")).toBeInTheDocument();
+    expect(screen.getByTestId("agent-action-open-session")).toBeInTheDocument();
+    expect(screen.getByTestId("agent-change-model")).toBeInTheDocument();
+    expect(screen.getByTestId("agent-change-effort")).toBeInTheDocument();
+    expect(
+      Array.from(menu.querySelectorAll('[role="menuitem"]')).map((item) =>
+        item.textContent?.trim(),
+      ),
+    ).toEqual([
+      "Resume in terminal",
+      "Open session file",
+      "Change model",
+      "Change effort",
+      "Delete agent",
+    ]);
+    expect(menu.querySelectorAll('[role="menuitem"] svg')).toHaveLength(5);
   });
 
-  it("shows only currently available inline actions", async () => {
+  it("shows only currently available menu actions", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     state.dispatchUserTurn(CLAUDE_AGENT.id, "user-1", "go", [], "send-1", "2026-05-16T00:00:00Z");
@@ -230,13 +250,14 @@ describe("Sidebar", () => {
 
     render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
 
+    await openAgentActions();
     expect(screen.getByTestId("agent-action-stop")).toBeInTheDocument();
     await waitFor(() => expect(screen.getByTestId("agent-action-resume")).toBeInTheDocument());
     expect(screen.getByTestId("agent-action-open-session")).toBeInTheDocument();
     expect(screen.queryByTestId("agent-action-remove")).toBeNull();
   });
 
-  it("opens session-backed inline actions when session info is available", async () => {
+  it("opens session-backed menu actions when session info is available", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     agentSessionInfoMock.mockResolvedValue({
@@ -246,9 +267,11 @@ describe("Sidebar", () => {
 
     render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
 
+    await openAgentActions();
     await fireEvent.click(await screen.findByTestId("agent-action-open-session"));
     expect(openSessionFileMock).toHaveBeenCalledWith(CLAUDE_AGENT.id);
 
+    await openAgentActions();
     await fireEvent.click(screen.getByTestId("agent-action-resume"));
     await waitFor(() => expect(screen.getByTestId("resume-panel")).toBeInTheDocument());
     expect(screen.getByTestId("resume-command")).toHaveTextContent("claude --resume abc");
@@ -267,6 +290,7 @@ describe("Sidebar", () => {
     render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
 
     await waitFor(() => expect(agentSessionInfoMock).toHaveBeenCalledWith(CLAUDE_AGENT.id));
+    await openAgentActions();
     expect(screen.queryByTestId("agent-action-resume")).toBeNull();
     expect(screen.queryByTestId("agent-action-open-session")).toBeNull();
     expect(screen.getByTestId("agent-action-remove")).toBeInTheDocument();
@@ -285,6 +309,7 @@ describe("Sidebar", () => {
     render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
 
     await waitFor(() => expect(agentSessionInfoMock).toHaveBeenCalledTimes(1));
+    await openAgentActions();
     expect(screen.queryByTestId("agent-action-resume")).toBeNull();
     expect(screen.queryByTestId("agent-action-open-session")).toBeNull();
 
@@ -295,12 +320,13 @@ describe("Sidebar", () => {
     expect(screen.getByTestId("agent-action-open-session")).toBeInTheDocument();
   });
 
-  it("remove swaps inline actions to Cancel | Confirm and pointer leave disarms it", async () => {
+  it("remove swaps menu actions to Cancel | Confirm and pointer leave disarms it", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
 
     render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
 
+    await openAgentActions();
     await fireEvent.click(screen.getByTestId("agent-action-remove"));
     expect(screen.getByTestId("agent-remove-cancel")).toBeInTheDocument();
     expect(screen.getByTestId("agent-remove-confirm")).toBeInTheDocument();
@@ -313,25 +339,17 @@ describe("Sidebar", () => {
     expect(removeAgentMock).not.toHaveBeenCalled();
   });
 
-  it("warns in the delete tooltip that responses are removed from the conversation", async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    try {
-      const state = await loadState();
-      await state.registerAgent(CLAUDE_AGENT);
+  it("warns on delete that responses are removed from the conversation", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
 
-      render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+    render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
 
-      await fireEvent.pointerEnter(screen.getByTestId("agent-action-remove"));
-      await vi.advanceTimersByTimeAsync(500);
-
-      const tooltip = await waitFor(() => screen.getByTestId("tooltip-content"));
-      expect(tooltip).toHaveTextContent("Delete agent");
-      expect(tooltip).toHaveTextContent(
-        "Deletes Switchboard's files for this agent; underlying session files are kept, and its responses are removed from the conversation.",
-      );
-    } finally {
-      vi.useRealTimers();
-    }
+    await openAgentActions();
+    expect(screen.getByTestId("agent-action-remove")).toHaveAttribute(
+      "title",
+      "Deletes Switchboard's files for this agent; underlying session files are kept, and its responses are removed from the conversation.",
+    );
   });
 
   it("confirming remove calls removeAgent and failures keep the row", async () => {
@@ -341,6 +359,7 @@ describe("Sidebar", () => {
 
     render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
 
+    await openAgentActions();
     await fireEvent.click(screen.getByTestId("agent-action-remove"));
     await fireEvent.click(screen.getByTestId("agent-remove-confirm"));
 
@@ -550,7 +569,7 @@ describe("Sidebar", () => {
     await state.registerAgent(CLAUDE_AGENT);
     render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
 
-    await fireEvent.click(screen.getByTestId("agent-action-more"));
+    await openAgentActions();
     await waitFor(() => expect(screen.getByTestId("agent-change-model")).toBeInTheDocument());
     expect(screen.getByTestId("agent-change-effort")).toBeInTheDocument();
   });
@@ -560,17 +579,19 @@ describe("Sidebar", () => {
     await state.registerAgent(GEMINI_AGENT);
     render(Sidebar, { props: { agents: [GEMINI_AGENT] } });
 
-    await fireEvent.click(screen.getByTestId("agent-action-more"));
+    await openAgentActions();
     await waitFor(() => expect(screen.getByTestId("agent-change-model")).toBeInTheDocument());
     expect(screen.queryByTestId("agent-change-effort")).toBeNull();
   });
 
-  it("Antigravity exposes no change actions (the more menu is absent)", async () => {
+  it("Antigravity exposes no change actions", async () => {
     const state = await loadState();
     await state.registerAgent(ANTIGRAVITY_AGENT);
     render(Sidebar, { props: { agents: [ANTIGRAVITY_AGENT] } });
 
-    expect(screen.queryByTestId("agent-action-more")).toBeNull();
+    await openAgentActions();
+    expect(screen.queryByTestId("agent-change-model")).toBeNull();
+    expect(screen.queryByTestId("agent-change-effort")).toBeNull();
   });
 
   it("Change model opus → sonnet preselects the current value and calls setAgentModel", async () => {
@@ -579,7 +600,7 @@ describe("Sidebar", () => {
     await state.registerAgent(agent);
     render(Sidebar, { props: { agents: [agent] } });
 
-    await fireEvent.click(screen.getByTestId("agent-action-more"));
+    await openAgentActions();
     await waitFor(() => expect(screen.getByTestId("agent-change-model")).toBeInTheDocument());
     await fireEvent.click(screen.getByTestId("agent-change-model"));
 
@@ -597,7 +618,7 @@ describe("Sidebar", () => {
     await state.registerAgent(agent);
     render(Sidebar, { props: { agents: [agent] } });
 
-    await fireEvent.click(screen.getByTestId("agent-action-more"));
+    await openAgentActions();
     await waitFor(() => expect(screen.getByTestId("agent-change-model")).toBeInTheDocument());
     await fireEvent.click(screen.getByTestId("agent-change-model"));
 
@@ -614,7 +635,7 @@ describe("Sidebar", () => {
     await state.registerAgent(agent);
     render(Sidebar, { props: { agents: [agent] } });
 
-    await fireEvent.click(screen.getByTestId("agent-action-more"));
+    await openAgentActions();
     await waitFor(() => expect(screen.getByTestId("agent-change-model")).toBeInTheDocument());
     await fireEvent.click(screen.getByTestId("agent-change-model"));
 
@@ -634,7 +655,7 @@ describe("Sidebar", () => {
     setAgentModelMock.mockReturnValueOnce(pending.promise);
     render(Sidebar, { props: { agents: [agent] } });
 
-    await fireEvent.click(screen.getByTestId("agent-action-more"));
+    await openAgentActions();
     await waitFor(() => expect(screen.getByTestId("agent-change-model")).toBeInTheDocument());
     await fireEvent.click(screen.getByTestId("agent-change-model"));
     await fireEvent.click(screen.getByTestId("change-save"));

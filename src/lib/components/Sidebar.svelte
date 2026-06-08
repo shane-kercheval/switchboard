@@ -1,4 +1,15 @@
 <script lang="ts">
+  import {
+    Check,
+    FileText,
+    Gauge,
+    MoreHorizontal,
+    SlidersHorizontal,
+    Square,
+    Terminal,
+    Trash2,
+    X,
+  } from "@lucide/svelte";
   import type { AgentRecord, AgentId } from "$lib/types";
   import { retryAgentHydration, runtimes, stopAgent, transcripts } from "$lib/state/index.svelte";
   import {
@@ -28,7 +39,6 @@
   import Dialog from "$lib/components/ui/Dialog.svelte";
   import ErrorDetailsDialog from "$lib/components/ui/ErrorDetailsDialog.svelte";
   import CopyButton from "$lib/components/ui/CopyButton.svelte";
-  import StopIcon from "$lib/components/ui/StopIcon.svelte";
   import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
 
   /// Cap the per-tooltip warning rows so a session with a long tail
@@ -48,14 +58,6 @@
       (rt.pending_sends ?? []).length > 0
     );
   }
-
-  const agentActionClass =
-    "text-muted hover:bg-raised hover:text-fg focus-visible:ring-accent focus-visible:bg-raised focus-visible:text-fg inline-flex h-[26px] w-[26px] items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none";
-  const agentDangerActionClass =
-    "border-transparent text-muted hover:border-status-failed/60 hover:bg-status-failed-soft/70 hover:text-status-failed focus-visible:ring-accent focus-visible:border-status-failed/60 focus-visible:bg-status-failed-soft/70 focus-visible:text-status-failed inline-flex h-[26px] w-[26px] items-center justify-center rounded-full border-[0.5px] transition-colors focus-visible:ring-2 focus-visible:outline-none";
-  const agentStopActionClass =
-    "border-muted/40 text-muted hover:border-status-failed/60 hover:bg-status-failed-soft/70 hover:text-status-failed focus-visible:ring-accent focus-visible:border-status-failed/60 focus-visible:bg-status-failed-soft/70 focus-visible:text-status-failed inline-flex h-[26px] w-[26px] items-center justify-center rounded-full border-[0.5px] transition-colors focus-visible:ring-2 focus-visible:outline-none";
-  const AGENT_ACTION_DELAY_MS = 500;
 
   /// `onAddAgent` is the "+ Add agent" entry point in the sidebar header.
   /// Optional so existing callers + tests that don't pass it continue
@@ -194,14 +196,6 @@
       .finally(() => {
         sessionInfoInFlight[agentId] = false;
       });
-  }
-
-  function agentActionWidth(count: number): string {
-    const visibleCount = Math.max(count, 1);
-    const iconWidthRem = 1.625;
-    const gapRem = 0.125;
-    const width = visibleCount * iconWidthRem + Math.max(visibleCount - 1, 0) * gapRem;
-    return `${Math.max(width, 2)}rem`;
   }
 
   $effect(() => {
@@ -595,14 +589,6 @@
         {@const active = isActive(agent.id)}
         {@const sessionInfo = sessionInfoByAgent[agent.id]}
         {@const confirmingRemove = removeConfirmAgentId === agent.id}
-        {@const canChange = canChangeModel(agent) || canChangeEffort(agent)}
-        {@const actionCount = confirmingRemove
-          ? 2
-          : (active ? 1 : 0) +
-            (sessionInfo?.resume_command ? 1 : 0) +
-            (sessionInfo?.session_file ? 1 : 0) +
-            (canChange ? 1 : 0) +
-            (!active ? 1 : 0)}
         <div
           class="group bg-raised/90 hover:bg-border/40 rounded-md px-2.5 py-2 transition-colors"
           data-testid="sidebar-agent"
@@ -688,236 +674,132 @@
                   {agent.name}
                 </span>
               </button>
-              <div
-                class="relative flex h-8 w-8 shrink-0 items-center justify-end transition-[width] group-hover:w-[var(--agent-action-width)]"
-                style={`--agent-action-width: ${agentActionWidth(actionCount)}`}
-              >
-                <div
-                  class="absolute top-1/2 right-0 -translate-y-1/2 transition-opacity group-hover:opacity-0"
+              <div class="flex shrink-0 items-center gap-0.5">
+                <DropdownMenu
+                  triggerClass={cn(
+                    ICON_BUTTON_CLASS,
+                    "hover:bg-border/60 shrink-0 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 data-[state=open]:opacity-100",
+                  )}
+                  triggerLabel={`Actions for ${agent.name}`}
+                  triggerTestid="agent-actions-trigger"
+                  contentTestid="agent-actions-menu"
                 >
-                  <HarnessIcon harness={agent.harness} size="md" testid="agent-harness-icon" />
-                </div>
-                <div
-                  class="pointer-events-none absolute top-1/2 right-0 flex max-w-0 -translate-y-1/2 items-center gap-0.5 overflow-hidden opacity-0 transition-[max-width,opacity] group-hover:pointer-events-auto group-hover:max-w-[var(--agent-action-width)] group-hover:opacity-100"
-                  data-testid="agent-inline-actions"
-                  style={`--agent-action-width: ${agentActionWidth(actionCount)}`}
-                >
+                  {#snippet trigger()}
+                    <MoreHorizontal size={14} strokeWidth={1.8} aria-hidden="true" />
+                  {/snippet}
                   {#if confirmingRemove}
-                    <Tooltip label="Cancel delete" delayDuration={AGENT_ACTION_DELAY_MS}>
-                      {#snippet trigger(props)}
-                        <button
-                          {...props}
-                          type="button"
-                          class={agentActionClass}
-                          aria-label="Cancel delete"
-                          tabindex="-1"
-                          data-testid="agent-remove-cancel"
-                          onclick={() => cancelRemove(agent.id)}
-                        >
-                          <svg
-                            viewBox="0 0 24 24"
-                            fill="none"
-                            stroke="currentColor"
-                            stroke-width="2"
-                            stroke-linecap="round"
-                            stroke-linejoin="round"
-                            class="h-4 w-4"
-                            aria-hidden="true"
-                          >
-                            <path d="M18 6 6 18M6 6l12 12" />
-                          </svg>
-                        </button>
-                      {/snippet}
-                    </Tooltip>
-                    <Tooltip label="Confirm delete" delayDuration={AGENT_ACTION_DELAY_MS}>
-                      {#snippet trigger(props)}
-                        <button
-                          {...props}
-                          type="button"
-                          class={agentDangerActionClass}
-                          disabled={removingAgentId === agent.id}
-                          aria-label="Confirm delete"
-                          tabindex="-1"
-                          data-testid="agent-remove-confirm"
-                          onclick={() => void confirmRemove(agent)}
-                        >
-                          <svg
-                            viewBox="0 0 24 24"
-                            fill="none"
-                            stroke="currentColor"
-                            stroke-width="2"
-                            stroke-linecap="round"
-                            stroke-linejoin="round"
-                            class="h-4 w-4"
-                            aria-hidden="true"
-                          >
-                            <path d="M20 6 9 17l-5-5" />
-                          </svg>
-                        </button>
-                      {/snippet}
-                    </Tooltip>
+                    <DropdownMenuItem
+                      onSelect={() => cancelRemove(agent.id)}
+                      closeOnSelect={false}
+                      class="gap-2"
+                      data-testid="agent-remove-cancel"
+                    >
+                      <X
+                        size={14}
+                        strokeWidth={1.8}
+                        class="text-muted shrink-0"
+                        aria-hidden="true"
+                      />
+                      Cancel delete
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      onSelect={() => void confirmRemove(agent)}
+                      disabled={removingAgentId === agent.id}
+                      class="text-status-failed gap-2"
+                      data-testid="agent-remove-confirm"
+                    >
+                      <Check size={14} strokeWidth={1.8} class="shrink-0" aria-hidden="true" />
+                      Confirm delete
+                    </DropdownMenuItem>
                   {:else}
                     {#if active}
-                      <Tooltip label="Stop agent" delayDuration={AGENT_ACTION_DELAY_MS}>
-                        {#snippet trigger(props)}
-                          <button
-                            {...props}
-                            type="button"
-                            class={agentStopActionClass}
-                            aria-label="Stop agent"
-                            tabindex="-1"
-                            data-testid="agent-action-stop"
-                            onclick={() => stopAgent(agent.id)}
-                          >
-                            <StopIcon class="h-5 w-5" />
-                          </button>
-                        {/snippet}
-                      </Tooltip>
+                      <DropdownMenuItem
+                        onSelect={() => stopAgent(agent.id)}
+                        class="text-status-failed gap-2"
+                        data-testid="agent-action-stop"
+                      >
+                        <Square size={14} strokeWidth={1.8} class="shrink-0" aria-hidden="true" />
+                        Stop agent
+                      </DropdownMenuItem>
                     {/if}
                     {#if sessionInfo?.resume_command}
-                      <Tooltip label="Resume in terminal" delayDuration={AGENT_ACTION_DELAY_MS}>
-                        {#snippet trigger(props)}
-                          <button
-                            {...props}
-                            type="button"
-                            class={agentActionClass}
-                            aria-label="Resume in terminal"
-                            tabindex="-1"
-                            data-testid="agent-action-resume"
-                            onclick={() => {
-                              resumeAgentId = agent.id;
-                              resumeOpen = true;
-                            }}
-                          >
-                            <svg
-                              viewBox="0 0 24 24"
-                              fill="none"
-                              stroke="currentColor"
-                              stroke-width="1.8"
-                              stroke-linecap="round"
-                              stroke-linejoin="round"
-                              class="h-4 w-4"
-                              aria-hidden="true"
-                            >
-                              <path d="M4 17 10 11 4 5" />
-                              <path d="M12 19h8" />
-                            </svg>
-                          </button>
-                        {/snippet}
-                      </Tooltip>
+                      <DropdownMenuItem
+                        onSelect={() => {
+                          resumeAgentId = agent.id;
+                          resumeOpen = true;
+                        }}
+                        class="gap-2"
+                        data-testid="agent-action-resume"
+                      >
+                        <Terminal
+                          size={14}
+                          strokeWidth={1.8}
+                          class="text-muted shrink-0"
+                          aria-hidden="true"
+                        />
+                        Resume in terminal
+                      </DropdownMenuItem>
                     {/if}
                     {#if sessionInfo?.session_file}
-                      <Tooltip label="Open session file" delayDuration={AGENT_ACTION_DELAY_MS}>
-                        {#snippet trigger(props)}
-                          <button
-                            {...props}
-                            type="button"
-                            class={agentActionClass}
-                            aria-label="Open session file"
-                            tabindex="-1"
-                            data-testid="agent-action-open-session"
-                            onclick={() => openSessionFile(agent)}
-                          >
-                            <svg
-                              viewBox="0 0 24 24"
-                              fill="none"
-                              stroke="currentColor"
-                              stroke-width="1.8"
-                              stroke-linecap="round"
-                              stroke-linejoin="round"
-                              class="h-4 w-4"
-                              aria-hidden="true"
-                            >
-                              <path
-                                d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"
-                              />
-                              <path d="M14 2v6h6" />
-                              <path d="M8 13h8M8 17h5" />
-                            </svg>
-                          </button>
-                        {/snippet}
-                      </Tooltip>
-                    {/if}
-                    {#if canChange}
-                      <!-- "More" menu hosts the model/effort change actions —
-                           a menu fits a growing, label-only action set better
-                           than another glyph in the inline strip. -->
-                      <DropdownMenu
-                        triggerClass={agentActionClass}
-                        triggerLabel="More actions"
-                        triggerTestid="agent-action-more"
-                        contentTestid="agent-more-menu"
+                      <DropdownMenuItem
+                        onSelect={() => openSessionFile(agent)}
+                        class="gap-2"
+                        data-testid="agent-action-open-session"
                       >
-                        {#snippet trigger()}
-                          <svg
-                            viewBox="0 0 24 24"
-                            fill="currentColor"
-                            class="h-4 w-4"
-                            aria-hidden="true"
-                          >
-                            <circle cx="5" cy="12" r="1.6" />
-                            <circle cx="12" cy="12" r="1.6" />
-                            <circle cx="19" cy="12" r="1.6" />
-                          </svg>
-                        {/snippet}
-                        {#if canChangeModel(agent)}
-                          <DropdownMenuItem
-                            onSelect={() => openChange(agent, "model")}
-                            data-testid="agent-change-model"
-                          >
-                            Change model
-                          </DropdownMenuItem>
-                        {/if}
-                        {#if canChangeEffort(agent)}
-                          <DropdownMenuItem
-                            onSelect={() => openChange(agent, "effort")}
-                            data-testid="agent-change-effort"
-                          >
-                            Change effort
-                          </DropdownMenuItem>
-                        {/if}
-                      </DropdownMenu>
+                        <FileText
+                          size={14}
+                          strokeWidth={1.8}
+                          class="text-muted shrink-0"
+                          aria-hidden="true"
+                        />
+                        Open session file
+                      </DropdownMenuItem>
+                    {/if}
+                    {#if canChangeModel(agent)}
+                      <DropdownMenuItem
+                        onSelect={() => openChange(agent, "model")}
+                        class="gap-2"
+                        data-testid="agent-change-model"
+                      >
+                        <SlidersHorizontal
+                          size={14}
+                          strokeWidth={1.8}
+                          class="text-muted shrink-0"
+                          aria-hidden="true"
+                        />
+                        Change model
+                      </DropdownMenuItem>
+                    {/if}
+                    {#if canChangeEffort(agent)}
+                      <DropdownMenuItem
+                        onSelect={() => openChange(agent, "effort")}
+                        class="gap-2"
+                        data-testid="agent-change-effort"
+                      >
+                        <Gauge
+                          size={14}
+                          strokeWidth={1.8}
+                          class="text-muted shrink-0"
+                          aria-hidden="true"
+                        />
+                        Change effort
+                      </DropdownMenuItem>
                     {/if}
                     {#if !active}
-                      <Tooltip delayDuration={AGENT_ACTION_DELAY_MS}>
-                        {#snippet trigger(props)}
-                          <button
-                            {...props}
-                            type="button"
-                            class={agentDangerActionClass}
-                            aria-label="Delete agent"
-                            tabindex="-1"
-                            data-testid="agent-action-remove"
-                            onclick={() => startRemove(agent)}
-                          >
-                            <svg
-                              viewBox="0 0 24 24"
-                              fill="none"
-                              stroke="currentColor"
-                              stroke-width="1.8"
-                              stroke-linecap="round"
-                              stroke-linejoin="round"
-                              class="h-4 w-4"
-                              aria-hidden="true"
-                            >
-                              <path d="M3 6h18" />
-                              <path d="M8 6V4h8v2" />
-                              <path d="M19 6 18 20H6L5 6" />
-                              <path d="M10 11v5M14 11v5" />
-                            </svg>
-                          </button>
-                        {/snippet}
-                        <div class="max-w-56">
-                          <div class="text-[13px] font-medium">Delete agent</div>
-                          <div class="text-primary-fg/75 mt-1 text-xs leading-4">
-                            Deletes Switchboard's files for this agent; underlying session files are
-                            kept, and its responses are removed from the conversation.
-                          </div>
-                        </div>
-                      </Tooltip>
+                      <DropdownMenuItem
+                        onSelect={() => startRemove(agent)}
+                        closeOnSelect={false}
+                        class="text-status-failed gap-2"
+                        data-testid="agent-action-remove"
+                        title="Deletes Switchboard's files for this agent; underlying session files are kept, and its responses are removed from the conversation."
+                      >
+                        <Trash2 size={14} strokeWidth={1.8} class="shrink-0" aria-hidden="true" />
+                        Delete agent
+                      </DropdownMenuItem>
                     {/if}
                   {/if}
-                </div>
+                </DropdownMenu>
+                <HarnessIcon harness={agent.harness} size="md" testid="agent-harness-icon" />
               </div>
             {/if}
           </div>

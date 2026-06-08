@@ -38,6 +38,11 @@
     /// dialog during agent auto-seeding, so the user can't navigate away into a
     /// partially-created project. Defaults to true (normal dismissible modal).
     dismissible?: boolean;
+    /// Override where focus lands when the modal opens. bits-ui otherwise focuses
+    /// the first focusable element (the header ✕). Call `event.preventDefault()`
+    /// and focus a specific element instead — e.g. the command palette focuses
+    /// its search field so the user can type immediately.
+    onOpenAutoFocus?: (event: Event) => void;
   };
 
   let {
@@ -47,6 +52,7 @@
     onClose,
     contentClass,
     dismissible = true,
+    onOpenAutoFocus,
   }: Props = $props();
 
   function handleOpenChange(next: boolean): void {
@@ -70,6 +76,7 @@
       onInteractOutside={(e) => {
         if (!dismissible) e.preventDefault();
       }}
+      {onOpenAutoFocus}
     >
       <div class="border-border/80 flex items-center justify-between gap-3 border-b px-4 py-3">
         <BitsDialog.Title class="text-fg text-sm font-semibold" data-testid="dialog-title">

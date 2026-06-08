@@ -38,10 +38,16 @@
   // the key isn't literal (the compose-bar number keys map to a chip's position,
   // not a fixed digit).
   const shortcuts: { action: string; keys: string[]; note?: string }[] = [
+    { action: "Open command palette", keys: ["⌘", "⇧", "P"] },
     { action: "Focus message box", keys: ["⌘", "K"] },
+    { action: "Add project", keys: ["⌘", "N"], note: "Projects view" },
+    { action: "Add repository", keys: ["⌘", "N"], note: "Git view" },
+    { action: "Add agent", keys: ["⌘", "⇧", "N"], note: "Projects view" },
+    { action: "Refresh all repositories", keys: ["⌘", "R"], note: "Git view" },
     { action: "Jump to next unread project", keys: ["⌘", "G"] },
     { action: "Toggle Projects / Git view", keys: ["⌘", "⇧", "G"] },
     { action: "Show current project in Git view", keys: ["⌘", "⇧", "F"] },
+    { action: "Open selection in editor", keys: ["⌘", "⇧", "E"] },
     { action: "Expand or restore Git details panel", keys: ["⌘", "⇧", "D"] },
     { action: "Toggle projects sidebar", keys: ["⌘", "B"] },
     { action: "Toggle agents sidebar", keys: ["⌘", "⇧", "B"] },
@@ -225,7 +231,7 @@
       <div>
         {#each shortcuts as shortcut (shortcut.action)}
           <div class="flex min-h-11 items-center justify-between gap-4 py-2">
-            <div class="text-fg text-sm">
+            <div class="text-fg text-sm" data-testid="shortcut-action">
               {shortcut.action}{#if shortcut.note}<span class="text-muted ml-1 text-xs"
                   >({shortcut.note})</span
                 >{/if}

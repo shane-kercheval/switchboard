@@ -909,6 +909,9 @@ describe("UnifiedTranscript — fan-out groups", () => {
     expect(columns[0]).toHaveAttribute("data-state", "cancelled");
     expect(screen.getByTestId("outcome-cancelled")).toBeInTheDocument();
     expect(screen.queryByTestId("outcome-failed")).toBeNull();
+    // The marker is authoritative: the turn's own "failed" status chip is
+    // suppressed so it doesn't contradict the "cancelled" marker.
+    expect(columns[0]).not.toHaveTextContent(/failed/i);
   });
 
   // A genuinely failed turn keeps its failed marker and its reason — the marker

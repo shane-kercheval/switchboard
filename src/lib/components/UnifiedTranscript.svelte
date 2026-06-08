@@ -633,6 +633,14 @@
               {@const state = columnState(col.rows)}
               {@const harness = agentById[col.agent_id]?.harness}
               {@const colCopyable = columnText(col.rows)}
+              <!-- A non-completed Outcome marker is authoritative for the
+                   column's status and renders its own chip below; suppress the
+                   turn's own status chip so a cancelled-mid turn the harness
+                   persisted as `failed` doesn't show a contradictory `failed`
+                   chip alongside the marker's `cancelled` (nor a redundant
+                   doubled `failed`). Safe per the single-(send_id, agent_id)
+                   column invariant. -->
+              {@const colHasOutcome = col.rows.some((r) => r.kind === "outcome")}
               <div
                 class="group space-y-1.5"
                 data-testid="fanout-column"
@@ -660,7 +668,7 @@
                   {/if}
                   {#each col.rows as r (r.key)}
                     {#if r.kind === "agent"}
-                      {@render turnStatusLabel(r.turn.status)}
+                      {#if !colHasOutcome}{@render turnStatusLabel(r.turn.status)}{/if}
                       {@render turnBody(r.turn, state === "streaming")}
                     {:else if r.status === "cancelled"}
                       <StatusChip status="cancelled" testid="outcome-cancelled" />

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/svelte";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import { tick } from "svelte";
 import type { AgentRecord, ConversationItem, NormalizedEvent } from "$lib/types";
 import { HEARTBEAT_TIMEOUT_MS } from "$lib/types";
@@ -2401,6 +2401,33 @@ describe("UnifiedTranscript fan-out group control", () => {
     return group.querySelector('[data-testid="fanout-preview-toggle-all"]')!;
   }
 
+  it("renders the group control with the responses, not inside the user message", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      u(CLAUDE_AGENT, "send-f", "u-a", "2026-05-16T00:00:00Z"),
+      a(CLAUDE_AGENT, "send-f", "a-a", "2026-05-16T00:00:01Z", "2026-05-16T00:00:03Z"),
+    ];
+    state.transcripts[CODEX_AGENT.id] = [
+      u(CODEX_AGENT, "send-f", "u-b", "2026-05-16T00:00:00Z"),
+      a(CODEX_AGENT, "send-f", "a-b", "2026-05-16T00:00:01Z", "2026-05-16T00:00:02Z"),
+    ];
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] },
+    });
+
+    const group = screen.getByTestId("fanout-group");
+    const userTurn = within(group)
+      .getAllByTestId("turn")
+      .find((el) => el.getAttribute("data-role") === "user")!;
+    // The toggle-all must not live inside the user message's hover scope (that
+    // was leaking the user prompt's meta onto response hover).
+    expect(userTurn.querySelector('[data-testid="fanout-preview-toggle-all"]')).toBeNull();
+    expect(groupToggle(group)).toBeInTheDocument();
+  });
+
   it("collapses all columns when any is expanded, and expands all when none is", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
@@ -2508,5 +2535,99 @@ describe("UnifiedTranscript fan-out group control", () => {
       .querySelector('[data-testid="turn-preview-toggle"]')!;
     await fireEvent.click(firstColToggle);
     expect(columnLabels(group)).toEqual(["Collapse", "Expand"]);
+  });
+});
+
+describe("UnifiedTranscript terminal-response collapse", () => {
+  beforeEach(() => {
+    setProjectCompact(PROJECT_ID, true);
+  });
+
+  function agentTurnEl(): HTMLElement {
+    return screen.getAllByTestId("turn").find((el) => el.getAttribute("data-role") === "agent")!;
+  }
+
+  it("gives a cancelled response a compact toggle (it is terminal, with content)", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "u-1",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: "s-1",
+        started_at: "2026-05-16T00:00:00Z",
+        text: "go",
+      },
+      {
+        role: "agent",
+        turn_id: "a-1",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: "s-1",
+        started_at: "2026-05-16T00:00:01Z",
+        ended_at: "2026-05-16T00:00:02Z",
+        status: "cancelled",
+        items: [{ item_kind: "text", kind: "text", text: "partial work before cancel" }],
+      },
+    ];
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    // Previously a cancelled response had no toggle and never collapsed.
+    const toggle = agentTurnEl().querySelector('[data-testid="turn-preview-toggle"]');
+    expect(toggle).not.toBeNull();
+    expect(toggle).toHaveAttribute("aria-label", "Collapse"); // latest → expanded, but collapsible
+    await fireEvent.click(toggle!);
+    expect(agentTurnEl().querySelector('[data-testid="turn-preview-toggle"]')).toHaveAttribute(
+      "aria-label",
+      "Expand",
+    ); // now collapsed
+  });
+
+  it("collapses a dangling streaming-on-disk turn closed by an outcome marker", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    // The exact dangling case: parser left status `streaming` (model owed a
+    // continuation), but an outcome marker closed it → it is terminal, not live.
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "u-1",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: "s-1",
+        started_at: "2026-05-16T00:00:00Z",
+        text: "go",
+      },
+      {
+        role: "agent",
+        turn_id: "a-1",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: "s-1",
+        started_at: "2026-05-16T00:00:01Z",
+        status: "streaming",
+        items: [{ item_kind: "text", kind: "text", text: "dangling text" }],
+      },
+    ];
+    const overlay: ConversationItem[] = [
+      {
+        kind: "outcome",
+        turn_id: "a-1",
+        send_id: "s-1",
+        agent_id: CLAUDE_AGENT.id,
+        status: "cancelled",
+        reason: null,
+        at: "2026-05-16T00:00:05Z",
+      },
+    ];
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT], overlay },
+    });
+
+    // It must not be treated as live (no working footer / live cap) but must be
+    // collapsible (has a toggle) — the bug was neither toggle nor collapse.
+    expect(screen.queryByTestId("turn-working")).toBeNull();
+    expect(screen.queryByTestId("turn-live-scroll")).toBeNull();
+    expect(agentTurnEl().querySelector('[data-testid="turn-preview-toggle"]')).not.toBeNull();
   });
 });

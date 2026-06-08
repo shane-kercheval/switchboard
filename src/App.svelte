@@ -23,7 +23,7 @@
   import SidebarToggleButton from "$lib/components/ui/SidebarToggleButton.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import { ICON_BUTTON_CLASS, ICON_SIZE } from "$lib/components/ui/iconButton";
-  import { ListCollapse, Rows3 } from "@lucide/svelte";
+  import { ChevronsDownUp, ChevronsUpDown } from "@lucide/svelte";
   import {
     hasOverrides,
     normalizeProjectCompact,
@@ -727,9 +727,9 @@
                 class={cn(ICON_BUTTON_CLASS, "hover:bg-panel")}
               >
                 {#if compactEnabled}
-                  <ListCollapse size={ICON_SIZE} aria-hidden="true" />
+                  <ChevronsUpDown size={ICON_SIZE} aria-hidden="true" />
                 {:else}
-                  <Rows3 size={ICON_SIZE} aria-hidden="true" />
+                  <ChevronsDownUp size={ICON_SIZE} aria-hidden="true" />
                 {/if}
               </button>
             {/snippet}

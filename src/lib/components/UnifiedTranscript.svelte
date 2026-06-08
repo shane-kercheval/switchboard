@@ -120,22 +120,42 @@
   /// Whether compact mode is on for the active project.
   const compactEnabled = $derived(stateFor(projectId).enabled);
 
-  /// Preview keys of the latest completed agent response set — the exception to
-  /// compact mode that stays expanded by default. Chosen by completion recency
-  /// (`ended_at ?? started_at`) across all complete agent turns, not rendered
-  /// order, so a slow earlier-anchored send that finishes last still wins. When
-  /// the latest turn belongs to a fan-out, every completed column in that group
-  /// is included. A turn an outcome marker has overridden (cancelled/failed) is
-  /// not a completed response and never qualifies.
+  /// A still-live response: genuinely streaming, not yet closed. These use the
+  /// M3 live cap, never the completed-preview compaction. A streaming-on-disk
+  /// turn an outcome marker has closed (a dangling/cancelled-mid turn) is *not*
+  /// live — it's terminal and collapses like any other response.
+  function isLiveStreaming(turn: AgentTurn): boolean {
+    return turn.status === "streaming" && !hasOutcomeFor(turn);
+  }
+
+  /// Whether an agent response can be collapsed: any terminal turn that has
+  /// content — complete, failed, cancelled, or a dangling streaming-on-disk turn
+  /// closed by an outcome marker. Only genuinely-live streaming and empty turns
+  /// are excluded, so every real response in the stream collapses uniformly.
+  function isCollapsibleResponse(turn: AgentTurn): boolean {
+    return !isLiveStreaming(turn) && turn.items.length > 0;
+  }
+
+  /// Whether a fan-out column is a collapsible terminal response (its latest
+  /// state is terminal and it has rendered content).
+  function isCollapsibleColumn(colRows: NonUserRow[]): boolean {
+    const state = columnState(colRows);
+    if (state === "queued" || state === "streaming") return false;
+    return colRows.some((r) => r.kind === "agent" && r.turn.items.length > 0);
+  }
+
+  /// Preview keys of the latest response set — the exception to compact mode that
+  /// stays expanded by default. Chosen by completion recency (`ended_at ??
+  /// started_at`) across all terminal agent turns, not rendered order, so a slow
+  /// earlier-anchored send that finishes last still wins. When the latest turn
+  /// belongs to a fan-out, every collapsible column in that group is included.
   const latestExpandedKeys = $derived.by(() => {
     // eslint-disable-next-line svelte/prefer-svelte-reactivity
     const keys = new Set<string>();
     let latest: AgentTurn | undefined;
     let latestAt = "";
     for (const row of rows) {
-      if (row.kind !== "agent" || row.turn.status !== "complete" || hasOutcomeFor(row.turn)) {
-        continue;
-      }
+      if (row.kind !== "agent" || !isCollapsibleResponse(row.turn)) continue;
       const at = row.turn.ended_at ?? row.turn.started_at;
       if (latest === undefined || at.localeCompare(latestAt) > 0) {
         latest = row.turn;
@@ -149,10 +169,7 @@
         : undefined;
     if (group !== undefined && group.kind === "fanout") {
       for (const col of group.columns) {
-        const completed = col.rows.some(
-          (r) => r.kind === "agent" && r.turn.status === "complete" && !hasOutcomeFor(r.turn),
-        );
-        if (completed) keys.add(`fanout:${group.send_id}:${col.agent_id}`);
+        if (isCollapsibleColumn(col.rows)) keys.add(`fanout:${group.send_id}:${col.agent_id}`);
       }
     } else {
       keys.add(`agent:${latest.turn_id}`);
@@ -588,7 +605,7 @@
         type="button"
         class={cn(
           META_ICON_BUTTON,
-          "shrink-0 opacity-0 group-focus-within:opacity-100 group-hover:opacity-100",
+          "shrink-0 opacity-0 group-focus-within/responses:opacity-100 group-hover/responses:opacity-100",
         )}
         data-testid="fanout-preview-toggle-all"
         aria-label={label}
@@ -788,9 +805,10 @@
        cancelled-mid turn doesn't reopen with a phantom spinner (Claude
        `streaming`) or a contradictory `failed` chip (Codex/Gemini/Antigravity). -->
   {@const ownedByOutcome = hasOutcomeFor(turn)}
-  <!-- Compact preview applies only to a genuinely completed response — not a
-       streaming turn (M3's live cap), nor one an outcome marker has overridden. -->
-  {@const previewEligible = turn.status === "complete" && !ownedByOutcome}
+  <!-- Compact preview applies to any terminal response with content (complete,
+       failed, cancelled, or dangling streaming-on-disk closed by a marker). Only
+       a genuinely-live streaming turn is excluded — it uses M3's live cap. -->
+  {@const previewEligible = isCollapsibleResponse(turn)}
   {@const key = `agent:${turn.turn_id}`}
   {@const defaultCompact = defaultCompactFor(key)}
   {@const compact = previewEligible && isCompact(projectId, key, defaultCompact)}
@@ -884,95 +902,113 @@
         {/if}
       {:else}
         {@const fanoutKeys = block.columns
-          .filter((col) => columnState(col.rows) === "complete")
+          .filter((col) => isCollapsibleColumn(col.rows))
           .map((col) => `fanout:${block.send_id}:${col.agent_id}`)}
-        <div class="group space-y-4" data-testid="fanout-group">
-          <div class="flex items-start justify-between gap-2">
-            {@render userMessage(block.user)}
+        <div class="space-y-4" data-testid="fanout-group">
+          {@render userMessage(block.user)}
+          <!-- The group control lives with the responses (not the user prompt)
+               and shares a named hover scope with them, so it reveals when the
+               responses are hovered and the user message's own hover chrome
+               stays independent. -->
+          <div class="group/responses space-y-2">
             {#if fanoutKeys.length > 0}
-              <div class="shrink-0 pt-1">{@render fanoutToggleAll(fanoutKeys)}</div>
+              <div class="flex justify-end">{@render fanoutToggleAll(fanoutKeys)}</div>
             {/if}
-          </div>
-          <!-- Side-by-side on wide viewports; stacks vertically below `lg`. -->
-          <div
-            class="grid gap-4"
-            style:grid-template-columns={`repeat(${block.columns.length}, minmax(0, 1fr))`}
-          >
-            {#each block.columns as col (col.agent_id)}
-              {@const state = columnState(col.rows)}
-              {@const harness = agentById[col.agent_id]?.harness}
-              {@const colCopyable = columnText(col.rows)}
-              <!-- A non-completed Outcome marker is authoritative for the
+            <!-- Side-by-side on wide viewports; stacks vertically below `lg`. -->
+            <div
+              class="grid gap-4"
+              style:grid-template-columns={`repeat(${block.columns.length}, minmax(0, 1fr))`}
+            >
+              {#each block.columns as col (col.agent_id)}
+                {@const state = columnState(col.rows)}
+                {@const harness = agentById[col.agent_id]?.harness}
+                {@const colCopyable = columnText(col.rows)}
+                <!-- A non-completed Outcome marker is authoritative for the
                    column's status and renders its own chip below; suppress the
                    turn's own status chip so a cancelled-mid turn the harness
                    persisted as `failed` doesn't show a contradictory `failed`
                    chip alongside the marker's `cancelled` (nor a redundant
                    doubled `failed`). Safe per the single-(send_id, agent_id)
                    column invariant. -->
-              {@const colHasOutcome = col.rows.some((r) => r.kind === "outcome")}
-              {@const colKey = `fanout:${block.send_id}:${col.agent_id}`}
-              {@const colEligible = state === "complete"}
-              {@const colDefaultCompact = defaultCompactFor(colKey)}
-              {@const colCompact = colEligible && isCompact(projectId, colKey, colDefaultCompact)}
-              <div
-                class="group space-y-1.5"
-                data-testid="fanout-column"
-                data-role="agent"
-                data-agent-id={col.agent_id}
-                data-state={state}
-              >
-                <div class="flex items-center gap-2 text-xs font-semibold tracking-wide uppercase">
-                  <span class="text-fg" data-testid="turn-agent-name"
-                    >{agentName(col.agent_id)}</span
-                  >
-                  {#if harness}<HarnessIcon {harness} />{/if}
-                </div>
+                {@const colHasOutcome = col.rows.some((r) => r.kind === "outcome")}
+                {@const colKey = `fanout:${block.send_id}:${col.agent_id}`}
+                {@const colEligible = isCollapsibleColumn(col.rows)}
+                {@const colDefaultCompact = defaultCompactFor(colKey)}
+                {@const colCompact = colEligible && isCompact(projectId, colKey, colDefaultCompact)}
                 <div
-                  class="space-y-1.5 border-l-[0.5px] pl-3"
-                  style:border-left-color={agentBorderColor(col.agent_id)}
+                  class="group space-y-1.5"
+                  data-testid="fanout-column"
+                  data-role="agent"
+                  data-agent-id={col.agent_id}
+                  data-state={state}
                 >
-                  {#if state === "queued"}
-                    {@render queuedFooter(
-                      col.agent_id,
-                      block.send_id,
-                      "fanout-queued",
-                      "fanout-card-cancel",
-                    )}
-                  {/if}
-                  {#if colCompact}
-                    <div class={cn("space-y-1.5", PREVIEW_CLIP)}>
+                  <div
+                    class="flex items-center gap-2 text-xs font-semibold tracking-wide uppercase"
+                  >
+                    <span class="text-fg" data-testid="turn-agent-name"
+                      >{agentName(col.agent_id)}</span
+                    >
+                    {#if harness}<HarnessIcon {harness} />{/if}
+                  </div>
+                  <div
+                    class="space-y-1.5 border-l-[0.5px] pl-3"
+                    style:border-left-color={agentBorderColor(col.agent_id)}
+                  >
+                    {#if state === "queued"}
+                      {@render queuedFooter(
+                        col.agent_id,
+                        block.send_id,
+                        "fanout-queued",
+                        "fanout-card-cancel",
+                      )}
+                    {/if}
+                    {#if colCompact}
+                      <!-- Status chips (cancelled/failed) stay outside the clip so
+                         a collapsed terminal column keeps its outcome signal. -->
                       {#each col.rows as r (r.key)}
-                        {#if r.kind === "agent"}{@render turnBody(r.turn, false, true)}{/if}
+                        {#if r.kind === "agent"}
+                          {#if !colHasOutcome}{@render turnStatusLabel(r.turn.status)}{/if}
+                        {:else if r.status === "cancelled"}
+                          <StatusChip status="cancelled" testid="outcome-cancelled" />
+                        {:else}
+                          <StatusChip status="failed" testid="outcome-failed" />
+                          {#if r.reason}<span class="text-muted text-xs"> — {r.reason}</span>{/if}
+                        {/if}
                       {/each}
-                    </div>
-                  {:else}
-                    {#each col.rows as r (r.key)}
-                      {#if r.kind === "agent"}
-                        {#if !colHasOutcome}{@render turnStatusLabel(r.turn.status)}{/if}
-                        {@render turnBody(r.turn, state === "streaming")}
-                      {:else if r.status === "cancelled"}
-                        <StatusChip status="cancelled" testid="outcome-cancelled" />
-                      {:else}
-                        <StatusChip status="failed" testid="outcome-failed" />
-                        {#if r.reason}<span class="text-muted text-xs"> — {r.reason}</span>{/if}
-                      {/if}
-                    {/each}
-                  {/if}
+                      <div class={cn("space-y-1.5", PREVIEW_CLIP)}>
+                        {#each col.rows as r (r.key)}
+                          {#if r.kind === "agent"}{@render turnBody(r.turn, false, true)}{/if}
+                        {/each}
+                      </div>
+                    {:else}
+                      {#each col.rows as r (r.key)}
+                        {#if r.kind === "agent"}
+                          {#if !colHasOutcome}{@render turnStatusLabel(r.turn.status)}{/if}
+                          {@render turnBody(r.turn, state === "streaming")}
+                        {:else if r.status === "cancelled"}
+                          <StatusChip status="cancelled" testid="outcome-cancelled" />
+                        {:else}
+                          <StatusChip status="failed" testid="outcome-failed" />
+                          {#if r.reason}<span class="text-muted text-xs"> — {r.reason}</span>{/if}
+                        {/if}
+                      {/each}
+                    {/if}
+                  </div>
+                  {@render messageMeta(
+                    columnAt(col.rows),
+                    colCopyable,
+                    `Copy ${agentName(col.agent_id)}'s message`,
+                    "mt-1",
+                    undefined,
+                    undefined,
+                    columnModel(col.rows),
+                    columnEffort(col.rows),
+                    colEligible ? colKey : undefined,
+                    colDefaultCompact,
+                  )}
                 </div>
-                {@render messageMeta(
-                  columnAt(col.rows),
-                  colCopyable,
-                  `Copy ${agentName(col.agent_id)}'s message`,
-                  "mt-1",
-                  undefined,
-                  undefined,
-                  columnModel(col.rows),
-                  columnEffort(col.rows),
-                  colEligible ? colKey : undefined,
-                  colDefaultCompact,
-                )}
-              </div>
-            {/each}
+              {/each}
+            </div>
           </div>
         </div>
       {/if}

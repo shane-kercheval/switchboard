@@ -1,8 +1,9 @@
 <script lang="ts">
-  import type { AgentRecord, Attachment, ConversationItem } from "$lib/types";
+  import type { AgentRecord, Attachment, ConversationItem, ProjectId } from "$lib/types";
   import { HEARTBEAT_TIMEOUT_MS } from "$lib/types";
-  import { formatDuration } from "$lib/utils";
+  import { cn, formatDuration } from "$lib/utils";
   import { convertFileSrc } from "@tauri-apps/api/core";
+  import { ChevronDown, ChevronUp } from "@lucide/svelte";
   import {
     cancelSend,
     retryAgentHydration,
@@ -28,6 +29,13 @@
   import ThinkingWidget from "$lib/components/ThinkingWidget.svelte";
   import ErrorDetailsDialog from "$lib/components/ui/ErrorDetailsDialog.svelte";
   import Button from "$lib/components/ui/Button.svelte";
+  import Tooltip from "$lib/components/ui/Tooltip.svelte";
+  import {
+    isCompact,
+    setManyOverrides,
+    stateFor,
+    toggleKey,
+  } from "$lib/state/transcriptPreview.svelte";
 
   type AgentTurn = Extract<Turn, { role: "agent" }>;
   type NonUserRow = Exclude<UnifiedRow, { kind: "user" }>;
@@ -37,12 +45,17 @@
   /// journal items (user messages + outcome markers). `loadStatus` drives the
   /// first-activation loading indicator and the project-load-failed state.
   let {
+    projectId,
     agents,
     overlay = [],
     loadStatus = "complete",
     loadError,
     onRetryLoad,
   }: {
+    /// The active project. Compact-transcript state and per-unit overrides are
+    /// read/written keyed by this id, so the component never reaches into the
+    /// workspace selection itself.
+    projectId: ProjectId;
     agents: AgentRecord[];
     overlay?: ConversationItem[];
     loadStatus?: "pending" | "loading" | "complete" | "failed";
@@ -103,6 +116,70 @@
       agents.map((a) => a.id),
     ),
   );
+
+  /// Whether compact mode is on for the active project.
+  const compactEnabled = $derived(stateFor(projectId).enabled);
+
+  /// Preview keys of the latest completed agent response set — the exception to
+  /// compact mode that stays expanded by default. Chosen by completion recency
+  /// (`ended_at ?? started_at`) across all complete agent turns, not rendered
+  /// order, so a slow earlier-anchored send that finishes last still wins. When
+  /// the latest turn belongs to a fan-out, every completed column in that group
+  /// is included. A turn an outcome marker has overridden (cancelled/failed) is
+  /// not a completed response and never qualifies.
+  const latestExpandedKeys = $derived.by(() => {
+    // eslint-disable-next-line svelte/prefer-svelte-reactivity
+    const keys = new Set<string>();
+    let latest: AgentTurn | undefined;
+    let latestAt = "";
+    for (const row of rows) {
+      if (row.kind !== "agent" || row.turn.status !== "complete" || hasOutcomeFor(row.turn)) {
+        continue;
+      }
+      const at = row.turn.ended_at ?? row.turn.started_at;
+      if (latest === undefined || at.localeCompare(latestAt) > 0) {
+        latest = row.turn;
+        latestAt = at;
+      }
+    }
+    if (latest === undefined) return keys;
+    const group =
+      latest.send_id !== undefined
+        ? blocks.find((b) => b.kind === "fanout" && b.send_id === latest!.send_id)
+        : undefined;
+    if (group !== undefined && group.kind === "fanout") {
+      for (const col of group.columns) {
+        const completed = col.rows.some(
+          (r) => r.kind === "agent" && r.turn.status === "complete" && !hasOutcomeFor(r.turn),
+        );
+        if (completed) keys.add(`fanout:${group.send_id}:${col.agent_id}`);
+      }
+    } else {
+      keys.add(`agent:${latest.turn_id}`);
+    }
+    return keys;
+  });
+
+  /// A unit's default compactness: compact when the mode is on, unless it is in
+  /// the latest-expanded set. User keys are never in that set, so user messages
+  /// simply follow the mode.
+  function defaultCompactFor(key: string): boolean {
+    return compactEnabled && !latestExpandedKeys.has(key);
+  }
+
+  /// Clip + bottom-fade for a compact completed unit. Absolute stops (not
+  /// percentages) so a short message that fits within the cap never fades. The
+  /// `-webkit-` mask is explicit because the app runs in WebKit (Tauri/macOS).
+  const PREVIEW_CLIP =
+    "max-h-[7rem] overflow-hidden [mask-image:linear-gradient(to_bottom,black_5.5rem,transparent_7rem)] [-webkit-mask-image:linear-gradient(to_bottom,black_5.5rem,transparent_7rem)]";
+
+  /// Shared footprint for the in-transcript meta-row icon buttons (preview
+  /// toggle, fan-out toggle-all). Intentionally mirrors `CopyButton` — the
+  /// control they sit beside — rather than `ICON_BUTTON_CLASS` (the app-chrome
+  /// style, `hover:bg-raised`), so their hover state matches the copy button in
+  /// the same row.
+  const META_ICON_BUTTON =
+    "text-muted hover:text-fg hover:bg-border/60 flex h-[26px] w-[26px] items-center justify-center rounded-full border border-transparent transition-colors";
 
   /// Send ids that are queued (dispatched, not yet started) across the project's
   /// agents — the per-agent `pending_sends` minus any being cancelled. A
@@ -286,6 +363,41 @@
       container.scrollTop = container.scrollHeight;
     }
   });
+
+  /// Inner bottom-pin for a capped live region. Each streaming unit's scroll
+  /// element gets its own instance (its own `pinned` closure), so columns pin
+  /// independently. Starts pinned; stays pinned while the user is near the
+  /// bottom (within the same 32px threshold as the outer transcript); releases
+  /// when the user scrolls up and re-engages when they return. The `signal`
+  /// argument is the unit's streamed-content length — Svelte re-runs `update`
+  /// when it changes, which re-pins to the newest activity if still pinned.
+  function liveScroll(node: HTMLElement, _signal: number) {
+    let pinnedHere = true;
+    const onLiveScroll = (): void => {
+      pinnedHere = node.scrollHeight - node.scrollTop - node.clientHeight < 32;
+    };
+    node.addEventListener("scroll", onLiveScroll);
+    node.scrollTop = node.scrollHeight;
+    return {
+      update(): void {
+        if (pinnedHere) node.scrollTop = node.scrollHeight;
+      },
+      destroy(): void {
+        node.removeEventListener("scroll", onLiveScroll);
+      },
+    };
+  }
+
+  /// A streaming unit's content-length signal, so `liveScroll`'s `update` fires
+  /// on every streamed token/tool mutation (item counts can stay constant).
+  function liveSignalOf(turn: AgentTurn): number {
+    let n = turn.items.length;
+    for (const item of turn.items) {
+      if (item.item_kind === "text") n += item.text.length;
+      else n += (item.output?.length ?? 0) + (item.completed_at !== undefined ? 1 : 0);
+    }
+    return n;
+  }
 </script>
 
 {#snippet failureBanner(
@@ -318,7 +430,7 @@
      cancelled/failed, so a turn the parser persisted as `streaming` (a turn
      cancelled mid-flight) doesn't reopen with a phantom live affordance on a
      dead turn. -->
-{#snippet turnBody(turn: AgentTurn, live: boolean = true)}
+{#snippet turnItems(turn: AgentTurn)}
   {#each turn.items as item, i (i)}
     {#if item.item_kind === "text"}
       {#if item.kind === "thinking"}
@@ -330,11 +442,46 @@
       <ToolCallWidget tool={item} />
     {/if}
   {/each}
-  {#if turn.status === "failed" && turn.error}
-    <div class="text-status-failed text-xs" data-testid="turn-error">{turn.error}</div>
-  {/if}
-  {#if turn.status === "streaming" && live}
+{/snippet}
+
+{#snippet turnBody(turn: AgentTurn, live: boolean = true, compact: boolean = false)}
+  {#if compact}
+    <!-- Compact completed preview: only the answer prose renders (tool calls and
+         model reasoning are suppressed). A response that is all tools and no
+         answer shows a muted count placeholder so it isn't a blank preview. -->
+    {@const answerCount = turn.items.filter(
+      (i) => i.item_kind === "text" && i.kind === "text",
+    ).length}
+    {@const hiddenTools = turn.items.filter((i) => i.item_kind === "tool").length}
+    {#if answerCount > 0}
+      {#each turn.items as item, i (i)}
+        {#if item.item_kind === "text" && item.kind === "text"}
+          <Markdown text={item.text} />
+        {/if}
+      {/each}
+    {:else if hiddenTools > 0}
+      <div class="text-muted text-xs italic" data-testid="hidden-tools-placeholder">
+        {hiddenTools} hidden tool {hiddenTools === 1 ? "call" : "calls"}
+      </div>
+    {/if}
+  {:else if turn.status === "streaming" && live}
+    <!-- Live cap: streamed content scrolls inside a bounded region (so several
+         active agents can't each take over the transcript), bottom-pinned to the
+         newest activity. The working/cancel footer renders OUTSIDE the scroll
+         region so it stays visible regardless of the inner scroll position. -->
+    <div
+      class="max-h-[min(600px,60vh)] overflow-y-auto"
+      data-testid="turn-live-scroll"
+      use:liveScroll={liveSignalOf(turn)}
+    >
+      {@render turnItems(turn)}
+    </div>
     {@render workingFooter(turn)}
+  {:else}
+    {@render turnItems(turn)}
+    {#if turn.status === "failed" && turn.error}
+      <div class="text-status-failed text-xs" data-testid="turn-error">{turn.error}</div>
+    {/if}
   {/if}
 {/snippet}
 
@@ -405,6 +552,58 @@
   </div>
 {/snippet}
 
+{#snippet previewToggle(key: string, defaultCompact: boolean)}
+  {@const compact = isCompact(projectId, key, defaultCompact)}
+  <Tooltip label={compact ? "Expand" : "Collapse"} side="bottom">
+    {#snippet trigger(props)}
+      <button
+        {...props}
+        type="button"
+        class={META_ICON_BUTTON}
+        data-testid="turn-preview-toggle"
+        aria-label={compact ? "Expand" : "Collapse"}
+        onclick={() => toggleKey(projectId, key, defaultCompact)}
+      >
+        {#if compact}
+          <ChevronDown class="h-4 w-4" aria-hidden="true" />
+        {:else}
+          <ChevronUp class="h-4 w-4" aria-hidden="true" />
+        {/if}
+      </button>
+    {/snippet}
+  </Tooltip>
+{/snippet}
+
+<!-- Group control for a fan-out: collapses all its response columns when any is
+     expanded, else expands them all. Writes per-column overrides (so each column
+     can still be toggled individually afterwards) and only touches this group's
+     columns. -->
+{#snippet fanoutToggleAll(keys: string[])}
+  {@const anyExpanded = keys.some((k) => !isCompact(projectId, k, defaultCompactFor(k)))}
+  {@const label = anyExpanded ? "Collapse all responses" : "Expand all responses"}
+  <Tooltip {label} side="bottom">
+    {#snippet trigger(props)}
+      <button
+        {...props}
+        type="button"
+        class={cn(
+          META_ICON_BUTTON,
+          "shrink-0 opacity-0 group-focus-within:opacity-100 group-hover:opacity-100",
+        )}
+        data-testid="fanout-preview-toggle-all"
+        aria-label={label}
+        onclick={() => setManyOverrides(projectId, keys, anyExpanded)}
+      >
+        {#if anyExpanded}
+          <ChevronUp class="h-4 w-4" aria-hidden="true" />
+        {:else}
+          <ChevronDown class="h-4 w-4" aria-hidden="true" />
+        {/if}
+      </button>
+    {/snippet}
+  </Tooltip>
+{/snippet}
+
 {#snippet messageMeta(
   at: string,
   copyable: string,
@@ -414,6 +613,8 @@
   costUsd: number | null | undefined = undefined,
   model: string | undefined = undefined,
   effort: string | undefined = undefined,
+  previewKey: string | undefined = undefined,
+  previewDefaultCompact: boolean = false,
 )}
   <!-- `justify-between` pins the always-visible spend group to the LEFT and the
        hover-revealed timestamp/copy to the RIGHT. The left group is always
@@ -464,6 +665,9 @@
       {#if copyable}
         <CopyButton text={copyable} {label} testid="message-copy" />
       {/if}
+      {#if previewKey !== undefined}
+        {@render previewToggle(previewKey, previewDefaultCompact)}
+      {/if}
     </div>
   </div>
 {/snippet}
@@ -509,14 +713,31 @@
 {/snippet}
 
 {#snippet userMessage(row: Extract<UnifiedRow, { kind: "user" }>)}
+  {@const key = `user:${row.key}`}
+  {@const defaultCompact = defaultCompactFor(key)}
   <div class="group min-w-0 flex-1" data-testid="turn" data-role="user">
     <div class="-mx-3 rounded-md bg-blue-100/20 px-3 py-2">
-      <Markdown text={row.text} />
-      {#if row.attachments.length > 0}
-        {@render attachmentList(row.attachments)}
-      {/if}
+      <!-- Clip wraps the content inside the bubble (not the bubble itself) so the
+           negative-margin background bleed survives `overflow:hidden`. -->
+      <div class={isCompact(projectId, key, defaultCompact) ? PREVIEW_CLIP : undefined}>
+        <Markdown text={row.text} />
+        {#if row.attachments.length > 0}
+          {@render attachmentList(row.attachments)}
+        {/if}
+      </div>
     </div>
-    {@render messageMeta(row.at, row.text, "Copy message")}
+    {@render messageMeta(
+      row.at,
+      row.text,
+      "Copy message",
+      "mt-1",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      key,
+      defaultCompact,
+    )}
   </div>
 {/snippet}
 
@@ -567,6 +788,12 @@
        cancelled-mid turn doesn't reopen with a phantom spinner (Claude
        `streaming`) or a contradictory `failed` chip (Codex/Gemini/Antigravity). -->
   {@const ownedByOutcome = hasOutcomeFor(turn)}
+  <!-- Compact preview applies only to a genuinely completed response — not a
+       streaming turn (M3's live cap), nor one an outcome marker has overridden. -->
+  {@const previewEligible = turn.status === "complete" && !ownedByOutcome}
+  {@const key = `agent:${turn.turn_id}`}
+  {@const defaultCompact = defaultCompactFor(key)}
+  {@const compact = previewEligible && isCompact(projectId, key, defaultCompact)}
   <div class="group space-y-1.5" data-testid="turn" data-role="agent">
     <div class="flex items-center gap-2 text-xs font-semibold tracking-wide uppercase">
       <span class="text-fg" data-testid="turn-agent-name">{agentName(turn.agent_id)}</span>
@@ -577,7 +804,11 @@
       style:border-left-color={agentBorderColor(turn.agent_id)}
     >
       {#if !ownedByOutcome}{@render turnStatusLabel(turn.status)}{/if}
-      {@render turnBody(turn, !ownedByOutcome)}
+      {#if compact}
+        <div class={cn("space-y-1.5", PREVIEW_CLIP)}>{@render turnBody(turn, false, true)}</div>
+      {:else}
+        {@render turnBody(turn, !ownedByOutcome)}
+      {/if}
     </div>
     {@render messageMeta(
       turn.started_at,
@@ -588,6 +819,8 @@
       turn.usage?.total_cost_usd,
       turn.model,
       turn.effort,
+      previewEligible ? key : undefined,
+      defaultCompact,
     )}
   </div>
 {/snippet}
@@ -650,9 +883,15 @@
           {@render agentRow(block.row.turn)}
         {/if}
       {:else}
-        <div class="space-y-4" data-testid="fanout-group">
+        {@const fanoutKeys = block.columns
+          .filter((col) => columnState(col.rows) === "complete")
+          .map((col) => `fanout:${block.send_id}:${col.agent_id}`)}
+        <div class="group space-y-4" data-testid="fanout-group">
           <div class="flex items-start justify-between gap-2">
             {@render userMessage(block.user)}
+            {#if fanoutKeys.length > 0}
+              <div class="shrink-0 pt-1">{@render fanoutToggleAll(fanoutKeys)}</div>
+            {/if}
           </div>
           <!-- Side-by-side on wide viewports; stacks vertically below `lg`. -->
           <div
@@ -671,6 +910,10 @@
                    doubled `failed`). Safe per the single-(send_id, agent_id)
                    column invariant. -->
               {@const colHasOutcome = col.rows.some((r) => r.kind === "outcome")}
+              {@const colKey = `fanout:${block.send_id}:${col.agent_id}`}
+              {@const colEligible = state === "complete"}
+              {@const colDefaultCompact = defaultCompactFor(colKey)}
+              {@const colCompact = colEligible && isCompact(projectId, colKey, colDefaultCompact)}
               <div
                 class="group space-y-1.5"
                 data-testid="fanout-column"
@@ -696,17 +939,25 @@
                       "fanout-card-cancel",
                     )}
                   {/if}
-                  {#each col.rows as r (r.key)}
-                    {#if r.kind === "agent"}
-                      {#if !colHasOutcome}{@render turnStatusLabel(r.turn.status)}{/if}
-                      {@render turnBody(r.turn, state === "streaming")}
-                    {:else if r.status === "cancelled"}
-                      <StatusChip status="cancelled" testid="outcome-cancelled" />
-                    {:else}
-                      <StatusChip status="failed" testid="outcome-failed" />
-                      {#if r.reason}<span class="text-muted text-xs"> — {r.reason}</span>{/if}
-                    {/if}
-                  {/each}
+                  {#if colCompact}
+                    <div class={cn("space-y-1.5", PREVIEW_CLIP)}>
+                      {#each col.rows as r (r.key)}
+                        {#if r.kind === "agent"}{@render turnBody(r.turn, false, true)}{/if}
+                      {/each}
+                    </div>
+                  {:else}
+                    {#each col.rows as r (r.key)}
+                      {#if r.kind === "agent"}
+                        {#if !colHasOutcome}{@render turnStatusLabel(r.turn.status)}{/if}
+                        {@render turnBody(r.turn, state === "streaming")}
+                      {:else if r.status === "cancelled"}
+                        <StatusChip status="cancelled" testid="outcome-cancelled" />
+                      {:else}
+                        <StatusChip status="failed" testid="outcome-failed" />
+                        {#if r.reason}<span class="text-muted text-xs"> — {r.reason}</span>{/if}
+                      {/if}
+                    {/each}
+                  {/if}
                 </div>
                 {@render messageMeta(
                   columnAt(col.rows),
@@ -717,6 +968,8 @@
                   undefined,
                   columnModel(col.rows),
                   columnEffort(col.rows),
+                  colEligible ? colKey : undefined,
+                  colDefaultCompact,
                 )}
               </div>
             {/each}

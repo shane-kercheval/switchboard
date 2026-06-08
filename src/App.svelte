@@ -21,6 +21,14 @@
   import SettingsButton from "$lib/components/ui/SettingsButton.svelte";
   import CommandPaletteButton from "$lib/components/ui/CommandPaletteButton.svelte";
   import SidebarToggleButton from "$lib/components/ui/SidebarToggleButton.svelte";
+  import Tooltip from "$lib/components/ui/Tooltip.svelte";
+  import { ICON_BUTTON_CLASS, ICON_SIZE } from "$lib/components/ui/iconButton";
+  import { ListCollapse, Rows3 } from "@lucide/svelte";
+  import {
+    hasOverrides,
+    normalizeProjectCompact,
+    stateFor,
+  } from "$lib/state/transcriptPreview.svelte";
   import DevIndicator from "$lib/components/ui/DevIndicator.svelte";
   import { windowDragRegion } from "$lib/windowDrag";
   import { hydrateAgent, registerAgent } from "$lib/state/index.svelte";
@@ -336,6 +344,28 @@
   const projectsSidebarVisible = $derived(
     projectsSidebarOpen && projectsSidebarHasContent && view.mode !== "git",
   );
+
+  // Compact-transcript header control. The action is a normalize, not a blind
+  // invert: with manual per-unit overrides present it resets (enable compact +
+  // clear overrides); otherwise it inverts the project's compact mode. Label and
+  // icon reflect that so the control reads as reset / compact / expand.
+  const compactEnabled = $derived(
+    selection.activeProjectId !== null && stateFor(selection.activeProjectId).enabled,
+  );
+  const compactHasOverrides = $derived(
+    selection.activeProjectId !== null && hasOverrides(selection.activeProjectId),
+  );
+  const compactLabel = $derived(
+    compactHasOverrides
+      ? "Reset compact transcript"
+      : compactEnabled
+        ? "Expand transcript"
+        : "Compact transcript",
+  );
+
+  function toggleCompactTranscript(): void {
+    if (selection.activeProjectId !== null) normalizeProjectCompact(selection.activeProjectId);
+  }
 
   function retryActivation(): void {
     if (selection.activeProjectId !== null) void activateProject(selection.activeProjectId);
@@ -685,6 +715,25 @@
           class="hover:bg-panel"
         />
         {#if showAgentsToggle}
+          <Tooltip label={compactLabel} side="bottom">
+            {#snippet trigger(props)}
+              <button
+                {...props}
+                type="button"
+                onclick={toggleCompactTranscript}
+                aria-label={compactLabel}
+                data-testid="transcript-compact-toggle"
+                data-tauri-no-drag
+                class={cn(ICON_BUTTON_CLASS, "hover:bg-panel")}
+              >
+                {#if compactEnabled}
+                  <ListCollapse size={ICON_SIZE} aria-hidden="true" />
+                {:else}
+                  <Rows3 size={ICON_SIZE} aria-hidden="true" />
+                {/if}
+              </button>
+            {/snippet}
+          </Tooltip>
           <SidebarToggleButton
             side="right"
             expanded={agentsSidebarOpen}
@@ -777,6 +826,7 @@
           <div class="flex min-h-0 flex-1 overflow-hidden">
             <div class="flex min-w-0 flex-1 flex-col overflow-hidden">
               <UnifiedTranscript
+                projectId={selection.activeProjectId!}
                 agents={activeAgents}
                 overlay={activeConvo?.items ?? []}
                 loadStatus={activeConvo?.status ?? "complete"}

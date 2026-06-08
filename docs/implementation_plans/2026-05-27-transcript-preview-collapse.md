@@ -68,6 +68,15 @@ Current relevant structure:
 - `src/lib/components/UnifiedTranscript.svelte` renders standalone rows, fan-out groups, message meta controls, tool widgets, and live working/cancel footers.
 - `src/lib/state/unified.ts` builds visible row/group structures. Fan-out groups are already represented as one user row plus per-agent columns, so compact controls should follow those visible units.
 
+## Future virtualization compatibility
+
+Transcript virtualization is planned separately after this feature. This feature should not implement virtualization, but it should preserve the assumptions a future virtualizer needs:
+
+- Compact state and overrides must be keyed only by stable data-derived ids, never DOM position, list index, or whether an element is currently mounted. Virtualization will unmount off-screen transcript units.
+- The latest completed response rule must be computed from transcript data (`Turn`/`UnifiedRow`/`RenderBlock`), not from rendered DOM presence. This plan defines "latest" by completion recency (`ended_at ?? started_at`) among complete agent turns.
+- Expand/collapse and streaming updates change visible block heights at runtime. Treat those as ordinary item resize events for the future virtualizer; do not design code that assumes heights only change while streaming or that off-screen blocks remain mounted.
+- The live cap introduces an inner scroll container inside a transcript item. The future virtualizer will own the outer transcript pin-to-bottom behavior; M3's inner bottom-pin must be scoped to the capped live content element only.
+
 ## Milestone 1 - Project-scoped compact state
 
 ### Goal & outcome
@@ -185,6 +194,14 @@ Add a live content wrapper for streaming agent responses:
 - Bottom-pin each internal live body when new content arrives.
 
 Each capped live region needs independent pinning state keyed by its streaming unit. The existing outer transcript auto-pin still keeps the transcript near the active rows, but once live content is capped the outer container stops growing with every streamed token/tool update; the inner live region's bottom-pin is therefore required for latest activity to remain visible.
+
+Inner pinning contract:
+
+- Track each live scroll element by its stable preview key.
+- A live region is pinned when `scrollHeight - scrollTop - clientHeight < 32`, matching the existing outer transcript threshold.
+- On streamed content/tool updates, if that region is pinned, set its `scrollTop` to `scrollHeight`.
+- If the user scrolls up inside the live region, stop auto-pinning that region until the user returns near the bottom.
+- Mounting a new live region starts pinned.
 
 For fan-out, apply the live cap per streaming column so one verbose agent does not distort the whole group.
 

@@ -640,7 +640,24 @@ describe("ProjectsSidebar — delete", () => {
 
     expect(screen.getByTestId("project-action-delete")).toHaveAttribute(
       "title",
-      "Removes Switchboard's files for this project; your code and agent session files are kept.",
+      "Removes Switchboard's files for this project; your code and agent session files are kept. Works even if the project's folder no longer exists.",
+    );
+  });
+
+  it("allows deleting an unavailable project (folder gone)", async () => {
+    const unavailable: ProjectListing = { ...projectIn(A1, "alpha", "/work/a"), available: false };
+    await renderWith([unavailable]);
+    await openProjectActions();
+
+    // Delete is actionable even though the project's directory is gone — it's
+    // the only way to clear a stale unavailable row.
+    const del = screen.getByTestId("project-action-delete");
+    expect(del).not.toHaveAttribute("aria-disabled", "true");
+
+    await fireEvent.click(del);
+    await fireEvent.click(screen.getByTestId("project-delete-confirm"));
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.some((c) => c[0] === "delete_project")).toBe(true),
     );
   });
 });
@@ -828,7 +845,7 @@ describe("ProjectsSidebar — archive + view toggle", () => {
     });
   });
 
-  it("on an unavailable row Archive stays enabled and Delete is disabled", async () => {
+  it("on an unavailable row both Archive and Delete stay enabled", async () => {
     await renderWith([{ ...projectIn(A1, "alpha", "/work/a"), available: false }]);
 
     await openProjectActions();
@@ -836,7 +853,12 @@ describe("ProjectsSidebar — archive + view toggle", () => {
       "aria-disabled",
       "true",
     );
-    expect(screen.getByTestId("project-action-delete")).toHaveAttribute("aria-disabled", "true");
+    // Delete must work for unavailable rows — it's the only way to clear a
+    // project whose folder no longer exists.
+    expect(screen.getByTestId("project-action-delete")).not.toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
   });
 });
 

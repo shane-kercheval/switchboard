@@ -1371,6 +1371,16 @@ pub async fn delete_project_impl(state: &AppState, project_id: ProjectId) -> Res
                 lock(&state.workspace).remove_cached_project(&directory.path, project_id);
             }
         }
+    } else {
+        // No reachable directory (its folder/volume is gone): the on-disk index
+        // can't be touched, so this prunes the project from the workspace
+        // *listing* only. Dropping its cached snapshot in `workspace.yaml` stops
+        // the row from resurrecting while the directory stays gone — which is the
+        // bug being fixed. Accepted limit: if that directory is later
+        // reconnected/re-added, its surviving on-disk index re-lists the project.
+        // That's an unavoidable consequence of deleting an offline project (we
+        // can't unlink files on an absent volume), not a leak this can close.
+        lock(&state.workspace).remove_cached_project_by_id(project_id);
     }
     persist_workspace(state);
     Ok(())
@@ -8275,6 +8285,86 @@ mod tests {
                 .iter()
                 .all(|p| p.id != project.id)
         );
+    }
+
+    #[tokio::test]
+    async fn delete_project_removes_unavailable_project_and_does_not_resurrect_from_cache() {
+        // The user-facing bug: a project whose directory is gone shows as an
+        // unavailable cached row, and deleting it must drop it for good — both
+        // from the listing and from the persisted workspace cache that serves
+        // unavailable rows (otherwise it resurrects on the next list / restart).
+        let (tmp, state, _) = fresh_state_with_mock();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "alpha");
+        // Prime the workspace cache so the project can be served as a row.
+        let _ = list_projects_impl(&state).unwrap();
+
+        // Simulate the directory becoming unreachable (folder/volume gone): drop
+        // the loaded handle + lock and the loaded directory registry, leaving only
+        // the persisted cache — exactly how an unavailable row is served.
+        lock(&state.projects).remove(&project.id);
+        lock(&state.project_locks).remove(&project.id);
+        lock(&state.directories).clear();
+
+        // Precondition: it lists as an unavailable row, so delete is meaningful.
+        let before = list_projects_impl(&state).unwrap();
+        let row = before.iter().find(|p| p.id == project.id).unwrap();
+        assert!(!row.available, "expected an unavailable cached row");
+
+        delete_project_impl(&state, project.id).await.unwrap();
+
+        // Gone from the listing and from the workspace cache (no resurrection).
+        assert!(
+            list_projects_impl(&state)
+                .unwrap()
+                .iter()
+                .all(|p| p.id != project.id)
+        );
+        assert!(!lock(&state.workspace).knows_project(project.id));
+    }
+
+    #[tokio::test]
+    async fn deleting_an_offline_project_leaves_disk_so_reconnecting_relists_it() {
+        // Accepted best-effort limit (engineer-approved): deleting a project
+        // whose directory is offline removes the listing row but cannot delete
+        // the on-disk files. If that directory is reconnected (re-init reads the
+        // surviving index), the project legitimately reappears. Pinned here so
+        // the behavior is a conscious choice, not a silent surprise.
+        let (tmp, state, _) = fresh_state_with_mock();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "alpha");
+        let _ = list_projects_impl(&state).unwrap();
+
+        // Go offline: drop the loaded handle/lock/registry, leaving the on-disk
+        // index intact.
+        lock(&state.projects).remove(&project.id);
+        lock(&state.project_locks).remove(&project.id);
+        lock(&state.directories).clear();
+
+        delete_project_impl(&state, project.id).await.unwrap();
+        assert!(
+            list_projects_impl(&state)
+                .unwrap()
+                .iter()
+                .all(|p| p.id != project.id),
+            "delete clears the offline listing row"
+        );
+
+        // Reconnect: re-init the same on-disk directory. Its index still lists the
+        // project (delete never reached disk), so it comes back as available.
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let row = list_projects_impl(&state)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.id == project.id)
+            .expect("offline-deleted project relists after the directory reconnects");
+        assert!(row.available);
     }
 
     #[tokio::test]

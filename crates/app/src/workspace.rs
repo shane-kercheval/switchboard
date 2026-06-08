@@ -91,7 +91,9 @@ impl Workspace {
     /// whose post-delete index re-read isn't available (e.g. the index file
     /// vanished out-of-band), so the deleted project can't resurrect as a stale
     /// cached row the next time `list_projects` falls back to the cache. No-op
-    /// (returns `false`) if `path` is unknown or the id wasn't cached.
+    /// (returns `false`) if `path` is unknown or the id wasn't cached. This is the
+    /// targeted form for when the owning directory is known; use
+    /// [`Workspace::remove_cached_project_by_id`] when it can't be resolved.
     pub fn remove_cached_project(&mut self, path: &Path, id: ProjectId) -> bool {
         if let Some(entry) = self.entries.iter_mut().find(|entry| entry.path == path) {
             let before = entry.cached_projects.len();
@@ -99,6 +101,22 @@ impl Workspace {
             return entry.cached_projects.len() != before;
         }
         false
+    }
+
+    /// Drop a project id from whichever directory entry caches it, without
+    /// needing to know the owning path. Used when deleting a project whose
+    /// directory is unreachable (its folder/volume is gone): the persisted
+    /// `workspace.yaml` cache is then the only remaining reference, so it must be
+    /// pruned by id alone or the unavailable row resurrects on the next list /
+    /// restart. Returns whether anything changed.
+    pub fn remove_cached_project_by_id(&mut self, id: ProjectId) -> bool {
+        let mut changed = false;
+        for entry in &mut self.entries {
+            let before = entry.cached_projects.len();
+            entry.cached_projects.retain(|p| p.id != id);
+            changed |= entry.cached_projects.len() != before;
+        }
+        changed
     }
 
     pub fn entries(&self) -> &[DirectoryEntry] {
@@ -338,6 +356,24 @@ mod tests {
 
     fn keep_id(workspace: &Workspace) -> uuid::Uuid {
         workspace.entries()[0].cached_projects[0].id
+    }
+
+    #[test]
+    fn remove_cached_project_by_id_drops_it_from_any_entry() {
+        let mut workspace = Workspace::default();
+        workspace.add(PathBuf::from("/a"));
+        workspace.add(PathBuf::from("/b"));
+        let keep = summary("keep");
+        let drop = summary("drop");
+        workspace.refresh_cache(Path::new("/a"), vec![keep.clone()]);
+        workspace.refresh_cache(Path::new("/b"), vec![drop.clone()]);
+
+        // Removes the id without being told which directory holds it.
+        assert!(workspace.remove_cached_project_by_id(drop.id));
+        assert!(!workspace.knows_project(drop.id));
+        assert!(workspace.knows_project(keep.id));
+        // A second removal of the now-absent id is a no-op.
+        assert!(!workspace.remove_cached_project_by_id(drop.id));
     }
 
     #[test]

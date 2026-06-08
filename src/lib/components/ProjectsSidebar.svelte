@@ -686,10 +686,10 @@
                         <DropdownMenuItem
                           onSelect={() => startDelete(project)}
                           closeOnSelect={false}
-                          disabled={busy || !project.available}
+                          disabled={busy}
                           class="text-status-failed gap-2"
                           data-testid="project-action-delete"
-                          title="Removes Switchboard's files for this project; your code and agent session files are kept."
+                          title="Removes Switchboard's files for this project; your code and agent session files are kept. Works even if the project's folder no longer exists."
                         >
                           <Trash2 size={14} strokeWidth={1.8} class="shrink-0" aria-hidden="true" />
                           Delete project

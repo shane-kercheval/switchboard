@@ -165,6 +165,11 @@ Tool call behavior in compact completed turns:
 - Thinking/reasoning widgets should be hidden in compact mode with other non-answer detail; expanding restores them.
 - If a compact response has hidden tools and no visible answer text, render a muted placeholder such as `2 hidden tool calls`.
 
+Current-code alignment (post-merge of attachments + reopen-dedup work):
+
+- User rows now carry a required `attachments: Attachment[]` (drag-and-drop attachments PR), rendered by an `attachmentList` snippet *inside* `userMessage`'s body block. The completed-preview wrapper around a user message must clip text **and** attachments together — wrap the whole body block, not just the `Markdown`. Test fixtures that build user rows must include `attachments` (it is no longer optional on `UnifiedRow`'s user variant).
+- A non-completed **outcome marker** is already authoritative for a turn's status (reopen-dedup PR): `hasOutcomeFor` / `ownedByOutcome` (standalone) and `colHasOutcome` (fan-out) suppress the status chip and live footer for cancelled/failed-mid turns. This does not fight the compact rule — the latest-completed selection only considers `status === "complete"` turns, so outcome-owned turns are excluded anyway — but the compact suppression must coexist with this existing suppression rather than duplicate it. An outcome-owned turn is not a completed response and gets no compact toggle.
+
 ### Definition of done
 
 - Header compact mode collapses older completed messages/responses only for the active project.
@@ -184,7 +189,9 @@ Streaming responses remain visible without taking over the transcript. The live 
 
 ### Implementation outline
 
-Split streaming rendering into a capped content region and a sibling live footer. Do not wrap the existing whole `turnBody` snippet with the live cap, because `workingFooter` currently includes the working/quiet label and cancel control. The cap applies only to streamed text/tool content; `workingFooter` renders outside the scrollable region for both standalone rows and fan-out columns.
+Split streaming rendering into a capped content region and a sibling live footer. Do not wrap the existing whole `turnBody` snippet with the live cap, because `turnBody` already renders `workingFooter` (the working/quiet label and cancel control) at its end. The cap applies only to streamed text/tool content; `workingFooter` renders outside the scrollable region for both standalone rows and fan-out columns.
+
+Current-code alignment (post-merge of reopen-dedup work): `turnBody` now takes a second `live: boolean` parameter that gates the working footer (`turn.status === "streaming" && live`). Callers pass `!ownedByOutcome` (standalone) and `state === "streaming"` (fan-out) so a cancelled-mid turn that the harness persisted as `streaming` does not reopen with a phantom live footer. The cap work must thread through this signature: rather than wrapping `turnBody` whole, render the streamed text/tool items inside the capped region and the footer as a sibling outside it — i.e. either pass `live: false` into the capped `turnBody` and render `workingFooter` separately below the cap, or factor the item loop out of `turnBody` so the cap wraps only the items. Either way, preserve the existing outcome-marker gating (`ownedByOutcome` / `colHasOutcome` still suppress the footer for outcome-owned turns).
 
 Add a live content wrapper for streaming agent responses:
 
@@ -258,7 +265,7 @@ In `App.svelte`, render the compact transcript button only when:
 - the roster is loaded
 - the active project has at least one agent
 
-Place it near the existing right-side title-bar controls, before the agents-sidebar toggle. Wrap with `Tooltip`; use `data-testid="transcript-compact-toggle"` and `data-tauri-no-drag`.
+Place it near the existing right-side title-bar controls, before the agents-sidebar toggle. The right cluster now reads (left→right): view toggle (`Projects | Git`), `CommandPaletteButton` (added by the command-palette PR), then the agents-sidebar toggle. Slot the compact toggle next to the command-palette button and before the agents-sidebar toggle. Wrap with `Tooltip`; use `data-testid="transcript-compact-toggle"` and `data-tauri-no-drag`.
 
 The button should call `normalizeProjectCompact(projectId)`, not blindly invert the boolean. Tooltip and aria label should reflect the action:
 

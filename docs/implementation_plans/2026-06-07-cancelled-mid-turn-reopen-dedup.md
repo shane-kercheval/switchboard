@@ -1,6 +1,6 @@
 # Cancelled-mid-turn reopen: stop duplicating the prompt, render partial content labelled cancelled
 
-**Status:** Proposed (rewritten after review)
+**Status:** Implemented
 **Date:** 2026-06-07
 **Branch:** `fix/in-flight-turn-hydration-dedup` (same PR as the M1–M4 in-flight-turn work)
 
@@ -69,28 +69,33 @@ that — **never** off the harness `TurnStatus`, which is an unreliable proxy in
   `Streaming` (M2's `eof_tail_status`, no `end_turn`) — a disk-status partition
   routes it to the non-completed bucket and strands the matched completed send.
 
-**Algorithm — end-aligned (tail-anchored) zip of disk turns to all sends.** Merge
-each agent's sends back into one dispatch-ordered list `S` (length `M`), tagged
-completed/non-completed from the journal — **all** sends, not just completed.
-Take the agent's disk **agent** turns `T` (length `N`). Align the **tails**, not
-the heads — the most recent disk turn answers the most recent send. Concretely:
-- `pairs = min(N, M)`
-- `turn_offset = N − pairs = max(0, N − M)` — the first `turn_offset` disk turns
-  are **pre-journaling history** (attached session, older than the first send) →
-  `send_id: None`, as today.
-- `send_offset = M − pairs = max(0, M − N)` — the first `send_offset` sends have
-  **no disk turn**; a non-completed one renders its content-free Outcome marker
-  alone (cancelled-before-output), a completed/in-flight one is dropped as today.
-- For `k in 0..pairs`: `T[turn_offset + k] ↔ S[send_offset + k]`, **regardless of
-  the turn's harness status** — a `Complete`-on-disk cancelled turn still pairs to
-  its cancelled send, a `Streaming` completed tail still pairs to its completed
-  send.
+**Algorithm — generalize the existing front-aligned offset from completed-only to
+all sends.** This is *one substitution*, not a new algorithm: the current code
+already correctly handles the two excess directions; it just pairs against the
+wrong list. The all-sends list already exists — `agent_sends[agent_id]`
+(`commands.rs:2995`) is every `Send` in dispatch order; `sends_by_agent`
+(`:3049-3057`) is that list filtered to completed-only, which is the bug (it
+excludes cancel-mid sends whose partial turns *are* on disk). Pair against the
+unfiltered `agent_sends` instead.
 
-Head-anchoring instead (zip from the front) is the trap: it pairs a *leading*
-contentless cancelled send to the next *completed* answer, mislabeling a finished
-answer as cancelled and reproducing the offset bug. Tail-anchoring is what the
-current code already does for the completed-only correlation; this generalizes it
-to all sends.
+Let `N` = the agent's disk **agent** turns, `M` = its **all-sends** count. The
+offset is on the **disk-turn side** (this is the load-bearing detail the prior
+draft's prose got wrong):
+- `turn_offset = N.saturating_sub(M)` — the first `turn_offset` disk turns are
+  **pre-journaling history** (attached session, older than the first send) →
+  `send_id: None`. (Leading *turn*-excess.)
+- A turn at agent-index `i ≥ turn_offset` pairs with `all_sends[i − turn_offset]`,
+  **regardless of harness status** (a `Complete`-on-disk cancelled turn pairs to
+  its cancelled send; a `Streaming` completed tail pairs to its completed send).
+- **Trailing *send*-excess is dropped** — a send with no disk turn (an **in-flight**
+  send still running, or a contentless cancelled-before-output) is not paired. An
+  in-flight send shows only its journal prompt; a cancelled one shows its bare
+  Outcome marker. **In-flight is handled, not a residual** — front-alignment drops
+  trailing send-excess, which is exactly the existing invariant at `:3186-3191`
+  and its gate test `merge_in_flight_send_does_not_mislabel_completed_turns`
+  (`:10191`). *Do not* re-introduce tail-anchoring (a `send_offset` that skips
+  leading sends) — it pairs the last completed turn with the in-flight send and
+  regresses that common path.
 
 A disk turn paired to a **completed** send renders as today (its `send_id`, its
 harness status). A disk turn paired to a **non-completed** send renders its
@@ -105,25 +110,29 @@ the current two-branch split (`:3159-3170`) but over the *all-sends* zip:
 - A user turn **with a following reply** (the next agent turn): journaled iff that
   reply is *not* pre-journaling history (its paired agent turn index `≥
   turn_offset`).
-- A **dangling** user turn (no following reply — a cancelled/failed/in-flight send
-  whose prompt was recorded but produced no agent turn): journaled while
-  unmatched non-completed/in-flight sends remain to account for it. The subtle
-  shape is **cancelled-before-output where the prompt *was* recorded on disk** —
-  a dangling user turn with no agent turn; the walk must still consume a send
-  slot for it or everything after mis-aligns.
-Re-derive both branch formulas against the new `turn_offset`/`send_offset`; the
-**existing characterization tests at `:3089-3106` are a gate this rewrite must
-pass**, not an assumption.
+- A **dangling** user turn (no following reply — a cancelled-before-output send
+  whose prompt was recorded but produced no agent turn): journaled while unmatched
+  trailing sends remain to account for it.
+This half is **coupled** to the agent-turn change — `turn_offset` and
+`dangling_journaled` must move to the all-sends basis **in lockstep** (compute
+`dangling_journaled` from `all_sends.len()`, not `completed.len() +
+non_completed_count`), or a cancel-mid prompt won't drop. With all-sends pairing,
+a cancel-mid prompt now drops through the *main* pairing (its turn pairs with its
+send), so the dangling branch *simplifies* — it only covers cancelled-before-output
+and in-flight. The **existing bare-CLI characterization tests at `:3089-3106` are
+a gate this must pass**, not an assumption.
 
-**Documented residual (a known-bound, not a silent gap).** The tail-aligned zip
-cannot disambiguate a **content-less non-completed send sandwiched between two
-completed sends** — nothing positional distinguishes which completed turn is
-which (tail-anchoring fixes the leading/trailing contentless shapes but not the
-interior one). Pin this the way the existing comment pins its edges (`:3089-3106`).
-Crucially, this residual is a **content mis-grouping** (a turn lands in the wrong
-column / gets the wrong `send_id`), **not** prompt duplication — the journal
-still owns the prompt, so the headline bug stays fixed. This residual is the
-precise trigger for the deferred key-join (below).
+**Documented residual (a known-bound, not a silent gap).** Front-alignment cannot
+disambiguate a **content-less non-completed send positioned *before* a
+content-bearing turn** — the leading (or interior) cancelled-before-output shape
+shifts every subsequent label by one. Pin it the way the existing comment pins its
+edges (`:3089-3106`; the existing `merge_cancel_before_harness_flush_overcounts…`
+test at `:10151` already characterizes a neighbor). Crucially, this residual is a
+**content mis-grouping** (a turn lands in the wrong column / gets the wrong
+`send_id`), **not** prompt duplication — the journal still owns the prompt, so the
+headline bug stays fixed. It is strictly narrower than the in-flight breakage
+tail-anchoring would cause, and it is the precise trigger for the deferred
+key-join (below).
 
 ### 2. Frontend — make the journal marker authoritative for the cancelled badge (`columnState`)
 
@@ -150,6 +159,17 @@ the whole split-source design; failed turns already carry a `failed` marker, so
   a marker can never paint a *different* live turn cancelled. Document that
   single-send-column invariant in `columnState` so a future change that lets a
   column span sends trips a flag (it would need send/turn-scoped matching then).
+- **`columnState` alone is necessary but not sufficient** — it sets the column's
+  badge (`data-state`), but the column's agent row independently renders the
+  live "Working…" footer (spinner + live cancel button) for any turn whose
+  *harness* status is `streaming`. A cancelled-mid Claude turn reopens as
+  `streaming`, so without a second gate the column reads `cancelled` yet still
+  shows a phantom spinner on a dead turn. Gate `turnBody`'s streaming footer on a
+  `live` flag and pass `live = (columnState === "streaming")` at the column site,
+  so the live affordance only renders when the column is *genuinely* live (no
+  authoritative non-completed marker). Standalone (non-fan-out) rows pass the
+  default `live = true` and are unchanged — the single-recipient reopen path is
+  out of scope here (its outcome is a sibling row, not a same-scope marker).
 
 ## Tests
 
@@ -165,11 +185,8 @@ the whole split-source design; failed turns already carry a `failed` marker, so
   `Complete`, one completed + one cancelled send): correct cross-boundary
   assignment — completed turn to completed send, the `Complete`-on-disk cancelled
   turn to the cancelled send; one prompt each, no duplicate/orphan.
-- **`[cancel(partial), completed]`** (reverse interleave): correct.
-- **`[cancel-pre-output, completed]` (leading contentless)** — the fixture that
-  passes under tail-anchoring and **fails under head-anchoring**: the lone disk
-  turn pairs to the *completed* send (not the leading cancelled one), one prompt,
-  no duplicate, no mislabel. This locks the anchor direction.
+- **`[cancel(partial), completed]`** (cancel-mid then completed): correct
+  send_ids, one prompt each, no duplicate.
 - **Cancelled-before-output with the prompt recorded on disk (dangling user
   turn)** — a `Turn::User` with no following agent turn for a cancelled send:
   prompt **dropped** (journaled), bare cancelled marker rendered, no duplicate,
@@ -184,6 +201,17 @@ the whole split-source design; failed turns already carry a `failed` marker, so
   marker, no content, no duplicate.
 - **Idempotent re-merge** (switch-back): re-running the merge yields the same
   items — no growth.
+- **Documented residual — `[cancel-pre-output, completed]` (leading contentless):**
+  *characterizes* the known mis-grouping (the completed answer lands under the
+  cancelled send's column / gets its `send_id`) so the bound is a conscious
+  decision — **not** a correctness assertion. The prompt is still journal-owned
+  (no duplication).
+- **Gate (must stay green — these pin front-alignment / in-flight):**
+  `merge_in_flight_send_does_not_mislabel_completed_turns` (`:10191`),
+  `merge_trailing_in_flight_prompt_*` (`:9989`),
+  `merge_cancel_before_harness_flush_*` (`:10151`), and the bare-CLI / pre-journaling
+  characterization tests (`:3089-3106`). **Run the rewrite against them**, don't
+  assume — they are exactly what tail-anchoring would have broken.
 - The documented residual (`[completed, cancel-pre-output, completed]`):
   characterize current behavior so the known-bound is a conscious decision.
 - **Gate:** the existing `merge_project_conversation` characterization tests
@@ -210,11 +238,45 @@ draft implied (M1 already persists the key on disk). **Revisit it when the
 documented residual proves to bite** — that mis-grouping shape is its trigger.
 Note this in `docs/research/harness-behavior.md`.
 
+## Additional bug found during real-data verification: Gemini tool-result fragmentation
+
+Verifying the fix against real captured sessions (`~/repos/temp`, projects
+`dedup-test` / `dedup-test-23`) surfaced a **separate, pre-existing Gemini
+session-parser bug** that produced the same user-visible symptoms (blank user
+rows + fragmented/"duplicated" fan-out tool rows) and was being mistaken for the
+merge bug.
+
+**Root cause** — `crates/harness/src/gemini/session_file.rs::handle_user`. Gemini
+echoes every tool result back into the transcript as a standalone `type:"user"`
+record carrying a `functionResponse` block (no prompt text), *in addition* to the
+inline `toolCalls[].result` on the agent's `gemini` record. `handle_user` treated
+each one as a fresh user prompt → it closed the current agent turn and pushed a
+**blank-text `Turn::User`** on every tool round-trip. One logical agent turn with
+N tool calls became N+1 turns (each a one-tool fragment) interleaved with N blank
+user rows. The merge's order-correlation then scattered the fragments (one send
+vs ~12 disk turns → `turn_offset` ≫ 0) as standalone rows *outside* the fan-out
+column — the exact stack of repeated `GEMINI` tool rows in the repro.
+
+**Fix** — skip `functionResponse` user records in `handle_user` (don't close the
+turn, don't emit a `Turn::User`); the inline `toolCalls[].result` already carries
+the output, so nothing is lost. After the fix the real session parses to **2
+turns** (one prompt + one whole agent turn with all 17 tool items) instead of
+25+. Regression test:
+`function_response_user_records_do_not_fragment_the_agent_turn`.
+
+**Isolated to Gemini.** Codex binds tool results via `function_call_output`
+response items and Antigravity distinguishes `is_tool_result()` from prompts —
+neither fragments. No merge/journal change; this is purely a read-side parser fix,
+so existing on-disk sessions render correctly once rebuilt.
+
 ## Scope / non-goals
 
-- **Two loci:** backend `merge_project_conversation` + frontend `columnState`.
+- **Two loci** (cancelled-mid dedup): backend `merge_project_conversation` +
+  frontend `UnifiedTranscript.svelte` (`columnState` badge authority **and** the
+  `turnBody` live-footer gate at the column site — both needed; see piece 2).
   (The first draft's "backend-only, no component change" was wrong — without the
-  badge fix the marker is inert and the turn renders as a spinner.)
+  badge fix the marker is inert and the turn renders as a spinner.) Plus the
+  Gemini parser fix above, found during verification.
 - **No schema change:** no `TurnStatus::Cancelled`, no journal field (that's the
   deferred key-join), no `ConversationItem` change. Render-both is preserved.
 - Live cancel behavior is unchanged (already correct).

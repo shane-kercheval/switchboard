@@ -196,18 +196,26 @@
     return now - Date.parse(quietSince) + HEARTBEAT_TIMEOUT_MS;
   }
 
-  /// A fan-out column's state, derived from its rows: the response turn's status
-  /// if present, else an outcome marker's status, else "queued" (dispatched, no
-  /// turn yet). "streaming"/"queued" are *live* — they keep cancel-send active.
+  /// A fan-out column's state, derived from its rows. A non-completed **outcome
+  /// marker** (cancelled/failed, journal-sourced) is *authoritative* and outranks
+  /// the harness-derived agent status: the journal is the source of truth for
+  /// non-completed outcomes (`TurnStatus` has no `cancelled`), so a cancelled turn
+  /// that the parser persisted as `streaming`/`failed` — or `complete` in the
+  /// cancel-after-end race — still reads `cancelled`/`failed` here, not a live
+  /// spinner or a mislabel. This is safe because a fan-out column is a single
+  /// `(send_id, agent_id)` pair: the marker can only belong to *this* column's
+  /// turn (if columns ever span sends, this must become send-scoped). Otherwise
+  /// the agent turn's status, else "queued" (dispatched, no turn yet).
+  /// "streaming"/"queued" are *live* — they keep cancel-send active.
   type ColumnState = "queued" | "streaming" | "complete" | "failed" | "cancelled";
   function columnState(colRows: NonUserRow[]): ColumnState {
     for (let i = colRows.length - 1; i >= 0; i--) {
       const r = colRows[i]!;
-      if (r.kind === "agent") return r.turn.status;
+      if (r.kind === "outcome") return r.status;
     }
     for (let i = colRows.length - 1; i >= 0; i--) {
       const r = colRows[i]!;
-      if (r.kind === "outcome") return r.status;
+      if (r.kind === "agent") return r.turn.status;
     }
     return "queued";
   }
@@ -280,7 +288,13 @@
   </div>
 {/snippet}
 
-{#snippet turnBody(turn: AgentTurn)}
+<!-- `live` gates the streaming "Working…" footer (spinner + live cancel button).
+     It defaults true for standalone rows; a fan-out column passes false when an
+     authoritative non-completed Outcome marker has overridden the column to
+     cancelled/failed, so a turn the parser persisted as `streaming` (a turn
+     cancelled mid-flight) doesn't reopen with a phantom live affordance on a
+     dead turn. -->
+{#snippet turnBody(turn: AgentTurn, live: boolean = true)}
   {#each turn.items as item, i (i)}
     {#if item.item_kind === "text"}
       {#if item.kind === "thinking"}
@@ -295,7 +309,7 @@
   {#if turn.status === "failed" && turn.error}
     <div class="text-status-failed text-xs" data-testid="turn-error">{turn.error}</div>
   {/if}
-  {#if turn.status === "streaming"}
+  {#if turn.status === "streaming" && live}
     {@render workingFooter(turn)}
   {/if}
 {/snippet}
@@ -647,7 +661,7 @@
                   {#each col.rows as r (r.key)}
                     {#if r.kind === "agent"}
                       {@render turnStatusLabel(r.turn.status)}
-                      {@render turnBody(r.turn)}
+                      {@render turnBody(r.turn, state === "streaming")}
                     {:else if r.status === "cancelled"}
                       <StatusChip status="cancelled" testid="outcome-cancelled" />
                     {:else}

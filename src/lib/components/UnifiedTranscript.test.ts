@@ -658,13 +658,13 @@ describe("UnifiedTranscript — fan-out groups", () => {
   function seedFanout(
     state: Awaited<ReturnType<typeof loadState>>,
     aliceResponse: {
-      status: "streaming" | "complete";
+      status: "streaming" | "complete" | "failed";
       text?: string;
       model?: string;
       effort?: string;
     } | null,
     bobResponse: {
-      status: "streaming" | "complete";
+      status: "streaming" | "complete" | "failed";
       text?: string;
       model?: string;
       effort?: string;
@@ -828,6 +828,122 @@ describe("UnifiedTranscript — fan-out groups", () => {
     render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT, CODEX_AGENT] } });
 
     expect(screen.queryByTestId("fanout-card-cancel")).toBeNull();
+  });
+
+  // A turn cancelled after it produced output reopens with its partial content
+  // and, for Claude, a `streaming` disk status (no terminal stop_reason). The
+  // journal's cancelled Outcome marker is authoritative: the column reads
+  // `cancelled` and shows none of the live affordances a `streaming` turn would
+  // otherwise render (no "Working…", no live cancel button).
+  it("reads a reopened cancelled-mid-turn column as cancelled with no live affordances", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    // Alice cancelled after partial output (disk `streaming`); bob completed.
+    seedFanout(
+      state,
+      { status: "streaming", text: "partial work" },
+      { status: "complete", text: "bob reply" },
+    );
+
+    render(UnifiedTranscript, {
+      props: {
+        agents: [CLAUDE_AGENT, CODEX_AGENT],
+        overlay: [
+          {
+            kind: "outcome",
+            turn_id: "o-alice",
+            send_id: SEND_1,
+            agent_id: CLAUDE_AGENT.id,
+            status: "cancelled",
+            reason: null,
+            at: "2026-05-16T00:00:05Z",
+          },
+        ],
+      },
+    });
+
+    const columns = screen.getAllByTestId("fanout-column");
+    expect(columns[0]).toHaveAttribute("data-agent-id", CLAUDE_AGENT.id);
+    expect(columns[0]).toHaveAttribute("data-state", "cancelled");
+    // Partial content is preserved (reopen mirrors live), labelled cancelled…
+    expect(columns[0]).toHaveTextContent("partial work");
+    expect(screen.getByTestId("outcome-cancelled")).toBeInTheDocument();
+    // …and the dead turn shows no live spinner or live cancel control.
+    expect(screen.queryByTestId("turn-working")).toBeNull();
+    expect(screen.queryByTestId("turn-live-control")).toBeNull();
+    expect(screen.queryByTestId("fanout-card-cancel")).toBeNull();
+  });
+
+  // Codex/Gemini/Antigravity persist a cancelled-mid turn as `failed`, not
+  // `streaming`. The cancelled marker still wins, so the column reads cancelled
+  // rather than the mislabelled "failed" the bare disk status would give.
+  it("reads a reopened cancelled column cancelled even when the disk turn is failed", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    seedFanout(
+      state,
+      { status: "failed", text: "partial work" },
+      { status: "complete", text: "bob reply" },
+    );
+
+    render(UnifiedTranscript, {
+      props: {
+        agents: [CLAUDE_AGENT, CODEX_AGENT],
+        overlay: [
+          {
+            kind: "outcome",
+            turn_id: "o-alice",
+            send_id: SEND_1,
+            agent_id: CLAUDE_AGENT.id,
+            status: "cancelled",
+            reason: null,
+            at: "2026-05-16T00:00:05Z",
+          },
+        ],
+      },
+    });
+
+    const columns = screen.getAllByTestId("fanout-column");
+    expect(columns[0]).toHaveAttribute("data-state", "cancelled");
+    expect(screen.getByTestId("outcome-cancelled")).toBeInTheDocument();
+    expect(screen.queryByTestId("outcome-failed")).toBeNull();
+  });
+
+  // A genuinely failed turn keeps its failed marker and its reason — the marker
+  // is authoritative but not suppressed, so failure detail still surfaces.
+  it("preserves a failed marker's reason on a reopened failed-mid-turn column", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    seedFanout(
+      state,
+      { status: "failed", text: "partial work" },
+      { status: "complete", text: "bob reply" },
+    );
+
+    render(UnifiedTranscript, {
+      props: {
+        agents: [CLAUDE_AGENT, CODEX_AGENT],
+        overlay: [
+          {
+            kind: "outcome",
+            turn_id: "o-alice",
+            send_id: SEND_1,
+            agent_id: CLAUDE_AGENT.id,
+            status: "failed",
+            reason: "process exited 1",
+            at: "2026-05-16T00:00:05Z",
+          },
+        ],
+      },
+    });
+
+    const columns = screen.getAllByTestId("fanout-column");
+    expect(columns[0]).toHaveAttribute("data-state", "failed");
+    expect(screen.getByTestId("outcome-failed")).toBeInTheDocument();
+    expect(columns[0]).toHaveTextContent("process exited 1");
   });
 
   it("renders a single-recipient send as a normal row, not a fan-out group", async () => {

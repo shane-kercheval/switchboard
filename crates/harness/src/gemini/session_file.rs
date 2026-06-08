@@ -436,9 +436,22 @@ impl GeminiReconstruction {
     }
 
     fn handle_user(&mut self, record: &Value) {
-        let text = record
-            .get("content")
-            .and_then(Value::as_array)
+        let content = record.get("content").and_then(Value::as_array);
+        // Gemini interleaves tool results back into the transcript as
+        // `type:"user"` records carrying `functionResponse` blocks (no prompt
+        // text). They are NOT user prompts: the matching `toolCalls[].result`
+        // already lives inline on the agent's `gemini` record, so these are
+        // redundant echoes. Treating them as prompts would close the agent turn
+        // and emit a blank-text `Turn::User` on every tool round-trip —
+        // fragmenting one agent turn into one-turn-per-tool-call and littering
+        // the transcript with empty user rows. Skip them entirely so the agent
+        // turn keeps accumulating until the next real prompt.
+        let is_tool_result =
+            content.is_some_and(|arr| arr.iter().any(|b| b.get("functionResponse").is_some()));
+        if is_tool_result {
+            return;
+        }
+        let text = content
             .and_then(|arr| arr.first())
             .and_then(|item| item.get("text"))
             .and_then(Value::as_str)
@@ -991,6 +1004,63 @@ mod tests {
             final_text.as_deref(),
             Some("SWITCHBOARD_GEMINI_PROBE_TOOL_5F8A21"),
             "final assistant text item must be the sentinel"
+        );
+    }
+
+    /// Real Gemini sessions echo each tool result back as a standalone
+    /// `type:"user"` record carrying a `functionResponse` block (no prompt
+    /// text), in addition to the inline `toolCalls[].result`. These must NOT be
+    /// treated as user prompts: doing so closed the agent turn and emitted a
+    /// blank `Turn::User` on every tool round-trip, fragmenting one agent turn
+    /// into one-per-tool-call and producing empty user rows. The agent turn must
+    /// stay whole — one user prompt, one agent turn with the tool + the trailing
+    /// text — and no blank user turn.
+    #[test]
+    fn function_response_user_records_do_not_fragment_the_agent_turn() {
+        const FIXTURE: &str = concat!(
+            r#"{"id":"u1","timestamp":"2026-06-07T21:00:01Z","type":"user","content":[{"text":"explore the repo"}]}"#,
+            "\n",
+            r#"{"id":"g1","timestamp":"2026-06-07T21:00:02Z","type":"gemini","content":"","thoughts":[],"tokens":{"input":1,"output":1,"cached":0},"model":"gemini-3-flash-preview","toolCalls":[{"id":"tc1","name":"list_directory","args":{"path":"."},"status":"success","result":[{"functionResponse":{"id":"tc1","name":"list_directory","response":{"output":"file_a\nfile_b"}}}]}]}"#,
+            "\n",
+            r#"{"id":"fr1","timestamp":"2026-06-07T21:00:03Z","type":"user","content":[{"functionResponse":{"id":"tc1","name":"list_directory","response":{"output":"file_a\nfile_b"}}}]}"#,
+            "\n",
+            r#"{"id":"g2","timestamp":"2026-06-07T21:00:04Z","type":"gemini","content":"Here is the summary.","thoughts":[],"tokens":{"input":1,"output":1,"cached":0},"model":"gemini-3-flash-preview"}"#,
+        );
+
+        let t = parse_gemini_transcript_content(FIXTURE, agent_id());
+
+        assert_eq!(
+            t.turns.len(),
+            2,
+            "one user prompt + one whole agent turn, no fragmentation: {:?}",
+            t.turns
+        );
+        assert!(
+            matches!(&t.turns[0], Turn::User { text, .. } if text == "explore the repo"),
+            "first turn is the real prompt, got {:?}",
+            t.turns[0]
+        );
+        assert!(
+            !t.turns
+                .iter()
+                .any(|turn| matches!(turn, Turn::User { text, .. } if text.is_empty())),
+            "no blank user turn from the functionResponse echo: {:?}",
+            t.turns
+        );
+        let Turn::Agent { items, status, .. } = &t.turns[1] else {
+            panic!("expected agent turn second, got {:?}", t.turns[1]);
+        };
+        assert_eq!(*status, TurnStatus::Complete);
+        let has_tool = items
+            .iter()
+            .any(|i| matches!(i, TurnItem::Tool { name, .. } if name == "list_directory"));
+        let has_text = items
+            .iter()
+            .any(|i| matches!(i, TurnItem::Text { text, .. } if text == "Here is the summary."));
+        assert!(has_tool, "tool call retained in the agent turn: {items:?}");
+        assert!(
+            has_text,
+            "trailing text stays in the same agent turn: {items:?}"
         );
     }
 

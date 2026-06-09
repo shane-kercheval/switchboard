@@ -1295,6 +1295,100 @@ describe("UnifiedTranscript — markdown rendering", () => {
     });
   });
 
+  it("holds the user's position when scrolled up instead of yanking to the bottom", async () => {
+    // Same jsdom-stub approach: a content change while the user is scrolled up
+    // should keep their distance from the bottom constant (no jump), rather than
+    // re-pinning to the bottom.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const container = screen.getByTestId("unified-transcript");
+    Object.defineProperty(container, "scrollHeight", { configurable: true, value: 1000 });
+    Object.defineProperty(container, "clientHeight", { configurable: true, value: 500 });
+
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "turn_start",
+      turn_id: "turn-1",
+      message_id: "msg-1",
+      started_at: "2026-05-16T00:00:00Z",
+    });
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "content_chunk",
+      turn_id: "turn-1",
+      kind: "text",
+      text: "first",
+    });
+    // Let the initial pin settle before simulating a user scroll.
+    await waitFor(() => expect(container.scrollTop).toBe(1000));
+
+    // User scrolls up: 200px from the bottom (1000 - 300 - 500), so not pinned.
+    // A bare scroll event with UNCHANGED height is user-initiated — this is the
+    // scrollbar-drag / keyboard case (no wheel or touch involved).
+    container.scrollTop = 300;
+    await fireEvent.scroll(container);
+
+    // More content arrives and the document grows by 200px.
+    Object.defineProperty(container, "scrollHeight", { configurable: true, value: 1200 });
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "content_chunk",
+      turn_id: "turn-1",
+      kind: "text",
+      text: " more arrives while reading history",
+    });
+
+    // Position held at 200px from the (new) bottom: 1200 - 500 - 200 = 500.
+    await waitFor(() => {
+      expect(container.scrollTop).toBe(500);
+    });
+  });
+
+  it("does not unpin on a layout-induced scroll (content height changed)", async () => {
+    // The browser clamps scrollTop (and fires `scroll`) when content shrinks on
+    // collapse — that must NOT be read as the user scrolling away, or the next
+    // re-anchor jumps to a stale position. A `scroll` whose height differs from
+    // the last anchor is layout-induced and leaves `pinned` alone.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const container = screen.getByTestId("unified-transcript");
+    Object.defineProperty(container, "scrollHeight", { configurable: true, value: 1000 });
+    Object.defineProperty(container, "clientHeight", { configurable: true, value: 500 });
+
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "turn_start",
+      turn_id: "turn-1",
+      message_id: "msg-1",
+      started_at: "2026-05-16T00:00:00Z",
+    });
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "content_chunk",
+      turn_id: "turn-1",
+      kind: "text",
+      text: "x",
+    });
+    await waitFor(() => expect(container.scrollTop).toBe(1000)); // pinned, lastScrollHeight=1000
+
+    // A content change leaves scrollTop far from the bottom AND fires `scroll`
+    // with a different height — the collapse-clamp shape.
+    Object.defineProperty(container, "scrollHeight", { configurable: true, value: 2000 });
+    container.scrollTop = 100; // gap of 2000 - 100 - 500 = 1400, well past the 32px threshold
+    await fireEvent.scroll(container); // height (2000) !== lastScrollHeight (1000) → must not unpin
+
+    // Still pinned: the next content change re-pins to the bottom (2000), not the
+    // preserve-distance position (2000 - 500 - 1400 = 100) it would land on if unpinned.
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "content_chunk",
+      turn_id: "turn-1",
+      kind: "text",
+      text: "y",
+    });
+    await waitFor(() => expect(container.scrollTop).toBe(2000));
+  });
+
   it("intercepts a link click, routes it to open_external_url, and prevents navigation", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
@@ -2127,17 +2221,21 @@ describe("UnifiedTranscript compact mode", () => {
   it("lets a manual toggle expand only that unit", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
+    // Each response has a tool call, so each has something to expand.
     state.transcripts[CLAUDE_AGENT.id] = [
       user(CLAUDE_AGENT, "send-a", "u-a", "2026-05-16T00:00:00Z"),
       done(CLAUDE_AGENT, "send-a", "a-a", "2026-05-16T00:00:01Z", "2026-05-16T00:00:02Z", [
+        TOOL("ta"),
         ANSWER("A"),
       ]),
       user(CLAUDE_AGENT, "send-b", "u-b", "2026-05-16T00:00:10Z"),
       done(CLAUDE_AGENT, "send-b", "a-b", "2026-05-16T00:00:11Z", "2026-05-16T00:00:12Z", [
+        TOOL("tb"),
         ANSWER("B"),
       ]),
       user(CLAUDE_AGENT, "send-c", "u-c", "2026-05-16T00:00:20Z"),
       done(CLAUDE_AGENT, "send-c", "a-c", "2026-05-16T00:00:21Z", "2026-05-16T00:00:22Z", [
+        TOOL("tc"),
         ANSWER("C"),
       ]),
     ];
@@ -2218,7 +2316,7 @@ describe("UnifiedTranscript compact mode", () => {
     expect(agentTurns()[0]!.querySelector('[data-testid="message-copy"]')).not.toBeNull();
   });
 
-  it("shows a hidden-tools placeholder for a tool-only compact response", async () => {
+  it("shows a hidden-items indicator with the tool-call count on a compact response", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     state.transcripts[CLAUDE_AGENT.id] = [
@@ -2226,18 +2324,54 @@ describe("UnifiedTranscript compact mode", () => {
       done(CLAUDE_AGENT, "send-a", "a-1", "2026-05-16T00:00:01Z", "2026-05-16T00:00:02Z", [
         TOOL("t1"),
         TOOL("t2"),
+        ANSWER("done"),
       ]),
     ];
-    toggleKey(PROJECT_ID, "agent:a-1", false);
+    setProjectCompact(PROJECT_ID, true);
 
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
-    expect(screen.getByTestId("hidden-tools-placeholder")).toHaveTextContent("2 hidden tool calls");
+    const indicator = screen.getByTestId("hidden-items-indicator");
+    expect(indicator).toHaveTextContent("2 tool calls");
+    // Clicking it expands the response, revealing the tools.
+    expect(screen.queryByTestId("tool-done")).toBeNull();
+    await fireEvent.click(indicator);
+    expect(screen.getAllByTestId("tool-done").length).toBe(2);
+    expect(screen.queryByTestId("hidden-items-indicator")).toBeNull();
   });
 
-  it("collapses user messages in compact mode", async () => {
+  it("shows the hidden-items indicator on an older clipped response too", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      user(CLAUDE_AGENT, "send-a", "u-a", "2026-05-16T00:00:00Z"),
+      done(CLAUDE_AGENT, "send-a", "a-old", "2026-05-16T00:00:01Z", "2026-05-16T00:00:02Z", [
+        TOOL("t1"),
+        ANSWER("older answer"),
+      ]),
+      user(CLAUDE_AGENT, "send-b", "u-b", "2026-05-16T00:00:10Z"),
+      done(CLAUDE_AGENT, "send-b", "a-new", "2026-05-16T00:00:11Z", "2026-05-16T00:00:12Z", [
+        ANSWER("newest"),
+      ]),
+    ];
+    setProjectCompact(PROJECT_ID, true);
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    // The older (clipped) response hid a tool → indicator present with the count.
+    const older = agentTurns()[0]!;
+    expect(within(older).getByTestId("hidden-items-indicator")).toHaveTextContent("1 tool call");
+    // The newest (last-block, no tools) hides nothing non-text → no indicator.
+    expect(within(agentTurns()[1]!).queryByTestId("hidden-items-indicator")).toBeNull();
+  });
+
+  it("shows no toggle when collapsing would hide nothing (short, no tools)", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    // A short user prompt and a single-block agent answer with no tools: the
+    // collapsed and expanded views are identical, so neither shows a toggle.
+    // (A long message that overflows the clip gets one via DOM measurement,
+    // which jsdom can't exercise — verified in the real app.)
     state.transcripts[CLAUDE_AGENT.id] = [
       user(CLAUDE_AGENT, "send-a", "u-a", "2026-05-16T00:00:00Z"),
       done(CLAUDE_AGENT, "send-a", "a-1", "2026-05-16T00:00:01Z", "2026-05-16T00:00:02Z", [
@@ -2251,7 +2385,11 @@ describe("UnifiedTranscript compact mode", () => {
     const userRow = screen
       .getAllByTestId("turn")
       .find((el) => el.getAttribute("data-role") === "user");
-    expect(toggleLabel(userRow!)).toBe("Expand");
+    expect(toggleLabel(userRow!)).toBeNull();
+    expect(toggleLabel(agentTurns()[0]!)).toBeNull();
+    // The content still renders (just without a redundant toggle).
+    expect(within(userRow!).getByText("prompt")).toBeInTheDocument();
+    expect(screen.getByText("hi")).toBeInTheDocument();
   });
 
   it("does not give a streaming response a compact preview", async () => {
@@ -2423,6 +2561,17 @@ describe("UnifiedTranscript fan-out group control", () => {
   });
 
   const text = (t: string) => ({ item_kind: "text" as const, kind: "text" as const, text: t });
+  const tool = (id: string) => ({
+    item_kind: "tool" as const,
+    tool_use_id: id,
+    kind: "builtin" as const,
+    name: "bash",
+    input: {},
+    output: "ok",
+    is_error: false,
+    started_at: "2026-05-16T00:00:01Z",
+    completed_at: "2026-05-16T00:00:02Z",
+  });
   function u(agent: AgentRecord, sendId: string, turnId: string, at: string): Turn {
     return {
       role: "user",
@@ -2433,6 +2582,7 @@ describe("UnifiedTranscript fan-out group control", () => {
       text: "fan",
     };
   }
+  // A response with a tool call so it has something to expand → a real toggle.
   function a(
     agent: AgentRecord,
     sendId: string,
@@ -2448,7 +2598,7 @@ describe("UnifiedTranscript fan-out group control", () => {
       started_at: started,
       ended_at: ended,
       status: "complete",
-      items: [text(`${agent.name} reply`)],
+      items: [tool(`${turnId}-t`), text(`${agent.name} reply`)],
     };
   }
   function columnLabels(group: HTMLElement): (string | null)[] {
@@ -2487,6 +2637,32 @@ describe("UnifiedTranscript fan-out group control", () => {
     // was leaking the user prompt's meta onto response hover).
     expect(userTurn.querySelector('[data-testid="fanout-preview-toggle-all"]')).toBeNull();
     expect(groupToggle(group)).toBeInTheDocument();
+  });
+
+  it("shows a per-column hidden-items indicator and expands the column on click", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    // `a()` includes a tool call, so each collapsed column hides a tool → indicator.
+    state.transcripts[CLAUDE_AGENT.id] = [
+      u(CLAUDE_AGENT, "send-f", "u-a", "2026-05-16T00:00:00Z"),
+      a(CLAUDE_AGENT, "send-f", "a-a", "2026-05-16T00:00:01Z", "2026-05-16T00:00:03Z"),
+    ];
+    state.transcripts[CODEX_AGENT.id] = [
+      u(CODEX_AGENT, "send-f", "u-b", "2026-05-16T00:00:00Z"),
+      a(CODEX_AGENT, "send-f", "a-b", "2026-05-16T00:00:01Z", "2026-05-16T00:00:02Z"),
+    ];
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] },
+    });
+
+    const [aliceCol] = screen.getAllByTestId("fanout-column");
+    const indicator = within(aliceCol!).getByTestId("hidden-items-indicator");
+    expect(indicator).toHaveTextContent("1 tool call");
+    expect(within(aliceCol!).queryByTestId("tool-done")).toBeNull(); // tool hidden while collapsed
+    await fireEvent.click(indicator);
+    expect(within(aliceCol!).getByTestId("tool-done")).toBeInTheDocument(); // expanded
   });
 
   it("expands all columns when none is, and collapses all when any is", async () => {
@@ -2630,13 +2806,27 @@ describe("UnifiedTranscript terminal-response collapse", () => {
         started_at: "2026-05-16T00:00:01Z",
         ended_at: "2026-05-16T00:00:02Z",
         status: "cancelled",
-        items: [{ item_kind: "text", kind: "text", text: "partial work before cancel" }],
+        items: [
+          { item_kind: "text", kind: "text", text: "partial work before cancel" },
+          {
+            item_kind: "tool",
+            tool_use_id: "ct",
+            kind: "builtin",
+            name: "bash",
+            input: {},
+            output: "ok",
+            is_error: false,
+            started_at: "2026-05-16T00:00:01Z",
+            completed_at: "2026-05-16T00:00:02Z",
+          },
+        ],
       },
     ];
 
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
-    // Previously a cancelled response had no toggle and never collapsed.
+    // Previously a cancelled response had no toggle and never collapsed; now it
+    // collapses and (having a hidden tool call) offers a toggle.
     const toggle = agentTurnEl().querySelector('[data-testid="turn-preview-toggle"]');
     expect(toggle).not.toBeNull();
     expect(toggle).toHaveAttribute("aria-label", "Expand"); // collapsed by default (its last block)
@@ -2668,7 +2858,20 @@ describe("UnifiedTranscript terminal-response collapse", () => {
         send_id: "s-1",
         started_at: "2026-05-16T00:00:01Z",
         status: "streaming",
-        items: [{ item_kind: "text", kind: "text", text: "dangling text" }],
+        items: [
+          { item_kind: "text", kind: "text", text: "dangling text" },
+          {
+            item_kind: "tool",
+            tool_use_id: "dt",
+            kind: "builtin",
+            name: "bash",
+            input: {},
+            output: "ok",
+            is_error: false,
+            started_at: "2026-05-16T00:00:01Z",
+            completed_at: "2026-05-16T00:00:02Z",
+          },
+        ],
       },
     ];
     const overlay: ConversationItem[] = [

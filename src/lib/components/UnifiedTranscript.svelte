@@ -3,7 +3,7 @@
   import { HEARTBEAT_TIMEOUT_MS } from "$lib/types";
   import { cn, formatDuration } from "$lib/utils";
   import { convertFileSrc } from "@tauri-apps/api/core";
-  import { ChevronDown, ChevronUp } from "@lucide/svelte";
+  import { ChevronRight, ChevronsDownUp, ChevronsUpDown } from "@lucide/svelte";
   import {
     cancelSend,
     retryAgentHydration,
@@ -12,6 +12,7 @@
     type Turn,
   } from "$lib/state/index.svelte";
   import {
+    answerTextOf,
     buildUnifiedRows,
     copyTextOf,
     groupRenderBlocks,
@@ -188,6 +189,80 @@
   const PREVIEW_CLIP =
     "max-h-[14rem] overflow-hidden [mask-image:linear-gradient(to_bottom,black_7rem,transparent_14rem)] [-webkit-mask-image:linear-gradient(to_bottom,black_7rem,transparent_14rem)]";
 
+  /// Whether each clipped preview's content actually exceeds the cap, keyed by
+  /// preview key — measured from the DOM. A toggle is only worth showing when
+  /// collapsing differs from expanding; for a clipped preview that means the text
+  /// overflows. jsdom has no layout (stays false there), so the data-derived
+  /// hidden-content check below drives toggles in tests.
+  ///
+  /// **Entries are deliberately NOT deleted on `destroy`.** The measurer mounts
+  /// only while clipped, so expanding unmounts it; keeping the `true` is what
+  /// leaves the re-collapse toggle visible on the expanded message. Deleting it
+  /// here would read back `undefined → false` and drop the toggle. Growth is one
+  /// boolean per distinct message — negligible. One observer per clipped preview
+  /// is fine pre-virtualization (observers ≈ on-screen messages); revisit with a
+  /// shared observer if virtualization or very long transcripts land.
+  let clipOverflow = $state<Record<string, boolean>>({});
+  function measureClip(node: HTMLElement, key: string) {
+    const ro = new ResizeObserver(() => {
+      clipOverflow[key] = node.scrollHeight - node.clientHeight > 1;
+    });
+    ro.observe(node);
+    return {
+      destroy(): void {
+        ro.disconnect();
+      },
+    };
+  }
+
+  function turnHasHiddenDetail(turn: AgentTurn): boolean {
+    return turn.items.some(
+      (i) => i.item_kind === "tool" || (i.item_kind === "text" && i.kind === "thinking"),
+    );
+  }
+
+  /// Whether expanding a response would reveal more than its collapsed view, so a
+  /// toggle is meaningful. A clipped preview hides tool calls / reasoning (and
+  /// clips overflowing text — the `clipOverflow` half); the last-block view also
+  /// hides any earlier answer blocks beyond the one the copy button copies.
+  function responseHasMore(turn: AgentTurn, key: string, isLastBlock: boolean): boolean {
+    if (turnHasHiddenDetail(turn)) return true;
+    // Mode-dependent by design: in `full_answer` mode both sides equal
+    // `answerTextOf` so this is always false (the last-block view already shows
+    // every text block); in `last_answer_block` mode it's true when earlier
+    // blocks exist (expanding would reveal them).
+    if (isLastBlock) return copyTextOf(turn, agentCopy.mode) !== answerTextOf(turn);
+    return clipOverflow[key] ?? false;
+  }
+
+  /// Summary line for a collapsed response's hidden detail, or null when nothing
+  /// non-text is hidden. Surfaced above the collapsed body so it's clear that
+  /// tool calls / reasoning (and, for the last-block view, earlier answer
+  /// blocks) are tucked away — a clip's fade only signals hidden *text*.
+  function hiddenItemsLabel(turn: AgentTurn, isLastBlock: boolean): string | null {
+    const tools = turn.items.filter((i) => i.item_kind === "tool").length;
+    const hasReasoning = turn.items.some((i) => i.item_kind === "text" && i.kind === "thinking");
+    const parts: string[] = [];
+    if (tools > 0) parts.push(`${tools} tool ${tools === 1 ? "call" : "calls"}`);
+    if (hasReasoning) parts.push("reasoning");
+    if (parts.length > 0) return parts.join(" · ");
+    if (isLastBlock && copyTextOf(turn, agentCopy.mode) !== answerTextOf(turn))
+      return "earlier output";
+    return null;
+  }
+
+  /// `hiddenItemsLabel` for a fan-out column — the first agent turn with hidden
+  /// detail (a column is one `(send_id, agent_id)` turn in practice).
+  function columnHiddenLabel(colRows: NonUserRow[], isLastBlock: boolean): string | null {
+    for (const r of colRows) {
+      if (r.kind === "agent") {
+        const label = hiddenItemsLabel(r.turn, isLastBlock);
+        if (label !== null) return label;
+      }
+    }
+    return null;
+  }
+
   /// Shared footprint for the in-transcript meta-row icon buttons (preview
   /// toggle, fan-out toggle-all). Intentionally mirrors `CopyButton` — the
   /// control they sit beside — rather than `ICON_BUTTON_CLASS` (the app-chrome
@@ -336,20 +411,55 @@
     return "queued";
   }
 
-  // Auto-pin to bottom unless the user has scrolled up.
+  // Scroll behaviour, the way chat apps work: while the user is at the bottom the
+  // view follows new content (streaming tokens, new sends); otherwise it holds
+  // its position on *any* height change — a message collapsing/expanding, a
+  // fan-out toggling, the live cap being removed when a turn completes — so
+  // nothing jerks and whatever the user clicked stays put. We measure height
+  // changes with a ResizeObserver and re-anchor ourselves because WebKit (the
+  // Tauri webview) has no native CSS scroll-anchoring.
   let container = $state<HTMLDivElement | null>(null);
+  let content = $state<HTMLDivElement | null>(null);
   let pinned = $state<boolean>(true);
+  // The user's saved gap from the bottom, updated only by real scrolls. Holding
+  // it constant across a resize keeps every element whose content-below is
+  // unchanged (e.g. the toggle you just clicked) at the same place on screen.
+  let distanceFromBottom = 0;
+  // Content height at the last (re)anchor or scroll. A `scroll` event whose
+  // height matches this is genuinely user-initiated (the content didn't change),
+  // so it may unpin; one with a *different* height is the browser clamping
+  // `scrollTop` as content changed (a message collapsing, the live cap dropping
+  // on completion) and must NOT flip us off the bottom — otherwise the re-anchor
+  // jumps to a stale position. Discriminating by content-change rather than by
+  // input device is what lets scrollbar-drag and keyboard scrolling work too.
+  let lastScrollHeight = 0;
 
   function onScroll(): void {
     if (!container) return;
-    const distanceFromBottom =
-      container.scrollHeight - container.scrollTop - container.clientHeight;
-    pinned = distanceFromBottom < 32;
+    distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
+    if (container.scrollHeight === lastScrollHeight) {
+      pinned = distanceFromBottom < 32;
+    }
+    lastScrollHeight = container.scrollHeight;
   }
 
-  /// Fine-grained scroll signal — reads mutated fields (text, output,
-  /// completed_at) so streaming in-place mutations (which leave row/item
-  /// counts constant) still trigger the auto-scroll effect.
+  /// Pin to the bottom when the user is already there; otherwise hold their gap
+  /// from the bottom so the view doesn't move. Advancing `lastScrollHeight` here
+  /// means the `scroll` event our own `scrollTop` write triggers compares equal
+  /// and is treated as user-initiated (it recomputes `pinned` from the gap we
+  /// just set, landing on the same value — benign).
+  function reanchor(): void {
+    if (!container) return;
+    container.scrollTop = pinned
+      ? container.scrollHeight
+      : container.scrollHeight - container.clientHeight - distanceFromBottom;
+    lastScrollHeight = container.scrollHeight;
+  }
+
+  /// Fine-grained content signal — text/output lengths and tool completion — so
+  /// streaming in-place mutations (constant row/item counts) still re-anchor.
+  /// This reactive path also makes the follow-the-bottom behaviour testable; the
+  /// ResizeObserver below (the layout path) is a no-op under jsdom.
   const scrollSignal = $derived.by(() => {
     let n = rows.length;
     for (const row of rows) {
@@ -374,31 +484,55 @@
 
   $effect(() => {
     void scrollSignal;
-    if (pinned && container) {
-      container.scrollTop = container.scrollHeight;
-    }
+    reanchor();
   });
+
+  /// Height changes with no data change — a message collapsing/expanding, a
+  /// fan-out toggling, the live cap dropping when a turn completes — re-anchor
+  /// too. WebKit (the Tauri webview) has no native CSS scroll-anchoring, so the
+  /// observer drives it for us.
+  $effect(() => {
+    const el = content;
+    if (el === null) return;
+    const ro = new ResizeObserver(reanchor);
+    ro.observe(el);
+    return () => ro.disconnect();
+  });
+
+  /// Top-edge fade for a capped live region, keyed by preview key: true once the
+  /// region has scrolled down far enough that content sits above the visible top
+  /// (so a mask cues "more above"). Stays off at the very top so the first line
+  /// is never faded.
+  let liveTopFade = $state<Record<string, boolean>>({});
+  const LIVE_TOP_FADE =
+    "[mask-image:linear-gradient(to_bottom,transparent_0,black_2.5rem)] [-webkit-mask-image:linear-gradient(to_bottom,transparent_0,black_2.5rem)]";
 
   /// Inner bottom-pin for a capped live region. Each streaming unit's scroll
   /// element gets its own instance (its own `pinned` closure), so columns pin
   /// independently. Starts pinned; stays pinned while the user is near the
   /// bottom (within the same 32px threshold as the outer transcript); releases
-  /// when the user scrolls up and re-engages when they return. The `signal`
-  /// argument is the unit's streamed-content length — Svelte re-runs `update`
-  /// when it changes, which re-pins to the newest activity if still pinned.
-  function liveScroll(node: HTMLElement, _signal: number) {
+  /// when the user scrolls up and re-engages when they return. `args.signal` is
+  /// the unit's streamed-content length — Svelte re-runs `update` when it
+  /// changes, re-pinning to the newest activity if still pinned. `args.key`
+  /// scopes the top-fade flag.
+  function liveScroll(node: HTMLElement, args: { key: string; signal: number }) {
     let pinnedHere = true;
-    const onLiveScroll = (): void => {
+    const sync = (): void => {
       pinnedHere = node.scrollHeight - node.scrollTop - node.clientHeight < 32;
+      liveTopFade[args.key] = node.scrollTop > 8;
     };
-    node.addEventListener("scroll", onLiveScroll);
+    node.addEventListener("scroll", sync);
     node.scrollTop = node.scrollHeight;
+    liveTopFade[args.key] = node.scrollTop > 8;
     return {
-      update(): void {
+      update(next: { key: string; signal: number }): void {
         if (pinnedHere) node.scrollTop = node.scrollHeight;
+        liveTopFade[next.key] = node.scrollTop > 8;
       },
       destroy(): void {
-        node.removeEventListener("scroll", onLiveScroll);
+        node.removeEventListener("scroll", sync);
+        // A completed turn never re-streams, so its top-fade flag is dead now.
+        delete liveTopFade[args.key];
       },
     };
   }
@@ -459,15 +593,6 @@
   {/each}
 {/snippet}
 
-{#snippet hiddenToolsPlaceholder(turn: AgentTurn)}
-  {@const hiddenTools = turn.items.filter((i) => i.item_kind === "tool").length}
-  {#if hiddenTools > 0}
-    <div class="text-muted text-xs italic" data-testid="hidden-tools-placeholder">
-      {hiddenTools} hidden tool {hiddenTools === 1 ? "call" : "calls"}
-    </div>
-  {/if}
-{/snippet}
-
 <!-- `mode` selects how a response renders:
      - `"full"` — everything (text, reasoning, tool calls); the streaming `live`
        cap or the static completed view.
@@ -475,6 +600,8 @@
        response (tool calls + reasoning suppressed).
      - `"last"` — the final answer block in full (what the copy button copies),
        for an agent's most-recent response; tool calls + reasoning hidden, no clip.
+     The hidden-items indicator above the body (call site) signals what `"answer"`
+     / `"last"` tuck away, so a tool-only response needs no in-body placeholder.
      `live` gates the streaming "Working…" footer (a fan-out column passes false
      when an outcome marker has closed a streaming-on-disk turn). -->
 {#snippet turnBody(
@@ -486,31 +613,28 @@
     {@const answer = copyTextOf(turn, agentCopy.mode)}
     {#if answer.length > 0}
       <Markdown text={answer} />
-    {:else}
-      {@render hiddenToolsPlaceholder(turn)}
     {/if}
   {:else if mode === "answer"}
-    {@const answerCount = turn.items.filter(
-      (i) => i.item_kind === "text" && i.kind === "text",
-    ).length}
-    {#if answerCount > 0}
-      {#each turn.items as item, i (i)}
-        {#if item.item_kind === "text" && item.kind === "text"}
-          <Markdown text={item.text} />
-        {/if}
-      {/each}
-    {:else}
-      {@render hiddenToolsPlaceholder(turn)}
-    {/if}
+    {#each turn.items as item, i (i)}
+      {#if item.item_kind === "text" && item.kind === "text"}
+        <Markdown text={item.text} />
+      {/if}
+    {/each}
   {:else if turn.status === "streaming" && live}
     <!-- Live cap: streamed content scrolls inside a bounded region (so several
          active agents can't each take over the transcript), bottom-pinned to the
-         newest activity. The working/cancel footer renders OUTSIDE the scroll
-         region so it stays visible regardless of the inner scroll position. -->
+         newest activity. A top mask fades content scrolled above the view; the
+         working/cancel footer renders OUTSIDE the scroll region so it stays
+         visible regardless of the inner scroll position. -->
+    <!-- Cap at 3/4 of the transcript area (the `[container-type:size]` ancestor),
+         so a long stream fills most of the view before it scrolls but never
+         outgrows the area — `cqh` tracks the container, not the viewport, so a
+         short window shrinks it too. -->
+    {@const liveKey = previewKeyForTurn(turn)}
     <div
-      class="max-h-[min(600px,60vh)] overflow-y-auto"
+      class={cn("max-h-[75cqh] overflow-y-auto", (liveTopFade[liveKey] ?? false) && LIVE_TOP_FADE)}
       data-testid="turn-live-scroll"
-      use:liveScroll={liveSignalOf(turn)}
+      use:liveScroll={{ key: liveKey, signal: liveSignalOf(turn) }}
     >
       {@render turnItems(turn)}
     </div>
@@ -521,6 +645,23 @@
       <div class="text-status-failed text-xs" data-testid="turn-error">{turn.error}</div>
     {/if}
   {/if}
+{/snippet}
+
+<!-- Disclosure shown above a collapsed body when tool calls / reasoning (or, for
+     the last-block view, earlier answer blocks) are hidden — the cue a fade
+     can't give. Always visible (it's signalling, not chrome) and clickable to
+     expand the whole response. -->
+{#snippet hiddenItemsIndicator(key: string, label: string)}
+  <button
+    type="button"
+    class="text-muted hover:text-fg inline-flex items-center gap-1 text-xs transition-colors"
+    data-testid="hidden-items-indicator"
+    aria-label={`Show ${label}`}
+    onclick={() => toggleKey(projectId, key, compactEnabled)}
+  >
+    <ChevronRight class="h-3.5 w-3.5" aria-hidden="true" />
+    <span>{label}</span>
+  </button>
 {/snippet}
 
 {#snippet turnStatusLabel(status: AgentTurn["status"])}
@@ -593,22 +734,20 @@
 {#snippet previewToggle(key: string, defaultCompact: boolean)}
   {@const compact = isCompact(projectId, key, defaultCompact)}
   {@const label = compact ? "Expand" : "Collapse"}
-  <!-- Always visible while collapsed (sits centered under the clip/last-block as
-       the "there's more" affordance); hover/focus-revealed once expanded. -->
+  <!-- Hover/focus-revealed only — the fade already signals a collapsed message,
+       so an always-on control would just be noise. -->
   <button
     type="button"
-    class={cn(
-      "text-muted hover:text-fg hover:bg-border/60 inline-flex items-center gap-1 rounded-full border border-transparent px-2 py-0.5 text-xs transition-colors",
-      compact ? "opacity-100" : "opacity-0 group-focus-within:opacity-100 group-hover:opacity-100",
-    )}
+    class="text-muted hover:text-fg hover:bg-border/60 inline-flex items-center gap-1 rounded-full border border-transparent px-2 py-0.5 text-xs opacity-0 transition-colors group-focus-within:opacity-100 group-hover:opacity-100"
     data-testid="turn-preview-toggle"
     aria-label={label}
     onclick={() => toggleKey(projectId, key, defaultCompact)}
   >
+    <!-- Same expand/collapse glyph as the header control. -->
     {#if compact}
-      <ChevronDown class="h-3.5 w-3.5" aria-hidden="true" />
+      <ChevronsUpDown class="h-3.5 w-3.5" aria-hidden="true" />
     {:else}
-      <ChevronUp class="h-3.5 w-3.5" aria-hidden="true" />
+      <ChevronsDownUp class="h-3.5 w-3.5" aria-hidden="true" />
     {/if}
     <span>{label}</span>
   </button>
@@ -635,9 +774,9 @@
         onclick={() => setManyOverrides(projectId, keys, anyExpanded)}
       >
         {#if anyExpanded}
-          <ChevronUp class="h-4 w-4" aria-hidden="true" />
+          <ChevronsDownUp class="h-4 w-4" aria-hidden="true" />
         {:else}
-          <ChevronDown class="h-4 w-4" aria-hidden="true" />
+          <ChevronsUpDown class="h-4 w-4" aria-hidden="true" />
         {/if}
       </button>
     {/snippet}
@@ -755,19 +894,33 @@
   </div>
 {/snippet}
 
+{#snippet userBody(row: Extract<UnifiedRow, { kind: "user" }>)}
+  <Markdown text={row.text} />
+  {#if row.attachments.length > 0}
+    {@render attachmentList(row.attachments)}
+  {/if}
+{/snippet}
+
 {#snippet userMessage(row: Extract<UnifiedRow, { kind: "user" }>)}
   {@const key = `user:${row.key}`}
   {@const defaultCompact = compactEnabled}
+  {@const compact = isCompact(projectId, key, defaultCompact)}
+  <!-- A user message has nothing hidden behind a collapse — only height — so it
+       gets a toggle only when its text actually overflows the clip. -->
+  {@const showToggle = clipOverflow[key] ?? false}
   <div class="group min-w-0 flex-1" data-testid="turn" data-role="user">
     <div class="-mx-3 rounded-md bg-blue-100/20 px-3 py-2">
       <!-- Clip wraps the content inside the bubble (not the bubble itself) so the
-           negative-margin background bleed survives `overflow:hidden`. -->
-      <div class={isCompact(projectId, key, defaultCompact) ? PREVIEW_CLIP : undefined}>
-        <Markdown text={row.text} />
-        {#if row.attachments.length > 0}
-          {@render attachmentList(row.attachments)}
-        {/if}
-      </div>
+           negative-margin background bleed survives `overflow:hidden`. The clip +
+           `measureClip` mount ONLY while compact (mirroring agent rows): on
+           expand the measurer unmounts and the retained `clipOverflow[key]=true`
+           keeps the re-collapse toggle alive, instead of the observer firing on
+           the now-unclipped div and clearing it. -->
+      {#if compact}
+        <div class={PREVIEW_CLIP} use:measureClip={key}>{@render userBody(row)}</div>
+      {:else}
+        {@render userBody(row)}
+      {/if}
     </div>
     {@render messageMeta(
       row.at,
@@ -778,7 +931,7 @@
       undefined,
       undefined,
       undefined,
-      key,
+      showToggle ? key : undefined,
       defaultCompact,
     )}
   </div>
@@ -839,6 +992,7 @@
   {@const defaultCompact = compactEnabled}
   {@const compact = previewEligible && isCompact(projectId, key, defaultCompact)}
   {@const lastBlock = lastBlockKeys.has(key)}
+  {@const showToggle = previewEligible && responseHasMore(turn, key, lastBlock)}
   <div class="group space-y-1.5" data-testid="turn" data-role="agent">
     <div class="flex items-center gap-2 text-xs font-semibold tracking-wide uppercase">
       <span class="text-fg" data-testid="turn-agent-name">{agentName(turn.agent_id)}</span>
@@ -849,10 +1003,16 @@
       style:border-left-color={agentBorderColor(turn.agent_id)}
     >
       {#if !ownedByOutcome}{@render turnStatusLabel(turn.status)}{/if}
-      {#if compact && lastBlock}
-        {@render turnBody(turn, false, "last")}
-      {:else if compact}
-        <div class={cn("space-y-1.5", PREVIEW_CLIP)}>{@render turnBody(turn, false, "answer")}</div>
+      {#if compact}
+        {@const hiddenLabel = hiddenItemsLabel(turn, lastBlock)}
+        {#if hiddenLabel}{@render hiddenItemsIndicator(key, hiddenLabel)}{/if}
+        {#if lastBlock}
+          {@render turnBody(turn, false, "last")}
+        {:else}
+          <div class={cn("space-y-1.5", PREVIEW_CLIP)} use:measureClip={key}>
+            {@render turnBody(turn, false, "answer")}
+          </div>
+        {/if}
       {:else}
         {@render turnBody(turn, !ownedByOutcome)}
       {/if}
@@ -866,7 +1026,7 @@
       turn.usage?.total_cost_usd,
       turn.model,
       turn.effort,
-      previewEligible ? key : undefined,
+      showToggle ? key : undefined,
       defaultCompact,
     )}
   </div>
@@ -876,7 +1036,7 @@
   bind:this={container}
   onscroll={onScroll}
   data-testid="unified-transcript"
-  class="bg-transcript flex-1 overflow-y-auto px-8 py-4"
+  class="bg-transcript [container-type:size] flex-1 overflow-y-auto px-8 py-4"
 >
   {#if loadStatus === "loading"}
     <p class="text-muted mb-3 text-xs italic" data-testid="transcript-loading">Loading history…</p>
@@ -916,7 +1076,7 @@
     <p class="text-muted text-sm">No messages yet. Type a prompt below.</p>
   {/if}
 
-  <div class="space-y-5">
+  <div bind:this={content} class="space-y-5">
     {#each blocks as block (block.kind === "fanout" ? block.key : block.row.key)}
       {#if block.kind === "row"}
         {#if block.row.kind === "user"}
@@ -965,6 +1125,11 @@
                 {@const colDefaultCompact = compactEnabled}
                 {@const colCompact = colEligible && isCompact(projectId, colKey, colDefaultCompact)}
                 {@const colLastBlock = lastBlockKeys.has(colKey)}
+                {@const colShowToggle =
+                  colEligible &&
+                  col.rows.some(
+                    (r) => r.kind === "agent" && responseHasMore(r.turn, colKey, colLastBlock),
+                  )}
                 <div
                   class="group space-y-1.5"
                   data-testid="fanout-column"
@@ -1005,12 +1170,16 @@
                           {#if r.reason}<span class="text-muted text-xs"> — {r.reason}</span>{/if}
                         {/if}
                       {/each}
+                      {@const colHiddenLabel = columnHiddenLabel(col.rows, colLastBlock)}
+                      {#if colHiddenLabel}
+                        {@render hiddenItemsIndicator(colKey, colHiddenLabel)}
+                      {/if}
                       {#if colLastBlock}
                         {#each col.rows as r (r.key)}
                           {#if r.kind === "agent"}{@render turnBody(r.turn, false, "last")}{/if}
                         {/each}
                       {:else}
-                        <div class={cn("space-y-1.5", PREVIEW_CLIP)}>
+                        <div class={cn("space-y-1.5", PREVIEW_CLIP)} use:measureClip={colKey}>
                           {#each col.rows as r (r.key)}
                             {#if r.kind === "agent"}{@render turnBody(r.turn, false, "answer")}{/if}
                           {/each}
@@ -1039,7 +1208,7 @@
                     undefined,
                     columnModel(col.rows),
                     columnEffort(col.rows),
-                    colEligible ? colKey : undefined,
+                    colShowToggle ? colKey : undefined,
                     colDefaultCompact,
                   )}
                 </div>

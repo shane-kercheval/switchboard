@@ -1,4 +1,4 @@
-.PHONY: dev build open run install-app uninstall-app deploy test lint fmt check clean install test-live test-live-claude test-live-codex test-live-gemini test-live-antigravity
+.PHONY: dev build open run install-app uninstall-app deploy test test-browser lint fmt check clean install test-live test-live-claude test-live-codex test-live-gemini test-live-antigravity
 
 # Crates that carry live (`#[ignore]`-gated) harness tests.
 LIVE_PKGS := -p switchboard-harness -p switchboard-dispatcher -p switchboard-app
@@ -56,6 +56,15 @@ test:
 	cargo test --workspace --all-features --locked
 	pnpm test
 
+# Real-WebKit frontend tests (Vitest browser mode) for the layout-coupled slice
+# jsdom can't see. Kept out of `test` so the fast jsdom inner loop stays offline
+# and quick. Ensures the WebKit binary first (idempotent, near-instant when
+# already present) so this target — and `check`, which inlines it — is
+# self-sufficient on a checkout that never ran `playwright install` by hand.
+test-browser:
+	pnpm exec playwright install webkit
+	pnpm test:browser
+
 lint:
 	cargo fmt --all -- --check
 	cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
@@ -76,6 +85,8 @@ check:
 	pnpm check
 	pnpm format:check
 	pnpm test
+	pnpm exec playwright install webkit
+	pnpm test:browser
 
 test-live:
 	cargo test --locked $(LIVE_PKGS) -- --ignored

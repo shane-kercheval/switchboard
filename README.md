@@ -75,13 +75,16 @@ Common commands (run from the repo root):
 ```sh
 make install     # one-time: pnpm install --frozen-lockfile
 make dev         # run the Tauri dev shell
-make test        # run all Rust + frontend tests
-make lint        # clippy, eslint, svelte-check
-make check       # everything CI runs — run before opening a PR
-make test-live   # live-harness suite against the real agent CLIs (developer-local)
+make test         # run all Rust + frontend tests (fast, offline jsdom suite)
+make test-browser # real-WebKit frontend suite (Vitest browser mode); installs WebKit if needed
+make lint         # clippy, eslint, svelte-check
+make check        # everything CI runs (incl. the browser suite) — run before opening a PR
+make test-live    # live-harness suite against the real agent CLIs (developer-local)
 ```
 
 `make test-live` exercises the adapters against the real `claude` / `codex` / `gemini` / `antigravity` CLIs to catch upstream drift. See [`crates/harness/tests/README.md`](./crates/harness/tests/README.md) for what it covers and how to set it up.
+
+`make test-browser` (and `make check`) run the frontend suite in a real WebKit engine via Vitest browser mode. The target installs a Playwright-managed WebKit build on demand — the first run downloads ~100 MB (cached afterward), so it needs network access once; no extra system packages are required on macOS. The default `make test` stays jsdom-only and needs none of this.
 
 See [`AGENTS.md`](./AGENTS.md) for project orientation and conventions, and [`docs/implementation_plans/`](./docs/implementation_plans/) for the roadmap and per-phase implementation plans.
 

@@ -32,5 +32,18 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # The browser test suite (part of `make check`) drives Playwright's WebKit
+      # build (~100MB). Cache it on the macOS path (runner is macos-15) so it
+      # downloads once instead of every push; `make check` reinstalls idempotently
+      # on a miss. restore-keys lets an unrelated lockfile bump reuse the prior
+      # browser when the resolved Playwright version is unchanged.
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-playwright-
+
       - name: make check
         run: make check

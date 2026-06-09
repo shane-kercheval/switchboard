@@ -917,7 +917,9 @@
            keeps the re-collapse toggle alive, instead of the observer firing on
            the now-unclipped div and clearing it. -->
       {#if compact}
-        <div class={PREVIEW_CLIP} use:measureClip={key}>{@render userBody(row)}</div>
+        <div class={PREVIEW_CLIP} use:measureClip={key} data-testid="preview-clip">
+          {@render userBody(row)}
+        </div>
       {:else}
         {@render userBody(row)}
       {/if}

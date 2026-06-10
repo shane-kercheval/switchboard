@@ -796,11 +796,12 @@
   previewDefaultCompact: boolean = false,
 )}
   <!-- Three zones: spend pinned LEFT (always visible), the preview toggle
-       CENTERED (the per-message expand/collapse affordance), and the
-       hover-revealed model/timestamp/copy pinned RIGHT. The left/right zones are
-       `flex-1` so the toggle stays centered under the message regardless of how
-       much each side holds. -->
-  <div class={`${mt} flex items-center gap-2`} data-testid="message-meta">
+       CENTERED, and the hover-revealed model/timestamp/copy pinned RIGHT. A
+       `1fr auto 1fr` grid keeps the toggle centered while there's room; the right
+       track is content-sized so model/timestamp/copy is NEVER squished — when
+       space tightens the (empty) left track collapses first, so the toggle slides
+       over and ends up hugging the right cluster rather than squeezing it. -->
+  <div class={`${mt} grid grid-cols-[1fr_auto_1fr] items-center gap-2`} data-testid="message-meta">
     <!-- Left: cost + overage marker, always visible. Two distinct gates (no
          `match harness`): the **cost** shows on `spend.real_spend` (the turn
          cost real money — for subscription Claude that's overage, since
@@ -809,7 +810,7 @@
          a future pay-per-use harness would set `real_spend` without `is_overage`
          → cost shows, marker correctly stays hidden. Caller passes `spend`/
          `costUsd` only at agent-turn sites; a real-money signal isn't hover-hidden. -->
-    <div class="flex flex-1 items-center gap-2">
+    <div class="flex min-w-0 items-center gap-2 justify-self-start">
       {#if spend?.is_overage}
         <span
           class="text-warning text-xs"
@@ -824,7 +825,7 @@
       {/if}
     </div>
     <!-- Center: per-message expand/collapse. -->
-    <div class="flex shrink-0 items-center justify-center">
+    <div class="flex items-center justify-self-center">
       {#if previewKey !== undefined}
         {@render previewToggle(previewKey, previewDefaultCompact)}
       {/if}
@@ -834,7 +835,7 @@
          subtle; the model/effort here are runtime history, distinct from the
          sidebar's selected-intent value. -->
     <div
-      class="flex flex-1 items-center justify-end gap-2 opacity-0 group-focus-within:opacity-100 group-hover:opacity-100"
+      class="flex items-center justify-end gap-2 justify-self-end whitespace-nowrap opacity-0 group-focus-within:opacity-100 group-hover:opacity-100"
     >
       {#if model}
         <span class="text-muted text-xs" data-testid="message-model">{model}</span>

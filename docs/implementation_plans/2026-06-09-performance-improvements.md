@@ -41,7 +41,7 @@ PR #31 (compact transcript mode + WebKit browser-test layer) landed after this d
 - Layout thrashing / forced synchronous layout: https://web.dev/articles/avoid-large-complex-layouts-and-layout-thrashing
 - CSS containment + `content-visibility`: https://developer.mozilla.org/en-US/docs/Web/CSS/content-visibility and https://web.dev/articles/content-visibility (M3)
 - `contain-intrinsic-size`: https://developer.mozilla.org/en-US/docs/Web/CSS/contain-intrinsic-size (M3)
-- `field-sizing`: https://developer.mozilla.org/en-US/docs/Web/CSS/field-sizing (M1 feature-detect)
+- `field-sizing`: https://developer.mozilla.org/en-US/docs/Web/CSS/field-sizing (background for M1's future note — explicitly out of scope)
 - TanStack Virtual (only if M4 triggers): https://tanstack.com/virtual/latest
 
 ## Shared conventions for all milestones
@@ -60,26 +60,25 @@ PR #31 (compact transcript mode + WebKit browser-test layer) landed after this d
 Make typing in the compose bar do the minimum possible layout work per keystroke, independent of any transcript change.
 
 - A keystroke triggers **at most one** forced layout (down from two), with no per-keystroke `getComputedStyle` call.
-- If the shipping WebKit supports `field-sizing: content`, the JS resize path is deleted entirely and CSS does the sizing.
-- Autosize behavior is visibly unchanged: grows with content, caps at `max-h-48`, shows an internal scrollbar past the cap, shrinks on delete, resets on send-clear.
+- Autosize behavior is visibly unchanged for **every** `autosize` consumer — the compose bar (cap `max-h-48`) *and* the prompt composer's two inputs (cap `max-h-40`): grows with content, caps at the instance's own max-height, shows an internal scrollbar past the cap, shrinks on delete, resets on send-clear.
 
 ### Implementation outline
 
-All changes in `src/lib/components/ui/Textarea.svelte` (its only `autosize` consumer is the compose bar).
+All changes in `src/lib/components/ui/Textarea.svelte`. It has **three** `autosize` consumers across two components: the compose bar (`ComposeBar.svelte`, cap `max-h-48`) and the prompt composer's argument + appended-text inputs (`PromptComposer.svelte`, cap `max-h-40`, inside their own scroll container). Every change below alters all three — the differing caps are why the cache must be per-instance.
 
-1. **First, feature-detect the CSS escape hatch.** Check `CSS.supports("field-sizing", "content")` in the actual Tauri webview (a quick `make dev` probe — log it, don't guess from caniuse). If supported: replace the JS autosize with `field-sizing: content` + the existing `max-h` cap, delete `resizeToContent` and both its call sites, and keep `rows` as the minimum. This is the cleanest outcome — zero JS layout reads on the typing path. The remaining steps apply only if it's unsupported.
-2. **Single resize path.** Remove the duplicate: today both `handleInput` and the `$effect` on `value` call `resizeToContent` for the same change. Keep the `$effect` (it also covers programmatic changes — send-clear setting `draft = ""`, draft restoration) and drop the resize from `handleInput`. One forced layout per value change instead of two.
-3. **Cache the max-height.** It comes from a static class (`max-h-48`); read it once (on mount, or lazily on first resize) instead of `getComputedStyle` per keystroke. Note in a comment that the cache assumes the cap doesn't change at runtime — if a future caller varies it, recompute on class change.
-4. **Coalesce via `requestAnimationFrame`.** Schedule the measure/write in rAF so multiple same-frame value changes (e.g. restore + selection) produce one resize, and the read happens after all other same-frame DOM writes rather than interleaving write→read→write with sibling components. Guard against the component unmounting before the frame fires.
+1. **Single resize path.** Remove the duplicate: today both `handleInput` and the `$effect` on `value` call `resizeToContent` for the same change. Keep the `$effect` (it also covers programmatic changes — send-clear setting `draft = ""`, draft restoration) and drop the resize from `handleInput`. One forced layout per value change instead of two.
+2. **Cache the max-height per instance.** Each instance's cap comes from a static class; read it lazily on first resize, **per component instance** (never module-level — the caps differ across consumers), instead of `getComputedStyle` per keystroke. Note in a comment that the cache assumes an instance's cap doesn't change at runtime — if a future caller varies it, recompute on class change.
+3. **Contingent — coalesce via `requestAnimationFrame`.** Only if M1's own manual measurement still shows layout cost attributable to interleaved write→read across components *after* steps 1–2: schedule the measure/write in rAF (with an unmount guard). Do not build this pre-emptively — with the duplicate resize gone, Svelte already coalesces same-flush changes into one effect run, and typing-driven and streaming-driven flushes are separate tasks, so the cross-component interleaving this would guard against is unmeasured.
+
+**Future note (deliberately not in scope):** `field-sizing: content` would let CSS do the sizing and the JS path be deleted — but the app renders in the *user's* system WKWebView, so adoption is gated on the **minimum supported** WebKit shipping the feature (a fleet fact), never on a dev-machine `CSS.supports` probe: deleting the JS fallback on a dev-machine "yes" would silently freeze the compose bar at minimum height for every user on an older macOS. No minimum macOS floor is declared today (`tauri.conf.json` has no `minimumSystemVersion`); that floor decision belongs to the macOS release/distribution work (`docs/implementation_plans/2026-05-30-macos-release-distribution.md`), not a perf PR. Revisit when a floor exists and includes a `field-sizing`-capable WebKit.
 
 What this milestone does **not** claim: the one remaining forced layout is still O(document). M3/M4 is what makes that layout cheap. State this in the component comment so nobody later "finishes" the optimization by deleting the resize entirely.
 
 ### Definition of done
 
-- jsdom component tests: one resize per value change (spy on the measure path), resize fires on programmatic clear (send path), no resize when `autosize` is false.
-- Browser-suite test (real layout): seeded multi-line value grows the textarea; past-cap content caps the height and sets internal overflow; deleting shrinks it. Poll geometry.
-- Manual before/after check on a seeded large transcript (use the M3 protocol if it exists yet; otherwise the dev app with a real long project) — record observations in the PR.
-- If the `field-sizing` path was taken: the probe result (WebKit version, supports yes) recorded in the PR; JS path fully removed, not dead-coded.
+- jsdom component tests: one resize per value change (spy on the measure path), resize fires on programmatic clear (send path), no resize when `autosize` is false, and — guarding the per-instance cache — two concurrently-mounted autosize textareas with different caps resize independently (this fails specifically on the module-level-cache mistake).
+- Browser-suite tests (real layout, poll geometry): seeded multi-line value grows the textarea; past-cap content caps the height and sets internal overflow; deleting shrinks it — for the compose bar **and** for a prompt-composer textarea at its own `max-h-40` cap.
+- Manual before/after check on a seeded large transcript (use the M3 protocol if it exists yet; otherwise the dev app with a real long project) — record observations in the PR. This measurement also decides whether the contingent rAF step triggers.
 
 ---
 
@@ -108,6 +107,7 @@ The current module comment is explicit about why writes are synchronous: a defer
 ### Definition of done
 
 - Unit tests (jsdom, fake timers): N rapid `setContent` calls → one `setItem`; `flush()` writes immediately; destroy-flush preserves a draft across a simulated remount (the existing `_testing.reloadFromStorage` restart-path pattern); send-clear followed by debounce expiry never resurrects the cleared draft; `pagehide` flushes.
+- Manual probe (jsdom proves the listener works, not that Tauri delivers lifecycle events to a closing webview): type, quit the dev app within the debounce window, relaunch, confirm the draft survived. If `pagehide`/`beforeunload` turns out not to fire during teardown, either flush from Tauri's window-close handling or document the accepted ≤200 ms loss in the module comment — the probe result decides which.
 - Update the module-top comment: it currently documents "writes are synchronous (no debounce)" with rationale — rewrite it to document the new contract (synchronous mutation, debounced persistence, enumerated flush points and the race each one closes).
 
 ---
@@ -134,8 +134,8 @@ Quantify the remaining typing cost against a controlled large transcript, then a
    - **Re-anchoring:** `reanchor()` reads/writes `container.scrollHeight`/`scrollTop`; with containment, heights of off-screen blocks are estimates. The existing `scroll-hold` / `streaming-pin` / `footer-anchor` browser tests must pass unmodified against the large fixture. Watch for scrollbar jitter as blocks materialize while scrolling up through history (intrinsic-size estimate quality); if jittery, derive better per-block estimates (e.g. from compact-clip height for collapsed units).
    - **`measureClip` observers:** a `ResizeObserver` on a layout-skipped subtree won't fire meaningfully. Acceptable while off-screen (the toggle isn't visible anyway) — but verify it fires correctly when the block scrolls into view, so toggles appear. The `transcript-overflow` and `user-recollapse` tests, run against the large fixture with the unit placed off-screen then scrolled to, cover this.
    - **Mask-image fades + containment** on the same element: verify no paint artifacts (manual + the overflow test).
-   - **Streaming:** the live/streaming block is at the bottom (on-screen when pinned) so it must never be layout-skipped while followed; confirm the pinned-streaming path is unaffected.
-5. **Measure after.** Same protocol. Record numbers in this doc under a `### M3 results` heading, plus the go/no-go decision and rationale.
+   - **Streaming, both sides:** while followed (pinned), the live block is on-screen and must never be layout-skipped — confirm the pinned path is unaffected. And the *unfollowed* side: scroll away from an actively streaming live-capped unit so it leaves the viewport (becomes skip-eligible while still growing), let it stream, then scroll back — its inner bottom-pin must still be engaged, top-fade state correct, no content missing. This exercises containment + ResizeObserver-driven growth + the `liveScroll` per-instance pin closure at once. (Completed units render flat — `liveScroll` exists only under `streaming` — so this is the only inner-scroll case.)
+5. **Measure after.** Same protocol. Record numbers in this doc under a `### M3 results` heading, plus the go/no-go decision and rationale. Record the exact WebKit/Safari version measured on: `content-visibility: auto` requires Safari-18+ engines (older system WebKits ignore it — a graceful no-op, no breakage, but no perf win either), and Safari 18.0–18.2 had real `content-visibility` rendering bugs (fixed in 18.3), so the spike's findings are engine-version-sensitive in ways one test machine won't show.
 
 Why this ordering (containment before virtualization) — record this rationale in the code comment on the containment class: containment is ~CSS-only, preserves DOM (copy, selection, accessibility, future find-in-page), keeps every PR-#31 behavior and test intact, and is removable in one line if M4 supersedes it. Virtualization is strictly more powerful (DOM count actually shrinks, helping non-layout costs too) but must reimplement the anchoring contract.
 

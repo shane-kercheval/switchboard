@@ -9,7 +9,7 @@ The version each harness was last vetted against. **Update the relevant row at t
 | Harness | Last reviewed | Date | How / result |
 |---|---|---|---|
 | Codex | `0.137.0` | 2026-06-04 | changelog + code review — no impact |
-| Claude Code | `2.1.153` | 2026-05-27 | subagent stream/disk probe (3 parent-tagged shapes, disk-side collapse verified — see `harness-behavior.md` §6); prior auth-failure/overage probes 2026-05-25 against 2.1.149 still current |
+| Claude Code | `2.1.170` | 2026-06-09 | changelog + code review (`2.1.154`→`2.1.170`) — no impact. Invocation flags, stream-json vocabulary, `result`/error shape, and session-file fields all unchanged; parser is skip-by-default at every dispatch level so additive events are tolerated; new Fable 5 model id flows through as an opaque `--model`/`result.model` string. Prior subagent stream/disk probe (`harness-behavior.md` §6) and 2026-05-25 auth-failure/overage probes still current |
 | Gemini | `0.42.0` | 2026-05-27 | core probes from M3; logged-out auth shape captured 2026-05-27 |
 | Antigravity (`agy`) | `1.0.2` | 2026-05-26 | hands-on probes (transcript, quota, auth) |
 

@@ -7,6 +7,7 @@ LIVE_PKGS := -p switchboard-harness -p switchboard-dispatcher -p switchboard-app
 # project's *dependencies*, not the app — to install the built app into
 # /Applications, see `install-app` / `deploy`.
 install:
+	@node -e 'const m=Number(process.versions.node.split(".")[0]); if(m<22){console.error("Switchboard needs Node >= 22 (you have "+process.versions.node+"). Switch Node versions and retry.");process.exit(1)}'
 	pnpm install --frozen-lockfile
 
 DEFAULT_DEV_PORT := 1420

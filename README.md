@@ -12,10 +12,31 @@ It's built for anyone who wants explicit, human-in-the-loop control over multi-a
 
 macOS only (v1, early development). Switchboard is currently installed by building from source — a one-time setup, after which it lives in `/Applications` and updates with a single command. A signed Homebrew install is planned.
 
+**1. Clone the repo:**
+
 ```sh
 git clone https://github.com/shane-kercheval/switchboard
 cd switchboard
-make install   # install dependencies (prerequisites: see Local development)
+```
+
+**2. Install the prerequisites** (one-time, run from the repo root). Each is needed to build from source:
+
+- **Xcode Command Line Tools** — `xcode-select --install`
+- **Rust** — install [rustup](https://rustup.rs); the pinned toolchain auto-installs on the first build. **After installing, restart your terminal** (or run `source "$HOME/.cargo/env"`) so `cargo` is on your `PATH` — otherwise the build fails with `cargo metadata ... No such file or directory`.
+- **Node** — version **22 or newer**. Use whatever you already have, or install one via [nvm](https://github.com/nvm-sh/nvm), [fnm](https://github.com/Schniz/fnm), Homebrew, etc. (You don't need a specific patch version — `make install` checks for the minimum and stops with a clear message if it's too old. Contributors: [`.nvmrc`](./.nvmrc) pins the exact version CI runs, picked up with `nvm use`; that exact pin isn't required just to build the app.)
+- **pnpm** — run `corepack enable`. Corepack ships with Node and provides the pnpm version pinned in [`package.json`](./package.json); you do **not** install pnpm separately.
+
+Confirm the toolchain resolves before continuing:
+
+```sh
+node --version   # 22 or newer
+pnpm --version   # Corepack provides the pinned version on first pnpm call
+```
+
+**3. Build, install, and launch:**
+
+```sh
+make install   # install JS dependencies (pnpm install --frozen-lockfile)
 make deploy    # build, install to /Applications, and launch
 ```
 
@@ -63,12 +84,7 @@ The architectural decisions, functional requirements, and open questions are bei
 
 ## Local development
 
-macOS only for v1. Prerequisites:
-
-- **Rust** — pinned via [`rust-toolchain.toml`](./rust-toolchain.toml). Install [rustup](https://rustup.rs); the toolchain will be auto-installed on first build.
-- **Node** — version pinned in [`.nvmrc`](./.nvmrc). Install via [nvm](https://github.com/nvm-sh/nvm) (`nvm use`) or any Node version manager.
-- **pnpm** — pinned via the `packageManager` field in `package.json`. Enable via `corepack enable` (Corepack ships with Node).
-- **Xcode Command Line Tools** — `xcode-select --install` (required for native macOS builds).
+macOS only for v1. The build prerequisites are the same as [Install](#install) above — Xcode Command Line Tools, Rust (rustup), Node (pinned in [`.nvmrc`](./.nvmrc)), and pnpm (`corepack enable`). If you've installed the app, you already have everything.
 
 Common commands (run from the repo root):
 

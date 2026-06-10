@@ -30,6 +30,7 @@
     stateFor,
   } from "$lib/state/transcriptPreview.svelte";
   import DevIndicator from "$lib/components/ui/DevIndicator.svelte";
+  import { installDevTranscriptSeed } from "$lib/dev/seedTranscript";
   import { windowDragRegion } from "$lib/windowDrag";
   import { hydrateAgent, registerAgent } from "$lib/state/index.svelte";
   import {
@@ -301,9 +302,11 @@
     });
 
     window.addEventListener("keydown", handleGlobalKeydown);
+    const removeDevSeed = installDevTranscriptSeed(() => activeAgents);
     return () => {
       stopProjectActivityObserver();
       window.removeEventListener("keydown", handleGlobalKeydown);
+      removeDevSeed();
     };
   });
 

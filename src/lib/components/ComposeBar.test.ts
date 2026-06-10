@@ -1060,6 +1060,7 @@ describe("ComposeBar persistence", () => {
     const store = await loadComposeStore();
     store.setContent(PROJECT_ID, { kind: "plain", draft: "from last time" });
     store.setSelection(PROJECT_ID, [AGENT_B.id]);
+    store.flush();
     store._testing.reloadFromStorage(); // drop in-memory copy; re-read localStorage
 
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
@@ -1111,6 +1112,7 @@ describe("ComposeBar persistence", () => {
     await state.registerAgent(AGENT_B);
     const store = await loadComposeStore();
     store.setSelection(PROJECT_ID, ["00000000-0000-7000-8000-00000000dead", AGENT_A.id]);
+    store.flush();
     store._testing.reloadFromStorage();
 
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
@@ -1135,6 +1137,56 @@ describe("ComposeBar persistence", () => {
     expect((screen.getByTestId("compose-textarea") as HTMLTextAreaElement).value).toBe("");
   });
 
+  it("a draft typed right before a project switch survives via the destroy flush", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const store = await loadComposeStore();
+
+    const first = render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await fireEvent.input(screen.getByTestId("compose-textarea"), {
+      target: { value: "mid-debounce draft" },
+    });
+    // Unmount (the project-switch path): the deferred draft write must land in
+    // onDestroy — reloadFromStorage then drops memory so only disk survives.
+    first.unmount();
+    store._testing.reloadFromStorage();
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    expect((screen.getByTestId("compose-textarea") as HTMLTextAreaElement).value).toBe(
+      "mid-debounce draft",
+    );
+  });
+
+  it("a fast project switch keeps each project's draft in its own slot", async () => {
+    // The deferral's worst case: type in project 1, switch to project 2, and
+    // restart before any timer fires. The forced disk round-trip in the middle
+    // is what makes this a real test — without it, the in-memory store
+    // satisfies the assertions even with the flush points deleted.
+    const OTHER_PROJECT = "00000000-0000-7000-8000-0000000000ee";
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const store = await loadComposeStore();
+
+    const first = render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await fireEvent.input(screen.getByTestId("compose-textarea"), {
+      target: { value: "project one draft" },
+    });
+    first.unmount();
+
+    const second = render(ComposeBar, {
+      props: { projectId: OTHER_PROJECT, agents: [AGENT_A] },
+    });
+    second.unmount();
+    store._testing.reloadFromStorage();
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    expect((screen.getByTestId("compose-textarea") as HTMLTextAreaElement).value).toBe(
+      "project one draft",
+    );
+    // Project 1's draft never leaked into project 2's slot.
+    expect(store.getCompose(OTHER_PROJECT).content).toEqual({ kind: "plain", draft: "" });
+  });
+
   it("recovers a single-agent project from a saved selection whose agent is gone", async () => {
     // Saved "send to bob" against a project that now has only alice: bob is
     // filtered out, and a single-agent project shows no chips — so without the
@@ -1144,6 +1196,7 @@ describe("ComposeBar persistence", () => {
     invokeMock.mockResolvedValue("msg-1");
     const store = await loadComposeStore();
     store.setSelection(PROJECT_ID, [AGENT_B.id]);
+    store.flush();
     store._testing.reloadFromStorage();
 
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
@@ -1169,6 +1222,7 @@ describe("ComposeBar persistence", () => {
       "00000000-0000-7000-8000-00000000dea1",
       "00000000-0000-7000-8000-00000000dea2",
     ]);
+    store.flush();
     store._testing.reloadFromStorage();
 
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
@@ -1404,6 +1458,7 @@ describe("ComposeBar prompt mode", () => {
       args: { focus: "saved focus" },
       appendedText: "saved tail",
     });
+    store.flush();
     store._testing.reloadFromStorage();
     mockPromptBackend({ prompts: [REVIEW] });
 
@@ -1427,6 +1482,7 @@ describe("ComposeBar prompt mode", () => {
       args: { focus: "saved focus" },
       appendedText: "tail",
     });
+    store.flush();
     store._testing.reloadFromStorage();
 
     let promptList: Prompt[] = []; // cache cold at mount (MCP not synced yet)
@@ -1466,6 +1522,7 @@ describe("ComposeBar prompt mode", () => {
       args: { focus: "x" },
       appendedText: "leftover text",
     });
+    store.flush();
     store._testing.reloadFromStorage();
     mockPromptBackend({ prompts: [] }); // prompt never appears, even after sync
 

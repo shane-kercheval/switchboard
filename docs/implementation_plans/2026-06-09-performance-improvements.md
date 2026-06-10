@@ -89,7 +89,7 @@ What this milestone does **not** claim: the one remaining forced layout is still
 Remove the synchronous serialize+`localStorage.setItem` from the per-keystroke path without weakening any of the durability guarantees the current synchronous design exists for.
 
 - Typing performs no `localStorage` write per keystroke; writes coalesce behind a short trailing debounce (~200 ms).
-- A draft still survives: project switch, compose-bar unmount, send-clear ordering (a send must never resurrect just-sent text), and app quit.
+- A draft still survives: project switch, compose-bar unmount, and send-clear ordering (a send must never resurrect just-sent text). App quit is best-effort — see the accepted-loss decision in the DoD.
 
 ### Implementation outline
 
@@ -107,7 +107,7 @@ The current module comment is explicit about why writes are synchronous: a defer
 ### Definition of done
 
 - Unit tests (jsdom, fake timers): N rapid `setContent` calls → one `setItem`; `flush()` writes immediately; destroy-flush preserves a draft across a simulated remount (the existing `_testing.reloadFromStorage` restart-path pattern); send-clear followed by debounce expiry never resurrects the cleared draft; `pagehide` flushes.
-- Manual probe (jsdom proves the listener works, not that Tauri delivers lifecycle events to a closing webview): type, quit the dev app within the debounce window, relaunch, confirm the draft survived. If `pagehide`/`beforeunload` turns out not to fire during teardown, either flush from Tauri's window-close handling or document the accepted ≤200 ms loss in the module comment — the probe result decides which.
+- Quit-mid-debounce loss is **accepted deliberately** (decided at M2 review): everything typed since the last ≥200 ms pause or flush (a trailing debounce never fires during continuous typing, so the loss is *not* bounded at 200 ms of keystrokes — a non-stop burst is lost whole). Triggered only when the app quits within ~200 ms of the last keystroke *and* neither quit event fires during teardown. Drafts are ergonomic, not load-bearing, and the common exits (send-clear, project switch) flush synchronously and are tested. The passive `pagehide`/`beforeunload` listeners ship as best-effort insurance; their delivery during Tauri webview teardown is intentionally unverified — no `visibilitychange` listener, no Tauri close-hook. (An optional ~30 s probe — type, ⌘Q fast, relaunch, check the draft — would convert "unverified" into a known answer; it gates nothing.)
 - Update the module-top comment: it currently documents "writes are synchronous (no debounce)" with rationale — rewrite it to document the new contract (synchronous mutation, debounced persistence, enumerated flush points and the race each one closes).
 
 ---

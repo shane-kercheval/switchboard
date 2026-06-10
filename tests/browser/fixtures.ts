@@ -19,6 +19,14 @@ export const ALICE: AgentRecord = {
   created_at: "2026-05-16T00:00:00Z",
 };
 
+/** Second agent for fan-out specs (same project as ALICE). */
+export const BOB: AgentRecord = {
+  ...ALICE,
+  id: "00000000-0000-7000-8000-000000000bbb",
+  name: "bob",
+  session_locator: { uuid: "00000000-0000-7000-8000-000000000002" },
+};
+
 type AgentTurn = Extract<Turn, { role: "agent" }>;
 type Item = AgentTurn["items"][number];
 

@@ -3026,3 +3026,41 @@ describe("UnifiedTranscript loading state", () => {
     expect(screen.getByText("hi")).toBeInTheDocument();
   });
 });
+
+describe("model footer visibility", () => {
+  it("shows the model only on completed turns, never on failed/cancelled ones", async () => {
+    // Harnesses stamp placeholder models on terminal-failure events (Claude
+    // records the literal "<synthetic>") — a non-complete turn's model is a
+    // leaked sentinel, not information.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "agent",
+        turn_id: "agent-ok",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:01Z",
+        status: "complete",
+        items: [{ item_kind: "text", kind: "text", text: "done" }],
+        model: "claude-fable-5",
+      },
+      {
+        role: "agent",
+        turn_id: "agent-bad",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:02Z",
+        status: "failed",
+        items: [{ item_kind: "text", kind: "text", text: "partial" }],
+        error: "boom",
+        model: "<synthetic>",
+      },
+    ];
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const models = screen.getAllByTestId("message-model").map((el) => el.textContent);
+    expect(models).toContain("claude-fable-5");
+    expect(models.join(" ")).not.toContain("synthetic");
+  });
+});

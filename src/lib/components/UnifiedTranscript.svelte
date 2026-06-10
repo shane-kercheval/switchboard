@@ -206,7 +206,26 @@
   const CONTAINMENT_AGENT_ROW = "[content-visibility:auto] [contain-intrinsic-size:auto_16rem]";
   const CONTAINMENT_FANOUT = "[content-visibility:auto] [contain-intrinsic-size:auto_20rem]";
 
+  function blockIsLive(block: RenderBlock): boolean {
+    if (block.kind === "row") {
+      return block.row.kind === "agent" && isLiveStreaming(block.row.turn);
+    }
+    return block.columns.some((col) =>
+      col.rows.some((r) => r.kind === "agent" && isLiveStreaming(r.turn)),
+    );
+  }
+
   function blockContainment(block: RenderBlock): string {
+    // LIVE blocks are exempt from containment: a streaming block's height must
+    // always be its real geometry (the pinned path follows it; the inner live
+    // pin and cap depend on it), and its per-chunk re-renders inside a skipped
+    // wrapper churn remembered sizes into spurious outer-height changes.
+    // Liveness is a stable property (it flips once at stream start/end), so a
+    // block's containment class never changes from unrelated appends — an
+    // index-based "last N" window flips membership on every new turn, and a
+    // freshly-contained block loses its remembered size and snaps to the
+    // declared placeholder when off-screen (a guaranteed view nudge per turn).
+    if (blockIsLive(block)) return "";
     if (block.kind === "fanout") return CONTAINMENT_FANOUT;
     return block.row.kind === "agent" ? CONTAINMENT_AGENT_ROW : CONTAINMENT_COMPACT_ROW;
   }
@@ -368,12 +387,20 @@
     return "";
   }
 
+  /// The model footer is shown only for COMPLETED turns: harnesses stamp
+  /// placeholder models on terminal-failure events (Claude records the literal
+  /// `<synthetic>`), so a failed/cancelled turn's model is a leaked sentinel,
+  /// not information.
+  function modelOf(turn: AgentTurn): string | undefined {
+    return turn.status === "complete" ? turn.model : undefined;
+  }
+
   /// A fan-out column's runtime selection footer: latest agent turn wins, matching
   /// `columnAt` and the copy aggregation's "column owns its agent rows" contract.
   function columnModel(colRows: NonUserRow[]): string | undefined {
     for (let i = colRows.length - 1; i >= 0; i--) {
       const r = colRows[i]!;
-      if (r.kind === "agent") return r.turn.model;
+      if (r.kind === "agent") return modelOf(r.turn);
     }
     return undefined;
   }
@@ -463,26 +490,102 @@
   // input device is what lets scrollbar-drag and keyboard scrolling work too.
   let lastScrollHeight = 0;
 
+  // The block at the top of the viewport (re-captured on every user scroll and
+  // after every re-anchor pass), its offset from the viewport top, and its
+  // height at capture time — what the user chose to read. While unpinned,
+  // restoring this anchor is the only correction that keeps the reading
+  // position still regardless of WHERE a height change happened: gap-from-bottom
+  // maintenance shifts the view by exactly the change whenever it happens below
+  // the viewport (a streaming response growing, a new turn arriving — the
+  // read-while-streaming bug), and containment makes off-screen heights churn
+  // in both directions as blocks skip/materialize. The gap is kept for two
+  // cases only:
+  // - the change happened INSIDE the anchor block (its own height moved): the
+  //   user expanded/collapsed the thing they're looking at, and the contract
+  //   there is "the toggle I clicked stays put" — which gap-hold provides,
+  //   since the toggle sits below the growth (footer-anchor test);
+  // - the anchor target is unreachable: content below shrank past the clamp (a
+  //   real collapse), where the contract is "hold the gap, don't slam into the
+  //   bottom" (scroll-hold tests).
+  let anchorEl: Element | null = null;
+  let anchorOffset = 0;
+  let anchorHeight = 0;
+
+  function captureAnchor(): void {
+    anchorEl = null;
+    if (!container || content === null) return;
+    const viewportTop = container.getBoundingClientRect().top;
+    // Blocks are in document order, so the first one whose bottom edge crosses
+    // the viewport top is binary-searchable.
+    const kids = content.children;
+    let lo = 0;
+    let hi = kids.length - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (kids[mid]!.getBoundingClientRect().bottom > viewportTop) {
+        anchorEl = kids[mid]!;
+        hi = mid - 1;
+      } else {
+        lo = mid + 1;
+      }
+    }
+    if (anchorEl === null) {
+      anchorOffset = 0;
+      anchorHeight = 0;
+      return;
+    }
+    const rect = anchorEl.getBoundingClientRect();
+    anchorOffset = rect.top - viewportTop;
+    anchorHeight = rect.height;
+  }
+
   function onScroll(): void {
     if (!container) return;
     distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
     if (container.scrollHeight === lastScrollHeight) {
       pinned = distanceFromBottom < 32;
+      captureAnchor();
     }
     lastScrollHeight = container.scrollHeight;
   }
 
-  /// Pin to the bottom when the user is already there; otherwise hold their gap
-  /// from the bottom so the view doesn't move. Advancing `lastScrollHeight` here
-  /// means the `scroll` event our own `scrollTop` write triggers compares equal
-  /// and is treated as user-initiated (it recomputes `pinned` from the gap we
-  /// just set, landing on the same value — benign).
+  /// Pin to the bottom when the user is already there; otherwise keep what the
+  /// user is reading still: anchor-restore when the change landed elsewhere,
+  /// gap-hold when it landed inside the anchor block or past the clamp (see
+  /// the anchor comment above). Advancing `lastScrollHeight` here means the
+  /// `scroll` event our own `scrollTop` write triggers compares equal and is
+  /// treated as user-initiated (it recomputes `pinned`/anchor from the
+  /// position we just set — benign).
   function reanchor(): void {
     if (!container) return;
-    container.scrollTop = pinned
-      ? container.scrollHeight
-      : container.scrollHeight - container.clientHeight - distanceFromBottom;
+    if (pinned) {
+      container.scrollTop = container.scrollHeight;
+      lastScrollHeight = container.scrollHeight;
+      return;
+    }
+    const maxScroll = container.scrollHeight - container.clientHeight;
+    let anchored = false;
+    if (anchorEl?.isConnected === true) {
+      const rect = anchorEl.getBoundingClientRect();
+      const drift = rect.top - container.getBoundingClientRect().top - anchorOffset;
+      const target = container.scrollTop + drift;
+      if (rect.height === anchorHeight && target >= 0 && target <= maxScroll) {
+        if (drift !== 0) container.scrollTop = target;
+        // The gap genuinely changed (the height change landed elsewhere);
+        // keep the stored gap honest so a later gap-hold corrects from
+        // reality, not a stale value.
+        distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
+        anchored = true;
+      }
+    }
+    if (!anchored) {
+      container.scrollTop = maxScroll - distanceFromBottom;
+    }
     lastScrollHeight = container.scrollHeight;
+    // The just-settled position is the new reference: an expand that fell back
+    // to gap-hold must not keep suppressing anchor-restore for the unrelated
+    // changes that follow it (e.g. streaming resuming below).
+    captureAnchor();
   }
 
   /// Fine-grained content signal — text/output lengths and tool completion — so
@@ -1094,7 +1197,7 @@
       label: "Copy message",
       spend: turn.spend,
       costUsd: turn.usage?.total_cost_usd,
-      model: turn.model,
+      model: modelOf(turn),
       effort: turn.effort,
       previewKey: showToggle ? key : undefined,
       previewDefaultCompact: defaultCompact,

@@ -16,9 +16,8 @@ import {
   transcriptContainer,
   distanceFromBottom,
 } from "./harness";
-import { ALICE, PROJECT_ID, agentTurn, longText, textItem, userTurn } from "./fixtures";
+import { ALICE, BOB, PROJECT_ID, agentTurn, longText, textItem, userTurn } from "./fixtures";
 import { buildLargeTranscript } from "$lib/dev/largeTranscript";
-import type { AgentRecord } from "$lib/types";
 
 // The containment spike's executable answers (plan M3): with
 // `content-visibility: auto` on every transcript block, off-screen history
@@ -35,13 +34,6 @@ import type { AgentRecord } from "$lib/types";
 // arbitrary-threshold flake; the M3 protocol's manual scroll-up step covers
 // it (both compact modes), and its observed signature is what a future
 // automated bound should be calibrated against.
-
-const BOB: AgentRecord = {
-  ...ALICE,
-  id: "00000000-0000-7000-8000-000000000bbb",
-  name: "bob",
-  session_locator: { uuid: "00000000-0000-7000-8000-000000000002" },
-};
 
 /// The block's DECLARED `contain-intrinsic-size` length (the pre-first-render
 /// placeholder), read from computed style so assertions track the per-kind

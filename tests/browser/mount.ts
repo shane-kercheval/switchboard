@@ -5,7 +5,9 @@
 // `mountTranscript` from here.
 import { render } from "vitest-browser-svelte";
 import type { AgentRecord } from "$lib/types";
+import type { DiffTarget } from "$lib/state/gitView.svelte";
 import TranscriptHost from "./TranscriptHost.svelte";
+import DiffPanelHost from "./DiffPanelHost.svelte";
 
 /**
  * Mount `UnifiedTranscript` in real WebKit inside a fixed-height flex column so
@@ -22,4 +24,11 @@ export function mountTranscript(opts: {
     agents: opts.agents,
     ...(opts.width !== undefined ? { width: opts.width } : {}),
   });
+}
+
+/** Mount `DiffPanel` (Git view) in a sized container for hit-target/layout checks. */
+export function mountDiffPanel(opts: { target: DiffTarget }): ReturnType<typeof render> {
+  // Pass props under `props` — a bare `{ target }` collides with Svelte's reserved
+  // mount-target option.
+  return render(DiffPanelHost, { props: { target: opts.target } });
 }

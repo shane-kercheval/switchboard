@@ -385,13 +385,16 @@
             <li>
               <div
                 class={cn(
-                  "group flex w-full items-start gap-1 rounded-none px-2 py-1.5 text-xs transition-colors",
+                  "group flex w-full items-stretch gap-1 rounded-none text-xs transition-colors",
                   file.path === selectedFile ? "bg-raised text-fg" : "text-muted hover:bg-raised",
                 )}
               >
+                <!-- The padding lives on the button (not the row) so the click
+                     target fills the whole hover area — otherwise the top/bottom
+                     (and left) padding band highlights but swallows the click. -->
                 <button
                   type="button"
-                  class="flex min-w-0 flex-1 items-start gap-2 text-left"
+                  class="flex min-w-0 flex-1 items-start gap-2 px-2 py-1.5 text-left"
                   data-testid="changed-file"
                   data-selected={file.path === selectedFile}
                   onclick={() => (selectedFile = file.path)}
@@ -416,7 +419,7 @@
                       type="button"
                       class={cn(
                         ICON_BUTTON_CLASS,
-                        "hover:bg-border/60 h-6 w-6 shrink-0 self-center opacity-0 transition-opacity group-focus-within:opacity-100 group-hover:opacity-100",
+                        "hover:bg-border/60 mr-2 h-6 w-6 shrink-0 self-center opacity-0 transition-opacity group-focus-within:opacity-100 group-hover:opacity-100",
                       )}
                       aria-label={`Open ${file.path} in difftool`}
                       data-testid="changed-file-difftool"

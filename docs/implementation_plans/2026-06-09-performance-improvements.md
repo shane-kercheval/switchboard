@@ -20,7 +20,7 @@ Small transcript → cheap reflow → no lag. Large transcript → expensive ref
 ### What it is NOT
 
 - **Not a Svelte re-render.** `draft` is local `$state` in `ComposeBar`; the transcript's reactive sources (`transcripts`, `runtimes`, `overlay`) don't depend on it. Svelte 5's fine-grained reactivity leaves the transcript untouched while typing. The cost is purely at the browser layout level.
-- **Not streaming-only.** Streaming adds work (markdown re-parse of the growing segment, `scrollSignal` recompute, reducer array copies per chunk, re-anchor scrolls), so typing-while-streaming is the worst case — but the core lag exists with everything idle. Streaming-time costs (the reducer/`buildUnifiedRows` work per chunk) are **out of scope** for this plan; if they're pursued later, re-profile first, because PR #28 reworked that path.
+- **Not streaming-only.** Streaming adds work (markdown re-parse of the growing segment, `scrollSignal` recompute, reducer array copies per chunk, re-anchor scrolls), so typing-while-streaming is the worst case — but the core lag exists with everything idle. Streaming-time costs were originally out of scope; after M1–M3 landed, hands-on testing confirmed idle typing is fixed while the streaming case persists, so it is now **M5** (added 2026-06-10). Its outline still obeys the original caveat: re-profile first, because PR #28 reworked that path.
 
 ### Secondary per-keystroke cost
 
@@ -195,7 +195,14 @@ Mechanical steps — no profiler experience assumed. This run also retroactively
 
 ---
 
-## Milestone 4 — Windowed virtualization (contingent: only if M3's gate fails)
+## Milestone 4 — Windowed virtualization (contingent: only if M3's gate fails — expected NOT to run)
+
+**Status (2026-06-10): on track to be cancelled.** Hands-on testing after M1–M3 found typing on a large idle transcript fast and normal — the symptom this milestone existed to fix if containment fell short. Containment did not fall short, so M4's trigger condition looks unmet; the formal cancellation waits only on the M3 protocol numbers landing in the results table (the gate closes on numbers, not impressions). Two clarifications so this milestone isn't revived for the wrong reason:
+
+- **Typing-while-streaming lag does NOT trigger M4.** The streaming block stays mounted under virtualization and the per-chunk JS pipeline runs regardless — that symptom is M5's, with its own mechanism and fixes.
+- **The one realistic remaining argument for M4 is project-switch latency** (see "Recorded but unscoped" below): virtualization would fix it as a side effect by making switch cost O(viewport). But the cheaper middle-tier candidates named there should be priced first — M4 is the most invasive possible answer to that symptom, rewriting the PR-#31 scroll layer to solve a problem two targeted caches might solve alone.
+
+If M4 is ever revived, the outline below remains the agreed constraints; its risk profile (delicate scroll-layer rework, sporadic scroll-position-dependent failure modes, mitigated by the browser suite and compact mode's bounded heights) was assessed in review on 2026-06-10.
 
 ### Goal & outcome
 
@@ -220,3 +227,52 @@ If containment can't bound the cost, window the transcript so off-screen blocks 
 - New browser tests: bottom-anchored mount; pinned follow during streaming with off-screen history; hold-position on expand/collapse of a mid-viewport block; scroll far up and back (estimate stability).
 - M3 protocol re-run; numbers recorded here.
 - `clipOverflow`/observer consolidation done; the two PR-#31 comments that anticipated virtualization updated.
+
+---
+
+## Milestone 5 — Streaming pipeline cost (typing-while-streaming lag)
+
+**Trigger (2026-06-10):** hands-on testing after M1–M3 confirmed the original diagnosis split cleanly — typing while agents are idle is fixed; typing while a response streams still lags. That matches the problem statement's "Not streaming-only" analysis: streaming lag is a *throughput* problem (a per-chunk pipeline competing with keystrokes for the main thread), not the layout problem M1–M3 solved. Neither M3's containment (the streaming block is on-screen, so never skipped) nor M4's virtualization (the streaming block stays mounted; the per-chunk JS runs regardless) addresses it — M5 is its own workstream, and **streaming lag is not an argument for triggering M4**.
+
+### Goal & outcome
+
+Typing while an agent streams feels like typing while idle.
+
+- No per-chunk work scales with conversation history (today the reducer map, `buildUnifiedRows`/`groupRenderBlocks`, and `scrollSignal` are all O(transcript) per chunk).
+- The pipeline runs at most once per displayed frame regardless of how fast chunks arrive from any harness.
+- Streaming rendering behavior is visibly unchanged (live text appears promptly, pin/anchor behavior identical), except where a Fix-3 variant deliberately trades live formatting — that trade is decided explicitly, not slipped in.
+
+### Implementation outline
+
+**Step 0 — profile first (mandatory, before any fix).** Run the M3 protocol's typing-while-streaming cell with the Timelines breakdown split into Layout vs Script, and within Script attribute time across: markdown parse/highlight (`renderMarkdown`), rows rebuild (`buildUnifiedRows`/`groupRenderBlocks`), reducer application, and re-anchor work. PR #28 reworked the reducer path after the original cost analysis, so any pre-profile ranking is stale by construction. Record the breakdown in the M5 results table; it gates Fixes 3 and 4.
+
+The four candidate fixes, in order, with their epistemic status stated so future readers know which were principle-driven and which were measurement-gated:
+
+1. **Coalesce event application to once per frame** — *unconditional: sound regardless of measurement.* Events currently drive state mutation directly from the wire; the display cannot show more than ~60 updates/sec, so pipeline runs beyond that are provably wasted. Batch incoming per-agent events at the single listener seam (`index.svelte.ts`) and apply once per animation frame. This also makes UI cost independent of any future harness's stream chattiness. Constraints: the batch applies FIFO through the existing reducers (batch raw events; never merge them); lifecycle events (`turn_start`/`turn_end`/failure/cancel) either flush the buffer immediately or land with proven ordering — a turn that ends and is cancelled in the same frame is the edge to test. Expect most of the effort in test plumbing: jsdom suites that fire an event and `await tick()` need a flush helper or fake-rAF.
+2. **Replace `scrollSignal`'s content walk with a revision counter** — *unconditional: design hygiene with a modest win.* The derived's job is "change signal"; it is implemented as a full digest (thousands of reactive-proxy reads per chunk). Bump a counter wherever `transcripts[agentId]` is assigned. Must provably change for every case the walk caught (text growth, tool output, `completed_at`, row count) — assignment-level bumping covers all. Preserves the jsdom-testability property the existing comment documents (the ResizeObserver path is inert under jsdom).
+3. **Stop re-parsing the live segment's markdown per chunk** — *gated on the post-Fix-1 profile.* The problem is pre-registered in `Markdown.svelte`'s own comment, including its named fallback. Variants, in escalation order: **(b)** rely on Fix 1's frame cap (free; each frame still parses the whole segment — may suffice); **(a)** render the live segment as plain text while streaming, full render on completion (the pre-named fallback; simple; visible UX change — no live formatting); **(c)** incremental block-level parsing with a stable-prefix cache (keeps live formatting, architecturally the best end state, but the most complex — unclosed-fence boundary detection is the classic trap, and it adds bug surface to the most user-visible render path). **The (a)-vs-(c) choice is the engineer's** (UX-vs-complexity), made only if profiling shows (b) insufficient; record the decision here.
+4. **Incremental row building** — *last resort, profile-gated; do not build speculatively.* The wholesale `buildUnifiedRows` rebuild is a deliberate design (pure, stateless, trivially testable); making it incremental trades that purity for cache invalidation, and the bug class it risks (duplicated/missing/misgrouped rows) is exactly what PR #28 fixed at another layer. Only justified if the profile shows the rebuild dominates *after* Fix 1 caps its frequency. If it does, prefer the middle option first: memoize per-agent sub-results so unchanged agents' rows are reused, keeping most of the purity.
+
+### Definition of done
+
+- Fixes 1–2 landed; Fix 3/4 status recorded in the results below (which variant, or "not needed" with the profile numbers that justified it).
+- Coalescing tests (jsdom, fake-rAF): N chunk events in one frame → state identical to sequential application; ordering preserved across mixed event types; `turn_end` (and end+cancel in one frame) never dropped or misordered; events for two agents in one frame both apply.
+- Counter tests: every event type that previously moved `scrollSignal` still triggers the re-anchor effect (assert via effect-run observation, not implementation internals).
+- Existing jsdom + browser suites green — streaming-pin and scroll-hold specifically re-validated, since coalescing changes *when* re-anchors happen.
+- Step-0 and post-fix profile numbers recorded below; rationale comments at the batch seam and the counter site per the plan's rationale-survival convention.
+
+### M5 results
+
+*(fill in: step-0 breakdown, post-fix re-measurement, Fix-3 decision)*
+
+| measurement | layout/frame (ms) | script/frame (ms) | dominant script stage | typing feel |
+| --- | --- | --- | --- | --- |
+| step 0 — before fixes | | | | |
+| after Fixes 1–2 | | | | |
+| after Fix 3 (variant: ___) | | | | |
+
+---
+
+## Recorded but unscoped: project-switch latency on large transcripts
+
+Observed 2026-06-10 alongside the M5 trigger: switching back to an already-cached large project shows "Loading project…" for a noticeable time. The data is cached (session-sticky hydration guards); the wait is render-side — Svelte rebuilds the full transcript DOM and re-runs `renderMarkdown` for every text segment on every switch, which containment cannot skip (`content-visibility` skips layout/paint, not component construction or parsing). Not scoped to a milestone. If it warrants one later, the middle-tier candidates (cheaper than M4): cache parsed markdown HTML across mounts keyed by segment text, and/or defer off-screen component mounting. M4 would also solve it as a side effect — this symptom, not typing, is the realistic remaining argument for M4.

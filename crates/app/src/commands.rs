@@ -3016,6 +3016,15 @@ pub enum ConversationItem {
         status: switchboard_harness::TurnStatus,
         items: Vec<switchboard_harness::TurnItem>,
         usage: Option<switchboard_harness::TurnUsage>,
+        /// Per-turn model + reasoning effort reconstructed by the session-file
+        /// parser (same source + meaning as [`switchboard_harness::Turn`]'s
+        /// fields). Carried through here so the transcript footer's model/effort
+        /// survives restart — without this, the project-conversation path drops
+        /// them and only live turns show a model. `effort` is Codex-only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
         /// Per-turn cost + overage, present when this turn was a real-spend turn
         /// whose telemetry was persisted (re-joined from the turn-metadata
         /// sidecar on reopen). `None` for normal-quota or pre-feature turns —
@@ -3266,6 +3275,8 @@ fn merge_project_conversation(
                     status,
                     items: t_items,
                     usage,
+                    model,
+                    effort,
                     spend,
                     hydration_key,
                     ..
@@ -3284,6 +3295,8 @@ fn merge_project_conversation(
                         status,
                         items: t_items,
                         usage,
+                        model,
+                        effort,
                         spend,
                         hydration_key,
                     });
@@ -9704,6 +9717,58 @@ mod tests {
         assert_eq!(
             item["hydration_key"], "msg_disk01",
             "hydration_key must be present on the project-conversation wire shape"
+        );
+    }
+
+    #[test]
+    fn merge_carries_model_and_effort_onto_agent_turn_and_serializes_them() {
+        // The per-turn model/effort the session-file parser reconstructs must
+        // survive the project-conversation merge AND reach the IPC wire — the
+        // path the app uses on project open. A parser-only test passes while this
+        // boundary silently drops them, which is exactly how the footer's model
+        // went missing on every restart. Guards that trap (sibling to the
+        // hydration_key guard above).
+        let agent = Uuid::now_v7();
+        let turn_id = Uuid::now_v7();
+        let mut turn = agent_turn(turn_id, agent, "hi", 2);
+        if let Turn::Agent { model, effort, .. } = &mut turn {
+            *model = Some("claude-opus-4-8".to_owned());
+            *effort = Some("high".to_owned());
+        }
+        let merged =
+            merge_project_conversation(vec![], vec![(agent, transcript_of(vec![turn]), None)]);
+
+        let (model, effort) = merged
+            .items
+            .iter()
+            .find_map(|i| match i {
+                ConversationItem::AgentTurn { model, effort, .. } => {
+                    Some((model.clone(), effort.clone()))
+                }
+                _ => None,
+            })
+            .expect("an agent turn");
+        assert_eq!(
+            model.as_deref(),
+            Some("claude-opus-4-8"),
+            "merge carries model"
+        );
+        assert_eq!(effort.as_deref(), Some("high"), "merge carries effort");
+
+        let value = serde_json::to_value(&merged).unwrap();
+        let item = value["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["kind"] == "agent_turn")
+            .expect("agent_turn on the wire");
+        assert_eq!(
+            item["model"], "claude-opus-4-8",
+            "model must be present on the project-conversation wire shape"
+        );
+        assert_eq!(
+            item["effort"], "high",
+            "effort must be present on the wire shape"
         );
     }
 

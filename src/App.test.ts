@@ -420,6 +420,8 @@ describe("App", () => {
     gv._testing.reset();
     const cp = await import("$lib/state/commandPalette.svelte");
     cp._testing.reset();
+    const tp = await import("$lib/state/transcriptPreview.svelte");
+    tp._testing.reset();
   });
 
   // --- harness availability banners (workspace empty → welcome) ---
@@ -1657,6 +1659,136 @@ describe("App", () => {
     // Re-show.
     await fireEvent.click(screen.getByTestId("agents-sidebar-toggle"));
     await waitFor(() => expect(screen.getByTestId("sidebar")).toBeInTheDocument());
+  });
+
+  // --- compact transcript header control ---
+
+  it("shows the compact transcript toggle for an open project with agents and hides it in Git view", async () => {
+    seedProject({
+      projectId: "p-a",
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() =>
+      expect(screen.getByTestId("transcript-compact-toggle")).toBeInTheDocument(),
+    );
+
+    // The Git view is a full takeover — the compact control is irrelevant there.
+    await fireEvent.click(screen.getByTestId("view-toggle-git"));
+    await waitFor(() =>
+      expect(screen.queryByTestId("transcript-compact-toggle")).not.toBeInTheDocument(),
+    );
+  });
+
+  it("does not show the compact toggle for a project with no agents", async () => {
+    seedProject({ projectId: "p-a", name: "alpha", agents: [] });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("breadcrumb")).toHaveTextContent("alpha"));
+    expect(screen.queryByTestId("transcript-compact-toggle")).not.toBeInTheDocument();
+  });
+
+  it("inverts compact mode from the header (default compact → expand)", async () => {
+    seedProject({
+      projectId: "p-a",
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    const btn = await screen.findByTestId("transcript-compact-toggle");
+    // Compact is on by default, so the action offered is "Expand transcript".
+    expect(btn).toHaveAttribute("aria-label", "Expand transcript");
+
+    await fireEvent.click(btn);
+    await waitFor(() =>
+      expect(screen.getByTestId("transcript-compact-toggle")).toHaveAttribute(
+        "aria-label",
+        "Compact transcript",
+      ),
+    );
+  });
+
+  it("reads as a reset when manual overrides exist and clears them on click", async () => {
+    seedProject({
+      projectId: "p-a",
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await screen.findByTestId("transcript-compact-toggle");
+
+    const tp = await import("$lib/state/transcriptPreview.svelte");
+    tp.toggleKey("p-a", "agent:x", false); // a manual per-unit override
+    await waitFor(() =>
+      expect(screen.getByTestId("transcript-compact-toggle")).toHaveAttribute(
+        "aria-label",
+        "Reset compact transcript",
+      ),
+    );
+
+    await fireEvent.click(screen.getByTestId("transcript-compact-toggle"));
+    // Reset → overrides cleared and compact stays enabled, so the action returns
+    // to "Expand transcript".
+    await waitFor(() =>
+      expect(screen.getByTestId("transcript-compact-toggle")).toHaveAttribute(
+        "aria-label",
+        "Expand transcript",
+      ),
+    );
+    expect(tp.hasOverrides("p-a")).toBe(false);
+  });
+
+  it("keeps compact state per project (header reflects the active project)", async () => {
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    seedProject({
+      projectId: "p-b",
+      directory: DIR_B,
+      name: "beta",
+      agents: [agent({ id: "ag-2", project_id: "p-b", name: "helper" })],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getAllByTestId("project-row").length).toBe(2));
+
+    // Turn compact off for alpha.
+    await fireEvent.click(screen.getByText("alpha"));
+    await fireEvent.click(await screen.findByTestId("transcript-compact-toggle"));
+    await waitFor(() =>
+      expect(screen.getByTestId("transcript-compact-toggle")).toHaveAttribute(
+        "aria-label",
+        "Compact transcript",
+      ),
+    );
+
+    // beta is untouched → still default-on ("Expand transcript").
+    await fireEvent.click(screen.getByText("beta"));
+    await waitFor(() =>
+      expect(screen.getByTestId("transcript-compact-toggle")).toHaveAttribute(
+        "aria-label",
+        "Expand transcript",
+      ),
+    );
+
+    // Back to alpha → its own off state is remembered.
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() =>
+      expect(screen.getByTestId("transcript-compact-toggle")).toHaveAttribute(
+        "aria-label",
+        "Compact transcript",
+      ),
+    );
   });
 
   it("settings button toggles settings without changing the selected project", async () => {

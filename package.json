@@ -15,8 +15,9 @@
     "lint": "eslint .",
     "format": "prettier --write \"**/*.{ts,js,svelte,css,html,json,md}\"",
     "format:check": "prettier --check \"**/*.{ts,js,svelte,css,html,json,md}\"",
-    "test": "vitest run",
-    "test:watch": "vitest"
+    "test": "vitest run --project jsdom",
+    "test:watch": "vitest --project jsdom",
+    "test:browser": "vitest run --project browser"
   },
   "dependencies": {
     "@lucide/svelte": "^1.17.0",
@@ -40,10 +41,13 @@
     "@testing-library/svelte": "^5.3.1",
     "@types/node": "^25.7.0",
     "@types/prismjs": "^1.26.6",
+    "@vitest/browser": "^4.1.8",
+    "@vitest/browser-playwright": "^4.1.8",
     "eslint": "^10.3.0",
     "eslint-plugin-svelte": "^3.17.1",
     "globals": "^17.6.0",
     "jsdom": "^29.1.1",
+    "playwright": "^1.60.0",
     "prettier": "^3.8.3",
     "prettier-plugin-svelte": "^3.5.2",
     "prettier-plugin-tailwindcss": "^0.8.0",
@@ -53,6 +57,7 @@
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.59.3",
     "vite": "^8.0.12",
-    "vitest": "^4.1.6"
+    "vitest": "^4.1.8",
+    "vitest-browser-svelte": "^2.1.1"
   }
 }

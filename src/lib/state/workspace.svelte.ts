@@ -689,6 +689,11 @@ export async function hydrateProject(
           status: item.status,
           items: item.items,
           usage: item.usage ?? null,
+          // Thread per-turn model/effort through this hand-built remap so the
+          // footer's model survives restart — a field not copied here is silently
+          // dropped (which is exactly how it went missing before).
+          model: item.model ?? null,
+          effort: item.effort ?? null,
           spend: item.spend ?? null,
           // Thread the stable hydration key through this hand-built remap — the
           // merge dedups on it, and a field not copied here is silently dropped.

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/svelte";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import { tick } from "svelte";
 import type { AgentRecord, ConversationItem, NormalizedEvent } from "$lib/types";
 import { HEARTBEAT_TIMEOUT_MS } from "$lib/types";
@@ -9,6 +9,12 @@ import { agentCopy } from "$lib/agentCopy.svelte";
 // not inside the first test's timeout (cold CI transforms have no vite cache).
 // `vi.mock` is hoisted above imports, so the mocks below still apply.
 import UnifiedTranscript from "./UnifiedTranscript.svelte";
+import {
+  setProjectCompact,
+  toggleKey,
+  _testing as previewState,
+} from "$lib/state/transcriptPreview.svelte";
+import type { Turn } from "$lib/state/index.svelte";
 
 const listeners = new Map<string, (e: { payload: NormalizedEvent }) => void>();
 vi.mock("@tauri-apps/api/event", () => ({
@@ -41,6 +47,8 @@ function fireTo(channel: string, event: NormalizedEvent): void {
   cb({ payload: event });
 }
 
+const PROJECT_ID = "00000000-0000-7000-8000-0000000000ff";
+
 const CLAUDE_AGENT: AgentRecord = {
   id: "00000000-0000-7000-8000-000000000aaa",
   project_id: "00000000-0000-7000-8000-0000000000ff",
@@ -62,6 +70,10 @@ beforeEach(() => {
   listeners.clear();
   invokeMock.mockReset();
   agentCopy.set("last_answer_block");
+  // Default the suite to expanded rendering so behavioral tests state the mode
+  // they exercise. Compact mode is on by default in the app, so the
+  // compact/fan-out-control describes opt back into it explicitly.
+  setProjectCompact(PROJECT_ID, false);
 });
 
 const SEND_1 = "00000000-0000-7000-8000-0000000000d1";
@@ -69,6 +81,7 @@ const SEND_1 = "00000000-0000-7000-8000-0000000000d1";
 afterEach(async () => {
   const { _testing } = await loadState();
   _testing.reset();
+  previewState.reset();
 });
 
 describe("UnifiedTranscript", () => {
@@ -76,7 +89,7 @@ describe("UnifiedTranscript", () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
 
-    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     expect(screen.getByText(/no messages yet/i)).toBeInTheDocument();
   });
@@ -123,7 +136,9 @@ describe("UnifiedTranscript", () => {
       },
     ];
 
-    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT, CODEX_AGENT] } });
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] },
+    });
 
     const turns = screen.getAllByTestId("turn");
     expect(turns).toHaveLength(4);
@@ -164,7 +179,7 @@ describe("UnifiedTranscript", () => {
       },
     ];
 
-    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     const turns = screen.getAllByTestId("turn");
     // User must render before agent — preserved via stable sort over
@@ -192,7 +207,7 @@ describe("UnifiedTranscript", () => {
       },
     ];
 
-    render(UnifiedTranscript, { props: { agents: [CODEX_AGENT] } });
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
 
     const turn = screen.getByTestId("turn");
     expect(turn).toHaveAttribute("data-role", "user");
@@ -227,7 +242,7 @@ describe("UnifiedTranscript", () => {
       },
     ];
 
-    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     const turn = screen.getByTestId("turn");
     // The text chunks and tool are rendered in order — DOM children
@@ -272,7 +287,7 @@ describe("UnifiedTranscript", () => {
       },
     ];
 
-    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     const tool = screen.getByTestId("turn-tool");
     expect(tool).toHaveTextContent("read_file");
@@ -310,7 +325,7 @@ describe("UnifiedTranscript", () => {
       },
     ];
 
-    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     const tool = screen.getByTestId("turn-tool");
     expect(tool).not.toHaveAttribute("open");
@@ -347,7 +362,7 @@ describe("UnifiedTranscript", () => {
       },
     ];
 
-    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     const tool = screen.getByTestId("turn-tool");
     expect(tool).not.toHaveAttribute("open");
@@ -377,7 +392,7 @@ describe("UnifiedTranscript", () => {
       },
     ];
 
-    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     const tool = screen.getByTestId("turn-tool");
     expect(tool).toHaveAttribute("open");
@@ -398,7 +413,7 @@ describe("UnifiedTranscript", () => {
       },
     ];
 
-    render(UnifiedTranscript, { props: { agents: [CODEX_AGENT] } });
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
 
     expect(screen.getByTestId("turn-working")).toHaveTextContent("Working...");
   });
@@ -417,7 +432,7 @@ describe("UnifiedTranscript", () => {
       },
     ];
 
-    render(UnifiedTranscript, { props: { agents: [CODEX_AGENT] } });
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
 
     expect(screen.getByTestId("turn")).toHaveTextContent("ack");
     expect(screen.getByTestId("turn-working")).toHaveTextContent("Working...");
@@ -442,7 +457,7 @@ describe("UnifiedTranscript", () => {
       in_flight_turn_id: "agent-1",
     };
 
-    render(UnifiedTranscript, { props: { agents: [CODEX_AGENT] } });
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
 
     const footer = screen.getByTestId("turn-working");
     expect(footer).toHaveTextContent("No response");
@@ -471,7 +486,7 @@ describe("UnifiedTranscript", () => {
       in_flight_turn_id: "some-other-turn",
     };
 
-    render(UnifiedTranscript, { props: { agents: [CODEX_AGENT] } });
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
 
     const footer = screen.getByTestId("turn-working");
     expect(footer).toHaveTextContent("Working...");
@@ -487,7 +502,7 @@ describe("UnifiedTranscript", () => {
       const state = await loadState();
       await state.registerAgent(CODEX_AGENT);
 
-      render(UnifiedTranscript, { props: { agents: [CODEX_AGENT] } });
+      render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
 
       fireTo(`agent:${CODEX_AGENT.id}`, {
         type: "turn_start",
@@ -526,7 +541,7 @@ describe("UnifiedTranscript", () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
 
-    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     fireTo(`agent:${CLAUDE_AGENT.id}`, {
       type: "turn_start",
@@ -574,7 +589,7 @@ describe("UnifiedTranscript", () => {
       },
     ];
 
-    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     // Cancel is send-scoped (TOCTOU-safe), not turn-scoped: it targets the
     // turn's send_id, so a turn that completes mid-click can't be mis-cancelled.
@@ -601,7 +616,7 @@ describe("UnifiedTranscript", () => {
     );
     state.recordSendAccepted(CLAUDE_AGENT.id, "user-1", "msg-q");
 
-    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     expect(screen.getByTestId("turn-queued")).toHaveTextContent("Queued...");
     // The cancel control targets the queued send (send-scoped).
@@ -626,7 +641,7 @@ describe("UnifiedTranscript", () => {
       },
     ];
 
-    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     expect(screen.queryByTestId("turn-live-control")).toBeNull();
   });
@@ -648,7 +663,7 @@ describe("UnifiedTranscript", () => {
       },
     ];
 
-    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     expect(screen.getByTestId("turn-error")).toHaveTextContent("rate limited");
   });
@@ -736,7 +751,9 @@ describe("UnifiedTranscript — fan-out groups", () => {
       { status: "complete", text: "bob reply" },
     );
 
-    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT, CODEX_AGENT] } });
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] },
+    });
 
     expect(screen.getByTestId("fanout-group")).toBeInTheDocument();
     // The user's message renders once at the group head — exactly one
@@ -765,7 +782,9 @@ describe("UnifiedTranscript — fan-out groups", () => {
       { status: "complete", text: "bob reply", model: "gpt-5.5", effort: "high" },
     );
 
-    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT, CODEX_AGENT] } });
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] },
+    });
 
     const columns = screen.getAllByTestId("fanout-column");
     expect(columns[0]).toHaveTextContent("claude-opus-4-8");
@@ -784,7 +803,9 @@ describe("UnifiedTranscript — fan-out groups", () => {
     // Alice responded; bob is still queued (busy agent).
     seedFanout(state, { status: "complete", text: "alice reply" }, null);
 
-    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT, CODEX_AGENT] } });
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] },
+    });
 
     expect(screen.getByTestId("fanout-queued")).toHaveTextContent("Queued...");
     const columns = screen.getAllByTestId("fanout-column");
@@ -798,7 +819,9 @@ describe("UnifiedTranscript — fan-out groups", () => {
     // Alice streaming, bob queued → group is live.
     seedFanout(state, { status: "streaming", text: "thinking" }, null);
 
-    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT, CODEX_AGENT] } });
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] },
+    });
 
     const queuedCancel = screen.getByTestId("fanout-card-cancel");
     const streamingCancel = screen.getByTestId("turn-live-control");
@@ -825,7 +848,9 @@ describe("UnifiedTranscript — fan-out groups", () => {
     await state.registerAgent(CODEX_AGENT);
     seedFanout(state, { status: "complete", text: "a" }, { status: "complete", text: "b" });
 
-    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT, CODEX_AGENT] } });
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] },
+    });
 
     expect(screen.queryByTestId("fanout-card-cancel")).toBeNull();
   });
@@ -848,6 +873,7 @@ describe("UnifiedTranscript — fan-out groups", () => {
 
     render(UnifiedTranscript, {
       props: {
+        projectId: PROJECT_ID,
         agents: [CLAUDE_AGENT, CODEX_AGENT],
         overlay: [
           {
@@ -875,6 +901,93 @@ describe("UnifiedTranscript — fan-out groups", () => {
     expect(screen.queryByTestId("fanout-card-cancel")).toBeNull();
   });
 
+  it("renders a collapsed column's status chip last — after the indicator and body", async () => {
+    // Consistency with the expanded view: the terminal status (cancelled/failed)
+    // belongs on the LAST line, after the `n tool calls` indicator and the body —
+    // not stacked on top of the indicator (the prior collapsed-only order).
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "u-alice",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: SEND_1,
+        started_at: "2026-05-16T00:00:00Z",
+        text: "fan out",
+      },
+      {
+        role: "agent",
+        turn_id: "a-alice",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: SEND_1,
+        started_at: "2026-05-16T00:00:01Z",
+        status: "streaming", // cancelled-mid on disk; the marker below is authoritative
+        items: [
+          {
+            item_kind: "tool",
+            tool_use_id: "t1",
+            kind: "builtin",
+            name: "Bash",
+            input: { command: "x" },
+            started_at: "2026-05-16T00:00:01Z",
+            completed_at: "2026-05-16T00:00:02Z",
+            output: "ok",
+          },
+          { item_kind: "text", kind: "text", text: "partial work" },
+        ],
+      },
+    ];
+    state.transcripts[CODEX_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "u-bob",
+        agent_id: CODEX_AGENT.id,
+        send_id: SEND_1,
+        started_at: "2026-05-16T00:00:00Z",
+        text: "fan out",
+      },
+      {
+        role: "agent",
+        turn_id: "a-bob",
+        agent_id: CODEX_AGENT.id,
+        send_id: SEND_1,
+        started_at: "2026-05-16T00:00:02Z",
+        status: "complete",
+        items: [{ item_kind: "text", kind: "text", text: "bob reply" }],
+      },
+    ];
+    setProjectCompact(PROJECT_ID, true);
+
+    render(UnifiedTranscript, {
+      props: {
+        projectId: PROJECT_ID,
+        agents: [CLAUDE_AGENT, CODEX_AGENT],
+        overlay: [
+          {
+            kind: "outcome",
+            turn_id: "o-alice",
+            send_id: SEND_1,
+            agent_id: CLAUDE_AGENT.id,
+            status: "cancelled",
+            reason: null,
+            at: "2026-05-16T00:00:05Z",
+          },
+        ],
+      },
+    });
+
+    const column = screen.getAllByTestId("fanout-column")[0]!;
+    const indicator = within(column).getByTestId("hidden-items-indicator");
+    const chip = within(column).getByTestId("outcome-cancelled");
+    // The chip follows the indicator in document order (it's last, not first).
+    expect(indicator.compareDocumentPosition(chip) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // …and it follows the body text too.
+    const body = within(column).getByText("partial work");
+    expect(body.compareDocumentPosition(chip) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
   // Codex/Gemini/Antigravity persist a cancelled-mid turn as `failed`, not
   // `streaming`. The cancelled marker still wins, so the column reads cancelled
   // rather than the mislabelled "failed" the bare disk status would give.
@@ -893,6 +1006,7 @@ describe("UnifiedTranscript — fan-out groups", () => {
 
     render(UnifiedTranscript, {
       props: {
+        projectId: PROJECT_ID,
         agents: [CLAUDE_AGENT, CODEX_AGENT],
         overlay: [
           {
@@ -932,6 +1046,7 @@ describe("UnifiedTranscript — fan-out groups", () => {
 
     render(UnifiedTranscript, {
       props: {
+        projectId: PROJECT_ID,
         agents: [CLAUDE_AGENT, CODEX_AGENT],
         overlay: [
           {
@@ -976,7 +1091,7 @@ describe("UnifiedTranscript — fan-out groups", () => {
       },
     ];
 
-    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     expect(screen.queryByTestId("fanout-group")).toBeNull();
     expect(screen.getAllByTestId("turn")).toHaveLength(2);
@@ -1036,7 +1151,11 @@ describe("UnifiedTranscript — standalone cancelled turns", () => {
     seedSolo(state, CLAUDE_AGENT, "streaming");
 
     render(UnifiedTranscript, {
-      props: { agents: [CLAUDE_AGENT], overlay: cancelledOverlay(CLAUDE_AGENT) },
+      props: {
+        projectId: PROJECT_ID,
+        agents: [CLAUDE_AGENT],
+        overlay: cancelledOverlay(CLAUDE_AGENT),
+      },
     });
 
     expect(screen.queryByTestId("fanout-group")).toBeNull();
@@ -1054,7 +1173,11 @@ describe("UnifiedTranscript — standalone cancelled turns", () => {
     seedSolo(state, CODEX_AGENT, "failed");
 
     render(UnifiedTranscript, {
-      props: { agents: [CODEX_AGENT], overlay: cancelledOverlay(CODEX_AGENT) },
+      props: {
+        projectId: PROJECT_ID,
+        agents: [CODEX_AGENT],
+        overlay: cancelledOverlay(CODEX_AGENT),
+      },
     });
 
     expect(screen.getByTestId("outcome-cancelled")).toBeInTheDocument();
@@ -1098,7 +1221,7 @@ describe("UnifiedTranscript — markdown rendering", () => {
       },
     ];
 
-    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     const turn = screen.getByTestId("turn");
     // Both text segments are formatted (not raw markdown).
@@ -1125,7 +1248,7 @@ describe("UnifiedTranscript — markdown rendering", () => {
       },
     ];
 
-    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     const turn = screen.getByTestId("turn");
     expect(turn.querySelector("h1")).toHaveTextContent("Heading");
@@ -1175,7 +1298,9 @@ describe("UnifiedTranscript — markdown rendering", () => {
       },
     ];
 
-    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT, CODEX_AGENT] } });
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] },
+    });
 
     const columns = screen.getAllByTestId("fanout-column");
     expect(columns[0]!.querySelector("strong")).toHaveTextContent("alice");
@@ -1186,7 +1311,7 @@ describe("UnifiedTranscript — markdown rendering", () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
 
-    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     fireTo(`agent:${CLAUDE_AGENT.id}`, {
       type: "turn_start",
@@ -1225,7 +1350,7 @@ describe("UnifiedTranscript — markdown rendering", () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
 
-    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     const container = screen.getByTestId("unified-transcript");
     Object.defineProperty(container, "scrollHeight", { configurable: true, value: 1000 });
@@ -1257,6 +1382,100 @@ describe("UnifiedTranscript — markdown rendering", () => {
     });
   });
 
+  it("holds the user's position when scrolled up instead of yanking to the bottom", async () => {
+    // Same jsdom-stub approach: a content change while the user is scrolled up
+    // should keep their distance from the bottom constant (no jump), rather than
+    // re-pinning to the bottom.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const container = screen.getByTestId("unified-transcript");
+    Object.defineProperty(container, "scrollHeight", { configurable: true, value: 1000 });
+    Object.defineProperty(container, "clientHeight", { configurable: true, value: 500 });
+
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "turn_start",
+      turn_id: "turn-1",
+      message_id: "msg-1",
+      started_at: "2026-05-16T00:00:00Z",
+    });
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "content_chunk",
+      turn_id: "turn-1",
+      kind: "text",
+      text: "first",
+    });
+    // Let the initial pin settle before simulating a user scroll.
+    await waitFor(() => expect(container.scrollTop).toBe(1000));
+
+    // User scrolls up: 200px from the bottom (1000 - 300 - 500), so not pinned.
+    // A bare scroll event with UNCHANGED height is user-initiated — this is the
+    // scrollbar-drag / keyboard case (no wheel or touch involved).
+    container.scrollTop = 300;
+    await fireEvent.scroll(container);
+
+    // More content arrives and the document grows by 200px.
+    Object.defineProperty(container, "scrollHeight", { configurable: true, value: 1200 });
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "content_chunk",
+      turn_id: "turn-1",
+      kind: "text",
+      text: " more arrives while reading history",
+    });
+
+    // Position held at 200px from the (new) bottom: 1200 - 500 - 200 = 500.
+    await waitFor(() => {
+      expect(container.scrollTop).toBe(500);
+    });
+  });
+
+  it("does not unpin on a layout-induced scroll (content height changed)", async () => {
+    // The browser clamps scrollTop (and fires `scroll`) when content shrinks on
+    // collapse — that must NOT be read as the user scrolling away, or the next
+    // re-anchor jumps to a stale position. A `scroll` whose height differs from
+    // the last anchor is layout-induced and leaves `pinned` alone.
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const container = screen.getByTestId("unified-transcript");
+    Object.defineProperty(container, "scrollHeight", { configurable: true, value: 1000 });
+    Object.defineProperty(container, "clientHeight", { configurable: true, value: 500 });
+
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "turn_start",
+      turn_id: "turn-1",
+      message_id: "msg-1",
+      started_at: "2026-05-16T00:00:00Z",
+    });
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "content_chunk",
+      turn_id: "turn-1",
+      kind: "text",
+      text: "x",
+    });
+    await waitFor(() => expect(container.scrollTop).toBe(1000)); // pinned, lastScrollHeight=1000
+
+    // A content change leaves scrollTop far from the bottom AND fires `scroll`
+    // with a different height — the collapse-clamp shape.
+    Object.defineProperty(container, "scrollHeight", { configurable: true, value: 2000 });
+    container.scrollTop = 100; // gap of 2000 - 100 - 500 = 1400, well past the 32px threshold
+    await fireEvent.scroll(container); // height (2000) !== lastScrollHeight (1000) → must not unpin
+
+    // Still pinned: the next content change re-pins to the bottom (2000), not the
+    // preserve-distance position (2000 - 500 - 1400 = 100) it would land on if unpinned.
+    fireTo(`agent:${CLAUDE_AGENT.id}`, {
+      type: "content_chunk",
+      turn_id: "turn-1",
+      kind: "text",
+      text: "y",
+    });
+    await waitFor(() => expect(container.scrollTop).toBe(2000));
+  });
+
   it("intercepts a link click, routes it to open_external_url, and prevents navigation", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
@@ -1271,7 +1490,7 @@ describe("UnifiedTranscript — markdown rendering", () => {
       },
     ];
 
-    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     const link = screen.getByTestId("turn").querySelector("a");
     if (!link) throw new Error("expected a rendered link");
@@ -1299,7 +1518,7 @@ describe("UnifiedTranscript — per-message copy", () => {
       },
     ];
 
-    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
     copyTextMock.mockClear();
 
     const turn = screen.getByTestId("turn");
@@ -1338,7 +1557,7 @@ describe("UnifiedTranscript — per-message copy", () => {
       },
     ];
 
-    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
     copyTextMock.mockClear();
 
     const turn = screen.getByTestId("turn");
@@ -1379,7 +1598,7 @@ describe("UnifiedTranscript — per-message copy", () => {
       },
     ];
 
-    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
     copyTextMock.mockClear();
 
     const turn = screen.getByTestId("turn");
@@ -1408,7 +1627,7 @@ describe("UnifiedTranscript — per-message copy", () => {
       },
     ];
 
-    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     // Both render, via distinct containers.
     const thinking = screen.getByTestId("turn-thinking");
@@ -1445,7 +1664,7 @@ describe("UnifiedTranscript — per-message copy", () => {
       },
     ];
 
-    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
     copyTextMock.mockClear();
 
     const turn = screen.getByTestId("turn");
@@ -1471,7 +1690,7 @@ describe("UnifiedTranscript — per-message copy", () => {
       },
     ];
 
-    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     const time = screen.getByTestId("turn").querySelector('[data-testid="message-time"]');
     if (!time) throw new Error("expected a timestamp on the message");
@@ -1505,7 +1724,7 @@ describe("UnifiedTranscript — per-message copy", () => {
       },
     ];
 
-    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     expect(screen.getByTestId("turn").querySelector('[data-testid="message-copy"]')).toBeNull();
   });
@@ -1556,7 +1775,9 @@ describe("UnifiedTranscript — per-message copy", () => {
       },
     ];
 
-    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT, CODEX_AGENT] } });
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] },
+    });
     copyTextMock.mockClear();
 
     const firstColumn = screen.getAllByTestId("fanout-column")[0]!;
@@ -1585,7 +1806,7 @@ describe("UnifiedTranscript — per-message cost + overage", () => {
       },
     ];
 
-    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     expect(screen.getByTestId("message-cost")).toHaveTextContent("$0.0125");
     expect(screen.getByTestId("message-overage")).toBeInTheDocument();
@@ -1609,7 +1830,7 @@ describe("UnifiedTranscript — per-message cost + overage", () => {
       },
     ];
 
-    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     expect(screen.queryByTestId("message-cost")).toBeNull();
     expect(screen.queryByTestId("message-overage")).toBeNull();
@@ -1631,7 +1852,7 @@ describe("UnifiedTranscript — per-message cost + overage", () => {
       },
     ];
 
-    render(UnifiedTranscript, { props: { agents: [CODEX_AGENT] } });
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
 
     expect(screen.queryByTestId("message-cost")).toBeNull();
     expect(screen.queryByTestId("message-overage")).toBeNull();
@@ -1647,6 +1868,7 @@ describe("UnifiedTranscript hydration failures", () => {
     const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, {
       props: {
+        projectId: PROJECT_ID,
         agents: [CLAUDE_AGENT],
         loadStatus: "failed",
         loadError: "journal read failed at /work/journal.jsonl",
@@ -1675,7 +1897,12 @@ describe("UnifiedTranscript hydration failures", () => {
 
     const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
     render(UnifiedTranscript, {
-      props: { agents: [CLAUDE_AGENT], loadStatus: "failed", loadError: "boom" },
+      props: {
+        projectId: PROJECT_ID,
+        agents: [CLAUDE_AGENT],
+        loadStatus: "failed",
+        loadError: "boom",
+      },
     });
 
     expect(screen.getByTestId("transcript-load-failed")).toBeInTheDocument();
@@ -1695,7 +1922,7 @@ describe("UnifiedTranscript hydration failures", () => {
     };
 
     const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
-    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     expect(screen.getByTestId("agent-hydration-failed")).toBeInTheDocument();
     expect(screen.queryByText(/no messages yet/i)).toBeNull();
@@ -1713,7 +1940,7 @@ describe("UnifiedTranscript hydration failures", () => {
     };
 
     const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
-    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     const banner = screen.getByTestId("agent-hydration-failed");
     expect(banner).toHaveTextContent("Couldn't load alice's history");
@@ -1737,7 +1964,7 @@ describe("UnifiedTranscript hydration failures", () => {
     };
 
     const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
-    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
     expect(screen.getByTestId("agent-hydration-failed")).toBeInTheDocument();
 
     // Retry re-runs hydration; stage a successful load.
@@ -1769,7 +1996,7 @@ describe("UnifiedTranscript hydration failures", () => {
     };
 
     const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
-    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     invokeMock.mockRejectedValueOnce(new Error("still broken"));
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -1799,7 +2026,7 @@ describe("UnifiedTranscript hydration failures", () => {
       },
     ];
 
-    render(UnifiedTranscript, { props: { agents: [CODEX_AGENT] } });
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
 
     expect(screen.getByTestId("message-model")).toHaveTextContent("gpt-5.5");
     expect(screen.getByTestId("message-effort")).toHaveTextContent("high");
@@ -1820,7 +2047,7 @@ describe("UnifiedTranscript hydration failures", () => {
       },
     ];
 
-    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     expect(screen.getByTestId("message-model")).toHaveTextContent("claude-opus-4-8");
     expect(screen.queryByTestId("message-effort")).toBeNull();
@@ -1839,7 +2066,7 @@ describe("UnifiedTranscript hydration failures", () => {
       },
     ];
 
-    render(UnifiedTranscript, { props: { agents: [CLAUDE_AGENT] } });
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     expect(screen.getByTestId("turn")).toBeInTheDocument();
     expect(screen.queryByTestId("message-model")).toBeNull();
@@ -1867,7 +2094,7 @@ describe("UnifiedTranscript — attachments", () => {
       },
     ];
 
-    render(UnifiedTranscript, { props: { agents: [CODEX_AGENT] } });
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
 
     const thumb = (await screen.findByTestId("attachment-thumb-image-1")) as HTMLImageElement;
     // The thumbnail uses convertFileSrc (asset:// URL), not the raw filesystem path.
@@ -1879,5 +2106,881 @@ describe("UnifiedTranscript — attachments", () => {
     const turn = screen.getByTestId("turn");
     expect(turn.textContent).not.toContain(imgPath);
     expect(turn.textContent).not.toContain(filePath);
+  });
+});
+
+describe("UnifiedTranscript compact mode", () => {
+  type AgentTurn = Extract<Turn, { role: "agent" }>;
+  type Item = AgentTurn["items"][number];
+
+  const ANSWER = (text: string): Item => ({ item_kind: "text", kind: "text", text });
+  const THINK = (text: string): Item => ({ item_kind: "text", kind: "thinking", text });
+  const TOOL = (id: string): Item => ({
+    item_kind: "tool",
+    tool_use_id: id,
+    kind: "builtin",
+    name: "bash",
+    input: {},
+    output: "ok",
+    is_error: false,
+    started_at: "2026-05-16T00:00:01Z",
+    completed_at: "2026-05-16T00:00:02Z",
+  });
+
+  function user(agent: AgentRecord, sendId: string, turnId: string, at: string): Turn {
+    return {
+      role: "user",
+      turn_id: turnId,
+      agent_id: agent.id,
+      send_id: sendId,
+      started_at: at,
+      text: "prompt",
+    };
+  }
+  function done(
+    agent: AgentRecord,
+    sendId: string,
+    turnId: string,
+    startedAt: string,
+    endedAt: string,
+    items: Item[],
+  ): Turn {
+    return {
+      role: "agent",
+      turn_id: turnId,
+      agent_id: agent.id,
+      send_id: sendId,
+      started_at: startedAt,
+      ended_at: endedAt,
+      status: "complete",
+      items,
+    };
+  }
+
+  /// aria-label of the preview toggle inside an element ("Expand" when the unit
+  /// is compact, "Collapse" when expanded), or null when there is no toggle.
+  function toggleLabel(el: HTMLElement): string | null {
+    return (
+      el.querySelector('[data-testid="turn-preview-toggle"]')?.getAttribute("aria-label") ?? null
+    );
+  }
+  function agentTurns(): HTMLElement[] {
+    return screen.getAllByTestId("turn").filter((el) => el.getAttribute("data-role") === "agent");
+  }
+
+  it("renders an agent's latest response as the last block and an older one clipped", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      user(CLAUDE_AGENT, "send-a", "u-a", "2026-05-16T00:00:00Z"),
+      done(CLAUDE_AGENT, "send-a", "a-a", "2026-05-16T00:00:01Z", "2026-05-16T00:00:02Z", [
+        ANSWER("old first"),
+        TOOL("t1"),
+        ANSWER("old last"),
+      ]),
+      user(CLAUDE_AGENT, "send-b", "u-b", "2026-05-16T00:00:10Z"),
+      done(CLAUDE_AGENT, "send-b", "a-b", "2026-05-16T00:00:11Z", "2026-05-16T00:00:12Z", [
+        ANSWER("new first"),
+        TOOL("t2"),
+        ANSWER("new last"),
+      ]),
+    ];
+    setProjectCompact(PROJECT_ID, true);
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const [older, latest] = agentTurns();
+    // Latest → last-block: only the final answer block, tools hidden.
+    expect(within(latest!).getByText("new last")).toBeInTheDocument();
+    expect(within(latest!).queryByText("new first")).toBeNull();
+    // Older → clipped preview: all answer text, tools hidden.
+    expect(within(older!).getByText("old first")).toBeInTheDocument();
+    expect(within(older!).getByText("old last")).toBeInTheDocument();
+    expect(screen.queryByTestId("tool-done")).toBeNull();
+    // Both are collapsed by default now.
+    expect(toggleLabel(older!)).toBe("Expand");
+    expect(toggleLabel(latest!)).toBe("Expand");
+  });
+
+  it("keeps each agent's most-recent response as last-block even when another agent replied later", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    // CLAUDE's only response is globally older than CODEX's, but it is still
+    // CLAUDE's latest → it gets the last-block treatment, not a clipped preview.
+    state.transcripts[CLAUDE_AGENT.id] = [
+      user(CLAUDE_AGENT, "send-1", "u-1", "2026-05-16T00:00:00Z"),
+      done(CLAUDE_AGENT, "send-1", "a-1", "2026-05-16T00:00:01Z", "2026-05-16T00:00:02Z", [
+        ANSWER("claude first"),
+        ANSWER("claude last"),
+      ]),
+    ];
+    state.transcripts[CODEX_AGENT.id] = [
+      user(CODEX_AGENT, "send-2", "u-2", "2026-05-16T00:00:09Z"),
+      done(CODEX_AGENT, "send-2", "a-2", "2026-05-16T00:00:10Z", "2026-05-16T00:00:11Z", [
+        ANSWER("codex first"),
+        ANSWER("codex last"),
+      ]),
+    ];
+    setProjectCompact(PROJECT_ID, true);
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] },
+    });
+
+    const [claudeTurn, codexTurn] = agentTurns();
+    expect(within(claudeTurn!).getByText("claude last")).toBeInTheDocument();
+    expect(within(claudeTurn!).queryByText("claude first")).toBeNull();
+    expect(within(codexTurn!).getByText("codex last")).toBeInTheDocument();
+    expect(within(codexTurn!).queryByText("codex first")).toBeNull();
+  });
+
+  it("picks each agent's last-block response by completion recency, not rendered order", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    // send-a is anchored earlier (renders first) but finishes LAST (ended t5).
+    state.transcripts[CLAUDE_AGENT.id] = [
+      user(CLAUDE_AGENT, "send-a", "u-a", "2026-05-16T00:00:00Z"),
+      done(CLAUDE_AGENT, "send-a", "a-a", "2026-05-16T00:00:01Z", "2026-05-16T00:00:05Z", [
+        ANSWER("a first"),
+        ANSWER("a last"),
+      ]),
+      user(CLAUDE_AGENT, "send-b", "u-b", "2026-05-16T00:00:02Z"),
+      done(CLAUDE_AGENT, "send-b", "a-b", "2026-05-16T00:00:03Z", "2026-05-16T00:00:04Z", [
+        ANSWER("b first"),
+        ANSWER("b last"),
+      ]),
+    ];
+    setProjectCompact(PROJECT_ID, true);
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const [first, second] = agentTurns();
+    // send-a is the latest by recency → last-block (only its final block).
+    expect(within(first!).getByText("a last")).toBeInTheDocument();
+    expect(within(first!).queryByText("a first")).toBeNull();
+    // send-b is older → clipped preview (all its answer text).
+    expect(within(second!).getByText("b first")).toBeInTheDocument();
+    expect(within(second!).getByText("b last")).toBeInTheDocument();
+  });
+
+  it("renders each latest fan-out column as its last block", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    // Earlier standalone send, then a later fan-out (each agent's latest).
+    state.transcripts[CLAUDE_AGENT.id] = [
+      user(CLAUDE_AGENT, "send-a", "u-a", "2026-05-16T00:00:00Z"),
+      done(CLAUDE_AGENT, "send-a", "a-a", "2026-05-16T00:00:01Z", "2026-05-16T00:00:02Z", [
+        ANSWER("solo first"),
+        ANSWER("solo last"),
+      ]),
+      user(CLAUDE_AGENT, "send-b", "u-bc", "2026-05-16T00:00:10Z"),
+      done(CLAUDE_AGENT, "send-b", "a-bc", "2026-05-16T00:00:11Z", "2026-05-16T00:00:13Z", [
+        ANSWER("alice first"),
+        ANSWER("alice last"),
+      ]),
+    ];
+    state.transcripts[CODEX_AGENT.id] = [
+      user(CODEX_AGENT, "send-b", "u-bx", "2026-05-16T00:00:10Z"),
+      done(CODEX_AGENT, "send-b", "a-bx", "2026-05-16T00:00:11Z", "2026-05-16T00:00:12Z", [
+        ANSWER("bob first"),
+        ANSWER("bob last"),
+      ]),
+    ];
+    setProjectCompact(PROJECT_ID, true);
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] },
+    });
+
+    const [aliceCol, bobCol] = screen.getAllByTestId("fanout-column");
+    expect(within(aliceCol!).getByText("alice last")).toBeInTheDocument();
+    expect(within(aliceCol!).queryByText("alice first")).toBeNull();
+    expect(within(bobCol!).getByText("bob last")).toBeInTheDocument();
+    expect(within(bobCol!).queryByText("bob first")).toBeNull();
+    // Older standalone → clipped preview (all answer text).
+    const solo = agentTurns()[0];
+    expect(within(solo!).getByText("solo first")).toBeInTheDocument();
+    expect(within(solo!).getByText("solo last")).toBeInTheDocument();
+  });
+
+  it("lets a manual toggle expand only that unit", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    // Each response has a tool call, so each has something to expand.
+    state.transcripts[CLAUDE_AGENT.id] = [
+      user(CLAUDE_AGENT, "send-a", "u-a", "2026-05-16T00:00:00Z"),
+      done(CLAUDE_AGENT, "send-a", "a-a", "2026-05-16T00:00:01Z", "2026-05-16T00:00:02Z", [
+        TOOL("ta"),
+        ANSWER("A"),
+      ]),
+      user(CLAUDE_AGENT, "send-b", "u-b", "2026-05-16T00:00:10Z"),
+      done(CLAUDE_AGENT, "send-b", "a-b", "2026-05-16T00:00:11Z", "2026-05-16T00:00:12Z", [
+        TOOL("tb"),
+        ANSWER("B"),
+      ]),
+      user(CLAUDE_AGENT, "send-c", "u-c", "2026-05-16T00:00:20Z"),
+      done(CLAUDE_AGENT, "send-c", "a-c", "2026-05-16T00:00:21Z", "2026-05-16T00:00:22Z", [
+        TOOL("tc"),
+        ANSWER("C"),
+      ]),
+    ];
+    setProjectCompact(PROJECT_ID, true);
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const [a, b, c] = agentTurns();
+    // Everything is collapsed by default.
+    expect(toggleLabel(a!)).toBe("Expand");
+    expect(toggleLabel(b!)).toBe("Expand");
+    expect(toggleLabel(c!)).toBe("Expand");
+    await fireEvent.click(a!.querySelector('[data-testid="turn-preview-toggle"]')!);
+    expect(toggleLabel(a!)).toBe("Collapse"); // now expanded
+    expect(toggleLabel(b!)).toBe("Expand"); // unchanged
+    expect(toggleLabel(c!)).toBe("Expand"); // unchanged
+  });
+
+  it("renders no compact toggle on a queued row", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.dispatchUserTurn(CLAUDE_AGENT.id, "u-q", "later", [], "send-q", "2026-05-16T00:00:00Z");
+    state.recordSendAccepted(CLAUDE_AGENT.id, "u-q", "msg-q");
+    setProjectCompact(PROJECT_ID, true);
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const queuedRow = agentTurns().find((el) => el.querySelector('[data-testid="turn-queued"]'));
+    expect(queuedRow).toBeDefined();
+    expect(toggleLabel(queuedRow!)).toBeNull();
+  });
+
+  it("renders no compact toggle on an outcome-only row", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    setProjectCompact(PROJECT_ID, true);
+
+    const overlay: ConversationItem[] = [
+      {
+        kind: "outcome",
+        turn_id: "o-1",
+        send_id: "send-a",
+        agent_id: CLAUDE_AGENT.id,
+        status: "failed",
+        reason: "boom",
+        at: "2026-05-16T00:00:05Z",
+      },
+    ];
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT], overlay },
+    });
+
+    const outcome = screen.getByTestId("turn-outcome");
+    expect(toggleLabel(outcome)).toBeNull();
+  });
+
+  it("hides tool calls and thinking widgets in a compact completed response", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      user(CLAUDE_AGENT, "send-a", "u-a", "2026-05-16T00:00:00Z"),
+      done(CLAUDE_AGENT, "send-a", "a-1", "2026-05-16T00:00:01Z", "2026-05-16T00:00:02Z", [
+        THINK("private reasoning"),
+        TOOL("t1"),
+        ANSWER("the answer"),
+      ]),
+    ];
+    // Force this single (latest) turn compact via an explicit override.
+    toggleKey(PROJECT_ID, "agent:a-1", false);
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    expect(screen.queryByTestId("turn-thinking")).toBeNull();
+    expect(screen.queryByTestId("tool-done")).toBeNull();
+    expect(screen.getByText("the answer")).toBeInTheDocument();
+    // Copy is unaffected by the compact preview.
+    expect(agentTurns()[0]!.querySelector('[data-testid="message-copy"]')).not.toBeNull();
+  });
+
+  it("shows a hidden-items indicator with the tool-call count on a compact response", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      user(CLAUDE_AGENT, "send-a", "u-a", "2026-05-16T00:00:00Z"),
+      done(CLAUDE_AGENT, "send-a", "a-1", "2026-05-16T00:00:01Z", "2026-05-16T00:00:02Z", [
+        TOOL("t1"),
+        TOOL("t2"),
+        ANSWER("done"),
+      ]),
+    ];
+    setProjectCompact(PROJECT_ID, true);
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const indicator = screen.getByTestId("hidden-items-indicator");
+    expect(indicator).toHaveTextContent("2 tool calls");
+    // Clicking it expands the response, revealing the tools.
+    expect(screen.queryByTestId("tool-done")).toBeNull();
+    await fireEvent.click(indicator);
+    expect(screen.getAllByTestId("tool-done").length).toBe(2);
+    expect(screen.queryByTestId("hidden-items-indicator")).toBeNull();
+  });
+
+  it("shows the hidden-items indicator on an older clipped response too", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      user(CLAUDE_AGENT, "send-a", "u-a", "2026-05-16T00:00:00Z"),
+      done(CLAUDE_AGENT, "send-a", "a-old", "2026-05-16T00:00:01Z", "2026-05-16T00:00:02Z", [
+        TOOL("t1"),
+        ANSWER("older answer"),
+      ]),
+      user(CLAUDE_AGENT, "send-b", "u-b", "2026-05-16T00:00:10Z"),
+      done(CLAUDE_AGENT, "send-b", "a-new", "2026-05-16T00:00:11Z", "2026-05-16T00:00:12Z", [
+        ANSWER("newest"),
+      ]),
+    ];
+    setProjectCompact(PROJECT_ID, true);
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    // The older (clipped) response hid a tool → indicator present with the count.
+    const older = agentTurns()[0]!;
+    expect(within(older).getByTestId("hidden-items-indicator")).toHaveTextContent("1 tool call");
+    // The newest (last-block, no tools) hides nothing non-text → no indicator.
+    expect(within(agentTurns()[1]!).queryByTestId("hidden-items-indicator")).toBeNull();
+  });
+
+  it("shows no toggle when collapsing would hide nothing (short, no tools)", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    // A short user prompt and a single-block agent answer with no tools: the
+    // collapsed and expanded views are identical, so neither shows a toggle.
+    // (A long message that overflows the clip gets one via DOM measurement,
+    // which jsdom can't exercise — verified in the real app.)
+    state.transcripts[CLAUDE_AGENT.id] = [
+      user(CLAUDE_AGENT, "send-a", "u-a", "2026-05-16T00:00:00Z"),
+      done(CLAUDE_AGENT, "send-a", "a-1", "2026-05-16T00:00:01Z", "2026-05-16T00:00:02Z", [
+        ANSWER("hi"),
+      ]),
+    ];
+    setProjectCompact(PROJECT_ID, true);
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const userRow = screen
+      .getAllByTestId("turn")
+      .find((el) => el.getAttribute("data-role") === "user");
+    expect(toggleLabel(userRow!)).toBeNull();
+    expect(toggleLabel(agentTurns()[0]!)).toBeNull();
+    // The content still renders (just without a redundant toggle).
+    expect(within(userRow!).getByText("prompt")).toBeInTheDocument();
+    expect(screen.getByText("hi")).toBeInTheDocument();
+  });
+
+  it("does not give a streaming response a compact preview", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      user(CLAUDE_AGENT, "send-a", "u-a", "2026-05-16T00:00:00Z"),
+      {
+        role: "agent",
+        turn_id: "a-1",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: "send-a",
+        started_at: "2026-05-16T00:00:01Z",
+        status: "streaming",
+        items: [ANSWER("streaming…")],
+      },
+    ];
+    setProjectCompact(PROJECT_ID, true);
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const [streaming] = agentTurns();
+    expect(toggleLabel(streaming!)).toBeNull(); // no compact toggle while streaming
+    expect(screen.getByTestId("turn-working")).toBeInTheDocument(); // live footer stays
+  });
+
+  it("offers a per-message toggle even with compact mode off, compacting only that unit", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    setProjectCompact(PROJECT_ID, false);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      user(CLAUDE_AGENT, "send-a", "u-a", "2026-05-16T00:00:00Z"),
+      done(CLAUDE_AGENT, "send-a", "a-1", "2026-05-16T00:00:01Z", "2026-05-16T00:00:02Z", [
+        TOOL("t1"),
+        ANSWER("the answer"),
+      ]),
+    ];
+    // Compact mode is OFF (default).
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const [turn] = agentTurns();
+    expect(toggleLabel(turn!)).toBe("Collapse"); // expanded, but a toggle is offered
+    expect(screen.getByTestId("tool-done")).toBeInTheDocument();
+
+    await fireEvent.click(turn!.querySelector('[data-testid="turn-preview-toggle"]')!);
+    expect(toggleLabel(turn!)).toBe("Expand"); // now compact
+    expect(screen.queryByTestId("tool-done")).toBeNull(); // tool suppressed
+  });
+});
+
+describe("UnifiedTranscript live streaming cap", () => {
+  // jsdom has no layout, so the bottom-pin scroll math can't be exercised here
+  // (verified in the real-app walkthrough). These cover the DOM contract: the
+  // cap wraps streamed content, the live footer sits outside it, and the cap is
+  // gone once the turn completes.
+  const text = (t: string) => ({ item_kind: "text" as const, kind: "text" as const, text: t });
+  function streaming(agent: AgentRecord, sendId: string, turnId: string, body: string): Turn {
+    return {
+      role: "agent",
+      turn_id: turnId,
+      agent_id: agent.id,
+      send_id: sendId,
+      started_at: "2026-05-16T00:00:01Z",
+      status: "streaming",
+      items: [text(body)],
+    };
+  }
+
+  it("caps a streaming standalone response and keeps the footer outside the cap", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "u-1",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: "send-1",
+        started_at: "2026-05-16T00:00:00Z",
+        text: "go",
+      },
+      streaming(CLAUDE_AGENT, "send-1", "a-1", "streaming output"),
+    ];
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const scroll = screen.getByTestId("turn-live-scroll");
+    expect(scroll).toHaveTextContent("streaming output"); // streamed content is inside the cap
+    // The working/cancel footer is rendered as a sibling, never inside the cap.
+    expect(scroll.querySelector('[data-testid="turn-working"]')).toBeNull();
+    expect(screen.getByTestId("turn-working")).toBeInTheDocument();
+  });
+
+  it("caps each streaming fan-out column independently", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "u-a",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: "send-f",
+        started_at: "2026-05-16T00:00:00Z",
+        text: "fan",
+      },
+      streaming(CLAUDE_AGENT, "send-f", "a-a", "alice streaming"),
+    ];
+    state.transcripts[CODEX_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "u-b",
+        agent_id: CODEX_AGENT.id,
+        send_id: "send-f",
+        started_at: "2026-05-16T00:00:00Z",
+        text: "fan",
+      },
+      streaming(CODEX_AGENT, "send-f", "a-b", "bob streaming"),
+    ];
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] },
+    });
+
+    expect(screen.getAllByTestId("turn-live-scroll")).toHaveLength(2);
+    // Each column's footer stays outside its own cap.
+    for (const scroll of screen.getAllByTestId("turn-live-scroll")) {
+      expect(scroll.querySelector('[data-testid="turn-working"]')).toBeNull();
+    }
+    expect(screen.getAllByTestId("turn-working")).toHaveLength(2);
+  });
+
+  it("removes the cap once the turn completes, leaving the latest response expanded", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "u-1",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: "send-1",
+        started_at: "2026-05-16T00:00:00Z",
+        text: "go",
+      },
+      {
+        role: "agent",
+        turn_id: "a-1",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: "send-1",
+        started_at: "2026-05-16T00:00:01Z",
+        ended_at: "2026-05-16T00:00:02Z",
+        status: "complete",
+        items: [text("final answer")],
+      },
+    ];
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    expect(screen.queryByTestId("turn-live-scroll")).toBeNull(); // cap gone
+    expect(screen.getByText("final answer")).toBeInTheDocument(); // latest, expanded
+    expect(screen.queryByTestId("turn-working")).toBeNull();
+  });
+});
+
+describe("UnifiedTranscript fan-out group control", () => {
+  // These cases lean on compact-on defaults (older groups collapsed, latest set
+  // expanded), which is the app default; opt back in after the suite-wide off.
+  beforeEach(() => {
+    setProjectCompact(PROJECT_ID, true);
+  });
+
+  const text = (t: string) => ({ item_kind: "text" as const, kind: "text" as const, text: t });
+  const tool = (id: string) => ({
+    item_kind: "tool" as const,
+    tool_use_id: id,
+    kind: "builtin" as const,
+    name: "bash",
+    input: {},
+    output: "ok",
+    is_error: false,
+    started_at: "2026-05-16T00:00:01Z",
+    completed_at: "2026-05-16T00:00:02Z",
+  });
+  function u(agent: AgentRecord, sendId: string, turnId: string, at: string): Turn {
+    return {
+      role: "user",
+      turn_id: turnId,
+      agent_id: agent.id,
+      send_id: sendId,
+      started_at: at,
+      text: "fan",
+    };
+  }
+  // A response with a tool call so it has something to expand → a real toggle.
+  function a(
+    agent: AgentRecord,
+    sendId: string,
+    turnId: string,
+    started: string,
+    ended: string,
+  ): Turn {
+    return {
+      role: "agent",
+      turn_id: turnId,
+      agent_id: agent.id,
+      send_id: sendId,
+      started_at: started,
+      ended_at: ended,
+      status: "complete",
+      items: [tool(`${turnId}-t`), text(`${agent.name} reply`)],
+    };
+  }
+  function columnLabels(group: HTMLElement): (string | null)[] {
+    return [...group.querySelectorAll('[data-testid="fanout-column"]')].map(
+      (col) =>
+        col.querySelector('[data-testid="turn-preview-toggle"]')?.getAttribute("aria-label") ??
+        null,
+    );
+  }
+  function groupToggle(group: HTMLElement): HTMLElement {
+    return group.querySelector('[data-testid="fanout-preview-toggle-all"]')!;
+  }
+
+  it("renders the group control with the responses, not inside the user message", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      u(CLAUDE_AGENT, "send-f", "u-a", "2026-05-16T00:00:00Z"),
+      a(CLAUDE_AGENT, "send-f", "a-a", "2026-05-16T00:00:01Z", "2026-05-16T00:00:03Z"),
+    ];
+    state.transcripts[CODEX_AGENT.id] = [
+      u(CODEX_AGENT, "send-f", "u-b", "2026-05-16T00:00:00Z"),
+      a(CODEX_AGENT, "send-f", "a-b", "2026-05-16T00:00:01Z", "2026-05-16T00:00:02Z"),
+    ];
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] },
+    });
+
+    const group = screen.getByTestId("fanout-group");
+    const userTurn = within(group)
+      .getAllByTestId("turn")
+      .find((el) => el.getAttribute("data-role") === "user")!;
+    // The toggle-all must not live inside the user message's hover scope (that
+    // was leaking the user prompt's meta onto response hover).
+    expect(userTurn.querySelector('[data-testid="fanout-preview-toggle-all"]')).toBeNull();
+    expect(groupToggle(group)).toBeInTheDocument();
+  });
+
+  it("shows a per-column hidden-items indicator and expands the column on click", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    // `a()` includes a tool call, so each collapsed column hides a tool → indicator.
+    state.transcripts[CLAUDE_AGENT.id] = [
+      u(CLAUDE_AGENT, "send-f", "u-a", "2026-05-16T00:00:00Z"),
+      a(CLAUDE_AGENT, "send-f", "a-a", "2026-05-16T00:00:01Z", "2026-05-16T00:00:03Z"),
+    ];
+    state.transcripts[CODEX_AGENT.id] = [
+      u(CODEX_AGENT, "send-f", "u-b", "2026-05-16T00:00:00Z"),
+      a(CODEX_AGENT, "send-f", "a-b", "2026-05-16T00:00:01Z", "2026-05-16T00:00:02Z"),
+    ];
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] },
+    });
+
+    const [aliceCol] = screen.getAllByTestId("fanout-column");
+    const indicator = within(aliceCol!).getByTestId("hidden-items-indicator");
+    expect(indicator).toHaveTextContent("1 tool call");
+    expect(within(aliceCol!).queryByTestId("tool-done")).toBeNull(); // tool hidden while collapsed
+    await fireEvent.click(indicator);
+    expect(within(aliceCol!).getByTestId("tool-done")).toBeInTheDocument(); // expanded
+  });
+
+  it("expands all columns when none is, and collapses all when any is", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    // A single fan-out → both columns start collapsed (each agent's last block).
+    state.transcripts[CLAUDE_AGENT.id] = [
+      u(CLAUDE_AGENT, "send-f", "u-a", "2026-05-16T00:00:00Z"),
+      a(CLAUDE_AGENT, "send-f", "a-a", "2026-05-16T00:00:01Z", "2026-05-16T00:00:03Z"),
+    ];
+    state.transcripts[CODEX_AGENT.id] = [
+      u(CODEX_AGENT, "send-f", "u-b", "2026-05-16T00:00:00Z"),
+      a(CODEX_AGENT, "send-f", "a-b", "2026-05-16T00:00:01Z", "2026-05-16T00:00:02Z"),
+    ];
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] },
+    });
+
+    const group = screen.getByTestId("fanout-group");
+    expect(columnLabels(group)).toEqual(["Expand", "Expand"]); // both collapsed
+    expect(groupToggle(group)).toHaveAttribute("aria-label", "Expand all responses");
+
+    await fireEvent.click(groupToggle(group));
+    expect(columnLabels(group)).toEqual(["Collapse", "Collapse"]); // all expanded
+    expect(groupToggle(group)).toHaveAttribute("aria-label", "Collapse all responses");
+
+    await fireEvent.click(groupToggle(group));
+    expect(columnLabels(group)).toEqual(["Expand", "Expand"]); // all collapsed again
+  });
+
+  it("affects only its own fan-out group", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    // Two fan-outs, plus a later standalone send so neither fan-out is the
+    // latest set → both groups' columns start compact by default.
+    state.transcripts[CLAUDE_AGENT.id] = [
+      u(CLAUDE_AGENT, "send-a", "u-a", "2026-05-16T00:00:00Z"),
+      a(CLAUDE_AGENT, "send-a", "a-a", "2026-05-16T00:00:01Z", "2026-05-16T00:00:02Z"),
+      u(CLAUDE_AGENT, "send-b", "u-b", "2026-05-16T00:00:10Z"),
+      a(CLAUDE_AGENT, "send-b", "a-b", "2026-05-16T00:00:11Z", "2026-05-16T00:00:12Z"),
+      {
+        role: "user",
+        turn_id: "u-z",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: "send-z",
+        started_at: "2026-05-16T00:00:20Z",
+        text: "solo",
+      },
+      {
+        role: "agent",
+        turn_id: "a-z",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: "send-z",
+        started_at: "2026-05-16T00:00:21Z",
+        ended_at: "2026-05-16T00:00:22Z",
+        status: "complete",
+        items: [text("latest solo")],
+      },
+    ];
+    state.transcripts[CODEX_AGENT.id] = [
+      u(CODEX_AGENT, "send-a", "uc-a", "2026-05-16T00:00:00Z"),
+      a(CODEX_AGENT, "send-a", "ac-a", "2026-05-16T00:00:01Z", "2026-05-16T00:00:02Z"),
+      u(CODEX_AGENT, "send-b", "uc-b", "2026-05-16T00:00:10Z"),
+      a(CODEX_AGENT, "send-b", "ac-b", "2026-05-16T00:00:11Z", "2026-05-16T00:00:12Z"),
+    ];
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] },
+    });
+
+    const [groupA, groupB] = screen.getAllByTestId("fanout-group");
+    expect(columnLabels(groupA!)).toEqual(["Expand", "Expand"]); // both compact
+    expect(columnLabels(groupB!)).toEqual(["Expand", "Expand"]);
+
+    await fireEvent.click(groupToggle(groupA!));
+    expect(columnLabels(groupA!)).toEqual(["Collapse", "Collapse"]); // group A expanded
+    expect(columnLabels(groupB!)).toEqual(["Expand", "Expand"]); // group B untouched
+  });
+
+  it("leaves columns individually toggleable after a group toggle", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      u(CLAUDE_AGENT, "send-f", "u-a", "2026-05-16T00:00:00Z"),
+      a(CLAUDE_AGENT, "send-f", "a-a", "2026-05-16T00:00:01Z", "2026-05-16T00:00:03Z"),
+    ];
+    state.transcripts[CODEX_AGENT.id] = [
+      u(CODEX_AGENT, "send-f", "u-b", "2026-05-16T00:00:00Z"),
+      a(CODEX_AGENT, "send-f", "a-b", "2026-05-16T00:00:01Z", "2026-05-16T00:00:02Z"),
+    ];
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] },
+    });
+
+    const group = screen.getByTestId("fanout-group");
+    expect(columnLabels(group)).toEqual(["Expand", "Expand"]); // both collapsed by default
+    await fireEvent.click(groupToggle(group)); // expand both
+    expect(columnLabels(group)).toEqual(["Collapse", "Collapse"]);
+
+    // Collapse just the first column individually — the group toggle wrote
+    // per-column overrides, so each column is still independently controllable.
+    const firstColToggle = group
+      .querySelectorAll('[data-testid="fanout-column"]')[0]!
+      .querySelector('[data-testid="turn-preview-toggle"]')!;
+    await fireEvent.click(firstColToggle);
+    expect(columnLabels(group)).toEqual(["Expand", "Collapse"]);
+  });
+});
+
+describe("UnifiedTranscript terminal-response collapse", () => {
+  beforeEach(() => {
+    setProjectCompact(PROJECT_ID, true);
+  });
+
+  function agentTurnEl(): HTMLElement {
+    return screen.getAllByTestId("turn").find((el) => el.getAttribute("data-role") === "agent")!;
+  }
+
+  it("gives a cancelled response a compact toggle (it is terminal, with content)", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "u-1",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: "s-1",
+        started_at: "2026-05-16T00:00:00Z",
+        text: "go",
+      },
+      {
+        role: "agent",
+        turn_id: "a-1",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: "s-1",
+        started_at: "2026-05-16T00:00:01Z",
+        ended_at: "2026-05-16T00:00:02Z",
+        status: "cancelled",
+        items: [
+          { item_kind: "text", kind: "text", text: "partial work before cancel" },
+          {
+            item_kind: "tool",
+            tool_use_id: "ct",
+            kind: "builtin",
+            name: "bash",
+            input: {},
+            output: "ok",
+            is_error: false,
+            started_at: "2026-05-16T00:00:01Z",
+            completed_at: "2026-05-16T00:00:02Z",
+          },
+        ],
+      },
+    ];
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    // Previously a cancelled response had no toggle and never collapsed; now it
+    // collapses and (having a hidden tool call) offers a toggle.
+    const toggle = agentTurnEl().querySelector('[data-testid="turn-preview-toggle"]');
+    expect(toggle).not.toBeNull();
+    expect(toggle).toHaveAttribute("aria-label", "Expand"); // collapsed by default (its last block)
+    await fireEvent.click(toggle!);
+    expect(agentTurnEl().querySelector('[data-testid="turn-preview-toggle"]')).toHaveAttribute(
+      "aria-label",
+      "Collapse",
+    ); // now expanded
+  });
+
+  it("collapses a dangling streaming-on-disk turn closed by an outcome marker", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    // The exact dangling case: parser left status `streaming` (model owed a
+    // continuation), but an outcome marker closed it → it is terminal, not live.
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "u-1",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: "s-1",
+        started_at: "2026-05-16T00:00:00Z",
+        text: "go",
+      },
+      {
+        role: "agent",
+        turn_id: "a-1",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: "s-1",
+        started_at: "2026-05-16T00:00:01Z",
+        status: "streaming",
+        items: [
+          { item_kind: "text", kind: "text", text: "dangling text" },
+          {
+            item_kind: "tool",
+            tool_use_id: "dt",
+            kind: "builtin",
+            name: "bash",
+            input: {},
+            output: "ok",
+            is_error: false,
+            started_at: "2026-05-16T00:00:01Z",
+            completed_at: "2026-05-16T00:00:02Z",
+          },
+        ],
+      },
+    ];
+    const overlay: ConversationItem[] = [
+      {
+        kind: "outcome",
+        turn_id: "a-1",
+        send_id: "s-1",
+        agent_id: CLAUDE_AGENT.id,
+        status: "cancelled",
+        reason: null,
+        at: "2026-05-16T00:00:05Z",
+      },
+    ];
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT], overlay },
+    });
+
+    // It must not be treated as live (no working footer / live cap) but must be
+    // collapsible (has a toggle) — the bug was neither toggle nor collapse.
+    expect(screen.queryByTestId("turn-working")).toBeNull();
+    expect(screen.queryByTestId("turn-live-scroll")).toBeNull();
+    expect(agentTurnEl().querySelector('[data-testid="turn-preview-toggle"]')).not.toBeNull();
   });
 });

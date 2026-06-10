@@ -1,106 +1,314 @@
 # Transcript preview / collapse
 
-**Status:** proposed, awaiting review.
-**Branch:** new worktree off `m4-dispatcher-contention-cancel`.
+**Status:** proposed, aligned for implementation.
+**Branch:** `transcript-preview-collapse`.
 
 ## Goal & scope
 
-Add a "preview" mode for transcript messages that collapses them to a few lines with a gradient fade, hides tool calls, and shows a per-message expand/collapse toggle. A global toggle in the app header switches all messages into or out of preview mode at once. The feature keeps the user in control: the global mode sets the default; per-message overrides let them expand or collapse individual turns without disturbing the rest.
+Add a project-scoped compact transcript mode that makes long conversations easier to scan without hiding the current work. In compact mode, older completed transcript units collapse to a short faded preview, tool calls are hidden behind a small placeholder, and users can expand/collapse individual messages or fan-out response columns. The latest completed agent response remains expanded by default. While agents are streaming, their live output is bounded in height so multiple active agents cannot overwhelm the transcript, then the completed latest response expands fully.
 
-**In scope:** per-message collapse (preview height + gradient fade + tool-call suppression), per-message toggle button, global toggle in the header, live-streaming turn exemption.
+**In scope:**
 
-**Out of scope:** persisting preview preference across app restarts, collapsing user messages differently from agent messages, any changes to `ToolCallWidget`'s own expand/collapse behavior.
+- Project-scoped compact state for the current app session.
+- Header-level compact/expanded toggle for the active project.
+- Per-message expand/collapse controls for completed user messages and completed standalone agent responses.
+- Per-column expand/collapse controls for fan-out response columns.
+- Fan-out group-level expand/collapse-all-responses control.
+- Completed-turn preview styling with gradient fade.
+- Tool call suppression and hidden-tool placeholder in compact completed turns.
+- Live-streaming response height cap with internal bottom-pinning while streaming.
+- Latest completed agent response exception.
 
----
+**Out of scope:**
 
-## Milestone 1 — Global preview state
+- Persisting compact state across app restarts.
+- Changing `ToolCallWidget`'s own expand/collapse behavior.
+- Backend, transcript model, or IPC changes.
+- Collapsing queued rows or failed/cancelled outcome-only rows.
 
-### Goal & Outcome
+## User experience
 
-- `ui.transcriptPreview: boolean` and `ui.userOverrides: Record<string, boolean>` exist in the shared `ui` state object in `src/lib/state/index.svelte.ts`. Both default to `false` / `{}`.
-- `_testing.reset()` resets both to their defaults.
-- No UI yet — this milestone is pure state plumbing.
+When a project is open in Projects view, the title bar shows a compact transcript icon near the right side, next to the agents-sidebar toggle. It does not render in Settings, Git view, no-project, loading, or no-agent states. The header control affects only the active project.
 
-### Implementation Outline
+The header control is a normalize/toggle action:
 
-Extend the `ui` state object (currently `{ lastRecipientId: AgentId | null }`) with two new fields:
-- `transcriptPreview: boolean` defaulting to `false` — the global "all messages in preview mode" flag.
-- `userOverrides: Record<string, boolean>` defaulting to `{}` — per-message explicit overrides keyed by turn/row key.
+- Expanded with no manual overrides: enable compact mode.
+- Compact with no manual overrides: disable compact mode.
+- Any state with manual overrides: enable compact mode and clear that project's overrides.
 
-No new functions needed; callers mutate these directly, the same way `ui.lastRecipientId` is set. Update `_testing.reset()` to reset both fields.
+This gives the user a reliable reset after manually opening or closing several transcript units. "Compact mode" still honors the latest-response exception: older eligible transcript units collapse, while the latest completed agent response stays expanded by default.
 
-**Why both fields in the shared state module, not local to `UnifiedTranscript`:** The global toggle button lives in `App.svelte` (a sibling of `UnifiedTranscript`, not a parent). Lifting both fields to `ui` eliminates prop threading and gives `App.svelte` direct access to clear `userOverrides` when the global toggle fires or the active project changes. This is the established pattern (`lastRecipientId`).
+When compact mode is off, completed transcript content behaves as it does today.
 
-**Project-switch clearing:** In `App.svelte`, add a `$effect` watching `selection.activeProjectId` that sets `ui.userOverrides = {}`. This ensures overrides from one project don't persist when switching to another. `unregisterAgents` is not the right hook — it fires on directory removal, not project switching within a directory.
+When compact mode is on:
 
-### Definition of Done
+- Older completed user messages and completed agent responses collapse to a readable preview of roughly a few lines.
+- The preview clips with a soft bottom fade.
+- Tool calls are not rendered in collapsed completed responses.
+- A response with hidden tools but no visible answer text shows a small muted placeholder such as `2 hidden tool calls`.
+- Copy buttons still copy the full copyable content, not just the visible preview.
+- The latest completed agent response remains expanded by default. If the latest send was fan-out, all completed agent columns in that latest fan-out group remain expanded by default.
+- Manual per-message or per-column overrides win over the default latest-response rule.
 
-- `ui.transcriptPreview` and `ui.userOverrides` are accessible from any component that imports the state module.
-- `_testing.reset()` resets both fields.
-- The `index.svelte.ts` state tests verify the reset covers both new fields.
-- A project-switch (simulated via `selection.activeProjectId` change) clears `userOverrides`.
+While an agent is streaming, its response is not converted into the faded completed preview. Instead, the live body renders normally inside a capped region, for example `max-height: min(600px, 60vh)`, with internal overflow and bottom-pinning so the latest activity stays visible. The working/quiet/cancel affordances remain visible. When streaming completes, the live cap is removed and that response becomes the latest completed agent response, expanded by default.
 
----
+Fan-out groups have two levels of control:
 
-## Milestone 2 — Per-message preview UI
+- Each agent response column can expand/collapse independently.
+- The fan-out group has a group-level control that expands or collapses all agent response columns in that group. If any column is expanded, the group control collapses all responses; if all columns are collapsed, it expands all responses.
 
-### Goal & Outcome
+## Current-code alignment
 
-- Every completed agent turn and user message in the transcript has a per-message expand/collapse toggle button rendered next to the copy button in the message's meta row.
-- When a turn is in preview mode: only the first ~5 lines of text are visible, the bottom fades out with a gradient, tool calls are not rendered, and a placeholder indicates hidden tool calls for tool-only turns.
-- When expanded: full content is shown, tool calls render normally.
-- The toggle is hidden (like the rest of the meta row) until the message is hovered or focused.
-- Live-streaming turns are never collapsed regardless of any state.
+The original plan assumed a shared `ui` object in `src/lib/state/index.svelte.ts`. That no longer matches the codebase: `index.svelte.ts` owns agent runtime/transcript state (`transcripts`, `runtimes`, listeners, hydration, heartbeats). Compact transcript state should live in a small dedicated frontend state module instead of being mixed into agent runtime state.
 
-### Implementation Outline
+Current relevant structure:
 
-**`isPreview` helper.** A function `isPreview(key: string, streaming: boolean): boolean`. The streaming exemption is structurally enforced as the outer guard:
+- `src/App.svelte` owns the title-bar controls and active-project selection.
+- `src/lib/state/workspace.svelte.ts` owns `selection.activeProjectId`.
+- `src/lib/components/UnifiedTranscript.svelte` renders standalone rows, fan-out groups, message meta controls, tool widgets, and live working/cancel footers.
+- `src/lib/state/unified.ts` builds visible row/group structures. Fan-out groups are already represented as one user row plus per-agent columns, so compact controls should follow those visible units.
 
+## Future virtualization compatibility
+
+Transcript virtualization is planned separately after this feature. This feature should not implement virtualization, but it should preserve the assumptions a future virtualizer needs:
+
+- Compact state and overrides must be keyed only by stable data-derived ids, never DOM position, list index, or whether an element is currently mounted. Virtualization will unmount off-screen transcript units.
+- The latest completed response rule must be computed from transcript data (`Turn`/`UnifiedRow`/`RenderBlock`), not from rendered DOM presence. This plan defines "latest" by completion recency (`ended_at ?? started_at`) among complete agent turns.
+- Expand/collapse and streaming updates change visible block heights at runtime. Treat those as ordinary item resize events for the future virtualizer; do not design code that assumes heights only change while streaming or that off-screen blocks remain mounted.
+- The live cap introduces an inner scroll container inside a transcript item. The future virtualizer will own the outer transcript pin-to-bottom behavior; M3's inner bottom-pin must be scoped to the capped live content element only.
+
+## Milestone 1 - Project-scoped compact state
+
+### Goal & outcome
+
+Create session-only compact transcript state keyed by project id. Project A can be compact while Project B remains expanded. Switching projects restores that project's compact state and per-message overrides for the current app session.
+
+### Implementation outline
+
+Add `src/lib/state/transcriptPreview.svelte.ts` with a project-keyed state shape:
+
+```ts
+type TranscriptPreviewProjectState = {
+  enabled: boolean;
+  overrides: Record<string, boolean>;
+};
 ```
-streaming ? false : (ui.userOverrides[key] ?? ui.transcriptPreview)
-```
 
-This is a hard rule — streaming always wins, even if a per-message override is set. The formula must not be written as `ui.userOverrides[key] ?? (ui.transcriptPreview && !streaming)`, which would allow an override to bypass the guard.
+Expose helpers rather than encouraging direct mutation:
 
-**`toggleTurn` helper.** Flips `ui.userOverrides[key]` relative to the current `isPreview(key, false)` result. Keeping it simple — always set the explicit value — is fine.
+- `stateFor(projectId: ProjectId): TranscriptPreviewProjectState`
+- `isCompact(projectId: ProjectId, key: string, defaultCompact: boolean): boolean`
+- `toggleKey(projectId: ProjectId, key: string, defaultCompact: boolean): void`
+- `setProjectCompact(projectId: ProjectId, enabled: boolean): void`
+- `normalizeProjectCompact(projectId: ProjectId): void`
+- `hasOverrides(projectId: ProjectId): boolean`
+- `setManyOverrides(projectId: ProjectId, keys: string[], compact: boolean): void`
+- `clearProjectOverrides(projectId: ProjectId): void`
+- `_testing.reset(): void`
 
-**Updating `messageMeta`.** Add a `key: string` parameter to the `messageMeta` snippet, defaulting to `""` to avoid breaking callsites that don't need the toggle. When `key` is non-empty, render a chevron toggle button alongside the copy button. The button calls `toggleTurn(key)` and uses `ICON_BUTTON_CLASS` from `iconButton.ts`.
+`setProjectCompact` should set the requested project mode and clear that project's overrides. `normalizeProjectCompact` should implement the header action: if the project has any overrides, set `enabled = true` and clear overrides; otherwise invert `enabled` and clear overrides. Project switching should not clear state; state is intentionally project-scoped. App restart resets everything because the state is in-memory only.
 
-**Streaming gate at the callsite, not in the snippet.** The `agentRow` callsite passes `key = ""` when `turn.status === "streaming"` — an empty key suppresses the toggle button. The snippet itself has no streaming context; this is intentional. Update all `messageMeta` callsites in `agentRow` and `userMessage` snippets to pass the row/turn key (or `""` for streaming). Fanout column callsites pass the column's agent turn's `turn_id` (readable from `col.rows`). Outcome rows pass no key (they're too short to need preview).
+### Definition of done
 
-**Icon and direction.** Use a chevron that points down when expanded and up when collapsed (or whichever direction the implementer judges most natural — match the pattern already used in `Sidebar.svelte`'s per-agent collapse chevrons). This is an area where the implementing agent should use their best judgment or make a recommendation; visual direction can be adjusted in review.
+- Compact state is keyed by `ProjectId`.
+- Toggling one project does not affect another project.
+- Per-key overrides are scoped to their project.
+- `normalizeProjectCompact` enables compact mode and clears overrides whenever overrides are present.
+- `_testing.reset()` clears all preview state.
+- Unit tests cover project isolation, override reset, and header-normalize behavior.
 
-**Preview container.** In `agentRow` (and `userMessage`), wrap the content area in a container div that conditionally applies preview styles. When `isPreview(key, streaming)` is true:
-- `max-height: 7rem` with `overflow: hidden`.
-- `mask-image: linear-gradient(to bottom, black 5.5rem, transparent 7rem)`.
+## Milestone 2 - Completed transcript compact UI
 
-Use absolute length stops, not percentages. Percentage stops scale with the container height — a 2-line message would render half-faded. Absolute stops mean: content up to 5.5rem renders fully opaque (short messages are never faded), the fade transition runs 5.5–7rem, and content beyond 7rem is clipped by `overflow: hidden`. Tailwind v4 supports `[mask-image:...]` arbitrary values; a short inline style is also fine.
+### Goal & outcome
 
-**Tool call suppression.** In the `turnBody` snippet, gate `ToolCallWidget` rendering on `!isPreview(turn.turn_id, turn.status === "streaming")`. Text chunks always render. The `StatusChip status="processing"` chip also renders in preview mode — it's the primary visual signal for a streaming turn.
+Completed transcript units collapse in compact mode, except for the latest completed agent response set. Users can expand/collapse individual messages and response columns.
 
-**Tool-only turn placeholder.** When a turn is in preview mode and contains no text items (only tool calls), the content area would otherwise be empty — the user has no indication anything is hidden. In this case, render a small muted label in the body (e.g., `{n} tool call(s)`) so the message doesn't look blank. The precise wording and styling should match the app's existing `text-muted text-xs` tone; the implementing agent should make a reasonable choice here.
+### Implementation outline
 
-**Global toggle in App.svelte.** In the header bar (around line 387, just before the `{#if showAgentsToggle}` block), add a button that:
-- Only renders when `activeProject !== null && !settingsOpen`.
-- On click: flips `ui.transcriptPreview` and clears `ui.userOverrides = {}`.
-- Wrapped in `Tooltip.svelte` (already in the component library) with a label that reflects the current state (e.g., `"Preview messages"` / `"Expand messages"`).
-- Uses `ICON_BUTTON_CLASS` for consistent sizing and hover style.
+Pass the active `projectId` into `UnifiedTranscript` from `App.svelte`. This avoids reading workspace selection inside the transcript component and keeps the component explicit.
 
-**Icon choice.** The implementing agent should use their best judgment. The `Sidebar.svelte` collapse-all button (lines 96–122) uses a stacked-arrows SVG for "collapse/expand all" and is the closest existing precedent. An Eye/Eye-Slash (show/hide), a lines-with-fold glyph, or an adaptation of the sidebar's arrows are all reasonable starting points. Make a recommendation in the PR and iterate from there.
+Define stable preview keys for visible units:
 
-### Definition of Done
+- User row: `user:${row.key}`
+- Standalone agent row: `agent:${turn.turn_id}`
+- Fan-out agent column: `fanout:${send_id}:${agent_id}`
 
-- A `[data-testid="turn-preview-toggle"]` button is present on each completed agent turn and user message and is keyboard-accessible.
-- Clicking the per-message toggle expands a previewed turn and collapses an expanded turn, without affecting other turns.
-- Enabling global preview collapses all non-streaming turns; streaming turns stay expanded.
-- Tool calls are absent from the DOM when a turn is in preview mode.
-- A tool-only turn in preview mode renders a visible placeholder indicating hidden tool calls.
-- Disabling global preview (global toggle) restores all turns to full view and clears per-message overrides.
-- Switching active projects clears per-message overrides.
-- Tests in `UnifiedTranscript.test.ts`:
-  - Preview mode hides tool call widgets.
-  - Per-message toggle expands a single previewed turn; others stay previewed.
-  - Streaming turns are never previewed regardless of `ui.transcriptPreview` value — including when `ui.userOverrides[key]` is explicitly set to `true` for that turn (covers the structural guard).
-  - Global toggle clears per-message overrides.
-  - Tool-only turn in preview mode renders a placeholder.
-  - Fanout columns: each column collapses/expands independently.
+Determine default compactness per visible unit:
+
+- Compact mode disabled: default expanded.
+- Compact mode enabled: completed user messages and completed agent responses default compact.
+- Latest completed agent response set defaults expanded.
+- Streaming rows do not use completed-preview compactness.
+- Queued rows and outcome-only rows do not get compact toggles.
+
+The "latest completed agent response set" is based on completion recency, not rendered transcript order. Among agent turns with `status === "complete"`, choose the turn with the greatest `ended_at ?? started_at`. If that turn has a `send_id` that belongs to a fan-out group, treat all completed agent columns in that fan-out group as the latest set. Failed, cancelled, queued, and streaming rows do not qualify as latest completed responses. While a newer send is still streaming, the previous latest completed response remains expanded and the streaming response uses the live cap.
+
+Add compact controls to `messageMeta`:
+
+- Render next to existing copy/timestamp/model/effort controls.
+- Use `ICON_BUTTON_CLASS` and `Tooltip`.
+- Use lucide icons from `@lucide/svelte` where possible.
+- Keep the control hover/focus-revealed like existing meta actions.
+- Use `data-testid="turn-preview-toggle"` for individual message/column controls.
+- Make the compact control opt-in at each `messageMeta` call site. User rows, completed standalone agent rows, and fan-out agent columns pass a control; outcome-only and queued rows do not.
+
+Add completed-preview body styling:
+
+- Use a wrapper around the message/response body.
+- When compact: `max-height` around `7rem`, `overflow: hidden`, and an absolute-stop mask gradient such as `linear-gradient(to bottom, black 5.5rem, transparent 7rem)`.
+- Use absolute stops rather than percentages so short messages do not fade unnecessarily.
+
+Tool call behavior in compact completed turns:
+
+- Suppress `ToolCallWidget` rendering when the owning completed unit is compact.
+- Text answer chunks still render inside the compact wrapper.
+- Thinking/reasoning widgets should be hidden in compact mode with other non-answer detail; expanding restores them.
+- If a compact response has hidden tools and no visible answer text, render a muted placeholder such as `2 hidden tool calls`.
+
+Current-code alignment (post-merge of attachments + reopen-dedup work):
+
+- User rows now carry a required `attachments: Attachment[]` (drag-and-drop attachments PR), rendered by an `attachmentList` snippet *inside* `userMessage`'s body block. The completed-preview wrapper around a user message must clip text **and** attachments together — wrap the whole body block, not just the `Markdown`. Test fixtures that build user rows must include `attachments` (it is no longer optional on `UnifiedRow`'s user variant).
+- A non-completed **outcome marker** is already authoritative for a turn's status (reopen-dedup PR): `hasOutcomeFor` / `ownedByOutcome` (standalone) and `colHasOutcome` (fan-out) suppress the status chip and live footer for cancelled/failed-mid turns. This does not fight the compact rule — the latest-completed selection only considers `status === "complete"` turns, so outcome-owned turns are excluded anyway — but the compact suppression must coexist with this existing suppression rather than duplicate it. An outcome-owned turn is not a completed response and gets no compact toggle.
+
+### Definition of done
+
+- Header compact mode collapses older completed messages/responses only for the active project.
+- Latest completed standalone agent response, selected by terminal recency, stays expanded by default.
+- Latest completed fan-out response columns, selected from the latest completed turn's `send_id`, stay expanded by default.
+- Manual individual toggles override the default for their message/column.
+- Outcome-only and queued rows do not render compact toggles.
+- Tool calls and thinking widgets are absent from compact completed responses.
+- Tool-only compact responses show a hidden-tools placeholder.
+- Copy behavior remains unchanged.
+
+## Milestone 3 - Live streaming cap
+
+### Goal & outcome
+
+Streaming responses remain visible without taking over the transcript. The live body is height-capped and internally follows the latest activity; once the turn completes, it becomes the latest completed response and expands fully.
+
+### Implementation outline
+
+Split streaming rendering into a capped content region and a sibling live footer. Do not wrap the existing whole `turnBody` snippet with the live cap, because `turnBody` already renders `workingFooter` (the working/quiet label and cancel control) at its end. The cap applies only to streamed text/tool content; `workingFooter` renders outside the scrollable region for both standalone rows and fan-out columns.
+
+Current-code alignment (post-merge of reopen-dedup work): `turnBody` now takes a second `live: boolean` parameter that gates the working footer (`turn.status === "streaming" && live`). Callers pass `!ownedByOutcome` (standalone) and `state === "streaming"` (fan-out) so a cancelled-mid turn that the harness persisted as `streaming` does not reopen with a phantom live footer. The cap work must thread through this signature: rather than wrapping `turnBody` whole, render the streamed text/tool items inside the capped region and the footer as a sibling outside it — i.e. either pass `live: false` into the capped `turnBody` and render `workingFooter` separately below the cap, or factor the item loop out of `turnBody` so the cap wraps only the items. Either way, preserve the existing outcome-marker gating (`ownedByOutcome` / `colHasOutcome` still suppress the footer for outcome-owned turns).
+
+Add a live content wrapper for streaming agent responses:
+
+- `max-height: min(600px, 60vh)` or a nearby value that feels right in the app.
+- `overflow-y: auto`.
+- `data-testid="turn-live-scroll"` for focused tests and browser inspection.
+- Bottom-pin each internal live body when new content arrives.
+
+Each capped live region needs independent pinning state keyed by its streaming unit. The existing outer transcript auto-pin still keeps the transcript near the active rows, but once live content is capped the outer container stops growing with every streamed token/tool update; the inner live region's bottom-pin is therefore required for latest activity to remain visible.
+
+Inner pinning contract:
+
+- Track each live scroll element by its stable preview key.
+- A live region is pinned when `scrollHeight - scrollTop - clientHeight < 32`, matching the existing outer transcript threshold.
+- On streamed content/tool updates, if that region is pinned, set its `scrollTop` to `scrollHeight`.
+- If the user scrolls up inside the live region, stop auto-pinning that region until the user returns near the bottom.
+- Mounting a new live region starts pinned.
+
+For fan-out, apply the live cap per streaming column so one verbose agent does not distort the whole group.
+
+Do not apply completed-preview fade or completed tool suppression to streaming content. Streaming tools/text should render normally inside the live cap.
+
+### Definition of done
+
+- Streaming standalone responses are height-capped while streaming.
+- Streaming fan-out columns are height-capped independently.
+- New streamed content remains visible near the bottom of the capped region.
+- Cancel/working/quiet affordances render outside `turn-live-scroll` and remain visible and usable.
+- On completion, the live cap is removed and the response is expanded as the latest completed response.
+
+## Milestone 4 - Fan-out group controls
+
+### Goal & outcome
+
+Users can expand/collapse all agent responses in a fan-out group without touching each column one at a time.
+
+### Implementation outline
+
+Render a group-level response control in the fan-out group's top row, aligned with the shared user-message/header area and visually consistent with other hover/focus transcript controls.
+
+Behavior:
+
+- Collect the preview keys for the fan-out group's agent columns.
+- If any controlled column is expanded, clicking collapses all controlled columns.
+- If all controlled columns are compact, clicking expands all controlled columns.
+- The group control affects only agent response columns, not the shared user message.
+- Use `data-testid="fanout-preview-toggle-all"`.
+
+The group-level control can sit near the shared user message's meta controls or in the fan-out group's header row. Prefer the least visually noisy placement after implementation review in the running UI.
+
+### Definition of done
+
+- Fan-out columns can still be expanded/collapsed independently.
+- A group-level control expands/collapses all response columns for one fan-out group.
+- Group-level toggling writes per-column overrides and does not affect other fan-out groups.
+- The control is keyboard-accessible and discoverable through tooltip/aria-label.
+
+## Milestone 5 - Header control and integration tests
+
+### Goal & outcome
+
+The active project's compact mode is controllable from the header and covered by focused tests.
+
+### Implementation outline
+
+In `App.svelte`, render the compact transcript button only when:
+
+- `selection.activeProjectId !== null`
+- `!settingsOpen`
+- `view.mode !== "git"`
+- the roster is loaded
+- the active project has at least one agent
+
+Place it near the existing right-side title-bar controls, before the agents-sidebar toggle. The right cluster now reads (left→right): view toggle (`Projects | Git`), `CommandPaletteButton` (added by the command-palette PR), then the agents-sidebar toggle. Slot the compact toggle next to the command-palette button and before the agents-sidebar toggle. Wrap with `Tooltip`; use `data-testid="transcript-compact-toggle"` and `data-tauri-no-drag`.
+
+The button should call `normalizeProjectCompact(projectId)`, not blindly invert the boolean. Tooltip and aria label should reflect the action:
+
+- Has overrides: `Reset compact transcript`
+- Compact off, no overrides: `Compact transcript`
+- Compact on, no overrides: `Expand transcript`
+
+Icon recommendation:
+
+- Prefer lucide `Rows3`, `ListCollapse`, `Minimize2`, or `Maximize2` depending on available exports and visual fit.
+- Use the icon state to indicate compact vs expanded mode.
+
+### Definition of done
+
+Tests should cover:
+
+- Project-scoped compact state isolation.
+- Header control affects only the active project.
+- Header control clears that project's per-key overrides.
+- Header control enables compact mode, rather than expanding, when overrides are present.
+- Older completed messages compact when enabled.
+- Latest completed standalone response is selected by completion recency, not rendered order.
+- Latest completed fan-out response columns are selected from the latest completed turn's `send_id`.
+- A slow earlier-anchored send that finishes after a later rendered send stays expanded.
+- Individual message/column toggle affects only that unit.
+- Outcome-only and queued rows do not show compact toggles.
+- Fan-out group toggle expands/collapses only that fan-out's agent columns.
+- Compact completed responses hide tool calls and thinking widgets.
+- Tool-only compact responses show a hidden-tools placeholder.
+- Streaming responses use live cap, not completed preview.
+- `turn-working` renders outside `turn-live-scroll`.
+- Streaming completion removes the live cap and leaves the latest response expanded.
+
+Because the riskiest behavior is visual layout and real scroll behavior, do not rely only on jsdom component tests. Before considering the feature done, run the app and verify in a real browser/in-app browser with:
+
+- Long completed text: compact preview fades and clips without fading short messages.
+- Tool-only completed response: compact placeholder is visible.
+- Long streaming standalone response: live content is capped, bottom-pinned, and cancel/working controls stay visible.
+- Long streaming fan-out responses: each column caps and bottom-pins independently.
+
+Run the focused frontend tests first, then the broader checks required for the touched surface:
+
+- `pnpm test -- UnifiedTranscript`
+- `pnpm test -- App`
+- `pnpm test -- transcriptPreview`
+- `make lint`

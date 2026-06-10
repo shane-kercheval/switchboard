@@ -28,6 +28,12 @@ dist/
 build/
 out/
 
+# Vitest browser-mode output (failure screenshots / attachments) — incidental
+# run artifacts, not asserted baselines (this suite checks measured geometry,
+# not visual regression).
+.vitest-attachments/
+**/__screenshots__/
+
 # Tauri generated
 crates/app/gen/
 

@@ -366,6 +366,8 @@ describe("project staleness refresh", () => {
     hydrationKey: string,
     startedAt: string,
     sendId?: string,
+    model?: string,
+    effort?: string,
   ): ConversationItem {
     return {
       kind: "agent_turn",
@@ -376,6 +378,8 @@ describe("project staleness refresh", () => {
       ended_at: startedAt,
       status: "complete",
       items: [{ item_kind: "text", kind: "text", text: "hi" }],
+      model: model ?? null,
+      effort: effort ?? null,
       hydration_key: hydrationKey,
     };
   }
@@ -458,6 +462,30 @@ describe("project staleness refresh", () => {
     expect(loadCount).toBe(2); // a re-read happened
     expect(state.transcripts[AGENT_1]?.length).toBe(2); // K1 deduped, K2 added — no dup
     expect(agentKeys(state).sort()).toEqual(["K1", "K2"]);
+  });
+
+  it("carries per-turn model/effort from agent_turn through the regroup", async () => {
+    // The project-conversation regroup is hand-built (LoadedTurn assembled field
+    // by field); a field not copied there is silently dropped — which is exactly
+    // how the footer's model went missing on restart. Guards the frontend half of
+    // that boundary (the Rust half is guarded in commands.rs).
+    const ws = await loadWorkspaceState();
+    const state = await loadAgentState();
+    installBackend([agent(AGENT_1, PROJECT_1)]);
+    fingerprints = [fp(AGENT_1, true, "2026-05-20T00:00:00Z", 100)];
+    conversation = convo([
+      agentTurnItem("t1", "K1", "2026-05-20T00:00:01Z", undefined, "claude-opus-4-8", "high"),
+    ]);
+
+    await ws.activateProject(PROJECT_1);
+    await vi.waitFor(() => expect(state.transcripts[AGENT_1]?.length).toBe(1));
+
+    const turn = state.transcripts[AGENT_1]![0]!;
+    expect(turn.role).toBe("agent");
+    if (turn.role === "agent") {
+      expect(turn.model).toBe("claude-opus-4-8");
+      expect(turn.effort).toBe("high");
+    }
   });
 
   it("does NOT re-read when the fingerprint is unchanged", async () => {

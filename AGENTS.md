@@ -35,10 +35,11 @@ All via `make`:
 
 - `make install` — `pnpm install --frozen-lockfile` (one-time / after lockfile changes).
 - `make dev` — runs the Tauri dev shell. Pass `DEV_PORT=<port>` (default 1420) to run a second instance side by side — e.g. two worktrees, or comparing a change against `main`. Each port gets its own isolated dev config, so concurrent instances don't clobber each other's project list. The default port shares one config with a bare `cargo run`; `docs/implementation_plans/2026-05-30-macos-release-distribution.md` (M1) has the isolation rules.
-- `make test` — runs all Rust + frontend tests.
+- `make test` — runs all Rust + frontend tests (the fast, offline jsdom suite — **not** the browser suite).
+- `make test-browser` — runs the real-WebKit frontend suite (Vitest browser mode); ensures the WebKit binary first. Slower than `make test`; kept separate so the jsdom inner loop stays quick.
 - `make lint` — runs clippy, eslint, svelte-check.
 - `make fmt` — formats Rust + frontend.
-- `make check` — everything CI runs (fmt check, lint, test, type-check). Run this before opening a PR.
+- `make check` — everything CI runs (fmt check, lint, test, type-check, **and** the browser suite). Run this before opening a PR.
 - `make clean` — removes build artifacts.
 
 Prerequisites: see `README.md`. Rust toolchain pinned in `rust-toolchain.toml`; Node in `.nvmrc`; pnpm via `packageManager` in `package.json` (`corepack enable`).
@@ -104,8 +105,9 @@ Use these terms consistently in code, comments, commits, and plan docs. The Rust
 - **Integration test** (Cargo term) — any `.rs` file under a crate's `tests/` directory. Each file compiles into its own test binary that links against the crate as an external consumer; can only call **`pub` items**. Best for end-to-end behavior through the public API. Also runs in `cargo test` / `make test`.
 - **Fixture-driven integration test** — subset of integration tests that exercise the public API using recorded `*.jsonl` fixtures, the `fake_claude` test binary, `MockHarnessAdapter`, or other stubs. Hermetic, fast, no external dependencies. Counted in default `make test` / `make check`.
 - **Live test** — subset of integration tests that spawn the real `claude` / `codex` CLI. Marked `#[ignore = "requires <harness> installed — run with: make test-live"]`. Costs subscription quota. Run via `make test-live`, not default `make test`. See "Live testing against real harnesses" above for the full policy.
+- **Browser test** (frontend) — a Svelte component test that runs in **real WebKit** (Vitest browser mode + Playwright), for layout-coupled behavior jsdom physically cannot exercise: overflow/clip measurement, scroll re-anchoring, `container-type`/`cqh` sizing, mask gradients. Files use the `*.browser.test.ts` suffix and live under `tests/browser/` (mount/seed helpers and the canonical mock surface live there too). Unlike live tests, browser tests are **fully hermetic** — a free, downloadable browser binary, deterministic, no network/auth — so they **run in CI** as part of `make check`, just via a separate target (`make test-browser`) so the default `make test` / `pnpm test` stays jsdom-only and fast. Author by mounting via the helper, seeding state like the jsdom suite, and **polling measured geometry** (`expect.poll` / `expect.element`) — never a fixed sleep. They assert **WebKit** behavior; cross-engine (Chromium/Firefox) coverage is out of scope.
 
-In short: **live ⊂ integration ⊂ all tests**, and fixture-driven is the other (non-live) half of the integration set.
+In short: **live ⊂ integration ⊂ all tests** (Rust), and fixture-driven is the other (non-live) half of the integration set. On the frontend, **jsdom tests** are the fast default suite and **browser tests** are the additive real-layout layer.
 
 ### Live testing against real harnesses
 

@@ -30,6 +30,11 @@ import { _testing as previewState } from "$lib/state/transcriptPreview.svelte";
 //
 // then drive streaming with `fireTo(listeners, channel, event)`.
 //
+// COMPOSE-SURFACE SPECS need MORE than this surface: ComposeBar's graph pulls
+// in `@tauri-apps/api/webview`, which must also be mocked, and its mounts live
+// in ./composeMount (NOT ./mount) so that graph stays out of every other
+// spec's imports — see composeMount.ts for the rationale.
+//
 // PATTERNS for new browser specs:
 // - Reset shared module state in `beforeEach` (call `resetState()`), NOT
 //   `afterEach`. Browser-mode tests in a file share one long-lived page, so a

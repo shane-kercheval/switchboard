@@ -901,6 +901,93 @@ describe("UnifiedTranscript — fan-out groups", () => {
     expect(screen.queryByTestId("fanout-card-cancel")).toBeNull();
   });
 
+  it("renders a collapsed column's status chip last — after the indicator and body", async () => {
+    // Consistency with the expanded view: the terminal status (cancelled/failed)
+    // belongs on the LAST line, after the `n tool calls` indicator and the body —
+    // not stacked on top of the indicator (the prior collapsed-only order).
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "u-alice",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: SEND_1,
+        started_at: "2026-05-16T00:00:00Z",
+        text: "fan out",
+      },
+      {
+        role: "agent",
+        turn_id: "a-alice",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: SEND_1,
+        started_at: "2026-05-16T00:00:01Z",
+        status: "streaming", // cancelled-mid on disk; the marker below is authoritative
+        items: [
+          {
+            item_kind: "tool",
+            tool_use_id: "t1",
+            kind: "builtin",
+            name: "Bash",
+            input: { command: "x" },
+            started_at: "2026-05-16T00:00:01Z",
+            completed_at: "2026-05-16T00:00:02Z",
+            output: "ok",
+          },
+          { item_kind: "text", kind: "text", text: "partial work" },
+        ],
+      },
+    ];
+    state.transcripts[CODEX_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "u-bob",
+        agent_id: CODEX_AGENT.id,
+        send_id: SEND_1,
+        started_at: "2026-05-16T00:00:00Z",
+        text: "fan out",
+      },
+      {
+        role: "agent",
+        turn_id: "a-bob",
+        agent_id: CODEX_AGENT.id,
+        send_id: SEND_1,
+        started_at: "2026-05-16T00:00:02Z",
+        status: "complete",
+        items: [{ item_kind: "text", kind: "text", text: "bob reply" }],
+      },
+    ];
+    setProjectCompact(PROJECT_ID, true);
+
+    render(UnifiedTranscript, {
+      props: {
+        projectId: PROJECT_ID,
+        agents: [CLAUDE_AGENT, CODEX_AGENT],
+        overlay: [
+          {
+            kind: "outcome",
+            turn_id: "o-alice",
+            send_id: SEND_1,
+            agent_id: CLAUDE_AGENT.id,
+            status: "cancelled",
+            reason: null,
+            at: "2026-05-16T00:00:05Z",
+          },
+        ],
+      },
+    });
+
+    const column = screen.getAllByTestId("fanout-column")[0]!;
+    const indicator = within(column).getByTestId("hidden-items-indicator");
+    const chip = within(column).getByTestId("outcome-cancelled");
+    // The chip follows the indicator in document order (it's last, not first).
+    expect(indicator.compareDocumentPosition(chip) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // …and it follows the body text too.
+    const body = within(column).getByText("partial work");
+    expect(body.compareDocumentPosition(chip) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
   // Codex/Gemini/Antigravity persist a cancelled-mid turn as `failed`, not
   // `streaming`. The cancelled marker still wins, so the column reads cancelled
   // rather than the mislabelled "failed" the bare disk status would give.

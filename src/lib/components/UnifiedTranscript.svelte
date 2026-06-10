@@ -672,6 +672,24 @@
   {/if}
 {/snippet}
 
+<!-- A fan-out column's terminal status chips (cancelled/failed), from its agent
+     turns' own status or an authoritative Outcome marker. Rendered LAST in the
+     column body (after the indicator and content) so the collapsed and expanded
+     views place the chip identically; an Outcome marker suppresses the turn's own
+     chip. -->
+{#snippet columnStatusChips(colRows: NonUserRow[], colHasOutcome: boolean)}
+  {#each colRows as r (r.key)}
+    {#if r.kind === "agent"}
+      {#if !colHasOutcome}{@render turnStatusLabel(r.turn.status)}{/if}
+    {:else if r.status === "cancelled"}
+      <StatusChip status="cancelled" testid="outcome-cancelled" />
+    {:else}
+      <StatusChip status="failed" testid="outcome-failed" />
+      {#if r.reason}<span class="text-muted text-xs"> — {r.reason}</span>{/if}
+    {/if}
+  {/each}
+{/snippet}
+
 {#snippet liveTurnControl(onclick: () => void, label: string, testid: string)}
   <button
     type="button"
@@ -1013,7 +1031,6 @@
       class="space-y-1.5 border-l-[0.5px] pl-3"
       style:border-left-color={agentBorderColor(turn.agent_id)}
     >
-      {#if !ownedByOutcome}{@render turnStatusLabel(turn.status)}{/if}
       {#if compact}
         {@const hiddenLabel = hiddenItemsLabel(turn, lastBlock)}
         {#if hiddenLabel}{@render hiddenItemsIndicator(key, hiddenLabel)}{/if}
@@ -1031,6 +1048,10 @@
       {:else}
         {@render turnBody(turn, !ownedByOutcome)}
       {/if}
+      <!-- Terminal status chip last (after the indicator and the body), so the
+           collapsed and expanded views agree. Outside any height clip → always
+           visible. Suppressed when an Outcome marker owns the status. -->
+      {#if !ownedByOutcome}{@render turnStatusLabel(turn.status)}{/if}
     </div>
     {@render messageMeta(
       turn.started_at,
@@ -1173,18 +1194,6 @@
                       )}
                     {/if}
                     {#if colCompact}
-                      <!-- Status chips (cancelled/failed) stay outside the clip so
-                         a collapsed terminal column keeps its outcome signal. -->
-                      {#each col.rows as r (r.key)}
-                        {#if r.kind === "agent"}
-                          {#if !colHasOutcome}{@render turnStatusLabel(r.turn.status)}{/if}
-                        {:else if r.status === "cancelled"}
-                          <StatusChip status="cancelled" testid="outcome-cancelled" />
-                        {:else}
-                          <StatusChip status="failed" testid="outcome-failed" />
-                          {#if r.reason}<span class="text-muted text-xs"> — {r.reason}</span>{/if}
-                        {/if}
-                      {/each}
                       {@const colHiddenLabel = columnHiddenLabel(col.rows, colLastBlock)}
                       {#if colHiddenLabel}
                         {@render hiddenItemsIndicator(colKey, colHiddenLabel)}
@@ -1204,18 +1213,18 @@
                           {/each}
                         </div>
                       {/if}
+                      <!-- Status chip(s) last (after the indicator + body), and
+                           outside the clip so a collapsed terminal column keeps
+                           its outcome signal — matching the expanded order. -->
+                      {@render columnStatusChips(col.rows, colHasOutcome)}
                     {:else}
                       {#each col.rows as r (r.key)}
-                        {#if r.kind === "agent"}
-                          {#if !colHasOutcome}{@render turnStatusLabel(r.turn.status)}{/if}
-                          {@render turnBody(r.turn, state === "streaming")}
-                        {:else if r.status === "cancelled"}
-                          <StatusChip status="cancelled" testid="outcome-cancelled" />
-                        {:else}
-                          <StatusChip status="failed" testid="outcome-failed" />
-                          {#if r.reason}<span class="text-muted text-xs"> — {r.reason}</span>{/if}
-                        {/if}
+                        {#if r.kind === "agent"}{@render turnBody(
+                            r.turn,
+                            state === "streaming",
+                          )}{/if}
                       {/each}
+                      {@render columnStatusChips(col.rows, colHasOutcome)}
                     {/if}
                   </div>
                   {@render messageMeta(

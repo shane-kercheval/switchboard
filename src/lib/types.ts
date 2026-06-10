@@ -595,6 +595,12 @@ export type ConversationItem =
       status: "streaming" | "complete" | "failed";
       items: LoadedTurnItem[];
       usage?: TurnUsage | null;
+      // Per-turn model + effort reconstructed from the harness session file —
+      // same source + meaning as `LoadedTurn.model`/`effort`. Carried so the
+      // footer's model survives restart (the project-conversation path, not just
+      // the per-agent `load_transcript` path).
+      model?: string | null;
+      effort?: string | null;
       // Per-turn cost/overage re-joined from the turn-metadata sidecar on
       // reopen — same source + meaning as `LoadedTurn.spend`.
       spend?: TurnSpend | null;

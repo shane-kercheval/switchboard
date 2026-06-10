@@ -55,6 +55,7 @@ export function agentTurn(opts: {
   at?: string;
   endedAt?: string;
   sendId?: string;
+  model?: string;
 }): AgentTurn {
   return {
     role: "agent",
@@ -65,5 +66,6 @@ export function agentTurn(opts: {
     items: opts.items,
     ...(opts.endedAt ? { ended_at: opts.endedAt } : {}),
     ...(opts.sendId ? { send_id: opts.sendId } : {}),
+    ...(opts.model ? { model: opts.model } : {}),
   };
 }

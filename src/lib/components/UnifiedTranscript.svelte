@@ -795,22 +795,24 @@
   previewKey: string | undefined = undefined,
   previewDefaultCompact: boolean = false,
 )}
-  <!-- Three zones: spend pinned LEFT (always visible), the preview toggle
-       CENTERED, and the hover-revealed model/timestamp/copy pinned RIGHT. A
-       `1fr auto 1fr` grid keeps the toggle centered while there's room; the right
-       track is content-sized so model/timestamp/copy is NEVER squished — when
-       space tightens the (empty) left track collapses first, so the toggle slides
-       over and ends up hugging the right cluster rather than squeezing it. -->
-  <div class={`${mt} grid grid-cols-[1fr_auto_1fr] items-center gap-2`} data-testid="message-meta">
-    <!-- Left: cost + overage marker, always visible. Two distinct gates (no
-         `match harness`): the **cost** shows on `spend.real_spend` (the turn
-         cost real money — for subscription Claude that's overage, since
-         `total_cost_usd` is otherwise notional); the **"using credits" marker**
-         shows on `spend.is_overage` specifically. They coincide for Claude, but
-         a future pay-per-use harness would set `real_spend` without `is_overage`
-         → cost shows, marker correctly stays hidden. Caller passes `spend`/
-         `costUsd` only at agent-turn sites; a real-money signal isn't hover-hidden. -->
-    <div class="flex min-w-0 items-center gap-2 justify-self-start">
+  <!-- Two zones on a flex row: the expand/collapse toggle + cost pinned LEFT, and
+       the hover-revealed model/timestamp/copy pinned RIGHT (`ml-auto`). The gap
+       between them collapses first as the row narrows; then the right cluster's
+       text wraps (model over timestamp) and truncates with `…`. The toggle and
+       copy button are `shrink-0` — never squished. -->
+  <div class={`${mt} flex items-center gap-2`} data-testid="message-meta">
+    <!-- Left: per-message expand/collapse, then cost + overage marker. The cost
+         is always visible; the toggle is hover/focus-revealed (its own opacity).
+         Two distinct cost gates (no `match harness`): the **cost** shows on
+         `spend.real_spend` (the turn cost real money — for subscription Claude
+         that's overage, since `total_cost_usd` is otherwise notional); the
+         **"using credits" marker** shows on `spend.is_overage` specifically. They
+         coincide for Claude, but a future pay-per-use harness would set
+         `real_spend` without `is_overage` → cost shows, marker stays hidden. -->
+    <div class="flex shrink-0 items-center gap-2">
+      {#if previewKey !== undefined}
+        {@render previewToggle(previewKey, previewDefaultCompact)}
+      {/if}
       {#if spend?.is_overage}
         <span
           class="text-warning text-xs"
@@ -824,32 +826,38 @@
         <span class="text-muted text-xs" data-testid="message-cost">${costUsd.toFixed(4)}</span>
       {/if}
     </div>
-    <!-- Center: per-message expand/collapse. -->
-    <div class="flex items-center justify-self-center">
-      {#if previewKey !== undefined}
-        {@render previewToggle(previewKey, previewDefaultCompact)}
-      {/if}
-    </div>
-    <!-- Right: per-turn model/effort (history — what this turn actually ran on,
-         resolved id and all), timestamp, and copy. All hover/focus-revealed and
-         subtle; the model/effort here are runtime history, distinct from the
-         sidebar's selected-intent value. -->
+    <!-- Right: per-turn model/effort (history — what this turn actually ran on),
+         timestamp, and copy. Hover/focus-revealed. The text group wraps so a
+         narrow column stacks model over timestamp, and each line truncates with
+         `…` rather than squishing to more lines; the copy button sits OUTSIDE the
+         wrap (`shrink-0`) so it is never squished. -->
     <div
-      class="flex items-center justify-end gap-2 justify-self-end whitespace-nowrap opacity-0 group-focus-within:opacity-100 group-hover:opacity-100"
+      class="ml-auto flex min-w-0 items-center gap-2 opacity-0 group-focus-within:opacity-100 group-hover:opacity-100"
     >
-      {#if model}
-        <span class="text-muted text-xs" data-testid="message-model">{model}</span>
-      {/if}
-      {#if effort}
-        <span class="text-muted text-xs" data-testid="message-effort">{effort}</span>
-      {/if}
-      {#if at}
-        <time class="text-muted text-xs" datetime={at} title={at} data-testid="message-time"
-          >{formatTime(at)}</time
-        >
-      {/if}
+      <div class="flex min-w-0 flex-wrap items-center justify-end gap-x-2">
+        {#if model}
+          <span class="text-muted max-w-full truncate text-xs" data-testid="message-model"
+            >{model}</span
+          >
+        {/if}
+        {#if effort}
+          <span class="text-muted max-w-full truncate text-xs" data-testid="message-effort"
+            >{effort}</span
+          >
+        {/if}
+        {#if at}
+          <time
+            class="text-muted max-w-full truncate text-xs"
+            datetime={at}
+            title={at}
+            data-testid="message-time">{formatTime(at)}</time
+          >
+        {/if}
+      </div>
       {#if copyable}
-        <CopyButton text={copyable} {label} testid="message-copy" />
+        <span class="shrink-0">
+          <CopyButton text={copyable} {label} testid="message-copy" />
+        </span>
       {/if}
     </div>
   </div>

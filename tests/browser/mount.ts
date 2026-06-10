@@ -15,6 +15,11 @@ import TranscriptHost from "./TranscriptHost.svelte";
 export function mountTranscript(opts: {
   projectId: string;
   agents: AgentRecord[];
+  width?: number;
 }): ReturnType<typeof render> {
-  return render(TranscriptHost, { projectId: opts.projectId, agents: opts.agents });
+  return render(TranscriptHost, {
+    projectId: opts.projectId,
+    agents: opts.agents,
+    ...(opts.width !== undefined ? { width: opts.width } : {}),
+  });
 }

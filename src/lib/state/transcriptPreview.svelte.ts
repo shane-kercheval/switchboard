@@ -15,10 +15,10 @@
 // response exception) and passed in as `defaultCompact`. This module only owns
 // the user's deviations from that default: an entry in `overrides` is an
 // explicit per-unit choice that wins over the default. Touching a unit creates a
-// sticky override that persists until a project-level clear (header normalize,
-// `setProjectCompact`, or `clearProjectOverrides`) — so `hasOverrides` means
-// "the user has manually opened or closed some units," which is exactly the
-// signal the header's reset action keys on.
+// sticky override that persists until a project-level clear (header normalize or
+// `setProjectCompact`) — so `hasOverrides` means "the user has manually opened or
+// closed some units," which is exactly the signal the header's reset action keys
+// on.
 //
 // **Virtualization-safe keys.** Override keys are stable, data-derived ids
 // supplied by the caller (never DOM position or list index), so they survive a
@@ -73,7 +73,9 @@ export function setManyOverrides(projectId: ProjectId, keys: string[], compact: 
 }
 
 /// Set a project's compact mode and drop its overrides — a clean mode switch
-/// with no lingering per-unit deviations.
+/// with no lingering per-unit deviations. The deterministic setter the tests use
+/// to establish a known compact state (the header wires `normalizeProjectCompact`,
+/// which only *toggles*); kept for that and a future explicit on/off control.
 export function setProjectCompact(projectId: ProjectId, enabled: boolean): void {
   const state = ensure(projectId);
   state.enabled = enabled;
@@ -82,12 +84,6 @@ export function setProjectCompact(projectId: ProjectId, enabled: boolean): void 
 
 export function hasOverrides(projectId: ProjectId): boolean {
   return Object.keys(stateFor(projectId).overrides).length > 0;
-}
-
-/// Drop a project's per-unit overrides, leaving its compact mode untouched.
-export function clearProjectOverrides(projectId: ProjectId): void {
-  const state = store[projectId];
-  if (state !== undefined) state.overrides = {};
 }
 
 /// The header toggle's action. With manual overrides present it acts as a

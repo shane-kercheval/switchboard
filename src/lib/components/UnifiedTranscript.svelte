@@ -801,18 +801,29 @@
   </Tooltip>
 {/snippet}
 
-{#snippet messageMeta(
-  at: string,
-  copyable: string,
-  label: string,
+{#snippet messageMeta({
+  at,
+  copyable = "",
+  label = "",
   mt = "mt-1",
-  spend: AgentTurn["spend"] = undefined,
-  costUsd: number | null | undefined = undefined,
-  model: string | undefined = undefined,
-  effort: string | undefined = undefined,
-  previewKey: string | undefined = undefined,
-  previewDefaultCompact: boolean = false,
-)}
+  spend = undefined,
+  costUsd = undefined,
+  model = undefined,
+  effort = undefined,
+  previewKey = undefined,
+  previewDefaultCompact = false,
+}: {
+  at: string;
+  copyable?: string;
+  label?: string;
+  mt?: string;
+  spend?: AgentTurn["spend"];
+  costUsd?: number | null;
+  model?: string;
+  effort?: string;
+  previewKey?: string;
+  previewDefaultCompact?: boolean;
+})}
   <!-- Two zones on a flex row: the expand/collapse toggle + cost pinned LEFT, and
        the hover-revealed model/timestamp/copy pinned RIGHT (`ml-auto`). The gap
        between them collapses first as the row narrows; then the right cluster's
@@ -951,18 +962,13 @@
         {@render userBody(row)}
       {/if}
     </div>
-    {@render messageMeta(
-      row.at,
-      row.text,
-      "Copy message",
-      "mt-1",
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      showToggle ? key : undefined,
-      defaultCompact,
-    )}
+    {@render messageMeta({
+      at: row.at,
+      copyable: row.text,
+      label: "Copy message",
+      previewKey: showToggle ? key : undefined,
+      previewDefaultCompact: defaultCompact,
+    })}
   </div>
 {/snippet}
 
@@ -986,7 +992,7 @@
         {#if row.reason}<span class="text-muted text-xs"> — {row.reason}</span>{/if}
       {/if}
     </div>
-    {@render messageMeta(row.at, "", "", "mt-2.5")}
+    {@render messageMeta({ at: row.at, mt: "mt-2.5" })}
   </div>
 {/snippet}
 
@@ -1053,18 +1059,17 @@
            visible. Suppressed when an Outcome marker owns the status. -->
       {#if !ownedByOutcome}{@render turnStatusLabel(turn.status)}{/if}
     </div>
-    {@render messageMeta(
-      turn.started_at,
+    {@render messageMeta({
+      at: turn.started_at,
       copyable,
-      "Copy message",
-      "mt-1",
-      turn.spend,
-      turn.usage?.total_cost_usd,
-      turn.model,
-      turn.effort,
-      showToggle ? key : undefined,
-      defaultCompact,
-    )}
+      label: "Copy message",
+      spend: turn.spend,
+      costUsd: turn.usage?.total_cost_usd,
+      model: turn.model,
+      effort: turn.effort,
+      previewKey: showToggle ? key : undefined,
+      previewDefaultCompact: defaultCompact,
+    })}
   </div>
 {/snippet}
 
@@ -1227,18 +1232,15 @@
                       {@render columnStatusChips(col.rows, colHasOutcome)}
                     {/if}
                   </div>
-                  {@render messageMeta(
-                    columnAt(col.rows),
-                    colCopyable,
-                    `Copy ${agentName(col.agent_id)}'s message`,
-                    "mt-1",
-                    undefined,
-                    undefined,
-                    columnModel(col.rows),
-                    columnEffort(col.rows),
-                    colShowToggle ? colKey : undefined,
-                    colDefaultCompact,
-                  )}
+                  {@render messageMeta({
+                    at: columnAt(col.rows),
+                    copyable: colCopyable,
+                    label: `Copy ${agentName(col.agent_id)}'s message`,
+                    model: columnModel(col.rows),
+                    effort: columnEffort(col.rows),
+                    previewKey: colShowToggle ? colKey : undefined,
+                    previewDefaultCompact: colDefaultCompact,
+                  })}
                 </div>
               {/each}
             </div>

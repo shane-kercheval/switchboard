@@ -7,7 +7,6 @@ const {
   setManyOverrides,
   setProjectCompact,
   hasOverrides,
-  clearProjectOverrides,
   normalizeProjectCompact,
   _testing,
 } = await import("./transcriptPreview.svelte");
@@ -68,19 +67,6 @@ describe("transcriptPreview", () => {
     setProjectCompact(A, true);
     expect(stateFor(A).enabled).toBe(true);
     expect(hasOverrides(A)).toBe(false);
-  });
-
-  it("clearProjectOverrides drops overrides but keeps compact mode", () => {
-    setProjectCompact(A, true);
-    toggleKey(A, "agent:1", true);
-    clearProjectOverrides(A);
-    expect(hasOverrides(A)).toBe(false);
-    expect(stateFor(A).enabled).toBe(true);
-  });
-
-  it("clearProjectOverrides is a no-op for an untouched project", () => {
-    clearProjectOverrides(A);
-    expect(stateFor(A)).toEqual({ enabled: true, overrides: {} });
   });
 
   describe("normalizeProjectCompact", () => {

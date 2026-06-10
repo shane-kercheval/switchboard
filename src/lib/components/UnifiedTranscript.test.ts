@@ -2984,3 +2984,45 @@ describe("UnifiedTranscript terminal-response collapse", () => {
     expect(agentTurnEl().querySelector('[data-testid="turn-preview-toggle"]')).not.toBeNull();
   });
 });
+
+describe("UnifiedTranscript loading state", () => {
+  it("centers a large spinner with the title while loading with no rows yet", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT], loadStatus: "loading" },
+    });
+
+    const loading = screen.getByTestId("transcript-loading");
+    expect(loading).toHaveTextContent("Loading history…");
+    // The same centered spinner+title look as the project-loading EmptyState.
+    expect(loading.querySelector(".animate-spin")).not.toBeNull();
+    expect(loading).toHaveClass("items-center", "justify-center");
+  });
+
+  it("keeps the small inline note when rows are already on screen", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "user-1",
+        agent_id: CLAUDE_AGENT.id,
+        started_at: "2026-05-16T00:00:00Z",
+        text: "hi",
+      },
+    ];
+
+    const UnifiedTranscript = (await import("./UnifiedTranscript.svelte")).default;
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT], loadStatus: "loading" },
+    });
+
+    // Visible content must not be covered by a centered takeover.
+    const loading = screen.getByTestId("transcript-loading");
+    expect(loading.querySelector(".animate-spin")).toBeNull();
+    expect(screen.getByText("hi")).toBeInTheDocument();
+  });
+});

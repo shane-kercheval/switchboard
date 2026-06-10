@@ -25,6 +25,7 @@
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
   import Markdown from "$lib/components/ui/Markdown.svelte";
   import CopyButton from "$lib/components/ui/CopyButton.svelte";
+  import Spinner from "$lib/components/ui/Spinner.svelte";
   import StatusChip from "$lib/components/ui/StatusChip.svelte";
   import StopIcon from "$lib/components/ui/StopIcon.svelte";
   import ToolCallWidget from "$lib/components/ToolCallWidget.svelte";
@@ -1107,7 +1108,20 @@
   data-testid="unified-transcript"
   class="bg-transcript [container-type:size] flex-1 overflow-y-auto px-8 py-4"
 >
-  {#if loadStatus === "loading"}
+  {#if loadStatus === "loading" && rows.length === 0}
+    <!-- Same centered spinner+title presentation as the project-loading
+         EmptyState, so the two sequential loading states the user sees on a
+         project switch don't jump between screen regions. -->
+    <div
+      class="flex h-full flex-col items-center justify-center gap-3 text-center"
+      data-testid="transcript-loading"
+    >
+      <Spinner class="h-8 w-8" />
+      <p class="text-muted text-sm">Loading history…</p>
+    </div>
+  {:else if loadStatus === "loading"}
+    <!-- Rows are already on screen (per-agent hydration landed first) — a
+         small note above them, not a centered takeover over visible content. -->
     <p class="text-muted mb-3 text-xs italic" data-testid="transcript-loading">Loading history…</p>
   {:else if loadStatus === "failed"}
     {@render failureBanner(

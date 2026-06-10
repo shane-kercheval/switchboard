@@ -25,4 +25,16 @@ describe("EmptyState", () => {
     render(EmptyState, { props: { title: "Failed", action } });
     expect(screen.getByTestId("cta")).toBeInTheDocument();
   });
+
+  it("renders a large spinner above the title when requested", () => {
+    render(EmptyState, { props: { title: "Loading…", spinner: true, testid: "empty" } });
+    const ring = screen.getByTestId("empty").querySelector(".animate-spin");
+    expect(ring).not.toBeNull();
+    expect(ring).toHaveClass("h-8", "w-8");
+  });
+
+  it("renders no spinner by default", () => {
+    render(EmptyState, { props: { title: "Nothing here", testid: "empty" } });
+    expect(screen.getByTestId("empty").querySelector(".animate-spin")).toBeNull();
+  });
 });

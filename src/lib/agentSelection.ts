@@ -24,6 +24,7 @@ export type SelectionOption = { label: string; value: string };
 /// config we can't set — the form renders a note instead).
 export const MODEL_OPTIONS: Record<HarnessKind, SelectionOption[]> = {
   claude_code: [
+    { label: "Fable", value: "fable" },
     { label: "Opus", value: "opus" },
     { label: "Sonnet", value: "sonnet" },
     { label: "Haiku", value: "haiku" },

@@ -1,3 +1,4 @@
+import { page } from "vitest/browser";
 import type { AgentRecord, NormalizedEvent } from "$lib/types";
 import * as stateMod from "$lib/state/index.svelte";
 import type { Turn } from "$lib/state/index.svelte";
@@ -48,6 +49,21 @@ import { _testing as previewState } from "$lib/state/transcriptPreview.svelte";
 //   type-specific testid when M2 needs to disambiguate user vs agent vs column
 //   clips. The M1 example seeds a single turn, so it can use the bare locator.
 // ---------------------------------------------------------------------------
+
+/** The unified transcript's outer scroll container. */
+export function transcriptContainer(): HTMLElement {
+  return page.getByTestId("unified-transcript").element() as HTMLElement;
+}
+
+/**
+ * Outer-scroll distance from the bottom — the measure every scroll spec
+ * asserts pinned/unpinned thresholds against. Shared so all specs agree on
+ * what "distance" means.
+ */
+export function distanceFromBottom(): number {
+  const c = transcriptContainer();
+  return c.scrollHeight - c.scrollTop - c.clientHeight;
+}
 
 /**
  * Deliver a normalized event to a captured per-agent listener (streaming drive).

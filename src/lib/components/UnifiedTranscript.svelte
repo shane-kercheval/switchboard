@@ -16,6 +16,7 @@
     buildUnifiedRows,
     copyTextOf,
     groupRenderBlocks,
+    type RenderBlock,
     type UnifiedRow,
   } from "$lib/state/unified";
   import { agentCopy } from "$lib/agentCopy.svelte";
@@ -181,6 +182,33 @@
     for (const v of latestPerAgent.values()) keys.add(v.key);
     return keys;
   });
+
+  /// Containment chosen over virtualization, deliberately: it is ~CSS-only,
+  /// preserves the full DOM (copy, selection, accessibility, any future
+  /// find-in-page), keeps the hand-built scroll-anchoring machinery and its
+  /// browser tests intact, and is removable in one line if windowed
+  /// virtualization ever supersedes it. Off-screen blocks skip layout and
+  /// paint and contribute `contain-intrinsic-size` placeholder geometry —
+  /// which is exactly the work the compose textarea's per-keystroke forced
+  /// reflow pays for on a long transcript. `auto` makes the engine remember
+  /// each block's real height once rendered; the per-kind length is only the
+  /// pre-first-render guess, sized to minimize |estimate − typical rendered
+  /// height| (that error is what shows as scrollbar jitter on the first-ever
+  /// scroll through unseen history). Estimates target the DEFAULT rendering —
+  /// compact mode on, fan-out columns side-by-side (≥ lg) — so compact-off
+  /// and stacked-column first scrolls carry larger error; acceptable, since
+  /// `auto` corrects each block after its first render. Three literal class
+  /// strings (not an interpolated size) because Tailwind only generates CSS
+  /// for classes it can see statically. Requires a Safari-18+ engine; older
+  /// system WebKits ignore the property — a graceful no-op, not a breakage.
+  const CONTAINMENT_COMPACT_ROW = "[content-visibility:auto] [contain-intrinsic-size:auto_4rem]";
+  const CONTAINMENT_AGENT_ROW = "[content-visibility:auto] [contain-intrinsic-size:auto_16rem]";
+  const CONTAINMENT_FANOUT = "[content-visibility:auto] [contain-intrinsic-size:auto_20rem]";
+
+  function blockContainment(block: RenderBlock): string {
+    if (block.kind === "fanout") return CONTAINMENT_FANOUT;
+    return block.row.kind === "agent" ? CONTAINMENT_AGENT_ROW : CONTAINMENT_COMPACT_ROW;
+  }
 
   /// Clip + bottom-fade for a height-clipped preview. Absolute stops (not
   /// percentages) so a short message never fades; the fade starts around the
@@ -1119,134 +1147,141 @@
 
   <div bind:this={content} class="space-y-5">
     {#each blocks as block (block.kind === "fanout" ? block.key : block.row.key)}
-      {#if block.kind === "row"}
-        {#if block.row.kind === "user"}
-          {@render userMessage(block.row)}
-          {#if block.row.send_id !== undefined && block.row.agent_ids.length === 1 && queuedSendIds.has(block.row.send_id)}
-            {@render queuedRow(block.row.agent_ids[0]!, block.row.send_id)}
+      <div class={blockContainment(block)} data-testid="transcript-block">
+        {#if block.kind === "row"}
+          {#if block.row.kind === "user"}
+            {@render userMessage(block.row)}
+            {#if block.row.send_id !== undefined && block.row.agent_ids.length === 1 && queuedSendIds.has(block.row.send_id)}
+              {@render queuedRow(block.row.agent_ids[0]!, block.row.send_id)}
+            {/if}
+          {:else if block.row.kind === "outcome"}
+            {@render outcomeRow(block.row)}
+          {:else}
+            {@render agentRow(block.row.turn)}
           {/if}
-        {:else if block.row.kind === "outcome"}
-          {@render outcomeRow(block.row)}
         {:else}
-          {@render agentRow(block.row.turn)}
-        {/if}
-      {:else}
-        {@const fanoutKeys = block.columns
-          .filter((col) => isCollapsibleColumn(col.rows))
-          .map((col) => `fanout:${block.send_id}:${col.agent_id}`)}
-        <div class="space-y-4" data-testid="fanout-group">
-          {@render userMessage(block.user)}
-          <!-- The group control lives with the responses (not the user prompt)
+          {@const fanoutKeys = block.columns
+            .filter((col) => isCollapsibleColumn(col.rows))
+            .map((col) => `fanout:${block.send_id}:${col.agent_id}`)}
+          <div class="space-y-4" data-testid="fanout-group">
+            {@render userMessage(block.user)}
+            <!-- The group control lives with the responses (not the user prompt)
                and shares a named hover scope with them, so it reveals when the
                responses are hovered and the user message's own hover chrome
                stays independent. -->
-          <div class="group/responses space-y-2">
-            {#if fanoutKeys.length > 0}
-              <div class="flex justify-end">{@render fanoutToggleAll(fanoutKeys)}</div>
-            {/if}
-            <!-- Side-by-side on wide viewports; stacks vertically below `lg`. -->
-            <div
-              class="grid gap-4"
-              style:grid-template-columns={`repeat(${block.columns.length}, minmax(0, 1fr))`}
-            >
-              {#each block.columns as col (col.agent_id)}
-                {@const state = columnState(col.rows)}
-                {@const harness = agentById[col.agent_id]?.harness}
-                {@const colCopyable = columnText(col.rows)}
-                <!-- A non-completed Outcome marker is authoritative for the
+            <div class="group/responses space-y-2">
+              {#if fanoutKeys.length > 0}
+                <div class="flex justify-end">{@render fanoutToggleAll(fanoutKeys)}</div>
+              {/if}
+              <!-- Side-by-side on wide viewports; stacks vertically below `lg`. -->
+              <div
+                class="grid gap-4"
+                style:grid-template-columns={`repeat(${block.columns.length}, minmax(0, 1fr))`}
+              >
+                {#each block.columns as col (col.agent_id)}
+                  {@const state = columnState(col.rows)}
+                  {@const harness = agentById[col.agent_id]?.harness}
+                  {@const colCopyable = columnText(col.rows)}
+                  <!-- A non-completed Outcome marker is authoritative for the
                    column's status and renders its own chip below; suppress the
                    turn's own status chip so a cancelled-mid turn the harness
                    persisted as `failed` doesn't show a contradictory `failed`
                    chip alongside the marker's `cancelled` (nor a redundant
                    doubled `failed`). Safe per the single-(send_id, agent_id)
                    column invariant. -->
-                {@const colHasOutcome = col.rows.some((r) => r.kind === "outcome")}
-                {@const colKey = `fanout:${block.send_id}:${col.agent_id}`}
-                {@const colEligible = isCollapsibleColumn(col.rows)}
-                {@const colDefaultCompact = compactEnabled}
-                {@const colCompact = colEligible && isCompact(projectId, colKey, colDefaultCompact)}
-                {@const colLastBlock = lastBlockKeys.has(colKey)}
-                {@const colShowToggle =
-                  colEligible &&
-                  col.rows.some(
-                    (r) => r.kind === "agent" && responseHasMore(r.turn, colKey, colLastBlock),
-                  )}
-                <div
-                  class="group space-y-1.5"
-                  data-testid="fanout-column"
-                  data-role="agent"
-                  data-agent-id={col.agent_id}
-                  data-state={state}
-                >
+                  {@const colHasOutcome = col.rows.some((r) => r.kind === "outcome")}
+                  {@const colKey = `fanout:${block.send_id}:${col.agent_id}`}
+                  {@const colEligible = isCollapsibleColumn(col.rows)}
+                  {@const colDefaultCompact = compactEnabled}
+                  {@const colCompact =
+                    colEligible && isCompact(projectId, colKey, colDefaultCompact)}
+                  {@const colLastBlock = lastBlockKeys.has(colKey)}
+                  {@const colShowToggle =
+                    colEligible &&
+                    col.rows.some(
+                      (r) => r.kind === "agent" && responseHasMore(r.turn, colKey, colLastBlock),
+                    )}
                   <div
-                    class="flex items-center gap-2 text-xs font-semibold tracking-wide uppercase"
+                    class="group space-y-1.5"
+                    data-testid="fanout-column"
+                    data-role="agent"
+                    data-agent-id={col.agent_id}
+                    data-state={state}
                   >
-                    <span class="text-fg" data-testid="turn-agent-name"
-                      >{agentName(col.agent_id)}</span
+                    <div
+                      class="flex items-center gap-2 text-xs font-semibold tracking-wide uppercase"
                     >
-                    {#if harness}<HarnessIcon {harness} />{/if}
-                  </div>
-                  <div
-                    class="space-y-1.5 border-l-[0.5px] pl-3"
-                    style:border-left-color={agentBorderColor(col.agent_id)}
-                  >
-                    {#if state === "queued"}
-                      {@render queuedFooter(
-                        col.agent_id,
-                        block.send_id,
-                        "fanout-queued",
-                        "fanout-card-cancel",
-                      )}
-                    {/if}
-                    {#if colCompact}
-                      {@const colHiddenLabel = columnHiddenLabel(col.rows, colLastBlock)}
-                      {#if colHiddenLabel}
-                        {@render hiddenItemsIndicator(colKey, colHiddenLabel)}
+                      <span class="text-fg" data-testid="turn-agent-name"
+                        >{agentName(col.agent_id)}</span
+                      >
+                      {#if harness}<HarnessIcon {harness} />{/if}
+                    </div>
+                    <div
+                      class="space-y-1.5 border-l-[0.5px] pl-3"
+                      style:border-left-color={agentBorderColor(col.agent_id)}
+                    >
+                      {#if state === "queued"}
+                        {@render queuedFooter(
+                          col.agent_id,
+                          block.send_id,
+                          "fanout-queued",
+                          "fanout-card-cancel",
+                        )}
                       {/if}
-                      {#if colLastBlock}
-                        {#each col.rows as r (r.key)}
-                          {#if r.kind === "agent"}{@render turnBody(r.turn, false, "last")}{/if}
-                        {/each}
-                      {:else}
-                        <div
-                          class={cn("space-y-1.5", PREVIEW_CLIP)}
-                          use:measureClip={colKey}
-                          data-testid="preview-clip"
-                        >
+                      {#if colCompact}
+                        {@const colHiddenLabel = columnHiddenLabel(col.rows, colLastBlock)}
+                        {#if colHiddenLabel}
+                          {@render hiddenItemsIndicator(colKey, colHiddenLabel)}
+                        {/if}
+                        {#if colLastBlock}
                           {#each col.rows as r (r.key)}
-                            {#if r.kind === "agent"}{@render turnBody(r.turn, false, "answer")}{/if}
+                            {#if r.kind === "agent"}{@render turnBody(r.turn, false, "last")}{/if}
                           {/each}
-                        </div>
-                      {/if}
-                      <!-- Status chip(s) last (after the indicator + body), and
+                        {:else}
+                          <div
+                            class={cn("space-y-1.5", PREVIEW_CLIP)}
+                            use:measureClip={colKey}
+                            data-testid="preview-clip"
+                          >
+                            {#each col.rows as r (r.key)}
+                              {#if r.kind === "agent"}{@render turnBody(
+                                  r.turn,
+                                  false,
+                                  "answer",
+                                )}{/if}
+                            {/each}
+                          </div>
+                        {/if}
+                        <!-- Status chip(s) last (after the indicator + body), and
                            outside the clip so a collapsed terminal column keeps
                            its outcome signal — matching the expanded order. -->
-                      {@render columnStatusChips(col.rows, colHasOutcome)}
-                    {:else}
-                      {#each col.rows as r (r.key)}
-                        {#if r.kind === "agent"}{@render turnBody(
-                            r.turn,
-                            state === "streaming",
-                          )}{/if}
-                      {/each}
-                      {@render columnStatusChips(col.rows, colHasOutcome)}
-                    {/if}
+                        {@render columnStatusChips(col.rows, colHasOutcome)}
+                      {:else}
+                        {#each col.rows as r (r.key)}
+                          {#if r.kind === "agent"}{@render turnBody(
+                              r.turn,
+                              state === "streaming",
+                            )}{/if}
+                        {/each}
+                        {@render columnStatusChips(col.rows, colHasOutcome)}
+                      {/if}
+                    </div>
+                    {@render messageMeta({
+                      at: columnAt(col.rows),
+                      copyable: colCopyable,
+                      label: `Copy ${agentName(col.agent_id)}'s message`,
+                      model: columnModel(col.rows),
+                      effort: columnEffort(col.rows),
+                      previewKey: colShowToggle ? colKey : undefined,
+                      previewDefaultCompact: colDefaultCompact,
+                    })}
                   </div>
-                  {@render messageMeta({
-                    at: columnAt(col.rows),
-                    copyable: colCopyable,
-                    label: `Copy ${agentName(col.agent_id)}'s message`,
-                    model: columnModel(col.rows),
-                    effort: columnEffort(col.rows),
-                    previewKey: colShowToggle ? colKey : undefined,
-                    previewDefaultCompact: colDefaultCompact,
-                  })}
-                </div>
-              {/each}
+                {/each}
+              </div>
             </div>
           </div>
-        </div>
-      {/if}
+        {/if}
+      </div>
     {/each}
   </div>
 </div>

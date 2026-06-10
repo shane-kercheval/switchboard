@@ -145,6 +145,54 @@ Why this ordering (containment before virtualization) — record this rationale 
 - Existing browser suite green against the large fixture; new browser test(s) for the off-screen→on-screen `measureClip` case.
 - `AGENTS.md` untouched (this is not a new convention — it's an implementation detail of the transcript; the browser-suite section already covers how to test it).
 
+### M3 measurement protocol
+
+Mechanical steps — no profiler experience assumed. This run also retroactively satisfies M1's deferred before/after check and decides M1's contingent rAF step.
+
+**Setup**
+
+1. **"After" app:** on this branch, `make dev`. Open (or create) a project with at least one agent — use two agents if you want fan-out blocks in the fixture.
+2. **"Before" app (for the vs-`main` comparison):** in a second worktree on `main`, cherry-pick the seeding commit from this branch: `git cherry-pick 164ff50` ("Add large-transcript dev seeding hook (M3)" — touches only `src/lib/dev/` + one App.svelte hook, so it applies cleanly and changes no rendering). Then `make dev DEV_PORT=1421`. The two apps run side by side with isolated dev configs.
+3. **Seed** in each app: click the app window once, press **⌃⌥⇧S** (Control-Option-Shift-S). The transcript fills with ~600 synthetic turns (the Inspector console logs `[dev-seed] prepended …`). Unseeded = the "small" variant; seeded = "large". Repeat presses on an already-seeded project are a no-op.
+4. **Scroll-jitter check (manual-only — CI structurally can't see this):** right after seeding, slowly drag the scrollbar from the bottom to the top through the never-rendered history. Watch the scrollbar thumb for jump-backs and the content for visible shifts as blocks materialize. Do it twice: compact mode **on** (default) and **off** — the per-block height estimates target the compact default, so compact-off is expected to be the noisier pass. Record observed/none for each in the results notes.
+5. **Paint check (manual):** while scrolled mid-history, confirm (a) the clipped previews' bottom fade masks render correctly; (b) hover-revealed meta/copy chrome stays inside its block; (c) tooltips still overlay correctly (they portal out of the blocks; anything that *didn't* portal would now be clipped by the blocks' paint containment).
+
+**Recording one measurement**
+
+1. Right-click anywhere in the app → **Inspect Element** (dev builds; alternatively Safari → Develop → *your Mac* → *Switchboard*). In the Web Inspector pick the **Timelines** tab.
+2. Make sure the **Layout & Rendering** and **JavaScript & Events** timelines are listed (the + button top-left adds them).
+3. Click the red **record** button, click into the compose bar, and type `the quick brown fox jumps over the lazy dog` (43 keystrokes) at your natural speed. Stop recording.
+4. Drag-select the typing range in the timeline overview. Read off and record:
+   - **Layout**: the summed duration and count of Layout events (Layout & Rendering row) → divide duration by 43 for per-keystroke layout cost; note the single longest Layout event.
+   - **Main thread**: total time in the selected range (the CPU/summary readout).
+
+**The matrix** — record each cell in the results table below:
+
+- {small, large} × {before (`main`+seed), after (this branch)} with compact mode **on** (the default).
+- Large × after with compact mode **off** (the worst-case DOM: the compact toggle button in the transcript toolbar; if per-unit overrides exist it first shows "Reset compact transcript" — click twice).
+- **Typing-while-streaming** (large × after): send a real prompt to one agent that yields a long streamed answer (e.g. "write a 400-word summary of how HTTP caching works"), and record while typing the same phrase during the stream. This cell splits the user-felt streaming lag into the per-keystroke layout tax (which M1/M3 attack) vs streaming-pipeline work (out of scope here — see "What it is NOT"); a large residue in this cell with small layout numbers is the signal a future streaming-focused effort is warranted.
+
+**Also record:** macOS version, and the WebKit/Safari version (Safari → About Safari, or `navigator.userAgent` in the Inspector console). `content-visibility: auto` needs a Safari-18+ engine; 18.0–18.2 had real rendering bugs (fixed in 18.3).
+
+### M3 results
+
+*(fill in after running the protocol)*
+
+| variant | layout/keystroke (ms) | layout count | longest layout (ms) | main thread total (ms) |
+| --- | --- | --- | --- | --- |
+| small × before | | | | |
+| small × after | | | | |
+| large × before | | | | |
+| large × after (compact on) | | | | |
+| large × after (compact off) | | | | |
+| large × after, typing-while-streaming | | | | |
+
+- Scroll-jitter check (compact on / off): ____ / ____.
+- Paint check (masks, in-block chrome, tooltips): ____.
+- Environment: macOS ____, WebKit/Safari ____. Note: the "after" cells were measured with the per-kind intrinsic-size estimates already tuned (user ~4rem / agent ~16rem / fan-out ~20rem), so a clean jitter result validates the tuned estimates — there was never a flat-estimate "after" build.
+- **M1 rAF contingency** (triggered only if residual cross-component interleaving cost shows after M1+M3): ____.
+- **Gate decision (M4 go/no-go):** ____ — *(cancel M4 if large×after ≈ small×after and the browser suite is green; otherwise M4 proceeds carrying these findings).*
+
 ---
 
 ## Milestone 4 — Windowed virtualization (contingent: only if M3's gate fails)

@@ -1,10 +1,9 @@
 import { beforeEach, expect, test, vi } from "vitest";
 import { page } from "vitest/browser";
-import type { AgentRecord } from "$lib/types";
 
 // Canonical IPC mock block — see ./harness header. Browser mode hoists `vi.mock`
-// only within the spec file, so it lives here, not in the helper. This case
-// drives no streaming, so it omits the listener-capture map.
+// only within the spec file, so it lives here, not in the helper. These cases
+// drive no streaming, so they omit the listener-capture map.
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => vi.fn()) }));
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(async () => null),
@@ -14,49 +13,24 @@ vi.mock("$lib/native", () => ({ copyText: vi.fn(async () => undefined) }));
 
 import { mountTranscript } from "./mount";
 import { registerAgent, seedTurns, resetState } from "./harness";
+import { ALICE, PROJECT_ID, agentTurn, longText, textItem, userTurn } from "./fixtures";
 
-// Canonical browser-test example: proves the CSS → measurement → toggle path
-// end-to-end in real WebKit. This is the assertion jsdom CANNOT make — there
-// `max-height` is parsed but never applied, so `scrollHeight === clientHeight`
-// (both 0) and the overflow that drives the toggle is invisible. Later browser
-// specs copy this shape (mount via harness, seed state, poll measured geometry).
+// Behavior 1: a message/response that genuinely overflows the clip gets a
+// collapse toggle; one that fits gets none. This is the assertion jsdom CANNOT
+// make — there `max-height` is parsed but never applied, so
+// `scrollHeight === clientHeight` (both 0) and the overflow is invisible. The
+// first test is also the canonical shape later specs copy: mount via the
+// harness, seed state, poll measured geometry.
 
-const PROJECT_ID = "00000000-0000-7000-8000-0000000000ff";
-
-const AGENT: AgentRecord = {
-  id: "00000000-0000-7000-8000-000000000aaa",
-  project_id: PROJECT_ID,
-  name: "alice",
-  harness: "claude_code",
-  session_locator: { uuid: "00000000-0000-7000-8000-000000000001" },
-  created_at: "2026-05-16T00:00:00Z",
-};
-
-// Far taller than the 14rem clip, so it overflows regardless of root font size.
-const LONG_TEXT = Array.from(
-  { length: 40 },
-  (_, i) => `Line ${i + 1} of a very long user message.`,
-).join("\n");
-
-// Reset in `beforeEach` (not `afterEach`) — the canonical clean-slate guarantee.
-// See ./harness header.
 beforeEach(() => {
   resetState();
 });
 
 test("a long user message overflows the clip and gets a collapse toggle (compact default)", async () => {
-  await registerAgent(AGENT);
-  seedTurns(AGENT.id, [
-    {
-      role: "user",
-      turn_id: "user-1",
-      agent_id: AGENT.id,
-      started_at: "2026-05-16T00:00:00Z",
-      text: LONG_TEXT,
-    },
-  ]);
+  await registerAgent(ALICE);
+  seedTurns(ALICE.id, [userTurn({ id: "user-1", agentId: ALICE.id, text: longText() })]);
 
-  mountTranscript({ projectId: PROJECT_ID, agents: [AGENT] });
+  mountTranscript({ projectId: PROJECT_ID, agents: [ALICE] });
 
   // Poll: ResizeObserver-driven measurement settles asynchronously.
   await expect
@@ -71,5 +45,56 @@ test("a long user message overflows the clip and gets a collapse toggle (compact
   expect(getComputedStyle(clip).overflowY).toBe("hidden");
 
   // …and the overflow drives the per-message collapse toggle into existence.
-  await expect.element(page.getByTestId("turn-preview-toggle")).toBeVisible();
+  await expect.element(page.getByTestId("turn-preview-toggle")).toBeInTheDocument();
+});
+
+test("a short user message fits the clip and gets no toggle (no false positives)", async () => {
+  await registerAgent(ALICE);
+  seedTurns(ALICE.id, [userTurn({ id: "user-1", agentId: ALICE.id, text: "short and sweet" })]);
+
+  mountTranscript({ projectId: PROJECT_ID, agents: [ALICE] });
+
+  // The clip still mounts while compact, but the content fits — so its measured
+  // overflow stays at zero and no toggle is offered.
+  await expect.element(page.getByTestId("preview-clip")).toBeInTheDocument();
+  await expect
+    .poll(() => {
+      const el = page.getByTestId("preview-clip").element() as HTMLElement;
+      return el.scrollHeight - el.clientHeight;
+    })
+    .toBeLessThanOrEqual(1);
+  expect(page.getByTestId("turn-preview-toggle").elements()).toHaveLength(0);
+});
+
+test("a non-last-block agent response that overflows gets a toggle", async () => {
+  // The agent's latest response renders as the full last-block view (no clip);
+  // an earlier response renders as the height-clipped preview. Seed two so the
+  // first is the clipped one whose overflow must drive a toggle.
+  await registerAgent(ALICE);
+  seedTurns(ALICE.id, [
+    agentTurn({
+      id: "agent-early",
+      agentId: ALICE.id,
+      at: "2026-05-16T00:00:01Z",
+      items: [textItem(longText())],
+    }),
+    agentTurn({
+      id: "agent-latest",
+      agentId: ALICE.id,
+      at: "2026-05-16T00:00:09Z",
+      items: [textItem("the latest, short reply")],
+    }),
+  ]);
+
+  mountTranscript({ projectId: PROJECT_ID, agents: [ALICE] });
+
+  // Exactly one clip (the earlier, non-last-block response); it overflows.
+  await expect.element(page.getByTestId("preview-clip")).toBeInTheDocument();
+  await expect
+    .poll(() => {
+      const el = page.getByTestId("preview-clip").element() as HTMLElement;
+      return el.scrollHeight - el.clientHeight;
+    })
+    .toBeGreaterThan(1);
+  await expect.element(page.getByTestId("turn-preview-toggle")).toBeInTheDocument();
 });

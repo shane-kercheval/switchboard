@@ -1011,7 +1011,11 @@
         {#if lastBlock}
           {@render turnBody(turn, false, "last")}
         {:else}
-          <div class={cn("space-y-1.5", PREVIEW_CLIP)} use:measureClip={key}>
+          <div
+            class={cn("space-y-1.5", PREVIEW_CLIP)}
+            use:measureClip={key}
+            data-testid="preview-clip"
+          >
             {@render turnBody(turn, false, "answer")}
           </div>
         {/if}
@@ -1181,7 +1185,11 @@
                           {#if r.kind === "agent"}{@render turnBody(r.turn, false, "last")}{/if}
                         {/each}
                       {:else}
-                        <div class={cn("space-y-1.5", PREVIEW_CLIP)} use:measureClip={colKey}>
+                        <div
+                          class={cn("space-y-1.5", PREVIEW_CLIP)}
+                          use:measureClip={colKey}
+                          data-testid="preview-clip"
+                        >
                           {#each col.rows as r (r.key)}
                             {#if r.kind === "agent"}{@render turnBody(r.turn, false, "answer")}{/if}
                           {/each}

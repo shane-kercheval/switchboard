@@ -301,7 +301,7 @@
             {:else}
               <Tooltip
                 label={`Send to ${pane.name}`}
-                shortcut={shortcut("mod", "alt", String(i + 1))}
+                shortcut={i < 9 ? shortcut("mod", "alt", String(i + 1)) : undefined}
               >
                 {#snippet trigger(props)}
                   <button
@@ -390,7 +390,7 @@
           data-testid="pane-coverage"
         ></div>
       {/if}
-      {#if multiPane && cmdHeld && hoveredPaneId === pane.id}
+      {#if multiPane && cmdHeld && hoveredPaneId === pane.id && pane.members.length > 0}
         <div
           class="ring-accent pointer-events-none absolute inset-0 z-10 flex items-start justify-center ring-2 ring-inset"
           data-testid="pane-target-overlay"

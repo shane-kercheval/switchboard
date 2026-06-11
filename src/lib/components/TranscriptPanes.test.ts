@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
-import { fireEvent, render, screen, within } from "@testing-library/svelte";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import type { AgentRecord, ConversationItem, NormalizedEvent } from "$lib/types";
 // Static import so the component-tree transform happens at module collection,
 // not inside the first test's timeout (cold CI transforms have no vite cache).
@@ -8,6 +8,7 @@ import type { AgentRecord, ConversationItem, NormalizedEvent } from "$lib/types"
 import TranscriptPanes from "./TranscriptPanes.svelte";
 import {
   layoutFor,
+  moveAgentToPane,
   moveAgentToNewPane,
   toggleAgentHidden,
   _testing as panesState,
@@ -18,6 +19,7 @@ import {
   _testing as selectionState,
 } from "$lib/state/recipientSelection.svelte";
 import { setProjectCompact, _testing as previewState } from "$lib/state/transcriptPreview.svelte";
+import { shortcut } from "$lib/platform";
 
 const listeners = new Map<string, (e: { payload: NormalizedEvent }) => void>();
 vi.mock("@tauri-apps/api/event", () => ({
@@ -64,6 +66,17 @@ const BOB: AgentRecord = {
 };
 const ROSTER = [ALICE, BOB];
 const ROSTER_IDS = [ALICE.id, BOB.id];
+
+function numberedAgent(index: number): AgentRecord {
+  return {
+    id: `00000000-0000-7000-8000-${String(index).padStart(12, "0")}`,
+    project_id: PROJECT_ID,
+    name: `agent-${index}`,
+    harness: index % 2 === 0 ? "codex" : "claude_code",
+    session_locator: null,
+    created_at: `2026-05-16T00:00:${String(index).padStart(2, "0")}Z`,
+  };
+}
 
 async function seedTwoAgentTranscripts(): Promise<void> {
   const state = await loadState();
@@ -436,6 +449,24 @@ describe("Cmd-held target overlay", () => {
     expect(screen.queryByTestId("pane-target-overlay")).not.toBeInTheDocument();
   });
 
+  it("does not advertise Cmd-click targeting over an empty pane", async () => {
+    await seedTwoAgentTranscripts();
+    const emptyPaneId = moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    const firstPaneId = layoutFor(PROJECT_ID, ROSTER_IDS).panes[0]!.id;
+    moveAgentToPane(PROJECT_ID, ROSTER_IDS, BOB.id, firstPaneId);
+    renderPanes();
+
+    const emptyPane = paneEls().find((pane) => pane.dataset.paneId === emptyPaneId);
+    if (emptyPane === undefined) throw new Error("expected empty pane");
+
+    await fireEvent.pointerEnter(emptyPane);
+    await fireEvent.keyDown(window, { key: "Meta" });
+    expect(screen.queryByTestId("pane-target-overlay")).not.toBeInTheDocument();
+
+    await fireEvent.pointerEnter(paneEls()[0]!);
+    expect(screen.getByTestId("pane-target-overlay")).toBeInTheDocument();
+  });
+
   it("follows the hovered pane", async () => {
     await seedTwoAgentTranscripts();
     moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
@@ -461,5 +492,40 @@ describe("Cmd-held target overlay", () => {
 
     await fireEvent.blur(window);
     expect(screen.queryByTestId("pane-target-overlay")).not.toBeInTheDocument();
+  });
+});
+
+describe("pane header shortcut hints", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("only shows Cmd+Alt shortcut hints for panes 1 through 9", async () => {
+    const agents = Array.from({ length: 10 }, (_, i) => numberedAgent(i + 1));
+    const rosterIds = agents.map((agent) => agent.id);
+    for (const agent of agents.slice(1)) {
+      moveAgentToNewPane(PROJECT_ID, rosterIds, agent.id);
+    }
+    render(TranscriptPanes, { props: { projectId: PROJECT_ID, agents } });
+
+    const targets = screen.getAllByTestId("pane-target");
+    expect(targets).toHaveLength(10);
+
+    await fireEvent.pointerEnter(targets[8]!);
+    await vi.advanceTimersByTimeAsync(500);
+    let content = await waitFor(() => screen.getByTestId("tooltip-content"));
+    expect(content).toHaveTextContent("Send to Pane 9");
+    expect(content).toHaveTextContent(shortcut("mod", "alt", "9"));
+
+    await fireEvent.pointerLeave(targets[8]!);
+    await fireEvent.pointerEnter(targets[9]!);
+    await vi.advanceTimersByTimeAsync(500);
+    content = await waitFor(() => screen.getByTestId("tooltip-content"));
+    expect(content).toHaveTextContent("Send to Pane 10");
+    expect(content).not.toHaveTextContent(shortcut("mod", "alt", "10"));
   });
 });

@@ -1787,6 +1787,143 @@ describe("UnifiedTranscript — per-message copy", () => {
 
     expect(copyTextMock).toHaveBeenCalledWith("final block");
   });
+
+  it("copies all fan-out responses with agent labels", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "user-claude",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: SEND_1,
+        started_at: "2026-05-16T00:00:00Z",
+        text: "fan out",
+      },
+      {
+        role: "agent",
+        turn_id: "agent-claude",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: SEND_1,
+        started_at: "2026-05-16T00:00:01Z",
+        status: "complete",
+        items: [
+          { item_kind: "text", kind: "text", text: "first block" },
+          { item_kind: "text", kind: "text", text: "alice final" },
+        ],
+      },
+    ];
+    state.transcripts[CODEX_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "user-codex",
+        agent_id: CODEX_AGENT.id,
+        send_id: SEND_1,
+        started_at: "2026-05-16T00:00:00Z",
+        text: "fan out",
+      },
+      {
+        role: "agent",
+        turn_id: "agent-codex",
+        agent_id: CODEX_AGENT.id,
+        send_id: SEND_1,
+        started_at: "2026-05-16T00:00:02Z",
+        status: "complete",
+        items: [
+          { item_kind: "text", kind: "thinking", text: "private reasoning" },
+          { item_kind: "text", kind: "text", text: "bob final" },
+        ],
+      },
+    ];
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] },
+    });
+    copyTextMock.mockClear();
+
+    await fireEvent.click(screen.getByTestId("fanout-copy"));
+
+    expect(copyTextMock).toHaveBeenCalledWith(
+      'alice:\n\n"""\nalice final\n"""\n\nbob:\n\n"""\nbob final\n"""',
+    );
+  });
+
+  it("omits queued recipients from fan-out copy", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "user-claude",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: SEND_1,
+        started_at: "2026-05-16T00:00:00Z",
+        text: "fan out",
+      },
+      {
+        role: "agent",
+        turn_id: "agent-claude",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: SEND_1,
+        started_at: "2026-05-16T00:00:01Z",
+        status: "complete",
+        items: [{ item_kind: "text", kind: "text", text: "alice only" }],
+      },
+    ];
+    state.transcripts[CODEX_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "user-codex",
+        agent_id: CODEX_AGENT.id,
+        send_id: SEND_1,
+        started_at: "2026-05-16T00:00:00Z",
+        text: "fan out",
+      },
+    ];
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] },
+    });
+    copyTextMock.mockClear();
+
+    await fireEvent.click(screen.getByTestId("fanout-copy"));
+
+    expect(copyTextMock).toHaveBeenCalledWith('alice:\n\n"""\nalice only\n"""');
+  });
+
+  it("hides fan-out copy when no recipient has answer prose", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    state.transcripts[CLAUDE_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "user-claude",
+        agent_id: CLAUDE_AGENT.id,
+        send_id: SEND_1,
+        started_at: "2026-05-16T00:00:00Z",
+        text: "fan out",
+      },
+    ];
+    state.transcripts[CODEX_AGENT.id] = [
+      {
+        role: "user",
+        turn_id: "user-codex",
+        agent_id: CODEX_AGENT.id,
+        send_id: SEND_1,
+        started_at: "2026-05-16T00:00:00Z",
+        text: "fan out",
+      },
+    ];
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] },
+    });
+
+    expect(screen.queryByTestId("fanout-copy")).toBeNull();
+  });
 });
 
 describe("UnifiedTranscript — per-message cost + overage", () => {

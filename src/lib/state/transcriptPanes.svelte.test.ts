@@ -7,12 +7,14 @@ const {
   hiddenCount,
   isAgentHidden,
   paneOfAgent,
+  unassignedAgentIds,
   toggleAgentHidden,
   soloAgent,
   showAllAgents,
   showAllInPane,
   moveAgentToPane,
   moveAgentToNewPane,
+  unassignAgentFromPane,
   closePane,
   renamePane,
   setFractions,
@@ -26,14 +28,15 @@ afterEach(() => {
   _testing.reset();
 });
 
-/// Every roster agent in exactly one pane — the partition invariant.
-function assertPartition(layout: PaneLayout, rosterIds: string[]): void {
+/// Every roster agent appears in at most one pane; hidden entries must belong
+/// to their pane. Unassigned agents are allowed.
+function assertOptionalMembership(layout: PaneLayout, rosterIds: string[]): void {
   const seen = new Map<string, number>();
   for (const pane of layout.panes) {
     for (const id of pane.members) seen.set(id, (seen.get(id) ?? 0) + 1);
     for (const id of pane.hidden) expect(pane.members).toContain(id);
   }
-  for (const id of rosterIds) expect(seen.get(id)).toBe(1);
+  for (const id of seen.keys()) expect(rosterIds).toContain(id);
   expect([...seen.values()].every((n) => n === 1)).toBe(true);
   expect(layout.fractions).toHaveLength(layout.panes.length);
   expect(layout.fractions.reduce((acc, f) => acc + f, 0)).toBeCloseTo(1);
@@ -46,7 +49,7 @@ describe("default layout", () => {
     expect(layout.panes[0]!.name).toBe("Pane 1");
     expect(layout.panes[0]!.members).toEqual(ROSTER);
     expect(layout.fractions).toEqual([1]);
-    assertPartition(layout, ROSTER);
+    assertOptionalMembership(layout, ROSTER);
   });
 
   it("scopes layout to its project", () => {
@@ -113,7 +116,7 @@ describe("visibility (eye / solo / show all)", () => {
   });
 });
 
-describe("partition (move / new pane)", () => {
+describe("membership (move / new pane / unassign)", () => {
   it("move to a new pane removes the agent from its old pane", () => {
     const paneId = moveAgentToNewPane(P, ROSTER, "b");
     const layout = layoutFor(P, ROSTER);
@@ -121,7 +124,7 @@ describe("partition (move / new pane)", () => {
     expect(layout.panes[0]!.members).toEqual(["a", "c"]);
     expect(layout.panes[1]!.id).toBe(paneId);
     expect(layout.panes[1]!.members).toEqual(["b"]);
-    assertPartition(layout, ROSTER);
+    assertOptionalMembership(layout, ROSTER);
   });
 
   it("move to an existing pane never duplicates", () => {
@@ -130,24 +133,24 @@ describe("partition (move / new pane)", () => {
     const layout = layoutFor(P, ROSTER);
     expect(layout.panes[0]!.members).toEqual(["a"]);
     expect(layout.panes[1]!.members).toEqual(["b", "c"]);
-    assertPartition(layout, ROSTER);
+    assertOptionalMembership(layout, ROSTER);
   });
 
   it("moving an agent drops its hidden entry from the old pane", () => {
     toggleAgentHidden(P, ROSTER, "b");
     moveAgentToNewPane(P, ROSTER, "b");
     expect(isAgentHidden(P, ROSTER, "b")).toBe(false);
-    assertPartition(layoutFor(P, ROSTER), ROSTER);
+    assertOptionalMembership(layoutFor(P, ROSTER), ROSTER);
   });
 
-  it("partition holds after an arbitrary op sequence", () => {
+  it("optional membership holds after an arbitrary op sequence", () => {
     const p2 = moveAgentToNewPane(P, ROSTER, "b");
     const p3 = moveAgentToNewPane(P, ROSTER, "c");
     moveAgentToPane(P, ROSTER, "a", p2);
     moveAgentToPane(P, ROSTER, "b", p3);
     closePane(P, ROSTER, p2);
     const layout = layoutFor(P, ROSTER);
-    assertPartition(layout, ROSTER);
+    assertOptionalMembership(layout, ROSTER);
   });
 
   it("new panes get unique default names, skipping renamed collisions", () => {
@@ -165,7 +168,7 @@ describe("partition (move / new pane)", () => {
     const layout = layoutFor(P, ROSTER);
     expect(layout.panes).toHaveLength(2);
     expect(layout.panes.find((p) => p.id === p2)!.members).toEqual([]);
-    assertPartition(layout, ROSTER);
+    assertOptionalMembership(layout, ROSTER);
   });
 
   it("paneOfAgent reports the hosting pane", () => {
@@ -174,37 +177,58 @@ describe("partition (move / new pane)", () => {
     expect(paneOfAgent(P, ROSTER, "a")!.name).toBe("Pane 1");
     expect(paneOfAgent(P, ROSTER, "nope")).toBeNull();
   });
+
+  it("unassigns an agent from its pane", () => {
+    unassignAgentFromPane(P, ROSTER, "b");
+    const layout = layoutFor(P, ROSTER);
+    expect(layout.panes[0]!.members).toEqual(["a", "c"]);
+    expect(paneOfAgent(P, ROSTER, "b")).toBeNull();
+    expect(unassignedAgentIds(P, ROSTER)).toEqual(["b"]);
+    assertOptionalMembership(layout, ROSTER);
+  });
+
+  it("moving an unassigned agent assigns it to the target pane", () => {
+    const p2 = moveAgentToNewPane(P, ROSTER, "c");
+    unassignAgentFromPane(P, ROSTER, "b");
+    moveAgentToPane(P, ROSTER, "b", p2);
+    const layout = layoutFor(P, ROSTER);
+    expect(layout.panes[1]!.members).toEqual(["c", "b"]);
+    expect(unassignedAgentIds(P, ROSTER)).toEqual([]);
+    assertOptionalMembership(layout, ROSTER);
+  });
 });
 
 describe("close pane", () => {
-  it("merges members and hidden entries into the left neighbor", () => {
+  it("unassigns the closed pane's members", () => {
     const p2 = moveAgentToNewPane(P, ROSTER, "b");
     moveAgentToPane(P, ROSTER, "c", p2);
     toggleAgentHidden(P, ROSTER, "c");
     closePane(P, ROSTER, p2);
     const layout = layoutFor(P, ROSTER);
     expect(layout.panes).toHaveLength(1);
-    expect(layout.panes[0]!.members).toEqual(["a", "b", "c"]);
-    expect(layout.panes[0]!.hidden).toEqual(["c"]);
-    assertPartition(layout, ROSTER);
+    expect(layout.panes[0]!.members).toEqual(["a"]);
+    expect(layout.panes[0]!.hidden).toEqual([]);
+    expect(unassignedAgentIds(P, ROSTER)).toEqual(["b", "c"]);
+    assertOptionalMembership(layout, ROSTER);
   });
 
-  it("closing the leftmost pane merges into what was the second pane (now first)", () => {
+  it("closing the leftmost pane leaves its members unassigned", () => {
     moveAgentToNewPane(P, ROSTER, "b"); // pane1: a,c · pane2: b
     const first = layoutFor(P, ROSTER).panes[0]!;
     closePane(P, ROSTER, first.id);
     const layout = layoutFor(P, ROSTER);
     expect(layout.panes).toHaveLength(1);
     expect(layout.panes[0]!.name).toBe("Pane 2");
-    expect(new Set(layout.panes[0]!.members)).toEqual(new Set(ROSTER));
-    assertPartition(layout, ROSTER);
+    expect(layout.panes[0]!.members).toEqual(["b"]);
+    expect(unassignedAgentIds(P, ROSTER)).toEqual(["a", "c"]);
+    assertOptionalMembership(layout, ROSTER);
   });
 
   it("is unavailable (no-op) with a single pane", () => {
     const only = layoutFor(P, ROSTER).panes[0]!;
     closePane(P, ROSTER, only.id);
     expect(layoutFor(P, ROSTER).panes).toHaveLength(1);
-    assertPartition(layoutFor(P, ROSTER), ROSTER);
+    assertOptionalMembership(layoutFor(P, ROSTER), ROSTER);
   });
 
   it("the neighbor absorbs the closed pane's width share", () => {
@@ -222,14 +246,15 @@ describe("roster reconciliation", () => {
     const layout = layoutFor(P, ["a", "b"]);
     expect(layout.panes[0]!.members).toEqual(["a", "b"]);
     expect(layout.panes[0]!.hidden).toEqual([]);
-    assertPartition(layout, ["a", "b"]);
+    assertOptionalMembership(layout, ["a", "b"]);
   });
 
-  it("re-homes roster agents missing from every pane into the leftmost pane", () => {
+  it("leaves roster agents missing from every pane unassigned", () => {
     moveAgentToNewPane(P, ROSTER, "b");
     const layout = layoutFor(P, [...ROSTER, "d"]);
-    expect(layout.panes[0]!.members).toEqual(["a", "c", "d"]);
-    assertPartition(layout, [...ROSTER, "d"]);
+    expect(layout.panes[0]!.members).toEqual(["a", "c"]);
+    expect(unassignedAgentIds(P, [...ROSTER, "d"])).toEqual(["d"]);
+    assertOptionalMembership(layout, [...ROSTER, "d"]);
   });
 
   it("a duplicated agent keeps only its leftmost slot", () => {
@@ -246,7 +271,7 @@ describe("roster reconciliation", () => {
     expect(layout.panes[0]!.members).toEqual(["a", "b"]);
     expect(layout.panes[1]!.members).toEqual(["c"]);
     expect(layout.panes[1]!.hidden).toEqual([]);
-    assertPartition(layout, ROSTER);
+    assertOptionalMembership(layout, ROSTER);
   });
 
   it("normalizes malformed fractions to equal shares", () => {
@@ -292,12 +317,13 @@ describe("persistence", () => {
     expect(layout.fractions[0]).toBeCloseTo(0.7);
   });
 
-  it("re-homes agents missing from a stale stored layout on restore", () => {
+  it("leaves agents missing from a stale stored layout unassigned on restore", () => {
     moveAgentToNewPane(P, ROSTER, "b");
     _testing.reloadFromStorage();
     const layout = layoutFor(P, [...ROSTER, "d"]);
-    expect(layout.panes[0]!.members).toContain("d");
-    assertPartition(layout, [...ROSTER, "d"]);
+    expect(layout.panes[0]!.members).not.toContain("d");
+    expect(unassignedAgentIds(P, [...ROSTER, "d"])).toEqual(["d"]);
+    assertOptionalMembership(layout, [...ROSTER, "d"]);
   });
 
   it("falls back to the default single pane on a corrupt entry", () => {
@@ -305,7 +331,7 @@ describe("persistence", () => {
     _testing.reloadFromStorage();
     const layout = layoutFor(P, ROSTER);
     expect(layout.panes).toHaveLength(1);
-    assertPartition(layout, ROSTER);
+    assertOptionalMembership(layout, ROSTER);
   });
 
   it("ignores an envelope with an unknown version", () => {

@@ -84,7 +84,7 @@
   }: { projectId: ProjectId; agents: AgentRecord[]; onAddAgent?: () => void } = $props();
 
   // Pane membership + visibility for this project's roster. The eye toggle and
-  // the move-to-pane actions both key off the same partition model.
+  // the move-to-pane actions both key off the same optional-membership model.
   const rosterIds = $derived(agents.map((a) => a.id));
   const paneLayout = $derived(layoutFor(projectId, rosterIds));
   const hiddenAgentCount = $derived(hiddenCount(projectId, rosterIds));
@@ -865,9 +865,9 @@
                         Change effort
                       </DropdownMenuItem>
                     {/if}
-                    <!-- Pane assignment. Move, never copy — panes partition the
-                         roster. Listed flat (no submenu): a project realistically
-                         has a handful of panes. -->
+                    <!-- Pane assignment. Move, never copy: an agent can belong
+                         to at most one pane. Listed flat (no submenu): a
+                         project realistically has a handful of panes. -->
                     {#if paneLayout.panes.length > 1}
                       {@const ownPaneId = paneOfAgent(projectId, rosterIds, agent.id)?.id}
                       {#each paneLayout.panes.filter((p) => p.id !== ownPaneId) as pane (pane.id)}

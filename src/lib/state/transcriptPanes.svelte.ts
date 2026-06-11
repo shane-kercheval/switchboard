@@ -1,16 +1,11 @@
-// Transcript pane layout: an ordered list of panes that **strictly partitions**
-// the project's roster, plus per-pane visibility and pane widths.
+// Transcript pane layout: an ordered list of panes that assign zero-or-one pane
+// to each roster agent, plus per-pane visibility and pane widths.
 //
-// **The partition is the model.** Every pane is a named set of agents; every
-// roster agent belongs to exactly one pane; no agent ever renders in two panes.
-// There is no special "unified"/"all" pane kind — the unified view is simply
-// the default state of one pane containing everyone. Moving an agent *moves*
-// it (never copies); closing a pane merges its members into a neighbor, so an
-// agent can never be orphaned. A mirror-style "all" pane (always showing the
-// whole roster alongside member panes) was considered and rejected: it needs a
-// pane-kind discriminant, duplicate rendering, an "unassigned" state, and a
-// coverage-border carve-out — the partition deletes all four
-// (docs/implementation_plans/2026-06-10-multi-panel-transcript.md).
+// **Membership is optional and exclusive.** Every pane is a named set of agents;
+// a roster agent may belong to one pane or to no pane, but never to two panes.
+// The default layout still starts with everyone in Pane 1 for continuity. From
+// there, removing an agent from a pane makes it unassigned, and closing a pane
+// unassigns its members. Moving an agent to a pane *moves* it (never copies).
 //
 // **Membership decides *where* an agent appears; `hidden` decides *whether*.**
 // The eye/solo toggles edit a pane's `hidden` set without touching membership.
@@ -81,18 +76,16 @@ function normalizeFractions(fractions: number[], paneCount: number): number[] {
   return fractions.map((f) => f / sum);
 }
 
-/// Reconcile a (possibly stale or absent) stored layout against the live
-/// roster, returning a layout that satisfies the partition invariant:
+/// Reconcile a (possibly stale or absent) stored layout against the live roster,
+/// returning a layout that satisfies the optional-exclusive membership invariant:
 /// - stale agent ids (removed agents) are pruned from members and hidden;
-/// - roster agents missing from every pane (new agents, or agents restored
-///   from a layout saved before they existed) join the **leftmost** pane —
-///   predictable, and degenerate-case-correct (one pane = today's behavior);
+/// - roster agents missing from every pane remain unassigned;
 /// - an agent somehow present in two panes keeps its first (leftmost) slot;
 /// - at least one pane always exists; fractions are normalized to the pane
 ///   count. Emptied panes stay open (the user named them; closing is theirs).
 ///
 /// Pure — exported for tests and for read-time use; mutations run it before
-/// applying so they always operate on a partition-valid layout.
+/// applying so they always operate on a membership-valid layout.
 export function reconcileLayout(layout: PaneLayout | undefined, rosterIds: AgentId[]): PaneLayout {
   if (layout === undefined || layout.panes.length === 0) return defaultLayout(rosterIds);
   // Pure-function locals, never reactive state — plain Sets are correct here.
@@ -111,11 +104,6 @@ export function reconcileLayout(layout: PaneLayout | undefined, rosterIds: Agent
     const hidden = pane.hidden.filter((id) => memberSet.has(id));
     return { ...pane, members, hidden };
   });
-  const missing = rosterIds.filter((id) => !seen.has(id));
-  if (missing.length > 0) {
-    const first = panes[0]!;
-    panes[0] = { ...first, members: [...first.members, ...missing] };
-  }
   return { panes, fractions: normalizeFractions(layout.fractions, panes.length) };
 }
 
@@ -229,9 +217,14 @@ export function paneOfAgent(
   return layoutFor(projectId, rosterIds).panes.find((p) => p.members.includes(agentId)) ?? null;
 }
 
+export function unassignedAgentIds(projectId: ProjectId, rosterIds: AgentId[]): AgentId[] {
+  const assigned = layoutFor(projectId, rosterIds).panes.flatMap((p) => p.members);
+  return rosterIds.filter((id) => !assigned.includes(id));
+}
+
 // ── Mutations ────────────────────────────────────────────────────────────────
 
-/// Reconcile-then-mutate: every mutation starts from a partition-valid layout
+/// Reconcile-then-mutate: every mutation starts from a membership-valid layout
 /// so a stale persisted state can't corrupt an operation.
 function update(
   projectId: ProjectId,
@@ -296,9 +289,8 @@ export function showAllInPane(projectId: ProjectId, rosterIds: AgentId[], paneId
 }
 
 /// Move an agent to an existing pane. **Move, never copy** — the agent leaves
-/// its previous pane's members and hidden sets; panes partition the roster, so
-/// an agent renders in exactly one pane. No-op if the target doesn't exist or
-/// already hosts the agent.
+/// its previous pane's members and hidden sets, so it renders in at most one
+/// pane. No-op if the target doesn't exist or already hosts the agent.
 export function moveAgentToPane(
   projectId: ProjectId,
   rosterIds: AgentId[],
@@ -320,6 +312,21 @@ export function moveAgentToPane(
       }),
     };
   });
+}
+
+export function unassignAgentFromPane(
+  projectId: ProjectId,
+  rosterIds: AgentId[],
+  agentId: AgentId,
+): void {
+  update(projectId, rosterIds, (layout) => ({
+    ...layout,
+    panes: layout.panes.map((pane) => ({
+      ...pane,
+      members: pane.members.filter((id) => id !== agentId),
+      hidden: pane.hidden.filter((id) => id !== agentId),
+    })),
+  }));
 }
 
 /// Unique default pane name: "Pane N" counting up from the pane count,
@@ -352,30 +359,17 @@ export function moveAgentToNewPane(
   return paneId;
 }
 
-/// Close a pane, merging its members and hidden-set entries into its **left**
-/// neighbor — or its **right** neighbor when the closed pane is leftmost
-/// (which then becomes the new leftmost). Partition invariant: an agent can
-/// never be orphaned, so close is a merge, never a drop. Unavailable (no-op)
-/// with a single pane — there is no neighbor to merge into. The neighbor
-/// absorbs the closed pane's width share.
+/// Close a pane, leaving its members unassigned. Unavailable (no-op) with a
+/// single pane: there must always be at least one place to add agents back.
+/// The closed pane's width share is absorbed by its left neighbor, or its right
+/// neighbor when the closed pane is leftmost.
 export function closePane(projectId: ProjectId, rosterIds: AgentId[], paneId: PaneId): void {
   update(projectId, rosterIds, (layout) => {
     if (layout.panes.length <= 1) return layout;
     const index = layout.panes.findIndex((p) => p.id === paneId);
     if (index === -1) return layout;
     const neighborIndex = index === 0 ? 1 : index - 1;
-    const closing = layout.panes[index]!;
-    const panes = layout.panes
-      .map((pane, i) =>
-        i === neighborIndex
-          ? {
-              ...pane,
-              members: [...pane.members, ...closing.members],
-              hidden: [...pane.hidden, ...closing.hidden],
-            }
-          : pane,
-      )
-      .filter((_, i) => i !== index);
+    const panes = layout.panes.filter((_, i) => i !== index);
     const fractions = layout.fractions
       .map((f, i) => (i === neighborIndex ? f + (layout.fractions[index] ?? 0) : f))
       .filter((_, i) => i !== index);

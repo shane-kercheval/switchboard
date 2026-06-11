@@ -8,6 +8,7 @@
   /// bindable for callers that need to drive it.
   import type { Snippet } from "svelte";
   import { DropdownMenu as Bits } from "bits-ui";
+  import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import { cn } from "$lib/utils";
 
   type Props = {
@@ -18,6 +19,8 @@
     triggerLabel?: string;
     triggerTestid?: string;
     triggerTabindex?: number;
+    tooltipLabel?: string;
+    tooltipSide?: "top" | "bottom" | "left" | "right";
     contentClass?: string;
     contentTestid?: string;
     align?: "start" | "center" | "end";
@@ -26,12 +29,14 @@
 
   let {
     open = $bindable(false),
-    trigger,
+    trigger: renderTrigger,
     children,
     triggerClass,
     triggerLabel,
     triggerTestid,
     triggerTabindex,
+    tooltipLabel,
+    tooltipSide = "top",
     contentClass,
     contentTestid,
     align = "end",
@@ -48,14 +53,30 @@
 </script>
 
 <Bits.Root bind:open>
-  <Bits.Trigger
-    class={triggerClass}
-    aria-label={triggerLabel}
-    data-testid={triggerTestid}
-    tabindex={triggerTabindex}
-  >
-    {@render trigger()}
-  </Bits.Trigger>
+  {#if tooltipLabel}
+    <Tooltip label={tooltipLabel} side={tooltipSide}>
+      {#snippet trigger(props)}
+        <Bits.Trigger
+          {...props}
+          class={triggerClass}
+          aria-label={triggerLabel}
+          data-testid={triggerTestid}
+          tabindex={triggerTabindex}
+        >
+          {@render renderTrigger()}
+        </Bits.Trigger>
+      {/snippet}
+    </Tooltip>
+  {:else}
+    <Bits.Trigger
+      class={triggerClass}
+      aria-label={triggerLabel}
+      data-testid={triggerTestid}
+      tabindex={triggerTabindex}
+    >
+      {@render renderTrigger()}
+    </Bits.Trigger>
+  {/if}
   <Bits.Portal>
     <Bits.Content
       {align}

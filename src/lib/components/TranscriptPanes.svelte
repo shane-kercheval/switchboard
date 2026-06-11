@@ -1,6 +1,6 @@
 <script lang="ts">
   /// The transcript pane row: 1..N side-by-side `UnifiedTranscript` instances
-  /// partitioning the project's roster, with resizable gutters and pane
+  /// showing assigned subsets of the project's roster, with resizable gutters and pane
   /// targeting. With a single pane (the default), every piece of pane chrome —
   /// header, gutters, coverage border, Cmd overlay, targeting gestures — is
   /// inert, so the no-split state renders exactly like the pre-pane UI: with
@@ -12,10 +12,12 @@
   /// the coverage border *derives* from the selection ∩ membership. Nothing
   /// here stores a targeted pane — a stored target could drift from the real
   /// recipient set and lie.
-  import { Check, Pencil, X } from "@lucide/svelte";
+  import { Check, Pencil, Plus, X } from "@lucide/svelte";
   import type { AgentRecord, ConversationItem, ProjectId } from "$lib/types";
   import UnifiedTranscript from "$lib/components/UnifiedTranscript.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
+  import DropdownMenu from "$lib/components/ui/DropdownMenu.svelte";
+  import DropdownMenuItem from "$lib/components/ui/DropdownMenuItem.svelte";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
   import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
   import { cn } from "$lib/utils";
@@ -28,6 +30,9 @@
     setFractions,
     setPaneRowWidth,
     showAllInPane,
+    unassignedAgentIds,
+    unassignAgentFromPane,
+    moveAgentToPane,
     type TranscriptPane,
   } from "$lib/state/transcriptPanes.svelte";
   import { selectionFor, targetRecipients } from "$lib/state/recipientSelection.svelte";
@@ -52,12 +57,18 @@
   const layout = $derived(layoutFor(projectId, rosterIds));
   const multiPane = $derived(layout.panes.length > 1);
   const selection = $derived(selectionFor(projectId));
+  const unassignedIds = $derived(unassignedAgentIds(projectId, rosterIds));
+  const paneChrome = $derived(multiPane || unassignedIds.length > 0);
 
   /// A pane's visible roster, in roster order (membership decides *where* an
   /// agent appears; the pane's hidden set decides *whether*). Roster order
   /// keeps pane columns consistent with the sidebar and fan-out columns.
   function paneAgents(pane: TranscriptPane): AgentRecord[] {
     return agents.filter((a) => pane.members.includes(a.id) && !pane.hidden.includes(a.id));
+  }
+
+  function paneMemberAgents(pane: TranscriptPane): AgentRecord[] {
+    return agents.filter((a) => pane.members.includes(a.id));
   }
 
   /// Tri-state recipient coverage: how much of this pane the current draft
@@ -261,7 +272,7 @@
       onpointerenter={() => (hoveredPaneId = pane.id)}
       onpointerleave={() => (hoveredPaneId = hoveredPaneId === pane.id ? null : hoveredPaneId)}
     >
-      {#if multiPane}
+      {#if paneChrome}
         <header
           class="border-border/80 bg-raised flex h-8 shrink-0 items-center gap-1 border-b px-2"
           data-testid="pane-header"
@@ -276,17 +287,21 @@
               onkeydown={onRenameKeydown}
               onblur={cancelRename}
             />
-            <button
-              type="button"
-              class={cn(ICON_BUTTON_CLASS, "shrink-0")}
-              aria-label="Save pane name"
-              title="Save"
-              data-testid="pane-rename-save"
-              onmousedown={(event) => event.preventDefault()}
-              onclick={commitRename}
-            >
-              <Check size={14} strokeWidth={2} aria-hidden="true" />
-            </button>
+            <Tooltip label="Save pane name">
+              {#snippet trigger(props)}
+                <button
+                  {...props}
+                  type="button"
+                  class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
+                  aria-label="Save pane name"
+                  data-testid="pane-rename-save"
+                  onmousedown={(event) => event.preventDefault()}
+                  onclick={commitRename}
+                >
+                  <Check size={14} strokeWidth={2} aria-hidden="true" />
+                </button>
+              {/snippet}
+            </Tooltip>
           {:else}
             {#if pane.members.length === 0}
               <!-- An empty pane is not a send target — a "Send to" affordance
@@ -298,7 +313,7 @@
               >
                 {pane.name}
               </span>
-            {:else}
+            {:else if multiPane}
               <Tooltip
                 label={`Send to ${pane.name}`}
                 shortcut={i < 9 ? shortcut("mod", "alt", String(i + 1)) : undefined}
@@ -307,48 +322,121 @@
                   <button
                     {...props}
                     type="button"
-                    class="hover:bg-panel flex h-6 min-w-0 flex-1 items-center gap-1.5 rounded px-1.5 text-left"
+                    class="hover:bg-panel flex h-6 min-w-0 items-center rounded px-1.5 text-left"
                     data-testid="pane-target"
                     onclick={() => targetPane(pane)}
                   >
                     <span class="text-fg truncate text-xs font-semibold" data-testid="pane-name">
                       {pane.name}
                     </span>
-                    <span class="flex shrink-0 items-center gap-0.5">
-                      {#each agents.filter( (a) => pane.members.includes(a.id), ) as member (member.id)}
-                        <HarnessIcon harness={member.harness} size="sm" class="h-3 w-3" />
-                      {/each}
-                    </span>
                   </button>
                 {/snippet}
               </Tooltip>
+            {:else}
+              <span
+                class="text-fg flex h-6 min-w-0 items-center px-1.5 text-xs font-semibold"
+                data-testid="pane-name"
+              >
+                {pane.name}
+              </span>
             {/if}
-            <button
-              type="button"
-              class={cn(ICON_BUTTON_CLASS, "shrink-0")}
-              aria-label={`Rename ${pane.name}`}
-              title="Rename pane"
-              data-testid="pane-rename"
-              onclick={(event) => {
-                event.stopPropagation();
-                startRename(pane);
-              }}
+            <div class="flex min-w-0 flex-1 items-center gap-1 overflow-hidden">
+              {#each paneMemberAgents(pane) as member (member.id)}
+                <span
+                  class="border-border bg-panel text-fg inline-flex h-5 max-w-28 min-w-0 items-center gap-1 rounded-full border px-1.5 text-[11px]"
+                  data-testid="pane-member-chip"
+                  data-agent-id={member.id}
+                >
+                  <HarnessIcon harness={member.harness} size="sm" class="h-3 w-3 shrink-0" />
+                  <span class="truncate">{member.name}</span>
+                  <button
+                    type="button"
+                    class="text-muted hover:text-status-failed hover:border-status-failed hover:bg-status-failed-soft/70 -mr-1 inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full border border-transparent"
+                    aria-label={`Remove ${member.name} from ${pane.name}`}
+                    data-testid="pane-member-remove"
+                    onclick={(event) => {
+                      event.stopPropagation();
+                      unassignAgentFromPane(projectId, rosterIds, member.id);
+                    }}
+                  >
+                    <X size={10} strokeWidth={2} aria-hidden="true" />
+                  </button>
+                </span>
+              {/each}
+            </div>
+            <DropdownMenu
+              triggerLabel={`Add agent to ${pane.name}`}
+              triggerTestid="pane-add-agent"
+              triggerClass={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
+              tooltipLabel={`Add or move agents to ${pane.name}`}
+              contentTestid="pane-add-agent-menu"
             >
-              <Pencil size={12} strokeWidth={1.8} aria-hidden="true" />
-            </button>
-            <button
-              type="button"
-              class={cn(ICON_BUTTON_CLASS, "shrink-0")}
-              aria-label={`Close ${pane.name}`}
-              title="Close pane (agents merge into the neighboring pane)"
-              data-testid="pane-close"
-              onclick={(event) => {
-                event.stopPropagation();
-                closePane(projectId, rosterIds, pane.id);
-              }}
-            >
-              <X size={14} strokeWidth={1.8} aria-hidden="true" />
-            </button>
+              {#snippet trigger()}
+                <Plus size={14} strokeWidth={1.8} aria-hidden="true" />
+              {/snippet}
+              {#each agents as agent (agent.id)}
+                {@const alreadyInPane = pane.members.includes(agent.id)}
+                {@const currentPane = layout.panes.find((p) => p.members.includes(agent.id))}
+                <DropdownMenuItem
+                  onSelect={() => moveAgentToPane(projectId, rosterIds, agent.id, pane.id)}
+                  disabled={alreadyInPane}
+                  class="gap-2"
+                  data-testid={`pane-add-agent-${agent.id}`}
+                >
+                  <HarnessIcon harness={agent.harness} size="sm" class="h-3.5 w-3.5 shrink-0" />
+                  <span class="min-w-0 flex-1 truncate">{agent.name}</span>
+                  {#if alreadyInPane}
+                    <span class="text-muted text-xs">in pane</span>
+                  {:else if currentPane !== undefined}
+                    <span class="text-muted text-xs">move</span>
+                  {:else}
+                    <span class="text-muted text-xs">add</span>
+                  {/if}
+                </DropdownMenuItem>
+              {/each}
+            </DropdownMenu>
+            <Tooltip label={`Rename ${pane.name}`}>
+              {#snippet trigger(props)}
+                <button
+                  {...props}
+                  type="button"
+                  class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
+                  aria-label={`Rename ${pane.name}`}
+                  data-testid="pane-rename"
+                  onclick={(event) => {
+                    event.stopPropagation();
+                    startRename(pane);
+                  }}
+                >
+                  <Pencil size={12} strokeWidth={1.8} aria-hidden="true" />
+                </button>
+              {/snippet}
+            </Tooltip>
+            {#if layout.panes.length > 1}
+              <Tooltip>
+                {#snippet trigger(props)}
+                  <button
+                    {...props}
+                    type="button"
+                    class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
+                    aria-label={`Close ${pane.name}`}
+                    data-testid="pane-close"
+                    onclick={(event) => {
+                      event.stopPropagation();
+                      closePane(projectId, rosterIds, pane.id);
+                    }}
+                  >
+                    <X size={14} strokeWidth={1.8} aria-hidden="true" />
+                  </button>
+                {/snippet}
+                <div class="max-w-52">
+                  <div class="text-[13px] font-medium">Close {pane.name}</div>
+                  <div class="text-primary-fg/70 mt-1 text-xs">
+                    Agents in this pane become unassigned and keep working in the background.
+                  </div>
+                </div>
+              </Tooltip>
+            {/if}
           {/if}
         </header>
       {/if}
@@ -358,7 +446,10 @@
           data-testid="pane-empty"
         >
           {#if pane.members.length === 0}
-            <p>No agents in this pane — move one here from the agents sidebar.</p>
+            <p>
+              No agents in this pane — add one from the pane header or move one here from the agents
+              sidebar.
+            </p>
           {:else}
             <p>All agents in this pane are hidden.</p>
             <button

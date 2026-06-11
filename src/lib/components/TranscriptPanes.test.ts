@@ -286,6 +286,8 @@ describe("pane chrome (headers, rename, close)", () => {
     renderPanes();
     const names = screen.getAllByTestId("pane-name").map((el) => el.textContent?.trim());
     expect(names).toEqual(["Pane 1", "Pane 2"]);
+    const chips = screen.getAllByTestId("pane-member-chip").map((el) => el.textContent?.trim());
+    expect(chips).toEqual(["alice", "bob"]);
   });
 
   it("renames via the explicit edit affordance without re-targeting", async () => {
@@ -304,7 +306,7 @@ describe("pane chrome (headers, rename, close)", () => {
     expect(selectionFor(PROJECT_ID)).toEqual([]);
   });
 
-  it("close merges the pane's agents into the neighbor", async () => {
+  it("close unassigns the pane's agents", async () => {
     await seedTwoAgentTranscripts();
     moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
     renderPanes();
@@ -313,9 +315,57 @@ describe("pane chrome (headers, rename, close)", () => {
 
     expect(paneEls()).toHaveLength(1);
     const layout = layoutFor(PROJECT_ID, ROSTER_IDS);
-    expect(new Set(layout.panes[0]!.members)).toEqual(new Set(ROSTER_IDS));
-    // Back to one pane → chrome disappears entirely.
-    expect(screen.queryByTestId("pane-header")).not.toBeInTheDocument();
+    expect(layout.panes[0]!.members).toEqual([ALICE.id]);
+    expect(within(paneEls()[0]!).getByText("hello from alice")).toBeInTheDocument();
+    expect(within(paneEls()[0]!).queryByText("hello from bob")).not.toBeInTheDocument();
+    // One pane remains, but chrome stays visible while unassigned agents exist
+    // so they can be added back from the pane header.
+    expect(screen.getByTestId("pane-header")).toBeInTheDocument();
+    expect(screen.getByTestId("pane-add-agent")).toBeInTheDocument();
+  });
+
+  it("removing a pane member chip unassigns that agent", async () => {
+    await seedTwoAgentTranscripts();
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    renderPanes();
+
+    const paneB = paneEls()[1]!;
+    await fireEvent.click(within(paneB).getByTestId("pane-member-remove"));
+
+    const layout = layoutFor(PROJECT_ID, ROSTER_IDS);
+    expect(layout.panes[1]!.members).toEqual([]);
+    expect(within(paneB).queryByText("hello from bob")).not.toBeInTheDocument();
+    expect(within(paneB).getByTestId("pane-empty")).toHaveTextContent(/add one .* pane header/i);
+  });
+
+  it("the pane add menu adds an unassigned agent", async () => {
+    await seedTwoAgentTranscripts();
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    renderPanes();
+
+    const paneB = paneEls()[1]!;
+    await fireEvent.click(within(paneB).getByTestId("pane-member-remove"));
+    await fireEvent.click(within(paneB).getByTestId("pane-add-agent"));
+    await fireEvent.click(screen.getByTestId(`pane-add-agent-${BOB.id}`));
+
+    expect(layoutFor(PROJECT_ID, ROSTER_IDS).panes[1]!.members).toEqual([BOB.id]);
+    expect(within(paneEls()[1]!).getByText("hello from bob")).toBeInTheDocument();
+  });
+
+  it("the pane add menu moves an agent from another pane", async () => {
+    await seedTwoAgentTranscripts();
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    renderPanes();
+
+    const paneB = paneEls()[1]!;
+    await fireEvent.click(within(paneB).getByTestId("pane-add-agent"));
+    await fireEvent.click(screen.getByTestId(`pane-add-agent-${ALICE.id}`));
+
+    const layout = layoutFor(PROJECT_ID, ROSTER_IDS);
+    expect(layout.panes[0]!.members).toEqual([]);
+    expect(layout.panes[1]!.members).toEqual([BOB.id, ALICE.id]);
+    expect(within(paneEls()[0]!).queryByText("hello from alice")).not.toBeInTheDocument();
+    expect(within(paneEls()[1]!).getByText("hello from alice")).toBeInTheDocument();
   });
 });
 

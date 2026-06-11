@@ -333,20 +333,10 @@
   const rosterIds = $derived(agents.map((a) => a.id));
   const paneLayout = $derived(layoutFor(projectId, rosterIds));
 
-  /// The pane whose member set the current recipients exactly equal, when ≥2
-  /// panes exist — drives the compose bar's non-positional dock treatment
-  /// (an accent border; deliberately no geometry coupling to the pane row —
-  /// the pane's own coverage border carries the spatial signal). Derived, never
-  /// stored: subset/superset/spanning selections leave the bar neutral.
-  const dockedPane = $derived.by<TranscriptPane | null>(() => {
-    if (paneLayout.panes.length < 2 || selectedIds.length === 0) return null;
-    const sel = new Set(selectedIds);
-    return (
-      paneLayout.panes.find(
-        (p) => p.members.length === sel.size && p.members.every((id) => sel.has(id)),
-      ) ?? null
-    );
-  });
+  // No "dock" treatment on the compose box: an earlier iteration accented the
+  // box's border whenever the recipient set exactly equaled one pane, but in
+  // real use a persistent accent on the compose surface read as unexplained
+  // noise. The pane's own coverage ring is the one targeting visual.
 
   /// Resolve the recipient set for a fresh mount.
   /// - A single-agent project shows no chips (nothing to choose), so the lone
@@ -1027,14 +1017,10 @@
   <div
     class={cn(
       "border-border bg-raised relative rounded-xl border p-2.5 shadow-[0_10px_32px_rgba(0,0,0,0.08)] transition-colors",
-      // Dock: the recipient set is exactly one pane — accent the bar (class-
-      // level only; no positional alignment to the pane, by design).
-      dockedPane !== null ? "border-accent/70" : "",
       dragOver ? "ring-accent border-accent ring-2" : "",
     )}
     data-testid="compose-box"
     data-drag-over={dragOver}
-    data-docked-pane={dockedPane?.id}
     bind:this={promptMenuWrapEl}
   >
     {#if promptMenuOpen}

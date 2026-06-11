@@ -142,6 +142,7 @@ describe("single pane (the no-split default)", () => {
     expect(screen.queryByTestId("pane-header")).not.toBeInTheDocument();
     expect(screen.queryByTestId("pane-gutter-1")).not.toBeInTheDocument();
     expect(paneEls()[0]).not.toHaveAttribute("data-coverage");
+    expect(screen.queryByTestId("pane-coverage")).not.toBeInTheDocument();
 
     // Targeting chrome is inert with one pane: holding Cmd shows no overlay.
     await fireEvent.pointerEnter(paneEls()[0]!);
@@ -391,16 +392,22 @@ describe("targeting", () => {
     setRecipients(PROJECT_ID, [ALICE.id, BOB.id]);
     await Promise.resolve();
     expect(paneEls()[1]).toHaveAttribute("data-coverage", "full");
+    // The indicator must be its own overlay ELEMENT: a ring on the pane
+    // itself paints beneath the opaque header/transcript children and is
+    // never visible (the regression a data-attribute assertion can't catch).
+    expect(within(paneEls()[1]!).getByTestId("pane-coverage")).toBeInTheDocument();
 
     // Dropping one recipient instantly demotes the border to partial — the
     // core invariant: the visual cannot disagree with who actually receives.
     setRecipients(PROJECT_ID, [ALICE.id]);
     await Promise.resolve();
     expect(paneEls()[1]).toHaveAttribute("data-coverage", "partial");
+    expect(within(paneEls()[1]!).getByTestId("pane-coverage")).toBeInTheDocument();
 
     setRecipients(PROJECT_ID, []);
     await Promise.resolve();
     expect(paneEls()[1]).toHaveAttribute("data-coverage", "none");
+    expect(within(paneEls()[1]!).queryByTestId("pane-coverage")).not.toBeInTheDocument();
   });
 
   it("whole-roster selection shows every pane fully covered", async () => {

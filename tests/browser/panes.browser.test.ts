@@ -169,6 +169,16 @@ test("Cmd+click targets the pane in real WebKit; plain click never re-targets", 
     .click({ modifiers: ["Meta"] });
   await expect.poll(() => selectionFor(PROJECT_ID)).toEqual([ALICE.id]);
 
+  // The coverage indicator is a real painted overlay spanning the pane — not
+  // a ring on the pane element, which its opaque children would occlude.
+  await expect
+    .poll(() => {
+      const overlay = paneEl(0).querySelector('[data-testid="pane-coverage"]');
+      if (overlay === null) return 0;
+      return overlay.getBoundingClientRect().width;
+    })
+    .toBeGreaterThan(MIN_PANE_WIDTH_PX - 2);
+
   // Plain click elsewhere in pane B: reading never re-aims the draft.
   await page.getByTestId("transcript-pane").nth(1).click();
   await expect.poll(() => selectionFor(PROJECT_ID)).toEqual([ALICE.id]);

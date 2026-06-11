@@ -83,10 +83,13 @@
 
   /// Cmd+click anywhere in a pane targets it (multi-pane only). Plain clicks
   /// never re-target — reading (scroll, select, copy) must stay safe while a
-  /// draft is half-typed elsewhere.
+  /// draft is half-typed elsewhere. ⌘ only, never Ctrl: on macOS Ctrl+click is
+  /// the system context-menu gesture, so treating Ctrl as a targeting modifier
+  /// hijacks right-clicks (and leaves the armed overlay stuck under the native
+  /// menu, which swallows the Ctrl keyup).
   function onPaneClick(pane: TranscriptPane, event: MouseEvent): void {
     if (!multiPane) return;
-    if (!(event.metaKey || event.ctrlKey)) return;
+    if (!event.metaKey) return;
     event.preventDefault();
     event.stopPropagation();
     targetPane(pane);
@@ -101,10 +104,10 @@
   let hoveredPaneId = $state<string | null>(null);
 
   function onWindowKeydown(event: KeyboardEvent): void {
-    if (event.key === "Meta" || event.key === "Control") cmdHeld = true;
+    if (event.key === "Meta") cmdHeld = true;
   }
   function onWindowKeyup(event: KeyboardEvent): void {
-    if (event.key === "Meta" || event.key === "Control") cmdHeld = false;
+    if (event.key === "Meta") cmdHeld = false;
   }
   function onWindowBlur(): void {
     cmdHeld = false;
@@ -202,13 +205,16 @@
     });
   }
 
-  const COVERAGE_CLASS: Record<"full" | "partial" | "none", string> = {
-    // One border, one meaning: accent = "this pane's members receive the
-    // draft"; the faded variant = "some of them do"; nothing = none. Inset
-    // ring instead of border so coverage changes never shift layout.
-    full: "ring-2 ring-inset ring-accent",
-    partial: "ring-2 ring-inset ring-accent/35",
-    none: "",
+  // One border, one meaning: accent = "this pane's members receive the
+  // draft"; the faded variant = "some of them do"; nothing = none. Rendered as
+  // an absolutely-positioned overlay (like the Cmd-held overlay), NOT as a
+  // ring on the pane element itself: an inset ring is a box-shadow painted in
+  // the pane's own background layer, beneath its opaque children (header +
+  // transcript backgrounds), so it would be drawn but never visible. The
+  // overlay also never shifts layout when coverage changes.
+  const COVERAGE_RING: Record<"full" | "partial", string> = {
+    full: "ring-accent",
+    partial: "ring-accent/35",
   };
 </script>
 
@@ -245,7 +251,7 @@
     <!-- svelte-ignore a11y_click_events_have_key_events -->
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <section
-      class={cn("relative flex min-w-0 flex-col overflow-hidden", multiPane && COVERAGE_CLASS[cov])}
+      class="relative flex min-w-0 flex-col overflow-hidden"
       style:flex={`${effectiveFractions[i] ?? 1} 1 0%`}
       style:min-width={multiPane ? `${MIN_PANE_WIDTH_PX}px` : undefined}
       data-testid="transcript-pane"
@@ -374,6 +380,15 @@
           {loadError}
           {onRetryLoad}
         />
+      {/if}
+      {#if multiPane && cov !== "none"}
+        <div
+          class={cn(
+            "pointer-events-none absolute inset-0 z-10 ring-2 ring-inset",
+            COVERAGE_RING[cov],
+          )}
+          data-testid="pane-coverage"
+        ></div>
       {/if}
       {#if multiPane && cmdHeld && hoveredPaneId === pane.id}
         <div

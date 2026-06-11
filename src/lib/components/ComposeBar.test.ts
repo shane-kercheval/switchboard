@@ -1805,32 +1805,20 @@ describe("ComposeBar pane targeting", () => {
     expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "true");
   });
 
-  it("docks (accent) exactly when the recipient set equals one pane's members", async () => {
+  it("never accents the compose box for pane targeting (the dock treatment was removed)", async () => {
     const panes = await importPanes();
     const selection = await importSelection();
     panes.moveAgentToNewPane(PROJECT_ID, ROSTER, AGENT_B.id);
-    const pane2 = panes.layoutFor(PROJECT_ID, ROSTER).panes[1]!;
 
     await renderTwoAgents();
 
+    // Even the exact-pane match that used to trigger the dock leaves the
+    // compose box neutral — the pane's own coverage ring is the one
+    // targeting visual.
     selection.setRecipients(PROJECT_ID, [AGENT_B.id]);
-    await waitFor(() => {
-      expect(screen.getByTestId("compose-box")).toHaveAttribute("data-docked-pane", pane2.id);
-    });
-
-    // Spanning selection → neutral (subset/superset never docks).
-    selection.setRecipients(PROJECT_ID, [AGENT_A.id, AGENT_B.id]);
-    await waitFor(() => {
-      expect(screen.getByTestId("compose-box")).not.toHaveAttribute("data-docked-pane");
-    });
-  });
-
-  it("never docks with the single default pane, even when everyone is selected", async () => {
-    const selection = await importSelection();
-    await renderTwoAgents();
-    selection.setRecipients(PROJECT_ID, [AGENT_A.id, AGENT_B.id]);
     await Promise.resolve();
     expect(screen.getByTestId("compose-box")).not.toHaveAttribute("data-docked-pane");
+    expect(screen.getByTestId("compose-box").className).not.toContain("border-accent");
   });
 
   it("an external pane-targeting write flows into the chips and persists", async () => {

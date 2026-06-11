@@ -1208,9 +1208,18 @@
                 <rect x="3" y="4" width="18" height="16" rx="2" />
                 <path d="M12 4v16" />
               </svg>
-              <span class="text-fg">{item.pane.name}</span>
-              <span class="text-muted text-[11px]">
-                {item.pane.members.length} agent{item.pane.members.length === 1 ? "" : "s"}
+              <span class="text-fg shrink-0">{item.pane.name}</span>
+              <!-- Member names in roster order (matching chip/pane-column
+                   order); the menu spans the compose box, so names fit —
+                   truncate is just the degenerate-case guard. -->
+              <span
+                class="text-muted min-w-0 truncate text-[11px]"
+                data-testid="pane-option-members"
+              >
+                {agents
+                  .filter((a) => item.pane.members.includes(a.id))
+                  .map((a) => a.name)
+                  .join(", ")}
               </span>
               {#if item.index < 9}
                 <span class="text-muted ml-auto font-mono text-[13px]">

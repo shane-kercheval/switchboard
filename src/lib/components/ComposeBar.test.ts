@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/svelte";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import { tick } from "svelte";
 import type { AgentRecord, NormalizedEvent, Prompt } from "$lib/types";
 // Static import so the component-tree transform happens at module collection,
@@ -1753,7 +1753,10 @@ describe("ComposeBar pane targeting", () => {
     selection.setRecipients(PROJECT_ID, [AGENT_A.id]);
 
     await fireEvent.input(textarea, { target: { value: "@review" } });
-    await fireEvent.click(await screen.findByTestId(`recipient-option-pane:${paneId}`));
+    const option = await screen.findByTestId(`recipient-option-pane:${paneId}`);
+    // The entry spells out the pane's member names, not a count.
+    expect(within(option).getByTestId("pane-option-members")).toHaveTextContent("bob");
+    await fireEvent.click(option);
 
     expect(selection.selectionFor(PROJECT_ID)).toEqual([AGENT_B.id]);
     // The @-token is consumed like an agent pick.

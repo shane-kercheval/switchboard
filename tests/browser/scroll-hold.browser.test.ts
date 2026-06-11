@@ -1,5 +1,4 @@
 import { beforeEach, expect, test, vi } from "vitest";
-import { page } from "vitest/browser";
 
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => vi.fn()) }));
 vi.mock("@tauri-apps/api/core", () => ({
@@ -9,7 +8,13 @@ vi.mock("@tauri-apps/api/core", () => ({
 vi.mock("$lib/native", () => ({ copyText: vi.fn(async () => undefined) }));
 
 import { mountTranscript } from "./mount";
-import { registerAgent, seedTurns, resetState } from "./harness";
+import {
+  registerAgent,
+  seedTurns,
+  resetState,
+  transcriptContainer as transcript,
+  distanceFromBottom,
+} from "./harness";
 import { setProjectCompact, toggleKey } from "$lib/state/transcriptPreview.svelte";
 import { ALICE, PROJECT_ID, agentTurn, longText, textItem, userTurn } from "./fixtures";
 
@@ -20,13 +25,6 @@ import { ALICE, PROJECT_ID, agentTurn, longText, textItem, userTurn } from "./fi
 // when new content arrives; a content-change-induced scroll (a collapse clamping
 // scrollTop) must NOT unpin; returning to the bottom re-pins.
 
-function transcript(): HTMLElement {
-  return page.getByTestId("unified-transcript").element() as HTMLElement;
-}
-function distanceFromBottom(): number {
-  const c = transcript();
-  return c.scrollHeight - c.scrollTop - c.clientHeight;
-}
 function scrollTo(top: number): void {
   const c = transcript();
   c.scrollTop = top;

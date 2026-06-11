@@ -11,9 +11,30 @@
 /// teammate. localStorage is also origin-scoped, so `make dev DEV_PORT=…`
 /// instances get isolated drafts for free.
 ///
-/// Writes are synchronous (no debounce): drafts are tiny, and a deferred write
-/// would otherwise race a send-clear (resurrecting just-sent text) or a project
-/// switch (writing one project's draft into another's slot).
+/// Persistence contract: **mutations are synchronous; only persistence defers.**
+/// `setContent`/`setSelection` update the in-memory `store` immediately (reads
+/// are always current), then schedule one trailing debounced write so typing
+/// doesn't pay a serialize+`localStorage.setItem` per keystroke. The debounced
+/// write serializes the store *at fire time*, never a snapshot from schedule
+/// time — so it cannot write stale state, which is what structurally prevents
+/// one project's draft landing in another's slot on a fast project switch.
+///
+/// Deferring the write creates timing races; each is closed by an explicit
+/// `flush()` point rather than by luck:
+/// - **send-clear** (`persistContentNow` in ComposeBar): the cleared content is
+///   written through immediately and any pending write cancelled, so a stale
+///   pre-send draft can never land after the clear and resurrect sent text.
+/// - **ComposeBar `onDestroy`**: a project switch remounts the bar (`{#key}`);
+///   the outgoing bar flushes so its draft is durable before the next mounts.
+/// - **`pagehide`/`beforeunload`** (registered once below): app quit
+///   mid-debounce. Best-effort by design: whether either event is delivered
+///   during Tauri webview teardown is deliberately unverified. If neither
+///   fires, the loss is everything typed since the last ≥200 ms pause or
+///   flush — a trailing debounce never fires during continuous typing, so
+///   this is NOT bounded at 200 ms of keystrokes. Triggered only by quitting
+///   within ~200 ms of the last keystroke; accepted because drafts are
+///   ergonomic, not load-bearing, and the common exits (send-clear, project
+///   switch) flush synchronously.
 ///
 /// The persisted blob is versioned (`STORAGE_VERSION`) so the snapshot shape can
 /// evolve without corrupting older drafts. An unversioned blob (the string-only
@@ -141,7 +162,17 @@ function readStored(): Record<ProjectId, ComposeSnapshot> {
 // through on change.
 const store: Record<ProjectId, ComposeSnapshot> = readStored();
 
-function persist(): void {
+const PERSIST_DEBOUNCE_MS = 200;
+
+let pendingPersist: ReturnType<typeof setTimeout> | undefined;
+
+/// Serialize the current store now, cancelling any pending debounced write
+/// (the state it would have written is already covered by this one).
+function persistNow(): void {
+  if (pendingPersist !== undefined) {
+    clearTimeout(pendingPersist);
+    pendingPersist = undefined;
+  }
   if (typeof localStorage === "undefined") return;
   try {
     localStorage.setItem(
@@ -154,6 +185,31 @@ function persist(): void {
   }
 }
 
+/// Trailing debounce: a burst of mutations (typing) pays one serialize+write
+/// per pause instead of one per keystroke.
+function schedulePersist(): void {
+  if (pendingPersist !== undefined) clearTimeout(pendingPersist);
+  pendingPersist = setTimeout(persistNow, PERSIST_DEBOUNCE_MS);
+}
+
+/// Run any pending debounced write immediately. Each caller is a flush point
+/// closing a specific deferral race — see the module comment for the list.
+/// The no-pending early return is load-bearing ("no pending ⇒ disk is
+/// current") and holds only while every store mutator calls
+/// `schedulePersist()` — a mutation path that skips it is un-flushable.
+export function flush(): void {
+  if (pendingPersist === undefined) return;
+  persistNow();
+}
+
+// App quit mid-debounce. Both events are registered (delivery varies by
+// engine/teardown path); the second flush is a no-op since the first cleared
+// the pending write.
+if (typeof window !== "undefined") {
+  window.addEventListener("pagehide", flush);
+  window.addEventListener("beforeunload", flush);
+}
+
 /// Current snapshot for a project; an empty plain draft when nothing is saved.
 export function getCompose(projectId: ProjectId): ComposeSnapshot {
   return store[projectId] ?? { content: emptyPlain() };
@@ -163,12 +219,12 @@ export function getCompose(projectId: ProjectId): ComposeSnapshot {
 /// untouched — it persists across a plain↔prompt mode switch.
 export function setContent(projectId: ProjectId, content: ComposeContent): void {
   store[projectId] = { ...(store[projectId] ?? { content: emptyPlain() }), content };
-  persist();
+  schedulePersist();
 }
 
 export function setSelection(projectId: ProjectId, selectedIds: AgentId[]): void {
   store[projectId] = { ...(store[projectId] ?? { content: emptyPlain() }), selectedIds };
-  persist();
+  schedulePersist();
 }
 
 /// Test-only API surface. Production hydrates once at module load; tests use
@@ -176,6 +232,12 @@ export function setSelection(projectId: ProjectId, selectedIds: AgentId[]): void
 /// restart path (write localStorage, drop the in-memory copy, re-read).
 export const _testing = {
   reset(): void {
+    // Drop any pending debounced write too — a leftover timer from one test
+    // must not fire mid-way through the next and write its store state.
+    if (pendingPersist !== undefined) {
+      clearTimeout(pendingPersist);
+      pendingPersist = undefined;
+    }
     for (const key of Object.keys(store)) delete store[key];
     if (typeof localStorage !== "undefined") localStorage.removeItem(STORAGE_KEY);
   },

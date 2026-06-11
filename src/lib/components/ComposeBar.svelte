@@ -9,6 +9,7 @@
   } from "$lib/state/index.svelte";
   import { buildLiveSendsMap } from "$lib/state/liveSends";
   import {
+    flush,
     getCompose,
     setContent,
     setSelection,
@@ -730,6 +731,9 @@
     // A mid-render unmount (project switch via the parent's `{#key}`) must not
     // leave the project's pane targeting frozen.
     setTargetingLocked(projectId, false);
+    // Flush point: a project switch remounts this bar (`{#key}`), so the
+    // outgoing bar's deferred draft write must land before the next one mounts.
+    flush();
   });
 
   async function refreshFileMatches(query: string, token: number): Promise<void> {
@@ -1005,11 +1009,13 @@
     persistContentNow();
   }
 
-  /// Persist the current compose content immediately (not via the scheduled
-  /// `$effect`), so a send-clear is durable even if the component unmounts in the
-  /// same frame (e.g. a project switch right after sending).
+  /// Persist the current compose content immediately — `flush()` writes through
+  /// and cancels the pending debounce — so a send-clear is durable even if the
+  /// component unmounts in the same frame (e.g. a project switch right after
+  /// sending), and a stale pre-send draft can never land after the clear.
   function persistContentNow(): void {
     setContent(projectId, currentContent());
+    flush();
   }
 </script>
 

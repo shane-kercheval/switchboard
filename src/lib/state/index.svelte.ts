@@ -59,6 +59,38 @@ import type { AgentRuntime, PendingSend, RuntimeMap, ToolCall, TranscriptMap, Tu
 /// `activeProject.agents.flatMap(id => transcripts[id]).sort_by(started_at)`.
 export const transcripts = $state<TranscriptMap>({});
 
+/// Monotonic revision of transcript content, bumped by `setTranscript` — the
+/// "did anything change?" signal for consumers that must react to every
+/// content write without walking the data (the transcript's re-anchor effect;
+/// the digest walk this replaces cost O(transcript) of reactive-proxy reads
+/// per streamed chunk).
+///
+/// SINGLE-WRITER CONTRACT (structural, like composeStore's flush() guard):
+/// every write to `transcripts` that live re-anchoring must observe goes
+/// through `setTranscript`. A writer that bypasses it renders fine but
+/// silently stops signalling re-anchors. Production writes (this module), the
+/// browser-test harness (`seedTurns`), and the dev seeding hook all route
+/// through it; jsdom component tests seeding static fixtures may assign
+/// directly — re-anchoring is inert without layout, so there is nothing for
+/// the bump to drive there.
+let transcriptRevision = $state(0);
+
+export function getTranscriptRevision(): number {
+  return transcriptRevision;
+}
+
+export function setTranscript(agentId: AgentId, turns: Turn[]): void {
+  // The reducer returns the SAME array reference for content-free events
+  // (`liveness`, `session_meta`, and every defensive no-op branch). A
+  // same-reference write is not a content change, so it must not advance the
+  // revision — otherwise the re-anchor effect does layout work for a heartbeat
+  // mid-stream. Reference equality is exactly the reducer's "nothing changed"
+  // signal; this keeps the revision meaning "content actually changed."
+  if (transcripts[agentId] === turns) return;
+  transcripts[agentId] = turns;
+  transcriptRevision += 1;
+}
+
 /// Per-agent operational state, keyed by `agent_id`. Powers the sidebar
 /// (run_status, last_error, meta, last_rate_limit, hydration_status) and
 /// the compose-bar Send gate.
@@ -225,13 +257,9 @@ export function applyAgentHydrate(
   // Pass the in-flight turn_id so a refresh re-read can't supersede an
   // actively-streaming live turn (which now carries an early `hydration_key`).
   const inFlightTurnId = runtimes[agentId]?.in_flight_turn_id;
-  transcripts[agentId] = transcriptReducer(
-    priorTurns,
-    hydrate,
+  setTranscript(
     agentId,
-    "",
-    undefined,
-    inFlightTurnId,
+    transcriptReducer(priorTurns, hydrate, agentId, "", undefined, inFlightTurnId),
   );
   const priorRuntime = runtimes[agentId];
   if (priorRuntime !== undefined) {
@@ -268,7 +296,7 @@ export async function registerAgent(agent: AgentRecord): Promise<void> {
         runtimes[agent.id] = freshRuntime(agent.id);
       }
       if (!(agent.id in transcripts)) {
-        transcripts[agent.id] = [];
+        setTranscript(agent.id, []);
       }
 
       const channel = `agent:${agent.id}`;
@@ -325,14 +353,9 @@ export function dispatchUserTurn(
     return;
   }
   const existing = transcripts[agentId] ?? [];
-  transcripts[agentId] = _internal.appendUserTurn(
-    existing,
+  setTranscript(
     agentId,
-    userTurnId,
-    text,
-    attachments,
-    startedAt,
-    sendId,
+    _internal.appendUserTurn(existing, agentId, userTurnId, text, attachments, startedAt, sendId),
   );
   // Append a pending-send entry regardless of whether the agent is idle or
   // busy — send-while-busy is un-gated (the backend queues), so a second send
@@ -428,13 +451,16 @@ export function failSendStart(
   // `failed-${message_id}` row.
   // eslint-disable-next-line svelte/prefer-svelte-reactivity
   const at = new Date().toISOString();
-  transcripts[agentId] = _internal.appendFailedTurn(
-    transcripts[agentId] ?? [],
+  setTranscript(
     agentId,
-    `failed-${userTurnId}`,
-    at,
-    error?.message ?? "send failed before the turn started",
-    entry?.send_id,
+    _internal.appendFailedTurn(
+      transcripts[agentId] ?? [],
+      agentId,
+      `failed-${userTurnId}`,
+      at,
+      error?.message ?? "send failed before the turn started",
+      entry?.send_id,
+    ),
   );
 }
 
@@ -591,13 +617,16 @@ function handleEvent(agentId: AgentId, event: NormalizedEvent): void {
       ? pendingEntryFor(priorRuntime, event.message_id)?.send_id
       : undefined;
   const sendId = startEntry?.send_id ?? cancelledSendId ?? failedSendId;
-  transcripts[agentId] = transcriptReducer(
-    priorTurns,
-    event,
+  setTranscript(
     agentId,
-    receivedAt,
-    sendId,
-    priorRuntime?.in_flight_turn_id,
+    transcriptReducer(
+      priorTurns,
+      event,
+      agentId,
+      receivedAt,
+      sendId,
+      priorRuntime?.in_flight_turn_id,
+    ),
   );
   runtimes[agentId] = runtimeReducer(priorRuntime, event);
   manageHeartbeat(agentId, event);
@@ -704,6 +733,7 @@ export const _testing = {
       clearTimeout(heartbeat.handle);
     }
     heartbeats.clear();
+    transcriptRevision = 0;
     for (const key of Object.keys(transcripts)) {
       delete transcripts[key];
     }

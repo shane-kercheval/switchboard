@@ -1,6 +1,16 @@
 import { beforeEach, expect, test, vi } from "vitest";
 
-vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => vi.fn()) }));
+// Captured listener map so specs can drive REAL events through the state
+// module's synchronous event path (see harness header for the hoist rationale).
+const { listeners } = vi.hoisted(() => ({
+  listeners: new Map<string, (e: { payload: unknown }) => void>(),
+}));
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn(async (name: string, cb: (e: { payload: unknown }) => void) => {
+    listeners.set(name, cb);
+    return vi.fn();
+  }),
+}));
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(async () => null),
   convertFileSrc: (p: string) => `asset://localhost/${p}`,
@@ -10,12 +20,14 @@ vi.mock("$lib/native", () => ({ copyText: vi.fn(async () => undefined) }));
 import { page } from "vitest/browser";
 import { mountTranscript } from "./mount";
 import {
+  fireTo,
   registerAgent,
   seedTurns,
   resetState,
   transcriptContainer,
   distanceFromBottom,
 } from "./harness";
+import type { NormalizedEvent } from "$lib/types";
 import { ALICE, BOB, PROJECT_ID, agentTurn, longText, textItem, userTurn } from "./fixtures";
 import { buildLargeTranscript } from "$lib/dev/largeTranscript";
 
@@ -60,7 +72,14 @@ function streamingTurn(length: number) {
 
 beforeEach(() => {
   resetState();
+  listeners.clear();
 });
+
+// Listener map uses `unknown` payloads (the hoist guard forbids importing
+// types into the factory); narrow at the call boundary.
+function fire(channel: string, event: NormalizedEvent): void {
+  fireTo(listeners as Parameters<typeof fireTo>[0], channel, event);
+}
 
 test("a streaming response growing just below never moves an unpinned reader", async () => {
   await registerAgent(ALICE);
@@ -211,6 +230,62 @@ test("a new completed turn appearing below never moves an unpinned reader", asyn
   ]);
 
   await expect.poll(() => distanceFromBottom()).toBeGreaterThan(100);
+  await expect
+    .poll(() => Math.abs(Math.round(anchor.getBoundingClientRect().top) - reading))
+    .toBeLessThanOrEqual(1);
+});
+
+test("real streamed events keep an unpinned reader still", async () => {
+  // Integration of the whole live path: wire listener -> reducers -> revision
+  // bump -> re-anchor, in real WebKit. The other tests in this spec seed state
+  // directly; this one streams the way production does (real per-chunk events).
+  await registerAgent(ALICE);
+  const history = buildLargeTranscript({ agentIds: [ALICE.id], exchanges: 30 })[ALICE.id]!;
+  seedTurns(ALICE.id, history);
+
+  mountTranscript({ projectId: PROJECT_ID, agents: [ALICE] });
+  await expect.poll(() => distanceFromBottom()).toBeLessThan(32);
+
+  const channel = `agent:${ALICE.id}`;
+  fire(channel, {
+    type: "turn_start",
+    turn_id: "live-rt",
+    message_id: "00000000-0000-7000-8000-0000000000f1",
+    started_at: "2026-05-16T00:00:00Z",
+  });
+  fire(channel, { type: "content_chunk", turn_id: "live-rt", kind: "text", text: longText(4) });
+  await expect.poll(() => page.getByTestId("turn-live-scroll").elements().length).toBe(1);
+
+  const c = transcriptContainer();
+  scrollTo(c.scrollHeight - c.clientHeight - 300);
+  await expect.poll(() => distanceFromBottom()).toBeGreaterThan(250);
+  const anchor = readBlock();
+  const reading = Math.round(anchor.getBoundingClientRect().top);
+
+  // Many chunks growing the live block below the reader — the anchor must
+  // absorb the applied growth on every one.
+  for (let round = 0; round < 5; round++) {
+    for (let i = 0; i < 8; i++) {
+      fire(channel, {
+        type: "content_chunk",
+        turn_id: "live-rt",
+        kind: "text",
+        text: `\nstreamed line ${round}-${i} of the live response`,
+      });
+    }
+    await expect
+      .poll(() => Math.abs(Math.round(anchor.getBoundingClientRect().top) - reading))
+      .toBeLessThanOrEqual(1);
+  }
+
+  // Completion — still still.
+  fire(channel, {
+    type: "turn_end",
+    turn_id: "live-rt",
+    outcome: { status: "completed" },
+    ended_at: "2026-05-16T00:00:30Z",
+  });
+  await expect.poll(() => page.getByTestId("turn-live-scroll").elements().length).toBe(0);
   await expect
     .poll(() => Math.abs(Math.round(anchor.getBoundingClientRect().top) - reading))
     .toBeLessThanOrEqual(1);

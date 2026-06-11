@@ -8,7 +8,7 @@
 // body is statically dead, and the generator is loaded via dynamic import on
 // first use, so neither ships in production builds.
 
-import { transcripts } from "$lib/state/index.svelte";
+import { setTranscript, transcripts } from "$lib/state/index.svelte";
 import type { AgentRecord } from "$lib/types";
 
 export function installDevTranscriptSeed(getAgents: () => AgentRecord[]): () => void {
@@ -39,7 +39,7 @@ export function installDevTranscriptSeed(getAgents: () => AgentRecord[]): () => 
       const { buildLargeTranscript } = await import("./largeTranscript");
       const seeded = buildLargeTranscript({ agentIds: agents.map((a) => a.id) });
       for (const [agentId, turns] of Object.entries(seeded)) {
-        transcripts[agentId] = [...turns, ...(transcripts[agentId] ?? [])];
+        setTranscript(agentId, [...turns, ...(transcripts[agentId] ?? [])]);
       }
       console.info(
         `[dev-seed] prepended ${Object.values(seeded).reduce((n, t) => n + t.length, 0)} synthetic turns across ${agents.length} agent(s)`,

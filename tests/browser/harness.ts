@@ -85,9 +85,11 @@ export async function registerAgent(agent: AgentRecord): Promise<void> {
   await stateMod.registerAgent(agent);
 }
 
-/** Directly seed an agent's transcript — same shortcut the jsdom suite uses. */
+/** Seed an agent's transcript. Routed through `setTranscript` (the store's
+ * single-writer contract): browser specs re-seed mid-test to simulate
+ * streaming, and the revision bump is what drives the re-anchor effect. */
 export function seedTurns(agentId: string, turns: Turn[]): void {
-  stateMod.transcripts[agentId] = turns;
+  stateMod.setTranscript(agentId, turns);
 }
 
 /** Reset shared module state between tests (transcripts/runtimes + compact). */

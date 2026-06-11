@@ -6,6 +6,7 @@
   import { ChevronRight, ChevronsDownUp, ChevronsUpDown } from "@lucide/svelte";
   import {
     cancelSend,
+    getTranscriptRevision,
     retryAgentHydration,
     runtimes,
     transcripts,
@@ -588,31 +589,17 @@
     captureAnchor();
   }
 
-  /// Fine-grained content signal — text/output lengths and tool completion — so
-  /// streaming in-place mutations (constant row/item counts) still re-anchor.
-  /// This reactive path also makes the follow-the-bottom behaviour testable; the
-  /// ResizeObserver below (the layout path) is a no-op under jsdom.
-  const scrollSignal = $derived.by(() => {
-    let n = rows.length;
-    for (const row of rows) {
-      if (row.kind === "user") {
-        n += row.text.length;
-      } else if (row.kind === "outcome") {
-        n += row.reason?.length ?? 0;
-      } else {
-        n += row.turn.items.length;
-        for (const item of row.turn.items) {
-          if (item.item_kind === "text") {
-            n += item.text.length;
-          } else {
-            if (item.completed_at !== undefined) n += 1;
-            n += item.output?.length ?? 0;
-          }
-        }
-      }
-    }
-    return n;
-  });
+  /// Content-change signal for the re-anchor effect. The store's transcript
+  /// revision covers every produced-content write (it bumps in `setTranscript`
+  /// — see its single-writer contract); `rows.length` covers overlay-driven
+  /// structure (queued rows, journal outcome markers) that doesn't pass
+  /// through the store writer. This replaces a full digest walk over every
+  /// row's text/output lengths — O(transcript) of reactive-proxy reads per
+  /// streamed chunk. String-joined so a simultaneous +1/−1 in the two parts
+  /// can't alias to an unchanged sum. This reactive path also keeps
+  /// follow-the-bottom testable under jsdom, where the ResizeObserver layout
+  /// path is inert.
+  const scrollSignal = $derived(`${getTranscriptRevision()}:${rows.length}`);
 
   $effect(() => {
     void scrollSignal;

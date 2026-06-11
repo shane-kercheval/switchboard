@@ -56,6 +56,11 @@ test("compose textarea grows with content, caps with inner scroll, shrinks on de
   await expect.element(locator).toBeInTheDocument();
   const el = (): HTMLTextAreaElement => locator.element() as HTMLTextAreaElement;
 
+  // This WebKit supports field-sizing, so the native (no-per-keystroke-layout)
+  // path is active — the whole point of the autosize rework. If this regresses
+  // to the JS path here, typing cost silently scales with the transcript again.
+  expect(getComputedStyle(el()).fieldSizing).toBe("content");
+
   let initial = 0;
   await expect
     .poll(() => {
@@ -70,12 +75,16 @@ test("compose textarea grows with content, caps with inner scroll, shrinks on de
 
   await locator.fill(LINES_PAST_ANY_CAP);
   await expect.poll(() => Math.abs(heightOf(el()) - capOf(el()))).toBeLessThanOrEqual(1);
+  // Genuinely scrollable past the cap — asserted via geometry, not the inline
+  // `style.overflowY` the JS path happens to set (the native field-sizing path
+  // scrolls via a class instead; both must satisfy this).
   expect(el().scrollHeight).toBeGreaterThan(el().clientHeight);
-  expect(el().style.overflowY).toBe("auto");
+  expect(getComputedStyle(el()).overflowY).toBe("auto");
 
   await locator.fill("short");
   await expect.poll(() => heightOf(el())).toBeLessThan(grown);
-  expect(el().style.overflowY).toBe("hidden");
+  // Shrunk back below the cap: the content fits, so nothing scrolls.
+  expect(el().scrollHeight - el().clientHeight).toBeLessThanOrEqual(1);
 });
 
 test("prompt-composer argument textarea caps at its own (smaller) max-height", async () => {
@@ -90,5 +99,5 @@ test("prompt-composer argument textarea caps at its own (smaller) max-height", a
   await locator.fill(LINES_PAST_ANY_CAP);
   await expect.poll(() => Math.abs(heightOf(el()) - capOf(el()))).toBeLessThanOrEqual(1);
   expect(el().scrollHeight).toBeGreaterThan(el().clientHeight);
-  expect(el().style.overflowY).toBe("auto");
+  expect(getComputedStyle(el()).overflowY).toBe("auto");
 });

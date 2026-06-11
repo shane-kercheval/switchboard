@@ -17,6 +17,23 @@
     ...rest
   }: Props = $props();
 
+  // Prefer the native CSS auto-size when the engine has it: `field-sizing:
+  // content` grows the field to its content at the browser's own layout time,
+  // so typing pays ZERO synchronous layout reads. The JS path below does a
+  // height-reset write + `scrollHeight` read per keystroke, which forces a
+  // synchronous document-wide reflow — and that reflow's cost scales with the
+  // transcript (a large conversation behind the compose bar makes every
+  // keystroke that grows the box re-lay-out the whole transcript). The JS path
+  // stays as the fallback for engines without `field-sizing` (older system
+  // WebKits): detected at runtime, never deleted. The `min-h`/`max-h` classes
+  // the consumer passes cap both paths identically; past the cap, overflow
+  // gives the internal scrollbar.
+  const fieldSizing =
+    autosize &&
+    typeof CSS !== "undefined" &&
+    typeof CSS.supports === "function" &&
+    CSS.supports("field-sizing", "content");
+
   // The max-height cap comes from the instance's classes and differs per
   // consumer (compose bar vs. prompt composer), so it is read once per instance
   // — never module-level — and cached instead of paying a `getComputedStyle`
@@ -58,12 +75,12 @@
   }
 
   $effect(() => {
-    if (!autosize || typeof value !== "string") return;
+    if (!autosize || fieldSizing || typeof value !== "string") return;
     resizeToContent(ref);
   });
 
   function handleInput(event: Event & { currentTarget: EventTarget & HTMLTextAreaElement }): void {
-    if (autosize) resizeToContent(event.currentTarget);
+    if (autosize && !fieldSizing) resizeToContent(event.currentTarget);
     oninput?.(event);
   }
 </script>
@@ -72,11 +89,15 @@
   bind:this={ref}
   bind:value
   oninput={handleInput}
+  style:field-sizing={fieldSizing ? "content" : undefined}
   class={cn(
     "border-border bg-raised w-full resize-none rounded-md border px-3 py-2 text-sm",
     "text-fg placeholder:text-muted",
     "focus-visible:ring-accent focus-visible:ring-2 focus-visible:outline-none",
     "disabled:bg-panel disabled:cursor-not-allowed disabled:opacity-50",
+    // The native path scrolls internally past the cap; the JS path toggles
+    // this inline per resize.
+    fieldSizing && "overflow-y-auto",
     className,
   )}
   {...rest}

@@ -11,7 +11,7 @@
   import ProjectsSidebar from "$lib/components/ProjectsSidebar.svelte";
   import SettingsView from "$lib/components/SettingsView.svelte";
   import Sidebar from "$lib/components/Sidebar.svelte";
-  import UnifiedTranscript from "$lib/components/UnifiedTranscript.svelte";
+  import TranscriptPanes from "$lib/components/TranscriptPanes.svelte";
   import WelcomeScreen from "$lib/components/WelcomeScreen.svelte";
   import Dialog from "$lib/components/ui/Dialog.svelte";
   import Button from "$lib/components/ui/Button.svelte";
@@ -29,6 +29,8 @@
     normalizeProjectCompact,
     stateFor,
   } from "$lib/state/transcriptPreview.svelte";
+  import { layoutFor } from "$lib/state/transcriptPanes.svelte";
+  import { targetRecipients } from "$lib/state/recipientSelection.svelte";
   import DevIndicator from "$lib/components/ui/DevIndicator.svelte";
   import { windowDragRegion } from "$lib/windowDrag";
   import { hydrateAgent, registerAgent } from "$lib/state/index.svelte";
@@ -133,6 +135,22 @@
         event.preventDefault();
         projectsSidebarOpen = !projectsSidebarOpen;
         agentsSidebarOpen = !agentsSidebarOpen;
+      } else if (/^Digit[1-9]$/.test(event.code)) {
+        // ⌘⌥1..N targets pane N (leftmost = 1): replace the compose recipient
+        // set with that pane's members. `event.code`, not `event.key` — Option
+        //+number on macOS produces a different character in `key`. Inert with
+        // a single pane (nothing to disambiguate); ⌘1..9 (no Alt) stays the
+        // per-agent chip toggle in ComposeBar.
+        if (selection.activeProjectId === null || settingsOpen || view.mode === "git") return;
+        const rosterIds = activeAgents.map((a) => a.id);
+        const layout = layoutFor(selection.activeProjectId, rosterIds);
+        if (layout.panes.length < 2) return;
+        const pane = layout.panes[Number(event.code.slice(5)) - 1];
+        // An empty pane keeps its positional number but is not a send target
+        // (targeting it could only clear the recipient set, silently).
+        if (pane === undefined || pane.members.length === 0) return;
+        event.preventDefault();
+        targetRecipients(selection.activeProjectId, [...pane.members]);
       }
       return;
     }
@@ -825,7 +843,7 @@
         {:else}
           <div class="flex min-h-0 flex-1 overflow-hidden">
             <div class="flex min-w-0 flex-1 flex-col overflow-hidden">
-              <UnifiedTranscript
+              <TranscriptPanes
                 projectId={selection.activeProjectId!}
                 agents={activeAgents}
                 overlay={activeConvo?.items ?? []}
@@ -848,7 +866,11 @@
               {/key}
             </div>
             {#if agentsSidebarOpen}
-              <Sidebar agents={activeAgents} onAddAgent={openAddAgent} />
+              <Sidebar
+                projectId={selection.activeProjectId!}
+                agents={activeAgents}
+                onAddAgent={openAddAgent}
+              />
             {/if}
           </div>
         {/if}

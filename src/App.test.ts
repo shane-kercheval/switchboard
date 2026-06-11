@@ -1913,6 +1913,58 @@ describe("App", () => {
     expect(screen.getByTestId("compose-textarea")).toBeInTheDocument();
   });
 
+  it("⌘⌥1..N targets pane N once split, and is inert with a single pane", async () => {
+    const panes = await import("$lib/state/transcriptPanes.svelte");
+    const selection = await import("$lib/state/recipientSelection.svelte");
+    panes._testing.reset();
+    selection._testing.reset();
+
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [
+        agent({ id: "ag-1", project_id: "p-a", name: "alice" }),
+        agent({ id: "ag-2", project_id: "p-a", name: "bob" }),
+      ],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+
+    const roster = ["ag-1", "ag-2"];
+
+    // Single pane: the chord is inert (no pane to disambiguate).
+    selection.setRecipients("p-a", ["ag-1"]);
+    await fireEvent.keyDown(window, { key: "1", code: "Digit1", metaKey: true, altKey: true });
+    expect(selection.selectionFor("p-a")).toEqual(["ag-1"]);
+
+    // Split, then ⌘⌥2 targets the new pane and ⌘⌥1 the leftmost — full
+    // replace semantics, same meaning as clicking the pane header.
+    panes.moveAgentToNewPane("p-a", roster, "ag-2");
+    await fireEvent.keyDown(window, { key: "2", code: "Digit2", metaKey: true, altKey: true });
+    expect(selection.selectionFor("p-a")).toEqual(["ag-2"]);
+    await fireEvent.keyDown(window, { key: "1", code: "Digit1", metaKey: true, altKey: true });
+    expect(selection.selectionFor("p-a")).toEqual(["ag-1"]);
+
+    // ⌘1 (no Alt) stays the per-agent chip toggle — no collision: it toggles
+    // alice out of the set rather than re-targeting a pane.
+    await fireEvent.keyDown(window, { key: "1", metaKey: true });
+    expect(selection.selectionFor("p-a")).toEqual([]);
+
+    // An empty pane keeps its positional number but is not a send target:
+    // ⌘⌥N on it is a no-op rather than clearing the recipient set.
+    const pane1 = panes.layoutFor("p-a", roster).panes[0]!.id;
+    panes.moveAgentToPane("p-a", roster, "ag-2", pane1); // empties pane 2
+    selection.setRecipients("p-a", ["ag-1"]);
+    await fireEvent.keyDown(window, { key: "2", code: "Digit2", metaKey: true, altKey: true });
+    expect(selection.selectionFor("p-a")).toEqual(["ag-1"]);
+
+    panes._testing.reset();
+    selection._testing.reset();
+  });
+
   it("opens the command palette with ⌘⇧P and runs a palette action", async () => {
     seedProject({
       projectId: "p-a",

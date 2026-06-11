@@ -1,6 +1,9 @@
 <script lang="ts">
   import {
     Check,
+    Columns2,
+    Eye,
+    EyeOff,
     FileText,
     Gauge,
     MoreHorizontal,
@@ -10,7 +13,7 @@
     Trash2,
     X,
   } from "@lucide/svelte";
-  import type { AgentRecord, AgentId } from "$lib/types";
+  import type { AgentRecord, AgentId, ProjectId } from "$lib/types";
   import { retryAgentHydration, runtimes, stopAgent, transcripts } from "$lib/state/index.svelte";
   import {
     removeAgent,
@@ -33,6 +36,18 @@
   import { cn, relativeTime } from "$lib/utils";
   import SidebarPanel from "$lib/components/ui/SidebarPanel.svelte";
   import SidebarSection from "$lib/components/ui/SidebarSection.svelte";
+  import {
+    canAddPane,
+    hiddenCount,
+    isAgentHidden,
+    layoutFor,
+    moveAgentToNewPane,
+    moveAgentToPane,
+    paneOfAgent,
+    showAllAgents,
+    soloAgent,
+    toggleAgentHidden,
+  } from "$lib/state/transcriptPanes.svelte";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
   import PlusIcon from "$lib/components/ui/PlusIcon.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
@@ -62,7 +77,28 @@
   /// `onAddAgent` is the "+ Add agent" entry point in the sidebar header.
   /// Optional so existing callers + tests that don't pass it continue
   /// rendering; when absent, the button isn't shown.
-  let { agents, onAddAgent }: { agents: AgentRecord[]; onAddAgent?: () => void } = $props();
+  let {
+    projectId,
+    agents,
+    onAddAgent,
+  }: { projectId: ProjectId; agents: AgentRecord[]; onAddAgent?: () => void } = $props();
+
+  // Pane membership + visibility for this project's roster. The eye toggle and
+  // the move-to-pane actions both key off the same partition model.
+  const rosterIds = $derived(agents.map((a) => a.id));
+  const paneLayout = $derived(layoutFor(projectId, rosterIds));
+  const hiddenAgentCount = $derived(hiddenCount(projectId, rosterIds));
+
+  /// Eye toggle: plain click hides/shows the agent within its pane; Alt-click
+  /// solos it (show only this agent in its pane; Alt-click again restores) —
+  /// the mixer/layer-tool gesture.
+  function onVisibilityClick(agent: AgentRecord, event: MouseEvent): void {
+    if (event.altKey) {
+      soloAgent(projectId, rosterIds, agent.id);
+    } else {
+      toggleAgentHidden(projectId, rosterIds, agent.id);
+    }
+  }
 
   let sessionInfoByAgent = $state<Record<AgentId, AgentSessionInfo | null>>({});
   let sessionInfoStarted = $state<Record<AgentId, boolean>>({});
@@ -523,6 +559,18 @@
   <SidebarSection title="Agents">
     {#snippet action()}
       <div class="flex items-center gap-0.5">
+        {#if hiddenAgentCount > 0}
+          <button
+            type="button"
+            class="text-muted hover:text-fg shrink-0 px-1 text-[11px] hover:underline"
+            title="Show all agents"
+            aria-label={`${hiddenAgentCount} hidden — show all agents`}
+            data-testid="sidebar-show-all-agents"
+            onclick={() => showAllAgents(projectId, rosterIds)}
+          >
+            {hiddenAgentCount} hidden
+          </button>
+        {/if}
         {#if agents.length > 0}
           <button
             type="button"
@@ -645,6 +693,7 @@
                 </svg>
               </button>
             {:else}
+              {@const agentHidden = isAgentHidden(projectId, rosterIds, agent.id)}
               <!-- Double-click the name row to rename. Single-click still
                    toggles collapse; a double-click toggles it twice (net no
                    change) before edit mode opens. -->
@@ -675,6 +724,37 @@
                 </span>
               </button>
               <div class="flex shrink-0 items-center gap-0.5">
+                <Tooltip
+                  label={agentHidden ? `Show ${agent.name}` : `Hide ${agent.name} (⌥-click: solo)`}
+                  delayDuration={800}
+                >
+                  {#snippet trigger(props)}
+                    <button
+                      {...props}
+                      type="button"
+                      class={cn(
+                        ICON_BUTTON_CLASS,
+                        "hover:bg-border/60 shrink-0",
+                        // The eye stays visible while the agent is hidden (it's
+                        // the state indicator); otherwise it appears on hover
+                        // like the actions trigger.
+                        agentHidden
+                          ? "text-muted"
+                          : "opacity-0 group-focus-within:opacity-100 group-hover:opacity-100",
+                      )}
+                      aria-label={agentHidden ? `Show ${agent.name}` : `Hide ${agent.name}`}
+                      aria-pressed={agentHidden}
+                      data-testid="agent-visibility-toggle"
+                      onclick={(event) => onVisibilityClick(agent, event)}
+                    >
+                      {#if agentHidden}
+                        <EyeOff size={14} strokeWidth={1.8} aria-hidden="true" />
+                      {:else}
+                        <Eye size={14} strokeWidth={1.8} aria-hidden="true" />
+                      {/if}
+                    </button>
+                  {/snippet}
+                </Tooltip>
                 <DropdownMenu
                   triggerClass={cn(
                     ICON_BUTTON_CLASS,
@@ -783,6 +863,46 @@
                           aria-hidden="true"
                         />
                         Change effort
+                      </DropdownMenuItem>
+                    {/if}
+                    <!-- Pane assignment. Move, never copy — panes partition the
+                         roster. Listed flat (no submenu): a project realistically
+                         has a handful of panes. -->
+                    {#if paneLayout.panes.length > 1}
+                      {@const ownPaneId = paneOfAgent(projectId, rosterIds, agent.id)?.id}
+                      {#each paneLayout.panes.filter((p) => p.id !== ownPaneId) as pane (pane.id)}
+                        <DropdownMenuItem
+                          onSelect={() => moveAgentToPane(projectId, rosterIds, agent.id, pane.id)}
+                          class="gap-2"
+                          data-testid={`agent-move-to-pane-${pane.id}`}
+                        >
+                          <Columns2
+                            size={14}
+                            strokeWidth={1.8}
+                            class="text-muted shrink-0"
+                            aria-hidden="true"
+                          />
+                          Move to {pane.name}
+                        </DropdownMenuItem>
+                      {/each}
+                    {/if}
+                    {#if agents.length > 1}
+                      <DropdownMenuItem
+                        onSelect={() => moveAgentToNewPane(projectId, rosterIds, agent.id)}
+                        disabled={!canAddPane(projectId, rosterIds)}
+                        class="gap-2"
+                        data-testid="agent-move-to-new-pane"
+                        title={canAddPane(projectId, rosterIds)
+                          ? undefined
+                          : "No room for another pane at minimum width"}
+                      >
+                        <Columns2
+                          size={14}
+                          strokeWidth={1.8}
+                          class="text-muted shrink-0"
+                          aria-hidden="true"
+                        />
+                        Move to new pane
                       </DropdownMenuItem>
                     {/if}
                     {#if !active}

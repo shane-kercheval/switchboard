@@ -43,6 +43,12 @@ export type PaneLayout = {
   panes: TranscriptPane[];
   /// One fraction per pane, summing to 1 — each pane's share of the row width.
   fractions: number[];
+  /// Panes collapsed into the minimized strip. Display-only: membership and
+  /// width fractions are preserved.
+  minimized: PaneId[];
+  /// Pane currently taking the transcript area. Display-only and mutually
+  /// exclusive with ordinary multi-pane rendering.
+  maximized: PaneId | null;
 };
 
 const STORAGE_KEY = "switchboard-transcript-panes";
@@ -60,6 +66,8 @@ function defaultLayout(rosterIds: AgentId[]): PaneLayout {
   return {
     panes: [{ id: newPaneId(), name: "Pane 1", members: [...rosterIds], hidden: [] }],
     fractions: [1],
+    minimized: [],
+    maximized: null,
   };
 }
 
@@ -74,6 +82,24 @@ function normalizeFractions(fractions: number[], paneCount: number): number[] {
     return equalFractions(paneCount);
   }
   return fractions.map((f) => f / sum);
+}
+
+function normalizeViewState(
+  minimized: unknown,
+  maximized: unknown,
+  panes: TranscriptPane[],
+): Pick<PaneLayout, "minimized" | "maximized"> {
+  const ids = panes.map((pane) => pane.id);
+  const valid = new Set(ids);
+  const out: PaneId[] = [];
+  if (Array.isArray(minimized)) {
+    for (const id of minimized) {
+      if (typeof id === "string" && valid.has(id) && !out.includes(id)) out.push(id);
+    }
+  }
+  const max = typeof maximized === "string" && valid.has(maximized) ? maximized : null;
+  if (max === null && out.length >= panes.length && out.length > 0) out.pop();
+  return { minimized: out, maximized: max };
 }
 
 /// Reconcile a (possibly stale or absent) stored layout against the live roster,
@@ -104,7 +130,11 @@ export function reconcileLayout(layout: PaneLayout | undefined, rosterIds: Agent
     const hidden = pane.hidden.filter((id) => memberSet.has(id));
     return { ...pane, members, hidden };
   });
-  return { panes, fractions: normalizeFractions(layout.fractions, panes.length) };
+  return {
+    panes,
+    fractions: normalizeFractions(layout.fractions, panes.length),
+    ...normalizeViewState(layout.minimized, layout.maximized, panes),
+  };
 }
 
 // ── Persistence ──────────────────────────────────────────────────────────────
@@ -130,7 +160,12 @@ function parsePane(value: unknown): TranscriptPane | null {
 /// load-bearing.
 function parseLayout(value: unknown): PaneLayout | null {
   if (value === null || typeof value !== "object") return null;
-  const v = value as { panes?: unknown; fractions?: unknown };
+  const v = value as {
+    panes?: unknown;
+    fractions?: unknown;
+    minimized?: unknown;
+    maximized?: unknown;
+  };
   if (!Array.isArray(v.panes)) return null;
   const panes: TranscriptPane[] = [];
   for (const p of v.panes) {
@@ -143,7 +178,11 @@ function parseLayout(value: unknown): PaneLayout | null {
     Array.isArray(v.fractions) && v.fractions.every((f) => typeof f === "number")
       ? (v.fractions as number[])
       : [];
-  return { panes, fractions: normalizeFractions(fractions, panes.length) };
+  return {
+    panes,
+    fractions: normalizeFractions(fractions, panes.length),
+    ...normalizeViewState(v.minimized, v.maximized, panes),
+  };
 }
 
 function readStored(): Record<ProjectId, PaneLayout> {
@@ -338,9 +377,44 @@ function nextPaneName(panes: TranscriptPane[]): string {
   return `Pane ${n}`;
 }
 
+function expandedPaneCount(layout: PaneLayout): number {
+  if (layout.maximized !== null) return 1;
+  return layout.panes.filter((pane) => !layout.minimized.includes(pane.id)).length;
+}
+
+function newPaneStartsMinimized(layout: PaneLayout): boolean {
+  return (
+    layout.maximized === null &&
+    rowGeometry.width > 0 &&
+    (expandedPaneCount(layout) + 1) * MIN_PANE_WIDTH_PX > rowGeometry.width
+  );
+}
+
+export function createEmptyPane(projectId: ProjectId, rosterIds: AgentId[]): PaneId {
+  const paneId = newPaneId();
+  update(projectId, rosterIds, (layout) => {
+    const panes = [
+      ...layout.panes,
+      { id: paneId, name: nextPaneName(layout.panes), members: [], hidden: [] },
+    ];
+    const minimized = newPaneStartsMinimized(layout)
+      ? [...layout.minimized, paneId]
+      : layout.minimized;
+    return {
+      panes,
+      fractions: equalFractions(panes.length),
+      minimized,
+      maximized: layout.maximized,
+    };
+  });
+  return paneId;
+}
+
 /// Create a new rightmost pane and move the agent into it. Returns the new
 /// pane's id. The new pane takes an equal share of the row (fractions
-/// renormalize).
+/// renormalize). If the live row cannot fit another expanded pane at the
+/// minimum width, the new pane starts minimized so the action remains available
+/// without creating a cramped transcript layout.
 export function moveAgentToNewPane(
   projectId: ProjectId,
   rosterIds: AgentId[],
@@ -354,7 +428,13 @@ export function moveAgentToNewPane(
       hidden: pane.hidden.filter((id) => id !== agentId),
     }));
     panes.push({ id: paneId, name: nextPaneName(layout.panes), members: [agentId], hidden: [] });
-    return { panes, fractions: equalFractions(panes.length) };
+    const startsMinimized = newPaneStartsMinimized(layout);
+    return {
+      panes,
+      fractions: equalFractions(panes.length),
+      minimized: startsMinimized ? [...layout.minimized, paneId] : layout.minimized,
+      maximized: layout.maximized,
+    };
   });
   return paneId;
 }
@@ -373,8 +453,55 @@ export function closePane(projectId: ProjectId, rosterIds: AgentId[], paneId: Pa
     const fractions = layout.fractions
       .map((f, i) => (i === neighborIndex ? f + (layout.fractions[index] ?? 0) : f))
       .filter((_, i) => i !== index);
-    return { panes, fractions: normalizeFractions(fractions, panes.length) };
+    const view = normalizeViewState(
+      layout.minimized.filter((id) => id !== paneId),
+      layout.maximized === paneId ? null : layout.maximized,
+      panes,
+    );
+    return {
+      panes,
+      fractions: normalizeFractions(fractions, panes.length),
+      ...view,
+    };
   });
+}
+
+export function minimizePane(projectId: ProjectId, rosterIds: AgentId[], paneId: PaneId): void {
+  update(projectId, rosterIds, (layout) => {
+    if (layout.maximized !== null) return layout;
+    const paneExists = layout.panes.some((pane) => pane.id === paneId);
+    if (!paneExists || layout.minimized.includes(paneId)) return layout;
+    const expandedCount = layout.panes.filter((pane) => !layout.minimized.includes(pane.id)).length;
+    if (expandedCount <= 1) return layout;
+    return { ...layout, minimized: [...layout.minimized, paneId] };
+  });
+}
+
+export function restorePane(projectId: ProjectId, rosterIds: AgentId[], paneId: PaneId): void {
+  // Known tradeoff: restore currently removes the tab without enforcing the
+  // row-width fit policy. On narrow windows this can clip rightmost panes until
+  // the user minimizes another pane. Keep membership untouched; revisit with an
+  // explicit displacement policy if this becomes a common workflow.
+  update(projectId, rosterIds, (layout) => ({
+    ...layout,
+    minimized: layout.minimized.filter((id) => id !== paneId),
+    maximized: layout.maximized === paneId ? null : layout.maximized,
+  }));
+}
+
+export function maximizePane(projectId: ProjectId, rosterIds: AgentId[], paneId: PaneId): void {
+  update(projectId, rosterIds, (layout) =>
+    layout.panes.some((pane) => pane.id === paneId) ? { ...layout, maximized: paneId } : layout,
+  );
+}
+
+export function restoreMaximizedPane(projectId: ProjectId, rosterIds: AgentId[]): void {
+  // Same fit-policy tradeoff as restorePane: restoring all panes can reveal
+  // more expanded panes than a narrow row can display.
+  update(projectId, rosterIds, (layout) => ({
+    ...layout,
+    ...normalizeViewState(layout.minimized, null, layout.panes),
+  }));
 }
 
 export function renamePane(
@@ -407,23 +534,14 @@ export function setFractions(
 
 // ── Row geometry ─────────────────────────────────────────────────────────────
 
-// The live pane row's measured width, published by the layout component.
-// Global (not per-project) because exactly one project's pane row is mounted
-// at a time. Drives only the can-another-pane-fit gate — geometry never
-// alters membership.
+// The live pane row's measured width, published by the layout component. Global
+// (not per-project) because exactly one project's pane row is mounted at a
+// time. Drives only whether a newly-created pane starts minimized — geometry
+// never alters membership.
 const rowGeometry = $state({ width: 0 });
 
 export function setPaneRowWidth(px: number): void {
   rowGeometry.width = px;
-}
-
-/// Whether "Move to new pane" should be offered: another pane must fit at the
-/// minimum width. Permissive while unmeasured (0) so a not-yet-mounted row
-/// can't spuriously disable the action.
-export function canAddPane(projectId: ProjectId, rosterIds: AgentId[]): boolean {
-  if (rowGeometry.width <= 0) return true;
-  const paneCount = layoutFor(projectId, rosterIds).panes.length;
-  return (paneCount + 1) * MIN_PANE_WIDTH_PX <= rowGeometry.width;
 }
 
 /// Test-only API surface. Production hydrates once at module load; tests use

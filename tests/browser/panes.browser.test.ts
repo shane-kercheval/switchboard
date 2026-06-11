@@ -12,7 +12,10 @@ import { mountPanes } from "./mount";
 import { registerAgent, seedTurns, resetState } from "./harness";
 import {
   MIN_PANE_WIDTH_PX,
+  createEmptyPane,
   moveAgentToNewPane,
+  restoreMaximizedPane,
+  restorePane,
   _testing as panesState,
 } from "$lib/state/transcriptPanes.svelte";
 import {
@@ -169,6 +172,14 @@ test("Cmd+click targets the pane in real WebKit; plain click never re-targets", 
     .click({ modifiers: ["Meta"] });
   await expect.poll(() => selectionFor(PROJECT_ID)).toEqual([ALICE.id]);
 
+  setRecipients(PROJECT_ID, [BOB.id]);
+  await page
+    .getByTestId("transcript-pane")
+    .nth(0)
+    .click({ modifiers: ["Meta", "Alt"] });
+  await expect.poll(() => selectionFor(PROJECT_ID)).toEqual([BOB.id]);
+
+  setRecipients(PROJECT_ID, [ALICE.id]);
   // The coverage indicator is a real painted overlay spanning the pane — not
   // a ring on the pane element, which its opaque children would occlude.
   await expect
@@ -182,4 +193,34 @@ test("Cmd+click targets the pane in real WebKit; plain click never re-targets", 
   // Plain click elsewhere in pane B: reading never re-aims the draft.
   await page.getByTestId("transcript-pane").nth(1).click();
   await expect.poll(() => selectionFor(PROJECT_ID)).toEqual([ALICE.id]);
+});
+
+test("minimizing a pane redistributes the row across visible panes", async () => {
+  await seedTwoAgents();
+  const pane2 = moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+  createEmptyPane(PROJECT_ID, ROSTER_IDS);
+  mountPanes({ projectId: PROJECT_ID, agents: [ALICE, BOB], width: 1000 });
+
+  await expect.poll(() => page.getByTestId("transcript-pane").elements().length).toBe(3);
+  await page.getByTestId("pane-minimize").nth(1).click();
+
+  await expect.poll(() => page.getByTestId("transcript-pane").elements().length).toBe(2);
+  await expect.poll(() => paneWidth(0)).toBeGreaterThan(480);
+
+  restorePane(PROJECT_ID, ROSTER_IDS, pane2);
+  await expect.poll(() => page.getByTestId("transcript-pane").elements().length).toBe(3);
+});
+
+test("maximizing a pane fills the row and restore returns the split layout", async () => {
+  await seedTwoAgents();
+  moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+  mountPanes({ projectId: PROJECT_ID, agents: [ALICE, BOB], width: 1000 });
+
+  await page.getByTestId("pane-maximize").nth(1).click();
+  await expect.poll(() => page.getByTestId("transcript-pane").elements().length).toBe(1);
+  await expect.poll(() => paneWidth(0)).toBeGreaterThan(980);
+
+  restoreMaximizedPane(PROJECT_ID, ROSTER_IDS);
+  await expect.poll(() => page.getByTestId("transcript-pane").elements().length).toBe(2);
+  await expect.poll(() => paneWidth(0)).toBeLessThan(600);
 });

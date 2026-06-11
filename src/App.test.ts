@@ -423,6 +423,10 @@ describe("App", () => {
     cp._testing.reset();
     const tp = await import("$lib/state/transcriptPreview.svelte");
     tp._testing.reset();
+    const panes = await import("$lib/state/transcriptPanes.svelte");
+    panes._testing.reset();
+    const recipients = await import("$lib/state/recipientSelection.svelte");
+    recipients._testing.reset();
   });
 
   // --- harness availability banners (workspace empty → welcome) ---
@@ -1954,6 +1958,83 @@ describe("App", () => {
     await fireEvent.keyDown(window, { key: ",", metaKey: true });
     await waitFor(() => expect(screen.queryByTestId("settings-view")).not.toBeInTheDocument());
     expect(screen.getByTestId("compose-textarea")).toBeInTheDocument();
+  });
+
+  it("adds an empty pane from the app header", async () => {
+    const panes = await import("$lib/state/transcriptPanes.svelte");
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [
+        agent({ id: "ag-1", project_id: "p-a", name: "alice" }),
+        agent({ id: "ag-2", project_id: "p-a", name: "bob" }),
+      ],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("app-pane-add")).toBeInTheDocument());
+
+    await fireEvent.click(screen.getByTestId("app-pane-add"));
+
+    const layout = panes.layoutFor("p-a", ["ag-1", "ag-2"]);
+    expect(layout.panes).toHaveLength(2);
+    expect(layout.panes[1]!.members).toEqual([]);
+  });
+
+  it("restores and switches minimized panes from the app header", async () => {
+    const panes = await import("$lib/state/transcriptPanes.svelte");
+    const state = await import("$lib/state/index.svelte");
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [
+        agent({ id: "ag-1", project_id: "p-a", name: "alice" }),
+        agent({ id: "ag-2", project_id: "p-a", name: "bob" }),
+      ],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("app-pane-add")).toBeInTheDocument());
+
+    const roster = ["ag-1", "ag-2"];
+    const pane2 = panes.moveAgentToNewPane("p-a", roster, "ag-2");
+    state.runtimes["ag-2"] = {
+      ...(state.runtimes["ag-2"] ?? {
+        agent_id: "ag-2",
+        run_status: "idle",
+        hydration_status: "complete",
+        pending_sends: [],
+      }),
+      run_status: "starting",
+      pending_sends: [{ send_id: "send-bob", user_turn_id: "user-bob" }],
+    };
+    panes.minimizePane("p-a", roster, pane2);
+    await waitFor(() => expect(screen.getByTestId("app-pane-minimized-tab")).toBeInTheDocument());
+    expect(screen.getByTestId("app-pane-minimized-tab")).toHaveTextContent("Pane 2");
+    expect(
+      within(screen.getByTestId("app-pane-minimized-tab")).getByRole("status", {
+        name: "Pane 2 has running agents",
+      }),
+    ).toBeInTheDocument();
+
+    await fireEvent.click(screen.getByTestId("app-pane-minimized-tab"));
+    expect(panes.layoutFor("p-a", roster).minimized).toEqual([]);
+
+    panes.maximizePane("p-a", roster, pane2);
+    await waitFor(() =>
+      expect(screen.getByTestId("app-pane-minimized-tab")).toHaveTextContent("Pane 1"),
+    );
+    await fireEvent.click(screen.getByTestId("app-pane-minimized-tab"));
+    expect(panes.layoutFor("p-a", roster).maximized).toBe(
+      panes.layoutFor("p-a", roster).panes[0]!.id,
+    );
+
+    await fireEvent.click(screen.getByTestId("app-pane-restore-all"));
+    expect(panes.layoutFor("p-a", roster).maximized).toBeNull();
   });
 
   it("⌘⌥1..N targets pane N once split, and is inert with a single pane", async () => {

@@ -96,6 +96,18 @@ export function setTranscript(agentId: AgentId, turns: Turn[]): void {
 /// the compose-bar Send gate.
 export const runtimes = $state<RuntimeMap>({});
 
+/// Display-only "working" predicate for passive activity indicators. A send
+/// that has already been cancel-requested no longer counts here; the sidebar's
+/// Stop gate deliberately uses a broader local predicate until the backend
+/// confirms cancellation.
+export function agentIsWorking(runtime: AgentRuntime | undefined): boolean {
+  return (
+    runtime !== undefined &&
+    (runtime.run_status !== "idle" ||
+      (runtime.pending_sends ?? []).some((pending) => pending.cancel_requested !== true))
+  );
+}
+
 /// Per-agent unlisten functions for the Tauri event channel. Keyed by
 /// `agent_id`. We hold these so the test harness can drain them via
 /// `_testing.reset()`; production callers never unregister.

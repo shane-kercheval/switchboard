@@ -37,7 +37,6 @@
   import SidebarPanel from "$lib/components/ui/SidebarPanel.svelte";
   import SidebarSection from "$lib/components/ui/SidebarSection.svelte";
   import {
-    canAddPane,
     hiddenCount,
     isAgentHidden,
     layoutFor,
@@ -889,12 +888,8 @@
                     {#if agents.length > 1}
                       <DropdownMenuItem
                         onSelect={() => moveAgentToNewPane(projectId, rosterIds, agent.id)}
-                        disabled={!canAddPane(projectId, rosterIds)}
                         class="gap-2"
                         data-testid="agent-move-to-new-pane"
-                        title={canAddPane(projectId, rosterIds)
-                          ? undefined
-                          : "No room for another pane at minimum width"}
                       >
                         <Columns2
                           size={14}

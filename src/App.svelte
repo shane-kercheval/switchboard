@@ -25,18 +25,25 @@
   import SidebarToggleButton from "$lib/components/ui/SidebarToggleButton.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import { ICON_BUTTON_CLASS, ICON_SIZE } from "$lib/components/ui/iconButton";
-  import { ChevronsDownUp, ChevronsUpDown } from "@lucide/svelte";
+  import { ChevronsDownUp, ChevronsUpDown, Plus } from "@lucide/svelte";
   import {
     hasOverrides,
     normalizeProjectCompact,
     stateFor,
   } from "$lib/state/transcriptPreview.svelte";
-  import { layoutFor } from "$lib/state/transcriptPanes.svelte";
+  import {
+    createEmptyPane,
+    layoutFor,
+    maximizePane,
+    restoreMaximizedPane,
+    restorePane,
+    type TranscriptPane,
+  } from "$lib/state/transcriptPanes.svelte";
   import { targetRecipients } from "$lib/state/recipientSelection.svelte";
   import DevIndicator from "$lib/components/ui/DevIndicator.svelte";
   import { installDevTranscriptSeed } from "$lib/dev/seedTranscript";
   import { windowDragRegion } from "$lib/windowDrag";
-  import { hydrateAgent, registerAgent } from "$lib/state/index.svelte";
+  import { agentIsWorking, hydrateAgent, registerAgent, runtimes } from "$lib/state/index.svelte";
   import {
     activateProject,
     addAgentToActiveProject,
@@ -337,8 +344,28 @@
   const activeAgents = $derived<AgentRecord[]>(
     selection.activeProjectId !== null ? (agentsByProject[selection.activeProjectId] ?? []) : [],
   );
+  const activeRosterIds = $derived(activeAgents.map((a) => a.id));
   const rosterLoaded = $derived(
     selection.activeProjectId !== null && selection.activeProjectId in agentsByProject,
+  );
+  const activePaneLayout = $derived(
+    selection.activeProjectId !== null
+      ? layoutFor(selection.activeProjectId, activeRosterIds)
+      : null,
+  );
+  const activeMaximizedPane = $derived(
+    activePaneLayout?.maximized === null || activePaneLayout === null
+      ? null
+      : (activePaneLayout.panes.find((pane) => pane.id === activePaneLayout.maximized) ?? null),
+  );
+  const headerTabPanes = $derived(
+    activePaneLayout === null
+      ? []
+      : activePaneLayout.panes.filter((pane) =>
+          activeMaximizedPane !== null
+            ? pane.id !== activeMaximizedPane.id
+            : activePaneLayout.minimized.includes(pane.id),
+        ),
   );
   const activeConvo = $derived(
     selection.activeProjectId !== null ? conversations[selection.activeProjectId] : undefined,
@@ -367,6 +394,13 @@
   const projectsSidebarVisible = $derived(
     projectsSidebarOpen && projectsSidebarHasContent && view.mode !== "git",
   );
+  const showPaneHeaderControls = $derived(
+    !settingsOpen &&
+      view.mode !== "git" &&
+      selection.activeProjectId !== null &&
+      rosterLoaded &&
+      activeAgents.length > 0,
+  );
 
   // Compact-transcript header control. The action is a normalize, not a blind
   // invert: with manual per-unit overrides present it resets (enable compact +
@@ -385,6 +419,29 @@
         ? "Expand transcript"
         : "Compact transcript",
   );
+
+  function paneIsActive(pane: TranscriptPane): boolean {
+    return pane.members.some((id) => agentIsWorking(runtimes[id]));
+  }
+
+  function selectHeaderPane(pane: TranscriptPane): void {
+    if (selection.activeProjectId === null) return;
+    if (activePaneLayout?.maximized !== null) {
+      maximizePane(selection.activeProjectId, activeRosterIds, pane.id);
+    } else {
+      restorePane(selection.activeProjectId, activeRosterIds, pane.id);
+    }
+  }
+
+  function addEmptyPane(): void {
+    if (selection.activeProjectId === null) return;
+    createEmptyPane(selection.activeProjectId, activeRosterIds);
+  }
+
+  function restoreAllPanes(): void {
+    if (selection.activeProjectId === null) return;
+    restoreMaximizedPane(selection.activeProjectId, activeRosterIds);
+  }
 
   /// Expand/collapse-all over a long conversation re-renders every block in
   /// one synchronous flush — perceptible lag with zero feedback. Cover the
@@ -710,6 +767,58 @@
           </div>
         {:else}
           <div class="flex-1"></div>
+        {/if}
+
+        {#if showPaneHeaderControls}
+          <div class="flex min-w-0 shrink items-center gap-1 overflow-hidden" data-tauri-no-drag>
+            {#each headerTabPanes as pane (pane.id)}
+              {@const active = paneIsActive(pane)}
+              <button
+                type="button"
+                class="border-border bg-panel text-fg hover:bg-raised inline-flex h-7 max-w-36 min-w-0 shrink items-center gap-1.5 rounded-full border px-2 text-xs"
+                data-testid="app-pane-minimized-tab"
+                data-pane-id={pane.id}
+                onclick={() => selectHeaderPane(pane)}
+              >
+                {#if active}
+                  <span
+                    class="inline-flex shrink-0 items-center justify-center"
+                    role="status"
+                    aria-label={`${pane.name} has running agents`}
+                    data-testid="app-pane-tab-activity"
+                  >
+                    <Spinner class="h-3.5 w-3.5" />
+                  </span>
+                {/if}
+                <span class="truncate font-medium">{pane.name}</span>
+                <span class="text-muted shrink-0">{pane.members.length}</span>
+              </button>
+            {/each}
+            {#if activeMaximizedPane !== null}
+              <button
+                type="button"
+                class="text-muted hover:text-fg hover:bg-border/60 inline-flex h-7 shrink-0 items-center rounded-full px-2 text-xs"
+                data-testid="app-pane-restore-all"
+                onclick={restoreAllPanes}
+              >
+                Restore all
+              </button>
+            {/if}
+            <Tooltip label="Add empty pane" side="bottom">
+              {#snippet trigger(props)}
+                <button
+                  {...props}
+                  type="button"
+                  class={cn(ICON_BUTTON_CLASS, "hover:bg-panel shrink-0")}
+                  aria-label="Add empty pane"
+                  data-testid="app-pane-add"
+                  onclick={addEmptyPane}
+                >
+                  <Plus size={ICON_SIZE} aria-hidden="true" />
+                </button>
+              {/snippet}
+            </Tooltip>
+          </div>
         {/if}
 
         <!-- Top-level view toggle: Projects | Git (⌘⇧G). Session-only; settings

@@ -12,12 +12,18 @@ const {
   soloAgent,
   showAllAgents,
   showAllInPane,
+  createEmptyPane,
   moveAgentToPane,
   moveAgentToNewPane,
   unassignAgentFromPane,
   closePane,
+  minimizePane,
+  restorePane,
+  maximizePane,
+  restoreMaximizedPane,
   renamePane,
   setFractions,
+  setPaneRowWidth,
   _testing,
 } = await import("./transcriptPanes.svelte");
 
@@ -40,6 +46,10 @@ function assertOptionalMembership(layout: PaneLayout, rosterIds: string[]): void
   expect([...seen.values()].every((n) => n === 1)).toBe(true);
   expect(layout.fractions).toHaveLength(layout.panes.length);
   expect(layout.fractions.reduce((acc, f) => acc + f, 0)).toBeCloseTo(1);
+  expect(layout.minimized.every((id) => layout.panes.some((pane) => pane.id === id))).toBe(true);
+  expect(
+    layout.maximized === null || layout.panes.some((pane) => pane.id === layout.maximized),
+  ).toBe(true);
 }
 
 describe("default layout", () => {
@@ -49,6 +59,8 @@ describe("default layout", () => {
     expect(layout.panes[0]!.name).toBe("Pane 1");
     expect(layout.panes[0]!.members).toEqual(ROSTER);
     expect(layout.fractions).toEqual([1]);
+    expect(layout.minimized).toEqual([]);
+    expect(layout.maximized).toBeNull();
     assertOptionalMembership(layout, ROSTER);
   });
 
@@ -162,6 +174,38 @@ describe("membership (move / new pane / unassign)", () => {
     expect(new Set(names).size).toBe(names.length);
   });
 
+  it("creates an empty pane at the right edge", () => {
+    const paneId = createEmptyPane(P, ROSTER);
+    const layout = layoutFor(P, ROSTER);
+    expect(layout.panes).toHaveLength(2);
+    expect(layout.panes[1]!.id).toBe(paneId);
+    expect(layout.panes[1]!.name).toBe("Pane 2");
+    expect(layout.panes[1]!.members).toEqual([]);
+    expect(layout.panes[0]!.members).toEqual(ROSTER);
+    assertOptionalMembership(layout, ROSTER);
+  });
+
+  it("starts an empty pane minimized when the row cannot fit another expanded pane", () => {
+    setPaneRowWidth(800);
+    moveAgentToNewPane(P, ROSTER, "b");
+    const paneId = createEmptyPane(P, ROSTER);
+    expect(layoutFor(P, ROSTER).minimized).toEqual([paneId]);
+  });
+
+  it("does not count minimized panes when deciding whether a new pane fits", () => {
+    setPaneRowWidth(1200);
+    const p2 = moveAgentToNewPane(P, ROSTER, "b");
+    const p3 = moveAgentToNewPane(P, ROSTER, "c");
+    minimizePane(P, ROSTER, p2);
+    minimizePane(P, ROSTER, p3);
+
+    const p4 = createEmptyPane(P, ROSTER);
+
+    const layout = layoutFor(P, ROSTER);
+    expect(layout.minimized).toEqual([p2, p3]);
+    expect(layout.minimized).not.toContain(p4);
+  });
+
   it("an emptied pane stays open", () => {
     const p2 = moveAgentToNewPane(P, ROSTER, "b");
     moveAgentToPane(P, ROSTER, "b", layoutFor(P, ROSTER).panes[0]!.id);
@@ -238,6 +282,84 @@ describe("close pane", () => {
     closePane(P, ROSTER, p2);
     expect(layoutFor(P, ROSTER).fractions[0]).toBeCloseTo(0.8);
   });
+
+  it("clears minimized and maximized view state for the closed pane", () => {
+    const p2 = moveAgentToNewPane(P, ROSTER, "b");
+    const p3 = moveAgentToNewPane(P, ROSTER, "c");
+    minimizePane(P, ROSTER, p3);
+    maximizePane(P, ROSTER, p2);
+    closePane(P, ROSTER, p2);
+    const layout = layoutFor(P, ROSTER);
+    expect(layout.maximized).toBeNull();
+    expect(layout.minimized).toEqual([p3]);
+    closePane(P, ROSTER, layout.panes[0]!.id);
+    expect(layoutFor(P, ROSTER).minimized).toEqual([]);
+  });
+});
+
+describe("pane display state", () => {
+  it("minimizes and restores a pane without changing membership or fractions", () => {
+    const p2 = moveAgentToNewPane(P, ROSTER, "b");
+    const before = layoutFor(P, ROSTER);
+    minimizePane(P, ROSTER, p2);
+    let layout = layoutFor(P, ROSTER);
+    expect(layout.minimized).toEqual([p2]);
+    expect(layout.panes.map((pane) => pane.members)).toEqual(
+      before.panes.map((pane) => pane.members),
+    );
+    expect(layout.fractions).toEqual(before.fractions);
+
+    restorePane(P, ROSTER, p2);
+    layout = layoutFor(P, ROSTER);
+    expect(layout.minimized).toEqual([]);
+    expect(layout.maximized).toBeNull();
+  });
+
+  it("does not minimize the last expanded pane", () => {
+    const p2 = moveAgentToNewPane(P, ROSTER, "b");
+    const [p1] = layoutFor(P, ROSTER).panes;
+    minimizePane(P, ROSTER, p2);
+    minimizePane(P, ROSTER, p1!.id);
+    expect(layoutFor(P, ROSTER).minimized).toEqual([p2]);
+  });
+
+  it("starts a new pane minimized when the row cannot fit another expanded pane", () => {
+    setPaneRowWidth(800);
+    moveAgentToNewPane(P, ROSTER, "b");
+    const p3 = moveAgentToNewPane(P, ROSTER, "c");
+    const layout = layoutFor(P, ROSTER);
+    expect(layout.panes).toHaveLength(3);
+    expect(layout.minimized).toEqual([p3]);
+  });
+
+  it("maximizes, switches maximized panes, and restores", () => {
+    const p2 = moveAgentToNewPane(P, ROSTER, "b");
+    const p1 = layoutFor(P, ROSTER).panes[0]!.id;
+    maximizePane(P, ROSTER, p1);
+    expect(layoutFor(P, ROSTER).maximized).toBe(p1);
+    maximizePane(P, ROSTER, p2);
+    expect(layoutFor(P, ROSTER).maximized).toBe(p2);
+    restoreMaximizedPane(P, ROSTER);
+    expect(layoutFor(P, ROSTER).maximized).toBeNull();
+  });
+
+  it("restore from maximized never leaves every pane minimized", () => {
+    const layout = reconcileLayout(
+      {
+        panes: [
+          { id: "p1", name: "Pane 1", members: ["a"], hidden: [] },
+          { id: "p2", name: "Pane 2", members: ["b"], hidden: [] },
+        ],
+        fractions: [0.5, 0.5],
+        minimized: ["p1", "p2"],
+        maximized: "p1",
+      },
+      ROSTER,
+    );
+    expect(layout.minimized).toEqual(["p1", "p2"]);
+    const restored = reconcileLayout({ ...layout, maximized: null }, ROSTER);
+    expect(restored.minimized).toHaveLength(1);
+  });
 });
 
 describe("roster reconciliation", () => {
@@ -265,6 +387,8 @@ describe("roster reconciliation", () => {
           { id: "p2", name: "Pane 2", members: ["b", "c"], hidden: ["b"] },
         ],
         fractions: [0.5, 0.5],
+        minimized: [],
+        maximized: null,
       },
       ROSTER,
     );
@@ -282,10 +406,31 @@ describe("roster reconciliation", () => {
           { id: "p2", name: "Pane 2", members: ["b", "c"], hidden: [] },
         ],
         fractions: [0.5],
+        minimized: ["p2"],
+        maximized: "p2",
       },
       ROSTER,
     );
     expect(layout.fractions).toEqual([0.5, 0.5]);
+    expect(layout.minimized).toEqual(["p2"]);
+    expect(layout.maximized).toBe("p2");
+  });
+
+  it("prunes stale minimized and maximized pane ids", () => {
+    const layout = reconcileLayout(
+      {
+        panes: [
+          { id: "p1", name: "Pane 1", members: ["a"], hidden: [] },
+          { id: "p2", name: "Pane 2", members: ["b"], hidden: [] },
+        ],
+        fractions: [0.5, 0.5],
+        minimized: ["missing", "p2", "p2"],
+        maximized: "missing",
+      },
+      ROSTER,
+    );
+    expect(layout.minimized).toEqual(["p2"]);
+    expect(layout.maximized).toBeNull();
   });
 });
 
@@ -315,6 +460,16 @@ describe("persistence", () => {
     expect(layout.panes[1]!.members).toEqual(["b"]);
     expect(layout.panes[0]!.hidden).toEqual(["a"]);
     expect(layout.fractions[0]).toBeCloseTo(0.7);
+  });
+
+  it("round-trips minimized and maximized pane state", () => {
+    const p2 = moveAgentToNewPane(P, ROSTER, "b");
+    minimizePane(P, ROSTER, p2);
+    maximizePane(P, ROSTER, layoutFor(P, ROSTER).panes[0]!.id);
+    _testing.reloadFromStorage();
+    const layout = layoutFor(P, ROSTER);
+    expect(layout.minimized).toEqual([p2]);
+    expect(layout.maximized).toBe(layout.panes[0]!.id);
   });
 
   it("leaves agents missing from a stale stored layout unassigned on restore", () => {

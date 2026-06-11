@@ -1,6 +1,7 @@
 import { vi, describe, it, expect, beforeEach, afterEach } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
+import { flushSync } from "svelte";
 import type {
   AgentRecord,
   NormalizedEvent,
@@ -912,6 +913,13 @@ describe("App", () => {
     expect(row).toHaveAttribute("data-active", "true");
     await waitFor(() => expect(screen.getByTestId("project-loading")).toBeInTheDocument());
     expect(screen.queryByTestId("compose-textarea")).not.toBeInTheDocument();
+    // The loading layout reserves the agents sidebar's width and the compose
+    // bar's height with empty shells, so the centered spinner doesn't jump
+    // (sideways or vertically) once the real layout mounts for the next
+    // loading state.
+    expect(screen.getByTestId("project-loading-sidebar-shell")).toBeInTheDocument();
+    expect(screen.getByTestId("project-loading-sidebar-shell")).toHaveClass("w-60");
+    expect(screen.getByTestId("project-loading-compose-shell")).toBeInTheDocument();
 
     releaseOpen();
     await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
@@ -1711,6 +1719,41 @@ describe("App", () => {
         "aria-label",
         "Compact transcript",
       ),
+    );
+  });
+
+  it("covers the transcript with a busy overlay while expand/collapse re-renders", async () => {
+    seedProject({
+      projectId: "p-a",
+      name: "alpha",
+      agents: [agent({ id: "ag-1", project_id: "p-a", name: "assistant" })],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("project-row")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    const btn = await screen.findByTestId("transcript-compact-toggle");
+    // The overlay lives beside the transcript pane, which mounts only after
+    // activation resolves — toggling before that would have nothing to cover.
+    await waitFor(() => expect(screen.getByTestId("unified-transcript")).toBeInTheDocument());
+
+    // Dispatch synchronously and flush before yielding to the event loop —
+    // the overlay's whole lifetime fits inside one await chain in jsdom, so
+    // the transient "up" phase is only observable via flushSync.
+    const clicked = fireEvent.click(btn);
+    flushSync();
+    // The overlay is up immediately — the mutation itself is deferred behind
+    // rAFs so the blur+spinner can paint before the heavy re-render blocks.
+    expect(screen.getByTestId("transcript-busy-overlay")).toBeInTheDocument();
+    expect(
+      screen.getByTestId("transcript-busy-overlay").querySelector(".animate-spin"),
+    ).not.toBeNull();
+    await clicked;
+
+    // It comes down once the re-render has flushed, with the mode flipped.
+    await waitFor(() => expect(screen.queryByTestId("transcript-busy-overlay")).toBeNull());
+    expect(screen.getByTestId("transcript-compact-toggle")).toHaveAttribute(
+      "aria-label",
+      "Compact transcript",
     );
   });
 

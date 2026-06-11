@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import * as api from "$lib/api";
   import Banner from "$lib/components/Banner.svelte";
   import ComposeBar from "$lib/components/ComposeBar.svelte";
@@ -17,6 +17,8 @@
   import Button from "$lib/components/ui/Button.svelte";
   import AppShell from "$lib/components/ui/AppShell.svelte";
   import EmptyState from "$lib/components/ui/EmptyState.svelte";
+  import SidebarPanel from "$lib/components/ui/SidebarPanel.svelte";
+  import Spinner from "$lib/components/ui/Spinner.svelte";
   import ErrorDetailsDialog from "$lib/components/ui/ErrorDetailsDialog.svelte";
   import SettingsButton from "$lib/components/ui/SettingsButton.svelte";
   import CommandPaletteButton from "$lib/components/ui/CommandPaletteButton.svelte";
@@ -30,6 +32,7 @@
     stateFor,
   } from "$lib/state/transcriptPreview.svelte";
   import DevIndicator from "$lib/components/ui/DevIndicator.svelte";
+  import { installDevTranscriptSeed } from "$lib/dev/seedTranscript";
   import { windowDragRegion } from "$lib/windowDrag";
   import { hydrateAgent, registerAgent } from "$lib/state/index.svelte";
   import {
@@ -301,9 +304,11 @@
     });
 
     window.addEventListener("keydown", handleGlobalKeydown);
+    const removeDevSeed = installDevTranscriptSeed(() => activeAgents);
     return () => {
       stopProjectActivityObserver();
       window.removeEventListener("keydown", handleGlobalKeydown);
+      removeDevSeed();
     };
   });
 
@@ -363,8 +368,28 @@
         : "Compact transcript",
   );
 
+  /// Expand/collapse-all over a long conversation re-renders every block in
+  /// one synchronous flush — perceptible lag with zero feedback. Cover the
+  /// center pane with a blur+spinner, let it PAINT first (two rAFs: the first
+  /// resolves before the next paint, the second after it has happened), then
+  /// run the mutation and drop the overlay once the re-render has flushed. The
+  /// spinner keeps animating through the blocked main thread because
+  /// `animate-spin` is a compositable transform animation.
+  let transcriptBusy = $state(false);
+
+  async function withTranscriptBusy(action: () => void): Promise<void> {
+    transcriptBusy = true;
+    await new Promise(requestAnimationFrame);
+    await new Promise(requestAnimationFrame);
+    action();
+    await tick();
+    transcriptBusy = false;
+  }
+
   function toggleCompactTranscript(): void {
-    if (selection.activeProjectId !== null) normalizeProjectCompact(selection.activeProjectId);
+    const projectId = selection.activeProjectId;
+    if (projectId === null) return;
+    void withTranscriptBusy(() => normalizeProjectCompact(projectId));
   }
 
   function retryActivation(): void {
@@ -811,7 +836,42 @@
             {/snippet}
           </EmptyState>
         {:else if projectViewResumePending || projectSwitching || !rosterLoaded}
-          <EmptyState testid="project-loading" title="Loading project…" />
+          <!-- Mirror the loaded view's layout (center pane + compose-bar shell
+               + agents-sidebar shell) so the spinner doesn't jump — sideways or
+               vertically — when the roster resolves and the next loading state
+               ("Loading history…") renders inside the real layout. The compose
+               shell reuses ComposeBar's chrome classes (outer strip, rounded
+               box, min-h-16 content) so its height tracks the real empty
+               compose bar; a multi-agent project adds a chips row the shell
+               can't predict — a small accepted residual. -->
+          <div class="flex min-h-0 flex-1 overflow-hidden">
+            <div class="flex min-w-0 flex-1 flex-col overflow-hidden">
+              <EmptyState testid="project-loading" title="Loading project…" spinner />
+              <div class="bg-raised px-4 pt-2 pb-4" data-testid="project-loading-compose-shell">
+                <div class="border-border bg-raised rounded-xl border p-2.5">
+                  <!-- Stand-ins for the compose box's two rows: the header row
+                       (h-6 buttons + mb-1.5, chips-less) and the textarea at
+                       its initial 3-row autosize. A real (inert) textarea with
+                       the same rows/font/padding inherits the exact height
+                       from the same CSS instead of hand-copying a pixel
+                       value. -->
+                  <div class="mb-1.5 h-6"></div>
+                  <textarea
+                    rows="3"
+                    disabled
+                    aria-hidden="true"
+                    tabindex="-1"
+                    class="pointer-events-none block w-full resize-none border-0 bg-transparent p-1 text-sm"
+                  ></textarea>
+                </div>
+              </div>
+            </div>
+            {#if agentsSidebarOpen}
+              <SidebarPanel side="right" width="w-60" testid="project-loading-sidebar-shell">
+                <div></div>
+              </SidebarPanel>
+            {/if}
+          </div>
         {:else if activeAgents.length === 0}
           <div class="flex flex-1 flex-col overflow-y-auto">
             <CreateAgentForm
@@ -824,7 +884,15 @@
           </div>
         {:else}
           <div class="flex min-h-0 flex-1 overflow-hidden">
-            <div class="flex min-w-0 flex-1 flex-col overflow-hidden">
+            <div class="relative flex min-w-0 flex-1 flex-col overflow-hidden">
+              {#if transcriptBusy}
+                <div
+                  class="bg-surface/30 absolute inset-0 z-50 flex items-center justify-center backdrop-blur-sm"
+                  data-testid="transcript-busy-overlay"
+                >
+                  <Spinner class="h-8 w-8" />
+                </div>
+              {/if}
               <UnifiedTranscript
                 projectId={selection.activeProjectId!}
                 agents={activeAgents}

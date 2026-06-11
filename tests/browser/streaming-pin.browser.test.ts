@@ -9,7 +9,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 vi.mock("$lib/native", () => ({ copyText: vi.fn(async () => undefined) }));
 
 import { mountTranscript } from "./mount";
-import { registerAgent, seedTurns, resetState } from "./harness";
+import { registerAgent, seedTurns, resetState, distanceFromBottom } from "./harness";
 import { ALICE, PROJECT_ID, agentTurn, longText, textItem, userTurn } from "./fixtures";
 
 // Behavior 6: the streaming live cap is sized to the transcript AREA (the
@@ -19,11 +19,6 @@ import { ALICE, PROJECT_ID, agentTurn, longText, textItem, userTurn } from "./fi
 // the view STAYS PINNED at the bottom so the finished response's end remains in
 // view (the reported "jerk away from the bottom" bug). jsdom can't see either:
 // `cqh`/`max-height` aren't applied and there's no scroll geometry.
-
-function distanceFromBottom(): number {
-  const c = page.getByTestId("unified-transcript").element() as HTMLElement;
-  return c.scrollHeight - c.scrollTop - c.clientHeight;
-}
 
 beforeEach(() => {
   resetState();

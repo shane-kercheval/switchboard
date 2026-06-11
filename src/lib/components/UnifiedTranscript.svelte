@@ -6,6 +6,7 @@
   import { ChevronRight, ChevronsDownUp, ChevronsUpDown } from "@lucide/svelte";
   import {
     cancelSend,
+    getTranscriptRevision,
     retryAgentHydration,
     runtimes,
     transcripts,
@@ -16,6 +17,7 @@
     buildUnifiedRows,
     copyTextOf,
     groupRenderBlocks,
+    type RenderBlock,
     type UnifiedRow,
   } from "$lib/state/unified";
   import { agentCopy } from "$lib/agentCopy.svelte";
@@ -24,6 +26,7 @@
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
   import Markdown from "$lib/components/ui/Markdown.svelte";
   import CopyButton from "$lib/components/ui/CopyButton.svelte";
+  import Spinner from "$lib/components/ui/Spinner.svelte";
   import StatusChip from "$lib/components/ui/StatusChip.svelte";
   import StopIcon from "$lib/components/ui/StopIcon.svelte";
   import ToolCallWidget from "$lib/components/ToolCallWidget.svelte";
@@ -182,6 +185,52 @@
     return keys;
   });
 
+  /// Containment chosen over virtualization, deliberately: it is ~CSS-only,
+  /// preserves the full DOM (copy, selection, accessibility, any future
+  /// find-in-page), keeps the hand-built scroll-anchoring machinery and its
+  /// browser tests intact, and is removable in one line if windowed
+  /// virtualization ever supersedes it. Off-screen blocks skip layout and
+  /// paint and contribute `contain-intrinsic-size` placeholder geometry —
+  /// which is exactly the work the compose textarea's per-keystroke forced
+  /// reflow pays for on a long transcript. `auto` makes the engine remember
+  /// each block's real height once rendered; the per-kind length is only the
+  /// pre-first-render guess, sized to minimize |estimate − typical rendered
+  /// height| (that error is what shows as scrollbar jitter on the first-ever
+  /// scroll through unseen history). Estimates target the DEFAULT rendering —
+  /// compact mode on, fan-out columns side-by-side (≥ lg) — so compact-off
+  /// and stacked-column first scrolls carry larger error; acceptable, since
+  /// `auto` corrects each block after its first render. Three literal class
+  /// strings (not an interpolated size) because Tailwind only generates CSS
+  /// for classes it can see statically. Requires a Safari-18+ engine; older
+  /// system WebKits ignore the property — a graceful no-op, not a breakage.
+  const CONTAINMENT_COMPACT_ROW = "[content-visibility:auto] [contain-intrinsic-size:auto_4rem]";
+  const CONTAINMENT_AGENT_ROW = "[content-visibility:auto] [contain-intrinsic-size:auto_16rem]";
+  const CONTAINMENT_FANOUT = "[content-visibility:auto] [contain-intrinsic-size:auto_20rem]";
+
+  function blockIsLive(block: RenderBlock): boolean {
+    if (block.kind === "row") {
+      return block.row.kind === "agent" && isLiveStreaming(block.row.turn);
+    }
+    return block.columns.some((col) =>
+      col.rows.some((r) => r.kind === "agent" && isLiveStreaming(r.turn)),
+    );
+  }
+
+  function blockContainment(block: RenderBlock): string {
+    // LIVE blocks are exempt from containment: a streaming block's height must
+    // always be its real geometry (the pinned path follows it; the inner live
+    // pin and cap depend on it), and its per-chunk re-renders inside a skipped
+    // wrapper churn remembered sizes into spurious outer-height changes.
+    // Liveness is a stable property (it flips once at stream start/end), so a
+    // block's containment class never changes from unrelated appends — an
+    // index-based "last N" window flips membership on every new turn, and a
+    // freshly-contained block loses its remembered size and snaps to the
+    // declared placeholder when off-screen (a guaranteed view nudge per turn).
+    if (blockIsLive(block)) return "";
+    if (block.kind === "fanout") return CONTAINMENT_FANOUT;
+    return block.row.kind === "agent" ? CONTAINMENT_AGENT_ROW : CONTAINMENT_COMPACT_ROW;
+  }
+
   /// Clip + bottom-fade for a height-clipped preview. Absolute stops (not
   /// percentages) so a short message never fades; the fade starts around the
   /// halfway mark so "there's more below" is unmistakable. The `-webkit-` mask is
@@ -339,12 +388,20 @@
     return "";
   }
 
+  /// The model footer is shown only for COMPLETED turns: harnesses stamp
+  /// placeholder models on terminal-failure events (Claude records the literal
+  /// `<synthetic>`), so a failed/cancelled turn's model is a leaked sentinel,
+  /// not information.
+  function modelOf(turn: AgentTurn): string | undefined {
+    return turn.status === "complete" ? turn.model : undefined;
+  }
+
   /// A fan-out column's runtime selection footer: latest agent turn wins, matching
   /// `columnAt` and the copy aggregation's "column owns its agent rows" contract.
   function columnModel(colRows: NonUserRow[]): string | undefined {
     for (let i = colRows.length - 1; i >= 0; i--) {
       const r = colRows[i]!;
-      if (r.kind === "agent") return r.turn.model;
+      if (r.kind === "agent") return modelOf(r.turn);
     }
     return undefined;
   }
@@ -434,53 +491,115 @@
   // input device is what lets scrollbar-drag and keyboard scrolling work too.
   let lastScrollHeight = 0;
 
+  // The block at the top of the viewport (re-captured on every user scroll and
+  // after every re-anchor pass), its offset from the viewport top, and its
+  // height at capture time — what the user chose to read. While unpinned,
+  // restoring this anchor is the only correction that keeps the reading
+  // position still regardless of WHERE a height change happened: gap-from-bottom
+  // maintenance shifts the view by exactly the change whenever it happens below
+  // the viewport (a streaming response growing, a new turn arriving — the
+  // read-while-streaming bug), and containment makes off-screen heights churn
+  // in both directions as blocks skip/materialize. The gap is kept for two
+  // cases only:
+  // - the change happened INSIDE the anchor block (its own height moved): the
+  //   user expanded/collapsed the thing they're looking at, and the contract
+  //   there is "the toggle I clicked stays put" — which gap-hold provides,
+  //   since the toggle sits below the growth (footer-anchor test);
+  // - the anchor target is unreachable: content below shrank past the clamp (a
+  //   real collapse), where the contract is "hold the gap, don't slam into the
+  //   bottom" (scroll-hold tests).
+  let anchorEl: Element | null = null;
+  let anchorOffset = 0;
+  let anchorHeight = 0;
+
+  function captureAnchor(): void {
+    anchorEl = null;
+    if (!container || content === null) return;
+    const viewportTop = container.getBoundingClientRect().top;
+    // Blocks are in document order, so the first one whose bottom edge crosses
+    // the viewport top is binary-searchable.
+    const kids = content.children;
+    let lo = 0;
+    let hi = kids.length - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (kids[mid]!.getBoundingClientRect().bottom > viewportTop) {
+        anchorEl = kids[mid]!;
+        hi = mid - 1;
+      } else {
+        lo = mid + 1;
+      }
+    }
+    if (anchorEl === null) {
+      anchorOffset = 0;
+      anchorHeight = 0;
+      return;
+    }
+    const rect = anchorEl.getBoundingClientRect();
+    anchorOffset = rect.top - viewportTop;
+    anchorHeight = rect.height;
+  }
+
   function onScroll(): void {
     if (!container) return;
     distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
     if (container.scrollHeight === lastScrollHeight) {
       pinned = distanceFromBottom < 32;
+      captureAnchor();
     }
     lastScrollHeight = container.scrollHeight;
   }
 
-  /// Pin to the bottom when the user is already there; otherwise hold their gap
-  /// from the bottom so the view doesn't move. Advancing `lastScrollHeight` here
-  /// means the `scroll` event our own `scrollTop` write triggers compares equal
-  /// and is treated as user-initiated (it recomputes `pinned` from the gap we
-  /// just set, landing on the same value — benign).
+  /// Pin to the bottom when the user is already there; otherwise keep what the
+  /// user is reading still: anchor-restore when the change landed elsewhere,
+  /// gap-hold when it landed inside the anchor block or past the clamp (see
+  /// the anchor comment above). Advancing `lastScrollHeight` here means the
+  /// `scroll` event our own `scrollTop` write triggers compares equal and is
+  /// treated as user-initiated (it recomputes `pinned`/anchor from the
+  /// position we just set — benign).
   function reanchor(): void {
     if (!container) return;
-    container.scrollTop = pinned
-      ? container.scrollHeight
-      : container.scrollHeight - container.clientHeight - distanceFromBottom;
-    lastScrollHeight = container.scrollHeight;
-  }
-
-  /// Fine-grained content signal — text/output lengths and tool completion — so
-  /// streaming in-place mutations (constant row/item counts) still re-anchor.
-  /// This reactive path also makes the follow-the-bottom behaviour testable; the
-  /// ResizeObserver below (the layout path) is a no-op under jsdom.
-  const scrollSignal = $derived.by(() => {
-    let n = rows.length;
-    for (const row of rows) {
-      if (row.kind === "user") {
-        n += row.text.length;
-      } else if (row.kind === "outcome") {
-        n += row.reason?.length ?? 0;
-      } else {
-        n += row.turn.items.length;
-        for (const item of row.turn.items) {
-          if (item.item_kind === "text") {
-            n += item.text.length;
-          } else {
-            if (item.completed_at !== undefined) n += 1;
-            n += item.output?.length ?? 0;
-          }
-        }
+    if (pinned) {
+      container.scrollTop = container.scrollHeight;
+      lastScrollHeight = container.scrollHeight;
+      return;
+    }
+    const maxScroll = container.scrollHeight - container.clientHeight;
+    let anchored = false;
+    if (anchorEl?.isConnected === true) {
+      const rect = anchorEl.getBoundingClientRect();
+      const drift = rect.top - container.getBoundingClientRect().top - anchorOffset;
+      const target = container.scrollTop + drift;
+      if (rect.height === anchorHeight && target >= 0 && target <= maxScroll) {
+        if (drift !== 0) container.scrollTop = target;
+        // The gap genuinely changed (the height change landed elsewhere);
+        // keep the stored gap honest so a later gap-hold corrects from
+        // reality, not a stale value.
+        distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
+        anchored = true;
       }
     }
-    return n;
-  });
+    if (!anchored) {
+      container.scrollTop = maxScroll - distanceFromBottom;
+    }
+    lastScrollHeight = container.scrollHeight;
+    // The just-settled position is the new reference: an expand that fell back
+    // to gap-hold must not keep suppressing anchor-restore for the unrelated
+    // changes that follow it (e.g. streaming resuming below).
+    captureAnchor();
+  }
+
+  /// Content-change signal for the re-anchor effect. The store's transcript
+  /// revision covers every produced-content write (it bumps in `setTranscript`
+  /// — see its single-writer contract); `rows.length` covers overlay-driven
+  /// structure (queued rows, journal outcome markers) that doesn't pass
+  /// through the store writer. This replaces a full digest walk over every
+  /// row's text/output lengths — O(transcript) of reactive-proxy reads per
+  /// streamed chunk. String-joined so a simultaneous +1/−1 in the two parts
+  /// can't alias to an unchanged sum. This reactive path also keeps
+  /// follow-the-bottom testable under jsdom, where the ResizeObserver layout
+  /// path is inert.
+  const scrollSignal = $derived(`${getTranscriptRevision()}:${rows.length}`);
 
   $effect(() => {
     void scrollSignal;
@@ -1065,7 +1184,7 @@
       label: "Copy message",
       spend: turn.spend,
       costUsd: turn.usage?.total_cost_usd,
-      model: turn.model,
+      model: modelOf(turn),
       effort: turn.effort,
       previewKey: showToggle ? key : undefined,
       previewDefaultCompact: defaultCompact,
@@ -1079,7 +1198,20 @@
   data-testid="unified-transcript"
   class="bg-transcript [container-type:size] flex-1 overflow-y-auto px-8 py-4"
 >
-  {#if loadStatus === "loading"}
+  {#if loadStatus === "loading" && rows.length === 0}
+    <!-- Same centered spinner+title presentation as the project-loading
+         EmptyState, so the two sequential loading states the user sees on a
+         project switch don't jump between screen regions. -->
+    <div
+      class="flex h-full flex-col items-center justify-center gap-3 text-center"
+      data-testid="transcript-loading"
+    >
+      <Spinner class="h-8 w-8" />
+      <p class="text-muted text-sm">Loading history…</p>
+    </div>
+  {:else if loadStatus === "loading"}
+    <!-- Rows are already on screen (per-agent hydration landed first) — a
+         small note above them, not a centered takeover over visible content. -->
     <p class="text-muted mb-3 text-xs italic" data-testid="transcript-loading">Loading history…</p>
   {:else if loadStatus === "failed"}
     {@render failureBanner(
@@ -1119,134 +1251,141 @@
 
   <div bind:this={content} class="space-y-5">
     {#each blocks as block (block.kind === "fanout" ? block.key : block.row.key)}
-      {#if block.kind === "row"}
-        {#if block.row.kind === "user"}
-          {@render userMessage(block.row)}
-          {#if block.row.send_id !== undefined && block.row.agent_ids.length === 1 && queuedSendIds.has(block.row.send_id)}
-            {@render queuedRow(block.row.agent_ids[0]!, block.row.send_id)}
+      <div class={blockContainment(block)} data-testid="transcript-block">
+        {#if block.kind === "row"}
+          {#if block.row.kind === "user"}
+            {@render userMessage(block.row)}
+            {#if block.row.send_id !== undefined && block.row.agent_ids.length === 1 && queuedSendIds.has(block.row.send_id)}
+              {@render queuedRow(block.row.agent_ids[0]!, block.row.send_id)}
+            {/if}
+          {:else if block.row.kind === "outcome"}
+            {@render outcomeRow(block.row)}
+          {:else}
+            {@render agentRow(block.row.turn)}
           {/if}
-        {:else if block.row.kind === "outcome"}
-          {@render outcomeRow(block.row)}
         {:else}
-          {@render agentRow(block.row.turn)}
-        {/if}
-      {:else}
-        {@const fanoutKeys = block.columns
-          .filter((col) => isCollapsibleColumn(col.rows))
-          .map((col) => `fanout:${block.send_id}:${col.agent_id}`)}
-        <div class="space-y-4" data-testid="fanout-group">
-          {@render userMessage(block.user)}
-          <!-- The group control lives with the responses (not the user prompt)
+          {@const fanoutKeys = block.columns
+            .filter((col) => isCollapsibleColumn(col.rows))
+            .map((col) => `fanout:${block.send_id}:${col.agent_id}`)}
+          <div class="space-y-4" data-testid="fanout-group">
+            {@render userMessage(block.user)}
+            <!-- The group control lives with the responses (not the user prompt)
                and shares a named hover scope with them, so it reveals when the
                responses are hovered and the user message's own hover chrome
                stays independent. -->
-          <div class="group/responses space-y-2">
-            {#if fanoutKeys.length > 0}
-              <div class="flex justify-end">{@render fanoutToggleAll(fanoutKeys)}</div>
-            {/if}
-            <!-- Side-by-side on wide viewports; stacks vertically below `lg`. -->
-            <div
-              class="grid gap-4"
-              style:grid-template-columns={`repeat(${block.columns.length}, minmax(0, 1fr))`}
-            >
-              {#each block.columns as col (col.agent_id)}
-                {@const state = columnState(col.rows)}
-                {@const harness = agentById[col.agent_id]?.harness}
-                {@const colCopyable = columnText(col.rows)}
-                <!-- A non-completed Outcome marker is authoritative for the
+            <div class="group/responses space-y-2">
+              {#if fanoutKeys.length > 0}
+                <div class="flex justify-end">{@render fanoutToggleAll(fanoutKeys)}</div>
+              {/if}
+              <!-- Side-by-side on wide viewports; stacks vertically below `lg`. -->
+              <div
+                class="grid gap-4"
+                style:grid-template-columns={`repeat(${block.columns.length}, minmax(0, 1fr))`}
+              >
+                {#each block.columns as col (col.agent_id)}
+                  {@const state = columnState(col.rows)}
+                  {@const harness = agentById[col.agent_id]?.harness}
+                  {@const colCopyable = columnText(col.rows)}
+                  <!-- A non-completed Outcome marker is authoritative for the
                    column's status and renders its own chip below; suppress the
                    turn's own status chip so a cancelled-mid turn the harness
                    persisted as `failed` doesn't show a contradictory `failed`
                    chip alongside the marker's `cancelled` (nor a redundant
                    doubled `failed`). Safe per the single-(send_id, agent_id)
                    column invariant. -->
-                {@const colHasOutcome = col.rows.some((r) => r.kind === "outcome")}
-                {@const colKey = `fanout:${block.send_id}:${col.agent_id}`}
-                {@const colEligible = isCollapsibleColumn(col.rows)}
-                {@const colDefaultCompact = compactEnabled}
-                {@const colCompact = colEligible && isCompact(projectId, colKey, colDefaultCompact)}
-                {@const colLastBlock = lastBlockKeys.has(colKey)}
-                {@const colShowToggle =
-                  colEligible &&
-                  col.rows.some(
-                    (r) => r.kind === "agent" && responseHasMore(r.turn, colKey, colLastBlock),
-                  )}
-                <div
-                  class="group space-y-1.5"
-                  data-testid="fanout-column"
-                  data-role="agent"
-                  data-agent-id={col.agent_id}
-                  data-state={state}
-                >
+                  {@const colHasOutcome = col.rows.some((r) => r.kind === "outcome")}
+                  {@const colKey = `fanout:${block.send_id}:${col.agent_id}`}
+                  {@const colEligible = isCollapsibleColumn(col.rows)}
+                  {@const colDefaultCompact = compactEnabled}
+                  {@const colCompact =
+                    colEligible && isCompact(projectId, colKey, colDefaultCompact)}
+                  {@const colLastBlock = lastBlockKeys.has(colKey)}
+                  {@const colShowToggle =
+                    colEligible &&
+                    col.rows.some(
+                      (r) => r.kind === "agent" && responseHasMore(r.turn, colKey, colLastBlock),
+                    )}
                   <div
-                    class="flex items-center gap-2 text-xs font-semibold tracking-wide uppercase"
+                    class="group space-y-1.5"
+                    data-testid="fanout-column"
+                    data-role="agent"
+                    data-agent-id={col.agent_id}
+                    data-state={state}
                   >
-                    <span class="text-fg" data-testid="turn-agent-name"
-                      >{agentName(col.agent_id)}</span
+                    <div
+                      class="flex items-center gap-2 text-xs font-semibold tracking-wide uppercase"
                     >
-                    {#if harness}<HarnessIcon {harness} />{/if}
-                  </div>
-                  <div
-                    class="space-y-1.5 border-l-[0.5px] pl-3"
-                    style:border-left-color={agentBorderColor(col.agent_id)}
-                  >
-                    {#if state === "queued"}
-                      {@render queuedFooter(
-                        col.agent_id,
-                        block.send_id,
-                        "fanout-queued",
-                        "fanout-card-cancel",
-                      )}
-                    {/if}
-                    {#if colCompact}
-                      {@const colHiddenLabel = columnHiddenLabel(col.rows, colLastBlock)}
-                      {#if colHiddenLabel}
-                        {@render hiddenItemsIndicator(colKey, colHiddenLabel)}
+                      <span class="text-fg" data-testid="turn-agent-name"
+                        >{agentName(col.agent_id)}</span
+                      >
+                      {#if harness}<HarnessIcon {harness} />{/if}
+                    </div>
+                    <div
+                      class="space-y-1.5 border-l-[0.5px] pl-3"
+                      style:border-left-color={agentBorderColor(col.agent_id)}
+                    >
+                      {#if state === "queued"}
+                        {@render queuedFooter(
+                          col.agent_id,
+                          block.send_id,
+                          "fanout-queued",
+                          "fanout-card-cancel",
+                        )}
                       {/if}
-                      {#if colLastBlock}
-                        {#each col.rows as r (r.key)}
-                          {#if r.kind === "agent"}{@render turnBody(r.turn, false, "last")}{/if}
-                        {/each}
-                      {:else}
-                        <div
-                          class={cn("space-y-1.5", PREVIEW_CLIP)}
-                          use:measureClip={colKey}
-                          data-testid="preview-clip"
-                        >
+                      {#if colCompact}
+                        {@const colHiddenLabel = columnHiddenLabel(col.rows, colLastBlock)}
+                        {#if colHiddenLabel}
+                          {@render hiddenItemsIndicator(colKey, colHiddenLabel)}
+                        {/if}
+                        {#if colLastBlock}
                           {#each col.rows as r (r.key)}
-                            {#if r.kind === "agent"}{@render turnBody(r.turn, false, "answer")}{/if}
+                            {#if r.kind === "agent"}{@render turnBody(r.turn, false, "last")}{/if}
                           {/each}
-                        </div>
-                      {/if}
-                      <!-- Status chip(s) last (after the indicator + body), and
+                        {:else}
+                          <div
+                            class={cn("space-y-1.5", PREVIEW_CLIP)}
+                            use:measureClip={colKey}
+                            data-testid="preview-clip"
+                          >
+                            {#each col.rows as r (r.key)}
+                              {#if r.kind === "agent"}{@render turnBody(
+                                  r.turn,
+                                  false,
+                                  "answer",
+                                )}{/if}
+                            {/each}
+                          </div>
+                        {/if}
+                        <!-- Status chip(s) last (after the indicator + body), and
                            outside the clip so a collapsed terminal column keeps
                            its outcome signal — matching the expanded order. -->
-                      {@render columnStatusChips(col.rows, colHasOutcome)}
-                    {:else}
-                      {#each col.rows as r (r.key)}
-                        {#if r.kind === "agent"}{@render turnBody(
-                            r.turn,
-                            state === "streaming",
-                          )}{/if}
-                      {/each}
-                      {@render columnStatusChips(col.rows, colHasOutcome)}
-                    {/if}
+                        {@render columnStatusChips(col.rows, colHasOutcome)}
+                      {:else}
+                        {#each col.rows as r (r.key)}
+                          {#if r.kind === "agent"}{@render turnBody(
+                              r.turn,
+                              state === "streaming",
+                            )}{/if}
+                        {/each}
+                        {@render columnStatusChips(col.rows, colHasOutcome)}
+                      {/if}
+                    </div>
+                    {@render messageMeta({
+                      at: columnAt(col.rows),
+                      copyable: colCopyable,
+                      label: `Copy ${agentName(col.agent_id)}'s message`,
+                      model: columnModel(col.rows),
+                      effort: columnEffort(col.rows),
+                      previewKey: colShowToggle ? colKey : undefined,
+                      previewDefaultCompact: colDefaultCompact,
+                    })}
                   </div>
-                  {@render messageMeta({
-                    at: columnAt(col.rows),
-                    copyable: colCopyable,
-                    label: `Copy ${agentName(col.agent_id)}'s message`,
-                    model: columnModel(col.rows),
-                    effort: columnEffort(col.rows),
-                    previewKey: colShowToggle ? colKey : undefined,
-                    previewDefaultCompact: colDefaultCompact,
-                  })}
-                </div>
-              {/each}
+                {/each}
+              </div>
             </div>
           </div>
-        </div>
-      {/if}
+        {/if}
+      </div>
     {/each}
   </div>
 </div>

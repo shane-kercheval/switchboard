@@ -1,9 +1,11 @@
 # Transcript performance improvements
 
-**Status:** in progress — M1–M3 landed; M4 cancelled on the M3 gate (2026-06-10); M5 next (step-0 baseline recorded).
+**Status:** complete except one open question — M1–M3 and M5 (Fix 2) landed, plus `field-sizing` (the headline compose fix; see M1's note); M4 cancelled on the M3 gate; M5 Fix 1 built then reverted. Open: M5 Fix 3, pending the hands-on typing-while-streaming check.
 **Branch:** `performance` (worktree `switchboard-performance`), based on `main` at `f2ab0aa` (includes PR #31).
 
 ## Problem statement
+
+*Diagnosis as of branch start — kept in its original present tense as the historical record. Each cost below is addressed by a milestone in this plan; see the milestones for what actually shipped.*
 
 Typing in the compose bar is slow and laggy when the active project's transcript is large. The lag is present even when no agent is streaming; it gets worse while one is. Diagnosed root cause and contributing costs are below — read this section in full before implementing anything, because the fix only makes sense against the diagnosis.
 
@@ -41,7 +43,7 @@ PR #31 (compact transcript mode + WebKit browser-test layer) landed after this d
 - Layout thrashing / forced synchronous layout: https://web.dev/articles/avoid-large-complex-layouts-and-layout-thrashing
 - CSS containment + `content-visibility`: https://developer.mozilla.org/en-US/docs/Web/CSS/content-visibility and https://web.dev/articles/content-visibility (M3)
 - `contain-intrinsic-size`: https://developer.mozilla.org/en-US/docs/Web/CSS/contain-intrinsic-size (M3)
-- `field-sizing`: https://developer.mozilla.org/en-US/docs/Web/CSS/field-sizing (background for M1's future note — explicitly out of scope)
+- `field-sizing`: https://developer.mozilla.org/en-US/docs/Web/CSS/field-sizing (was deferred as out of scope; **now implemented**, runtime-detected with the JS fallback retained — see M1's field-sizing note)
 - TanStack Virtual (only if M4 triggers): https://tanstack.com/virtual/latest
 
 ## Shared conventions for all milestones

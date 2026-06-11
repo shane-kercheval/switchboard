@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/svelte";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import { tick } from "svelte";
 import type { AgentRecord, NormalizedEvent, Prompt } from "$lib/types";
 // Static import so the component-tree transform happens at module collection,
@@ -94,7 +94,14 @@ function fireTo(channel: string, event: NormalizedEvent): void {
 
 const chip = (id: string) => screen.getByTestId(`recipient-chip-${id}`);
 
-beforeEach(() => {
+beforeEach(async () => {
+  // Pane/selection state is module-global; reset it BEFORE each test, not in
+  // afterEach: vitest runs afterEach hooks LIFO, so a teardown reset would
+  // fire while the previous test's ComposeBar is still mounted — clearing the
+  // selection store triggers its live persistence effect, which writes a
+  // spurious deselect-all into composeStore after composeStore's own reset.
+  (await import("$lib/state/transcriptPanes.svelte"))._testing.reset();
+  (await import("$lib/state/recipientSelection.svelte"))._testing.reset();
   listeners.clear();
   dragDropCb = undefined;
   resolveDropSub = undefined;
@@ -1764,5 +1771,202 @@ describe("ComposeBar — attachment lifecycle", () => {
     expect(err.textContent).toContain("Couldn't attach");
     expect(err.textContent).toContain("diagram.png");
     expect(screen.queryByTestId("attachment-chip-image-1")).toBeNull();
+  });
+});
+
+describe("ComposeBar pane targeting", () => {
+  const ROSTER = [AGENT_A.id, AGENT_B.id];
+
+  async function importPanes() {
+    return await import("$lib/state/transcriptPanes.svelte");
+  }
+  async function importSelection() {
+    return await import("$lib/state/recipientSelection.svelte");
+  }
+
+  async function renderTwoAgents(): Promise<HTMLTextAreaElement> {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    return screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+  }
+
+  it("offers no pane entries in the @ menu with the single default pane", async () => {
+    const textarea = await renderTwoAgents();
+    await fireEvent.input(textarea, { target: { value: "@pane" } });
+    await screen.findByTestId("recipient-menu");
+    expect(screen.queryByTestId(/^recipient-option-pane:/)).not.toBeInTheDocument();
+  });
+
+  it("@panename targets the pane with replace semantics once split", async () => {
+    const panes = await importPanes();
+    const selection = await importSelection();
+    const paneId = panes.moveAgentToNewPane(PROJECT_ID, ROSTER, AGENT_B.id);
+    panes.renamePane(PROJECT_ID, ROSTER, paneId, "reviewers");
+
+    const textarea = await renderTwoAgents();
+    // Start from a different selection so replace (not add) is observable.
+    selection.setRecipients(PROJECT_ID, [AGENT_A.id]);
+
+    await fireEvent.input(textarea, { target: { value: "@review" } });
+    const option = await screen.findByTestId(`recipient-option-pane:${paneId}`);
+    // The entry spells out the pane's member names, not a count.
+    expect(within(option).getByTestId("pane-option-members")).toHaveTextContent("bob");
+    await fireEvent.click(option);
+
+    expect(selection.selectionFor(PROJECT_ID)).toEqual([AGENT_B.id]);
+    // The @-token is consumed like an agent pick.
+    expect(textarea.value).toBe("");
+  });
+
+  it("pane entries list ahead of agent entries", async () => {
+    const panes = await importPanes();
+    panes.moveAgentToNewPane(PROJECT_ID, ROSTER, AGENT_B.id);
+    const textarea = await renderTwoAgents();
+
+    await fireEvent.input(textarea, { target: { value: "@" } });
+    const menu = await screen.findByTestId("recipient-menu");
+    const keys = Array.from(menu.querySelectorAll('[data-testid^="recipient-option-"]')).map((el) =>
+      el.getAttribute("data-testid"),
+    );
+    const firstPane = keys.findIndex((k) => k?.startsWith("recipient-option-pane:"));
+    const firstAgent = keys.findIndex((k) => k === `recipient-option-${AGENT_A.id}`);
+    expect(firstPane).toBeGreaterThanOrEqual(0);
+    expect(firstAgent).toBeGreaterThan(firstPane);
+  });
+
+  it("marks a recipient chip only when targeted AND hidden", async () => {
+    const panes = await importPanes();
+    const selection = await importSelection();
+    await renderTwoAgents();
+
+    // Hidden but UNSELECTED (the default selection is alice): no hazard, so
+    // no warning — a cue that fires without a hazard trains users to ignore it.
+    panes.toggleAgentHidden(PROJECT_ID, ROSTER, AGENT_B.id);
+    await waitFor(() => {
+      expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "false");
+    });
+    expect(screen.queryByTestId(`recipient-hidden-cue-${AGENT_B.id}`)).not.toBeInTheDocument();
+    expect(chip(AGENT_B.id)).not.toHaveAttribute("data-hidden-recipient");
+
+    // Selecting the hidden agent makes it targeted-but-hidden: cue appears.
+    selection.setRecipients(PROJECT_ID, [AGENT_A.id, AGENT_B.id]);
+    await waitFor(() => {
+      expect(screen.getByTestId(`recipient-hidden-cue-${AGENT_B.id}`)).toBeInTheDocument();
+      expect(chip(AGENT_B.id)).toHaveAttribute("data-hidden-recipient", "true");
+    });
+
+    // Revealing the agent clears the cue while it stays selected.
+    panes.showAllAgents(PROJECT_ID, ROSTER);
+    await waitFor(() => {
+      expect(screen.queryByTestId(`recipient-hidden-cue-${AGENT_B.id}`)).not.toBeInTheDocument();
+    });
+    expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "true");
+  });
+
+  it("never accents the compose box for pane targeting (the dock treatment was removed)", async () => {
+    const panes = await importPanes();
+    const selection = await importSelection();
+    panes.moveAgentToNewPane(PROJECT_ID, ROSTER, AGENT_B.id);
+
+    await renderTwoAgents();
+
+    // Even the exact-pane match that used to trigger the dock leaves the
+    // compose box neutral — the pane's own coverage ring is the one
+    // targeting visual.
+    selection.setRecipients(PROJECT_ID, [AGENT_B.id]);
+    await Promise.resolve();
+    expect(screen.getByTestId("compose-box")).not.toHaveAttribute("data-docked-pane");
+    expect(screen.getByTestId("compose-box").className).not.toContain("border-accent");
+  });
+
+  it("an external pane-targeting write flows into the chips and persists", async () => {
+    const selection = await importSelection();
+    const composeStore = await loadComposeStore();
+    await renderTwoAgents();
+
+    // Simulates a pane header click / Cmd+Alt+N from outside this component.
+    selection.setRecipients(PROJECT_ID, [AGENT_B.id]);
+    await waitFor(() => {
+      expect(chip(AGENT_B.id)).toHaveAttribute("data-selected", "true");
+      expect(chip(AGENT_A.id)).toHaveAttribute("data-selected", "false");
+    });
+    expect(composeStore.getCompose(PROJECT_ID).selectedIds).toEqual([AGENT_B.id]);
+  });
+
+  it("refuses pane targeting while a prompt render is in flight, so the send still dispatches", async () => {
+    const panes = await importPanes();
+    const selection = await importSelection();
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    panes.moveAgentToNewPane(PROJECT_ID, ROSTER, AGENT_B.id);
+
+    let release!: (v: { text: string }) => void;
+    const gate = new Promise<{ text: string }>((res) => {
+      release = res;
+    });
+    mockPromptBackend({ prompts: [SUMMARY], render: () => gate });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+    // Default selection is alice; dispatch a prompt send to her.
+    await enterPromptMode("prompt-option-tiddly:summary");
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    // Mid-render, a pane gesture is refused — without this, the post-render
+    // recipient check would silently abort the send.
+    expect(selection.targetRecipients(PROJECT_ID, [AGENT_B.id])).toBe(false);
+    expect(selection.selectionFor(PROJECT_ID)).toEqual([AGENT_A.id]);
+
+    release({ text: "DONE" });
+    await waitFor(() => {
+      const sends = invokeMock.mock.calls.filter(([c]) => c === "send_message");
+      expect(sends).toHaveLength(1);
+    });
+    expect((state.transcripts[AGENT_A.id] ?? [])[0]).toMatchObject({ text: "DONE" });
+
+    // The freeze lifts with the render: targeting works again.
+    expect(selection.targetRecipients(PROJECT_ID, [AGENT_B.id])).toBe(true);
+  });
+
+  it("releases the targeting lock even when the prompt render fails", async () => {
+    const panes = await importPanes();
+    const selection = await importSelection();
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    panes.moveAgentToNewPane(PROJECT_ID, ROSTER, AGENT_B.id);
+
+    mockPromptBackend({
+      prompts: [SUMMARY],
+      render: () => Promise.reject(new Error("render boom")),
+    });
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+    await enterPromptMode("prompt-option-tiddly:summary");
+    await fireEvent.click(screen.getByTestId("compose-send"));
+    await waitFor(() => {
+      expect(screen.getByTestId("compose-send-error")).toHaveTextContent("render boom");
+    });
+
+    // A stuck lock would disable pane targeting forever — the failure path
+    // must release it.
+    expect(selection.targetRecipients(PROJECT_ID, [AGENT_B.id])).toBe(true);
+  });
+
+  it("omits empty panes from the @ menu's pane entries", async () => {
+    const panes = await importPanes();
+    const paneId = panes.moveAgentToNewPane(PROJECT_ID, ROSTER, AGENT_B.id);
+    const pane1 = panes.layoutFor(PROJECT_ID, ROSTER).panes[0]!.id;
+    // Empty pane 2 by moving bob back; the pane stays open but has no members.
+    panes.moveAgentToPane(PROJECT_ID, ROSTER, AGENT_B.id, pane1);
+
+    const textarea = await renderTwoAgents();
+    await fireEvent.input(textarea, { target: { value: "@" } });
+    await screen.findByTestId("recipient-menu");
+
+    expect(screen.queryByTestId(`recipient-option-pane:${paneId}`)).not.toBeInTheDocument();
+    expect(screen.getByTestId(`recipient-option-pane:${pane1}`)).toBeInTheDocument();
   });
 });

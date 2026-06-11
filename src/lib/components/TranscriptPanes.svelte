@@ -1,0 +1,407 @@
+<script lang="ts">
+  /// The transcript pane row: 1..N side-by-side `UnifiedTranscript` instances
+  /// partitioning the project's roster, with resizable gutters and pane
+  /// targeting. With a single pane (the default), every piece of pane chrome —
+  /// header, gutters, coverage border, Cmd overlay, targeting gestures — is
+  /// inert, so the no-split state renders exactly like the pre-pane UI: with
+  /// one pane there is nothing to disambiguate, and the chrome would be pure
+  /// noise in the most common state.
+  ///
+  /// Targeting is a lens over the compose recipient set (`recipientSelection`):
+  /// gestures *write* `targetRecipients` (the lock-aware user-targeting path);
+  /// the coverage border *derives* from the selection ∩ membership. Nothing
+  /// here stores a targeted pane — a stored target could drift from the real
+  /// recipient set and lie.
+  import { Check, Pencil, X } from "@lucide/svelte";
+  import type { AgentRecord, ConversationItem, ProjectId } from "$lib/types";
+  import UnifiedTranscript from "$lib/components/UnifiedTranscript.svelte";
+  import Tooltip from "$lib/components/ui/Tooltip.svelte";
+  import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
+  import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
+  import { cn } from "$lib/utils";
+  import { shortcut } from "$lib/platform";
+  import {
+    MIN_PANE_WIDTH_PX,
+    closePane,
+    layoutFor,
+    renamePane,
+    setFractions,
+    setPaneRowWidth,
+    showAllInPane,
+    type TranscriptPane,
+  } from "$lib/state/transcriptPanes.svelte";
+  import { selectionFor, targetRecipients } from "$lib/state/recipientSelection.svelte";
+
+  let {
+    projectId,
+    agents,
+    overlay = [],
+    loadStatus = "complete",
+    loadError,
+    onRetryLoad,
+  }: {
+    projectId: ProjectId;
+    agents: AgentRecord[];
+    overlay?: ConversationItem[];
+    loadStatus?: "pending" | "loading" | "complete" | "failed";
+    loadError?: string;
+    onRetryLoad?: () => void;
+  } = $props();
+
+  const rosterIds = $derived(agents.map((a) => a.id));
+  const layout = $derived(layoutFor(projectId, rosterIds));
+  const multiPane = $derived(layout.panes.length > 1);
+  const selection = $derived(selectionFor(projectId));
+
+  /// A pane's visible roster, in roster order (membership decides *where* an
+  /// agent appears; the pane's hidden set decides *whether*). Roster order
+  /// keeps pane columns consistent with the sidebar and fan-out columns.
+  function paneAgents(pane: TranscriptPane): AgentRecord[] {
+    return agents.filter((a) => pane.members.includes(a.id) && !pane.hidden.includes(a.id));
+  }
+
+  /// Tri-state recipient coverage: how much of this pane the current draft
+  /// targets. Derived from the recipient set every render, so the border can
+  /// never disagree with who actually receives the send.
+  function coverage(pane: TranscriptPane): "full" | "partial" | "none" {
+    if (pane.members.length === 0) return "none";
+    const selected = new Set(selection);
+    const count = pane.members.filter((id) => selected.has(id)).length;
+    if (count === 0) return "none";
+    return count === pane.members.length ? "full" : "partial";
+  }
+
+  /// Replace the recipient set with the pane's members — the meaning of every
+  /// targeting gesture (header click, Cmd+click, `@panename`, Cmd+Alt+N).
+  /// An empty pane is not a send target anywhere: targeting it could only
+  /// clear the recipient set, silently. Goes through `targetRecipients` so the
+  /// prompt-render targeting freeze applies (see recipientSelection).
+  function targetPane(pane: TranscriptPane): void {
+    if (pane.members.length === 0) return;
+    targetRecipients(projectId, [...pane.members]);
+  }
+
+  /// Cmd+click anywhere in a pane targets it (multi-pane only). Plain clicks
+  /// never re-target — reading (scroll, select, copy) must stay safe while a
+  /// draft is half-typed elsewhere. ⌘ only, never Ctrl: on macOS Ctrl+click is
+  /// the system context-menu gesture, so treating Ctrl as a targeting modifier
+  /// hijacks right-clicks (and leaves the armed overlay stuck under the native
+  /// menu, which swallows the Ctrl keyup).
+  function onPaneClick(pane: TranscriptPane, event: MouseEvent): void {
+    if (!multiPane) return;
+    if (!event.metaKey) return;
+    event.preventDefault();
+    event.stopPropagation();
+    targetPane(pane);
+  }
+
+  // ── Cmd-held target overlay ─────────────────────────────────────────────────
+  // Holding Cmd previews the Cmd+click commit on the hovered pane. The armed
+  // state clears on keyup AND on window blur: if the app loses focus while Cmd
+  // is held (Cmd+Tab away), the keyup never arrives and the overlay would
+  // stick.
+  let cmdHeld = $state(false);
+  let hoveredPaneId = $state<string | null>(null);
+
+  function onWindowKeydown(event: KeyboardEvent): void {
+    if (event.key === "Meta") cmdHeld = true;
+  }
+  function onWindowKeyup(event: KeyboardEvent): void {
+    if (event.key === "Meta") cmdHeld = false;
+  }
+  function onWindowBlur(): void {
+    cmdHeld = false;
+  }
+
+  // ── Gutter resize ───────────────────────────────────────────────────────────
+  // Generalized from GitView's detail-panel resize: pointer-down on gutter i
+  // adjusts panes i and i+1, both clamped to MIN_PANE_WIDTH_PX against the live
+  // row width. Drafted locally during the drag; committed (and persisted) once
+  // on pointer-up.
+  let rowEl = $state<HTMLDivElement | null>(null);
+  let rowWidth = $state(0);
+  let resizing = $state<{ index: number; pairSum: number; leftStart: number } | null>(null);
+  let draftFractions = $state<number[] | null>(null);
+
+  const effectiveFractions = $derived(draftFractions ?? layout.fractions);
+
+  $effect(() => {
+    setPaneRowWidth(rowWidth);
+  });
+
+  function startResize(index: number, event: PointerEvent): void {
+    const fractions = layout.fractions;
+    resizing = {
+      index,
+      pairSum: (fractions[index] ?? 0) + (fractions[index + 1] ?? 0),
+      leftStart: fractions.slice(0, index).reduce((acc, f) => acc + f, 0),
+    };
+    draftFractions = [...fractions];
+    event.preventDefault();
+  }
+
+  function resizeMove(event: PointerEvent): void {
+    if (resizing === null || rowEl === null) return;
+    const rect = rowEl.getBoundingClientRect();
+    if (rect.width <= 0) return;
+    const { index, pairSum, leftStart } = resizing;
+    const minF = MIN_PANE_WIDTH_PX / rect.width;
+    const boundary = (event.clientX - rect.left) / rect.width;
+    let left = boundary - leftStart;
+    const lo = minF;
+    const hi = pairSum - minF;
+    // Row too narrow for both panes at min width → hold the pair at an even
+    // split rather than inverting the clamp range.
+    left = hi < lo ? pairSum / 2 : Math.min(hi, Math.max(lo, left));
+    const next = [...(draftFractions ?? layout.fractions)];
+    next[index] = left;
+    next[index + 1] = pairSum - left;
+    draftFractions = next;
+  }
+
+  function endResize(): void {
+    if (resizing !== null && draftFractions !== null) {
+      setFractions(projectId, rosterIds, draftFractions);
+    }
+    resizing = null;
+    draftFractions = null;
+  }
+
+  // ── Inline pane rename ──────────────────────────────────────────────────────
+  // Mirrors the sidebar's agent-rename pattern: explicit edit affordance opens
+  // an inline input; Enter/check commits, Escape/blur cancels. The header
+  // text itself is the *target* gesture, so the two affordances never collide.
+  let renamingPaneId = $state<string | null>(null);
+  let renameDraft = $state("");
+
+  function startRename(pane: TranscriptPane): void {
+    renamingPaneId = pane.id;
+    renameDraft = pane.name;
+  }
+
+  function commitRename(): void {
+    if (renamingPaneId !== null) renamePane(projectId, rosterIds, renamingPaneId, renameDraft);
+    renamingPaneId = null;
+  }
+
+  function cancelRename(): void {
+    renamingPaneId = null;
+  }
+
+  function onRenameKeydown(event: KeyboardEvent): void {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      commitRename();
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      cancelRename();
+    }
+  }
+
+  function focusSelect(node: HTMLInputElement): void {
+    requestAnimationFrame(() => {
+      node.focus();
+      node.select();
+    });
+  }
+
+  // One border, one meaning: accent = "this pane's members receive the
+  // draft"; the faded variant = "some of them do"; nothing = none. Rendered as
+  // an absolutely-positioned overlay (like the Cmd-held overlay), NOT as a
+  // ring on the pane element itself: an inset ring is a box-shadow painted in
+  // the pane's own background layer, beneath its opaque children (header +
+  // transcript backgrounds), so it would be drawn but never visible. The
+  // overlay also never shifts layout when coverage changes.
+  const COVERAGE_RING: Record<"full" | "partial", string> = {
+    full: "ring-accent",
+    partial: "ring-accent/35",
+  };
+</script>
+
+<svelte:window
+  onpointermove={resizeMove}
+  onpointerup={endResize}
+  onkeydown={onWindowKeydown}
+  onkeyup={onWindowKeyup}
+  onblur={onWindowBlur}
+/>
+
+<div
+  bind:this={rowEl}
+  bind:clientWidth={rowWidth}
+  class="flex min-h-0 min-w-0 flex-1 overflow-hidden"
+  data-testid="transcript-panes"
+>
+  {#each layout.panes as pane, i (pane.id)}
+    {@const visible = paneAgents(pane)}
+    {@const cov = multiPane ? coverage(pane) : "none"}
+    {#if i > 0}
+      <div
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize panes"
+        data-testid={`pane-gutter-${i}`}
+        class="bg-border/80 hover:bg-accent/70 w-1 shrink-0 cursor-col-resize transition-colors"
+        onpointerdown={(event) => startResize(i - 1, event)}
+      ></div>
+    {/if}
+    <!-- Cmd+click targets the pane; plain clicks pass through untouched, so a
+         click-to-read can never re-aim a half-typed draft. Keyboard targeting
+         exists via Cmd+Alt+1..N. -->
+    <!-- svelte-ignore a11y_click_events_have_key_events -->
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <section
+      class="relative flex min-w-0 flex-col overflow-hidden"
+      style:flex={`${effectiveFractions[i] ?? 1} 1 0%`}
+      style:min-width={multiPane ? `${MIN_PANE_WIDTH_PX}px` : undefined}
+      data-testid="transcript-pane"
+      data-pane-id={pane.id}
+      data-coverage={multiPane ? cov : undefined}
+      onclick={(event) => onPaneClick(pane, event)}
+      onpointerenter={() => (hoveredPaneId = pane.id)}
+      onpointerleave={() => (hoveredPaneId = hoveredPaneId === pane.id ? null : hoveredPaneId)}
+    >
+      {#if multiPane}
+        <header
+          class="border-border/80 bg-raised flex h-8 shrink-0 items-center gap-1 border-b px-2"
+          data-testid="pane-header"
+        >
+          {#if renamingPaneId === pane.id}
+            <input
+              use:focusSelect
+              bind:value={renameDraft}
+              class="text-fg border-border bg-panel focus-visible:ring-accent h-6 min-w-0 flex-1 rounded border px-1.5 text-xs font-semibold focus-visible:ring-1 focus-visible:outline-none"
+              aria-label="Pane name"
+              data-testid="pane-rename-input"
+              onkeydown={onRenameKeydown}
+              onblur={cancelRename}
+            />
+            <button
+              type="button"
+              class={cn(ICON_BUTTON_CLASS, "shrink-0")}
+              aria-label="Save pane name"
+              title="Save"
+              data-testid="pane-rename-save"
+              onmousedown={(event) => event.preventDefault()}
+              onclick={commitRename}
+            >
+              <Check size={14} strokeWidth={2} aria-hidden="true" />
+            </button>
+          {:else}
+            {#if pane.members.length === 0}
+              <!-- An empty pane is not a send target — a "Send to" affordance
+                   here could only clear the recipient set. Plain name; the
+                   pane body explains how to populate it. -->
+              <span
+                class="text-muted flex h-6 min-w-0 flex-1 items-center px-1.5 text-xs font-semibold"
+                data-testid="pane-name"
+              >
+                {pane.name}
+              </span>
+            {:else}
+              <Tooltip
+                label={`Send to ${pane.name}`}
+                shortcut={i < 9 ? shortcut("mod", "alt", String(i + 1)) : undefined}
+              >
+                {#snippet trigger(props)}
+                  <button
+                    {...props}
+                    type="button"
+                    class="hover:bg-panel flex h-6 min-w-0 flex-1 items-center gap-1.5 rounded px-1.5 text-left"
+                    data-testid="pane-target"
+                    onclick={() => targetPane(pane)}
+                  >
+                    <span class="text-fg truncate text-xs font-semibold" data-testid="pane-name">
+                      {pane.name}
+                    </span>
+                    <span class="flex shrink-0 items-center gap-0.5">
+                      {#each agents.filter( (a) => pane.members.includes(a.id), ) as member (member.id)}
+                        <HarnessIcon harness={member.harness} size="sm" class="h-3 w-3" />
+                      {/each}
+                    </span>
+                  </button>
+                {/snippet}
+              </Tooltip>
+            {/if}
+            <button
+              type="button"
+              class={cn(ICON_BUTTON_CLASS, "shrink-0")}
+              aria-label={`Rename ${pane.name}`}
+              title="Rename pane"
+              data-testid="pane-rename"
+              onclick={(event) => {
+                event.stopPropagation();
+                startRename(pane);
+              }}
+            >
+              <Pencil size={12} strokeWidth={1.8} aria-hidden="true" />
+            </button>
+            <button
+              type="button"
+              class={cn(ICON_BUTTON_CLASS, "shrink-0")}
+              aria-label={`Close ${pane.name}`}
+              title="Close pane (agents merge into the neighboring pane)"
+              data-testid="pane-close"
+              onclick={(event) => {
+                event.stopPropagation();
+                closePane(projectId, rosterIds, pane.id);
+              }}
+            >
+              <X size={14} strokeWidth={1.8} aria-hidden="true" />
+            </button>
+          {/if}
+        </header>
+      {/if}
+      {#if visible.length === 0}
+        <div
+          class="text-muted flex flex-1 flex-col items-center justify-center gap-2 p-6 text-center text-xs"
+          data-testid="pane-empty"
+        >
+          {#if pane.members.length === 0}
+            <p>No agents in this pane — move one here from the agents sidebar.</p>
+          {:else}
+            <p>All agents in this pane are hidden.</p>
+            <button
+              type="button"
+              class="text-accent hover:underline"
+              data-testid="pane-show-all"
+              onclick={() => showAllInPane(projectId, rosterIds, pane.id)}
+            >
+              Show all
+            </button>
+          {/if}
+        </div>
+      {:else}
+        <UnifiedTranscript
+          {projectId}
+          agents={visible}
+          {overlay}
+          {loadStatus}
+          {loadError}
+          {onRetryLoad}
+        />
+      {/if}
+      {#if multiPane && cov !== "none"}
+        <div
+          class={cn(
+            "pointer-events-none absolute inset-0 z-10 ring-2 ring-inset",
+            COVERAGE_RING[cov],
+          )}
+          data-testid="pane-coverage"
+        ></div>
+      {/if}
+      {#if multiPane && cmdHeld && hoveredPaneId === pane.id && pane.members.length > 0}
+        <div
+          class="ring-accent pointer-events-none absolute inset-0 z-10 flex items-start justify-center ring-2 ring-inset"
+          data-testid="pane-target-overlay"
+        >
+          <span
+            class="bg-accent-soft text-fg mt-10 rounded-full px-2.5 py-0.5 text-xs font-medium shadow"
+          >
+            Send to {pane.name} — ⌘click
+          </span>
+        </div>
+      {/if}
+    </section>
+  {/each}
+</div>

@@ -59,6 +59,17 @@ There is also a quieter benefit: because Switchboard resolves prompts itself and
 - **Workflow**: a reusable, parameterized routing template — for example "fan-out review and aggregate" — defined as a YAML file and invoked by name.
 - **Routing**: message passing between agents, optionally wrapped in a prompt template, with support for fan-out (one to many) and fan-in (many to one).
 
+## Transcript panes
+
+By default a project shows one unified transcript of all its agents. You can split it into side-by-side panes — for example reviewers on the left, the implementer on the right — where each pane shows only its agents' conversation.
+
+- **Create a pane** (the part that isn't obvious): hover over an agent in the agents sidebar, open its **⋯ actions menu**, and choose **"Move to new pane."** There's no standalone split button — a pane is created by moving an agent into it. The same menu moves agents between existing panes. Needs at least two agents and enough window width (each pane has a minimum width).
+- **Send to a pane**: click a pane's header (or ⌘-click anywhere in it, type `@panename` in the composer, or press ⌘⌥1–9) to make that pane's agents the message recipients. The targeted pane shows a green ring — your draft goes exactly to the agents inside it. Hold ⌘ to preview which pane a click would target.
+- **Rename / resize / close**: panes rename from the pencil icon in their header, resize by dragging the divider between them, and close from the ✕ — closing merges its agents into the neighboring pane, and moving everyone back into one pane restores the unified view.
+- **Hide agents**: the eye icon on an agent's sidebar card hides its messages without removing it (⌥-click to solo it — show only that agent in its pane). Hidden agents still receive messages you send them; the recipient chip shows a warning when you're about to message a hidden agent.
+
+The layout (panes, names, widths, hidden agents) is remembered per project on this machine.
+
 ## Non-goals
 
 - Replacing the agent CLIs. Switchboard drives them; it doesn't reimplement them.

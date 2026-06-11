@@ -8,6 +8,7 @@ import type { AgentRecord } from "$lib/types";
 import type { DiffTarget } from "$lib/state/gitView.svelte";
 import TranscriptHost from "./TranscriptHost.svelte";
 import DiffPanelHost from "./DiffPanelHost.svelte";
+import PanesHost from "./PanesHost.svelte";
 
 /**
  * Mount `UnifiedTranscript` in real WebKit inside a fixed-height flex column so
@@ -20,6 +21,22 @@ export function mountTranscript(opts: {
   width?: number;
 }): ReturnType<typeof render> {
   return render(TranscriptHost, {
+    projectId: opts.projectId,
+    agents: opts.agents,
+    ...(opts.width !== undefined ? { width: opts.width } : {}),
+  });
+}
+
+/**
+ * Mount the `TranscriptPanes` row in real WebKit inside a fixed-size flex
+ * column, so pane widths, gutter drags, and per-pane scrolling are measurable.
+ */
+export function mountPanes(opts: {
+  projectId: string;
+  agents: AgentRecord[];
+  width?: number;
+}): ReturnType<typeof render> {
+  return render(PanesHost, {
     projectId: opts.projectId,
     agents: opts.agents,
     ...(opts.width !== undefined ? { width: opts.width } : {}),

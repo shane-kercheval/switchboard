@@ -17,6 +17,13 @@
     type PromptContent,
   } from "$lib/state/composeStore";
   import { recordProjectsActivityLocally } from "$lib/state/workspace.svelte";
+  import {
+    selectionFor,
+    setRecipients,
+    setTargetingLocked,
+    targetRecipients,
+  } from "$lib/state/recipientSelection.svelte";
+  import { isAgentHidden, layoutFor, type TranscriptPane } from "$lib/state/transcriptPanes.svelte";
   import * as api from "$lib/api";
   import type {
     AgentId,
@@ -281,7 +288,7 @@
   // Drop any selected ids whose agent disappeared (agent removed at runtime).
   $effect(() => {
     const valid = selectedIds.filter((id) => agents.some((a) => a.id === id));
-    if (valid.length !== selectedIds.length) selectedIds = valid;
+    if (valid.length !== selectedIds.length) setSelectedIds(valid);
   });
 
   // Persist the compose content per project (machine-local; see composeStore).
@@ -307,7 +314,30 @@
   /// Recipient set — every agent is shown as a toggle chip (click to add/drop);
   /// `@name` is the keyboard path to the same toggle. Sticky across sends, and
   /// persisted per project (across switches and restarts) via `composeStore`.
-  let selectedIds = $state<AgentId[]>(untrack(() => initialSelection(saved.selectedIds, agents)));
+  ///
+  /// The set itself lives in the shared `recipientSelection` store — the single
+  /// source of truth for "who receives the send" — so pane targeting (header
+  /// click, Cmd+click, Cmd+Alt+N) can write it and the pane coverage borders
+  /// can derive from it. This component seeds it from the persisted snapshot at
+  /// mount and persists writes back (the `setSelection` effect below), wherever
+  /// they originated.
+  // Defensive: a fresh composer can never start with targeting frozen (the
+  // unmount release above should make this a no-op, but a stuck lock would
+  // silently disable pane targeting forever — not a failure worth risking).
+  untrack(() => setTargetingLocked(projectId, false));
+  untrack(() => setRecipients(projectId, initialSelection(saved.selectedIds, agents)));
+  const selectedIds = $derived(selectionFor(projectId));
+  function setSelectedIds(ids: AgentId[]): void {
+    setRecipients(projectId, ids);
+  }
+
+  const rosterIds = $derived(agents.map((a) => a.id));
+  const paneLayout = $derived(layoutFor(projectId, rosterIds));
+
+  // No "dock" treatment on the compose box: an earlier iteration accented the
+  // box's border whenever the recipient set exactly equaled one pane, but in
+  // real use a persistent accent on the compose surface read as unexplained
+  // noise. The pane's own coverage ring is the one targeting visual.
 
   /// Resolve the recipient set for a fresh mount.
   /// - A single-agent project shows no chips (nothing to choose), so the lone
@@ -364,7 +394,7 @@
           menuOpen = false;
           e.preventDefault();
         } else if (!sending && selectedIds.length > 0) {
-          selectedIds = [];
+          setSelectedIds([]);
           e.preventDefault();
         }
         return;
@@ -385,7 +415,7 @@
         if (e.key.toLowerCase() === "a") {
           e.preventDefault();
           if (sending) return;
-          selectedIds = agents.map((a) => a.id);
+          setSelectedIds(agents.map((a) => a.id));
         }
         return;
       }
@@ -446,6 +476,7 @@
   type RecipientMenuItem =
     | { kind: "all"; key: string }
     | { kind: "clear"; key: string }
+    | { kind: "pane"; key: string; pane: TranscriptPane; index: number }
     | { kind: "agent"; key: string; agent: AgentRecord };
   type AttachmentMenuItem = { kind: "attachment"; key: string; chipId: string; label: string };
   type MenuItem = FileMenuItem | AttachmentMenuItem | RecipientMenuItem;
@@ -486,6 +517,19 @@
     }
     if (selectedIds.length > 0 && "clear".includes(q)) {
       items.push({ kind: "clear", key: "clear" });
+    }
+    // Pane targets, ahead of individual agents — only once the user has
+    // actually split (≥2 panes): with the single default pane the existing
+    // `all` action already covers the only possible pane target, and a pane
+    // entry would be a duplicate row in the most common state.
+    if (paneLayout.panes.length > 1) {
+      for (const [index, pane] of paneLayout.panes.entries()) {
+        // An empty pane is not a send target (picking it could only clear
+        // the recipient set); it keeps its positional ⌘⌥ number regardless.
+        if (pane.members.length === 0) continue;
+        if (!pane.name.toLowerCase().includes(q)) continue;
+        items.push({ kind: "pane", key: `pane:${pane.id}`, pane, index });
+      }
     }
     return [
       ...items,
@@ -553,9 +597,9 @@
 
   function toggleRecipient(id: AgentId): void {
     if (sending) return;
-    selectedIds = selectedIds.includes(id)
-      ? selectedIds.filter((x) => x !== id)
-      : [...selectedIds, id];
+    setSelectedIds(
+      selectedIds.includes(id) ? selectedIds.filter((x) => x !== id) : [...selectedIds, id],
+    );
   }
 
   function preferredHighlightIndex(items: MenuItem[]): number {
@@ -636,13 +680,19 @@
       // lets the user write prose referring to it.
       insertFileMention(item.label);
     } else if (item.kind === "all") {
-      selectedIds = agents.map((a) => a.id);
+      setSelectedIds(agents.map((a) => a.id));
       stripAtToken();
     } else if (item.kind === "clear") {
-      selectedIds = [];
+      setSelectedIds([]);
+      stripAtToken();
+    } else if (item.kind === "pane") {
+      // Replace semantics, matching `@agentname` — `@panename` makes the pane
+      // the target, exactly like clicking its header (and honors the same
+      // targeting freeze).
+      targetRecipients(projectId, [...item.pane.members]);
       stripAtToken();
     } else {
-      selectedIds = [item.agent.id];
+      setSelectedIds([item.agent.id]);
       stripAtToken();
     }
     closeMentionMenu();
@@ -678,6 +728,9 @@
     fileSearchToken += 1;
     // Abandon any in-flight staging for this (now unmounting) compose session.
     composeGeneration += 1;
+    // A mid-render unmount (project switch via the parent's `{#key}`) must not
+    // leave the project's pane targeting frozen.
+    setTargetingLocked(projectId, false);
     // Flush point: a project switch remounts this bar (`{#key}`), so the
     // outgoing bar's deferred draft write must land before the next one mounts.
     flush();
@@ -906,16 +959,24 @@
       promptMenuOpen = false;
       closeMentionMenu();
       sending = true;
+      // Freeze pane targeting for the render window: the post-render check
+      // below silently aborts the send if a captured recipient left the set,
+      // so a pane gesture landing mid-render would drop the send with no
+      // feedback. Raw selection writes (pruning a removed agent) still pass —
+      // a removed recipient SHOULD trigger that abort. `finally` (plus the
+      // unmount/init releases) guarantees the lock can't outlive the render.
+      setTargetingLocked(projectId, true);
       let finalText: string;
       try {
         const rendered = await api.renderPrompt(prompt.provider, prompt.name, renderArgs);
         finalText = combinePromptMessage(rendered.text, appended);
       } catch (err) {
         sendError = `Send failed: ${err instanceof Error ? err.message : String(err)}`;
-        sending = false;
         return;
+      } finally {
+        sending = false;
+        setTargetingLocked(projectId, false);
       }
-      sending = false;
       // If the composer state changed outside the locked UI while rendering,
       // avoid dispatching text into a now-different prompt/recipient context.
       const stillSelected = new Set(selectedIds);
@@ -1139,6 +1200,38 @@
               </svg>
               <span class="text-fg">Clear</span>
               <span class="text-muted ml-auto font-mono text-[13px]">{shortcut("esc")}</span>
+            {:else if item.kind === "pane"}
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.8"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                class="text-accent h-4 w-4"
+                aria-hidden="true"
+              >
+                <rect x="3" y="4" width="18" height="16" rx="2" />
+                <path d="M12 4v16" />
+              </svg>
+              <span class="text-fg shrink-0">{item.pane.name}</span>
+              <!-- Member names in roster order (matching chip/pane-column
+                   order); the menu spans the compose box, so names fit —
+                   truncate is just the degenerate-case guard. -->
+              <span
+                class="text-muted min-w-0 truncate text-[11px]"
+                data-testid="pane-option-members"
+              >
+                {agents
+                  .filter((a) => item.pane.members.includes(a.id))
+                  .map((a) => a.name)
+                  .join(", ")}
+              </span>
+              {#if item.index < 9}
+                <span class="text-muted ml-auto font-mono text-[13px]">
+                  {shortcut("mod", "alt", String(item.index + 1))}
+                </span>
+              {/if}
             {:else if item.kind === "agent"}
               {@const agentIndex = agents.findIndex((a) => a.id === item.agent.id)}
               <HarnessIcon harness={item.agent.harness} size="sm" class="h-4 w-4" />
@@ -1159,10 +1252,18 @@
           <span class="text-muted">To</span>
           {#each agents as agent, i (agent.id)}
             {@const selected = selectedIds.includes(agent.id)}
+            <!-- Targeted ∧ hidden — the cue exists for one hazard: sending to
+                 an agent whose replies you've hidden. A hidden-but-unselected
+                 chip carries no hazard, so it gets no warning. -->
+            {@const chipHidden = selected && isAgentHidden(projectId, rosterIds, agent.id)}
             <Tooltip
-              label={selected ? `Drop ${agent.name}` : `Add ${agent.name}`}
+              label={chipHidden
+                ? `${agent.name} is hidden in its pane — replies won't be visible`
+                : selected
+                  ? `Drop ${agent.name}`
+                  : `Add ${agent.name}`}
               shortcut={i < 9 ? shortcut("mod", String(i + 1)) : undefined}
-              delayDuration={1000}
+              delayDuration={chipHidden ? 300 : 1000}
             >
               {#snippet trigger(props)}
                 <button
@@ -1177,6 +1278,7 @@
                   )}
                   data-testid={`recipient-chip-${agent.id}`}
                   data-selected={selected}
+                  data-hidden-recipient={chipHidden || undefined}
                   aria-pressed={selected}
                   disabled={sending}
                   onclick={() => toggleRecipient(agent.id)}
@@ -1194,6 +1296,27 @@
                   {/if}
                   <HarnessIcon harness={agent.harness} size="sm" class="h-3.5 w-3.5" />
                   {agent.name}
+                  {#if chipHidden}
+                    <!-- Targeted-but-hidden cue: without it a user sends to a
+                         hidden agent and never sees the reply appear. -->
+                    <svg
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="2"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      class="text-warning h-3 w-3 shrink-0"
+                      data-testid={`recipient-hidden-cue-${agent.id}`}
+                      aria-hidden="true"
+                    >
+                      <path
+                        d="M10.7 5.1a9.6 9.6 0 0 1 1.3-.1c7 0 10 7 10 7a13.2 13.2 0 0 1-1.7 2.5"
+                      />
+                      <path d="M6.6 6.6A13.5 13.5 0 0 0 2 12s3 7 10 7a9.7 9.7 0 0 0 5.4-1.6" />
+                      <path d="m2 2 20 20" />
+                    </svg>
+                  {/if}
                 </button>
               {/snippet}
             </Tooltip>
@@ -1209,7 +1332,7 @@
                   aria-label="Clear recipients"
                   disabled={sending}
                   onclick={() => {
-                    if (!sending) selectedIds = [];
+                    if (!sending) setSelectedIds([]);
                   }}
                 >
                   <svg

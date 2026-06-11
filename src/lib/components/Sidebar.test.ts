@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/svelte";
+import { render, screen, fireEvent, waitFor, within } from "@testing-library/svelte";
 import type { AgentRecord, NormalizedEvent } from "$lib/types";
 // Static import so the component-tree transform happens at module collection,
 // not inside the first test's timeout (cold CI transforms have no vite cache).
@@ -88,6 +88,8 @@ async function openAgentActions(index = 0): Promise<HTMLElement> {
   return menu;
 }
 
+const PROJECT_ID = "00000000-0000-7000-8000-0000000000ff";
+
 const CLAUDE_AGENT: AgentRecord = {
   id: "00000000-0000-7000-8000-000000000aaa",
   project_id: "00000000-0000-7000-8000-0000000000ff",
@@ -134,6 +136,13 @@ beforeEach(() => {
   copyTextMock.mockResolvedValue(undefined);
 });
 
+beforeEach(async () => {
+  // Reset up front, not in afterEach — vitest afterEach hooks run LIFO, ahead
+  // of testing-library's auto-cleanup, so a teardown reset would mutate pane
+  // state under the still-mounted previous component.
+  (await import("$lib/state/transcriptPanes.svelte"))._testing.reset();
+});
+
 afterEach(async () => {
   const { _testing } = await loadState();
   _testing.reset();
@@ -145,7 +154,7 @@ describe("Sidebar", () => {
     await state.registerAgent(CLAUDE_AGENT);
     await state.registerAgent(CODEX_AGENT);
 
-    render(Sidebar, { props: { agents: [CLAUDE_AGENT, CODEX_AGENT] } });
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] } });
 
     const rows = screen.getAllByTestId("sidebar-agent");
     expect(rows).toHaveLength(2);
@@ -158,7 +167,7 @@ describe("Sidebar", () => {
   });
 
   it("renders empty-state message when no agents", async () => {
-    render(Sidebar, { props: { agents: [] } });
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [] } });
     expect(screen.queryAllByTestId("sidebar-agent")).toHaveLength(0);
     expect(screen.getByText(/no agents/i)).toBeInTheDocument();
   });
@@ -190,7 +199,7 @@ describe("Sidebar", () => {
       },
     ];
 
-    render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     // Expanded by default → details (the context bar) are visible.
     expect(screen.getByTestId("agent-context-bar")).toBeInTheDocument();
@@ -213,7 +222,7 @@ describe("Sidebar", () => {
       resume_command: "cd '/proj' && claude --resume abc --dangerously-skip-permissions",
     });
 
-    render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     expect(screen.getByTestId("agent-harness-icon")).toBeInTheDocument();
     const trigger = screen.getByTestId("agent-actions-trigger");
@@ -248,7 +257,7 @@ describe("Sidebar", () => {
       resume_command: "cd '/proj' && claude --resume abc --dangerously-skip-permissions",
     });
 
-    render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     await openAgentActions();
     expect(screen.getByTestId("agent-action-stop")).toBeInTheDocument();
@@ -265,7 +274,7 @@ describe("Sidebar", () => {
       resume_command: "cd '/proj' && claude --resume abc --dangerously-skip-permissions",
     });
 
-    render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     await openAgentActions();
     await fireEvent.click(await screen.findByTestId("agent-action-open-session"));
@@ -287,7 +296,7 @@ describe("Sidebar", () => {
     await state.registerAgent(CLAUDE_AGENT);
     agentSessionInfoMock.mockResolvedValue({ session_file: null, resume_command: null });
 
-    render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     await waitFor(() => expect(agentSessionInfoMock).toHaveBeenCalledWith(CLAUDE_AGENT.id));
     await openAgentActions();
@@ -306,7 +315,7 @@ describe("Sidebar", () => {
         resume_command: "cd '/proj' && claude --resume abc --dangerously-skip-permissions",
       });
 
-    render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     await waitFor(() => expect(agentSessionInfoMock).toHaveBeenCalledTimes(1));
     await openAgentActions();
@@ -324,7 +333,7 @@ describe("Sidebar", () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
 
-    render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     await openAgentActions();
     await fireEvent.click(screen.getByTestId("agent-action-remove"));
@@ -343,7 +352,7 @@ describe("Sidebar", () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
 
-    render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     await openAgentActions();
     expect(screen.getByTestId("agent-action-remove")).toHaveAttribute(
@@ -357,7 +366,7 @@ describe("Sidebar", () => {
     await state.registerAgent(CLAUDE_AGENT);
     removeAgentMock.mockRejectedValueOnce(new Error("registry locked"));
 
-    render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     await openAgentActions();
     await fireEvent.click(screen.getByTestId("agent-action-remove"));
@@ -391,7 +400,7 @@ describe("Sidebar", () => {
       },
     ];
 
-    render(Sidebar, { props: { agents: [CLAUDE_AGENT, CODEX_AGENT] } });
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] } });
 
     expect(screen.getByTestId("agent-context-bar")).toBeInTheDocument();
 
@@ -423,7 +432,7 @@ describe("Sidebar", () => {
       },
     ];
 
-    render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     expect(screen.queryByTestId("agent-cost")).toBeNull();
   });
@@ -438,7 +447,7 @@ describe("Sidebar", () => {
       last_rate_limit: { primary: { used_percent: 42.5 } },
     };
 
-    render(Sidebar, { props: { agents: [CODEX_AGENT] } });
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
 
     expect(screen.getByTestId("agent-rate-limit")).toHaveTextContent("quota used: 43%");
   });
@@ -468,7 +477,7 @@ describe("Sidebar", () => {
       },
     ];
 
-    render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     // (130000 + 10000) / 200000 = 0.70 → "70%" (NOT the ~8% the old
     // input-only formula would have shown from the marginal 5000 input).
@@ -501,7 +510,7 @@ describe("Sidebar", () => {
       },
     ];
 
-    render(Sidebar, { props: { agents: [CODEX_AGENT] } });
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
 
     // (80000 + 20000) / 200000 = 0.50 → "50%". Re-adding cached would give
     // (80000 + 60000 + 20000) / 200000 = 80%, the regression this guards.
@@ -531,7 +540,7 @@ describe("Sidebar", () => {
       },
     ];
 
-    render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     expect(screen.queryByTestId("agent-context-bar")).toBeNull();
   });
@@ -552,7 +561,7 @@ describe("Sidebar", () => {
       },
     };
 
-    render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     // No selected model on this agent → the SessionMeta model shows as the
     // observed fallback; mcp/skills counts stay in the meta block.
@@ -567,7 +576,7 @@ describe("Sidebar", () => {
   it("Claude exposes both Change model and Change effort actions", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
-    render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     await openAgentActions();
     await waitFor(() => expect(screen.getByTestId("agent-change-model")).toBeInTheDocument());
@@ -577,7 +586,7 @@ describe("Sidebar", () => {
   it("Gemini exposes Change model only (no effort capability)", async () => {
     const state = await loadState();
     await state.registerAgent(GEMINI_AGENT);
-    render(Sidebar, { props: { agents: [GEMINI_AGENT] } });
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [GEMINI_AGENT] } });
 
     await openAgentActions();
     await waitFor(() => expect(screen.getByTestId("agent-change-model")).toBeInTheDocument());
@@ -587,7 +596,7 @@ describe("Sidebar", () => {
   it("Antigravity exposes no change actions", async () => {
     const state = await loadState();
     await state.registerAgent(ANTIGRAVITY_AGENT);
-    render(Sidebar, { props: { agents: [ANTIGRAVITY_AGENT] } });
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [ANTIGRAVITY_AGENT] } });
 
     await openAgentActions();
     expect(screen.queryByTestId("agent-change-model")).toBeNull();
@@ -598,7 +607,7 @@ describe("Sidebar", () => {
     const state = await loadState();
     const agent = { ...CLAUDE_AGENT, model: "opus" };
     await state.registerAgent(agent);
-    render(Sidebar, { props: { agents: [agent] } });
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
 
     await openAgentActions();
     await waitFor(() => expect(screen.getByTestId("agent-change-model")).toBeInTheDocument());
@@ -616,7 +625,7 @@ describe("Sidebar", () => {
     const state = await loadState();
     const agent = { ...CLAUDE_AGENT, model: "opus" };
     await state.registerAgent(agent);
-    render(Sidebar, { props: { agents: [agent] } });
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
 
     await openAgentActions();
     await waitFor(() => expect(screen.getByTestId("agent-change-model")).toBeInTheDocument());
@@ -633,7 +642,7 @@ describe("Sidebar", () => {
     const state = await loadState();
     const agent = { ...CLAUDE_AGENT, model: "future-opus" };
     await state.registerAgent(agent);
-    render(Sidebar, { props: { agents: [agent] } });
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
 
     await openAgentActions();
     await waitFor(() => expect(screen.getByTestId("agent-change-model")).toBeInTheDocument());
@@ -653,7 +662,7 @@ describe("Sidebar", () => {
     await state.registerAgent(agent);
     const pending = deferred();
     setAgentModelMock.mockReturnValueOnce(pending.promise);
-    render(Sidebar, { props: { agents: [agent] } });
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
 
     await openAgentActions();
     await waitFor(() => expect(screen.getByTestId("agent-change-model")).toBeInTheDocument());
@@ -686,7 +695,7 @@ describe("Sidebar", () => {
       },
     };
 
-    render(Sidebar, { props: { agents: [agent] } });
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
 
     expect(screen.getByTestId("agent-selected-model")).toHaveTextContent("opus");
     // The selection wins — the observed line is not shown when intent exists.
@@ -709,7 +718,9 @@ describe("Sidebar", () => {
       },
     };
 
-    const { rerender } = render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+    const { rerender } = render(Sidebar, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] },
+    });
     expect(screen.getByTestId("agent-observed-model")).toHaveTextContent("claude-sonnet-4-6");
     expect(screen.queryByTestId("agent-selected-model")).toBeNull();
 
@@ -724,7 +735,7 @@ describe("Sidebar", () => {
     const state = await loadState();
     const agent = { ...CLAUDE_AGENT, model: "opus", effort: "high" };
     await state.registerAgent(agent);
-    render(Sidebar, { props: { agents: [agent] } });
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
 
     expect(screen.getByTestId("agent-selected-effort")).toHaveTextContent("high");
   });
@@ -753,7 +764,7 @@ async function renderClaudeWithRateLimit(info: unknown, asOf: string | null): Pr
     last_rate_limit: info,
     last_rate_limit_as_of: asOf,
   };
-  render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+  render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 }
 
 /// Claude rate-limit surface — two independent signals (the always-present
@@ -863,7 +874,7 @@ describe("Sidebar Claude rate-limit surface", () => {
         overageResetsAt: epochFromNow(6 * 86400),
       },
     };
-    render(Sidebar, { props: { agents: [CODEX_AGENT] } });
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
     expect(screen.queryByTestId("agent-rate-window")).toBeNull();
     expect(screen.queryByTestId("agent-overage")).toBeNull();
   });
@@ -922,7 +933,7 @@ async function renderCodexWithRateLimit(info: unknown): Promise<void> {
   const runtime = state.runtimes[CODEX_AGENT.id];
   if (runtime === undefined) throw new Error("unreachable");
   state.runtimes[CODEX_AGENT.id] = { ...runtime, last_rate_limit: info };
-  render(Sidebar, { props: { agents: [CODEX_AGENT] } });
+  render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
 }
 
 /// Codex rate-limit windows — both independent windows (primary ~5-hour +
@@ -1006,7 +1017,7 @@ describe("Sidebar clean-hide for absent metadata", () => {
         usage: { input_tokens: 100, output_tokens: 20, total_cost_usd: null },
       },
     ];
-    render(Sidebar, { props: { agents: [CODEX_AGENT] } });
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
     expect(screen.queryByTestId("agent-cost")).toBeNull();
   });
 
@@ -1015,7 +1026,7 @@ describe("Sidebar clean-hide for absent metadata", () => {
     // value-gated cell must be absent, not blank.
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
-    render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
     expect(screen.queryByTestId("agent-cost")).toBeNull();
     expect(screen.queryByTestId("agent-rate-limit")).toBeNull();
     expect(screen.queryByTestId("agent-rate-limit-claude")).toBeNull();
@@ -1055,7 +1066,7 @@ describe("Sidebar agent-parse-warnings tooltip", () => {
       ],
     };
 
-    render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     const indicator = screen.getByTestId("agent-parse-warnings");
     expect(indicator).toHaveTextContent("⚠ 2 transcript warnings");
@@ -1096,7 +1107,7 @@ describe("Sidebar agent-parse-warnings tooltip", () => {
       })),
     };
 
-    render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     // Indicator reflects the full count (not the cap).
     expect(screen.getByTestId("agent-parse-warnings")).toHaveTextContent(
@@ -1120,7 +1131,7 @@ describe("Sidebar agent-scoped event tolerance", () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
 
-    render(Sidebar, { props: { agents: [CLAUDE_AGENT] } });
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     // The state-module listener is mocked-but-existing; fire events
     // through it by calling the captured callback. Sidebar should
@@ -1164,7 +1175,7 @@ describe("Sidebar inline rename", () => {
   async function enterEditViaDoubleClick(agent: AgentRecord): Promise<HTMLInputElement> {
     const state = await loadState();
     await state.registerAgent(agent);
-    render(Sidebar, { props: { agents: [agent] } });
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
     const toggle = screen.getByTestId("agent-name").closest("button");
     if (!toggle) throw new Error("expected the agent name to sit in a toggle button");
     await fireEvent.dblClick(toggle);
@@ -1254,7 +1265,7 @@ describe("Sidebar inline rename", () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     await state.registerAgent(CODEX_AGENT);
-    render(Sidebar, { props: { agents: [CLAUDE_AGENT, CODEX_AGENT] } });
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] } });
 
     const [firstName] = screen.getAllByTestId("agent-name");
     const toggle = firstName?.closest("button");
@@ -1315,5 +1326,91 @@ describe("Sidebar inline rename", () => {
     expect(err).toHaveTextContent("registry locked");
     // Still editing — the agent is kept on the field for a retry.
     expect(screen.getByTestId("agent-rename-input")).toBeInTheDocument();
+  });
+});
+
+describe("Sidebar pane visibility + assignment", () => {
+  async function importPanes() {
+    return await import("$lib/state/transcriptPanes.svelte");
+  }
+
+  it("eye toggle hides and shows an agent within its pane", async () => {
+    const panes = await importPanes();
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] } });
+
+    const toggles = screen.getAllByTestId("agent-visibility-toggle");
+    await fireEvent.click(toggles[0]!);
+    expect(
+      panes.isAgentHidden(PROJECT_ID, [CLAUDE_AGENT.id, CODEX_AGENT.id], CLAUDE_AGENT.id),
+    ).toBe(true);
+    await fireEvent.click(toggles[0]!);
+    expect(
+      panes.isAgentHidden(PROJECT_ID, [CLAUDE_AGENT.id, CODEX_AGENT.id], CLAUDE_AGENT.id),
+    ).toBe(false);
+  });
+
+  it("alt-click solos the agent; alt-click again restores", async () => {
+    const panes = await importPanes();
+    const roster = [CLAUDE_AGENT.id, CODEX_AGENT.id];
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] } });
+
+    const toggles = screen.getAllByTestId("agent-visibility-toggle");
+    await fireEvent.click(toggles[0]!, { altKey: true });
+    expect(panes.isAgentHidden(PROJECT_ID, roster, CLAUDE_AGENT.id)).toBe(false);
+    expect(panes.isAgentHidden(PROJECT_ID, roster, CODEX_AGENT.id)).toBe(true);
+
+    await fireEvent.click(toggles[0]!, { altKey: true });
+    expect(panes.hiddenCount(PROJECT_ID, roster)).toBe(0);
+  });
+
+  it("shows the hidden count with a Show-all reset only while something is hidden", async () => {
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] } });
+
+    expect(screen.queryByTestId("sidebar-show-all-agents")).not.toBeInTheDocument();
+
+    await fireEvent.click(screen.getAllByTestId("agent-visibility-toggle")[1]!);
+    const reset = screen.getByTestId("sidebar-show-all-agents");
+    expect(reset).toHaveTextContent("1 hidden");
+
+    await fireEvent.click(reset);
+    expect(screen.queryByTestId("sidebar-show-all-agents")).not.toBeInTheDocument();
+  });
+
+  it("offers Move to new pane for multi-agent projects and moves the agent", async () => {
+    const panes = await importPanes();
+    const roster = [CLAUDE_AGENT.id, CODEX_AGENT.id];
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] } });
+
+    const menu = await openAgentActions(1);
+    await fireEvent.click(within(menu).getByTestId("agent-move-to-new-pane"));
+
+    const layout = panes.layoutFor(PROJECT_ID, roster);
+    expect(layout.panes).toHaveLength(2);
+    expect(layout.panes[1]!.members).toEqual([CODEX_AGENT.id]);
+    expect(layout.panes[0]!.members).toEqual([CLAUDE_AGENT.id]);
+  });
+
+  it("lists other panes as move targets once split, excluding the agent's own", async () => {
+    const panes = await importPanes();
+    const roster = [CLAUDE_AGENT.id, CODEX_AGENT.id];
+    const newPane = panes.moveAgentToNewPane(PROJECT_ID, roster, CODEX_AGENT.id);
+    const pane1 = panes.layoutFor(PROJECT_ID, roster).panes[0]!.id;
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] } });
+
+    // alice (pane 1) can move to pane 2 — but not to her own pane.
+    const menu = await openAgentActions(0);
+    expect(within(menu).queryByTestId(`agent-move-to-pane-${pane1}`)).not.toBeInTheDocument();
+    await fireEvent.click(within(menu).getByTestId(`agent-move-to-pane-${newPane}`));
+
+    expect(panes.layoutFor(PROJECT_ID, roster).panes[1]!.members).toEqual([
+      CODEX_AGENT.id,
+      CLAUDE_AGENT.id,
+    ]);
+  });
+
+  it("hides Move to new pane for a single-agent project", async () => {
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    const menu = await openAgentActions(0);
+    expect(within(menu).queryByTestId("agent-move-to-new-pane")).not.toBeInTheDocument();
   });
 });

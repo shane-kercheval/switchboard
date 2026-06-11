@@ -59,6 +59,21 @@
       note: "by chip position",
     },
     { action: "Select all compose recipients", keys: ["⌘", "⇧", "A"] },
+    {
+      action: "Send to pane",
+      keys: ["⌘", "⌥", "1–9"],
+      note: "by pane position, when split",
+    },
+    {
+      action: "Send to clicked pane",
+      keys: ["⌘", "Click"],
+      note: "anywhere in the pane; hold ⌘ to preview",
+    },
+    {
+      action: "Solo an agent in its pane",
+      keys: ["⌥", "Click"],
+      note: "on the eye toggle, agents sidebar",
+    },
   ];
 
   const sectionClass = "border-border space-y-3 border-t pt-5";

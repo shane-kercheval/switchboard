@@ -833,7 +833,7 @@
               {@const completed = paneTabIsCompleted(pane)}
               <button
                 type="button"
-                class="border-border bg-panel text-fg hover:bg-raised inline-flex h-7 max-w-36 min-w-0 shrink items-center gap-1.5 rounded-full border px-2 text-xs"
+                class="border-border bg-panel text-fg hover:bg-raised inline-flex h-6.5 max-w-36 min-w-0 shrink items-center gap-1.5 rounded-full border px-2 text-xs"
                 data-testid="app-pane-minimized-tab"
                 data-pane-id={pane.id}
                 onclick={() => selectHeaderPane(pane)}
@@ -863,7 +863,7 @@
             {#if activeMaximizedPane !== null && headerTabPanes.length > 1}
               <button
                 type="button"
-                class="text-muted hover:text-fg hover:bg-border/60 inline-flex h-7 shrink-0 items-center rounded-full px-2 text-xs"
+                class="text-muted hover:text-fg hover:bg-border/60 inline-flex h-6.5 shrink-0 items-center rounded-full px-2 text-xs"
                 data-testid="app-pane-restore-all"
                 onclick={restoreAllPanes}
               >

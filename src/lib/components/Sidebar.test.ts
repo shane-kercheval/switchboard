@@ -19,11 +19,14 @@ const renameAgentMock = vi.fn<(id: string, name: string) => Promise<void>>();
 const removeAgentMock = vi.fn<(id: string) => Promise<void>>();
 const setAgentModelMock = vi.fn<(id: string, model?: string) => Promise<void>>();
 const setAgentEffortMock = vi.fn<(id: string, effort?: string) => Promise<void>>();
+const reorderAgentsMock = vi.fn<(projectId: string, orderedIds: string[]) => Promise<void>>();
 vi.mock("$lib/state/workspace.svelte", () => ({
   renameAgent: (id: string, name: string) => renameAgentMock(id, name),
   removeAgent: (id: string) => removeAgentMock(id),
   setAgentModel: (id: string, model?: string) => setAgentModelMock(id, model),
   setAgentEffort: (id: string, effort?: string) => setAgentEffortMock(id, effort),
+  reorderAgents: (projectId: string, orderedIds: string[]) =>
+    reorderAgentsMock(projectId, orderedIds),
 }));
 
 const agentSessionInfoMock = vi.fn();
@@ -130,6 +133,7 @@ beforeEach(() => {
   removeAgentMock.mockResolvedValue(undefined);
   setAgentModelMock.mockResolvedValue(undefined);
   setAgentEffortMock.mockResolvedValue(undefined);
+  reorderAgentsMock.mockResolvedValue(undefined);
   agentSessionInfoMock.mockResolvedValue({ session_file: null, resume_command: null });
   openSessionFileMock.mockReset();
   copyTextMock.mockReset();
@@ -1412,5 +1416,144 @@ describe("Sidebar pane visibility + assignment", () => {
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
     const menu = await openAgentActions(0);
     expect(within(menu).queryByTestId("agent-move-to-new-pane")).not.toBeInTheDocument();
+  });
+});
+
+describe("Sidebar — agent reordering", () => {
+  const THREE_AGENTS = [CLAUDE_AGENT, CODEX_AGENT, GEMINI_AGENT];
+
+  function grip(index: number): HTMLElement {
+    const grips = screen.getAllByTestId("agent-drag-grip");
+    const el = grips.at(index);
+    if (el === undefined) throw new Error("expected a drag grip");
+    return el;
+  }
+
+  it("menu Move down commits the adjacent swap", async () => {
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: THREE_AGENTS } });
+    const menu = await openAgentActions(0);
+    await fireEvent.click(within(menu).getByTestId("agent-move-down"));
+    expect(reorderAgentsMock).toHaveBeenCalledWith(PROJECT_ID, [
+      CODEX_AGENT.id,
+      CLAUDE_AGENT.id,
+      GEMINI_AGENT.id,
+    ]);
+  });
+
+  it("menu Move up commits the adjacent swap", async () => {
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: THREE_AGENTS } });
+    const menu = await openAgentActions(2);
+    await fireEvent.click(within(menu).getByTestId("agent-move-up"));
+    expect(reorderAgentsMock).toHaveBeenCalledWith(PROJECT_ID, [
+      CLAUDE_AGENT.id,
+      GEMINI_AGENT.id,
+      CODEX_AGENT.id,
+    ]);
+  });
+
+  it("disables Move up on the first agent and Move down on the last", async () => {
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] } });
+    const first = await openAgentActions(0);
+    expect(within(first).getByTestId("agent-move-up")).toHaveAttribute("data-disabled");
+    expect(within(first).getByTestId("agent-move-down")).not.toHaveAttribute("data-disabled");
+    const last = await openAgentActions(1);
+    expect(within(last).getByTestId("agent-move-down")).toHaveAttribute("data-disabled");
+    expect(within(last).getByTestId("agent-move-up")).not.toHaveAttribute("data-disabled");
+  });
+
+  it("hides move items and grips for a single-agent roster", async () => {
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    expect(screen.queryAllByTestId("agent-drag-grip")).toHaveLength(0);
+    const menu = await openAgentActions(0);
+    expect(within(menu).queryByTestId("agent-move-up")).not.toBeInTheDocument();
+    expect(within(menu).queryByTestId("agent-move-down")).not.toBeInTheDocument();
+  });
+
+  it("Alt+ArrowDown with focus inside a card moves that agent down", async () => {
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: THREE_AGENTS } });
+    const names = screen.getAllByTestId("agent-name");
+    await fireEvent.keyDown(names[1]!, { key: "ArrowDown", altKey: true });
+    expect(reorderAgentsMock).toHaveBeenCalledWith(PROJECT_ID, [
+      CLAUDE_AGENT.id,
+      GEMINI_AGENT.id,
+      CODEX_AGENT.id,
+    ]);
+  });
+
+  it("Alt+ArrowUp at the top is a no-op", async () => {
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: THREE_AGENTS } });
+    const names = screen.getAllByTestId("agent-name");
+    await fireEvent.keyDown(names[0]!, { key: "ArrowUp", altKey: true });
+    expect(reorderAgentsMock).not.toHaveBeenCalled();
+  });
+
+  // macOS WebKit does not focus buttons on click, so the chord must also work
+  // scoped to the card under the pointer, with no focus involved.
+  it("Alt+ArrowDown moves the hovered card when nothing in it has focus", async () => {
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: THREE_AGENTS } });
+    const cards = screen.getAllByTestId("sidebar-agent");
+    await fireEvent.pointerEnter(cards[1]!);
+    await fireEvent.keyDown(window, { key: "ArrowDown", altKey: true });
+    expect(reorderAgentsMock).toHaveBeenCalledWith(PROJECT_ID, [
+      CLAUDE_AGENT.id,
+      GEMINI_AGENT.id,
+      CODEX_AGENT.id,
+    ]);
+  });
+
+  it("Alt+Arrow does nothing when no card is hovered or focused", async () => {
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: THREE_AGENTS } });
+    const cards = screen.getAllByTestId("sidebar-agent");
+    await fireEvent.pointerEnter(cards[1]!);
+    await fireEvent.pointerLeave(cards[1]!);
+    await fireEvent.keyDown(window, { key: "ArrowDown", altKey: true });
+    expect(reorderAgentsMock).not.toHaveBeenCalled();
+  });
+
+  it("surfaces a rejected reorder as an inline error on the moved card", async () => {
+    reorderAgentsMock.mockRejectedValue(new Error("roster changed"));
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: THREE_AGENTS } });
+    const menu = await openAgentActions(0);
+    await fireEvent.click(within(menu).getByTestId("agent-move-down"));
+    const error = await screen.findByTestId("agent-reorder-error");
+    expect(error).toHaveTextContent("roster changed");
+    // The error renders under the card that was moved.
+    expect(error.closest("[data-agent-id]")).toHaveAttribute("data-agent-id", CLAUDE_AGENT.id);
+  });
+
+  // jsdom has no real layout (every rect is zero-height), so a drag past the
+  // slop threshold deterministically resolves to "after every other card" —
+  // enough to exercise the gesture wiring (slop gate, commit, cancel). The
+  // midpoint math itself is covered by the agentReorder unit tests.
+  it("grip drag past the slop threshold commits an order on release", async () => {
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: THREE_AGENTS } });
+    const handle = grip(0);
+    await fireEvent.pointerDown(handle, { pointerId: 1, button: 0, clientX: 0, clientY: 0 });
+    await fireEvent.pointerMove(handle, { pointerId: 1, clientX: 0, clientY: 100 });
+    await fireEvent.pointerUp(handle, { pointerId: 1 });
+    expect(reorderAgentsMock).toHaveBeenCalledWith(PROJECT_ID, [
+      CODEX_AGENT.id,
+      GEMINI_AGENT.id,
+      CLAUDE_AGENT.id,
+    ]);
+  });
+
+  it("a grip press below the slop threshold commits nothing", async () => {
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: THREE_AGENTS } });
+    const handle = grip(0);
+    await fireEvent.pointerDown(handle, { pointerId: 1, button: 0, clientX: 0, clientY: 0 });
+    await fireEvent.pointerMove(handle, { pointerId: 1, clientX: 1, clientY: 2 });
+    await fireEvent.pointerUp(handle, { pointerId: 1 });
+    expect(reorderAgentsMock).not.toHaveBeenCalled();
+  });
+
+  it("Escape cancels an in-flight drag without committing", async () => {
+    render(Sidebar, { props: { projectId: PROJECT_ID, agents: THREE_AGENTS } });
+    const handle = grip(0);
+    await fireEvent.pointerDown(handle, { pointerId: 1, button: 0, clientX: 0, clientY: 0 });
+    await fireEvent.pointerMove(handle, { pointerId: 1, clientX: 0, clientY: 100 });
+    await fireEvent.keyDown(window, { key: "Escape" });
+    await fireEvent.pointerUp(handle, { pointerId: 1 });
+    expect(reorderAgentsMock).not.toHaveBeenCalled();
   });
 });

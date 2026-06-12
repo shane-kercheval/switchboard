@@ -1655,6 +1655,36 @@ pub fn set_agent_effort_impl(
     Ok(updated)
 }
 
+/// Rewrite a project's registry in `agent_ids` order — the roster's canonical
+/// display order (sidebar cards, compose chips, ⌘1..9). Synchronous under
+/// `registry_write` like the other registry mutations. Permutation validation
+/// lives in core ([`Project::reorder_agents`]): under the held lock the
+/// on-disk roster can't change between read and rewrite, so a mismatch means
+/// the *caller's* list was stale (e.g. an agent was created or removed after
+/// the frontend read the roster) and the remedy is to re-fetch and retry.
+/// Returns the records in their new order.
+pub fn reorder_agents_impl(
+    state: &AppState,
+    project_id: ProjectId,
+    agent_ids: &[AgentId],
+) -> Result<Vec<AgentRecord>, AppError> {
+    let _write = lock(&state.registry_write);
+    let project = lock(&state.projects)
+        .get(&project_id)
+        .cloned()
+        .ok_or(AppError::ProjectNotLoaded(project_id))?;
+    let agents = project.reorder_agents(agent_ids)?;
+    {
+        // Record contents are unchanged by reorder; this keeps the cache
+        // consistent with the list path (same contract as other mutations).
+        let mut cache = lock(&state.agents_by_id);
+        for agent in &agents {
+            cache.insert(agent.id, agent.clone());
+        }
+    }
+    Ok(agents)
+}
+
 /// Attach an existing harness session (Claude Code, Codex, Gemini, or
 /// Antigravity) as a new Switchboard agent in the active project.
 ///
@@ -7737,6 +7767,54 @@ mod tests {
         let (_tmp, state, _) = fresh_state_with_mock();
         let err = rename_agent_impl(&state, Uuid::now_v7(), "x").unwrap_err();
         assert!(matches!(err, AppError::AgentNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn reorder_agents_rewrites_registry_and_returns_new_order() {
+        let (tmp, state, _) = fresh_state_with_mock();
+        let (a, project_id) = project_with_agent(&state, &tmp).await;
+        let b = create_agent_impl(&state, "second", HarnessKind::ClaudeCode, None, None).unwrap();
+        let c = create_agent_impl(&state, "third", HarnessKind::ClaudeCode, None, None).unwrap();
+
+        let reordered = reorder_agents_impl(&state, project_id, &[c.id, a.id, b.id]).unwrap();
+        assert_eq!(
+            reordered.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![c.id, a.id, b.id]
+        );
+
+        // The new order is durable — a fresh list serves it from disk.
+        let listed = list_agents_impl(&state, Some(project_id)).unwrap();
+        assert_eq!(
+            listed.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![c.id, a.id, b.id]
+        );
+    }
+
+    #[tokio::test]
+    async fn reorder_agents_rejects_stale_id_list() {
+        let (tmp, state, _) = fresh_state_with_mock();
+        let (a, project_id) = project_with_agent(&state, &tmp).await;
+        let b = create_agent_impl(&state, "second", HarnessKind::ClaudeCode, None, None).unwrap();
+
+        // Stale: the caller read the roster before `b` existed.
+        let err = reorder_agents_impl(&state, project_id, &[a.id]).unwrap_err();
+        assert!(matches!(
+            err,
+            AppError::Core(CoreError::ReorderRosterMismatch { .. })
+        ));
+        // Registry untouched on rejection.
+        let listed = list_agents_impl(&state, Some(project_id)).unwrap();
+        assert_eq!(
+            listed.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![a.id, b.id]
+        );
+    }
+
+    #[tokio::test]
+    async fn reorder_agents_unloaded_project_errors() {
+        let (_tmp, state, _) = fresh_state_with_mock();
+        let err = reorder_agents_impl(&state, Uuid::now_v7(), &[]).unwrap_err();
+        assert!(matches!(err, AppError::ProjectNotLoaded(_)));
     }
 
     #[tokio::test]

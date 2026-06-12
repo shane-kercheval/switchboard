@@ -1,11 +1,14 @@
 <script lang="ts">
   import {
+    ArrowDown,
+    ArrowUp,
     Check,
     Columns2,
     Eye,
     EyeOff,
     FileText,
     Gauge,
+    GripVertical,
     MoreHorizontal,
     SlidersHorizontal,
     Square,
@@ -13,14 +16,18 @@
     Trash2,
     X,
   } from "@lucide/svelte";
+  import { flip } from "svelte/animate";
   import type { AgentRecord, AgentId, ProjectId } from "$lib/types";
   import { retryAgentHydration, runtimes, stopAgent, transcripts } from "$lib/state/index.svelte";
   import {
     removeAgent,
     renameAgent,
+    reorderAgents,
     setAgentModel,
     setAgentEffort,
   } from "$lib/state/workspace.svelte";
+  import { DRAG_SLOP_PX, dropIndexForPointer, movedOrder } from "$lib/agentReorder";
+  import { shortcut } from "$lib/platform";
   import { SUPPORTS_EFFORT_SELECTION, SUPPORTS_MODEL_SELECTION } from "$lib/harnessDisplay";
   import { EFFORT_OPTIONS, MODEL_OPTIONS, type SelectionOption } from "$lib/agentSelection";
   import DropdownMenu from "$lib/components/ui/DropdownMenu.svelte";
@@ -255,6 +262,9 @@
       resumeOpen = false;
     }
     if (editing !== null && !ids.has(editing.agentId)) closeChange();
+    if (reorderError !== null && !ids.has(reorderError.agentId)) reorderError = null;
+    if (dragState !== null && !ids.has(dragState.agentId)) dragState = null;
+    if (hoveredAgentId !== null && !ids.has(hoveredAgentId)) hoveredAgentId = null;
   });
 
   function openSessionFile(agent: AgentRecord): void {
@@ -274,16 +284,227 @@
   }
 
   function agentRowPointerActions(node: HTMLElement, agentId: AgentId): { destroy: () => void } {
-    const handlePointerEnter = (): void => refreshAgentSessionInfo(agentId, true);
-    const handlePointerLeave = (): void => cancelRemove(agentId);
+    const handlePointerEnter = (): void => {
+      hoveredAgentId = agentId;
+      refreshAgentSessionInfo(agentId, true);
+    };
+    const handlePointerLeave = (): void => {
+      if (hoveredAgentId === agentId) hoveredAgentId = null;
+      cancelRemove(agentId);
+    };
+    // Alt+Arrow reorders the focused card (the menu items advertise the
+    // chord). Skipped while typing — Alt+Arrow is a text-caret motion inside
+    // the rename input.
+    const handleKeydown = (event: KeyboardEvent): void => {
+      if (!event.altKey || (event.key !== "ArrowUp" && event.key !== "ArrowDown")) return;
+      if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement)
+        return;
+      event.preventDefault();
+      event.stopPropagation();
+      void moveAgentBy(agentId, event.key === "ArrowUp" ? -1 : 1);
+    };
     node.addEventListener("pointerenter", handlePointerEnter);
     node.addEventListener("pointerleave", handlePointerLeave);
+    node.addEventListener("keydown", handleKeydown);
     return {
       destroy: () => {
         node.removeEventListener("pointerenter", handlePointerEnter);
         node.removeEventListener("pointerleave", handlePointerLeave);
+        node.removeEventListener("keydown", handleKeydown);
       },
     };
+  }
+
+  // --- Roster reordering -------------------------------------------------
+  // Roster order is the canonical display order app-wide (these cards, the
+  // compose chips and their ⌘1..9 numbering, pane columns), so all reorder
+  // gestures funnel into one commit path. Two gestures: Move up/down (menu
+  // items + Alt+Arrow), and dragging the grip that replaces the collapse
+  // chevron on hover.
+
+  let reorderError = $state<{ agentId: AgentId; message: string } | null>(null);
+
+  /// In-flight grip drag. `order` is the local preview the cards render from
+  /// while dragging; the store is only touched on drop. `started` gates the
+  /// slop threshold — an un-started drag is just a pressed grip, and resolves
+  /// to the grip's normal click (collapse toggle).
+  let dragState = $state<{
+    agentId: AgentId;
+    pointerId: number;
+    started: boolean;
+    startX: number;
+    startY: number;
+    order: AgentId[];
+  } | null>(null);
+
+  /// Card currently under the pointer — the target of the Alt+Arrow reorder
+  /// chord. Hover, not focus, because macOS WebKit does not focus buttons on
+  /// click, so a focus-scoped chord would be unreachable by mouse. Mirrors
+  /// `hoveredPaneId` in TranscriptPanes.
+  let hoveredAgentId = $state<AgentId | null>(null);
+
+  let agentListEl: HTMLElement | null = null;
+
+  const displayAgents = $derived.by(() => {
+    if (dragState === null || !dragState.started) return agents;
+    const byId = new Map(agents.map((a) => [a.id, a]));
+    const preview = dragState.order.flatMap((id) => byId.get(id) ?? []);
+    return preview.length === agents.length ? preview : agents;
+  });
+
+  async function commitOrder(agentId: AgentId, order: AgentId[]): Promise<void> {
+    if (order.length !== rosterIds.length || order.every((id, i) => id === rosterIds[i])) return;
+    reorderError = null;
+    try {
+      await reorderAgents(projectId, order);
+    } catch (err) {
+      reorderError = {
+        agentId,
+        message: err instanceof Error ? err.message : String(err),
+      };
+    }
+  }
+
+  async function moveAgentBy(agentId: AgentId, delta: -1 | 1): Promise<void> {
+    const from = rosterIds.indexOf(agentId);
+    await commitOrder(agentId, movedOrder(rosterIds, from, from + delta));
+  }
+
+  /// Recompute the preview order from the rendered cards' midpoints. Reads
+  /// geometry from the DOM (display order) rather than tracking it, so the
+  /// math stays correct under collapsed/expanded cards of different heights.
+  function updateDragOrder(drag: NonNullable<typeof dragState>, pointerY: number): void {
+    if (agentListEl === null) return;
+    const others: AgentId[] = [];
+    const midpoints: number[] = [];
+    for (const card of agentListEl.querySelectorAll<HTMLElement>("[data-agent-id]")) {
+      const id = card.dataset.agentId;
+      if (id === undefined || id === drag.agentId) continue;
+      const rect = card.getBoundingClientRect();
+      others.push(id);
+      midpoints.push(rect.top + rect.height / 2);
+    }
+    const at = dropIndexForPointer(midpoints, pointerY);
+    const next = [...others.slice(0, at), drag.agentId, ...others.slice(at)];
+    if (!next.every((id, i) => id === drag.order[i])) drag.order = next;
+  }
+
+  /// Nudge the nearest scrollable ancestor while the drag pointer hugs its
+  /// edge. Advances per pointermove (no rAF loop) — continuing to scroll
+  /// requires wiggling the pointer, an accepted simplification for a sidebar
+  /// roster.
+  function dragAutoScroll(pointerY: number): void {
+    for (let el = agentListEl; el !== null; el = el.parentElement) {
+      if (el.scrollHeight <= el.clientHeight + 1) continue;
+      const overflowY = getComputedStyle(el).overflowY;
+      if (overflowY !== "auto" && overflowY !== "scroll") continue;
+      const rect = el.getBoundingClientRect();
+      if (pointerY < rect.top + 28) el.scrollTop -= 10;
+      else if (pointerY > rect.bottom - 28) el.scrollTop += 10;
+      return;
+    }
+  }
+
+  /// Swallow the click the browser synthesizes right after pointerup, so
+  /// dropping (or Escape-releasing) a drag never also toggles a card's
+  /// collapse. Capture-phase, self-removing: the click fires synchronously
+  /// after pointerup, so if none arrives by the next macrotask there is
+  /// nothing to swallow and the trap is disarmed.
+  function swallowNextClick(): void {
+    const swallow = (event: MouseEvent): void => {
+      event.preventDefault();
+      event.stopPropagation();
+    };
+    window.addEventListener("click", swallow, { capture: true });
+    setTimeout(() => window.removeEventListener("click", swallow, { capture: true }), 0);
+  }
+
+  /// Drag session: pointerdown on the grip arms it; move/up/cancel/Escape are
+  /// window-level for the drag's lifetime. Window, NOT element listeners with
+  /// pointer capture: the keyed {#each} moves the dragged card's DOM node on
+  /// every preview reorder, and re-inserting a node silently releases its
+  /// pointer capture — the drag would freeze mid-gesture (same pattern as the
+  /// pane-gutter resize in TranscriptPanes).
+  function beginDrag(agentId: AgentId, event: PointerEvent): void {
+    if (agents.length < 2 || event.button !== 0 || dragState !== null) return;
+    // Suppress text selection / focus side effects; the grip's click (collapse
+    // toggle) still fires if the press never passes the slop threshold.
+    event.preventDefault();
+    const pointerId = event.pointerId;
+    let cancelled = false;
+    dragState = {
+      agentId,
+      pointerId,
+      started: false,
+      startX: event.clientX,
+      startY: event.clientY,
+      order: agents.map((a) => a.id),
+    };
+    const onMove = (e: PointerEvent): void => {
+      if (e.pointerId !== pointerId || cancelled) return;
+      const drag = dragState;
+      if (drag === null) return;
+      if (!drag.started) {
+        if (Math.hypot(e.clientX - drag.startX, e.clientY - drag.startY) < DRAG_SLOP_PX) return;
+        drag.started = true;
+      }
+      dragAutoScroll(e.clientY);
+      updateDragOrder(drag, e.clientY);
+    };
+    const onUp = (e: PointerEvent): void => {
+      if (e.pointerId !== pointerId) return;
+      const drag = dragState;
+      const started = cancelled || drag?.started === true;
+      cleanup();
+      dragState = null;
+      if (started) swallowNextClick();
+      if (cancelled || drag === null || !drag.started) return;
+      void commitOrder(drag.agentId, drag.order);
+    };
+    const onCancel = (e: PointerEvent): void => {
+      if (e.pointerId !== pointerId) return;
+      cleanup();
+      dragState = null;
+    };
+    // Escape reverts the preview immediately but keeps the listeners armed
+    // until the actual pointerup, whose synthesized click still needs
+    // swallowing.
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key !== "Escape" || cancelled || dragState?.started !== true) return;
+      e.preventDefault();
+      cancelled = true;
+      dragState = null;
+    };
+    const cleanup = (): void => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onCancel);
+      window.removeEventListener("keydown", onKey, { capture: true });
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onCancel);
+    window.addEventListener("keydown", onKey, { capture: true });
+  }
+
+  function gripDrag(node: HTMLElement, agentId: AgentId): { destroy: () => void } {
+    const onPointerDown = (event: PointerEvent): void => beginDrag(agentId, event);
+    node.addEventListener("pointerdown", onPointerDown);
+    return {
+      destroy: () => node.removeEventListener("pointerdown", onPointerDown),
+    };
+  }
+
+  /// Alt+Arrow reorders the card under the pointer. The per-card focus-within
+  /// handler (see `agentRowPointerActions`) takes precedence via
+  /// stopPropagation when keyboard focus is inside a card.
+  function onWindowKeydown(event: KeyboardEvent): void {
+    if (!event.altKey || (event.key !== "ArrowUp" && event.key !== "ArrowDown")) return;
+    if (hoveredAgentId === null) return;
+    if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement)
+      return;
+    event.preventDefault();
+    void moveAgentBy(hoveredAgentId, event.key === "ArrowUp" ? -1 : 1);
   }
 
   async function confirmRemove(agent: AgentRecord): Promise<void> {
@@ -554,6 +775,8 @@
   }
 </script>
 
+<svelte:window onkeydown={onWindowKeydown} />
+
 <SidebarPanel side="right" width="w-60" testid="sidebar">
   <SidebarSection title="Agents">
     {#snippet action()}
@@ -617,8 +840,8 @@
     {#if agents.length === 0}
       <p class="text-muted px-3 py-3 text-xs">No agents in this project yet.</p>
     {/if}
-    <div class="flex flex-col gap-1.5 px-2 pb-2">
-      {#each agents as agent (agent.id)}
+    <div class="flex flex-col gap-1.5 px-2 pb-2" bind:this={agentListEl}>
+      {#each displayAgents as agent (agent.id)}
         {@const runtime = runtimes[agent.id]}
         {@const util = contextUtilization(agent.id)}
         {@const codexWindows =
@@ -637,10 +860,16 @@
         {@const sessionInfo = sessionInfoByAgent[agent.id]}
         {@const confirmingRemove = removeConfirmAgentId === agent.id}
         <div
-          class="group bg-raised/90 hover:bg-border/40 rounded-md px-2.5 py-2 transition-colors"
+          class={cn(
+            "group bg-raised/90 hover:bg-border/40 rounded-md px-2.5 py-2 transition-colors",
+            dragState?.started === true &&
+              dragState.agentId === agent.id &&
+              "ring-accent/60 relative z-10 shadow-lg ring-1",
+          )}
           data-testid="sidebar-agent"
           data-agent-id={agent.id}
           use:agentRowPointerActions={agent.id}
+          animate:flip={{ duration: dragState?.started === true ? 0 : 150 }}
         >
           <div class="flex items-center justify-between gap-2">
             {#if editingAgentId === agent.id}
@@ -703,21 +932,27 @@
                 onclick={() => toggleCollapsed(agent.id)}
                 ondblclick={() => startEdit(agent)}
               >
-                <svg
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="1.5"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                  class={cn(
-                    "text-muted h-3 w-3 shrink-0 transition-transform",
-                    isCollapsed && "-rotate-90",
-                  )}
-                  aria-hidden="true"
-                >
-                  <path d="m6 9 6 6 6-6" />
-                </svg>
+                <!-- Leading slot: the drag grip, hover/focus-revealed (multi-
+                     agent rosters only). `invisible` (not `hidden`) so the slot
+                     keeps its width and the name never shifts on hover. The
+                     collapse affordance is the whole header row (aria-expanded
+                     carries the state); a click on the grip still toggles
+                     collapse — only a drag past the slop threshold reorders. -->
+                {#if agents.length > 1}
+                  <span
+                    class={cn(
+                      "text-muted h-3 w-3 shrink-0 cursor-grab touch-none active:cursor-grabbing",
+                      dragState?.agentId === agent.id
+                        ? "visible"
+                        : "invisible group-focus-within:visible group-hover:visible",
+                    )}
+                    data-testid="agent-drag-grip"
+                    aria-hidden="true"
+                    use:gripDrag={agent.id}
+                  >
+                    <GripVertical size={12} strokeWidth={1.8} />
+                  </span>
+                {/if}
                 <span class="text-fg truncate text-[13px] font-semibold" data-testid="agent-name">
                   {agent.name}
                 </span>
@@ -862,6 +1097,49 @@
                           aria-hidden="true"
                         />
                         Change effort
+                      </DropdownMenuItem>
+                    {/if}
+                    <!-- Roster reorder. Disabled (not hidden) at the ends so the
+                         boundary reads as "can't move further", not a missing
+                         feature. closeOnSelect={false}: moving several positions
+                         is one menu trip. -->
+                    {#if agents.length > 1}
+                      {@const rosterIndex = rosterIds.indexOf(agent.id)}
+                      <DropdownMenuItem
+                        onSelect={() => void moveAgentBy(agent.id, -1)}
+                        closeOnSelect={false}
+                        disabled={rosterIndex === 0}
+                        class="gap-2"
+                        data-testid="agent-move-up"
+                      >
+                        <ArrowUp
+                          size={14}
+                          strokeWidth={1.8}
+                          class="text-muted shrink-0"
+                          aria-hidden="true"
+                        />
+                        Move up
+                        <span class="text-muted ml-auto font-mono text-xs"
+                          >{shortcut("alt", "↑")}</span
+                        >
+                      </DropdownMenuItem>
+                      <DropdownMenuItem
+                        onSelect={() => void moveAgentBy(agent.id, 1)}
+                        closeOnSelect={false}
+                        disabled={rosterIndex === agents.length - 1}
+                        class="gap-2"
+                        data-testid="agent-move-down"
+                      >
+                        <ArrowDown
+                          size={14}
+                          strokeWidth={1.8}
+                          class="text-muted shrink-0"
+                          aria-hidden="true"
+                        />
+                        Move down
+                        <span class="text-muted ml-auto font-mono text-xs"
+                          >{shortcut("alt", "↓")}</span
+                        >
                       </DropdownMenuItem>
                     {/if}
                     <!-- Pane assignment. Move, never copy: an agent can belong
@@ -1171,6 +1449,11 @@
           {#if removeError?.agentId === agent.id}
             <div class="text-status-failed mt-1 text-xs" data-testid="agent-remove-error">
               Couldn't delete agent: {removeError.message}
+            </div>
+          {/if}
+          {#if reorderError?.agentId === agent.id}
+            <div class="text-status-failed mt-1 text-xs" data-testid="agent-reorder-error">
+              Couldn't reorder agents: {reorderError.message}
             </div>
           {/if}
         </div>

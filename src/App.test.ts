@@ -2180,6 +2180,91 @@ describe("App", () => {
     selection._testing.reset();
   });
 
+  it("⌘⌥N reveals the targeted pane: restores a minimized one, replaces a maximized one", async () => {
+    const panes = await import("$lib/state/transcriptPanes.svelte");
+    const selection = await import("$lib/state/recipientSelection.svelte");
+    panes._testing.reset();
+    selection._testing.reset();
+
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [
+        agent({ id: "ag-1", project_id: "p-a", name: "alice" }),
+        agent({ id: "ag-2", project_id: "p-a", name: "bob" }),
+      ],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+
+    const roster = ["ag-1", "ag-2"];
+    const p2 = panes.moveAgentToNewPane("p-a", roster, "ag-2");
+    const p1 = panes.layoutFor("p-a", roster).panes[0]!.id;
+
+    // Minimized, nothing maximized: the chord restores the pane into the row
+    // — a send must never stream into an invisible pane.
+    panes.minimizePane("p-a", roster, p2);
+    await fireEvent.keyDown(window, { key: "2", code: "Digit2", metaKey: true, altKey: true });
+    expect(selection.selectionFor("p-a")).toEqual(["ag-2"]);
+    expect(panes.layoutFor("p-a", roster).minimized).toEqual([]);
+
+    // Another pane maximized: the chord keeps focus mode but swaps which pane
+    // holds it.
+    panes.maximizePane("p-a", roster, p1);
+    await fireEvent.keyDown(window, { key: "2", code: "Digit2", metaKey: true, altKey: true });
+    expect(panes.layoutFor("p-a", roster).maximized).toBe(p2);
+    expect(selection.selectionFor("p-a")).toEqual(["ag-2"]);
+
+    panes._testing.reset();
+    selection._testing.reset();
+  });
+
+  it("⌘⌥N is fully inert while targeting is locked — no retarget, no reveal", async () => {
+    const panes = await import("$lib/state/transcriptPanes.svelte");
+    const selection = await import("$lib/state/recipientSelection.svelte");
+    panes._testing.reset();
+    selection._testing.reset();
+
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [
+        agent({ id: "ag-1", project_id: "p-a", name: "alice" }),
+        agent({ id: "ag-2", project_id: "p-a", name: "bob" }),
+      ],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+
+    const roster = ["ag-1", "ag-2"];
+    const p2 = panes.moveAgentToNewPane("p-a", roster, "ag-2");
+    panes.minimizePane("p-a", roster, p2);
+    selection.setRecipients("p-a", ["ag-1"]);
+
+    // Locked (prompt-render window): the gesture is atomic — neither the
+    // recipient set nor pane visibility may change, or the revealed pane
+    // would imply a target the refused write never made.
+    selection.setTargetingLocked("p-a", true);
+    await fireEvent.keyDown(window, { key: "2", code: "Digit2", metaKey: true, altKey: true });
+    expect(selection.selectionFor("p-a")).toEqual(["ag-1"]);
+    expect(panes.layoutFor("p-a", roster).minimized).toEqual([p2]);
+
+    // Unlocked: the same chord retargets and reveals.
+    selection.setTargetingLocked("p-a", false);
+    await fireEvent.keyDown(window, { key: "2", code: "Digit2", metaKey: true, altKey: true });
+    expect(selection.selectionFor("p-a")).toEqual(["ag-2"]);
+    expect(panes.layoutFor("p-a", roster).minimized).toEqual([]);
+
+    panes._testing.reset();
+    selection._testing.reset();
+  });
+
   it("opens the command palette with ⌘⇧P and runs a palette action", async () => {
     seedProject({
       projectId: "p-a",

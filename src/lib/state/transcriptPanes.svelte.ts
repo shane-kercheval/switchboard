@@ -495,6 +495,30 @@ export function maximizePane(projectId: ProjectId, rosterIds: AgentId[], paneId:
   );
 }
 
+/// Make a pane visible, preserving the user's view mode: while another pane is
+/// maximized the target *replaces* it (focus stays focus); otherwise a
+/// minimized target is restored into the row. A revealed pane always leaves
+/// the minimized set, so it doesn't vanish back to a tab when maximization is
+/// later restored. Already-visible panes are untouched.
+///
+/// This is the reveal half of pane-targeting gestures (minimized header tab,
+/// Cmd+Alt+N, `@panename`): targeting a pane the user cannot see would stream
+/// the reply into an invisible pane.
+export function revealPane(projectId: ProjectId, rosterIds: AgentId[], paneId: PaneId): void {
+  update(projectId, rosterIds, (layout) => {
+    if (!layout.panes.some((pane) => pane.id === paneId)) return layout;
+    if (layout.maximized !== null && layout.maximized !== paneId) {
+      return {
+        ...layout,
+        maximized: paneId,
+        minimized: layout.minimized.filter((id) => id !== paneId),
+      };
+    }
+    if (!layout.minimized.includes(paneId)) return layout;
+    return { ...layout, minimized: layout.minimized.filter((id) => id !== paneId) };
+  });
+}
+
 export function restoreMaximizedPane(projectId: ProjectId, rosterIds: AgentId[]): void {
   // Same fit-policy tradeoff as restorePane: restoring all panes can reveal
   // more expanded panes than a narrow row can display.

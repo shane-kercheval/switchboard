@@ -445,6 +445,41 @@ impl Project {
         write_jsonl(&self.registry_path, &agents)?;
         Ok(updated)
     }
+
+    /// Rewrite `registry.jsonl` so its records appear in `ordered_ids` order.
+    /// Physical record order is the roster's canonical, user-visible order
+    /// (sidebar cards, compose chips, ⌘1..9), so reordering is a full rewrite
+    /// like the other mutations — same atomic + `registry_write`-serialized
+    /// contract. `ordered_ids` must be an exact permutation of the current
+    /// roster; a stale list (an agent added or removed since the caller read
+    /// the roster) is rejected rather than silently dropping or duplicating
+    /// records. Returns the records in their new order.
+    pub fn reorder_agents(
+        &self,
+        ordered_ids: &[crate::agent::AgentId],
+    ) -> Result<Vec<AgentRecord>> {
+        let agents = self.list_agents()?;
+        let mismatch = CoreError::ReorderRosterMismatch {
+            expected: agents.len(),
+            provided: ordered_ids.len(),
+        };
+        if ordered_ids.len() != agents.len() {
+            return Err(mismatch);
+        }
+        let mut by_id: std::collections::HashMap<crate::agent::AgentId, AgentRecord> =
+            agents.into_iter().map(|a| (a.id, a)).collect();
+        let mut reordered = Vec::with_capacity(ordered_ids.len());
+        for id in ordered_ids {
+            // A duplicate id hits this on its second occurrence (already
+            // removed), so the permutation check needs no separate pass.
+            let Some(record) = by_id.remove(id) else {
+                return Err(mismatch);
+            };
+            reordered.push(record);
+        }
+        write_jsonl(&self.registry_path, &reordered)?;
+        Ok(reordered)
+    }
 }
 
 /// Canonicalized-uniqueness check shared by register (`exclude` = `None`) and
@@ -780,6 +815,106 @@ mod tests {
         assert_eq!(listed[0].session_locator, a.session_locator);
         assert_eq!(listed[1].session_locator, Some(locator));
         assert_eq!(listed[2].session_locator, c.session_locator);
+    }
+
+    #[test]
+    fn reorder_agents_persists_the_new_order() {
+        let (_tmp, project) = fresh_project();
+        let a = project
+            .register_agent("alpha", HarnessKind::ClaudeCode, None, None)
+            .unwrap();
+        let b = project
+            .register_agent("beta", HarnessKind::Codex, None, None)
+            .unwrap();
+        let c = project
+            .register_agent("gamma", HarnessKind::Gemini, None, None)
+            .unwrap();
+
+        let reordered = project.reorder_agents(&[c.id, a.id, b.id]).unwrap();
+        assert_eq!(reordered, vec![c.clone(), a.clone(), b.clone()]);
+
+        // The rewrite is durable and field-preserving, not just reflected in
+        // the return value.
+        let listed = project.list_agents().unwrap();
+        assert_eq!(listed, vec![c, a, b]);
+    }
+
+    #[test]
+    fn reorder_agents_identity_permutation_is_a_valid_noop() {
+        let (_tmp, project) = fresh_project();
+        let a = project
+            .register_agent("alpha", HarnessKind::ClaudeCode, None, None)
+            .unwrap();
+        let b = project
+            .register_agent("beta", HarnessKind::ClaudeCode, None, None)
+            .unwrap();
+        let reordered = project.reorder_agents(&[a.id, b.id]).unwrap();
+        assert_eq!(reordered, vec![a, b]);
+    }
+
+    #[test]
+    fn reorder_agents_rejects_wrong_length() {
+        let (_tmp, project) = fresh_project();
+        let a = project
+            .register_agent("alpha", HarnessKind::ClaudeCode, None, None)
+            .unwrap();
+        let b = project
+            .register_agent("beta", HarnessKind::ClaudeCode, None, None)
+            .unwrap();
+
+        let err = project.reorder_agents(&[a.id]).unwrap_err();
+        assert!(matches!(
+            err,
+            CoreError::ReorderRosterMismatch {
+                expected: 2,
+                provided: 1
+            }
+        ));
+        // Registry untouched on rejection.
+        assert_eq!(
+            project
+                .list_agents()
+                .unwrap()
+                .iter()
+                .map(|r| r.id)
+                .collect::<Vec<_>>(),
+            vec![a.id, b.id]
+        );
+    }
+
+    #[test]
+    fn reorder_agents_rejects_unknown_id() {
+        let (_tmp, project) = fresh_project();
+        let a = project
+            .register_agent("alpha", HarnessKind::ClaudeCode, None, None)
+            .unwrap();
+        let err = project.reorder_agents(&[Uuid::now_v7()]).unwrap_err();
+        assert!(matches!(err, CoreError::ReorderRosterMismatch { .. }));
+        assert_eq!(project.list_agents().unwrap()[0].id, a.id);
+    }
+
+    #[test]
+    fn reorder_agents_rejects_duplicate_id() {
+        let (_tmp, project) = fresh_project();
+        let a = project
+            .register_agent("alpha", HarnessKind::ClaudeCode, None, None)
+            .unwrap();
+        let b = project
+            .register_agent("beta", HarnessKind::ClaudeCode, None, None)
+            .unwrap();
+        // Right length, but `b` appears twice and `a` never — a permutation
+        // check by length alone would corrupt the registry here.
+        let err = project.reorder_agents(&[b.id, b.id]).unwrap_err();
+        assert!(matches!(err, CoreError::ReorderRosterMismatch { .. }));
+        assert_eq!(
+            project
+                .list_agents()
+                .unwrap()
+                .iter()
+                .map(|r| r.id)
+                .collect::<Vec<_>>(),
+            vec![a.id, b.id]
+        );
     }
 
     #[test]

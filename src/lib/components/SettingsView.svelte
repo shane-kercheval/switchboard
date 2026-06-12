@@ -62,7 +62,7 @@
     {
       action: "Send to pane",
       keys: ["⌘", "⌥", "1–9"],
-      note: "by pane position, when split",
+      note: "by pane position, when split; shows the pane if hidden",
     },
     {
       action: "Send to clicked pane",

@@ -87,6 +87,16 @@ pub enum CoreError {
         harness: crate::harness::HarnessKind,
         axis: crate::harness::SelectionAxis,
     },
+
+    /// A reorder's id list must be an exact permutation of the current roster.
+    /// Covers every shape failure (wrong length, unknown id, duplicate id) with
+    /// one variant: the caller's list is stale or malformed either way, and the
+    /// remedy is identical — re-read the roster and retry.
+    #[error(
+        "reorder id list must contain each current agent id exactly once \
+         ({provided} ids provided for {expected} agents)"
+    )]
+    ReorderRosterMismatch { expected: usize, provided: usize },
 }
 
 impl CoreError {

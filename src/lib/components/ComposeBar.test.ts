@@ -1820,6 +1820,50 @@ describe("ComposeBar pane targeting", () => {
     expect(textarea.value).toBe("");
   });
 
+  it("@panename reveals a minimized pane when targeting it", async () => {
+    const panes = await importPanes();
+    const selection = await importSelection();
+    const paneId = panes.moveAgentToNewPane(PROJECT_ID, ROSTER, AGENT_B.id);
+    panes.renamePane(PROJECT_ID, ROSTER, paneId, "reviewers");
+    panes.minimizePane(PROJECT_ID, ROSTER, paneId);
+
+    const textarea = await renderTwoAgents();
+    await fireEvent.input(textarea, { target: { value: "@review" } });
+    const option = await screen.findByTestId(`recipient-option-pane:${paneId}`);
+    await fireEvent.click(option);
+
+    // Targeting both retargets and reveals — a send must never stream into a
+    // pane the user cannot see.
+    expect(selection.selectionFor(PROJECT_ID)).toEqual([AGENT_B.id]);
+    expect(panes.layoutFor(PROJECT_ID, ROSTER).minimized).toEqual([]);
+  });
+
+  it("@panename is fully inert while targeting is locked — no retarget, no reveal", async () => {
+    const panes = await importPanes();
+    const selection = await importSelection();
+    const paneId = panes.moveAgentToNewPane(PROJECT_ID, ROSTER, AGENT_B.id);
+    panes.renamePane(PROJECT_ID, ROSTER, paneId, "reviewers");
+    panes.minimizePane(PROJECT_ID, ROSTER, paneId);
+
+    const textarea = await renderTwoAgents();
+    selection.setRecipients(PROJECT_ID, [AGENT_A.id]);
+    selection.setTargetingLocked(PROJECT_ID, true);
+
+    await fireEvent.input(textarea, { target: { value: "@review" } });
+    const option = await screen.findByTestId(`recipient-option-pane:${paneId}`);
+    await fireEvent.click(option);
+
+    // The gesture is atomic under the prompt-render lock: the refused target
+    // write must not leave a revealed pane implying it became the target.
+    expect(selection.selectionFor(PROJECT_ID)).toEqual([AGENT_A.id]);
+    expect(panes.layoutFor(PROJECT_ID, ROSTER).minimized).toEqual([paneId]);
+    // The @-token is still consumed — refusal is silent, like every other
+    // lock-refused gesture.
+    expect(textarea.value).toBe("");
+
+    selection.setTargetingLocked(PROJECT_ID, false);
+  });
+
   it("pane entries list ahead of agent entries", async () => {
     const panes = await importPanes();
     panes.moveAgentToNewPane(PROJECT_ID, ROSTER, AGENT_B.id);

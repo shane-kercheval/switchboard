@@ -92,11 +92,14 @@ impl SessionLocator {
 
 /// One row in `<directory>/.switchboard/projects/<project-id>/registry.jsonl`.
 ///
-/// Records are appended on registration. The only in-place mutation in v1 is
-/// `session_locator` — set once when a runtime-assigned locator is first
-/// captured (Codex/Antigravity), and on the Antigravity fork-and-heal case
-/// where the conversation id changes (see [`crate::project::Project::set_session_locator`]).
-/// Every other field is immutable after registration.
+/// Records are appended on registration. Four things mutate after that, each
+/// through its own dedicated `Project` method (never a generic update API):
+/// `name` (rename), `model` / `effort` (selection changes), `session_locator`
+/// (runtime capture for Codex/Antigravity, including the Antigravity
+/// fork-and-heal case — see [`crate::project::Project::set_session_locator`]),
+/// and the records' physical order (user reordering — file order *is* the
+/// roster's display order). `id`, `project_id`, `harness`, and `created_at`
+/// are immutable.
 ///
 /// `project_id` is denormalized for defensive reasons — the registry path also
 /// encodes the project, but carrying it in the record means a misplaced file

@@ -34,9 +34,8 @@
   import {
     createEmptyPane,
     layoutFor,
-    maximizePane,
     restoreMaximizedPane,
-    restorePane,
+    revealPane,
     type TranscriptPane,
   } from "$lib/state/transcriptPanes.svelte";
   import { targetRecipients } from "$lib/state/recipientSelection.svelte";
@@ -160,7 +159,13 @@
         // (targeting it could only clear the recipient set, silently).
         if (pane === undefined || pane.members.length === 0) return;
         event.preventDefault();
-        targetRecipients(selection.activeProjectId, [...pane.members]);
+        // Targeting also reveals: a minimized (or maximized-over) pane would
+        // otherwise receive the send invisibly. Reveal is gated on the target
+        // write so the gesture is atomic under the prompt-render targeting
+        // lock — a refused chord must not change pane visibility either.
+        if (targetRecipients(selection.activeProjectId, [...pane.members])) {
+          revealPane(selection.activeProjectId, rosterIds, pane.id);
+        }
       }
       return;
     }
@@ -482,11 +487,10 @@
     const key = paneTabKey(selection.activeProjectId, pane.id);
     delete paneTabCompleted[key];
     paneTabWasActive = paneTabWasActive.filter((id) => id !== key);
-    if (activePaneLayout?.maximized !== null) {
-      maximizePane(selection.activeProjectId, activeRosterIds, pane.id);
-      if (pane.members.length > 0) targetRecipients(selection.activeProjectId, [...pane.members]);
-    } else {
-      restorePane(selection.activeProjectId, activeRosterIds, pane.id);
+    const wasMaximized = activePaneLayout?.maximized !== null;
+    revealPane(selection.activeProjectId, activeRosterIds, pane.id);
+    if (wasMaximized && pane.members.length > 0) {
+      targetRecipients(selection.activeProjectId, [...pane.members]);
     }
   }
 
@@ -833,7 +837,7 @@
               {@const completed = paneTabIsCompleted(pane)}
               <button
                 type="button"
-                class="border-border bg-panel text-fg hover:bg-raised inline-flex h-7 max-w-36 min-w-0 shrink items-center gap-1.5 rounded-full border px-2 text-xs"
+                class="border-border bg-panel text-fg hover:bg-raised inline-flex h-6.5 max-w-36 min-w-0 shrink items-center gap-1.5 rounded-full border px-2 text-xs"
                 data-testid="app-pane-minimized-tab"
                 data-pane-id={pane.id}
                 onclick={() => selectHeaderPane(pane)}
@@ -863,7 +867,7 @@
             {#if activeMaximizedPane !== null && headerTabPanes.length > 1}
               <button
                 type="button"
-                class="text-muted hover:text-fg hover:bg-border/60 inline-flex h-7 shrink-0 items-center rounded-full px-2 text-xs"
+                class="text-muted hover:text-fg hover:bg-border/60 inline-flex h-6.5 shrink-0 items-center rounded-full px-2 text-xs"
                 data-testid="app-pane-restore-all"
                 onclick={restoreAllPanes}
               >

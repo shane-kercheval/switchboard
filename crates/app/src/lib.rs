@@ -45,11 +45,11 @@ use crate::commands::{
     project_session_fingerprints_impl, read_tracked_repo_from_inputs, remove_agent_impl,
     remove_directory_impl, remove_mcp_provider_impl, remove_queued_message_impl,
     remove_tracked_repo_impl, rename_agent_impl, rename_project_impl, render_prompt_impl,
-    reveal_in_finder_argv, search_project_files_in_root, search_project_files_root_impl,
-    send_message_impl, set_active_project_impl, set_agent_effort_impl, set_agent_model_impl,
-    set_preferences_impl, set_project_archived_impl, stage_attachment_impl,
-    sync_prompts_and_notify, terminal_open_argv, test_mcp_connection_impl, tracked_repos_inputs,
-    tracked_roots, validate_external_url,
+    reorder_agents_impl, reveal_in_finder_argv, search_project_files_in_root,
+    search_project_files_root_impl, send_message_impl, set_active_project_impl,
+    set_agent_effort_impl, set_agent_model_impl, set_preferences_impl, set_project_archived_impl,
+    stage_attachment_impl, sync_prompts_and_notify, terminal_open_argv, test_mcp_connection_impl,
+    tracked_repos_inputs, tracked_roots, validate_external_url,
 };
 use crate::preferences::Preferences;
 use crate::state::AppState;
@@ -469,6 +469,21 @@ async fn attach_agent(
         effort,
     )
     .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn reorder_agents(
+    state: State<'_, AppState>,
+    project_id: String,
+    agent_ids: Vec<String>,
+) -> Result<Vec<AgentRecord>, String> {
+    let pid = parse_uuid(&project_id).map_err(|e| e.to_string())?;
+    let ids = agent_ids
+        .iter()
+        .map(|s| parse_uuid(s))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    reorder_agents_impl(state.inner(), pid, &ids).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1091,6 +1106,7 @@ pub fn run() {
             rename_agent,
             set_agent_model,
             set_agent_effort,
+            reorder_agents,
             attach_agent,
             list_agents,
             search_project_files,

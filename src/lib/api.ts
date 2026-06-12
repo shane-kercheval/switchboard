@@ -313,6 +313,17 @@ export async function attachAgent(
   });
 }
 
+/// Persist a new roster order for a project. `agentIds` must be an exact
+/// permutation of the project's current agents — the backend rejects a stale
+/// list (an agent added or removed since the roster was read). Returns the
+/// records in their new order.
+export async function reorderAgents(
+  projectId: ProjectId,
+  agentIds: AgentId[],
+): Promise<AgentRecord[]> {
+  return await invoke<AgentRecord[]>("reorder_agents", { projectId, agentIds });
+}
+
 export async function listAgents(projectId?: ProjectId): Promise<AgentRecord[]> {
   return await invoke<AgentRecord[]>("list_agents", { projectId });
 }

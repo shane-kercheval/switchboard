@@ -704,3 +704,116 @@ describe("agent model/effort selection", () => {
     expect(ws.agentsByProject[PROJECT_1]?.[0]?.effort).toBeNull();
   });
 });
+
+describe("agent reorder", () => {
+  const AGENT_3 = "00000000-0000-7000-8000-00000000000c";
+
+  it("applies the new order optimistically, then reconciles with the backend reply", async () => {
+    const ws = await loadWorkspaceState();
+    const a = agent(AGENT_1, PROJECT_1);
+    const b = agent(AGENT_2, PROJECT_1);
+    const c = agent(AGENT_3, PROJECT_1);
+    ws.agentsByProject[PROJECT_1] = [a, b, c];
+
+    let resolveBackend!: (records: AgentRecord[]) => void;
+    invokeMock.mockImplementation(async (cmd) =>
+      cmd === "reorder_agents"
+        ? new Promise<AgentRecord[]>((r) => {
+            resolveBackend = r;
+          })
+        : undefined,
+    );
+
+    const call = ws.reorderAgents(PROJECT_1, [c.id, a.id, b.id]);
+    // Optimistic: the roster reorders before the backend replies.
+    expect(ws.agentsByProject[PROJECT_1]?.map((r) => r.id)).toEqual([c.id, a.id, b.id]);
+
+    resolveBackend([c, a, b]);
+    await call;
+    expect(invokeMock).toHaveBeenCalledWith("reorder_agents", {
+      projectId: PROJECT_1,
+      agentIds: [c.id, a.id, b.id],
+    });
+    expect(ws.agentsByProject[PROJECT_1]?.map((r) => r.id)).toEqual([c.id, a.id, b.id]);
+  });
+
+  it("reverts to the previous order and rethrows when the backend rejects", async () => {
+    const ws = await loadWorkspaceState();
+    const a = agent(AGENT_1, PROJECT_1);
+    const b = agent(AGENT_2, PROJECT_1);
+    ws.agentsByProject[PROJECT_1] = [a, b];
+    invokeMock.mockImplementation(async (cmd) => {
+      if (cmd === "reorder_agents") throw new Error("roster changed");
+      return undefined;
+    });
+
+    await expect(ws.reorderAgents(PROJECT_1, [b.id, a.id])).rejects.toThrow("roster changed");
+    expect(ws.agentsByProject[PROJECT_1]?.map((r) => r.id)).toEqual([a.id, b.id]);
+  });
+
+  it("is a no-op for a project with no loaded roster", async () => {
+    const ws = await loadWorkspaceState();
+    await ws.reorderAgents(PROJECT_1, [AGENT_1]);
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it("drops a concurrent reorder for the same project and makes only one backend call", async () => {
+    const ws = await loadWorkspaceState();
+    const a = agent(AGENT_1, PROJECT_1);
+    const b = agent(AGENT_2, PROJECT_1);
+    ws.agentsByProject[PROJECT_1] = [a, b];
+
+    let resolveFirst!: (records: AgentRecord[]) => void;
+    invokeMock.mockImplementation(async (cmd) =>
+      cmd === "reorder_agents"
+        ? new Promise<AgentRecord[]>((r) => {
+            resolveFirst = r;
+          })
+        : undefined,
+    );
+
+    // First call: in-flight.
+    const first = ws.reorderAgents(PROJECT_1, [b.id, a.id]);
+    // Optimistic order applied.
+    expect(ws.agentsByProject[PROJECT_1]?.map((r) => r.id)).toEqual([b.id, a.id]);
+
+    // Second call: dropped while first is still in-flight.
+    await ws.reorderAgents(PROJECT_1, [a.id, b.id]);
+    // Optimistic order unchanged (second call was a no-op).
+    expect(ws.agentsByProject[PROJECT_1]?.map((r) => r.id)).toEqual([b.id, a.id]);
+
+    resolveFirst([b, a]);
+    await first;
+    // Only one backend call was made.
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+    expect(ws.agentsByProject[PROJECT_1]?.map((r) => r.id)).toEqual([b.id, a.id]);
+  });
+
+  it("does not apply the optimistic update for a duplicate-id list", async () => {
+    const ws = await loadWorkspaceState();
+    const a = agent(AGENT_1, PROJECT_1);
+    const b = agent(AGENT_2, PROJECT_1);
+    ws.agentsByProject[PROJECT_1] = [a, b];
+
+    let resolveBackend!: (records: AgentRecord[]) => void;
+    invokeMock.mockImplementation(async (cmd) =>
+      cmd === "reorder_agents"
+        ? new Promise<AgentRecord[]>((r) => {
+            resolveBackend = r;
+          })
+        : undefined,
+    );
+
+    // [b.id, b.id] passes the length checks but is not a valid permutation.
+    const call = ws.reorderAgents(PROJECT_1, [b.id, b.id]);
+    // Roster must not briefly show a duplicate entry while the call is in
+    // flight — the optimistic gate is what's under test here. (The real
+    // backend would reject the list; either way the store reconciles to a
+    // backend-authoritative order on settle.)
+    expect(ws.agentsByProject[PROJECT_1]?.map((r) => r.id)).toEqual([a.id, b.id]);
+
+    resolveBackend([a, b]);
+    await call;
+    expect(ws.agentsByProject[PROJECT_1]?.map((r) => r.id)).toEqual([a.id, b.id]);
+  });
+});

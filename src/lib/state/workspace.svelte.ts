@@ -483,6 +483,55 @@ export async function setAgentEffort(agentId: AgentId, effort?: string): Promise
   replaceAgentRecord(agentId, updated);
 }
 
+/// One reorder per project in-flight at a time. A concurrent call (e.g. from
+/// key autorepeat while a write is still pending) is dropped; the accepted call
+/// keeps the previous-state snapshot clean so a failure rollback always restores
+/// a backend-consistent order. Dropping is correct here: the last accepted move
+/// is the intended order, and the dropped tick just means the animation runs
+/// slightly slower than the key repeat rate — imperceptible.
+// eslint-disable-next-line svelte/prefer-svelte-reactivity
+const reorderInFlight = new Set<ProjectId>();
+
+/// Reorder a project's roster. Roster order is the canonical display order
+/// everywhere it appears (sidebar cards, compose chips and their ⌘1..9
+/// numbering, pane columns and member chips), so the new order is applied
+/// optimistically for immediate feedback across all of them, then reconciled
+/// with the backend-persisted records. On failure the previous order is
+/// restored and the error propagates to the caller (the sidebar surfaces it).
+/// Concurrent calls for the same project are dropped (see `reorderInFlight`).
+export async function reorderAgents(projectId: ProjectId, orderedIds: AgentId[]): Promise<void> {
+  if (reorderInFlight.has(projectId)) return;
+  const previous = agentsByProject[projectId];
+  if (!previous) return;
+  reorderInFlight.add(projectId);
+  // Transient lookup, never stored or observed — reactivity not needed.
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity
+  const byId = new Map(previous.map((a) => [a.id, a]));
+  // Mirror the backend's permutation check (take-and-remove: a duplicate id
+  // misses on its second lookup), so an exact permutation is the only input
+  // that repaints the roster — anything else skips the optimistic update and
+  // goes straight to the backend's authoritative rejection, with no transient
+  // duplicate cards rendered in between.
+  const optimistic: AgentRecord[] = [];
+  for (const id of orderedIds) {
+    const record = byId.get(id);
+    if (record === undefined) break;
+    byId.delete(id);
+    optimistic.push(record);
+  }
+  if (optimistic.length === previous.length && orderedIds.length === previous.length) {
+    agentsByProject[projectId] = optimistic;
+  }
+  try {
+    agentsByProject[projectId] = await api.reorderAgents(projectId, orderedIds);
+  } catch (e) {
+    agentsByProject[projectId] = previous;
+    throw e;
+  } finally {
+    reorderInFlight.delete(projectId);
+  }
+}
+
 /// Replace an agent's record across whichever project roster holds it — located
 /// across all rosters rather than assumed active, matching `renameAgent`.
 function replaceAgentRecord(agentId: AgentId, updated: AgentRecord): void {

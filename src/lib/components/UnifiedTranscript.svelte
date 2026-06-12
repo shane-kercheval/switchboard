@@ -379,6 +379,17 @@
       .join("\n\n");
   }
 
+  function fanoutText(columns: Extract<RenderBlock, { kind: "fanout" }>["columns"]): string {
+    return columns
+      .map((col) => {
+        const text = columnText(col.rows);
+        if (text.length === 0) return "";
+        return `${agentName(col.agent_id)}:\n\n"""\n${text}\n"""`;
+      })
+      .filter((t) => t.length > 0)
+      .join("\n\n");
+  }
+
   /// A fan-out column's timestamp: its latest agent turn's start, or "" (queued).
   function columnAt(colRows: NonUserRow[]): string {
     for (let i = colRows.length - 1; i >= 0; i--) {
@@ -1267,6 +1278,7 @@
           {@const fanoutKeys = block.columns
             .filter((col) => isCollapsibleColumn(col.rows))
             .map((col) => `fanout:${block.send_id}:${col.agent_id}`)}
+          {@const fanoutCopyable = fanoutText(block.columns)}
           <div class="space-y-4" data-testid="fanout-group">
             {@render userMessage(block.user)}
             <!-- The group control lives with the responses (not the user prompt)
@@ -1274,8 +1286,18 @@
                responses are hovered and the user message's own hover chrome
                stays independent. -->
             <div class="group/responses space-y-2">
-              {#if fanoutKeys.length > 0}
-                <div class="flex justify-end">{@render fanoutToggleAll(fanoutKeys)}</div>
+              {#if fanoutKeys.length > 0 || fanoutCopyable.length > 0}
+                <div class="flex justify-end gap-1">
+                  {#if fanoutCopyable.length > 0}
+                    <CopyButton
+                      text={fanoutCopyable}
+                      label="Copy all responses"
+                      testid="fanout-copy"
+                      class="shrink-0 opacity-0 group-focus-within/responses:opacity-100 group-hover/responses:opacity-100"
+                    />
+                  {/if}
+                  {#if fanoutKeys.length > 0}{@render fanoutToggleAll(fanoutKeys)}{/if}
+                </div>
               {/if}
               <!-- Side-by-side on wide viewports; stacks vertically below `lg`. -->
               <div

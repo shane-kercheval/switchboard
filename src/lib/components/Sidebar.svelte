@@ -37,7 +37,6 @@
   import SidebarPanel from "$lib/components/ui/SidebarPanel.svelte";
   import SidebarSection from "$lib/components/ui/SidebarSection.svelte";
   import {
-    canAddPane,
     hiddenCount,
     isAgentHidden,
     layoutFor,
@@ -84,7 +83,7 @@
   }: { projectId: ProjectId; agents: AgentRecord[]; onAddAgent?: () => void } = $props();
 
   // Pane membership + visibility for this project's roster. The eye toggle and
-  // the move-to-pane actions both key off the same partition model.
+  // the move-to-pane actions both key off the same optional-membership model.
   const rosterIds = $derived(agents.map((a) => a.id));
   const paneLayout = $derived(layoutFor(projectId, rosterIds));
   const hiddenAgentCount = $derived(hiddenCount(projectId, rosterIds));
@@ -865,9 +864,9 @@
                         Change effort
                       </DropdownMenuItem>
                     {/if}
-                    <!-- Pane assignment. Move, never copy — panes partition the
-                         roster. Listed flat (no submenu): a project realistically
-                         has a handful of panes. -->
+                    <!-- Pane assignment. Move, never copy: an agent can belong
+                         to at most one pane. Listed flat (no submenu): a
+                         project realistically has a handful of panes. -->
                     {#if paneLayout.panes.length > 1}
                       {@const ownPaneId = paneOfAgent(projectId, rosterIds, agent.id)?.id}
                       {#each paneLayout.panes.filter((p) => p.id !== ownPaneId) as pane (pane.id)}
@@ -889,12 +888,8 @@
                     {#if agents.length > 1}
                       <DropdownMenuItem
                         onSelect={() => moveAgentToNewPane(projectId, rosterIds, agent.id)}
-                        disabled={!canAddPane(projectId, rosterIds)}
                         class="gap-2"
                         data-testid="agent-move-to-new-pane"
-                        title={canAddPane(projectId, rosterIds)
-                          ? undefined
-                          : "No room for another pane at minimum width"}
                       >
                         <Columns2
                           size={14}

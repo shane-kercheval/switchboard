@@ -8,6 +8,7 @@ import type { AgentRecord, ConversationItem, NormalizedEvent } from "$lib/types"
 import TranscriptPanes from "./TranscriptPanes.svelte";
 import {
   layoutFor,
+  minimizePane,
   moveAgentToPane,
   moveAgentToNewPane,
   toggleAgentHidden,
@@ -286,6 +287,8 @@ describe("pane chrome (headers, rename, close)", () => {
     renderPanes();
     const names = screen.getAllByTestId("pane-name").map((el) => el.textContent?.trim());
     expect(names).toEqual(["Pane 1", "Pane 2"]);
+    const chips = screen.getAllByTestId("pane-member-chip").map((el) => el.textContent?.trim());
+    expect(chips).toEqual(["alice", "bob"]);
   });
 
   it("renames via the explicit edit affordance without re-targeting", async () => {
@@ -294,7 +297,8 @@ describe("pane chrome (headers, rename, close)", () => {
     setRecipients(PROJECT_ID, []);
     renderPanes();
 
-    await fireEvent.click(screen.getAllByTestId("pane-rename")[0]!);
+    await fireEvent.click(screen.getAllByTestId("pane-actions")[0]!);
+    await fireEvent.click(screen.getByTestId("pane-rename"));
     const input = screen.getByTestId("pane-rename-input");
     await fireEvent.input(input, { target: { value: "reviewers" } });
     await fireEvent.keyDown(input, { key: "Enter" });
@@ -304,18 +308,127 @@ describe("pane chrome (headers, rename, close)", () => {
     expect(selectionFor(PROJECT_ID)).toEqual([]);
   });
 
-  it("close merges the pane's agents into the neighbor", async () => {
+  it("close unassigns the pane's agents", async () => {
     await seedTwoAgentTranscripts();
     moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
     renderPanes();
 
-    await fireEvent.click(screen.getAllByTestId("pane-close")[1]!);
+    await fireEvent.click(screen.getAllByTestId("pane-actions")[1]!);
+    await fireEvent.click(screen.getByTestId("pane-close"));
 
     expect(paneEls()).toHaveLength(1);
     const layout = layoutFor(PROJECT_ID, ROSTER_IDS);
-    expect(new Set(layout.panes[0]!.members)).toEqual(new Set(ROSTER_IDS));
-    // Back to one pane → chrome disappears entirely.
-    expect(screen.queryByTestId("pane-header")).not.toBeInTheDocument();
+    expect(layout.panes[0]!.members).toEqual([ALICE.id]);
+    expect(within(paneEls()[0]!).getByText("hello from alice")).toBeInTheDocument();
+    expect(within(paneEls()[0]!).queryByText("hello from bob")).not.toBeInTheDocument();
+    // One pane remains, but chrome stays visible while unassigned agents exist
+    // so they can be added back from the pane header.
+    expect(screen.getByTestId("pane-header")).toBeInTheDocument();
+    expect(screen.getByTestId("pane-actions")).toBeInTheDocument();
+  });
+
+  it("removing a pane member chip unassigns that agent", async () => {
+    await seedTwoAgentTranscripts();
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    renderPanes();
+
+    const paneB = paneEls()[1]!;
+    await fireEvent.click(within(paneB).getByTestId("pane-member-remove"));
+
+    const layout = layoutFor(PROJECT_ID, ROSTER_IDS);
+    expect(layout.panes[1]!.members).toEqual([]);
+    expect(within(paneB).queryByText("hello from bob")).not.toBeInTheDocument();
+    expect(within(paneB).getByTestId("pane-empty")).toHaveTextContent(/add one .* pane header/i);
+  });
+
+  it("the pane actions menu adds an unassigned agent", async () => {
+    await seedTwoAgentTranscripts();
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    renderPanes();
+
+    const paneB = paneEls()[1]!;
+    await fireEvent.click(within(paneB).getByTestId("pane-member-remove"));
+    await fireEvent.click(within(paneB).getByTestId("pane-actions"));
+    await fireEvent.click(screen.getByTestId(`pane-add-agent-${BOB.id}`));
+
+    expect(layoutFor(PROJECT_ID, ROSTER_IDS).panes[1]!.members).toEqual([BOB.id]);
+    expect(within(paneEls()[1]!).getByText("hello from bob")).toBeInTheDocument();
+  });
+
+  it("the pane actions menu moves an agent from another pane", async () => {
+    await seedTwoAgentTranscripts();
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    renderPanes();
+
+    const paneB = paneEls()[1]!;
+    await fireEvent.click(within(paneB).getByTestId("pane-actions"));
+    await fireEvent.click(screen.getByTestId(`pane-add-agent-${ALICE.id}`));
+
+    const layout = layoutFor(PROJECT_ID, ROSTER_IDS);
+    expect(layout.panes[0]!.members).toEqual([]);
+    expect(layout.panes[1]!.members).toEqual([BOB.id, ALICE.id]);
+    expect(within(paneEls()[0]!).queryByText("hello from alice")).not.toBeInTheDocument();
+    expect(within(paneEls()[1]!).getByText("hello from alice")).toBeInTheDocument();
+  });
+
+  it("minimizes a pane without changing membership", async () => {
+    await seedTwoAgentTranscripts();
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, ALICE.id);
+    renderPanes();
+
+    await fireEvent.click(screen.getAllByTestId("pane-minimize")[1]!);
+
+    expect(paneEls()).toHaveLength(2);
+    expect(layoutFor(PROJECT_ID, ROSTER_IDS).minimized).toEqual([
+      layoutFor(PROJECT_ID, ROSTER_IDS).panes[1]!.id,
+    ]);
+    expect(screen.queryByText("hello from bob")).not.toBeInTheDocument();
+  });
+
+  it("shows only maximize controls for exactly two panes", async () => {
+    await seedTwoAgentTranscripts();
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    renderPanes();
+
+    expect(paneEls()).toHaveLength(2);
+    expect(screen.getAllByTestId("pane-maximize")).toHaveLength(2);
+    expect(screen.queryByTestId("pane-minimize")).not.toBeInTheDocument();
+  });
+
+  it("maximizes one pane and restores it from its header control", async () => {
+    await seedTwoAgentTranscripts();
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    renderPanes();
+
+    await fireEvent.click(screen.getAllByTestId("pane-maximize")[1]!);
+
+    expect(paneEls()).toHaveLength(1);
+    expect(paneEls()[0]).toHaveAttribute("data-maximized", "true");
+    expect(screen.getByText("hello from bob")).toBeInTheDocument();
+    expect(screen.queryByText("hello from alice")).not.toBeInTheDocument();
+
+    await fireEvent.click(screen.getByTestId("pane-maximize"));
+    expect(paneEls()).toHaveLength(2);
+    expect(screen.getByText("hello from alice")).toBeInTheDocument();
+    expect(screen.getByText("hello from bob")).toBeInTheDocument();
+  });
+
+  it("shows pane activity in headers", async () => {
+    await seedTwoAgentTranscripts();
+    const state = await loadState();
+    const runtime = state.runtimes[BOB.id];
+    if (runtime === undefined) throw new Error("runtime missing");
+    state.runtimes[BOB.id] = {
+      ...runtime,
+      run_status: "starting",
+      pending_sends: [{ send_id: "send-bob", user_turn_id: "user-bob" }],
+    };
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    renderPanes();
+
+    expect(within(paneEls()[1]!).getByTestId("pane-activity")).toBeInTheDocument();
+    expect(within(paneEls()[0]!).queryByTestId("pane-activity")).not.toBeInTheDocument();
   });
 });
 
@@ -395,6 +508,19 @@ describe("targeting", () => {
     expect(selectionFor(PROJECT_ID)).toEqual([ALICE.id]);
   });
 
+  it("modified Cmd-click does not target a pane", async () => {
+    await seedTwoAgentTranscripts();
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    setRecipients(PROJECT_ID, [BOB.id]);
+    renderPanes();
+
+    await fireEvent.click(paneEls()[0]!, { metaKey: true, altKey: true });
+    expect(selectionFor(PROJECT_ID)).toEqual([BOB.id]);
+
+    await fireEvent.click(paneEls()[0]!, { metaKey: true, shiftKey: true });
+    expect(selectionFor(PROJECT_ID)).toEqual([BOB.id]);
+  });
+
   it("coverage border derives from the recipient set and cannot lie", async () => {
     await seedTwoAgentTranscripts();
     const paneId = moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
@@ -446,6 +572,25 @@ describe("Cmd-held target overlay", () => {
     expect(screen.getByTestId("pane-target-overlay")).toBeInTheDocument();
 
     await fireEvent.keyUp(window, { key: "Meta" });
+    expect(screen.queryByTestId("pane-target-overlay")).not.toBeInTheDocument();
+  });
+
+  it("does not arm when Cmd is combined with another modifier", async () => {
+    await seedTwoAgentTranscripts();
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    renderPanes();
+
+    await fireEvent.pointerEnter(paneEls()[0]!);
+    await fireEvent.keyDown(window, { key: "Meta", metaKey: true, altKey: true });
+    expect(screen.queryByTestId("pane-target-overlay")).not.toBeInTheDocument();
+
+    await fireEvent.keyDown(window, { key: "Alt", metaKey: true, altKey: true });
+    expect(screen.queryByTestId("pane-target-overlay")).not.toBeInTheDocument();
+
+    await fireEvent.keyUp(window, { key: "Alt", metaKey: true });
+    expect(screen.getByTestId("pane-target-overlay")).toBeInTheDocument();
+
+    await fireEvent.keyDown(window, { key: "Shift", metaKey: true, shiftKey: true });
     expect(screen.queryByTestId("pane-target-overlay")).not.toBeInTheDocument();
   });
 
@@ -527,5 +672,25 @@ describe("pane header shortcut hints", () => {
     content = await waitFor(() => screen.getByTestId("tooltip-content"));
     expect(content).toHaveTextContent("Send to Pane 10");
     expect(content).not.toHaveTextContent(shortcut("mod", "alt", "10"));
+  });
+
+  it("keeps shortcut hints aligned to full pane order when a pane is minimized", async () => {
+    const carol = numberedAgent(3);
+    const agents = [ALICE, BOB, carol];
+    const rosterIds = agents.map((agent) => agent.id);
+    const pane2 = moveAgentToNewPane(PROJECT_ID, rosterIds, BOB.id);
+    moveAgentToNewPane(PROJECT_ID, rosterIds, carol.id);
+    minimizePane(PROJECT_ID, rosterIds, pane2);
+    render(TranscriptPanes, { props: { projectId: PROJECT_ID, agents } });
+
+    const targets = screen.getAllByTestId("pane-target");
+    expect(targets).toHaveLength(2);
+
+    await fireEvent.pointerEnter(targets[1]!);
+    await vi.advanceTimersByTimeAsync(500);
+    const content = await waitFor(() => screen.getByTestId("tooltip-content"));
+    expect(content).toHaveTextContent("Send to Pane 3");
+    expect(content).toHaveTextContent(shortcut("mod", "alt", "3"));
+    expect(content).not.toHaveTextContent(shortcut("mod", "alt", "2"));
   });
 });

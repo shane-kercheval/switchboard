@@ -2014,15 +2014,40 @@ describe("App", () => {
     };
     panes.minimizePane("p-a", roster, pane2);
     await waitFor(() => expect(screen.getByTestId("app-pane-minimized-tab")).toBeInTheDocument());
-    expect(screen.getByTestId("app-pane-minimized-tab")).toHaveTextContent("Pane 2");
+    expect(screen.getByTestId("app-pane-minimized-tab")).toHaveTextContent(/^Pane 2$/);
     expect(
       within(screen.getByTestId("app-pane-minimized-tab")).getByRole("status", {
         name: "Pane 2 has running agents",
       }),
     ).toBeInTheDocument();
 
+    state.runtimes["ag-2"] = {
+      ...state.runtimes["ag-2"]!,
+      run_status: "idle",
+      pending_sends: [],
+    };
+    await waitFor(() =>
+      expect(
+        within(screen.getByTestId("app-pane-minimized-tab")).getByRole("status", {
+          name: "Pane 2 activity ended",
+        }),
+      ).toBeInTheDocument(),
+    );
+
     await fireEvent.click(screen.getByTestId("app-pane-minimized-tab"));
     expect(panes.layoutFor("p-a", roster).minimized).toEqual([]);
+
+    panes.maximizePane("p-a", roster, panes.layoutFor("p-a", roster).panes[0]!.id);
+    await waitFor(() =>
+      expect(screen.getByTestId("app-pane-minimized-tab")).toHaveTextContent(/^Pane 2$/),
+    );
+    expect(
+      within(screen.getByTestId("app-pane-minimized-tab")).queryByRole("status", {
+        name: "Pane 2 activity ended",
+      }),
+    ).not.toBeInTheDocument();
+    await fireEvent.click(screen.getByTestId("app-pane-minimized-tab"));
+    expect(panes.layoutFor("p-a", roster).maximized).toBe(pane2);
 
     panes.maximizePane("p-a", roster, pane2);
     await waitFor(() =>
@@ -2033,8 +2058,71 @@ describe("App", () => {
       panes.layoutFor("p-a", roster).panes[0]!.id,
     );
 
-    await fireEvent.click(screen.getByTestId("app-pane-restore-all"));
+    expect(screen.queryByTestId("app-pane-restore-all")).not.toBeInTheDocument();
+    await fireEvent.click(screen.getByTestId("pane-maximize"));
     expect(panes.layoutFor("p-a", roster).maximized).toBeNull();
+  });
+
+  it("keeps pane tab completion markers across project switches", async () => {
+    const panes = await import("$lib/state/transcriptPanes.svelte");
+    const state = await import("$lib/state/index.svelte");
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [
+        agent({ id: "ag-1", project_id: "p-a", name: "alice" }),
+        agent({ id: "ag-2", project_id: "p-a", name: "bob" }),
+      ],
+    });
+    seedProject({
+      projectId: "p-b",
+      directory: DIR_B,
+      name: "beta",
+      agents: [agent({ id: "ag-3", project_id: "p-b", name: "beta-agent" })],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+    await fireEvent.click(within(projectRowByName("alpha")).getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("app-pane-add")).toBeInTheDocument());
+
+    const roster = ["ag-1", "ag-2"];
+    const pane2 = panes.moveAgentToNewPane("p-a", roster, "ag-2");
+    state.runtimes["ag-2"] = {
+      ...(state.runtimes["ag-2"] ?? {
+        agent_id: "ag-2",
+        run_status: "idle",
+        hydration_status: "complete",
+        pending_sends: [],
+      }),
+      run_status: "starting",
+      pending_sends: [{ send_id: "send-bob", user_turn_id: "user-bob" }],
+    };
+    panes.minimizePane("p-a", roster, pane2);
+    await waitFor(() =>
+      expect(
+        within(screen.getByTestId("app-pane-minimized-tab")).getByRole("status", {
+          name: "Pane 2 has running agents",
+        }),
+      ).toBeInTheDocument(),
+    );
+
+    await fireEvent.click(within(projectRowByName("beta")).getByText("beta"));
+    await waitFor(() => expect(screen.queryByTestId("app-pane-minimized-tab")).toBeNull());
+    state.runtimes["ag-2"] = {
+      ...state.runtimes["ag-2"]!,
+      run_status: "idle",
+      pending_sends: [],
+    };
+
+    await fireEvent.click(within(projectRowByName("alpha")).getByText("alpha"));
+    await waitFor(() =>
+      expect(
+        within(screen.getByTestId("app-pane-minimized-tab")).getByRole("status", {
+          name: "Pane 2 activity ended",
+        }),
+      ).toBeInTheDocument(),
+    );
   });
 
   it("⌘⌥1..N targets pane N once split, and is inert with a single pane", async () => {

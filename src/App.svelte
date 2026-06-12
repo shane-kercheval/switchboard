@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, tick } from "svelte";
+  import { onMount, tick, untrack } from "svelte";
   import * as api from "$lib/api";
   import Banner from "$lib/components/Banner.svelte";
   import ComposeBar from "$lib/components/ComposeBar.svelte";
@@ -25,7 +25,7 @@
   import SidebarToggleButton from "$lib/components/ui/SidebarToggleButton.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import { ICON_BUTTON_CLASS, ICON_SIZE } from "$lib/components/ui/iconButton";
-  import { ChevronsDownUp, ChevronsUpDown, Plus } from "@lucide/svelte";
+  import { ChevronsDownUp, ChevronsUpDown, CircleCheck, Plus } from "@lucide/svelte";
   import {
     hasOverrides,
     normalizeProjectCompact,
@@ -424,8 +424,64 @@
     return pane.members.some((id) => agentIsWorking(runtimes[id]));
   }
 
+  // Previous-frame bookkeeping only; rendered state lives in paneTabCompleted.
+  // Entries for inactive projects intentionally remain until that project is
+  // active again, so background pane completions survive project switches.
+  let paneTabWasActive: string[] = [];
+  let paneTabCompleted = $state<Record<string, true>>({});
+
+  function paneTabKey(projectId: ProjectId, paneId: string): string {
+    return `${projectId}:${paneId}`;
+  }
+
+  $effect(() => {
+    const projectId = selection.activeProjectId;
+    const layout = activePaneLayout;
+    if (projectId === null || layout === null) return;
+    const projectPrefix = `${projectId}:`;
+    const paneKeys = layout.panes.map((pane) => paneTabKey(projectId, pane.id));
+    const tabEntries = headerTabPanes.map((pane) => ({
+      key: paneTabKey(projectId, pane.id),
+      active: paneIsActive(pane),
+    }));
+    const tabKeys = tabEntries.map((entry) => entry.key);
+
+    untrack(() => {
+      for (const key of paneTabWasActive) {
+        if (key.startsWith(projectPrefix) && (!paneKeys.includes(key) || !tabKeys.includes(key))) {
+          paneTabWasActive = paneTabWasActive.filter((id) => id !== key);
+        }
+      }
+      for (const key of Object.keys(paneTabCompleted)) {
+        if (key.startsWith(projectPrefix) && (!paneKeys.includes(key) || !tabKeys.includes(key))) {
+          delete paneTabCompleted[key];
+        }
+      }
+      for (const entry of tabEntries) {
+        if (entry.active) {
+          if (!paneTabWasActive.includes(entry.key))
+            paneTabWasActive = [...paneTabWasActive, entry.key];
+          delete paneTabCompleted[entry.key];
+        } else if (paneTabWasActive.includes(entry.key)) {
+          paneTabWasActive = paneTabWasActive.filter((id) => id !== entry.key);
+          paneTabCompleted[entry.key] = true;
+        }
+      }
+    });
+  });
+
+  function paneTabIsCompleted(pane: TranscriptPane): boolean {
+    return (
+      selection.activeProjectId !== null &&
+      paneTabCompleted[paneTabKey(selection.activeProjectId, pane.id)] === true
+    );
+  }
+
   function selectHeaderPane(pane: TranscriptPane): void {
     if (selection.activeProjectId === null) return;
+    const key = paneTabKey(selection.activeProjectId, pane.id);
+    delete paneTabCompleted[key];
+    paneTabWasActive = paneTabWasActive.filter((id) => id !== key);
     if (activePaneLayout?.maximized !== null) {
       maximizePane(selection.activeProjectId, activeRosterIds, pane.id);
     } else {
@@ -773,6 +829,7 @@
           <div class="flex min-w-0 shrink items-center gap-1 overflow-hidden" data-tauri-no-drag>
             {#each headerTabPanes as pane (pane.id)}
               {@const active = paneIsActive(pane)}
+              {@const completed = paneTabIsCompleted(pane)}
               <button
                 type="button"
                 class="border-border bg-panel text-fg hover:bg-raised inline-flex h-7 max-w-36 min-w-0 shrink items-center gap-1.5 rounded-full border px-2 text-xs"
@@ -789,12 +846,20 @@
                   >
                     <Spinner class="h-3.5 w-3.5" />
                   </span>
+                {:else if completed}
+                  <span
+                    class="text-accent inline-flex shrink-0 items-center justify-center"
+                    role="status"
+                    aria-label={`${pane.name} activity ended`}
+                    data-testid="app-pane-tab-completed"
+                  >
+                    <CircleCheck size={14} strokeWidth={1.8} aria-hidden="true" />
+                  </span>
                 {/if}
                 <span class="truncate font-medium">{pane.name}</span>
-                <span class="text-muted shrink-0">{pane.members.length}</span>
               </button>
             {/each}
-            {#if activeMaximizedPane !== null}
+            {#if activeMaximizedPane !== null && headerTabPanes.length > 1}
               <button
                 type="button"
                 class="text-muted hover:text-fg hover:bg-border/60 inline-flex h-7 shrink-0 items-center rounded-full px-2 text-xs"

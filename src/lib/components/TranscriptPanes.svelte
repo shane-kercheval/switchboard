@@ -491,7 +491,6 @@
                 triggerLabel={`Actions for ${pane.name}`}
                 triggerTestid="pane-actions"
                 triggerClass={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
-                tooltipLabel={`Actions for ${pane.name}`}
                 contentTestid="pane-actions-menu"
               >
                 {#snippet trigger()}

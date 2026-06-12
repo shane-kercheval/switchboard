@@ -399,12 +399,14 @@ describe("pane chrome (headers, rename, close)", () => {
   it("maximizes one pane and restores it from its header control", async () => {
     await seedTwoAgentTranscripts();
     moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    setRecipients(PROJECT_ID, [ALICE.id]);
     renderPanes();
 
     await fireEvent.click(screen.getAllByTestId("pane-maximize")[1]!);
 
     expect(paneEls()).toHaveLength(1);
     expect(paneEls()[0]).toHaveAttribute("data-maximized", "true");
+    expect(selectionFor(PROJECT_ID)).toEqual([BOB.id]);
     expect(screen.getByText("hello from bob")).toBeInTheDocument();
     expect(screen.queryByText("hello from alice")).not.toBeInTheDocument();
 

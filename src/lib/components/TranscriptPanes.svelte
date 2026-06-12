@@ -475,6 +475,7 @@
                           restoreMaximizedPane(projectId, rosterIds);
                         } else {
                           maximizePane(projectId, rosterIds, pane.id);
+                          targetPane(pane);
                         }
                       }}
                     >

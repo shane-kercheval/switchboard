@@ -484,6 +484,7 @@
     paneTabWasActive = paneTabWasActive.filter((id) => id !== key);
     if (activePaneLayout?.maximized !== null) {
       maximizePane(selection.activeProjectId, activeRosterIds, pane.id);
+      if (pane.members.length > 0) targetRecipients(selection.activeProjectId, [...pane.members]);
     } else {
       restorePane(selection.activeProjectId, activeRosterIds, pane.id);
     }

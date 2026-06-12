@@ -1986,6 +1986,7 @@ describe("App", () => {
   it("restores and switches minimized panes from the app header", async () => {
     const panes = await import("$lib/state/transcriptPanes.svelte");
     const state = await import("$lib/state/index.svelte");
+    const recipients = await import("$lib/state/recipientSelection.svelte");
     seedProject({
       projectId: "p-a",
       directory: DIR_A,
@@ -2048,6 +2049,7 @@ describe("App", () => {
     ).not.toBeInTheDocument();
     await fireEvent.click(screen.getByTestId("app-pane-minimized-tab"));
     expect(panes.layoutFor("p-a", roster).maximized).toBe(pane2);
+    expect(recipients.selectionFor("p-a")).toEqual(["ag-2"]);
 
     panes.maximizePane("p-a", roster, pane2);
     await waitFor(() =>
@@ -2057,6 +2059,7 @@ describe("App", () => {
     expect(panes.layoutFor("p-a", roster).maximized).toBe(
       panes.layoutFor("p-a", roster).panes[0]!.id,
     );
+    expect(recipients.selectionFor("p-a")).toEqual(["ag-1"]);
 
     expect(screen.queryByTestId("app-pane-restore-all")).not.toBeInTheDocument();
     await fireEvent.click(screen.getByTestId("pane-maximize"));

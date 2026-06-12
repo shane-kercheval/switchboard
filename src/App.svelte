@@ -34,9 +34,8 @@
   import {
     createEmptyPane,
     layoutFor,
-    maximizePane,
     restoreMaximizedPane,
-    restorePane,
+    revealPane,
     type TranscriptPane,
   } from "$lib/state/transcriptPanes.svelte";
   import { targetRecipients } from "$lib/state/recipientSelection.svelte";
@@ -160,7 +159,13 @@
         // (targeting it could only clear the recipient set, silently).
         if (pane === undefined || pane.members.length === 0) return;
         event.preventDefault();
-        targetRecipients(selection.activeProjectId, [...pane.members]);
+        // Targeting also reveals: a minimized (or maximized-over) pane would
+        // otherwise receive the send invisibly. Reveal is gated on the target
+        // write so the gesture is atomic under the prompt-render targeting
+        // lock — a refused chord must not change pane visibility either.
+        if (targetRecipients(selection.activeProjectId, [...pane.members])) {
+          revealPane(selection.activeProjectId, rosterIds, pane.id);
+        }
       }
       return;
     }
@@ -482,11 +487,10 @@
     const key = paneTabKey(selection.activeProjectId, pane.id);
     delete paneTabCompleted[key];
     paneTabWasActive = paneTabWasActive.filter((id) => id !== key);
-    if (activePaneLayout?.maximized !== null) {
-      maximizePane(selection.activeProjectId, activeRosterIds, pane.id);
-      if (pane.members.length > 0) targetRecipients(selection.activeProjectId, [...pane.members]);
-    } else {
-      restorePane(selection.activeProjectId, activeRosterIds, pane.id);
+    const wasMaximized = activePaneLayout?.maximized !== null;
+    revealPane(selection.activeProjectId, activeRosterIds, pane.id);
+    if (wasMaximized && pane.members.length > 0) {
+      targetRecipients(selection.activeProjectId, [...pane.members]);
     }
   }
 

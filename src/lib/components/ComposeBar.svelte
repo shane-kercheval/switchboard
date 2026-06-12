@@ -23,7 +23,12 @@
     setTargetingLocked,
     targetRecipients,
   } from "$lib/state/recipientSelection.svelte";
-  import { isAgentHidden, layoutFor, type TranscriptPane } from "$lib/state/transcriptPanes.svelte";
+  import {
+    isAgentHidden,
+    layoutFor,
+    revealPane,
+    type TranscriptPane,
+  } from "$lib/state/transcriptPanes.svelte";
   import * as api from "$lib/api";
   import type {
     AgentId,
@@ -688,8 +693,12 @@
     } else if (item.kind === "pane") {
       // Replace semantics, matching `@agentname` — `@panename` makes the pane
       // the target, exactly like clicking its header (and honors the same
-      // targeting freeze).
-      targetRecipients(projectId, [...item.pane.members]);
+      // targeting freeze). Targeting also reveals a minimized or
+      // maximized-over pane, like Cmd+Alt+N; the reveal is gated on the
+      // target write so a freeze-refused gesture changes nothing visible.
+      if (targetRecipients(projectId, [...item.pane.members])) {
+        revealPane(projectId, rosterIds, item.pane.id);
+      }
       stripAtToken();
     } else {
       setSelectedIds([item.agent.id]);

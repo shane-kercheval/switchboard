@@ -593,7 +593,9 @@
             <span
               class="bg-accent-soft text-fg mt-10 rounded-full px-2.5 py-0.5 text-xs font-medium shadow"
             >
-              Send to {pane.name} — ⌘click
+              Send to {pane.name} — {shortcut("mod", "click")}{item.originalIndex < 9
+                ? ` · ${shortcut("mod", "alt", String(item.originalIndex + 1))}`
+                : ""}
             </span>
           </div>
         {/if}

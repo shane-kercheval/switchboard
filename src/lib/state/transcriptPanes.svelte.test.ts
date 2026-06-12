@@ -21,6 +21,7 @@ const {
   restorePane,
   maximizePane,
   restoreMaximizedPane,
+  revealPane,
   renamePane,
   setFractions,
   setPaneRowWidth,
@@ -341,6 +342,46 @@ describe("pane display state", () => {
     expect(layoutFor(P, ROSTER).maximized).toBe(p2);
     restoreMaximizedPane(P, ROSTER);
     expect(layoutFor(P, ROSTER).maximized).toBeNull();
+  });
+
+  it("reveal restores a minimized pane when nothing is maximized", () => {
+    const p2 = moveAgentToNewPane(P, ROSTER, "b");
+    minimizePane(P, ROSTER, p2);
+    revealPane(P, ROSTER, p2);
+    const layout = layoutFor(P, ROSTER);
+    expect(layout.minimized).toEqual([]);
+    expect(layout.maximized).toBeNull();
+  });
+
+  it("reveal replaces the maximized pane and unminimizes the target", () => {
+    const p2 = moveAgentToNewPane(P, ROSTER, "b");
+    const p1 = layoutFor(P, ROSTER).panes[0]!.id;
+    minimizePane(P, ROSTER, p2);
+    maximizePane(P, ROSTER, p1);
+    revealPane(P, ROSTER, p2);
+    const layout = layoutFor(P, ROSTER);
+    // Focus mode is preserved (the target takes the maximized slot), and the
+    // target leaves the minimized set so it doesn't vanish back to a tab when
+    // maximization is later restored.
+    expect(layout.maximized).toBe(p2);
+    expect(layout.minimized).toEqual([]);
+  });
+
+  it("reveal replaces the maximized pane even when the target is not minimized", () => {
+    const p2 = moveAgentToNewPane(P, ROSTER, "b");
+    const p1 = layoutFor(P, ROSTER).panes[0]!.id;
+    maximizePane(P, ROSTER, p1);
+    revealPane(P, ROSTER, p2);
+    expect(layoutFor(P, ROSTER).maximized).toBe(p2);
+  });
+
+  it("reveal is a no-op for an already-visible pane when nothing is maximized, and for an unknown pane", () => {
+    const p2 = moveAgentToNewPane(P, ROSTER, "b");
+    const before = layoutFor(P, ROSTER);
+    revealPane(P, ROSTER, p2);
+    expect(layoutFor(P, ROSTER)).toEqual(before);
+    revealPane(P, ROSTER, "nonexistent-pane");
+    expect(layoutFor(P, ROSTER)).toEqual(before);
   });
 
   it("restore from maximized never leaves every pane minimized", () => {

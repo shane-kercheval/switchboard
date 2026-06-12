@@ -1077,10 +1077,9 @@
        gets a toggle only when its text actually overflows the clip. -->
   {@const showToggle = clipOverflow[key] ?? false}
   <div class="group min-w-0 flex-1" data-testid="turn" data-role="user">
-    <div class="-mx-3 rounded-md bg-blue-100/20 px-3 py-2">
-      <!-- Clip wraps the content inside the bubble (not the bubble itself) so the
-           negative-margin background bleed survives `overflow:hidden`. The clip +
-           `measureClip` mount ONLY while compact (mirroring agent rows): on
+    <div class="w-full max-w-full overflow-hidden rounded-xl bg-blue-100/20 px-4 py-2">
+      <!-- Clip wraps the content inside the bubble (not the bubble itself). The
+           clip + `measureClip` mount ONLY while compact (mirroring agent rows): on
            expand the measurer unmounts and the retained `clipOverflow[key]=true`
            keeps the re-collapse toggle alive, instead of the observer firing on
            the now-unclipped div and clearing it. -->

@@ -21,15 +21,16 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use switchboard_core::{AgentId, AgentRecord, Attachment, HarnessKind, SendId, SessionLocator};
 use switchboard_dispatcher::{
-    CancelOutcome, ConversationJournal, DispatchContext, DispatchContextFactory, Dispatcher,
-    EventEmitter, JournalError, MetadataCache, NoopJournal, NoopMetadataCache,
-    NoopSessionLocatorSink, NotQueued, OnBusy, RecordingEmitter, SendOutcome, SessionLocatorError,
-    SessionLocatorSink,
+    AwaitableSendOutcome, CancelOutcome, CompletionResult, ConversationJournal, DispatchContext,
+    DispatchContextFactory, Dispatcher, EventEmitter, JournalError, MetadataCache, NoopJournal,
+    NoopMetadataCache, NoopSessionLocatorSink, NotQueued, OnBusy, RecordingEmitter, SendOutcome,
+    SessionLocatorError, SessionLocatorSink,
 };
 use switchboard_harness::{
-    CancelSource, ContextWindowSource, DispatchOptions, HarnessAdapter, MessageId,
+    CancelSource, ContextWindowSource, DispatchOptions, FailureKind, HarnessAdapter, MessageId,
     MockHarnessAdapter, MockScenario, RateLimitSource, TurnId, TurnOutcome, TurnSpend,
 };
+use tokio::sync::oneshot;
 use uuid::Uuid;
 
 /// Default deadline for any `wait_for*` so a logic bug fails as a bounded
@@ -651,6 +652,12 @@ async fn truncated_stream_without_turn_end_returns_to_idle() {
     // drops the sender without TurnEnd — a deliberate contract violation.
     // The dispatcher's actor still reaches AgentIdle (state recovery); the
     // missing terminal is a visible bug the frontend reducer must handle.
+    //
+    // FOLLOW-UP (lands in M2, when compose-bar rendering is touched): unify
+    // truncation handling so the **non-awaited** manual path also synthesizes a
+    // `Failed` terminal instead of silently going idle. When that lands, this
+    // test changes to expect a `turn_end` with a `failed` outcome, collapsing
+    // the gated split the awaited path established in M1.
     let dispatcher = Arc::new(Dispatcher::new());
     let emitter = Arc::new(RecordingEmitter::new());
     let agent = agent_record();
@@ -3306,5 +3313,315 @@ async fn repeated_capture_events_each_persist_and_are_not_deduped() {
         sink.persisted.lock().unwrap().len(),
         2,
         "each turn's capture event persists independently — never deduped"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Opt-in per-send completion signal (`send_message_awaiting_completion`).
+//
+// These cover the contract the workflow runtime + cross-agent forward resolver
+// depend on: the handle fires exactly once at the turn's terminal, carrying the
+// outcome and (for a completed turn) the captured text — and never hangs, even
+// when the turn never starts or the stream truncates.
+// ---------------------------------------------------------------------------
+
+/// Unwrap an awaitable send to its completion receiver (the idle/FailFast path
+/// never returns `Busy`).
+fn accepted_completion(outcome: AwaitableSendOutcome) -> oneshot::Receiver<CompletionResult> {
+    match outcome {
+        AwaitableSendOutcome::Accepted { completion, .. } => completion,
+        AwaitableSendOutcome::Busy => panic!("expected Accepted, got Busy"),
+    }
+}
+
+/// Await a completion receiver under the shared timeout, asserting the sender
+/// was not dropped.
+async fn completion_within(rx: oneshot::Receiver<CompletionResult>) -> CompletionResult {
+    tokio::time::timeout(WAIT, rx)
+        .await
+        .expect("completion signal within timeout")
+        .expect("completion sender was not dropped")
+}
+
+#[tokio::test]
+async fn awaited_send_completion_resolves_completed_with_captured_text() {
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let factory = TestFactory::new(
+        MockScenario::Streaming,
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+    );
+
+    let rx = accepted_completion(
+        dispatcher
+            .send_message_awaiting_completion(agent.id, "hello", vec![], Uuid::now_v7(), factory)
+            .await,
+    );
+
+    let result = completion_within(rx).await;
+    assert_eq!(result.outcome, TurnOutcome::Completed);
+    // MockScenario::Streaming emits three Text chunks echoing the prompt; the
+    // captured text is their concatenation — sourced from the live stream, not
+    // re-read from disk.
+    assert_eq!(
+        result.text,
+        "Mock response to: hello — replied by mock harness."
+    );
+}
+
+#[tokio::test]
+async fn awaited_send_completion_excludes_thinking_text() {
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let factory = TestFactory::new(
+        MockScenario::StreamingWithThinking,
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+    );
+
+    let rx = accepted_completion(
+        dispatcher
+            .send_message_awaiting_completion(agent.id, "hello", vec![], Uuid::now_v7(), factory)
+            .await,
+    );
+
+    let result = completion_within(rx).await;
+    assert_eq!(result.outcome, TurnOutcome::Completed);
+    // Only the two `Text` chunks — the interleaved `Thinking` chunk
+    // ("secret reasoning") must not appear in forwardable output.
+    assert_eq!(result.text, "visible-one visible-two");
+}
+
+#[tokio::test]
+async fn awaited_send_completion_resolves_failed_on_dispatch_error() {
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let factory = TestFactory::new(
+        MockScenario::DispatchFails,
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+    );
+
+    let rx = accepted_completion(
+        dispatcher
+            .send_message_awaiting_completion(agent.id, "hello", vec![], Uuid::now_v7(), factory)
+            .await,
+    );
+
+    let result = completion_within(rx).await;
+    assert!(
+        matches!(
+            result.outcome,
+            TurnOutcome::Failed {
+                kind: FailureKind::AdapterFailure,
+                ..
+            }
+        ),
+        "a dispatch error resolves the handle as Failed, got {:?}",
+        result.outcome
+    );
+    assert!(result.text.is_empty(), "a failed turn carries no text");
+}
+
+#[tokio::test]
+async fn awaited_send_completion_resolves_cancelled_when_cancelled_mid_flight() {
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let factory = TestFactory::new(
+        MockScenario::AwaitCancellation,
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+    );
+
+    let rx = accepted_completion(
+        dispatcher
+            .send_message_awaiting_completion(
+                agent.id,
+                "long task",
+                vec![],
+                Uuid::now_v7(),
+                factory,
+            )
+            .await,
+    );
+
+    within(
+        &emitter,
+        "turn_start (in flight)",
+        emitter.wait_for_type("turn_start", 1),
+    )
+    .await;
+    assert_eq!(
+        dispatcher.cancel(agent.id, CancelSource::User),
+        CancelOutcome::Requested,
+    );
+
+    let result = completion_within(rx).await;
+    assert_eq!(
+        result.outcome,
+        TurnOutcome::Cancelled {
+            source: CancelSource::User,
+        },
+    );
+    assert!(result.text.is_empty(), "a cancelled turn carries no text");
+}
+
+#[tokio::test]
+async fn awaited_send_completion_resolves_failure_when_record_send_fails() {
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let factory = TestFactory::new(
+        MockScenario::Streaming,
+        agent.clone(),
+        Arc::clone(&emitter),
+        Arc::new(FailingJournal),
+    );
+
+    let rx = accepted_completion(
+        dispatcher
+            .send_message_awaiting_completion(agent.id, "hello", vec![], Uuid::now_v7(), factory)
+            .await,
+    );
+
+    let result = completion_within(rx).await;
+    assert!(
+        matches!(result.outcome, TurnOutcome::Failed { .. }),
+        "a send whose journal write fails resolves the handle as a failure, got {:?}",
+        result.outcome
+    );
+}
+
+#[tokio::test]
+async fn awaited_send_completion_resolves_failed_when_stream_truncates() {
+    // Case (f): the stream ends with no terminal and no cancel. For an awaited
+    // send the dispatcher synthesizes a Failed terminal so the handle resolves
+    // rather than hanging — and (unlike the non-awaited path) emits a turn_end.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let factory = TestFactory::new(
+        MockScenario::TruncatedStream,
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+    );
+
+    let rx = accepted_completion(
+        dispatcher
+            .send_message_awaiting_completion(agent.id, "hello", vec![], Uuid::now_v7(), factory)
+            .await,
+    );
+
+    let result = completion_within(rx).await;
+    assert!(
+        matches!(
+            result.outcome,
+            TurnOutcome::Failed {
+                kind: FailureKind::AdapterFailure,
+                ..
+            }
+        ),
+        "a truncated stream resolves an awaited handle as Failed, got {:?}",
+        result.outcome
+    );
+
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+    let events = emitter.snapshot();
+    assert_eq!(
+        count_type(&events, "turn_end"),
+        1,
+        "an awaited truncated turn synthesizes a terminal event (unlike the non-awaited path)"
+    );
+}
+
+#[tokio::test]
+async fn dropping_completion_receiver_does_not_disturb_the_turn() {
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let factory = TestFactory::new(
+        MockScenario::Streaming,
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+    );
+
+    // Take the handle and immediately drop it — the actor must not panic or
+    // stall when it later tries to fire a completion no one is awaiting.
+    let rx = accepted_completion(
+        dispatcher
+            .send_message_awaiting_completion(agent.id, "hello", vec![], Uuid::now_v7(), factory)
+            .await,
+    );
+    drop(rx);
+
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+    let events = emitter.snapshot();
+    // The turn runs to its normal terminal regardless of the dropped receiver.
+    assert_eq!(events.len(), 6);
+    assert_eq!(event_type(&events[4].1), "turn_end");
+    assert_eq!(events[4].1["outcome"]["status"], "completed");
+}
+
+#[tokio::test]
+async fn awaited_send_completion_resolves_failed_when_locator_persist_fails() {
+    // The sixth fire-site: a `SessionLocatorCaptured` whose persist fails
+    // force-fails the turn (locator loss is an authoritative failure). The
+    // awaited handle must resolve `Failed` rather than hang.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let factory = TestFactory::sequence_with_locator_sink(
+        [MockScenario::CapturesLocator(SessionLocator::Uuid(
+            Uuid::now_v7(),
+        ))],
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+        Arc::new(NoopMetadataCache),
+        Arc::new(FailingLocatorSink),
+    );
+
+    let rx = accepted_completion(
+        dispatcher
+            .send_message_awaiting_completion(agent.id, "hello", vec![], Uuid::now_v7(), factory)
+            .await,
+    );
+
+    let result = completion_within(rx).await;
+    assert!(
+        matches!(
+            result.outcome,
+            TurnOutcome::Failed {
+                kind: FailureKind::AdapterFailure,
+                ..
+            }
+        ),
+        "a locator-persist failure force-fails the turn and resolves the awaited handle, got {:?}",
+        result.outcome
+    );
+    assert!(
+        result.text.is_empty(),
+        "a force-failed turn carries no text"
     );
 }

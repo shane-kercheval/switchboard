@@ -22,6 +22,12 @@ pub enum MockScenario {
     /// test double for the dispatcher.
     Streaming,
 
+    /// Emits a `Text` chunk, a `Thinking` chunk, another `Text` chunk, then
+    /// `TurnEnd(Completed)`. The vehicle for the completion-signal test that the
+    /// captured text excludes reasoning: the awaited `CompletionResult.text`
+    /// must concatenate only the two `Text` chunks, never the `Thinking` one.
+    StreamingWithThinking,
+
     /// Intentionally violates the stream contract — panics mid-stream before
     /// `TurnEnd`. The **only** legitimate use is testing the dispatcher's
     /// `AgentIdleGuard` Drop path under producer-task panic. Never use in
@@ -189,6 +195,37 @@ impl HarnessAdapter for MockHarnessAdapter {
                             text: chunk,
                         });
                     }
+                    let _ = tx.send(AdapterEvent::TurnEnd {
+                        turn_id,
+                        outcome: TurnOutcome::Completed,
+                        ended_at: Utc::now(),
+                        usage: None,
+                        context_window_source: None,
+                        stable_message_id: None,
+                        first_message_id: None,
+                        spend: None,
+                        model: None,
+                        effort: None,
+                    });
+                });
+            }
+            MockScenario::StreamingWithThinking => {
+                tokio::spawn(async move {
+                    let _ = tx.send(AdapterEvent::ContentChunk {
+                        turn_id,
+                        kind: ContentKind::Text,
+                        text: "visible-one ".to_owned(),
+                    });
+                    let _ = tx.send(AdapterEvent::ContentChunk {
+                        turn_id,
+                        kind: ContentKind::Thinking,
+                        text: "secret reasoning".to_owned(),
+                    });
+                    let _ = tx.send(AdapterEvent::ContentChunk {
+                        turn_id,
+                        kind: ContentKind::Text,
+                        text: "visible-two".to_owned(),
+                    });
                     let _ = tx.send(AdapterEvent::TurnEnd {
                         turn_id,
                         outcome: TurnOutcome::Completed,

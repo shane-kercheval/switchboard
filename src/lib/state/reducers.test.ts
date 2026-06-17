@@ -402,6 +402,24 @@ describe("transcriptReducer", () => {
       expect(turn.spend?.is_overage).toBe(true);
     });
 
+    it("renders a synthesized truncation terminal as a failed turn", () => {
+      // The dispatcher now synthesizes a `failed` turn_end (AdapterFailure) when
+      // a stream ends with no terminal — for compose-bar sends too, not only
+      // awaited ones. It is indistinguishable from any failed terminal at the
+      // reducer, so the streaming turn transitions to `failed` and shows the
+      // error rather than spinning forever as it did under the old warn-and-idle.
+      let turns = reduce([], turnStart(TURN_1));
+      turns = reduce(turns, contentChunk(TURN_1, "partial output"));
+      turns = reduce(
+        turns,
+        turnEndFailed(TURN_1, "turn stream ended without a terminal event"),
+      );
+      const turn = turns[0];
+      if (turn?.role !== "agent") throw new Error("unreachable");
+      expect(turn.status).toBe("failed");
+      expect(turn.error).toBe("turn stream ended without a terminal event");
+    });
+
     it("stamps per-turn model + effort from turn_end (live carrier)", () => {
       // Proves the footer populates during streaming, not only on reopen.
       let turns = reduce([], turnStart(TURN_1));

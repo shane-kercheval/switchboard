@@ -13,6 +13,7 @@ import type {
   CommitChanges,
   DirectoryInfo,
   FileDiff,
+  ForwardOutcome,
   GitCommitRange,
   HarnessInstallStatus,
   HarnessKind,
@@ -367,6 +368,28 @@ export async function stageAttachment(
 // per-turn cancelled terminals flow back over the agent event channels.
 export async function cancelSend(sendId: SendId, recipients: AgentId[]): Promise<void> {
   await invoke("cancel_send", { sendId, recipients });
+}
+
+// Manual cross-agent forward: hold until each `sources` agent's current turn
+// finishes, then compose their outputs into the user's `body` and return the
+// composed body for the caller to dispatch (the backend resolves but does not
+// send — see `ForwardOutcome`). Long-lived by design — the promise resolves only
+// once the hold settles (resolved / invalidated / cancelled). `sources` are
+// pane-expanded agent ids (panes are frontend-only). `forwardId` correlates a
+// later `cancelForward` with this in-flight hold.
+export async function forwardMessage(
+  body: string,
+  sources: AgentId[],
+  forwardId: string,
+): Promise<ForwardOutcome> {
+  return await invoke<ForwardOutcome>("forward_message", { body, sources, forwardId });
+}
+
+// Cancel a held forward by id, releasing its source wait without dispatching.
+// Idempotent — a no-op once the forward has settled. The held `forwardMessage`
+// call then resolves `{ status: "cancelled" }`.
+export async function cancelForward(forwardId: string): Promise<void> {
+  await invoke("cancel_forward", { forwardId });
 }
 
 export async function cancelTurn(agentId: AgentId): Promise<void> {

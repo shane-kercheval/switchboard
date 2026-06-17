@@ -28,12 +28,6 @@ pub enum AppError {
     #[error("queued message {0} not found (already started or removed)")]
     QueuedMessageNotFound(MessageId),
 
-    /// A manual forward was requested with no recipients — malformed (a frontend
-    /// bug or a direct IPC call). Rejected so a forward can't report "sent" with
-    /// no turns behind it.
-    #[error("a forward must have at least one recipient")]
-    NoForwardRecipients,
-
     /// A manual forward was requested with no sources — there is nothing to
     /// forward. Rejected at the command boundary.
     #[error("a forward must reference at least one source agent")]

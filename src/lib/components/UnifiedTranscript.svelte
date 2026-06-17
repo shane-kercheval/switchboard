@@ -20,6 +20,13 @@
     type RenderBlock,
     type UnifiedRow,
   } from "$lib/state/unified";
+  import {
+    FORWARD_SENTINEL,
+    forwardCaptionFor,
+    heldForwardsFor,
+    type HeldForward,
+  } from "$lib/state/heldForwards.svelte";
+  import { cancelForward } from "$lib/api";
   import { agentCopy } from "$lib/agentCopy.svelte";
   import { HARNESS_COLOR } from "$lib/harnessDisplay";
   import Badge from "$lib/components/ui/Badge.svelte";
@@ -1076,8 +1083,23 @@
   <!-- A user message has nothing hidden behind a collapse — only height — so it
        gets a toggle only when its text actually overflows the clip. -->
   {@const showToggle = clipOverflow[key] ?? false}
-  <div class="group min-w-0 flex-1" data-testid="turn" data-role="user">
-    <div class="w-full max-w-full overflow-hidden rounded-xl bg-blue-100/20 px-4 py-2">
+  <!-- Forward treatment: a cross-agent forward is style-only marked (an accent
+       edge) so it's clear the body — rendered VERBATIM, sentinel lines and all —
+       was forwarded, not typed. The marker is derived from the body's canonical
+       sentinel, so it's durable across reload (the journal persists the body).
+       The partial-empty caption names which sources were included vs. skipped; it
+       renders in the meta row (outside the collapse clip) so it stays visible
+       even while the message is collapsed — and is live-only (a skipped source
+       leaves no trace in the body to rebuild it from). -->
+  {@const forwarded = FORWARD_SENTINEL.test(row.text)}
+  {@const caption = row.send_id !== undefined ? forwardCaptionFor(projectId, row.send_id) : undefined}
+  <div class="group min-w-0 flex-1" data-testid="turn" data-role="user" data-forwarded={forwarded}>
+    <div
+      class={cn(
+        "w-full max-w-full overflow-hidden rounded-xl bg-blue-100/20 px-4 py-2",
+        forwarded && "border-accent/60 border-l-2",
+      )}
+    >
       <!-- Clip wraps the content inside the bubble (not the bubble itself). The
            clip + `measureClip` mount ONLY while compact (mirroring agent rows): on
            expand the measurer unmounts and the retained `clipOverflow[key]=true`
@@ -1098,6 +1120,11 @@
       previewKey: showToggle ? key : undefined,
       previewDefaultCompact: defaultCompact,
     })}
+    {#if caption !== undefined}
+      <div class="text-muted mt-0.5 text-xs" data-testid="forward-caption">
+        ↪ forwarded from {caption.included.join(", ")} · {caption.skipped.join(", ")} had no output
+      </div>
+    {/if}
   </div>
 {/snippet}
 
@@ -1135,6 +1162,33 @@
     </div>
     <div class="border-l-[0.5px] pl-3" style:border-left-color={agentBorderColor(agentId)}>
       {@render queuedFooter(agentId, sendId, "turn-queued", "turn-live-control")}
+    </div>
+  </div>
+{/snippet}
+
+<!-- A held cross-agent forward: the user's typed body (verbatim, if any) plus a
+     "waiting for {sources}…" footer — distinct copy from a busy recipient's
+     "Queued…" — and a cancel control. Cancelling fires `cancel_forward`; the
+     compose bar's awaiting `forward_message` then resolves cancelled, removes
+     this entry, and restores the composer (text + source chips). -->
+{#snippet heldForwardRow(held: HeldForward)}
+  {@const sourceNames = held.sources.map((s) => s.name).join(", ")}
+  {@const recipientNames = held.recipients.map((id) => agentName(id)).join(", ")}
+  <div class="group min-w-0 flex-1" data-testid="held-forward" data-forward-id={held.forwardId}>
+    {#if held.body.trim() !== ""}
+      <div
+        class="border-accent/60 w-full max-w-full overflow-hidden rounded-xl border-l-2 bg-blue-100/20 px-4 py-2"
+      >
+        <Markdown text={held.body} />
+      </div>
+    {/if}
+    <div class="text-muted mt-2 flex items-center gap-2 text-xs" data-testid="held-forward-waiting">
+      <span class="animate-pulse">↪ Forward to {recipientNames} — waiting for {sourceNames}…</span>
+      {@render liveTurnControl(
+        () => void cancelForward(held.forwardId),
+        `Cancel forward (waiting for ${sourceNames})`,
+        "held-forward-cancel",
+      )}
     </div>
   </div>
 {/snippet}
@@ -1407,6 +1461,15 @@
           </div>
         {/if}
       </div>
+    {/each}
+    <!-- Held cross-agent forwards: submitted but still waiting on their source
+         agents' turns to finish before the backend dispatches them. Render at the
+         bottom (newest pending action), distinct from a "Queued…" send — a held
+         forward issued no `send_message` yet, so it has no `pending_sends` entry;
+         it lives in the project-keyed `heldForwards` store (survives navigation,
+         lost on restart). -->
+    {#each heldForwardsFor(projectId) as held (held.forwardId)}
+      {@render heldForwardRow(held)}
     {/each}
   </div>
 </div>

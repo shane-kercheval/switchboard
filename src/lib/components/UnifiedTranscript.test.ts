@@ -3201,3 +3201,95 @@ describe("model footer visibility", () => {
     expect(models.join(" ")).not.toContain("synthetic");
   });
 });
+
+describe("UnifiedTranscript — cross-agent forward", () => {
+  async function loadHeld() {
+    return await import("$lib/state/heldForwards.svelte");
+  }
+
+  afterEach(async () => {
+    (await loadHeld())._testing.reset();
+  });
+
+  it("renders a held forward as a 'waiting for…' row, cancellable via cancel_forward", async () => {
+    const state = await loadState();
+    const held = await loadHeld();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    held.addHeldForward(PROJECT_ID, {
+      forwardId: "fwd-1",
+      sendId: "s-1",
+      body: "please aggregate",
+      sources: [{ id: CODEX_AGENT.id, name: "bob" }],
+      recipients: [CLAUDE_AGENT.id],
+    });
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] },
+    });
+
+    const heldEl = await screen.findByTestId("held-forward");
+    // Distinct copy from a busy recipient's "Queued…", and the body is verbatim.
+    expect(heldEl).toHaveTextContent("waiting for bob");
+    expect(heldEl).toHaveTextContent("please aggregate");
+    expect(screen.queryByTestId("turn-queued")).toBeNull();
+
+    await fireEvent.click(screen.getByTestId("held-forward-cancel"));
+    expect(invokeMock).toHaveBeenCalledWith(
+      "cancel_forward",
+      expect.objectContaining({ forwardId: "fwd-1" }),
+    );
+    // Cancelling a held forward does NOT cancel the source agents' turns.
+    expect(invokeMock.mock.calls.some(([c]) => c === "cancel_turn" || c === "cancel_send")).toBe(
+      false,
+    );
+  });
+
+  it("renders a forward verbatim, marked via its body sentinel, with a partial-empty caption", async () => {
+    const state = await loadState();
+    const held = await loadHeld();
+    await state.registerAgent(CLAUDE_AGENT);
+    // A forward dispatches as a normal send; the marker is derived from the
+    // body's sentinel (durable across reload), not a live store.
+    const body = "=== START forwarded from bob ===\nthe review\n=== END forwarded from bob ===";
+    state.dispatchUserTurn(CLAUDE_AGENT.id, "u-1", body, [], "s-2", "2026-05-16T00:00:00Z");
+    held.setForwardCaption(PROJECT_ID, "s-2", { included: ["bob"], skipped: ["carol"] });
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const turn = await waitFor(() => {
+      const userTurn = screen
+        .getAllByTestId("turn")
+        .find((t) => t.getAttribute("data-role") === "user");
+      if (!userTurn) throw new Error("no user turn yet");
+      return userTurn;
+    });
+    // Verbatim: the sentinel text is present, unchanged; marked as a forward.
+    expect(turn).toHaveTextContent("START forwarded from bob");
+    expect(turn).toHaveAttribute("data-forwarded", "true");
+
+    // The partial-empty caption is separate from the wire body (it names the
+    // included + skipped sources) and lives in the meta row.
+    const caption = screen.getByTestId("forward-caption");
+    expect(caption).toHaveTextContent("forwarded from bob");
+    expect(caption).toHaveTextContent("carol had no output");
+  });
+
+  it("does not mark an ordinary (non-forward) user message", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.dispatchUserTurn(CLAUDE_AGENT.id, "u-1", "just a normal message", [], "s-3");
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const turn = await waitFor(() => {
+      const userTurn = screen
+        .getAllByTestId("turn")
+        .find((t) => t.getAttribute("data-role") === "user");
+      if (!userTurn) throw new Error("no user turn yet");
+      return userTurn;
+    });
+    expect(turn).toHaveAttribute("data-forwarded", "false");
+    expect(screen.queryByTestId("forward-caption")).toBeNull();
+  });
+});

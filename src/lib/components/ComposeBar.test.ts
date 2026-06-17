@@ -2014,3 +2014,207 @@ describe("ComposeBar pane targeting", () => {
     expect(screen.getByTestId(`recipient-option-pane:${pane1}`)).toBeInTheDocument();
   });
 });
+
+describe("ComposeBar — cross-agent forward", () => {
+  const AGENT_C: AgentRecord = {
+    id: "00000000-0000-7000-8000-000000000ccc",
+    project_id: PROJECT_ID,
+    name: "carol",
+    harness: "claude_code",
+    session_locator: { uuid: "00000000-0000-7000-8000-000000000003" },
+    created_at: "2026-05-16T00:00:02Z",
+  };
+
+  // Give an agent a completed turn so it's a non-empty forward source (else its
+  // chip is flagged "no output").
+  async function seedCompletedTurn(agentId: string): Promise<void> {
+    const state = await loadState();
+    state.transcripts[agentId] = [
+      {
+        role: "agent",
+        turn_id: `t-${agentId}`,
+        agent_id: agentId,
+        started_at: "2026-05-16T00:00:00Z",
+        status: "complete",
+        items: [{ item_kind: "text", kind: "text", text: "done" }],
+      },
+    ];
+  }
+
+  async function resetHeldForwards(): Promise<void> {
+    (await import("$lib/state/heldForwards.svelte"))._testing.reset();
+  }
+
+  // Open the `@` menu and pick the "forward from {agent}" entry for `agentId`.
+  async function pickForwardSource(agentId: string): Promise<void> {
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "@" } });
+    await fireEvent.click(await screen.findByTestId(`forward-option-forward-agent:${agentId}`));
+  }
+
+  afterEach(async () => {
+    await resetHeldForwards();
+  });
+
+  it("picks a forward source from the @ menu and dispatches a forward", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    await seedCompletedTurn(AGENT_B.id);
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "forward_message") {
+        return { status: "resolved", body: "composed body", skipped: [] };
+      }
+      if (cmd === "send_message") return "msg-1";
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    // AGENT_A is the default recipient; forward FROM bob TO alice.
+    await pickForwardSource(AGENT_B.id);
+    expect(screen.getByTestId("forward-source-chip-bob")).toBeInTheDocument();
+
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "please aggregate" } });
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    // The backend resolves + composes (no recipients/send_id — it doesn't dispatch).
+    await waitFor(() => {
+      const calls = invokeMock.mock.calls.filter(([c]) => c === "forward_message");
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.[1]).toMatchObject({ sources: [AGENT_B.id], body: "please aggregate" });
+      expect(typeof (calls[0]?.[1] as { forwardId?: unknown }).forwardId).toBe("string");
+    });
+    // The frontend then dispatches the composed body to the recipient via the
+    // normal send path (so it groups/cancels like any send).
+    await waitFor(() => {
+      const sends = invokeMock.mock.calls.filter(([c]) => c === "send_message");
+      expect(sends).toHaveLength(1);
+      expect(sends[0]?.[1]).toMatchObject({ agentId: AGENT_A.id, prompt: "composed body" });
+    });
+    // Composer clears on submit.
+    await waitFor(() => {
+      expect(screen.queryByTestId("forward-source-chip-bob")).toBeNull();
+      expect((screen.getByTestId("compose-textarea") as HTMLTextAreaElement).value).toBe("");
+    });
+  });
+
+  it("flags an idle-empty source on its chip", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    // AGENT_B has no completed turn → nothing to forward yet.
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    await pickForwardSource(AGENT_B.id);
+
+    const chipEl = screen.getByTestId("forward-source-chip-bob");
+    expect(chipEl).toHaveAttribute("data-empty", "true");
+    expect(chipEl).toHaveTextContent("no output");
+  });
+
+  it("composes multiple forward sources in declared order", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    await state.registerAgent(AGENT_C);
+    await seedCompletedTurn(AGENT_B.id);
+    await seedCompletedTurn(AGENT_C.id);
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "forward_message") return { status: "resolved", body: "x", skipped: [] };
+      if (cmd === "send_message") return "msg-1";
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B, AGENT_C] } });
+    await pickForwardSource(AGENT_B.id);
+    await pickForwardSource(AGENT_C.id);
+    expect(screen.getByTestId("forward-source-chip-bob")).toBeInTheDocument();
+    expect(screen.getByTestId("forward-source-chip-carol")).toBeInTheDocument();
+
+    await fireEvent.click(screen.getByTestId("compose-send"));
+    await waitFor(() => {
+      const calls = invokeMock.mock.calls.filter(([c]) => c === "forward_message");
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.[1]).toMatchObject({ sources: [AGENT_B.id, AGENT_C.id] });
+    });
+  });
+
+  it("restores the composer when a forward is invalidated", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    await seedCompletedTurn(AGENT_B.id);
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "forward_message") {
+        return { status: "invalidated", reason: "bob's turn failed before it could be forwarded" };
+      }
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    await pickForwardSource(AGENT_B.id);
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "aggregate this" } });
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    // The source chip + typed text return to the composer (nothing was sent).
+    await waitFor(() => {
+      expect(screen.getByTestId("forward-source-chip-bob")).toBeInTheDocument();
+      expect((screen.getByTestId("compose-textarea") as HTMLTextAreaElement).value).toBe(
+        "aggregate this",
+      );
+    });
+  });
+
+  it("restores the composer when a held forward is cancelled", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    await seedCompletedTurn(AGENT_B.id);
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "forward_message") return { status: "cancelled" };
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    await pickForwardSource(AGENT_B.id);
+    const textarea = screen.getByTestId("compose-textarea") as HTMLTextAreaElement;
+    await fireEvent.input(textarea, { target: { value: "aggregate this" } });
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("forward-source-chip-bob")).toBeInTheDocument();
+      expect((screen.getByTestId("compose-textarea") as HTMLTextAreaElement).value).toBe(
+        "aggregate this",
+      );
+    });
+  });
+
+  it("seeds a held forward (no send_message issued during the hold)", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    await seedCompletedTurn(AGENT_B.id);
+    // forward_message never resolves during the test → the forward stays held.
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "forward_message") return new Promise(() => {});
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    await pickForwardSource(AGENT_B.id);
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    const held = await import("$lib/state/heldForwards.svelte");
+    await waitFor(() => {
+      const forwards = held.heldForwardsFor(PROJECT_ID);
+      expect(forwards).toHaveLength(1);
+      expect(forwards[0]?.sources.map((s) => s.id)).toEqual([AGENT_B.id]);
+      expect(forwards[0]?.recipients).toEqual([AGENT_A.id]);
+    });
+    // While holding, no `send_message` is issued — the frontend dispatches only
+    // once `forward_message` resolves. Distinct from a queued send.
+    expect(invokeMock.mock.calls.filter(([c]) => c === "send_message")).toHaveLength(0);
+  });
+});

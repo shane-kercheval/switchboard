@@ -7,6 +7,12 @@
     runtimes,
     transcripts,
   } from "$lib/state/index.svelte";
+  import {
+    addHeldForward,
+    removeHeldForward,
+    setForwardCaption,
+    type ForwardSource,
+  } from "$lib/state/heldForwards.svelte";
   import { buildLiveSendsMap } from "$lib/state/liveSends";
   import {
     flush,
@@ -116,6 +122,30 @@
 
   function removeAttachmentChip(id: string): void {
     attachmentChips = attachmentChips.filter((chip) => chip.id !== id);
+  }
+
+  // Forward sources: agents whose latest output is forwarded into this send (the
+  // §7 manual cross-agent forward). Picked from the `@`-menu's "Forward from"
+  // entries; a pane entry expands to its members at pick time. Session-only,
+  // cleared on send / restore — like attachment chips. A send with ≥1 forward
+  // source dispatches via `forward_message` instead of the normal send path.
+  let forwardSources = $state<ForwardSource[]>([]);
+
+  function addForwardSource(source: ForwardSource): void {
+    if (forwardSources.some((s) => s.id === source.id)) return;
+    forwardSources = [...forwardSources, source];
+  }
+
+  function removeForwardSource(id: AgentId): void {
+    forwardSources = forwardSources.filter((s) => s.id !== id);
+  }
+
+  /// True when this agent already has a completed turn the forward can carry — a
+  /// forward source with no output yet is flagged on its chip up front.
+  function agentHasCompletedOutput(agentId: AgentId): boolean {
+    return (transcripts[agentId] ?? []).some(
+      (turn) => turn.role === "agent" && turn.status === "complete",
+    );
   }
 
   /// The current chips as the `Attachment` wire shape (drops the local `id`),
@@ -484,7 +514,10 @@
     | { kind: "pane"; key: string; pane: TranscriptPane; index: number }
     | { kind: "agent"; key: string; agent: AgentRecord };
   type AttachmentMenuItem = { kind: "attachment"; key: string; chipId: string; label: string };
-  type MenuItem = FileMenuItem | AttachmentMenuItem | RecipientMenuItem;
+  type ForwardMenuItem =
+    | { kind: "forward-agent"; key: string; agent: AgentRecord }
+    | { kind: "forward-pane"; key: string; pane: TranscriptPane };
+  type MenuItem = FileMenuItem | AttachmentMenuItem | RecipientMenuItem | ForwardMenuItem;
   // Current chips as menu rows, filtered by the `@`-query on their label (e.g.
   // `@image` narrows to `image-*`), consistent with how the file and recipient
   // sections filter.
@@ -545,9 +578,31 @@
       })),
     ];
   });
+  /// "Forward from {agent | pane}" entries — the manual cross-agent forward
+  /// source picker (§7). Mirrors the recipient section's agent + pane filtering,
+  /// but picking one adds a forward *source* chip rather than selecting a
+  /// recipient. Suppressed in single-agent projects (nothing to forward between)
+  /// and for sources already added.
+  const forwardItems = $derived.by<ForwardMenuItem[]>(() => {
+    if (!menuOpen || agents.length <= 1) return [];
+    const q = menuQuery.toLowerCase();
+    const items: ForwardMenuItem[] = [];
+    if (paneLayout.panes.length > 1) {
+      for (const pane of paneLayout.panes) {
+        if (pane.members.length === 0) continue;
+        if (!pane.name.toLowerCase().includes(q)) continue;
+        items.push({ kind: "forward-pane", key: `forward-pane:${pane.id}`, pane });
+      }
+    }
+    for (const agent of agentCandidates) {
+      if (forwardSources.some((s) => s.id === agent.id)) continue;
+      items.push({ kind: "forward-agent", key: `forward-agent:${agent.id}`, agent });
+    }
+    return items;
+  });
   const menuItems = $derived.by<MenuItem[]>(() => {
     if (!menuOpen) return [];
-    return [...fileItems, ...attachmentItems, ...recipientItems];
+    return [...fileItems, ...attachmentItems, ...recipientItems, ...forwardItems];
   });
   const fileStatusText = $derived.by<string | null>(() => {
     if (fileItems.length > 0) return null;
@@ -583,7 +638,8 @@
   const sendDisabled = $derived(
     mode === "prompt"
       ? selectedPrompt === null || missingRequired.length > 0 || sending || !allRecipientsHydrated
-      : (draft.trim() === "" && attachmentChips.length === 0) || !allRecipientsHydrated,
+      : (draft.trim() === "" && attachmentChips.length === 0 && forwardSources.length === 0) ||
+        !allRecipientsHydrated,
   );
 
   // Every live send across this project's agents, mapped to the agents it's
@@ -596,7 +652,11 @@
   // primary action is "stop the live send" rather than "send". Prompt mode never
   // morphs — its primary action is always send.
   const showStop = $derived(
-    mode === "plain" && liveSends.size > 0 && draft.trim() === "" && attachmentChips.length === 0,
+    mode === "plain" &&
+      liveSends.size > 0 &&
+      draft.trim() === "" &&
+      attachmentChips.length === 0 &&
+      forwardSources.length === 0,
   );
   const primaryDisabled = $derived(showStop ? false : sendDisabled);
 
@@ -698,6 +758,18 @@
       // target write so a freeze-refused gesture changes nothing visible.
       if (targetRecipients(projectId, [...item.pane.members])) {
         revealPane(projectId, rosterIds, item.pane.id);
+      }
+      stripAtToken();
+    } else if (item.kind === "forward-agent") {
+      addForwardSource({ id: item.agent.id, name: item.agent.name });
+      stripAtToken();
+    } else if (item.kind === "forward-pane") {
+      // Expand the pane to its members at pick time (membership captured now,
+      // moments before send), adding each as its own forward source — the
+      // canonical composition labels each agent separately, never the pane.
+      for (const id of item.pane.members) {
+        const agent = agents.find((a) => a.id === id);
+        if (agent) addForwardSource({ id: agent.id, name: agent.name });
       }
       stripAtToken();
     } else {
@@ -913,16 +985,86 @@
     void handleSubmit();
   }
 
-  /// Dispatch `text` to `targets` under one send_id. Shared by the plain and
-  /// prompt paths — the prompt path renders first, then calls this with the
+  /// Manual cross-agent forward (§7). Seeds the held "waiting for {agent}…" entry
+  /// (live-UI-only), then awaits the long-lived `forward_message`, which holds
+  /// for the sources and returns the **composed body** (it does not dispatch).
+  /// On `resolved` the frontend dispatches that body through the normal send path
+  /// (`dispatchToRecipients`) — so the forward groups, queues, cancels, and
+  /// renders exactly like any send, with the live `message_id → send_id`
+  /// correlation intact (no race, no special-casing). On invalidate/cancel it
+  /// restores the composer.
+  function dispatchForward(body: string, sources: ForwardSource[], targets: AgentRecord[]): void {
+    const forwardId = crypto.randomUUID();
+    const sendId = crypto.randomUUID();
+    const recipients = targets.map((t) => t.id);
+    addHeldForward(projectId, { forwardId, sendId, body, sources, recipients });
+    void (async () => {
+      try {
+        const outcome = await api.forwardMessage(
+          body,
+          sources.map((s) => s.id),
+          forwardId,
+        );
+        removeHeldForward(projectId, forwardId);
+        if (outcome.status === "resolved") {
+          // Dispatch the composed body as a normal send under this forward's
+          // send_id — the user message + responses render and group via the
+          // existing machinery. The forward marker is derived from the body's
+          // sentinel lines at render time (durable across reload); only the
+          // partial-empty caption needs the live store (it can't be reconstructed
+          // — skipped sources leave no trace in the wire body).
+          dispatchToRecipients(outcome.body, [], targets, sendId);
+          if (outcome.skipped.length > 0) {
+            const included = sources
+              .map((s) => s.name)
+              .filter((name) => !outcome.skipped.includes(name));
+            setForwardCaption(projectId, sendId, { included, skipped: outcome.skipped });
+          }
+        } else {
+          // invalidated (a source failed/cancelled, or all sources empty) or the
+          // user cancelled the hold — nothing resolved; restore the composer.
+          restoreForward(body, sources);
+          if (outcome.status === "invalidated") sendError = `Forward not sent: ${outcome.reason}`;
+        }
+      } catch (err) {
+        removeHeldForward(projectId, forwardId);
+        sendError = `Forward failed: ${err instanceof Error ? err.message : String(err)}`;
+        restoreForward(body, sources);
+      }
+    })();
+  }
+
+  /// Restore a cancelled/invalidated forward's source chips, and its typed text
+  /// when the composer is empty (don't clobber a new draft the user started
+  /// while the forward was holding).
+  ///
+  /// **Known limitation (deferred):** this runs in the closure of the ComposeBar
+  /// instance that submitted the forward. If the user navigates away and back
+  /// while the forward is holding, that instance is unmounted on resolve, so the
+  /// held entry is still cleaned up but the typed text is **not** restored to the
+  /// (remounted) composer — narrow timing edge, small loss of the user's own
+  /// un-sent text. A durable fix would route restore through project-keyed state
+  /// the remounted composer observes.
+  function restoreForward(body: string, sources: ForwardSource[]): void {
+    for (const source of sources) addForwardSource(source);
+    if (draft.trim() === "" && body !== "") {
+      draft = body;
+    }
+    persistContentNow();
+  }
+
+  /// Dispatch `text` to `targets` under one send_id. Shared by the plain, prompt,
+  /// and forward paths — the prompt path renders first, then calls this with the
   /// finished text and the recipients captured at click time (so toggling chips
-  /// mid-render can't redirect the send).
+  /// mid-render can't redirect the send); the forward path passes the
+  /// backend-composed body and its own `sendId` (so it can key the forward
+  /// caption to the dispatched send).
   function dispatchToRecipients(
     text: string,
     attachments: Attachment[],
     targets: AgentRecord[],
+    sendId: string = crypto.randomUUID(),
   ): void {
-    const sendId = crypto.randomUUID();
     // Bump this project's local last-activity so it sorts/reads as active right
     // away, before any turn event round-trips. Once per send action.
     recordProjectsActivityLocally([projectId], currentIsoTimestamp());
@@ -1004,6 +1146,20 @@
       attachmentChips = [];
       composeGeneration += 1;
       mode = "plain";
+      persistContentNow();
+      return;
+    }
+
+    // A send with ≥1 forward source goes through the cross-agent forward path
+    // (held until the sources settle, dispatched by the backend) rather than the
+    // normal send. Attachments don't ride a forward (its body is text + the
+    // forwarded blocks), so they're left for a subsequent plain send.
+    if (forwardSources.length > 0) {
+      closeMentionMenu();
+      dispatchForward(draft.trim(), [...forwardSources], [...selectedAgents]);
+      draft = "";
+      forwardSources = [];
+      composeGeneration += 1;
       persistContentNow();
       return;
     }
@@ -1252,6 +1408,117 @@
               {/if}
             {/if}
           </button>
+        {/each}
+
+        {#if forwardItems.length > 0}
+          <div
+            class={cn(
+              "text-muted px-2.5 py-0.5 text-[11px] font-medium tracking-wide uppercase select-none",
+              "mt-1",
+            )}
+          >
+            Forward from
+          </div>
+        {/if}
+        {#each forwardItems as item (item.key)}
+          {@const i = menuItems.findIndex((candidate) => candidate.key === item.key)}
+          <button
+            type="button"
+            class={"hover:bg-panel/80 flex w-full cursor-pointer items-center gap-2 rounded-md px-2.5 py-1 text-left leading-5 outline-none select-none " +
+              (i === highlighted ? "bg-panel/80" : "")}
+            data-testid={`forward-option-${item.key}`}
+            role="option"
+            aria-selected={i === highlighted}
+            onclick={() => pickItem(item)}
+          >
+            <!-- ↪ forward glyph, shared by both forward entry kinds. -->
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              class="text-accent h-4 w-4"
+              aria-hidden="true"
+            >
+              <polyline points="15 17 20 12 15 7" />
+              <path d="M4 18v-2a4 4 0 0 1 4-4h12" />
+            </svg>
+            {#if item.kind === "forward-pane"}
+              <span class="text-fg shrink-0">{item.pane.name}</span>
+              <span class="text-muted min-w-0 truncate text-[11px]">
+                {agents
+                  .filter((a) => item.pane.members.includes(a.id))
+                  .map((a) => a.name)
+                  .join(", ")}
+              </span>
+            {:else}
+              <HarnessIcon harness={item.agent.harness} size="sm" class="h-4 w-4" />
+              <span class="text-fg">{item.agent.name}</span>
+              {#if !agentHasCompletedOutput(item.agent.id)}
+                <span class="text-muted ml-auto text-[11px] italic">no output yet</span>
+              {/if}
+            {/if}
+          </button>
+        {/each}
+      </div>
+    {/if}
+    {#if forwardSources.length > 0}
+      <div class="mb-1.5 flex flex-wrap items-center gap-1.5" data-testid="forward-source-chips">
+        <span class="text-muted text-xs">Forwarding from</span>
+        {#each forwardSources as source (source.id)}
+          {@const empty = !agentHasCompletedOutput(source.id)}
+          <span
+            class={cn(
+              "inline-flex max-w-[14rem] items-center gap-1.5 rounded-full border py-px pr-1 pl-2 text-xs",
+              empty
+                ? "border-status-failed/40 bg-status-failed-soft/40 text-status-failed"
+                : "border-border bg-panel text-fg",
+            )}
+            data-testid={`forward-source-chip-${source.name}`}
+            data-empty={empty}
+          >
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              class="h-3 w-3 shrink-0"
+              aria-hidden="true"
+            >
+              <polyline points="15 17 20 12 15 7" />
+              <path d="M4 18v-2a4 4 0 0 1 4-4h12" />
+            </svg>
+            <span class="truncate" title={source.name}>{source.name}</span>
+            {#if empty}
+              <span class="shrink-0 italic" title="This agent has no completed output to forward"
+                >no output</span
+              >
+            {/if}
+            <button
+              type="button"
+              class="text-muted hover:text-fg hover:bg-raised flex h-4 w-4 shrink-0 items-center justify-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+              data-testid={`forward-source-remove-${source.name}`}
+              aria-label={`Remove forward source ${source.name}`}
+              disabled={sending}
+              onclick={() => removeForwardSource(source.id)}
+            >
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                class="h-3 w-3"
+                aria-hidden="true"
+              >
+                <path d="m6 6 12 12M18 6 6 18" />
+              </svg>
+            </button>
+          </span>
         {/each}
       </div>
     {/if}

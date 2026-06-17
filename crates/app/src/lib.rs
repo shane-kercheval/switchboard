@@ -37,7 +37,8 @@ use crate::commands::{
     check_codex_auth_impl, check_codex_binary_impl, check_gemini_auth_impl,
     check_gemini_binary_impl, commit_changed_files_impl, commit_file_diff_impl, commit_ranges_impl,
     create_agent_impl, create_project_impl, delete_project_impl, editor_open_argv, fetch_repo_impl,
-    file_diff_impl, get_harness_install_status_impl, get_preferences_impl, init_directory_impl,
+    ForwardOutcome, cancel_forward_impl, file_diff_impl, forward_message_impl,
+    get_harness_install_status_impl, get_preferences_impl, init_directory_impl,
     list_agents_impl, list_mcp_providers_impl, list_projects_impl, list_prompts_impl,
     list_tracked_repos_from_inputs, list_workspace_directories_impl,
     load_project_conversation_impl, load_transcript_impl, open_commit_file_difftool_impl,
@@ -623,6 +624,56 @@ async fn cancel_send(
 }
 
 #[tauri::command]
+async fn forward_message(
+    state: State<'_, AppState>,
+    recipients: Vec<String>,
+    body: String,
+    sources: Vec<String>,
+    send_id: String,
+    forward_id: String,
+) -> Result<ForwardOutcome, String> {
+    let recipient_ids = recipients
+        .iter()
+        .map(|r| parse_uuid(r))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    let source_ids = sources
+        .iter()
+        .map(|s| parse_uuid(s))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    let sid = parse_uuid(&send_id).map_err(|e| e.to_string())?;
+    let fid = parse_uuid(&forward_id).map_err(|e| e.to_string())?;
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    // Long-lived by design: the call stays open while the held send waits for
+    // its sources to finish, then resolves with the dispatch/invalidate/cancel
+    // outcome. `cancel_forward` (below) interrupts the wait out of band.
+    forward_message_impl(
+        state.inner(),
+        recipient_ids,
+        body,
+        source_ids,
+        sid,
+        fid,
+        &home,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn cancel_forward(state: State<'_, AppState>, forward_id: String) -> Result<(), String> {
+    let fid = parse_uuid(&forward_id).map_err(|e| e.to_string())?;
+    // Idempotent: fires the held forward's cancel token if it's still in flight,
+    // a no-op once it has settled. The open `forward_message` call observes the
+    // token and returns `Cancelled`.
+    cancel_forward_impl(state.inner(), fid);
+    Ok(())
+}
+
+#[tauri::command]
 async fn load_transcript(
     state: State<'_, AppState>,
     agent_id: String,
@@ -1116,6 +1167,8 @@ pub fn run() {
             cancel_turn,
             cancel_agent,
             cancel_send,
+            forward_message,
+            cancel_forward,
             agent_session_info,
             open_session_file,
             open_external_url,

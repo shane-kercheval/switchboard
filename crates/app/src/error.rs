@@ -28,6 +28,17 @@ pub enum AppError {
     #[error("queued message {0} not found (already started or removed)")]
     QueuedMessageNotFound(MessageId),
 
+    /// A manual forward was requested with no recipients — malformed (a frontend
+    /// bug or a direct IPC call). Rejected so a forward can't report "sent" with
+    /// no turns behind it.
+    #[error("a forward must have at least one recipient")]
+    NoForwardRecipients,
+
+    /// A manual forward was requested with no sources — there is nothing to
+    /// forward. Rejected at the command boundary.
+    #[error("a forward must reference at least one source agent")]
+    NoForwardSources,
+
     /// Pre-dispatch harness check failed (e.g., binary not on PATH).
     /// Distinct because the call site is the adapter's `probe()` method, and
     /// the frontend gates behaviour on it (`check_claude_binary` banner)

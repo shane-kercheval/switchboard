@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
@@ -15,10 +15,15 @@ use switchboard_core::{
     ProjectSummary, SelectionAxis, SendId, SessionLocator, normalize_selection,
 };
 use switchboard_dispatcher::{
-    CancelOutcome, DispatchContextFactory, EventEmitter, OnBusy, RemovedQueuedMessage, SendOutcome,
+    CancelOutcome, CurrentTurnWait, DispatchContextFactory, EventEmitter, OnBusy,
+    RemovedQueuedMessage, SendOutcome,
 };
-use switchboard_harness::{CancelSource, HarnessAdapter, MessageId};
+use switchboard_harness::{
+    CancelSource, ForwardedBlock, HarnessAdapter, MessageId, TurnOutcome, compose_forwarded_message,
+    latest_completed_agent_text,
+};
 use switchboard_prompts::PromptService;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::dispatch_context::ProjectDispatchContextFactory;
@@ -2349,6 +2354,21 @@ pub async fn stage_attachment_impl(
         })?
 }
 
+/// Select the harness adapter for an agent. Per-harness routing keyed on
+/// `agent.harness` — the substantive failure surface (routing Codex through the
+/// Claude adapter would silently spawn the wrong binary), pinned by the app
+/// routing test. Shared by `send_message_impl` and the forward's recipient
+/// pre-validation so both reject an unsupported harness identically.
+fn adapter_for(state: &AppState, agent: &AgentRecord) -> Result<Arc<dyn HarnessAdapter>, AppError> {
+    match agent.harness {
+        HarnessKind::ClaudeCode => Ok(Arc::clone(&state.claude_adapter)),
+        HarnessKind::Codex => Ok(Arc::clone(&state.codex_adapter)),
+        HarnessKind::Gemini => Ok(Arc::clone(&state.gemini_adapter)),
+        HarnessKind::Antigravity => Ok(Arc::clone(&state.antigravity_adapter)),
+        _ => Err(AppError::UnsupportedHarness),
+    }
+}
+
 pub async fn send_message_impl(
     state: &AppState,
     agent_id: AgentId,
@@ -2371,13 +2391,7 @@ pub async fn send_message_impl(
     // through the Claude adapter would silently spawn the wrong binary.
     // App routing test in the test module below pins this against
     // regression.
-    let adapter: Arc<dyn HarnessAdapter> = match agent.harness {
-        HarnessKind::ClaudeCode => Arc::clone(&state.claude_adapter),
-        HarnessKind::Codex => Arc::clone(&state.codex_adapter),
-        HarnessKind::Gemini => Arc::clone(&state.gemini_adapter),
-        HarnessKind::Antigravity => Arc::clone(&state.antigravity_adapter),
-        _ => return Err(AppError::UnsupportedHarness),
-    };
+    let adapter = adapter_for(state, &agent)?;
     // The actor (created on first send) owns this builder and calls it per turn
     // — so `is_first_dispatch_after_attach` and the agent's current
     // `session_locator` are read live, never frozen at enqueue. See
@@ -2459,6 +2473,265 @@ pub fn cancel_send_impl(state: &AppState, send_id: SendId, recipients: &[AgentId
 /// frontend's optimistic `stopAgent` cleanup is what resolves their cards.
 pub fn cancel_agent_impl(state: &AppState, agent_id: AgentId) -> CancelOutcome {
     state.dispatcher.cancel_agent(agent_id, CancelSource::User)
+}
+
+/// Outcome of a manual cross-agent forward (`forward_message_impl`), returned to
+/// the frontend so it can resolve the held "waiting for …" entry.
+///
+/// `Dispatched` — the composed message went out to every recipient; `skipped`
+/// names the sources that had no output (the partial-empty caption; empty when
+/// none were skipped). `Invalidated` — a source's turn failed/cancelled, or
+/// **every** source was empty, so nothing was dispatched and the composer text +
+/// chips restore. `Cancelled` — the user cancelled the hold before dispatch
+/// (also restores). The two non-dispatched arms are deliberately distinct so the
+/// frontend can phrase the restore ("a source failed" vs. "you cancelled").
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ForwardOutcome {
+    Dispatched {
+        /// Display names of sources skipped for having no completed output —
+        /// the UI-only partial-empty caption. Empty when nothing was skipped.
+        skipped: Vec<String>,
+    },
+    Invalidated {
+        reason: String,
+    },
+    Cancelled,
+}
+
+/// One source's resolution after its current turn settled (or immediately, if it
+/// was idle). Internal to the forward resolver.
+enum SourceResolution {
+    /// The source's latest completed output. `text` may be empty (a completed
+    /// turn that produced only thinking / tool items, or no completed turn yet)
+    /// — the caller's empty-source policy decides what that means.
+    Resolved { name: String, text: String },
+    /// The source's awaited turn reached a non-completed terminal — the forward
+    /// must not dispatch stale/empty input in its place.
+    Invalidated { name: String, outcome: TurnOutcome },
+}
+
+/// Manual cross-agent forward (system-design §7, the binding principle's manual
+/// surface). Holds outside any queue while each `source` agent's current
+/// in-flight turn settles, then composes the canonical forwarded body (the
+/// user's `body` first, then each non-empty source's latest completed output in
+/// declared order) and dispatches it to every `recipient` with the compose-bar's
+/// `OnBusy::Enqueue` (a busy recipient queues, like any manual send).
+///
+/// The hold is cancellable: `cancel_forward_impl(forward_id)` fires the token
+/// this registers, releasing the wait without dispatching. A source's turn
+/// failing/cancelling, or **all** sources resolving empty, invalidates the
+/// forward (no dispatch). Empty-source policy here is the manual one — skip
+/// empties, fail only if every source is empty; the workflow path supplies its
+/// own (fail on any) against the same primitives.
+///
+/// `home_dir` is passed in (not resolved here) so tests stage a temp home; the
+/// shim forwards `$HOME`. Pane sources/recipients are expanded to member agent
+/// ids by the frontend before this is called — panes are not a backend concept.
+pub async fn forward_message_impl(
+    state: &AppState,
+    recipients: Vec<AgentId>,
+    body: String,
+    sources: Vec<AgentId>,
+    send_id: SendId,
+    forward_id: Uuid,
+    home_dir: &Path,
+) -> Result<ForwardOutcome, AppError> {
+    // A forward with no recipients or no sources is malformed (a frontend bug or
+    // a direct IPC call) — reject it rather than report a "sent to nobody" or a
+    // forward of nothing.
+    if recipients.is_empty() {
+        return Err(AppError::NoForwardRecipients);
+    }
+    if sources.is_empty() {
+        return Err(AppError::NoForwardSources);
+    }
+    // Pre-validate every recipient up front (atomic precondition for this one
+    // forward action): if any is unknown or an unsupported harness, reject the
+    // whole forward before composing or dispatching. This is the deliberate
+    // difference from the compose bar's multi-recipient send — that is N
+    // independent frontend `invoke`s, each surfacing its own recipient's failure,
+    // whereas a forward is one backend call, so validating up front avoids both a
+    // partial delivery reported as total failure and a silently-dropped
+    // recipient. Once dispatched, the per-recipient turns remain independent
+    // (cancel-send, per-turn outcomes) exactly like any fan-out.
+    for &recipient in &recipients {
+        let (_, agent) = lookup_agent(state, recipient)?;
+        adapter_for(state, &agent)?;
+    }
+
+    let token = CancellationToken::new();
+    lock(&state.forwards).insert(forward_id, token.clone());
+    // RAII cleanup: the registry entry is removed when this guard drops — on the
+    // normal return *and* if the long-lived command future is aborted mid-await
+    // (e.g. webview teardown), so a held forward never leaks a stale cancel token.
+    let _guard = ForwardGuard {
+        forwards: &state.forwards,
+        forward_id,
+    };
+    forward_resolve_and_dispatch(state, recipients, body, sources, send_id, &token, home_dir).await
+}
+
+/// Removes a held forward's cancel-token entry from [`AppState::forwards`] on
+/// drop — so cleanup happens on every exit path of `forward_message_impl`,
+/// including a cancelled/aborted command future, making the "entries never
+/// outlive their command" invariant structural rather than relying on a manual
+/// remove being reached.
+struct ForwardGuard<'a> {
+    forwards: &'a Mutex<HashMap<Uuid, CancellationToken>>,
+    forward_id: Uuid,
+}
+
+impl Drop for ForwardGuard<'_> {
+    fn drop(&mut self) {
+        lock(self.forwards).remove(&self.forward_id);
+    }
+}
+
+/// The body of [`forward_message_impl`], factored out so the [`ForwardGuard`]
+/// cleans up the registry entry across every return path.
+async fn forward_resolve_and_dispatch(
+    state: &AppState,
+    recipients: Vec<AgentId>,
+    body: String,
+    sources: Vec<AgentId>,
+    send_id: SendId,
+    token: &CancellationToken,
+    home_dir: &Path,
+) -> Result<ForwardOutcome, AppError> {
+    // Await every source's current turn, racing the hold's cancel token. The
+    // wait is the long part; once we begin composing/dispatching the forward is
+    // committed (a cancel arriving during that brief tail is a no-op).
+    let resolved = tokio::select! {
+        biased;
+        () = token.cancelled() => return Ok(ForwardOutcome::Cancelled),
+        result = resolve_all_sources(state, &sources, home_dir) => result?,
+    };
+
+    // Invalidate on the first source whose turn failed/cancelled — never forward
+    // stale/empty input in its place.
+    for resolution in &resolved {
+        if let SourceResolution::Invalidated { name, outcome } = resolution {
+            let verb = match outcome {
+                TurnOutcome::Cancelled { .. } => "was cancelled",
+                _ => "failed",
+            };
+            return Ok(ForwardOutcome::Invalidated {
+                reason: format!("{name}'s turn {verb} before it could be forwarded"),
+            });
+        }
+    }
+
+    // Manual empty-source policy: keep the non-empty sources in declared order,
+    // record the skipped ones for the UI caption. The blocks are owned here so
+    // the borrowed `ForwardedBlock`s composed below outlive the call.
+    let mut blocks: Vec<(String, String)> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    for resolution in resolved {
+        if let SourceResolution::Resolved { name, text } = resolution {
+            if text.trim().is_empty() {
+                skipped.push(name);
+            } else {
+                blocks.push((name, text));
+            }
+        }
+    }
+
+    // All sources empty ⇒ nothing to forward: fail and restore (manual policy).
+    if blocks.is_empty() {
+        return Ok(ForwardOutcome::Invalidated {
+            reason: "none of the forwarded agents had any output to send".to_owned(),
+        });
+    }
+
+    let forwarded = compose_forwarded_message(
+        &body,
+        &blocks
+            .iter()
+            .map(|(name, text)| ForwardedBlock {
+                agent_name: name,
+                text,
+            })
+            .collect::<Vec<_>>(),
+    );
+
+    // Dispatch the composed body to each recipient via the normal send path
+    // (OnBusy::Enqueue — a busy recipient queues). One send_id groups the
+    // fan-out so the user's forwarded message renders once.
+    for recipient in recipients {
+        send_message_impl(state, recipient, &forwarded, vec![], send_id).await?;
+    }
+
+    Ok(ForwardOutcome::Dispatched { skipped })
+}
+
+/// Resolve every source concurrently and in declared order. Concurrency is
+/// load-bearing, not just latency: `join_all` polls every source on the first
+/// poll, so each source's `wait_for_current_turn` registers against its current
+/// in-flight turn **up front** — a source that fails while we're blocked on
+/// another is then observed as `Terminal(Failed)` and invalidates the forward,
+/// rather than slipping through as `Idle` (which a serial loop, registering
+/// later sources only after earlier ones resolve, would miss).
+async fn resolve_all_sources(
+    state: &AppState,
+    sources: &[AgentId],
+    home_dir: &Path,
+) -> Result<Vec<SourceResolution>, AppError> {
+    // `try_join_all` polls every source on the first poll (so all waits register
+    // up front, before any can settle) and preserves declared order; a source's
+    // *turn* failing is an `Ok(Invalidated)` it collects, while a genuine error
+    // (unknown source id, I/O) short-circuits.
+    futures::future::try_join_all(sources.iter().map(|&s| resolve_source(state, s, home_dir))).await
+}
+
+/// Resolve one forward source: await its current in-flight turn's terminal (the
+/// dispatcher's per-agent wait; immediate when idle). A completed in-flight turn
+/// carries its text **live** from the dispatcher (no disk read, no flush race);
+/// an idle source's latest completed output is read from disk (settled, since
+/// nothing is running). A non-completed terminal invalidates the source.
+async fn resolve_source(
+    state: &AppState,
+    agent_id: AgentId,
+    home_dir: &Path,
+) -> Result<SourceResolution, AppError> {
+    let (project, agent) = lookup_agent(state, agent_id)?;
+    match state.dispatcher.wait_for_current_turn(agent_id).await {
+        CurrentTurnWait::Terminal { outcome, .. }
+            if !matches!(outcome, TurnOutcome::Completed) =>
+        {
+            Ok(SourceResolution::Invalidated {
+                name: agent.name,
+                outcome,
+            })
+        }
+        // A turn we waited on completed: its text was captured live by the
+        // dispatcher, so use it directly — never re-read disk, which could return
+        // an *older* completed turn the just-finished one hasn't yet superseded.
+        CurrentTurnWait::Terminal { text, .. } => Ok(SourceResolution::Resolved {
+            name: agent.name,
+            text,
+        }),
+        // The agent was idle: read its latest completed output from disk. Nothing
+        // is running, so the file is settled — no flush race.
+        CurrentTurnWait::Idle => {
+            let transcript = load_agent_transcript(&project, &agent, home_dir)?;
+            Ok(SourceResolution::Resolved {
+                name: agent.name,
+                text: latest_completed_agent_text(&transcript.turns).unwrap_or_default(),
+            })
+        }
+    }
+}
+
+/// Cancel a held manual forward by `forward_id`: fire the registered hold token
+/// so `forward_message_impl` releases its source wait and returns
+/// [`ForwardOutcome::Cancelled`] without dispatching. Idempotent — a no-op when
+/// the forward already settled (no entry), so a cancel racing a just-dispatched
+/// forward never errors.
+pub fn cancel_forward_impl(state: &AppState, forward_id: Uuid) {
+    if let Some(token) = lock(&state.forwards).get(&forward_id) {
+        token.cancel();
+    }
 }
 
 /// Cancel every in-flight turn for `agents`, await their drains, then release
@@ -4109,6 +4382,518 @@ mod tests {
         prompt: &str,
     ) -> Result<MessageId, AppError> {
         send_message_impl(state, agent_id, prompt, Vec::new(), Uuid::now_v7()).await
+    }
+
+    /// Stage a Claude source agent under the active project with one completed
+    /// turn whose text is `text`, returning its agent id. The session file is
+    /// written where `load_agent_transcript` looks for it (the project's
+    /// canonical directory + the agent's session locator). `text == ""` stages a
+    /// source with **no** forwardable output (an empty session file) — the
+    /// empty-source case.
+    fn seed_source(
+        state: &AppState,
+        home: &Path,
+        project_id: ProjectId,
+        name: &str,
+        text: &str,
+    ) -> AgentId {
+        let agent = create_agent_impl(state, name, HarnessKind::ClaudeCode, None, None).unwrap();
+        let session_uuid = Uuid::now_v7();
+        set_agent_session_locator_impl(state, agent.id, SessionLocator::Uuid(session_uuid)).unwrap();
+        let directory = lock(&state.projects)
+            .get(&project_id)
+            .unwrap()
+            .directory
+            .clone();
+        let path = switchboard_harness::claude_session_file_path(home, &directory, &session_uuid);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let content = if text.is_empty() {
+            String::new()
+        } else {
+            [
+                serde_json::json!({
+                    "type": "user",
+                    "message": { "role": "user", "content": "hi" },
+                    "timestamp": "2026-06-17T00:00:00Z",
+                }),
+                serde_json::json!({
+                    "type": "assistant",
+                    "message": {
+                        "id": "m1",
+                        "model": "claude-sonnet-4-6",
+                        "role": "assistant",
+                        "content": [{ "type": "text", "text": text }],
+                        "stop_reason": "end_turn",
+                        "usage": { "input_tokens": 10, "output_tokens": 5 },
+                    },
+                    "timestamp": "2026-06-17T00:00:01Z",
+                }),
+            ]
+            .iter()
+            .map(|r| serde_json::to_string(r).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+        };
+        std::fs::write(&path, content).unwrap();
+        agent.id
+    }
+
+    /// The body a forward actually dispatched to `recipient`, recovered from the
+    /// mock's echo ("Mock response to: {prompt} — replied by mock harness.").
+    fn forwarded_body_to(emitter: &RecordingEmitter, recipient: AgentId) -> String {
+        let channel = format!("agent:{recipient}");
+        let echoed: String = emitter
+            .snapshot()
+            .iter()
+            .filter(|(ch, v)| ch == &channel && v["type"] == "content_chunk")
+            .map(|(_, v)| v["text"].as_str().unwrap_or_default().to_owned())
+            .collect();
+        echoed
+            .strip_prefix("Mock response to: ")
+            .and_then(|s| s.strip_suffix(" — replied by mock harness."))
+            .unwrap_or(&echoed)
+            .to_owned()
+    }
+
+    /// Count `turn_start` events on a specific agent's channel — used to assert a
+    /// recipient was (or was not) dispatched to.
+    fn turn_starts_for(emitter: &RecordingEmitter, agent_id: AgentId) -> usize {
+        let channel = format!("agent:{agent_id}");
+        emitter
+            .snapshot()
+            .iter()
+            .filter(|(ch, v)| ch == &channel && v["type"] == "turn_start")
+            .count()
+    }
+
+    #[tokio::test]
+    async fn forward_single_source_composes_and_dispatches_to_recipient() {
+        let (tmp, state, emitter) = fresh_state_with_mock();
+        let home = TempDir::new().unwrap();
+        let (recipient, project_id) = project_with_agent(&state, &tmp).await;
+        let source = seed_source(&state, home.path(), project_id, "reviewer-1", "LGTM with nits");
+
+        let outcome = forward_message_impl(
+            &state,
+            vec![recipient.id],
+            String::new(),
+            vec![source],
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, ForwardOutcome::Dispatched { skipped: vec![] });
+
+        within(
+            &emitter,
+            "recipient idle",
+            emitter.wait_for_type("agent_idle", 1),
+        )
+        .await;
+        assert_eq!(
+            forwarded_body_to(&emitter, recipient.id),
+            "=== START forwarded from reviewer-1 ===\nLGTM with nits\n=== END forwarded from reviewer-1 ==="
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_prepends_typed_body_before_the_blocks() {
+        let (tmp, state, emitter) = fresh_state_with_mock();
+        let home = TempDir::new().unwrap();
+        let (recipient, project_id) = project_with_agent(&state, &tmp).await;
+        let source = seed_source(&state, home.path(), project_id, "reviewer-1", "the review");
+
+        forward_message_impl(
+            &state,
+            vec![recipient.id],
+            "Please aggregate:".to_owned(),
+            vec![source],
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            home.path(),
+        )
+        .await
+        .unwrap();
+
+        within(
+            &emitter,
+            "recipient idle",
+            emitter.wait_for_type("agent_idle", 1),
+        )
+        .await;
+        assert_eq!(
+            forwarded_body_to(&emitter, recipient.id),
+            "Please aggregate:\n\n=== START forwarded from reviewer-1 ===\nthe review\n=== END forwarded from reviewer-1 ==="
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_multiple_sources_compose_in_declared_order() {
+        let (tmp, state, emitter) = fresh_state_with_mock();
+        let home = TempDir::new().unwrap();
+        let (recipient, project_id) = project_with_agent(&state, &tmp).await;
+        let s1 = seed_source(&state, home.path(), project_id, "reviewer-1", "first review");
+        let s2 = seed_source(&state, home.path(), project_id, "reviewer-2", "second review");
+
+        let outcome = forward_message_impl(
+            &state,
+            vec![recipient.id],
+            String::new(),
+            vec![s1, s2],
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, ForwardOutcome::Dispatched { skipped: vec![] });
+
+        within(
+            &emitter,
+            "recipient idle",
+            emitter.wait_for_type("agent_idle", 1),
+        )
+        .await;
+        assert_eq!(
+            forwarded_body_to(&emitter, recipient.id),
+            "=== START forwarded from reviewer-1 ===\nfirst review\n=== END forwarded from reviewer-1 ===\n\n=== START forwarded from reviewer-2 ===\nsecond review\n=== END forwarded from reviewer-2 ==="
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_partial_empty_skips_the_empty_source_and_reports_it() {
+        let (tmp, state, emitter) = fresh_state_with_mock();
+        let home = TempDir::new().unwrap();
+        let (recipient, project_id) = project_with_agent(&state, &tmp).await;
+        let s1 = seed_source(&state, home.path(), project_id, "reviewer-1", "real output");
+        let s2 = seed_source(&state, home.path(), project_id, "reviewer-2", "");
+
+        let outcome = forward_message_impl(
+            &state,
+            vec![recipient.id],
+            String::new(),
+            vec![s1, s2],
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        // The empty source is reported (UI-only caption) but absent from the wire.
+        assert_eq!(
+            outcome,
+            ForwardOutcome::Dispatched {
+                skipped: vec!["reviewer-2".to_owned()],
+            }
+        );
+
+        within(
+            &emitter,
+            "recipient idle",
+            emitter.wait_for_type("agent_idle", 1),
+        )
+        .await;
+        assert_eq!(
+            forwarded_body_to(&emitter, recipient.id),
+            "=== START forwarded from reviewer-1 ===\nreal output\n=== END forwarded from reviewer-1 ===",
+            "the wire body carries only the non-empty source — the skip is UI-only"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_all_empty_invalidates_without_dispatching() {
+        let (tmp, state, emitter) = fresh_state_with_mock();
+        let home = TempDir::new().unwrap();
+        let (recipient, project_id) = project_with_agent(&state, &tmp).await;
+        let s1 = seed_source(&state, home.path(), project_id, "reviewer-1", "");
+        let s2 = seed_source(&state, home.path(), project_id, "reviewer-2", "");
+
+        let outcome = forward_message_impl(
+            &state,
+            vec![recipient.id],
+            String::new(),
+            vec![s1, s2],
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome, ForwardOutcome::Invalidated { .. }),
+            "all-empty fails (restore), got {outcome:?}"
+        );
+        assert_eq!(
+            turn_starts_for(&emitter, recipient.id),
+            0,
+            "an invalidated forward dispatches nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_invalidates_when_a_source_turn_is_cancelled() {
+        use switchboard_harness::MockScenario;
+        let (tmp, state, emitter) = fresh_state_with_scenario(MockScenario::AwaitCancellation);
+        let home = TempDir::new().unwrap();
+        let (recipient, _project_id) = project_with_agent(&state, &tmp).await;
+        let source =
+            create_agent_impl(&state, "reviewer-1", HarnessKind::ClaudeCode, None, None).unwrap();
+        // Put the source's turn in flight (AwaitCancellation parks until cancelled).
+        send_msg(&state, source.id, "work").await.unwrap();
+        within(
+            &emitter,
+            "source in flight",
+            emitter.wait_for_type("turn_start", 1),
+        )
+        .await;
+
+        // `join!` polls the forward first, so its `wait_for_current_turn` command
+        // lands on the source actor's FIFO before the cancel — the wait registers
+        // mid-turn and then fires `Cancelled`.
+        let (outcome, ()) = tokio::join!(
+            forward_message_impl(
+                &state,
+                vec![recipient.id],
+                String::new(),
+                vec![source.id],
+                Uuid::now_v7(),
+                Uuid::now_v7(),
+                home.path(),
+            ),
+            async {
+                state.dispatcher.cancel(source.id, CancelSource::User);
+            }
+        );
+        assert!(
+            matches!(outcome.unwrap(), ForwardOutcome::Invalidated { .. }),
+            "a source turn cancelling invalidates the forward"
+        );
+        assert_eq!(
+            turn_starts_for(&emitter, recipient.id),
+            0,
+            "an invalidated forward dispatches nothing to the recipient"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_cancelled_while_waiting_does_not_dispatch() {
+        use switchboard_harness::MockScenario;
+        let (tmp, state, emitter) = fresh_state_with_scenario(MockScenario::AwaitCancellation);
+        let home = TempDir::new().unwrap();
+        let (recipient, _project_id) = project_with_agent(&state, &tmp).await;
+        let source =
+            create_agent_impl(&state, "reviewer-1", HarnessKind::ClaudeCode, None, None).unwrap();
+        send_msg(&state, source.id, "work").await.unwrap();
+        within(
+            &emitter,
+            "source in flight",
+            emitter.wait_for_type("turn_start", 1),
+        )
+        .await;
+
+        let forward_id = Uuid::now_v7();
+        // The forward inserts its hold token on first poll (before suspending on
+        // the source wait), so the cancel finds it. Cancelling the *forward* does
+        // not cancel the source's turn.
+        let (outcome, ()) = tokio::join!(
+            forward_message_impl(
+                &state,
+                vec![recipient.id],
+                String::new(),
+                vec![source.id],
+                Uuid::now_v7(),
+                forward_id,
+                home.path(),
+            ),
+            async {
+                cancel_forward_impl(&state, forward_id);
+            }
+        );
+        assert_eq!(outcome.unwrap(), ForwardOutcome::Cancelled);
+        assert_eq!(
+            turn_starts_for(&emitter, recipient.id),
+            0,
+            "a cancelled hold dispatches nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_to_busy_recipient_is_accepted_and_queued() {
+        use switchboard_harness::MockScenario;
+        // The recipient is mid-turn (parked); the forward dispatches with the
+        // compose-bar's Enqueue, so it is accepted and queued rather than failing.
+        let (tmp, state, emitter) = fresh_state_with_scenario(MockScenario::AwaitCancellation);
+        let home = TempDir::new().unwrap();
+        let (recipient, project_id) = project_with_agent(&state, &tmp).await;
+        let source = seed_source(&state, home.path(), project_id, "reviewer-1", "ready output");
+        // Occupy the recipient with an in-flight turn.
+        send_msg(&state, recipient.id, "busy work").await.unwrap();
+        within(
+            &emitter,
+            "recipient in flight",
+            emitter.wait_for_type("turn_start", 1),
+        )
+        .await;
+
+        let outcome = forward_message_impl(
+            &state,
+            vec![recipient.id],
+            String::new(),
+            vec![source],
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        // Accepted (queued behind the in-flight turn), not failed.
+        assert_eq!(outcome, ForwardOutcome::Dispatched { skipped: vec![] });
+    }
+
+    #[tokio::test]
+    async fn forward_uses_live_captured_text_over_stale_disk() {
+        use switchboard_harness::MockScenario;
+        // The stale-read fix: a source that is mid-turn when the forward holds,
+        // and completes while held, must forward the **new** turn's text — even
+        // though an *older* completed turn sits on disk and the new one may not
+        // have flushed. Source = Claude on a gated scenario (parks mid-turn until
+        // released) with stale "OLD-DISK" text staged on disk; recipient = Codex
+        // on Streaming so it echoes the dispatched body.
+        let signal = Arc::new(tokio::sync::Notify::new());
+        let tmp = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let claude: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::with_scenario(
+            MockScenario::CompletesOnSignal(Arc::clone(&signal)),
+        ));
+        let codex: Arc<dyn HarnessAdapter> =
+            Arc::new(MockHarnessAdapter::with_scenario(MockScenario::Streaming));
+        let emitter = Arc::new(RecordingEmitter::new());
+        let state = AppState::new(
+            Arc::clone(&claude),
+            Arc::clone(&codex),
+            Arc::clone(&claude),
+            Arc::clone(&claude),
+            emitter.clone() as Arc<dyn EventEmitter>,
+        );
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "proj");
+        set_active_project_impl(&state, project.id).unwrap();
+
+        // Source with a STALE completed turn on disk; then dispatch a new turn
+        // that parks mid-flight (gated scenario).
+        let source = seed_source(&state, home.path(), project.id, "reviewer-1", "OLD-DISK");
+        let recipient =
+            create_agent_impl(&state, "aggregator", HarnessKind::Codex, None, None).unwrap();
+        send_msg(&state, source, "new work").await.unwrap();
+        within(
+            &emitter,
+            "source in flight",
+            emitter.wait_for_type("turn_start", 1),
+        )
+        .await;
+
+        // Hold the forward; release the source's in-flight turn. Whichever order
+        // the actor processes the wait vs. the terminal, the captured text wins.
+        let (outcome, ()) = tokio::join!(
+            forward_message_impl(
+                &state,
+                vec![recipient.id],
+                String::new(),
+                vec![source],
+                Uuid::now_v7(),
+                Uuid::now_v7(),
+                home.path(),
+            ),
+            async {
+                signal.notify_one();
+            }
+        );
+        assert_eq!(
+            outcome.unwrap(),
+            ForwardOutcome::Dispatched { skipped: vec![] }
+        );
+
+        // Both turns settle: the source's gated completion and the recipient's echo.
+        within(
+            &emitter,
+            "both idle",
+            emitter.wait_for_type("agent_idle", 2),
+        )
+        .await;
+        let body = forwarded_body_to(&emitter, recipient.id);
+        assert!(
+            body.contains("fresh-live-output") && !body.contains("OLD-DISK"),
+            "forwarded the live-captured new text, not the stale disk turn: {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_rejects_empty_recipients_and_empty_sources() {
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        let home = TempDir::new().unwrap();
+        let (recipient, project_id) = project_with_agent(&state, &tmp).await;
+        let source = seed_source(&state, home.path(), project_id, "reviewer-1", "output");
+
+        let no_recipients = forward_message_impl(
+            &state,
+            vec![],
+            String::new(),
+            vec![source],
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            home.path(),
+        )
+        .await;
+        assert!(matches!(
+            no_recipients,
+            Err(AppError::NoForwardRecipients)
+        ));
+
+        let no_sources = forward_message_impl(
+            &state,
+            vec![recipient.id],
+            String::new(),
+            vec![],
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            home.path(),
+        )
+        .await;
+        assert!(matches!(no_sources, Err(AppError::NoForwardSources)));
+    }
+
+    #[tokio::test]
+    async fn forward_rejects_a_bad_recipient_and_dispatches_to_none() {
+        // A forward is one atomic action: an unknown recipient rejects the whole
+        // forward before any dispatch — no partial delivery, no silent drop.
+        let (tmp, state, emitter) = fresh_state_with_mock();
+        let home = TempDir::new().unwrap();
+        let (good_recipient, project_id) = project_with_agent(&state, &tmp).await;
+        let source = seed_source(&state, home.path(), project_id, "reviewer-1", "output");
+
+        let outcome = forward_message_impl(
+            &state,
+            vec![good_recipient.id, Uuid::now_v7()],
+            String::new(),
+            vec![source],
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            home.path(),
+        )
+        .await;
+        assert!(
+            matches!(outcome, Err(AppError::AgentNotFound(_))),
+            "an unknown recipient rejects the whole forward, got {outcome:?}"
+        );
+        assert_eq!(
+            turn_starts_for(&emitter, good_recipient.id),
+            0,
+            "the valid recipient must not receive a partial delivery"
+        );
     }
 
     #[tokio::test]

@@ -11,6 +11,10 @@
     addHeldForward,
     removeHeldForward,
     setForwardCaption,
+    forwardSourceKey,
+    expandForwardSources,
+    forwardSourceForAgent,
+    forwardSourceForPane,
     type ForwardSource,
   } from "$lib/state/heldForwards.svelte";
   import { buildLiveSendsMap } from "$lib/state/liveSends";
@@ -133,23 +137,13 @@
   // source dispatches via `forward_message` instead of the normal send path.
   let forwardSources = $state<ForwardSource[]>([]);
 
-  function addForwardSourcesFromPane(pane: TranscriptPane): void {
-    // Expand the pane to its members at pick time (membership captured now), each
-    // added as its own forward source — the canonical composition labels agents
-    // individually, never the pane.
-    for (const id of pane.members) {
-      const agent = agents.find((a) => a.id === id);
-      if (agent) addForwardSource({ id: agent.id, name: agent.name });
-    }
-  }
-
   function addForwardSource(source: ForwardSource): void {
-    if (forwardSources.some((s) => s.id === source.id)) return;
+    if (forwardSources.some((s) => forwardSourceKey(s) === forwardSourceKey(source))) return;
     forwardSources = [...forwardSources, source];
   }
 
-  function removeForwardSource(id: AgentId): void {
-    forwardSources = forwardSources.filter((s) => s.id !== id);
+  function removeForwardSource(key: string): void {
+    forwardSources = forwardSources.filter((s) => forwardSourceKey(s) !== key);
   }
 
   /// True when this agent already has a completed turn the forward can carry — a
@@ -158,6 +152,22 @@
     return (transcripts[agentId] ?? []).some(
       (turn) => turn.role === "agent" && turn.status === "complete",
     );
+  }
+
+  /// Whether a source has nothing to forward yet — an agent with no completed
+  /// turn, or a pane whose every member is empty (or has no members).
+  function sourceIsEmpty(source: ForwardSource): boolean {
+    const ids = source.kind === "agent" ? [source.id] : source.members;
+    return ids.length === 0 || ids.every((id) => !agentHasCompletedOutput(id));
+  }
+
+  /// Agent names that actually carried output, for the partial-empty caption —
+  /// derived from the expanded agent ids (panes included) minus the backend's
+  /// skipped names.
+  function includedNames(sources: ForwardSource[], skipped: string[]): string[] {
+    return expandForwardSources(sources)
+      .map((id) => agents.find((a) => a.id === id)?.name)
+      .filter((name): name is string => name !== undefined && !skipped.includes(name));
   }
 
   /// The current chips as the `Attachment` wire shape (drops the local `id`),
@@ -233,8 +243,12 @@
   let selectedPrompt = $state<Prompt | null>(null);
   let promptArgs = $state<Record<string, string>>({});
   // Per-argument forward sources (live-UI-only, like `forwardSources`). A
-  // prompt-mode send with any entry here routes through the forward-prompt path.
+  // prompt-mode send with any entry here — or in `promptAppendedSources` — routes
+  // through the forward-prompt path.
   let promptArgSources = $state<Record<string, ForwardSource[]>>({});
+  // Forward sources for the appended-text field (the appended text is just
+  // another forwardable field; the backend composes it into the appended tail).
+  let promptAppendedSources = $state<ForwardSource[]>([]);
   let appendedText = $state<string>("");
   let promptMenuOpen = $state(false);
   let promptMenuWrapEl = $state<HTMLDivElement | undefined>(undefined);
@@ -454,14 +468,17 @@
       // a chord typed into it also toggle recipients or send. Mirrors the ⌘K
       // guard above.
       if (hasOpenDialog()) return;
-      // ⌘⌃1..9 → add pane N's members as forward sources, mirroring ⌘⌥1..9
-      // ("target pane N"). Both modifiers required, so it never collides with
-      // ⌘1..9 (target agent N) — intercepted before that branch below.
+      // ⌘⌃1..9 → add pane N as a forward source, mirroring ⌘⌥1..9 ("target pane
+      // N"). Both modifiers required, so it never collides with ⌘1..9 (target
+      // agent N) — intercepted before that branch below. Plain-mode only: in
+      // prompt mode the whole-message forward set is hidden (forwarding is
+      // per-field), so this must not mutate it from behind a hidden UI.
       if (e.metaKey && e.ctrlKey && !e.shiftKey && e.key >= "1" && e.key <= "9") {
+        if (mode === "prompt") return;
         const pane = paneLayout.panes[Number(e.key) - 1];
         if (pane !== undefined && pane.members.length > 0) {
           e.preventDefault();
-          if (!sending) addForwardSourcesFromPane(pane);
+          if (!sending) addForwardSource(forwardSourceForPane(pane, agents));
         }
         return;
       }
@@ -620,8 +637,9 @@
         items.push({ kind: "forward-pane", key: `forward-pane:${pane.id}`, pane });
       }
     }
+    const alreadyForwarded = expandForwardSources(forwardSources);
     for (const agent of agentCandidates) {
-      if (forwardSources.some((s) => s.id === agent.id)) continue;
+      if (alreadyForwarded.includes(agent.id)) continue;
       items.push({ kind: "forward-agent", key: `forward-agent:${agent.id}`, agent });
     }
     return items;
@@ -793,16 +811,12 @@
       }
       stripAtToken();
     } else if (item.kind === "forward-agent") {
-      addForwardSource({ id: item.agent.id, name: item.agent.name });
+      addForwardSource(forwardSourceForAgent(item.agent));
       stripAtToken();
     } else if (item.kind === "forward-pane") {
-      // Expand the pane to its members at pick time (membership captured now,
-      // moments before send), adding each as its own forward source — the
-      // canonical composition labels each agent separately, never the pane.
-      for (const id of item.pane.members) {
-        const agent = agents.find((a) => a.id === id);
-        if (agent) addForwardSource({ id: agent.id, name: agent.name });
-      }
+      // One pane chip (membership snapshotted at pick time, moments before send);
+      // it expands to per-agent blocks only at dispatch.
+      addForwardSource(forwardSourceForPane(item.pane, agents));
       stripAtToken();
     } else {
       setSelectedIds([item.agent.id]);
@@ -993,6 +1007,7 @@
     selectedPrompt = prompt;
     promptArgs = Object.fromEntries(prompt.arguments.map((a) => [a.name, ""]));
     promptArgSources = {};
+    promptAppendedSources = [];
     appendedText = carried;
     focusPromptFieldOnMount = true;
     draft = "";
@@ -1007,6 +1022,7 @@
     selectedPrompt = null;
     promptArgs = {};
     promptArgSources = {};
+    promptAppendedSources = [];
     focusPromptFieldOnMount = false;
     appendedText = "";
   }
@@ -1025,20 +1041,22 @@
   /// On `resolved` the frontend dispatches that body through the normal send path
   /// (`dispatchToRecipients`) — so the forward groups, queues, cancels, and
   /// renders exactly like any send, with the live `message_id → send_id`
-  /// correlation intact (no race, no special-casing). On invalidate/cancel it
-  /// restores the composer.
-  function dispatchForward(body: string, sources: ForwardSource[], targets: AgentRecord[]): void {
+  /// correlation intact (no race, no special-casing) — carrying the staged
+  /// `attachments`, because a forward is still a send and the user's files ride it
+  /// like any other message. On invalidate/cancel it restores the composer.
+  function dispatchForward(
+    body: string,
+    sources: ForwardSource[],
+    attachments: Attachment[],
+    targets: AgentRecord[],
+  ): void {
     const forwardId = crypto.randomUUID();
     const sendId = crypto.randomUUID();
     const recipients = targets.map((t) => t.id);
     addHeldForward(projectId, { forwardId, sendId, body, sources, recipients });
     void (async () => {
       try {
-        const outcome = await api.forwardMessage(
-          body,
-          sources.map((s) => s.id),
-          forwardId,
-        );
+        const outcome = await api.forwardMessage(body, expandForwardSources(sources), forwardId);
         removeHeldForward(projectId, forwardId);
         if (outcome.status === "resolved") {
           // Dispatch the composed body as a normal send under this forward's
@@ -1047,30 +1065,31 @@
           // sentinel lines at render time (durable across reload); only the
           // partial-empty caption needs the live store (it can't be reconstructed
           // — skipped sources leave no trace in the wire body).
-          dispatchToRecipients(outcome.body, [], targets, sendId);
+          dispatchToRecipients(outcome.body, attachments, targets, sendId);
           if (outcome.skipped.length > 0) {
-            const included = sources
-              .map((s) => s.name)
-              .filter((name) => !outcome.skipped.includes(name));
-            setForwardCaption(projectId, sendId, { included, skipped: outcome.skipped });
+            setForwardCaption(projectId, sendId, {
+              included: includedNames(sources, outcome.skipped),
+              skipped: outcome.skipped,
+            });
           }
         } else {
           // invalidated (a source failed/cancelled, or all sources empty) or the
           // user cancelled the hold — nothing resolved; restore the composer.
-          restoreForward(body, sources);
+          restoreForward(body, sources, attachments);
           if (outcome.status === "invalidated") sendError = `Forward not sent: ${outcome.reason}`;
         }
       } catch (err) {
         removeHeldForward(projectId, forwardId);
         sendError = `Forward failed: ${err instanceof Error ? err.message : String(err)}`;
-        restoreForward(body, sources);
+        restoreForward(body, sources, attachments);
       }
     })();
   }
 
-  /// Restore a cancelled/invalidated forward's source chips, and its typed text
-  /// when the composer is empty (don't clobber a new draft the user started
-  /// while the forward was holding).
+  /// Restore a cancelled/invalidated forward's source chips, its typed text, and
+  /// its attachment chips — each only when the composer hasn't been touched since
+  /// (don't clobber a new draft/attachment the user started while the forward was
+  /// holding).
   ///
   /// **Known limitation (deferred):** this runs in the closure of the ComposeBar
   /// instance that submitted the forward. If the user navigates away and back
@@ -1079,10 +1098,13 @@
   /// (remounted) composer — narrow timing edge, small loss of the user's own
   /// un-sent text. A durable fix would route restore through project-keyed state
   /// the remounted composer observes.
-  function restoreForward(body: string, sources: ForwardSource[]): void {
+  function restoreForward(body: string, sources: ForwardSource[], attachments: Attachment[]): void {
     for (const source of sources) addForwardSource(source);
     if (draft.trim() === "" && body !== "") {
       draft = body;
+    }
+    if (attachmentChips.length === 0 && attachments.length > 0) {
+      attachmentChips = attachments.map((a) => ({ ...a, id: crypto.randomUUID() }));
     }
     persistContentNow();
   }
@@ -1102,18 +1124,19 @@
     typedArgs: Record<string, string>,
     appended: string,
     argSources: Record<string, ForwardSource[]>,
+    appendedSources: ForwardSource[],
     attachments: Attachment[],
     targets: AgentRecord[],
   ): void {
     const forwardId = crypto.randomUUID();
     const sendId = crypto.randomUUID();
     const recipients = targets.map((t) => t.id);
-    // Dedupe sources across all arguments for the held entry's "waiting for…"
-    // label (an agent can feed more than one argument).
+    // Dedupe sources across every argument *and* the appended text for the held
+    // entry's "waiting for…" label (one agent/pane can feed several fields).
     const allSources: ForwardSource[] = [];
-    for (const list of Object.values(argSources)) {
+    for (const list of [...Object.values(argSources), appendedSources]) {
       for (const source of list) {
-        if (allSources.some((s) => s.id === source.id)) continue;
+        if (allSources.some((s) => forwardSourceKey(s) === forwardSourceKey(source))) continue;
         allSources.push(source);
       }
     }
@@ -1124,40 +1147,48 @@
       .filter((a) => (argSources[a.name]?.length ?? 0) > 0)
       .map((a) => ({
         name: a.name,
-        sources: (argSources[a.name] ?? []).map((s) => s.id),
+        sources: expandForwardSources(argSources[a.name] ?? []),
         required: a.required,
       }));
     void (async () => {
       try {
+        // The backend renders the prompt, composes the appended text (typed +
+        // forwarded blocks), and returns the **already-combined** body — so the
+        // appended sources resolve in the same hold (one invalidation domain) and
+        // the frontend dispatches verbatim, no client-side combine.
         const outcome = await api.forwardPrompt(
           prompt.provider,
           prompt.name,
           buildRenderArgs(prompt, typedArgs),
           forwardArgs,
+          appended,
+          expandForwardSources(appendedSources),
           forwardId,
         );
         removeHeldForward(projectId, forwardId);
         if (outcome.status === "resolved") {
-          dispatchToRecipients(
-            combinePromptMessage(outcome.body, appended),
-            attachments,
-            targets,
-            sendId,
-          );
+          dispatchToRecipients(outcome.body, attachments, targets, sendId);
           if (outcome.skipped.length > 0) {
-            const included = allSources
-              .map((s) => s.name)
-              .filter((name) => !outcome.skipped.includes(name));
-            setForwardCaption(projectId, sendId, { included, skipped: outcome.skipped });
+            setForwardCaption(projectId, sendId, {
+              included: includedNames(allSources, outcome.skipped),
+              skipped: outcome.skipped,
+            });
           }
         } else {
-          restoreForwardPrompt(prompt, typedArgs, appended, argSources, attachments);
+          restoreForwardPrompt(
+            prompt,
+            typedArgs,
+            appended,
+            argSources,
+            appendedSources,
+            attachments,
+          );
           if (outcome.status === "invalidated") sendError = `Forward not sent: ${outcome.reason}`;
         }
       } catch (err) {
         removeHeldForward(projectId, forwardId);
         sendError = `Forward failed: ${err instanceof Error ? err.message : String(err)}`;
-        restoreForwardPrompt(prompt, typedArgs, appended, argSources, attachments);
+        restoreForwardPrompt(prompt, typedArgs, appended, argSources, appendedSources, attachments);
       }
     })();
   }
@@ -1173,6 +1204,7 @@
     typedArgs: Record<string, string>,
     appended: string,
     argSources: Record<string, ForwardSource[]>,
+    appendedSources: ForwardSource[],
     attachments: Attachment[],
   ): void {
     if (
@@ -1185,6 +1217,7 @@
     selectedPrompt = prompt;
     promptArgs = { ...typedArgs };
     promptArgSources = { ...argSources };
+    promptAppendedSources = [...appendedSources];
     appendedText = appended;
     attachmentChips = attachments.map((a) => ({ ...a, id: crypto.randomUUID() }));
     mode = "prompt";
@@ -1246,13 +1279,16 @@
       const appended = appendedText;
       const targets = [...selectedAgents];
 
-      // A prompt with ≥1 forwarded argument goes through the held forward-prompt
-      // path (resolved + rendered server-side once the sources settle), not the
-      // immediate render below. Clears back to the plain composer right away —
-      // the held entry owns the rest; restore re-enters prompt mode if it fails.
-      // Attachments ride the forward (it's a prompt send) and clear optimistically
-      // like the prompt/args; restore rebuilds the chips if the forward fails.
-      if (prompt.arguments.some((a) => (promptArgSources[a.name]?.length ?? 0) > 0)) {
+      // A prompt with ≥1 forwarded argument *or* a forwarded appended text goes
+      // through the held forward-prompt path (resolved + rendered server-side once
+      // the sources settle), not the immediate render below. Clears back to the
+      // plain composer right away — the held entry owns the rest; restore re-enters
+      // prompt mode if it fails. Attachments ride the forward (it's a prompt send)
+      // and clear optimistically like the prompt/args; restore rebuilds them.
+      const anyArgForwarded = prompt.arguments.some(
+        (a) => (promptArgSources[a.name]?.length ?? 0) > 0,
+      );
+      if (anyArgForwarded || promptAppendedSources.length > 0) {
         promptMenuOpen = false;
         closeMentionMenu();
         dispatchForwardPrompt(
@@ -1260,12 +1296,18 @@
           { ...promptArgs },
           appended,
           { ...promptArgSources },
+          [...promptAppendedSources],
           attachments,
           targets,
         );
         selectedPrompt = null;
         promptArgs = {};
         promptArgSources = {};
+        promptAppendedSources = [];
+        // A completed send is a fresh start: drop any plain-mode forward set that
+        // was hidden during prompt mode, so it can't silently resurface and ride a
+        // later plain send. (Removing the prompt before sending still restores it.)
+        forwardSources = [];
         focusPromptFieldOnMount = false;
         appendedText = "";
         draft = "";
@@ -1308,6 +1350,9 @@
       selectedPrompt = null;
       promptArgs = {};
       promptArgSources = {};
+      promptAppendedSources = [];
+      // A completed send is a fresh start — see the prompt-forward branch above.
+      forwardSources = [];
       focusPromptFieldOnMount = false;
       appendedText = "";
       draft = "";
@@ -1321,14 +1366,16 @@
     }
 
     // A send with ≥1 forward source goes through the cross-agent forward path
-    // (held until the sources settle, dispatched by the backend) rather than the
-    // normal send. Attachments don't ride a forward (its body is text + the
-    // forwarded blocks), so they're left for a subsequent plain send.
+    // (held until the sources settle) rather than the normal send. It still
+    // carries the staged attachments — a forward is a send, so the user's files
+    // ride it like any message; they clear optimistically and restore rebuilds
+    // their chips if the forward fails.
     if (forwardSources.length > 0) {
       closeMentionMenu();
-      dispatchForward(draft.trim(), [...forwardSources], [...selectedAgents]);
+      dispatchForward(draft.trim(), [...forwardSources], attachments, [...selectedAgents]);
       draft = "";
       forwardSources = [];
+      attachmentChips = [];
       composeGeneration += 1;
       persistContentNow();
       return;
@@ -1616,6 +1663,7 @@
               <path d="M4 18v-2a4 4 0 0 1 4-4h12" />
             </svg>
             {#if item.kind === "forward-pane"}
+              {@const paneIndex = paneLayout.panes.findIndex((p) => p.id === item.pane.id)}
               <span class="text-fg shrink-0">{item.pane.name}</span>
               <span class="text-muted min-w-0 truncate text-[11px]">
                 {agents
@@ -1623,6 +1671,11 @@
                   .map((a) => a.name)
                   .join(", ")}
               </span>
+              {#if paneIndex >= 0 && paneIndex < 9}
+                <span class="text-muted ml-auto shrink-0 pl-2 font-mono text-[11px]"
+                  >{shortcut("mod", "ctrl", String(paneIndex + 1))}</span
+                >
+              {/if}
             {:else}
               <HarnessIcon harness={item.agent.harness} size="sm" class="h-4 w-4" />
               <span class="text-fg">{item.agent.name}</span>
@@ -1634,15 +1687,18 @@
         {/each}
       </div>
     {/if}
-    {#if forwardSources.length > 0}
+    {#if mode !== "prompt" && forwardSources.length > 0}
+      <!-- Plain-mode only: in prompt mode, forwarding is per-field (per argument
+           or the appended text), so the message-level forward set doesn't apply
+           and is hidden (its state is preserved for when the prompt is removed). -->
       <div class="mb-1.5 flex flex-wrap items-center gap-1.5" data-testid="forward-source-chips">
         <span class="text-muted text-xs">Forwarding from</span>
-        {#each forwardSources as source (source.id)}
+        {#each forwardSources as source (forwardSourceKey(source))}
           <ForwardSourceChip
             {source}
-            empty={!agentHasCompletedOutput(source.id)}
+            empty={sourceIsEmpty(source)}
             disabled={sending}
-            onRemove={() => removeForwardSource(source.id)}
+            onRemove={() => removeForwardSource(forwardSourceKey(source))}
           />
         {/each}
       </div>
@@ -1757,22 +1813,27 @@
         <div></div>
       {/if}
       <div class="flex shrink-0 items-center gap-1">
-        <ForwardSourcePicker
-          {agents}
-          panes={paneLayout.panes}
-          onPickAgent={(agent) => addForwardSource({ id: agent.id, name: agent.name })}
-          onPickPane={(pane) => addForwardSourcesFromPane(pane)}
-          agentHasOutput={agentHasCompletedOutput}
-          disabled={sending}
-          triggerTestid="compose-forward-button"
-          triggerText="Forward"
-          triggerLabel="Forward an agent's output"
-          tooltipLabel="Forward an agent's output"
-          triggerClass={cn(
-            "text-muted hover:text-fg hover:bg-panel focus-visible:ring-accent flex h-6 items-center gap-1 rounded-full border border-transparent px-2 text-xs transition-colors focus-visible:ring-2 focus-visible:outline-none",
-            sending ? "cursor-not-allowed opacity-60" : "",
-          )}
-        />
+        {#if mode !== "prompt"}
+          <!-- Plain-mode only: prompt mode forwards per-field, so the
+               message-level ↪ Forward button is hidden while a prompt is active. -->
+          <ForwardSourcePicker
+            {agents}
+            panes={paneLayout.panes}
+            onPickAgent={(agent) => addForwardSource(forwardSourceForAgent(agent))}
+            onPickPane={(pane) => addForwardSource(forwardSourceForPane(pane, agents))}
+            agentHasOutput={agentHasCompletedOutput}
+            disabled={sending}
+            showPaneShortcuts
+            triggerTestid="compose-forward-button"
+            triggerText="Forward"
+            triggerLabel="Forward an agent's output"
+            tooltipLabel="Forward an agent's output"
+            triggerClass={cn(
+              "text-muted hover:text-fg hover:bg-panel focus-visible:ring-accent flex h-6 items-center gap-1 rounded-full border border-transparent px-2 text-xs transition-colors focus-visible:ring-2 focus-visible:outline-none",
+              sending ? "cursor-not-allowed opacity-60" : "",
+            )}
+          />
+        {/if}
         <Tooltip label="Insert a prompt" shortcut={shortcut("/")}>
           {#snippet trigger(props)}
             <button
@@ -1871,6 +1932,7 @@
           bind:args={promptArgs}
           bind:appendedText
           bind:argSources={promptArgSources}
+          bind:appendedSources={promptAppendedSources}
           {agents}
           panes={paneLayout.panes}
           agentHasOutput={agentHasCompletedOutput}

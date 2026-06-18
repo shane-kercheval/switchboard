@@ -406,6 +406,8 @@ export async function forwardPrompt(
   name: string,
   typedArgs: Record<string, string>,
   forwardArgs: ForwardArg[],
+  appendedText: string,
+  appendedSources: AgentId[],
   forwardId: string,
 ): Promise<ForwardOutcome> {
   return await invoke<ForwardOutcome>("forward_prompt", {
@@ -413,6 +415,8 @@ export async function forwardPrompt(
     name,
     typedArgs,
     forwardArgs,
+    appendedText,
+    appendedSources,
     forwardId,
   });
 }

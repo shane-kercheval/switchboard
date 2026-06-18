@@ -15,13 +15,51 @@
 // resolves the composed body — so there is no per-agent pending entry to carry
 // it. The hold lives here instead.
 
-import type { AgentId, ProjectId, SendId } from "$lib/types";
+import type { AgentId, AgentRecord, ProjectId, SendId } from "$lib/types";
+import type { PaneId, TranscriptPane } from "$lib/state/transcriptPanes.svelte";
 
-/// One forward source: the agent's id (for pane-expanded restore) and display
-/// name (for the "waiting for {name}" label and the chip).
-export interface ForwardSource {
-  id: AgentId;
-  name: string;
+/// One forward source the user picked. An **agent** forwards that agent's latest
+/// output; a **pane** forwards each of its members' (membership snapshotted at
+/// pick time) — shown as a single named chip but expanded to agent ids at
+/// dispatch (the wire content is always per-agent blocks; the pane grouping is
+/// UI-only). `name` drives the chip and the "waiting for {name}…" label for both.
+export type ForwardSource =
+  | { kind: "agent"; id: AgentId; name: string }
+  | { kind: "pane"; paneId: PaneId; name: string; members: AgentId[] };
+
+/// Stable identity for dedup / removal / list keys — the agent id or the pane id.
+export function forwardSourceKey(source: ForwardSource): string {
+  return source.kind === "agent" ? source.id : source.paneId;
+}
+
+/// Build an agent forward source. Shared by both forward surfaces so the shape
+/// has one definition.
+export function forwardSourceForAgent(agent: AgentRecord): ForwardSource {
+  return { kind: "agent", id: agent.id, name: agent.name };
+}
+
+/// Build a pane forward source — one chip standing for the pane's members,
+/// snapshotted at pick time and restricted to currently-live agents (a member
+/// removed before dispatch simply drops out). Shared by both forward surfaces.
+export function forwardSourceForPane(pane: TranscriptPane, agents: AgentRecord[]): ForwardSource {
+  return {
+    kind: "pane",
+    paneId: pane.id,
+    name: pane.name,
+    members: pane.members.filter((id) => agents.some((a) => a.id === id)),
+  };
+}
+
+/// The agent ids a set of sources forwards from, in declared order and
+/// de-duplicated — panes expand to their snapshotted members. This is what the
+/// dispatch/backend sees; the pane grouping never reaches the wire.
+export function expandForwardSources(sources: ForwardSource[]): AgentId[] {
+  const ids: AgentId[] = [];
+  for (const source of sources) {
+    const members = source.kind === "agent" ? [source.id] : source.members;
+    for (const id of members) if (!ids.includes(id)) ids.push(id);
+  }
+  return ids;
 }
 
 /// A submitted-but-still-holding forward. Carries everything needed to render

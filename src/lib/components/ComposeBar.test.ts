@@ -2099,6 +2099,44 @@ describe("ComposeBar — cross-agent forward", () => {
     });
   });
 
+  it("a plain forward carries staged attachments through to the dispatched send", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    await seedCompletedTurn(AGENT_B.id);
+    invokeMock.mockImplementation(
+      async (cmd: string, args?: Record<string, unknown>): Promise<unknown> => {
+        if (cmd === "search_project_files") return [];
+        if (cmd === "stage_attachment") {
+          const source = String((args as { sourcePath?: unknown })?.sourcePath ?? "drop");
+          const name = source.split("/").pop() ?? source;
+          return { path: `/proj/.switchboard/attachments/uuid__${name}`, original_name: name };
+        }
+        if (cmd === "forward_message") return { status: "resolved", body: "composed", skipped: [] };
+        if (cmd === "send_message") return "msg-1";
+        return null;
+      },
+    );
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    fireDrop(["/a/diagram.png"]);
+    await waitFor(() => expect(screen.getByTestId("attachment-chip-image-1")).toBeInTheDocument());
+    await pickForwardSource(AGENT_B.id);
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    // The forwarded body dispatches with the staged attachment — a forward is a
+    // send, so the user's files ride it like any message.
+    await waitFor(() => {
+      const sends = invokeMock.mock.calls.filter(([c]) => c === "send_message");
+      expect(sends).toHaveLength(1);
+      const payload = sends[0]?.[1] as { prompt: string; attachments: { original_name: string }[] };
+      expect(payload.prompt).toBe("composed");
+      expect(payload.attachments).toHaveLength(1);
+      expect(payload.attachments[0]?.original_name).toBe("diagram.png");
+    });
+    await waitFor(() => expect(screen.queryByTestId("attachment-chip-image-1")).toBeNull());
+  });
+
   it("a forward's recipient response groups under the forwarded message (live)", async () => {
     // The §7 live-parity the resolve/dispatch split restored: the backend
     // resolves + composes, the frontend dispatches the body through the normal
@@ -2254,7 +2292,7 @@ describe("ComposeBar — cross-agent forward", () => {
     await waitFor(() => {
       const forwards = held.heldForwardsFor(PROJECT_ID);
       expect(forwards).toHaveLength(1);
-      expect(forwards[0]?.sources.map((s) => s.id)).toEqual([AGENT_B.id]);
+      expect(held.expandForwardSources(forwards[0]?.sources ?? [])).toEqual([AGENT_B.id]);
       expect(forwards[0]?.recipients).toEqual([AGENT_A.id]);
     });
     // While holding, no `send_message` is issued — the frontend dispatches only
@@ -2276,6 +2314,7 @@ describe("ComposeBar — cross-agent forward", () => {
           return { path: `/proj/.switchboard/attachments/uuid__${name}`, original_name: name };
         }
         if (cmd === "list_prompts") return [REVIEW];
+        if (cmd === "render_prompt") return { text: "RENDERED" };
         if (cmd === "forward_prompt") {
           if (forward instanceof Error) throw forward;
           return forward;
@@ -2292,18 +2331,143 @@ describe("ComposeBar — cross-agent forward", () => {
     await fireEvent.click(await screen.findByTestId(`forward-picker-agent-${agentId}`));
   }
 
-  it("⌘⌃1 forwards from pane 1's members (mirrors ⌘⌥1 targeting)", async () => {
+  it("⌘⌃1 forwards from pane 1 as a single named chip (mirrors ⌘⌥1 targeting)", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
 
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
-    // The default single pane holds every agent; ⌘⌃1 adds them all as sources.
+    // The default pane "Pane 1" holds every agent; ⌘⌃1 adds it as one pane chip
+    // (expanded to its members only at dispatch), not one chip per agent.
     await fireEvent.keyDown(window, { key: "1", metaKey: true, ctrlKey: true });
 
     await waitFor(() => {
-      expect(screen.getByTestId("forward-source-chip-alice")).toBeInTheDocument();
-      expect(screen.getByTestId("forward-source-chip-bob")).toBeInTheDocument();
+      const chip = screen.getByTestId("forward-source-chip-Pane 1");
+      expect(chip).toHaveAttribute("data-kind", "pane");
+    });
+    expect(screen.queryByTestId("forward-source-chip-alice")).toBeNull();
+    expect(screen.queryByTestId("forward-source-chip-bob")).toBeNull();
+  });
+
+  it("a pane forward chip dispatches expanded to its member agent ids", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    await seedCompletedTurn(AGENT_A.id);
+    await seedCompletedTurn(AGENT_B.id);
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "forward_message") return { status: "resolved", body: "composed", skipped: [] };
+      if (cmd === "send_message") return "msg-1";
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    await fireEvent.keyDown(window, { key: "1", metaKey: true, ctrlKey: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("forward-source-chip-Pane 1")).toBeInTheDocument(),
+    );
+    await fireEvent.input(screen.getByTestId("compose-textarea"), { target: { value: "go" } });
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    // The single pane chip expands to its member agent ids on the wire.
+    await waitFor(() => {
+      const calls = invokeMock.mock.calls.filter(([c]) => c === "forward_message");
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.[1]).toMatchObject({ sources: [AGENT_A.id, AGENT_B.id] });
+    });
+  });
+
+  it("hides the compose-bar forward button and chips in prompt mode", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    await seedCompletedTurn(AGENT_B.id);
+    mockPromptForwardBackend({ status: "resolved", body: "x", skipped: [] });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    // Plain mode: the ↪ Forward button shows and a source chip can be added.
+    expect(screen.getByTestId("compose-forward-button")).toBeInTheDocument();
+    await pickForwardSource(AGENT_B.id);
+    expect(screen.getByTestId("forward-source-chips")).toBeInTheDocument();
+
+    // Prompt mode: forwarding is per-field, so the message-level affordances hide
+    // (their state is preserved, just not shown).
+    await enterPromptMode("prompt-option-local:review");
+    expect(screen.queryByTestId("compose-forward-button")).toBeNull();
+    expect(screen.queryByTestId("forward-source-chips")).toBeNull();
+  });
+
+  it("⌘⌃N does nothing in prompt mode (no hidden forward source added)", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    mockPromptForwardBackend({ status: "resolved", body: "x", skipped: [] });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    await enterPromptMode("prompt-option-local:review");
+    await fireEvent.keyDown(window, { key: "1", metaKey: true, ctrlKey: true });
+
+    // No chip while in prompt mode (the forward set is hidden there), and nothing
+    // resurfaces after the prompt is removed — the shortcut never mutated it.
+    expect(screen.queryByTestId("forward-source-chip-Pane 1")).toBeNull();
+    await fireEvent.click(screen.getByTestId("prompt-remove"));
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+    expect(screen.queryByTestId("forward-source-chips")).toBeNull();
+  });
+
+  it("clears a hidden plain-mode forward source after a successful prompt send", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    await seedCompletedTurn(AGENT_B.id);
+    mockPromptForwardBackend({ status: "resolved", body: "RENDERED", skipped: [] });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    // Add a plain forward source, then switch to a prompt (no per-field forward).
+    await pickForwardSource(AGENT_B.id);
+    await enterPromptMode("prompt-option-local:review");
+    await fireEvent.input(screen.getByTestId("prompt-arg-focus"), { target: { value: "x" } });
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    // Back in plain mode: the stale forward source is gone (a send is a fresh start).
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+    expect(screen.queryByTestId("forward-source-chips")).toBeNull();
+
+    // A subsequent plain send is a normal send, not a forward of stale output.
+    invokeMock.mockClear();
+    await fireEvent.input(screen.getByTestId("compose-textarea"), { target: { value: "next" } });
+    await fireEvent.click(screen.getByTestId("compose-send"));
+    await waitFor(() =>
+      expect(invokeMock.mock.calls.filter(([c]) => c === "send_message")).toHaveLength(1),
+    );
+    expect(invokeMock.mock.calls.filter(([c]) => c === "forward_message")).toHaveLength(0);
+  });
+
+  it("forwards into the appended text and dispatches with appended sources", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    await seedCompletedTurn(AGENT_B.id);
+    mockPromptForwardBackend({ status: "resolved", body: "RENDERED + APPENDED", skipped: [] });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    await enterPromptMode("prompt-option-local:review");
+    // Required arg satisfied by typed text; forward only into the appended field.
+    await fireEvent.input(screen.getByTestId("prompt-arg-focus"), { target: { value: "tests" } });
+    await fireEvent.click(screen.getByTestId("prompt-appended-forward"));
+    await fireEvent.click(await screen.findByTestId(`forward-picker-agent-${AGENT_B.id}`));
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    await waitFor(() => {
+      const calls = invokeMock.mock.calls.filter(([c]) => c === "forward_prompt");
+      expect(calls).toHaveLength(1);
+      // No forwarded arguments; the appended text carries the source.
+      expect(calls[0]?.[1]).toMatchObject({ forwardArgs: [], appendedSources: [AGENT_B.id] });
+    });
+    // The backend-combined body dispatches verbatim (no client-side combine).
+    await waitFor(() => {
+      const sends = invokeMock.mock.calls.filter(([c]) => c === "send_message");
+      expect(sends[0]?.[1]).toMatchObject({ prompt: "RENDERED + APPENDED" });
     });
   });
 
@@ -2383,7 +2547,7 @@ describe("ComposeBar — cross-agent forward", () => {
     await waitFor(() => {
       const forwards = held.heldForwardsFor(PROJECT_ID);
       expect(forwards).toHaveLength(1);
-      expect(forwards[0]?.sources.map((s) => s.id)).toEqual([AGENT_B.id]);
+      expect(held.expandForwardSources(forwards[0]?.sources ?? [])).toEqual([AGENT_B.id]);
       expect(forwards[0]?.recipients).toEqual([AGENT_A.id]);
     });
     expect(invokeMock.mock.calls.filter(([c]) => c === "send_message")).toHaveLength(0);

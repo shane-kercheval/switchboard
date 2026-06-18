@@ -2735,12 +2735,15 @@ pub struct ForwardArg {
 /// `typed_args` carries every argument's typed value (forwarded args included —
 /// their typed text leads the composition); `forward_args` adds the sources +
 /// required flag for the arguments being forwarded into.
+#[allow(clippy::too_many_arguments)]
 pub async fn forward_prompt_impl(
     state: &AppState,
     provider: String,
     name: String,
     typed_args: std::collections::BTreeMap<String, String>,
     forward_args: Vec<ForwardArg>,
+    appended_text: String,
+    appended_sources: Vec<AgentId>,
     forward_id: Uuid,
     home_dir: &Path,
 ) -> Result<ForwardOutcome, AppError> {
@@ -2756,29 +2759,73 @@ pub async fn forward_prompt_impl(
         &name,
         typed_args,
         &forward_args,
+        &appended_text,
+        &appended_sources,
         &token,
         home_dir,
     )
     .await
 }
 
+/// Collect a slice of resolved sources into a composed value: empty sources are
+/// recorded in `skipped`, non-empty ones become canonical blocks led by `typed`.
+fn compose_resolutions(
+    slice: &[SourceResolution],
+    typed: &str,
+    skipped: &mut Vec<String>,
+) -> String {
+    let mut blocks: Vec<(String, String)> = Vec::new();
+    for resolution in slice {
+        if let SourceResolution::Resolved {
+            name: source_name,
+            text,
+        } = resolution
+        {
+            if text.trim().is_empty() {
+                skipped.push(source_name.clone());
+            } else {
+                blocks.push((source_name.clone(), text.clone()));
+            }
+        }
+    }
+    compose_forwarded_message(
+        typed,
+        &blocks
+            .iter()
+            .map(|(source_name, text)| ForwardedBlock {
+                agent_name: source_name,
+                text,
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
 /// Body of [`forward_prompt_impl`], factored out so the [`ForwardGuard`] cleans
-/// up the registry entry on every return path.
+/// up the registry entry on every return path. Resolves the argument sources and
+/// the appended-text sources in **one** hold (so a failure in either invalidates
+/// the whole forward), renders the prompt, composes the appended tail, and returns
+/// the **already-combined** body — the appended text is just another forwardable
+/// field, combined here so the frontend dispatches verbatim.
+#[allow(clippy::too_many_arguments)]
 async fn forward_prompt_resolve(
     state: &AppState,
     provider: &str,
     name: &str,
     mut args: std::collections::BTreeMap<String, String>,
     forward_args: &[ForwardArg],
+    appended_text: &str,
+    appended_sources: &[AgentId],
     token: &CancellationToken,
     home_dir: &Path,
 ) -> Result<ForwardOutcome, AppError> {
-    // Flatten every argument's sources into one list so all source waits register
-    // up front (concurrent) — preserving the cross-source invalidation guarantee
-    // *across arguments*, not just within one — then regroup per argument below.
+    // Flatten every argument's sources, then the appended text's, into one list so
+    // all source waits register up front (concurrent) — preserving the
+    // cross-source invalidation guarantee *across fields*, not just within one —
+    // then regroup per field below.
     let flat: Vec<AgentId> = forward_args
         .iter()
         .flat_map(|a| a.sources.iter().copied())
+        .chain(appended_sources.iter().copied())
         .collect();
     let resolved = tokio::select! {
         biased;
@@ -2803,43 +2850,19 @@ async fn forward_prompt_resolve(
         }
     }
 
-    // Regroup the flat resolutions per argument (the flat list is in declared
-    // arg/source order, so a running cursor slices each argument's run), compose
-    // each forwarded argument's value, and fill the args map. Correct only because
-    // `resolve_all_sources` (via `try_join_all`) preserves input order — a
-    // reordering combinator would silently mis-assign sources to arguments.
+    // Regroup the flat resolutions per field (the flat list is in declared
+    // arg/source order followed by the appended sources, so a running cursor slices
+    // each field's run), compose each forwarded argument's value, and fill the args
+    // map. Correct only because `resolve_all_sources` (via `try_join_all`)
+    // preserves input order — a reordering combinator would silently mis-assign
+    // sources to fields.
     let mut skipped: Vec<String> = Vec::new();
     let mut cursor = 0;
     for arg in forward_args {
         let slice = &resolved[cursor..cursor + arg.sources.len()];
         cursor += arg.sources.len();
-
-        let mut blocks: Vec<(String, String)> = Vec::new();
-        for resolution in slice {
-            if let SourceResolution::Resolved {
-                name: source_name,
-                text,
-            } = resolution
-            {
-                if text.trim().is_empty() {
-                    skipped.push(source_name.clone());
-                } else {
-                    blocks.push((source_name.clone(), text.clone()));
-                }
-            }
-        }
-
         let typed = args.get(&arg.name).cloned().unwrap_or_default();
-        let composed = compose_forwarded_message(
-            &typed,
-            &blocks
-                .iter()
-                .map(|(source_name, text)| ForwardedBlock {
-                    agent_name: source_name,
-                    text,
-                })
-                .collect::<Vec<_>>(),
-        );
+        let composed = compose_resolutions(slice, &typed, &mut skipped);
         // A required argument with no value to send (no typed text and every
         // source empty) fails — the typed-only case is gated in the composer.
         // The explicit check yields the friendly message; the `required` flag is
@@ -2863,15 +2886,25 @@ async fn forward_prompt_resolve(
         }
     }
 
-    // The same agent can feed two arguments and be empty in both — dedupe so the
+    // The appended text's run is whatever follows the arguments' sources. Compose
+    // it (typed appended lead + its forwarded blocks); the appended text is never
+    // "required", so there is no empty-check.
+    let appended = compose_resolutions(&resolved[cursor..], appended_text, &mut skipped);
+
+    // The same agent can feed two fields and be empty in both — dedupe so the
     // skipped caption never lists a name twice.
     skipped.sort_unstable();
     skipped.dedup();
     let rendered = state.prompts.render(provider, name, &args).await?;
-    Ok(ForwardOutcome::Resolved {
-        body: rendered.text,
-        skipped,
-    })
+    // Combine like the frontend's `combinePromptMessage`: the rendered prompt,
+    // then (when non-empty) a blank line and the composed appended tail.
+    let trimmed_appended = appended.trim();
+    let body = if trimmed_appended.is_empty() {
+        rendered.text
+    } else {
+        format!("{}\n\n{trimmed_appended}", rendered.text)
+    };
+    Ok(ForwardOutcome::Resolved { body, skipped })
 }
 
 /// Cancel a held manual forward by `forward_id`: fire the registered hold token
@@ -13252,6 +13285,8 @@ mod tests {
                 sources: vec![source],
                 required: true,
             }],
+            String::new(),
+            Vec::new(),
             Uuid::now_v7(),
             home.path(),
         )
@@ -13290,6 +13325,8 @@ mod tests {
                 sources: vec![empty],
                 required: true,
             }],
+            String::new(),
+            Vec::new(),
             Uuid::now_v7(),
             home.path(),
         )
@@ -13316,6 +13353,8 @@ mod tests {
                 sources: vec![empty],
                 required: false,
             }],
+            String::new(),
+            Vec::new(),
             Uuid::now_v7(),
             home.path(),
         )
@@ -13329,6 +13368,45 @@ mod tests {
             "rendered with empty optional arg: {body:?}"
         );
         assert_eq!(skipped, &["reviewer-1".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn forward_prompt_forwards_into_the_appended_text() {
+        // The appended text is a forwardable field too: no forwarded *arguments*,
+        // but the appended text forwards from a source. The backend renders the
+        // prompt, composes the appended tail (typed lead + forwarded block), and
+        // returns the combined body.
+        let (_tmp, home, state, project_id) = prompt_forward_state().await;
+        let source = seed_source(
+            &state,
+            home.path(),
+            project_id,
+            "reviewer-1",
+            "EXTRA CONTEXT",
+        );
+
+        let outcome = forward_prompt_impl(
+            &state,
+            "local".to_owned(),
+            "notes".to_owned(),
+            std::collections::BTreeMap::new(),
+            vec![],
+            "see below:".to_owned(),
+            vec![source],
+            Uuid::now_v7(),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        let (body, skipped) = resolved(&outcome);
+        assert!(skipped.is_empty());
+        assert!(body.contains("Notes:"), "rendered prompt present: {body:?}");
+        assert!(
+            body.contains(
+                "see below:\n\n=== START forwarded from reviewer-1 ===\nEXTRA CONTEXT\n=== END forwarded from reviewer-1 ==="
+            ),
+            "appended tail = typed lead + forwarded block, after the rendered prompt: {body:?}"
+        );
     }
 
     #[tokio::test]
@@ -13352,6 +13430,8 @@ mod tests {
                 sources: vec![source],
                 required: true,
             }],
+            String::new(),
+            Vec::new(),
             Uuid::now_v7(),
             home.path(),
         )
@@ -13424,6 +13504,8 @@ mod tests {
                         required: true,
                     },
                 ],
+                String::new(),
+                Vec::new(),
                 Uuid::now_v7(),
                 home.path(),
             ),

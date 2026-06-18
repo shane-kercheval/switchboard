@@ -4,7 +4,12 @@
   import * as api from "$lib/api";
   import type { Prompt, AgentRecord, AgentId } from "$lib/types";
   import type { TranscriptPane } from "$lib/state/transcriptPanes.svelte";
-  import type { ForwardSource } from "$lib/state/heldForwards.svelte";
+  import {
+    forwardSourceKey,
+    forwardSourceForAgent,
+    forwardSourceForPane,
+    type ForwardSource,
+  } from "$lib/state/heldForwards.svelte";
   import {
     buildRenderArgs,
     combinePromptMessage,
@@ -31,6 +36,7 @@
     args = $bindable(),
     appendedText = $bindable(),
     argSources = $bindable({}),
+    appendedSources = $bindable([]),
     agents = [],
     panes = [],
     agentHasOutput,
@@ -42,14 +48,17 @@
     prompt: Prompt;
     args: Record<string, string>;
     appendedText: string;
-    /// Per-argument forward sources — the agents whose latest output gets composed
-    /// into each argument (typed text first, then the forwarded blocks). Bound so
-    /// the compose bar can read them at send time and route through the
+    /// Per-argument forward sources — the agents/panes whose latest output gets
+    /// composed into each argument (typed text first, then the forwarded blocks).
+    /// Bound so the compose bar can read them at send time and route through the
     /// forward-prompt path. Live-UI-only, like the compose bar's own forward set.
     argSources?: Record<string, ForwardSource[]>;
+    /// Forward sources for the appended-text field — the appended text is just
+    /// another forwardable field (composed into the appended tail at send).
+    appendedSources?: ForwardSource[];
     agents?: AgentRecord[];
     panes?: TranscriptPane[];
-    /// Flags agents with no completed output yet, so the per-argument picker and
+    /// Flags agents with no completed output yet, so the per-field picker and
     /// chips can show "no output" before send.
     agentHasOutput?: (id: AgentId) => boolean;
     onremove: () => void;
@@ -62,23 +71,37 @@
     busy?: boolean;
   } = $props();
 
-  function addArgSource(argName: string, source: ForwardSource): void {
-    const list = argSources[argName] ?? [];
-    if (list.some((s) => s.id === source.id)) return;
-    argSources[argName] = [...list, source];
+  /// Whether a source has nothing to forward yet — an agent with no completed
+  /// turn, or a pane whose every member is empty (or has no members).
+  function sourceIsEmpty(source: ForwardSource): boolean {
+    if (!agentHasOutput) return false;
+    const ids = source.kind === "agent" ? [source.id] : source.members;
+    return ids.length === 0 || ids.every((id) => !agentHasOutput(id));
   }
 
-  function addArgSourcesFromPane(argName: string, pane: TranscriptPane): void {
-    // Expand the pane to its members at pick time; each becomes its own source —
-    // the canonical composition labels agents individually, never the pane.
-    for (const id of pane.members) {
-      const agent = agents.find((a) => a.id === id);
-      if (agent) addArgSource(argName, { id: agent.id, name: agent.name });
-    }
+  // Each forwardable field (every argument, plus the appended text) owns its own
+  // source list; the snippets below are handed that list plus add/remove closures,
+  // so there is no shared key namespace to collide with argument names.
+  function withSource(list: ForwardSource[], source: ForwardSource): ForwardSource[] {
+    return list.some((s) => forwardSourceKey(s) === forwardSourceKey(source))
+      ? list
+      : [...list, source];
   }
 
-  function removeArgSource(argName: string, id: AgentId): void {
-    argSources[argName] = (argSources[argName] ?? []).filter((s) => s.id !== id);
+  function addArgSource(name: string, source: ForwardSource): void {
+    argSources[name] = withSource(argSources[name] ?? [], source);
+  }
+
+  function removeArgSource(name: string, key: string): void {
+    argSources[name] = (argSources[name] ?? []).filter((s) => forwardSourceKey(s) !== key);
+  }
+
+  function addAppendedSource(source: ForwardSource): void {
+    appendedSources = withSource(appendedSources, source);
+  }
+
+  function removeAppendedSource(key: string): void {
+    appendedSources = appendedSources.filter((s) => forwardSourceKey(s) !== key);
   }
 
   type PreviewState =
@@ -103,16 +126,28 @@
   /// Build the preview args: forwarded arguments can't show real forwarded output
   /// (it's live, resolved server-side at send time), so each shows a placeholder
   /// after any typed lead text — the preview conveys structure, not final content.
+  function withPlaceholders(typed: string, sources: ForwardSource[]): string {
+    const lead = typed.trim();
+    const placeholders = sources.map((s) => `«forwarding from ${s.name}…»`).join("\n\n");
+    return lead === "" ? placeholders : `${lead}\n\n${placeholders}`;
+  }
+
   function previewArgs(): Record<string, string> {
     const out = buildRenderArgs(prompt, args);
     for (const arg of prompt.arguments) {
       const sources = argSources[arg.name] ?? [];
       if (sources.length === 0) continue;
-      const typed = (args[arg.name] ?? "").trim();
-      const placeholders = sources.map((s) => `«forwarding from ${s.name}…»`).join("\n\n");
-      out[arg.name] = typed === "" ? placeholders : `${typed}\n\n${placeholders}`;
+      out[arg.name] = withPlaceholders(args[arg.name] ?? "", sources);
     }
     return out;
+  }
+
+  /// The appended text as previewed: forwarded appended sources show as
+  /// placeholders after any typed appended lead (real output resolves at send).
+  function previewAppended(): string {
+    return appendedSources.length === 0
+      ? appendedText
+      : withPlaceholders(appendedText, appendedSources);
   }
 
   function firstPromptField(): HTMLTextAreaElement | undefined {
@@ -139,7 +174,7 @@
     preview = { kind: "loading" };
     try {
       const rendered = await api.renderPrompt(prompt.provider, prompt.name, previewArgs());
-      preview = { kind: "ready", text: combinePromptMessage(rendered.text, appendedText) };
+      preview = { kind: "ready", text: combinePromptMessage(rendered.text, previewAppended()) };
     } catch (e) {
       preview = { kind: "error", message: e instanceof Error ? e.message : String(e) };
     }
@@ -203,83 +238,112 @@
       class="min-h-0 [scrollbar-gutter:stable] space-y-3 overflow-y-auto py-1 pr-3 pl-1"
       data-testid="prompt-fields-scroll"
     >
+      {#snippet fieldPicker(onAdd: (source: ForwardSource) => void, label: string, testid: string)}
+        <!-- ↪ sits beside the input (top-aligned, fixed square) so it reads as an
+             action on that field, not a floating label-row control. The field's
+             own add closure is passed in — no shared key namespace. -->
+        <ForwardSourcePicker
+          {agents}
+          {panes}
+          onPickAgent={(agent) => onAdd(forwardSourceForAgent(agent))}
+          onPickPane={(pane) => onAdd(forwardSourceForPane(pane, agents))}
+          {agentHasOutput}
+          disabled={busy}
+          triggerTestid={testid}
+          triggerLabel={label}
+          tooltipLabel="Forward an agent's output"
+          triggerClass="text-muted hover:text-fg hover:bg-panel border-border focus-visible:ring-accent flex h-9 w-9 shrink-0 items-center justify-center self-start rounded-md border transition-colors focus-visible:ring-2 focus-visible:outline-none"
+        />
+      {/snippet}
+
+      {#snippet fieldChips(
+        sources: ForwardSource[],
+        onRemove: (key: string) => void,
+        testid: string,
+      )}
+        {#if sources.length > 0}
+          <div class="flex flex-wrap items-center gap-1.5" data-testid={testid}>
+            {#each sources as source (forwardSourceKey(source))}
+              <ForwardSourceChip
+                {source}
+                empty={sourceIsEmpty(source)}
+                disabled={busy}
+                onRemove={() => onRemove(forwardSourceKey(source))}
+              />
+            {/each}
+          </div>
+        {/if}
+      {/snippet}
+
       {#each prompt.arguments as arg (arg.name)}
         {@const isMissing = missing.includes(arg.name)}
-        {@const sources = argSources[arg.name] ?? []}
         <div class="flex flex-col gap-1">
-          <div class="flex items-baseline justify-between gap-1.5">
-            <label
-              class="text-fg flex items-baseline gap-1.5 text-xs font-medium"
-              for={`prompt-arg-${arg.name}`}
-            >
-              <span>{arg.name}</span>
-              {#if arg.required}
-                <span class="text-status-failed" data-testid={`prompt-arg-required-${arg.name}`}
-                  >required</span
-                >
-              {:else}
-                <span class="text-muted font-normal">optional</span>
-              {/if}
-            </label>
-            {#if agents.length > 0}
-              <ForwardSourcePicker
-                {agents}
-                {panes}
-                onPickAgent={(agent) => addArgSource(arg.name, { id: agent.id, name: agent.name })}
-                onPickPane={(pane) => addArgSourcesFromPane(arg.name, pane)}
-                {agentHasOutput}
-                disabled={busy}
-                triggerTestid={`prompt-arg-forward-${arg.name}`}
-                triggerLabel={`Forward an agent's output into ${arg.name}`}
-                tooltipLabel="Forward an agent's output"
-                triggerClass="text-muted hover:text-fg hover:bg-panel focus-visible:ring-accent flex h-5 w-5 shrink-0 items-center justify-center rounded-full transition-colors focus-visible:ring-2 focus-visible:outline-none"
-              />
+          <label
+            class="text-fg flex items-baseline gap-1.5 text-xs font-medium"
+            for={`prompt-arg-${arg.name}`}
+          >
+            <span>{arg.name}</span>
+            {#if arg.required}
+              <span class="text-status-failed" data-testid={`prompt-arg-required-${arg.name}`}
+                >required</span
+              >
+            {:else}
+              <span class="text-muted font-normal">optional</span>
             {/if}
-          </div>
+          </label>
           {#if arg.description}
             <p class="text-muted text-[11px]">{arg.description}</p>
           {/if}
-          <Textarea
-            autosize
-            id={`prompt-arg-${arg.name}`}
-            data-testid={`prompt-arg-${arg.name}`}
-            rows={2}
-            bind:ref={argRefs[arg.name]}
-            bind:value={args[arg.name]}
-            disabled={busy}
-            class={cn("max-h-40 min-h-9 text-sm", isMissing ? "border-status-failed" : "")}
-          />
-          {#if sources.length > 0}
-            <div
-              class="flex flex-wrap items-center gap-1.5"
-              data-testid={`prompt-arg-sources-${arg.name}`}
-            >
-              {#each sources as source (source.id)}
-                <ForwardSourceChip
-                  {source}
-                  empty={agentHasOutput ? !agentHasOutput(source.id) : false}
-                  disabled={busy}
-                  onRemove={() => removeArgSource(arg.name, source.id)}
-                />
-              {/each}
-            </div>
-          {/if}
+          <div class="flex items-start gap-1.5">
+            <Textarea
+              autosize
+              id={`prompt-arg-${arg.name}`}
+              data-testid={`prompt-arg-${arg.name}`}
+              rows={2}
+              bind:ref={argRefs[arg.name]}
+              bind:value={args[arg.name]}
+              disabled={busy}
+              class={cn("max-h-40 min-h-9 flex-1 text-sm", isMissing ? "border-status-failed" : "")}
+            />
+            {#if agents.length > 0}
+              {@render fieldPicker(
+                (source) => addArgSource(arg.name, source),
+                `Forward an agent's output into ${arg.name}`,
+                `prompt-arg-forward-${arg.name}`,
+              )}
+            {/if}
+          </div>
+          {@render fieldChips(
+            argSources[arg.name] ?? [],
+            (key) => removeArgSource(arg.name, key),
+            `prompt-arg-sources-${arg.name}`,
+          )}
         </div>
       {/each}
 
       <div class="flex flex-col gap-1">
         <label class="text-fg text-xs font-medium" for="prompt-appended">Appended text</label>
-        <Textarea
-          autosize
-          id="prompt-appended"
-          data-testid="prompt-appended"
-          rows={2}
-          placeholder="Optional text appended after the prompt…"
-          bind:ref={appendedRef}
-          bind:value={appendedText}
-          disabled={busy}
-          class="max-h-40 min-h-9 text-sm"
-        />
+        <div class="flex items-start gap-1.5">
+          <Textarea
+            autosize
+            id="prompt-appended"
+            data-testid="prompt-appended"
+            rows={2}
+            placeholder="Optional text appended after the prompt…"
+            bind:ref={appendedRef}
+            bind:value={appendedText}
+            disabled={busy}
+            class="max-h-40 min-h-9 flex-1 text-sm"
+          />
+          {#if agents.length > 0}
+            {@render fieldPicker(
+              addAppendedSource,
+              "Forward an agent's output into the appended text",
+              "prompt-appended-forward",
+            )}
+          {/if}
+        </div>
+        {@render fieldChips(appendedSources, removeAppendedSource, "prompt-appended-sources")}
       </div>
     </div>
 

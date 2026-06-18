@@ -649,27 +649,33 @@ async fn forward_message(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn forward_prompt(
     state: State<'_, AppState>,
     provider: String,
     name: String,
     typed_args: std::collections::BTreeMap<String, String>,
     forward_args: Vec<ForwardArg>,
+    appended_text: String,
+    appended_sources: Vec<switchboard_core::AgentId>,
     forward_id: String,
 ) -> Result<ForwardOutcome, String> {
     let fid = parse_uuid(&forward_id).map_err(|e| e.to_string())?;
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
-    // Long-lived by design (like `forward_message`): holds for the per-argument
-    // sources, then resolves the rendered prompt body (or invalidate / cancel).
-    // The frontend dispatches the body; `cancel_forward` interrupts the hold.
+    // Long-lived by design (like `forward_message`): holds for every field's
+    // sources (arguments + appended text), then resolves the rendered + appended
+    // body (or invalidate / cancel). The frontend dispatches the body;
+    // `cancel_forward` interrupts the hold.
     forward_prompt_impl(
         state.inner(),
         provider,
         name,
         typed_args,
         forward_args,
+        appended_text,
+        appended_sources,
         fid,
         &home,
     )

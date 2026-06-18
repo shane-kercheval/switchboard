@@ -10,6 +10,7 @@
   import DropdownMenu from "$lib/components/ui/DropdownMenu.svelte";
   import DropdownMenuItem from "$lib/components/ui/DropdownMenuItem.svelte";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
+  import { shortcut } from "$lib/platform";
 
   let {
     agents,
@@ -23,6 +24,7 @@
     triggerLabel = "Forward output from an agent or pane",
     triggerText,
     tooltipLabel,
+    showPaneShortcuts = false,
   }: {
     agents: AgentRecord[];
     panes: TranscriptPane[];
@@ -39,6 +41,11 @@
     /// bar). Omitted for the per-argument icon-only trigger.
     triggerText?: string;
     tooltipLabel?: string;
+    /// Show the `⌘⌃N` pane-forward chord on each pane row. Compose-bar only — the
+    /// prompt composer's per-argument pickers have no such shortcut, so it stays
+    /// off there (the index matches the pane's position in `panes`, mirroring the
+    /// compose bar's handler).
+    showPaneShortcuts?: boolean;
   } = $props();
 
   // Panes are only meaningful targets once the user has actually split (≥2): with
@@ -81,7 +88,7 @@
   {/snippet}
 
   {#if multiPane}
-    {#each panes as pane (pane.id)}
+    {#each panes as pane, index (pane.id)}
       {#if pane.members.length > 0}
         <DropdownMenuItem
           onSelect={() => onPickPane(pane)}
@@ -104,6 +111,11 @@
           </svg>
           <span class="text-fg shrink-0">{pane.name}</span>
           <span class="text-muted min-w-0 truncate text-[11px]">{paneMemberNames(pane)}</span>
+          {#if showPaneShortcuts && index < 9}
+            <span class="text-muted ml-auto shrink-0 pl-2 font-mono text-[11px]"
+              >{shortcut("mod", "ctrl", String(index + 1))}</span
+            >
+          {/if}
         </DropdownMenuItem>
       {/if}
     {/each}

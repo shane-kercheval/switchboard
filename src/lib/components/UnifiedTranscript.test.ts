@@ -3320,6 +3320,37 @@ describe("UnifiedTranscript — cross-agent forward", () => {
     expect(caption).toHaveTextContent("carol had no output");
   });
 
+  it("bands only the forwarded blocks, leaving the user's typed text plain", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    const body =
+      "Please aggregate these:\n\n=== START forwarded from bob ===\nthe review\n=== END forwarded from bob ===";
+    state.dispatchUserTurn(CLAUDE_AGENT.id, "u-1", body, [], "s-2", "2026-05-16T00:00:00Z");
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const block = await screen.findByTestId("forward-block");
+    // The band wraps the forwarded block (sentinel + content) verbatim…
+    expect(block).toHaveTextContent("START forwarded from bob");
+    expect(block).toHaveTextContent("the review");
+    // …but NOT the user's own typed text (which renders plain, outside the band).
+    expect(block).not.toHaveTextContent("Please aggregate these");
+  });
+
+  it("does not band a block whose START and END agents don't pair", async () => {
+    // Defensive: the canonical backend shape always pairs START X / END X. Stray
+    // or pasted sentinel-looking text with mismatched agents must not mis-band —
+    // it falls through to plain rendering (no forward-block).
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    const body = "=== START forwarded from alice ===\nx\n=== END forwarded from bob ===";
+    state.dispatchUserTurn(CLAUDE_AGENT.id, "u-1", body, [], "s-1", "2026-05-16T00:00:00Z");
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    await waitFor(() => expect(screen.getAllByTestId("turn").length).toBeGreaterThan(0));
+    expect(screen.queryByTestId("forward-block")).toBeNull();
+  });
+
   it("does not mark an ordinary (non-forward) user message", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);

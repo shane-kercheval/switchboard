@@ -141,6 +141,42 @@
       .filter((entry) => entry.recipients.length > 0);
   });
 
+  /// One forwarded `=== START forwarded from <agent> === … === END … ===` block.
+  /// Captures the START sentinel, the inner content, and the END sentinel
+  /// separately so the sentinels can be styled while the content renders as
+  /// Markdown. Matched non-greedily so adjacent blocks don't merge; blocks don't
+  /// nest, so this is unambiguous. The END agent is a backreference to the START
+  /// agent (`\2`), so a block only bands when its sentinels pair — the canonical
+  /// backend shape always does; stray/pasted sentinel-looking text won't mis-band
+  /// (the backreference matches the captured name literally, so no regex
+  /// injection from agent names).
+  const FORWARD_BLOCK =
+    /(=== START forwarded from (.+?) ===)\n([\s\S]*?)\n(=== END forwarded from \2 ===)/g;
+
+  type ForwardSegment =
+    | { kind: "text"; text: string }
+    | { kind: "forward"; start: string; inner: string; end: string };
+
+  /// Split a forwarded message body into ordered segments — the user's typed text
+  /// (or a rendered prompt) as `text`, each forwarded block as `forward` — so the
+  /// transcript can give *only the forwarded portions* a style-only band, leaving
+  /// the user's own text plain. Text is kept verbatim (sentinels included); only
+  /// the blank-line separators between segments are trimmed for layout.
+  function splitForwardSegments(text: string): ForwardSegment[] {
+    const segments: ForwardSegment[] = [];
+    let last = 0;
+    for (const m of text.matchAll(FORWARD_BLOCK)) {
+      const idx = m.index ?? 0;
+      const between = text.slice(last, idx).replace(/^\n+|\n+$/g, "");
+      if (between !== "") segments.push({ kind: "text", text: between });
+      segments.push({ kind: "forward", start: m[1]!, inner: m[3]!, end: m[4]! });
+      last = idx + m[0].length;
+    }
+    const tail = text.slice(last).replace(/^\n+|\n+$/g, "");
+    if (tail !== "") segments.push({ kind: "text", text: tail });
+    return segments;
+  }
+
   /// Whether compact mode is on for the active project.
   const compactEnabled = $derived(stateFor(projectId).enabled);
 
@@ -1083,7 +1119,31 @@
 {/snippet}
 
 {#snippet userBody(row: Extract<UnifiedRow, { kind: "user" }>)}
-  <Markdown text={row.text} />
+  {#if FORWARD_SENTINEL.test(row.text)}
+    <!-- Forward: give each forwarded block (and only it) a style-only band so the
+         aggregated portion stands apart from the user's own typed text, which
+         stays plain. Text is verbatim — the `=== … ===` sentinels are kept. -->
+    {#each splitForwardSegments(row.text) as seg, i (i)}
+      {#if seg.kind === "forward"}
+        <!-- Border-only band: a neutral dark-gray left rule (the `muted` token —
+             not the harness-colored agent rules, not the accent green). Extra
+             `py` makes the rule extend past the text top/bottom, and `my` adds
+             separation between adjacent forwarded blocks. The `=== … ===`
+             sentinels render bold + monospace (verbatim, as plain text so the
+             `===` isn't parsed as Markdown); the content between renders as
+             Markdown. -->
+        <div class="border-muted my-3 border-l-2 pl-3" data-testid="forward-block">
+          <div class="font-mono text-xs font-bold">{seg.start}</div>
+          <Markdown text={seg.inner} />
+          <div class="font-mono text-xs font-bold">{seg.end}</div>
+        </div>
+      {:else}
+        <Markdown text={seg.text} />
+      {/if}
+    {/each}
+  {:else}
+    <Markdown text={row.text} />
+  {/if}
   {#if row.attachments.length > 0}
     {@render attachmentList(row.attachments)}
   {/if}
@@ -1096,23 +1156,18 @@
   <!-- A user message has nothing hidden behind a collapse — only height — so it
        gets a toggle only when its text actually overflows the clip. -->
   {@const showToggle = clipOverflow[key] ?? false}
-  <!-- Forward treatment: a cross-agent forward is style-only marked (an accent
-       edge) so it's clear the body — rendered VERBATIM, sentinel lines and all —
-       was forwarded, not typed. The marker is derived from the body's canonical
-       sentinel, so it's durable across reload (the journal persists the body).
-       The partial-empty caption names which sources were included vs. skipped; it
-       renders in the meta row (outside the collapse clip) so it stays visible
-       even while the message is collapsed — and is live-only (a skipped source
-       leaves no trace in the body to rebuild it from). -->
+  <!-- Forward treatment: only the forwarded *blocks* get a style-only band (see
+       `userBody`), so the user's own typed text isn't visually claimed as
+       forwarded; the body renders VERBATIM (sentinels intact). `data-forwarded`
+       (derived from the body's canonical sentinel, so durable across reload)
+       marks the turn for tests/hooks. The partial-empty caption names which
+       sources were included vs. skipped; it renders in the meta row (outside the
+       collapse clip) so it stays visible even while collapsed — and is live-only
+       (a skipped source leaves no trace in the body to rebuild it from). -->
   {@const forwarded = FORWARD_SENTINEL.test(row.text)}
   {@const caption = row.send_id !== undefined ? forwardCaptionFor(projectId, row.send_id) : undefined}
   <div class="group min-w-0 flex-1" data-testid="turn" data-role="user" data-forwarded={forwarded}>
-    <div
-      class={cn(
-        "w-full max-w-full overflow-hidden rounded-xl bg-blue-100/20 px-4 py-2",
-        forwarded && "border-accent/60 border-l-2",
-      )}
-    >
+    <div class="w-full max-w-full overflow-hidden rounded-xl bg-blue-100/20 px-4 py-2">
       <!-- Clip wraps the content inside the bubble (not the bubble itself). The
            clip + `measureClip` mount ONLY while compact (mirroring agent rows): on
            expand the measurer unmounts and the retained `clipOverflow[key]=true`

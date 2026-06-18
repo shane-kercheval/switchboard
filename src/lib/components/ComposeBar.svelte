@@ -1741,7 +1741,7 @@
           autosize
           data-testid="compose-textarea"
           data-shortcut-scope="composer"
-          placeholder="Type a message…  (⌘+Enter to send, @ to add a recipient, / for a prompt)"
+          placeholder="Type a message…  (⌘+Enter to send, @ to add a recipient or forward source, / for a prompt)"
           rows={3}
           bind:ref={textareaEl}
           bind:value={draft}

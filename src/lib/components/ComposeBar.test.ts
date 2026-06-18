@@ -2099,6 +2099,49 @@ describe("ComposeBar — cross-agent forward", () => {
     });
   });
 
+  it("a forward's recipient response groups under the forwarded message (live)", async () => {
+    // The §7 live-parity the resolve/dispatch split restored: the backend
+    // resolves + composes, the frontend dispatches the body through the normal
+    // send path, so the recipient's response turn carries the SAME send_id as the
+    // forwarded user message and groups under it — exactly like any send.
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    await seedCompletedTurn(AGENT_B.id);
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "forward_message") return { status: "resolved", body: "composed body", skipped: [] };
+      if (cmd === "send_message") return "msg-fwd";
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    await pickForwardSource(AGENT_B.id);
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    // The composed body dispatches to recipient A as a normal send.
+    await waitFor(() => {
+      expect(invokeMock.mock.calls.filter(([c]) => c === "send_message")).toHaveLength(1);
+    });
+
+    // A's response turn (correlated by message_id) must carry the forwarded
+    // user message's send_id — so the unified view groups them.
+    fireTo(`agent:${AGENT_A.id}`, {
+      type: "turn_start",
+      turn_id: "t-a",
+      message_id: "msg-fwd",
+      started_at: "2026-05-16T00:00:00Z",
+    });
+    await waitFor(() => {
+      const turns = state.transcripts[AGENT_A.id] ?? [];
+      const sendIdOf = (t: (typeof turns)[number] | undefined) =>
+        (t as { send_id?: string } | undefined)?.send_id;
+      const userTurn = turns.find((t) => t.role === "user");
+      const agentTurn = turns.find((t) => t.role === "agent");
+      expect(sendIdOf(userTurn)).toBeDefined();
+      expect(sendIdOf(agentTurn)).toBe(sendIdOf(userTurn));
+    });
+  });
+
   it("flags an idle-empty source on its chip", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);

@@ -128,6 +128,19 @@
     ),
   );
 
+  /// Held forwards whose recipients fall in *this* transcript's agents, paired
+  /// with that pane-local recipient subset. A held "waiting…" row belongs to the
+  /// pane(s) that will receive the forward — exactly like a queued send shows in
+  /// its recipient's column — not in every pane (which is also why a recipient in
+  /// another pane would resolve to "unknown" here). With a single pane this is
+  /// the whole roster, so every held forward renders once.
+  const heldForwardsHere = $derived.by(() => {
+    const ids = new Set(agents.map((a) => a.id));
+    return heldForwardsFor(projectId)
+      .map((held) => ({ held, recipients: held.recipients.filter((r) => ids.has(r)) }))
+      .filter((entry) => entry.recipients.length > 0);
+  });
+
   /// Whether compact mode is on for the active project.
   const compactEnabled = $derived(stateFor(projectId).enabled);
 
@@ -1171,9 +1184,9 @@
      "Queued…" — and a cancel control. Cancelling fires `cancel_forward`; the
      compose bar's awaiting `forward_message` then resolves cancelled, removes
      this entry, and restores the composer (text + source chips). -->
-{#snippet heldForwardRow(held: HeldForward)}
+{#snippet heldForwardRow(held: HeldForward, recipientsHere: string[])}
   {@const sourceNames = held.sources.map((s) => s.name).join(", ")}
-  {@const recipientNames = held.recipients.map((id) => agentName(id)).join(", ")}
+  {@const recipientNames = recipientsHere.map((id) => agentName(id)).join(", ")}
   <div class="group min-w-0 flex-1" data-testid="held-forward" data-forward-id={held.forwardId}>
     {#if held.body.trim() !== ""}
       <div
@@ -1463,13 +1476,13 @@
       </div>
     {/each}
     <!-- Held cross-agent forwards: submitted but still waiting on their source
-         agents' turns to finish before the backend dispatches them. Render at the
-         bottom (newest pending action), distinct from a "Queued…" send — a held
+         agents' turns to settle. Render at the bottom (newest pending action),
+         in the recipient's pane(s) only, distinct from a "Queued…" send — a held
          forward issued no `send_message` yet, so it has no `pending_sends` entry;
          it lives in the project-keyed `heldForwards` store (survives navigation,
          lost on restart). -->
-    {#each heldForwardsFor(projectId) as held (held.forwardId)}
-      {@render heldForwardRow(held)}
+    {#each heldForwardsHere as entry (entry.held.forwardId)}
+      {@render heldForwardRow(entry.held, entry.recipients)}
     {/each}
   </div>
 </div>

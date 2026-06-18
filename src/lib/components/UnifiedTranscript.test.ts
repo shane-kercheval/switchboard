@@ -3245,6 +3245,51 @@ describe("UnifiedTranscript — cross-agent forward", () => {
     );
   });
 
+  it("shows a held forward only in the pane(s) that contain its recipient", async () => {
+    // Each pane renders its own UnifiedTranscript scoped to its agents. A held
+    // forward must show in the recipient's pane only — not leak into a pane that
+    // doesn't contain the recipient (where the name would also resolve "unknown").
+    const state = await loadState();
+    const held = await loadHeld();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    held.addHeldForward(PROJECT_ID, {
+      forwardId: "fwd-1",
+      sendId: "s-1",
+      body: "aggregate",
+      sources: [{ id: CODEX_AGENT.id, name: "bob" }],
+      recipients: [CLAUDE_AGENT.id],
+    });
+
+    // This pane holds only the *source* (codex), not the recipient (claude).
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
+    expect(screen.queryByTestId("held-forward")).toBeNull();
+  });
+
+  it("shows only this pane's recipients in the held row — resolvable, never 'unknown'", async () => {
+    // The "Forward to unknown" regression: a fan-out forward whose recipients span
+    // panes must, in each pane, name only the recipients that pane contains (so
+    // the name always resolves) — not every recipient.
+    const state = await loadState();
+    const held = await loadHeld();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    held.addHeldForward(PROJECT_ID, {
+      forwardId: "fwd-1",
+      sendId: "s-1",
+      body: "x",
+      sources: [{ id: CODEX_AGENT.id, name: "bob" }],
+      recipients: [CLAUDE_AGENT.id, CODEX_AGENT.id],
+    });
+
+    // This pane holds only claude; the held row names claude, not the other
+    // recipient (which lives in a different pane) and never "unknown".
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    const heldEl = await screen.findByTestId("held-forward");
+    expect(heldEl).toHaveTextContent("Forward to alice");
+    expect(heldEl).not.toHaveTextContent("unknown");
+  });
+
   it("renders a forward verbatim, marked via its body sentinel, with a partial-empty caption", async () => {
     const state = await loadState();
     const held = await loadHeld();

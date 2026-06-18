@@ -185,6 +185,23 @@ A *separate* axis from model (§3.3), with a **different capability set**. Verif
 
 **Caveats.** Claude `max` is **session-only** and had a historical "flag ignored" bug ([#50099](https://github.com/anthropics/claude-code/issues/50099), v2.1.113). **Re-probed @ 2.1.163 (2026-06-05): honored, bug does not reproduce.** Same reasoning prompt (`--model sonnet`): `--effort low` → 5 output tokens, `--effort max` → 80 (≈16×) at higher cost/latency, both reaching the correct answer — `max` demonstrably drives more reasoning, so it is safe for the M5 picker to offer. Re-probe on CLI bumps. Codex `none` is a *real* level (forces no extended reasoning) and is **not** the same as leaving effort unset (which passes no flag → harness default). Net: **effort is ours to drive only on Claude and Codex.** Gemini exposes a model flag but locks thinking behind config; Antigravity locks the model behind config but folds effort into the model name — mirror images, each with one axis we can't reach. Sources: Claude [model-config](https://code.claude.com/docs/en/model-config) / [effort](https://platform.claude.com/docs/en/build-with-claude/effort); Codex [reasoning-effort](https://codex.danielvaughan.com/2026/03/27/reasoning-effort-tuning/); Gemini [thinking config FR #25122](https://github.com/google-gemini/gemini-cli/issues/25122).
 
+### 3.5 Session branching / fork
+
+> **Status: Claude-only headless support. Codex interactive-only. Gemini/Antigravity unavailable.**
+
+"Fork" means branching the conversation tree at the current tip to create an independent new session that shares the prior context but diverges from that point forward. The TUI equivalent is Claude Code's `/branch` slash command.
+
+| Harness | Mechanism | Headless (-p) | Wire signal | Session-file shape |
+|---|---|---|---|---|
+| **Claude** | `--fork-session` flag, used with `--resume <session-id>` or `--continue` | ✅ **confirmed** — `claude -p --verbose --resume <id> --fork-session "<prompt>"` works; turn completes and the new session file is written to disk | **No `parent_session_id` in `system/init`** — the forked session's init event carries only its own new `session_id`; the branch relationship is not announced on the stream | New `.jsonl` in the same project dir; records carry `parentUuid` links that cross back into the original session file, forming a contiguous tree. The fork point record in the new file has a `parentUuid` matching a `uuid` in the original session. The forked file also receives the full prior context as `attachment` records (~132 records for a 145-record original — verified 2026-06-17 @ 2.1.172). |
+| **Codex** | `codex fork` subcommand | ❌ **interactive-only** — `codex fork` opens a session picker; `codex exec` has no fork subcommand or flag. No headless path. | — | — |
+| **Gemini** | None observed | ❌ | — | — |
+| **Antigravity** | Server-side automatic fork only — when a resumed conversation UUID no longer exists server-side, `agy` silently forks a fresh conversation and the adapter detects + re-captures the new UUID (the "fork-and-heal" in G15). No user-triggered fork. | ❌ | — | — |
+
+**Switchboard implication.** Because `--fork-session` works headlessly, Switchboard can expose "Fork session" as an agent row action for Claude Code agents without requiring the user to leave the app. The command shape is `claude -p --verbose --resume <session_locator> --fork-session -- "<first prompt on fork>"`, producing a new agent whose `session_locator` is the new session ID from the forked session's `system/init` event. The Codex asymmetry (no headless fork) matches system-design §9's documented fork capability matrix. Gemini and Antigravity show an explanatory tooltip.
+
+**`parent_session_id` is absent from the stream.** Switchboard has no wire signal that a session is a fork — the new session's `system/init` looks identical to any fresh session. The branch relationship lives only in the on-disk `parentUuid` chain. Switchboard does not need to read or track this chain; it is the harness's internal tree, not Switchboard's.
+
 ---
 
 ## 4. Gap register (actionable)

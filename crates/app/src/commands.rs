@@ -2711,11 +2711,174 @@ async fn resolve_source(
     }
 }
 
+/// One prompt argument filled by forwarding (the frontend sends one per argument
+/// that has ≥1 source). `required` lets the backend fail the forward when a
+/// required argument resolves fully empty — its typed text is empty **and** all
+/// its sources are empty; a typed-only required-empty argument is caught by the
+/// composer's existing gating before this is called.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ForwardArg {
+    pub name: String,
+    pub sources: Vec<AgentId>,
+    pub required: bool,
+}
+
+/// Manual forward into a prompt's arguments (the prompt-composer analogue of
+/// [`forward_message_impl`], and the manual precursor of M4's workflow `send`
+/// with `prompt` + `template_vars` — M4 reuses this resolve → fill-args → render
+/// tail, so keep them in step). Resolve-only, like `forward_message_impl`: holds
+/// for the sources, composes each forwarded argument (its typed text first, then
+/// its forwarded blocks — the same `compose_forwarded_message` as the compose
+/// bar), fills the args map, renders the prompt via `PromptService`, and returns
+/// the rendered body for the frontend to dispatch through the normal send path.
+///
+/// `typed_args` carries every argument's typed value (forwarded args included —
+/// their typed text leads the composition); `forward_args` adds the sources +
+/// required flag for the arguments being forwarded into.
+pub async fn forward_prompt_impl(
+    state: &AppState,
+    provider: String,
+    name: String,
+    typed_args: std::collections::BTreeMap<String, String>,
+    forward_args: Vec<ForwardArg>,
+    forward_id: Uuid,
+    home_dir: &Path,
+) -> Result<ForwardOutcome, AppError> {
+    let token = CancellationToken::new();
+    lock(&state.forwards).insert(forward_id, token.clone());
+    let _guard = ForwardGuard {
+        forwards: &state.forwards,
+        forward_id,
+    };
+    forward_prompt_resolve(
+        state,
+        &provider,
+        &name,
+        typed_args,
+        &forward_args,
+        &token,
+        home_dir,
+    )
+    .await
+}
+
+/// Body of [`forward_prompt_impl`], factored out so the [`ForwardGuard`] cleans
+/// up the registry entry on every return path.
+async fn forward_prompt_resolve(
+    state: &AppState,
+    provider: &str,
+    name: &str,
+    mut args: std::collections::BTreeMap<String, String>,
+    forward_args: &[ForwardArg],
+    token: &CancellationToken,
+    home_dir: &Path,
+) -> Result<ForwardOutcome, AppError> {
+    // Flatten every argument's sources into one list so all source waits register
+    // up front (concurrent) — preserving the cross-source invalidation guarantee
+    // *across arguments*, not just within one — then regroup per argument below.
+    let flat: Vec<AgentId> = forward_args
+        .iter()
+        .flat_map(|a| a.sources.iter().copied())
+        .collect();
+    let resolved = tokio::select! {
+        biased;
+        () = token.cancelled() => return Ok(ForwardOutcome::Cancelled),
+        result = resolve_all_sources(state, &flat, home_dir) => result?,
+    };
+
+    // Invalidate on the first source whose turn failed/cancelled (same as M2).
+    for resolution in &resolved {
+        if let SourceResolution::Invalidated {
+            name: source_name,
+            outcome,
+        } = resolution
+        {
+            let verb = match outcome {
+                TurnOutcome::Cancelled { .. } => "was cancelled",
+                _ => "failed",
+            };
+            return Ok(ForwardOutcome::Invalidated {
+                reason: format!("{source_name}'s turn {verb} before it could be forwarded"),
+            });
+        }
+    }
+
+    // Regroup the flat resolutions per argument (the flat list is in declared
+    // arg/source order, so a running cursor slices each argument's run), compose
+    // each forwarded argument's value, and fill the args map. Correct only because
+    // `resolve_all_sources` (via `try_join_all`) preserves input order — a
+    // reordering combinator would silently mis-assign sources to arguments.
+    let mut skipped: Vec<String> = Vec::new();
+    let mut cursor = 0;
+    for arg in forward_args {
+        let slice = &resolved[cursor..cursor + arg.sources.len()];
+        cursor += arg.sources.len();
+
+        let mut blocks: Vec<(String, String)> = Vec::new();
+        for resolution in slice {
+            if let SourceResolution::Resolved {
+                name: source_name,
+                text,
+            } = resolution
+            {
+                if text.trim().is_empty() {
+                    skipped.push(source_name.clone());
+                } else {
+                    blocks.push((source_name.clone(), text.clone()));
+                }
+            }
+        }
+
+        let typed = args.get(&arg.name).cloned().unwrap_or_default();
+        let composed = compose_forwarded_message(
+            &typed,
+            &blocks
+                .iter()
+                .map(|(source_name, text)| ForwardedBlock {
+                    agent_name: source_name,
+                    text,
+                })
+                .collect::<Vec<_>>(),
+        );
+        // A required argument with no value to send (no typed text and every
+        // source empty) fails — the typed-only case is gated in the composer.
+        // The explicit check yields the friendly message; the `required` flag is
+        // caller-supplied, so it is *not* trusted as the sole guard.
+        if arg.required && composed.trim().is_empty() {
+            return Ok(ForwardOutcome::Invalidated {
+                reason: format!(
+                    "required argument \"{}\" had no output to forward",
+                    arg.name
+                ),
+            });
+        }
+        // Never insert an empty composed value: an absent key lets
+        // `PromptService::render` enforce required-ness itself (a stale/wrong
+        // caller-supplied `required: false` can't slip an empty required arg
+        // through, since the renderer rejects missing required args). A non-empty
+        // value is inserted; a blank optional stays absent so the prompt applies
+        // its own default.
+        if !composed.trim().is_empty() {
+            args.insert(arg.name.clone(), composed);
+        }
+    }
+
+    // The same agent can feed two arguments and be empty in both — dedupe so the
+    // skipped caption never lists a name twice.
+    skipped.sort_unstable();
+    skipped.dedup();
+    let rendered = state.prompts.render(provider, name, &args).await?;
+    Ok(ForwardOutcome::Resolved {
+        body: rendered.text,
+        skipped,
+    })
+}
+
 /// Cancel a held manual forward by `forward_id`: fire the registered hold token
-/// so `forward_message_impl` releases its source wait and returns
-/// [`ForwardOutcome::Cancelled`] without dispatching. Idempotent — a no-op when
-/// the forward already settled (no entry), so a cancel racing a just-dispatched
-/// forward never errors.
+/// so the held `forward_message_impl` / `forward_prompt_impl` releases its source
+/// wait and returns [`ForwardOutcome::Cancelled`] without resolving. Idempotent —
+/// a no-op when the forward already settled (no entry), so a cancel racing a
+/// just-resolved forward never errors.
 pub fn cancel_forward_impl(state: &AppState, forward_id: Uuid) {
     if let Some(token) = lock(&state.forwards).get(&forward_id) {
         token.cancel();
@@ -13004,6 +13167,276 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Prompt(_)));
+    }
+
+    // `topic` typed, `feedback` forwarded — the M2.5 prompt-forward fixture.
+    const AGGREGATE_PROMPT: &str = "---\nname: aggregate\ndescription: Aggregate.\narguments:\n  - name: topic\n    required: true\n  - name: feedback\n    required: true\n---\nTopic: {{ topic }}\n\n{{ feedback }}\n";
+    // A single optional forwarded arg.
+    const NOTES_PROMPT: &str = "---\nname: notes\ndescription: Notes.\narguments:\n  - name: extra\n    required: false\n---\nNotes: {{ extra }}\n";
+
+    /// Stand up a prompts-enabled state with a directory + active project, ready
+    /// for `seed_source` + `forward_prompt_impl`. Returns the state, a temp HOME
+    /// for staging source transcripts, and the project id.
+    async fn prompt_forward_state() -> (TempDir, TempDir, AppState, ProjectId) {
+        let (tmp, state) = state_with_prompts();
+        let home = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("prompts").join("aggregate.md"),
+            AGGREGATE_PROMPT,
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("prompts").join("notes.md"), NOTES_PROMPT).unwrap();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "proj");
+        set_active_project_impl(&state, project.id).unwrap();
+        (tmp, home, state, project.id)
+    }
+
+    /// Like `prompt_forward_state` but with caller-supplied Claude/Codex adapters,
+    /// so a test can hold a source's turn deterministically in flight (the
+    /// cross-argument invalidation race needs one source pending while another
+    /// fails). Returns the recording emitter too, for `turn_start` waits.
+    async fn prompt_forward_state_with_adapters(
+        claude: Arc<dyn HarnessAdapter>,
+        codex: Arc<dyn HarnessAdapter>,
+    ) -> (TempDir, TempDir, AppState, ProjectId, Arc<RecordingEmitter>) {
+        let tmp = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let mock: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::new());
+        let emitter = Arc::new(RecordingEmitter::new());
+        let state = AppState::new(
+            claude,
+            codex,
+            Arc::clone(&mock),
+            Arc::clone(&mock),
+            emitter.clone() as Arc<dyn EventEmitter>,
+        );
+        let prompts_dir = tmp.path().join("prompts");
+        std::fs::create_dir_all(&prompts_dir).unwrap();
+        std::fs::write(prompts_dir.join("aggregate.md"), AGGREGATE_PROMPT).unwrap();
+        let service = switchboard_prompts::PromptService::new(
+            tmp.path().join("config.yaml"),
+            prompts_dir,
+            None,
+            Arc::new(switchboard_prompts::InMemorySecretStore::new()),
+        );
+        let state = state.with_prompts(service);
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "proj");
+        set_active_project_impl(&state, project.id).unwrap();
+        (tmp, home, state, project.id, emitter)
+    }
+
+    #[tokio::test]
+    async fn forward_prompt_fills_forwarded_arg_and_renders_with_typed_args() {
+        let (_tmp, home, state, project_id) = prompt_forward_state().await;
+        let source = seed_source(
+            &state,
+            home.path(),
+            project_id,
+            "reviewer-1",
+            "LGTM with nits",
+        );
+
+        let outcome = forward_prompt_impl(
+            &state,
+            "local".to_owned(),
+            "aggregate".to_owned(),
+            std::collections::BTreeMap::from([("topic".to_owned(), "poems".to_owned())]),
+            vec![ForwardArg {
+                name: "feedback".to_owned(),
+                sources: vec![source],
+                required: true,
+            }],
+            Uuid::now_v7(),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        let (body, skipped) = resolved(&outcome);
+        assert!(skipped.is_empty());
+        // The typed arg rendered, and the forwarded arg filled with the canonical
+        // M2 block shape (shared `compose_forwarded_message`).
+        assert!(
+            body.contains("Topic: poems"),
+            "typed arg rendered: {body:?}"
+        );
+        assert!(
+            body.contains(
+                "=== START forwarded from reviewer-1 ===\nLGTM with nits\n=== END forwarded from reviewer-1 ==="
+            ),
+            "forwarded arg uses the canonical block shape: {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_prompt_required_arg_all_empty_invalidates() {
+        let (_tmp, home, state, project_id) = prompt_forward_state().await;
+        let empty = seed_source(&state, home.path(), project_id, "reviewer-1", "");
+
+        let outcome = forward_prompt_impl(
+            &state,
+            "local".to_owned(),
+            "aggregate".to_owned(),
+            // `topic` typed so it isn't the blocker; `feedback` (required) forwards
+            // from an empty source and has no typed text → nothing to send.
+            std::collections::BTreeMap::from([("topic".to_owned(), "poems".to_owned())]),
+            vec![ForwardArg {
+                name: "feedback".to_owned(),
+                sources: vec![empty],
+                required: true,
+            }],
+            Uuid::now_v7(),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome, ForwardOutcome::Invalidated { .. }),
+            "a required arg with no forwardable output fails, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_prompt_optional_arg_empty_proceeds() {
+        let (_tmp, home, state, project_id) = prompt_forward_state().await;
+        let empty = seed_source(&state, home.path(), project_id, "reviewer-1", "");
+
+        let outcome = forward_prompt_impl(
+            &state,
+            "local".to_owned(),
+            "notes".to_owned(),
+            std::collections::BTreeMap::new(),
+            vec![ForwardArg {
+                name: "extra".to_owned(),
+                sources: vec![empty],
+                required: false,
+            }],
+            Uuid::now_v7(),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        // Optional arg resolves empty → the send still proceeds (renders the
+        // prompt with an empty value), and the empty source is reported as skipped.
+        let (body, skipped) = resolved(&outcome);
+        assert!(
+            body.contains("Notes:"),
+            "rendered with empty optional arg: {body:?}"
+        );
+        assert_eq!(skipped, &["reviewer-1".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn forward_prompt_composes_typed_lead_then_blocks_in_one_arg() {
+        // The distinctive M2.5 shape: ONE argument that is both typed *and*
+        // forwarded — the typed lead text leads, then the forwarded block, in that
+        // argument's single rendered value.
+        let (_tmp, home, state, project_id) = prompt_forward_state().await;
+        let source = seed_source(&state, home.path(), project_id, "reviewer-1", "LGTM");
+
+        let outcome = forward_prompt_impl(
+            &state,
+            "local".to_owned(),
+            "aggregate".to_owned(),
+            std::collections::BTreeMap::from([
+                ("topic".to_owned(), "poems".to_owned()),
+                ("feedback".to_owned(), "My take:".to_owned()),
+            ]),
+            vec![ForwardArg {
+                name: "feedback".to_owned(),
+                sources: vec![source],
+                required: true,
+            }],
+            Uuid::now_v7(),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        let (body, _) = resolved(&outcome);
+        assert!(
+            body.contains(
+                "My take:\n\n=== START forwarded from reviewer-1 ===\nLGTM\n=== END forwarded from reviewer-1 ==="
+            ),
+            "typed lead precedes the forwarded block within the one argument: {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_prompt_invalidates_when_a_later_arg_source_is_cancelled() {
+        use switchboard_harness::MockScenario;
+        // The cross-argument invalidation guarantee: a source feeding a *later*
+        // argument whose turn is cancelled **while an earlier argument's source is
+        // still in flight** invalidates the whole prompt forward. Proves the
+        // flatten-then-regroup design surfaces a failure regardless of which
+        // argument owns the source — a regression to sequential per-argument
+        // resolution would register the later source's waiter too late and miss
+        // its in-flight cancellation. `topic`'s source (Claude) parks until
+        // signalled; `feedback`'s source (Codex) parks until cancelled.
+        let signal = Arc::new(tokio::sync::Notify::new());
+        let claude: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::with_scenario(
+            MockScenario::CompletesOnSignal(Arc::clone(&signal)),
+        ));
+        let codex: Arc<dyn HarnessAdapter> = Arc::new(MockHarnessAdapter::with_scenario(
+            MockScenario::AwaitCancellation,
+        ));
+        let (_tmp, home, state, _project_id, emitter) =
+            prompt_forward_state_with_adapters(claude, codex).await;
+
+        let topic_src =
+            create_agent_impl(&state, "reviewer-1", HarnessKind::ClaudeCode, None, None).unwrap();
+        let feedback_src =
+            create_agent_impl(&state, "reviewer-2", HarnessKind::Codex, None, None).unwrap();
+        // Both turns in flight: topic's parked on the signal, feedback's parked
+        // until cancelled.
+        send_msg(&state, topic_src.id, "work").await.unwrap();
+        send_msg(&state, feedback_src.id, "work").await.unwrap();
+        within(
+            &emitter,
+            "both sources in flight",
+            emitter.wait_for_type("turn_start", 2),
+        )
+        .await;
+
+        // `join!` polls the forward first, so both `wait_for_current_turn` commands
+        // register up front (mid-turn) before either settles. Then cancel the LATER
+        // arg's (feedback) source while the earlier arg's (topic) source is still
+        // parked, and release topic so `try_join_all` can complete.
+        let (outcome, ()) = tokio::join!(
+            forward_prompt_impl(
+                &state,
+                "local".to_owned(),
+                "aggregate".to_owned(),
+                std::collections::BTreeMap::new(),
+                vec![
+                    ForwardArg {
+                        name: "topic".to_owned(),
+                        sources: vec![topic_src.id],
+                        required: true,
+                    },
+                    ForwardArg {
+                        name: "feedback".to_owned(),
+                        sources: vec![feedback_src.id],
+                        required: true,
+                    },
+                ],
+                Uuid::now_v7(),
+                home.path(),
+            ),
+            async {
+                state.dispatcher.cancel(feedback_src.id, CancelSource::User);
+                signal.notify_one();
+            }
+        );
+        let outcome = outcome.unwrap();
+        assert!(
+            matches!(&outcome, ForwardOutcome::Invalidated { reason } if reason.contains("reviewer-2")),
+            "a later argument's cancelled source invalidates the whole forward: {outcome:?}"
+        );
     }
 
     #[test]

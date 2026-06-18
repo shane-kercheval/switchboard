@@ -694,8 +694,10 @@ impl Dispatcher {
     /// when the actor is first created (it owns the builder thereafter); later
     /// sends to an existing actor ignore the passed factory.
     ///
-    /// This is the compose-bar path: it carries **no** completion handle, so
-    /// the actor allocates nothing extra and accumulates no per-turn text.
+    /// This is the compose-bar path: it carries **no** completion handle, so no
+    /// caller is awaiting the turn's terminal here. (Per-turn text is still
+    /// captured always-on for current-turn waiters — see the `captured_text`
+    /// declaration in the actor loop.)
     pub async fn send_message(
         &self,
         agent_id: AgentId,

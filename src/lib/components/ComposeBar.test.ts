@@ -2109,7 +2109,8 @@ describe("ComposeBar — cross-agent forward", () => {
     await state.registerAgent(AGENT_B);
     await seedCompletedTurn(AGENT_B.id);
     invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
-      if (cmd === "forward_message") return { status: "resolved", body: "composed body", skipped: [] };
+      if (cmd === "forward_message")
+        return { status: "resolved", body: "composed body", skipped: [] };
       if (cmd === "send_message") return "msg-fwd";
       return null;
     });
@@ -2259,5 +2260,231 @@ describe("ComposeBar — cross-agent forward", () => {
     // While holding, no `send_message` is issued — the frontend dispatches only
     // once `forward_message` resolves. Distinct from a queued send.
     expect(invokeMock.mock.calls.filter(([c]) => c === "send_message")).toHaveLength(0);
+  });
+
+  // Manual forwarding into a prompt's arguments — the prompt-composer analogue of
+  // the compose-bar forward above. The backend resolves the per-argument sources,
+  // composes + fills + renders the prompt, and returns the rendered body; the
+  // frontend dispatches it through the normal send path.
+  function mockPromptForwardBackend(forward: unknown): void {
+    invokeMock.mockImplementation(
+      async (cmd: string, args?: Record<string, unknown>): Promise<unknown> => {
+        if (cmd === "search_project_files") return [];
+        if (cmd === "stage_attachment") {
+          const source = String((args as { sourcePath?: unknown })?.sourcePath ?? "drop");
+          const name = source.split("/").pop() ?? source;
+          return { path: `/proj/.switchboard/attachments/uuid__${name}`, original_name: name };
+        }
+        if (cmd === "list_prompts") return [REVIEW];
+        if (cmd === "forward_prompt") {
+          if (forward instanceof Error) throw forward;
+          return forward;
+        }
+        if (cmd === "send_message") return "msg-fwd";
+        return null;
+      },
+    );
+  }
+
+  // Open the per-argument forward picker and pick `agentId` as a source.
+  async function pickArgForward(argName: string, agentId: string): Promise<void> {
+    await fireEvent.click(screen.getByTestId(`prompt-arg-forward-${argName}`));
+    await fireEvent.click(await screen.findByTestId(`forward-picker-agent-${agentId}`));
+  }
+
+  it("⌘⌃1 forwards from pane 1's members (mirrors ⌘⌥1 targeting)", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    // The default single pane holds every agent; ⌘⌃1 adds them all as sources.
+    await fireEvent.keyDown(window, { key: "1", metaKey: true, ctrlKey: true });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("forward-source-chip-alice")).toBeInTheDocument();
+      expect(screen.getByTestId("forward-source-chip-bob")).toBeInTheDocument();
+    });
+  });
+
+  it("forwards an agent's output into a prompt argument and dispatches the rendered body", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    await seedCompletedTurn(AGENT_B.id);
+    mockPromptForwardBackend({ status: "resolved", body: "RENDERED WITH FORWARD", skipped: [] });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    await enterPromptMode("prompt-option-local:review");
+    await pickArgForward("focus", AGENT_B.id);
+    expect(
+      within(screen.getByTestId("prompt-arg-sources-focus")).getByTestId("forward-source-chip-bob"),
+    ).toBeInTheDocument();
+    // The required `focus` is typed-empty but the source fills it → send enabled.
+    expect((screen.getByTestId("compose-send") as HTMLButtonElement).disabled).toBe(false);
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    // Backend gets the prompt id, the empty typed args, and the per-arg sources.
+    await waitFor(() => {
+      const calls = invokeMock.mock.calls.filter(([c]) => c === "forward_prompt");
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.[1]).toMatchObject({
+        provider: "local",
+        name: "review",
+        typedArgs: {},
+        forwardArgs: [{ name: "focus", sources: [AGENT_B.id], required: true }],
+      });
+      expect(typeof (calls[0]?.[1] as { forwardId?: unknown }).forwardId).toBe("string");
+    });
+    // The rendered body dispatches to the recipient via the normal send path.
+    await waitFor(() => {
+      const sends = invokeMock.mock.calls.filter(([c]) => c === "send_message");
+      expect(sends).toHaveLength(1);
+      expect(sends[0]?.[1]).toMatchObject({ agentId: AGENT_A.id, prompt: "RENDERED WITH FORWARD" });
+    });
+    // Composer returns to plain mode on submit.
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+  });
+
+  it("sends the typed lead text as the argument's typed value alongside its source", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    await seedCompletedTurn(AGENT_B.id);
+    mockPromptForwardBackend({ status: "resolved", body: "BODY", skipped: [] });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    await enterPromptMode("prompt-option-local:review");
+    await fireEvent.input(screen.getByTestId("prompt-arg-focus"), { target: { value: "lead" } });
+    await pickArgForward("focus", AGENT_B.id);
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    await waitFor(() => {
+      const calls = invokeMock.mock.calls.filter(([c]) => c === "forward_prompt");
+      expect(calls).toHaveLength(1);
+      // Typed lead rides as the typed arg; the backend prepends it to the blocks.
+      expect(calls[0]?.[1]).toMatchObject({ typedArgs: { focus: "lead" } });
+    });
+  });
+
+  it("holds the prompt forward and seeds a held entry (no send during the hold)", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    await seedCompletedTurn(AGENT_B.id);
+    mockPromptForwardBackend(new Promise(() => {})); // never resolves
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    await enterPromptMode("prompt-option-local:review");
+    await pickArgForward("focus", AGENT_B.id);
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    const held = await import("$lib/state/heldForwards.svelte");
+    await waitFor(() => {
+      const forwards = held.heldForwardsFor(PROJECT_ID);
+      expect(forwards).toHaveLength(1);
+      expect(forwards[0]?.sources.map((s) => s.id)).toEqual([AGENT_B.id]);
+      expect(forwards[0]?.recipients).toEqual([AGENT_A.id]);
+    });
+    expect(invokeMock.mock.calls.filter(([c]) => c === "send_message")).toHaveLength(0);
+  });
+
+  it("restores prompt mode when a prompt forward is invalidated", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    await seedCompletedTurn(AGENT_B.id);
+    mockPromptForwardBackend({
+      status: "invalidated",
+      reason: 'required argument "focus" had no output to forward',
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    await enterPromptMode("prompt-option-local:review");
+    await pickArgForward("focus", AGENT_B.id);
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    // The prompt composer comes back with the source chip and an error.
+    await waitFor(() => {
+      expect(screen.getByTestId("prompt-composer")).toBeInTheDocument();
+      expect(screen.getByTestId("forward-source-chip-bob")).toBeInTheDocument();
+      expect(screen.getByTestId("compose-send-error")).toHaveTextContent("no output to forward");
+    });
+    expect(invokeMock.mock.calls.filter(([c]) => c === "send_message")).toHaveLength(0);
+  });
+
+  it("restores prompt mode (and re-stages chips) when a prompt forward is cancelled", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    await seedCompletedTurn(AGENT_B.id);
+    mockPromptForwardBackend({ status: "cancelled" });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    fireDrop(["/a/diagram.png"]);
+    await waitFor(() => expect(screen.getByTestId("attachment-chip-image-1")).toBeInTheDocument());
+    await enterPromptMode("prompt-option-local:review");
+    await pickArgForward("focus", AGENT_B.id);
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    // A cancelled hold restores the whole composer: prompt, the per-arg source
+    // chip, and the attachment chip (rebuilt from the snapshot).
+    await waitFor(() => {
+      expect(screen.getByTestId("prompt-composer")).toBeInTheDocument();
+      expect(screen.getByTestId("forward-source-chip-bob")).toBeInTheDocument();
+      expect(screen.getByTestId("attachment-chip-image-1")).toBeInTheDocument();
+    });
+    expect(invokeMock.mock.calls.filter(([c]) => c === "send_message")).toHaveLength(0);
+  });
+
+  it("restores prompt mode and clears the held entry when the forward IPC rejects", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    await seedCompletedTurn(AGENT_B.id);
+    mockPromptForwardBackend(new Error("ipc down"));
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    await enterPromptMode("prompt-option-local:review");
+    await pickArgForward("focus", AGENT_B.id);
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    const held = await import("$lib/state/heldForwards.svelte");
+    await waitFor(() => {
+      expect(screen.getByTestId("prompt-composer")).toBeInTheDocument();
+      expect(screen.getByTestId("forward-source-chip-bob")).toBeInTheDocument();
+      expect(screen.getByTestId("compose-send-error")).toHaveTextContent("ipc down");
+      // No ghost held entry survives an IPC failure.
+      expect(held.heldForwardsFor(PROJECT_ID)).toHaveLength(0);
+    });
+    expect(invokeMock.mock.calls.filter(([c]) => c === "send_message")).toHaveLength(0);
+  });
+
+  it("a prompt forward carries staged attachments through to the dispatched send", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    await seedCompletedTurn(AGENT_B.id);
+    mockPromptForwardBackend({ status: "resolved", body: "RENDERED BODY", skipped: [] });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+    fireDrop(["/a/diagram.png"]);
+    await waitFor(() => expect(screen.getByTestId("attachment-chip-image-1")).toBeInTheDocument());
+    await enterPromptMode("prompt-option-local:review");
+    await pickArgForward("focus", AGENT_B.id);
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    // The resolved body dispatches with the staged attachment (a prompt forward is
+    // a prompt send, so it carries files like any prompt send).
+    await waitFor(() => {
+      const sends = invokeMock.mock.calls.filter(([c]) => c === "send_message");
+      expect(sends).toHaveLength(1);
+      const payload = sends[0]?.[1] as { prompt: string; attachments: { original_name: string }[] };
+      expect(payload.prompt).toBe("RENDERED BODY");
+      expect(payload.attachments).toHaveLength(1);
+      expect(payload.attachments[0]?.original_name).toBe("diagram.png");
+    });
+    // Chips clear once the forward has dispatched.
+    await waitFor(() => expect(screen.queryByTestId("attachment-chip-image-1")).toBeNull());
   });
 });

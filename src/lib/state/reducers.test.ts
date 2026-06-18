@@ -410,10 +410,7 @@ describe("transcriptReducer", () => {
       // error rather than spinning forever as it did under the old warn-and-idle.
       let turns = reduce([], turnStart(TURN_1));
       turns = reduce(turns, contentChunk(TURN_1, "partial output"));
-      turns = reduce(
-        turns,
-        turnEndFailed(TURN_1, "turn stream ended without a terminal event"),
-      );
+      turns = reduce(turns, turnEndFailed(TURN_1, "turn stream ended without a terminal event"));
       const turn = turns[0];
       if (turn?.role !== "agent") throw new Error("unreachable");
       expect(turn.status).toBe("failed");

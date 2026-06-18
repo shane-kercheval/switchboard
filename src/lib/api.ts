@@ -385,6 +385,38 @@ export async function forwardMessage(
   return await invoke<ForwardOutcome>("forward_message", { body, sources, forwardId });
 }
 
+// One prompt argument being forwarded into: its name, the (pane-expanded) source
+// agent ids, and whether the argument is required (the backend fails the forward
+// if a required arg resolves fully empty).
+export interface ForwardArg {
+  name: string;
+  sources: AgentId[];
+  required: boolean;
+}
+
+// Manual forward into a prompt's arguments (M2.5): hold until each forwarded
+// argument's sources finish, compose each (typed text + forwarded blocks), fill
+// the args map, render the prompt, and return the rendered body for the caller to
+// dispatch. `typedArgs` carries every argument's typed value (forwarded args
+// included — their typed text leads); `forwardArgs` adds sources + required for
+// the arguments being forwarded into. Same hold/cancel/`ForwardOutcome` contract
+// as `forwardMessage`.
+export async function forwardPrompt(
+  provider: string,
+  name: string,
+  typedArgs: Record<string, string>,
+  forwardArgs: ForwardArg[],
+  forwardId: string,
+): Promise<ForwardOutcome> {
+  return await invoke<ForwardOutcome>("forward_prompt", {
+    provider,
+    name,
+    typedArgs,
+    forwardArgs,
+    forwardId,
+  });
+}
+
 // Cancel a held forward by id, releasing its source wait without dispatching.
 // Idempotent — a no-op once the forward has settled. The held `forwardMessage`
 // call then resolves `{ status: "cancelled" }`.

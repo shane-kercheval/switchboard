@@ -1165,7 +1165,8 @@
        collapse clip) so it stays visible even while collapsed — and is live-only
        (a skipped source leaves no trace in the body to rebuild it from). -->
   {@const forwarded = FORWARD_SENTINEL.test(row.text)}
-  {@const caption = row.send_id !== undefined ? forwardCaptionFor(projectId, row.send_id) : undefined}
+  {@const caption =
+    row.send_id !== undefined ? forwardCaptionFor(projectId, row.send_id) : undefined}
   <div class="group min-w-0 flex-1" data-testid="turn" data-role="user" data-forwarded={forwarded}>
     <div class="w-full max-w-full overflow-hidden rounded-xl bg-blue-100/20 px-4 py-2">
       <!-- Clip wraps the content inside the bubble (not the bubble itself). The

@@ -29,28 +29,28 @@ use tauri::{Emitter, Manager, State};
 
 use crate::commands::ProjectConversation;
 use crate::commands::{
-    AgentSessionFingerprint, AgentSessionInfo, DirectoryInfo, ForwardOutcome, HarnessInstallStatus,
-    ProjectListing, RepoListing, StagedAttachment, WorkspaceDirectories, add_mcp_provider_impl,
-    add_tracked_repo_impl, agent_session_info_impl, attach_agent_impl, cancel_agent_impl,
-    cancel_forward_impl, cancel_send_impl, cancel_turn_impl, changed_files_impl,
+    AgentSessionFingerprint, AgentSessionInfo, DirectoryInfo, ForwardArg, ForwardOutcome,
+    HarnessInstallStatus, ProjectListing, RepoListing, StagedAttachment, WorkspaceDirectories,
+    add_mcp_provider_impl, add_tracked_repo_impl, agent_session_info_impl, attach_agent_impl,
+    cancel_agent_impl, cancel_forward_impl, cancel_send_impl, cancel_turn_impl, changed_files_impl,
     check_antigravity_auth_impl, check_antigravity_binary_impl, check_claude_auth_impl,
     check_claude_binary_impl, check_codex_auth_impl, check_codex_binary_impl,
     check_gemini_auth_impl, check_gemini_binary_impl, commit_changed_files_impl,
     commit_file_diff_impl, commit_ranges_impl, create_agent_impl, create_project_impl,
     delete_project_impl, editor_open_argv, fetch_repo_impl, file_diff_impl, forward_message_impl,
-    get_harness_install_status_impl, get_preferences_impl, init_directory_impl, list_agents_impl,
-    list_mcp_providers_impl, list_projects_impl, list_prompts_impl, list_tracked_repos_from_inputs,
-    list_workspace_directories_impl, load_project_conversation_impl, load_transcript_impl,
-    open_commit_file_difftool_impl, open_project_impl, open_worktree_file_difftool_impl,
-    parse_uuid, pick_directory_impl, project_session_fingerprints_impl,
-    read_tracked_repo_from_inputs, remove_agent_impl, remove_directory_impl,
-    remove_mcp_provider_impl, remove_queued_message_impl, remove_tracked_repo_impl,
-    rename_agent_impl, rename_project_impl, render_prompt_impl, reorder_agents_impl,
-    reveal_in_finder_argv, search_project_files_in_root, search_project_files_root_impl,
-    send_message_impl, set_active_project_impl, set_agent_effort_impl, set_agent_model_impl,
-    set_preferences_impl, set_project_archived_impl, stage_attachment_impl,
-    sync_prompts_and_notify, terminal_open_argv, test_mcp_connection_impl, tracked_repos_inputs,
-    tracked_roots, validate_external_url,
+    forward_prompt_impl, get_harness_install_status_impl, get_preferences_impl,
+    init_directory_impl, list_agents_impl, list_mcp_providers_impl, list_projects_impl,
+    list_prompts_impl, list_tracked_repos_from_inputs, list_workspace_directories_impl,
+    load_project_conversation_impl, load_transcript_impl, open_commit_file_difftool_impl,
+    open_project_impl, open_worktree_file_difftool_impl, parse_uuid, pick_directory_impl,
+    project_session_fingerprints_impl, read_tracked_repo_from_inputs, remove_agent_impl,
+    remove_directory_impl, remove_mcp_provider_impl, remove_queued_message_impl,
+    remove_tracked_repo_impl, rename_agent_impl, rename_project_impl, render_prompt_impl,
+    reorder_agents_impl, reveal_in_finder_argv, search_project_files_in_root,
+    search_project_files_root_impl, send_message_impl, set_active_project_impl,
+    set_agent_effort_impl, set_agent_model_impl, set_preferences_impl, set_project_archived_impl,
+    stage_attachment_impl, sync_prompts_and_notify, terminal_open_argv, test_mcp_connection_impl,
+    tracked_repos_inputs, tracked_roots, validate_external_url,
 };
 use crate::preferences::Preferences;
 use crate::state::AppState;
@@ -649,6 +649,35 @@ async fn forward_message(
 }
 
 #[tauri::command]
+async fn forward_prompt(
+    state: State<'_, AppState>,
+    provider: String,
+    name: String,
+    typed_args: std::collections::BTreeMap<String, String>,
+    forward_args: Vec<ForwardArg>,
+    forward_id: String,
+) -> Result<ForwardOutcome, String> {
+    let fid = parse_uuid(&forward_id).map_err(|e| e.to_string())?;
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    // Long-lived by design (like `forward_message`): holds for the per-argument
+    // sources, then resolves the rendered prompt body (or invalidate / cancel).
+    // The frontend dispatches the body; `cancel_forward` interrupts the hold.
+    forward_prompt_impl(
+        state.inner(),
+        provider,
+        name,
+        typed_args,
+        forward_args,
+        fid,
+        &home,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn cancel_forward(state: State<'_, AppState>, forward_id: String) -> Result<(), String> {
     let fid = parse_uuid(&forward_id).map_err(|e| e.to_string())?;
     // Idempotent: fires the held forward's cancel token if it's still in flight,
@@ -1153,6 +1182,7 @@ pub fn run() {
             cancel_agent,
             cancel_send,
             forward_message,
+            forward_prompt,
             cancel_forward,
             agent_session_info,
             open_session_file,

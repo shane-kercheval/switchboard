@@ -53,6 +53,8 @@
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import PromptMenu from "$lib/components/PromptMenu.svelte";
   import PromptComposer from "$lib/components/PromptComposer.svelte";
+  import ForwardSourceChip from "$lib/components/ui/ForwardSourceChip.svelte";
+  import ForwardSourcePicker from "$lib/components/ui/ForwardSourcePicker.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
   import { basename, cn, currentIsoTimestamp } from "$lib/utils";
   import { shortcut } from "$lib/platform";
@@ -130,6 +132,16 @@
   // cleared on send / restore — like attachment chips. A send with ≥1 forward
   // source dispatches via `forward_message` instead of the normal send path.
   let forwardSources = $state<ForwardSource[]>([]);
+
+  function addForwardSourcesFromPane(pane: TranscriptPane): void {
+    // Expand the pane to its members at pick time (membership captured now), each
+    // added as its own forward source — the canonical composition labels agents
+    // individually, never the pane.
+    for (const id of pane.members) {
+      const agent = agents.find((a) => a.id === id);
+      if (agent) addForwardSource({ id: agent.id, name: agent.name });
+    }
+  }
 
   function addForwardSource(source: ForwardSource): void {
     if (forwardSources.some((s) => s.id === source.id)) return;
@@ -220,6 +232,9 @@
   let mode = $state<"plain" | "prompt">("plain");
   let selectedPrompt = $state<Prompt | null>(null);
   let promptArgs = $state<Record<string, string>>({});
+  // Per-argument forward sources (live-UI-only, like `forwardSources`). A
+  // prompt-mode send with any entry here routes through the forward-prompt path.
+  let promptArgSources = $state<Record<string, ForwardSource[]>>({});
   let appendedText = $state<string>("");
   let promptMenuOpen = $state(false);
   let promptMenuWrapEl = $state<HTMLDivElement | undefined>(undefined);
@@ -439,6 +454,17 @@
       // a chord typed into it also toggle recipients or send. Mirrors the ⌘K
       // guard above.
       if (hasOpenDialog()) return;
+      // ⌘⌃1..9 → add pane N's members as forward sources, mirroring ⌘⌥1..9
+      // ("target pane N"). Both modifiers required, so it never collides with
+      // ⌘1..9 (target agent N) — intercepted before that branch below.
+      if (e.metaKey && e.ctrlKey && !e.shiftKey && e.key >= "1" && e.key <= "9") {
+        const pane = paneLayout.panes[Number(e.key) - 1];
+        if (pane !== undefined && pane.members.length > 0) {
+          e.preventDefault();
+          if (!sending) addForwardSourcesFromPane(pane);
+        }
+        return;
+      }
       if (e.key === "Enter") {
         if (mode === "prompt" && composeEl?.contains(document.activeElement)) {
           e.preventDefault();
@@ -628,7 +654,13 @@
   );
 
   const missingRequired = $derived(
-    selectedPrompt === null ? [] : missingRequiredArgs(selectedPrompt, promptArgs),
+    selectedPrompt === null
+      ? []
+      : missingRequiredArgs(selectedPrompt, promptArgs).filter(
+          // A required argument with ≥1 forward source isn't blocking — the
+          // forwarded output fills it (mirrors PromptComposer's `missing`).
+          (name) => (promptArgSources[name]?.length ?? 0) === 0,
+        ),
   );
 
   /// Send is gated on a recipient + every recipient's history being loaded, plus
@@ -639,7 +671,7 @@
     mode === "prompt"
       ? selectedPrompt === null || missingRequired.length > 0 || sending || !allRecipientsHydrated
       : (draft.trim() === "" && attachmentChips.length === 0 && forwardSources.length === 0) ||
-        !allRecipientsHydrated,
+          !allRecipientsHydrated,
   );
 
   // Every live send across this project's agents, mapped to the agents it's
@@ -960,6 +992,7 @@
     const carried = mode === "plain" ? draft : appendedText;
     selectedPrompt = prompt;
     promptArgs = Object.fromEntries(prompt.arguments.map((a) => [a.name, ""]));
+    promptArgSources = {};
     appendedText = carried;
     focusPromptFieldOnMount = true;
     draft = "";
@@ -973,6 +1006,7 @@
     mode = "plain";
     selectedPrompt = null;
     promptArgs = {};
+    promptArgSources = {};
     focusPromptFieldOnMount = false;
     appendedText = "";
   }
@@ -1053,6 +1087,110 @@
     persistContentNow();
   }
 
+  /// Manual forward into a prompt's arguments (§7) — the prompt-composer analogue
+  /// of `dispatchForward`. Seeds the held "waiting for {agent}…" entry, then awaits
+  /// `forward_prompt`, which holds for every argument's sources, composes each
+  /// argument (typed lead + forwarded blocks), renders the prompt, and returns the
+  /// **rendered body**. On `resolved` the frontend appends the user's appended text
+  /// and dispatches through the normal send path (so it groups/queues/cancels like
+  /// any send) — carrying the staged `attachments`, because a prompt forward is a
+  /// prompt send (one argument is just forward-sourced), so it carries files like
+  /// any prompt send. On invalidate/cancel it restores the prompt composer and its
+  /// attachment chips.
+  function dispatchForwardPrompt(
+    prompt: Prompt,
+    typedArgs: Record<string, string>,
+    appended: string,
+    argSources: Record<string, ForwardSource[]>,
+    attachments: Attachment[],
+    targets: AgentRecord[],
+  ): void {
+    const forwardId = crypto.randomUUID();
+    const sendId = crypto.randomUUID();
+    const recipients = targets.map((t) => t.id);
+    // Dedupe sources across all arguments for the held entry's "waiting for…"
+    // label (an agent can feed more than one argument).
+    const allSources: ForwardSource[] = [];
+    for (const list of Object.values(argSources)) {
+      for (const source of list) {
+        if (allSources.some((s) => s.id === source.id)) continue;
+        allSources.push(source);
+      }
+    }
+    // body "" — a prompt forward composes server-side (render after fill), so the
+    // held row only signals the wait; there's no pre-composed body to show.
+    addHeldForward(projectId, { forwardId, sendId, body: "", sources: allSources, recipients });
+    const forwardArgs: api.ForwardArg[] = prompt.arguments
+      .filter((a) => (argSources[a.name]?.length ?? 0) > 0)
+      .map((a) => ({
+        name: a.name,
+        sources: (argSources[a.name] ?? []).map((s) => s.id),
+        required: a.required,
+      }));
+    void (async () => {
+      try {
+        const outcome = await api.forwardPrompt(
+          prompt.provider,
+          prompt.name,
+          buildRenderArgs(prompt, typedArgs),
+          forwardArgs,
+          forwardId,
+        );
+        removeHeldForward(projectId, forwardId);
+        if (outcome.status === "resolved") {
+          dispatchToRecipients(
+            combinePromptMessage(outcome.body, appended),
+            attachments,
+            targets,
+            sendId,
+          );
+          if (outcome.skipped.length > 0) {
+            const included = allSources
+              .map((s) => s.name)
+              .filter((name) => !outcome.skipped.includes(name));
+            setForwardCaption(projectId, sendId, { included, skipped: outcome.skipped });
+          }
+        } else {
+          restoreForwardPrompt(prompt, typedArgs, appended, argSources, attachments);
+          if (outcome.status === "invalidated") sendError = `Forward not sent: ${outcome.reason}`;
+        }
+      } catch (err) {
+        removeHeldForward(projectId, forwardId);
+        sendError = `Forward failed: ${err instanceof Error ? err.message : String(err)}`;
+        restoreForwardPrompt(prompt, typedArgs, appended, argSources, attachments);
+      }
+    })();
+  }
+
+  /// Restore a cancelled/invalidated prompt forward — but only into a pristine
+  /// plain composer, so a new prompt, draft, or attachment the user started while
+  /// the forward was holding is never clobbered. Same deferred navigate-away
+  /// limitation as `restoreForward`. The attachment chips are rebuilt from the
+  /// snapshot (the staged files persist on disk), preserving their original
+  /// labels.
+  function restoreForwardPrompt(
+    prompt: Prompt,
+    typedArgs: Record<string, string>,
+    appended: string,
+    argSources: Record<string, ForwardSource[]>,
+    attachments: Attachment[],
+  ): void {
+    if (
+      mode !== "plain" ||
+      selectedPrompt !== null ||
+      draft.trim() !== "" ||
+      attachmentChips.length > 0
+    )
+      return;
+    selectedPrompt = prompt;
+    promptArgs = { ...typedArgs };
+    promptArgSources = { ...argSources };
+    appendedText = appended;
+    attachmentChips = attachments.map((a) => ({ ...a, id: crypto.randomUUID() }));
+    mode = "prompt";
+    persistContentNow();
+  }
+
   /// Dispatch `text` to `targets` under one send_id. Shared by the plain, prompt,
   /// and forward paths — the prompt path renders first, then calls this with the
   /// finished text and the recipients captured at click time (so toggling chips
@@ -1107,6 +1245,37 @@
       const renderArgs = buildRenderArgs(prompt, promptArgs);
       const appended = appendedText;
       const targets = [...selectedAgents];
+
+      // A prompt with ≥1 forwarded argument goes through the held forward-prompt
+      // path (resolved + rendered server-side once the sources settle), not the
+      // immediate render below. Clears back to the plain composer right away —
+      // the held entry owns the rest; restore re-enters prompt mode if it fails.
+      // Attachments ride the forward (it's a prompt send) and clear optimistically
+      // like the prompt/args; restore rebuilds the chips if the forward fails.
+      if (prompt.arguments.some((a) => (promptArgSources[a.name]?.length ?? 0) > 0)) {
+        promptMenuOpen = false;
+        closeMentionMenu();
+        dispatchForwardPrompt(
+          prompt,
+          { ...promptArgs },
+          appended,
+          { ...promptArgSources },
+          attachments,
+          targets,
+        );
+        selectedPrompt = null;
+        promptArgs = {};
+        promptArgSources = {};
+        focusPromptFieldOnMount = false;
+        appendedText = "";
+        draft = "";
+        attachmentChips = [];
+        composeGeneration += 1;
+        mode = "plain";
+        persistContentNow();
+        return;
+      }
+
       promptMenuOpen = false;
       closeMentionMenu();
       sending = true;
@@ -1138,6 +1307,7 @@
       // carried back.
       selectedPrompt = null;
       promptArgs = {};
+      promptArgSources = {};
       focusPromptFieldOnMount = false;
       appendedText = "";
       draft = "";
@@ -1468,57 +1638,12 @@
       <div class="mb-1.5 flex flex-wrap items-center gap-1.5" data-testid="forward-source-chips">
         <span class="text-muted text-xs">Forwarding from</span>
         {#each forwardSources as source (source.id)}
-          {@const empty = !agentHasCompletedOutput(source.id)}
-          <span
-            class={cn(
-              "inline-flex max-w-[14rem] items-center gap-1.5 rounded-full border py-px pr-1 pl-2 text-xs",
-              empty
-                ? "border-status-failed/40 bg-status-failed-soft/40 text-status-failed"
-                : "border-border bg-panel text-fg",
-            )}
-            data-testid={`forward-source-chip-${source.name}`}
-            data-empty={empty}
-          >
-            <svg
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="2"
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              class="h-3 w-3 shrink-0"
-              aria-hidden="true"
-            >
-              <polyline points="15 17 20 12 15 7" />
-              <path d="M4 18v-2a4 4 0 0 1 4-4h12" />
-            </svg>
-            <span class="truncate" title={source.name}>{source.name}</span>
-            {#if empty}
-              <span class="shrink-0 italic" title="This agent has no completed output to forward"
-                >no output</span
-              >
-            {/if}
-            <button
-              type="button"
-              class="text-muted hover:text-fg hover:bg-raised flex h-4 w-4 shrink-0 items-center justify-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50"
-              data-testid={`forward-source-remove-${source.name}`}
-              aria-label={`Remove forward source ${source.name}`}
-              disabled={sending}
-              onclick={() => removeForwardSource(source.id)}
-            >
-              <svg
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="2"
-                stroke-linecap="round"
-                class="h-3 w-3"
-                aria-hidden="true"
-              >
-                <path d="m6 6 12 12M18 6 6 18" />
-              </svg>
-            </button>
-          </span>
+          <ForwardSourceChip
+            {source}
+            empty={!agentHasCompletedOutput(source.id)}
+            disabled={sending}
+            onRemove={() => removeForwardSource(source.id)}
+          />
         {/each}
       </div>
     {/if}
@@ -1631,7 +1756,23 @@
       {:else}
         <div></div>
       {/if}
-      <div class="shrink-0">
+      <div class="flex shrink-0 items-center gap-1">
+        <ForwardSourcePicker
+          {agents}
+          panes={paneLayout.panes}
+          onPickAgent={(agent) => addForwardSource({ id: agent.id, name: agent.name })}
+          onPickPane={(pane) => addForwardSourcesFromPane(pane)}
+          agentHasOutput={agentHasCompletedOutput}
+          disabled={sending}
+          triggerTestid="compose-forward-button"
+          triggerText="Forward"
+          triggerLabel="Forward an agent's output"
+          tooltipLabel="Forward an agent's output"
+          triggerClass={cn(
+            "text-muted hover:text-fg hover:bg-panel focus-visible:ring-accent flex h-6 items-center gap-1 rounded-full border border-transparent px-2 text-xs transition-colors focus-visible:ring-2 focus-visible:outline-none",
+            sending ? "cursor-not-allowed opacity-60" : "",
+          )}
+        />
         <Tooltip label="Insert a prompt" shortcut={shortcut("/")}>
           {#snippet trigger(props)}
             <button
@@ -1729,6 +1870,10 @@
           prompt={selectedPrompt}
           bind:args={promptArgs}
           bind:appendedText
+          bind:argSources={promptArgSources}
+          {agents}
+          panes={paneLayout.panes}
+          agentHasOutput={agentHasCompletedOutput}
           focusFirstField={focusPromptFieldOnMount}
           onremove={removePrompt}
           busy={sending}

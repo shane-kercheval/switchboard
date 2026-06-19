@@ -15,6 +15,7 @@
 /// capability has an empty list here and no default.
 
 import type { HarnessKind } from "./types";
+import { HARNESS_DEFAULT_AGENT_NAME } from "./harnessDisplay";
 
 /// One picker option: `value` is the alias/id submitted to the backend,
 /// `label` the friendlier display text.
@@ -88,3 +89,28 @@ export const DEFAULT_EFFORT: Record<HarnessKind, string | undefined> = {
   gemini: undefined,
   antigravity: undefined,
 };
+
+/// The auto-derived agent name for a create: named after the model it'll run,
+/// with effort appended where the harness has that axis — so a roster of
+/// auto-created agents reads as `opus-high`, `gpt-5-5-medium`, … at a glance.
+/// Harnesses with no concrete model to name after fall back to the bare harness
+/// name: Antigravity (model is harness-owned) and Gemini left on `auto` (it
+/// picks up whatever model was last used).
+///
+/// The result is **guaranteed** to be a valid agent name. Model ids are
+/// vendor-shaped strings this module is built to edit as models ship/sunset
+/// (`gpt-5.5`, a future `provider/model`, …), so rather than trust the current
+/// curated values to be clean we slugify: every run of characters outside the
+/// agent-name charset (letters/digits/`-`/`_`, mirroring
+/// `nameValidation.ALLOWED_NAME`) collapses to a single `-`, leading/trailing
+/// separators are trimmed, and an empty result falls back to the harness slug.
+export function defaultAgentName(
+  harness: HarnessKind,
+  model: string | undefined,
+  effort: string | undefined,
+): string {
+  if (!model || model === "auto") return HARNESS_DEFAULT_AGENT_NAME[harness];
+  const raw = effort ? `${model}-${effort}` : model;
+  const slug = raw.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
+  return slug === "" ? HARNESS_DEFAULT_AGENT_NAME[harness] : slug;
+}

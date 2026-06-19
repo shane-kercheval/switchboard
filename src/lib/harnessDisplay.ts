@@ -91,13 +91,16 @@ export const SUPPORTS_EFFORT_SELECTION: Record<HarnessKind, boolean> = {
   antigravity: false,
 };
 
-/// Default agent name for a harness — the pre-filled name in the create form
-/// and the name each auto-created agent gets on a new project. A **direct**
-/// slug map, deliberately not derived from a display label: these are
-/// persisted, canonicalized identifiers, and `HARNESS_LABEL` is the short
-/// display label (`"Claude"`) which would slug to the wrong name. All four are
-/// distinct under the backend's name canonicalization, so a new project's
-/// auto-created agents never self-collide.
+/// Bare per-harness agent name — the fallback used by `defaultAgentName`
+/// (`agentSelection.ts`) when there's no concrete model to name an agent after
+/// (Antigravity, or Gemini left on `auto`). Create-form pre-fill and
+/// new-project auto-seed names now derive from model+effort for the
+/// model-selectable harnesses (`opus-high`, `gpt-5-5-medium`); only the
+/// fallback path lands here. A **direct** slug map, deliberately not derived
+/// from a display label: these are persisted, canonicalized identifiers, and
+/// `HARNESS_LABEL` is the short display label (`"Claude"`) which would slug to
+/// the wrong name. All four are distinct under the backend's name
+/// canonicalization.
 export const HARNESS_DEFAULT_AGENT_NAME: Record<HarnessKind, string> = {
   claude_code: "claude-code",
   codex: "codex",

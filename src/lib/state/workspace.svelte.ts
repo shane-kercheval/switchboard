@@ -42,8 +42,7 @@ import type {
 } from "$lib/types";
 import { tick, untrack } from "svelte";
 import { harnessAvailability, refreshHarnessAvailability } from "$lib/harnessAvailability.svelte";
-import { HARNESS_DEFAULT_AGENT_NAME } from "$lib/harnessDisplay";
-import { DEFAULT_EFFORT, DEFAULT_MODEL } from "$lib/agentSelection";
+import { DEFAULT_EFFORT, DEFAULT_MODEL, defaultAgentName } from "$lib/agentSelection";
 import { currentIsoTimestamp } from "$lib/utils";
 import { buildLiveSendsMap } from "$lib/state/liveSends";
 import {
@@ -415,7 +414,7 @@ async function seedAgentsForInstalledHarnesses(projectId: ProjectId): Promise<vo
       // auto-created agent is born with a known, displayed model/effort
       // (`undefined` for a no-capability harness → backend stores `None`).
       const agent = await api.createAgent(
-        HARNESS_DEFAULT_AGENT_NAME[harness],
+        defaultAgentName(harness, DEFAULT_MODEL[harness], DEFAULT_EFFORT[harness]),
         harness,
         DEFAULT_MODEL[harness],
         DEFAULT_EFFORT[harness],

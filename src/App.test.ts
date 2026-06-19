@@ -615,11 +615,13 @@ describe("App", () => {
     expect(createProjectCalls[0]?.[1]).toEqual({ name: "brand-new", directory: DIR_A });
 
     // All four harnesses are installed by default → one agent each, named after
-    // the harness, in HARNESSES order.
+    // the model+effort it'll run (Gemini's `auto` and Antigravity's
+    // harness-owned model fall back to the bare harness name), in HARNESSES
+    // order.
     await waitFor(() => expect(createAgentCalls()).toHaveLength(4));
     expect(createAgentCalls()).toEqual([
-      { name: "claude-code", harness: "claude_code" },
-      { name: "codex", harness: "codex" },
+      { name: "opus-high", harness: "claude_code" },
+      { name: "gpt-5-5-medium", harness: "codex" },
       { name: "gemini", harness: "gemini" },
       { name: "antigravity", harness: "antigravity" },
     ]);
@@ -633,8 +635,8 @@ describe("App", () => {
       .filter(([c]) => c === "create_agent")
       .map(([, a]) => a as { name: string; harness: string; model?: string; effort?: string });
     expect(seededArgs).toEqual([
-      { name: "claude-code", harness: "claude_code", model: "opus", effort: "high" },
-      { name: "codex", harness: "codex", model: "gpt-5.5", effort: "medium" },
+      { name: "opus-high", harness: "claude_code", model: "opus", effort: "high" },
+      { name: "gpt-5-5-medium", harness: "codex", model: "gpt-5.5", effort: "medium" },
       { name: "gemini", harness: "gemini", model: "auto", effort: undefined },
       { name: "antigravity", harness: "antigravity", model: undefined, effort: undefined },
     ]);
@@ -650,8 +652,8 @@ describe("App", () => {
 
     await waitFor(() => expect(createAgentCalls()).toHaveLength(2));
     expect(createAgentCalls()).toEqual([
-      { name: "claude-code", harness: "claude_code" },
-      { name: "codex", harness: "codex" },
+      { name: "opus-high", harness: "claude_code" },
+      { name: "gpt-5-5-medium", harness: "codex" },
     ]);
   });
 
@@ -1201,7 +1203,7 @@ describe("App", () => {
     expect(createCalls).toHaveLength(1);
     // The form preselects and submits Claude's defaults.
     expect(createCalls[0]?.[1]).toEqual({
-      name: "claude-code",
+      name: "opus-high",
       harness: "claude_code",
       model: "opus",
       effort: "high",

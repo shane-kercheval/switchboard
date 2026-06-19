@@ -4,7 +4,6 @@
   import { harnessUnavailableReason, isHarnessSelectable } from "$lib/harnessAvailability";
   import {
     ALL_HARNESSES,
-    HARNESS_DEFAULT_AGENT_NAME,
     HARNESS_LABEL,
     SUPPORTS_EFFORT_SELECTION,
     SUPPORTS_MODEL_SELECTION,
@@ -14,6 +13,7 @@
     DEFAULT_MODEL,
     EFFORT_OPTIONS,
     MODEL_OPTIONS,
+    defaultAgentName,
     type SelectionOption,
   } from "$lib/agentSelection";
   import { normalizeAgentName, validateAgentName } from "$lib/agentName";
@@ -59,7 +59,13 @@
     roster = [],
     availability = {},
   }: Props = $props();
-  let name = $state<string>(HARNESS_DEFAULT_AGENT_NAME["claude_code"]);
+  let name = $state<string>(
+    defaultAgentName("claude_code", DEFAULT_MODEL["claude_code"], DEFAULT_EFFORT["claude_code"]),
+  );
+  /// Set once the user edits the name field, which freezes it: until then the
+  /// name tracks the model/effort/harness selection (see the `$effect` below);
+  /// after, the user's value is theirs to keep.
+  let nameTouched = $state<boolean>(false);
   let harness = $state<HarnessKind>("claude_code");
   let mode = $state<"create" | "attach">("create");
   let existingSessionId = $state<string>("");
@@ -84,6 +90,21 @@
   }
   let model = $state<string>(defaultModelFor("create", "claude_code"));
   let effort = $state<string>(defaultEffortFor("create", "claude_code"));
+
+  /// Keep the name in lock-step with the current selection while the user
+  /// hasn't taken it over. In create mode it tracks the model/effort the new
+  /// agent will run (`opus-high`, `gpt-5-5-medium`, …); attach keeps the bare
+  /// harness name — the agent inherits an existing session whose model we may be
+  /// only optionally overriding, so naming it after a picker value would
+  /// mislabel it. Writing `name` here is safe — the effect never reads it, so
+  /// there's no reactive loop.
+  $effect(() => {
+    const auto =
+      mode === "attach"
+        ? defaultAgentName(harness, undefined, undefined)
+        : defaultAgentName(harness, model, effort);
+    if (!nameTouched) name = auto;
+  });
 
   const modelSupported = $derived(SUPPORTS_MODEL_SELECTION[harness]);
   const effortSupported = $derived(SUPPORTS_EFFORT_SELECTION[harness]);
@@ -194,9 +215,6 @@
   /// `$effect` so the reset stays adjacent to the trigger and there's no
   /// hidden reactive dependency.
   function selectHarness(kind: HarnessKind): void {
-    if (name === HARNESS_DEFAULT_AGENT_NAME[harness]) {
-      name = HARNESS_DEFAULT_AGENT_NAME[kind];
-    }
     harness = kind;
     // Reset the pickers to the new harness's default so a stale, out-of-list
     // value (e.g. a Codex model carried over to Gemini) can't be submitted.
@@ -384,6 +402,7 @@
       aria-invalid={!nameValidation.ok}
       aria-describedby={nameError ? "agent-name-error" : undefined}
       title={nameError ?? undefined}
+      oninput={() => (nameTouched = true)}
       onkeydown={submitOnEnter}
     />
     {#if nameError}

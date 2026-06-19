@@ -226,7 +226,7 @@
   }
 
   function openFileInEditor(file: ChangedFile): Promise<void> {
-    if (!canOpenFileInEditor(file)) return Promise.resolve();
+    if (target.kind !== "uncommitted" || !canOpenFileInEditor(file)) return Promise.resolve();
     externalActionError = null;
     return openInEditor(worktreeFilePath(target.worktreePath, file.path));
   }
@@ -450,9 +450,7 @@
                           onError={(error) =>
                             onExternalActionError("[switchboard] copy file path failed", error)}
                         >
-                          {#snippet children()}
-                            <Copy size={14} strokeWidth={1.8} aria-hidden="true" />
-                          {/snippet}
+                          <Copy size={14} strokeWidth={1.8} aria-hidden="true" />
                         </AsyncIconButton>
                       {/snippet}
                     </Tooltip>
@@ -472,9 +470,7 @@
                                 error,
                               )}
                           >
-                            {#snippet children()}
-                              <Code2 size={14} strokeWidth={1.8} aria-hidden="true" />
-                            {/snippet}
+                            <Code2 size={14} strokeWidth={1.8} aria-hidden="true" />
                           </AsyncIconButton>
                         {/snippet}
                       </Tooltip>
@@ -492,9 +488,7 @@
                         onError={(error) =>
                           onExternalActionError("[switchboard] git difftool failed", error)}
                       >
-                        {#snippet children()}
                           <ExternalLink size={14} strokeWidth={1.8} aria-hidden="true" />
-                        {/snippet}
                       </AsyncIconButton>
                     {/snippet}
                   </Tooltip>

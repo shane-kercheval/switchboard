@@ -107,6 +107,8 @@
   let commandError = $state<string | null>(null);
   let projectViewResumePending = $state<boolean>(false);
   let projectViewResumeSeq = 0;
+  let gitViewResumePending = $state<boolean>(false);
+  let gitViewResumeSeq = 0;
 
   function isComposerShortcutTarget(target: EventTarget | null): boolean {
     return (
@@ -287,8 +289,14 @@
     settingsOpen = false;
     if (mode === "git") {
       projectViewResumePending = false;
+      // Entering Git renders the full repos→branches tree in one synchronous
+      // flush, which blocks the paint after the toggle (the old view appears to
+      // hang). Show a spinner shell for one paint first, mirroring the project
+      // side below, so the switch is felt immediately.
+      if (view.mode !== "git") showGitViewLoadingForNextPaint();
       void enterGitView();
     } else {
+      gitViewResumePending = false;
       if (view.mode === "git" && selection.activeProjectId !== null) {
         showProjectViewLoadingForNextPaint();
       }
@@ -301,6 +309,19 @@
     projectViewResumePending = true;
     const clear = (): void => {
       if (seq === projectViewResumeSeq) projectViewResumePending = false;
+    };
+    if (typeof requestAnimationFrame !== "function") {
+      setTimeout(clear, 0);
+      return;
+    }
+    requestAnimationFrame(() => setTimeout(clear, 0));
+  }
+
+  function showGitViewLoadingForNextPaint(): void {
+    const seq = ++gitViewResumeSeq;
+    gitViewResumePending = true;
+    const clear = (): void => {
+      if (seq === gitViewResumeSeq) gitViewResumePending = false;
     };
     if (typeof requestAnimationFrame !== "function") {
       setTimeout(clear, 0);
@@ -483,15 +504,32 @@
   }
 
   function selectHeaderPane(pane: TranscriptPane): void {
-    if (selection.activeProjectId === null) return;
-    const key = paneTabKey(selection.activeProjectId, pane.id);
+    const projectId = selection.activeProjectId;
+    if (projectId === null) return;
+    const key = paneTabKey(projectId, pane.id);
     delete paneTabCompleted[key];
     paneTabWasActive = paneTabWasActive.filter((id) => id !== key);
     const wasMaximized = activePaneLayout?.maximized !== null;
-    revealPane(selection.activeProjectId, activeRosterIds, pane.id);
-    if (wasMaximized && pane.members.length > 0) {
-      targetRecipients(selection.activeProjectId, [...pane.members]);
-    }
+    // Capture the roster alongside `projectId`: the reveal is deferred two
+    // animation frames (below), and `activeRosterIds` is a live derivation, so
+    // reading it inside the closure would pair the old project with whatever
+    // roster is active when the frames land. `reconcileLayout` prunes pane
+    // membership against the roster it's handed and persists, so a stale read
+    // would corrupt the original project's saved layout.
+    const rosterIds = [...activeRosterIds];
+    // Revealing a pane remounts its `UnifiedTranscript` (and re-derives every
+    // render block) in one synchronous flush — perceptible lag with no feedback
+    // on a long transcript. Reuse the transcript-busy overlay so the switch
+    // shows a spinner first, then runs the remount once it has painted.
+    void withTranscriptBusy(() => {
+      // The user navigated away before the deferred reveal ran — drop it rather
+      // than mutate a project's layout they're no longer looking at.
+      if (selection.activeProjectId !== projectId) return;
+      revealPane(projectId, rosterIds, pane.id);
+      if (wasMaximized && pane.members.length > 0) {
+        targetRecipients(projectId, [...pane.members]);
+      }
+    });
   }
 
   function addEmptyPane(): void {
@@ -996,7 +1034,13 @@
         {#if settingsOpen}
           <SettingsView onClose={closeSettings} />
         {:else if view.mode === "git"}
-          <GitView />
+          {#if gitViewResumePending}
+            <div class="flex min-h-0 flex-1 flex-col overflow-hidden">
+              <EmptyState testid="git-view-loading" title="Loading repositories…" spinner />
+            </div>
+          {:else}
+            <GitView />
+          {/if}
         {:else if selection.activeProjectId === null}
           <!-- Every no-project state shows the same orientation surface
                (what Switchboard is, the project/agent explainer, the CTAs, and

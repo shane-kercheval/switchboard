@@ -2058,7 +2058,10 @@ describe("App", () => {
     );
 
     await fireEvent.click(screen.getByTestId("app-pane-minimized-tab"));
-    expect(panes.layoutFor("p-a", roster).minimized).toEqual([]);
+    // Revealing a pane is deferred behind the transcript-busy spinner (two
+    // animation frames), so poll for the layout change rather than asserting
+    // synchronously right after the click.
+    await waitFor(() => expect(panes.layoutFor("p-a", roster).minimized).toEqual([]));
 
     panes.maximizePane("p-a", roster, panes.layoutFor("p-a", roster).panes[0]!.id);
     await waitFor(() =>
@@ -2070,22 +2073,81 @@ describe("App", () => {
       }),
     ).not.toBeInTheDocument();
     await fireEvent.click(screen.getByTestId("app-pane-minimized-tab"));
-    expect(panes.layoutFor("p-a", roster).maximized).toBe(pane2);
-    expect(recipients.selectionFor("p-a")).toEqual(["ag-2"]);
+    await waitFor(() => {
+      expect(panes.layoutFor("p-a", roster).maximized).toBe(pane2);
+      expect(recipients.selectionFor("p-a")).toEqual(["ag-2"]);
+    });
 
     panes.maximizePane("p-a", roster, pane2);
     await waitFor(() =>
       expect(screen.getByTestId("app-pane-minimized-tab")).toHaveTextContent("Pane 1"),
     );
     await fireEvent.click(screen.getByTestId("app-pane-minimized-tab"));
-    expect(panes.layoutFor("p-a", roster).maximized).toBe(
-      panes.layoutFor("p-a", roster).panes[0]!.id,
-    );
-    expect(recipients.selectionFor("p-a")).toEqual(["ag-1"]);
+    await waitFor(() => {
+      expect(panes.layoutFor("p-a", roster).maximized).toBe(
+        panes.layoutFor("p-a", roster).panes[0]!.id,
+      );
+      expect(recipients.selectionFor("p-a")).toEqual(["ag-1"]);
+    });
 
     expect(screen.queryByTestId("app-pane-restore-all")).not.toBeInTheDocument();
     await fireEvent.click(screen.getByTestId("pane-maximize"));
     expect(panes.layoutFor("p-a", roster).maximized).toBeNull();
+  });
+
+  it("does not corrupt the original project's pane layout when the user switches project before the deferred reveal runs", async () => {
+    const panes = await import("$lib/state/transcriptPanes.svelte");
+    const ws = await import("$lib/state/workspace.svelte");
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [
+        agent({ id: "ag-1", project_id: "p-a", name: "alice" }),
+        agent({ id: "ag-2", project_id: "p-a", name: "bob" }),
+      ],
+    });
+    seedProject({
+      projectId: "p-b",
+      directory: DIR_B,
+      name: "beta",
+      agents: [
+        agent({ id: "ag-3", project_id: "p-b", name: "carol" }),
+        agent({ id: "ag-4", project_id: "p-b", name: "dave" }),
+      ],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+    await fireEvent.click(within(projectRowByName("alpha")).getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("app-pane-add")).toBeInTheDocument());
+
+    // Park ag-2 in its own pane and minimize it, so project A has a non-default
+    // layout (ag-2 lives in pane 2) that corruption would be visible against.
+    const rosterA = ["ag-1", "ag-2"];
+    const pane2 = panes.moveAgentToNewPane("p-a", rosterA, "ag-2");
+    panes.minimizePane("p-a", rosterA, pane2);
+    await waitFor(() => expect(screen.getByTestId("app-pane-minimized-tab")).toBeInTheDocument());
+
+    // Clicking the tab schedules the reveal behind the spinner's two animation
+    // frames. Synchronously switch to project B before those frames fire (no
+    // awaited gap, so no timer can run in between): `activateProject` sets the
+    // active project id synchronously. When the deferred action lands, B is
+    // active. Under the bug, the closure read the live roster (B's) and
+    // `reconcileLayout` would prune ag-2 from A's pane and persist the loss.
+    fireEvent.click(screen.getByTestId("app-pane-minimized-tab"));
+    void ws.activateProject("p-b");
+    expect(ws.selection.activeProjectId).toBe("p-b");
+
+    // Advance well past the reveal's two deferred frames so its action has run
+    // (and, per the guard, been dropped) before asserting.
+    for (let i = 0; i < 4; i++) await new Promise(requestAnimationFrame);
+
+    // A's saved layout is untouched: ag-2 still belongs to pane 2 (the captured
+    // roster prevented the prune) and pane 2 is still minimized (the staleness
+    // guard dropped the now-irrelevant reveal).
+    const layoutA = panes.layoutFor("p-a", rosterA);
+    expect(layoutA.panes.find((p) => p.id === pane2)?.members).toEqual(["ag-2"]);
+    expect(layoutA.minimized).toContain(pane2);
   });
 
   it("keeps pane tab completion markers across project switches", async () => {

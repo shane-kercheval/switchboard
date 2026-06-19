@@ -336,9 +336,7 @@
               }}
               onError={onHeaderActionError}
             >
-              {#snippet children()}
-                <FolderOpen size={14} strokeWidth={1.8} aria-hidden="true" />
-              {/snippet}
+              <FolderOpen size={14} strokeWidth={1.8} aria-hidden="true" />
             </AsyncIconButton>
           {/snippet}
         </Tooltip>
@@ -357,9 +355,7 @@
               }}
               onError={onHeaderActionError}
             >
-              {#snippet children()}
-                <Code2 size={14} strokeWidth={1.8} aria-hidden="true" />
-              {/snippet}
+              <Code2 size={14} strokeWidth={1.8} aria-hidden="true" />
             </AsyncIconButton>
           {/snippet}
         </Tooltip>
@@ -377,9 +373,7 @@
               }}
               onError={onHeaderActionError}
             >
-              {#snippet children()}
-                <Copy size={14} strokeWidth={1.8} aria-hidden="true" />
-              {/snippet}
+              <Copy size={14} strokeWidth={1.8} aria-hidden="true" />
             </AsyncIconButton>
           {/snippet}
         </Tooltip>

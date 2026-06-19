@@ -435,6 +435,37 @@ describe("groupRenderBlocks", () => {
     expect(fan.columns[1]?.rows.map((r) => r.key)).toEqual(["a:tb"]);
   });
 
+  it("emits one fan-out block when a send appears as both a live and a journal-overlay user row", () => {
+    // In flight, a send surfaces twice: the live user turns (this session) AND
+    // the journal-overlay `user_message` written at turn-start — both carry
+    // SEND_1 but have distinct row keys (`u:<send_id>` vs `u:<journal_id>`), so
+    // they pass every upstream check. Without block-level dedup this minted two
+    // fan-out blocks with the same `f:SEND_1` key, which breaks the transcript's
+    // keyed `{#each}` (orphaned, never-updated DOM — a stuck hover footer).
+    const rows = buildUnifiedRows(
+      [
+        userTurn(TURN_1, AGENT_A, "2026-05-16T00:00:00Z", "fan out", SEND_1),
+        userTurn("u2", AGENT_B, "2026-05-16T00:00:00Z", "fan out", SEND_1),
+        agentTurn("ta", AGENT_A, "2026-05-16T00:00:01Z", SEND_1),
+      ],
+      [
+        {
+          kind: "user_message",
+          id: "journal-1",
+          send_id: SEND_1,
+          agent_ids: [AGENT_A, AGENT_B],
+          text: "fan out",
+          at: "2026-05-16T00:00:00Z",
+        },
+      ],
+    );
+    const blocks = groupRenderBlocks(rows, [AGENT_A, AGENT_B]);
+    expect(blocks.filter((b) => b.kind === "fanout")).toHaveLength(1);
+    // Block keys must be unique — duplicate keys are what corrupt the keyed each.
+    const keys = blocks.map((b) => (b.kind === "fanout" ? b.key : b.row.key));
+    expect(new Set(keys).size).toBe(keys.length);
+  });
+
   it("routes a per-recipient outcome marker into that recipient's column", () => {
     const rows = buildUnifiedRows(
       [

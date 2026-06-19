@@ -373,8 +373,20 @@ export function groupRenderBlocks(rows: UnifiedRow[], agentOrder: AgentId[] = []
   // agent/outcome rows are skipped (they live in the group). Everything else is
   // a standalone row.
   const blocks: RenderBlock[] = [];
+  // A fan-out send can surface as more than one user row sharing its `send_id`
+  // (the live row plus the journal-overlay row — they carry distinct row keys,
+  // `u:<send_id>` vs `u:<journal_id>`, so nothing upstream collapses them).
+  // Emitting a block per occurrence would mint duplicate `f:<send_id>` block
+  // keys, which breaks the keyed `{#each}` in the transcript: Svelte leaves
+  // orphaned, no-longer-updated DOM copies behind (a stuck hover footer on the
+  // in-flight send is the visible symptom). The user's message renders once per
+  // send (system-design §3), so anchor the group at the first occurrence and
+  // skip any later user row for the same send.
+  const emittedFanouts = new Set<string>();
   for (const row of rows) {
     if (row.kind === "user" && row.send_id !== undefined && fanoutUsers.has(row.send_id)) {
+      if (emittedFanouts.has(row.send_id)) continue;
+      emittedFanouts.add(row.send_id);
       const perAgent = colsBySend.get(row.send_id) ?? new Map<AgentId, NonUserRow[]>();
       blocks.push({
         kind: "fanout",

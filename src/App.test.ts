@@ -2264,6 +2264,44 @@ describe("App", () => {
     selection._testing.reset();
   });
 
+  it("⌘⌥[ / ⌘⌥] cycle the targeted pane by position", async () => {
+    const panes = await import("$lib/state/transcriptPanes.svelte");
+    const selection = await import("$lib/state/recipientSelection.svelte");
+    panes._testing.reset();
+    selection._testing.reset();
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [
+        agent({ id: "ag-1", project_id: "p-a", name: "alice" }),
+        agent({ id: "ag-2", project_id: "p-a", name: "bob" }),
+      ],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+
+    const roster = ["ag-1", "ag-2"];
+    panes.moveAgentToNewPane("p-a", roster, "ag-2"); // pane 1: alice, pane 2: bob
+    selection.setRecipients("p-a", ["ag-1"]);
+
+    // ⌘⌥] → next pane (bob); again wraps back to alice. `code`, not `key`
+    // (Option+bracket changes the produced character).
+    await fireEvent.keyDown(window, { key: "]", code: "BracketRight", metaKey: true, altKey: true });
+    expect(selection.selectionFor("p-a")).toEqual(["ag-2"]);
+    await fireEvent.keyDown(window, { key: "]", code: "BracketRight", metaKey: true, altKey: true });
+    expect(selection.selectionFor("p-a")).toEqual(["ag-1"]);
+
+    // ⌘⌥[ → previous pane (wraps from alice to bob).
+    await fireEvent.keyDown(window, { key: "[", code: "BracketLeft", metaKey: true, altKey: true });
+    expect(selection.selectionFor("p-a")).toEqual(["ag-2"]);
+
+    panes._testing.reset();
+    selection._testing.reset();
+  });
+
   it("⌘⌥N reveals the targeted pane: restores a minimized one, replaces a maximized one", async () => {
     const panes = await import("$lib/state/transcriptPanes.svelte");
     const selection = await import("$lib/state/recipientSelection.svelte");

@@ -34,11 +34,12 @@
   import {
     createEmptyPane,
     layoutFor,
+    paneToCycleTo,
     restoreMaximizedPane,
     revealPane,
     type TranscriptPane,
   } from "$lib/state/transcriptPanes.svelte";
-  import { targetRecipients } from "$lib/state/recipientSelection.svelte";
+  import { selectionFor, targetRecipients } from "$lib/state/recipientSelection.svelte";
   import DevIndicator from "$lib/components/ui/DevIndicator.svelte";
   import { installDevTranscriptSeed } from "$lib/dev/seedTranscript";
   import { windowDragRegion } from "$lib/windowDrag";
@@ -168,6 +169,12 @@
         if (targetRecipients(selection.activeProjectId, [...pane.members])) {
           revealPane(selection.activeProjectId, rosterIds, pane.id);
         }
+      } else if (event.code === "BracketLeft" || event.code === "BracketRight") {
+        // ⌘⌥[ / ⌘⌥] cycle the targeted pane by position (left/right, wrapping),
+        // like editor tabs. `event.code` since Option+bracket changes `key`.
+        if (selection.activeProjectId === null || settingsOpen || view.mode === "git") return;
+        event.preventDefault();
+        cyclePane(event.code === "BracketRight" ? 1 : -1);
       }
       return;
     }
@@ -530,6 +537,20 @@
         targetRecipients(projectId, [...pane.members]);
       }
     });
+  }
+
+  /// Cycle the targeted pane by position (⌘⌥[ = -1, ⌘⌥] = +1). Reuses the
+  /// ⌘⌥N reveal-on-target path so a maximized pane re-maximizes, a hidden one is
+  /// restored, and a refused target (prompt-render lock) changes nothing.
+  function cyclePane(direction: 1 | -1): void {
+    const projectId = selection.activeProjectId;
+    if (projectId === null || settingsOpen || view.mode === "git") return;
+    const rosterIds = activeAgents.map((a) => a.id);
+    const pane = paneToCycleTo(projectId, rosterIds, selectionFor(projectId), direction);
+    if (pane === null) return;
+    if (targetRecipients(projectId, [...pane.members])) {
+      revealPane(projectId, rosterIds, pane.id);
+    }
   }
 
   function addEmptyPane(): void {

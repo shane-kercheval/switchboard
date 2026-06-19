@@ -65,6 +65,11 @@
       note: "by pane position, when split; shows the pane if hidden",
     },
     {
+      action: "Cycle to previous / next pane",
+      keys: ["⌘", "⌥", "[ / ]"],
+      note: "by position, when split; shows the pane if hidden",
+    },
+    {
       action: "Send to clicked pane",
       keys: ["⌘", "Click"],
       note: "anywhere in the pane; hold ⌘ to preview",

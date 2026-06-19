@@ -1007,14 +1007,15 @@
   previewKey?: string;
   previewDefaultCompact?: boolean;
 })}
-  <!-- Two zones on a flex row: the expand/collapse toggle + cost pinned LEFT, and
+  <!-- Two zones on a flex row: cost/overage + expand/collapse toggle pinned LEFT, and
        the hover-revealed model/timestamp/copy pinned RIGHT (`ml-auto`). The gap
        between them collapses first as the row narrows; then the right cluster's
        text wraps (model over timestamp) and truncates with `…`. The toggle and
        copy button are `shrink-0` — never squished. -->
   <div class={`${mt} flex items-center gap-2`} data-testid="message-meta">
-    <!-- Left: per-message expand/collapse, then cost + overage marker. The cost
-         is always visible; the toggle is hover/focus-revealed (its own opacity).
+    <!-- Left: cost + overage marker, then per-message expand/collapse. The cost
+         is always visible; the toggle is hover/focus-revealed (its own opacity),
+         so overage stays anchored instead of shifting behind an invisible toggle.
          Two distinct cost gates (no `match harness`): the **cost** shows on
          `spend.real_spend` (the turn cost real money — for subscription Claude
          that's overage, since `total_cost_usd` is otherwise notional); the
@@ -1022,20 +1023,20 @@
          coincide for Claude, but a future pay-per-use harness would set
          `real_spend` without `is_overage` → cost shows, marker stays hidden. -->
     <div class="flex shrink-0 items-center gap-2">
-      {#if previewKey !== undefined}
-        {@render previewToggle(previewKey, previewDefaultCompact)}
-      {/if}
       {#if spend?.is_overage}
         <span
           class="text-warning text-xs"
           data-testid="message-overage"
-          title={spend.overage_resets_at
+          title={spend?.overage_resets_at
             ? `Spending overage credits — window resets ${new Date(spend.overage_resets_at).toLocaleString()}`
             : "Spending overage credits"}>⚡ using credits</span
         >
       {/if}
       {#if spend?.real_spend && costUsd != null}
         <span class="text-muted text-xs" data-testid="message-cost">${costUsd.toFixed(4)}</span>
+      {/if}
+      {#if previewKey !== undefined}
+        {@render previewToggle(previewKey, previewDefaultCompact)}
       {/if}
     </div>
     <!-- Right: per-turn model/effort (history — what this turn actually ran on),

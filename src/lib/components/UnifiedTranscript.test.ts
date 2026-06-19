@@ -1938,7 +1938,20 @@ describe("UnifiedTranscript — per-message cost + overage", () => {
         agent_id: CLAUDE_AGENT.id,
         started_at: "2026-05-16T00:00:01Z",
         status: "complete",
-        items: [{ item_kind: "text", kind: "text", text: "done" }],
+        items: [
+          { item_kind: "text", kind: "text", text: "done" },
+          {
+            item_kind: "tool",
+            tool_use_id: "tool-1",
+            kind: "builtin",
+            name: "Read",
+            input: {},
+            output: "ok",
+            is_error: false,
+            started_at: "2026-05-16T00:00:01Z",
+            completed_at: "2026-05-16T00:00:02Z",
+          },
+        ],
         usage: { input_tokens: 10, output_tokens: 5, total_cost_usd: 0.0125 },
         spend: { real_spend: true, is_overage: true, overage_resets_at: null },
       },
@@ -1947,7 +1960,10 @@ describe("UnifiedTranscript — per-message cost + overage", () => {
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     expect(screen.getByTestId("message-cost")).toHaveTextContent("$0.0125");
-    expect(screen.getByTestId("message-overage")).toBeInTheDocument();
+    const overage = screen.getByTestId("message-overage");
+    const toggle = screen.getByTestId("turn-preview-toggle");
+    expect(overage).toBeInTheDocument();
+    expect(overage.compareDocumentPosition(toggle) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
   });
 
   it("renders neither cost nor marker on a normal-quota Claude turn", async () => {

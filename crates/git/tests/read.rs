@@ -49,6 +49,34 @@ fn commit_all(dir: &Path, message: &str) {
     git(dir, &["commit", "-q", "-m", message]);
 }
 
+/// Run a git command with explicit author + committer dates. Commit times have
+/// 1-second resolution, so commits created in the same wall-clock second tie
+/// under the `TOPOLOGICAL | TIME` revwalk and sibling order becomes
+/// non-deterministic — a fixed epoch makes order-sensitive tests stable.
+fn git_dated(dir: &Path, epoch: i64, args: &[&str]) -> String {
+    let date = format!("@{epoch} +0000");
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_AUTHOR_DATE", &date)
+        .env("GIT_COMMITTER_DATE", &date)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn git {args:?}: {e}"));
+    assert!(
+        output.status.success(),
+        "git {args:?} failed in {}:\nstdout: {}\nstderr: {}",
+        dir.display(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+fn commit_all_at(dir: &Path, message: &str, epoch: i64) {
+    git(dir, &["add", "-A"]);
+    git_dated(dir, epoch, &["commit", "-q", "-m", message]);
+}
+
 /// A repo with one commit on `main`. Returns the tempdir (kept alive by caller).
 fn repo_with_main() -> TempDir {
     let dir = TempDir::new().unwrap();
@@ -883,22 +911,32 @@ fn commit_ranges_recent_for_local_only_branch() {
 
 #[test]
 fn commit_ranges_do_not_mark_default_branch_integration_merge_as_branch_work() {
-    let dir = repo_with_main();
+    // Explicit, strictly-increasing dates so the two sibling commits ("feature
+    // work" and "main work") can't tie on a same-second timestamp and flip the
+    // walk's sibling order. "feature work" is dated newer than "main work" so
+    // the merge's first parent (feature) precedes its second (main), matching
+    // the asserted order below.
+    let dir = TempDir::new().unwrap();
+    init_repo(dir.path());
+    write(dir.path(), "README.md", "hello\n");
+    commit_all_at(dir.path(), "initial", 1000);
+
     git(dir.path(), &["checkout", "-q", "-b", "feature"]);
     write(dir.path(), "feature.txt", "feature\n");
-    commit_all(dir.path(), "feature work");
+    commit_all_at(dir.path(), "feature work", 3000);
 
     git(dir.path(), &["checkout", "-q", "main"]);
     write(dir.path(), "main.txt", "main\n");
-    commit_all(dir.path(), "main work");
+    commit_all_at(dir.path(), "main work", 2000);
 
     git(dir.path(), &["checkout", "-q", "feature"]);
-    git(
+    git_dated(
         dir.path(),
+        4000,
         &["merge", "--no-ff", "main", "-m", "merge main into feature"],
     );
     write(dir.path(), "feature-2.txt", "feature 2\n");
-    commit_all(dir.path(), "more feature work");
+    commit_all_at(dir.path(), "more feature work", 5000);
 
     let ranges = commit_ranges(dir.path(), BranchKind::Local, "feature").unwrap();
     assert_eq!(

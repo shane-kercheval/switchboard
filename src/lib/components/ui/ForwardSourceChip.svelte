@@ -74,7 +74,7 @@
   {/if}
   <button
     type="button"
-    class="text-muted hover:text-fg hover:bg-raised flex h-4 w-4 shrink-0 items-center justify-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+    class="text-muted hover:text-status-failed hover:border-status-failed hover:bg-status-failed-soft/70 flex h-4 w-4 shrink-0 items-center justify-center rounded-full border border-transparent transition-colors disabled:cursor-not-allowed disabled:opacity-50"
     data-testid={`forward-source-remove-${source.name}`}
     aria-label={`Remove forward source ${source.name}`}
     {disabled}

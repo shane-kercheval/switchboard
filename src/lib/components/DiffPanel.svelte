@@ -6,12 +6,13 @@
   /// ref) still shows real content. Loads are guarded against target/file races
   /// (a newer selection's result always wins).
   import { untrack } from "svelte";
-  import { ExternalLink, Maximize2, Minimize2 } from "@lucide/svelte";
+  import { Code2, Copy, ExternalLink, Maximize2, Minimize2 } from "@lucide/svelte";
   import { cn, basename } from "$lib/utils";
   import EmptyState from "$lib/components/ui/EmptyState.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
   import DiffView from "$lib/components/DiffView.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
+  import AsyncIconButton from "$lib/components/ui/AsyncIconButton.svelte";
   import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
   import {
     SEGMENTED_MAIN_CONTAINER_CLASS,
@@ -24,11 +25,13 @@
     fileDiff,
     commitChangedFiles,
     commitFileDiff,
+    openInEditor,
     openCommitFileDifftool,
     openWorktreeFileDifftool,
     revealInFinder,
   } from "$lib/api";
   import { languageForPath } from "$lib/diff";
+  import { copyText } from "$lib/native";
   import { shortcut } from "$lib/platform";
   import { preferences, updatePreferences } from "$lib/preferences.svelte";
   import type { ChangedFile, ChangeKind, DiffStyle, FileDiff } from "$lib/types";
@@ -187,6 +190,14 @@
     return i >= 0 ? filePath.slice(0, i) : "";
   }
 
+  function worktreeFilePath(worktreePath: string, filePath: string): string {
+    return `${worktreePath.replace(/\/+$/, "")}/${filePath.replace(/^\/+/, "")}`;
+  }
+
+  function canOpenFileInEditor(file: ChangedFile): boolean {
+    return target.kind === "uncommitted" && file.change !== "deleted";
+  }
+
   // Only a worktree path is revealable in Finder; a commit has no folder.
   function revealTarget(): void {
     if (target.kind !== "uncommitted") return;
@@ -196,21 +207,28 @@
     });
   }
 
-  function openFileDifftool(file: ChangedFile, event: MouseEvent): void {
-    // Mouse clicks should not leave the hover-revealed action pinned visible;
-    // keyboard activation keeps focus for accessibility.
-    if (event.detail > 0) {
-      (event.currentTarget as HTMLButtonElement).blur();
-    }
+  function onExternalActionError(message: string, error: unknown): void {
+    externalActionError = error instanceof Error ? error.message : String(error);
+    console.error(message, error);
+  }
+
+  function openFileDifftool(file: ChangedFile): Promise<void> {
     externalActionError = null;
-    const action =
-      target.kind === "uncommitted"
-        ? openWorktreeFileDifftool(target.worktreePath, file.path, file.change)
-        : openCommitFileDifftool(target.repoRoot, target.oid, file.path);
-    void action.catch((e: unknown) => {
-      externalActionError = e instanceof Error ? e.message : String(e);
-      console.error("[switchboard] git difftool failed", e);
-    });
+    return target.kind === "uncommitted"
+      ? openWorktreeFileDifftool(target.worktreePath, file.path, file.change)
+      : openCommitFileDifftool(target.repoRoot, target.oid, file.path);
+  }
+
+  function copyFilePath(file: ChangedFile): Promise<void> {
+    if (target.kind !== "uncommitted") return Promise.resolve();
+    externalActionError = null;
+    return copyText(worktreeFilePath(target.worktreePath, file.path));
+  }
+
+  function openFileInEditor(file: ChangedFile): Promise<void> {
+    if (!canOpenFileInEditor(file)) return Promise.resolve();
+    externalActionError = null;
+    return openInEditor(worktreeFilePath(target.worktreePath, file.path));
   }
 
   function startFileResize(event: PointerEvent): void {
@@ -385,7 +403,7 @@
             <li>
               <div
                 class={cn(
-                  "group flex w-full items-stretch gap-1 rounded-none text-xs transition-colors",
+                  "group relative flex w-full items-stretch rounded-none text-xs transition-colors",
                   file.path === selectedFile ? "bg-raised text-fg" : "text-muted hover:bg-raised",
                 )}
               >
@@ -394,7 +412,12 @@
                      (and left) padding band highlights but swallows the click. -->
                 <button
                   type="button"
-                  class="flex min-w-0 flex-1 items-start gap-2 px-2 py-1.5 text-left"
+                  class={cn(
+                    "flex min-w-0 flex-1 items-start gap-2 px-2 py-1.5 pr-2 text-left transition-[padding]",
+                    target.kind === "uncommitted"
+                      ? "group-focus-within:pr-[5.75rem] group-hover:pr-[5.75rem]"
+                      : "group-focus-within:pr-10 group-hover:pr-10",
+                  )}
                   data-testid="changed-file"
                   data-selected={file.path === selectedFile}
                   onclick={() => (selectedFile = file.path)}
@@ -412,23 +435,70 @@
                     {/if}
                   </span>
                 </button>
-                <Tooltip label="Open in difftool" side="left">
-                  {#snippet trigger(props)}
-                    <button
-                      {...props}
-                      type="button"
-                      class={cn(
-                        ICON_BUTTON_CLASS,
-                        "hover:bg-border/60 mr-2 h-6 w-6 shrink-0 self-center opacity-0 transition-opacity group-focus-within:opacity-100 group-hover:opacity-100",
-                      )}
-                      aria-label={`Open ${file.path} in difftool`}
-                      data-testid="changed-file-difftool"
-                      onclick={(event) => openFileDifftool(file, event)}
-                    >
-                      <ExternalLink size={14} strokeWidth={1.8} aria-hidden="true" />
-                    </button>
-                  {/snippet}
-                </Tooltip>
+                <div
+                  class="pointer-events-none absolute top-1/2 right-2 flex -translate-y-1/2 items-center gap-0.5 opacity-0 transition-opacity group-focus-within:pointer-events-auto group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:opacity-100"
+                >
+                  {#if target.kind === "uncommitted"}
+                    <Tooltip label="Copy path" side="top">
+                      {#snippet trigger(props)}
+                        <AsyncIconButton
+                          {...props}
+                          class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 h-6 w-6 shrink-0")}
+                          label={`Copy path for ${file.path}`}
+                          testid="changed-file-copy-path"
+                          action={() => copyFilePath(file)}
+                          onError={(error) =>
+                            onExternalActionError("[switchboard] copy file path failed", error)}
+                        >
+                          {#snippet children()}
+                            <Copy size={14} strokeWidth={1.8} aria-hidden="true" />
+                          {/snippet}
+                        </AsyncIconButton>
+                      {/snippet}
+                    </Tooltip>
+                    {#if canOpenFileInEditor(file)}
+                      <Tooltip label="Open in editor" side="top">
+                        {#snippet trigger(props)}
+                          <AsyncIconButton
+                            {...props}
+                            class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 h-6 w-6 shrink-0")}
+                            label={`Open ${file.path} in editor`}
+                            testid="changed-file-editor"
+                            completeAfterMs={700}
+                            action={() => openFileInEditor(file)}
+                            onError={(error) =>
+                              onExternalActionError(
+                                "[switchboard] open file in editor failed",
+                                error,
+                              )}
+                          >
+                            {#snippet children()}
+                              <Code2 size={14} strokeWidth={1.8} aria-hidden="true" />
+                            {/snippet}
+                          </AsyncIconButton>
+                        {/snippet}
+                      </Tooltip>
+                    {/if}
+                  {/if}
+                  <Tooltip label="Open in difftool" side="top">
+                    {#snippet trigger(props)}
+                      <AsyncIconButton
+                        {...props}
+                        class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 h-6 w-6 shrink-0")}
+                        label={`Open ${file.path} in difftool`}
+                        testid="changed-file-difftool"
+                        completeAfterMs={700}
+                        action={() => openFileDifftool(file)}
+                        onError={(error) =>
+                          onExternalActionError("[switchboard] git difftool failed", error)}
+                      >
+                        {#snippet children()}
+                          <ExternalLink size={14} strokeWidth={1.8} aria-hidden="true" />
+                        {/snippet}
+                      </AsyncIconButton>
+                    {/snippet}
+                  </Tooltip>
+                </div>
               </div>
             </li>
           {/each}

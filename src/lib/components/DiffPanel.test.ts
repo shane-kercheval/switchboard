@@ -10,12 +10,19 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: (cmd: string, args?: Record<string, unknown>) => invokeMock(cmd, args),
 }));
 
+const copyTextMock = vi.fn(async (_text: string): Promise<void> => undefined);
+vi.mock("$lib/native", () => ({
+  copyText: (text: string) => copyTextMock(text),
+}));
+
 // Real preferences store (its `diff_style` drives the layout toggle); reset between tests.
 const { _testing } = await import("$lib/preferences.svelte");
 
 afterEach(() => {
   _testing.reset();
   invokeMock.mockReset();
+  copyTextMock.mockReset();
+  copyTextMock.mockResolvedValue(undefined);
 });
 
 const diffFixture = (over: Partial<FileDiff> = {}): FileDiff => ({
@@ -113,6 +120,77 @@ describe("DiffPanel (uncommitted target)", () => {
       file: "code.ts",
       change: "modified",
     });
+    await waitFor(() =>
+      expect(screen.getByTestId("changed-file-difftool")).toHaveAttribute("data-state", "done"),
+    );
+    expect(screen.getByTestId("changed-file-difftool")).toHaveClass("text-accent");
+  });
+
+  it("shows difftool launch success even when the external tool stays open", async () => {
+    invokeMock.mockImplementation((cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "changed_files")
+        return Promise.resolve([{ path: "code.ts", change: "modified" }]);
+      if (cmd === "file_diff") return Promise.resolve(diffFixture({ path: String(args?.file) }));
+      if (cmd === "open_worktree_file_difftool") return new Promise<never>(() => {});
+      return Promise.resolve(null);
+    });
+    render(DiffPanel, { props: { target: wtTarget(), onClose: noop } });
+    await waitFor(() => expect(screen.getByTestId("diff-view")).toBeInTheDocument());
+
+    await fireEvent.click(screen.getByLabelText("Open code.ts in difftool"));
+
+    expect(screen.getByTestId("changed-file-difftool")).toHaveAttribute("data-state", "pending");
+    expect(screen.getByTestId("changed-file-difftool")).not.toBeDisabled();
+    expect(screen.getByTestId("changed-file-difftool")).toHaveAttribute("aria-disabled", "true");
+    await waitFor(
+      () =>
+        expect(screen.getByTestId("changed-file-difftool")).toHaveAttribute("data-state", "done"),
+      { timeout: 1200 },
+    );
+  });
+
+  it("copies the selected worktree file's absolute path", async () => {
+    wire({ files: [{ path: "src/code.ts", change: "modified" }] });
+    render(DiffPanel, {
+      props: { target: wtTarget({ worktreePath: "/wt/project/" }), onClose: noop },
+    });
+    await waitFor(() => expect(screen.getByTestId("diff-view")).toBeInTheDocument());
+
+    await fireEvent.click(screen.getByLabelText("Copy path for src/code.ts"));
+
+    expect(copyTextMock).toHaveBeenCalledWith("/wt/project/src/code.ts");
+    await waitFor(() =>
+      expect(screen.getByTestId("changed-file-copy-path")).toHaveAttribute("data-state", "done"),
+    );
+  });
+
+  it("opens the selected worktree file in the configured editor", async () => {
+    wire({ files: [{ path: "src/code.ts", change: "modified" }] });
+    render(DiffPanel, {
+      props: { target: wtTarget({ worktreePath: "/wt/project/" }), onClose: noop },
+    });
+    await waitFor(() => expect(screen.getByTestId("diff-view")).toBeInTheDocument());
+
+    await fireEvent.click(screen.getByLabelText("Open src/code.ts in editor"));
+
+    expect(invokeMock).toHaveBeenCalledWith("open_in_editor", {
+      path: "/wt/project/src/code.ts",
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("changed-file-editor")).toHaveAttribute("data-state", "done"),
+    );
+  });
+
+  it("does not show the editor action for a deleted worktree file", async () => {
+    wire({ files: [{ path: "src/removed.ts", change: "deleted" }] });
+    render(DiffPanel, {
+      props: { target: wtTarget({ worktreePath: "/wt/project/" }), onClose: noop },
+    });
+    await waitFor(() => expect(screen.getByTestId("diff-view")).toBeInTheDocument());
+
+    expect(screen.queryByTestId("changed-file-editor")).not.toBeInTheDocument();
+    expect(screen.getByTestId("changed-file-copy-path")).toBeInTheDocument();
+    expect(screen.getByTestId("changed-file-difftool")).toBeInTheDocument();
   });
 
   it("surfaces git difftool failures inline", async () => {
@@ -329,6 +407,14 @@ describe("DiffPanel (commit target)", () => {
       oid: "abc123def456",
       file: "code.ts",
     });
+  });
+
+  it("does not show copy-path actions for commit files", async () => {
+    wire({ files: [{ path: "code.ts", change: "modified" }] });
+    render(DiffPanel, { props: { target: commitTarget(), onClose: noop } });
+    await waitFor(() => expect(screen.getByTestId("diff-view")).toBeInTheDocument());
+
+    expect(screen.queryByTestId("changed-file-copy-path")).not.toBeInTheDocument();
   });
 
   it("shows a calm empty state for a commit that changed no files", async () => {

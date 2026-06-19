@@ -28,6 +28,11 @@ pub enum AppError {
     #[error("queued message {0} not found (already started or removed)")]
     QueuedMessageNotFound(MessageId),
 
+    /// A manual forward was requested with no sources — there is nothing to
+    /// forward. Rejected at the command boundary.
+    #[error("a forward must reference at least one source agent")]
+    NoForwardSources,
+
     /// Pre-dispatch harness check failed (e.g., binary not on PATH).
     /// Distinct because the call site is the adapter's `probe()` method, and
     /// the frontend gates behaviour on it (`check_claude_binary` banner)

@@ -10,6 +10,8 @@ use switchboard_core::{AgentId, AgentRecord, Directory, Project, ProjectId};
 use switchboard_dispatcher::{Dispatcher, EventEmitter};
 use switchboard_harness::HarnessAdapter;
 use switchboard_prompts::PromptService;
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::git_registry::{self, GitRegistry};
 use crate::preferences::{self, Preferences};
@@ -208,6 +210,17 @@ pub struct AppState {
     /// one via [`AppState::with_prompts`], and tests that exercise prompts do the
     /// same with temp paths.
     pub prompts: PromptService,
+
+    /// In-flight manual forwards, keyed by `forward_id`. Each entry is the
+    /// [`CancellationToken`] for one held cross-agent forward: while
+    /// `forward_message_impl` awaits its sources, `cancel_forward_impl` fires the
+    /// matching token to release the hold without dispatching (the user
+    /// cancelling a "waiting for …" send). The command inserts on entry and
+    /// removes on every exit, so a finished/cancelled forward leaves no entry.
+    /// Frontend-owned `forward_id` (minted per held send), so an entry never
+    /// outlives the one command that owns it. Not load-bearing across restart —
+    /// a held forward is live-UI-only until it dispatches (system-design §7).
+    pub forwards: Mutex<HashMap<Uuid, CancellationToken>>,
 }
 
 impl AppState {
@@ -239,6 +252,7 @@ impl AppState {
             preferences: Mutex::new(Preferences::default()),
             preferences_path: None,
             prompts: PromptService::disabled(),
+            forwards: Mutex::new(HashMap::new()),
         }
     }
 

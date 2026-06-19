@@ -20,6 +20,20 @@ export type TurnOutcome =
   | { status: "failed"; kind: FailureKind; message: string }
   | { status: "cancelled"; source: CancelSource };
 
+// Result of resolving a manual cross-agent forward (`forward_message`). Mirrors
+// `ForwardOutcome` in `crates/app/src/commands.rs` (`tag = "status"`). The
+// backend resolves + composes but does NOT dispatch; the frontend dispatches the
+// returned `resolved.body` through the normal send path (so the forward groups,
+// cancels, and renders exactly like any send). `resolved.body` is the composed
+// message (the frontend can't compose it — the forwarded blocks hold each
+// source's resolved output, which only the backend has); `resolved.skipped`
+// names sources that had no output (the partial-empty caption). `invalidated` /
+// `cancelled` mean nothing resolved (restore the composer).
+export type ForwardOutcome =
+  | { status: "resolved"; body: string; skipped: string[] }
+  | { status: "invalidated"; reason: string }
+  | { status: "cancelled" };
+
 // ContentChunk.kind discriminates rendering. `thinking` carries model reasoning,
 // rendered distinct from (and subordinate to) the answer (the `ThinkingWidget`).
 // Emitted by Antigravity (live + on reopen) and Claude Sonnet 4.6 (live + on

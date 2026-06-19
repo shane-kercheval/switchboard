@@ -21,15 +21,16 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use switchboard_core::{AgentId, AgentRecord, Attachment, HarnessKind, SendId, SessionLocator};
 use switchboard_dispatcher::{
-    CancelOutcome, ConversationJournal, DispatchContext, DispatchContextFactory, Dispatcher,
-    EventEmitter, JournalError, MetadataCache, NoopJournal, NoopMetadataCache,
-    NoopSessionLocatorSink, NotQueued, OnBusy, RecordingEmitter, SendOutcome, SessionLocatorError,
-    SessionLocatorSink,
+    AwaitableSendOutcome, CancelOutcome, CompletionResult, ConversationJournal, CurrentTurnWait,
+    DispatchContext, DispatchContextFactory, Dispatcher, EventEmitter, JournalError, MetadataCache,
+    NoopJournal, NoopMetadataCache, NoopSessionLocatorSink, NotQueued, OnBusy, RecordingEmitter,
+    SendOutcome, SessionLocatorError, SessionLocatorSink,
 };
 use switchboard_harness::{
-    CancelSource, ContextWindowSource, DispatchOptions, HarnessAdapter, MessageId,
+    CancelSource, ContextWindowSource, DispatchOptions, FailureKind, HarnessAdapter, MessageId,
     MockHarnessAdapter, MockScenario, RateLimitSource, TurnId, TurnOutcome, TurnSpend,
 };
+use tokio::sync::oneshot;
 use uuid::Uuid;
 
 /// Default deadline for any `wait_for*` so a logic bug fails as a bounded
@@ -646,19 +647,22 @@ async fn panic_in_producer_recovers_and_a_later_send_completes() {
 }
 
 #[tokio::test]
-async fn truncated_stream_without_turn_end_returns_to_idle() {
-    // Fault-injection: MockScenario::TruncatedStream emits chunks and
-    // drops the sender without TurnEnd — a deliberate contract violation.
-    // The dispatcher's actor still reaches AgentIdle (state recovery); the
-    // missing terminal is a visible bug the frontend reducer must handle.
+async fn truncated_stream_without_turn_end_synthesizes_failed_terminal() {
+    // Fault-injection: MockScenario::TruncatedStream emits chunks and drops the
+    // sender without TurnEnd — a deliberate contract violation. The dispatcher
+    // synthesizes a `Failed` terminal so there is one truncation semantics for
+    // every send (awaited and non-awaited alike): the compose-bar path renders
+    // a failed turn instead of silently returning to idle, which had read as a
+    // successful empty turn. AgentIdle still follows (state recovery).
     let dispatcher = Arc::new(Dispatcher::new());
     let emitter = Arc::new(RecordingEmitter::new());
     let agent = agent_record();
+    let journal = Arc::new(RecordingJournal::default());
     let factory = TestFactory::new(
         MockScenario::TruncatedStream,
         agent.clone(),
         Arc::clone(&emitter),
-        noop_journal(),
+        Arc::clone(&journal) as Arc<dyn ConversationJournal>,
     );
 
     dispatcher
@@ -681,11 +685,21 @@ async fn truncated_stream_without_turn_end_returns_to_idle() {
     let events = emitter.snapshot();
     let kinds: Vec<&str> = events.iter().map(|(_, v)| event_type(v)).collect();
     assert_eq!(kinds.first().copied(), Some("turn_start"));
-    assert!(
-        !kinds.contains(&"turn_end"),
-        "TruncatedStream emits no terminal event — got {kinds:?}"
+    let terminal = events
+        .iter()
+        .find(|(_, v)| event_type(v) == "turn_end")
+        .expect("truncation now synthesizes a terminal turn_end");
+    assert_eq!(
+        terminal.1["outcome"]["status"], "failed",
+        "the synthesized terminal is a failed outcome"
     );
     assert_eq!(kinds.last().copied(), Some("agent_idle"));
+    // A non-completed terminal writes one outcome marker to the journal.
+    assert_eq!(
+        journal.outcomes.lock().unwrap().len(),
+        1,
+        "the synthesized failed terminal journals an outcome marker"
+    );
 }
 
 #[tokio::test]
@@ -3306,5 +3320,543 @@ async fn repeated_capture_events_each_persist_and_are_not_deduped() {
         sink.persisted.lock().unwrap().len(),
         2,
         "each turn's capture event persists independently — never deduped"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Opt-in per-send completion signal (`send_message_awaiting_completion`).
+//
+// These cover the contract the workflow runtime + cross-agent forward resolver
+// depend on: the handle fires exactly once at the turn's terminal, carrying the
+// outcome and (for a completed turn) the captured text — and never hangs, even
+// when the turn never starts or the stream truncates.
+// ---------------------------------------------------------------------------
+
+/// Unwrap an awaitable send to its completion receiver (the idle/FailFast path
+/// never returns `Busy`).
+fn accepted_completion(outcome: AwaitableSendOutcome) -> oneshot::Receiver<CompletionResult> {
+    match outcome {
+        AwaitableSendOutcome::Accepted { completion, .. } => completion,
+        AwaitableSendOutcome::Busy => panic!("expected Accepted, got Busy"),
+    }
+}
+
+/// Await a completion receiver under the shared timeout, asserting the sender
+/// was not dropped.
+async fn completion_within(rx: oneshot::Receiver<CompletionResult>) -> CompletionResult {
+    tokio::time::timeout(WAIT, rx)
+        .await
+        .expect("completion signal within timeout")
+        .expect("completion sender was not dropped")
+}
+
+#[tokio::test]
+async fn awaited_send_completion_resolves_completed_with_captured_text() {
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let factory = TestFactory::new(
+        MockScenario::Streaming,
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+    );
+
+    let rx = accepted_completion(
+        dispatcher
+            .send_message_awaiting_completion(agent.id, "hello", vec![], Uuid::now_v7(), factory)
+            .await,
+    );
+
+    let result = completion_within(rx).await;
+    assert_eq!(result.outcome, TurnOutcome::Completed);
+    // MockScenario::Streaming emits three Text chunks echoing the prompt; the
+    // captured text is their concatenation — sourced from the live stream, not
+    // re-read from disk.
+    assert_eq!(
+        result.text,
+        "Mock response to: hello — replied by mock harness."
+    );
+}
+
+#[tokio::test]
+async fn awaited_send_completion_excludes_thinking_text() {
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let factory = TestFactory::new(
+        MockScenario::StreamingWithThinking,
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+    );
+
+    let rx = accepted_completion(
+        dispatcher
+            .send_message_awaiting_completion(agent.id, "hello", vec![], Uuid::now_v7(), factory)
+            .await,
+    );
+
+    let result = completion_within(rx).await;
+    assert_eq!(result.outcome, TurnOutcome::Completed);
+    // Only the two `Text` chunks — the interleaved `Thinking` chunk
+    // ("secret reasoning") must not appear in forwardable output.
+    assert_eq!(result.text, "visible-one visible-two");
+}
+
+#[tokio::test]
+async fn awaited_send_completion_resolves_failed_on_dispatch_error() {
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let factory = TestFactory::new(
+        MockScenario::DispatchFails,
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+    );
+
+    let rx = accepted_completion(
+        dispatcher
+            .send_message_awaiting_completion(agent.id, "hello", vec![], Uuid::now_v7(), factory)
+            .await,
+    );
+
+    let result = completion_within(rx).await;
+    assert!(
+        matches!(
+            result.outcome,
+            TurnOutcome::Failed {
+                kind: FailureKind::AdapterFailure,
+                ..
+            }
+        ),
+        "a dispatch error resolves the handle as Failed, got {:?}",
+        result.outcome
+    );
+    assert!(result.text.is_empty(), "a failed turn carries no text");
+}
+
+#[tokio::test]
+async fn awaited_send_completion_resolves_cancelled_when_cancelled_mid_flight() {
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let factory = TestFactory::new(
+        MockScenario::AwaitCancellation,
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+    );
+
+    let rx = accepted_completion(
+        dispatcher
+            .send_message_awaiting_completion(
+                agent.id,
+                "long task",
+                vec![],
+                Uuid::now_v7(),
+                factory,
+            )
+            .await,
+    );
+
+    within(
+        &emitter,
+        "turn_start (in flight)",
+        emitter.wait_for_type("turn_start", 1),
+    )
+    .await;
+    assert_eq!(
+        dispatcher.cancel(agent.id, CancelSource::User),
+        CancelOutcome::Requested,
+    );
+
+    let result = completion_within(rx).await;
+    assert_eq!(
+        result.outcome,
+        TurnOutcome::Cancelled {
+            source: CancelSource::User,
+        },
+    );
+    assert!(result.text.is_empty(), "a cancelled turn carries no text");
+}
+
+#[tokio::test]
+async fn awaited_send_completion_resolves_failure_when_record_send_fails() {
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let factory = TestFactory::new(
+        MockScenario::Streaming,
+        agent.clone(),
+        Arc::clone(&emitter),
+        Arc::new(FailingJournal),
+    );
+
+    let rx = accepted_completion(
+        dispatcher
+            .send_message_awaiting_completion(agent.id, "hello", vec![], Uuid::now_v7(), factory)
+            .await,
+    );
+
+    let result = completion_within(rx).await;
+    assert!(
+        matches!(result.outcome, TurnOutcome::Failed { .. }),
+        "a send whose journal write fails resolves the handle as a failure, got {:?}",
+        result.outcome
+    );
+}
+
+#[tokio::test]
+async fn awaited_send_completion_resolves_failed_when_stream_truncates() {
+    // Case (f): the stream ends with no terminal and no cancel. For an awaited
+    // send the dispatcher synthesizes a Failed terminal so the handle resolves
+    // rather than hanging — and (unlike the non-awaited path) emits a turn_end.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let factory = TestFactory::new(
+        MockScenario::TruncatedStream,
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+    );
+
+    let rx = accepted_completion(
+        dispatcher
+            .send_message_awaiting_completion(agent.id, "hello", vec![], Uuid::now_v7(), factory)
+            .await,
+    );
+
+    let result = completion_within(rx).await;
+    assert!(
+        matches!(
+            result.outcome,
+            TurnOutcome::Failed {
+                kind: FailureKind::AdapterFailure,
+                ..
+            }
+        ),
+        "a truncated stream resolves an awaited handle as Failed, got {:?}",
+        result.outcome
+    );
+
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+    let events = emitter.snapshot();
+    assert_eq!(
+        count_type(&events, "turn_end"),
+        1,
+        "an awaited truncated turn synthesizes a terminal event (unlike the non-awaited path)"
+    );
+}
+
+#[tokio::test]
+async fn dropping_completion_receiver_does_not_disturb_the_turn() {
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let factory = TestFactory::new(
+        MockScenario::Streaming,
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+    );
+
+    // Take the handle and immediately drop it — the actor must not panic or
+    // stall when it later tries to fire a completion no one is awaiting.
+    let rx = accepted_completion(
+        dispatcher
+            .send_message_awaiting_completion(agent.id, "hello", vec![], Uuid::now_v7(), factory)
+            .await,
+    );
+    drop(rx);
+
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+    let events = emitter.snapshot();
+    // The turn runs to its normal terminal regardless of the dropped receiver.
+    assert_eq!(events.len(), 6);
+    assert_eq!(event_type(&events[4].1), "turn_end");
+    assert_eq!(events[4].1["outcome"]["status"], "completed");
+}
+
+#[tokio::test]
+async fn awaited_send_completion_resolves_failed_when_locator_persist_fails() {
+    // The sixth fire-site: a `SessionLocatorCaptured` whose persist fails
+    // force-fails the turn (locator loss is an authoritative failure). The
+    // awaited handle must resolve `Failed` rather than hang.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let factory = TestFactory::sequence_with_locator_sink(
+        [MockScenario::CapturesLocator(SessionLocator::Uuid(
+            Uuid::now_v7(),
+        ))],
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+        Arc::new(NoopMetadataCache),
+        Arc::new(FailingLocatorSink),
+    );
+
+    let rx = accepted_completion(
+        dispatcher
+            .send_message_awaiting_completion(agent.id, "hello", vec![], Uuid::now_v7(), factory)
+            .await,
+    );
+
+    let result = completion_within(rx).await;
+    assert!(
+        matches!(
+            result.outcome,
+            TurnOutcome::Failed {
+                kind: FailureKind::AdapterFailure,
+                ..
+            }
+        ),
+        "a locator-persist failure force-fails the turn and resolves the awaited handle, got {:?}",
+        result.outcome
+    );
+    assert!(
+        result.text.is_empty(),
+        "a force-failed turn carries no text"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Per-agent current-turn wait (`wait_for_current_turn`).
+//
+// The manual cross-agent forward's source wait: await a turn the caller did
+// *not* dispatch (no per-send handle) reaching its terminal, or resolve `Idle`
+// at once when the agent has no in-flight turn. Carries only the outcome — the
+// manual path reads forwarded text from disk after this resolves.
+// ---------------------------------------------------------------------------
+
+/// Await a current-turn wait under the shared timeout.
+async fn current_turn_within(
+    fut: impl std::future::Future<Output = CurrentTurnWait>,
+) -> CurrentTurnWait {
+    tokio::time::timeout(WAIT, fut)
+        .await
+        .expect("current-turn wait within timeout")
+}
+
+#[tokio::test]
+async fn wait_for_current_turn_is_idle_for_a_never_dispatched_agent() {
+    // No actor exists — there is no in-flight turn, so the source's latest
+    // completed output (if any) is already on disk: resolve `Idle` at once.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let outcome = current_turn_within(dispatcher.wait_for_current_turn(Uuid::now_v7())).await;
+    assert_eq!(outcome, CurrentTurnWait::Idle);
+}
+
+#[tokio::test]
+async fn wait_for_current_turn_is_idle_when_the_agent_already_finished() {
+    // The agent ran a turn to completion and parked idle; a subsequent wait
+    // resolves `Idle` (nothing in flight — read the just-completed turn off disk).
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let factory = TestFactory::new(
+        MockScenario::Streaming,
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+    );
+
+    dispatcher
+        .send_message(
+            agent.id,
+            "hello",
+            vec![],
+            Uuid::now_v7(),
+            factory,
+            OnBusy::Enqueue,
+        )
+        .await;
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+
+    let outcome = current_turn_within(dispatcher.wait_for_current_turn(agent.id)).await;
+    assert_eq!(outcome, CurrentTurnWait::Idle);
+}
+
+#[tokio::test]
+async fn wait_for_current_turn_registers_mid_flight_and_resolves_terminal() {
+    // The substantive contract: a wait registered while a turn is in flight
+    // (one this surface did not dispatch) resolves with that turn's terminal.
+    // `AwaitCancellation` parks the producer until the token fires, so the turn
+    // is deterministically in flight when the wait registers. `join!` polls the
+    // wait first — its `WaitForCurrentTurn` command lands on the actor's FIFO
+    // *before* the cancel, so it registers mid-turn (not after the terminal),
+    // then fires when the synthesized `Cancelled` terminal lands.
+    //
+    // The Completed / Failed outcomes plumb through the same `awaiters.fire` site
+    // proven by the `send_message_awaiting_completion` suite above; this pins the
+    // mid-flight registration + fire that is unique to the current-turn wait.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let factory = TestFactory::new(
+        MockScenario::AwaitCancellation,
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+    );
+
+    dispatcher
+        .send_message(
+            agent.id,
+            "long task",
+            vec![],
+            Uuid::now_v7(),
+            factory,
+            OnBusy::Enqueue,
+        )
+        .await;
+    within(
+        &emitter,
+        "turn_start (in flight)",
+        emitter.wait_for_type("turn_start", 1),
+    )
+    .await;
+
+    let (outcome, ()) = tokio::join!(
+        current_turn_within(dispatcher.wait_for_current_turn(agent.id)),
+        async {
+            assert_eq!(
+                dispatcher.cancel(agent.id, CancelSource::User),
+                CancelOutcome::Requested,
+            );
+        }
+    );
+    assert_eq!(
+        outcome,
+        CurrentTurnWait::Terminal {
+            outcome: TurnOutcome::Cancelled {
+                source: CancelSource::User,
+            },
+            text: String::new(),
+        },
+        "a cancelled turn carries no forwardable text",
+    );
+}
+
+#[tokio::test]
+async fn wait_for_current_turn_returns_captured_text_on_in_flight_completion() {
+    // The stale-read fix: a turn that is in flight when the wait registers and
+    // then *completes* resolves with the turn's text captured **live** — no disk
+    // read, so an older completed turn can't mask it. `CompletesOnSignal` parks
+    // after emitting its content (so the wait deterministically registers
+    // mid-turn), then completes when the test releases it.
+    let signal = Arc::new(tokio::sync::Notify::new());
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let factory = TestFactory::new(
+        MockScenario::CompletesOnSignal(Arc::clone(&signal)),
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+    );
+
+    dispatcher
+        .send_message(
+            agent.id,
+            "work",
+            vec![],
+            Uuid::now_v7(),
+            factory,
+            OnBusy::Enqueue,
+        )
+        .await;
+    within(
+        &emitter,
+        "turn_start (in flight)",
+        emitter.wait_for_type("turn_start", 1),
+    )
+    .await;
+
+    let (outcome, ()) = tokio::join!(
+        current_turn_within(dispatcher.wait_for_current_turn(agent.id)),
+        async {
+            // The wait registered mid-turn on the first poll; release the turn.
+            signal.notify_one();
+        }
+    );
+    assert_eq!(
+        outcome,
+        CurrentTurnWait::Terminal {
+            outcome: TurnOutcome::Completed,
+            text: "fresh-live-output".to_owned(),
+        },
+        "the completing in-flight turn's text is captured live, not read from disk",
+    );
+}
+
+#[tokio::test]
+async fn wait_for_current_turn_resolves_when_registered_after_the_terminal() {
+    // A wait that arrives during the post-terminal enrichment-drain window (the
+    // turn already terminated, the actor is still draining the stream) must be
+    // answered with the stashed outcome, not registered against a turn that will
+    // never fire again. `CodexPostTerminalEnrichment` emits a terminal then more
+    // events, holding the actor inside `drain_turn` after the terminal — but
+    // because that drain is near-instant, accept either the stashed `Terminal`
+    // (registered post-terminal in-loop) or `Idle` (the actor already parked):
+    // both are correct, and neither hangs.
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let factory = TestFactory::new(
+        MockScenario::CodexPostTerminalEnrichment,
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+    );
+
+    dispatcher
+        .send_message(
+            agent.id,
+            "hello",
+            vec![],
+            Uuid::now_v7(),
+            factory,
+            OnBusy::Enqueue,
+        )
+        .await;
+    within(
+        &emitter,
+        "agent_idle",
+        emitter.wait_for_type("agent_idle", 1),
+    )
+    .await;
+
+    // After the turn fully settled, the wait never hangs and reports a terminal
+    // (idle) rather than blocking on an already-finished turn.
+    let outcome = current_turn_within(dispatcher.wait_for_current_turn(agent.id)).await;
+    assert!(
+        matches!(
+            outcome,
+            CurrentTurnWait::Idle
+                | CurrentTurnWait::Terminal {
+                    outcome: TurnOutcome::Completed,
+                    ..
+                }
+        ),
+        "a wait after the terminal resolves without hanging, got {outcome:?}"
     );
 }

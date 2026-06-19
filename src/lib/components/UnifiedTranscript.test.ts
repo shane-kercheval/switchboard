@@ -3201,3 +3201,171 @@ describe("model footer visibility", () => {
     expect(models.join(" ")).not.toContain("synthetic");
   });
 });
+
+describe("UnifiedTranscript — cross-agent forward", () => {
+  async function loadHeld() {
+    return await import("$lib/state/heldForwards.svelte");
+  }
+
+  afterEach(async () => {
+    (await loadHeld())._testing.reset();
+  });
+
+  it("renders a held forward as a 'waiting for…' row, cancellable via cancel_forward", async () => {
+    const state = await loadState();
+    const held = await loadHeld();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    held.addHeldForward(PROJECT_ID, {
+      forwardId: "fwd-1",
+      sendId: "s-1",
+      body: "please aggregate",
+      sources: [{ kind: "agent", id: CODEX_AGENT.id, name: "bob" }],
+      recipients: [CLAUDE_AGENT.id],
+    });
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] },
+    });
+
+    const heldEl = await screen.findByTestId("held-forward");
+    // Distinct copy from a busy recipient's "Queued…", and the body is verbatim.
+    expect(heldEl).toHaveTextContent("waiting for bob");
+    expect(heldEl).toHaveTextContent("please aggregate");
+    expect(screen.queryByTestId("turn-queued")).toBeNull();
+
+    await fireEvent.click(screen.getByTestId("held-forward-cancel"));
+    expect(invokeMock).toHaveBeenCalledWith(
+      "cancel_forward",
+      expect.objectContaining({ forwardId: "fwd-1" }),
+    );
+    // Cancelling a held forward does NOT cancel the source agents' turns.
+    expect(invokeMock.mock.calls.some(([c]) => c === "cancel_turn" || c === "cancel_send")).toBe(
+      false,
+    );
+  });
+
+  it("shows a held forward only in the pane(s) that contain its recipient", async () => {
+    // Each pane renders its own UnifiedTranscript scoped to its agents. A held
+    // forward must show in the recipient's pane only — not leak into a pane that
+    // doesn't contain the recipient (where the name would also resolve "unknown").
+    const state = await loadState();
+    const held = await loadHeld();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    held.addHeldForward(PROJECT_ID, {
+      forwardId: "fwd-1",
+      sendId: "s-1",
+      body: "aggregate",
+      sources: [{ kind: "agent", id: CODEX_AGENT.id, name: "bob" }],
+      recipients: [CLAUDE_AGENT.id],
+    });
+
+    // This pane holds only the *source* (codex), not the recipient (claude).
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CODEX_AGENT] } });
+    expect(screen.queryByTestId("held-forward")).toBeNull();
+  });
+
+  it("shows only this pane's recipients in the held row — resolvable, never 'unknown'", async () => {
+    // The "Forward to unknown" regression: a fan-out forward whose recipients span
+    // panes must, in each pane, name only the recipients that pane contains (so
+    // the name always resolves) — not every recipient.
+    const state = await loadState();
+    const held = await loadHeld();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    held.addHeldForward(PROJECT_ID, {
+      forwardId: "fwd-1",
+      sendId: "s-1",
+      body: "x",
+      sources: [{ kind: "agent", id: CODEX_AGENT.id, name: "bob" }],
+      recipients: [CLAUDE_AGENT.id, CODEX_AGENT.id],
+    });
+
+    // This pane holds only claude; the held row names claude, not the other
+    // recipient (which lives in a different pane) and never "unknown".
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    const heldEl = await screen.findByTestId("held-forward");
+    expect(heldEl).toHaveTextContent("Forward to alice");
+    expect(heldEl).not.toHaveTextContent("unknown");
+  });
+
+  it("renders a forward verbatim, marked via its body sentinel, with a partial-empty caption", async () => {
+    const state = await loadState();
+    const held = await loadHeld();
+    await state.registerAgent(CLAUDE_AGENT);
+    // A forward dispatches as a normal send; the marker is derived from the
+    // body's sentinel (durable across reload), not a live store.
+    const body = "=== START forwarded from bob ===\nthe review\n=== END forwarded from bob ===";
+    state.dispatchUserTurn(CLAUDE_AGENT.id, "u-1", body, [], "s-2", "2026-05-16T00:00:00Z");
+    held.setForwardCaption(PROJECT_ID, "s-2", { included: ["bob"], skipped: ["carol"] });
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const turn = await waitFor(() => {
+      const userTurn = screen
+        .getAllByTestId("turn")
+        .find((t) => t.getAttribute("data-role") === "user");
+      if (!userTurn) throw new Error("no user turn yet");
+      return userTurn;
+    });
+    // Verbatim: the sentinel text is present, unchanged; marked as a forward.
+    expect(turn).toHaveTextContent("START forwarded from bob");
+    expect(turn).toHaveAttribute("data-forwarded", "true");
+
+    // The partial-empty caption is separate from the wire body (it names the
+    // included + skipped sources) and lives in the meta row.
+    const caption = screen.getByTestId("forward-caption");
+    expect(caption).toHaveTextContent("forwarded from bob");
+    expect(caption).toHaveTextContent("carol had no output");
+  });
+
+  it("bands only the forwarded blocks, leaving the user's typed text plain", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    const body =
+      "Please aggregate these:\n\n=== START forwarded from bob ===\nthe review\n=== END forwarded from bob ===";
+    state.dispatchUserTurn(CLAUDE_AGENT.id, "u-1", body, [], "s-2", "2026-05-16T00:00:00Z");
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const block = await screen.findByTestId("forward-block");
+    // The band wraps the forwarded block (sentinel + content) verbatim…
+    expect(block).toHaveTextContent("START forwarded from bob");
+    expect(block).toHaveTextContent("the review");
+    // …but NOT the user's own typed text (which renders plain, outside the band).
+    expect(block).not.toHaveTextContent("Please aggregate these");
+  });
+
+  it("does not band a block whose START and END agents don't pair", async () => {
+    // Defensive: the canonical backend shape always pairs START X / END X. Stray
+    // or pasted sentinel-looking text with mismatched agents must not mis-band —
+    // it falls through to plain rendering (no forward-block).
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    const body = "=== START forwarded from alice ===\nx\n=== END forwarded from bob ===";
+    state.dispatchUserTurn(CLAUDE_AGENT.id, "u-1", body, [], "s-1", "2026-05-16T00:00:00Z");
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+    await waitFor(() => expect(screen.getAllByTestId("turn").length).toBeGreaterThan(0));
+    expect(screen.queryByTestId("forward-block")).toBeNull();
+  });
+
+  it("does not mark an ordinary (non-forward) user message", async () => {
+    const state = await loadState();
+    await state.registerAgent(CLAUDE_AGENT);
+    state.dispatchUserTurn(CLAUDE_AGENT.id, "u-1", "just a normal message", [], "s-3");
+
+    render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
+
+    const turn = await waitFor(() => {
+      const userTurn = screen
+        .getAllByTestId("turn")
+        .find((t) => t.getAttribute("data-role") === "user");
+      if (!userTurn) throw new Error("no user turn yet");
+      return userTurn;
+    });
+    expect(turn).toHaveAttribute("data-forwarded", "false");
+    expect(screen.queryByTestId("forward-caption")).toBeNull();
+  });
+});

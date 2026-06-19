@@ -29,17 +29,18 @@ use tauri::{Emitter, Manager, State};
 
 use crate::commands::ProjectConversation;
 use crate::commands::{
-    AgentSessionFingerprint, AgentSessionInfo, DirectoryInfo, HarnessInstallStatus, ProjectListing,
-    RepoListing, StagedAttachment, WorkspaceDirectories, add_mcp_provider_impl,
-    add_tracked_repo_impl, agent_session_info_impl, attach_agent_impl, cancel_agent_impl,
-    cancel_send_impl, cancel_turn_impl, changed_files_impl, check_antigravity_auth_impl,
-    check_antigravity_binary_impl, check_claude_auth_impl, check_claude_binary_impl,
-    check_codex_auth_impl, check_codex_binary_impl, check_gemini_auth_impl,
-    check_gemini_binary_impl, commit_changed_files_impl, commit_file_diff_impl, commit_ranges_impl,
-    create_agent_impl, create_project_impl, delete_project_impl, editor_open_argv, fetch_repo_impl,
-    file_diff_impl, get_harness_install_status_impl, get_preferences_impl, init_directory_impl,
-    list_agents_impl, list_mcp_providers_impl, list_projects_impl, list_prompts_impl,
-    list_tracked_repos_from_inputs, list_workspace_directories_impl,
+    AgentSessionFingerprint, AgentSessionInfo, DirectoryInfo, ForwardArg, ForwardOutcome,
+    HarnessInstallStatus, ProjectListing, RepoListing, StagedAttachment, WorkspaceDirectories,
+    add_mcp_provider_impl, add_tracked_repo_impl, agent_session_info_impl, attach_agent_impl,
+    cancel_agent_impl, cancel_forward_impl, cancel_send_impl, cancel_turn_impl, changed_files_impl,
+    check_antigravity_auth_impl, check_antigravity_binary_impl, check_claude_auth_impl,
+    check_claude_binary_impl, check_codex_auth_impl, check_codex_binary_impl,
+    check_gemini_auth_impl, check_gemini_binary_impl, commit_changed_files_impl,
+    commit_file_diff_impl, commit_ranges_impl, create_agent_impl, create_project_impl,
+    delete_project_impl, editor_open_argv, fetch_repo_impl, file_diff_impl, forward_message_impl,
+    forward_prompt_impl, get_harness_install_status_impl, get_preferences_impl,
+    init_directory_impl, list_agents_impl, list_mcp_providers_impl, list_projects_impl,
+    list_prompts_impl, list_tracked_repos_from_inputs, list_workspace_directories_impl,
     load_project_conversation_impl, load_transcript_impl, open_commit_file_difftool_impl,
     open_project_impl, open_worktree_file_difftool_impl, parse_uuid, pick_directory_impl,
     project_session_fingerprints_impl, read_tracked_repo_from_inputs, remove_agent_impl,
@@ -623,6 +624,76 @@ async fn cancel_send(
 }
 
 #[tauri::command]
+async fn forward_message(
+    state: State<'_, AppState>,
+    body: String,
+    sources: Vec<String>,
+    forward_id: String,
+) -> Result<ForwardOutcome, String> {
+    let source_ids = sources
+        .iter()
+        .map(|s| parse_uuid(s))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    let fid = parse_uuid(&forward_id).map_err(|e| e.to_string())?;
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    // Long-lived by design: the call stays open while the held forward waits for
+    // its sources to finish, then resolves the composed body (or invalidate /
+    // cancel). The frontend dispatches the body; `cancel_forward` (below)
+    // interrupts the wait out of band.
+    forward_message_impl(state.inner(), body, source_ids, fid, &home)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn forward_prompt(
+    state: State<'_, AppState>,
+    provider: String,
+    name: String,
+    typed_args: std::collections::BTreeMap<String, String>,
+    forward_args: Vec<ForwardArg>,
+    appended_text: String,
+    appended_sources: Vec<switchboard_core::AgentId>,
+    forward_id: String,
+) -> Result<ForwardOutcome, String> {
+    let fid = parse_uuid(&forward_id).map_err(|e| e.to_string())?;
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    // Long-lived by design (like `forward_message`): holds for every field's
+    // sources (arguments + appended text), then resolves the rendered + appended
+    // body (or invalidate / cancel). The frontend dispatches the body;
+    // `cancel_forward` interrupts the hold.
+    forward_prompt_impl(
+        state.inner(),
+        provider,
+        name,
+        typed_args,
+        forward_args,
+        appended_text,
+        appended_sources,
+        fid,
+        &home,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn cancel_forward(state: State<'_, AppState>, forward_id: String) -> Result<(), String> {
+    let fid = parse_uuid(&forward_id).map_err(|e| e.to_string())?;
+    // Idempotent: fires the held forward's cancel token if it's still in flight,
+    // a no-op once it has settled. The open `forward_message` call observes the
+    // token and returns `Cancelled`.
+    cancel_forward_impl(state.inner(), fid);
+    Ok(())
+}
+
+#[tauri::command]
 async fn load_transcript(
     state: State<'_, AppState>,
     agent_id: String,
@@ -1116,6 +1187,9 @@ pub fn run() {
             cancel_turn,
             cancel_agent,
             cancel_send,
+            forward_message,
+            forward_prompt,
+            cancel_forward,
             agent_session_info,
             open_session_file,
             open_external_url,

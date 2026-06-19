@@ -1,8 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/svelte";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import PromptComposer from "./PromptComposer.svelte";
-import type { Prompt } from "$lib/types";
+import ForwardHarness from "./_PromptComposerForwardHarness.svelte";
+import type { AgentRecord, Prompt } from "$lib/types";
+import type { TranscriptPane } from "$lib/state/transcriptPanes.svelte";
+import type { ForwardSource } from "$lib/state/heldForwards.svelte";
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
@@ -177,5 +180,141 @@ describe("PromptComposer", () => {
     const { onremove } = setup({ focus: "", tone: "" });
     await fireEvent.click(screen.getByTestId("prompt-remove"));
     expect(onremove).toHaveBeenCalledTimes(1);
+  });
+});
+
+const BOB: AgentRecord = {
+  id: "00000000-0000-7000-8000-000000000bbb",
+  project_id: "00000000-0000-7000-8000-0000000000ff",
+  name: "bob",
+  harness: "codex",
+  session_locator: null,
+  created_at: "2026-05-16T00:00:00Z",
+};
+const CAROL: AgentRecord = {
+  id: "00000000-0000-7000-8000-000000000ccc",
+  project_id: "00000000-0000-7000-8000-0000000000ff",
+  name: "carol",
+  harness: "claude_code",
+  session_locator: null,
+  created_at: "2026-05-16T00:00:01Z",
+};
+
+function setupForward(
+  args: Record<string, string>,
+  opts: {
+    argSources?: Record<string, ForwardSource[]>;
+    panes?: TranscriptPane[];
+    agentHasOutput?: (id: string) => boolean;
+  } = {},
+): void {
+  render(ForwardHarness, {
+    props: {
+      prompt: PROMPT,
+      initialArgs: args,
+      initialArgSources: opts.argSources ?? {},
+      agents: [BOB, CAROL],
+      panes: opts.panes ?? [],
+      agentHasOutput: opts.agentHasOutput,
+    },
+  });
+}
+
+describe("PromptComposer per-argument forwarding", () => {
+  it("renders a forward picker per argument once agents exist", () => {
+    setupForward({ focus: "", tone: "" });
+    expect(screen.getByTestId("prompt-arg-forward-focus")).toBeInTheDocument();
+    expect(screen.getByTestId("prompt-arg-forward-tone")).toBeInTheDocument();
+  });
+
+  it("omits the forward picker when there are no agents to forward from", () => {
+    setup({ focus: "", tone: "" });
+    expect(screen.queryByTestId("prompt-arg-forward-focus")).toBeNull();
+  });
+
+  it("adds a source chip under the argument when an agent is picked", async () => {
+    setupForward({ focus: "", tone: "" });
+    await fireEvent.click(screen.getByTestId("prompt-arg-forward-focus"));
+    await fireEvent.click(await screen.findByTestId(`forward-picker-agent-${BOB.id}`));
+
+    const sources = await screen.findByTestId("prompt-arg-sources-focus");
+    expect(within(sources).getByTestId("forward-source-chip-bob")).toBeInTheDocument();
+    // The picked source belongs to `focus`, not `tone`.
+    expect(screen.queryByTestId("prompt-arg-sources-tone")).toBeNull();
+  });
+
+  it("removes a source chip via its remove control", async () => {
+    setupForward(
+      { focus: "", tone: "" },
+      { argSources: { focus: [{ kind: "agent", id: BOB.id, name: "bob" }] } },
+    );
+    expect(screen.getByTestId("forward-source-chip-bob")).toBeInTheDocument();
+
+    await fireEvent.click(screen.getByTestId("forward-source-remove-bob"));
+    await waitFor(() => expect(screen.queryByTestId("forward-source-chip-bob")).toBeNull());
+  });
+
+  it("flags a source with no completed output on its chip", () => {
+    setupForward(
+      { focus: "", tone: "" },
+      {
+        argSources: { focus: [{ kind: "agent", id: BOB.id, name: "bob" }] },
+        agentHasOutput: () => false,
+      },
+    );
+    const chip = screen.getByTestId("forward-source-chip-bob");
+    expect(chip).toHaveAttribute("data-empty", "true");
+    expect(chip).toHaveTextContent("no output");
+  });
+
+  it("treats a required argument as satisfied once it has a forward source", () => {
+    // `focus` is required and typed-empty, but a source fills it → Preview enabled
+    // and no missing-required highlight.
+    setupForward(
+      { focus: "", tone: "" },
+      { argSources: { focus: [{ kind: "agent", id: BOB.id, name: "bob" }] } },
+    );
+    expect((screen.getByTestId("prompt-preview-button") as HTMLButtonElement).disabled).toBe(false);
+    expect(screen.getByTestId("prompt-arg-focus")).not.toHaveClass("border-status-failed");
+  });
+
+  it("previews a forwarded argument with a placeholder for the live source", async () => {
+    invokeMock.mockResolvedValue({ text: "RENDERED" });
+    setupForward(
+      { focus: "lead text", tone: "" },
+      { argSources: { focus: [{ kind: "agent", id: BOB.id, name: "bob" }] } },
+    );
+
+    await fireEvent.click(screen.getByTestId("prompt-preview-button"));
+    await screen.findByTestId("prompt-preview");
+
+    const call = invokeMock.mock.calls.find(([c]) => c === "render_prompt");
+    const sentArgs = (call?.[1] as { args: Record<string, string> }).args;
+    // The forwarded arg shows typed lead + a placeholder (real output is resolved
+    // server-side at send time, not in the local preview).
+    expect(sentArgs.focus).toContain("lead text");
+    expect(sentArgs.focus).toContain("«forwarding from bob…»");
+  });
+
+  it("adds a pane pick as a single named chip (not expanded per member)", async () => {
+    const pane: TranscriptPane = {
+      id: "pane-1",
+      name: "Reviewers",
+      members: [BOB.id, CAROL.id],
+      hidden: [],
+    };
+    const other: TranscriptPane = { id: "pane-2", name: "Pane 2", members: [CAROL.id], hidden: [] };
+    // Two non-empty panes → the picker offers pane rows.
+    setupForward({ focus: "", tone: "" }, { panes: [pane, other] });
+
+    await fireEvent.click(screen.getByTestId("prompt-arg-forward-focus"));
+    await fireEvent.click(await screen.findByTestId("forward-picker-pane-pane-1"));
+
+    const sources = await screen.findByTestId("prompt-arg-sources-focus");
+    // One chip for the pane, labelled by the pane name — not one chip per member.
+    const chip = within(sources).getByTestId("forward-source-chip-Reviewers");
+    expect(chip).toHaveAttribute("data-kind", "pane");
+    expect(within(sources).queryByTestId("forward-source-chip-bob")).toBeNull();
+    expect(within(sources).queryByTestId("forward-source-chip-carol")).toBeNull();
   });
 });

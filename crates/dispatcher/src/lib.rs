@@ -37,6 +37,67 @@
 //! `MessageFailed`. `AgentIdle` fires only when the actor parks with an empty
 //! backlog (genuine idle) — never between chained queued turns.
 //!
+//! **Opt-in per-send completion signal.** A caller that needs to *await* a
+//! specific send's outcome (the workflow runtime, the cross-agent forward
+//! resolver) uses [`Dispatcher::send_message_awaiting_completion`], which hands
+//! back a [`oneshot::Receiver<CompletionResult>`]. The signal fires **exactly
+//! once**, when that send's turn reaches a terminal state, carrying the same
+//! [`TurnOutcome`] the actor used for the terminal `TurnEnd` it emitted (or
+//! synthesized) **plus the turn's captured text output**. A per-send `oneshot`
+//! is the minimal primitive here: the caller holds the handle at send time and
+//! there is exactly one awaiter per send, so — unlike a `turn_id`-keyed
+//! broadcast/watch — there is no keying, no cleanup, and no missed-event window.
+//! It fires at *every* terminal-synthesis point (normal terminal, synthesized
+//! cancel, force-failed locator persist, journal/dispatch failure, and a stream
+//! that ends with neither terminal nor cancel — which now synthesizes a `Failed`
+//! terminal for awaited *and* non-awaited sends alike, one truncation semantics
+//! for both), so an awaited send can never hang. A dropped `Receiver` (caller
+//! stopped awaiting) is ignored, exactly as the actor ignores any other dropped
+//! reply channel.
+//!
+//! **Per-agent current-turn wait.** A second, distinct await primitive serves
+//! the *manual* cross-agent forward: [`Dispatcher::wait_for_current_turn`]
+//! resolves when an agent's already-running turn reaches its terminal (or
+//! immediately, [`CurrentTurnWait::Idle`], if the agent is idle). Unlike the
+//! per-send signal above, the waiter never dispatched that turn — the manual
+//! forward references an agent whose turn the user kicked off from an *earlier*
+//! compose send (`completion = None`), so there is no per-send handle to it. It
+//! still carries the turn's captured text on a `Completed` terminal — because the
+//! actor captures every turn's text from its start (not only awaited sends), a
+//! waiter that registers mid-turn gets the whole output without a disk read. Disk
+//! is read only for an agent that was already *idle* at wait time (no live turn to
+//! capture). Both primitives fire at the same terminal-synthesis points — a turn
+//! resolves all its awaiters together via [`TurnAwaiters`].
+//!
+//! **The signal resolves at the turn's terminal, not when the agent is next
+//! re-dispatchable.** It fires the instant the terminal is observed — so the
+//! forwarded text is available with minimal latency — but the actor then keeps
+//! draining post-terminal adapter events (for some harnesses a session-file
+//! read, not microseconds) before it parks and accepts new work. A caller that
+//! awaits a completion and *immediately* `FailFast`-sends to the **same agent**
+//! can therefore still get `Busy`. Resolving completion later (at idle) would
+//! add latency the forward doesn't need, so consumers that re-dispatch to a
+//! just-awaited agent must await that agent's `AgentIdle` first (or tolerate a
+//! single `Busy`), rather than treating completion as "agent is free."
+//!
+//! **Why the payload carries captured text, not a turn id (decision #7).** The
+//! awaited turn's text is accumulated by the actor from the live stream (the
+//! `Text`-kind `ContentChunk`s it already drains) and delivered in the
+//! `CompletionResult`, so a forward/aggregate consumer never reads it back from
+//! disk. This sidesteps identity entirely: the dispatcher's `turn_id` is **not**
+//! joinable to the harness session file's own turn ids (they are different id
+//! spaces — `crates/app` correlates them only positionally), and the one stable
+//! per-turn key that does exist (`hydration_key`) is absent for some harnesses.
+//! "Hold a `turn_id`, then find the matching turn on disk" therefore cannot work
+//! for the just-awaited turn; capturing the text at completion is the only
+//! reliable source. Text is accumulated for **every** turn from its start (one
+//! bounded `String` per in-flight turn): a manual forward's current-turn waiter
+//! registers *mid-turn* and would otherwise miss the prefix, and the same capture
+//! removes the disk-flush race the manual path would hit reading a just-finished
+//! turn off disk. (An earlier design captured only for awaited sends; that left
+//! the manual path reading disk, which could return a *stale* earlier turn when
+//! the just-finished one had not flushed — so capture is now unconditional.)
+//!
 //! The `EventEmitter` trait keeps the dispatcher unit-testable without a Tauri
 //! app — `RecordingEmitter` collects emissions (and offers an async wait) for
 //! assertions; production wiring (in `crates/app`) provides a Tauri-backed
@@ -52,8 +113,9 @@ use switchboard_core::{
     AgentId, AgentRecord, Attachment, SendId, SessionLocator, render_prompt_with_attachments,
 };
 use switchboard_harness::{
-    AdapterEvent, CancelSource, ContextWindowSource, DispatchOptions, EventStream, FailureKind,
-    HarnessAdapter, MessageId, NormalizedEvent, RateLimitSource, TurnId, TurnOutcome, TurnSpend,
+    AdapterEvent, CancelSource, ContentKind, ContextWindowSource, DispatchOptions, EventStream,
+    FailureKind, HarnessAdapter, MessageId, NormalizedEvent, RateLimitSource, TurnId, TurnOutcome,
+    TurnSpend,
 };
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -64,7 +126,11 @@ use uuid::Uuid;
 /// emitter, options, and journal are rebuilt by the actor's
 /// [`DispatchContextFactory`] at start time, so per-dispatch state is never
 /// frozen at enqueue.
-#[derive(Debug, Clone)]
+///
+/// Not `Clone`: it owns the optional one-shot completion sender, which is
+/// single-consumer by construction. The item is *moved* through the backlog and
+/// into `run_turn`; nothing duplicates it.
+#[derive(Debug)]
 struct WorkItem {
     message_id: MessageId,
     send_id: SendId,
@@ -73,6 +139,113 @@ struct WorkItem {
     /// the user's literal text.
     prompt: String,
     attachments: Vec<Attachment>,
+    /// Set only for sends made via [`Dispatcher::send_message_awaiting_completion`].
+    /// The actor fires it once when this send's turn reaches a terminal state.
+    /// `None` for the compose-bar path — that path allocates no completion
+    /// channel and accumulates no text. The awaitable path is `FailFast`, so such
+    /// an item is dispatched immediately and never lingers in the backlog to be
+    /// queue-dropped; firing at a terminal is therefore the only way it resolves.
+    /// Defensive belt-and-suspenders: were an item with a sender ever dropped
+    /// pre-terminal anyway, the sender drops and the awaiter's `recv` resolves
+    /// `Err`, surfacing as a failed send rather than a hang.
+    completion: Option<oneshot::Sender<CompletionResult>>,
+}
+
+/// Delivered once, when an awaited send's turn reaches a terminal state, over
+/// the channel returned by [`Dispatcher::send_message_awaiting_completion`].
+///
+/// `text` is the turn's accumulated `Text`-kind output (no `Thinking`, no tool
+/// output) for a `Completed` turn; it is empty for `Failed`/`Cancelled` turns,
+/// which produce no forwardable output. See the module doc for why this is
+/// captured from the live stream rather than re-derived from disk (decision #7).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompletionResult {
+    pub outcome: TurnOutcome,
+    pub text: String,
+}
+
+/// The set of awaiters a turn must resolve **exactly once** when it reaches a
+/// terminal state, bundled so every terminal-synthesis path fires all of them
+/// together (the centralization that keeps a new terminal path from
+/// emit-or-journal-but-forget-to-fire). Two kinds ride the same terminal:
+///
+/// - `completion` — the M1 per-send handle (outcome + captured text). At most
+///   one, set at send time only for `send_message_awaiting_completion`.
+/// - `current_turn` — per-agent [`Command::WaitForCurrentTurn`] waiters
+///   registered *mid-turn* (the manual forward's source wait). Carry the same
+///   captured text as the completion handle. Any number can register against
+///   one running turn.
+#[derive(Default)]
+struct TurnAwaiters {
+    completion: Option<oneshot::Sender<CompletionResult>>,
+    current_turn: Vec<oneshot::Sender<CurrentTurnWait>>,
+}
+
+impl TurnAwaiters {
+    /// Fire every awaiter exactly once with this terminal `outcome` and captured
+    /// `text` (empty for a non-completed turn). A single turn can carry **both** a
+    /// completion handle (a workflow dispatched this agent) and current-turn
+    /// waiters (a manual forward references it), so both kinds get the text — the
+    /// completion side must not consume it by move and leave the waiters textless.
+    /// Senders are taken / drained, so a second call is a no-op; a dropped
+    /// receiver makes `send` return `Err`, which is ignored — consistent with how
+    /// the actor treats every other dropped reply channel.
+    fn fire(&mut self, outcome: &TurnOutcome, text: &str) {
+        if let Some(tx) = self.completion.take() {
+            let _ = tx.send(CompletionResult {
+                outcome: outcome.clone(),
+                text: text.to_owned(),
+            });
+        }
+        for tx in self.current_turn.drain(..) {
+            let _ = tx.send(CurrentTurnWait::Terminal {
+                outcome: outcome.clone(),
+                text: text.to_owned(),
+            });
+        }
+    }
+}
+
+/// Result of [`Dispatcher::send_message_awaiting_completion`]. Modelled as an
+/// enum (rather than `(SendOutcome, Option<Receiver>)`) so a caller cannot
+/// confuse "the agent was busy, nothing was queued" with "queued, awaiting
+/// completion": the completion handle exists **only** on the `Accepted` arm,
+/// minted only once acceptance is certain.
+#[must_use]
+pub enum AwaitableSendOutcome {
+    /// The send was accepted. `completion` resolves when the turn terminates.
+    Accepted {
+        message_id: MessageId,
+        completion: oneshot::Receiver<CompletionResult>,
+    },
+    /// `FailFast` was requested and the agent was busy; nothing was enqueued and
+    /// there is no completion handle to await.
+    Busy,
+}
+
+/// Result of [`Dispatcher::wait_for_current_turn`] — the per-agent
+/// "await this agent's current in-flight turn's terminal" capability used by the
+/// manual cross-agent forward.
+///
+/// Like the per-send [`CompletionResult`] (M1), this carries the turn's captured
+/// text — but for a turn the waiter never dispatched (the manual forward
+/// references an agent whose turn the user kicked off from an *earlier* compose
+/// send, so there is no per-send handle to it). Because the waiter registers
+/// *mid-turn*, the dispatcher accumulates every turn's text from its start (not
+/// only awaited sends), so a `Terminal { Completed }` carries the **whole**
+/// turn's output live — no disk read, no flush race. Disk is read only for an
+/// `Idle` source (no live turn to capture; its file is already settled).
+#[derive(Debug, Clone, PartialEq)]
+pub enum CurrentTurnWait {
+    /// The agent had no in-flight turn — it was idle (or between queued turns,
+    /// or never dispatched). The caller reads the source's latest completed
+    /// output from disk (settled, since nothing is running).
+    Idle,
+    /// The agent had an in-flight turn, which reached this terminal outcome.
+    /// `text` is the turn's captured `Text`-kind output for a `Completed`
+    /// outcome (empty for `Failed` / `Cancelled`, which the manual forward
+    /// invalidates on) — the same live-stream capture as [`CompletionResult`].
+    Terminal { outcome: TurnOutcome, text: String },
 }
 
 /// What `send_message` should do when the agent already has a turn in flight.
@@ -143,6 +316,15 @@ enum Command {
     Remove {
         message_id: MessageId,
         reply: oneshot::Sender<Result<RemovedQueuedMessage, NotQueued>>,
+    },
+    /// Await the agent's **current in-flight turn's** terminal (the per-agent
+    /// forward-source wait). Replies [`CurrentTurnWait::Idle`] at once if no turn
+    /// is running; otherwise the reply is held and fired with
+    /// [`CurrentTurnWait::Terminal`] when the running turn reaches its terminal —
+    /// the same instant the M1 completion signal fires, since both ride the
+    /// turn's terminal-synthesis points.
+    WaitForCurrentTurn {
+        reply: oneshot::Sender<CurrentTurnWait>,
     },
     /// Cancel the running turn (out-of-band; no-op if none is live).
     Cancel(CancelSource),
@@ -511,6 +693,11 @@ impl Dispatcher {
     /// authoritative `Accepted`/`Busy` decision. The `factory` is used only
     /// when the actor is first created (it owns the builder thereafter); later
     /// sends to an existing actor ignore the passed factory.
+    ///
+    /// This is the compose-bar path: it carries **no** completion handle, so no
+    /// caller is awaiting the turn's terminal here. (Per-turn text is still
+    /// captured always-on for current-turn waiters — see the `captured_text`
+    /// declaration in the actor loop.)
     pub async fn send_message(
         &self,
         agent_id: AgentId,
@@ -520,13 +707,74 @@ impl Dispatcher {
         factory: Arc<dyn DispatchContextFactory>,
         on_busy: OnBusy,
     ) -> SendOutcome {
-        let message_id = Uuid::now_v7();
         let item = WorkItem {
-            message_id,
+            message_id: Uuid::now_v7(),
             send_id,
             prompt: prompt.to_owned(),
             attachments,
+            completion: None,
         };
+        self.accept(agent_id, item, factory, on_busy).await
+    }
+
+    /// Like [`send_message`](Self::send_message), but hands back a one-shot
+    /// channel that resolves with the turn's [`CompletionResult`] (outcome +
+    /// captured text) when this send's turn terminates. Used by the workflow
+    /// runtime and the cross-agent forward resolver, which must *await* a
+    /// specific send. The completion handle is delivered only on the `Accepted`
+    /// arm — a `Busy` outcome means no turn started, so there is nothing to await.
+    ///
+    /// **Fail-fast only, by construction.** This path is always `OnBusy::FailFast`
+    /// — it never enqueues. That is both the spec's rule (a workflow step *fails
+    /// fast* on contention rather than queuing — system-design §7) and what makes
+    /// the completion contract airtight: a `FailFast`-accepted send is dispatched
+    /// by the actor as its very next action (an idle agent pops it before
+    /// servicing any other command; a busy agent returns `Busy` and enqueues
+    /// nothing), so an awaited item can never sit in the backlog to be queue-
+    /// dropped. The handle therefore resolves with a `CompletionResult` for every
+    /// accepted send; the only way it resolves `Err` is the caller dropping its
+    /// own receiver. (An awaitable *enqueue* variant would re-introduce the
+    /// queue-drop path — if a future milestone needs it, it must teach the queue-
+    /// drop paths to fire the completion first.)
+    pub async fn send_message_awaiting_completion(
+        &self,
+        agent_id: AgentId,
+        prompt: &str,
+        attachments: Vec<Attachment>,
+        send_id: SendId,
+        factory: Arc<dyn DispatchContextFactory>,
+    ) -> AwaitableSendOutcome {
+        let (completion_tx, completion_rx) = oneshot::channel();
+        let item = WorkItem {
+            message_id: Uuid::now_v7(),
+            send_id,
+            prompt: prompt.to_owned(),
+            attachments,
+            completion: Some(completion_tx),
+        };
+        match self.accept(agent_id, item, factory, OnBusy::FailFast).await {
+            SendOutcome::Accepted(message_id) => AwaitableSendOutcome::Accepted {
+                message_id,
+                completion: completion_rx,
+            },
+            // `completion_rx` is dropped here — Busy means no turn, no signal.
+            SendOutcome::Busy => AwaitableSendOutcome::Busy,
+        }
+    }
+
+    /// Shared acceptance path for both send entry points. Spawns the actor on
+    /// first use, then routes the prebuilt [`WorkItem`] through the
+    /// `Enqueue`/`FailFast` decision. The item's `completion` sender (if any)
+    /// rides along untouched; a path that drops the item without starting a turn
+    /// drops the sender, which the awaiter observes as a failed `recv`.
+    async fn accept(
+        &self,
+        agent_id: AgentId,
+        item: WorkItem,
+        factory: Arc<dyn DispatchContextFactory>,
+        on_busy: OnBusy,
+    ) -> SendOutcome {
+        let message_id = item.message_id;
         // `None` ⇒ the agent is `Closing` (mid-teardown): reject rather than
         // resurrect it with a fresh actor.
         let Some(commands) = self.ensure_actor(agent_id, Arc::clone(&factory)) else {
@@ -656,6 +904,45 @@ impl Dispatcher {
             return Err(NotQueued);
         }
         rx.await.unwrap_or(Err(NotQueued))
+    }
+
+    /// Await `agent_id`'s **current in-flight turn** reaching a terminal state —
+    /// the per-agent forward-source wait. Resolves [`CurrentTurnWait::Idle`]
+    /// immediately when the agent has no actor (never dispatched) or is idle /
+    /// between queued turns; otherwise resolves [`CurrentTurnWait::Terminal`]
+    /// with the running turn's outcome when it terminates.
+    ///
+    /// Unlike [`send_message_awaiting_completion`](Self::send_message_awaiting_completion)
+    /// this awaits a turn the caller did **not** dispatch (so there is no
+    /// completion handle to it), yet still returns the turn's captured text on
+    /// `Terminal { Completed }` — the actor captures every turn's text from its
+    /// start, so a mid-turn waiter gets the whole output without a disk read. A
+    /// lost actor (`Err` on `recv`) is treated as `Idle`.
+    ///
+    /// **Binding semantics:** resolves for whichever turn is current when the
+    /// actor *processes* this request, not when it was sent. An agent with a
+    /// queued backlog can therefore bind to a later turn if its visible turn ends
+    /// in the window before the actor services the request — a narrow edge
+    /// accepted for v1 (forwarding the agent's next reply, not the intended one;
+    /// no data loss). Pinning the exact turn would require threading the intended
+    /// `turn_id` from the caller, which has no handle to thread.
+    pub async fn wait_for_current_turn(&self, agent_id: AgentId) -> CurrentTurnWait {
+        let commands = {
+            let agents = lock(&self.agents);
+            match agents.get(&agent_id) {
+                Some(AgentSlot::Active(tx)) => tx.clone(),
+                // No actor (never dispatched) or shutting down: no in-flight turn.
+                _ => return CurrentTurnWait::Idle,
+            }
+        };
+        let (tx, rx) = oneshot::channel();
+        if commands
+            .send(Command::WaitForCurrentTurn { reply: tx })
+            .is_err()
+        {
+            return CurrentTurnWait::Idle;
+        }
+        rx.await.unwrap_or(CurrentTurnWait::Idle)
     }
 
     /// Close `agent_id`'s actor atomically: mark the slot `Closing` (so a racing
@@ -862,6 +1149,12 @@ fn apply_idle_command(
             let _ = reply.send(remove_from_backlog(backlog, agent_id, message_id));
             IdleAfter::Continue
         }
+        // No turn live (idle, or between queued turns) ⇒ nothing to wait on; the
+        // source's latest completed output, if any, is already on disk.
+        Command::WaitForCurrentTurn { reply } => {
+            let _ = reply.send(CurrentTurnWait::Idle);
+            IdleAfter::Continue
+        }
         // No turn live ⇒ cancel is a no-op.
         Command::Cancel(_) => IdleAfter::Continue,
         // No turn live ⇒ only this send's *queued* items can exist; drop them
@@ -917,6 +1210,11 @@ async fn run_turn(
         metadata,
         locator_sink,
     } = factory.build(item.send_id);
+    // Take the completion sender out of the item so the failure paths below can
+    // fire it on early return; on success it is handed to `drain_turn`, which
+    // fires it at the turn's terminal. Partial move — the remaining `item`
+    // fields stay accessible.
+    let mut completion = item.completion;
     let turn_id: TurnId = Uuid::now_v7();
     let started_at = Utc::now();
 
@@ -937,6 +1235,15 @@ async fn run_turn(
             agent_id,
             &e.to_string(),
         );
+        // An awaited send must not hang because its turn never started.
+        fire_completion(
+            &mut completion,
+            TurnOutcome::Failed {
+                kind: FailureKind::AdapterFailure,
+                message: e.to_string(),
+            },
+            String::new(),
+        );
         return TurnAfter::Continue;
     }
 
@@ -956,23 +1263,20 @@ async fn run_turn(
             // Send is journaled but the turn never started: record a Failed
             // marker against the minted turn_id (intentional — restart shows a
             // failed turn, not an orphan user message) and surface MessageFailed.
-            journal.record_outcome(
-                turn_id,
-                agent_id,
-                &TurnOutcome::Failed {
-                    kind: FailureKind::AdapterFailure,
-                    message: e.to_string(),
-                },
-                started_at,
-                Utc::now(),
-            );
+            let message = e.to_string();
+            let outcome = TurnOutcome::Failed {
+                kind: FailureKind::AdapterFailure,
+                message: message.clone(),
+            };
+            journal.record_outcome(turn_id, agent_id, &outcome, started_at, Utc::now());
             emit_message_failed(
                 emitter.as_ref(),
                 channel,
                 item.message_id,
                 agent_id,
-                &e.to_string(),
+                &message,
             );
+            fire_completion(&mut completion, outcome, String::new());
             return TurnAfter::Continue;
         }
     };
@@ -999,6 +1303,7 @@ async fn run_turn(
         &metadata,
         &locator_sink,
         &token,
+        completion,
         stream,
         commands,
         backlog,
@@ -1023,14 +1328,37 @@ async fn drain_turn(
     metadata: &Arc<dyn MetadataCache>,
     locator_sink: &Arc<dyn SessionLocatorSink>,
     token: &CancellationToken,
+    completion: Option<oneshot::Sender<CompletionResult>>,
     mut stream: EventStream,
     commands: &mut mpsc::UnboundedReceiver<Command>,
     backlog: &mut VecDeque<WorkItem>,
 ) -> TurnAfter {
+    // Everything that must be fired at this turn's terminal: the M1 per-send
+    // completion handle (if any) plus any per-agent current-turn waiters that
+    // register mid-turn. Both fire together at every terminal-synthesis point.
+    let mut awaiters = TurnAwaiters {
+        completion,
+        current_turn: Vec::new(),
+    };
     let mut terminal_seen = false;
+    // The terminal outcome + captured text, stashed once observed so a
+    // `WaitForCurrentTurn` arriving *after* the terminal but before the stream
+    // ends (the post-terminal enrichment-drain window) is answered immediately
+    // with the same payload rather than registered against a turn that already
+    // fired its awaiters.
+    let mut terminal: Option<(TurnOutcome, String)> = None;
     let mut cancel_source: Option<CancelSource> = None;
     let mut shutdown_reply: Option<oneshot::Sender<()>> = None;
     let mut channel_closed = false;
+    // Accumulated `Text`-kind output for the turn — the text a forward/aggregate
+    // consumer reads, delivered to both the M1 completion handle and the
+    // current-turn waiters. Captured for **every** turn from its start, not only
+    // awaited ones: a current-turn waiter (manual forward) registers *mid-turn*,
+    // so the prefix it would otherwise miss must already be buffered. The cost is
+    // one bounded `String` per in-flight turn — negligible for a desktop app, and
+    // it removes the disk-flush race the manual path would otherwise hit.
+    // `Thinking` text and tool output are deliberately excluded.
+    let mut captured_text = String::new();
     // Set when the dispatcher itself synthesizes a `Failed` terminal (a
     // load-bearing locator-persist failure). Distinct from the cancel latch:
     // cancellation deliberately still forwards buffered content (system-design
@@ -1055,6 +1383,12 @@ async fn drain_turn(
                 if force_failed {
                     continue;
                 }
+                // Accumulate the turn's text output (see the `captured_text`
+                // declaration for why this is always-on). Only `Text` kind, no
+                // `Thinking`; tool output never arrives as a `ContentChunk`.
+                if let AdapterEvent::ContentChunk { kind: ContentKind::Text, text, .. } = &event {
+                    captured_text.push_str(text);
+                }
                 // Internal adapter→dispatcher event: persist the runtime-captured
                 // session locator to the **running turn's** agent (never an
                 // event-supplied id — see `SessionLocatorCaptured`). Load-bearing:
@@ -1071,29 +1405,24 @@ async fn drain_turn(
                                 "session locator persist failed after the turn's terminal — locator lost"
                             );
                         } else {
-                            let ended_at = Utc::now();
+                            // A force-failed turn produced no forwardable output.
                             let outcome = TurnOutcome::Failed {
                                 kind: FailureKind::AdapterFailure,
                                 message: format!("failed to persist session locator: {e}"),
                             };
-                            emit_event(
+                            synthesize_terminal(
                                 emitter.as_ref(),
                                 channel,
-                                &NormalizedEvent::TurnEnd {
-                                    turn_id,
-                                    outcome: outcome.clone(),
-                                    ended_at,
-                                    usage: None,
-                                    spend: None,
-                                    model: None,
-                                    effort: None,
-                                    // Synthesized failure — no harness turn id.
-                                    hydration_key: None,
-                                },
+                                turn_id,
                                 agent_id,
+                                started_at,
+                                journal.as_ref(),
+                                &mut awaiters,
+                                &outcome,
+                                "",
                             );
-                            journal.record_outcome(turn_id, agent_id, &outcome, started_at, ended_at);
                             terminal_seen = true;
+                            terminal = Some((outcome, String::new()));
                             force_failed = true;
                             // Tear down the child; the adapter may still be
                             // mid-stream (Antigravity's post-exit drain), and
@@ -1114,6 +1443,16 @@ async fn drain_turn(
                     if !matches!(outcome, TurnOutcome::Completed) {
                         journal.record_outcome(turn_id, agent_id, outcome, started_at, *ended_at);
                     }
+                    // Fire the awaited-send + current-turn waiters with the real
+                    // outcome. Only a completed turn carries forwardable text; a
+                    // failed terminal has none.
+                    let text = if matches!(outcome, TurnOutcome::Completed) {
+                        std::mem::take(&mut captured_text)
+                    } else {
+                        String::new()
+                    };
+                    awaiters.fire(outcome, &text);
+                    terminal = Some((outcome.clone(), text));
                 }
                 // Persist stream-only (class-C) rate-limit snapshots so they
                 // survive an app restart. The gate is on the event's `source`,
@@ -1212,6 +1551,21 @@ async fn drain_turn(
                     Some(Command::Remove { message_id, reply }) => {
                         let _ = reply.send(remove_from_backlog(backlog, agent_id, message_id));
                     }
+                    Some(Command::WaitForCurrentTurn { reply }) => {
+                        // Mid-turn: register to fire at this turn's terminal. If
+                        // the terminal already passed (we're draining post-terminal
+                        // enrichment), answer immediately with the stashed outcome
+                        // + text — registering would strand the caller.
+                        match &terminal {
+                            Some((outcome, text)) => {
+                                let _ = reply.send(CurrentTurnWait::Terminal {
+                                    outcome: outcome.clone(),
+                                    text: text.clone(),
+                                });
+                            }
+                            None => awaiters.current_turn.push(reply),
+                        }
+                    }
                     Some(Command::CancelSend { send_id, source }) => {
                         // Fire the running turn's cancel token only if this turn
                         // belongs to the send (post-terminal cancel is a no-op
@@ -1258,34 +1612,48 @@ async fn drain_turn(
         // fired here, so `unwrap_or` covers only the structurally-unreachable
         // case.
         let source = cancel_source.unwrap_or(CancelSource::User);
-        let ended_at = Utc::now();
-        let outcome = TurnOutcome::Cancelled { source };
-        emit_event(
+        // A cancelled turn never completed — no forwardable output.
+        synthesize_terminal(
             emitter.as_ref(),
             channel,
-            &NormalizedEvent::TurnEnd {
-                turn_id,
-                outcome: outcome.clone(),
-                ended_at,
-                usage: None,
-                // A cancelled turn never completed — no cost/overage to attribute.
-                spend: None,
-                model: None,
-                effort: None,
-                // Synthesized cancelled terminal — no harness turn id.
-                hydration_key: None,
-            },
+            turn_id,
             agent_id,
+            started_at,
+            journal.as_ref(),
+            &mut awaiters,
+            &TurnOutcome::Cancelled { source },
+            "",
         );
-        journal.record_outcome(turn_id, agent_id, &outcome, started_at, ended_at);
         terminal_seen = true;
     }
 
     if !terminal_seen {
+        // The stream ended with neither a terminal nor a fired cancel — an
+        // adapter-contract violation. Synthesize a `Failed { AdapterFailure }`
+        // terminal (consistent with the dispatch-failure path) so there is one
+        // truncation semantics for every send: the awaited path's caller can't
+        // be stranded, and the compose-bar path renders a failed turn rather
+        // than silently returning to idle (which read as a successful empty
+        // turn). With no awaiters, `synthesize_terminal`'s firing has nothing to
+        // send, so the non-awaited path effectively pays only the emit + journal.
         tracing::warn!(
             agent_id = %agent_id,
             channel = %channel,
-            "turn stream ended without a terminal TurnEnd and without a fired cancel token — adapter contract violation; backlog advances"
+            "turn stream ended without a terminal TurnEnd and without a fired cancel token — adapter contract violation; synthesizing a failed terminal"
+        );
+        synthesize_terminal(
+            emitter.as_ref(),
+            channel,
+            turn_id,
+            agent_id,
+            started_at,
+            journal.as_ref(),
+            &mut awaiters,
+            &TurnOutcome::Failed {
+                kind: FailureKind::AdapterFailure,
+                message: "turn stream ended without a terminal event".to_owned(),
+            },
+            "",
         );
     }
 
@@ -1294,6 +1662,64 @@ async fn drain_turn(
         None if channel_closed => TurnAfter::ChannelClosed,
         None => TurnAfter::Continue,
     }
+}
+
+/// Fire an awaited send's completion signal exactly once. Takes the sender so a
+/// second call is a no-op; a dropped receiver (caller stopped awaiting) makes
+/// `send` return `Err`, which is ignored — consistent with how the actor treats
+/// every other dropped reply channel.
+fn fire_completion(
+    completion: &mut Option<oneshot::Sender<CompletionResult>>,
+    outcome: TurnOutcome,
+    text: String,
+) {
+    if let Some(tx) = completion.take() {
+        let _ = tx.send(CompletionResult { outcome, text });
+    }
+}
+
+/// Emit a **dispatcher-synthesized** terminal `TurnEnd`, journal its outcome, and
+/// fire the turn's awaiters — the three things every synthesized terminal must do
+/// together. Centralized so a new synthesized-terminal path (a future milestone)
+/// can't emit-or-journal-but-forget-to-fire: calling this does all three by
+/// construction. A synthesized terminal carries no harness usage/cost/model/effort
+/// and no `hydration_key` (there is no harness turn id behind it).
+///
+/// This is **only** for terminals the dispatcher invents (cancel, force-fail,
+/// stream-truncation). A real adapter `TurnEnd` is forwarded verbatim through
+/// `into_normalized` and fires its awaiters inline — it must not be re-emitted
+/// here. With no awaiters present the firing has nothing to send, so the
+/// non-awaited compose-bar path effectively pays only the emit + journal.
+#[allow(clippy::too_many_arguments)]
+fn synthesize_terminal(
+    emitter: &dyn EventEmitter,
+    channel: &str,
+    turn_id: TurnId,
+    agent_id: AgentId,
+    started_at: DateTime<Utc>,
+    journal: &dyn ConversationJournal,
+    awaiters: &mut TurnAwaiters,
+    outcome: &TurnOutcome,
+    text: &str,
+) {
+    let ended_at = Utc::now();
+    emit_event(
+        emitter,
+        channel,
+        &NormalizedEvent::TurnEnd {
+            turn_id,
+            outcome: outcome.clone(),
+            ended_at,
+            usage: None,
+            spend: None,
+            model: None,
+            effort: None,
+            hydration_key: None,
+        },
+        agent_id,
+    );
+    journal.record_outcome(turn_id, agent_id, outcome, started_at, ended_at);
+    awaiters.fire(outcome, text);
 }
 
 /// Remove a queued message by id from an agent's backlog, returning its payload.

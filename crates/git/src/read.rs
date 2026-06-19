@@ -1113,15 +1113,37 @@ fn commit_summary(
         author_name: author.name().ok().map(str::to_owned),
         author_email: author.email().ok().map(str::to_owned),
         authored_at: format_commit_time(author.when()),
-        branch_work: !selected_default_branch && is_branch_work(repo, commit.id(), default_tip),
+        branch_work: !selected_default_branch && is_branch_work(repo, commit, default_tip),
     }
 }
 
-fn is_branch_work(repo: &Repository, oid: Oid, default_tip: Option<Oid>) -> bool {
+fn is_branch_work(repo: &Repository, commit: &git2::Commit<'_>, default_tip: Option<Oid>) -> bool {
     let Some(default_tip) = default_tip else {
         return false;
     };
-    oid != default_tip && !repo.graph_descendant_of(default_tip, oid).unwrap_or(false)
+    let oid = commit.id();
+    oid != default_tip
+        && !repo.graph_descendant_of(default_tip, oid).unwrap_or(false)
+        && !merge_imports_only_default_branch(repo, commit, default_tip)
+}
+
+fn merge_imports_only_default_branch(
+    repo: &Repository,
+    commit: &git2::Commit<'_>,
+    default_tip: Oid,
+) -> bool {
+    if commit.parent_count() < 2 {
+        return false;
+    }
+
+    (1..commit.parent_count()).all(|parent_index| {
+        commit.parent_id(parent_index).is_ok_and(|parent| {
+            parent == default_tip
+                || repo
+                    .graph_descendant_of(default_tip, parent)
+                    .unwrap_or(false)
+        })
+    })
 }
 
 /// git2's `Time` (epoch seconds + a per-commit UTC offset in minutes) → RFC-3339,

@@ -285,8 +285,9 @@ pub struct GitCommitSummary {
     /// when the stored time can't be represented (defensive — real commits have
     /// a valid time).
     pub authored_at: Option<String>,
-    /// True when this commit is reachable from the selected ref and not reachable
-    /// from the repo's resolved default branch tip.
+    /// True when this commit is branch-specific work: reachable from the
+    /// selected ref, not reachable from the repo's resolved default branch tip,
+    /// and not a merge commit that only integrates default-branch history.
     pub branch_work: bool,
 }
 

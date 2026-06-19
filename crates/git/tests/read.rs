@@ -882,6 +882,86 @@ fn commit_ranges_recent_for_local_only_branch() {
 }
 
 #[test]
+fn commit_ranges_do_not_mark_default_branch_integration_merge_as_branch_work() {
+    let dir = repo_with_main();
+    git(dir.path(), &["checkout", "-q", "-b", "feature"]);
+    write(dir.path(), "feature.txt", "feature\n");
+    commit_all(dir.path(), "feature work");
+
+    git(dir.path(), &["checkout", "-q", "main"]);
+    write(dir.path(), "main.txt", "main\n");
+    commit_all(dir.path(), "main work");
+
+    git(dir.path(), &["checkout", "-q", "feature"]);
+    git(
+        dir.path(),
+        &["merge", "--no-ff", "main", "-m", "merge main into feature"],
+    );
+    write(dir.path(), "feature-2.txt", "feature 2\n");
+    commit_all(dir.path(), "more feature work");
+
+    let ranges = commit_ranges(dir.path(), BranchKind::Local, "feature").unwrap();
+    assert_eq!(
+        subjects(&ranges[0]),
+        vec![
+            "more feature work",
+            "merge main into feature",
+            "feature work",
+            "main work",
+            "initial",
+        ]
+    );
+    let branch_work: Vec<_> = ranges[0].commits.iter().map(|c| c.branch_work).collect();
+    assert_eq!(
+        branch_work,
+        vec![true, false, true, false, false],
+        "the merge commit imports default-branch history, but is not itself feature work"
+    );
+}
+
+#[test]
+fn commit_ranges_mark_octopus_merge_with_non_default_parent_as_branch_work() {
+    let dir = repo_with_main();
+    git(dir.path(), &["checkout", "-q", "-b", "feature"]);
+    write(dir.path(), "feature.txt", "feature\n");
+    commit_all(dir.path(), "feature work");
+
+    git(dir.path(), &["checkout", "-q", "main"]);
+    write(dir.path(), "main.txt", "main\n");
+    commit_all(dir.path(), "main work");
+    git(
+        dir.path(),
+        &["checkout", "-q", "-b", "other-topic", "HEAD~1"],
+    );
+    write(dir.path(), "other.txt", "other\n");
+    commit_all(dir.path(), "other topic work");
+
+    git(dir.path(), &["checkout", "-q", "feature"]);
+    git(
+        dir.path(),
+        &[
+            "merge",
+            "--no-ff",
+            "main",
+            "other-topic",
+            "-m",
+            "octopus integration",
+        ],
+    );
+
+    let ranges = commit_ranges(dir.path(), BranchKind::Local, "feature").unwrap();
+    let octopus = ranges[0]
+        .commits
+        .iter()
+        .find(|commit| commit.subject == "octopus integration")
+        .expect("octopus merge is included in the feature history");
+    assert!(
+        octopus.branch_work,
+        "an octopus merge that imports non-default work is branch work"
+    );
+}
+
+#[test]
 fn commit_ranges_recent_for_remote_only_branch() {
     let (bare, clone) = cloned_repo();
     let pusher = fresh_clone(bare.path());

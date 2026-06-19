@@ -718,7 +718,7 @@
         <div class="max-w-56">
           <div class="text-[13px] leading-4 font-medium">Branch work</div>
           <div class="text-primary-fg/70 mt-1 text-xs leading-4">
-            This commit is not in the default branch.
+            This commit is unique work on this branch.
           </div>
         </div>
       </Tooltip>

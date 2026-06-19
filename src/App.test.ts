@@ -603,7 +603,7 @@ describe("App", () => {
     expect(invokeMock.mock.calls.some(([c]) => c === "init_directory")).toBe(false);
   });
 
-  it("new project: choosing a folder + name creates the project, activates it, and auto-seeds an agent per installed harness", async () => {
+  it("new project: choosing a folder + name creates the project, activates it, and auto-seeds an agent per auto-seed harness", async () => {
     await mountApp();
     await waitFor(() => expect(screen.getByTestId("welcome-add-project")).toBeInTheDocument());
 
@@ -614,32 +614,42 @@ describe("App", () => {
     expect(createProjectCalls).toHaveLength(1);
     expect(createProjectCalls[0]?.[1]).toEqual({ name: "brand-new", directory: DIR_A });
 
-    // All four harnesses are installed by default → one agent each, named after
-    // the model+effort it'll run (Gemini's `auto` and Antigravity's
-    // harness-owned model fall back to the bare harness name), in HARNESSES
+    // All four harnesses are installed, but Gemini is excluded from auto-seeding
+    // (no longer on individual plans) → one agent each for Claude/Codex/
+    // Antigravity, named after the model+effort it'll run (Antigravity's
+    // harness-owned model falls back to the bare harness name), in HARNESSES
     // order.
-    await waitFor(() => expect(createAgentCalls()).toHaveLength(4));
+    await waitFor(() => expect(createAgentCalls()).toHaveLength(3));
     expect(createAgentCalls()).toEqual([
       { name: "opus-high", harness: "claude_code" },
       { name: "gpt-5-5-medium", harness: "codex" },
-      { name: "gemini", harness: "gemini" },
       { name: "antigravity", harness: "antigravity" },
     ]);
     // Auto-seeded → the roster is populated, not the empty first-agent prompt.
-    await waitFor(() => expect(screen.getAllByTestId("sidebar-agent")).toHaveLength(4));
+    await waitFor(() => expect(screen.getAllByTestId("sidebar-agent")).toHaveLength(3));
     expect(screen.queryByTestId("confirm-create-agent")).not.toBeInTheDocument();
 
     // Each seeded agent is born with its harness's default model/effort
-    // (Antigravity carries neither; Gemini carries no effort).
+    // (Antigravity carries neither).
     const seededArgs = invokeMock.mock.calls
       .filter(([c]) => c === "create_agent")
       .map(([, a]) => a as { name: string; harness: string; model?: string; effort?: string });
     expect(seededArgs).toEqual([
       { name: "opus-high", harness: "claude_code", model: "opus", effort: "high" },
       { name: "gpt-5-5-medium", harness: "codex", model: "gpt-5.5", effort: "medium" },
-      { name: "gemini", harness: "gemini", model: "auto", effort: undefined },
       { name: "antigravity", harness: "antigravity", model: undefined, effort: undefined },
     ]);
+  });
+
+  it("new project: an installed but auto-seed-excluded harness (Gemini) is not seeded", async () => {
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("welcome-add-project")).toBeInTheDocument());
+
+    await createNewProjectViaDialog("brand-new");
+
+    // Gemini is installed by default in the test backend, yet never seeded.
+    await waitFor(() => expect(createAgentCalls()).toHaveLength(3));
+    expect(createAgentCalls().some(({ harness }) => harness === "gemini")).toBe(false);
   });
 
   it("new project: seeds agents only for installed harnesses", async () => {
@@ -684,7 +694,7 @@ describe("App", () => {
     expect(createAgentCalls()).toHaveLength(0);
 
     release();
-    await waitFor(() => expect(createAgentCalls()).toHaveLength(4));
+    await waitFor(() => expect(createAgentCalls()).toHaveLength(3));
   });
 
   it("new project: a failed agent create surfaces a dismissible banner and the rest still seed", async () => {
@@ -694,11 +704,11 @@ describe("App", () => {
 
     await createNewProjectViaDialog("brand-new");
 
-    // The other three still created; the failure is surfaced, not silent.
-    await waitFor(() => expect(createAgentCalls()).toHaveLength(4));
+    // The other two still created; the failure is surfaced, not silent.
+    await waitFor(() => expect(createAgentCalls()).toHaveLength(3));
     const banner = await screen.findByTestId("banner-agent-create-failed-codex");
     expect(banner).toHaveTextContent("Couldn't create the Codex agent");
-    expect(screen.getAllByTestId("sidebar-agent")).toHaveLength(3);
+    expect(screen.getAllByTestId("sidebar-agent")).toHaveLength(2);
 
     // Dismissible.
     await fireEvent.click(screen.getByTestId("banner-agent-create-failed-codex-dismiss"));

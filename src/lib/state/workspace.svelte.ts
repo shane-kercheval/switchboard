@@ -42,6 +42,7 @@ import type {
 } from "$lib/types";
 import { tick, untrack } from "svelte";
 import { harnessAvailability, refreshHarnessAvailability } from "$lib/harnessAvailability.svelte";
+import { AUTO_SEED_ON_NEW_PROJECT } from "$lib/harnessDisplay";
 import { DEFAULT_EFFORT, DEFAULT_MODEL, defaultAgentName } from "$lib/agentSelection";
 import { currentIsoTimestamp } from "$lib/utils";
 import { buildLiveSendsMap } from "$lib/state/liveSends";
@@ -380,9 +381,10 @@ export async function createProjectAndActivate(name: string, directory: string):
   await seedAgentsForInstalledHarnesses(summary.id);
 }
 
-/// Auto-populate a freshly created project with one agent per installed harness.
-/// New projects only — called solely from `createProjectAndActivate`, never on
-/// activation of an existing project.
+/// Auto-populate a freshly created project with one agent per installed harness
+/// that opts into auto-seeding (`AUTO_SEED_ON_NEW_PROJECT`); excluded harnesses
+/// like Gemini stay dialog-only. New projects only — called solely from
+/// `createProjectAndActivate`, never on activation of an existing project.
 ///
 /// Awaits a fresh availability probe before reading `installed()`: the store's
 /// startup probe is fired un-awaited and reports `[]` until it resolves, so a
@@ -409,6 +411,10 @@ async function seedAgentsForInstalledHarnesses(projectId: ProjectId): Promise<vo
   await refreshHarnessAvailability();
   for (const harness of harnessAvailability.installed()) {
     if (selection.activeProjectId !== projectId) break;
+    // Installed but auto-seed-excluded harnesses (e.g. Gemini) are still
+    // selectable in the create-agent dialog — they're just not born into a
+    // fresh project by default.
+    if (!AUTO_SEED_ON_NEW_PROJECT[harness]) continue;
     try {
       // Seed the same harness defaults the create form preselects, so every
       // auto-created agent is born with a known, displayed model/effort

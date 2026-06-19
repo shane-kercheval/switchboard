@@ -12,7 +12,7 @@
   /// the coverage border *derives* from the selection ∩ membership. Nothing
   /// here stores a targeted pane — a stored target could drift from the real
   /// recipient set and lie.
-  import { Check, Maximize2, Minimize2, MoreHorizontal, Pencil, X } from "@lucide/svelte";
+  import { Check, Maximize2, Minimize2, MoreHorizontal, Pencil, Square, X } from "@lucide/svelte";
   import type { AgentRecord, ConversationItem, ProjectId } from "$lib/types";
   import UnifiedTranscript from "$lib/components/UnifiedTranscript.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
@@ -32,6 +32,7 @@
     minimizePane,
     renamePane,
     restoreMaximizedPane,
+    returnToUnifiedView,
     setFractions,
     setPaneRowWidth,
     showAllInPane,
@@ -40,7 +41,12 @@
     moveAgentToPane,
     type TranscriptPane,
   } from "$lib/state/transcriptPanes.svelte";
-  import { selectionFor, targetRecipients } from "$lib/state/recipientSelection.svelte";
+  import {
+    deselectAgent,
+    selectAgent,
+    selectionFor,
+    targetRecipients,
+  } from "$lib/state/recipientSelection.svelte";
 
   let {
     projectId,
@@ -115,6 +121,30 @@
   function targetPane(pane: TranscriptPane): void {
     if (pane.members.length === 0) return;
     targetRecipients(projectId, [...pane.members]);
+  }
+
+  /// Close a pane: a deliberate "I'm done with these agents for now". The pane's
+  /// agents are dismissed — unassigned from any pane (so they leave the view) and
+  /// deselected (so they stop receiving sends). They only return via "Return to
+  /// unified view". When the close leaves a single pane, that survivor is
+  /// targeted so you land on the agents you're left with.
+  function handleClosePane(pane: TranscriptPane): void {
+    const remaining = layout.panes.filter((p) => p.id !== pane.id);
+    closePane(projectId, rosterIds, pane.id);
+    if (remaining.length === 1) {
+      // Replace semantics drop the dismissed pane's agents from the selection
+      // while targeting the lone survivor.
+      targetRecipients(projectId, [...remaining[0]!.members]);
+    } else {
+      for (const id of pane.members) deselectAgent(projectId, id);
+    }
+  }
+
+  /// Bring every dismissed agent back into a single unified pane — the explicit
+  /// "un-dismiss everyone" / exit-split action. Selection is preserved: returning
+  /// agents to view doesn't re-target them.
+  function handleReturnToUnified(): void {
+    returnToUnifiedView(projectId, rosterIds);
   }
 
   function hasOnlyMeta(event: MouseEvent | KeyboardEvent): boolean {
@@ -443,6 +473,7 @@
                       onclick={(event) => {
                         event.stopPropagation();
                         unassignAgentFromPane(projectId, rosterIds, member.id);
+                        deselectAgent(projectId, member.id);
                       }}
                     >
                       <X size={10} strokeWidth={2} aria-hidden="true" />
@@ -524,7 +555,10 @@
                   {@const alreadyInPane = pane.members.includes(agent.id)}
                   {@const currentPane = layout.panes.find((p) => p.members.includes(agent.id))}
                   <DropdownMenuItem
-                    onSelect={() => moveAgentToPane(projectId, rosterIds, agent.id, pane.id)}
+                    onSelect={() => {
+                      moveAgentToPane(projectId, rosterIds, agent.id, pane.id);
+                      selectAgent(projectId, agent.id);
+                    }}
                     disabled={alreadyInPane}
                     class="gap-2"
                     data-testid={`pane-add-agent-${agent.id}`}
@@ -550,7 +584,7 @@
                 </DropdownMenuItem>
                 {#if layout.panes.length > 1}
                   <DropdownMenuItem
-                    onSelect={() => closePane(projectId, rosterIds, pane.id)}
+                    onSelect={() => handleClosePane(pane)}
                     class="items-start gap-2"
                     data-testid="pane-close"
                   >
@@ -559,6 +593,21 @@
                       <span>Close pane</span>
                       <span class="text-muted text-xs leading-4">
                         Agents become unassigned and keep working.
+                      </span>
+                    </span>
+                  </DropdownMenuItem>
+                {/if}
+                {#if layout.panes.length > 1 || unassignedIds.length > 0}
+                  <DropdownMenuItem
+                    onSelect={handleReturnToUnified}
+                    class="items-start gap-2"
+                    data-testid="pane-return-unified"
+                  >
+                    <Square size={14} strokeWidth={1.8} aria-hidden="true" class="mt-0.5 shrink-0" />
+                    <span class="flex min-w-0 flex-col">
+                      <span>Return to unified view</span>
+                      <span class="text-muted text-xs leading-4">
+                        Show every agent together in one pane.
                       </span>
                     </span>
                   </DropdownMenuItem>

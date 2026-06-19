@@ -466,6 +466,25 @@ export function closePane(projectId: ProjectId, rosterIds: AgentId[], paneId: Pa
   });
 }
 
+/// Collapse every pane back into a single unified pane holding the whole roster
+/// — the "return to unified view" / exit-split gesture. Re-merges any unassigned
+/// agents so the unified view shows everyone; per-agent eye-hidden state carries
+/// over so a hidden agent stays hidden. The recipient selection is the caller's
+/// concern (gestures own it), not touched here.
+export function returnToUnifiedView(projectId: ProjectId, rosterIds: AgentId[]): void {
+  update(projectId, rosterIds, (layout) => {
+    // Membership is exclusive, so an agent appears in at most one pane's hidden
+    // set — no dedup needed. Filter to the live roster for safety.
+    const hidden = layout.panes.flatMap((p) => p.hidden).filter((id) => rosterIds.includes(id));
+    return {
+      panes: [{ id: newPaneId(), name: "Pane 1", members: [...rosterIds], hidden }],
+      fractions: [1],
+      minimized: [],
+      maximized: null,
+    };
+  });
+}
+
 export function minimizePane(projectId: ProjectId, rosterIds: AgentId[], paneId: PaneId): void {
   update(projectId, rosterIds, (layout) => {
     if (layout.maximized !== null) return layout;

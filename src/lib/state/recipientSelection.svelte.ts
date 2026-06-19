@@ -56,6 +56,25 @@ export function targetRecipients(projectId: ProjectId, ids: AgentId[]): boolean 
   return true;
 }
 
+/// Add one agent to the recipient set — the "added an agent to a pane" gesture
+/// reflecting the new member as a selected compose chip. Lock-aware like
+/// `targetRecipients` (refused mid-render); a no-op when already selected.
+export function selectAgent(projectId: ProjectId, agentId: AgentId): boolean {
+  if (targetingLocked[projectId] === true) return false;
+  const current = store[projectId] ?? [];
+  if (!current.includes(agentId)) store[projectId] = [...current, agentId];
+  return true;
+}
+
+/// Remove one agent from the recipient set — the "removed an agent from a pane"
+/// gesture deselecting its compose chip. Lock-aware; a no-op when not selected.
+export function deselectAgent(projectId: ProjectId, agentId: AgentId): boolean {
+  if (targetingLocked[projectId] === true) return false;
+  const current = store[projectId] ?? [];
+  if (current.includes(agentId)) store[projectId] = current.filter((id) => id !== agentId);
+  return true;
+}
+
 /// Freeze / unfreeze user targeting for a project (the prompt-render window).
 /// Callers MUST guarantee release (try/finally + unlock on unmount): a stuck
 /// lock would silently disable pane targeting for the project forever — a

@@ -60,6 +60,7 @@
     soloAgent,
     toggleAgentHidden,
   } from "$lib/state/transcriptPanes.svelte";
+  import { selectAgent } from "$lib/state/recipientSelection.svelte";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
   import PlusIcon from "$lib/components/ui/PlusIcon.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
@@ -1155,7 +1156,10 @@
                       {@const ownPaneId = paneOfAgent(projectId, rosterIds, agent.id)?.id}
                       {#each paneLayout.panes.filter((p) => p.id !== ownPaneId) as pane (pane.id)}
                         <DropdownMenuItem
-                          onSelect={() => moveAgentToPane(projectId, rosterIds, agent.id, pane.id)}
+                          onSelect={() => {
+                            moveAgentToPane(projectId, rosterIds, agent.id, pane.id);
+                            selectAgent(projectId, agent.id);
+                          }}
                           class="gap-2"
                           data-testid={`agent-move-to-pane-${pane.id}`}
                         >
@@ -1171,7 +1175,10 @@
                     {/if}
                     {#if agents.length > 1}
                       <DropdownMenuItem
-                        onSelect={() => moveAgentToNewPane(projectId, rosterIds, agent.id)}
+                        onSelect={() => {
+                          moveAgentToNewPane(projectId, rosterIds, agent.id);
+                          selectAgent(projectId, agent.id);
+                        }}
                         class="gap-2"
                         data-testid="agent-move-to-new-pane"
                       >

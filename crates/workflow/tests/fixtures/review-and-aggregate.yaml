@@ -1,0 +1,23 @@
+name: review-and-aggregate
+description: Send to multiple reviewers in parallel, aggregate, send to primary.
+
+inputs:
+  primary_agent: agent
+  reviewer_agents: [agent]
+  review_prompt: prompt_id
+  aggregation_prompt: prompt_id
+  user_context: text?
+
+steps:
+  - send:
+      to: "{{ reviewer_agents }}"
+      prompt: "{{ review_prompt }}"
+      template_vars:
+        context: "{{ user_context }}"
+  - wait_for_all:
+      agents: "{{ reviewer_agents }}"
+  - send:
+      to: "{{ primary_agent }}"
+      prompt: "{{ aggregation_prompt }}"
+      template_vars:
+        feedback: "{{ aggregated_responses(reviewer_agents) }}"

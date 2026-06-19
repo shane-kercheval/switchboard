@@ -1,0 +1,22 @@
+name: plan-then-implement
+description: Planner produces a plan; implementer executes it.
+
+inputs:
+  planner: agent
+  implementer: agent
+  goal: text
+
+steps:
+  - send:
+      to: "{{ planner }}"
+      text: "Produce a step-by-step plan to: {{ goal }}"
+  - wait_for:
+      agent: "{{ planner }}"
+  - send:
+      to: "{{ implementer }}"
+      forward_from: "{{ planner }}"
+      text: |
+        Execute the plan above. Ask me if you encounter ambiguity
+        rather than guessing.
+  - wait_for:
+      agent: "{{ implementer }}"

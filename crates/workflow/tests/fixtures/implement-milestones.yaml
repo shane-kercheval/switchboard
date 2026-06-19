@@ -1,0 +1,36 @@
+name: implement-milestones
+description: For each milestone, plan, get user approval, implement, review, and pause for revision.
+
+inputs:
+  coder: agent
+  reviewer: agent
+  milestones: [text]
+
+steps:
+  - for_each:
+      item: milestone
+      in: "{{ milestones }}"
+      steps:
+        - send:
+            to: "{{ coder }}"
+            text: "Plan milestone: {{ milestone }}. Output the plan only; don't implement yet."
+        - wait_for:
+            agent: "{{ coder }}"
+        - pause_for_user:
+            context: "Plan for {{ milestone }} ready. Approve, redirect, or add context."
+            recipient: "{{ coder }}"
+        - send:
+            to: "{{ reviewer }}"
+            forward_from: "{{ coder }}"
+            text: "Review the implementation above for the milestone: {{ milestone }}"
+        - wait_for:
+            agent: "{{ reviewer }}"
+        - send:
+            to: "{{ coder }}"
+            forward_from: "{{ reviewer }}"
+            text: "Address the review feedback above for: {{ milestone }}"
+        - wait_for:
+            agent: "{{ coder }}"
+        - pause_for_user:
+            context: "Milestone {{ milestone }} done. Commit and continue, or revise?"
+            recipient: "{{ coder }}"

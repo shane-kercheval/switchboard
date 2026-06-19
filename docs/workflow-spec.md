@@ -86,7 +86,7 @@ Long-form keys:
 |---|---|---|
 | `type` | yes | One of the type shorthands above. |
 | `description` | optional | Human description shown in the invocation form. |
-| `default` | optional | Default value if the user leaves the field blank. Providing `default` implicitly makes the input optional; the `?` suffix on a type is shorthand for an optional input with a default of `""`. |
+| `default` | optional | Default value if the user leaves the field blank. Providing `default` implicitly makes the input optional; the `?` suffix on a type is shorthand for an optional input with a default of `""`. **`default` is only valid on a `text` input in v1** — it is the optional-input mechanism, and optional non-`text` inputs (`agent?` / `prompt_id?`, and optional `[agent]`, which would contradict the non-empty-fan-in rule) are deferred to v2. A `default` on any non-`text` type is a parse error. |
 
 Long-form `type` is required when long form is used; mixing shorthand and long form across different inputs is allowed.
 
@@ -234,12 +234,19 @@ All string values in a workflow file are passed through the templating engine be
 - Variable substitution: `{{ var }}`
 - Member access: `{{ obj.field }}`, `{{ list[0] }}`
 - For loops: `{% for x in list %}...{% endfor %}` (including `loop.index`, `loop.first`, `loop.last`)
-- If conditions: `{% if expr %}...{% elif %}...{% else %}...{% endif %}` (limited to truthiness checks and equality; arithmetic deferred to v2)
+- If conditions: `{% if expr %}...{% elif %}...{% else %}...{% endif %}`
+- Expression operators: comparison (`==`, `!=`, `<`, `>`, `<=`, `>=`), boolean (`and`, `or`, `not`), and basic arithmetic (`+`, `-`, `*`)
 - Whitespace control: `{%-`, `-%}`, `{{-`, `-}}`
 - Comments: `{# ... #}`
 - Built-in filters: `length`, `lower`, `upper`, `default`, `join`, `trim`
 
-### Unsupported in v1 (use produces a render error)
+### Enforcement boundary (what parse-time validation rejects)
+
+Parse-time validation enforces the **tag** subset and the **filter** allowlist above: an unsupported tag (`{% set %}`, `{% raw %}`, macros, inheritance, includes, the `do` tag) or a filter outside the six listed is a parse error. These are the constructs whose availability or behavior **differs across Jinja engines**, so blocking them is what preserves cross-engine portability (MiniJinja ↔ Tiddly's Jinja2, per system-design §6).
+
+Expression-level syntax — the comparison / boolean / arithmetic operators, member access, and indexing above — is **accepted and not parse-rejected**. These operators are core Jinja syntax that renders identically across engines, so enforcing them would buy no portability while requiring a full expression parser. *Author guidance (not enforced):* keep expressions simple for cross-engine fidelity; obscure numeric semantics (e.g. division / floor-division, type coercion) are not guaranteed identical across engines and are not part of the committed v1 contract.
+
+### Unsupported in v1 (tags/filters → parse error; see "Enforcement boundary")
 
 - Custom filters (Tiddly's project-specific filters)
 - The `do` extension
@@ -283,7 +290,7 @@ Functions accepting `agents` arguments accept either a single agent reference or
 - Turns from prior workflow runs against the same agent.
 - Turns from concurrent workflow runs targeting the same agent.
 
-Rationale: deterministic, predictable behavior. The author writes the workflow as a sequence of dispatches with declared dependencies; the helpers should reflect what the workflow itself orchestrated, not silently couple to whatever the user (or another workflow) did out-of-band. Implementation: the workflow runtime maintains a per-run map of agent → most-recent-completed-turn-this-workflow-saw, updated on `wait_for` / `wait_for_all` success **and on `pause_for_user` Mode-2 implicit-wait completion**; the helpers read from this map. The map stores the agent's **resolved output text**, captured from the turn's live event stream at completion — *not* a turn-id to be re-joined against the harness session file later. (An earlier design stored turn-id references and read bodies from disk on resolve; that join is unreliable — the dispatcher turn id and the harness file's turn ids are different id spaces, and one harness has no per-turn id at all — so the runtime captures the text when the turn completes instead. This is also what the run checkpoint persists, so a crash-recovered run can re-feed an earlier step's output; see the M6 plan and the scoped agent-content exception in system-design §3.)
+Rationale: deterministic, predictable behavior. The author writes the workflow as a sequence of dispatches with declared dependencies; the helpers should reflect what the workflow itself orchestrated, not silently couple to whatever the user (or another workflow) did out-of-band. Implementation: the workflow runtime maintains a per-run map of agent → most-recent-completed-turn-this-workflow-saw, updated on `wait_for` / `wait_for_all` success **and on `pause_for_user` Mode-2 implicit-wait completion**; the helpers read from this map. The map stores the agent's **resolved output text**, captured from the turn's live event stream at completion — *not* a turn-id to be re-joined against the harness session file later. (An earlier design stored turn-id references and read bodies from disk on resolve; that join is unreliable — the dispatcher turn id and the harness file's turn ids are different id spaces, and one harness has no per-turn id at all — so the runtime captures the text when the turn completes instead.) This map is **in-memory only** and lives for the duration of a single run; it is **not persisted**. (An earlier design persisted it so a crash-recovered run could re-feed an earlier step's output — but resume/retry is deferred beyond v1, so no agent content is written to disk and the system-design §3 "no agent content" invariant stands unmodified. See "Failure handling" above.)
 
 **Cross-iteration visibility within `for_each`:** Turns from earlier iterations of the same `for_each` body are workflow-run turns and remain visible to helpers in later iterations — only `user_input` is scoped per-iteration. Authors who don't want stale cross-iteration values should explicitly `wait_for` after a fresh `send` at the start of each iteration so the helper sees the new turn rather than the prior iteration's.
 
@@ -358,9 +365,9 @@ Per system-design §7:
 - A user manually cancelling an agent's turn that is part of a workflow step → `cancelled`. Applies uniformly — cancelling any one participating agent in a fan-in step also marks the whole workflow `cancelled`.
 - A user clicking cancel-workflow → `cancelled`
 - Any agent failure within a `wait_for_all` → step `failed`
-- Switchboard process death mid-step → `interrupted` (recovery: surface "interrupted at step N" with retry/abandon options)
+- Switchboard process death mid-step → `interrupted` (v1: surfaced as an interrupted run the user can **abandon**; no resume — see below)
 
-A `failed` or `interrupted` workflow can be retried from the failed step or abandoned. A `cancelled` workflow cannot be auto-resumed (user must re-invoke from the start).
+**v1 does not support resuming or retrying a run.** A `failed`, `interrupted`, or `cancelled` run is terminal: the user **abandons** it (which clears its run record) and, if they still want the work done, re-invokes the workflow from the start. The status values above are *display* states — they describe how a run ended, not resumable states. Resume / retry-from-step, and the snapshot + checkpoint-replay machinery it would require, are **deferred beyond v1** (rationale: a crash leaves participating agents' in-flight turns dead and a half-run transcript, so a correct resume needs both runtime replay and a non-trivial UI to convey what ran; the value is low because crashes are rare, and the cost spans the interpreter and the progress UI). See the v1 plan (M5) for the deferred scope.
 
 ### Sibling-failure policy (parallel `send` / fan-in)
 
@@ -375,20 +382,11 @@ Boundary cases:
 
 Manual cancel remains the user's escape hatch if they want to stop still-running siblings of a doomed step (e.g. coding agents mid-edit); Switchboard does not do this automatically.
 
-**Workflow file snapshot at invocation:** Workflow runs execute against an immutable snapshot of the workflow file and its bound inputs, captured at invocation time. Prompt resolution still happens at each step's dispatch (per system-design §6 prompt resolution rules) — edits to a referenced prompt take effect on the next workflow invocation, not the in-flight run. Edits to the workflow file on disk after invocation do not affect the in-flight run or retries; the snapshot is what executes. Rationale: deterministic execution and deterministic retry; reload-on-retry would create incoherent "same run, different program" behavior given step-index checkpointing.
+**Workflow file snapshot during a live run:** A workflow run executes against an immutable snapshot of the workflow file and its bound inputs, captured at invocation time and held **in memory** for the life of the run, so editing the file on disk mid-run does not change the program the running workflow executes. (Prompt resolution still happens at each step's dispatch per system-design §6 — editing a referenced *prompt* takes effect on the next invocation, not the in-flight run.) Because v1 has no resume, the snapshot does **not** need to be persisted: it exists only to keep a single live run coherent, and a crashed run is abandoned rather than re-executed.
 
-### Retry from inside a `for_each` iteration
+### Retry from inside a `for_each` iteration — deferred beyond v1
 
-When a step inside a `for_each` body fails or is interrupted, the workflow checkpoint captures the iteration index, the iteration variable's value, the per-run **output-scope map** (agent → most-recent-completed-turn-id; see §"Output scope"), and the most recently captured `user_input` in the current scope. On retry, the runtime rebinds the iteration variable from the checkpoint, restores the output-scope map and `user_input`, and resumes execution at the failed step's index *within that iteration*. Earlier steps in the same iteration are not re-executed.
-
-The output-scope-map restoration is what lets `forward_from` / `last_output` / `aggregated_responses` / `responses_from` correctly resolve in steps that come *after* the failed step but *before* a re-completed dispatch — without it, retries would fail with "no in-workflow completed output for agent X" even though earlier iteration steps already completed those dispatches.
-
-The `user_input` restoration rule has two cases:
-
-- **Retry of a non-pause step that comes after a completed `pause_for_user`**: the prior scoped `user_input` is restored from the checkpoint so subsequent steps that template-reference it render correctly.
-- **Retry of the same Mode-2 `pause_for_user` step that failed at dispatch**: the runtime re-enters the pause UI per the Mode-2 dispatch-failure rule. The compose bar is pre-filled with the captured `user_input` and the user must re-submit explicitly. The captured `user_input` is *not* automatically replayed — re-submission is a conscious act.
-
-Authors should keep this in mind when writing iteration bodies that have side-effecting steps (e.g., a `send` that creates a file or commits): on retry of step N within iteration K, steps 1..N-1 of iteration K do not run again. Where retry-correctness matters, design the workflow so the failing step is the side-effecting one (so its effects are not double-applied) or so earlier-step effects are idempotent.
+Resume/retry is not in v1 (see "Failure handling" above), so the iteration-level retry mechanics — checkpointing the iteration index + variable, restoring the per-run output-scope map and `user_input`, and resuming at the failed step within the iteration — are **deferred**. The design intent is recorded here for the future milestone that adds resume: a checkpoint would capture the iteration index, the iteration variable's value, the per-run output-scope map (agent → resolved text), and the current-scope `user_input`, so that `forward_from` / `last_output` / `aggregated_responses` / `responses_from` resolve correctly in steps after the failed step but before a re-completed dispatch, and so a side-effecting iteration body is not re-run from its start. None of this executes in v1.
 
 ## Validation
 
@@ -400,9 +398,10 @@ A workflow file is validated at two times:
 - Top-level keys are exactly `name`, `description`, optionally `inputs`, `steps`
 - `name` matches the slug regex and equals the filename
 - `inputs` declarations use valid types
+- No `default` (and thus no optionality) on a non-`text` input (per §Inputs — `text`-only in v1)
 - Each `steps` entry has exactly one step-type key with a known type
 - Each step's required fields are present
-- All template strings parse as valid templates (referenced variable names need not be declared yet — that's an invocation-time check)
+- All template strings parse as valid templates and stay within the **tag/filter** subset (per §Templating "Enforcement boundary"); expression-level operators are accepted. Referenced variable names need not be declared yet — that's an invocation-time check.
 - No nested `for_each`
 - No reserved built-in names used as input names
 - No `for_each` `item:` name that collides with a workflow input name *or* with the reserved built-in name `user_input` (per §`for_each` — silent shadowing is rejected at the boundary)

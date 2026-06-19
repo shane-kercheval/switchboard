@@ -66,8 +66,8 @@ test("a short user message fits the clip and gets no toggle (no false positives)
   expect(page.getByTestId("turn-preview-toggle").elements()).toHaveLength(0);
 });
 
-test("a non-last-block agent response that overflows gets a toggle", async () => {
-  // The agent's latest response renders as the full last-block view (no clip);
+test("a non-latest agent response that overflows gets a toggle", async () => {
+  // The agent's latest response renders as the full latest-response view (no clip);
   // an earlier response renders as the height-clipped preview. Seed two so the
   // first is the clipped one whose overflow must drive a toggle.
   await registerAgent(ALICE);
@@ -88,7 +88,7 @@ test("a non-last-block agent response that overflows gets a toggle", async () =>
 
   mountTranscript({ projectId: PROJECT_ID, agents: [ALICE] });
 
-  // Exactly one clip (the earlier, non-last-block response); it overflows.
+  // Exactly one clip (the earlier, non-latest response); it overflows.
   await expect.element(page.getByTestId("preview-clip")).toBeInTheDocument();
   await expect
     .poll(() => {

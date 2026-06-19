@@ -30,7 +30,7 @@ test("expanding a mid-list message keeps its toggle anchored on screen", async (
   await registerAgent(ALICE);
   // A long (clipped → toggled) user message at the top, with a tall response
   // below it so the message is mid-list and the transcript scrolls. The latest
-  // agent response renders as the full last-block view (no toggle of its own),
+  // agent response renders as the full latest-response view (no toggle of its own),
   // so the user message owns the only toggle.
   seedTurns(ALICE.id, [
     userTurn({ id: "user-1", agentId: ALICE.id, text: longText(30) }),

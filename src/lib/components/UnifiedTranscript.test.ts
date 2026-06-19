@@ -979,6 +979,7 @@ describe("UnifiedTranscript — fan-out groups", () => {
     });
 
     const column = screen.getAllByTestId("fanout-column")[0]!;
+    await fireEvent.click(within(column).getByTestId("turn-preview-toggle"));
     const indicator = within(column).getByTestId("hidden-items-indicator");
     const chip = within(column).getByTestId("outcome-cancelled");
     // The chip follows the indicator in document order (it's last, not first).
@@ -2305,7 +2306,7 @@ describe("UnifiedTranscript compact mode", () => {
     return screen.getAllByTestId("turn").filter((el) => el.getAttribute("data-role") === "agent");
   }
 
-  it("renders an agent's latest response as the last block and an older one clipped", async () => {
+  it("renders an agent's latest response as full answer prose and an older one clipped", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     state.transcripts[CLAUDE_AGENT.id] = [
@@ -2326,25 +2327,26 @@ describe("UnifiedTranscript compact mode", () => {
 
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
-    const [older, latest] = agentTurns();
-    // Latest → last-block: only the final answer block, tools hidden.
-    expect(within(latest!).getByText("new last")).toBeInTheDocument();
-    expect(within(latest!).queryByText("new first")).toBeNull();
+    const [older, newest] = agentTurns();
+    // Latest → expanded by default, including all answer prose and tool widgets.
+    expect(within(newest!).getByText("new first")).toBeInTheDocument();
+    expect(within(newest!).getByText("new last")).toBeInTheDocument();
+    expect(within(newest!).getByTestId("tool-done")).toBeInTheDocument();
     // Older → clipped preview: all answer text, tools hidden.
     expect(within(older!).getByText("old first")).toBeInTheDocument();
     expect(within(older!).getByText("old last")).toBeInTheDocument();
-    expect(screen.queryByTestId("tool-done")).toBeNull();
-    // Both are collapsed by default now.
+    expect(within(older!).queryByTestId("tool-done")).toBeNull();
+    // Older is collapsed by default; latest is expanded and can be collapsed.
     expect(toggleLabel(older!)).toBe("Expand");
-    expect(toggleLabel(latest!)).toBe("Expand");
+    expect(toggleLabel(newest!)).toBe("Collapse");
   });
 
-  it("keeps each agent's most-recent response as last-block even when another agent replied later", async () => {
+  it("keeps each agent's most-recent response full even when another agent replied later", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     await state.registerAgent(CODEX_AGENT);
     // CLAUDE's only response is globally older than CODEX's, but it is still
-    // CLAUDE's latest → it gets the last-block treatment, not a clipped preview.
+    // CLAUDE's latest → it gets the latest-response treatment, not a clipped preview.
     state.transcripts[CLAUDE_AGENT.id] = [
       user(CLAUDE_AGENT, "send-1", "u-1", "2026-05-16T00:00:00Z"),
       done(CLAUDE_AGENT, "send-1", "a-1", "2026-05-16T00:00:01Z", "2026-05-16T00:00:02Z", [
@@ -2366,13 +2368,13 @@ describe("UnifiedTranscript compact mode", () => {
     });
 
     const [claudeTurn, codexTurn] = agentTurns();
+    expect(within(claudeTurn!).getByText("claude first")).toBeInTheDocument();
     expect(within(claudeTurn!).getByText("claude last")).toBeInTheDocument();
-    expect(within(claudeTurn!).queryByText("claude first")).toBeNull();
+    expect(within(codexTurn!).getByText("codex first")).toBeInTheDocument();
     expect(within(codexTurn!).getByText("codex last")).toBeInTheDocument();
-    expect(within(codexTurn!).queryByText("codex first")).toBeNull();
   });
 
-  it("picks each agent's last-block response by completion recency, not rendered order", async () => {
+  it("picks each agent's latest response by completion recency, not rendered order", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     // send-a is anchored earlier (renders first) but finishes LAST (ended t5).
@@ -2393,15 +2395,15 @@ describe("UnifiedTranscript compact mode", () => {
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     const [first, second] = agentTurns();
-    // send-a is the latest by recency → last-block (only its final block).
+    // send-a is the latest by recency → full answer prose.
+    expect(within(first!).getByText("a first")).toBeInTheDocument();
     expect(within(first!).getByText("a last")).toBeInTheDocument();
-    expect(within(first!).queryByText("a first")).toBeNull();
     // send-b is older → clipped preview (all its answer text).
     expect(within(second!).getByText("b first")).toBeInTheDocument();
     expect(within(second!).getByText("b last")).toBeInTheDocument();
   });
 
-  it("renders each latest fan-out column as its last block", async () => {
+  it("renders each latest fan-out column as full answer prose", async () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     await state.registerAgent(CODEX_AGENT);
@@ -2432,10 +2434,10 @@ describe("UnifiedTranscript compact mode", () => {
     });
 
     const [aliceCol, bobCol] = screen.getAllByTestId("fanout-column");
+    expect(within(aliceCol!).getByText("alice first")).toBeInTheDocument();
     expect(within(aliceCol!).getByText("alice last")).toBeInTheDocument();
-    expect(within(aliceCol!).queryByText("alice first")).toBeNull();
+    expect(within(bobCol!).getByText("bob first")).toBeInTheDocument();
     expect(within(bobCol!).getByText("bob last")).toBeInTheDocument();
-    expect(within(bobCol!).queryByText("bob first")).toBeNull();
     // Older standalone → clipped preview (all answer text).
     const solo = agentTurns()[0];
     expect(within(solo!).getByText("solo first")).toBeInTheDocument();
@@ -2468,14 +2470,14 @@ describe("UnifiedTranscript compact mode", () => {
     render(UnifiedTranscript, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT] } });
 
     const [a, b, c] = agentTurns();
-    // Everything is collapsed by default.
+    // Older responses are collapsed by default; the latest response is expanded.
     expect(toggleLabel(a!)).toBe("Expand");
     expect(toggleLabel(b!)).toBe("Expand");
-    expect(toggleLabel(c!)).toBe("Expand");
+    expect(toggleLabel(c!)).toBe("Collapse");
     await fireEvent.click(a!.querySelector('[data-testid="turn-preview-toggle"]')!);
     expect(toggleLabel(a!)).toBe("Collapse"); // now expanded
     expect(toggleLabel(b!)).toBe("Expand"); // unchanged
-    expect(toggleLabel(c!)).toBe("Expand"); // unchanged
+    expect(toggleLabel(c!)).toBe("Collapse"); // unchanged
   });
 
   it("renders no compact toggle on a queued row", async () => {
@@ -2550,6 +2552,10 @@ describe("UnifiedTranscript compact mode", () => {
         TOOL("t2"),
         ANSWER("done"),
       ]),
+      user(CLAUDE_AGENT, "send-b", "u-b", "2026-05-16T00:00:10Z"),
+      done(CLAUDE_AGENT, "send-b", "a-2", "2026-05-16T00:00:11Z", "2026-05-16T00:00:12Z", [
+        ANSWER("newest"),
+      ]),
     ];
     setProjectCompact(PROJECT_ID, true);
 
@@ -2585,7 +2591,7 @@ describe("UnifiedTranscript compact mode", () => {
     // The older (clipped) response hid a tool → indicator present with the count.
     const older = agentTurns()[0]!;
     expect(within(older).getByTestId("hidden-items-indicator")).toHaveTextContent("1 tool call");
-    // The newest (last-block, no tools) hides nothing non-text → no indicator.
+    // The newest (latest-response view, no tools) hides nothing non-text → no indicator.
     expect(within(agentTurns()[1]!).queryByTestId("hidden-items-indicator")).toBeNull();
   });
 
@@ -2882,6 +2888,7 @@ describe("UnifiedTranscript fan-out group control", () => {
     });
 
     const [aliceCol] = screen.getAllByTestId("fanout-column");
+    await fireEvent.click(within(aliceCol!).getByTestId("turn-preview-toggle"));
     const indicator = within(aliceCol!).getByTestId("hidden-items-indicator");
     expect(indicator).toHaveTextContent("1 tool call");
     expect(within(aliceCol!).queryByTestId("tool-done")).toBeNull(); // tool hidden while collapsed
@@ -2893,7 +2900,7 @@ describe("UnifiedTranscript fan-out group control", () => {
     const state = await loadState();
     await state.registerAgent(CLAUDE_AGENT);
     await state.registerAgent(CODEX_AGENT);
-    // A single fan-out → both columns start collapsed (each agent's last block).
+    // A single fan-out → both columns start expanded (each agent's latest response).
     state.transcripts[CLAUDE_AGENT.id] = [
       u(CLAUDE_AGENT, "send-f", "u-a", "2026-05-16T00:00:00Z"),
       a(CLAUDE_AGENT, "send-f", "a-a", "2026-05-16T00:00:01Z", "2026-05-16T00:00:03Z"),
@@ -2908,15 +2915,15 @@ describe("UnifiedTranscript fan-out group control", () => {
     });
 
     const group = screen.getByTestId("fanout-group");
-    expect(columnLabels(group)).toEqual(["Expand", "Expand"]); // both collapsed
-    expect(groupToggle(group)).toHaveAttribute("aria-label", "Expand all responses");
-
-    await fireEvent.click(groupToggle(group));
-    expect(columnLabels(group)).toEqual(["Collapse", "Collapse"]); // all expanded
+    expect(columnLabels(group)).toEqual(["Collapse", "Collapse"]); // both expanded
     expect(groupToggle(group)).toHaveAttribute("aria-label", "Collapse all responses");
 
     await fireEvent.click(groupToggle(group));
-    expect(columnLabels(group)).toEqual(["Expand", "Expand"]); // all collapsed again
+    expect(columnLabels(group)).toEqual(["Expand", "Expand"]); // all collapsed
+    expect(groupToggle(group)).toHaveAttribute("aria-label", "Expand all responses");
+
+    await fireEvent.click(groupToggle(group));
+    expect(columnLabels(group)).toEqual(["Collapse", "Collapse"]); // all expanded again
   });
 
   it("affects only its own fan-out group", async () => {
@@ -2954,6 +2961,24 @@ describe("UnifiedTranscript fan-out group control", () => {
       a(CODEX_AGENT, "send-a", "ac-a", "2026-05-16T00:00:01Z", "2026-05-16T00:00:02Z"),
       u(CODEX_AGENT, "send-b", "uc-b", "2026-05-16T00:00:10Z"),
       a(CODEX_AGENT, "send-b", "ac-b", "2026-05-16T00:00:11Z", "2026-05-16T00:00:12Z"),
+      {
+        role: "user",
+        turn_id: "uc-z",
+        agent_id: CODEX_AGENT.id,
+        send_id: "send-z-codex",
+        started_at: "2026-05-16T00:00:20Z",
+        text: "solo",
+      },
+      {
+        role: "agent",
+        turn_id: "ac-z",
+        agent_id: CODEX_AGENT.id,
+        send_id: "send-z-codex",
+        started_at: "2026-05-16T00:00:21Z",
+        ended_at: "2026-05-16T00:00:22Z",
+        status: "complete",
+        items: [text("latest solo codex")],
+      },
     ];
 
     render(UnifiedTranscript, {
@@ -2987,17 +3012,17 @@ describe("UnifiedTranscript fan-out group control", () => {
     });
 
     const group = screen.getByTestId("fanout-group");
-    expect(columnLabels(group)).toEqual(["Expand", "Expand"]); // both collapsed by default
-    await fireEvent.click(groupToggle(group)); // expand both
-    expect(columnLabels(group)).toEqual(["Collapse", "Collapse"]);
+    expect(columnLabels(group)).toEqual(["Collapse", "Collapse"]); // both expanded by default
+    await fireEvent.click(groupToggle(group)); // collapse both
+    expect(columnLabels(group)).toEqual(["Expand", "Expand"]);
 
-    // Collapse just the first column individually — the group toggle wrote
+    // Expand just the first column individually — the group toggle wrote
     // per-column overrides, so each column is still independently controllable.
     const firstColToggle = group
       .querySelectorAll('[data-testid="fanout-column"]')[0]!
       .querySelector('[data-testid="turn-preview-toggle"]')!;
     await fireEvent.click(firstColToggle);
-    expect(columnLabels(group)).toEqual(["Expand", "Collapse"]);
+    expect(columnLabels(group)).toEqual(["Collapse", "Expand"]);
   });
 });
 
@@ -3053,12 +3078,12 @@ describe("UnifiedTranscript terminal-response collapse", () => {
     // collapses and (having a hidden tool call) offers a toggle.
     const toggle = agentTurnEl().querySelector('[data-testid="turn-preview-toggle"]');
     expect(toggle).not.toBeNull();
-    expect(toggle).toHaveAttribute("aria-label", "Expand"); // collapsed by default (its last block)
+    expect(toggle).toHaveAttribute("aria-label", "Collapse"); // expanded by default (latest response)
     await fireEvent.click(toggle!);
     expect(agentTurnEl().querySelector('[data-testid="turn-preview-toggle"]')).toHaveAttribute(
       "aria-label",
-      "Collapse",
-    ); // now expanded
+      "Expand",
+    ); // now collapsed
   });
 
   it("collapses a dangling streaming-on-disk turn closed by an outcome marker", async () => {

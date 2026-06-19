@@ -3633,6 +3633,234 @@ async fn awaited_send_completion_resolves_failed_when_locator_persist_fails() {
     );
 }
 
+#[tokio::test]
+async fn failfast_send_to_mid_flight_agent_is_busy() {
+    // Genuine contention: while a turn is actually running (terminal not yet
+    // seen), a FailFast send must be refused. `CompletesOnSignal` parks the turn
+    // mid-flight until released, so the contention is deterministic.
+    let signal = Arc::new(tokio::sync::Notify::new());
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let factory = TestFactory::new(
+        MockScenario::CompletesOnSignal(Arc::clone(&signal)),
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+    );
+
+    let _running = accepted_completion(
+        dispatcher
+            .send_message_awaiting_completion(
+                agent.id,
+                "first",
+                vec![],
+                Uuid::now_v7(),
+                Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
+            )
+            .await,
+    );
+    within(
+        &emitter,
+        "turn_start (mid-flight)",
+        emitter.wait_for_type("turn_start", 1),
+    )
+    .await;
+
+    let outcome = dispatcher
+        .send_message_awaiting_completion(agent.id, "second", vec![], Uuid::now_v7(), factory)
+        .await;
+    assert!(
+        matches!(outcome, AwaitableSendOutcome::Busy),
+        "a FailFast send to a genuinely mid-flight agent must be Busy",
+    );
+    // Release the parked turn so the actor can shut down cleanly.
+    signal.notify_one();
+}
+
+/// Count `agent_idle` emissions recorded so far (matched on the wire `type`).
+fn idle_count(emitter: &RecordingEmitter) -> usize {
+    emitter
+        .snapshot()
+        .iter()
+        .filter(|(_, p)| p.get("type").and_then(|t| t.as_str()) == Some("agent_idle"))
+        .count()
+}
+
+#[tokio::test]
+async fn failfast_resend_during_own_drain_is_accepted_not_busy() {
+    // The post-terminal-drain accept, exercised deterministically: turn 1 emits
+    // its terminal then *holds the stream open* (CompletesThenHolds), so the actor
+    // is parked inside drain_turn after the terminal when the re-send arrives. The
+    // re-send must be accepted via the in-drain arm (not the idle path) and run
+    // once the hold releases — guarding the back-to-back `send`→`wait`→`send`
+    // workflow shape against a spurious Busy.
+    let signal = Arc::new(tokio::sync::Notify::new());
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let factory = TestFactory::sequence(
+        [
+            MockScenario::CompletesThenHolds(Arc::clone(&signal)),
+            MockScenario::Streaming,
+        ],
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+    );
+
+    let rx1 = accepted_completion(
+        dispatcher
+            .send_message_awaiting_completion(
+                agent.id,
+                "first",
+                vec![],
+                Uuid::now_v7(),
+                Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
+            )
+            .await,
+    );
+    assert_eq!(completion_within(rx1).await.outcome, TurnOutcome::Completed);
+    // Turn 1 is terminal but still held in drain — no idle yet, so the next accept
+    // is provably via the in-drain arm rather than the parked-idle path.
+    assert_eq!(
+        idle_count(&emitter),
+        0,
+        "actor must still be draining turn 1"
+    );
+
+    let rx2 = accepted_completion(
+        dispatcher
+            .send_message_awaiting_completion(agent.id, "second", vec![], Uuid::now_v7(), factory)
+            .await,
+    );
+    assert_eq!(
+        idle_count(&emitter),
+        0,
+        "still no idle between the two turns"
+    );
+
+    // Release the hold so turn 1's drain finishes and the accepted turn 2 runs.
+    signal.notify_one();
+    assert_eq!(completion_within(rx2).await.outcome, TurnOutcome::Completed);
+}
+
+#[tokio::test]
+async fn failfast_during_drain_with_queued_work_is_busy() {
+    // The third arm of the FailFast condition: terminal_seen is true, but other
+    // work is already queued — that is genuine contention and must stay Busy
+    // (workflow "contention = step failure"), not be bridged like the empty-backlog
+    // self-drain case.
+    let signal = Arc::new(tokio::sync::Notify::new());
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let factory = TestFactory::sequence(
+        [
+            MockScenario::CompletesThenHolds(Arc::clone(&signal)),
+            MockScenario::Streaming,
+        ],
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+    );
+
+    let rx1 = accepted_completion(
+        dispatcher
+            .send_message_awaiting_completion(
+                agent.id,
+                "first",
+                vec![],
+                Uuid::now_v7(),
+                Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
+            )
+            .await,
+    );
+    assert_eq!(completion_within(rx1).await.outcome, TurnOutcome::Completed);
+
+    // Queue a second send while turn 1 is held in drain (Enqueue → backlog).
+    let queued = accepted(
+        dispatcher
+            .send_message(
+                agent.id,
+                "queued",
+                vec![],
+                Uuid::now_v7(),
+                Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
+                OnBusy::Enqueue,
+            )
+            .await,
+    );
+    let _ = queued;
+
+    // Now a FailFast send sees terminal_seen && non-empty backlog → Busy.
+    let outcome = dispatcher
+        .send_message_awaiting_completion(agent.id, "third", vec![], Uuid::now_v7(), factory)
+        .await;
+    assert!(
+        matches!(outcome, AwaitableSendOutcome::Busy),
+        "a FailFast send with other work already queued must be Busy",
+    );
+    signal.notify_one();
+}
+
+#[tokio::test]
+async fn cancel_send_during_drain_resolves_accepted_awaitable_as_cancelled() {
+    // Finding-1 guard: an awaitable send accepted into the backlog during the
+    // post-terminal drain must, if cancelled before it runs, resolve its
+    // completion as `Cancelled` — never strand the awaiter on a RecvError. The
+    // dispatcher's "an accepted awaitable always resolves" contract must hold even
+    // for this brief queued window.
+    let signal = Arc::new(tokio::sync::Notify::new());
+    let dispatcher = Arc::new(Dispatcher::new());
+    let emitter = Arc::new(RecordingEmitter::new());
+    let agent = agent_record();
+    let factory = TestFactory::sequence(
+        [
+            MockScenario::CompletesThenHolds(Arc::clone(&signal)),
+            MockScenario::Streaming,
+        ],
+        agent.clone(),
+        Arc::clone(&emitter),
+        noop_journal(),
+    );
+
+    let rx1 = accepted_completion(
+        dispatcher
+            .send_message_awaiting_completion(
+                agent.id,
+                "first",
+                vec![],
+                Uuid::now_v7(),
+                Arc::clone(&factory) as Arc<dyn DispatchContextFactory>,
+            )
+            .await,
+    );
+    assert_eq!(completion_within(rx1).await.outcome, TurnOutcome::Completed);
+
+    // Accept a second send into the backlog during turn 1's drain, then cancel it.
+    let send_id = Uuid::now_v7();
+    let rx2 = accepted_completion(
+        dispatcher
+            .send_message_awaiting_completion(agent.id, "second", vec![], send_id, factory)
+            .await,
+    );
+    dispatcher.cancel_send(send_id, &[agent.id], CancelSource::Workflow);
+
+    let result = completion_within(rx2).await;
+    assert!(
+        matches!(
+            result.outcome,
+            TurnOutcome::Cancelled {
+                source: CancelSource::Workflow
+            }
+        ),
+        "a cancelled queued awaitable must resolve Cancelled, not a receiver error, got {:?}",
+        result.outcome,
+    );
+    signal.notify_one();
+}
+
 // ---------------------------------------------------------------------------
 // Per-agent current-turn wait (`wait_for_current_turn`).
 //

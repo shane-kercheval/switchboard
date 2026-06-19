@@ -10,7 +10,7 @@ use crate::error::{CoreError, Result};
 use crate::harness::{HarnessKind, SelectionAxis};
 use crate::io::{append_jsonl, read_jsonl, read_yaml, write_jsonl, write_yaml};
 use crate::name::{canonicalize_for_uniqueness, validate_name};
-use crate::paths::{ATTACHMENTS_DIR, CONFIG_FILE, JOURNAL_FILE, REGISTRY_FILE};
+use crate::paths::{ATTACHMENTS_DIR, CONFIG_FILE, JOURNAL_FILE, REGISTRY_FILE, RUNS_DIR};
 
 pub type ProjectId = Uuid;
 
@@ -72,6 +72,21 @@ impl Project {
     /// `projects/`. Created lazily on first stage; absent until then.
     pub fn attachments_dir(&self) -> PathBuf {
         self.root.join(ATTACHMENTS_DIR)
+    }
+
+    /// Directory holding this project's workflow-run records
+    /// (`projects/<id>/runs/`). One `<run-id>.jsonl` per run, written by the
+    /// workflow interpreter as progress/terminal bookkeeping (no agent content —
+    /// resume is deferred, so these are surfacing/abandon records, not replay
+    /// state). Runtime data; `.gitignore`d like the rest of `projects/`. Created
+    /// lazily on the first run.
+    pub fn runs_dir(&self) -> PathBuf {
+        self.root.join(RUNS_DIR)
+    }
+
+    /// Path to a specific run's record file (`projects/<id>/runs/<run-id>.jsonl`).
+    pub fn run_path(&self, run_id: Uuid) -> PathBuf {
+        self.runs_dir().join(format!("{run_id}.jsonl"))
     }
 
     /// Append a new agent to this project's registry. Validates the name (regex +

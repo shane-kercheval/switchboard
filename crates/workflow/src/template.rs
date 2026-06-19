@@ -35,8 +35,20 @@ use minijinja::value::{Value, ValueKind};
 use minijinja::{Environment, Error as MjError, ErrorKind, UndefinedBehavior};
 use switchboard_core::name::canonicalize_for_uniqueness;
 
-use crate::checkpoint::OutputScope;
 use crate::error::{Result, WorkflowError};
+
+/// Per-run map of agent → most-recent resolved completed-turn **text** observed
+/// by this run, keyed by the canonical (hyphen→underscore, lowercased) agent
+/// name — matching the project's agent-name uniqueness rule and how the helpers
+/// (`responses_from`, `last_output`, …) look agents up. The interpreter updates
+/// it on each awaited terminal; the helpers read through it.
+///
+/// **In-memory only.** With resume deferred (no crash-replay in v1), this scope
+/// lives for the duration of a live run and is never persisted — so it carries no
+/// agent content to disk. `BTreeMap` keeps it cheap and deterministic; callers
+/// that need declared/agent-list order (the helpers) iterate their own argument
+/// list and look up here, never iterate this map.
+pub type OutputScope = BTreeMap<String, String>;
 
 /// Control-structure tags the workflow subset permits. Any other tag keyword
 /// (`set`, `macro`, `block`, `include`, `raw`, …) is rejected — an allowlist, so

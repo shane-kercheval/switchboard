@@ -36,7 +36,7 @@ use crate::error::{CoreError, Result};
 /// Keep the artifact and surface the error (see `Directory::create_project`).
 /// The parent-directory fsync has no portable Windows equivalent, so it's gated
 /// to unix; Windows durability is deferred.
-pub(crate) fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+pub fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let mut line = serde_json::to_string(value).map_err(|source| CoreError::Serialize {
         path: path.to_owned(),
         source,
@@ -76,7 +76,7 @@ pub(crate) fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 /// if the file doesn't exist — callers that consider absence corruption (e.g.,
 /// `Directory::list_projects` after init) must check existence themselves
 /// before calling this.
-pub(crate) fn read_jsonl<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
+pub fn read_jsonl<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
     let file = match File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),

@@ -70,15 +70,17 @@
 //! resolves all its awaiters together via [`TurnAwaiters`].
 //!
 //! **The signal resolves at the turn's terminal, not when the agent is next
-//! re-dispatchable.** It fires the instant the terminal is observed — so the
-//! forwarded text is available with minimal latency — but the actor then keeps
-//! draining post-terminal adapter events (for some harnesses a session-file
-//! read, not microseconds) before it parks and accepts new work. A caller that
-//! awaits a completion and *immediately* `FailFast`-sends to the **same agent**
-//! can therefore still get `Busy`. Resolving completion later (at idle) would
-//! add latency the forward doesn't need, so consumers that re-dispatch to a
-//! just-awaited agent must await that agent's `AgentIdle` first (or tolerate a
-//! single `Busy`), rather than treating completion as "agent is free."
+//! re-dispatchable** — it fires the instant the terminal is observed, so the
+//! forwarded text is available with minimal latency, while the actor then keeps
+//! draining post-terminal adapter events (for some harnesses a session-file read,
+//! not microseconds) before it parks. To keep a back-to-back same-agent
+//! `send`→await→`send` from spuriously failing in that window, the `FailFast`
+//! enqueue path **accepts** a send that arrives once the current turn is terminal
+//! and nothing else is queued (it runs when drain finishes); it returns `Busy`
+//! only for genuine contention — a turn still mid-flight, or other work already
+//! queued. So a caller may re-dispatch to a just-awaited agent immediately after
+//! its completion without awaiting `AgentIdle`, and `Busy` still means a real
+//! conflict (the workflow "contention = step failure" rule holds).
 //!
 //! **Why the payload carries captured text, not a turn id (decision #7).** The
 //! awaited turn's text is accumulated by the actor from the live stream (the
@@ -141,13 +143,14 @@ struct WorkItem {
     attachments: Vec<Attachment>,
     /// Set only for sends made via [`Dispatcher::send_message_awaiting_completion`].
     /// The actor fires it once when this send's turn reaches a terminal state.
-    /// `None` for the compose-bar path — that path allocates no completion
-    /// channel and accumulates no text. The awaitable path is `FailFast`, so such
-    /// an item is dispatched immediately and never lingers in the backlog to be
-    /// queue-dropped; firing at a terminal is therefore the only way it resolves.
-    /// Defensive belt-and-suspenders: were an item with a sender ever dropped
-    /// pre-terminal anyway, the sender drops and the awaiter's `recv` resolves
-    /// `Err`, surfacing as a failed send rather than a hang.
+    /// `None` for the compose-bar path — that path allocates no completion channel
+    /// and accumulates no text. The awaitable path is `FailFast`, normally
+    /// dispatched immediately; but the post-terminal-drain accept (see the
+    /// `FailFast` enqueue arm) can briefly queue such an item, so the contract
+    /// "an accepted awaitable always resolves" is upheld by **every** backlog-drop
+    /// path firing this completion with a synthesized `Cancelled` terminal before
+    /// discarding the item (see [`resolve_dropped_completion`]) — never a silent
+    /// drop that would leave the awaiter on a `RecvError`.
     completion: Option<oneshot::Sender<CompletionResult>>,
 }
 
@@ -1105,7 +1108,13 @@ fn abandon_backlog(
     channel: &str,
     agent_id: AgentId,
 ) {
-    for item in backlog.drain(..) {
+    for mut item in backlog.drain(..) {
+        resolve_dropped_completion(
+            &mut item,
+            TurnOutcome::Cancelled {
+                source: CancelSource::Shutdown,
+            },
+        );
         emit_message_failed(
             emitter,
             channel,
@@ -1159,14 +1168,14 @@ fn apply_idle_command(
         Command::Cancel(_) => IdleAfter::Continue,
         // No turn live ⇒ only this send's *queued* items can exist; drop them
         // and emit MessageCancelled for each.
-        Command::CancelSend { send_id, source: _ } => {
-            drop_queued_send(backlog, send_id, emitter, channel, agent_id);
+        Command::CancelSend { send_id, source } => {
+            drop_queued_send(backlog, send_id, source, emitter, channel, agent_id);
             IdleAfter::Continue
         }
         // No turn live ⇒ drop the whole backlog (the actor stays alive),
         // emitting MessageCancelled for each dropped send.
-        Command::CancelAgent { source: _ } => {
-            drop_all_queued(backlog, emitter, channel, agent_id);
+        Command::CancelAgent { source } => {
+            drop_all_queued(backlog, source, emitter, channel, agent_id);
             IdleAfter::Continue
         }
         // The caller (`agent_actor`) abandons the backlog (emitting
@@ -1536,8 +1545,26 @@ async fn drain_turn(
                     Some(Command::Enqueue { item, on_busy, reply }) => {
                         match on_busy {
                             OnBusy::FailFast => {
-                                // A turn is running ⇒ busy.
-                                if let Some(reply) = reply { let _ = reply.send(SendOutcome::Busy); }
+                                // FailFast normally refuses while a turn runs. But once
+                                // our own turn has reached terminal and we're only
+                                // draining post-terminal enrichment events with nothing
+                                // else queued, the agent is effectively free — accept and
+                                // let the new turn start when drain finishes, rather than
+                                // spuriously failing a back-to-back same-agent send
+                                // (the completion signal fires at terminal, before the
+                                // actor parks idle). Genuine contention — a turn still
+                                // mid-flight (terminal not seen) or other work already
+                                // queued — still returns Busy, preserving the
+                                // workflow "contention = step failure" rule.
+                                if terminal_seen && backlog.is_empty() {
+                                    let message_id = item.message_id;
+                                    backlog.push_back(item);
+                                    if let Some(reply) = reply {
+                                        let _ = reply.send(SendOutcome::Accepted(message_id));
+                                    }
+                                } else if let Some(reply) = reply {
+                                    let _ = reply.send(SendOutcome::Busy);
+                                }
                             }
                             OnBusy::Enqueue => {
                                 let message_id = item.message_id;
@@ -1577,7 +1604,7 @@ async fn drain_turn(
                             cancel_source.get_or_insert(source);
                             token.cancel();
                         }
-                        drop_queued_send(backlog, send_id, emitter.as_ref(), channel, agent_id);
+                        drop_queued_send(backlog, send_id, source, emitter.as_ref(), channel, agent_id);
                     }
                     Some(Command::CancelAgent { source }) => {
                         // Stop the agent: cancel the running turn (post-terminal
@@ -1588,7 +1615,7 @@ async fn drain_turn(
                             cancel_source.get_or_insert(source);
                             token.cancel();
                         }
-                        drop_all_queued(backlog, emitter.as_ref(), channel, agent_id);
+                        drop_all_queued(backlog, source, emitter.as_ref(), channel, agent_id);
                     }
                     Some(Command::Shutdown { source, reply }) => {
                         // Cancel the running turn and keep draining to its
@@ -1732,9 +1759,18 @@ fn remove_from_backlog(
         .iter()
         .position(|m| m.message_id == message_id)
         .ok_or(NotQueued)?;
-    let item = backlog
+    let mut item = backlog
         .remove(pos)
         .expect("position from iter is in bounds");
+    // A removed queued message is a user action; resolve any awaitable completion
+    // so an accepted awaitable that was removed before running doesn't strand its
+    // awaiter (compose-bar items carry no completion, so this is usually a no-op).
+    resolve_dropped_completion(
+        &mut item,
+        TurnOutcome::Cancelled {
+            source: CancelSource::User,
+        },
+    );
     Ok(RemovedQueuedMessage {
         agent_id,
         send_id: item.send_id,
@@ -1837,12 +1873,14 @@ fn emit_message_cancelled(
 fn drop_queued_send(
     backlog: &mut VecDeque<WorkItem>,
     send_id: SendId,
+    source: CancelSource,
     emitter: &dyn EventEmitter,
     channel: &str,
     agent_id: AgentId,
 ) {
-    backlog.retain(|m| {
+    backlog.retain_mut(|m| {
         if m.send_id == send_id {
+            resolve_dropped_completion(m, TurnOutcome::Cancelled { source });
             emit_message_cancelled(emitter, channel, m.message_id, agent_id);
             false
         } else {
@@ -1855,12 +1893,30 @@ fn drop_queued_send(
 /// emitting `MessageCancelled` for each.
 fn drop_all_queued(
     backlog: &mut VecDeque<WorkItem>,
+    source: CancelSource,
     emitter: &dyn EventEmitter,
     channel: &str,
     agent_id: AgentId,
 ) {
-    for item in backlog.drain(..) {
+    for mut item in backlog.drain(..) {
+        resolve_dropped_completion(&mut item, TurnOutcome::Cancelled { source });
         emit_message_cancelled(emitter, channel, item.message_id, agent_id);
+    }
+}
+
+/// Resolve a queued item's awaitable completion (if any) with `outcome` before
+/// the item is dropped, so a `send_message_awaiting_completion` caller whose item
+/// was accepted into the backlog and then cancelled / abandoned receives a real
+/// [`CompletionResult`] rather than a `RecvError`. The post-terminal-drain accept
+/// in the `FailFast` enqueue path can briefly queue an awaitable item, so every
+/// drop path must honor this — it keeps "an accepted awaitable always resolves"
+/// universally true. A no-op for the compose-bar path (no completion sender).
+fn resolve_dropped_completion(item: &mut WorkItem, outcome: TurnOutcome) {
+    if let Some(tx) = item.completion.take() {
+        let _ = tx.send(CompletionResult {
+            outcome,
+            text: String::new(),
+        });
     }
 }
 

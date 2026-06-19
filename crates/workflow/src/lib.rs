@@ -39,14 +39,13 @@
 //! or invocation — the interpreter (M4) must surface render errors at step
 //! execution.
 
-mod checkpoint;
 mod error;
 mod invocation;
 mod model;
 mod parse;
+mod run;
 mod template;
 
-pub use checkpoint::{CheckpointRecord, IterationState, OutputScope, RunStatus, TerminalStatus};
 pub use error::{Result, WorkflowError};
 pub use invocation::{InputValue, bind_invocation, validate_agent_list, validate_invocation};
 pub use model::{
@@ -54,4 +53,5 @@ pub use model::{
     WaitForStep, Workflow,
 };
 pub use parse::parse_workflow;
-pub use template::{Scope, ScopeValue, render, validate_template};
+pub use run::{RunRecord, RunStatus, TerminalStatus};
+pub use template::{OutputScope, Scope, ScopeValue, render, validate_template};

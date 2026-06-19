@@ -1392,8 +1392,13 @@
                 {/each}
               </div>
               {#if fanoutEntries.length > 0 || fanoutCopyable.length > 0}
+                <!-- Reveal toggles opacity with NO transition: on macOS WebKit a
+                     settled `transition-opacity` leaves the leave-change unpainted
+                     until a reflow (the footer stuck visible until a resize). The
+                     other hover-reveals here (message meta) already toggle opacity
+                     instantly for the same reason. -->
                 <div
-                  class="pointer-events-none flex items-center gap-2 pt-0.5 opacity-0 transition-opacity group-focus-within/responses:pointer-events-auto group-focus-within/responses:opacity-100 group-hover/responses:pointer-events-auto group-hover/responses:opacity-100"
+                  class="pointer-events-none flex items-center gap-2 pt-0.5 opacity-0 group-focus-within/responses:pointer-events-auto group-focus-within/responses:opacity-100 group-hover/responses:pointer-events-auto group-hover/responses:opacity-100"
                   data-testid="fanout-actions-footer"
                 >
                   <div class="border-border/60 h-px min-w-0 flex-1 border-t"></div>

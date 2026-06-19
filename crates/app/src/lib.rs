@@ -15,6 +15,7 @@ mod preferences;
 mod prompts_setup;
 mod secret_store;
 mod state;
+pub mod workflow;
 mod workspace;
 
 use std::path::Path;

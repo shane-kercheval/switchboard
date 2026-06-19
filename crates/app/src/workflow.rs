@@ -1,0 +1,1284 @@
+//! The workflow interpreter (M4): executes a parsed, bound [`Workflow`] against a
+//! project's live agents by driving the real [`Dispatcher`]. It is a *conductor*
+//! over app-owned machinery (the dispatcher, `PromptService`, run-record IO), so
+//! it lives in `crates/app`, not the pure workflow crate.
+//!
+//! ## Model
+//!
+//! A step-based interpreter (not a DAG scheduler — v1 doesn't need one). It walks
+//! the snapshotted steps and:
+//!
+//! - `send` dispatches each recipient via [`Dispatcher::send_message_awaiting_completion`]
+//!   (`FailFast`), minting one `send_id` per step (shared across a fan-out's
+//!   recipients), and keeps each turn's completion handle.
+//! - `wait_for` / `wait_for_all` await those handles; on a `Completed` terminal
+//!   the agent's resolved text enters the **in-memory per-run output scope** that
+//!   `forward_from` and the template helpers read. The scope is never persisted
+//!   (resume is deferred — §3 stands).
+//! - `pause_for_user` / `for_each` are not executable in this milestone; the
+//!   interpreter errors clearly (defense-in-depth — M5's invocation check gates
+//!   them up front).
+//!
+//! ## Failure / cancel
+//!
+//! Workflow contention is `FailFast` → a `Busy` is a step failure (the deliberate
+//! opposite of the manual compose bar's queue). A failed step marks the run
+//! `failed` but never cancels surviving siblings (the non-destructive floor — they
+//! run to their natural terminal in the dispatcher). A workflow-level cancel, or a
+//! participating turn observed `Cancelled`, marks the run `cancelled` and fires
+//! `CancelSource::Workflow` on the run's agents. The run does not go `complete`
+//! until every turn it dispatched has settled (the trailing-settle hold); a
+//! trailing failure marks it `failed`.
+//!
+//! Progress is recorded to `runs/<run-id>.jsonl` ([`RunRecord`]) so M5 can surface
+//! an active or interrupted run for abandon. No agent text is written.
+
+use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use chrono::Utc;
+use switchboard_core::AgentId;
+use switchboard_core::name::canonicalize_for_uniqueness;
+use switchboard_dispatcher::{
+    AwaitableSendOutcome, CompletionResult, DispatchContextFactory, Dispatcher,
+};
+use switchboard_harness::forward::{ForwardedBlock, compose_forwarded_message};
+use switchboard_harness::{CancelSource, TurnOutcome};
+use switchboard_prompts::{PromptId, PromptService};
+use switchboard_workflow::{
+    OutputScope, RunRecord, RunStatus, Scope, ScopeValue, SendStep, Step, Templated,
+    TerminalStatus, WaitForAllStep, WaitForStep, Workflow, render, resolve_agent_refs,
+    validate_agent_list,
+};
+use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+
+/// Produces the per-send [`DispatchContextFactory`] for an agent. The production
+/// implementation (M5) builds a `ProjectDispatchContextFactory` from `AppState`;
+/// tests provide a mock-backed one. This is the single seam the interpreter needs
+/// to dispatch without depending on `AppState` internals — it is integration-
+/// tested through the real `Dispatcher` + `MockHarnessAdapter`, not a mock of the
+/// dispatcher.
+pub trait DispatchFactoryProvider: Send + Sync {
+    fn factory_for(&self, agent_id: AgentId) -> Arc<dyn DispatchContextFactory>;
+}
+
+/// A single workflow run. Construct it with the bound snapshot + dependencies and
+/// drive it to a terminal [`RunStatus`] with [`WorkflowRun::execute`]. Built by
+/// the M5 invoke command (and by integration tests) — all inputs are owned/`Arc`
+/// so the run can move into a background task.
+pub struct WorkflowRun {
+    /// Immutable snapshot of the parsed workflow (captured at invocation).
+    pub workflow: Workflow,
+    /// Bound input values (from `bind_invocation`), the outermost render scope.
+    pub inputs: BTreeMap<String, ScopeValue>,
+    /// Canonical agent name → `AgentId` for every agent the workflow may target.
+    pub agents: BTreeMap<String, AgentId>,
+    pub dispatcher: Arc<Dispatcher>,
+    pub prompts: PromptService,
+    pub factories: Arc<dyn DispatchFactoryProvider>,
+    /// `runs/<run-id>.jsonl` — where progress/terminal records are appended.
+    pub run_path: PathBuf,
+    /// Fired by a workflow-level cancel; the run stops and is marked `cancelled`.
+    pub cancel: CancellationToken,
+}
+
+/// How a single step ended unsuccessfully.
+enum StepError {
+    /// The step failed (contention, render error, missing forward output, an
+    /// awaited turn's harness failure). Carries the operational reason.
+    Failed(String),
+    /// Execution was cancelled — a workflow-level cancel, or a participating
+    /// turn observed `Cancelled`. The whole run is `cancelled`.
+    Cancelled,
+}
+
+impl WorkflowRun {
+    pub async fn execute(self) -> RunStatus {
+        let mut outputs: OutputScope = OutputScope::new();
+        // Per agent, the FIFO queue of dispatched turns not yet awaited. A queue
+        // (not one slot) so a second send to an agent — accepted once its prior
+        // turn is terminal, via the dispatcher's drain-window accept — does not
+        // overwrite and lose the first turn's outcome: every dispatched turn is
+        // awaited somewhere (a `wait_for` or trailing settle), so an earlier
+        // failure is always observed. `wait_for` consumes the **oldest** queued
+        // turn (`pop_front`); the output scope therefore reflects the turn the
+        // workflow explicitly awaited ("most-recent-completed-turn-this-workflow-saw"),
+        // which in the unusual multi-outstanding-same-agent case leaves a never-
+        // awaited turn settled-for-failure-accounting but not absorbed into scope.
+        let mut pending: BTreeMap<AgentId, VecDeque<oneshot::Receiver<CompletionResult>>> =
+            BTreeMap::new();
+        // Count of this run's turns currently in flight per agent (incremented on
+        // dispatch, decremented when a turn's terminal is observed). This — not
+        // the declared roster — is what a workflow cancel targets, so cancelling
+        // never kills an agent's *unrelated* (manual / other-run) turn. Tracked
+        // separately from `pending` because `wait_for_all` moves handles out of
+        // `pending` while awaiting, so `pending` alone undercounts in flight.
+        let mut in_flight: BTreeMap<AgentId, usize> = BTreeMap::new();
+
+        self.record(&RunRecord::Started {
+            workflow: self.workflow.name.clone(),
+            total_steps: self.workflow.steps.len(),
+            at: Utc::now(),
+        });
+
+        // The steps are the immutable snapshot; clone so the walk doesn't borrow
+        // `self` while the step executors take `&mut` of it.
+        let steps = self.workflow.steps.clone();
+        for (index, step) in steps.iter().enumerate() {
+            if self.cancel.is_cancelled() {
+                return self.finish_cancelled(&in_flight);
+            }
+            let result = match step {
+                Step::Send(s) => {
+                    self.execute_send(s, &outputs, &mut pending, &mut in_flight)
+                        .await
+                }
+                Step::WaitFor(w) => {
+                    self.execute_wait_for(w, &mut outputs, &mut pending, &mut in_flight)
+                        .await
+                }
+                Step::WaitForAll(w) => {
+                    self.execute_wait_for_all(w, &mut outputs, &mut pending, &mut in_flight)
+                        .await
+                }
+                // Parsed but not executable until M7 (M5 gates these at invoke;
+                // this is defense-in-depth so a slipped-through run fails clearly).
+                Step::PauseForUser(_) | Step::ForEach(_) => Err(StepError::Failed(
+                    "step type not supported in this version".to_owned(),
+                )),
+            };
+            match result {
+                Ok(()) => self.record(&RunRecord::StepCompleted {
+                    step_index: index,
+                    at: Utc::now(),
+                }),
+                Err(StepError::Failed(reason)) => return self.finish_failed(Some(index), reason),
+                Err(StepError::Cancelled) => return self.finish_cancelled(&in_flight),
+            }
+        }
+
+        // Trailing settle: hold the run open until every dispatched turn settles,
+        // including fire-and-forget sends with no trailing wait.
+        match self.settle_remaining(&mut pending, &mut in_flight).await {
+            Ok(()) => {
+                self.record(&RunRecord::Terminal {
+                    status: TerminalStatus::Complete,
+                    failed_step: None,
+                    reason: None,
+                    at: Utc::now(),
+                });
+                RunStatus::Complete
+            }
+            Err(StepError::Failed(reason)) => self.finish_failed(None, reason),
+            Err(StepError::Cancelled) => self.finish_cancelled(&in_flight),
+        }
+    }
+
+    async fn execute_send(
+        &self,
+        step: &SendStep,
+        outputs: &OutputScope,
+        pending: &mut BTreeMap<AgentId, VecDeque<oneshot::Receiver<CompletionResult>>>,
+        in_flight: &mut BTreeMap<AgentId, usize>,
+    ) -> Result<(), StepError> {
+        let recipients = self.resolve_agent_ids(&step.to, outputs)?;
+        let body = self.build_body(step, outputs).await?;
+        // One send_id for the whole step; a fan-out's recipients share it so the
+        // user-facing send renders once, exactly like a manual multi-recipient send.
+        let send_id = Uuid::now_v7();
+        for agent_id in recipients {
+            match self
+                .dispatcher
+                .send_message_awaiting_completion(
+                    agent_id,
+                    &body,
+                    Vec::new(),
+                    send_id,
+                    self.factories.factory_for(agent_id),
+                )
+                .await
+            {
+                AwaitableSendOutcome::Accepted { completion, .. } => {
+                    pending.entry(agent_id).or_default().push_back(completion);
+                    *in_flight.entry(agent_id).or_insert(0) += 1;
+                }
+                // Contention = step failure (FailFast). Per the partial-dispatch
+                // rule, remaining recipients are not dispatched and already-issued
+                // turns are left to run to their natural terminal (not cancelled —
+                // their output stays visible in the transcript).
+                AwaitableSendOutcome::Busy => {
+                    return Err(StepError::Failed(
+                        "an agent is busy — workflow steps fail fast on contention".to_owned(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn execute_wait_for(
+        &self,
+        step: &WaitForStep,
+        outputs: &mut OutputScope,
+        pending: &mut BTreeMap<AgentId, VecDeque<oneshot::Receiver<CompletionResult>>>,
+        in_flight: &mut BTreeMap<AgentId, usize>,
+    ) -> Result<(), StepError> {
+        let (name, agent_id) = self.resolve_single_agent(&step.agent, outputs)?;
+        let rx = pending
+            .get_mut(&agent_id)
+            .and_then(VecDeque::pop_front)
+            .ok_or_else(|| StepError::Failed(format!("no turn to wait on for agent `{name}`")))?;
+        // On a cancel-race (`?` returns early) the turn is *not* observed, so its
+        // in-flight count stays live for `finish_cancelled` to cancel.
+        let result = self.await_completion(rx).await?;
+        Self::observe(in_flight, agent_id);
+        Self::absorb(&name, result, outputs)
+    }
+
+    async fn execute_wait_for_all(
+        &self,
+        step: &WaitForAllStep,
+        outputs: &mut OutputScope,
+        pending: &mut BTreeMap<AgentId, VecDeque<oneshot::Receiver<CompletionResult>>>,
+        in_flight: &mut BTreeMap<AgentId, usize>,
+    ) -> Result<(), StepError> {
+        let agents = self.resolve_named_agent_ids(&step.agents, outputs)?;
+        // Take every awaited turn's handle up front so a later missing one fails
+        // before we block on the first.
+        let mut waits = Vec::with_capacity(agents.len());
+        for (name, agent_id) in agents {
+            let rx = pending
+                .get_mut(&agent_id)
+                .and_then(VecDeque::pop_front)
+                .ok_or_else(|| {
+                    StepError::Failed(format!("no turn to wait on for agent `{name}`"))
+                })?;
+            waits.push((name, agent_id, rx));
+        }
+        // Await all (the non-destructive floor: a sibling failing does not stop
+        // the others — every survivor settles and its output is retained), then
+        // fail the step if any one failed. Cancellation short-circuits the run.
+        let mut failure: Option<String> = None;
+        for (name, agent_id, rx) in waits {
+            let result = self.await_completion(rx).await?;
+            Self::observe(in_flight, agent_id);
+            match Self::absorb(&name, result, outputs) {
+                Ok(()) => {}
+                Err(StepError::Failed(reason)) => {
+                    failure.get_or_insert(reason);
+                }
+                Err(StepError::Cancelled) => return Err(StepError::Cancelled),
+            }
+        }
+        match failure {
+            Some(reason) => Err(StepError::Failed(reason)),
+            None => Ok(()),
+        }
+    }
+
+    /// Mark one of `agent`'s in-flight turns as observed-terminal (decrementing
+    /// the per-agent count, dropping the entry at zero). Called only after a turn
+    /// actually settles, so a cancel that races the await leaves the count live.
+    fn observe(in_flight: &mut BTreeMap<AgentId, usize>, agent: AgentId) {
+        if let Some(count) = in_flight.get_mut(&agent) {
+            *count -= 1;
+            if *count == 0 {
+                in_flight.remove(&agent);
+            }
+        }
+    }
+
+    /// Fold one awaited turn's outcome into the run: store a completed turn's text
+    /// into the output scope, surface a failed turn as a step failure, and a
+    /// cancelled turn as run cancellation.
+    fn absorb(
+        name: &str,
+        result: CompletionResult,
+        outputs: &mut OutputScope,
+    ) -> Result<(), StepError> {
+        match result.outcome {
+            TurnOutcome::Completed => {
+                outputs.insert(canonicalize_for_uniqueness(name), result.text);
+                Ok(())
+            }
+            TurnOutcome::Failed { message, .. } => Err(StepError::Failed(format!(
+                "agent `{name}` failed: {message}"
+            ))),
+            TurnOutcome::Cancelled { .. } => Err(StepError::Cancelled),
+            // `TurnOutcome` is `#[non_exhaustive]`; a future terminal we don't yet
+            // model is treated as a step failure rather than silently completing.
+            _ => Err(StepError::Failed(format!(
+                "agent `{name}` ended with an unrecognized outcome"
+            ))),
+        }
+    }
+
+    /// Await one completion, racing a workflow-level cancel. A dropped sender
+    /// (which the dispatcher's drop paths now avoid) is treated as a failure
+    /// rather than a hang.
+    async fn await_completion(
+        &self,
+        rx: oneshot::Receiver<CompletionResult>,
+    ) -> Result<CompletionResult, StepError> {
+        tokio::select! {
+            biased;
+            () = self.cancel.cancelled() => Err(StepError::Cancelled),
+            received = rx => received.map_err(|_| {
+                StepError::Failed("dispatcher dropped the turn completion".to_owned())
+            }),
+        }
+    }
+
+    /// Trailing-settle: await every still-outstanding turn so the run does not go
+    /// `complete` while a fire-and-forget send is in flight.
+    async fn settle_remaining(
+        &self,
+        pending: &mut BTreeMap<AgentId, VecDeque<oneshot::Receiver<CompletionResult>>>,
+        in_flight: &mut BTreeMap<AgentId, usize>,
+    ) -> Result<(), StepError> {
+        let mut failure: Option<String> = None;
+        let outstanding: Vec<(AgentId, oneshot::Receiver<CompletionResult>)> =
+            std::mem::take(pending)
+                .into_iter()
+                .flat_map(|(agent_id, queue)| queue.into_iter().map(move |rx| (agent_id, rx)))
+                .collect();
+        for (agent_id, rx) in outstanding {
+            let result = self.await_completion(rx).await?;
+            Self::observe(in_flight, agent_id);
+            match result.outcome {
+                TurnOutcome::Completed => {}
+                TurnOutcome::Failed { message, .. } => {
+                    failure.get_or_insert(format!("a trailing turn failed: {message}"));
+                }
+                TurnOutcome::Cancelled { .. } => return Err(StepError::Cancelled),
+                _ => {
+                    failure.get_or_insert(
+                        "a trailing turn ended with an unrecognized outcome".to_owned(),
+                    );
+                }
+            }
+        }
+        match failure {
+            Some(reason) => Err(StepError::Failed(reason)),
+            None => Ok(()),
+        }
+    }
+
+    /// Build the dispatched body: the rendered `prompt`/`text` lead (if any), then
+    /// each `forward_from` source's resolved output composed into a canonical
+    /// block. `prompt` resolves through `PromptService`; `forward_from` reads the
+    /// per-run output scope (the agent must have completed earlier this run).
+    async fn build_body(
+        &self,
+        step: &SendStep,
+        outputs: &OutputScope,
+    ) -> Result<String, StepError> {
+        let base = if let Some(prompt) = &step.prompt {
+            let id = render(prompt, self.scope(), outputs).map_err(render_failed)?;
+            let id = PromptId::parse(&id).map_err(|e| StepError::Failed(e.to_string()))?;
+            let mut args: BTreeMap<String, String> = BTreeMap::new();
+            for (name, template) in &step.template_vars {
+                args.insert(
+                    name.clone(),
+                    render(template, self.scope(), outputs).map_err(render_failed)?,
+                );
+            }
+            self.prompts
+                .render(&id.provider, &id.name, &args)
+                .await
+                .map_err(|e| StepError::Failed(e.to_string()))?
+                .text
+        } else if let Some(text) = &step.text {
+            render(text, self.scope(), outputs).map_err(render_failed)?
+        } else {
+            String::new()
+        };
+
+        let Some(forward) = &step.forward_from else {
+            return Ok(base);
+        };
+        let names = resolve_agent_refs(forward, &self.scope(), outputs).map_err(render_failed)?;
+        let mut blocks: Vec<(String, String)> = Vec::with_capacity(names.len());
+        for name in &names {
+            let key = canonicalize_for_uniqueness(name.trim());
+            match outputs.get(&key) {
+                Some(text) => blocks.push((name.trim().to_owned(), text.clone())),
+                None => {
+                    return Err(StepError::Failed(format!(
+                        "no in-workflow completed output for agent `{}`",
+                        name.trim()
+                    )));
+                }
+            }
+        }
+        let block_refs: Vec<ForwardedBlock<'_>> = blocks
+            .iter()
+            .map(|(name, text)| ForwardedBlock {
+                agent_name: name,
+                text,
+            })
+            .collect();
+        Ok(compose_forwarded_message(&base, &block_refs))
+    }
+
+    /// Resolve a `to` / `agents` field to recipient ids — validating the resolved
+    /// list (non-empty, unique, all in the roster) per the spec, then mapping to
+    /// `AgentId`s in declared order.
+    fn resolve_agent_ids(
+        &self,
+        field: &Templated,
+        outputs: &OutputScope,
+    ) -> Result<Vec<AgentId>, StepError> {
+        Ok(self
+            .resolve_named_agent_ids(field, outputs)?
+            .into_iter()
+            .map(|(_, id)| id)
+            .collect())
+    }
+
+    /// As [`Self::resolve_agent_ids`] but keeps each agent's canonical name (needed
+    /// to key the output scope when its turn is awaited).
+    fn resolve_named_agent_ids(
+        &self,
+        field: &Templated,
+        outputs: &OutputScope,
+    ) -> Result<Vec<(String, AgentId)>, StepError> {
+        let names = resolve_agent_refs(field, &self.scope(), outputs).map_err(render_failed)?;
+        let roster: HashSet<String> = self.agents.keys().cloned().collect();
+        validate_agent_list(&names, &roster).map_err(|e| StepError::Failed(e.to_string()))?;
+        Ok(names
+            .iter()
+            .map(|name| {
+                let key = canonicalize_for_uniqueness(name.trim());
+                let id = self.agents[&key];
+                (key, id)
+            })
+            .collect())
+    }
+
+    /// Resolve a single-agent field (`wait_for`). Errors if it resolves to zero or
+    /// more than one agent, or to one outside the roster.
+    fn resolve_single_agent(
+        &self,
+        template: &str,
+        outputs: &OutputScope,
+    ) -> Result<(String, AgentId), StepError> {
+        let names = resolve_agent_refs(
+            &Templated::Scalar(template.to_owned()),
+            &self.scope(),
+            outputs,
+        )
+        .map_err(render_failed)?;
+        match names.as_slice() {
+            [name] => {
+                let key = canonicalize_for_uniqueness(name.trim());
+                let id = self.agents.get(&key).copied().ok_or_else(|| {
+                    StepError::Failed(format!("agent `{}` does not exist", name.trim()))
+                })?;
+                Ok((key, id))
+            }
+            _ => Err(StepError::Failed("expected a single agent".to_owned())),
+        }
+    }
+
+    fn scope(&self) -> Scope {
+        // M6: no `user_input` (no pause) and no iteration (no for_each); the send's
+        // template_vars are rendered into prompt args here, not layered into scope.
+        Scope {
+            inputs: self.inputs.clone(),
+            ..Scope::default()
+        }
+    }
+
+    /// Cancel the run's **own** in-flight turns with `CancelSource::Workflow` —
+    /// only agents this run currently has a turn running on, never the whole
+    /// declared roster (which would kill an agent's unrelated manual / other-run
+    /// turn). Cancel is per-agent, so an inherent residual race remains: a
+    /// workflow turn that finished but isn't yet observed (a fire-and-forget not
+    /// yet settled) still counts here, so if a manual turn started on that agent
+    /// in the gap, this can hit it. That window is narrow and uncloseable without
+    /// per-turn cancellation; the fix narrows it from "all participants" to
+    /// "agents with a live workflow turn."
+    fn cancel_inflight(&self, in_flight: &BTreeMap<AgentId, usize>) {
+        for (agent_id, count) in in_flight {
+            if *count > 0 {
+                self.dispatcher.cancel(*agent_id, CancelSource::Workflow);
+            }
+        }
+    }
+
+    fn finish_cancelled(&self, in_flight: &BTreeMap<AgentId, usize>) -> RunStatus {
+        self.cancel_inflight(in_flight);
+        self.record(&RunRecord::Terminal {
+            status: TerminalStatus::Cancelled,
+            failed_step: None,
+            reason: None,
+            at: Utc::now(),
+        });
+        RunStatus::Cancelled
+    }
+
+    fn finish_failed(&self, failed_step: Option<usize>, reason: String) -> RunStatus {
+        // Per the non-destructive floor, surviving turns are *not* cancelled — they
+        // settle in the dispatcher and their output stays visible.
+        self.record(&RunRecord::Terminal {
+            status: TerminalStatus::Failed,
+            failed_step,
+            reason: Some(reason),
+            at: Utc::now(),
+        });
+        RunStatus::Failed
+    }
+
+    /// Append a run record (best-effort: a failed write is logged, not fatal — a
+    /// lost record only degrades M5's crash-surfacing, never the running workflow).
+    fn record(&self, record: &RunRecord) {
+        if let Err(e) = switchboard_core::append_jsonl(&self.run_path, record) {
+            tracing::warn!(path = %self.run_path.display(), error = %e, "failed to append workflow run record");
+        }
+    }
+}
+
+// Takes the error by value because it is used as a `map_err` fn, which hands the
+// owned error in.
+#[allow(clippy::needless_pass_by_value)]
+fn render_failed(err: switchboard_workflow::WorkflowError) -> StepError {
+    StepError::Failed(err.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    //! Integration tests through the **real `Dispatcher` + `MockHarnessAdapter`**
+    //! (the `dispatcher_with_mock.rs` model): the interpreter drives genuine
+    //! concurrency, not a mock of it. A per-agent `MockFactory` vends the agent's
+    //! next scenario; a shared `RecordingEmitter` lets tests observe turns, and a
+    //! recording journal captures each dispatched body for composition assertions.
+
+    use super::*;
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::Mutex;
+    use switchboard_core::{AgentRecord, Attachment, HarnessKind, SendId, SessionLocator};
+    use switchboard_dispatcher::{
+        ConversationJournal, DispatchContext, JournalError, NoopMetadataCache,
+        NoopSessionLocatorSink, RecordingEmitter,
+    };
+    use switchboard_harness::mock::{MockHarnessAdapter, MockScenario};
+    use switchboard_harness::{DispatchOptions, TurnId};
+    use switchboard_prompts::{InMemorySecretStore, PromptService};
+    use switchboard_workflow::{InputValue, bind_invocation, parse_workflow};
+
+    /// Captures each dispatched body (the user-side prompt) per agent, so tests can
+    /// assert what the interpreter composed (forward blocks, rendered prompts).
+    struct RecordingJournal {
+        sends: Arc<Mutex<Vec<(AgentId, String)>>>,
+    }
+    impl ConversationJournal for RecordingJournal {
+        fn record_send(
+            &self,
+            _turn_id: TurnId,
+            agent_id: AgentId,
+            prompt: &str,
+            _attachments: &[Attachment],
+            _at: chrono::DateTime<Utc>,
+        ) -> Result<(), JournalError> {
+            self.sends
+                .lock()
+                .unwrap()
+                .push((agent_id, prompt.to_owned()));
+            Ok(())
+        }
+        fn record_outcome(
+            &self,
+            _: TurnId,
+            _: AgentId,
+            _: &TurnOutcome,
+            _: chrono::DateTime<Utc>,
+            _: chrono::DateTime<Utc>,
+        ) {
+        }
+    }
+
+    /// Per-agent factory: vends the agent's next mock scenario each turn (the actor
+    /// holds the factory it was spawned with, so the scenario queue persists across
+    /// that agent's turns).
+    struct MockFactory {
+        agent: AgentRecord,
+        scenarios: Mutex<VecDeque<MockScenario>>,
+        emitter: Arc<RecordingEmitter>,
+        journal: Arc<dyn ConversationJournal>,
+    }
+    impl DispatchContextFactory for MockFactory {
+        fn build(&self, _send_id: SendId) -> DispatchContext {
+            let scenario = self
+                .scenarios
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(MockScenario::Streaming);
+            DispatchContext {
+                adapter: Arc::new(MockHarnessAdapter::with_scenario(scenario)),
+                cwd: PathBuf::from("."),
+                agent: self.agent.clone(),
+                emitter: Arc::clone(&self.emitter) as Arc<dyn switchboard_dispatcher::EventEmitter>,
+                options: DispatchOptions::default(),
+                journal: Arc::clone(&self.journal),
+                metadata: Arc::new(NoopMetadataCache),
+                locator_sink: Arc::new(NoopSessionLocatorSink),
+            }
+        }
+        fn idle_emitter(&self) -> Arc<dyn switchboard_dispatcher::EventEmitter> {
+            Arc::clone(&self.emitter) as Arc<dyn switchboard_dispatcher::EventEmitter>
+        }
+    }
+
+    struct Provider {
+        factories: HashMap<AgentId, Arc<MockFactory>>,
+    }
+    impl DispatchFactoryProvider for Provider {
+        fn factory_for(&self, agent_id: AgentId) -> Arc<dyn DispatchContextFactory> {
+            Arc::clone(&self.factories[&agent_id]) as Arc<dyn DispatchContextFactory>
+        }
+    }
+
+    /// Test rig: a set of named agents with per-agent scenario queues, one shared
+    /// dispatcher / emitter / recording journal.
+    struct Rig {
+        dispatcher: Arc<Dispatcher>,
+        provider: Arc<Provider>,
+        agents: BTreeMap<String, AgentId>, // canonical name → id
+        names: Vec<String>,                // display names (the roster)
+        ids: HashMap<String, AgentId>,     // display name → id
+        emitter: Arc<RecordingEmitter>,
+        sends: Arc<Mutex<Vec<(AgentId, String)>>>,
+    }
+
+    fn rig(agents: Vec<(&str, Vec<MockScenario>)>) -> Rig {
+        let emitter = Arc::new(RecordingEmitter::new());
+        let sends = Arc::new(Mutex::new(Vec::new()));
+        let journal: Arc<dyn ConversationJournal> = Arc::new(RecordingJournal {
+            sends: Arc::clone(&sends),
+        });
+        let mut factories = HashMap::new();
+        let mut agent_map = BTreeMap::new();
+        let mut ids = HashMap::new();
+        let mut names = Vec::new();
+        // `MockScenario` is not `Clone` (some variants hold a `Notify`), so the
+        // scenario queues are moved in, not copied.
+        for (name, scenarios) in agents {
+            let record = AgentRecord {
+                id: Uuid::now_v7(),
+                project_id: Uuid::now_v7(),
+                name: name.to_owned(),
+                harness: HarnessKind::ClaudeCode,
+                session_locator: Some(SessionLocator::Uuid(Uuid::now_v7())),
+                model: None,
+                effort: None,
+                created_at: Utc::now(),
+            };
+            let id = record.id;
+            factories.insert(
+                id,
+                Arc::new(MockFactory {
+                    agent: record,
+                    scenarios: Mutex::new(VecDeque::from(scenarios)),
+                    emitter: Arc::clone(&emitter),
+                    journal: Arc::clone(&journal),
+                }),
+            );
+            agent_map.insert(canonicalize_for_uniqueness(name), id);
+            ids.insert(name.to_owned(), id);
+            names.push(name.to_owned());
+        }
+        Rig {
+            dispatcher: Arc::new(Dispatcher::new()),
+            provider: Arc::new(Provider { factories }),
+            agents: agent_map,
+            names,
+            ids,
+            emitter,
+            sends,
+        }
+    }
+
+    fn supplied(pairs: Vec<(&str, InputValue)>) -> BTreeMap<String, InputValue> {
+        pairs.into_iter().map(|(k, v)| (k.to_owned(), v)).collect()
+    }
+
+    fn text(s: &str) -> InputValue {
+        InputValue::Text(s.to_owned())
+    }
+
+    fn list(items: &[&str]) -> InputValue {
+        InputValue::List(items.iter().map(|s| (*s).to_owned()).collect())
+    }
+
+    /// Build a `WorkflowRun` for `yaml` + `supplied` inputs against `rig`, writing
+    /// run records under a fresh temp dir (kept alive by the returned guard).
+    #[allow(clippy::needless_pass_by_value)] // owned args read more cleanly at call sites
+    fn build_run(
+        rig: &Rig,
+        prompts: PromptService,
+        yaml: &str,
+        stem: &str,
+        supplied: BTreeMap<String, InputValue>,
+        cancel: CancellationToken,
+    ) -> (WorkflowRun, tempfile::TempDir, PathBuf) {
+        let workflow = parse_workflow(stem, yaml).expect("workflow parses");
+        let inputs = bind_invocation(&workflow, &supplied, &rig.names, |id| {
+            id.starts_with("local:")
+        })
+        .expect("invocation binds");
+        let dir = tempfile::tempdir().unwrap();
+        let run_path = dir.path().join("run.jsonl");
+        let run = WorkflowRun {
+            workflow,
+            inputs,
+            agents: rig.agents.clone(),
+            dispatcher: Arc::clone(&rig.dispatcher),
+            prompts,
+            factories: Arc::clone(&rig.provider) as Arc<dyn DispatchFactoryProvider>,
+            run_path: run_path.clone(),
+            cancel,
+        };
+        (run, dir, run_path)
+    }
+
+    fn records(path: &std::path::Path) -> Vec<RunRecord> {
+        switchboard_core::read_jsonl(path).unwrap()
+    }
+
+    fn prompt_service_with(files: &[(&str, &str)]) -> (tempfile::TempDir, PromptService) {
+        let dir = tempfile::tempdir().unwrap();
+        let prompts_dir = dir.path().join("prompts");
+        std::fs::create_dir(&prompts_dir).unwrap();
+        for (name, body) in files {
+            std::fs::write(prompts_dir.join(format!("{name}.md")), body).unwrap();
+        }
+        let service = PromptService::new(
+            dir.path().join("config.yaml"),
+            prompts_dir,
+            None,
+            Arc::new(InMemorySecretStore::new()),
+        );
+        (dir, service)
+    }
+
+    const SEQUENTIAL: &str = "name: seq\ndescription: d\ninputs:\n  planner: agent\n  implementer: agent\n  goal: text\nsteps:\n  - send:\n      to: \"{{ planner }}\"\n      text: \"Plan: {{ goal }}\"\n  - wait_for:\n      agent: \"{{ planner }}\"\n  - send:\n      to: \"{{ implementer }}\"\n      forward_from: \"{{ planner }}\"\n      text: \"Execute the plan above.\"\n  - wait_for:\n      agent: \"{{ implementer }}\"\n";
+
+    #[tokio::test]
+    async fn sequential_handoff_runs_to_complete() {
+        let rig = rig(vec![
+            ("planner", vec![MockScenario::Streaming]),
+            ("implementer", vec![MockScenario::Streaming]),
+        ]);
+        let (run, _dir, path) = build_run(
+            &rig,
+            PromptService::disabled(),
+            SEQUENTIAL,
+            "seq",
+            supplied(vec![
+                ("planner", text("planner")),
+                ("implementer", text("implementer")),
+                ("goal", text("ship it")),
+            ]),
+            CancellationToken::new(),
+        );
+        assert_eq!(run.execute().await, RunStatus::Complete);
+
+        let recs = records(&path);
+        assert!(matches!(
+            recs.first(),
+            Some(RunRecord::Started { total_steps: 4, .. })
+        ));
+        assert!(matches!(
+            recs.last(),
+            Some(RunRecord::Terminal {
+                status: TerminalStatus::Complete,
+                ..
+            })
+        ));
+        // The implementer's dispatched body forwards the planner's output verbatim.
+        let implementer = rig.ids["implementer"];
+        let body = rig
+            .sends
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(id, _)| *id == implementer)
+            .map(|(_, b)| b.clone())
+            .expect("implementer was dispatched");
+        assert!(
+            body.contains("=== START forwarded from planner ==="),
+            "got: {body}"
+        );
+        assert!(body.contains("Execute the plan above."));
+    }
+
+    #[tokio::test]
+    async fn fan_in_aggregates_reviewer_outputs_into_the_prompt() {
+        let (_pd, prompts) = prompt_service_with(&[
+            (
+                "review",
+                "---\nname: review\ndescription: d\narguments:\n  - name: context\n---\nReview. {{ context }}\n",
+            ),
+            (
+                "aggregate",
+                "---\nname: aggregate\ndescription: d\narguments:\n  - name: feedback\n---\nSummarize:\n{{ feedback }}\n",
+            ),
+        ]);
+        let rig = rig(vec![
+            ("primary", vec![MockScenario::Streaming]),
+            ("reviewer-1", vec![MockScenario::Streaming]),
+            ("reviewer-2", vec![MockScenario::Streaming]),
+        ]);
+        let yaml = "name: fan\ndescription: d\ninputs:\n  primary_agent: agent\n  reviewer_agents: [agent]\n  review_prompt: prompt_id\n  aggregation_prompt: prompt_id\n  user_context: text?\nsteps:\n  - send:\n      to: \"{{ reviewer_agents }}\"\n      prompt: \"{{ review_prompt }}\"\n      template_vars:\n        context: \"{{ user_context }}\"\n  - wait_for_all:\n      agents: \"{{ reviewer_agents }}\"\n  - send:\n      to: \"{{ primary_agent }}\"\n      prompt: \"{{ aggregation_prompt }}\"\n      template_vars:\n        feedback: \"{{ aggregated_responses(reviewer_agents) }}\"\n";
+        let (run, _dir, path) = build_run(
+            &rig,
+            prompts,
+            yaml,
+            "fan",
+            supplied(vec![
+                ("primary_agent", text("primary")),
+                ("reviewer_agents", list(&["reviewer-1", "reviewer-2"])),
+                ("review_prompt", text("local:review")),
+                ("aggregation_prompt", text("local:aggregate")),
+            ]),
+            CancellationToken::new(),
+        );
+        assert_eq!(run.execute().await, RunStatus::Complete);
+        assert!(matches!(
+            records(&path).last(),
+            Some(RunRecord::Terminal {
+                status: TerminalStatus::Complete,
+                ..
+            })
+        ));
+
+        let primary = rig.ids["primary"];
+        let body = rig
+            .sends
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(id, _)| *id == primary)
+            .map(|(_, b)| b.clone())
+            .expect("primary dispatched");
+        // The aggregation prompt rendered with both reviewers' outputs, in order,
+        // each in a canonical response block.
+        assert!(body.contains("Summarize:"));
+        assert!(
+            body.contains("=== START response from reviewer-1 ==="),
+            "got: {body}"
+        );
+        assert!(body.contains("=== START response from reviewer-2 ==="));
+        assert!(body.find("reviewer-1").unwrap() < body.find("reviewer-2").unwrap());
+    }
+
+    #[tokio::test]
+    async fn contention_fails_the_step() {
+        // Pre-occupy the agent with a held turn (from "another source"), so the
+        // workflow's FailFast send to it is refused → step failure.
+        let signal = Arc::new(tokio::sync::Notify::new());
+        let rig = rig(vec![(
+            "worker",
+            vec![MockScenario::CompletesOnSignal(Arc::clone(&signal))],
+        )]);
+        let worker = rig.ids["worker"];
+        let _busy = rig
+            .dispatcher
+            .send_message_awaiting_completion(
+                worker,
+                "occupy",
+                Vec::new(),
+                Uuid::now_v7(),
+                rig.provider.factory_for(worker),
+            )
+            .await;
+        rig.emitter.wait_for_type("turn_start", 1).await;
+
+        let yaml = "name: c\ndescription: d\ninputs:\n  w: agent\nsteps:\n  - send:\n      to: \"{{ w }}\"\n      text: hi\n";
+        let (run, _dir, path) = build_run(
+            &rig,
+            PromptService::disabled(),
+            yaml,
+            "c",
+            supplied(vec![("w", text("worker"))]),
+            CancellationToken::new(),
+        );
+        assert_eq!(run.execute().await, RunStatus::Failed);
+        assert!(matches!(
+            records(&path).last(),
+            Some(RunRecord::Terminal {
+                status: TerminalStatus::Failed,
+                failed_step: Some(0),
+                reason: Some(_),
+                ..
+            })
+        ));
+        signal.notify_one();
+    }
+
+    #[tokio::test]
+    async fn sibling_failure_fails_run_and_keeps_survivor() {
+        let rig = rig(vec![
+            ("good", vec![MockScenario::Streaming]),
+            ("bad", vec![MockScenario::DispatchFails]),
+        ]);
+        let yaml = "name: s\ndescription: d\ninputs:\n  rs: [agent]\nsteps:\n  - send:\n      to: \"{{ rs }}\"\n      text: review\n  - wait_for_all:\n      agents: \"{{ rs }}\"\n";
+        let (run, _dir, path) = build_run(
+            &rig,
+            PromptService::disabled(),
+            yaml,
+            "s",
+            supplied(vec![("rs", list(&["good", "bad"]))]),
+            CancellationToken::new(),
+        );
+        assert_eq!(run.execute().await, RunStatus::Failed);
+        assert!(matches!(
+            records(&path).last(),
+            Some(RunRecord::Terminal {
+                status: TerminalStatus::Failed,
+                ..
+            })
+        ));
+        // The surviving sibling ran to a completed terminal and was not cancelled.
+        let good = rig.ids["good"];
+        let good_channel = format!("agent:{good}");
+        let completed = rig.emitter.snapshot().into_iter().any(|(ch, p)| {
+            ch == good_channel
+                && p.get("type").and_then(|t| t.as_str()) == Some("turn_end")
+                && p.get("outcome")
+                    .and_then(|o| o.get("status"))
+                    .and_then(|s| s.as_str())
+                    == Some("completed")
+        });
+        assert!(
+            completed,
+            "the surviving sibling must complete, not be cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_cancel_marks_run_cancelled() {
+        let rig = rig(vec![("w", vec![MockScenario::AwaitCancellation])]);
+        let cancel = CancellationToken::new();
+        let yaml = "name: x\ndescription: d\ninputs:\n  w: agent\nsteps:\n  - send:\n      to: \"{{ w }}\"\n      text: go\n  - wait_for:\n      agent: \"{{ w }}\"\n";
+        let (run, _dir, path) = build_run(
+            &rig,
+            PromptService::disabled(),
+            yaml,
+            "x",
+            supplied(vec![("w", text("w"))]),
+            cancel.clone(),
+        );
+        let emitter = Arc::clone(&rig.emitter);
+        let (status, ()) = tokio::join!(run.execute(), async move {
+            // Cancel once the awaited turn is in flight.
+            emitter.wait_for_type("turn_start", 1).await;
+            cancel.cancel();
+        });
+        assert_eq!(status, RunStatus::Cancelled);
+        assert!(matches!(
+            records(&path).last(),
+            Some(RunRecord::Terminal {
+                status: TerminalStatus::Cancelled,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn participant_turn_cancelled_marks_run_cancelled() {
+        // Distinct from a workflow-level cancel: a user cancels a *participating*
+        // agent's turn (the awaited completion resolves `Cancelled`), which marks
+        // the whole run cancelled — uniformly, per the spec.
+        let rig = rig(vec![("w", vec![MockScenario::AwaitCancellation])]);
+        let yaml = "name: x\ndescription: d\ninputs:\n  w: agent\nsteps:\n  - send:\n      to: \"{{ w }}\"\n      text: go\n  - wait_for:\n      agent: \"{{ w }}\"\n";
+        let (run, _dir, path) = build_run(
+            &rig,
+            PromptService::disabled(),
+            yaml,
+            "x",
+            supplied(vec![("w", text("w"))]),
+            CancellationToken::new(),
+        );
+        let emitter = Arc::clone(&rig.emitter);
+        let dispatcher = Arc::clone(&rig.dispatcher);
+        let worker = rig.ids["w"];
+        let (status, ()) = tokio::join!(run.execute(), async move {
+            // Cancel the agent's turn directly (not the workflow token).
+            emitter.wait_for_type("turn_start", 1).await;
+            dispatcher.cancel(worker, CancelSource::User);
+        });
+        assert_eq!(status, RunStatus::Cancelled);
+        assert!(matches!(
+            records(&path).last(),
+            Some(RunRecord::Terminal {
+                status: TerminalStatus::Cancelled,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn trailing_settle_holds_for_fire_and_forget_then_completes() {
+        // A send with no trailing wait_for: the run must hold open until it settles.
+        let rig = rig(vec![("w", vec![MockScenario::Streaming])]);
+        let yaml = "name: t\ndescription: d\ninputs:\n  w: agent\nsteps:\n  - send:\n      to: \"{{ w }}\"\n      text: go\n";
+        let (run, _dir, path) = build_run(
+            &rig,
+            PromptService::disabled(),
+            yaml,
+            "t",
+            supplied(vec![("w", text("w"))]),
+            CancellationToken::new(),
+        );
+        assert_eq!(run.execute().await, RunStatus::Complete);
+        assert!(matches!(
+            records(&path).last(),
+            Some(RunRecord::Terminal {
+                status: TerminalStatus::Complete,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn trailing_failure_marks_run_failed() {
+        let rig = rig(vec![("w", vec![MockScenario::DispatchFails])]);
+        let yaml = "name: t\ndescription: d\ninputs:\n  w: agent\nsteps:\n  - send:\n      to: \"{{ w }}\"\n      text: go\n";
+        let (run, _dir, path) = build_run(
+            &rig,
+            PromptService::disabled(),
+            yaml,
+            "t",
+            supplied(vec![("w", text("w"))]),
+            CancellationToken::new(),
+        );
+        assert_eq!(run.execute().await, RunStatus::Failed);
+        assert!(matches!(
+            records(&path).last(),
+            Some(RunRecord::Terminal {
+                status: TerminalStatus::Failed,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn forward_from_with_no_output_fails() {
+        // forward_from references an agent that has no completed output this run
+        // (never waited on) → step failure.
+        let rig = rig(vec![
+            ("a", vec![MockScenario::Streaming]),
+            ("b", vec![MockScenario::Streaming]),
+        ]);
+        let yaml = "name: f\ndescription: d\ninputs:\n  a: agent\n  b: agent\nsteps:\n  - send:\n      to: \"{{ b }}\"\n      forward_from: \"{{ a }}\"\n      text: use it\n";
+        let (run, _dir, path) = build_run(
+            &rig,
+            PromptService::disabled(),
+            yaml,
+            "f",
+            supplied(vec![("a", text("a")), ("b", text("b"))]),
+            CancellationToken::new(),
+        );
+        assert_eq!(run.execute().await, RunStatus::Failed);
+        let last = records(&path).pop().unwrap();
+        assert!(matches!(
+            &last,
+            RunRecord::Terminal { status: TerminalStatus::Failed, reason: Some(r), .. } if r.contains("no in-workflow completed output")
+        ));
+    }
+
+    #[tokio::test]
+    async fn capability_gate_rejects_for_each() {
+        // `for_each` parses but is not executable in this milestone — the
+        // interpreter fails clearly (defense-in-depth behind M5's invoke gate).
+        let rig = rig(vec![("w", vec![MockScenario::Streaming])]);
+        let yaml = "name: g\ndescription: d\ninputs:\n  ms: [text]\n  w: agent\nsteps:\n  - for_each:\n      item: m\n      in: \"{{ ms }}\"\n      steps:\n        - send:\n            to: \"{{ w }}\"\n            text: \"{{ m }}\"\n";
+        let (run, _dir, path) = build_run(
+            &rig,
+            PromptService::disabled(),
+            yaml,
+            "g",
+            supplied(vec![("ms", list(&["x"])), ("w", text("w"))]),
+            CancellationToken::new(),
+        );
+        assert_eq!(run.execute().await, RunStatus::Failed);
+        let last = records(&path).pop().unwrap();
+        assert!(matches!(
+            &last,
+            RunRecord::Terminal { status: TerminalStatus::Failed, reason: Some(r), .. } if r.contains("not supported")
+        ));
+    }
+
+    #[tokio::test]
+    async fn back_to_back_same_agent_completes() {
+        // Single-agent send→wait→send→wait: the second send re-dispatches to a
+        // just-awaited agent, exercising the dispatcher's drain-window accept
+        // end-to-end through the interpreter.
+        let rig = rig(vec![(
+            "w",
+            vec![MockScenario::Streaming, MockScenario::Streaming],
+        )]);
+        let yaml = "name: b\ndescription: d\ninputs:\n  w: agent\nsteps:\n  - send:\n      to: \"{{ w }}\"\n      text: one\n  - wait_for:\n      agent: \"{{ w }}\"\n  - send:\n      to: \"{{ w }}\"\n      text: two\n  - wait_for:\n      agent: \"{{ w }}\"\n";
+        let (run, _dir, _path) = build_run(
+            &rig,
+            PromptService::disabled(),
+            yaml,
+            "b",
+            supplied(vec![("w", text("w"))]),
+            CancellationToken::new(),
+        );
+        assert_eq!(run.execute().await, RunStatus::Complete);
+    }
+
+    #[tokio::test]
+    async fn cancel_spares_an_unrelated_participant_turn() {
+        // Roster [a, b]. The workflow drives only `a`; `b` is busy with a turn the
+        // workflow did NOT dispatch. Cancelling the workflow must cancel a's turn
+        // but leave b's unrelated turn untouched (the over-cancel fix: cancel
+        // targets the run's own in-flight turns, not the declared roster).
+        let rig = rig(vec![
+            ("a", vec![MockScenario::AwaitCancellation]),
+            ("b", vec![MockScenario::AwaitCancellation]),
+        ]);
+        let a = rig.ids["a"];
+        let b = rig.ids["b"];
+        // A turn on `b` that the workflow does not own.
+        let _manual = rig
+            .dispatcher
+            .send_message_awaiting_completion(
+                b,
+                "manual",
+                Vec::new(),
+                Uuid::now_v7(),
+                rig.provider.factory_for(b),
+            )
+            .await;
+
+        let cancel = CancellationToken::new();
+        let yaml = "name: x\ndescription: d\ninputs:\n  a: agent\n  b: agent\nsteps:\n  - send:\n      to: \"{{ a }}\"\n      text: go\n  - wait_for:\n      agent: \"{{ a }}\"\n";
+        let (run, _dir, _path) = build_run(
+            &rig,
+            PromptService::disabled(),
+            yaml,
+            "x",
+            supplied(vec![("a", text("a")), ("b", text("b"))]),
+            cancel.clone(),
+        );
+        let emitter = Arc::clone(&rig.emitter);
+        let (status, ()) = tokio::join!(run.execute(), async move {
+            // Both a's workflow turn and b's manual turn are in flight.
+            emitter.wait_for_type("turn_start", 2).await;
+            cancel.cancel();
+        });
+        assert_eq!(status, RunStatus::Cancelled);
+        // b's turn (AwaitCancellation) only ends if cancelled. The workflow must
+        // not have cancelled it → no terminal on b's channel.
+        let b_channel = format!("agent:{b}");
+        let b_terminated = rig.emitter.snapshot().into_iter().any(|(ch, p)| {
+            ch == b_channel && p.get("type").and_then(|t| t.as_str()) == Some("turn_end")
+        });
+        assert!(
+            !b_terminated,
+            "the unrelated participant turn must survive workflow cancel"
+        );
+        // Clean up: end b's turn (and a's, already cancelled).
+        rig.dispatcher.cancel(b, CancelSource::User);
+        let _ = a;
+    }
+
+    #[tokio::test]
+    async fn same_agent_fire_and_forget_first_failure_fails_run() {
+        // Two un-awaited sends to the same agent (the second accepted once the
+        // first is terminal). The first turn fails; its outcome must not be lost
+        // when the second is tracked — the run is Failed, not Complete.
+        let rig = rig(vec![
+            (
+                "w",
+                vec![MockScenario::DispatchFails, MockScenario::Streaming],
+            ),
+            ("o", vec![MockScenario::Streaming]),
+        ]);
+        // send w (fails), then send/wait o (gives w's first turn time to settle),
+        // then send w again (accepted) — no wait on either w send.
+        let yaml = "name: f\ndescription: d\ninputs:\n  w: agent\n  o: agent\nsteps:\n  - send:\n      to: \"{{ w }}\"\n      text: x\n  - send:\n      to: \"{{ o }}\"\n      text: y\n  - wait_for:\n      agent: \"{{ o }}\"\n  - send:\n      to: \"{{ w }}\"\n      text: z\n";
+        let (run, _dir, path) = build_run(
+            &rig,
+            PromptService::disabled(),
+            yaml,
+            "f",
+            supplied(vec![("w", text("w")), ("o", text("o"))]),
+            CancellationToken::new(),
+        );
+        assert_eq!(run.execute().await, RunStatus::Failed);
+        assert!(matches!(
+            records(&path).last(),
+            Some(RunRecord::Terminal {
+                status: TerminalStatus::Failed,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn partial_fanout_contention_does_not_cancel_accepted_sibling() {
+        // Locks down the spec's partial-dispatch rule (and the rejected review
+        // finding): when a fan-out has one recipient accepted and a later one
+        // busy, the step fails — but the accepted turn is NOT cancelled; it runs
+        // to its natural terminal (its output stays visible).
+        let signal = Arc::new(tokio::sync::Notify::new());
+        let rig = rig(vec![
+            ("a", vec![MockScenario::Streaming]),
+            (
+                "busy",
+                vec![MockScenario::CompletesOnSignal(Arc::clone(&signal))],
+            ),
+        ]);
+        let busy = rig.ids["busy"];
+        // Pre-occupy `busy` with a turn the workflow doesn't own.
+        let _occupy = rig
+            .dispatcher
+            .send_message_awaiting_completion(
+                busy,
+                "occupy",
+                Vec::new(),
+                Uuid::now_v7(),
+                rig.provider.factory_for(busy),
+            )
+            .await;
+        rig.emitter.wait_for_type("turn_start", 1).await;
+
+        // Fan-out to [a, busy] in order: `a` is accepted, `busy` fails fast.
+        let yaml = "name: p\ndescription: d\ninputs:\n  rs: [agent]\nsteps:\n  - send:\n      to: \"{{ rs }}\"\n      text: hi\n";
+        let (run, _dir, _path) = build_run(
+            &rig,
+            PromptService::disabled(),
+            yaml,
+            "p",
+            supplied(vec![("rs", list(&["a", "busy"]))]),
+            CancellationToken::new(),
+        );
+        assert_eq!(run.execute().await, RunStatus::Failed);
+        // `a`'s accepted turn runs to a completed terminal — the failure did not
+        // cancel it. (Would time out here if it had been cancelled instead.)
+        let a_channel = format!("agent:{}", rig.ids["a"]);
+        rig.emitter
+            .wait_for(|events| {
+                events.iter().any(|(ch, p)| {
+                    *ch == a_channel
+                        && p.get("type").and_then(|t| t.as_str()) == Some("turn_end")
+                        && p.get("outcome")
+                            .and_then(|o| o.get("status"))
+                            .and_then(|s| s.as_str())
+                            == Some("completed")
+                })
+            })
+            .await;
+        signal.notify_one();
+    }
+}

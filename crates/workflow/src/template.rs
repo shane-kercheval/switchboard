@@ -125,10 +125,10 @@ pub fn validate_template(field: &str, src: &str) -> Result<()> {
     Ok(())
 }
 
-/// Render a template against a scope and the per-run output scope (which the
-/// helper functions read). Undefined variables and helper failures surface as
-/// [`WorkflowError::Render`].
-pub fn render(src: &str, scope: Scope, outputs: &OutputScope) -> Result<String> {
+/// Build the strict-undefined environment with the `.items()` method bridge and
+/// the four helper functions registered against `outputs`. Shared by [`render`]
+/// and [`resolve_agent_refs`].
+fn build_env<'a>(outputs: &OutputScope) -> Environment<'a> {
     let mut env = Environment::new();
     env.set_undefined_behavior(UndefinedBehavior::Strict);
     // Expose `.items()` on maps (the form `responses_from(...)` callers use, per
@@ -149,9 +149,99 @@ pub fn render(src: &str, scope: Scope, outputs: &OutputScope) -> Result<String> 
         }
     });
     register_helpers(&mut env, &Arc::new(outputs.clone()));
+    env
+}
+
+/// Render a template against a scope and the per-run output scope (which the
+/// helper functions read). Undefined variables and helper failures surface as
+/// [`WorkflowError::Render`].
+pub fn render(src: &str, scope: Scope, outputs: &OutputScope) -> Result<String> {
+    let env = build_env(outputs);
     let ctx = scope.into_context();
     env.render_str(src, ctx)
         .map_err(|e| WorkflowError::render(render_error_message(&e)))
+}
+
+/// Resolve an agent-reference field (`to` / `agents` / `forward_from`) to its
+/// list of agent names. Unlike [`render`] (which produces a string), this yields
+/// a list, because such a field commonly references an `[agent]` input
+/// (`to: "{{ reviewer_agents }}"`) that must expand to its members rather than
+/// stringify to `["a", "b"]`. Resolution rules:
+///
+/// - A YAML list literal (`to: [a, b]`) renders each item to one name.
+/// - A scalar that is a single `{{ expr }}` is **evaluated as an expression**: a
+///   sequence result expands to many names, a string result is one name. (So
+///   `{{ reviewer_agents }}` → the list, `{{ planner }}` → one name.)
+/// - Any other scalar (a literal `planner`, or a mixed template `{{ a }}-{{ b }}`)
+///   renders to a single name.
+///
+/// The returned names are raw references (not yet validated/normalized); callers
+/// apply [`crate::validate_agent_list`] against the project roster.
+pub fn resolve_agent_refs(
+    field: &crate::model::Templated,
+    scope: &Scope,
+    outputs: &OutputScope,
+) -> Result<Vec<String>> {
+    use crate::model::Templated;
+    match field {
+        Templated::List(items) => items
+            .iter()
+            .map(|item| render(item, scope.clone(), outputs))
+            .collect(),
+        Templated::Scalar(s) => match pure_expression(s) {
+            Some(expr) => {
+                let env = build_env(outputs);
+                let ctx = scope.clone().into_context();
+                let compiled = env
+                    .compile_expression(expr)
+                    .map_err(|e| WorkflowError::render(render_error_message(&e)))?;
+                let value = compiled
+                    .eval(ctx)
+                    .map_err(|e| WorkflowError::render(render_error_message(&e)))?;
+                coerce_agent_value(&value)
+            }
+            None => Ok(vec![render(s, scope.clone(), outputs)?]),
+        },
+    }
+}
+
+/// `Some(inner)` if `s` is a single whole-string interpolation `{{ inner }}`
+/// (the case that must be evaluated as an expression so a list stays a list);
+/// `None` for a literal or a multi-interpolation template (rendered as a string).
+fn pure_expression(s: &str) -> Option<&str> {
+    let t = s.trim();
+    let inner = t.strip_prefix("{{")?.strip_suffix("}}")?;
+    // Reject mixed templates like `{{ a }}-{{ b }}` (more than one interpolation).
+    if inner.contains("{{") || inner.contains("}}") {
+        return None;
+    }
+    // Strip the optional whitespace-control dashes (`{{- expr -}}`) the subset
+    // supports, so agent-ref resolution accepts the same syntax `render` does.
+    let inner = inner.trim();
+    let inner = inner.strip_prefix('-').unwrap_or(inner);
+    let inner = inner.strip_suffix('-').unwrap_or(inner);
+    Some(inner.trim())
+}
+
+/// A resolved agent-reference value: a string is one name; a sequence is many.
+fn coerce_agent_value(value: &Value) -> Result<Vec<String>> {
+    if let Some(s) = value.as_str() {
+        return Ok(vec![s.to_owned()]);
+    }
+    match value.kind() {
+        ValueKind::Seq | ValueKind::Iterable => value
+            .try_iter()
+            .map_err(|e| WorkflowError::render(render_error_message(&e)))?
+            .map(|item| {
+                item.as_str().map(str::to_owned).ok_or_else(|| {
+                    WorkflowError::render("agent reference list contains a non-string")
+                })
+            })
+            .collect(),
+        _ => Err(WorkflowError::render(
+            "agent reference must resolve to a name or a list of names",
+        )),
+    }
 }
 
 /// `MiniJinja` nests the useful detail (the helper's message, the undefined name)
@@ -383,6 +473,7 @@ fn read_ident(chars: &[char], start: usize) -> (String, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Templated;
 
     fn scope_with_inputs(pairs: &[(&str, ScopeValue)]) -> Scope {
         let mut scope = Scope::default();
@@ -621,6 +712,79 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, "a,b");
+    }
+
+    #[test]
+    fn resolve_agent_refs_expands_list_input_and_single_input() {
+        let mut scope = Scope::default();
+        scope.inputs.insert(
+            "reviewers".to_owned(),
+            ScopeValue::List(vec!["reviewer-1".to_owned(), "reviewer-2".to_owned()]),
+        );
+        scope
+            .inputs
+            .insert("primary".to_owned(), ScopeValue::Text("primary".to_owned()));
+        let out = OutputScope::new();
+
+        // `{{ list_input }}` expands to its members (not a stringified list).
+        let list = resolve_agent_refs(
+            &Templated::Scalar("{{ reviewers }}".to_owned()),
+            &scope,
+            &out,
+        )
+        .unwrap();
+        assert_eq!(list, vec!["reviewer-1".to_owned(), "reviewer-2".to_owned()]);
+
+        // `{{ single_input }}` is one name.
+        let single =
+            resolve_agent_refs(&Templated::Scalar("{{ primary }}".to_owned()), &scope, &out)
+                .unwrap();
+        assert_eq!(single, vec!["primary".to_owned()]);
+
+        // A YAML list literal renders each item to one name.
+        let literal = resolve_agent_refs(
+            &Templated::List(vec!["a".to_owned(), "{{ primary }}".to_owned()]),
+            &scope,
+            &out,
+        )
+        .unwrap();
+        assert_eq!(literal, vec!["a".to_owned(), "primary".to_owned()]);
+
+        // A bare literal scalar is one name.
+        let bare =
+            resolve_agent_refs(&Templated::Scalar("planner".to_owned()), &scope, &out).unwrap();
+        assert_eq!(bare, vec!["planner".to_owned()]);
+    }
+
+    #[test]
+    fn resolve_agent_refs_accepts_whitespace_control() {
+        // The subset supports `{{- expr -}}`; agent-ref resolution must accept it
+        // the same as `{{ expr }}` (it's a second evaluation path).
+        let mut scope = Scope::default();
+        scope.inputs.insert(
+            "reviewers".to_owned(),
+            ScopeValue::List(vec!["r1".to_owned(), "r2".to_owned()]),
+        );
+        scope
+            .inputs
+            .insert("primary".to_owned(), ScopeValue::Text("primary".to_owned()));
+        let out = OutputScope::new();
+        for src in ["{{- reviewers -}}", "{{- reviewers }}", "{{ reviewers -}}"] {
+            assert_eq!(
+                resolve_agent_refs(&Templated::Scalar(src.to_owned()), &scope, &out).unwrap(),
+                vec!["r1".to_owned(), "r2".to_owned()],
+                "whitespace control should not change resolution of {src}"
+            );
+        }
+        assert_eq!(
+            resolve_agent_refs(
+                &Templated::Scalar("{{- primary -}}".to_owned()),
+                &scope,
+                &out
+            )
+            .unwrap(),
+            vec!["primary".to_owned()]
+        );
     }
 
     #[test]

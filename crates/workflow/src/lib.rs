@@ -20,9 +20,9 @@
 //!
 //! ## Output scope is resolved text, not turn ids
 //!
-//! The template helpers and the persisted checkpoint scope hold each agent's
-//! **resolved completed-turn text**, captured from the live event stream at
-//! completion — never a turn-id to be re-joined from a harness session file
+//! The template helpers and the in-memory per-run output scope ([`OutputScope`])
+//! hold each agent's **resolved completed-turn text**, captured from the live
+//! event stream at completion — never a turn-id to be re-joined from a harness
 //! later. The dispatcher's `turn_id` is not joinable to a harness file's own turn
 //! ids, and one harness has no per-turn id at all, so that join is impossible;
 //! capturing text at completion sidesteps identity entirely. (The spec's
@@ -54,4 +54,4 @@ pub use model::{
 };
 pub use parse::parse_workflow;
 pub use run::{RunRecord, RunStatus, TerminalStatus};
-pub use template::{OutputScope, Scope, ScopeValue, render, validate_template};
+pub use template::{OutputScope, Scope, ScopeValue, render, resolve_agent_refs, validate_template};

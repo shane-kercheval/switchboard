@@ -3982,6 +3982,7 @@ dependencies = [
  "switchboard-git",
  "switchboard-harness",
  "switchboard-prompts",
+ "switchboard-workflow",
  "tauri",
  "tauri-build",
  "tauri-plugin-clipboard-manager",

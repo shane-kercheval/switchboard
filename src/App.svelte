@@ -829,39 +829,44 @@
         {/if}
 
         {#if showPaneHeaderControls}
-          <div class="flex min-w-0 shrink items-center gap-1 overflow-hidden" data-tauri-no-drag>
-            {#each headerTabPanes as pane (pane.id)}
-              {@const active = paneIsActive(pane)}
-              {@const completed = paneTabIsCompleted(pane)}
-              <button
-                type="button"
-                class="border-border bg-panel text-fg hover:bg-raised inline-flex h-6.5 max-w-36 min-w-0 shrink items-center gap-1.5 rounded-full border px-2 text-xs"
-                data-testid="app-pane-minimized-tab"
-                data-pane-id={pane.id}
-                onclick={() => selectHeaderPane(pane)}
-              >
-                {#if active}
-                  <span
-                    class="inline-flex shrink-0 items-center justify-center"
-                    role="status"
-                    aria-label={`${pane.name} has running agents`}
-                    data-testid="app-pane-tab-activity"
-                  >
-                    <Spinner class="h-3.5 w-3.5" />
-                  </span>
-                {:else if completed}
-                  <span
-                    class="text-accent inline-flex shrink-0 items-center justify-center"
-                    role="status"
-                    aria-label={`${pane.name} activity ended`}
-                    data-testid="app-pane-tab-completed"
-                  >
-                    <CircleCheck size={14} strokeWidth={1.8} aria-hidden="true" />
-                  </span>
-                {/if}
-                <span class="truncate font-medium">{pane.name}</span>
-              </button>
-            {/each}
+          <div class="flex min-w-0 shrink items-center gap-1" data-tauri-no-drag>
+            <div
+              class="flex min-w-0 shrink items-center gap-1 overflow-hidden"
+              data-testid="app-pane-tab-strip"
+            >
+              {#each headerTabPanes as pane (pane.id)}
+                {@const active = paneIsActive(pane)}
+                {@const completed = paneTabIsCompleted(pane)}
+                <button
+                  type="button"
+                  class="border-border bg-panel text-fg hover:bg-raised inline-flex h-6.5 max-w-36 min-w-0 shrink items-center gap-1.5 rounded-full border px-2 text-xs"
+                  data-testid="app-pane-minimized-tab"
+                  data-pane-id={pane.id}
+                  onclick={() => selectHeaderPane(pane)}
+                >
+                  {#if active}
+                    <span
+                      class="inline-flex shrink-0 items-center justify-center"
+                      role="status"
+                      aria-label={`${pane.name} has running agents`}
+                      data-testid="app-pane-tab-activity"
+                    >
+                      <Spinner class="h-3.5 w-3.5" />
+                    </span>
+                  {:else if completed}
+                    <span
+                      class="text-accent inline-flex shrink-0 items-center justify-center"
+                      role="status"
+                      aria-label={`${pane.name} activity ended`}
+                      data-testid="app-pane-tab-completed"
+                    >
+                      <CircleCheck size={14} strokeWidth={1.8} aria-hidden="true" />
+                    </span>
+                  {/if}
+                  <span class="truncate font-medium">{pane.name}</span>
+                </button>
+              {/each}
+            </div>
             {#if activeMaximizedPane !== null && headerTabPanes.length > 1}
               <button
                 type="button"
@@ -883,6 +888,25 @@
                   onclick={addEmptyPane}
                 >
                   <Plus size={ICON_SIZE} aria-hidden="true" />
+                </button>
+              {/snippet}
+            </Tooltip>
+            <Tooltip label={compactLabel} side="bottom">
+              {#snippet trigger(props)}
+                <button
+                  {...props}
+                  type="button"
+                  onclick={toggleCompactTranscript}
+                  aria-label={compactLabel}
+                  data-testid="transcript-compact-toggle"
+                  data-tauri-no-drag
+                  class={cn(ICON_BUTTON_CLASS, "hover:bg-panel shrink-0")}
+                >
+                  {#if compactEnabled}
+                    <ChevronsUpDown size={ICON_SIZE} aria-hidden="true" />
+                  {:else}
+                    <ChevronsDownUp size={ICON_SIZE} aria-hidden="true" />
+                  {/if}
                 </button>
               {/snippet}
             </Tooltip>
@@ -935,25 +959,6 @@
           class="hover:bg-panel"
         />
         {#if showAgentsToggle}
-          <Tooltip label={compactLabel} side="bottom">
-            {#snippet trigger(props)}
-              <button
-                {...props}
-                type="button"
-                onclick={toggleCompactTranscript}
-                aria-label={compactLabel}
-                data-testid="transcript-compact-toggle"
-                data-tauri-no-drag
-                class={cn(ICON_BUTTON_CLASS, "hover:bg-panel")}
-              >
-                {#if compactEnabled}
-                  <ChevronsUpDown size={ICON_SIZE} aria-hidden="true" />
-                {:else}
-                  <ChevronsDownUp size={ICON_SIZE} aria-hidden="true" />
-                {/if}
-              </button>
-            {/snippet}
-          </Tooltip>
           <SidebarToggleButton
             side="right"
             expanded={agentsSidebarOpen}

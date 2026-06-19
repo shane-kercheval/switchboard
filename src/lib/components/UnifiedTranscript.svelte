@@ -904,7 +904,7 @@
 {#snippet fanoutToggleAll(entries: { key: string; defaultCompact: boolean }[])}
   {@const anyExpanded = entries.some((e) => !isCompact(projectId, e.key, e.defaultCompact))}
   {@const keys = entries.map((e) => e.key)}
-  {@const label = anyExpanded ? "Collapse all responses" : "Expand all responses"}
+  {@const label = anyExpanded ? "Collapse all responses above" : "Expand all responses above"}
   <Tooltip {label} side="bottom">
     {#snippet trigger(props)}
       <button
@@ -1285,19 +1285,6 @@
                responses are hovered and the user message's own hover chrome
                stays independent. -->
             <div class="group/responses space-y-2">
-              {#if fanoutEntries.length > 0 || fanoutCopyable.length > 0}
-                <div class="flex justify-end gap-1">
-                  {#if fanoutCopyable.length > 0}
-                    <CopyButton
-                      text={fanoutCopyable}
-                      label="Copy all responses"
-                      testid="fanout-copy"
-                      class="shrink-0 opacity-0 group-focus-within/responses:opacity-100 group-hover/responses:opacity-100"
-                    />
-                  {/if}
-                  {#if fanoutEntries.length > 0}{@render fanoutToggleAll(fanoutEntries)}{/if}
-                </div>
-              {/if}
               <!-- Side-by-side on wide viewports; stacks vertically below `lg`. -->
               <div
                 class="grid gap-4"
@@ -1404,6 +1391,31 @@
                   </div>
                 {/each}
               </div>
+              {#if fanoutEntries.length > 0 || fanoutCopyable.length > 0}
+                <div
+                  class="pointer-events-none flex items-center gap-2 pt-0.5 opacity-0 transition-opacity group-focus-within/responses:pointer-events-auto group-focus-within/responses:opacity-100 group-hover/responses:pointer-events-auto group-hover/responses:opacity-100"
+                  data-testid="fanout-actions-footer"
+                >
+                  <div class="border-border/60 h-px min-w-0 flex-1 border-t"></div>
+                  <div class="flex shrink-0 items-center gap-1">
+                    {#if fanoutCopyable.length > 0}
+                      <Tooltip label="Copy all responses above" side="bottom">
+                        {#snippet trigger(props)}
+                          <span {...props} class="inline-flex shrink-0">
+                            <CopyButton
+                              text={fanoutCopyable}
+                              label="Copy all responses above"
+                              testid="fanout-copy"
+                              class="shrink-0"
+                            />
+                          </span>
+                        {/snippet}
+                      </Tooltip>
+                    {/if}
+                    {#if fanoutEntries.length > 0}{@render fanoutToggleAll(fanoutEntries)}{/if}
+                  </div>
+                </div>
+              {/if}
             </div>
           </div>
         {/if}

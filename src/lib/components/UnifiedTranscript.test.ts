@@ -2866,7 +2866,8 @@ describe("UnifiedTranscript fan-out group control", () => {
     // The toggle-all must not live inside the user message's hover scope (that
     // was leaking the user prompt's meta onto response hover).
     expect(userTurn.querySelector('[data-testid="fanout-preview-toggle-all"]')).toBeNull();
-    expect(groupToggle(group)).toBeInTheDocument();
+    const footer = within(group).getByTestId("fanout-actions-footer");
+    expect(footer).toContainElement(groupToggle(group));
   });
 
   it("shows a per-column hidden-items indicator and expands the column on click", async () => {
@@ -2916,11 +2917,11 @@ describe("UnifiedTranscript fan-out group control", () => {
 
     const group = screen.getByTestId("fanout-group");
     expect(columnLabels(group)).toEqual(["Collapse", "Collapse"]); // both expanded
-    expect(groupToggle(group)).toHaveAttribute("aria-label", "Collapse all responses");
+    expect(groupToggle(group)).toHaveAttribute("aria-label", "Collapse all responses above");
 
     await fireEvent.click(groupToggle(group));
     expect(columnLabels(group)).toEqual(["Expand", "Expand"]); // all collapsed
-    expect(groupToggle(group)).toHaveAttribute("aria-label", "Expand all responses");
+    expect(groupToggle(group)).toHaveAttribute("aria-label", "Expand all responses above");
 
     await fireEvent.click(groupToggle(group));
     expect(columnLabels(group)).toEqual(["Collapse", "Collapse"]); // all expanded again

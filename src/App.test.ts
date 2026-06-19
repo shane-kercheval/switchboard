@@ -1699,6 +1699,16 @@ describe("App", () => {
     await waitFor(() =>
       expect(screen.getByTestId("transcript-compact-toggle")).toBeInTheDocument(),
     );
+    const paneAdd = screen.getByTestId("app-pane-add");
+    const compact = screen.getByTestId("transcript-compact-toggle");
+    const projectsToggle = screen.getByTestId("view-toggle-projects");
+    const tabStrip = screen.getByTestId("app-pane-tab-strip");
+    expect(tabStrip).not.toContainElement(paneAdd);
+    expect(tabStrip).not.toContainElement(compact);
+    expect(paneAdd.compareDocumentPosition(compact) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+    expect(
+      compact.compareDocumentPosition(projectsToggle) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).not.toBe(0);
 
     // The Git view is a full takeover — the compact control is irrelevant there.
     await fireEvent.click(screen.getByTestId("view-toggle-git"));

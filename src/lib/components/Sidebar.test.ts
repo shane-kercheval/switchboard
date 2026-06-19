@@ -625,9 +625,9 @@ describe("Sidebar", () => {
     expect(setAgentModelMock).toHaveBeenCalledExactlyOnceWith(agent.id, "sonnet");
   });
 
-  it("Change model 'No override' clears the selection (calls setAgentModel with undefined)", async () => {
+  it("Change model: an agent with no pinned model seeds the harness default; no 'No override' option", async () => {
     const state = await loadState();
-    const agent = { ...CLAUDE_AGENT, model: "opus" };
+    const agent = { ...CLAUDE_AGENT, model: null };
     await state.registerAgent(agent);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
 
@@ -636,10 +636,13 @@ describe("Sidebar", () => {
     await fireEvent.click(screen.getByTestId("agent-change-model"));
 
     await screen.findByTestId("change-select");
-    await choosePicker("change-select", "");
+    // The picker offers concrete values only — no "No override" sentinel ("") —
+    // and preselects the harness default for an agent that pins nothing.
+    expect(pickerHasOption("change-select", "")).toBe(false);
+    expect(pickerValue("change-select")).toBe("opus");
     await fireEvent.click(screen.getByTestId("change-save"));
 
-    expect(setAgentModelMock).toHaveBeenCalledExactlyOnceWith(agent.id, undefined);
+    expect(setAgentModelMock).toHaveBeenCalledExactlyOnceWith(agent.id, "opus");
   });
 
   it("Change model includes an unknown persisted value so Save preserves it", async () => {

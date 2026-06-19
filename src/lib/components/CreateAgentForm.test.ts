@@ -537,12 +537,15 @@ describe("CreateAgentForm", () => {
     } satisfies AgentFormSubmit);
   });
 
-  it("attach defaults to 'keep current' → submits no model/effort (session preserved)", async () => {
+  it("attach mode: no model/effort controls; submits no model/effort (session left as-is)", async () => {
     const { onSubmit } = renderForm();
     await fireEvent.click(screen.getByTestId("mode-attach"));
-    // The picker's default is the keep-current sentinel (empty value).
-    expect(pickerValue("model-select")).toBe("");
-    expect(pickerValue("effort-select")).toBe("");
+    // Attach pins nothing: neither the pickers nor the unsupported-capability
+    // notes are shown — model/effort are managed from the agent's actions menu.
+    expect(screen.queryByTestId("model-select")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("effort-select")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("model-note")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("effort-note")).not.toBeInTheDocument();
     const sessionInput = screen.getByTestId("attach-session-id") as HTMLInputElement;
     await fireEvent.input(sessionInput, { target: { value: VALID_UUID } });
     await fireEvent.click(screen.getByTestId("confirm-create-agent"));
@@ -554,31 +557,34 @@ describe("CreateAgentForm", () => {
     } satisfies AgentFormSubmit);
   });
 
-  it("attach with a deliberately chosen model/effort submits them", async () => {
-    const { onSubmit } = renderForm();
-    await fireEvent.click(screen.getByTestId("mode-attach"));
-    await choosePicker("model-select", "sonnet");
-    await choosePicker("effort-select", "low");
-    const sessionInput = screen.getByTestId("attach-session-id") as HTMLInputElement;
-    await fireEvent.input(sessionInput, { target: { value: VALID_UUID } });
-    await fireEvent.click(screen.getByTestId("confirm-create-agent"));
-    expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
-      mode: "attach",
-      name: "claude-code",
-      harness: "claude_code",
-      existingSessionId: VALID_UUID,
-      model: "sonnet",
-      effort: "low",
-    } satisfies AgentFormSubmit);
-  });
-
-  it("toggling attach → create restores the concrete harness default", async () => {
+  it("attach hides the model/effort pickers; switching back to create shows them again", async () => {
     renderForm();
     await fireEvent.click(screen.getByTestId("mode-attach"));
-    expect(pickerValue("model-select")).toBe("");
+    expect(screen.queryByTestId("model-select")).not.toBeInTheDocument();
     await fireEvent.click(screen.getByTestId("mode-create"));
+    // Untouched, so they're at the harness default — this is re-render, not reset
+    // (see the draft-preservation test below).
     expect(pickerValue("model-select")).toBe("opus");
     expect(pickerValue("effort-select")).toBe("high");
+  });
+
+  it("create model/effort selections survive a create → attach → create toggle (draft preservation)", async () => {
+    const { onSubmit } = renderForm();
+    await choosePicker("model-select", "haiku");
+    await choosePicker("effort-select", "low");
+    await fireEvent.click(screen.getByTestId("mode-attach"));
+    await fireEvent.click(screen.getByTestId("mode-create"));
+    // The user's picks are preserved, not reset to the harness default.
+    expect(pickerValue("model-select")).toBe("haiku");
+    expect(pickerValue("effort-select")).toBe("low");
+    await fireEvent.click(screen.getByTestId("confirm-create-agent"));
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
+      mode: "create",
+      name: "haiku-low",
+      harness: "claude_code",
+      model: "haiku",
+      effort: "low",
+    } satisfies AgentFormSubmit);
   });
 
   it("create: the name tracks the model/effort pickers until the user edits it", async () => {

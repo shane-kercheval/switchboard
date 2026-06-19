@@ -566,8 +566,6 @@
             submission.name,
             submission.harness,
             submission.existingSessionId,
-            submission.model,
-            submission.effort,
           );
     await registerAgent(agent);
     addAgentToActiveProject(agent);

@@ -2667,22 +2667,117 @@ async fn resolve_all_sources(
     sources: &[AgentId],
     home_dir: &Path,
 ) -> Result<Vec<SourceResolution>, AppError> {
+    // Read the project journal **once** (it's the same file for every source in a
+    // forward) rather than per source — `latest_turn_failure_note` consults it for
+    // each idle source. Fail-loud: a corrupt journal propagates here (matching the
+    // reader's contract) instead of being swallowed into a silent stale forward.
+    let journal = match sources.first() {
+        Some(&first) => {
+            let (project, _) = lookup_agent(state, first)?;
+            switchboard_core::journal::read_records(&project.journal_path())?
+        }
+        None => Vec::new(),
+    };
+    let journal = journal.as_slice();
     // `try_join_all` polls every source on the first poll (so all waits register
     // up front, before any can settle) and preserves declared order; a source's
     // *turn* failing is an `Ok(Invalidated)` it collects, while a genuine error
     // (unknown source id, I/O) short-circuits.
-    futures::future::try_join_all(sources.iter().map(|&s| resolve_source(state, s, home_dir))).await
+    futures::future::try_join_all(
+        sources
+            .iter()
+            .map(|&s| resolve_source(state, s, home_dir, journal)),
+    )
+    .await
+}
+
+/// If the agent's **most recent** turn (per the journal `records`) ended
+/// non-completed, a human-readable note to forward in its place. `None` when that
+/// turn completed (or the agent has no journaled turns) — the caller then forwards
+/// the latest completed text as usual.
+///
+/// The idle resolver otherwise reads only the harness session file, which holds
+/// no record of a turn that failed before writing a result (e.g. a CLI that
+/// crashed). Without this, forwarding from a just-failed source would silently
+/// grab an *older* successful turn — a stale answer the recipient would treat as
+/// current. The journal is the durable source of the failure: it records every
+/// turn's start (`Send`) and writes an `Outcome` only for non-completed terminals,
+/// carrying the failure message.
+///
+/// "Most recent turn" is the agent's **last `Send` in append order** — the journal
+/// is append-only and a single agent's `Send`s land in turn order, so this is
+/// clock-independent (no timestamp comparison). An earlier failure followed by a
+/// later success therefore reads as completed (the latest `Send` has no `Outcome`).
+///
+/// **Known limitation (accepted):** "most recent" is judged from Switchboard's
+/// journal only. Turns the app didn't dispatch — output from running the CLI
+/// directly, or imported history — carry no `Send`, and the app's model already
+/// treats such turns as older pre-history. So in the rare case where an agent
+/// fails in Switchboard and *then* produces a newer turn outside it, this still
+/// reports the failure. Closing that would require ordering journal outcomes
+/// against harness-file turns by timestamp — a systemic change (the transcript
+/// merge has the same blind spot), out of scope for the forward resolver.
+fn latest_turn_failure_note(
+    records: &[switchboard_core::JournalRecord],
+    agent_id: AgentId,
+    agent_name: &str,
+) -> Option<String> {
+    use switchboard_core::JournalRecord;
+    let latest_turn = records
+        .iter()
+        .filter_map(|r| match r {
+            JournalRecord::Send {
+                agent_id: a,
+                turn_id,
+                ..
+            } if *a == agent_id => Some(*turn_id),
+            _ => None,
+        })
+        .next_back()?;
+    // A completed turn writes no `Outcome`; only a failed/cancelled one does — so
+    // the mere *presence* of an `Outcome` for the latest turn means it did not
+    // complete. The payload only refines the wording: if it can't be parsed (a
+    // cross-version / corrupt blob), we still emit a note rather than fall back to
+    // a stale older turn.
+    let outcome = records.iter().find_map(|r| match r {
+        JournalRecord::Outcome {
+            agent_id: a,
+            turn_id,
+            outcome,
+            ..
+        } if *a == agent_id && *turn_id == latest_turn => Some(outcome),
+        _ => None,
+    })?;
+    let note = match serde_json::from_value::<TurnOutcome>(outcome.clone()) {
+        Ok(TurnOutcome::Failed { message, .. }) => format!(
+            "⚠️ {agent_name}'s most recent turn failed and produced no output to forward.\n\nError: {message}"
+        ),
+        Ok(TurnOutcome::Cancelled { .. }) => format!(
+            "⚠️ {agent_name}'s most recent turn was cancelled before producing output to forward."
+        ),
+        // The journal never writes a `Completed` `Outcome` (contract); if one
+        // somehow appears, treat it as no-failure and let the caller read disk.
+        Ok(TurnOutcome::Completed) => return None,
+        // A future non-completed variant, or an unparseable payload: we still know
+        // (from the `Outcome`'s presence) the turn didn't complete.
+        Ok(_) | Err(_) => format!("⚠️ {agent_name}'s most recent turn did not complete."),
+    };
+    Some(note)
 }
 
 /// Resolve one forward source: await its current in-flight turn's terminal (the
 /// dispatcher's per-agent wait; immediate when idle). A completed in-flight turn
 /// carries its text **live** from the dispatcher (no disk read, no flush race);
 /// an idle source's latest completed output is read from disk (settled, since
-/// nothing is running). A non-completed terminal invalidates the source.
+/// nothing is running). A non-completed terminal on a turn we *waited on*
+/// invalidates the source (the held forward aborts — see system-design §7); a
+/// source whose most recent turn *already* failed before we forwarded resolves to
+/// a failure note (so the recipient learns it failed instead of a stale answer).
 async fn resolve_source(
     state: &AppState,
     agent_id: AgentId,
     home_dir: &Path,
+    journal: &[switchboard_core::JournalRecord],
 ) -> Result<SourceResolution, AppError> {
     let (project, agent) = lookup_agent(state, agent_id)?;
     match state.dispatcher.wait_for_current_turn(agent_id).await {
@@ -2699,9 +2794,17 @@ async fn resolve_source(
             name: agent.name,
             text,
         }),
-        // The agent was idle: read its latest completed output from disk. Nothing
-        // is running, so the file is settled — no flush race.
+        // The agent was idle. If its most recent turn failed/cancelled (the harness
+        // file may not record it), forward that fact rather than a stale older
+        // turn; otherwise read the latest completed output from disk (settled,
+        // nothing running — no flush race).
         CurrentTurnWait::Idle => {
+            if let Some(note) = latest_turn_failure_note(journal, agent_id, &agent.name) {
+                return Ok(SourceResolution::Resolved {
+                    name: agent.name,
+                    text: note,
+                });
+            }
             let transcript = load_agent_transcript(&project, &agent, home_dir)?;
             Ok(SourceResolution::Resolved {
                 name: agent.name,
@@ -4629,6 +4732,218 @@ mod tests {
             ForwardOutcome::Resolved { body, skipped } => (body, skipped),
             other => panic!("expected Resolved, got {other:?}"),
         }
+    }
+
+    /// Parse a fixed RFC-3339 timestamp for deterministic journal ordering.
+    fn journal_ts(ts: &str) -> chrono::DateTime<chrono::Utc> {
+        ts.parse().unwrap()
+    }
+
+    /// Append one record to a project's journal (the durable source of a turn's
+    /// non-completed outcome — see `latest_turn_failure_note`).
+    fn append_journal(
+        state: &AppState,
+        project_id: ProjectId,
+        record: &switchboard_core::JournalRecord,
+    ) {
+        let path = lock(&state.projects)
+            .get(&project_id)
+            .unwrap()
+            .journal_path();
+        switchboard_core::journal::append_record(&path, record).unwrap();
+    }
+
+    #[tokio::test]
+    async fn forward_idle_source_with_failed_latest_turn_forwards_the_error() {
+        use switchboard_core::JournalRecord;
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        let home = TempDir::new().unwrap();
+        let (_recipient, project_id) = project_with_agent(&state, &tmp).await;
+        // A completed turn sits on disk — the "stale" answer the old code grabbed.
+        let source = seed_source(&state, home.path(), project_id, "gemini", "STALE ANSWER");
+        // The agent's most recent turn (per the journal) failed and wrote no
+        // content to its session file.
+        let send = Uuid::now_v7();
+        let turn = Uuid::now_v7();
+        append_journal(
+            &state,
+            project_id,
+            &JournalRecord::Send {
+                send_id: send,
+                turn_id: turn,
+                agent_id: source,
+                prompt: "go".to_owned(),
+                attachments: Vec::new(),
+                at: journal_ts("2026-06-17T01:00:00Z"),
+            },
+        );
+        append_journal(
+            &state,
+            project_id,
+            &JournalRecord::Outcome {
+                send_id: send,
+                turn_id: turn,
+                agent_id: source,
+                outcome: serde_json::json!({
+                    "status": "failed",
+                    "kind": "harness_error",
+                    "message": "IneligibleTierError: nope",
+                }),
+                started_at: journal_ts("2026-06-17T01:00:00Z"),
+                ended_at: journal_ts("2026-06-17T01:00:05Z"),
+            },
+        );
+
+        let outcome = forward_message_impl(
+            &state,
+            String::new(),
+            vec![source],
+            Uuid::now_v7(),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        let (body, skipped) = resolved(&outcome);
+        assert!(
+            body.contains("gemini's most recent turn failed"),
+            "forwards the failure note: {body:?}"
+        );
+        assert!(
+            body.contains("IneligibleTierError: nope"),
+            "includes the error message so the recipient can react: {body:?}"
+        );
+        assert!(
+            !body.contains("STALE ANSWER"),
+            "does not silently grab the stale older answer: {body:?}"
+        );
+        assert!(skipped.is_empty());
+    }
+
+    #[tokio::test]
+    async fn forward_idle_source_with_cancelled_latest_turn_forwards_the_cancellation() {
+        use switchboard_core::JournalRecord;
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        let home = TempDir::new().unwrap();
+        let (_recipient, project_id) = project_with_agent(&state, &tmp).await;
+        let source = seed_source(&state, home.path(), project_id, "gemini", "STALE ANSWER");
+        // The agent's most recent turn was cancelled (distinct wording from failed).
+        let send = Uuid::now_v7();
+        let turn = Uuid::now_v7();
+        append_journal(
+            &state,
+            project_id,
+            &JournalRecord::Send {
+                send_id: send,
+                turn_id: turn,
+                agent_id: source,
+                prompt: "go".to_owned(),
+                attachments: Vec::new(),
+                at: journal_ts("2026-06-17T01:00:00Z"),
+            },
+        );
+        append_journal(
+            &state,
+            project_id,
+            &JournalRecord::Outcome {
+                send_id: send,
+                turn_id: turn,
+                agent_id: source,
+                outcome: serde_json::json!({ "status": "cancelled", "source": "user" }),
+                started_at: journal_ts("2026-06-17T01:00:00Z"),
+                ended_at: journal_ts("2026-06-17T01:00:02Z"),
+            },
+        );
+
+        let outcome = forward_message_impl(
+            &state,
+            String::new(),
+            vec![source],
+            Uuid::now_v7(),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        let (body, _) = resolved(&outcome);
+        assert!(
+            body.contains("was cancelled before producing output"),
+            "forwards the cancellation note: {body:?}"
+        );
+        assert!(
+            !body.contains("STALE ANSWER"),
+            "does not grab the stale older answer: {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_idle_source_with_completed_latest_turn_forwards_content() {
+        use switchboard_core::JournalRecord;
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        let home = TempDir::new().unwrap();
+        let (_recipient, project_id) = project_with_agent(&state, &tmp).await;
+        let source = seed_source(&state, home.path(), project_id, "gemini", "FRESH ANSWER");
+        // An earlier turn failed, but a *later* turn completed (no Outcome). The
+        // most-recent-turn logic must read this as completed, not poisoned.
+        let failed_send = Uuid::now_v7();
+        let failed_turn = Uuid::now_v7();
+        append_journal(
+            &state,
+            project_id,
+            &JournalRecord::Send {
+                send_id: failed_send,
+                turn_id: failed_turn,
+                agent_id: source,
+                prompt: "a".to_owned(),
+                attachments: Vec::new(),
+                at: journal_ts("2026-06-17T01:00:00Z"),
+            },
+        );
+        append_journal(
+            &state,
+            project_id,
+            &JournalRecord::Outcome {
+                send_id: failed_send,
+                turn_id: failed_turn,
+                agent_id: source,
+                outcome: serde_json::json!({
+                    "status": "failed",
+                    "kind": "harness_error",
+                    "message": "old boom",
+                }),
+                started_at: journal_ts("2026-06-17T01:00:00Z"),
+                ended_at: journal_ts("2026-06-17T01:00:01Z"),
+            },
+        );
+        append_journal(
+            &state,
+            project_id,
+            &JournalRecord::Send {
+                send_id: Uuid::now_v7(),
+                turn_id: Uuid::now_v7(),
+                agent_id: source,
+                prompt: "b".to_owned(),
+                attachments: Vec::new(),
+                at: journal_ts("2026-06-17T02:00:00Z"),
+            },
+        );
+
+        let outcome = forward_message_impl(
+            &state,
+            String::new(),
+            vec![source],
+            Uuid::now_v7(),
+            home.path(),
+        )
+        .await
+        .unwrap();
+        let (body, _) = resolved(&outcome);
+        assert!(
+            body.contains("FRESH ANSWER"),
+            "the later completed turn's content wins: {body:?}"
+        );
+        assert!(
+            !body.contains("old boom"),
+            "an earlier failure does not poison a later success: {body:?}"
+        );
     }
 
     #[tokio::test]

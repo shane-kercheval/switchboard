@@ -562,7 +562,7 @@ describe("targeting", () => {
 });
 
 describe("Cmd-held target overlay", () => {
-  it("arms on Cmd-down over the hovered pane, disarms on Cmd-up", async () => {
+  it("arms only after pointer movement while Cmd is held, then disarms on Cmd-up", async () => {
     await seedTwoAgentTranscripts();
     moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
     renderPanes();
@@ -571,6 +571,9 @@ describe("Cmd-held target overlay", () => {
     expect(screen.queryByTestId("pane-target-overlay")).not.toBeInTheDocument();
 
     await fireEvent.keyDown(window, { key: "Meta" });
+    expect(screen.queryByTestId("pane-target-overlay")).not.toBeInTheDocument();
+
+    await fireEvent.pointerMove(window);
     expect(screen.getByTestId("pane-target-overlay")).toBeInTheDocument();
 
     await fireEvent.keyUp(window, { key: "Meta" });
@@ -590,9 +593,47 @@ describe("Cmd-held target overlay", () => {
     expect(screen.queryByTestId("pane-target-overlay")).not.toBeInTheDocument();
 
     await fireEvent.keyUp(window, { key: "Alt", metaKey: true });
+    expect(screen.queryByTestId("pane-target-overlay")).not.toBeInTheDocument();
+
+    await fireEvent.pointerMove(window);
     expect(screen.getByTestId("pane-target-overlay")).toBeInTheDocument();
 
     await fireEvent.keyDown(window, { key: "Shift", metaKey: true, shiftKey: true });
+    expect(screen.queryByTestId("pane-target-overlay")).not.toBeInTheDocument();
+  });
+
+  it("suppresses the overlay during non-modifier Cmd chords", async () => {
+    await seedTwoAgentTranscripts();
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    renderPanes();
+
+    await fireEvent.pointerEnter(paneEls()[0]!);
+    await fireEvent.keyDown(window, { key: "Meta" });
+    await fireEvent.pointerMove(window);
+    expect(screen.getByTestId("pane-target-overlay")).toBeInTheDocument();
+
+    await fireEvent.keyDown(window, { key: "c", metaKey: true });
+    expect(screen.queryByTestId("pane-target-overlay")).not.toBeInTheDocument();
+
+    await fireEvent.pointerMove(window);
+    expect(screen.queryByTestId("pane-target-overlay")).not.toBeInTheDocument();
+
+    await fireEvent.keyUp(window, { key: "c", metaKey: true });
+    expect(screen.queryByTestId("pane-target-overlay")).not.toBeInTheDocument();
+
+    await fireEvent.pointerMove(window);
+    expect(screen.getByTestId("pane-target-overlay")).toBeInTheDocument();
+  });
+
+  it("does not arm from pointer movement during a non-modifier Cmd chord", async () => {
+    await seedTwoAgentTranscripts();
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    renderPanes();
+
+    await fireEvent.pointerEnter(paneEls()[0]!);
+    await fireEvent.keyDown(window, { key: "v", metaKey: true });
+    await fireEvent.pointerMove(window);
+
     expect(screen.queryByTestId("pane-target-overlay")).not.toBeInTheDocument();
   });
 
@@ -635,6 +676,7 @@ describe("Cmd-held target overlay", () => {
 
     await fireEvent.pointerEnter(paneEls()[0]!);
     await fireEvent.keyDown(window, { key: "Meta" });
+    await fireEvent.pointerMove(window);
     expect(screen.getByTestId("pane-target-overlay")).toBeInTheDocument();
 
     await fireEvent.blur(window);

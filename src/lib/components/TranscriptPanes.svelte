@@ -136,21 +136,41 @@
   }
 
   // ── Cmd-held target overlay ─────────────────────────────────────────────────
-  // Holding plain Cmd previews the Cmd+click commit on the hovered pane. The
-  // armed state clears on keyup AND on window blur: if the app loses focus
+  // Holding plain Cmd previews the Cmd+click commit only after pointer movement
+  // while Cmd is held. That avoids false-positive pane rings when the cursor
+  // happens to rest over a pane during unrelated Cmd chords (Cmd+Tab/C/V/etc.).
+  // The armed state clears on keyup AND on window blur: if the app loses focus
   // while Cmd is held (Cmd+Tab away), the keyup never arrives and the overlay
   // would stick.
   let cmdOnlyHeld = $state(false);
+  let cmdPointerMoved = $state(false);
   let hoveredPaneId = $state<string | null>(null);
 
   function onWindowKeydown(event: KeyboardEvent): void {
-    cmdOnlyHeld = hasOnlyMeta(event);
+    if (event.key === "Meta" && !event.altKey && !event.shiftKey && !event.ctrlKey) {
+      cmdOnlyHeld = true;
+      cmdPointerMoved = false;
+      return;
+    }
+    cmdOnlyHeld = false;
+    cmdPointerMoved = false;
   }
   function onWindowKeyup(event: KeyboardEvent): void {
-    cmdOnlyHeld = event.key === "Meta" ? false : hasOnlyMeta(event);
+    if (event.key === "Meta" || !event.metaKey) {
+      cmdOnlyHeld = false;
+      cmdPointerMoved = false;
+      return;
+    }
+    cmdOnlyHeld = !event.altKey && !event.shiftKey && !event.ctrlKey;
+    cmdPointerMoved = false;
   }
   function onWindowBlur(): void {
     cmdOnlyHeld = false;
+    cmdPointerMoved = false;
+  }
+  function onWindowPointerMove(event: PointerEvent): void {
+    resizeMove(event);
+    if (cmdOnlyHeld) cmdPointerMoved = true;
   }
 
   // ── Gutter resize ───────────────────────────────────────────────────────────
@@ -284,7 +304,7 @@
 </script>
 
 <svelte:window
-  onpointermove={resizeMove}
+  onpointermove={onWindowPointerMove}
   onpointerup={endResize}
   onkeydown={onWindowKeydown}
   onkeyup={onWindowKeyup}
@@ -330,7 +350,10 @@
         data-coverage={multiPane && maximizedPane === null ? cov : undefined}
         data-maximized={maximizedPane?.id === pane.id}
         onclick={(event) => onPaneClick(pane, event)}
-        onpointerenter={() => (hoveredPaneId = pane.id)}
+        onpointerenter={() => {
+          hoveredPaneId = pane.id;
+          if (cmdOnlyHeld) cmdPointerMoved = true;
+        }}
         onpointerleave={() => (hoveredPaneId = hoveredPaneId === pane.id ? null : hoveredPaneId)}
       >
         {#if paneChrome}
@@ -585,7 +608,7 @@
             data-testid="pane-coverage"
           ></div>
         {/if}
-        {#if multiPane && maximizedPane === null && cmdOnlyHeld && hoveredPaneId === pane.id && pane.members.length > 0}
+        {#if multiPane && maximizedPane === null && cmdOnlyHeld && cmdPointerMoved && hoveredPaneId === pane.id && pane.members.length > 0}
           <div
             class="ring-accent pointer-events-none absolute inset-0 z-10 flex items-start justify-center ring-2 ring-inset"
             data-testid="pane-target-overlay"

@@ -22,6 +22,12 @@ pub enum MockScenario {
     /// test double for the dispatcher.
     Streaming,
 
+    /// Emits a `Text` chunk, a `Thinking` chunk, another `Text` chunk, then
+    /// `TurnEnd(Completed)`. The vehicle for the completion-signal test that the
+    /// captured text excludes reasoning: the awaited `CompletionResult.text`
+    /// must concatenate only the two `Text` chunks, never the `Thinking` one.
+    StreamingWithThinking,
+
     /// Intentionally violates the stream contract — panics mid-stream before
     /// `TurnEnd`. The **only** legitimate use is testing the dispatcher's
     /// `AgentIdleGuard` Drop path under producer-task panic. Never use in
@@ -119,6 +125,15 @@ pub enum MockScenario {
     /// vehicle for the persist-failure suppression test: with a failing sink the
     /// dispatcher force-fails on the capture, and nothing after it may forward.
     CapturesLocatorThenContent(SessionLocator),
+
+    /// Emits one `ContentChunk` (`"fresh-live-output"`), then **awaits an external
+    /// [`tokio::sync::Notify`]** the test controls, then emits
+    /// `TurnEnd(Completed)` and ends. The deterministic vehicle for proving an
+    /// in-flight turn's text is captured live and handed to a current-turn waiter:
+    /// the producer parks after emitting content (so a `wait_for_current_turn`
+    /// registers mid-turn), and completes only when the test releases it — unlike
+    /// the cancellation scenarios, whose synthesized terminal is `Cancelled`.
+    CompletesOnSignal(std::sync::Arc<tokio::sync::Notify>),
 }
 
 /// A `HarnessAdapter` that produces canned events without spawning any subprocess.
@@ -189,6 +204,37 @@ impl HarnessAdapter for MockHarnessAdapter {
                             text: chunk,
                         });
                     }
+                    let _ = tx.send(AdapterEvent::TurnEnd {
+                        turn_id,
+                        outcome: TurnOutcome::Completed,
+                        ended_at: Utc::now(),
+                        usage: None,
+                        context_window_source: None,
+                        stable_message_id: None,
+                        first_message_id: None,
+                        spend: None,
+                        model: None,
+                        effort: None,
+                    });
+                });
+            }
+            MockScenario::StreamingWithThinking => {
+                tokio::spawn(async move {
+                    let _ = tx.send(AdapterEvent::ContentChunk {
+                        turn_id,
+                        kind: ContentKind::Text,
+                        text: "visible-one ".to_owned(),
+                    });
+                    let _ = tx.send(AdapterEvent::ContentChunk {
+                        turn_id,
+                        kind: ContentKind::Thinking,
+                        text: "secret reasoning".to_owned(),
+                    });
+                    let _ = tx.send(AdapterEvent::ContentChunk {
+                        turn_id,
+                        kind: ContentKind::Text,
+                        text: "visible-two".to_owned(),
+                    });
                     let _ = tx.send(AdapterEvent::TurnEnd {
                         turn_id,
                         outcome: TurnOutcome::Completed,
@@ -472,6 +518,30 @@ impl HarnessAdapter for MockHarnessAdapter {
                         kind: ContentKind::Text,
                         text: "post-capture content".to_owned(),
                     });
+                    let _ = tx.send(AdapterEvent::TurnEnd {
+                        turn_id,
+                        outcome: TurnOutcome::Completed,
+                        ended_at: Utc::now(),
+                        usage: None,
+                        context_window_source: None,
+                        stable_message_id: None,
+                        first_message_id: None,
+                        spend: None,
+                        model: None,
+                        effort: None,
+                    });
+                });
+            }
+            MockScenario::CompletesOnSignal(ref signal) => {
+                let signal = std::sync::Arc::clone(signal);
+                tokio::spawn(async move {
+                    let _ = tx.send(AdapterEvent::ContentChunk {
+                        turn_id,
+                        kind: ContentKind::Text,
+                        text: "fresh-live-output".to_owned(),
+                    });
+                    // Park mid-turn until the test releases us, then complete.
+                    signal.notified().await;
                     let _ = tx.send(AdapterEvent::TurnEnd {
                         turn_id,
                         outcome: TurnOutcome::Completed,

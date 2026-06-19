@@ -13,6 +13,7 @@ import type {
   CommitChanges,
   DirectoryInfo,
   FileDiff,
+  ForwardOutcome,
   GitCommitRange,
   HarnessInstallStatus,
   HarnessKind,
@@ -367,6 +368,64 @@ export async function stageAttachment(
 // per-turn cancelled terminals flow back over the agent event channels.
 export async function cancelSend(sendId: SendId, recipients: AgentId[]): Promise<void> {
   await invoke("cancel_send", { sendId, recipients });
+}
+
+// Manual cross-agent forward: hold until each `sources` agent's current turn
+// finishes, then compose their outputs into the user's `body` and return the
+// composed body for the caller to dispatch (the backend resolves but does not
+// send — see `ForwardOutcome`). Long-lived by design — the promise resolves only
+// once the hold settles (resolved / invalidated / cancelled). `sources` are
+// pane-expanded agent ids (panes are frontend-only). `forwardId` correlates a
+// later `cancelForward` with this in-flight hold.
+export async function forwardMessage(
+  body: string,
+  sources: AgentId[],
+  forwardId: string,
+): Promise<ForwardOutcome> {
+  return await invoke<ForwardOutcome>("forward_message", { body, sources, forwardId });
+}
+
+// One prompt argument being forwarded into: its name, the (pane-expanded) source
+// agent ids, and whether the argument is required (the backend fails the forward
+// if a required arg resolves fully empty).
+export interface ForwardArg {
+  name: string;
+  sources: AgentId[];
+  required: boolean;
+}
+
+// Manual forward into a prompt's arguments (M2.5): hold until each forwarded
+// argument's sources finish, compose each (typed text + forwarded blocks), fill
+// the args map, render the prompt, and return the rendered body for the caller to
+// dispatch. `typedArgs` carries every argument's typed value (forwarded args
+// included — their typed text leads); `forwardArgs` adds sources + required for
+// the arguments being forwarded into. Same hold/cancel/`ForwardOutcome` contract
+// as `forwardMessage`.
+export async function forwardPrompt(
+  provider: string,
+  name: string,
+  typedArgs: Record<string, string>,
+  forwardArgs: ForwardArg[],
+  appendedText: string,
+  appendedSources: AgentId[],
+  forwardId: string,
+): Promise<ForwardOutcome> {
+  return await invoke<ForwardOutcome>("forward_prompt", {
+    provider,
+    name,
+    typedArgs,
+    forwardArgs,
+    appendedText,
+    appendedSources,
+    forwardId,
+  });
+}
+
+// Cancel a held forward by id, releasing its source wait without dispatching.
+// Idempotent — a no-op once the forward has settled. The held `forwardMessage`
+// call then resolves `{ status: "cancelled" }`.
+export async function cancelForward(forwardId: string): Promise<void> {
+  await invoke("cancel_forward", { forwardId });
 }
 
 export async function cancelTurn(agentId: AgentId): Promise<void> {

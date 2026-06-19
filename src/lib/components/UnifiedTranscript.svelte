@@ -21,6 +21,13 @@
     type RenderBlock,
     type UnifiedRow,
   } from "$lib/state/unified";
+  import {
+    FORWARD_SENTINEL,
+    forwardCaptionFor,
+    heldForwardsFor,
+    type HeldForward,
+  } from "$lib/state/heldForwards.svelte";
+  import { cancelForward } from "$lib/api";
   import { agentCopy } from "$lib/agentCopy.svelte";
   import { HARNESS_COLOR } from "$lib/harnessDisplay";
   import Badge from "$lib/components/ui/Badge.svelte";
@@ -121,6 +128,55 @@
       agents.map((a) => a.id),
     ),
   );
+
+  /// Held forwards whose recipients fall in *this* transcript's agents, paired
+  /// with that pane-local recipient subset. A held "waiting…" row belongs to the
+  /// pane(s) that will receive the forward — exactly like a queued send shows in
+  /// its recipient's column — not in every pane (which is also why a recipient in
+  /// another pane would resolve to "unknown" here). With a single pane this is
+  /// the whole roster, so every held forward renders once.
+  const heldForwardsHere = $derived.by(() => {
+    const ids = new Set(agents.map((a) => a.id));
+    return heldForwardsFor(projectId)
+      .map((held) => ({ held, recipients: held.recipients.filter((r) => ids.has(r)) }))
+      .filter((entry) => entry.recipients.length > 0);
+  });
+
+  /// One forwarded `=== START forwarded from <agent> === … === END … ===` block.
+  /// Captures the START sentinel, the inner content, and the END sentinel
+  /// separately so the sentinels can be styled while the content renders as
+  /// Markdown. Matched non-greedily so adjacent blocks don't merge; blocks don't
+  /// nest, so this is unambiguous. The END agent is a backreference to the START
+  /// agent (`\2`), so a block only bands when its sentinels pair — the canonical
+  /// backend shape always does; stray/pasted sentinel-looking text won't mis-band
+  /// (the backreference matches the captured name literally, so no regex
+  /// injection from agent names).
+  const FORWARD_BLOCK =
+    /(=== START forwarded from (.+?) ===)\n([\s\S]*?)\n(=== END forwarded from \2 ===)/g;
+
+  type ForwardSegment =
+    | { kind: "text"; text: string }
+    | { kind: "forward"; start: string; inner: string; end: string };
+
+  /// Split a forwarded message body into ordered segments — the user's typed text
+  /// (or a rendered prompt) as `text`, each forwarded block as `forward` — so the
+  /// transcript can give *only the forwarded portions* a style-only band, leaving
+  /// the user's own text plain. Text is kept verbatim (sentinels included); only
+  /// the blank-line separators between segments are trimmed for layout.
+  function splitForwardSegments(text: string): ForwardSegment[] {
+    const segments: ForwardSegment[] = [];
+    let last = 0;
+    for (const m of text.matchAll(FORWARD_BLOCK)) {
+      const idx = m.index ?? 0;
+      const between = text.slice(last, idx).replace(/^\n+|\n+$/g, "");
+      if (between !== "") segments.push({ kind: "text", text: between });
+      segments.push({ kind: "forward", start: m[1]!, inner: m[3]!, end: m[4]! });
+      last = idx + m[0].length;
+    }
+    const tail = text.slice(last).replace(/^\n+|\n+$/g, "");
+    if (tail !== "") segments.push({ kind: "text", text: tail });
+    return segments;
+  }
 
   /// Whether compact mode is on for the active project.
   const compactEnabled = $derived(stateFor(projectId).enabled);
@@ -1060,7 +1116,31 @@
 {/snippet}
 
 {#snippet userBody(row: Extract<UnifiedRow, { kind: "user" }>)}
-  <Markdown text={row.text} />
+  {#if FORWARD_SENTINEL.test(row.text)}
+    <!-- Forward: give each forwarded block (and only it) a style-only band so the
+         aggregated portion stands apart from the user's own typed text, which
+         stays plain. Text is verbatim — the `=== … ===` sentinels are kept. -->
+    {#each splitForwardSegments(row.text) as seg, i (i)}
+      {#if seg.kind === "forward"}
+        <!-- Border-only band: a neutral dark-gray left rule (the `muted` token —
+             not the harness-colored agent rules, not the accent green). Extra
+             `py` makes the rule extend past the text top/bottom, and `my` adds
+             separation between adjacent forwarded blocks. The `=== … ===`
+             sentinels render bold + monospace (verbatim, as plain text so the
+             `===` isn't parsed as Markdown); the content between renders as
+             Markdown. -->
+        <div class="border-muted my-3 border-l-2 pl-3" data-testid="forward-block">
+          <div class="font-mono text-xs font-bold">{seg.start}</div>
+          <Markdown text={seg.inner} />
+          <div class="font-mono text-xs font-bold">{seg.end}</div>
+        </div>
+      {:else}
+        <Markdown text={seg.text} />
+      {/if}
+    {/each}
+  {:else}
+    <Markdown text={row.text} />
+  {/if}
   {#if row.attachments.length > 0}
     {@render attachmentList(row.attachments)}
   {/if}
@@ -1073,7 +1153,18 @@
   <!-- A user message has nothing hidden behind a collapse — only height — so it
        gets a toggle only when its text actually overflows the clip. -->
   {@const showToggle = clipOverflow[key] ?? false}
-  <div class="group min-w-0 flex-1" data-testid="turn" data-role="user">
+  <!-- Forward treatment: only the forwarded *blocks* get a style-only band (see
+       `userBody`), so the user's own typed text isn't visually claimed as
+       forwarded; the body renders VERBATIM (sentinels intact). `data-forwarded`
+       (derived from the body's canonical sentinel, so durable across reload)
+       marks the turn for tests/hooks. The partial-empty caption names which
+       sources were included vs. skipped; it renders in the meta row (outside the
+       collapse clip) so it stays visible even while collapsed — and is live-only
+       (a skipped source leaves no trace in the body to rebuild it from). -->
+  {@const forwarded = FORWARD_SENTINEL.test(row.text)}
+  {@const caption =
+    row.send_id !== undefined ? forwardCaptionFor(projectId, row.send_id) : undefined}
+  <div class="group min-w-0 flex-1" data-testid="turn" data-role="user" data-forwarded={forwarded}>
     <div class="w-full max-w-full overflow-hidden rounded-xl bg-blue-100/20 px-4 py-2">
       <!-- Clip wraps the content inside the bubble (not the bubble itself). The
            clip + `measureClip` mount ONLY while compact (mirroring agent rows): on
@@ -1095,6 +1186,11 @@
       previewKey: showToggle ? key : undefined,
       previewDefaultCompact: defaultCompact,
     })}
+    {#if caption !== undefined}
+      <div class="text-muted mt-0.5 text-xs" data-testid="forward-caption">
+        ↪ forwarded from {caption.included.join(", ")} · {caption.skipped.join(", ")} had no output
+      </div>
+    {/if}
   </div>
 {/snippet}
 
@@ -1132,6 +1228,33 @@
     </div>
     <div class="border-l-[0.5px] pl-3" style:border-left-color={agentBorderColor(agentId)}>
       {@render queuedFooter(agentId, sendId, "turn-queued", "turn-live-control")}
+    </div>
+  </div>
+{/snippet}
+
+<!-- A held cross-agent forward: the user's typed body (verbatim, if any) plus a
+     "waiting for {sources}…" footer — distinct copy from a busy recipient's
+     "Queued…" — and a cancel control. Cancelling fires `cancel_forward`; the
+     compose bar's awaiting `forward_message` then resolves cancelled, removes
+     this entry, and restores the composer (text + source chips). -->
+{#snippet heldForwardRow(held: HeldForward, recipientsHere: string[])}
+  {@const sourceNames = held.sources.map((s) => s.name).join(", ")}
+  {@const recipientNames = recipientsHere.map((id) => agentName(id)).join(", ")}
+  <div class="group min-w-0 flex-1" data-testid="held-forward" data-forward-id={held.forwardId}>
+    {#if held.body.trim() !== ""}
+      <div
+        class="border-accent/60 w-full max-w-full overflow-hidden rounded-xl border-l-2 bg-blue-100/20 px-4 py-2"
+      >
+        <Markdown text={held.body} />
+      </div>
+    {/if}
+    <div class="text-muted mt-2 flex items-center gap-2 text-xs" data-testid="held-forward-waiting">
+      <span class="animate-pulse">↪ Forward to {recipientNames} — waiting for {sourceNames}…</span>
+      {@render liveTurnControl(
+        () => void cancelForward(held.forwardId),
+        `Cancel forward (waiting for ${sourceNames})`,
+        "held-forward-cancel",
+      )}
     </div>
   </div>
 {/snippet}
@@ -1425,6 +1548,15 @@
           </div>
         {/if}
       </div>
+    {/each}
+    <!-- Held cross-agent forwards: submitted but still waiting on their source
+         agents' turns to settle. Render at the bottom (newest pending action),
+         in the recipient's pane(s) only, distinct from a "Queued…" send — a held
+         forward issued no `send_message` yet, so it has no `pending_sends` entry;
+         it lives in the project-keyed `heldForwards` store (survives navigation,
+         lost on restart). -->
+    {#each heldForwardsHere as entry (entry.held.forwardId)}
+      {@render heldForwardRow(entry.held, entry.recipients)}
     {/each}
   </div>
 </div>

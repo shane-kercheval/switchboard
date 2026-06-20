@@ -122,7 +122,7 @@ Long-form keys: `type` (required), `description` (optional), `default` (optional
 
 `send` is **fire-and-forget**: it dispatches and returns immediately. To wait for the recipient(s) to finish, follow with `wait_for` or `wait_for_all`. (The exception is `pause_for_user` with `recipient` set, which bundles dispatch and wait — see below.)
 
-**When `to` is a list of agents**: dispatches are issued in declared order; agents run in parallel; the step returns once all dispatches have been issued (not when any has completed). Always follow with `wait_for_all` to synchronize before consuming their outputs. If any dispatch in the list fails (e.g., one agent is busy), Switchboard cancels any already-issued dispatches in the same step before marking the step `failed` — retry re-issues the whole list cleanly.
+**When `to` is a list of agents**: dispatches are issued in declared order; agents run in parallel; the step returns once all dispatches have been issued (not when any has completed). Always follow with `wait_for_all` to synchronize before consuming their outputs. If any dispatch in the list fails (e.g., one agent is busy), the remaining dispatches are not attempted and the step is marked `failed`, but dispatches already issued in the same step are **not** cancelled — they run to their natural terminal state and their output stays visible. Retry re-runs the whole step, re-issuing every dispatch.
 
 ### `wait_for` and `wait_for_all` — synchronization
 

@@ -272,7 +272,7 @@ Workflows are authored as YAML files at `<directory>/.switchboard/workflows/` (d
 
 Authoring is intentionally file-based. The user edits workflows in whichever editor they prefer (Vim, VS Code, etc.); Switchboard's UI reads the files but does not include an editor of its own. The supported authoring path for new users is to point an existing Claude Code, Codex, or Gemini agent at `docs/agent-instructions/workflows.md` and have it generate a starter workflow from a description (per §2 "Agent-friendly authoring"). Hand-authoring against the DSL spec works too for power users.
 
-v1 ships with a small library of built-in workflows (review-and-aggregate, sequential handoff with template) as starting points; users can copy or fork these to author their own.
+v1 ships with a small library of built-in workflows (review-and-aggregate — review in parallel, aggregate, hand to a primary; review-analyze-discuss — fan-in review, analyze, then a round-trip discussion back to the analyst) as starting points; users can copy or fork these to author their own.
 
 Users without an existing harness installation outside Switchboard can use a Switchboard-spawned agent itself to author a workflow from the instruction docs — agents Switchboard manages are full Claude Code / Codex / Gemini sessions and can read project files normally. Hand-authoring against the DSL spec also works for power users.
 
@@ -615,7 +615,7 @@ The user has a project `feature-event-logs` open in Switchboard. They have three
 
 All three are listed in the overview sidebar. The unified project transcript shows their conversation history so far in chronological order.
 
-The user has previously authored a workflow in `.switchboard/workflows/review-and-aggregate.yaml`. The review prompt ships as a built-in local prompt (`local:code-review`); the aggregation wrapper is one the user keeps in Tiddly (`tiddly:ai-review-feedback`). Both work because Switchboard resolves each ID against the named provider.
+The user has authored a workflow in `.switchboard/workflows/review-and-aggregate.yaml` — a variant of the built-in that takes a saved `aggregation_prompt` input (the shipped built-in wraps its aggregation step inline; this user wanted a swappable, cross-platform wrapper). The review prompt is the built-in `code-review`; the aggregation wrapper is one the user keeps in Tiddly (`tiddly:ai-review-feedback`). Both resolve because Switchboard routes each ID to its named provider — which is the point of the example.
 
 **Invocation:**
 

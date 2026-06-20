@@ -112,6 +112,19 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// `attempt 0` reads immediately; the rest are spaced `POLL_INTERVAL` apart.
 const FINAL_DRAIN_ATTEMPTS: u32 = 6;
 
+/// Value passed to `agy --print-timeout`. `agy`'s default is `5m`, and it is a
+/// whole-turn wall-clock cap (probe-confirmed) — not just an initial-response
+/// wait — so a long-but-actively-working turn (e.g. a PR review running a test
+/// suite) gets killed mid-flight with `Error: timed out waiting for response`.
+/// The dispatcher imposes no turn deadline and the other three harnesses have
+/// no built-in cap, so we override `agy`'s default with a generous value to
+/// match that posture. `0` is NOT a disable sentinel — it means zero-wait and
+/// times out immediately — so a large finite value is used; `24h` never cuts a
+/// real turn yet still eventually reaps a truly-wedged `agy` rather than leaking
+/// it. (An automatic backstop for a zero-progress wedge, if ever wanted, belongs
+/// in the dispatcher for every adapter, not as an Antigravity-only timer.)
+const PRINT_TIMEOUT: &str = "24h";
+
 /// Verify a binary name is on PATH, mapping a miss to `BinaryNotFound`.
 /// Used by [`AntigravityAdapter::probe`]; factored out so the negative-path
 /// test can pass a synthetic name.
@@ -325,6 +338,8 @@ fn build_args(prompt: &str, cwd: &Path, resume_id: Option<Uuid>, log_file: &Path
         args.push(uuid.to_string());
     }
     args.push("--dangerously-skip-permissions".to_owned());
+    args.push("--print-timeout".to_owned());
+    args.push(PRINT_TIMEOUT.to_owned());
     args.push("--log-file".to_owned());
     args.push(log_file.to_string_lossy().into_owned());
     args
@@ -1390,6 +1405,21 @@ mod tests {
         assert!(args.contains(&"--dangerously-skip-permissions".to_owned()));
         let idx = args.iter().position(|a| a == "--log-file").unwrap();
         assert_eq!(args[idx + 1], "/tmp/x.log");
+    }
+
+    #[test]
+    fn build_args_passes_generous_print_timeout() {
+        // agy's --print-timeout defaults to 5m and is a whole-turn wall-clock
+        // cap; we override it so long turns aren't cut while actively working.
+        let log = PathBuf::from("/tmp/x.log");
+        for resume in [None, Some(Uuid::new_v4())] {
+            let args = build_args("hello", Path::new("/work/proj"), resume, &log);
+            let idx = args
+                .iter()
+                .position(|a| a == "--print-timeout")
+                .expect("must pass --print-timeout");
+            assert_eq!(args[idx + 1], "24h");
+        }
     }
 
     #[test]

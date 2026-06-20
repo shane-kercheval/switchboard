@@ -1,7 +1,7 @@
 //! The read functions: path → [`RepoView`], plus per-worktree changed-files and
 //! diff text. All local, all `git2`, all synchronous.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use git2::{
@@ -138,11 +138,14 @@ pub enum BranchKind {
 /// Capped commit-summary ranges for one branch, read on demand (a revwalk, never
 /// a fetch — like every read here, it sees only what's already local).
 ///
-/// The ranges mirror the branch's relationship to its upstream:
-/// - **Local, diverged-or-ahead/behind**: `unpushed` (local not in upstream)
-///   and/or `incoming` (upstream not in local) — whichever sides are non-empty.
-/// - **Local, in sync or no upstream**, and **any remote branch**: `recent`
-///   commits walked back from the tip.
+/// The local branch's history is one `recent` range (walked back from the tip),
+/// with each commit carrying a per-commit `unpushed` flag for commits the
+/// upstream doesn't have yet — unpushed commits can be interleaved with pushed
+/// ones (e.g. after merging the default branch), so they're marked in place
+/// rather than split into a contiguous section. When the upstream additionally
+/// has commits the local branch lacks, an `incoming` range is appended (those
+/// aren't in the local history, so they stay a separate set). A branch with no
+/// upstream, and any remote branch, yields just `recent` with no unpushed flags.
 ///
 /// A ref that no longer resolves (deleted between listing and click) or an empty
 /// branch yields an empty `Vec` rather than an error — the same "absent is not a
@@ -979,59 +982,107 @@ fn build_commit_ranges(
     default_tip: Option<Oid>,
     selected_default_branch: bool,
 ) -> std::result::Result<Vec<GitCommitRange>, git2::Error> {
+    let no_ahead = HashSet::new();
     let Some(upstream) = upstream else {
-        // No upstream (local-only branch, or a remote ref): recent history.
+        // No upstream (local-only branch, or a remote ref): recent history,
+        // nothing to mark as unpushed.
+        let annotation = CommitAnnotation {
+            default_tip,
+            selected_default_branch,
+            ahead: &no_ahead,
+        };
         return Ok(vec![commit_range(
             repo,
             CommitRangeKind::Recent,
             "Recent commits",
             tip,
             None,
-            default_tip,
-            selected_default_branch,
+            &annotation,
         )?]);
     };
 
-    let (ahead, behind) = repo.graph_ahead_behind(tip, upstream).unwrap_or((0, 0));
-    // In sync: no unpushed/incoming split to make — show recent history.
-    if ahead == 0 && behind == 0 {
-        return Ok(vec![commit_range(
-            repo,
-            CommitRangeKind::Recent,
-            "Recent commits",
-            tip,
-            None,
-            default_tip,
-            selected_default_branch,
-        )?]);
-    }
+    // Unpushed commits are flagged per-commit inside the single local-history
+    // list rather than split into their own section: a merge of the default
+    // branch can leave unpushed commits interleaved with already-pushed ones
+    // (by date), so a contiguous "unpushed" range can't represent them. The
+    // ahead set is the local commits the upstream doesn't have yet.
+    let ahead = collect_ahead(repo, tip, upstream);
+    let local = CommitAnnotation {
+        default_tip,
+        selected_default_branch,
+        ahead: &ahead,
+    };
+    let mut ranges = vec![commit_range(
+        repo,
+        CommitRangeKind::Recent,
+        "Recent commits",
+        tip,
+        None,
+        &local,
+    )?];
 
-    let mut ranges = Vec::new();
-    if ahead > 0 {
-        // Commits reachable from the local tip but not the upstream.
-        ranges.push(commit_range(
-            repo,
-            CommitRangeKind::Unpushed,
-            "Unpushed commits",
-            tip,
-            Some(upstream),
+    if has_incoming(repo, upstream, tip) {
+        // Upstream commits the local branch lacks — a genuinely separate set
+        // (not in the local history), so it stays its own section and carries no
+        // unpushed flags (these commits are on the remote, not local).
+        let incoming = CommitAnnotation {
             default_tip,
             selected_default_branch,
-        )?);
-    }
-    if behind > 0 {
-        // Commits reachable from the upstream but not the local tip.
+            ahead: &no_ahead,
+        };
         ranges.push(commit_range(
             repo,
             CommitRangeKind::Incoming,
             "Incoming commits",
             upstream,
             Some(tip),
-            default_tip,
-            selected_default_branch,
+            &incoming,
         )?);
     }
     Ok(ranges)
+}
+
+/// OIDs reachable from `tip` but not from `upstream` — the local commits that
+/// haven't been pushed. Used to flag commits within the local-history list.
+///
+/// Best-effort, matching this module's "absent is not an error" stance: a failed
+/// revwalk setup yields an empty set and `flatten()` drops any commit that fails
+/// to resolve mid-walk. The cost of a missed OID is a single commit rendering
+/// without its "not pushed" dot — a degraded indicator, never a failed read.
+fn collect_ahead(repo: &Repository, tip: Oid, upstream: Oid) -> HashSet<Oid> {
+    let mut set = HashSet::new();
+    let Ok(mut walk) = repo.revwalk() else {
+        return set;
+    };
+    if walk.push(tip).is_err() || walk.hide(upstream).is_err() {
+        return set;
+    }
+    for oid in walk.flatten() {
+        set.insert(oid);
+    }
+    set
+}
+
+/// Whether `upstream` has any commit the local `tip` lacks (incoming/"not
+/// pulled"). Short-circuits on the first such commit. Degrades to `false` on a
+/// revwalk-setup failure, the same best-effort stance as [`collect_ahead`].
+fn has_incoming(repo: &Repository, upstream: Oid, tip: Oid) -> bool {
+    let Ok(mut walk) = repo.revwalk() else {
+        return false;
+    };
+    if walk.push(upstream).is_err() || walk.hide(tip).is_err() {
+        return false;
+    }
+    walk.flatten().next().is_some()
+}
+
+/// Per-commit annotation inputs shared across a range walk: the default-branch
+/// tip and whether the default branch is selected (drive `branch_work`), plus
+/// the ahead set — local OIDs not on the upstream (drives `unpushed`).
+struct CommitAnnotation<'a> {
+    default_tip: Option<Oid>,
+    selected_default_branch: bool,
+    ahead: &'a HashSet<Oid>,
 }
 
 /// One range: walk from `push`, optionally hiding everything reachable from
@@ -1042,11 +1093,9 @@ fn commit_range(
     label: &str,
     push: Oid,
     hide: Option<Oid>,
-    default_tip: Option<Oid>,
-    selected_default_branch: bool,
+    annotation: &CommitAnnotation<'_>,
 ) -> std::result::Result<GitCommitRange, git2::Error> {
-    let (commits, truncated) =
-        walk_commits(repo, push, hide, default_tip, selected_default_branch)?;
+    let (commits, truncated) = walk_commits(repo, push, hide, annotation)?;
     Ok(GitCommitRange {
         kind,
         label: label.to_owned(),
@@ -1062,8 +1111,7 @@ fn walk_commits(
     repo: &Repository,
     push: Oid,
     hide: Option<Oid>,
-    default_tip: Option<Oid>,
-    selected_default_branch: bool,
+    annotation: &CommitAnnotation<'_>,
 ) -> std::result::Result<(Vec<GitCommitSummary>, bool), git2::Error> {
     let mut walk = repo.revwalk()?;
     // Topological (child before parent) with time as the tiebreak. Commit times
@@ -1084,12 +1132,7 @@ fn walk_commits(
             break;
         }
         let commit = repo.find_commit(oid?)?;
-        commits.push(commit_summary(
-            repo,
-            &commit,
-            default_tip,
-            selected_default_branch,
-        ));
+        commits.push(commit_summary(repo, &commit, annotation));
     }
     Ok((commits, truncated))
 }
@@ -1097,8 +1140,7 @@ fn walk_commits(
 fn commit_summary(
     repo: &Repository,
     commit: &git2::Commit<'_>,
-    default_tip: Option<Oid>,
-    selected_default_branch: bool,
+    annotation: &CommitAnnotation<'_>,
 ) -> GitCommitSummary {
     let author = commit.author();
     GitCommitSummary {
@@ -1113,7 +1155,9 @@ fn commit_summary(
         author_name: author.name().ok().map(str::to_owned),
         author_email: author.email().ok().map(str::to_owned),
         authored_at: format_commit_time(author.when()),
-        branch_work: !selected_default_branch && is_branch_work(repo, commit, default_tip),
+        branch_work: !annotation.selected_default_branch
+            && is_branch_work(repo, commit, annotation.default_tip),
+        unpushed: annotation.ahead.contains(&commit.id()),
     }
 }
 

@@ -55,6 +55,7 @@
     loadStatus = "complete",
     loadError,
     onRetryLoad,
+    runWithBusy = (action: () => void) => action(),
   }: {
     projectId: ProjectId;
     agents: AgentRecord[];
@@ -62,6 +63,10 @@
     loadStatus?: "pending" | "loading" | "complete" | "failed";
     loadError?: string;
     onRetryLoad?: () => void;
+    /// Run a layout change that remounts/re-lays-out the transcript behind the
+    /// host's busy spinner. Supplied by `App` (the overlay lives there);
+    /// defaults to running immediately so standalone/test mounts stay synchronous.
+    runWithBusy?: (action: () => void) => void;
   } = $props();
 
   const rosterIds = $derived(agents.map((a) => a.id));
@@ -121,6 +126,29 @@
   function targetPane(pane: TranscriptPane): void {
     if (pane.members.length === 0) return;
     targetRecipients(projectId, [...pane.members]);
+  }
+
+  /// Minimize/maximize remount or re-lay-out the transcript in one synchronous
+  /// flush, so run them behind the host's busy spinner. Project + roster are
+  /// captured up front because the spinner defers the mutation a couple of frames.
+  function minimizePaneBusy(pane: TranscriptPane): void {
+    const pid = projectId;
+    const ids = [...rosterIds];
+    runWithBusy(() => minimizePane(pid, ids, pane.id));
+  }
+
+  function toggleMaximizePaneBusy(pane: TranscriptPane): void {
+    const pid = projectId;
+    const ids = [...rosterIds];
+    const wasMaximized = maximizedPane?.id === pane.id;
+    runWithBusy(() => {
+      if (wasMaximized) {
+        restoreMaximizedPane(pid, ids);
+      } else {
+        maximizePane(pid, ids, pane.id);
+        if (pane.members.length > 0) targetRecipients(pid, [...pane.members]);
+      }
+    });
   }
 
   /// Close a pane: a deliberate "I'm done with these agents for now". The pane's
@@ -505,7 +533,7 @@
                       data-testid="pane-minimize"
                       onclick={(event) => {
                         event.stopPropagation();
-                        minimizePane(projectId, rosterIds, pane.id);
+                        minimizePaneBusy(pane);
                       }}
                     >
                       <Minimize2 size={12} strokeWidth={1.8} aria-hidden="true" />
@@ -528,12 +556,7 @@
                       data-testid="pane-maximize"
                       onclick={(event) => {
                         event.stopPropagation();
-                        if (maximizedPane?.id === pane.id) {
-                          restoreMaximizedPane(projectId, rosterIds);
-                        } else {
-                          maximizePane(projectId, rosterIds, pane.id);
-                          targetPane(pane);
-                        }
+                        toggleMaximizePaneBusy(pane);
                       }}
                     >
                       {#if maximizedPane?.id === pane.id}

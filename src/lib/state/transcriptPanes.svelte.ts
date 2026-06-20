@@ -582,6 +582,18 @@ export function restoreMaximizedPane(projectId: ProjectId, rosterIds: AgentId[])
   }));
 }
 
+/// Expand every pane back into the row — clears BOTH the maximized pane and all
+/// minimized panes. The "Restore all" affordance; unlike `restoreMaximizedPane`
+/// (which only un-maximizes), this also brings back minimized panes. May overflow
+/// a narrow row — the accepted fit tradeoff (CSS min-width + clipping handles it).
+export function expandAllPanes(projectId: ProjectId, rosterIds: AgentId[]): void {
+  update(projectId, rosterIds, (layout) => ({
+    ...layout,
+    minimized: [],
+    maximized: null,
+  }));
+}
+
 export function renamePane(
   projectId: ProjectId,
   rosterIds: AgentId[],

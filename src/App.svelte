@@ -33,9 +33,9 @@
   } from "$lib/state/transcriptPreview.svelte";
   import {
     createEmptyPane,
+    expandAllPanes,
     layoutFor,
     paneToCycleTo,
-    restoreMaximizedPane,
     revealPane,
     type TranscriptPane,
   } from "$lib/state/transcriptPanes.svelte";
@@ -552,8 +552,28 @@
     const rosterIds = activeAgents.map((a) => a.id);
     const pane = paneToCycleTo(projectId, rosterIds, selectionFor(projectId), direction);
     if (pane === null) return;
-    if (targetRecipients(projectId, [...pane.members])) {
-      revealPane(projectId, rosterIds, pane.id);
+    const reveal = (): void => {
+      if (targetRecipients(projectId, [...pane.members])) {
+        revealPane(projectId, rosterIds, pane.id);
+      }
+    };
+    // Cycling onto a hidden pane (minimized, or any pane while another is
+    // maximized) remounts its transcript, so show the spinner first — exactly
+    // like clicking a header tab. An already-visible target just re-targets, so
+    // it runs immediately with no spurious spinner.
+    const layout = activePaneLayout;
+    const targetHidden =
+      layout !== null &&
+      (layout.maximized !== null
+        ? layout.maximized !== pane.id
+        : layout.minimized.includes(pane.id));
+    if (targetHidden) {
+      void withTranscriptBusy(() => {
+        if (selection.activeProjectId !== projectId) return;
+        reveal();
+      });
+    } else {
+      reveal();
     }
   }
 
@@ -563,8 +583,15 @@
   }
 
   function restoreAllPanes(): void {
-    if (selection.activeProjectId === null) return;
-    restoreMaximizedPane(selection.activeProjectId, activeRosterIds);
+    const projectId = selection.activeProjectId;
+    if (projectId === null) return;
+    const rosterIds = [...activeRosterIds];
+    // Restoring remounts every previously-minimized/maximized pane in one flush
+    // — show the spinner first, like the other pane-layout gestures.
+    void withTranscriptBusy(() => {
+      if (selection.activeProjectId !== projectId) return;
+      expandAllPanes(projectId, rosterIds);
+    });
   }
 
   /// Expand/collapse-all over a long conversation re-renders every block in
@@ -926,7 +953,10 @@
                 </button>
               {/each}
             </div>
-            {#if activeMaximizedPane !== null && headerTabPanes.length > 1}
+            <!-- Shown whenever more than one pane is hidden — minimized into the
+                 tab strip, or hidden behind a maximized pane. `headerTabPanes`
+                 already captures both cases. -->
+            {#if headerTabPanes.length > 1}
               <button
                 type="button"
                 class="text-muted hover:text-fg hover:bg-border/60 inline-flex h-6.5 shrink-0 items-center rounded-full px-2 text-xs"
@@ -1164,6 +1194,7 @@
                 overlay={activeConvo?.items ?? []}
                 loadStatus={activeConvo?.status ?? "complete"}
                 loadError={activeConvo?.error}
+                runWithBusy={withTranscriptBusy}
                 onRetryLoad={() => {
                   if (selection.activeProjectId !== null)
                     void retryProjectHydration(selection.activeProjectId);

@@ -289,6 +289,11 @@ pub struct GitCommitSummary {
     /// selected ref, not reachable from the repo's resolved default branch tip,
     /// and not a merge commit that only integrates default-branch history.
     pub branch_work: bool,
+    /// True when this commit is in the local branch but not yet on its upstream
+    /// ("not pushed"). Orthogonal to `branch_work`: a merged-in default-branch
+    /// commit can be `unpushed` without being branch work. Always `false` for a
+    /// branch with no upstream and for incoming (upstream-only) commits.
+    pub unpushed: bool,
 }
 
 /// Which slice of history a [`GitCommitRange`] holds. Serializes to a bare
@@ -296,18 +301,19 @@ pub struct GitCommitSummary {
 /// on the wire — not a tagged object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum CommitRangeKind {
-    /// Most recent commits on the ref (in-sync, local-only, or remote-only).
+    /// The local branch's recent history (in-sync, local-only, ahead, or the
+    /// shared+local list when diverged). Per-commit `unpushed` flags distinguish
+    /// not-yet-pushed commits within this list.
     Recent,
-    /// Local commits the upstream doesn't have yet ("not pushed").
-    Unpushed,
     /// Upstream commits the local branch doesn't have yet ("not pulled").
     Incoming,
 }
 
-/// A capped, labelled slice of a branch's history. A branch yields one range
-/// (recent) when in sync / local-only / remote-only, and up to two
-/// (unpushed + incoming) when it diverges from its upstream.
+/// A capped, labelled slice of a branch's history. A branch yields the `Recent`
+/// local history (with per-commit `unpushed` flags), plus an `Incoming` range
+/// when the upstream has commits the local branch lacks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GitCommitRange {
     pub kind: CommitRangeKind,

@@ -34,11 +34,12 @@
   import {
     createEmptyPane,
     layoutFor,
+    paneToCycleTo,
     restoreMaximizedPane,
     revealPane,
     type TranscriptPane,
   } from "$lib/state/transcriptPanes.svelte";
-  import { targetRecipients } from "$lib/state/recipientSelection.svelte";
+  import { selectionFor, targetRecipients } from "$lib/state/recipientSelection.svelte";
   import DevIndicator from "$lib/components/ui/DevIndicator.svelte";
   import { installDevTranscriptSeed } from "$lib/dev/seedTranscript";
   import { windowDragRegion } from "$lib/windowDrag";
@@ -107,6 +108,8 @@
   let commandError = $state<string | null>(null);
   let projectViewResumePending = $state<boolean>(false);
   let projectViewResumeSeq = 0;
+  let gitViewResumePending = $state<boolean>(false);
+  let gitViewResumeSeq = 0;
 
   function isComposerShortcutTarget(target: EventTarget | null): boolean {
     return (
@@ -167,6 +170,16 @@
           revealPane(selection.activeProjectId, rosterIds, pane.id);
         }
       }
+      return;
+    }
+
+    if (event.shiftKey && (event.code === "BracketLeft" || event.code === "BracketRight")) {
+      // ⌘⇧[ / ⌘⇧] cycle the targeted pane by position (left/right, wrapping),
+      // like switching browser/terminal tabs. `event.code`, not `event.key` —
+      // Shift+bracket produces "{"/"}" in `key`.
+      if (selection.activeProjectId === null || settingsOpen || view.mode === "git") return;
+      event.preventDefault();
+      cyclePane(event.code === "BracketRight" ? 1 : -1);
       return;
     }
 
@@ -287,8 +300,14 @@
     settingsOpen = false;
     if (mode === "git") {
       projectViewResumePending = false;
+      // Entering Git renders the full repos→branches tree in one synchronous
+      // flush, which blocks the paint after the toggle (the old view appears to
+      // hang). Show a spinner shell for one paint first, mirroring the project
+      // side below, so the switch is felt immediately.
+      if (view.mode !== "git") showGitViewLoadingForNextPaint();
       void enterGitView();
     } else {
+      gitViewResumePending = false;
       if (view.mode === "git" && selection.activeProjectId !== null) {
         showProjectViewLoadingForNextPaint();
       }
@@ -301,6 +320,19 @@
     projectViewResumePending = true;
     const clear = (): void => {
       if (seq === projectViewResumeSeq) projectViewResumePending = false;
+    };
+    if (typeof requestAnimationFrame !== "function") {
+      setTimeout(clear, 0);
+      return;
+    }
+    requestAnimationFrame(() => setTimeout(clear, 0));
+  }
+
+  function showGitViewLoadingForNextPaint(): void {
+    const seq = ++gitViewResumeSeq;
+    gitViewResumePending = true;
+    const clear = (): void => {
+      if (seq === gitViewResumeSeq) gitViewResumePending = false;
     };
     if (typeof requestAnimationFrame !== "function") {
       setTimeout(clear, 0);
@@ -483,14 +515,45 @@
   }
 
   function selectHeaderPane(pane: TranscriptPane): void {
-    if (selection.activeProjectId === null) return;
-    const key = paneTabKey(selection.activeProjectId, pane.id);
+    const projectId = selection.activeProjectId;
+    if (projectId === null) return;
+    const key = paneTabKey(projectId, pane.id);
     delete paneTabCompleted[key];
     paneTabWasActive = paneTabWasActive.filter((id) => id !== key);
     const wasMaximized = activePaneLayout?.maximized !== null;
-    revealPane(selection.activeProjectId, activeRosterIds, pane.id);
-    if (wasMaximized && pane.members.length > 0) {
-      targetRecipients(selection.activeProjectId, [...pane.members]);
+    // Capture the roster alongside `projectId`: the reveal is deferred two
+    // animation frames (below), and `activeRosterIds` is a live derivation, so
+    // reading it inside the closure would pair the old project with whatever
+    // roster is active when the frames land. `reconcileLayout` prunes pane
+    // membership against the roster it's handed and persists, so a stale read
+    // would corrupt the original project's saved layout.
+    const rosterIds = [...activeRosterIds];
+    // Revealing a pane remounts its `UnifiedTranscript` (and re-derives every
+    // render block) in one synchronous flush — perceptible lag with no feedback
+    // on a long transcript. Reuse the transcript-busy overlay so the switch
+    // shows a spinner first, then runs the remount once it has painted.
+    void withTranscriptBusy(() => {
+      // The user navigated away before the deferred reveal ran — drop it rather
+      // than mutate a project's layout they're no longer looking at.
+      if (selection.activeProjectId !== projectId) return;
+      revealPane(projectId, rosterIds, pane.id);
+      if (wasMaximized && pane.members.length > 0) {
+        targetRecipients(projectId, [...pane.members]);
+      }
+    });
+  }
+
+  /// Cycle the targeted pane by position (⌘⇧[ = -1, ⌘⇧] = +1). Reuses the
+  /// ⌘⌥N reveal-on-target path so a maximized pane re-maximizes, a hidden one is
+  /// restored, and a refused target (prompt-render lock) changes nothing.
+  function cyclePane(direction: 1 | -1): void {
+    const projectId = selection.activeProjectId;
+    if (projectId === null || settingsOpen || view.mode === "git") return;
+    const rosterIds = activeAgents.map((a) => a.id);
+    const pane = paneToCycleTo(projectId, rosterIds, selectionFor(projectId), direction);
+    if (pane === null) return;
+    if (targetRecipients(projectId, [...pane.members])) {
+      revealPane(projectId, rosterIds, pane.id);
     }
   }
 
@@ -562,13 +625,7 @@
             submission.model,
             submission.effort,
           )
-        : await api.attachAgent(
-            submission.name,
-            submission.harness,
-            submission.existingSessionId,
-            submission.model,
-            submission.effort,
-          );
+        : await api.attachAgent(submission.name, submission.harness, submission.existingSessionId);
     await registerAgent(agent);
     addAgentToActiveProject(agent);
     if (submission.mode === "attach") {
@@ -831,39 +888,44 @@
         {/if}
 
         {#if showPaneHeaderControls}
-          <div class="flex min-w-0 shrink items-center gap-1 overflow-hidden" data-tauri-no-drag>
-            {#each headerTabPanes as pane (pane.id)}
-              {@const active = paneIsActive(pane)}
-              {@const completed = paneTabIsCompleted(pane)}
-              <button
-                type="button"
-                class="border-border bg-panel text-fg hover:bg-raised inline-flex h-6.5 max-w-36 min-w-0 shrink items-center gap-1.5 rounded-full border px-2 text-xs"
-                data-testid="app-pane-minimized-tab"
-                data-pane-id={pane.id}
-                onclick={() => selectHeaderPane(pane)}
-              >
-                {#if active}
-                  <span
-                    class="inline-flex shrink-0 items-center justify-center"
-                    role="status"
-                    aria-label={`${pane.name} has running agents`}
-                    data-testid="app-pane-tab-activity"
-                  >
-                    <Spinner class="h-3.5 w-3.5" />
-                  </span>
-                {:else if completed}
-                  <span
-                    class="text-accent inline-flex shrink-0 items-center justify-center"
-                    role="status"
-                    aria-label={`${pane.name} activity ended`}
-                    data-testid="app-pane-tab-completed"
-                  >
-                    <CircleCheck size={14} strokeWidth={1.8} aria-hidden="true" />
-                  </span>
-                {/if}
-                <span class="truncate font-medium">{pane.name}</span>
-              </button>
-            {/each}
+          <div class="flex min-w-0 shrink items-center gap-1" data-tauri-no-drag>
+            <div
+              class="flex min-w-0 shrink items-center gap-1 overflow-hidden"
+              data-testid="app-pane-tab-strip"
+            >
+              {#each headerTabPanes as pane (pane.id)}
+                {@const active = paneIsActive(pane)}
+                {@const completed = paneTabIsCompleted(pane)}
+                <button
+                  type="button"
+                  class="border-border bg-panel text-fg hover:bg-raised inline-flex h-6.5 max-w-36 min-w-0 shrink items-center gap-1.5 rounded-full border px-2 text-xs"
+                  data-testid="app-pane-minimized-tab"
+                  data-pane-id={pane.id}
+                  onclick={() => selectHeaderPane(pane)}
+                >
+                  {#if active}
+                    <span
+                      class="inline-flex shrink-0 items-center justify-center"
+                      role="status"
+                      aria-label={`${pane.name} has running agents`}
+                      data-testid="app-pane-tab-activity"
+                    >
+                      <Spinner class="h-3.5 w-3.5" />
+                    </span>
+                  {:else if completed}
+                    <span
+                      class="text-accent inline-flex shrink-0 items-center justify-center"
+                      role="status"
+                      aria-label={`${pane.name} activity ended`}
+                      data-testid="app-pane-tab-completed"
+                    >
+                      <CircleCheck size={14} strokeWidth={1.8} aria-hidden="true" />
+                    </span>
+                  {/if}
+                  <span class="truncate font-medium">{pane.name}</span>
+                </button>
+              {/each}
+            </div>
             {#if activeMaximizedPane !== null && headerTabPanes.length > 1}
               <button
                 type="button"
@@ -885,6 +947,25 @@
                   onclick={addEmptyPane}
                 >
                   <Plus size={ICON_SIZE} aria-hidden="true" />
+                </button>
+              {/snippet}
+            </Tooltip>
+            <Tooltip label={compactLabel} side="bottom">
+              {#snippet trigger(props)}
+                <button
+                  {...props}
+                  type="button"
+                  onclick={toggleCompactTranscript}
+                  aria-label={compactLabel}
+                  data-testid="transcript-compact-toggle"
+                  data-tauri-no-drag
+                  class={cn(ICON_BUTTON_CLASS, "hover:bg-panel shrink-0")}
+                >
+                  {#if compactEnabled}
+                    <ChevronsUpDown size={ICON_SIZE} aria-hidden="true" />
+                  {:else}
+                    <ChevronsDownUp size={ICON_SIZE} aria-hidden="true" />
+                  {/if}
                 </button>
               {/snippet}
             </Tooltip>
@@ -937,25 +1018,6 @@
           class="hover:bg-panel"
         />
         {#if showAgentsToggle}
-          <Tooltip label={compactLabel} side="bottom">
-            {#snippet trigger(props)}
-              <button
-                {...props}
-                type="button"
-                onclick={toggleCompactTranscript}
-                aria-label={compactLabel}
-                data-testid="transcript-compact-toggle"
-                data-tauri-no-drag
-                class={cn(ICON_BUTTON_CLASS, "hover:bg-panel")}
-              >
-                {#if compactEnabled}
-                  <ChevronsUpDown size={ICON_SIZE} aria-hidden="true" />
-                {:else}
-                  <ChevronsDownUp size={ICON_SIZE} aria-hidden="true" />
-                {/if}
-              </button>
-            {/snippet}
-          </Tooltip>
           <SidebarToggleButton
             side="right"
             expanded={agentsSidebarOpen}
@@ -993,7 +1055,13 @@
         {#if settingsOpen}
           <SettingsView onClose={closeSettings} />
         {:else if view.mode === "git"}
-          <GitView />
+          {#if gitViewResumePending}
+            <div class="flex min-h-0 flex-1 flex-col overflow-hidden">
+              <EmptyState testid="git-view-loading" title="Loading repositories…" spinner />
+            </div>
+          {:else}
+            <GitView />
+          {/if}
         {:else if selection.activeProjectId === null}
           <!-- Every no-project state shows the same orientation surface
                (what Switchboard is, the project/agent explainer, the CTAs, and

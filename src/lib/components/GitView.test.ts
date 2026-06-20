@@ -14,9 +14,10 @@ vi.mock("@tauri-apps/api/path", () => ({
 }));
 
 const pickDirectoryMock = vi.fn<() => Promise<string | null>>(async () => null);
+const copyTextMock = vi.fn(async (_text: string): Promise<void> => undefined);
 vi.mock("$lib/native", () => ({
   pickDirectory: () => pickDirectoryMock(),
-  copyText: vi.fn(async () => {}),
+  copyText: (text: string) => copyTextMock(text),
 }));
 
 const { refreshAll, fetchStates, _testing } = await import("$lib/state/gitView.svelte");
@@ -41,6 +42,8 @@ afterEach(() => {
   invokeMock.mockReset();
   pickDirectoryMock.mockReset();
   pickDirectoryMock.mockResolvedValue(null);
+  copyTextMock.mockReset();
+  copyTextMock.mockResolvedValue(undefined);
 });
 
 const repo = (over: Partial<RepoListing["repo"]> = {}): RepoListing => ({
@@ -137,12 +140,38 @@ describe("GitView", () => {
     expect(screen.queryByTestId("repo-fetch-failed")).not.toBeInTheDocument();
     expect(screen.queryByTestId("repo-actions-trigger")).not.toBeInTheDocument();
     expect(screen.getByTestId("repo-action-reveal")).toBeInTheDocument();
+    expect(screen.getByTestId("repo-action-editor")).toBeInTheDocument();
     expect(screen.getByTestId("repo-action-copy-path")).toBeInTheDocument();
     expect(screen.getByTestId("repo-action-remove")).toBeInTheDocument();
     expect(screen.getByTestId("repo-refresh")).not.toHaveAttribute("tabindex", "-1");
     expect(screen.getByTestId("repo-action-remove")).not.toHaveAttribute("tabindex", "-1");
     screen.getByTestId("repo-action-remove").focus();
     expect(screen.getByTestId("repo-action-remove")).toHaveFocus();
+  });
+
+  it("repo header actions show async success feedback", async () => {
+    wire([repo()]);
+    await refreshAll();
+    render(GitView);
+    await waitFor(() => expect(screen.getByTestId("git-repo")).toBeInTheDocument());
+
+    await fireEvent.click(screen.getByTestId("repo-action-editor"));
+    expect(invokeMock).toHaveBeenCalledWith("open_in_editor", { path: "/repos/app" });
+    await waitFor(() =>
+      expect(screen.getByTestId("repo-action-editor")).toHaveAttribute("data-state", "done"),
+    );
+
+    await fireEvent.click(screen.getByTestId("repo-action-reveal"));
+    expect(invokeMock).toHaveBeenCalledWith("reveal_in_finder", { path: "/repos/app" });
+    await waitFor(() =>
+      expect(screen.getByTestId("repo-action-reveal")).toHaveAttribute("data-state", "done"),
+    );
+
+    await fireEvent.click(screen.getByTestId("repo-action-copy-path"));
+    expect(copyTextMock).toHaveBeenCalledWith("/repos/app");
+    await waitFor(() =>
+      expect(screen.getByTestId("repo-action-copy-path")).toHaveAttribute("data-state", "done"),
+    );
   });
 
   it("contributes git commands to the palette while mounted and clears them on unmount", async () => {

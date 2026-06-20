@@ -60,7 +60,7 @@ test("the toggle stays left of the cluster and the model truncates when room run
   // with an ellipsis rather than overflow or wrap endlessly.
   await registerAgent(ALICE);
   seedTurns(ALICE.id, [
-    // Earlier (non-last-block → clipped → owns a toggle) response, with the model.
+    // Earlier (non-latest → clipped → owns a toggle) response, with the model.
     agentTurn({
       id: "agent-early",
       agentId: ALICE.id,
@@ -68,7 +68,7 @@ test("the toggle stays left of the cluster and the model truncates when room run
       items: [textItem(longText())],
       model: LONG_MODEL,
     }),
-    // A later response so the early one is NOT the last block.
+    // A later response so the early one is NOT the latest response.
     agentTurn({
       id: "agent-late",
       agentId: ALICE.id,

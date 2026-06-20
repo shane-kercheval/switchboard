@@ -7,10 +7,15 @@ import { page } from "vitest/browser";
 // suite.
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(async (cmd: string) => {
-    if (cmd === "changed_files") return [{ path: "src/code.ts", change: "modified" }];
+    if (cmd === "changed_files")
+      return [{ path: "src/components/really-long-file-name-for-actions.ts", change: "modified" }];
     return null;
   }),
   convertFileSrc: (p: string) => p,
+}));
+
+vi.mock("$lib/native", () => ({
+  copyText: vi.fn(async () => undefined),
 }));
 
 import { mountDiffPanel } from "./mount";
@@ -49,6 +54,36 @@ test("a changed-file row's click target fills the full row height", async () => 
       const r = row.getBoundingClientRect();
       // The button covers the row top-to-bottom — no dead padding band above or below.
       return b.top - r.top <= 0.5 && r.bottom - b.bottom <= 0.5;
+    })
+    .toBe(true);
+});
+
+test("changed-file actions do not reserve row text width until hover", async () => {
+  mountDiffPanel({ target: TARGET });
+
+  const button = page.getByTestId("changed-file");
+  await expect.element(button).toBeInTheDocument();
+
+  await expect
+    .poll(() => {
+      const el = page.getByTestId("changed-file").element() as HTMLElement;
+      const row = el.parentElement as HTMLElement;
+      const b = el.getBoundingClientRect();
+      const r = row.getBoundingClientRect();
+      return Math.abs(b.width - r.width) <= 1;
+    })
+    .toBe(true);
+
+  await button.hover();
+
+  await expect
+    .poll(() => {
+      const el = page.getByTestId("changed-file").element() as HTMLElement;
+      const action = page.getByTestId("changed-file-copy-path").element() as HTMLElement;
+      const b = el.getBoundingClientRect();
+      const a = action.getBoundingClientRect();
+      const padding = Number.parseFloat(getComputedStyle(el).paddingRight);
+      return padding >= 80 && b.right >= a.right;
     })
     .toBe(true);
 });

@@ -22,6 +22,8 @@ describe("CopyButton", () => {
 
     expect(copyTextMock).toHaveBeenCalledWith("hello world");
     await waitFor(() => expect(button).toHaveAttribute("data-copied", "true"));
+    expect(button).toHaveClass("bg-accent-soft");
+    expect(button).toHaveClass("text-accent");
   });
 
   it("does not confirm when the clipboard write fails", async () => {

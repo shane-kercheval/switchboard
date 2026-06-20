@@ -21,6 +21,7 @@
   import GitStatusIcon from "$lib/components/GitStatusIcon.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
+  import AsyncIconButton from "$lib/components/ui/AsyncIconButton.svelte";
   import DropdownMenu from "$lib/components/ui/DropdownMenu.svelte";
   import DropdownMenuItem from "$lib/components/ui/DropdownMenuItem.svelte";
   import { ICON_BUTTON_CLASS } from "$lib/components/ui/iconButton";
@@ -143,6 +144,11 @@
       actionError = e instanceof Error ? e.message : String(e);
       console.error("[switchboard] git view open action failed", e);
     });
+  }
+
+  function onHeaderActionError(error: unknown): void {
+    actionError = error instanceof Error ? error.message : String(error);
+    console.error("[switchboard] git view open action failed", error);
   }
 
   async function openLinkedProject(project: LinkedProject): Promise<void> {
@@ -286,8 +292,8 @@
         class={cn(
           "flex shrink-0 items-center gap-0.5 overflow-hidden transition-[max-width,opacity]",
           busy
-            ? "pointer-events-auto max-w-[112px] opacity-100"
-            : "pointer-events-none max-w-0 opacity-0 group-focus-within:pointer-events-auto group-focus-within:max-w-[112px] group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:max-w-[112px] group-hover:opacity-100",
+            ? "pointer-events-auto max-w-[140px] opacity-100"
+            : "pointer-events-none max-w-0 opacity-0 group-focus-within:pointer-events-auto group-focus-within:max-w-[140px] group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:max-w-[140px] group-hover:opacity-100",
         )}
       >
         <button
@@ -318,31 +324,57 @@
 
         <Tooltip label="Reveal in Finder" side="top">
           {#snippet trigger(props)}
-            <button
+            <AsyncIconButton
               {...props}
-              type="button"
               class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
-              aria-label="Reveal repo in Finder"
-              data-testid="repo-action-reveal"
-              onclick={() => runAction(revealInFinder(repo.root))}
+              label="Reveal repo in Finder"
+              testid="repo-action-reveal"
+              completeAfterMs={700}
+              action={() => {
+                actionError = null;
+                return revealInFinder(repo.root);
+              }}
+              onError={onHeaderActionError}
             >
               <FolderOpen size={14} strokeWidth={1.8} aria-hidden="true" />
-            </button>
+            </AsyncIconButton>
+          {/snippet}
+        </Tooltip>
+
+        <Tooltip label="Open in editor" side="top">
+          {#snippet trigger(props)}
+            <AsyncIconButton
+              {...props}
+              class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
+              label="Open repo in editor"
+              testid="repo-action-editor"
+              completeAfterMs={700}
+              action={() => {
+                actionError = null;
+                return openInEditor(repo.root);
+              }}
+              onError={onHeaderActionError}
+            >
+              <Code2 size={14} strokeWidth={1.8} aria-hidden="true" />
+            </AsyncIconButton>
           {/snippet}
         </Tooltip>
 
         <Tooltip label="Copy path" side="top">
           {#snippet trigger(props)}
-            <button
+            <AsyncIconButton
               {...props}
-              type="button"
               class={cn(ICON_BUTTON_CLASS, "hover:bg-border/60 shrink-0")}
-              aria-label="Copy repo path"
-              data-testid="repo-action-copy-path"
-              onclick={() => runAction(copyText(repo.root))}
+              label="Copy repo path"
+              testid="repo-action-copy-path"
+              action={() => {
+                actionError = null;
+                return copyText(repo.root);
+              }}
+              onError={onHeaderActionError}
             >
               <Copy size={14} strokeWidth={1.8} aria-hidden="true" />
-            </button>
+            </AsyncIconButton>
           {/snippet}
         </Tooltip>
 
@@ -680,7 +712,7 @@
         <div class="max-w-56">
           <div class="text-[13px] leading-4 font-medium">Branch work</div>
           <div class="text-primary-fg/70 mt-1 text-xs leading-4">
-            This commit is not in the default branch.
+            This commit is unique work on this branch.
           </div>
         </div>
       </Tooltip>

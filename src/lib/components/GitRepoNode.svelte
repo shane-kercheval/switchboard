@@ -656,6 +656,9 @@
       {@const hasBranchWork = branchCommits.ranges.some((range) =>
         range.commits.some((commit) => commit.branch_work),
       )}
+      {@const hasUnpushed = branchCommits.ranges.some((range) =>
+        range.commits.some((commit) => commit.unpushed),
+      )}
       {#each branchCommits.ranges as range (range.kind)}
         {#if range.commits.length > 0}
           <div
@@ -676,8 +679,8 @@
               data-selected={cSel}
               onclick={() => selectCommit(repo.root, commit)}
             >
-              {#if hasBranchWork}
-                {@render branchWorkDot(commit.branch_work)}
+              {#if hasUnpushed || hasBranchWork}
+                {@render commitDot(commit.unpushed, commit.branch_work)}
               {/if}
               <span class="text-muted shrink-0 font-mono text-[11px]" title={commit.short_oid}>
                 {compactCommitTimestamp(commit)}
@@ -694,9 +697,33 @@
   </div>
 {/snippet}
 
-{#snippet branchWorkDot(branchWork: boolean)}
+{#snippet commitDot(unpushed: boolean, branchWork: boolean)}
+  <!-- One dot per commit. Unpushed (amber) takes precedence over branch work
+       (black): an unpushed commit shows only the amber dot, never both. The
+       fixed-width slot keeps the timestamp column aligned whether or not a dot
+       renders. -->
   <span class="inline-flex h-4 w-2 shrink-0 items-center justify-center">
-    {#if branchWork}
+    {#if unpushed}
+      <Tooltip side="top" delayDuration={0} skipDelayDuration={0} disableHoverableContent>
+        {#snippet trigger(props)}
+          <span
+            {...props}
+            class="inline-flex h-4 w-2 items-center justify-center"
+            aria-label="Not pushed"
+            data-testid="unpushed-indicator"
+          >
+            <span class="bg-warning h-1.5 w-1.5 rounded-full" aria-hidden="true"></span>
+          </span>
+        {/snippet}
+
+        <div class="max-w-56">
+          <div class="text-[13px] leading-4 font-medium">Not pushed</div>
+          <div class="text-primary-fg/70 mt-1 text-xs leading-4">
+            This commit isn't on the upstream branch yet.
+          </div>
+        </div>
+      </Tooltip>
+    {:else if branchWork}
       <Tooltip side="top" delayDuration={0} skipDelayDuration={0} disableHoverableContent>
         {#snippet trigger(props)}
           <span

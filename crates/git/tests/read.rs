@@ -835,7 +835,7 @@ fn subjects(range: &switchboard_git::GitCommitRange) -> Vec<&str> {
 }
 
 #[test]
-fn commit_ranges_unpushed_for_ahead_branch() {
+fn commit_ranges_marks_unpushed_within_full_local_history() {
     let (_bare, clone) = cloned_repo();
     write(clone.path(), "a.txt", "a\n");
     commit_all(clone.path(), "local 1");
@@ -843,14 +843,16 @@ fn commit_ranges_unpushed_for_ahead_branch() {
     commit_all(clone.path(), "local 2");
 
     let ranges = commit_ranges(clone.path(), BranchKind::Local, "main").unwrap();
+    // One list with the FULL local history — the already-pushed "initial" stays
+    // visible alongside the unpushed work (it used to vanish until you pushed).
     assert_eq!(ranges.len(), 1);
-    assert_eq!(ranges[0].kind, CommitRangeKind::Unpushed);
-    // Newest first, and only the two unpushed commits (not the pushed "initial").
-    assert_eq!(subjects(&ranges[0]), vec!["local 2", "local 1"]);
-    assert!(
-        ranges[0].commits.iter().all(|c| !c.branch_work),
-        "unpushed commits on the local default branch are default-branch work, not feature-branch work"
-    );
+    assert_eq!(ranges[0].kind, CommitRangeKind::Recent);
+    assert_eq!(subjects(&ranges[0]), vec!["local 2", "local 1", "initial"]);
+    let unpushed: Vec<_> = ranges[0].commits.iter().map(|c| c.unpushed).collect();
+    assert_eq!(unpushed, vec![true, true, false]);
+    // Unpushed commits on the local default branch are default-branch work, not
+    // feature-branch work — so none are marked branch work.
+    assert!(ranges[0].commits.iter().all(|c| !c.branch_work));
     assert!(!ranges[0].truncated);
 }
 
@@ -865,9 +867,15 @@ fn commit_ranges_incoming_for_behind_branch() {
     git(clone.path(), &["fetch", "-q", "origin"]);
 
     let ranges = commit_ranges(clone.path(), BranchKind::Local, "main").unwrap();
-    assert_eq!(ranges.len(), 1);
-    assert_eq!(ranges[0].kind, CommitRangeKind::Incoming);
-    assert_eq!(subjects(&ranges[0]), vec!["remote 1"]);
+    // Local history (nothing unpushed) plus the separate incoming set.
+    let kinds: Vec<_> = ranges.iter().map(|r| r.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![CommitRangeKind::Recent, CommitRangeKind::Incoming]
+    );
+    assert_eq!(subjects(&ranges[0]), vec!["initial"]);
+    assert!(ranges[0].commits.iter().all(|c| !c.unpushed));
+    assert_eq!(subjects(&ranges[1]), vec!["remote 1"]);
 }
 
 #[test]
@@ -885,10 +893,78 @@ fn commit_ranges_both_for_diverged_branch() {
     let kinds: Vec<_> = ranges.iter().map(|r| r.kind).collect();
     assert_eq!(
         kinds,
-        vec![CommitRangeKind::Unpushed, CommitRangeKind::Incoming]
+        vec![CommitRangeKind::Recent, CommitRangeKind::Incoming]
     );
-    assert_eq!(subjects(&ranges[0]), vec!["local 1"]);
+    // Local history flags the unpushed commit and keeps the shared "initial".
+    assert_eq!(subjects(&ranges[0]), vec!["local 1", "initial"]);
+    let unpushed: Vec<_> = ranges[0].commits.iter().map(|c| c.unpushed).collect();
+    assert_eq!(unpushed, vec![true, false]);
     assert_eq!(subjects(&ranges[1]), vec!["remote 1"]);
+}
+
+#[test]
+fn commit_ranges_flag_merged_default_branch_commits_as_unpushed_intertwined() {
+    // `feature` is pushed at "feature pushed"; the remote's main then gains an
+    // OLDER-dated "main work". Merging origin/main into feature leaves the merge
+    // and "main work" unpushed, with the already-pushed "feature pushed" sitting
+    // between them by date — unpushed commits interleaved with pushed ones, which
+    // a single contiguous "unpushed" section could not represent.
+    let (bare, clone) = cloned_repo();
+    git(clone.path(), &["checkout", "-q", "-b", "feature"]);
+    write(clone.path(), "f.txt", "f\n");
+    commit_all_at(clone.path(), "feature pushed", 5000);
+    git(clone.path(), &["push", "-q", "-u", "origin", "feature"]);
+
+    let pusher = fresh_clone(bare.path());
+    write(pusher.path(), "m.txt", "m\n");
+    commit_all_at(pusher.path(), "main work", 3000); // older than "feature pushed"
+    git(pusher.path(), &["push", "-q", "origin", "main"]);
+
+    git(clone.path(), &["fetch", "-q", "origin"]);
+    git_dated(
+        clone.path(),
+        9000,
+        &["merge", "--no-ff", "origin/main", "-m", "merge main"],
+    );
+
+    let ranges = commit_ranges(clone.path(), BranchKind::Local, "feature").unwrap();
+    assert_eq!(ranges.len(), 1);
+    assert_eq!(ranges[0].kind, CommitRangeKind::Recent);
+    assert_eq!(
+        subjects(&ranges[0]),
+        vec!["merge main", "feature pushed", "main work", "initial"]
+    );
+    let unpushed: Vec<_> = ranges[0].commits.iter().map(|c| c.unpushed).collect();
+    assert_eq!(unpushed, vec![true, false, true, false]);
+}
+
+#[test]
+fn commit_ranges_marks_unpushed_on_feature_branch_keeping_shared_history() {
+    // The everyday path: a feature branch tracking its own upstream, with a new
+    // local commit on top of already-pushed history. The pushed commit and the
+    // shared "initial" stay visible (full history), and `branch_work` /
+    // `unpushed` are independent per commit.
+    let (_bare, clone) = cloned_repo();
+    git(clone.path(), &["checkout", "-q", "-b", "feature"]);
+    write(clone.path(), "f1.txt", "f1\n");
+    commit_all(clone.path(), "feature pushed");
+    git(clone.path(), &["push", "-q", "-u", "origin", "feature"]);
+    write(clone.path(), "f2.txt", "f2\n");
+    commit_all(clone.path(), "feature 2");
+
+    let ranges = commit_ranges(clone.path(), BranchKind::Local, "feature").unwrap();
+    assert_eq!(ranges.len(), 1);
+    assert_eq!(ranges[0].kind, CommitRangeKind::Recent);
+    assert_eq!(
+        subjects(&ranges[0]),
+        vec!["feature 2", "feature pushed", "initial"]
+    );
+    let unpushed: Vec<_> = ranges[0].commits.iter().map(|c| c.unpushed).collect();
+    assert_eq!(unpushed, vec![true, false, false]);
+    // Orthogonal: both feature commits are branch work; "feature pushed" is
+    // branch work yet already pushed, so the two flags differ on the same commit.
+    let branch_work: Vec<_> = ranges[0].commits.iter().map(|c| c.branch_work).collect();
+    assert_eq!(branch_work, vec![true, true, false]);
 }
 
 #[test]

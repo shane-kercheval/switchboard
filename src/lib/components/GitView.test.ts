@@ -111,6 +111,17 @@ function wire(list: RepoListing[]) {
               author_email: null,
               authored_at: `${currentYear}-06-05T17:14:00Z`,
               branch_work: true,
+              unpushed: true,
+            },
+            {
+              oid: "5ca1ab1e99",
+              short_oid: "5ca1ab1",
+              subject: "shared commit",
+              author_name: "T",
+              author_email: null,
+              authored_at: `${currentYear}-06-04T17:14:00Z`,
+              branch_work: true,
+              unpushed: false,
             },
           ],
         },
@@ -541,12 +552,19 @@ describe("GitView", () => {
     // Dirty branch → the panel opens on uncommitted changes…
     expect(screen.getByTestId("detail-title")).toHaveTextContent("Uncommitted changes");
     // …and the branch's commits load into the tree.
-    await waitFor(() => expect(screen.getByTestId("commit-row")).toBeInTheDocument());
-    expect(screen.getByTestId("commit-row")).toHaveTextContent("first commit");
-    expect(screen.getByTestId("commit-row")).toHaveTextContent(/06-05 \d{2}:14/);
-    expect(
-      within(screen.getByTestId("commit-row")).getByTestId("branch-work-indicator"),
-    ).toBeInTheDocument();
+    await waitFor(() => expect(screen.getAllByTestId("commit-row")).toHaveLength(2));
+    const rowFor = (subject: string): HTMLElement =>
+      screen.getAllByTestId("commit-row").find((row) => row.textContent?.includes(subject))!;
+    const firstRow = rowFor("first commit");
+    expect(firstRow).toHaveTextContent(/06-05 \d{2}:14/);
+    // Unpushed commit → only the unpushed (amber) dot; the branch-work dot is
+    // suppressed since the two never co-occur on one commit.
+    expect(within(firstRow).getByTestId("unpushed-indicator")).toBeInTheDocument();
+    expect(within(firstRow).queryByTestId("branch-work-indicator")).not.toBeInTheDocument();
+    // Pushed branch-work commit → the branch-work (black) dot, no unpushed dot.
+    const sharedRow = rowFor("shared commit");
+    expect(within(sharedRow).getByTestId("branch-work-indicator")).toBeInTheDocument();
+    expect(within(sharedRow).queryByTestId("unpushed-indicator")).not.toBeInTheDocument();
 
     await fireEvent.click(screen.getByTestId("detail-expand-toggle"));
     expect(screen.getByTestId("git-detail-sidebar")).toHaveAttribute("data-expanded", "true");

@@ -22,6 +22,7 @@ const {
   restorePane,
   maximizePane,
   restoreMaximizedPane,
+  expandAllPanes,
   revealPane,
   renamePane,
   setFractions,
@@ -616,5 +617,23 @@ describe("paneToCycleTo (positional pane cycling)", () => {
     expect(paneToCycleTo(P, ROSTER, ["a"], 1)).toBeNull(); // default single pane
     createEmptyPane(P, ROSTER);
     expect(paneToCycleTo(P, ROSTER, ["a"], 1)).toBeNull(); // one real pane + one empty
+  });
+});
+
+describe("expandAllPanes", () => {
+  it("clears both the maximized pane and all minimized panes", () => {
+    moveAgentToNewPane(P, ROSTER, "b");
+    moveAgentToNewPane(P, ROSTER, "c"); // 3 panes: [a] [b] [c]
+    const initial = layoutFor(P, ROSTER).panes;
+    minimizePane(P, ROSTER, initial[1]!.id);
+    maximizePane(P, ROSTER, initial[0]!.id);
+    expect(layoutFor(P, ROSTER).maximized).not.toBeNull();
+    expect(layoutFor(P, ROSTER).minimized.length).toBeGreaterThan(0);
+
+    expandAllPanes(P, ROSTER);
+
+    const layout = layoutFor(P, ROSTER);
+    expect(layout.maximized).toBeNull();
+    expect(layout.minimized).toEqual([]);
   });
 });

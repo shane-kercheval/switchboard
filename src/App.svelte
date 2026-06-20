@@ -552,8 +552,28 @@
     const rosterIds = activeAgents.map((a) => a.id);
     const pane = paneToCycleTo(projectId, rosterIds, selectionFor(projectId), direction);
     if (pane === null) return;
-    if (targetRecipients(projectId, [...pane.members])) {
-      revealPane(projectId, rosterIds, pane.id);
+    const reveal = (): void => {
+      if (targetRecipients(projectId, [...pane.members])) {
+        revealPane(projectId, rosterIds, pane.id);
+      }
+    };
+    // Cycling onto a hidden pane (minimized, or any pane while another is
+    // maximized) remounts its transcript, so show the spinner first — exactly
+    // like clicking a header tab. An already-visible target just re-targets, so
+    // it runs immediately with no spurious spinner.
+    const layout = activePaneLayout;
+    const targetHidden =
+      layout !== null &&
+      (layout.maximized !== null
+        ? layout.maximized !== pane.id
+        : layout.minimized.includes(pane.id));
+    if (targetHidden) {
+      void withTranscriptBusy(() => {
+        if (selection.activeProjectId !== projectId) return;
+        reveal();
+      });
+    } else {
+      reveal();
     }
   }
 

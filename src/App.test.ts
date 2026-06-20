@@ -2317,6 +2317,51 @@ describe("App", () => {
     selection._testing.reset();
   });
 
+  it("⌘⇧] shows the transcript spinner when cycling onto a hidden pane", async () => {
+    const panes = await import("$lib/state/transcriptPanes.svelte");
+    const selection = await import("$lib/state/recipientSelection.svelte");
+    panes._testing.reset();
+    selection._testing.reset();
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [
+        agent({ id: "ag-1", project_id: "p-a", name: "alice" }),
+        agent({ id: "ag-2", project_id: "p-a", name: "bob" }),
+      ],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+
+    const roster = ["ag-1", "ag-2"];
+    panes.moveAgentToNewPane("p-a", roster, "ag-2"); // pane 1: alice, pane 2: bob
+    const pane2 = panes.layoutFor("p-a", roster).panes[1]!.id;
+    // Maximize pane 1 → pane 2 is hidden, so cycling onto it remounts the
+    // transcript and should show the busy spinner (the reported bug: it didn't).
+    panes.maximizePane("p-a", roster, panes.layoutFor("p-a", roster).panes[0]!.id);
+
+    await fireEvent.keyDown(window, {
+      key: "}",
+      code: "BracketRight",
+      metaKey: true,
+      shiftKey: true,
+    });
+
+    // Spinner shows up front, before the deferred reveal runs.
+    expect(screen.getByTestId("transcript-busy-overlay")).toBeInTheDocument();
+
+    // Then the cycle applies: pane 2 is targeted + re-maximized, overlay clears.
+    await waitFor(() => expect(selection.selectionFor("p-a")).toEqual(["ag-2"]));
+    expect(panes.layoutFor("p-a", roster).maximized).toBe(pane2);
+    await waitFor(() => expect(screen.queryByTestId("transcript-busy-overlay")).toBeNull());
+
+    panes._testing.reset();
+    selection._testing.reset();
+  });
+
   it("⌘⌥N reveals the targeted pane: restores a minimized one, replaces a maximized one", async () => {
     const panes = await import("$lib/state/transcriptPanes.svelte");
     const selection = await import("$lib/state/recipientSelection.svelte");

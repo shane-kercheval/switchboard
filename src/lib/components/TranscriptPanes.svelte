@@ -12,7 +12,7 @@
   /// the coverage border *derives* from the selection ∩ membership. Nothing
   /// here stores a targeted pane — a stored target could drift from the real
   /// recipient set and lie.
-  import { Check, Maximize2, Minimize2, MoreHorizontal, Pencil, X } from "@lucide/svelte";
+  import { Check, Maximize2, Minimize2, MoreHorizontal, Pencil, Square, X } from "@lucide/svelte";
   import type { AgentRecord, ConversationItem, ProjectId } from "$lib/types";
   import UnifiedTranscript from "$lib/components/UnifiedTranscript.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
@@ -32,6 +32,7 @@
     minimizePane,
     renamePane,
     restoreMaximizedPane,
+    returnToUnifiedView,
     setFractions,
     setPaneRowWidth,
     showAllInPane,
@@ -40,7 +41,12 @@
     moveAgentToPane,
     type TranscriptPane,
   } from "$lib/state/transcriptPanes.svelte";
-  import { selectionFor, targetRecipients } from "$lib/state/recipientSelection.svelte";
+  import {
+    deselectAgent,
+    selectAgent,
+    selectionFor,
+    targetRecipients,
+  } from "$lib/state/recipientSelection.svelte";
 
   let {
     projectId,
@@ -117,6 +123,30 @@
     targetRecipients(projectId, [...pane.members]);
   }
 
+  /// Close a pane: a deliberate "I'm done with these agents for now". The pane's
+  /// agents are dismissed — unassigned from any pane (so they leave the view) and
+  /// deselected (so they stop receiving sends). They only return via "Return to
+  /// unified view". When the close leaves a single pane, that survivor is
+  /// targeted so you land on the agents you're left with.
+  function handleClosePane(pane: TranscriptPane): void {
+    const remaining = layout.panes.filter((p) => p.id !== pane.id);
+    closePane(projectId, rosterIds, pane.id);
+    if (remaining.length === 1) {
+      // Replace semantics drop the dismissed pane's agents from the selection
+      // while targeting the lone survivor.
+      targetRecipients(projectId, [...remaining[0]!.members]);
+    } else {
+      for (const id of pane.members) deselectAgent(projectId, id);
+    }
+  }
+
+  /// Bring every dismissed agent back into a single unified pane — the explicit
+  /// "un-dismiss everyone" / exit-split action. Selection is preserved: returning
+  /// agents to view doesn't re-target them.
+  function handleReturnToUnified(): void {
+    returnToUnifiedView(projectId, rosterIds);
+  }
+
   function hasOnlyMeta(event: MouseEvent | KeyboardEvent): boolean {
     const meta = event.metaKey || (event instanceof KeyboardEvent && event.key === "Meta");
     return meta && !event.altKey && !event.shiftKey && !event.ctrlKey;
@@ -136,21 +166,41 @@
   }
 
   // ── Cmd-held target overlay ─────────────────────────────────────────────────
-  // Holding plain Cmd previews the Cmd+click commit on the hovered pane. The
-  // armed state clears on keyup AND on window blur: if the app loses focus
+  // Holding plain Cmd previews the Cmd+click commit only after pointer movement
+  // while Cmd is held. That avoids false-positive pane rings when the cursor
+  // happens to rest over a pane during unrelated Cmd chords (Cmd+Tab/C/V/etc.).
+  // The armed state clears on keyup AND on window blur: if the app loses focus
   // while Cmd is held (Cmd+Tab away), the keyup never arrives and the overlay
   // would stick.
   let cmdOnlyHeld = $state(false);
+  let cmdPointerMoved = $state(false);
   let hoveredPaneId = $state<string | null>(null);
 
   function onWindowKeydown(event: KeyboardEvent): void {
-    cmdOnlyHeld = hasOnlyMeta(event);
+    if (event.key === "Meta" && !event.altKey && !event.shiftKey && !event.ctrlKey) {
+      cmdOnlyHeld = true;
+      cmdPointerMoved = false;
+      return;
+    }
+    cmdOnlyHeld = false;
+    cmdPointerMoved = false;
   }
   function onWindowKeyup(event: KeyboardEvent): void {
-    cmdOnlyHeld = event.key === "Meta" ? false : hasOnlyMeta(event);
+    if (event.key === "Meta" || !event.metaKey) {
+      cmdOnlyHeld = false;
+      cmdPointerMoved = false;
+      return;
+    }
+    cmdOnlyHeld = !event.altKey && !event.shiftKey && !event.ctrlKey;
+    cmdPointerMoved = false;
   }
   function onWindowBlur(): void {
     cmdOnlyHeld = false;
+    cmdPointerMoved = false;
+  }
+  function onWindowPointerMove(event: PointerEvent): void {
+    resizeMove(event);
+    if (cmdOnlyHeld) cmdPointerMoved = true;
   }
 
   // ── Gutter resize ───────────────────────────────────────────────────────────
@@ -284,7 +334,7 @@
 </script>
 
 <svelte:window
-  onpointermove={resizeMove}
+  onpointermove={onWindowPointerMove}
   onpointerup={endResize}
   onkeydown={onWindowKeydown}
   onkeyup={onWindowKeyup}
@@ -330,7 +380,10 @@
         data-coverage={multiPane && maximizedPane === null ? cov : undefined}
         data-maximized={maximizedPane?.id === pane.id}
         onclick={(event) => onPaneClick(pane, event)}
-        onpointerenter={() => (hoveredPaneId = pane.id)}
+        onpointerenter={() => {
+          hoveredPaneId = pane.id;
+          if (cmdOnlyHeld) cmdPointerMoved = true;
+        }}
         onpointerleave={() => (hoveredPaneId = hoveredPaneId === pane.id ? null : hoveredPaneId)}
       >
         {#if paneChrome}
@@ -342,6 +395,9 @@
               <input
                 use:focusSelect
                 bind:value={renameDraft}
+                autocorrect="off"
+                autocapitalize="off"
+                spellcheck="false"
                 class="text-fg border-border bg-panel focus-visible:ring-accent h-6 min-w-0 flex-1 rounded border px-1.5 text-xs font-semibold focus-visible:ring-1 focus-visible:outline-none"
                 aria-label="Pane name"
                 data-testid="pane-rename-input"
@@ -420,6 +476,7 @@
                       onclick={(event) => {
                         event.stopPropagation();
                         unassignAgentFromPane(projectId, rosterIds, member.id);
+                        deselectAgent(projectId, member.id);
                       }}
                     >
                       <X size={10} strokeWidth={2} aria-hidden="true" />
@@ -501,7 +558,10 @@
                   {@const alreadyInPane = pane.members.includes(agent.id)}
                   {@const currentPane = layout.panes.find((p) => p.members.includes(agent.id))}
                   <DropdownMenuItem
-                    onSelect={() => moveAgentToPane(projectId, rosterIds, agent.id, pane.id)}
+                    onSelect={() => {
+                      moveAgentToPane(projectId, rosterIds, agent.id, pane.id);
+                      selectAgent(projectId, agent.id);
+                    }}
                     disabled={alreadyInPane}
                     class="gap-2"
                     data-testid={`pane-add-agent-${agent.id}`}
@@ -527,7 +587,7 @@
                 </DropdownMenuItem>
                 {#if layout.panes.length > 1}
                   <DropdownMenuItem
-                    onSelect={() => closePane(projectId, rosterIds, pane.id)}
+                    onSelect={() => handleClosePane(pane)}
                     class="items-start gap-2"
                     data-testid="pane-close"
                   >
@@ -536,6 +596,26 @@
                       <span>Close pane</span>
                       <span class="text-muted text-xs leading-4">
                         Agents become unassigned and keep working.
+                      </span>
+                    </span>
+                  </DropdownMenuItem>
+                {/if}
+                {#if layout.panes.length > 1 || unassignedIds.length > 0}
+                  <DropdownMenuItem
+                    onSelect={handleReturnToUnified}
+                    class="items-start gap-2"
+                    data-testid="pane-return-unified"
+                  >
+                    <Square
+                      size={14}
+                      strokeWidth={1.8}
+                      aria-hidden="true"
+                      class="mt-0.5 shrink-0"
+                    />
+                    <span class="flex min-w-0 flex-col">
+                      <span>Return to unified view</span>
+                      <span class="text-muted text-xs leading-4">
+                        Show every agent together in one pane.
                       </span>
                     </span>
                   </DropdownMenuItem>
@@ -585,7 +665,7 @@
             data-testid="pane-coverage"
           ></div>
         {/if}
-        {#if multiPane && maximizedPane === null && cmdOnlyHeld && hoveredPaneId === pane.id && pane.members.length > 0}
+        {#if multiPane && maximizedPane === null && cmdOnlyHeld && cmdPointerMoved && hoveredPaneId === pane.id && pane.members.length > 0}
           <div
             class="ring-accent pointer-events-none absolute inset-0 z-10 flex items-start justify-center ring-2 ring-inset"
             data-testid="pane-target-overlay"

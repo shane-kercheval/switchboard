@@ -261,6 +261,41 @@ export function unassignedAgentIds(projectId: ProjectId, rosterIds: AgentId[]): 
   return rosterIds.filter((id) => !assigned.includes(id));
 }
 
+function sameMembers(a: AgentId[], b: AgentId[]): boolean {
+  if (a.length !== b.length) return false;
+  const set = new Set(a);
+  return b.every((id) => set.has(id));
+}
+
+/// The pane to move to when cycling panes by position (⌘⌥[ / ⌘⌥]). `direction`
+/// is -1 (previous/left) or +1 (next/right); cycling wraps. Only non-empty panes
+/// participate — an empty pane is never a send target. The "current" pane is the
+/// maximized one if any, else the pane whose membership matches the live
+/// selection (set by the last targeting gesture, including a prior cycle), so no
+/// separate focus cursor is stored — selection stays the single source of truth.
+/// A custom per-agent selection that matches no pane enters from the leftmost
+/// (next) or rightmost (previous) end. Returns null when fewer than two panes can
+/// be cycled.
+export function paneToCycleTo(
+  projectId: ProjectId,
+  rosterIds: AgentId[],
+  selectedIds: AgentId[],
+  direction: 1 | -1,
+): TranscriptPane | null {
+  const layout = layoutFor(projectId, rosterIds);
+  const candidates = layout.panes.filter((pane) => pane.members.length > 0);
+  if (candidates.length < 2) return null;
+  const currentId =
+    layout.maximized ??
+    candidates.find((pane) => sameMembers(pane.members, selectedIds))?.id ??
+    null;
+  const currentIdx =
+    currentId === null ? -1 : candidates.findIndex((pane) => pane.id === currentId);
+  const startIdx = currentIdx === -1 ? (direction === 1 ? -1 : 0) : currentIdx;
+  const nextIdx = (startIdx + direction + candidates.length) % candidates.length;
+  return candidates[nextIdx]!;
+}
+
 // ── Mutations ────────────────────────────────────────────────────────────────
 
 /// Reconcile-then-mutate: every mutation starts from a membership-valid layout
@@ -462,6 +497,25 @@ export function closePane(projectId: ProjectId, rosterIds: AgentId[], paneId: Pa
       panes,
       fractions: normalizeFractions(fractions, panes.length),
       ...view,
+    };
+  });
+}
+
+/// Collapse every pane back into a single unified pane holding the whole roster
+/// — the "return to unified view" / exit-split gesture. Re-merges any unassigned
+/// agents so the unified view shows everyone; per-agent eye-hidden state carries
+/// over so a hidden agent stays hidden. The recipient selection is the caller's
+/// concern (gestures own it), not touched here.
+export function returnToUnifiedView(projectId: ProjectId, rosterIds: AgentId[]): void {
+  update(projectId, rosterIds, (layout) => {
+    // Membership is exclusive, so an agent appears in at most one pane's hidden
+    // set — no dedup needed. Filter to the live roster for safety.
+    const hidden = layout.panes.flatMap((p) => p.hidden).filter((id) => rosterIds.includes(id));
+    return {
+      panes: [{ id: newPaneId(), name: "Pane 1", members: [...rosterIds], hidden }],
+      fractions: [1],
+      minimized: [],
+      maximized: null,
     };
   });
 }

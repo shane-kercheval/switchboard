@@ -17,6 +17,7 @@
     buildUnifiedRows,
     copyTextOf,
     groupRenderBlocks,
+    lastAnswerTextOf,
     type RenderBlock,
     type UnifiedRow,
   } from "$lib/state/unified";
@@ -205,7 +206,7 @@
   }
 
   /// The render key for a turn — matches the key its render site uses, so
-  /// `lastBlockKeys` membership lines up there. A turn whose send fans out
+  /// `latestResponseKeys` membership lines up there. A turn whose send fans out
   /// renders as a column (`fanout:…`); otherwise a standalone row.
   function previewKeyForTurn(turn: AgentTurn): string {
     if (
@@ -218,12 +219,11 @@
   }
 
   /// Preview keys of each agent's most-recent collapsible response. When compact,
-  /// these render the "last block" view — the final answer (the block the copy
-  /// button copies), in full, with tool calls and reasoning hidden — instead of
-  /// the height-clipped preview. Per agent and by recency (`ended_at ??
+  /// these render expanded by default instead of using the height-clipped
+  /// preview. Per agent and by recency (`ended_at ??
   /// started_at`), so an agent's latest reply keeps this treatment even when
   /// other agents' replies sit below it.
-  const lastBlockKeys = $derived.by(() => {
+  const latestResponseKeys = $derived.by(() => {
     // eslint-disable-next-line svelte/prefer-svelte-reactivity
     const latestPerAgent = new Map<string, { at: string; key: string }>();
     for (const row of rows) {
@@ -328,40 +328,36 @@
 
   /// Whether expanding a response would reveal more than its collapsed view, so a
   /// toggle is meaningful. A clipped preview hides tool calls / reasoning (and
-  /// clips overflowing text — the `clipOverflow` half); the last-block view also
-  /// hides any earlier answer blocks beyond the one the copy button copies.
-  function responseHasMore(turn: AgentTurn, key: string, isLastBlock: boolean): boolean {
+  /// clips overflowing text — the `clipOverflow` half); the latest-response view
+  /// is expanded by default, so its toggle means "collapse to the final answer
+  /// block."
+  function responseHasMore(turn: AgentTurn, key: string, isLatestResponse: boolean): boolean {
+    if (isLatestResponse)
+      return turnHasHiddenDetail(turn) || answerTextOf(turn) !== lastAnswerTextOf(turn);
     if (turnHasHiddenDetail(turn)) return true;
-    // Mode-dependent by design: in `full_answer` mode both sides equal
-    // `answerTextOf` so this is always false (the last-block view already shows
-    // every text block); in `last_answer_block` mode it's true when earlier
-    // blocks exist (expanding would reveal them).
-    if (isLastBlock) return copyTextOf(turn, agentCopy.mode) !== answerTextOf(turn);
     return clipOverflow[key] ?? false;
   }
 
   /// Summary line for a collapsed response's hidden detail, or null when nothing
   /// non-text is hidden. Surfaced above the collapsed body so it's clear that
-  /// tool calls / reasoning (and, for the last-block view, earlier answer
-  /// blocks) are tucked away — a clip's fade only signals hidden *text*.
-  function hiddenItemsLabel(turn: AgentTurn, isLastBlock: boolean): string | null {
+  /// tool calls / reasoning are tucked away — a clip's fade only signals hidden
+  /// *text*.
+  function hiddenItemsLabel(turn: AgentTurn): string | null {
     const tools = turn.items.filter((i) => i.item_kind === "tool").length;
     const hasReasoning = turn.items.some((i) => i.item_kind === "text" && i.kind === "thinking");
     const parts: string[] = [];
     if (tools > 0) parts.push(`${tools} tool ${tools === 1 ? "call" : "calls"}`);
     if (hasReasoning) parts.push("reasoning");
     if (parts.length > 0) return parts.join(" · ");
-    if (isLastBlock && copyTextOf(turn, agentCopy.mode) !== answerTextOf(turn))
-      return "earlier output";
     return null;
   }
 
   /// `hiddenItemsLabel` for a fan-out column — the first agent turn with hidden
   /// detail (a column is one `(send_id, agent_id)` turn in practice).
-  function columnHiddenLabel(colRows: NonUserRow[], isLastBlock: boolean): string | null {
+  function columnHiddenLabel(colRows: NonUserRow[]): string | null {
     for (const r of colRows) {
       if (r.kind === "agent") {
-        const label = hiddenItemsLabel(r.turn, isLastBlock);
+        const label = hiddenItemsLabel(r.turn);
         if (label !== null) return label;
       }
     }
@@ -784,19 +780,20 @@
        cap or the static completed view.
      - `"answer"` — answer prose only, for the height-clipped preview of an older
        response (tool calls + reasoning suppressed).
-     - `"last"` — the final answer block in full (what the copy button copies),
-       for an agent's most-recent response; tool calls + reasoning hidden, no clip.
+     - `"final"` — only the final answer prose block, for a latest response the
+       user manually collapsed. The copy button remains independent and can
+       still copy only the final answer block.
      The hidden-items indicator above the body (call site) signals what `"answer"`
-     / `"last"` tuck away, so a tool-only response needs no in-body placeholder.
+     / `"final"` tuck away, so a tool-only response needs no in-body placeholder.
      `live` gates the streaming "Working…" footer (a fan-out column passes false
      when an outcome marker has closed a streaming-on-disk turn). -->
 {#snippet turnBody(
   turn: AgentTurn,
   live: boolean = true,
-  mode: "full" | "answer" | "last" = "full",
+  mode: "full" | "answer" | "final" = "full",
 )}
-  {#if mode === "last"}
-    {@const answer = copyTextOf(turn, agentCopy.mode)}
+  {#if mode === "final"}
+    {@const answer = lastAnswerTextOf(turn)}
     {#if answer.length > 0}
       <Markdown text={answer} />
     {/if}
@@ -833,10 +830,9 @@
   {/if}
 {/snippet}
 
-<!-- Disclosure shown above a collapsed body when tool calls / reasoning (or, for
-     the last-block view, earlier answer blocks) are hidden — the cue a fade
-     can't give. Always visible (it's signalling, not chrome) and clickable to
-     expand the whole response. -->
+<!-- Disclosure shown above a collapsed body when tool calls / reasoning are
+     hidden — the cue a fade can't give. Always visible (it's signalling, not
+     chrome) and clickable to expand the whole response. -->
 {#snippet hiddenItemsIndicator(key: string, label: string)}
   <button
     type="button"
@@ -961,9 +957,10 @@
      expanded, else expands them all. Writes per-column overrides (so each column
      can still be toggled individually afterwards) and only touches this group's
      columns. -->
-{#snippet fanoutToggleAll(keys: string[])}
-  {@const anyExpanded = keys.some((k) => !isCompact(projectId, k, compactEnabled))}
-  {@const label = anyExpanded ? "Collapse all responses" : "Expand all responses"}
+{#snippet fanoutToggleAll(entries: { key: string; defaultCompact: boolean }[])}
+  {@const anyExpanded = entries.some((e) => !isCompact(projectId, e.key, e.defaultCompact))}
+  {@const keys = entries.map((e) => e.key)}
+  {@const label = anyExpanded ? "Collapse all responses above" : "Expand all responses above"}
   <Tooltip {label} side="bottom">
     {#snippet trigger(props)}
       <button
@@ -1010,14 +1007,15 @@
   previewKey?: string;
   previewDefaultCompact?: boolean;
 })}
-  <!-- Two zones on a flex row: the expand/collapse toggle + cost pinned LEFT, and
+  <!-- Two zones on a flex row: cost/overage + expand/collapse toggle pinned LEFT, and
        the hover-revealed model/timestamp/copy pinned RIGHT (`ml-auto`). The gap
        between them collapses first as the row narrows; then the right cluster's
        text wraps (model over timestamp) and truncates with `…`. The toggle and
        copy button are `shrink-0` — never squished. -->
   <div class={`${mt} flex items-center gap-2`} data-testid="message-meta">
-    <!-- Left: per-message expand/collapse, then cost + overage marker. The cost
-         is always visible; the toggle is hover/focus-revealed (its own opacity).
+    <!-- Left: cost + overage marker, then per-message expand/collapse. The cost
+         is always visible; the toggle is hover/focus-revealed (its own opacity),
+         so overage stays anchored instead of shifting behind an invisible toggle.
          Two distinct cost gates (no `match harness`): the **cost** shows on
          `spend.real_spend` (the turn cost real money — for subscription Claude
          that's overage, since `total_cost_usd` is otherwise notional); the
@@ -1025,20 +1023,20 @@
          coincide for Claude, but a future pay-per-use harness would set
          `real_spend` without `is_overage` → cost shows, marker stays hidden. -->
     <div class="flex shrink-0 items-center gap-2">
-      {#if previewKey !== undefined}
-        {@render previewToggle(previewKey, previewDefaultCompact)}
-      {/if}
       {#if spend?.is_overage}
         <span
           class="text-warning text-xs"
           data-testid="message-overage"
-          title={spend.overage_resets_at
+          title={spend?.overage_resets_at
             ? `Spending overage credits — window resets ${new Date(spend.overage_resets_at).toLocaleString()}`
             : "Spending overage credits"}>⚡ using credits</span
         >
       {/if}
       {#if spend?.real_spend && costUsd != null}
         <span class="text-muted text-xs" data-testid="message-cost">${costUsd.toFixed(4)}</span>
+      {/if}
+      {#if previewKey !== undefined}
+        {@render previewToggle(previewKey, previewDefaultCompact)}
       {/if}
     </div>
     <!-- Right: per-turn model/effort (history — what this turn actually ran on),
@@ -1276,10 +1274,10 @@
        a genuinely-live streaming turn is excluded — it uses M3's live cap. -->
   {@const previewEligible = isCollapsibleResponse(turn)}
   {@const key = `agent:${turn.turn_id}`}
-  {@const defaultCompact = compactEnabled}
+  {@const latestResponse = latestResponseKeys.has(key)}
+  {@const defaultCompact = compactEnabled && !latestResponse}
   {@const compact = previewEligible && isCompact(projectId, key, defaultCompact)}
-  {@const lastBlock = lastBlockKeys.has(key)}
-  {@const showToggle = previewEligible && responseHasMore(turn, key, lastBlock)}
+  {@const showToggle = previewEligible && responseHasMore(turn, key, latestResponse)}
   <div class="group space-y-1.5" data-testid="turn" data-role="agent">
     <div class="flex items-center gap-2 text-xs font-semibold tracking-wide uppercase">
       <span class="text-fg" data-testid="turn-agent-name">{agentName(turn.agent_id)}</span>
@@ -1290,10 +1288,10 @@
       style:border-left-color={agentBorderColor(turn.agent_id)}
     >
       {#if compact}
-        {@const hiddenLabel = hiddenItemsLabel(turn, lastBlock)}
+        {@const hiddenLabel = hiddenItemsLabel(turn)}
         {#if hiddenLabel}{@render hiddenItemsIndicator(key, hiddenLabel)}{/if}
-        {#if lastBlock}
-          {@render turnBody(turn, false, "last")}
+        {#if latestResponse}
+          {@render turnBody(turn, false, "final")}
         {:else}
           <div
             class={cn("space-y-1.5", PREVIEW_CLIP)}
@@ -1397,9 +1395,12 @@
             {@render agentRow(block.row.turn)}
           {/if}
         {:else}
-          {@const fanoutKeys = block.columns
+          {@const fanoutEntries = block.columns
             .filter((col) => isCollapsibleColumn(col.rows))
-            .map((col) => `fanout:${block.send_id}:${col.agent_id}`)}
+            .map((col) => {
+              const key = `fanout:${block.send_id}:${col.agent_id}`;
+              return { key, defaultCompact: compactEnabled && !latestResponseKeys.has(key) };
+            })}
           {@const fanoutCopyable = fanoutText(block.columns)}
           <div class="space-y-4" data-testid="fanout-group">
             {@render userMessage(block.user)}
@@ -1408,19 +1409,6 @@
                responses are hovered and the user message's own hover chrome
                stays independent. -->
             <div class="group/responses space-y-2">
-              {#if fanoutKeys.length > 0 || fanoutCopyable.length > 0}
-                <div class="flex justify-end gap-1">
-                  {#if fanoutCopyable.length > 0}
-                    <CopyButton
-                      text={fanoutCopyable}
-                      label="Copy all responses"
-                      testid="fanout-copy"
-                      class="shrink-0 opacity-0 group-focus-within/responses:opacity-100 group-hover/responses:opacity-100"
-                    />
-                  {/if}
-                  {#if fanoutKeys.length > 0}{@render fanoutToggleAll(fanoutKeys)}{/if}
-                </div>
-              {/if}
               <!-- Side-by-side on wide viewports; stacks vertically below `lg`. -->
               <div
                 class="grid gap-4"
@@ -1440,14 +1428,15 @@
                   {@const colHasOutcome = col.rows.some((r) => r.kind === "outcome")}
                   {@const colKey = `fanout:${block.send_id}:${col.agent_id}`}
                   {@const colEligible = isCollapsibleColumn(col.rows)}
-                  {@const colDefaultCompact = compactEnabled}
+                  {@const colLatestResponse = latestResponseKeys.has(colKey)}
+                  {@const colDefaultCompact = compactEnabled && !colLatestResponse}
                   {@const colCompact =
                     colEligible && isCompact(projectId, colKey, colDefaultCompact)}
-                  {@const colLastBlock = lastBlockKeys.has(colKey)}
                   {@const colShowToggle =
                     colEligible &&
                     col.rows.some(
-                      (r) => r.kind === "agent" && responseHasMore(r.turn, colKey, colLastBlock),
+                      (r) =>
+                        r.kind === "agent" && responseHasMore(r.turn, colKey, colLatestResponse),
                     )}
                   <div
                     class="group space-y-1.5"
@@ -1477,13 +1466,13 @@
                         )}
                       {/if}
                       {#if colCompact}
-                        {@const colHiddenLabel = columnHiddenLabel(col.rows, colLastBlock)}
+                        {@const colHiddenLabel = columnHiddenLabel(col.rows)}
                         {#if colHiddenLabel}
                           {@render hiddenItemsIndicator(colKey, colHiddenLabel)}
                         {/if}
-                        {#if colLastBlock}
+                        {#if colLatestResponse}
                           {#each col.rows as r (r.key)}
-                            {#if r.kind === "agent"}{@render turnBody(r.turn, false, "last")}{/if}
+                            {#if r.kind === "agent"}{@render turnBody(r.turn, false, "final")}{/if}
                           {/each}
                         {:else}
                           <div
@@ -1526,6 +1515,36 @@
                   </div>
                 {/each}
               </div>
+              {#if fanoutEntries.length > 0 || fanoutCopyable.length > 0}
+                <!-- Reveal toggles opacity with NO transition: on macOS WebKit a
+                     settled `transition-opacity` leaves the leave-change unpainted
+                     until a reflow (the footer stuck visible until a resize). The
+                     other hover-reveals here (message meta) already toggle opacity
+                     instantly for the same reason. -->
+                <div
+                  class="pointer-events-none flex items-center gap-2 pt-0.5 opacity-0 group-focus-within/responses:pointer-events-auto group-focus-within/responses:opacity-100 group-hover/responses:pointer-events-auto group-hover/responses:opacity-100"
+                  data-testid="fanout-actions-footer"
+                >
+                  <div class="border-border/60 h-px min-w-0 flex-1 border-t"></div>
+                  <div class="flex shrink-0 items-center gap-1">
+                    {#if fanoutCopyable.length > 0}
+                      <Tooltip label="Copy all responses above" side="bottom">
+                        {#snippet trigger(props)}
+                          <span {...props} class="inline-flex shrink-0">
+                            <CopyButton
+                              text={fanoutCopyable}
+                              label="Copy all responses above"
+                              testid="fanout-copy"
+                              class="shrink-0"
+                            />
+                          </span>
+                        {/snippet}
+                      </Tooltip>
+                    {/if}
+                    {#if fanoutEntries.length > 0}{@render fanoutToggleAll(fanoutEntries)}{/if}
+                  </div>
+                </div>
+              {/if}
             </div>
           </div>
         {/if}

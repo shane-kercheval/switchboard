@@ -12,6 +12,7 @@ import {
   moveAgentToPane,
   moveAgentToNewPane,
   toggleAgentHidden,
+  unassignAgentFromPane,
   _testing as panesState,
 } from "$lib/state/transcriptPanes.svelte";
 import {
@@ -308,7 +309,7 @@ describe("pane chrome (headers, rename, close)", () => {
     expect(selectionFor(PROJECT_ID)).toEqual([]);
   });
 
-  it("close unassigns the pane's agents", async () => {
+  it("closing one of two panes dismisses that pane's agents, leaving the survivor", async () => {
     await seedTwoAgentTranscripts();
     moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
     renderPanes();
@@ -318,13 +319,98 @@ describe("pane chrome (headers, rename, close)", () => {
 
     expect(paneEls()).toHaveLength(1);
     const layout = layoutFor(PROJECT_ID, ROSTER_IDS);
+    // Bob is dismissed: unassigned (invisible), only Alice remains. Chrome stays
+    // so the set-aside agent can be brought back via "Return to unified view".
     expect(layout.panes[0]!.members).toEqual([ALICE.id]);
     expect(within(paneEls()[0]!).getByText("hello from alice")).toBeInTheDocument();
     expect(within(paneEls()[0]!).queryByText("hello from bob")).not.toBeInTheDocument();
-    // One pane remains, but chrome stays visible while unassigned agents exist
-    // so they can be added back from the pane header.
     expect(screen.getByTestId("pane-header")).toBeInTheDocument();
-    expect(screen.getByTestId("pane-actions")).toBeInTheDocument();
+  });
+
+  it("closing one of two panes drops the dismissed agent and targets the survivor", async () => {
+    await seedTwoAgentTranscripts();
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id); // pane 1: alice, pane 2: bob
+    setRecipients(PROJECT_ID, [BOB.id]);
+    renderPanes();
+
+    // Close Bob's pane → Bob is dismissed (deselected) and the lone survivor
+    // (Alice) is targeted.
+    await fireEvent.click(screen.getAllByTestId("pane-actions")[1]!);
+    await fireEvent.click(screen.getByTestId("pane-close"));
+
+    expect(selectionFor(PROJECT_ID)).toEqual([ALICE.id]);
+  });
+
+  it("returns to the unified view from a two-pane split, preserving selection", async () => {
+    await seedTwoAgentTranscripts();
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    setRecipients(PROJECT_ID, [BOB.id]);
+    renderPanes();
+
+    await fireEvent.click(screen.getAllByTestId("pane-actions")[0]!);
+    await fireEvent.click(screen.getByTestId("pane-return-unified"));
+
+    const layout = layoutFor(PROJECT_ID, ROSTER_IDS);
+    expect(layout.panes).toHaveLength(1);
+    expect(layout.panes[0]!.members).toEqual([ALICE.id, BOB.id]);
+    // Un-dismissing everyone doesn't retarget — selection is preserved.
+    expect(selectionFor(PROJECT_ID)).toEqual([BOB.id]);
+  });
+
+  it("closing one of three panes unassigns and deselects that pane's agent", async () => {
+    const carol = numberedAgent(3);
+    const agents = [ALICE, BOB, carol];
+    const rosterIds = agents.map((a) => a.id);
+    moveAgentToNewPane(PROJECT_ID, rosterIds, BOB.id); // pane 2: bob
+    moveAgentToNewPane(PROJECT_ID, rosterIds, carol.id); // pane 3: carol
+    setRecipients(PROJECT_ID, [ALICE.id, BOB.id, carol.id]);
+    render(TranscriptPanes, { props: { projectId: PROJECT_ID, agents } });
+
+    // With 3 panes, closing one stays a split: Bob is unassigned + deselected,
+    // not merged back.
+    await fireEvent.click(screen.getAllByTestId("pane-actions")[1]!);
+    await fireEvent.click(screen.getByTestId("pane-close"));
+
+    const layout = layoutFor(PROJECT_ID, rosterIds);
+    expect(layout.panes).toHaveLength(2);
+    expect(layout.panes.flatMap((p) => p.members)).not.toContain(BOB.id);
+    expect(selectionFor(PROJECT_ID)).toEqual([ALICE.id, carol.id]);
+  });
+
+  it("returns to the unified view from a multi-pane split, preserving selection", async () => {
+    const carol = numberedAgent(3);
+    const agents = [ALICE, BOB, carol];
+    const rosterIds = agents.map((a) => a.id);
+    moveAgentToNewPane(PROJECT_ID, rosterIds, BOB.id);
+    moveAgentToNewPane(PROJECT_ID, rosterIds, carol.id); // 3 panes
+    setRecipients(PROJECT_ID, [BOB.id]);
+    render(TranscriptPanes, { props: { projectId: PROJECT_ID, agents } });
+
+    await fireEvent.click(screen.getAllByTestId("pane-actions")[0]!);
+    await fireEvent.click(screen.getByTestId("pane-return-unified"));
+
+    const layout = layoutFor(PROJECT_ID, rosterIds);
+    expect(layout.panes).toHaveLength(1);
+    expect(layout.panes[0]!.members).toEqual(rosterIds);
+    // Exiting the split keeps whatever was selected — no retargeting.
+    expect(selectionFor(PROJECT_ID)).toEqual([BOB.id]);
+  });
+
+  it("returns to the unified view from a single pane holding orphaned agents", async () => {
+    await seedTwoAgentTranscripts();
+    // A single pane that doesn't hold the whole roster (e.g. a newly added agent
+    // lands unassigned): Bob is orphaned and invisible, with chrome shown.
+    unassignAgentFromPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    setRecipients(PROJECT_ID, [ALICE.id]);
+    renderPanes();
+
+    await fireEvent.click(screen.getByTestId("pane-actions"));
+    await fireEvent.click(screen.getByTestId("pane-return-unified"));
+
+    const layout = layoutFor(PROJECT_ID, ROSTER_IDS);
+    expect(layout.panes).toHaveLength(1);
+    expect(layout.panes[0]!.members).toEqual([ALICE.id, BOB.id]); // Bob re-merged, visible
+    expect(selectionFor(PROJECT_ID)).toEqual([ALICE.id]); // selection preserved
   });
 
   it("removing a pane member chip unassigns that agent", async () => {
@@ -369,6 +455,30 @@ describe("pane chrome (headers, rename, close)", () => {
     expect(layout.panes[1]!.members).toEqual([BOB.id, ALICE.id]);
     expect(within(paneEls()[0]!).queryByText("hello from alice")).not.toBeInTheDocument();
     expect(within(paneEls()[1]!).getByText("hello from alice")).toBeInTheDocument();
+  });
+
+  it("removing a pane member chip deselects that agent's compose chip", async () => {
+    await seedTwoAgentTranscripts();
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    setRecipients(PROJECT_ID, [ALICE.id, BOB.id]);
+    renderPanes();
+
+    await fireEvent.click(within(paneEls()[1]!).getByTestId("pane-member-remove"));
+
+    expect(selectionFor(PROJECT_ID)).toEqual([ALICE.id]);
+  });
+
+  it("moving an agent into a pane from the actions menu selects its compose chip", async () => {
+    await seedTwoAgentTranscripts();
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    setRecipients(PROJECT_ID, []);
+    renderPanes();
+
+    const paneB = paneEls()[1]!;
+    await fireEvent.click(within(paneB).getByTestId("pane-actions"));
+    await fireEvent.click(screen.getByTestId(`pane-add-agent-${ALICE.id}`));
+
+    expect(selectionFor(PROJECT_ID)).toEqual([ALICE.id]);
   });
 
   it("minimizes a pane without changing membership", async () => {
@@ -562,7 +672,7 @@ describe("targeting", () => {
 });
 
 describe("Cmd-held target overlay", () => {
-  it("arms on Cmd-down over the hovered pane, disarms on Cmd-up", async () => {
+  it("arms only after pointer movement while Cmd is held, then disarms on Cmd-up", async () => {
     await seedTwoAgentTranscripts();
     moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
     renderPanes();
@@ -571,6 +681,9 @@ describe("Cmd-held target overlay", () => {
     expect(screen.queryByTestId("pane-target-overlay")).not.toBeInTheDocument();
 
     await fireEvent.keyDown(window, { key: "Meta" });
+    expect(screen.queryByTestId("pane-target-overlay")).not.toBeInTheDocument();
+
+    await fireEvent.pointerMove(window);
     expect(screen.getByTestId("pane-target-overlay")).toBeInTheDocument();
 
     await fireEvent.keyUp(window, { key: "Meta" });
@@ -590,9 +703,47 @@ describe("Cmd-held target overlay", () => {
     expect(screen.queryByTestId("pane-target-overlay")).not.toBeInTheDocument();
 
     await fireEvent.keyUp(window, { key: "Alt", metaKey: true });
+    expect(screen.queryByTestId("pane-target-overlay")).not.toBeInTheDocument();
+
+    await fireEvent.pointerMove(window);
     expect(screen.getByTestId("pane-target-overlay")).toBeInTheDocument();
 
     await fireEvent.keyDown(window, { key: "Shift", metaKey: true, shiftKey: true });
+    expect(screen.queryByTestId("pane-target-overlay")).not.toBeInTheDocument();
+  });
+
+  it("suppresses the overlay during non-modifier Cmd chords", async () => {
+    await seedTwoAgentTranscripts();
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    renderPanes();
+
+    await fireEvent.pointerEnter(paneEls()[0]!);
+    await fireEvent.keyDown(window, { key: "Meta" });
+    await fireEvent.pointerMove(window);
+    expect(screen.getByTestId("pane-target-overlay")).toBeInTheDocument();
+
+    await fireEvent.keyDown(window, { key: "c", metaKey: true });
+    expect(screen.queryByTestId("pane-target-overlay")).not.toBeInTheDocument();
+
+    await fireEvent.pointerMove(window);
+    expect(screen.queryByTestId("pane-target-overlay")).not.toBeInTheDocument();
+
+    await fireEvent.keyUp(window, { key: "c", metaKey: true });
+    expect(screen.queryByTestId("pane-target-overlay")).not.toBeInTheDocument();
+
+    await fireEvent.pointerMove(window);
+    expect(screen.getByTestId("pane-target-overlay")).toBeInTheDocument();
+  });
+
+  it("does not arm from pointer movement during a non-modifier Cmd chord", async () => {
+    await seedTwoAgentTranscripts();
+    moveAgentToNewPane(PROJECT_ID, ROSTER_IDS, BOB.id);
+    renderPanes();
+
+    await fireEvent.pointerEnter(paneEls()[0]!);
+    await fireEvent.keyDown(window, { key: "v", metaKey: true });
+    await fireEvent.pointerMove(window);
+
     expect(screen.queryByTestId("pane-target-overlay")).not.toBeInTheDocument();
   });
 
@@ -635,6 +786,7 @@ describe("Cmd-held target overlay", () => {
 
     await fireEvent.pointerEnter(paneEls()[0]!);
     await fireEvent.keyDown(window, { key: "Meta" });
+    await fireEvent.pointerMove(window);
     expect(screen.getByTestId("pane-target-overlay")).toBeInTheDocument();
 
     await fireEvent.blur(window);

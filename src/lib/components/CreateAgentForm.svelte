@@ -4,7 +4,6 @@
   import { harnessUnavailableReason, isHarnessSelectable } from "$lib/harnessAvailability";
   import {
     ALL_HARNESSES,
-    HARNESS_DEFAULT_AGENT_NAME,
     HARNESS_LABEL,
     SUPPORTS_EFFORT_SELECTION,
     SUPPORTS_MODEL_SELECTION,
@@ -14,6 +13,7 @@
     DEFAULT_MODEL,
     EFFORT_OPTIONS,
     MODEL_OPTIONS,
+    defaultAgentName,
     type SelectionOption,
   } from "$lib/agentSelection";
   import { normalizeAgentName, validateAgentName } from "$lib/agentName";
@@ -59,50 +59,53 @@
     roster = [],
     availability = {},
   }: Props = $props();
-  let name = $state<string>(HARNESS_DEFAULT_AGENT_NAME["claude_code"]);
+  let name = $state<string>(
+    defaultAgentName("claude_code", DEFAULT_MODEL["claude_code"], DEFAULT_EFFORT["claude_code"]),
+  );
+  /// Set once the user edits the name field, which freezes it: until then the
+  /// name tracks the model/effort/harness selection (see the `$effect` below);
+  /// after, the user's value is theirs to keep.
+  let nameTouched = $state<boolean>(false);
   let harness = $state<HarnessKind>("claude_code");
   let mode = $state<"create" | "attach">("create");
   let existingSessionId = $state<string>("");
 
-  /// Model + effort selection. The empty string is the "keep current" sentinel
-  /// (attach default) and maps to `undefined` on submit — i.e. send no
-  /// flag and leave the attached session's existing model/effort untouched.
-  /// **Create and attach have different correct defaults:** create preselects
-  /// the harness default and submits it concretely (a new agent has no session
-  /// to preserve); attach defaults to "keep current" because Claude is
-  /// session-sticky — overriding would silently switch a running session's
-  /// model. The user can still pick a concrete value in attach mode to switch
-  /// deliberately.
-  const KEEP_CURRENT = "";
-  function defaultModelFor(forMode: "create" | "attach", kind: HarnessKind): string {
-    if (forMode === "attach") return KEEP_CURRENT;
-    return DEFAULT_MODEL[kind] ?? KEEP_CURRENT;
+  /// Model + effort selection — **create mode only**. Attach brings in an
+  /// existing on-disk session and pins nothing: the pickers aren't shown there
+  /// and no model/effort flag is submitted, so the harness runs the resumed
+  /// session as-is. The user manages model/effort from the agent's actions menu
+  /// afterward (the canonical place for an existing agent). The empty string is
+  /// the "unset" sentinel for a create-mode harness with no capability on an
+  /// axis (Antigravity's model; Gemini/Antigravity effort) — it maps to
+  /// `undefined` on submit so the backend stores `None`.
+  const UNSET = "";
+  function defaultModelFor(kind: HarnessKind): string {
+    return DEFAULT_MODEL[kind] ?? UNSET;
   }
-  function defaultEffortFor(forMode: "create" | "attach", kind: HarnessKind): string {
-    if (forMode === "attach") return KEEP_CURRENT;
-    return DEFAULT_EFFORT[kind] ?? KEEP_CURRENT;
+  function defaultEffortFor(kind: HarnessKind): string {
+    return DEFAULT_EFFORT[kind] ?? UNSET;
   }
-  let model = $state<string>(defaultModelFor("create", "claude_code"));
-  let effort = $state<string>(defaultEffortFor("create", "claude_code"));
+  let model = $state<string>(defaultModelFor("claude_code"));
+  let effort = $state<string>(defaultEffortFor("claude_code"));
+
+  /// Keep the name in lock-step with the current selection while the user
+  /// hasn't taken it over. In create mode it tracks the model/effort the new
+  /// agent will run (`opus-high`, `gpt-5-5-medium`, …); attach keeps the bare
+  /// harness name — it inherits an existing session and pins nothing, so naming
+  /// it after a picker value would mislabel it. Writing `name` here is safe — the
+  /// effect never reads it, so there's no reactive loop.
+  $effect(() => {
+    const auto =
+      mode === "attach"
+        ? defaultAgentName(harness, undefined, undefined)
+        : defaultAgentName(harness, model, effort);
+    if (!nameTouched) name = auto;
+  });
 
   const modelSupported = $derived(SUPPORTS_MODEL_SELECTION[harness]);
   const effortSupported = $derived(SUPPORTS_EFFORT_SELECTION[harness]);
-  /// Attach prepends the "no override" sentinel so leaving the picker alone
-  /// sends no flag; create offers only concrete values. The label is "No
-  /// override" rather than "keep current" because omitting the flag only
-  /// *preserves* the session's model on the sticky harness (Claude) — Gemini
-  /// reverts to its default and Codex resolves its config default. "No
-  /// override" describes what Switchboard does (send nothing) for all three.
-  const modelOptions = $derived<SelectionOption[]>(
-    mode === "attach"
-      ? [{ label: "No override", value: KEEP_CURRENT }, ...MODEL_OPTIONS[harness]]
-      : MODEL_OPTIONS[harness],
-  );
-  const effortOptions = $derived<SelectionOption[]>(
-    mode === "attach"
-      ? [{ label: "No override", value: KEEP_CURRENT }, ...EFFORT_OPTIONS[harness]]
-      : EFFORT_OPTIONS[harness],
-  );
+  const modelOptions = $derived<SelectionOption[]>(MODEL_OPTIONS[harness]);
+  const effortOptions = $derived<SelectionOption[]>(EFFORT_OPTIONS[harness]);
 
   /// Per-harness gate, looked up by kind (no per-harness branches). Missing
   /// availability defaults to "available". Two predicates from
@@ -160,26 +163,29 @@
   function handleSubmit(): void {
     if (!canSubmit) return;
     const trimmedName = normalizeAgentName(name);
-    // The "No override" sentinel (and any unsupported-capability empty value)
-    // collapses to `undefined` → the backend sends no flag. Backend
-    // normalization is the real trust boundary; this is the UX layer.
-    const selectedModel = model === KEEP_CURRENT ? undefined : model;
-    const selectedEffort = effort === KEEP_CURRENT ? undefined : effort;
-    const selection = {
-      ...(selectedModel !== undefined ? { model: selectedModel } : {}),
-      ...(selectedEffort !== undefined ? { effort: selectedEffort } : {}),
-    };
-    if (mode === "create") {
-      onSubmit({ mode: "create", name: trimmedName, harness, ...selection });
-    } else {
+    if (mode === "attach") {
+      // Attach pins nothing — model/effort are managed from the agent's actions
+      // menu after the existing session is brought in.
       onSubmit({
         mode: "attach",
         name: trimmedName,
         harness,
         existingSessionId: existingSessionId.trim(),
-        ...selection,
       });
+      return;
     }
+    // The unset sentinel (an unsupported-capability axis) collapses to
+    // `undefined` → the backend sends no flag. Backend normalization is the real
+    // trust boundary; this is the UX layer.
+    const selectedModel = model === UNSET ? undefined : model;
+    const selectedEffort = effort === UNSET ? undefined : effort;
+    onSubmit({
+      mode: "create",
+      name: trimmedName,
+      harness,
+      ...(selectedModel !== undefined ? { model: selectedModel } : {}),
+      ...(selectedEffort !== undefined ? { effort: selectedEffort } : {}),
+    });
   }
 
   function submitOnEnter(event: KeyboardEvent): void {
@@ -194,14 +200,11 @@
   /// `$effect` so the reset stays adjacent to the trigger and there's no
   /// hidden reactive dependency.
   function selectHarness(kind: HarnessKind): void {
-    if (name === HARNESS_DEFAULT_AGENT_NAME[harness]) {
-      name = HARNESS_DEFAULT_AGENT_NAME[kind];
-    }
     harness = kind;
     // Reset the pickers to the new harness's default so a stale, out-of-list
     // value (e.g. a Codex model carried over to Gemini) can't be submitted.
-    model = defaultModelFor(mode, kind);
-    effort = defaultEffortFor(mode, kind);
+    model = defaultModelFor(kind);
+    effort = defaultEffortFor(kind);
   }
 
   function selectMode(next: "create" | "attach"): void {
@@ -210,10 +213,10 @@
     if (next === "create") {
       existingSessionId = "";
     }
-    // Create and attach have different correct defaults (concrete vs. "keep
-    // current"), so re-seed on the toggle.
-    model = defaultModelFor(next, harness);
-    effort = defaultEffortFor(next, harness);
+    // Create-mode model/effort selections are intentionally preserved across a
+    // mode toggle (draft preservation) — an incidental switch to attach and back
+    // shouldn't discard the user's picks. Harness change is the only reset point
+    // (see `selectHarness`), since that's what can leave a stale out-of-list value.
   }
 
   // Visual classes for a harness option (a native radio styled as a segmented
@@ -324,54 +327,59 @@
     {/if}
   </fieldset>
 
-  <!-- Model: a curated per-harness picker where the harness supports it, a
-       short note where it doesn't (Antigravity's model is set inside
-       Antigravity). -->
-  {#if modelSupported}
-    <label class="block space-y-1">
-      <span class="text-muted text-xs">Model</span>
-      <SelectionPicker
-        bind:value={model}
-        options={modelOptions}
-        disabled={busy}
-        testid="model-select"
-        ariaLabel="Model"
-      />
-    </label>
-  {:else}
-    <p class="text-muted text-xs leading-relaxed" data-testid="model-note">
-      {HARNESS_LABEL[harness]}'s model is selected inside {HARNESS_LABEL[harness]} — it can't be set from
-      Switchboard.
-    </p>
-  {/if}
+  <!-- Model/effort are a create-only concern. Attach brings in an existing
+       session and pins nothing; the user sets model/effort from the agent's
+       actions menu afterward. -->
+  {#if mode === "create"}
+    <!-- Model: a curated per-harness picker where the harness supports it, a
+         short note where it doesn't (Antigravity's model is set inside
+         Antigravity). -->
+    {#if modelSupported}
+      <label class="block space-y-1">
+        <span class="text-muted text-xs">Model</span>
+        <SelectionPicker
+          bind:value={model}
+          options={modelOptions}
+          disabled={busy}
+          testid="model-select"
+          ariaLabel="Model"
+        />
+      </label>
+    {:else}
+      <p class="text-muted text-xs leading-relaxed" data-testid="model-note">
+        {HARNESS_LABEL[harness]}'s model is selected inside {HARNESS_LABEL[harness]} — it can't be set
+        from Switchboard.
+      </p>
+    {/if}
 
-  <!-- Effort: a curated picker for Claude/Codex, a note for Gemini (config
-       only) and Antigravity (folded into the model). -->
-  {#if effortSupported}
-    <label class="block space-y-1">
-      <span class="text-muted text-xs">Reasoning effort</span>
-      <SelectionPicker
-        bind:value={effort}
-        options={effortOptions}
-        disabled={busy}
-        testid="effort-select"
-        ariaLabel="Reasoning effort"
-        presentation="segmented"
-      />
-      {#if harness === "claude_code"}
-        <span class="text-muted block text-xs">
-          Higher levels may run at a lower effort on some models.
-        </span>
-      {/if}
-    </label>
-  {:else if harness === "gemini"}
-    <p class="text-muted text-xs leading-relaxed" data-testid="effort-note">
-      Gemini's reasoning effort is set in Gemini's own config, not from Switchboard.
-    </p>
-  {:else}
-    <p class="text-muted text-xs leading-relaxed" data-testid="effort-note">
-      Antigravity folds reasoning effort into the model you pick inside Antigravity.
-    </p>
+    <!-- Effort: a curated picker for Claude/Codex, a note for Gemini (config
+         only) and Antigravity (folded into the model). -->
+    {#if effortSupported}
+      <label class="block space-y-1">
+        <span class="text-muted text-xs">Reasoning effort</span>
+        <SelectionPicker
+          bind:value={effort}
+          options={effortOptions}
+          disabled={busy}
+          testid="effort-select"
+          ariaLabel="Reasoning effort"
+          presentation="segmented"
+        />
+        {#if harness === "claude_code"}
+          <span class="text-muted block text-xs">
+            Higher levels may run at a lower effort on some models.
+          </span>
+        {/if}
+      </label>
+    {:else if harness === "gemini"}
+      <p class="text-muted text-xs leading-relaxed" data-testid="effort-note">
+        Gemini's reasoning effort is set in Gemini's own config, not from Switchboard.
+      </p>
+    {:else}
+      <p class="text-muted text-xs leading-relaxed" data-testid="effort-note">
+        Antigravity folds reasoning effort into the model you pick inside Antigravity.
+      </p>
+    {/if}
   {/if}
 
   <label class="block space-y-1">
@@ -384,6 +392,7 @@
       aria-invalid={!nameValidation.ok}
       aria-describedby={nameError ? "agent-name-error" : undefined}
       title={nameError ?? undefined}
+      oninput={() => (nameTouched = true)}
       onkeydown={submitOnEnter}
     />
     {#if nameError}

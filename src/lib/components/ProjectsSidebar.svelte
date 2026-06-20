@@ -161,6 +161,17 @@
     void activateProject(project.id);
   }
 
+  function onProjectButtonClick(event: MouseEvent, project: ProjectListing): void {
+    if (event.detail > 1) return;
+    selectProject(project);
+  }
+
+  function onProjectButtonMouseDown(event: MouseEvent, project: ProjectListing): void {
+    if (event.detail < 2) return;
+    event.preventDefault();
+    startEdit(project);
+  }
+
   /// Commit the draft. An unchanged verbatim name skips the round-trip. On
   /// success the row updates and we leave edit mode; on a backend rejection we
   /// stay in edit mode and surface it.
@@ -471,6 +482,9 @@
                   <input
                     use:focusSelect
                     bind:value={draftName}
+                    autocorrect="off"
+                    autocapitalize="off"
+                    spellcheck="false"
                     class={cn(
                       "text-fg border-border bg-panel h-6 min-w-0 flex-1 rounded border px-1.5 text-[13px] font-semibold",
                       "focus-visible:ring-accent focus-visible:ring-1 focus-visible:outline-none",
@@ -532,8 +546,13 @@
               <button
                 type="button"
                 class="flex min-w-0 flex-1 flex-col items-start gap-0.5 px-2.5 py-2 text-left"
-                onclick={() => selectProject(project)}
-                ondblclick={() => startEdit(project)}
+                data-testid="project-select"
+                onclick={(event) => onProjectButtonClick(event, project)}
+                onmousedown={(event) => onProjectButtonMouseDown(event, project)}
+                ondblclick={(event) => {
+                  event.preventDefault();
+                  startEdit(project);
+                }}
               >
                 <div class="flex w-full items-center gap-2">
                   <span class="text-fg truncate text-[13px] font-semibold">

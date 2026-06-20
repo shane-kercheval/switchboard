@@ -56,7 +56,7 @@ describe("CreateAgentForm", () => {
     await fireEvent.click(screen.getByTestId("confirm-create-agent"));
     expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
       mode: "create",
-      name: "claude-code",
+      name: "opus-high",
       harness: "claude_code",
       model: "opus",
       effort: "high",
@@ -93,7 +93,7 @@ describe("CreateAgentForm", () => {
     await fireEvent.click(screen.getByTestId("confirm-create-agent"));
     expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
       mode: "create",
-      name: "codex",
+      name: "gpt-5-5-medium",
       harness: "codex",
       model: "gpt-5.5",
       effort: "medium",
@@ -295,7 +295,7 @@ describe("CreateAgentForm", () => {
     await fireEvent.click(screen.getByTestId("confirm-create-agent"));
     expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
       mode: "create",
-      name: "claude-code",
+      name: "opus-high",
       harness: "claude_code",
       model: "opus",
       effort: "high",
@@ -428,10 +428,10 @@ describe("CreateAgentForm", () => {
   });
 
   it("flags the default name on open when it already collides with the roster", () => {
-    // Realistic add-another-agent case: an auto-created "claude-code" already
+    // Realistic add-another-agent case: an auto-created "opus-high" already
     // exists, so the form opens with its default name already flagged.
     const onSubmit = vi.fn();
-    render(CreateAgentForm, { props: { onSubmit, roster: [rosterAgent("claude-code")] } });
+    render(CreateAgentForm, { props: { onSubmit, roster: [rosterAgent("opus-high")] } });
     expect(screen.getByTestId("agent-name-error")).toHaveTextContent("already exists");
     expect((screen.getByTestId("confirm-create-agent") as HTMLButtonElement).disabled).toBe(true);
   });
@@ -513,7 +513,7 @@ describe("CreateAgentForm", () => {
     await fireEvent.click(screen.getByTestId("confirm-create-agent"));
     expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
       mode: "create",
-      name: "claude-code",
+      name: "sonnet-max",
       harness: "claude_code",
       model: "sonnet",
       effort: "max",
@@ -530,19 +530,22 @@ describe("CreateAgentForm", () => {
     await fireEvent.click(screen.getByTestId("confirm-create-agent"));
     expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
       mode: "create",
-      name: "codex",
+      name: "gpt-5-5-medium",
       harness: "codex",
       model: "gpt-5.5",
       effort: "medium",
     } satisfies AgentFormSubmit);
   });
 
-  it("attach defaults to 'keep current' → submits no model/effort (session preserved)", async () => {
+  it("attach mode: no model/effort controls; submits no model/effort (session left as-is)", async () => {
     const { onSubmit } = renderForm();
     await fireEvent.click(screen.getByTestId("mode-attach"));
-    // The picker's default is the keep-current sentinel (empty value).
-    expect(pickerValue("model-select")).toBe("");
-    expect(pickerValue("effort-select")).toBe("");
+    // Attach pins nothing: neither the pickers nor the unsupported-capability
+    // notes are shown — model/effort are managed from the agent's actions menu.
+    expect(screen.queryByTestId("model-select")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("effort-select")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("model-note")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("effort-note")).not.toBeInTheDocument();
     const sessionInput = screen.getByTestId("attach-session-id") as HTMLInputElement;
     await fireEvent.input(sessionInput, { target: { value: VALID_UUID } });
     await fireEvent.click(screen.getByTestId("confirm-create-agent"));
@@ -554,38 +557,81 @@ describe("CreateAgentForm", () => {
     } satisfies AgentFormSubmit);
   });
 
-  it("attach with a deliberately chosen model/effort submits them", async () => {
-    const { onSubmit } = renderForm();
+  it("attach hides the model/effort pickers; switching back to create shows them again", async () => {
+    renderForm();
     await fireEvent.click(screen.getByTestId("mode-attach"));
-    await choosePicker("model-select", "sonnet");
+    expect(screen.queryByTestId("model-select")).not.toBeInTheDocument();
+    await fireEvent.click(screen.getByTestId("mode-create"));
+    // Untouched, so they're at the harness default — this is re-render, not reset
+    // (see the draft-preservation test below).
+    expect(pickerValue("model-select")).toBe("opus");
+    expect(pickerValue("effort-select")).toBe("high");
+  });
+
+  it("create model/effort selections survive a create → attach → create toggle (draft preservation)", async () => {
+    const { onSubmit } = renderForm();
+    await choosePicker("model-select", "haiku");
     await choosePicker("effort-select", "low");
-    const sessionInput = screen.getByTestId("attach-session-id") as HTMLInputElement;
-    await fireEvent.input(sessionInput, { target: { value: VALID_UUID } });
+    await fireEvent.click(screen.getByTestId("mode-attach"));
+    await fireEvent.click(screen.getByTestId("mode-create"));
+    // The user's picks are preserved, not reset to the harness default.
+    expect(pickerValue("model-select")).toBe("haiku");
+    expect(pickerValue("effort-select")).toBe("low");
     await fireEvent.click(screen.getByTestId("confirm-create-agent"));
     expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
-      mode: "attach",
-      name: "claude-code",
+      mode: "create",
+      name: "haiku-low",
       harness: "claude_code",
-      existingSessionId: VALID_UUID,
-      model: "sonnet",
+      model: "haiku",
       effort: "low",
     } satisfies AgentFormSubmit);
   });
 
-  it("toggling attach → create restores the concrete harness default", async () => {
+  it("create: the name tracks the model/effort pickers until the user edits it", async () => {
     renderForm();
-    await fireEvent.click(screen.getByTestId("mode-attach"));
-    expect(pickerValue("model-select")).toBe("");
-    await fireEvent.click(screen.getByTestId("mode-create"));
-    expect(pickerValue("model-select")).toBe("opus");
-    expect(pickerValue("effort-select")).toBe("high");
+    const nameInput = screen.getByTestId("agent-name") as HTMLInputElement;
+    expect(nameInput.value).toBe("opus-high");
+    await choosePicker("model-select", "sonnet");
+    expect(nameInput.value).toBe("sonnet-high");
+    await choosePicker("effort-select", "low");
+    expect(nameInput.value).toBe("sonnet-low");
+  });
+
+  it("create: switching harness re-derives the auto-name (incl. bare-name harnesses)", async () => {
+    renderForm();
+    const nameInput = screen.getByTestId("agent-name") as HTMLInputElement;
+    await fireEvent.click(screen.getByTestId("harness-codex"));
+    expect(nameInput.value).toBe("gpt-5-5-medium");
+    await fireEvent.click(screen.getByTestId("harness-gemini"));
+    expect(nameInput.value).toBe("gemini");
+    await fireEvent.click(screen.getByTestId("harness-antigravity"));
+    expect(nameInput.value).toBe("antigravity");
+  });
+
+  it("editing the name freezes it against later picker and harness changes", async () => {
+    const { onSubmit } = renderForm();
+    const nameInput = screen.getByTestId("agent-name") as HTMLInputElement;
+    await fireEvent.input(nameInput, { target: { value: "my-thing" } });
+    // Neither a picker change nor a harness switch overrides the user's name.
+    await choosePicker("model-select", "sonnet");
+    expect(nameInput.value).toBe("my-thing");
+    await fireEvent.click(screen.getByTestId("harness-codex"));
+    expect(nameInput.value).toBe("my-thing");
+    await fireEvent.click(screen.getByTestId("confirm-create-agent"));
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith({
+      mode: "create",
+      name: "my-thing",
+      harness: "codex",
+      model: "gpt-5.5",
+      effort: "medium",
+    } satisfies AgentFormSubmit);
   });
 
   it("aria-invalid tracks validity (incl. empty); aria-describedby links the message only when shown", async () => {
     const onSubmit = vi.fn();
     render(CreateAgentForm, { props: { onSubmit, roster: [rosterAgent("codex")] } });
     const nameInput = screen.getByTestId("agent-name") as HTMLInputElement;
-    // Default "claude-code" is valid: not invalid, no description.
+    // Default "opus-high" is valid: not invalid, no description.
     expect(nameInput.getAttribute("aria-invalid")).toBe("false");
     expect(nameInput.getAttribute("aria-describedby")).toBeNull();
 

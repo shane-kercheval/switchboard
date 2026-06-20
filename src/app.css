@@ -470,7 +470,7 @@ body {
   }
   .md-code-copy[data-copied="true"] {
     color: var(--accent);
-    background-color: var(--code-copy-hover);
+    background-color: var(--accent-soft);
     opacity: 1;
   }
   .md-code-copy[data-copied="true"] .md-copy-icon {
@@ -567,7 +567,6 @@ body {
   background-color: var(--code-bg-user);
 }
 
-[data-role="user"] .md-code-copy:hover:not([data-copied="true"]),
-[data-role="user"] .md-code-copy[data-copied="true"] {
+[data-role="user"] .md-code-copy:hover:not([data-copied="true"]) {
   background-color: var(--code-copy-hover-user);
 }

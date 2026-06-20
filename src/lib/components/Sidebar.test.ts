@@ -145,6 +145,7 @@ beforeEach(async () => {
   // of testing-library's auto-cleanup, so a teardown reset would mutate pane
   // state under the still-mounted previous component.
   (await import("$lib/state/transcriptPanes.svelte"))._testing.reset();
+  (await import("$lib/state/recipientSelection.svelte"))._testing.reset();
 });
 
 afterEach(async () => {
@@ -625,9 +626,9 @@ describe("Sidebar", () => {
     expect(setAgentModelMock).toHaveBeenCalledExactlyOnceWith(agent.id, "sonnet");
   });
 
-  it("Change model 'No override' clears the selection (calls setAgentModel with undefined)", async () => {
+  it("Change model: an agent with no pinned model seeds the harness default; no 'No override' option", async () => {
     const state = await loadState();
-    const agent = { ...CLAUDE_AGENT, model: "opus" };
+    const agent = { ...CLAUDE_AGENT, model: null };
     await state.registerAgent(agent);
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [agent] } });
 
@@ -636,10 +637,13 @@ describe("Sidebar", () => {
     await fireEvent.click(screen.getByTestId("agent-change-model"));
 
     await screen.findByTestId("change-select");
-    await choosePicker("change-select", "");
+    // The picker offers concrete values only — no "No override" sentinel ("") —
+    // and preselects the harness default for an agent that pins nothing.
+    expect(pickerHasOption("change-select", "")).toBe(false);
+    expect(pickerValue("change-select")).toBe("opus");
     await fireEvent.click(screen.getByTestId("change-save"));
 
-    expect(setAgentModelMock).toHaveBeenCalledExactlyOnceWith(agent.id, undefined);
+    expect(setAgentModelMock).toHaveBeenCalledExactlyOnceWith(agent.id, "opus");
   });
 
   it("Change model includes an unknown persisted value so Save preserves it", async () => {
@@ -1382,6 +1386,7 @@ describe("Sidebar pane visibility + assignment", () => {
 
   it("offers Move to new pane for multi-agent projects and moves the agent", async () => {
     const panes = await importPanes();
+    const selection = await import("$lib/state/recipientSelection.svelte");
     const roster = [CLAUDE_AGENT.id, CODEX_AGENT.id];
     render(Sidebar, { props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] } });
 
@@ -1392,10 +1397,13 @@ describe("Sidebar pane visibility + assignment", () => {
     expect(layout.panes).toHaveLength(2);
     expect(layout.panes[1]!.members).toEqual([CODEX_AGENT.id]);
     expect(layout.panes[0]!.members).toEqual([CLAUDE_AGENT.id]);
+    // Adding the agent to a pane selects its compose chip.
+    expect(selection.selectionFor(PROJECT_ID)).toEqual([CODEX_AGENT.id]);
   });
 
   it("lists other panes as move targets once split, excluding the agent's own", async () => {
     const panes = await importPanes();
+    const selection = await import("$lib/state/recipientSelection.svelte");
     const roster = [CLAUDE_AGENT.id, CODEX_AGENT.id];
     const newPane = panes.moveAgentToNewPane(PROJECT_ID, roster, CODEX_AGENT.id);
     const pane1 = panes.layoutFor(PROJECT_ID, roster).panes[0]!.id;
@@ -1410,6 +1418,9 @@ describe("Sidebar pane visibility + assignment", () => {
       CODEX_AGENT.id,
       CLAUDE_AGENT.id,
     ]);
+    // The direct move-to-new-pane in setup is a pure layout op (no selection
+    // change); only the menu gesture selects the moved agent's compose chip.
+    expect(selection.selectionFor(PROJECT_ID)).toEqual([CLAUDE_AGENT.id]);
   });
 
   it("hides Move to new pane for a single-agent project", async () => {

@@ -313,7 +313,7 @@ async function renderWith(list: ProjectListing[]) {
 
 function rowSelectButton(index = 0): HTMLButtonElement {
   const rows = screen.getAllByTestId("project-row");
-  const btn = rows[index]?.querySelector("button");
+  const btn = rows[index]?.querySelector('[data-testid="project-select"]');
   if (!btn) throw new Error("expected a select button in the project row");
   return btn as HTMLButtonElement;
 }
@@ -373,6 +373,17 @@ describe("ProjectsSidebar — rename", () => {
     await renderWith([projectIn(A1, "alpha", "/work/a")]);
 
     await fireEvent.dblClick(rowSelectButton());
+    expect(await screen.findByTestId("project-rename-input")).toBeInTheDocument();
+  });
+
+  it("enters edit from the second press of a real double-click sequence", async () => {
+    mockRenameEchoes();
+    await renderWith([projectIn(A1, "alpha", "/work/a")]);
+
+    const button = rowSelectButton();
+    await fireEvent.click(button, { detail: 1 });
+    await fireEvent.mouseDown(button, { detail: 2 });
+
     expect(await screen.findByTestId("project-rename-input")).toBeInTheDocument();
   });
 

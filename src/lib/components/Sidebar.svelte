@@ -29,7 +29,13 @@
   import { DRAG_SLOP_PX, dropIndexForPointer, movedOrder } from "$lib/agentReorder";
   import { shortcut } from "$lib/platform";
   import { SUPPORTS_EFFORT_SELECTION, SUPPORTS_MODEL_SELECTION } from "$lib/harnessDisplay";
-  import { EFFORT_OPTIONS, MODEL_OPTIONS, type SelectionOption } from "$lib/agentSelection";
+  import {
+    DEFAULT_EFFORT,
+    DEFAULT_MODEL,
+    EFFORT_OPTIONS,
+    MODEL_OPTIONS,
+    type SelectionOption,
+  } from "$lib/agentSelection";
   import DropdownMenu from "$lib/components/ui/DropdownMenu.svelte";
   import DropdownMenuItem from "$lib/components/ui/DropdownMenuItem.svelte";
   import SelectionPicker from "$lib/components/ui/SelectionPicker.svelte";
@@ -54,6 +60,7 @@
     soloAgent,
     toggleAgentHidden,
   } from "$lib/state/transcriptPanes.svelte";
+  import { selectAgent } from "$lib/state/recipientSelection.svelte";
   import HarnessIcon from "$lib/components/ui/HarnessIcon.svelte";
   import PlusIcon from "$lib/components/ui/PlusIcon.svelte";
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
@@ -123,12 +130,10 @@
   let removeError = $state<{ agentId: AgentId; message: string } | null>(null);
 
   /// Per-agent model/effort change editor. `editing` names which agent + axis is
-  /// open; `editValue` is the picker's current value (the "No override" sentinel
-  /// `""` clears the override on submit). Mirrors the resume/rename editors —
-  /// errors surface inline and keep the dialog open.
-  const NO_OVERRIDE = "";
+  /// open; `editValue` is the picker's current (always concrete) value. Mirrors
+  /// the resume/rename editors — errors surface inline and keep the dialog open.
   let editing = $state<{ agentId: AgentId; axis: "model" | "effort" } | null>(null);
-  let editValue = $state<string>(NO_OVERRIDE);
+  let editValue = $state<string>("");
   let editBusy = $state<boolean>(false);
   let editError = $state<string | null>(null);
 
@@ -144,22 +149,19 @@
     return [{ label: current, value: current }, ...options];
   }
 
-  /// The curated list for the axis being edited, prefixed with the "No override"
-  /// sentinel so clearing back to the harness default is reachable. If the agent
-  /// already carries a value that is no longer in the curated list, keep that
-  /// value selectable so the dialog honestly reflects persisted state.
+  /// The curated list for the axis being edited (concrete values only — picking
+  /// a model/effort is always a concrete choice). If the agent already carries a
+  /// value that is no longer in the curated list, keep it selectable so the
+  /// dialog honestly reflects persisted state.
   const editOptions = $derived<SelectionOption[]>(
     editing === null || editingAgent === null
       ? []
-      : [
-          { label: "No override", value: NO_OVERRIDE },
-          ...withCurrentOption(
-            editing.axis === "model"
-              ? MODEL_OPTIONS[editingAgent.harness]
-              : EFFORT_OPTIONS[editingAgent.harness],
-            editing.axis === "model" ? editingAgent.model : editingAgent.effort,
-          ),
-        ],
+      : withCurrentOption(
+          editing.axis === "model"
+            ? MODEL_OPTIONS[editingAgent.harness]
+            : EFFORT_OPTIONS[editingAgent.harness],
+          editing.axis === "model" ? editingAgent.model : editingAgent.effort,
+        ),
   );
 
   function canChangeModel(agent: AgentRecord): boolean {
@@ -171,7 +173,13 @@
 
   function openChange(agent: AgentRecord, axis: "model" | "effort"): void {
     editing = { agentId: agent.id, axis };
-    editValue = (axis === "model" ? agent.model : agent.effort) ?? NO_OVERRIDE;
+    // Seed with the agent's current value, or the harness default when it pins
+    // nothing yet (e.g. an attached agent) — the menu only opens for harnesses
+    // that have a default on this axis, so the fallback is always concrete.
+    const current = axis === "model" ? agent.model : agent.effort;
+    const fallback =
+      axis === "model" ? DEFAULT_MODEL[agent.harness] : DEFAULT_EFFORT[agent.harness];
+    editValue = current ?? fallback ?? "";
     editError = null;
     editBusy = false;
   }
@@ -185,7 +193,7 @@
   async function submitChange(): Promise<void> {
     if (editing === null) return;
     const { agentId, axis } = editing;
-    const value = editValue === NO_OVERRIDE ? undefined : editValue;
+    const value = editValue;
     const stillEditingSubmittedTarget = (): boolean =>
       editing?.agentId === agentId && editing.axis === axis;
     editBusy = true;
@@ -881,6 +889,9 @@
               <input
                 use:focusSelect
                 bind:value={draftName}
+                autocorrect="off"
+                autocapitalize="off"
+                spellcheck="false"
                 class={cn(
                   "text-fg border-border bg-panel h-6 min-w-0 flex-1 rounded border px-1.5 text-[13px] font-semibold",
                   "focus-visible:ring-accent focus-visible:ring-1 focus-visible:outline-none",
@@ -1149,7 +1160,10 @@
                       {@const ownPaneId = paneOfAgent(projectId, rosterIds, agent.id)?.id}
                       {#each paneLayout.panes.filter((p) => p.id !== ownPaneId) as pane (pane.id)}
                         <DropdownMenuItem
-                          onSelect={() => moveAgentToPane(projectId, rosterIds, agent.id, pane.id)}
+                          onSelect={() => {
+                            moveAgentToPane(projectId, rosterIds, agent.id, pane.id);
+                            selectAgent(projectId, agent.id);
+                          }}
                           class="gap-2"
                           data-testid={`agent-move-to-pane-${pane.id}`}
                         >
@@ -1165,7 +1179,10 @@
                     {/if}
                     {#if agents.length > 1}
                       <DropdownMenuItem
-                        onSelect={() => moveAgentToNewPane(projectId, rosterIds, agent.id)}
+                        onSelect={() => {
+                          moveAgentToNewPane(projectId, rosterIds, agent.id);
+                          selectAgent(projectId, agent.id);
+                        }}
                         class="gap-2"
                         data-testid="agent-move-to-new-pane"
                       >
@@ -1288,12 +1305,12 @@
               </Tooltip>
             {/if}
             <!-- Selected model/effort (intent), shown first. When the user
-                 hasn't chosen a model (Antigravity, or an attached agent left at
-                 "No override") we fall back to the harness-observed
-                 model from `runtime.meta` so the line isn't blank when a model
-                 is known. Effort is selection-only — no observed source. The
-                 per-turn transcript footer carries the actual runtime history
-                 (which may show a resolved id even when intent is an alias). -->
+                 hasn't chosen a model (Antigravity, or an attached agent, which
+                 pins nothing) we fall back to the harness-observed model from
+                 `runtime.meta` so the line isn't blank when a model is known.
+                 Effort is selection-only — no observed source. The per-turn
+                 transcript footer carries the actual runtime history (which may
+                 show a resolved id even when intent is an alias). -->
             {#if agent.model || runtime?.meta?.model || agent.effort}
               <div
                 class="text-muted mt-1.5 space-y-0.5 text-xs leading-4"
@@ -1505,8 +1522,8 @@
   details={hydrationDetailsError}
 />
 
-<!-- Change model / effort. Reuses the shared selection picker; the "No override" option
-     clears the selection back to `None`. Applies on the agent's next send. -->
+<!-- Change model / effort. Reuses the shared selection picker (concrete values
+     only). Applies on the agent's next send. -->
 <Dialog
   open={editing !== null}
   onClose={closeChange}
@@ -1528,10 +1545,7 @@
         presentation={editing?.axis === "effort" ? "segmented" : "auto"}
       />
     </label>
-    <p class="text-muted text-xs leading-relaxed">
-      “No override” clears Switchboard's selection — the harness then runs on whatever it would on
-      its own. Takes effect on the next message.
-    </p>
+    <p class="text-muted text-xs leading-relaxed">Takes effect on the next message.</p>
     {#if editError}
       <p class="text-status-failed text-xs" data-testid="change-error">{editError}</p>
     {/if}

@@ -8,6 +8,7 @@ const {
   isAgentHidden,
   paneOfAgent,
   unassignedAgentIds,
+  paneToCycleTo,
   toggleAgentHidden,
   soloAgent,
   showAllAgents,
@@ -568,5 +569,52 @@ describe("fractions", () => {
     expect(layoutFor(P, ROSTER).fractions).toEqual([0.5, 0.5]);
     setFractions(P, ROSTER, [0, 0]);
     expect(layoutFor(P, ROSTER).fractions).toEqual([0.5, 0.5]);
+  });
+});
+
+describe("paneToCycleTo (positional pane cycling)", () => {
+  // Pull b and c into their own panes → pane order [a] [b] [c].
+  function threePanes(): void {
+    moveAgentToNewPane(P, ROSTER, "b");
+    moveAgentToNewPane(P, ROSTER, "c");
+  }
+
+  it("cycles to the next pane by position, wrapping at the end", () => {
+    threePanes();
+    expect(paneToCycleTo(P, ROSTER, ["b"], 1)?.members).toEqual(["c"]);
+    expect(paneToCycleTo(P, ROSTER, ["c"], 1)?.members).toEqual(["a"]);
+  });
+
+  it("cycles to the previous pane by position, wrapping at the start", () => {
+    threePanes();
+    expect(paneToCycleTo(P, ROSTER, ["b"], -1)?.members).toEqual(["a"]);
+    expect(paneToCycleTo(P, ROSTER, ["a"], -1)?.members).toEqual(["c"]);
+  });
+
+  it("enters from the near end when the selection matches no single pane", () => {
+    threePanes();
+    expect(paneToCycleTo(P, ROSTER, [], 1)?.members).toEqual(["a"]); // next → leftmost
+    expect(paneToCycleTo(P, ROSTER, [], -1)?.members).toEqual(["c"]); // prev → rightmost
+    expect(paneToCycleTo(P, ROSTER, ["a", "b"], 1)?.members).toEqual(["a"]); // cross-pane custom set
+  });
+
+  it("treats the maximized pane as the current one, ignoring the selection", () => {
+    threePanes();
+    const p2 = layoutFor(P, ROSTER).panes[1]!.id;
+    maximizePane(P, ROSTER, p2);
+    // Selection points at pane 1, but pane 2 is maximized → next is pane 3.
+    expect(paneToCycleTo(P, ROSTER, ["a"], 1)?.members).toEqual(["c"]);
+  });
+
+  it("skips empty panes", () => {
+    threePanes();
+    createEmptyPane(P, ROSTER); // a 4th, member-less pane
+    expect(paneToCycleTo(P, ROSTER, ["c"], 1)?.members).toEqual(["a"]); // wraps past the empty one
+  });
+
+  it("returns null when fewer than two panes can be cycled", () => {
+    expect(paneToCycleTo(P, ROSTER, ["a"], 1)).toBeNull(); // default single pane
+    createEmptyPane(P, ROSTER);
+    expect(paneToCycleTo(P, ROSTER, ["a"], 1)).toBeNull(); // one real pane + one empty
   });
 });

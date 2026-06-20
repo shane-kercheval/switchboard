@@ -603,7 +603,7 @@ describe("App", () => {
     expect(invokeMock.mock.calls.some(([c]) => c === "init_directory")).toBe(false);
   });
 
-  it("new project: choosing a folder + name creates the project, activates it, and auto-seeds an agent per installed harness", async () => {
+  it("new project: choosing a folder + name creates the project, activates it, and auto-seeds an agent per auto-seed harness", async () => {
     await mountApp();
     await waitFor(() => expect(screen.getByTestId("welcome-add-project")).toBeInTheDocument());
 
@@ -614,30 +614,42 @@ describe("App", () => {
     expect(createProjectCalls).toHaveLength(1);
     expect(createProjectCalls[0]?.[1]).toEqual({ name: "brand-new", directory: DIR_A });
 
-    // All four harnesses are installed by default → one agent each, named after
-    // the harness, in HARNESSES order.
-    await waitFor(() => expect(createAgentCalls()).toHaveLength(4));
+    // All four harnesses are installed, but Gemini is excluded from auto-seeding
+    // (no longer on individual plans) → one agent each for Claude/Codex/
+    // Antigravity, named after the model+effort it'll run (Antigravity's
+    // harness-owned model falls back to the bare harness name), in HARNESSES
+    // order.
+    await waitFor(() => expect(createAgentCalls()).toHaveLength(3));
     expect(createAgentCalls()).toEqual([
-      { name: "claude-code", harness: "claude_code" },
-      { name: "codex", harness: "codex" },
-      { name: "gemini", harness: "gemini" },
+      { name: "opus-high", harness: "claude_code" },
+      { name: "gpt-5-5-medium", harness: "codex" },
       { name: "antigravity", harness: "antigravity" },
     ]);
     // Auto-seeded → the roster is populated, not the empty first-agent prompt.
-    await waitFor(() => expect(screen.getAllByTestId("sidebar-agent")).toHaveLength(4));
+    await waitFor(() => expect(screen.getAllByTestId("sidebar-agent")).toHaveLength(3));
     expect(screen.queryByTestId("confirm-create-agent")).not.toBeInTheDocument();
 
     // Each seeded agent is born with its harness's default model/effort
-    // (Antigravity carries neither; Gemini carries no effort).
+    // (Antigravity carries neither).
     const seededArgs = invokeMock.mock.calls
       .filter(([c]) => c === "create_agent")
       .map(([, a]) => a as { name: string; harness: string; model?: string; effort?: string });
     expect(seededArgs).toEqual([
-      { name: "claude-code", harness: "claude_code", model: "opus", effort: "high" },
-      { name: "codex", harness: "codex", model: "gpt-5.5", effort: "medium" },
-      { name: "gemini", harness: "gemini", model: "auto", effort: undefined },
+      { name: "opus-high", harness: "claude_code", model: "opus", effort: "high" },
+      { name: "gpt-5-5-medium", harness: "codex", model: "gpt-5.5", effort: "medium" },
       { name: "antigravity", harness: "antigravity", model: undefined, effort: undefined },
     ]);
+  });
+
+  it("new project: an installed but auto-seed-excluded harness (Gemini) is not seeded", async () => {
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("welcome-add-project")).toBeInTheDocument());
+
+    await createNewProjectViaDialog("brand-new");
+
+    // Gemini is installed by default in the test backend, yet never seeded.
+    await waitFor(() => expect(createAgentCalls()).toHaveLength(3));
+    expect(createAgentCalls().some(({ harness }) => harness === "gemini")).toBe(false);
   });
 
   it("new project: seeds agents only for installed harnesses", async () => {
@@ -650,8 +662,8 @@ describe("App", () => {
 
     await waitFor(() => expect(createAgentCalls()).toHaveLength(2));
     expect(createAgentCalls()).toEqual([
-      { name: "claude-code", harness: "claude_code" },
-      { name: "codex", harness: "codex" },
+      { name: "opus-high", harness: "claude_code" },
+      { name: "gpt-5-5-medium", harness: "codex" },
     ]);
   });
 
@@ -682,7 +694,7 @@ describe("App", () => {
     expect(createAgentCalls()).toHaveLength(0);
 
     release();
-    await waitFor(() => expect(createAgentCalls()).toHaveLength(4));
+    await waitFor(() => expect(createAgentCalls()).toHaveLength(3));
   });
 
   it("new project: a failed agent create surfaces a dismissible banner and the rest still seed", async () => {
@@ -692,11 +704,11 @@ describe("App", () => {
 
     await createNewProjectViaDialog("brand-new");
 
-    // The other three still created; the failure is surfaced, not silent.
-    await waitFor(() => expect(createAgentCalls()).toHaveLength(4));
+    // The other two still created; the failure is surfaced, not silent.
+    await waitFor(() => expect(createAgentCalls()).toHaveLength(3));
     const banner = await screen.findByTestId("banner-agent-create-failed-codex");
     expect(banner).toHaveTextContent("Couldn't create the Codex agent");
-    expect(screen.getAllByTestId("sidebar-agent")).toHaveLength(3);
+    expect(screen.getAllByTestId("sidebar-agent")).toHaveLength(2);
 
     // Dismissible.
     await fireEvent.click(screen.getByTestId("banner-agent-create-failed-codex-dismiss"));
@@ -1201,7 +1213,7 @@ describe("App", () => {
     expect(createCalls).toHaveLength(1);
     // The form preselects and submits Claude's defaults.
     expect(createCalls[0]?.[1]).toEqual({
-      name: "claude-code",
+      name: "opus-high",
       harness: "claude_code",
       model: "opus",
       effort: "high",
@@ -1687,6 +1699,16 @@ describe("App", () => {
     await waitFor(() =>
       expect(screen.getByTestId("transcript-compact-toggle")).toBeInTheDocument(),
     );
+    const paneAdd = screen.getByTestId("app-pane-add");
+    const compact = screen.getByTestId("transcript-compact-toggle");
+    const projectsToggle = screen.getByTestId("view-toggle-projects");
+    const tabStrip = screen.getByTestId("app-pane-tab-strip");
+    expect(tabStrip).not.toContainElement(paneAdd);
+    expect(tabStrip).not.toContainElement(compact);
+    expect(paneAdd.compareDocumentPosition(compact) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+    expect(
+      compact.compareDocumentPosition(projectsToggle) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).not.toBe(0);
 
     // The Git view is a full takeover — the compact control is irrelevant there.
     await fireEvent.click(screen.getByTestId("view-toggle-git"));
@@ -2036,7 +2058,10 @@ describe("App", () => {
     );
 
     await fireEvent.click(screen.getByTestId("app-pane-minimized-tab"));
-    expect(panes.layoutFor("p-a", roster).minimized).toEqual([]);
+    // Revealing a pane is deferred behind the transcript-busy spinner (two
+    // animation frames), so poll for the layout change rather than asserting
+    // synchronously right after the click.
+    await waitFor(() => expect(panes.layoutFor("p-a", roster).minimized).toEqual([]));
 
     panes.maximizePane("p-a", roster, panes.layoutFor("p-a", roster).panes[0]!.id);
     await waitFor(() =>
@@ -2048,22 +2073,81 @@ describe("App", () => {
       }),
     ).not.toBeInTheDocument();
     await fireEvent.click(screen.getByTestId("app-pane-minimized-tab"));
-    expect(panes.layoutFor("p-a", roster).maximized).toBe(pane2);
-    expect(recipients.selectionFor("p-a")).toEqual(["ag-2"]);
+    await waitFor(() => {
+      expect(panes.layoutFor("p-a", roster).maximized).toBe(pane2);
+      expect(recipients.selectionFor("p-a")).toEqual(["ag-2"]);
+    });
 
     panes.maximizePane("p-a", roster, pane2);
     await waitFor(() =>
       expect(screen.getByTestId("app-pane-minimized-tab")).toHaveTextContent("Pane 1"),
     );
     await fireEvent.click(screen.getByTestId("app-pane-minimized-tab"));
-    expect(panes.layoutFor("p-a", roster).maximized).toBe(
-      panes.layoutFor("p-a", roster).panes[0]!.id,
-    );
-    expect(recipients.selectionFor("p-a")).toEqual(["ag-1"]);
+    await waitFor(() => {
+      expect(panes.layoutFor("p-a", roster).maximized).toBe(
+        panes.layoutFor("p-a", roster).panes[0]!.id,
+      );
+      expect(recipients.selectionFor("p-a")).toEqual(["ag-1"]);
+    });
 
     expect(screen.queryByTestId("app-pane-restore-all")).not.toBeInTheDocument();
     await fireEvent.click(screen.getByTestId("pane-maximize"));
     expect(panes.layoutFor("p-a", roster).maximized).toBeNull();
+  });
+
+  it("does not corrupt the original project's pane layout when the user switches project before the deferred reveal runs", async () => {
+    const panes = await import("$lib/state/transcriptPanes.svelte");
+    const ws = await import("$lib/state/workspace.svelte");
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [
+        agent({ id: "ag-1", project_id: "p-a", name: "alice" }),
+        agent({ id: "ag-2", project_id: "p-a", name: "bob" }),
+      ],
+    });
+    seedProject({
+      projectId: "p-b",
+      directory: DIR_B,
+      name: "beta",
+      agents: [
+        agent({ id: "ag-3", project_id: "p-b", name: "carol" }),
+        agent({ id: "ag-4", project_id: "p-b", name: "dave" }),
+      ],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+    await fireEvent.click(within(projectRowByName("alpha")).getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("app-pane-add")).toBeInTheDocument());
+
+    // Park ag-2 in its own pane and minimize it, so project A has a non-default
+    // layout (ag-2 lives in pane 2) that corruption would be visible against.
+    const rosterA = ["ag-1", "ag-2"];
+    const pane2 = panes.moveAgentToNewPane("p-a", rosterA, "ag-2");
+    panes.minimizePane("p-a", rosterA, pane2);
+    await waitFor(() => expect(screen.getByTestId("app-pane-minimized-tab")).toBeInTheDocument());
+
+    // Clicking the tab schedules the reveal behind the spinner's two animation
+    // frames. Synchronously switch to project B before those frames fire (no
+    // awaited gap, so no timer can run in between): `activateProject` sets the
+    // active project id synchronously. When the deferred action lands, B is
+    // active. Under the bug, the closure read the live roster (B's) and
+    // `reconcileLayout` would prune ag-2 from A's pane and persist the loss.
+    fireEvent.click(screen.getByTestId("app-pane-minimized-tab"));
+    void ws.activateProject("p-b");
+    expect(ws.selection.activeProjectId).toBe("p-b");
+
+    // Advance well past the reveal's two deferred frames so its action has run
+    // (and, per the guard, been dropped) before asserting.
+    for (let i = 0; i < 4; i++) await new Promise(requestAnimationFrame);
+
+    // A's saved layout is untouched: ag-2 still belongs to pane 2 (the captured
+    // roster prevented the prune) and pane 2 is still minimized (the staleness
+    // guard dropped the now-irrelevant reveal).
+    const layoutA = panes.layoutFor("p-a", rosterA);
+    expect(layoutA.panes.find((p) => p.id === pane2)?.members).toEqual(["ag-2"]);
+    expect(layoutA.minimized).toContain(pane2);
   });
 
   it("keeps pane tab completion markers across project switches", async () => {
@@ -2175,6 +2259,59 @@ describe("App", () => {
     selection.setRecipients("p-a", ["ag-1"]);
     await fireEvent.keyDown(window, { key: "2", code: "Digit2", metaKey: true, altKey: true });
     expect(selection.selectionFor("p-a")).toEqual(["ag-1"]);
+
+    panes._testing.reset();
+    selection._testing.reset();
+  });
+
+  it("⌘⇧[ / ⌘⇧] cycle the targeted pane by position", async () => {
+    const panes = await import("$lib/state/transcriptPanes.svelte");
+    const selection = await import("$lib/state/recipientSelection.svelte");
+    panes._testing.reset();
+    selection._testing.reset();
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [
+        agent({ id: "ag-1", project_id: "p-a", name: "alice" }),
+        agent({ id: "ag-2", project_id: "p-a", name: "bob" }),
+      ],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+
+    const roster = ["ag-1", "ag-2"];
+    panes.moveAgentToNewPane("p-a", roster, "ag-2"); // pane 1: alice, pane 2: bob
+    selection.setRecipients("p-a", ["ag-1"]);
+
+    // ⌘⇧] → next pane (bob); again wraps back to alice. `code`, not `key`
+    // (Shift+bracket produces "{"/"}").
+    await fireEvent.keyDown(window, {
+      key: "}",
+      code: "BracketRight",
+      metaKey: true,
+      shiftKey: true,
+    });
+    expect(selection.selectionFor("p-a")).toEqual(["ag-2"]);
+    await fireEvent.keyDown(window, {
+      key: "}",
+      code: "BracketRight",
+      metaKey: true,
+      shiftKey: true,
+    });
+    expect(selection.selectionFor("p-a")).toEqual(["ag-1"]);
+
+    // ⌘⇧[ → previous pane (wraps from alice to bob).
+    await fireEvent.keyDown(window, {
+      key: "{",
+      code: "BracketLeft",
+      metaKey: true,
+      shiftKey: true,
+    });
+    expect(selection.selectionFor("p-a")).toEqual(["ag-2"]);
 
     panes._testing.reset();
     selection._testing.reset();

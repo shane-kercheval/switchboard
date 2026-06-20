@@ -33,9 +33,9 @@
   } from "$lib/state/transcriptPreview.svelte";
   import {
     createEmptyPane,
+    expandAllPanes,
     layoutFor,
     paneToCycleTo,
-    restoreMaximizedPane,
     revealPane,
     type TranscriptPane,
   } from "$lib/state/transcriptPanes.svelte";
@@ -590,7 +590,7 @@
     // — show the spinner first, like the other pane-layout gestures.
     void withTranscriptBusy(() => {
       if (selection.activeProjectId !== projectId) return;
-      restoreMaximizedPane(projectId, rosterIds);
+      expandAllPanes(projectId, rosterIds);
     });
   }
 
@@ -953,7 +953,10 @@
                 </button>
               {/each}
             </div>
-            {#if activeMaximizedPane !== null && headerTabPanes.length > 1}
+            <!-- Shown whenever more than one pane is hidden — minimized into the
+                 tab strip, or hidden behind a maximized pane. `headerTabPanes`
+                 already captures both cases. -->
+            {#if headerTabPanes.length > 1}
               <button
                 type="button"
                 class="text-muted hover:text-fg hover:bg-border/60 inline-flex h-6.5 shrink-0 items-center rounded-full px-2 text-xs"

@@ -2432,6 +2432,49 @@ describe("App", () => {
     selection._testing.reset();
   });
 
+  it("Restore all appears with minimized panes and brings them all back", async () => {
+    const panes = await import("$lib/state/transcriptPanes.svelte");
+    const selection = await import("$lib/state/recipientSelection.svelte");
+    panes._testing.reset();
+    selection._testing.reset();
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [
+        agent({ id: "ag-1", project_id: "p-a", name: "alice" }),
+        agent({ id: "ag-2", project_id: "p-a", name: "bob" }),
+        agent({ id: "ag-3", project_id: "p-a", name: "carol" }),
+      ],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+
+    const roster = ["ag-1", "ag-2", "ag-3"];
+    panes.moveAgentToNewPane("p-a", roster, "ag-2");
+    panes.moveAgentToNewPane("p-a", roster, "ag-3"); // 3 panes
+    const initial = panes.layoutFor("p-a", roster).panes;
+    // Minimize two panes (no maximize) — the reported bug: Restore all was hidden.
+    panes.minimizePane("p-a", roster, initial[1]!.id);
+    panes.minimizePane("p-a", roster, initial[2]!.id);
+
+    await waitFor(() => expect(screen.getByTestId("app-pane-restore-all")).toBeInTheDocument());
+
+    await fireEvent.click(screen.getByTestId("app-pane-restore-all"));
+
+    // Restore all expands everything: no minimized, no maximized left.
+    await waitFor(() => {
+      const layout = panes.layoutFor("p-a", roster);
+      expect(layout.minimized).toEqual([]);
+      expect(layout.maximized).toBeNull();
+    });
+
+    panes._testing.reset();
+    selection._testing.reset();
+  });
+
   it("⌘⌥N reveals the targeted pane: restores a minimized one, replaces a maximized one", async () => {
     const panes = await import("$lib/state/transcriptPanes.svelte");
     const selection = await import("$lib/state/recipientSelection.svelte");

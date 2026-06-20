@@ -583,8 +583,15 @@
   }
 
   function restoreAllPanes(): void {
-    if (selection.activeProjectId === null) return;
-    restoreMaximizedPane(selection.activeProjectId, activeRosterIds);
+    const projectId = selection.activeProjectId;
+    if (projectId === null) return;
+    const rosterIds = [...activeRosterIds];
+    // Restoring remounts every previously-minimized/maximized pane in one flush
+    // — show the spinner first, like the other pane-layout gestures.
+    void withTranscriptBusy(() => {
+      if (selection.activeProjectId !== projectId) return;
+      restoreMaximizedPane(projectId, rosterIds);
+    });
   }
 
   /// Expand/collapse-all over a long conversation re-renders every block in
@@ -1184,6 +1191,7 @@
                 overlay={activeConvo?.items ?? []}
                 loadStatus={activeConvo?.status ?? "complete"}
                 loadError={activeConvo?.error}
+                runWithBusy={withTranscriptBusy}
                 onRetryLoad={() => {
                   if (selection.activeProjectId !== null)
                     void retryProjectHydration(selection.activeProjectId);

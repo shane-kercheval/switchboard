@@ -2092,7 +2092,8 @@ describe("App", () => {
 
     expect(screen.queryByTestId("app-pane-restore-all")).not.toBeInTheDocument();
     await fireEvent.click(screen.getByTestId("pane-maximize"));
-    expect(panes.layoutFor("p-a", roster).maximized).toBeNull();
+    // Maximize/restore is deferred behind the busy spinner — poll for the result.
+    await waitFor(() => expect(panes.layoutFor("p-a", roster).maximized).toBeNull());
   });
 
   it("does not corrupt the original project's pane layout when the user switches project before the deferred reveal runs", async () => {
@@ -2356,6 +2357,75 @@ describe("App", () => {
     // Then the cycle applies: pane 2 is targeted + re-maximized, overlay clears.
     await waitFor(() => expect(selection.selectionFor("p-a")).toEqual(["ag-2"]));
     expect(panes.layoutFor("p-a", roster).maximized).toBe(pane2);
+    await waitFor(() => expect(screen.queryByTestId("transcript-busy-overlay")).toBeNull());
+
+    panes._testing.reset();
+    selection._testing.reset();
+  });
+
+  it("maximizing a pane shows the transcript spinner", async () => {
+    const panes = await import("$lib/state/transcriptPanes.svelte");
+    const selection = await import("$lib/state/recipientSelection.svelte");
+    panes._testing.reset();
+    selection._testing.reset();
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [
+        agent({ id: "ag-1", project_id: "p-a", name: "alice" }),
+        agent({ id: "ag-2", project_id: "p-a", name: "bob" }),
+      ],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+
+    const roster = ["ag-1", "ag-2"];
+    panes.moveAgentToNewPane("p-a", roster, "ag-2"); // 2 panes
+    const pane1 = panes.layoutFor("p-a", roster).panes[0]!.id;
+    await waitFor(() => expect(screen.getAllByTestId("pane-maximize")).toHaveLength(2));
+
+    await fireEvent.click(screen.getAllByTestId("pane-maximize")[0]!);
+    expect(screen.getByTestId("transcript-busy-overlay")).toBeInTheDocument();
+    await waitFor(() => expect(panes.layoutFor("p-a", roster).maximized).toBe(pane1));
+    await waitFor(() => expect(screen.queryByTestId("transcript-busy-overlay")).toBeNull());
+
+    panes._testing.reset();
+    selection._testing.reset();
+  });
+
+  it("Restore all shows the transcript spinner", async () => {
+    const panes = await import("$lib/state/transcriptPanes.svelte");
+    const selection = await import("$lib/state/recipientSelection.svelte");
+    panes._testing.reset();
+    selection._testing.reset();
+    seedProject({
+      projectId: "p-a",
+      directory: DIR_A,
+      name: "alpha",
+      agents: [
+        agent({ id: "ag-1", project_id: "p-a", name: "alice" }),
+        agent({ id: "ag-2", project_id: "p-a", name: "bob" }),
+        agent({ id: "ag-3", project_id: "p-a", name: "carol" }),
+      ],
+    });
+    await mountApp();
+    await waitFor(() => expect(screen.getByTestId("projects-sidebar")).toBeInTheDocument());
+    await fireEvent.click(screen.getByText("alpha"));
+    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+
+    const roster = ["ag-1", "ag-2", "ag-3"];
+    panes.moveAgentToNewPane("p-a", roster, "ag-2");
+    panes.moveAgentToNewPane("p-a", roster, "ag-3"); // 3 panes
+    // Maximize one → the other two become header tabs → "Restore all" appears.
+    panes.maximizePane("p-a", roster, panes.layoutFor("p-a", roster).panes[0]!.id);
+    await waitFor(() => expect(screen.getByTestId("app-pane-restore-all")).toBeInTheDocument());
+
+    await fireEvent.click(screen.getByTestId("app-pane-restore-all"));
+    expect(screen.getByTestId("transcript-busy-overlay")).toBeInTheDocument();
+    await waitFor(() => expect(panes.layoutFor("p-a", roster).maximized).toBeNull());
     await waitFor(() => expect(screen.queryByTestId("transcript-busy-overlay")).toBeNull());
 
     panes._testing.reset();

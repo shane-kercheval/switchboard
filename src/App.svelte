@@ -625,11 +625,7 @@
             submission.model,
             submission.effort,
           )
-        : await api.attachAgent(
-            submission.name,
-            submission.harness,
-            submission.existingSessionId,
-          );
+        : await api.attachAgent(submission.name, submission.harness, submission.existingSessionId);
     await registerAgent(agent);
     addAgentToActiveProject(agent);
     if (submission.mode === "attach") {

@@ -177,7 +177,8 @@
     // nothing yet (e.g. an attached agent) — the menu only opens for harnesses
     // that have a default on this axis, so the fallback is always concrete.
     const current = axis === "model" ? agent.model : agent.effort;
-    const fallback = axis === "model" ? DEFAULT_MODEL[agent.harness] : DEFAULT_EFFORT[agent.harness];
+    const fallback =
+      axis === "model" ? DEFAULT_MODEL[agent.harness] : DEFAULT_EFFORT[agent.harness];
     editValue = current ?? fallback ?? "";
     editError = null;
     editBusy = false;

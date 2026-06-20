@@ -2289,13 +2289,28 @@ describe("App", () => {
 
     // ⌘⇧] → next pane (bob); again wraps back to alice. `code`, not `key`
     // (Shift+bracket produces "{"/"}").
-    await fireEvent.keyDown(window, { key: "}", code: "BracketRight", metaKey: true, shiftKey: true });
+    await fireEvent.keyDown(window, {
+      key: "}",
+      code: "BracketRight",
+      metaKey: true,
+      shiftKey: true,
+    });
     expect(selection.selectionFor("p-a")).toEqual(["ag-2"]);
-    await fireEvent.keyDown(window, { key: "}", code: "BracketRight", metaKey: true, shiftKey: true });
+    await fireEvent.keyDown(window, {
+      key: "}",
+      code: "BracketRight",
+      metaKey: true,
+      shiftKey: true,
+    });
     expect(selection.selectionFor("p-a")).toEqual(["ag-1"]);
 
     // ⌘⇧[ → previous pane (wraps from alice to bob).
-    await fireEvent.keyDown(window, { key: "{", code: "BracketLeft", metaKey: true, shiftKey: true });
+    await fireEvent.keyDown(window, {
+      key: "{",
+      code: "BracketLeft",
+      metaKey: true,
+      shiftKey: true,
+    });
     expect(selection.selectionFor("p-a")).toEqual(["ag-2"]);
 
     panes._testing.reset();

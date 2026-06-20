@@ -75,7 +75,10 @@ function seedTwoSends(newestStreaming: boolean): void {
 /** Hover the newest fan-out's first column. */
 async function hoverNewest(): Promise<void> {
   const colCount = (page.getByTestId("fanout-column").elements() as HTMLElement[]).length;
-  await page.getByTestId("fanout-column").nth(colCount - 2).hover();
+  await page
+    .getByTestId("fanout-column")
+    .nth(colCount - 2)
+    .hover();
 }
 
 async function frame(): Promise<void> {

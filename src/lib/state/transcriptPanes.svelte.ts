@@ -289,7 +289,8 @@ export function paneToCycleTo(
     layout.maximized ??
     candidates.find((pane) => sameMembers(pane.members, selectedIds))?.id ??
     null;
-  const currentIdx = currentId === null ? -1 : candidates.findIndex((pane) => pane.id === currentId);
+  const currentIdx =
+    currentId === null ? -1 : candidates.findIndex((pane) => pane.id === currentId);
   const startIdx = currentIdx === -1 ? (direction === 1 ? -1 : 0) : currentIdx;
   const nextIdx = (startIdx + direction + candidates.length) % candidates.length;
   return candidates[nextIdx]!;

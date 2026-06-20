@@ -488,7 +488,7 @@
                         onError={(error) =>
                           onExternalActionError("[switchboard] git difftool failed", error)}
                       >
-                          <ExternalLink size={14} strokeWidth={1.8} aria-hidden="true" />
+                        <ExternalLink size={14} strokeWidth={1.8} aria-hidden="true" />
                       </AsyncIconButton>
                     {/snippet}
                   </Tooltip>

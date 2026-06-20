@@ -606,7 +606,12 @@
                     class="items-start gap-2"
                     data-testid="pane-return-unified"
                   >
-                    <Square size={14} strokeWidth={1.8} aria-hidden="true" class="mt-0.5 shrink-0" />
+                    <Square
+                      size={14}
+                      strokeWidth={1.8}
+                      aria-hidden="true"
+                      class="mt-0.5 shrink-0"
+                    />
                     <span class="flex min-w-0 flex-col">
                       <span>Return to unified view</span>
                       <span class="text-muted text-xs leading-4">

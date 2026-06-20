@@ -1015,6 +1015,20 @@
     promptMenuOpen = false;
   }
 
+  /// Copy a read-only built-in into the user's own prompts, then refresh the
+  /// cache so the owned copy appears (the backend syncs before this resolves).
+  /// Keeps the menu open so the user sees their new prompt land; a name clash or
+  /// write failure surfaces on the send-error line.
+  async function copyPrompt(prompt: Prompt): Promise<void> {
+    try {
+      await api.copyBuiltinPrompt(prompt.name);
+      await loadPrompts();
+      sendError = null;
+    } catch (err) {
+      sendError = `Couldn't copy prompt: ${err instanceof Error ? err.message : String(err)}`;
+    }
+  }
+
   /// Leave prompt mode, carrying Appended text back into the plain textarea.
   function removePrompt(): void {
     draft = appendedText;
@@ -1418,6 +1432,7 @@
         {prompts}
         loading={!promptsLoaded}
         onpick={pickPrompt}
+        oncopy={copyPrompt}
         onclose={() => (promptMenuOpen = false)}
       />
     {/if}

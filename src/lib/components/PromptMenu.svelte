@@ -1,7 +1,7 @@
 <script lang="ts">
   import { tick } from "svelte";
   import type { Prompt } from "$lib/types";
-  import { promptDisplayName } from "$lib/prompt";
+  import { isBuiltinPrompt, promptDisplayName } from "$lib/prompt";
   import { cn } from "$lib/utils";
 
   /// A typeahead popover over the cached prompt list. Opened by the compose
@@ -13,6 +13,7 @@
     prompts,
     loading = false,
     onpick,
+    oncopy,
     onclose,
   }: {
     prompts: Prompt[];
@@ -20,6 +21,9 @@
     /// "no prompts" empty state, which would otherwise flash on first open.
     loading?: boolean;
     onpick: (prompt: Prompt) => void;
+    /// Copy a read-only built-in into the user's own prompts. Only built-in rows
+    /// surface the affordance; omitting the handler hides it everywhere.
+    oncopy?: (prompt: Prompt) => void;
     onclose: () => void;
   } = $props();
 
@@ -78,26 +82,50 @@
 >
   <div class="max-h-64 overflow-y-auto" data-testid="prompt-menu-scroll">
     {#each filtered as prompt, i (promptKey(prompt))}
-      <button
-        type="button"
-        class={cn(
-          "flex w-full cursor-pointer flex-col gap-0.5 rounded-md px-2.5 py-1.5 text-left outline-none select-none",
-          i === highlighted ? "bg-panel/80" : "",
-        )}
-        data-testid={`prompt-option-${promptKey(prompt)}`}
-        role="option"
-        aria-selected={i === highlighted}
-        onmousemove={() => (highlighted = i)}
-        onclick={() => onpick(prompt)}
-      >
-        <span class="flex items-baseline gap-1.5">
-          <span class="text-fg text-sm font-medium">{promptDisplayName(prompt)}</span>
-          <span class="text-muted font-mono text-[11px]">{prompt.provider}</span>
-        </span>
-        {#if prompt.description}
-          <span class="text-muted truncate text-xs">{prompt.description}</span>
+      {@const builtin = isBuiltinPrompt(prompt)}
+      <!-- The row wraps a full-width pick button plus, for built-ins, a separate
+           "Copy to my prompts" button. They are siblings (not nested) so both
+           stay real, accessible buttons. -->
+      <div class="relative" role="presentation" onmousemove={() => (highlighted = i)}>
+        <button
+          type="button"
+          class={cn(
+            "flex w-full cursor-pointer flex-col gap-0.5 rounded-md px-2.5 py-1.5 text-left outline-none select-none",
+            i === highlighted ? "bg-panel/80" : "",
+            builtin ? "pr-24" : "",
+          )}
+          data-testid={`prompt-option-${promptKey(prompt)}`}
+          role="option"
+          aria-selected={i === highlighted}
+          onclick={() => onpick(prompt)}
+        >
+          <span class="flex items-baseline gap-1.5">
+            <span class="text-fg text-sm font-medium">{promptDisplayName(prompt)}</span>
+            <span class="text-muted font-mono text-[11px]">{prompt.provider}</span>
+            {#if builtin}
+              <span
+                class="border-border/80 text-muted rounded border px-1 text-[10px] tracking-wide uppercase"
+                data-testid={`prompt-builtin-tag-${promptKey(prompt)}`}
+              >
+                Built-in · read-only
+              </span>
+            {/if}
+          </span>
+          {#if prompt.description}
+            <span class="text-muted truncate text-xs">{prompt.description}</span>
+          {/if}
+        </button>
+        {#if builtin && oncopy}
+          <button
+            type="button"
+            class="text-accent hover:bg-panel/80 absolute top-1.5 right-2 cursor-pointer rounded px-1.5 py-0.5 text-[11px] outline-none"
+            data-testid={`prompt-copy-${promptKey(prompt)}`}
+            onclick={() => oncopy(prompt)}
+          >
+            Copy to my prompts
+          </button>
         {/if}
-      </button>
+      </div>
     {/each}
     {#if filtered.length === 0}
       {#if loading && prompts.length === 0}

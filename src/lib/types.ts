@@ -562,12 +562,14 @@ export type DiffStyle = "side_by_side" | "unified";
 // Mirror of Rust `Preferences` (`crates/app/src/preferences.rs`) — backend-owned
 // `config.yaml`. `editor_command` defaults to "code"; null → OS default
 // folder-open. `terminal_app` defaults to "Terminal"; `diff_style` defaults to
-// "unified".
+// "unified". `show_builtins` defaults to true (the read-only built-in prompts &
+// workflows appear in the pickers; off → only the user's own content).
 // Theme is NOT here — it stays in frontend localStorage (a device-local concern).
 export type Preferences = {
   editor_command: string | null;
   terminal_app: string;
   diff_style: DiffStyle;
+  show_builtins: boolean;
 };
 
 // Mirror of Rust `ProjectConversation` / `ConversationItem` / `OutcomeStatus` /

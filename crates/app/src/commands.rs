@@ -1085,8 +1085,48 @@ pub fn set_preferences_impl(state: &AppState, prefs: &Preferences) -> Result<(),
 /// All prompts across configured providers (user-global; no project argument).
 /// Never hard-fails: an unreachable/misconfigured provider contributes nothing
 /// rather than breaking the listing.
+///
+/// The read-only built-in library is dropped from the listing when the user's
+/// `show_builtins` preference is off. This is the **only** place built-ins are
+/// hidden — `PromptService` always lists and renders them — so the toggle
+/// governs picker visibility without unwiring a workflow already pointed at a
+/// built-in (resolution by id still succeeds).
 pub fn list_prompts_impl(state: &AppState) -> Vec<switchboard_prompts::Prompt> {
-    state.prompts.list()
+    let prompts = state.prompts.list();
+    if lock(&state.preferences).show_builtins {
+        return prompts;
+    }
+    prompts
+        .into_iter()
+        .filter(|p| p.provider != switchboard_prompts::BUILTIN_PROVIDER)
+        .collect()
+}
+
+/// Copy a built-in prompt into the user's prompts directory as `<name>.md`, so
+/// they can customize it as an owned file. Refuses to overwrite an existing file
+/// (the app never clobbers a user's prompt). After this, the copy is an ordinary
+/// local prompt the app never touches again — built-in updates don't affect it.
+/// Returns the path written.
+pub fn copy_builtin_prompt_impl(name: &str, prompts_dir: &Path) -> Result<PathBuf, AppError> {
+    let content = switchboard_prompts::builtin_prompt_content(name).ok_or_else(|| {
+        AppError::Prompt(switchboard_prompts::PromptError::PromptNotFound {
+            provider: switchboard_prompts::BUILTIN_PROVIDER.to_owned(),
+            name: name.to_owned(),
+        })
+    })?;
+    let dest = prompts_dir.join(format!("{name}.md"));
+    if dest.exists() {
+        return Err(AppError::PromptCopyExists { path: dest });
+    }
+    std::fs::create_dir_all(prompts_dir).map_err(|source| AppError::PromptCopyIo {
+        path: prompts_dir.to_path_buf(),
+        source,
+    })?;
+    std::fs::write(&dest, content).map_err(|source| AppError::PromptCopyIo {
+        path: dest.clone(),
+        source,
+    })?;
+    Ok(dest)
 }
 
 /// Render a prompt to its finished text. Provider-dispatched (local → `MiniJinja`,
@@ -13410,6 +13450,7 @@ mod tests {
             editor_command: Some("zed".to_owned()),
             terminal_app: "iTerm".to_owned(),
             diff_style: preferences::DiffStyle::Unified,
+            show_builtins: false,
         };
         set_preferences_impl(&state, &prefs).unwrap();
 
@@ -13433,6 +13474,7 @@ mod tests {
                 editor_command: Some("  ".to_owned()),
                 terminal_app: String::new(),
                 diff_style: preferences::DiffStyle::SideBySide,
+                show_builtins: true,
             },
         )
         .unwrap();
@@ -13453,6 +13495,7 @@ mod tests {
             editor_command: Some("code".to_owned()),
             terminal_app: "Terminal".to_owned(),
             diff_style: preferences::DiffStyle::SideBySide,
+            show_builtins: true,
         };
         set_preferences_impl(&state, &prefs).unwrap();
         assert_eq!(get_preferences_impl(&state), prefs);
@@ -13486,11 +13529,105 @@ mod tests {
         state.prompts.sync().await;
 
         let prompts = list_prompts_impl(&state);
-        assert_eq!(prompts.len(), 1);
-        assert_eq!(prompts[0].provider, "local");
-        assert_eq!(prompts[0].name, "greet");
-        assert_eq!(prompts[0].arguments.len(), 1);
-        assert!(prompts[0].arguments[0].required);
+        let greet = prompts
+            .iter()
+            .find(|p| p.provider == "local" && p.name == "greet")
+            .expect("the local prompt should be listed");
+        assert_eq!(greet.arguments.len(), 1);
+        assert!(greet.arguments[0].required);
+    }
+
+    #[tokio::test]
+    async fn list_prompts_includes_built_ins_by_default() {
+        // Default preferences show built-ins, so a fresh state lists the bundled
+        // library after sync — no local files needed.
+        let (_tmp, state) = state_with_prompts();
+        state.prompts.sync().await;
+
+        let prompts = list_prompts_impl(&state);
+        let builtins: Vec<&str> = prompts
+            .iter()
+            .filter(|p| p.provider == switchboard_prompts::BUILTIN_PROVIDER)
+            .map(|p| p.name.as_str())
+            .collect();
+        assert!(builtins.contains(&"code-review"), "got {builtins:?}");
+        assert!(builtins.contains(&"ai-review-feedback"), "got {builtins:?}");
+    }
+
+    #[tokio::test]
+    async fn show_builtins_off_hides_built_ins_but_keeps_resolution() {
+        // The toggle is visibility-only: built-ins drop out of the listing, yet a
+        // render-by-id still resolves (so a workflow wired to one never breaks).
+        let (tmp, state) = state_with_prompts();
+        std::fs::write(tmp.path().join("prompts").join("greet.md"), GREET_PROMPT).unwrap();
+        state.prompts.sync().await;
+
+        set_preferences_impl(
+            &state,
+            &Preferences {
+                show_builtins: false,
+                ..Preferences::default()
+            },
+        )
+        .unwrap();
+
+        let prompts = list_prompts_impl(&state);
+        assert!(
+            prompts
+                .iter()
+                .all(|p| p.provider != switchboard_prompts::BUILTIN_PROVIDER),
+            "built-ins must be hidden when the toggle is off"
+        );
+        assert!(
+            prompts
+                .iter()
+                .any(|p| p.provider == "local" && p.name == "greet"),
+            "the user's own prompt is unaffected by the toggle"
+        );
+
+        // Resolution by id is unaffected — the built-in still renders.
+        let rendered = render_prompt_impl(
+            &state,
+            switchboard_prompts::BUILTIN_PROVIDER,
+            "code-review",
+            &std::collections::BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            rendered
+                .text
+                .contains("Review the current uncommitted changes")
+        );
+    }
+
+    #[test]
+    fn copy_builtin_prompt_writes_owned_file_and_refuses_to_clobber() {
+        let dir = TempDir::new().unwrap();
+        let prompts_dir = dir.path().join("prompts");
+
+        // First copy lands an owned file with the built-in's content.
+        let written = copy_builtin_prompt_impl("code-review", &prompts_dir).unwrap();
+        assert_eq!(written, prompts_dir.join("code-review.md"));
+        let content = std::fs::read_to_string(&written).unwrap();
+        assert!(content.contains("name: code-review"));
+
+        // A second copy refuses rather than overwrite the user's file.
+        std::fs::write(&written, "MY EDITS").unwrap();
+        let err = copy_builtin_prompt_impl("code-review", &prompts_dir).unwrap_err();
+        assert!(matches!(err, AppError::PromptCopyExists { .. }));
+        // The user's edits are intact.
+        assert_eq!(std::fs::read_to_string(&written).unwrap(), "MY EDITS");
+    }
+
+    #[test]
+    fn copy_unknown_builtin_is_not_found() {
+        let dir = TempDir::new().unwrap();
+        let err = copy_builtin_prompt_impl("nope", &dir.path().join("prompts")).unwrap_err();
+        assert!(matches!(
+            err,
+            AppError::Prompt(switchboard_prompts::PromptError::PromptNotFound { .. })
+        ));
     }
 
     #[tokio::test]

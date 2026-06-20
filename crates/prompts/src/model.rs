@@ -10,6 +10,13 @@ use crate::error::PromptError;
 /// Reserved prefix for the built-in local file store.
 pub const LOCAL_PROVIDER: &str = "local";
 
+/// Reserved prefix for the app-owned, read-only built-in prompt library. A
+/// prompt resolves as built-in iff `provider == BUILTIN_PROVIDER`; that equality
+/// is the wire contract the frontend uses to tag a row read-only. Reserved in
+/// [`crate::config::is_valid_provider_name`] so a user-configured MCP provider
+/// can't claim the name and shadow the built-ins.
+pub const BUILTIN_PROVIDER: &str = "builtin";
+
 /// A prompt as surfaced to the UI: provider-attributed metadata plus its
 /// declared arguments. The template body is intentionally absent — it is never
 /// sent to the frontend; only the rendered text is (via `render`).

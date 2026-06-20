@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::LOCAL_PROVIDER;
+use crate::model::{BUILTIN_PROVIDER, LOCAL_PROVIDER};
 
 /// On-disk shape of the user-global `config.yaml` **local** prompt section.
 /// Deliberately models *only* `local_prompt_dirs` and ignores everything else
@@ -71,7 +71,7 @@ impl McpSection {
             if !is_valid_provider_name(&config.name) {
                 tracing::warn!(
                     name = %config.name,
-                    "skipping mcp provider with invalid name (empty, reserved `local`, or containing `:`)"
+                    "skipping mcp provider with invalid name (empty, reserved `local`/`builtin`, or containing `:`)"
                 );
                 continue;
             }
@@ -88,12 +88,16 @@ impl McpSection {
 }
 
 /// Whether `name` is usable as a provider addressing prefix. A provider name is
-/// the prefix in `<name>:<prompt>`, so it must be non-empty, must not be the
-/// reserved `local` (which always routes to the file store), and must not contain
-/// `:` (which would break address parsing). Duplicate detection is the caller's
-/// job — it needs the full set. M3's "Add MCP server" form reuses this rule.
+/// the prefix in `<name>:<prompt>`, so it must be non-empty, must not be a
+/// reserved prefix (`local`, which always routes to the file store, or `builtin`,
+/// which routes to the read-only built-in library), and must not contain `:`
+/// (which would break address parsing). Duplicate detection is the caller's job —
+/// it needs the full set. The "Add MCP server" form reuses this rule.
 pub(crate) fn is_valid_provider_name(name: &str) -> bool {
-    !name.trim().is_empty() && name != LOCAL_PROVIDER && !name.contains(':')
+    !name.trim().is_empty()
+        && name != LOCAL_PROVIDER
+        && name != BUILTIN_PROVIDER
+        && !name.contains(':')
 }
 
 /// Resolve the ordered list of directories to scan for local prompts.
@@ -290,9 +294,31 @@ mcp_providers:
         assert!(is_valid_provider_name("team"));
         assert!(is_valid_provider_name("my-team_mcp"));
         assert!(!is_valid_provider_name("local"));
+        assert!(!is_valid_provider_name("builtin"));
         assert!(!is_valid_provider_name(""));
         assert!(!is_valid_provider_name("   "));
         assert!(!is_valid_provider_name("a:b"));
+    }
+
+    #[test]
+    fn mcp_provider_cannot_claim_reserved_builtin_name() {
+        // The no-collision guarantee for the built-in library holds by
+        // construction: an MCP entry named `builtin` is skipped, so it can never
+        // shadow the app-owned read-only prompts.
+        let yaml = r"
+mcp_providers:
+  - name: builtin
+    transport:
+      type: http
+      url: https://a.example.com
+  - name: ok
+    transport:
+      type: http
+      url: https://b.example.com
+";
+        let section: McpSection = serde_norway::from_str(yaml).unwrap();
+        let names: Vec<String> = section.into_configs().into_iter().map(|c| c.name).collect();
+        assert_eq!(names, vec!["ok".to_owned()]);
     }
 
     #[test]

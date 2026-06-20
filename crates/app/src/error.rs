@@ -241,6 +241,19 @@ pub enum AppError {
         #[source]
         source: std::io::Error,
     },
+
+    /// "Copy to my prompts" would overwrite an existing file. The app never
+    /// clobbers a user's prompt — they rename or remove the existing file first.
+    #[error("a prompt file already exists at {path}")]
+    PromptCopyExists { path: PathBuf },
+
+    /// Writing the copied built-in prompt into the user's folder failed.
+    #[error("failed to copy prompt to {path}: {source}")]
+    PromptCopyIo {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 impl AppError {

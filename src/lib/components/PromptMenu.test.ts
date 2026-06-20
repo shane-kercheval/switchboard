@@ -32,11 +32,21 @@ const PROMPTS: Prompt[] = [
   },
 ];
 
+const BUILTIN: Prompt = {
+  provider: "builtin",
+  name: "code-review",
+  title: null,
+  description: "Review the current uncommitted changes",
+  arguments: [],
+  tags: [],
+};
+
 function setup(prompts: Prompt[] = PROMPTS, loading = false) {
   const onpick = vi.fn();
+  const oncopy = vi.fn();
   const onclose = vi.fn();
-  render(PromptMenu, { props: { prompts, loading, onpick, onclose } });
-  return { onpick, onclose };
+  render(PromptMenu, { props: { prompts, loading, onpick, oncopy, onclose } });
+  return { onpick, oncopy, onclose };
 }
 
 describe("PromptMenu", () => {
@@ -133,5 +143,29 @@ describe("PromptMenu", () => {
   it("autofocuses the search field on open", async () => {
     setup();
     await waitFor(() => expect(screen.getByTestId("prompt-menu-search")).toHaveFocus());
+  });
+
+  it("tags a built-in read-only and offers a copy action; a user prompt gets neither", () => {
+    setup([BUILTIN, PROMPTS[0]!]);
+    // The built-in carries the read-only tag and a copy button.
+    expect(screen.getByTestId("prompt-builtin-tag-builtin:code-review")).toBeInTheDocument();
+    expect(screen.getByTestId("prompt-copy-builtin:code-review")).toBeInTheDocument();
+    // The user's own local prompt does not.
+    expect(screen.queryByTestId("prompt-builtin-tag-local:code-review")).toBeNull();
+    expect(screen.queryByTestId("prompt-copy-local:code-review")).toBeNull();
+  });
+
+  it("invokes oncopy (not onpick) when the copy action is clicked", async () => {
+    const { oncopy, onpick } = setup([BUILTIN]);
+    await fireEvent.click(screen.getByTestId("prompt-copy-builtin:code-review"));
+    expect(oncopy).toHaveBeenCalledTimes(1);
+    expect(oncopy.mock.calls[0]?.[0]).toMatchObject({ provider: "builtin", name: "code-review" });
+    expect(onpick).not.toHaveBeenCalled();
+  });
+
+  it("still picks the built-in row itself", async () => {
+    const { onpick } = setup([BUILTIN]);
+    await fireEvent.click(screen.getByTestId("prompt-option-builtin:code-review"));
+    expect(onpick.mock.calls[0]?.[0]).toMatchObject({ provider: "builtin", name: "code-review" });
   });
 });

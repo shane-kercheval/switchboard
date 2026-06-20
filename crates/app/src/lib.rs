@@ -12,7 +12,6 @@ mod journal;
 mod locator_sink;
 mod metadata;
 mod preferences;
-mod prompts_setup;
 mod secret_store;
 mod state;
 pub mod workflow;
@@ -37,21 +36,22 @@ use crate::commands::{
     check_antigravity_auth_impl, check_antigravity_binary_impl, check_claude_auth_impl,
     check_claude_binary_impl, check_codex_auth_impl, check_codex_binary_impl,
     check_gemini_auth_impl, check_gemini_binary_impl, commit_changed_files_impl,
-    commit_file_diff_impl, commit_ranges_impl, create_agent_impl, create_project_impl,
-    delete_project_impl, editor_open_argv, fetch_repo_impl, file_diff_impl, forward_message_impl,
-    forward_prompt_impl, get_harness_install_status_impl, get_preferences_impl,
-    init_directory_impl, list_agents_impl, list_mcp_providers_impl, list_projects_impl,
-    list_prompts_impl, list_tracked_repos_from_inputs, list_workspace_directories_impl,
-    load_project_conversation_impl, load_transcript_impl, open_commit_file_difftool_impl,
-    open_project_impl, open_worktree_file_difftool_impl, parse_uuid, pick_directory_impl,
-    project_session_fingerprints_impl, read_tracked_repo_from_inputs, remove_agent_impl,
-    remove_directory_impl, remove_mcp_provider_impl, remove_queued_message_impl,
-    remove_tracked_repo_impl, rename_agent_impl, rename_project_impl, render_prompt_impl,
-    reorder_agents_impl, reveal_in_finder_argv, search_project_files_in_root,
-    search_project_files_root_impl, send_message_impl, set_active_project_impl,
-    set_agent_effort_impl, set_agent_model_impl, set_preferences_impl, set_project_archived_impl,
-    stage_attachment_impl, sync_prompts_and_notify, terminal_open_argv, test_mcp_connection_impl,
-    tracked_repos_inputs, tracked_roots, validate_external_url,
+    commit_file_diff_impl, commit_ranges_impl, copy_builtin_prompt_impl, create_agent_impl,
+    create_project_impl, delete_project_impl, editor_open_argv, fetch_repo_impl, file_diff_impl,
+    forward_message_impl, forward_prompt_impl, get_harness_install_status_impl,
+    get_preferences_impl, init_directory_impl, list_agents_impl, list_mcp_providers_impl,
+    list_projects_impl, list_prompts_impl, list_tracked_repos_from_inputs,
+    list_workspace_directories_impl, load_project_conversation_impl, load_transcript_impl,
+    open_commit_file_difftool_impl, open_project_impl, open_worktree_file_difftool_impl,
+    parse_uuid, pick_directory_impl, project_session_fingerprints_impl,
+    read_tracked_repo_from_inputs, remove_agent_impl, remove_directory_impl,
+    remove_mcp_provider_impl, remove_queued_message_impl, remove_tracked_repo_impl,
+    rename_agent_impl, rename_project_impl, render_prompt_impl, reorder_agents_impl,
+    reveal_in_finder_argv, search_project_files_in_root, search_project_files_root_impl,
+    send_message_impl, set_active_project_impl, set_agent_effort_impl, set_agent_model_impl,
+    set_preferences_impl, set_project_archived_impl, stage_attachment_impl,
+    sync_prompts_and_notify, terminal_open_argv, test_mcp_connection_impl, tracked_repos_inputs,
+    tracked_roots, validate_external_url,
 };
 use crate::preferences::Preferences;
 use crate::state::AppState;
@@ -814,6 +814,18 @@ async fn open_local_prompts_dir() -> Result<(), String> {
     run_open_argv(vec!["open".to_owned(), path.to_string_lossy().into_owned()]).await
 }
 
+/// Copy a built-in prompt into the user's prompts folder as an owned, editable
+/// file, then refresh the prompt cache so the copy appears. Returns the written
+/// path. Errors (already-exists, write failure) surface to the caller.
+#[tauri::command]
+async fn copy_builtin_prompt(state: State<'_, AppState>, name: String) -> Result<String, String> {
+    let prompts_dir = local_prompts_dir_path()?;
+    let written = copy_builtin_prompt_impl(&name, &prompts_dir).map_err(|e| e.to_string())?;
+    let state = state.inner();
+    sync_prompts_and_notify(state.prompts.clone(), Arc::clone(&state.emitter)).await;
+    Ok(written.to_string_lossy().into_owned())
+}
+
 #[tauri::command]
 async fn open_worktree_file_difftool(
     state: State<'_, AppState>,
@@ -987,10 +999,11 @@ fn local_prompts_dir_path() -> Result<std::path::PathBuf, String> {
         .ok_or_else(|| "prompt providers are not configured (no config path)".to_owned())
 }
 
-/// Build the prompt service from the user-global config dir, seeding the example
-/// prompts on first run. The pure `crates/prompts` never touches `directories`;
-/// the app resolves and injects the config path, default prompts dir, home, and
-/// the secret store.
+/// Build the prompt service from the user-global config dir. The pure
+/// `crates/prompts` never touches `directories`; the app resolves and injects the
+/// config path, default prompts dir, home, and the secret store. Built-in example
+/// prompts come from the read-only library baked into the service — nothing is
+/// written into the user's folder.
 ///
 /// The injected secret store is the OS keychain (`KeyringSecretStore`), namespaced
 /// by build so debug tokens stay separate from a release install's.
@@ -998,7 +1011,6 @@ fn build_prompt_service() -> switchboard_prompts::PromptService {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     if let Some(dir) = config_dir() {
         let prompts_dir = dir.join("prompts");
-        crate::prompts_setup::seed_example_prompts(&prompts_dir);
         let secrets = build_secret_store(&dir);
         switchboard_prompts::PromptService::new(dir.join("config.yaml"), prompts_dir, home, secrets)
     } else {
@@ -1167,6 +1179,7 @@ pub fn run() {
             test_mcp_connection,
             local_prompts_dir,
             open_local_prompts_dir,
+            copy_builtin_prompt,
             create_project,
             rename_project,
             delete_project,

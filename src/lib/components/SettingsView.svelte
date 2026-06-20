@@ -288,6 +288,36 @@
           agent via the compose bar. Bearer tokens are stored in your OS keychain, never in config.
         </p>
       </div>
+
+      <div class="flex items-start justify-between gap-4">
+        <div class="min-w-0">
+          <div class="text-fg text-sm">Show built-in prompts &amp; workflows</div>
+          <p class="text-muted mt-0.5 text-xs leading-relaxed">
+            Switchboard ships read-only example prompts and workflows. They live in the app, not
+            your folder — to customize one, use “Copy to my prompts” in the picker, then edit your
+            copy. Turn this off to see only your own content.
+          </p>
+        </div>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={preferences.show_builtins}
+          aria-label="Show built-in prompts and workflows"
+          data-testid="show-builtins-toggle"
+          class={cn(
+            "relative mt-0.5 inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full transition-colors outline-none",
+            preferences.show_builtins ? "bg-accent" : "bg-border",
+          )}
+          onclick={() => void updatePreferences({ show_builtins: !preferences.show_builtins })}
+        >
+          <span
+            class={cn(
+              "bg-raised inline-block h-4 w-4 transform rounded-full transition-transform",
+              preferences.show_builtins ? "translate-x-4" : "translate-x-0.5",
+            )}
+          ></span>
+        </button>
+      </div>
       <div
         class="border-border bg-panel flex min-h-12 items-center gap-2 rounded-md border px-2.5 py-2"
       >

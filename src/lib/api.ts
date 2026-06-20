@@ -500,6 +500,13 @@ export async function openLocalPromptsDir(): Promise<void> {
   await invoke("open_local_prompts_dir");
 }
 
+/// Copy a built-in prompt into the user's prompts folder as an owned, editable
+/// file (`<name>.md`), refreshing the prompt cache so it appears. Rejects with an
+/// actionable error if a file of that name already exists. Returns the path.
+export async function copyBuiltinPrompt(name: string): Promise<string> {
+  return await invoke<string>("copy_builtin_prompt", { name });
+}
+
 /// Rebuild the cached prompt list from all providers (the Settings "Sync" action).
 export async function syncPrompts(): Promise<void> {
   await invoke("sync_prompts");

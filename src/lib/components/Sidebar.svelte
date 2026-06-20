@@ -888,6 +888,9 @@
               <input
                 use:focusSelect
                 bind:value={draftName}
+                autocorrect="off"
+                autocapitalize="off"
+                spellcheck="false"
                 class={cn(
                   "text-fg border-border bg-panel h-6 min-w-0 flex-1 rounded border px-1.5 text-[13px] font-semibold",
                   "focus-visible:ring-accent focus-visible:ring-1 focus-visible:outline-none",

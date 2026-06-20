@@ -116,6 +116,9 @@
     bind:value={query}
     onkeydown={onKeydown}
     type="text"
+    autocorrect="off"
+    autocapitalize="off"
+    spellcheck="false"
     placeholder="Search prompts…"
     data-testid="prompt-menu-search"
     class="border-border bg-panel text-fg placeholder:text-muted focus-visible:ring-accent mt-1 w-full rounded-md border px-2.5 py-1.5 text-sm focus-visible:ring-2 focus-visible:outline-none"

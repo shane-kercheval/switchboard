@@ -395,6 +395,9 @@
               <input
                 use:focusSelect
                 bind:value={renameDraft}
+                autocorrect="off"
+                autocapitalize="off"
+                spellcheck="false"
                 class="text-fg border-border bg-panel focus-visible:ring-accent h-6 min-w-0 flex-1 rounded border px-1.5 text-xs font-semibold focus-visible:ring-1 focus-visible:outline-none"
                 aria-label="Pane name"
                 data-testid="pane-rename-input"

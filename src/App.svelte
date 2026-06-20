@@ -169,13 +169,17 @@
         if (targetRecipients(selection.activeProjectId, [...pane.members])) {
           revealPane(selection.activeProjectId, rosterIds, pane.id);
         }
-      } else if (event.code === "BracketLeft" || event.code === "BracketRight") {
-        // ⌘⌥[ / ⌘⌥] cycle the targeted pane by position (left/right, wrapping),
-        // like editor tabs. `event.code` since Option+bracket changes `key`.
-        if (selection.activeProjectId === null || settingsOpen || view.mode === "git") return;
-        event.preventDefault();
-        cyclePane(event.code === "BracketRight" ? 1 : -1);
       }
+      return;
+    }
+
+    if (event.shiftKey && (event.code === "BracketLeft" || event.code === "BracketRight")) {
+      // ⌘⇧[ / ⌘⇧] cycle the targeted pane by position (left/right, wrapping),
+      // like switching browser/terminal tabs. `event.code`, not `event.key` —
+      // Shift+bracket produces "{"/"}" in `key`.
+      if (selection.activeProjectId === null || settingsOpen || view.mode === "git") return;
+      event.preventDefault();
+      cyclePane(event.code === "BracketRight" ? 1 : -1);
       return;
     }
 
@@ -539,7 +543,7 @@
     });
   }
 
-  /// Cycle the targeted pane by position (⌘⌥[ = -1, ⌘⌥] = +1). Reuses the
+  /// Cycle the targeted pane by position (⌘⇧[ = -1, ⌘⇧] = +1). Reuses the
   /// ⌘⌥N reveal-on-target path so a maximized pane re-maximizes, a hidden one is
   /// restored, and a refused target (prompt-render lock) changes nothing.
   function cyclePane(direction: 1 | -1): void {

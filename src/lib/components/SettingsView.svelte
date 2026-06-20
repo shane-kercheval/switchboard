@@ -66,7 +66,7 @@
     },
     {
       action: "Cycle to previous / next pane",
-      keys: ["⌘", "⌥", "[ / ]"],
+      keys: ["⌘", "⇧", "[ / ]"],
       note: "by position, when split; shows the pane if hidden",
     },
     {

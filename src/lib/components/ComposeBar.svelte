@@ -1053,11 +1053,19 @@
     const forwardId = crypto.randomUUID();
     const sendId = crypto.randomUUID();
     const recipients = targets.map((t) => t.id);
-    addHeldForward(projectId, { forwardId, sendId, body, sources, recipients });
+    // Capture the project id for the held-forward store calls: the hold can
+    // outlive this ComposeBar instance (the user navigates to another project
+    // while it waits — the compose bar is `{#key projectId}`-remounted, so this
+    // instance is destroyed mid-await). The cleanup below must key the global
+    // `heldForwards` store by *this* forward's project, not the reactive
+    // `projectId` prop, which no longer resolves to it once the instance is gone
+    // — otherwise the held entry is never removed and the "waiting…" row sticks.
+    const forwardProjectId = projectId;
+    addHeldForward(forwardProjectId, { forwardId, sendId, body, sources, recipients });
     void (async () => {
       try {
         const outcome = await api.forwardMessage(body, expandForwardSources(sources), forwardId);
-        removeHeldForward(projectId, forwardId);
+        removeHeldForward(forwardProjectId, forwardId);
         if (outcome.status === "resolved") {
           // Dispatch the composed body as a normal send under this forward's
           // send_id — the user message + responses render and group via the
@@ -1065,9 +1073,9 @@
           // sentinel lines at render time (durable across reload); only the
           // partial-empty caption needs the live store (it can't be reconstructed
           // — skipped sources leave no trace in the wire body).
-          dispatchToRecipients(outcome.body, attachments, targets, sendId);
+          dispatchToRecipients(outcome.body, attachments, targets, sendId, forwardProjectId);
           if (outcome.skipped.length > 0) {
-            setForwardCaption(projectId, sendId, {
+            setForwardCaption(forwardProjectId, sendId, {
               included: includedNames(sources, outcome.skipped),
               skipped: outcome.skipped,
             });
@@ -1079,7 +1087,7 @@
           if (outcome.status === "invalidated") sendError = `Forward not sent: ${outcome.reason}`;
         }
       } catch (err) {
-        removeHeldForward(projectId, forwardId);
+        removeHeldForward(forwardProjectId, forwardId);
         sendError = `Forward failed: ${err instanceof Error ? err.message : String(err)}`;
         restoreForward(body, sources, attachments);
       }
@@ -1096,8 +1104,19 @@
   /// while the forward is holding, that instance is unmounted on resolve, so the
   /// held entry is still cleaned up but the typed text is **not** restored to the
   /// (remounted) composer — narrow timing edge, small loss of the user's own
-  /// un-sent text. A durable fix would route restore through project-keyed state
-  /// the remounted composer observes.
+  /// un-sent text.
+  ///
+  /// This is the same root cause as the captured-id fixes elsewhere in the
+  /// forward closures (held-store cleanup, the dispatch activity bump): the
+  /// forward lifecycle is owned by a `{#key projectId}`-remounted component that
+  /// is deliberately destroyed mid-hold, so anything the resolve closure touches
+  /// on the instance is suspect. Project-keyed *global* reads were re-pinned to a
+  /// captured id; instance-local reads like this restore are merely lost (no
+  /// cross-project corruption). The durable fix is to hoist the forward
+  /// dispatch/hold lifecycle into the project-scoped store layer (which already
+  /// survives remounts — that's why the `heldForwards` store works), so neither
+  /// cleanup, activity, nor restore depends on the submitting component being
+  /// alive. Deferred until forward-lifecycle code is next touched.
   function restoreForward(body: string, sources: ForwardSource[], attachments: Attachment[]): void {
     for (const source of sources) addForwardSource(source);
     if (draft.trim() === "" && body !== "") {
@@ -1140,9 +1159,20 @@
         allSources.push(source);
       }
     }
+    // Capture the project id for the held-forward store calls — see
+    // `dispatchForward`: this hold can outlive the `{#key projectId}`-remounted
+    // ComposeBar instance, so the cleanup must key the global store by *this*
+    // forward's project, not the now-stale reactive `projectId` prop.
+    const forwardProjectId = projectId;
     // body "" — a prompt forward composes server-side (render after fill), so the
     // held row only signals the wait; there's no pre-composed body to show.
-    addHeldForward(projectId, { forwardId, sendId, body: "", sources: allSources, recipients });
+    addHeldForward(forwardProjectId, {
+      forwardId,
+      sendId,
+      body: "",
+      sources: allSources,
+      recipients,
+    });
     const forwardArgs: api.ForwardArg[] = prompt.arguments
       .filter((a) => (argSources[a.name]?.length ?? 0) > 0)
       .map((a) => ({
@@ -1165,11 +1195,11 @@
           expandForwardSources(appendedSources),
           forwardId,
         );
-        removeHeldForward(projectId, forwardId);
+        removeHeldForward(forwardProjectId, forwardId);
         if (outcome.status === "resolved") {
-          dispatchToRecipients(outcome.body, attachments, targets, sendId);
+          dispatchToRecipients(outcome.body, attachments, targets, sendId, forwardProjectId);
           if (outcome.skipped.length > 0) {
-            setForwardCaption(projectId, sendId, {
+            setForwardCaption(forwardProjectId, sendId, {
               included: includedNames(allSources, outcome.skipped),
               skipped: outcome.skipped,
             });
@@ -1186,7 +1216,7 @@
           if (outcome.status === "invalidated") sendError = `Forward not sent: ${outcome.reason}`;
         }
       } catch (err) {
-        removeHeldForward(projectId, forwardId);
+        removeHeldForward(forwardProjectId, forwardId);
         sendError = `Forward failed: ${err instanceof Error ? err.message : String(err)}`;
         restoreForwardPrompt(prompt, typedArgs, appended, argSources, appendedSources, attachments);
       }
@@ -1230,15 +1260,23 @@
   /// mid-render can't redirect the send); the forward path passes the
   /// backend-composed body and its own `sendId` (so it can key the forward
   /// caption to the dispatched send).
+  ///
+  /// `dispatchProjectId` is the project this send belongs to, passed explicitly
+  /// rather than read from the `projectId` prop: the forward paths call this from
+  /// a closure that can outlive the `{#key projectId}`-remounted instance (the
+  /// user navigates away mid-hold), so the ambient prop may no longer point at the
+  /// submitting project — see `dispatchForward`. The live submit paths pass the
+  /// prop, which is correct there.
   function dispatchToRecipients(
     text: string,
     attachments: Attachment[],
     targets: AgentRecord[],
     sendId: string = crypto.randomUUID(),
+    dispatchProjectId: ProjectId = projectId,
   ): void {
     // Bump this project's local last-activity so it sorts/reads as active right
     // away, before any turn event round-trips. Once per send action.
-    recordProjectsActivityLocally([projectId], currentIsoTimestamp());
+    recordProjectsActivityLocally([dispatchProjectId], currentIsoTimestamp());
     for (const agent of targets) {
       const userTurnId = crypto.randomUUID();
       // Every recipient gets the SAME snapshotted attachment list (one shared

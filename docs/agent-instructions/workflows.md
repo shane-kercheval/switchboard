@@ -322,6 +322,90 @@ steps:
             recipient: "{{ coder }}"
 ```
 
+## Shipped built-in workflows
+
+Two workflows ship with the app as a read-only built-in library (alongside the built-in prompts they consume, `code-review` and `ai-review-feedback`). They appear in the `+ Workflow` menu tagged **built-in / read-only**; "Copy to my workflows" writes an editable copy into `<dir>/.switchboard/workflows/` if you want to customize one. They are the canonical examples to model your own on.
+
+### `review-and-aggregate` (generic fan-in)
+
+Review in parallel with several agents, then hand the combined feedback to a primary agent. The aggregation is an **inline `text`** step (no second prompt), so the workflow is self-contained.
+
+```yaml
+name: review-and-aggregate
+description: Fan a review prompt out to several reviewers in parallel, then hand the combined feedback to a primary agent for recommendations.
+inputs:
+  primary_agent: agent
+  reviewer_agents: [agent]
+  review_prompt: prompt_id
+  user_context: text?
+steps:
+  - send:
+      to: "{{ reviewer_agents }}"
+      prompt: "{{ review_prompt }}"
+      template_vars:
+        context: "{{ user_context }}"
+  - wait_for_all:
+      agents: "{{ reviewer_agents }}"
+  - send:
+      to: "{{ primary_agent }}"
+      text: |
+        Here's feedback from several reviewers:
+
+        {{ aggregated_responses(reviewer_agents) }}
+
+        Let me know what your recommendations are.
+```
+
+### `review-analyze-discuss` (flagship)
+
+Reviewers review in parallel; an analyst distills their feedback into a decision-ready verdict (filling the `ai-review-feedback` prompt's `review` argument via `template_vars`); the reviewers respond to the analysis; the analyst gives a final recommendation. It demonstrates filling a saved prompt's argument with forwarded output, plus round-trip discussion via the `last_output` / `aggregated_responses` helpers in inline `text`.
+
+```yaml
+name: review-analyze-discuss
+description: Reviewers review in parallel, an analyst distills their feedback into a decision-ready verdict, the reviewers respond to it, and the analyst gives a final recommendation.
+inputs:
+  reviewers: [agent]
+  analyst: agent
+  review_prompt: prompt_id
+  analysis_prompt: prompt_id
+  context: text?
+steps:
+  - send:
+      to: "{{ reviewers }}"
+      prompt: "{{ review_prompt }}"
+      template_vars:
+        context: "{{ context }}"
+  - wait_for_all:
+      agents: "{{ reviewers }}"
+  - send:
+      to: "{{ analyst }}"
+      prompt: "{{ analysis_prompt }}"
+      template_vars:
+        review: "{{ aggregated_responses(reviewers) }}"
+  - wait_for:
+      agent: "{{ analyst }}"
+  - send:
+      to: "{{ reviewers }}"
+      text: |
+        An analyst reviewed all of the feedback and responded:
+
+        {{ last_output(analyst) }}
+
+        Do you agree with this analysis? Push back where you think it's wrong, and confirm where it's right.
+  - wait_for_all:
+      agents: "{{ reviewers }}"
+  - send:
+      to: "{{ analyst }}"
+      text: |
+        Here's how the reviewers responded to your analysis:
+
+        {{ aggregated_responses(reviewers) }}
+
+        Weigh their responses and give your final recommendation.
+  - wait_for:
+      agent: "{{ analyst }}"
+```
+
 ## Conventions
 
 - **Filename = name field**. `review-and-aggregate.yaml` has `name: review-and-aggregate`.

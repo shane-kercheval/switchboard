@@ -2705,4 +2705,62 @@ describe("ComposeBar — cross-agent forward", () => {
     // Chips clear once the forward has dispatched.
     await waitFor(() => expect(screen.queryByTestId("attachment-chip-image-1")).toBeNull());
   });
+
+  it("enters workflow mode (hiding To/forward) and invokes the workflow", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    const WORKFLOW = {
+      name: "review-and-aggregate",
+      is_builtin: true,
+      description: "d",
+      inputs: [
+        { name: "primary_agent", ty: "agent", optional: false, description: null },
+        { name: "reviewer_agents", ty: "agent_list", optional: false, description: null },
+        { name: "review_prompt", ty: "prompt_id", optional: false, description: null },
+      ],
+      invocable: true,
+      parse_error: null,
+      recommended_prompts: { review_prompt: "builtin:code-review" },
+    };
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "list_prompts") return [];
+      if (cmd === "invoke_workflow") return "run-1";
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    await waitFor(() => screen.getByTestId("workflow-option-builtin:review-and-aggregate"));
+    await fireEvent.click(screen.getByTestId("workflow-option-builtin:review-and-aggregate"));
+
+    // Workflow mode: the composer renders, and the To field + message forward
+    // affordance are hidden (the workflow owns routing via its agent inputs).
+    expect(screen.getByTestId("workflow-composer")).toBeInTheDocument();
+    expect(screen.queryByTestId("recipient-field")).toBeNull();
+    expect(screen.queryByTestId("compose-forward-button")).toBeNull();
+
+    // Fill the required agent inputs (review_prompt is pre-seeded from the
+    // recommended built-in prompt).
+    await fireEvent.click(screen.getByTestId("workflow-agent-primary_agent-alice"));
+    await fireEvent.click(screen.getByTestId("workflow-agent-reviewer_agents-bob"));
+
+    await fireEvent.click(screen.getByTestId("workflow-invoke-button"));
+    await waitFor(() => {
+      expect(invokeMock.mock.calls.some(([c]) => c === "invoke_workflow")).toBe(true);
+    });
+    const call = invokeMock.mock.calls.find(([c]) => c === "invoke_workflow");
+    expect(call?.[1]).toMatchObject({
+      projectId: PROJECT_ID,
+      name: "review-and-aggregate",
+      isBuiltin: true,
+      inputs: {
+        primary_agent: "alice",
+        reviewer_agents: ["bob"],
+        review_prompt: "builtin:code-review",
+      },
+    });
+  });
 });

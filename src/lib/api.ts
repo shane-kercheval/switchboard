@@ -30,6 +30,9 @@ import type {
   RepoListing,
   SendId,
   StagedAttachment,
+  WorkflowInputValue,
+  WorkflowListing,
+  WorkflowRunInfo,
   WorkspaceDirectories,
 } from "./types";
 
@@ -528,4 +531,59 @@ export async function renderPrompt(
   args: Record<string, string>,
 ): Promise<RenderedPrompt> {
   return await invoke<RenderedPrompt>("render_prompt", { provider, name, args });
+}
+
+// ── Workflows ─────────────────────────────────────────────────────────────────
+
+/// All workflows available to a project: the read-only built-in library (when
+/// `show_builtins` is on) merged with the project directory's own files.
+export async function listWorkflows(projectId: ProjectId): Promise<WorkflowListing[]> {
+  return await invoke<WorkflowListing[]>("list_workflows", { projectId });
+}
+
+/// Validate a workflow invocation (capability gate + input/roster/prompt rules)
+/// without launching it. Rejects with an actionable error string.
+export async function validateWorkflowInvocation(
+  projectId: ProjectId,
+  name: string,
+  isBuiltin: boolean,
+  inputs: Record<string, WorkflowInputValue>,
+): Promise<void> {
+  await invoke("validate_workflow_invocation", { projectId, name, isBuiltin, inputs });
+}
+
+/// Validate + launch a workflow run on a background task; returns its run id.
+export async function invokeWorkflow(
+  projectId: ProjectId,
+  name: string,
+  isBuiltin: boolean,
+  inputs: Record<string, WorkflowInputValue>,
+): Promise<string> {
+  return await invoke<string>("invoke_workflow", { projectId, name, isBuiltin, inputs });
+}
+
+/// Fire a running workflow's cancel token (no-op if it already finished).
+export async function cancelWorkflowRun(runId: string): Promise<void> {
+  await invoke("cancel_workflow_run", { runId });
+}
+
+/// Active + retained-failed + interrupted runs for a project (the run indicator).
+export async function listWorkflowRuns(projectId: ProjectId): Promise<WorkflowRunInfo[]> {
+  return await invoke<WorkflowRunInfo[]>("list_workflow_runs", { projectId });
+}
+
+/// Clear a failed or interrupted run's file (the Abandon action).
+export async function abandonWorkflowRun(projectId: ProjectId, runId: string): Promise<void> {
+  await invoke("abandon_workflow_run", { projectId, runId });
+}
+
+/// Copy a built-in workflow into the project directory's `workflows/` folder as
+/// an owned, editable file. Returns the written path; rejects if it would clobber.
+export async function copyBuiltinWorkflow(projectId: ProjectId, name: string): Promise<string> {
+  return await invoke<string>("copy_builtin_workflow", { projectId, name });
+}
+
+/// Open the project directory's `workflows/` folder in Finder.
+export async function openWorkflowsDir(projectId: ProjectId): Promise<void> {
+  await invoke("open_workflows_dir", { projectId });
 }

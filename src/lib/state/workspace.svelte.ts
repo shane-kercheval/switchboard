@@ -54,6 +54,10 @@ import {
   transcripts,
   unregisterAgents,
 } from "./index.svelte";
+import {
+  subscribeProjectWorkflows,
+  unsubscribeProjectWorkflows,
+} from "$lib/state/workflows.svelte";
 
 /// Per-project hydrated overlay. `items` holds only `user_message` and
 /// `outcome` kinds (agent content is routed to per-agent state); `status`
@@ -344,6 +348,7 @@ export async function removeDirectory(path: string): Promise<void> {
 
   // Backend drop succeeded — tear down the matching frontend state.
   unregisterAgents(removedAgentIds);
+  unsubscribeProjectWorkflows(removedProjectIds);
   for (const id of removedProjectIds) {
     delete agentsByProject[id];
     delete conversations[id];
@@ -573,6 +578,7 @@ export async function deleteProject(projectId: ProjectId): Promise<void> {
   await api.deleteProject(projectId);
 
   unregisterAgents(removedAgentIds);
+  unsubscribeProjectWorkflows([projectId]);
   projects.list = projects.list.filter((p) => p.id !== projectId);
   delete agentsByProject[projectId];
   delete conversations[projectId];
@@ -662,6 +668,9 @@ function ensureProjectLoaded(projectId: ProjectId): Promise<void> {
     const agents = await api.listAgents(projectId);
     agentsByProject[projectId] = agents;
     await Promise.all(agents.map((a) => registerAgent(a)));
+    // Subscribe to the project's workflow progress channel (not active-gated, so
+    // a run in a background project keeps updating). Idempotent; seeds run state.
+    void subscribeProjectWorkflows(projectId);
     void hydrateProject(projectId);
   })();
   loadStarted.set(projectId, load);

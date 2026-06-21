@@ -742,3 +742,64 @@ export type Prompt = {
 export type RenderedPrompt = {
   text: string;
 };
+
+// ── Workflows (system-design §7) ──────────────────────────────────────────────
+// Mirror the Rust types in `crates/app/src/workflow_commands.rs`.
+
+// One declared workflow input as the invocation form renders it. `ty` is the
+// base type; `text?` is `ty: "text"` with `optional: true`. List inputs
+// (`[agent]`/`[text]`) are `agent_list`/`text_list`.
+export type WorkflowInputType = "agent" | "agent_list" | "prompt_id" | "text" | "text_list";
+
+export type WorkflowInputInfo = {
+  name: string;
+  ty: WorkflowInputType;
+  optional: boolean;
+  description: string | null;
+};
+
+// A workflow as the menu/list shows it: parsed metadata OR a parse error, plus
+// the read-only/built-in flag and the up-front `invocable` flag (false when it
+// uses a not-yet-runnable step — `pause_for_user`/`for_each`). `recommended_prompts`
+// maps a `prompt_id` input name → a recommended built-in prompt id (built-ins only).
+export type WorkflowListing = {
+  name: string;
+  is_builtin: boolean;
+  description: string | null;
+  inputs: WorkflowInputInfo[];
+  invocable: boolean;
+  parse_error: string | null;
+  recommended_prompts: Record<string, string>;
+};
+
+// A run as the indicator shows it (from `list_workflow_runs`). `status` is
+// `running` (live), `failed` (retained terminal), or `interrupted` (no terminal,
+// not live). `step` is the zero-based current/failing step.
+export type WorkflowRunStatus = "running" | "failed" | "interrupted";
+
+export type WorkflowRunInfo = {
+  run_id: string;
+  workflow: string;
+  step: number;
+  total: number;
+  status: WorkflowRunStatus;
+  reason: string | null;
+};
+
+// The `workflow:<project-id>` channel payload. `status` is `running` while live,
+// or a terminal (`complete`/`cancelled`/`failed`). Carries no agent output text.
+export type WorkflowProgressStatus = "running" | "complete" | "cancelled" | "failed";
+
+export type WorkflowProgressPayload = {
+  run_id: string;
+  workflow: string;
+  step: number;
+  total: number;
+  status: WorkflowProgressStatus;
+  reason: string | null;
+};
+
+// An input value supplied at invocation. A scalar (agent/prompt_id/text) is a
+// bare string; a list (`[agent]`/`[text]`) is a string array — matching the
+// untagged Rust `InputValue`.
+export type WorkflowInputValue = string | string[];

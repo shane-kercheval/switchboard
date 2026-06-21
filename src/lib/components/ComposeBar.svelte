@@ -47,9 +47,12 @@
     AttachmentKind,
     ProjectId,
     Prompt,
+    WorkflowInputValue,
+    WorkflowListing,
   } from "$lib/types";
   import { classifyKind } from "$lib/attachments";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
+  import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
   import { buildRenderArgs, combinePromptMessage, missingRequiredArgs } from "$lib/prompt";
   import Textarea from "$lib/components/ui/Textarea.svelte";
   import StopIcon from "$lib/components/ui/StopIcon.svelte";
@@ -57,6 +60,9 @@
   import Tooltip from "$lib/components/ui/Tooltip.svelte";
   import PromptMenu from "$lib/components/PromptMenu.svelte";
   import PromptComposer from "$lib/components/PromptComposer.svelte";
+  import WorkflowMenu from "$lib/components/WorkflowMenu.svelte";
+  import WorkflowComposer from "$lib/components/WorkflowComposer.svelte";
+  import Button from "$lib/components/ui/Button.svelte";
   import ForwardSourceChip from "$lib/components/ui/ForwardSourceChip.svelte";
   import ForwardSourcePicker from "$lib/components/ui/ForwardSourcePicker.svelte";
   import Spinner from "$lib/components/ui/Spinner.svelte";
@@ -237,9 +243,12 @@
   });
 
   // ── Prompt mode ────────────────────────────────────────────────────────────
-  // `mode` swaps the compose area between the plain textarea and the structured
-  // prompt composer; the recipients header and send button are shared.
-  let mode = $state<"plain" | "prompt">("plain");
+  // `mode` swaps the compose area between the plain textarea, the structured
+  // prompt composer, and the workflow invocation form. In workflow mode the
+  // compose bar's own To field + message-level forward affordances are hidden:
+  // a workflow parameterizes its recipients via its declared agent inputs, so
+  // the workflow owns routing (the prompt-vs-workflow routing distinction).
+  let mode = $state<"plain" | "prompt" | "workflow">("plain");
   let selectedPrompt = $state<Prompt | null>(null);
   let promptArgs = $state<Record<string, string>>({});
   // Per-argument forward sources (live-UI-only, like `forwardSources`). A
@@ -258,6 +267,16 @@
   // "loading" row instead of momentarily claiming there are no prompts.
   let promptsLoaded = $state(false);
   let sending = $state(false);
+
+  // Workflow invocation state (live-UI-only). The menu lists the project's
+  // workflows; picking an invocable one enters workflow mode with a per-input
+  // form. Not persisted across reloads (a half-filled invocation is transient).
+  let workflowMenuOpen = $state(false);
+  let workflows = $state<WorkflowListing[]>([]);
+  let workflowsLoaded = $state(false);
+  let selectedWorkflow = $state<WorkflowListing | null>(null);
+  let workflowInputs = $state<Record<string, WorkflowInputValue>>({});
+  let invokingWorkflow = $state(false);
   // A saved prompt-mode draft to restore once the cache loads; consumed when
   // restoration settles. Null when the saved draft was plain.
   let pendingRestore = $state<PromptContent | null>(
@@ -470,11 +489,12 @@
       if (hasOpenDialog()) return;
       // ⌘⌃1..9 → add pane N as a forward source, mirroring ⌘⌥1..9 ("target pane
       // N"). Both modifiers required, so it never collides with ⌘1..9 (target
-      // agent N) — intercepted before that branch below. Plain-mode only: in
-      // prompt mode the whole-message forward set is hidden (forwarding is
-      // per-field), so this must not mutate it from behind a hidden UI.
+      // agent N) — intercepted before that branch below. **Plain-mode only**: in
+      // prompt mode forwarding is per-field, and in workflow mode the workflow
+      // owns routing — the whole-message forward set is hidden in both, so this
+      // must not mutate it from behind a hidden UI.
       if (e.metaKey && e.ctrlKey && !e.shiftKey && e.key >= "1" && e.key <= "9") {
-        if (mode === "prompt") return;
+        if (mode !== "plain") return;
         const pane = paneLayout.panes[Number(e.key) - 1];
         if (pane !== undefined && pane.members.length > 0) {
           e.preventDefault();
@@ -627,7 +647,9 @@
   /// recipient. Suppressed in single-agent projects (nothing to forward between)
   /// and for sources already added.
   const forwardItems = $derived.by<ForwardMenuItem[]>(() => {
-    if (!menuOpen || agents.length <= 1) return [];
+    // Message-level forwarding is plain-mode only (prompt mode forwards per-field;
+    // workflow mode routes via its agent inputs).
+    if (!menuOpen || agents.length <= 1 || mode !== "plain") return [];
     const q = menuQuery.toLowerCase();
     const items: ForwardMenuItem[] = [];
     if (paneLayout.panes.length > 1) {
@@ -1039,6 +1061,108 @@
     promptAppendedSources = [];
     focusPromptFieldOnMount = false;
     appendedText = "";
+  }
+
+  // --- Workflows ------------------------------------------------------------
+
+  async function loadWorkflows(): Promise<void> {
+    try {
+      const list = await api.listWorkflows(projectId);
+      workflows = Array.isArray(list) ? list : [];
+    } catch {
+      workflows = [];
+    } finally {
+      workflowsLoaded = true;
+    }
+  }
+
+  function openWorkflowMenu(): void {
+    closeMentionMenu();
+    promptMenuOpen = false;
+    void loadWorkflows();
+    void loadPrompts();
+    workflowMenuOpen = true;
+  }
+
+  /// Enter workflow mode with the picked workflow, seeding each `prompt_id`
+  /// input with its recommended built-in prompt (built-ins only) so the default
+  /// path is render-consistent.
+  function pickWorkflow(workflow: WorkflowListing): void {
+    selectedWorkflow = workflow;
+    const seeded: Record<string, WorkflowInputValue> = {};
+    for (const input of workflow.inputs) {
+      if (input.ty === "agent_list" || input.ty === "text_list") {
+        seeded[input.name] = [];
+      } else if (input.ty === "prompt_id") {
+        seeded[input.name] = workflow.recommended_prompts[input.name] ?? "";
+      } else {
+        seeded[input.name] = "";
+      }
+    }
+    workflowInputs = seeded;
+    mode = "workflow";
+    workflowMenuOpen = false;
+  }
+
+  function removeWorkflow(): void {
+    mode = "plain";
+    selectedWorkflow = null;
+    workflowInputs = {};
+  }
+
+  async function copyWorkflow(workflow: WorkflowListing): Promise<void> {
+    try {
+      await api.copyBuiltinWorkflow(projectId, workflow.name);
+      await loadWorkflows();
+      sendError = null;
+    } catch (err) {
+      sendError = `Couldn't copy workflow: ${err instanceof Error ? err.message : String(err)}`;
+    }
+  }
+
+  /// Required workflow inputs left unfilled (mirrors WorkflowComposer's gate), so
+  /// the invoke button can be disabled. A non-invocable workflow blocks invoke.
+  const workflowMissing = $derived.by(() => {
+    if (selectedWorkflow === null) return [];
+    if (!selectedWorkflow.invocable) return selectedWorkflow.inputs.map((i) => i.name);
+    return selectedWorkflow.inputs
+      .filter((i) => {
+        if (i.optional) return false;
+        const v = workflowInputs[i.name];
+        if (i.ty === "agent_list" || i.ty === "text_list") {
+          return !Array.isArray(v) || v.length === 0;
+        }
+        return typeof v !== "string" || v.trim() === "";
+      })
+      .map((i) => i.name);
+  });
+
+  /// Request OS-notification permission once, contextually at first invoke.
+  async function ensureNotificationPermission(): Promise<void> {
+    try {
+      if (!(await isPermissionGranted())) {
+        await requestPermission();
+      }
+    } catch (err) {
+      console.warn("[switchboard] notification permission request failed", err);
+    }
+  }
+
+  async function invokeWorkflowAction(): Promise<void> {
+    if (selectedWorkflow === null || invokingWorkflow || workflowMissing.length > 0) return;
+    const workflow = selectedWorkflow;
+    invokingWorkflow = true;
+    sendError = null;
+    try {
+      // Contextual permission request at first invoke (not at cold startup).
+      void ensureNotificationPermission();
+      await api.invokeWorkflow(projectId, workflow.name, workflow.is_builtin, workflowInputs);
+      removeWorkflow();
+    } catch (err) {
+      sendError = `Couldn't run workflow: ${err instanceof Error ? err.message : String(err)}`;
+    } finally {
+      invokingWorkflow = false;
+    }
   }
 
   function handlePrimaryAction(): void {
@@ -1474,6 +1598,15 @@
         onclose={() => (promptMenuOpen = false)}
       />
     {/if}
+    {#if workflowMenuOpen}
+      <WorkflowMenu
+        {workflows}
+        loading={!workflowsLoaded}
+        onpick={pickWorkflow}
+        oncopy={copyWorkflow}
+        onclose={() => (workflowMenuOpen = false)}
+      />
+    {/if}
     {#if menuOpen && hasMenuContent}
       <!-- Full compose-box width, matching the prompt menu's placement. The
            menu opens upward from the compose box instead of following the @
@@ -1740,10 +1873,11 @@
         {/each}
       </div>
     {/if}
-    {#if mode !== "prompt" && forwardSources.length > 0}
-      <!-- Plain-mode only: in prompt mode, forwarding is per-field (per argument
-           or the appended text), so the message-level forward set doesn't apply
-           and is hidden (its state is preserved for when the prompt is removed). -->
+    {#if mode === "plain" && forwardSources.length > 0}
+      <!-- Plain-mode only: prompt mode forwards per-field, and workflow mode
+           routes via its agent inputs, so the message-level forward set doesn't
+           apply and is hidden in both (its state is preserved for restore when
+           the prompt/workflow is removed). -->
       <div class="mb-1.5 flex flex-wrap items-center gap-1.5" data-testid="forward-source-chips">
         <span class="text-muted text-xs">Forwarding from</span>
         {#each forwardSources as source (forwardSourceKey(source))}
@@ -1757,7 +1891,7 @@
       </div>
     {/if}
     <div class="mb-1.5 flex items-start justify-between gap-2">
-      {#if agents.length > 1}
+      {#if agents.length > 1 && mode !== "workflow"}
         <div class="flex flex-wrap items-center gap-1.5 text-xs" data-testid="recipient-field">
           <span class="text-muted">To</span>
           {#each agents as agent, i (agent.id)}
@@ -1866,9 +2000,10 @@
         <div></div>
       {/if}
       <div class="flex shrink-0 items-center gap-1">
-        {#if mode !== "prompt"}
-          <!-- Plain-mode only: prompt mode forwards per-field, so the
-               message-level ↪ Forward button is hidden while a prompt is active. -->
+        {#if mode === "plain"}
+          <!-- Plain-mode only: prompt mode forwards per-field, and workflow mode
+               routes via its agent inputs, so the message-level ↪ Forward button
+               is hidden in both. -->
           <ForwardSourcePicker
             {agents}
             panes={paneLayout.panes}
@@ -1887,42 +2022,82 @@
             )}
           />
         {/if}
-        <Tooltip label="Insert a prompt" shortcut={shortcut("/")}>
-          {#snippet trigger(props)}
-            <button
-              {...props}
-              type="button"
-              class={cn(
-                "text-muted hover:text-fg hover:bg-panel focus-visible:ring-accent flex h-6 items-center gap-1 rounded-full border border-transparent px-2 text-xs transition-colors focus-visible:ring-2 focus-visible:outline-none",
-                sending ? "cursor-not-allowed opacity-60" : "",
-              )}
-              data-testid="compose-prompt-button"
-              aria-label="Insert a prompt"
-              disabled={sending}
-              onclick={() => {
-                if (sending) return;
-                if (promptMenuOpen) {
-                  promptMenuOpen = false;
-                } else {
-                  openPromptMenu();
-                }
-              }}
-            >
-              <svg
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="2"
-                stroke-linecap="round"
-                class="h-4 w-4"
-                aria-hidden="true"
+        {#if mode !== "workflow"}
+          <Tooltip label="Insert a prompt" shortcut={shortcut("/")}>
+            {#snippet trigger(props)}
+              <button
+                {...props}
+                type="button"
+                class={cn(
+                  "text-muted hover:text-fg hover:bg-panel focus-visible:ring-accent flex h-6 items-center gap-1 rounded-full border border-transparent px-2 text-xs transition-colors focus-visible:ring-2 focus-visible:outline-none",
+                  sending ? "cursor-not-allowed opacity-60" : "",
+                )}
+                data-testid="compose-prompt-button"
+                aria-label="Insert a prompt"
+                disabled={sending}
+                onclick={() => {
+                  if (sending) return;
+                  if (promptMenuOpen) {
+                    promptMenuOpen = false;
+                  } else {
+                    openPromptMenu();
+                  }
+                }}
               >
-                <path d="M12 5v14M5 12h14" />
-              </svg>
-              Prompt
-            </button>
-          {/snippet}
-        </Tooltip>
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  class="h-4 w-4"
+                  aria-hidden="true"
+                >
+                  <path d="M12 5v14M5 12h14" />
+                </svg>
+                Prompt
+              </button>
+            {/snippet}
+          </Tooltip>
+        {/if}
+        {#if mode !== "prompt"}
+          <Tooltip label="Run a workflow">
+            {#snippet trigger(props)}
+              <button
+                {...props}
+                type="button"
+                class={cn(
+                  "text-muted hover:text-fg hover:bg-panel focus-visible:ring-accent flex h-6 items-center gap-1 rounded-full border border-transparent px-2 text-xs transition-colors focus-visible:ring-2 focus-visible:outline-none",
+                  sending ? "cursor-not-allowed opacity-60" : "",
+                )}
+                data-testid="compose-workflow-button"
+                aria-label="Run a workflow"
+                disabled={sending}
+                onclick={() => {
+                  if (sending) return;
+                  if (workflowMenuOpen) {
+                    workflowMenuOpen = false;
+                  } else {
+                    openWorkflowMenu();
+                  }
+                }}
+              >
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  class="h-4 w-4"
+                  aria-hidden="true"
+                >
+                  <path d="M12 5v14M5 12h14" />
+                </svg>
+                Workflow
+              </button>
+            {/snippet}
+          </Tooltip>
+        {/if}
       </div>
     </div>
 
@@ -1974,6 +2149,31 @@
       >
         <Spinner class="h-4 w-4" />
         Restoring prompt…
+      </div>
+    {:else if mode === "workflow" && selectedWorkflow !== null}
+      <!-- Workflow mode: the invocation form spans the compose area. The compose
+           bar's To field + message forwards are hidden (the workflow routes via
+           its agent inputs); the run launches in the background. -->
+      <div class="mt-2">
+        <WorkflowComposer
+          workflow={selectedWorkflow}
+          {agents}
+          {prompts}
+          bind:inputs={workflowInputs}
+          onremove={removeWorkflow}
+        >
+          {#snippet invoke()}
+            <Button
+              variant="primary"
+              size="sm"
+              data-testid="workflow-invoke-button"
+              disabled={workflowMissing.length > 0 || invokingWorkflow}
+              onclick={() => void invokeWorkflowAction()}
+            >
+              {invokingWorkflow ? "Starting…" : "Run workflow"}
+            </Button>
+          {/snippet}
+        </WorkflowComposer>
       </div>
     {:else if mode === "prompt" && selectedPrompt !== null}
       <!-- Prompt mode stacks full-width: the argument/appended boxes span the

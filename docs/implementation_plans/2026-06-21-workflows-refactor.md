@@ -60,9 +60,10 @@ These decisions are load-bearing across milestones; define them once and reuse.
   - **User-fillable args** = `A \ T` — surfaced as form fields (required if the prompt marks the argument required).
 
 - **Flat, merge-by-name argument namespace (type-aware collisions).** Derived user-fillable args share one flat namespace with declared inputs, keyed by argument name. A given name appears in the form **once**; at render it is passed to *every* hardcoded prompt that declares it as a user-fillable arg. Prompt arguments are **strings** (`render_template` requires string values and rejects unknown args), so collisions resolve by type:
-  - A scalar **`text`/`text?` declared input** may shadow-and-satisfy a prompt argument of the same name: one field, the declared input's label/description wins, and its value also feeds the prompt. This is the intended escape hatch (custom labeling of a field that feeds a prompt). **Surface it** in the descriptor (or a dev-log) so the merge is diagnosable, not silent.
-  - A **non-text declared input** (`agent`/`[agent]`/`[text]`) sharing a prompt-arg name, or **two prompts** contributing the same user-fillable arg name, is a **descriptor/validation error** at form-build time — not a silent merge (it would feed a non-string into a string slot, or hide an ambiguity).
-  These rules must be documented in code and in the spec.
+  - A scalar **`text`/`text?` declared input** may shadow-and-satisfy a prompt argument of the same name: one field, the declared input's label/description wins, and its value also feeds the prompt (the intended escape hatch for custom-labeling a field that feeds a prompt).
+  - **Two hardcoded prompts** with a same-named, same-typed (string) user-fillable arg **share** one field: its value feeds both, and it is required if *either* prompt marks it required.
+  - A **non-text declared input** (`agent`/`[agent]`/`[text]`) colliding with a (string) prompt-arg name is a **descriptor/validation error** at form-build time — it would feed a non-string into a string slot. This is the **only** collision that is an error rather than a share.
+  Every share above must be **surfaced** in the descriptor (or a dev-log) so it's diagnosable, not silent. These rules must be documented in code and in the spec.
 
 - **Rationale must survive into code.** Every non-obvious decision above (why `prompt_id` is gone, why bindings are validated at invocation, the merge-by-name rule and its two consequences) must appear as a comment/docstring at the relevant code site, not just here. A reviewer reading `build_body` or the validation function should find the "why" without this plan.
 
@@ -122,6 +123,10 @@ At invocation time the app knows exactly what the user must fill and refuses to 
 - Unit/integration tests for the resolution+classification primitive: a prompt with an optional user arg → that arg is user-fillable; a `template_vars` key not on the prompt → invalid binding; a required prompt arg with no binding → user-fillable+required; an unresolved prompt id → unresolved state.
 - A test that `describe_workflow_form` on `review-and-aggregate` returns `reviewers`, `worker`, and a derived optional `context`; on `review-analyze-discuss` returns `reviewers`, `worker`, `context` (and that `review` is **not** surfaced — it's computed).
 - A test that invocation is **blocked** when a hardcoded prompt is missing a `template_vars`-targeted argument (simulate via a fixture prompt), with the error naming the prompt+argument.
+- **Collision rules:** a declared `text` input shadowing a prompt arg → one field whose value feeds the prompt; a declared `[agent]` input colliding with a prompt-arg name → descriptor error; two hardcoded prompts with a same-named string user arg → one shared field (required if either prompt requires it).
+- **Partition (regression guard):** a derived arg value (e.g. `context`) is accepted at invocation, not rejected as "not declared"; a missing required *declared* input still fails; a value naming a non-roster agent still fails; a required *derived* arg left unfilled blocks invocation.
+- **Invoke is authoritative:** a workflow whose descriptor validated cleanly is still re-validated at invoke and blocked if the prompt's schema changed in between (simulate by mutating the fixture prompt's arguments between describe and invoke).
+- **Freshness:** a local/built-in prompt resolves under a cold cache (never falsely "unresolved"); an unresolvable id yields the unresolved state. (If an MCP prompt stub is available, also cover cold → resolved-after-sync; otherwise record it as covered only at the integration boundary.)
 - The existing app-layer invoke/validate tests updated to the new input shape (no `review_prompt`/`primary_agent`-style prompt inputs; `worker`/`reviewers` + derived `context`).
 - Rationale comments at the validation site (why drift is caught here, not at run).
 
@@ -143,6 +148,7 @@ When a workflow runs, each hardcoded-prompt step renders with the right argument
 ### Definition of Done
 - Integration test through `WorkflowRun`: invoke `review-and-aggregate` with a `context` value → the dispatched body to reviewers contains the rendered `code-review` prompt *with* the context section; invoke without `context` → renders the no-context branch. (Reuse the existing `RecordingDispatch`-style harness in `workflow.rs` tests.)
 - A test that `review-analyze-discuss`'s analysis step still renders `ai-review-feedback` with the aggregated `review` arg.
+- **Per-prompt argument isolation** (the built-ins don't exercise this — needs a synthetic two-prompt fixture): a workflow whose step A hardcodes a prompt with user arg `foo` and step B a prompt with user arg `bar`. Filling both, step A renders with only `foo` and step B with only `bar`, and neither fails on an unknown argument — proving each prompt receives exactly its own declared args, not the whole user-value map (`render_template` rejects unknown args, so a leak would fail the run).
 - Rationale comment in `build_body` explaining the two arg sources and why only the prompt's declared args are passed.
 
 ---
@@ -159,6 +165,7 @@ The workflow form shows the user exactly what the chosen workflow needs — agen
 ### Implementation Outline
 - **On pick**, call the M2 `describe_workflow_form` command instead of seeding from `WorkflowListing.inputs` + `recommended_prompts`. `ComposeBar.pickWorkflow` builds form state from the descriptor; drop the `recommended_prompts` seeding and the `prompt_id` branch. **Re-fetch the descriptor on `prompts:synced`** (mirroring the prompt menu's cold-cache handling) so a workflow that hardcodes an MCP prompt resolves once sync lands, instead of stranding the user on an "unresolved" form until they re-pick.
 - **`WorkflowComposer`**: remove the `prompt_id` field rendering (the embedded prompt menu / `promptMenuFor` state). Render derived prompt-arg fields as describable text fields, reusing the existing field pattern. (The per-field `ForwardSourcePicker` wiring — same as `PromptComposer` — arrives in M5; M4 fields are plain text inputs.) Surface the compatibility error from the descriptor as a blocking message (sibling to the existing non-`invocable` message) that disables Run.
+- **Pending vs. error for the unresolved state (latency UX).** Resolving a prompt's *schema* reads the synchronous in-memory cache (`PromptService.list()`) — it is **not** a network call, so building the form is instant. The only slow window is a **cold cache before the first background `sync()` lands**, where an MCP-hardcoded prompt isn't cached yet and the descriptor reports `unresolved`. Treat `unresolved` as a **non-error pending affordance** — a "resolving prompts…" spinner with Run disabled and **no** incompatibility styling — *not* the blocking drift error. It self-heals via the existing `prompts:synced` re-fetch. Only escalate `unresolved` to the blocking-error presentation once resolution has **settled** (a `prompts:synced` has fired and the prompt is still unresolved → genuinely missing). The `invalid_bindings` incompatibility is always a hard error regardless of sync state. (Distinguishing pending from settled-missing is the frontend tracking "has a sync settled since pick"; `PromptService` already exposes per-provider `ProviderStatus` if a richer signal is wanted — don't over-build it.) Note: the *dispatch-time* MCP `render()` call (M3) is a genuine network round-trip, but it happens inside a running workflow where the run indicator / per-step progress already absorbs the latency; no form spinner is involved there.
 - **Grouping/labeling**: derived fields belong to a specific prompt; a light label/hint indicating which prompt a field feeds is enough (decide presentation against the code). The contract is "derived prompt args render as fillable, describable fields"; don't over-build grouping the built-ins don't need (each built-in has a single derived `context`).
 - **`api.ts` / `types.ts`**: add the `describe_workflow_form` binding and its descriptor type; drop `recommended_prompts` from the `WorkflowListing` type; the invoke payload carries the flat declared+derived value map (shape unchanged: `Record<string, string | string[]>`).
 - **Missing-required gating** (`WorkflowComposer.missingRequired` / `ComposeBar.workflowMissing`): extend to include required derived args.
@@ -166,28 +173,35 @@ The workflow form shows the user exactly what the chosen workflow needs — agen
 ### Definition of Done
 - Component tests: a workflow descriptor with a derived optional `context` renders a `context` field; a descriptor with a required derived arg blocks Run until filled; an incompatible descriptor shows the error and disables Run; no prompt-picker control renders.
 - A `ComposeBar` test that picking a workflow calls `describe_workflow_form` and invoking passes the combined declared+derived values.
+- A test that an **unresolved** descriptor re-fetches on `prompts:synced` and resolves into a fillable form (no manual re-pick needed).
+- A test that the **unresolved** state renders as a non-error pending affordance (spinner / "resolving…", Run disabled, no incompatibility error) while a sync may be in flight, and only escalates to the blocking error once a `prompts:synced` has settled with the prompt still unresolved.
 - Update existing `WorkflowComposer`/`ComposeBar` tests that referenced `prompt_id` fields or `recommended_prompts`.
 
 ---
 
-## Milestone 5 — Forward-from on text & derived prompt-argument fields (separable; deferrable)
+## Milestone 5 — Forward-from on text & derived prompt-argument fields (separable)
 
 ### Goal & Outcome
-A workflow's user-fillable text fields (genuine `text` inputs and derived prompt args) can be filled by forwarding an agent's or pane's latest output, like prompt-composer arguments.
+A workflow's user-fillable text fields (genuine `text` inputs and derived prompt args) can be filled by forwarding an agent's or pane's **already-completed** latest output, like prompt-composer arguments.
 - The user can attach an agent/pane forward source to a workflow text field; at invocation that field's value is the forwarded output (composed like a prompt forward).
+- **Completed-source semantics (decided):** the source's latest *completed* turn is captured at invoke and the run starts immediately. If a chosen source still has an **in-flight turn**, invocation is **rejected with a clear message** ("agent X is still responding — wait for it to finish, then run the workflow"). The workflow launch is never held open waiting on a streaming agent.
+
+This is **decided, not open** — see "Decision: completed-only, no holding" below. M5 is a small, well-understood addition layered on M1–M4; it can ship after them, but carries no unresolved design question.
 
 ### Implementation Outline
-This milestone has a genuine **open design question** and is the largest, least-certain piece — it can ship after M1–M4. **Do not start it without resolving the question below with the reviewers.**
+- **Resolution at invoke (backend).** Reuse the existing source resolver (`resolve_all_sources` / `resolve_source` in `commands.rs`), but in **completed-only** mode: instead of awaiting a source's in-flight turn, detect it (the resolver already distinguishes idle-with-completed-transcript from an active turn via `dispatcher.wait_for_current_turn`) and **reject** the invoke if any chosen source is mid-turn. For idle sources, read the latest completed output exactly as the resolver does today. Compose typed-lead + forwarded blocks via the existing `compose_forwarded_message` / `compose_resolutions` helpers. The resolved field values are bound as the field's value — they are *field inputs*, not a held send.
+- **Invoke payload.** Gains per-field forward sources for text/derived fields (mirror `ForwardArg`: field name → source agent ids). Resolution + the completed-only check run in the app layer at invoke, **before** the run is spawned. Because resolution is synchronous-ish (no holding), it does not change the existing fast invoke→run-id return contract in any user-visible way.
+- **Reuse, don't reinvent (frontend).** The per-field `ForwardSourcePicker` + chip UI from `PromptComposer`, and `expandForwardSources`. `WorkflowComposer`'s derived/text fields gain the same picker the prompt composer fields already have.
 
-- **Open question — hold semantics at invocation.** Prompt-argument forwarding (Milestone 2.5, `forward_prompt`) *holds* the send until the forwarded sources finish, then composes and dispatches. A workflow invocation kicks off an autonomous multi-step run. Two options:
-  1. **Require sources already complete** at invoke (no holding): simpler; the forwarded value is captured from a completed turn, the run starts immediately. Fails fast if a source is still streaming.
-  2. **Hold the invocation** until sources settle (reuse the `forward_prompt` held-resolution path), then start the run: consistent with manual forwarding, but couples workflow launch to the held-forward lifecycle and its cancellation/restore edge cases.
-  Recommendation to evaluate: option 1 for v1 (matched-to-problem; a workflow source is almost always a prior completed turn), with the held path deferred. Reviewers to confirm.
-- Reuse, don't reinvent: the per-field `ForwardSourcePicker` + chip UI from `PromptComposer`, and the `expandForwardSources` / forward-resolution composition already built for `forward_prompt`. The invoke payload gains per-field forward sources for text/derived fields; the resolution composes typed-lead + forwarded blocks exactly as `forward_prompt` does.
+### Decision: completed-only, no holding (rationale, and the deferred path)
+Manual forwarding (`forward_prompt`) *holds* the send until sources finish. A code investigation (2026-06-21) confirmed the held resolver and the run's cancel/registry lifecycle are both reusable, so holding is **technically feasible** — but its cost is **UX, not backend**: holding the invoke open for a still-streaming agent means a minutes-long, hung-looking invoke with no cancel affordance on the gated button (the manual held-forward has dedicated "waiting/[cancel]/restore" UI precisely for this; a workflow invoke does not). The clean version of holding would make the wait a first-class **run phase** (return the run id immediately, resolve sources as the run's first step with normal progress + cancel) — a meaningfully larger change to the interpreter and scope model. Since a workflow forward source is almost always an already-completed turn, completed-only serves the real case at near-zero risk. **If real usage shows users genuinely forwarding from still-streaming agents, revisit with the run-phase approach (not an IPC-held invoke).** This supersedes the earlier "open question — hold semantics" framing.
 
 ### Definition of Done
-- Deferred until the hold-semantics question is answered. When built: component tests for attaching/removing a forward source on a workflow text field; a backend test that invocation resolves a forwarded field to the composed output; the chosen hold semantics covered (e.g. option 1: a still-streaming source is rejected at invoke with a clear message).
-- If deferred at ship time, record it explicitly in the plan and in `workflows.md` ("workflow fields don't yet support forward-from") so the limitation isn't silent.
+- Component tests: attaching/removing a forward source on a workflow text/derived field (reusing the `ForwardSourcePicker` pattern).
+- Backend test: invocation resolves a forwarded field to the composed output from the source's completed turn.
+- Backend test: a still-streaming source is **rejected at invoke** with a clear message, and the run does not start.
+- The completed-only limitation is documented in `workflows.md` ("workflow forward fields use an agent's latest *completed* output; if the agent is mid-response, wait for it to finish") so the behavior isn't surprising.
+- If M5 ships after M1–M4 rather than with them, record the interim "workflow fields don't yet support forward-from" note in `workflows.md` so the gap isn't silent.
 
 ---
 
@@ -205,6 +219,7 @@ The authoring guide and spec teach the hardcoded-prompt model; no stale prompt-m
 ### Definition of Done
 - No remaining `prompt_id`-as-input or `aggregation_prompt`-input examples in the authoritative docs; no "under revision" markers.
 - The retry/checkpoint contradiction in `workflows.md` is resolved.
+- The doc presents the **two ways a step produces its message**, side by side: (a) **named prompt** (`prompt: builtin:…`) — fixed prompt, arguments auto-derived from its schema; (b) **inline text** (`text: "… {{ arg }}"`) — literal body, `{{ }}` vars resolved from workflow scope, made user-fillable by declaring them in `inputs:`. Includes a worked inline-text-with-arguments example so the inline path isn't lost behind the named-prompt arg-derivation prose.
 - An author following `workflows.md` alone can write a correct hardcoded-prompt workflow without reading code.
 
 ---
@@ -214,5 +229,5 @@ The authoring guide and spec teach the hardcoded-prompt model; no stale prompt-m
 - **M1 is a breaking parser change** (the flagged decision). Land it only after the `prompt_id`-removal decision is confirmed.
 - **M2 establishes the shared resolution + classification primitive**; M3 and M4 must reuse it, not re-derive prompt schemas. A plan where M3 re-implements schema lookup has failed the "establish patterns early" rule.
 - **M4 depends on M2's descriptor command and M3's invoke shape.** M4 can render derived fields as plain text inputs even if M5 (forward pickers) is deferred.
-- **M5 is the only piece with an unresolved design question** and is deferrable without weakening the core fix. Treat it as a separate decision.
+- **M5 is separable and deferrable** without weakening the core fix. Its design is **decided** (completed-only forward, no holding — see M5); it is small and carries no open question.
 - The whole change is one logical unit but **need not be one PR** — M1–M4 + M6 are the shippable core; M5 can follow.

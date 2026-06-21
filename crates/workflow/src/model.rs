@@ -6,6 +6,13 @@
 //! parser can emit precise, spec-worded errors and preserve input declaration
 //! order — see the parser for the rationale.
 
+/// The fixed message surfaced when a workflow that uses a capability-gated step
+/// is invocation-validated, invoked, or reaches the interpreter. The step types
+/// parse and validate as syntactically valid but are not runnable in this
+/// version; this single definition keeps the message identical across the
+/// invocation gate and the interpreter's defense-in-depth check.
+pub const UNSUPPORTED_STEP_MESSAGE: &str = "step type not supported in this version";
+
 /// A parsed workflow: the four top-level keys, with `inputs` kept in declaration
 /// order (the invocation form renders fields in that order).
 #[derive(Debug, Clone, PartialEq)]
@@ -14,6 +21,23 @@ pub struct Workflow {
     pub description: String,
     pub inputs: Vec<InputDecl>,
     pub steps: Vec<Step>,
+}
+
+impl Workflow {
+    /// The keyword of the first capability-gated step this workflow contains
+    /// (`"pause_for_user"` / `"for_each"`), or `None` if every step is runnable
+    /// in this version. A top-level scan is complete: a gated step nested in a
+    /// `for_each` body is unreachable without that `for_each`, which is itself
+    /// gated and caught here. Drives both the invocation gate (refuse with
+    /// [`UNSUPPORTED_STEP_MESSAGE`]) and the list `invocable` flag.
+    #[must_use]
+    pub fn gated_step_kind(&self) -> Option<&'static str> {
+        self.steps.iter().find_map(|step| match step {
+            Step::PauseForUser(_) => Some("pause_for_user"),
+            Step::ForEach(_) => Some("for_each"),
+            _ => None,
+        })
+    }
 }
 
 /// One declared input. `optional` is derived at parse time: `true` for a `text?`
@@ -118,4 +142,56 @@ pub struct ForEachStep {
     pub item: String,
     pub r#in: Templated,
     pub steps: Vec<Step>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn workflow(steps: Vec<Step>) -> Workflow {
+        Workflow {
+            name: "w".to_owned(),
+            description: "d".to_owned(),
+            inputs: Vec::new(),
+            steps,
+        }
+    }
+
+    fn send() -> Step {
+        Step::Send(SendStep {
+            to: Templated::Scalar("{{ a }}".to_owned()),
+            prompt: None,
+            text: Some("hi".to_owned()),
+            template_vars: Vec::new(),
+            forward_from: None,
+        })
+    }
+
+    #[test]
+    fn runnable_workflow_has_no_gated_step() {
+        assert_eq!(workflow(vec![send()]).gated_step_kind(), None);
+    }
+
+    #[test]
+    fn pause_for_user_is_gated() {
+        let steps = vec![
+            send(),
+            Step::PauseForUser(PauseForUserStep {
+                context: None,
+                recipient: None,
+                required: true,
+            }),
+        ];
+        assert_eq!(workflow(steps).gated_step_kind(), Some("pause_for_user"));
+    }
+
+    #[test]
+    fn for_each_is_gated() {
+        let steps = vec![Step::ForEach(ForEachStep {
+            item: "x".to_owned(),
+            r#in: Templated::List(vec!["a".to_owned()]),
+            steps: vec![send()],
+        })];
+        assert_eq!(workflow(steps).gated_step_kind(), Some("for_each"));
+    }
 }

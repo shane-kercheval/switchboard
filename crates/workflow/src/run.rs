@@ -1,11 +1,11 @@
 //! Workflow-run record types — the format of a run's `runs/<run-id>.jsonl`.
 //! Defined here (with the language) per architecture decision #1; the interpreter
-//! in `crates/app` (M4) writes them and the app owns the path.
+//! in `crates/app` writes them and the app owns the path.
 //!
 //! **Progress bookkeeping, not replay state.** Resume/retry is deferred beyond v1
 //! (a crashed or failed run is *abandoned*, not resumed — see the v1 plan and
 //! `docs/workflow-spec.md` §"Failure handling"), so these records carry only what
-//! M5 needs to *surface* a run and let the user abandon it: the run's workflow
+//! the app needs to *surface* a run and let the user abandon it: the run's workflow
 //! name + step count, a marker per completed step, and a terminal marker. They
 //! carry **no agent output text** — the system-design §3 "Switchboard stores no
 //! agent content" invariant stands unmodified. The live per-run output scope the
@@ -13,7 +13,7 @@
 //! reaches disk.
 //!
 //! **Interrupted is inferred, never written.** A run whose file ends without a
-//! [`RunRecord::Terminal`] died mid-run; M5 reads that as `interrupted`. That is
+//! [`RunRecord::Terminal`] died mid-run; the app reads that as `interrupted`. That is
 //! why the written terminal carries [`TerminalStatus`] (no `Interrupted`), while
 //! the reader-facing [`RunStatus`] includes it.
 
@@ -66,8 +66,8 @@ impl From<TerminalStatus> for RunStatus {
 #[serde(tag = "type", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum RunRecord {
-    /// First line of the file: the run's workflow name and step count, so M5 can
-    /// label it ("interrupted at step N of M, workflow X") without re-reading the
+    /// First line of the file: the run's workflow name and step count, so the app
+    /// can label it ("interrupted at step N of M, workflow X") without re-reading the
     /// workflow file. Carries the *name* only — not the program or inputs (that
     /// snapshot is the deferred-resume concern, not written here).
     Started {

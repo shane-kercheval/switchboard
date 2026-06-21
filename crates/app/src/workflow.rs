@@ -1,4 +1,4 @@
-//! The workflow interpreter (M4): executes a parsed, bound [`Workflow`] against a
+//! The workflow interpreter: executes a parsed, bound [`Workflow`] against a
 //! project's live agents by driving the real [`Dispatcher`]. It is a *conductor*
 //! over app-owned machinery (the dispatcher, `PromptService`, run-record IO), so
 //! it lives in `crates/app`, not the pure workflow crate.
@@ -15,9 +15,9 @@
 //!   the agent's resolved text enters the **in-memory per-run output scope** that
 //!   `forward_from` and the template helpers read. The scope is never persisted
 //!   (resume is deferred — §3 stands).
-//! - `pause_for_user` / `for_each` are not executable in this milestone; the
-//!   interpreter errors clearly (defense-in-depth — M5's invocation check gates
-//!   them up front).
+//! - `pause_for_user` / `for_each` are not executable in this version; the
+//!   interpreter errors clearly (defense-in-depth — the invoke command gates them
+//!   up front).
 //!
 //! ## Failure / cancel
 //!
@@ -30,8 +30,9 @@
 //! until every turn it dispatched has settled (the trailing-settle hold); a
 //! trailing failure marks it `failed`.
 //!
-//! Progress is recorded to `runs/<run-id>.jsonl` ([`RunRecord`]) so M5 can surface
-//! an active or interrupted run for abandon. No agent text is written.
+//! Progress is recorded to `runs/<run-id>.jsonl` ([`RunRecord`]) so the app can
+//! surface an active or interrupted run for abandon, and mirrored live through a
+//! [`ProgressSink`] for the run indicator. No agent text is written or emitted.
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -48,27 +49,73 @@ use switchboard_harness::{CancelSource, TurnOutcome};
 use switchboard_prompts::{PromptId, PromptService};
 use switchboard_workflow::{
     OutputScope, RunRecord, RunStatus, Scope, ScopeValue, SendStep, Step, Templated,
-    TerminalStatus, WaitForAllStep, WaitForStep, Workflow, render, resolve_agent_refs,
-    validate_agent_list,
+    TerminalStatus, UNSUPPORTED_STEP_MESSAGE, WaitForAllStep, WaitForStep, Workflow, render,
+    resolve_agent_refs, validate_agent_list,
 };
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 /// Produces the per-send [`DispatchContextFactory`] for an agent. The production
-/// implementation (M5) builds a `ProjectDispatchContextFactory` from `AppState`;
+/// implementation builds a `ProjectDispatchContextFactory` from `AppState`;
 /// tests provide a mock-backed one. This is the single seam the interpreter needs
 /// to dispatch without depending on `AppState` internals — it is integration-
 /// tested through the real `Dispatcher` + `MockHarnessAdapter`, not a mock of the
 /// dispatcher.
 pub trait DispatchFactoryProvider: Send + Sync {
-    fn factory_for(&self, agent_id: AgentId) -> Arc<dyn DispatchContextFactory>;
+    /// The per-send factory for `agent_id`, or `None` if the agent is no longer
+    /// resolvable (e.g. removed mid-run). The interpreter turns `None` into a
+    /// clean step failure rather than panicking — `factory_for` is called only
+    /// with the run's bound agents, so `None` is the rare removed-mid-run case.
+    fn factory_for(&self, agent_id: AgentId) -> Option<Arc<dyn DispatchContextFactory>>;
+}
+
+/// A live progress event emitted by the interpreter as a run advances. It carries
+/// **no run/project identity** (the app's sink attaches `run_id`/`project_id`
+/// when mapping onto the `workflow:<project-id>` channel) and **no agent output
+/// text** (§3 — the turns themselves stream on `agent:<id>` and render in the
+/// transcript; the indicator only tracks orchestration). Emission points coincide
+/// with the on-disk record boundaries (start, terminal) plus one step-start, so
+/// live events and the run file cannot drift.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkflowProgress {
+    /// The run has begun: its workflow name and total top-level step count.
+    Started {
+        workflow: String,
+        total_steps: usize,
+    },
+    /// A top-level step has *begun* (zero-based index) — so the indicator advances
+    /// when a step starts, not only when the prior one completes.
+    StepStarted { step_index: usize },
+    /// The run reached a controlled terminal, with the failing step and reason on
+    /// a failed run.
+    Terminal {
+        status: TerminalStatus,
+        failed_step: Option<usize>,
+        reason: Option<String>,
+    },
+}
+
+/// Receives the interpreter's live [`WorkflowProgress`] events. The production
+/// sink maps them onto the project-scoped `workflow:<project-id>` channel; tests
+/// supply a recorder. Separate from [`DispatchFactoryProvider`] because progress
+/// is a fire-and-forget side-channel, not part of dispatch.
+pub trait ProgressSink: Send + Sync {
+    fn emit(&self, event: WorkflowProgress);
+}
+
+/// A sink that drops every event — for runs (and tests) that don't observe
+/// progress.
+pub struct NullProgressSink;
+
+impl ProgressSink for NullProgressSink {
+    fn emit(&self, _event: WorkflowProgress) {}
 }
 
 /// A single workflow run. Construct it with the bound snapshot + dependencies and
 /// drive it to a terminal [`RunStatus`] with [`WorkflowRun::execute`]. Built by
-/// the M5 invoke command (and by integration tests) — all inputs are owned/`Arc`
-/// so the run can move into a background task.
+/// the invoke command (and by integration tests) — all inputs are owned/`Arc` so
+/// the run can move into a background task.
 pub struct WorkflowRun {
     /// Immutable snapshot of the parsed workflow (captured at invocation).
     pub workflow: Workflow,
@@ -81,6 +128,10 @@ pub struct WorkflowRun {
     pub factories: Arc<dyn DispatchFactoryProvider>,
     /// `runs/<run-id>.jsonl` — where progress/terminal records are appended.
     pub run_path: PathBuf,
+    /// Live progress side-channel: start / step-start / terminal events the app
+    /// forwards to the run indicator. Disk records are the durable record; this is
+    /// the live mirror.
+    pub progress: Arc<dyn ProgressSink>,
     /// Fired by a workflow-level cancel; the run stops and is marked `cancelled`.
     pub cancel: CancellationToken,
 }
@@ -123,6 +174,10 @@ impl WorkflowRun {
             total_steps: self.workflow.steps.len(),
             at: Utc::now(),
         });
+        self.progress.emit(WorkflowProgress::Started {
+            workflow: self.workflow.name.clone(),
+            total_steps: self.workflow.steps.len(),
+        });
 
         // The steps are the immutable snapshot; clone so the walk doesn't borrow
         // `self` while the step executors take `&mut` of it.
@@ -131,6 +186,8 @@ impl WorkflowRun {
             if self.cancel.is_cancelled() {
                 return self.finish_cancelled(&in_flight);
             }
+            self.progress
+                .emit(WorkflowProgress::StepStarted { step_index: index });
             let result = match step {
                 Step::Send(s) => {
                     self.execute_send(s, &outputs, &mut pending, &mut in_flight)
@@ -144,11 +201,13 @@ impl WorkflowRun {
                     self.execute_wait_for_all(w, &mut outputs, &mut pending, &mut in_flight)
                         .await
                 }
-                // Parsed but not executable until M7 (M5 gates these at invoke;
-                // this is defense-in-depth so a slipped-through run fails clearly).
-                Step::PauseForUser(_) | Step::ForEach(_) => Err(StepError::Failed(
-                    "step type not supported in this version".to_owned(),
-                )),
+                // These parse and invocation-validate as syntactically valid but
+                // are gated out of this version at the invoke command; this branch
+                // is defense-in-depth so a slipped-through run fails clearly with
+                // the same message.
+                Step::PauseForUser(_) | Step::ForEach(_) => {
+                    Err(StepError::Failed(UNSUPPORTED_STEP_MESSAGE.to_owned()))
+                }
             };
             match result {
                 Ok(()) => self.record(&RunRecord::StepCompleted {
@@ -163,15 +222,7 @@ impl WorkflowRun {
         // Trailing settle: hold the run open until every dispatched turn settles,
         // including fire-and-forget sends with no trailing wait.
         match self.settle_remaining(&mut pending, &mut in_flight).await {
-            Ok(()) => {
-                self.record(&RunRecord::Terminal {
-                    status: TerminalStatus::Complete,
-                    failed_step: None,
-                    reason: None,
-                    at: Utc::now(),
-                });
-                RunStatus::Complete
-            }
+            Ok(()) => self.finish_terminal(TerminalStatus::Complete, None, None),
             Err(StepError::Failed(reason)) => self.finish_failed(None, reason),
             Err(StepError::Cancelled) => self.finish_cancelled(&in_flight),
         }
@@ -190,15 +241,14 @@ impl WorkflowRun {
         // user-facing send renders once, exactly like a manual multi-recipient send.
         let send_id = Uuid::now_v7();
         for agent_id in recipients {
+            let factory = self.factories.factory_for(agent_id).ok_or_else(|| {
+                StepError::Failed(
+                    "a participating agent is unavailable for dispatch (removed mid-run, or its harness is unsupported)".to_owned(),
+                )
+            })?;
             match self
                 .dispatcher
-                .send_message_awaiting_completion(
-                    agent_id,
-                    &body,
-                    Vec::new(),
-                    send_id,
-                    self.factories.factory_for(agent_id),
-                )
+                .send_message_awaiting_completion(agent_id, &body, Vec::new(), send_id, factory)
                 .await
             {
                 AwaitableSendOutcome::Accepted { completion, .. } => {
@@ -485,8 +535,9 @@ impl WorkflowRun {
     }
 
     fn scope(&self) -> Scope {
-        // M6: no `user_input` (no pause) and no iteration (no for_each); the send's
-        // template_vars are rendered into prompt args here, not layered into scope.
+        // No `user_input` (no pause) and no iteration (no for_each) in this
+        // version; the send's template_vars are rendered into prompt args here,
+        // not layered into scope.
         Scope {
             inputs: self.inputs.clone(),
             ..Scope::default()
@@ -512,29 +563,40 @@ impl WorkflowRun {
 
     fn finish_cancelled(&self, in_flight: &BTreeMap<AgentId, usize>) -> RunStatus {
         self.cancel_inflight(in_flight);
-        self.record(&RunRecord::Terminal {
-            status: TerminalStatus::Cancelled,
-            failed_step: None,
-            reason: None,
-            at: Utc::now(),
-        });
-        RunStatus::Cancelled
+        self.finish_terminal(TerminalStatus::Cancelled, None, None)
     }
 
     fn finish_failed(&self, failed_step: Option<usize>, reason: String) -> RunStatus {
         // Per the non-destructive floor, surviving turns are *not* cancelled — they
         // settle in the dispatcher and their output stays visible.
+        self.finish_terminal(TerminalStatus::Failed, failed_step, Some(reason))
+    }
+
+    /// Record the terminal to disk **and** emit the matching live progress event,
+    /// from one place so the durable record and the live mirror can never drift.
+    /// Returns the `RunStatus` the run resolves to.
+    fn finish_terminal(
+        &self,
+        status: TerminalStatus,
+        failed_step: Option<usize>,
+        reason: Option<String>,
+    ) -> RunStatus {
         self.record(&RunRecord::Terminal {
-            status: TerminalStatus::Failed,
+            status,
             failed_step,
-            reason: Some(reason),
+            reason: reason.clone(),
             at: Utc::now(),
         });
-        RunStatus::Failed
+        self.progress.emit(WorkflowProgress::Terminal {
+            status,
+            failed_step,
+            reason,
+        });
+        status.into()
     }
 
     /// Append a run record (best-effort: a failed write is logged, not fatal — a
-    /// lost record only degrades M5's crash-surfacing, never the running workflow).
+    /// lost record only degrades crash-surfacing, never the running workflow).
     fn record(&self, record: &RunRecord) {
         if let Err(e) = switchboard_core::append_jsonl(&self.run_path, record) {
             tracing::warn!(path = %self.run_path.display(), error = %e, "failed to append workflow run record");
@@ -638,8 +700,10 @@ mod tests {
         factories: HashMap<AgentId, Arc<MockFactory>>,
     }
     impl DispatchFactoryProvider for Provider {
-        fn factory_for(&self, agent_id: AgentId) -> Arc<dyn DispatchContextFactory> {
-            Arc::clone(&self.factories[&agent_id]) as Arc<dyn DispatchContextFactory>
+        fn factory_for(&self, agent_id: AgentId) -> Option<Arc<dyn DispatchContextFactory>> {
+            self.factories
+                .get(&agent_id)
+                .map(|f| Arc::clone(f) as Arc<dyn DispatchContextFactory>)
         }
     }
 
@@ -716,7 +780,8 @@ mod tests {
     }
 
     /// Build a `WorkflowRun` for `yaml` + `supplied` inputs against `rig`, writing
-    /// run records under a fresh temp dir (kept alive by the returned guard).
+    /// run records under a fresh temp dir (kept alive by the returned guard). Uses
+    /// a null progress sink; use [`build_run_with_sink`] to observe progress.
     #[allow(clippy::needless_pass_by_value)] // owned args read more cleanly at call sites
     fn build_run(
         rig: &Rig,
@@ -725,6 +790,29 @@ mod tests {
         stem: &str,
         supplied: BTreeMap<String, InputValue>,
         cancel: CancellationToken,
+    ) -> (WorkflowRun, tempfile::TempDir, PathBuf) {
+        build_run_with_sink(
+            rig,
+            prompts,
+            yaml,
+            stem,
+            supplied,
+            cancel,
+            Arc::new(NullProgressSink),
+        )
+    }
+
+    /// Like [`build_run`] but with a caller-supplied progress sink, so the
+    /// progress-seam test can record the emitted events.
+    #[allow(clippy::needless_pass_by_value)]
+    fn build_run_with_sink(
+        rig: &Rig,
+        prompts: PromptService,
+        yaml: &str,
+        stem: &str,
+        supplied: BTreeMap<String, InputValue>,
+        cancel: CancellationToken,
+        progress: Arc<dyn ProgressSink>,
     ) -> (WorkflowRun, tempfile::TempDir, PathBuf) {
         let workflow = parse_workflow(stem, yaml).expect("workflow parses");
         let inputs = bind_invocation(&workflow, &supplied, &rig.names, |id| {
@@ -741,9 +829,28 @@ mod tests {
             prompts,
             factories: Arc::clone(&rig.provider) as Arc<dyn DispatchFactoryProvider>,
             run_path: run_path.clone(),
+            progress,
             cancel,
         };
         (run, dir, run_path)
+    }
+
+    /// A progress sink that records every event for assertions.
+    #[derive(Default)]
+    struct RecordingProgressSink {
+        events: std::sync::Mutex<Vec<WorkflowProgress>>,
+    }
+
+    impl RecordingProgressSink {
+        fn snapshot(&self) -> Vec<WorkflowProgress> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    impl ProgressSink for RecordingProgressSink {
+        fn emit(&self, event: WorkflowProgress) {
+            self.events.lock().unwrap().push(event);
+        }
     }
 
     fn records(path: &std::path::Path) -> Vec<RunRecord> {
@@ -894,7 +1001,7 @@ mod tests {
                 "occupy",
                 Vec::new(),
                 Uuid::now_v7(),
-                rig.provider.factory_for(worker),
+                rig.provider.factory_for(worker).unwrap(),
             )
             .await;
         rig.emitter.wait_for_type("turn_start", 1).await;
@@ -1095,8 +1202,8 @@ mod tests {
 
     #[tokio::test]
     async fn capability_gate_rejects_for_each() {
-        // `for_each` parses but is not executable in this milestone — the
-        // interpreter fails clearly (defense-in-depth behind M5's invoke gate).
+        // `for_each` parses but is not executable in this version — the
+        // interpreter fails clearly (defense-in-depth behind the invoke gate).
         let rig = rig(vec![("w", vec![MockScenario::Streaming])]);
         let yaml = "name: g\ndescription: d\ninputs:\n  ms: [text]\n  w: agent\nsteps:\n  - for_each:\n      item: m\n      in: \"{{ ms }}\"\n      steps:\n        - send:\n            to: \"{{ w }}\"\n            text: \"{{ m }}\"\n";
         let (run, _dir, path) = build_run(
@@ -1113,6 +1220,87 @@ mod tests {
             &last,
             RunRecord::Terminal { status: TerminalStatus::Failed, reason: Some(r), .. } if r.contains("not supported")
         ));
+    }
+
+    #[tokio::test]
+    async fn progress_sink_receives_start_step_starts_and_terminal_in_order() {
+        let rig = rig(vec![
+            ("planner", vec![MockScenario::Streaming]),
+            ("implementer", vec![MockScenario::Streaming]),
+        ]);
+        let sink = Arc::new(RecordingProgressSink::default());
+        let (run, _dir, _path) = build_run_with_sink(
+            &rig,
+            PromptService::disabled(),
+            SEQUENTIAL,
+            "seq",
+            supplied(vec![
+                ("planner", text("planner")),
+                ("implementer", text("implementer")),
+                ("goal", text("ship it")),
+            ]),
+            CancellationToken::new(),
+            sink.clone(),
+        );
+        assert_eq!(run.execute().await, RunStatus::Complete);
+
+        // Start (name + total), one step-start per top-level step in order, then a
+        // Complete terminal — and no agent output text anywhere in the stream.
+        let events = sink.snapshot();
+        assert_eq!(
+            events.first(),
+            Some(&WorkflowProgress::Started {
+                workflow: "seq".to_owned(),
+                total_steps: 4,
+            })
+        );
+        let step_starts: Vec<usize> = events
+            .iter()
+            .filter_map(|e| match e {
+                WorkflowProgress::StepStarted { step_index } => Some(*step_index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(step_starts, vec![0, 1, 2, 3]);
+        assert_eq!(
+            events.last(),
+            Some(&WorkflowProgress::Terminal {
+                status: TerminalStatus::Complete,
+                failed_step: None,
+                reason: None,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn progress_terminal_carries_failed_step_and_reason_on_failure() {
+        // A step-0 failure (forward_from referencing never-awaited output) fails
+        // the run; the terminal progress event names the failing step and a reason.
+        let rig = rig(vec![
+            ("a", vec![MockScenario::Streaming]),
+            ("b", vec![MockScenario::Streaming]),
+        ]);
+        let sink = Arc::new(RecordingProgressSink::default());
+        let yaml = "name: f\ndescription: d\ninputs:\n  a: agent\n  b: agent\nsteps:\n  - send:\n      to: \"{{ b }}\"\n      forward_from: \"{{ a }}\"\n      text: use it\n";
+        let (run, _dir, _path) = build_run_with_sink(
+            &rig,
+            PromptService::disabled(),
+            yaml,
+            "f",
+            supplied(vec![("a", text("a")), ("b", text("b"))]),
+            CancellationToken::new(),
+            sink.clone(),
+        );
+        assert_eq!(run.execute().await, RunStatus::Failed);
+        let last = sink.snapshot().pop().unwrap();
+        match last {
+            WorkflowProgress::Terminal {
+                status: TerminalStatus::Failed,
+                failed_step: Some(0),
+                reason: Some(reason),
+            } => assert!(!reason.is_empty()),
+            other => panic!("expected failed terminal with step+reason, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1156,7 +1344,7 @@ mod tests {
                 "manual",
                 Vec::new(),
                 Uuid::now_v7(),
-                rig.provider.factory_for(b),
+                rig.provider.factory_for(b).unwrap(),
             )
             .await;
 
@@ -1248,7 +1436,7 @@ mod tests {
                 "occupy",
                 Vec::new(),
                 Uuid::now_v7(),
-                rig.provider.factory_for(busy),
+                rig.provider.factory_for(busy).unwrap(),
             )
             .await;
         rig.emitter.wait_for_type("turn_start", 1).await;

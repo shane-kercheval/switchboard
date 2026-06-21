@@ -1,0 +1,23 @@
+name: review-and-aggregate
+description: Fan a review prompt out to several reviewers in parallel, then hand the combined feedback to a primary agent for recommendations.
+inputs:
+  primary_agent: agent
+  reviewer_agents: [agent]
+  review_prompt: prompt_id
+  user_context: text?
+steps:
+  - send:
+      to: "{{ reviewer_agents }}"
+      prompt: "{{ review_prompt }}"
+      template_vars:
+        context: "{{ user_context }}"
+  - wait_for_all:
+      agents: "{{ reviewer_agents }}"
+  - send:
+      to: "{{ primary_agent }}"
+      text: |
+        Here's feedback from several reviewers:
+
+        {{ aggregated_responses(reviewer_agents) }}
+
+        Let me know what your recommendations are.

@@ -1,0 +1,43 @@
+name: review-analyze-discuss
+description: Reviewers review in parallel, an analyst distills their feedback into a decision-ready verdict, the reviewers respond to it, and the analyst gives a final recommendation.
+inputs:
+  reviewers: [agent]
+  analyst: agent
+  review_prompt: prompt_id
+  analysis_prompt: prompt_id
+  context: text?
+steps:
+  - send:
+      to: "{{ reviewers }}"
+      prompt: "{{ review_prompt }}"
+      template_vars:
+        context: "{{ context }}"
+  - wait_for_all:
+      agents: "{{ reviewers }}"
+  - send:
+      to: "{{ analyst }}"
+      prompt: "{{ analysis_prompt }}"
+      template_vars:
+        review: "{{ aggregated_responses(reviewers) }}"
+  - wait_for:
+      agent: "{{ analyst }}"
+  - send:
+      to: "{{ reviewers }}"
+      text: |
+        An analyst reviewed all of the feedback and responded:
+
+        {{ last_output(analyst) }}
+
+        Do you agree with this analysis? Push back where you think it's wrong, and confirm where it's right.
+  - wait_for_all:
+      agents: "{{ reviewers }}"
+  - send:
+      to: "{{ analyst }}"
+      text: |
+        Here's how the reviewers responded to your analysis:
+
+        {{ aggregated_responses(reviewers) }}
+
+        Weigh their responses and give your final recommendation.
+  - wait_for:
+      agent: "{{ analyst }}"

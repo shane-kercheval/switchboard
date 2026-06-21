@@ -36,9 +36,10 @@
 //! but a template variable's *resolution* is checked only at render time (under
 //! strict-undefined). A reference to a name that resolves in no scope therefore
 //! surfaces as a [`WorkflowError::Render`] when the step executes, not at parse
-//! or invocation — the interpreter (M4) must surface render errors at step
+//! or invocation — the interpreter must surface render errors at step
 //! execution.
 
+mod builtin;
 mod error;
 mod invocation;
 mod model;
@@ -46,11 +47,14 @@ mod parse;
 mod run;
 mod template;
 
+pub use builtin::{
+    builtin_workflow, builtin_workflow_content, builtin_workflows, parse_builtin_workflows,
+};
 pub use error::{Result, WorkflowError};
 pub use invocation::{InputValue, bind_invocation, validate_agent_list, validate_invocation};
 pub use model::{
-    ForEachStep, InputDecl, InputType, PauseForUserStep, SendStep, Step, Templated, WaitForAllStep,
-    WaitForStep, Workflow,
+    ForEachStep, InputDecl, InputType, PauseForUserStep, SendStep, Step, Templated,
+    UNSUPPORTED_STEP_MESSAGE, WaitForAllStep, WaitForStep, Workflow,
 };
 pub use parse::parse_workflow;
 pub use run::{RunRecord, RunStatus, TerminalStatus};

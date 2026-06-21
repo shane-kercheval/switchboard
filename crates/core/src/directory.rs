@@ -329,6 +329,14 @@ impl Directory {
     fn switchboard_dir(&self) -> PathBuf {
         self.path.join(SWITCHBOARD_DIR)
     }
+
+    /// `<dir>/.switchboard/workflows` — the directory-scoped workflow store
+    /// (Git-tracked; the user drops YAML files here). A sibling of `projects/`,
+    /// created by [`Directory::init`].
+    #[must_use]
+    pub fn workflows_dir(&self) -> PathBuf {
+        self.switchboard_dir().join(WORKFLOWS_DIR)
+    }
     fn projects_dir(&self) -> PathBuf {
         self.switchboard_dir().join(PROJECTS_DIR)
     }

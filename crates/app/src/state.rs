@@ -15,7 +15,44 @@ use uuid::Uuid;
 
 use crate::git_registry::{self, GitRegistry};
 use crate::preferences::{self, Preferences};
+use crate::workflow_commands::{Notifier, NullNotifier};
 use crate::workspace::{self, Workspace};
+
+/// A live workflow run's in-memory handle. The on-disk `runs/<run-id>.jsonl` is
+/// the durable record (and the only thing that survives a crash); this registry
+/// is the live mirror that lets the app cancel a run, list active runs, and
+/// report each one's current step without re-reading disk. The owning background
+/// task removes the entry when the run reaches a terminal status.
+pub struct ActiveRun {
+    /// Fires a workflow-level cancel; the interpreter observes it and finishes
+    /// `cancelled`. Cloned out under the registry lock (never fired while holding
+    /// it) by cancel and by directory/project teardown.
+    pub cancel: CancellationToken,
+    /// The project the run belongs to — used to scope teardown and the
+    /// `workflow:<project-id>` progress channel.
+    pub project_id: ProjectId,
+    /// The workflow's name, for the run indicator label.
+    pub workflow: String,
+    /// Latest step progress, updated by the progress sink as the run advances, so
+    /// `list_workflow_runs` reports a live run's step without reading disk.
+    pub snapshot: RunSnapshot,
+    /// Notified once when the run reaches a terminal status. Teardown collects a
+    /// clone **before** firing cancel, then awaits it — so the wait can't be
+    /// stranded by the owning task removing its own registry entry. `notify_one`
+    /// stores a permit if the terminal beats the waiter, so the wakeup is never
+    /// lost regardless of ordering.
+    pub done: Arc<tokio::sync::Notify>,
+}
+
+/// A live run's step progress. A run is only in the registry while running, so
+/// there is no terminal status here — terminal removes the entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunSnapshot {
+    /// Total top-level steps (from the run-start event).
+    pub total_steps: usize,
+    /// Zero-based index of the step currently in progress.
+    pub current_step: usize,
+}
 
 /// The single piece of state managed by Tauri. Multi-project and
 /// multi-directory (per system-design §3): the app holds N working directories
@@ -42,10 +79,18 @@ use crate::workspace::{self, Workspace};
 /// `needs_session_meta` is the tail because both `attach_agent_impl` (under
 /// `registry_write`) and `send_message_impl` (no other locks held) acquire
 /// it briefly with no `.await` crossing the guard. `project_locks` and
-/// `agents_by_id` (M4.1) are leaf maps acquired briefly; they are taken while
+/// `agents_by_id` are leaf maps acquired briefly; they are taken while
 /// `registry_write` is held during open/create/remove — which precedes them in
 /// the order, so those nestings are compliant.
 /// When nesting them, follow the documented tail order.
+///
+/// `forwards` and `workflow_runs` are **tail-leaf** maps (acquired alone, last,
+/// briefly, never across an `.await`): they sort after `agents_by_id`. Teardown
+/// (`remove_directory` / `delete_project`) collects the affected runs' cancel
+/// tokens under the `workflow_runs` lock, releases it, then fires them and awaits
+/// the runs reaching terminal **before** draining agents — so no cancel token is
+/// fired while the lock is held, and the order keeps a run resolving `cancelled`
+/// (not `failed`) and stops it dispatching against unloaded state.
 ///
 /// `preferences` is a **standalone leaf**: it is only ever acquired by
 /// `get_preferences` / `set_preferences`, never nested with another state lock.
@@ -221,6 +266,24 @@ pub struct AppState {
     /// outlives the one command that owns it. Not load-bearing across restart —
     /// a held forward is live-UI-only until it dispatches (system-design §7).
     pub forwards: Mutex<HashMap<Uuid, CancellationToken>>,
+
+    /// In-flight workflow runs, keyed by `run_id`. The live mirror of the on-disk
+    /// `runs/<run-id>.jsonl` records: lets cancel/list act on a running workflow
+    /// and report its current step without touching disk. The run's background
+    /// task inserts on spawn and removes on terminal; directory/project teardown
+    /// fires the entry's cancel **before** draining agents. A **tail-leaf** mutex
+    /// (peer of `forwards`): acquired briefly, last in the lock order, and never
+    /// held across an `.await` — cancel tokens are cloned out under the lock and
+    /// fired after release. Not load-bearing across restart (an interrupted run is
+    /// recovered from its file, not this map). `Arc` so the run's background task
+    /// and its progress sink (both `'static`) share this one map — the sink
+    /// updates a run's step snapshot, the task removes the entry on terminal.
+    pub workflow_runs: Arc<Mutex<HashMap<Uuid, ActiveRun>>>,
+
+    /// Fires OS notifications on a workflow run's completion/failure (suppressed
+    /// when the window is focused). Defaults to a no-op; production injects the
+    /// plugin-backed notifier via [`AppState::with_notifier`].
+    pub notifier: Arc<dyn Notifier>,
 }
 
 impl AppState {
@@ -253,7 +316,17 @@ impl AppState {
             preferences_path: None,
             prompts: PromptService::disabled(),
             forwards: Mutex::new(HashMap::new()),
+            workflow_runs: Arc::new(Mutex::new(HashMap::new())),
+            notifier: Arc::new(NullNotifier),
         }
+    }
+
+    /// Builder step that injects the production notifier. Production calls this
+    /// after `new`; tests that assert on notifications pass a recorder.
+    #[must_use]
+    pub fn with_notifier(mut self, notifier: Arc<dyn Notifier>) -> Self {
+        self.notifier = notifier;
+        self
     }
 
     /// Builder step that injects the configured prompt service. Production calls

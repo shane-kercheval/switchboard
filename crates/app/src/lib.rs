@@ -15,6 +15,7 @@ mod preferences;
 mod secret_store;
 mod state;
 pub mod workflow;
+mod workflow_commands;
 mod workspace;
 
 use std::path::Path;
@@ -55,12 +56,19 @@ use crate::commands::{
 };
 use crate::preferences::Preferences;
 use crate::state::AppState;
+use crate::workflow_commands::{
+    WorkflowListing, WorkflowRunInfo, abandon_workflow_run_impl, cancel_workflow_run_impl,
+    copy_builtin_workflow_impl, invoke_workflow_impl, list_workflow_runs_impl, list_workflows_impl,
+    validate_workflow_invocation_impl, workflows_dir_for_project,
+};
 
-use switchboard_core::{AgentRecord, Attachment, HarnessKind, ProjectSummary};
+use switchboard_core::{AgentRecord, Attachment, HarnessKind, ProjectId, ProjectSummary};
 use switchboard_git::{
     BranchKind, ChangeKind, ChangedFile, CommitChanges, FileDiff, GitCommitRange,
 };
 use switchboard_prompts::{McpProviderInfo, Prompt, RenderedPrompt};
+use switchboard_workflow::InputValue;
+use uuid::Uuid;
 
 #[tauri::command]
 async fn check_claude_binary(state: State<'_, AppState>) -> Result<(), String> {
@@ -826,6 +834,95 @@ async fn copy_builtin_prompt(state: State<'_, AppState>, name: String) -> Result
     Ok(written.to_string_lossy().into_owned())
 }
 
+/// All workflows available to a project: the read-only built-in library (when
+/// `show_builtins` is on) merged with the project directory's own files.
+#[tauri::command]
+async fn list_workflows(
+    state: State<'_, AppState>,
+    project_id: ProjectId,
+) -> Result<Vec<WorkflowListing>, String> {
+    list_workflows_impl(state.inner(), project_id).map_err(|e| e.to_string())
+}
+
+/// Validate a workflow invocation (capability gate + input/roster/prompt rules)
+/// without launching it — drives the form's enable/disable + error display.
+#[tauri::command]
+async fn validate_workflow_invocation(
+    state: State<'_, AppState>,
+    project_id: ProjectId,
+    name: String,
+    is_builtin: bool,
+    inputs: std::collections::BTreeMap<String, InputValue>,
+) -> Result<(), String> {
+    validate_workflow_invocation_impl(state.inner(), project_id, &name, is_builtin, &inputs)
+        .map_err(|e| e.to_string())
+}
+
+/// Validate + launch a workflow run on a background task, returning its run id.
+#[tauri::command]
+async fn invoke_workflow(
+    state: State<'_, AppState>,
+    project_id: ProjectId,
+    name: String,
+    is_builtin: bool,
+    inputs: std::collections::BTreeMap<String, InputValue>,
+) -> Result<String, String> {
+    invoke_workflow_impl(state.inner(), project_id, &name, is_builtin, &inputs)
+        .map(|id| id.to_string())
+        .map_err(|e| e.to_string())
+}
+
+/// Fire a running workflow's cancel token (no-op if it already finished).
+#[tauri::command]
+async fn cancel_workflow_run(state: State<'_, AppState>, run_id: Uuid) -> Result<(), String> {
+    cancel_workflow_run_impl(state.inner(), run_id);
+    Ok(())
+}
+
+/// Active + retained-failed + interrupted runs for a project (the run indicator).
+#[tauri::command]
+async fn list_workflow_runs(
+    state: State<'_, AppState>,
+    project_id: ProjectId,
+) -> Result<Vec<WorkflowRunInfo>, String> {
+    Ok(list_workflow_runs_impl(state.inner(), project_id))
+}
+
+/// Clear a failed or interrupted run's file (the Abandon action).
+#[tauri::command]
+async fn abandon_workflow_run(
+    state: State<'_, AppState>,
+    project_id: ProjectId,
+    run_id: Uuid,
+) -> Result<(), String> {
+    abandon_workflow_run_impl(state.inner(), project_id, run_id).map_err(|e| e.to_string())
+}
+
+/// Copy a built-in workflow into the project directory's `workflows/` folder as
+/// an owned, editable file. Returns the written path; refuses to overwrite.
+#[tauri::command]
+async fn copy_builtin_workflow(
+    state: State<'_, AppState>,
+    project_id: ProjectId,
+    name: String,
+) -> Result<String, String> {
+    let dir = workflows_dir_for_project(state.inner(), project_id).map_err(|e| e.to_string())?;
+    let written = copy_builtin_workflow_impl(&name, &dir).map_err(|e| e.to_string())?;
+    Ok(written.to_string_lossy().into_owned())
+}
+
+/// Open the project directory's `workflows/` folder in Finder (mirrors the
+/// prompts-folder action), creating it if needed.
+#[tauri::command]
+async fn open_workflows_dir(
+    state: State<'_, AppState>,
+    project_id: ProjectId,
+) -> Result<(), String> {
+    let dir = workflows_dir_for_project(state.inner(), project_id).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    run_open_argv(vec!["open".to_owned(), dir.to_string_lossy().into_owned()]).await
+}
+
 #[tauri::command]
 async fn open_worktree_file_difftool(
     state: State<'_, AppState>,
@@ -1072,6 +1169,39 @@ fn with_persistence_paths(state: AppState) -> AppState {
     }
 }
 
+/// Production [`Notifier`](crate::workflow_commands::Notifier): fires an OS
+/// notification via the notification plugin, **suppressed when the main window is
+/// focused** (the OS notification is for when the user has walked away — when
+/// they're watching, the run indicator carries it). A focus-query failure is
+/// treated as "not focused" so a terminal still surfaces.
+struct TauriNotifier {
+    app: tauri::AppHandle,
+}
+
+impl crate::workflow_commands::Notifier for TauriNotifier {
+    fn notify(&self, title: &str, body: &str) {
+        use tauri_plugin_notification::NotificationExt;
+        let focused = self
+            .app
+            .get_webview_window("main")
+            .and_then(|w| w.is_focused().ok())
+            .unwrap_or(false);
+        if focused {
+            return;
+        }
+        if let Err(e) = self
+            .app
+            .notification()
+            .builder()
+            .title(title)
+            .body(body)
+            .show()
+        {
+            tracing::warn!(error = %e, "failed to show workflow notification");
+        }
+    }
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "length is dominated by the flat `generate_handler!` command registry, which reads better as one list than split across helpers"
@@ -1107,6 +1237,7 @@ pub fn run() {
     builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(move |app| {
             let emitter: Arc<dyn EventEmitter> = Arc::new(AppHandleEmitter {
                 app: app.handle().clone(),
@@ -1133,6 +1264,11 @@ pub fn run() {
                 Arc::clone(&state.emitter),
             ));
             let state = state.with_prompts(prompts);
+            // Fire OS notifications for workflow run terminals (suppressed when the
+            // window is focused).
+            let state = state.with_notifier(Arc::new(TauriNotifier {
+                app: app.handle().clone(),
+            }));
             // Cold start: open a `Directory` handle for every workspace entry so
             // restored directories report `available: true` and participate in
             // the cross-harness session-id collision scan. Unopenable
@@ -1180,6 +1316,14 @@ pub fn run() {
             local_prompts_dir,
             open_local_prompts_dir,
             copy_builtin_prompt,
+            list_workflows,
+            validate_workflow_invocation,
+            invoke_workflow,
+            cancel_workflow_run,
+            list_workflow_runs,
+            abandon_workflow_run,
+            copy_builtin_workflow,
+            open_workflows_dir,
             create_project,
             rename_project,
             delete_project,

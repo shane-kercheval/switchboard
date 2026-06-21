@@ -234,10 +234,28 @@ pub async fn remove_directory_impl(state: &AppState, path: &str) -> Result<(), A
         // `write` drops here — the guard is released BEFORE the drain `.await`.
     }
 
+    // Cancel any workflow runs for the removed projects and let them settle to
+    // `cancelled` BEFORE draining agents. Cancel-runs-first is load-bearing: if
+    // agents drained first, a run would observe an out-of-band terminal and
+    // resolve `failed`/ambiguous instead of `cancelled`, and could write into a
+    // directory about to be deleted.
+    crate::workflow_commands::cancel_runs_for_projects(state, &project_ids).await;
+
     // Shut down each agent's dispatcher actor (cancels + drains any live turn)
     // and release the named project locks. Holds no other state lock across the
     // await.
     drain_agents_then_release_locks(state, &agent_ids, &project_ids, CancelSource::Shutdown).await;
+
+    // Final prune: a turn settling between the earlier map-clear and this drain
+    // (a workflow run cancelling, or a manual turn) can re-insert an agent into
+    // `agents_by_id` via the session-locator sink, which `insert`s unconditionally.
+    // Re-prune the removed projects' agents now that no actor remains to write.
+    {
+        let project_set: HashSet<ProjectId> = project_ids.iter().copied().collect();
+        lock(&state.agents_by_id).retain(|_, r| !project_set.contains(&r.project_id));
+        let removed: HashSet<AgentId> = agent_ids.iter().copied().collect();
+        lock(&state.needs_session_meta).retain(|id| !removed.contains(id));
+    }
 
     // Always drop the workspace entry + persist (idempotent for absent dirs).
     lock(&state.workspace).remove(&canonical);
@@ -1353,6 +1371,10 @@ pub async fn delete_project_impl(state: &AppState, project_id: ProjectId) -> Res
         Err(e) => return Err(e),
     };
 
+    // Cancel this project's workflow runs and let them settle to `cancelled`
+    // BEFORE draining agents (cancel-runs-first — see `remove_directory_impl`).
+    crate::workflow_commands::cancel_runs_for_projects(state, &[project_id]).await;
+
     // Phase (a): drain this project's loaded agents (only loaded projects have
     // cached agents, so an unopened/unavailable project drains nothing). No lock
     // is held across the await.
@@ -2399,7 +2421,10 @@ pub async fn stage_attachment_impl(
 /// Claude adapter would silently spawn the wrong binary), pinned by the app
 /// routing test. Shared by `send_message_impl` and the forward's recipient
 /// pre-validation so both reject an unsupported harness identically.
-fn adapter_for(state: &AppState, agent: &AgentRecord) -> Result<Arc<dyn HarnessAdapter>, AppError> {
+pub(crate) fn adapter_for(
+    state: &AppState,
+    agent: &AgentRecord,
+) -> Result<Arc<dyn HarnessAdapter>, AppError> {
     match agent.harness {
         HarnessKind::ClaudeCode => Ok(Arc::clone(&state.claude_adapter)),
         HarnessKind::Codex => Ok(Arc::clone(&state.codex_adapter)),
@@ -4475,7 +4500,7 @@ fn find_directory_for_project(
 /// not found" and ghost-delete a project whose files are actually present. Falls
 /// back to the on-disk index scan for an available-but-never-opened project.
 /// Returns `ProjectNotLoaded` only when no loaded directory claims the id.
-fn resolve_owning_directory(
+pub(crate) fn resolve_owning_directory(
     state: &AppState,
     project_id: ProjectId,
 ) -> Result<Directory, AppError> {
@@ -14021,5 +14046,482 @@ mod tests {
             .map(|(name, _)| name)
             .collect();
         assert_eq!(names, vec![PROMPTS_SYNCED_EVENT.to_owned()]);
+    }
+
+    // --- Workflow commands ----------------------------------------------------
+
+    use crate::workflow_commands::{
+        abandon_workflow_run_impl, cancel_workflow_run_impl, copy_builtin_workflow_impl,
+        invoke_workflow_impl, list_workflow_runs_impl, list_workflows_impl,
+        validate_workflow_invocation_impl, workflows_dir_for_project,
+    };
+    use switchboard_workflow::{InputValue, RunRecord, TerminalStatus};
+
+    /// A prompts-enabled state (real `PromptService`, so built-ins resolve) with a
+    /// project + the named agents, the prompt cache warmed.
+    async fn workflow_state(agent_names: &[&str]) -> (TempDir, AppState, ProjectId) {
+        let (tmp, state) = state_with_prompts();
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "proj");
+        set_active_project_impl(&state, project.id).unwrap();
+        for name in agent_names {
+            create_agent_impl(&state, name, HarnessKind::ClaudeCode, None, None).unwrap();
+        }
+        state.prompts.sync().await;
+        (tmp, state, project.id)
+    }
+
+    fn text(s: &str) -> InputValue {
+        InputValue::Text(s.to_owned())
+    }
+    fn list(items: &[&str]) -> InputValue {
+        InputValue::List(items.iter().map(|s| (*s).to_owned()).collect())
+    }
+    fn inputs(pairs: Vec<(&str, InputValue)>) -> std::collections::BTreeMap<String, InputValue> {
+        pairs.into_iter().map(|(k, v)| (k.to_owned(), v)).collect()
+    }
+
+    #[tokio::test]
+    async fn list_workflows_includes_builtins_and_toggle_hides_them() {
+        let (_tmp, state, pid) = workflow_state(&[]).await;
+
+        let listed = list_workflows_impl(&state, pid).unwrap();
+        let builtins: Vec<&str> = listed
+            .iter()
+            .filter(|w| w.is_builtin)
+            .map(|w| w.name.as_str())
+            .collect();
+        assert!(builtins.contains(&"review-and-aggregate"), "{builtins:?}");
+        assert!(builtins.contains(&"review-analyze-discuss"), "{builtins:?}");
+        // Both shipped built-ins use only runnable steps.
+        assert!(listed.iter().filter(|w| w.is_builtin).all(|w| w.invocable));
+        // review-and-aggregate pre-selects code-review for its review_prompt.
+        let raa = listed
+            .iter()
+            .find(|w| w.name == "review-and-aggregate")
+            .unwrap();
+        assert_eq!(
+            raa.recommended_prompts
+                .get("review_prompt")
+                .map(String::as_str),
+            Some("builtin:code-review")
+        );
+
+        set_preferences_impl(
+            &state,
+            &Preferences {
+                show_builtins: false,
+                ..Preferences::default()
+            },
+        )
+        .unwrap();
+        let listed = list_workflows_impl(&state, pid).unwrap();
+        assert!(
+            listed.iter().all(|w| !w.is_builtin),
+            "built-ins hidden when the toggle is off"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_workflows_surfaces_a_directory_parse_error_in_place() {
+        let (_tmp, state, pid) = workflow_state(&[]).await;
+        let dir = workflows_dir_for_project(&state, pid).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("broken.yaml"), "this: is: not a workflow\n").unwrap();
+
+        let listed = list_workflows_impl(&state, pid).unwrap();
+        let broken = listed.iter().find(|w| w.name == "broken").unwrap();
+        assert!(broken.parse_error.is_some(), "parse error surfaced");
+        assert!(!broken.invocable);
+        // The built-ins are unaffected by one malformed directory file.
+        assert!(listed.iter().any(|w| w.is_builtin));
+    }
+
+    #[tokio::test]
+    async fn list_flags_a_gated_workflow_non_invocable() {
+        let (_tmp, state, pid) = workflow_state(&["w"]).await;
+        let dir = workflows_dir_for_project(&state, pid).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("iterate.yaml"),
+            "name: iterate\ndescription: d\ninputs:\n  ms: [text]\n  w: agent\nsteps:\n  - for_each:\n      item: m\n      in: \"{{ ms }}\"\n      steps:\n        - send:\n            to: \"{{ w }}\"\n            text: \"{{ m }}\"\n",
+        )
+        .unwrap();
+        let listed = list_workflows_impl(&state, pid).unwrap();
+        let iterate = listed.iter().find(|w| w.name == "iterate").unwrap();
+        assert!(!iterate.invocable, "a for_each workflow is non-invocable");
+        assert!(iterate.parse_error.is_none(), "it still parses");
+    }
+
+    #[tokio::test]
+    async fn validate_invocation_enforces_inputs_roster_prompt_and_gate() {
+        let (_tmp, state, pid) = workflow_state(&["primary", "reviewer-1"]).await;
+
+        // Missing required input (no reviewer_agents).
+        let err = validate_workflow_invocation_impl(
+            &state,
+            pid,
+            "review-and-aggregate",
+            true,
+            &inputs(vec![("primary_agent", text("primary"))]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AppError::Workflow(_)));
+
+        // Non-existent agent.
+        let err = validate_workflow_invocation_impl(
+            &state,
+            pid,
+            "review-and-aggregate",
+            true,
+            &inputs(vec![
+                ("primary_agent", text("ghost")),
+                ("reviewer_agents", list(&["reviewer-1"])),
+                ("review_prompt", text("builtin:code-review")),
+            ]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AppError::Workflow(_)));
+
+        // Unresolvable prompt id.
+        let err = validate_workflow_invocation_impl(
+            &state,
+            pid,
+            "review-and-aggregate",
+            true,
+            &inputs(vec![
+                ("primary_agent", text("primary")),
+                ("reviewer_agents", list(&["reviewer-1"])),
+                ("review_prompt", text("local:does-not-exist")),
+            ]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AppError::Workflow(_)));
+
+        // A well-formed invocation validates.
+        validate_workflow_invocation_impl(
+            &state,
+            pid,
+            "review-and-aggregate",
+            true,
+            &inputs(vec![
+                ("primary_agent", text("primary")),
+                ("reviewer_agents", list(&["reviewer-1"])),
+                ("review_prompt", text("builtin:code-review")),
+            ]),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn capability_gate_refuses_invoke_with_the_fixed_message() {
+        let (_tmp, state, pid) = workflow_state(&["w"]).await;
+        let dir = workflows_dir_for_project(&state, pid).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("iterate.yaml"),
+            "name: iterate\ndescription: d\ninputs:\n  ms: [text]\n  w: agent\nsteps:\n  - for_each:\n      item: m\n      in: \"{{ ms }}\"\n      steps:\n        - send:\n            to: \"{{ w }}\"\n            text: \"{{ m }}\"\n",
+        )
+        .unwrap();
+        let err = invoke_workflow_impl(
+            &state,
+            pid,
+            "iterate",
+            false,
+            &inputs(vec![("ms", list(&["x"])), ("w", text("w"))]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AppError::WorkflowStepUnsupported));
+        assert_eq!(err.to_string(), "step type not supported in this version");
+    }
+
+    #[derive(Default)]
+    struct RecordingNotifier {
+        calls: std::sync::Mutex<Vec<(String, String)>>,
+    }
+    impl crate::workflow_commands::Notifier for RecordingNotifier {
+        fn notify(&self, title: &str, body: &str) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((title.to_owned(), body.to_owned()));
+        }
+    }
+
+    #[tokio::test]
+    async fn notification_fires_on_completion() {
+        let (tmp, state) = state_with_prompts();
+        let rec = Arc::new(RecordingNotifier::default());
+        let state =
+            state.with_notifier(Arc::clone(&rec) as Arc<dyn crate::workflow_commands::Notifier>);
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "proj");
+        set_active_project_impl(&state, project.id).unwrap();
+        for name in ["primary", "reviewer-1"] {
+            create_agent_impl(&state, name, HarnessKind::ClaudeCode, None, None).unwrap();
+        }
+        state.prompts.sync().await;
+
+        let run_id = invoke_workflow_impl(
+            &state,
+            project.id,
+            "review-and-aggregate",
+            true,
+            &inputs(vec![
+                ("primary_agent", text("primary")),
+                ("reviewer_agents", list(&["reviewer-1"])),
+                ("review_prompt", text("builtin:code-review")),
+            ]),
+        )
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if !lock(&state.workflow_runs).contains_key(&run_id) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("run did not terminalize");
+        // Give the spawned task a beat to fire the notification after terminal.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let calls = rec.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "exactly one completion notification");
+        assert_eq!(calls[0].0, "Workflow complete");
+    }
+
+    #[tokio::test]
+    async fn invoke_runs_to_terminal_and_clears_the_registry() {
+        let (_tmp, state, pid) = workflow_state(&["primary", "reviewer-1", "reviewer-2"]).await;
+        let run_id = invoke_workflow_impl(
+            &state,
+            pid,
+            "review-and-aggregate",
+            true,
+            &inputs(vec![
+                ("primary_agent", text("primary")),
+                ("reviewer_agents", list(&["reviewer-1", "reviewer-2"])),
+                ("review_prompt", text("builtin:code-review")),
+            ]),
+        )
+        .unwrap();
+
+        // The live registry has the run on spawn.
+        assert!(lock(&state.workflow_runs).contains_key(&run_id));
+
+        // It reaches a terminal and the background task clears the registry entry.
+        let cleared = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if !lock(&state.workflow_runs).contains_key(&run_id) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(cleared.is_ok(), "run did not terminalize in time");
+
+        // A completed run's file is pruned (retention).
+        let project = lock(&state.projects).get(&pid).cloned().unwrap();
+        assert!(
+            !project.run_path(run_id).exists(),
+            "a complete run file is pruned"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_marks_a_run_cancelled_and_prunes_it() {
+        use switchboard_harness::MockScenario;
+        // A harness that hangs (awaits cancellation) keeps the run live so we can
+        // cancel it deterministically.
+        let (tmp, state, _emitter) = fresh_state_with_scenario(MockScenario::AwaitCancellation);
+        let prompts_dir = tmp.path().join("prompts");
+        std::fs::create_dir_all(&prompts_dir).unwrap();
+        let service = switchboard_prompts::PromptService::new(
+            tmp.path().join("config.yaml"),
+            prompts_dir,
+            None,
+            Arc::new(switchboard_prompts::InMemorySecretStore::new()),
+        );
+        let state = state.with_prompts(service);
+        let rec = Arc::new(RecordingNotifier::default());
+        let state =
+            state.with_notifier(Arc::clone(&rec) as Arc<dyn crate::workflow_commands::Notifier>);
+        init_directory_impl(&state, tmp.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let project = create_project_in_only_dir(&state, "proj");
+        set_active_project_impl(&state, project.id).unwrap();
+        create_agent_impl(&state, "primary", HarnessKind::ClaudeCode, None, None).unwrap();
+        create_agent_impl(&state, "reviewer-1", HarnessKind::ClaudeCode, None, None).unwrap();
+        state.prompts.sync().await;
+
+        let run_id = invoke_workflow_impl(
+            &state,
+            project.id,
+            "review-and-aggregate",
+            true,
+            &inputs(vec![
+                ("primary_agent", text("primary")),
+                ("reviewer_agents", list(&["reviewer-1"])),
+                ("review_prompt", text("builtin:code-review")),
+            ]),
+        )
+        .unwrap();
+
+        // Give the run a moment to dispatch.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Abandon refuses a still-live run (it would just be recreated).
+        assert!(matches!(
+            abandon_workflow_run_impl(&state, project.id, run_id),
+            Err(AppError::WorkflowRunActive { .. })
+        ));
+        cancel_workflow_run_impl(&state, run_id);
+
+        let cleared = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if !lock(&state.workflow_runs).contains_key(&run_id) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(cleared.is_ok(), "cancelled run did not terminalize");
+        // A cancelled run's file is pruned, like a complete one.
+        let loaded = lock(&state.projects).get(&project.id).cloned().unwrap();
+        assert!(!loaded.run_path(run_id).exists());
+        // No notification fires on a user-initiated cancel.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            rec.calls.lock().unwrap().is_empty(),
+            "cancel must not notify"
+        );
+    }
+
+    /// Seed a run file on disk with the given records (simulating a prior process).
+    fn seed_run_file(project: &switchboard_core::Project, run_id: Uuid, records: &[RunRecord]) {
+        let path = project.run_path(run_id);
+        std::fs::create_dir_all(project.runs_dir()).unwrap();
+        for record in records {
+            switchboard_core::append_jsonl(&path, record).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn list_runs_reports_failed_and_interrupted_and_abandon_clears_them() {
+        let (_tmp, state, pid) = workflow_state(&[]).await;
+        let project = lock(&state.projects).get(&pid).cloned().unwrap();
+
+        // A retained failed run (last record is a Failed terminal).
+        let failed = Uuid::now_v7();
+        seed_run_file(
+            &project,
+            failed,
+            &[
+                RunRecord::Started {
+                    workflow: "w".to_owned(),
+                    total_steps: 3,
+                    at: chrono::Utc::now(),
+                },
+                RunRecord::StepCompleted {
+                    step_index: 0,
+                    at: chrono::Utc::now(),
+                },
+                RunRecord::Terminal {
+                    status: TerminalStatus::Failed,
+                    failed_step: Some(1),
+                    reason: Some("boom".to_owned()),
+                    at: chrono::Utc::now(),
+                },
+            ],
+        );
+        // An interrupted run (no terminal record).
+        let interrupted = Uuid::now_v7();
+        seed_run_file(
+            &project,
+            interrupted,
+            &[
+                RunRecord::Started {
+                    workflow: "w2".to_owned(),
+                    total_steps: 5,
+                    at: chrono::Utc::now(),
+                },
+                RunRecord::StepCompleted {
+                    step_index: 0,
+                    at: chrono::Utc::now(),
+                },
+            ],
+        );
+        // A complete run (should NOT surface — pruned class).
+        let complete = Uuid::now_v7();
+        seed_run_file(
+            &project,
+            complete,
+            &[
+                RunRecord::Started {
+                    workflow: "w3".to_owned(),
+                    total_steps: 1,
+                    at: chrono::Utc::now(),
+                },
+                RunRecord::Terminal {
+                    status: TerminalStatus::Complete,
+                    failed_step: None,
+                    reason: None,
+                    at: chrono::Utc::now(),
+                },
+            ],
+        );
+
+        let runs = list_workflow_runs_impl(&state, pid);
+        let by_id = |id: Uuid| runs.iter().find(|r| r.run_id == id.to_string());
+        let f = by_id(failed).expect("failed run surfaces");
+        assert_eq!(f.status, "failed");
+        assert_eq!(f.reason.as_deref(), Some("boom"));
+        let i = by_id(interrupted).expect("interrupted run surfaces");
+        assert_eq!(i.status, "interrupted");
+        assert!(by_id(complete).is_none(), "a complete run is not surfaced");
+
+        // Abandon deletes both the failed and interrupted files.
+        abandon_workflow_run_impl(&state, pid, failed).unwrap();
+        abandon_workflow_run_impl(&state, pid, interrupted).unwrap();
+        assert!(!project.run_path(failed).exists());
+        assert!(!project.run_path(interrupted).exists());
+    }
+
+    #[tokio::test]
+    async fn copy_builtin_workflow_writes_yaml_and_refuses_to_clobber() {
+        let (_tmp, state, pid) = workflow_state(&[]).await;
+        let dir = workflows_dir_for_project(&state, pid).unwrap();
+
+        let written = copy_builtin_workflow_impl("review-and-aggregate", &dir).unwrap();
+        assert_eq!(written, dir.join("review-and-aggregate.yaml"));
+        let content = std::fs::read_to_string(&written).unwrap();
+        assert!(content.contains("name: review-and-aggregate"));
+
+        // It now lists as a normal (non-built-in) directory workflow.
+        let listed = list_workflows_impl(&state, pid).unwrap();
+        assert!(
+            listed
+                .iter()
+                .any(|w| w.name == "review-and-aggregate" && !w.is_builtin),
+            "the copy lists as a user workflow"
+        );
+
+        // A second copy refuses rather than clobber.
+        let err = copy_builtin_workflow_impl("review-and-aggregate", &dir).unwrap_err();
+        assert!(matches!(err, AppError::WorkflowCopyExists { .. }));
+
+        // A pre-existing `.yml` of the same name also blocks the `.yaml` copy
+        // (the scan treats both extensions as the same workflow).
+        std::fs::write(dir.join("review-analyze-discuss.yml"), "name: x\n").unwrap();
+        let err = copy_builtin_workflow_impl("review-analyze-discuss", &dir).unwrap_err();
+        assert!(matches!(err, AppError::WorkflowCopyExists { .. }));
     }
 }

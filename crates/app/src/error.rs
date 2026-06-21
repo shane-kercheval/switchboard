@@ -242,6 +242,42 @@ pub enum AppError {
         source: std::io::Error,
     },
 
+    /// A workflow-language error (parse, invocation-validation, or binding) from
+    /// the pure crate, surfaced at the command boundary.
+    #[error(transparent)]
+    Workflow(#[from] switchboard_workflow::WorkflowError),
+
+    /// No workflow with this name was found (built-in or in the directory).
+    #[error("workflow {name:?} not found")]
+    WorkflowNotFound { name: String },
+
+    /// The workflow uses a step type that is not runnable in this version
+    /// (`pause_for_user` / `for_each`) — gated at invoke, not a parse failure.
+    #[error("step type not supported in this version")]
+    WorkflowStepUnsupported,
+
+    /// No workflow run with this id is active or on disk for the project.
+    #[error("workflow run {run_id} not found")]
+    WorkflowRunNotFound { run_id: uuid::Uuid },
+
+    /// Abandon was asked to clear a run that is still live. The interpreter would
+    /// just recreate the file on its next record; cancel it first.
+    #[error("workflow run {run_id} is still active; cancel it before abandoning")]
+    WorkflowRunActive { run_id: uuid::Uuid },
+
+    /// "Copy to my workflows" would overwrite an existing file; the app never
+    /// clobbers a user's workflow.
+    #[error("a workflow file already exists at {path}")]
+    WorkflowCopyExists { path: PathBuf },
+
+    /// A filesystem error reading, writing, or deleting a workflow / run file.
+    #[error("workflow file I/O error at {path}: {source}")]
+    WorkflowCopyIo {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
     /// "Copy to my prompts" would overwrite an existing file. The app never
     /// clobbers a user's prompt — they rename or remove the existing file first.
     #[error("a prompt file already exists at {path}")]

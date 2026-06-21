@@ -16,6 +16,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
+use serde::{Deserialize, Serialize};
 use switchboard_core::name::canonicalize_for_uniqueness;
 
 use crate::error::{Result, WorkflowError};
@@ -25,7 +26,12 @@ use crate::template::ScopeValue;
 /// A value the user supplied for a declared input at invocation. A scalar input
 /// (`agent` / `prompt_id` / `text`) takes [`InputValue::Text`]; a list input
 /// (`[agent]` / `[text]`) takes [`InputValue::List`].
-#[derive(Debug, Clone, PartialEq)]
+///
+/// **Wire shape (untagged):** a scalar serializes as a JSON string, a list as a
+/// JSON array of strings — so the invocation form sends a bare string for scalar
+/// fields and an array for list fields, with no discriminant wrapper.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
 pub enum InputValue {
     Text(String),
     List(Vec<String>),
@@ -79,7 +85,7 @@ pub fn validate_invocation(
 
 /// Validate the supplied inputs and return the bound input scope — a
 /// [`ScopeValue`] for **every** declared input, with defaults applied to omitted
-/// optional inputs. This is the value M4 drops into [`crate::Scope::inputs`].
+/// optional inputs. This is the value the interpreter drops into [`crate::Scope::inputs`].
 ///
 /// Default application is language semantics, so it lives here rather than being
 /// reimplemented in the app: an omitted optional input (only `text` can be
@@ -184,7 +190,7 @@ fn require_agent_exists(name: &str, agent: &str, roster: &HashSet<String>) -> Re
 }
 
 /// Validate a resolved `[agent]` list: non-empty, free of duplicates (after
-/// normalization), and every member exists in the roster. Exposed so the M4
+/// normalization), and every member exists in the roster. Exposed so the
 /// interpreter applies the identical rule to lists it resolves from templates at
 /// dispatch (the spec applies this to every agent list used as a target, sync
 /// argument, forward source, or helper argument).

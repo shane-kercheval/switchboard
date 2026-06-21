@@ -72,7 +72,7 @@ impl PromptProvider for LocalProvider {
 impl LocalProvider {
     /// Synchronous listing — the filesystem scan. The trait's `async list`
     /// delegates here; the work is blocking I/O, fast enough to run inline.
-    fn list_sync(&self) -> Vec<Prompt> {
+    pub(crate) fn list_sync(&self) -> Vec<Prompt> {
         let mut out = Vec::new();
         let mut seen: BTreeSet<String> = BTreeSet::new();
         for dir in &self.dirs {

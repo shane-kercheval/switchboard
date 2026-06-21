@@ -121,6 +121,12 @@ pub struct WorkflowRun {
     pub workflow: Workflow,
     /// Bound input values (from `bind_invocation`), the outermost render scope.
     pub inputs: BTreeMap<String, ScopeValue>,
+    /// User-fillable prompt-argument values by name (auto-derived args the user
+    /// filled, plus declared `text` inputs that feed a same-named prompt arg).
+    /// Deliberately **not** in the `MiniJinja` workflow scope — these are prompt
+    /// args, not template vars, so a derived arg can't shadow a `text:` template
+    /// variable. A `send`'s prompt receives only the subset its schema declares.
+    pub user_args: BTreeMap<String, String>,
     /// Canonical agent name → `AgentId` for every agent the workflow may target.
     pub agents: BTreeMap<String, AgentId>,
     pub dispatcher: Arc<Dispatcher>,
@@ -417,6 +423,19 @@ impl WorkflowRun {
         }
     }
 
+    /// The declared argument names of a hardcoded prompt, via the prompt cache
+    /// (the same `PromptService` lookup the form descriptor and invoke validation
+    /// use). Empty if the prompt isn't cached — invoke pre-flight already gated an
+    /// unresolved/incompatible workflow, so the schema is expected here; an empty
+    /// result simply passes no user args and lets `render` (a live fetch for MCP)
+    /// be the final authority.
+    fn prompt_arg_names(&self, id: &PromptId) -> Vec<String> {
+        self.prompts
+            .get(&id.provider, &id.name)
+            .map(|p| p.arguments.into_iter().map(|a| a.name).collect())
+            .unwrap_or_default()
+    }
+
     /// Build the dispatched body: the rendered `prompt`/`text` lead (if any), then
     /// each `forward_from` source's resolved output composed into a canonical
     /// block. `prompt` resolves through `PromptService`; `forward_from` reads the
@@ -427,14 +446,32 @@ impl WorkflowRun {
         outputs: &OutputScope,
     ) -> Result<String, StepError> {
         let base = if let Some(prompt) = &step.prompt {
-            let id = render(prompt, self.scope(), outputs).map_err(render_failed)?;
-            let id = PromptId::parse(&id).map_err(|e| StepError::Failed(e.to_string()))?;
+            // `send.prompt` is a hardcoded literal (parse-time invariant), so there
+            // is nothing to render — parse it straight into a `PromptId`. Parsing
+            // stays in the app layer; the pure workflow crate never sees `PromptId`.
+            let id = PromptId::parse(prompt).map_err(|e| StepError::Failed(e.to_string()))?;
+
+            // The prompt's args come from two sources: the workflow's computed
+            // `template_vars` bindings, and the user-filled values for this
+            // prompt's own user-fillable args. `render_template` rejects unknown
+            // args, so we pass *only* the args this prompt declares — never the
+            // whole user-value map (a leak would fail the run).
             let mut args: BTreeMap<String, String> = BTreeMap::new();
             for (name, template) in &step.template_vars {
                 args.insert(
                     name.clone(),
                     render(template, self.scope(), outputs).map_err(render_failed)?,
                 );
+            }
+            for arg in self.prompt_arg_names(&id) {
+                if args.contains_key(&arg) {
+                    continue; // already bound by a computed template_var
+                }
+                // Omit an unfilled/blank value so an optional arg's `{% if %}`
+                // takes its empty branch instead of receiving "".
+                if let Some(value) = self.user_args.get(&arg).filter(|v| !v.trim().is_empty()) {
+                    args.insert(arg, value.clone());
+                }
             }
             self.prompts
                 .render(&id.provider, &id.name, &args)
@@ -815,15 +852,24 @@ mod tests {
         progress: Arc<dyn ProgressSink>,
     ) -> (WorkflowRun, tempfile::TempDir, PathBuf) {
         let workflow = parse_workflow(stem, yaml).expect("workflow parses");
-        let inputs = bind_invocation(&workflow, &supplied, &rig.names, |id| {
-            id.starts_with("local:")
-        })
-        .expect("invocation binds");
+        let inputs = bind_invocation(&workflow, &supplied, &rig.names).expect("invocation binds");
+        // Mirror invoke: a declared `text` input can feed a prompt arg of the same
+        // name. These interpreter tests bind every prompt arg via template_vars, so
+        // the text-input passthrough is enough; derived-arg assembly is covered by
+        // the dedicated isolation test below.
+        let user_args = inputs
+            .iter()
+            .filter_map(|(k, v)| match v {
+                ScopeValue::Text(s) => Some((k.clone(), s.clone())),
+                ScopeValue::List(_) => None,
+            })
+            .collect();
         let dir = tempfile::tempdir().unwrap();
         let run_path = dir.path().join("run.jsonl");
         let run = WorkflowRun {
             workflow,
             inputs,
+            user_args,
             agents: rig.agents.clone(),
             dispatcher: Arc::clone(&rig.dispatcher),
             prompts,
@@ -833,6 +879,44 @@ mod tests {
             cancel,
         };
         (run, dir, run_path)
+    }
+
+    /// Build a run with **explicit** user-fillable prompt-arg values, to exercise
+    /// M3's per-prompt argument assembly (a derived arg the user filled is not a
+    /// declared input, so `build_run` can't inject it from the bound scope).
+    #[allow(clippy::needless_pass_by_value)]
+    fn build_run_with_user_args(
+        rig: &Rig,
+        prompts: PromptService,
+        yaml: &str,
+        stem: &str,
+        supplied: BTreeMap<String, InputValue>,
+        user_args: BTreeMap<String, String>,
+    ) -> (WorkflowRun, tempfile::TempDir, PathBuf) {
+        let workflow = parse_workflow(stem, yaml).expect("workflow parses");
+        let inputs = bind_invocation(&workflow, &supplied, &rig.names).expect("invocation binds");
+        let dir = tempfile::tempdir().unwrap();
+        let run_path = dir.path().join("run.jsonl");
+        let run = WorkflowRun {
+            workflow,
+            inputs,
+            user_args,
+            agents: rig.agents.clone(),
+            dispatcher: Arc::clone(&rig.dispatcher),
+            prompts,
+            factories: Arc::clone(&rig.provider) as Arc<dyn DispatchFactoryProvider>,
+            run_path: run_path.clone(),
+            progress: Arc::new(NullProgressSink),
+            cancel: CancellationToken::new(),
+        };
+        (run, dir, run_path)
+    }
+
+    fn user_args(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
     }
 
     /// A progress sink that records every event for assertions.
@@ -941,7 +1025,7 @@ mod tests {
             ("reviewer-1", vec![MockScenario::Streaming]),
             ("reviewer-2", vec![MockScenario::Streaming]),
         ]);
-        let yaml = "name: fan\ndescription: d\ninputs:\n  primary_agent: agent\n  reviewer_agents: [agent]\n  review_prompt: prompt_id\n  aggregation_prompt: prompt_id\n  user_context: text?\nsteps:\n  - send:\n      to: \"{{ reviewer_agents }}\"\n      prompt: \"{{ review_prompt }}\"\n      template_vars:\n        context: \"{{ user_context }}\"\n  - wait_for_all:\n      agents: \"{{ reviewer_agents }}\"\n  - send:\n      to: \"{{ primary_agent }}\"\n      prompt: \"{{ aggregation_prompt }}\"\n      template_vars:\n        feedback: \"{{ aggregated_responses(reviewer_agents) }}\"\n";
+        let yaml = "name: fan\ndescription: d\ninputs:\n  primary_agent: agent\n  reviewer_agents: [agent]\n  user_context: text?\nsteps:\n  - send:\n      to: \"{{ reviewer_agents }}\"\n      prompt: \"local:review\"\n      template_vars:\n        context: \"{{ user_context }}\"\n  - wait_for_all:\n      agents: \"{{ reviewer_agents }}\"\n  - send:\n      to: \"{{ primary_agent }}\"\n      prompt: \"local:aggregate\"\n      template_vars:\n        feedback: \"{{ aggregated_responses(reviewer_agents) }}\"\n";
         let (run, _dir, path) = build_run(
             &rig,
             prompts,
@@ -950,8 +1034,6 @@ mod tests {
             supplied(vec![
                 ("primary_agent", text("primary")),
                 ("reviewer_agents", list(&["reviewer-1", "reviewer-2"])),
-                ("review_prompt", text("local:review")),
-                ("aggregation_prompt", text("local:aggregate")),
             ]),
             CancellationToken::new(),
         );
@@ -982,6 +1064,107 @@ mod tests {
         );
         assert!(body.contains("=== START response from reviewer-2 ==="));
         assert!(body.find("reviewer-1").unwrap() < body.find("reviewer-2").unwrap());
+    }
+
+    #[tokio::test]
+    async fn user_fillable_arg_renders_into_the_prompt_or_omits_when_blank() {
+        let body_for = |user: BTreeMap<String, String>| async move {
+            let (_pd, prompts) = prompt_service_with(&[(
+                "rev",
+                "---\nname: rev\ndescription: d\narguments:\n  - name: context\n    required: false\n---\nReview.{% if context %} Context: {{ context }}{% endif %}\n",
+            )]);
+            let rig = rig(vec![("worker", vec![MockScenario::Streaming])]);
+            let yaml = "name: w\ndescription: d\ninputs:\n  w: agent\nsteps:\n  - send:\n      to: \"{{ w }}\"\n      prompt: \"local:rev\"\n";
+            let (run, _dir, _path) = build_run_with_user_args(
+                &rig,
+                prompts,
+                yaml,
+                "w",
+                supplied(vec![("w", text("worker"))]),
+                user,
+            );
+            assert_eq!(run.execute().await, RunStatus::Complete);
+            let worker = rig.ids["worker"];
+            rig.sends
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(id, _)| *id == worker)
+                .map(|(_, b)| b.clone())
+                .expect("worker dispatched")
+        };
+
+        // The user filled `context` (an auto-derived arg) → it renders in.
+        let with = body_for(user_args(&[("context", "watch the error paths")])).await;
+        assert!(
+            with.contains("Context: watch the error paths"),
+            "got: {with}"
+        );
+
+        // Unfilled → the arg is omitted, so the optional `{% if %}` takes its empty
+        // branch (rather than receiving an empty string and rendering a stray label).
+        let without = body_for(BTreeMap::new()).await;
+        assert!(without.contains("Review."));
+        assert!(!without.contains("Context:"), "got: {without}");
+    }
+
+    #[tokio::test]
+    async fn each_prompt_receives_only_its_own_declared_args() {
+        // Two prompts with disjoint args. The run carries both user values, but each
+        // send must pass only the arg its own prompt declares — `render_template`
+        // rejects unknown args, so a leak would fail the run.
+        let (_pd, prompts) = prompt_service_with(&[
+            (
+                "pa",
+                "---\nname: pa\ndescription: d\narguments:\n  - name: foo\n    required: true\n---\nA:{{ foo }}\n",
+            ),
+            (
+                "pb",
+                "---\nname: pb\ndescription: d\narguments:\n  - name: bar\n    required: true\n---\nB:{{ bar }}\n",
+            ),
+        ]);
+        let rig = rig(vec![
+            ("a", vec![MockScenario::Streaming]),
+            ("b", vec![MockScenario::Streaming]),
+        ]);
+        let yaml = "name: iso\ndescription: d\ninputs:\n  a: agent\n  b: agent\nsteps:\n  - send:\n      to: \"{{ a }}\"\n      prompt: \"local:pa\"\n  - send:\n      to: \"{{ b }}\"\n      prompt: \"local:pb\"\n";
+        let (run, _dir, _path) = build_run_with_user_args(
+            &rig,
+            prompts,
+            yaml,
+            "iso",
+            supplied(vec![("a", text("a")), ("b", text("b"))]),
+            user_args(&[("foo", "FOO"), ("bar", "BAR")]),
+        );
+        // Neither send fails on an unknown argument.
+        assert_eq!(run.execute().await, RunStatus::Complete);
+
+        let sends = rig.sends.lock().unwrap();
+        let body_for = |id: AgentId| {
+            sends
+                .iter()
+                .find(|(sid, _)| *sid == id)
+                .map(|(_, b)| b.clone())
+                .expect("dispatched")
+        };
+        let a_body = body_for(rig.ids["a"]);
+        let b_body = body_for(rig.ids["b"]);
+        assert!(
+            a_body.contains("A:FOO"),
+            "prompt A got its own arg: {a_body}"
+        );
+        assert!(
+            !a_body.contains("BAR"),
+            "prompt A must not see B's arg: {a_body}"
+        );
+        assert!(
+            b_body.contains("B:BAR"),
+            "prompt B got its own arg: {b_body}"
+        );
+        assert!(
+            !b_body.contains("FOO"),
+            "prompt B must not see A's arg: {b_body}"
+        );
     }
 
     #[tokio::test]

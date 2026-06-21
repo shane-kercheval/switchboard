@@ -9,7 +9,7 @@
 //! where it meets `AppState`: building per-agent dispatch factories, spawning the
 //! run on a background task, and applying the retention policy on terminal.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -17,10 +17,11 @@ use serde::Serialize;
 use switchboard_core::name::canonicalize_for_uniqueness;
 use switchboard_core::{AgentId, AgentRecord, Project, ProjectId};
 use switchboard_dispatcher::{DispatchContextFactory, EventEmitter};
+use switchboard_prompts::{PromptArgument, PromptId, PromptService};
 use switchboard_workflow::{
-    InputType, InputValue, RunRecord, RunStatus, TerminalStatus, Workflow, bind_invocation,
-    builtin_workflow, builtin_workflow_content, builtin_workflows, parse_workflow,
-    validate_invocation,
+    InputType, InputValue, RunRecord, RunStatus, ScopeValue, Step, TerminalStatus, Workflow,
+    WorkflowError, bind_invocation, builtin_workflow, builtin_workflow_content, builtin_workflows,
+    parse_workflow,
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -216,10 +217,10 @@ fn terminal_status_str(status: TerminalStatus) -> &'static str {
 
 /// One declared input as the invocation form needs it: name, base type, whether
 /// it's optional, and its description (in declaration order).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WorkflowInputInfo {
     pub name: String,
-    /// `"agent"` | `"agent_list"` | `"prompt_id"` | `"text"` | `"text_list"`.
+    /// `"agent"` | `"agent_list"` | `"text"` | `"text_list"`.
     pub ty: String,
     pub optional: bool,
     pub description: Option<String>,
@@ -239,9 +240,6 @@ pub struct WorkflowListing {
     pub invocable: bool,
     /// The parse error for a malformed directory file; `None` otherwise.
     pub parse_error: Option<String>,
-    /// Recommended prompt id per `prompt_id` input (built-ins only), for form
-    /// pre-selection. Keyed by input name; empty for user workflows.
-    pub recommended_prompts: BTreeMap<String, String>,
 }
 
 /// A run as the indicator shows it. `status` is `"running"` (live),
@@ -260,7 +258,6 @@ fn input_type_str(ty: InputType) -> &'static str {
     match ty {
         InputType::Agent => "agent",
         InputType::AgentList => "agent_list",
-        InputType::PromptId => "prompt_id",
         InputType::Text => "text",
         InputType::TextList => "text_list",
     }
@@ -279,28 +276,6 @@ fn input_infos(workflow: &Workflow) -> Vec<WorkflowInputInfo> {
         .collect()
 }
 
-/// Recommended built-in prompt id per `prompt_id` input, keyed by built-in
-/// workflow name. App-owned (built-ins are app-owned), so this needs no DSL
-/// change; a user workflow's `prompt_id` input gets no pre-selection. Pre-selecting
-/// the co-versioned built-ins keeps the default path render-consistent.
-fn recommended_prompts_for(workflow_name: &str) -> BTreeMap<String, String> {
-    let mut map = BTreeMap::new();
-    match workflow_name {
-        "review-analyze-discuss" => {
-            map.insert("review_prompt".to_owned(), "builtin:code-review".to_owned());
-            map.insert(
-                "analysis_prompt".to_owned(),
-                "builtin:ai-review-feedback".to_owned(),
-            );
-        }
-        "review-and-aggregate" => {
-            map.insert("review_prompt".to_owned(), "builtin:code-review".to_owned());
-        }
-        _ => {}
-    }
-    map
-}
-
 fn builtin_listing(workflow: &Workflow) -> WorkflowListing {
     WorkflowListing {
         name: workflow.name.clone(),
@@ -309,7 +284,6 @@ fn builtin_listing(workflow: &Workflow) -> WorkflowListing {
         inputs: input_infos(workflow),
         invocable: workflow.gated_step_kind().is_none(),
         parse_error: None,
-        recommended_prompts: recommended_prompts_for(&workflow.name),
     }
 }
 
@@ -344,7 +318,6 @@ fn user_workflow_listings(workflows_dir: &Path) -> Vec<WorkflowListing> {
                 inputs: input_infos(&workflow),
                 invocable: workflow.gated_step_kind().is_none(),
                 parse_error: None,
-                recommended_prompts: BTreeMap::new(),
             }),
             Err(e) => listings.push(WorkflowListing {
                 name: stem,
@@ -353,7 +326,6 @@ fn user_workflow_listings(workflows_dir: &Path) -> Vec<WorkflowListing> {
                 inputs: Vec::new(),
                 invocable: false,
                 parse_error: Some(e.to_string()),
-                recommended_prompts: BTreeMap::new(),
             }),
         }
     }
@@ -439,21 +411,407 @@ fn snapshot_workflow(state: &AppState, name: &str, is_builtin: bool) -> Result<W
     })
 }
 
-/// True if `id` (a `provider:name` prompt address) resolves against the prompt
-/// cache. Built-ins are always present; local/MCP reflect the last sync.
-fn prompt_resolves(state: &AppState, id: &str) -> bool {
-    match switchboard_prompts::PromptId::parse(id) {
-        Ok(parsed) => state
-            .prompts
-            .list()
-            .iter()
-            .any(|p| p.provider == parsed.provider && p.name == parsed.name),
-        Err(_) => false,
+// --- prompt-schema resolution + binding classification -----------------------
+//
+// A workflow step names its prompt as a hardcoded literal; the prompt's
+// user-fillable arguments are auto-derived from the resolved prompt, not declared
+// as inputs. The single primitive below resolves a prompt id to its declared
+// arguments and the classification rules turn each `send`'s bindings into form
+// fields + a compatibility verdict. Reused by the form descriptor, invoke
+// pre-flight, and (via `resolve_prompt_schema`) the runtime arg assembly, so the
+// three never derive prompt schemas three different ways.
+
+/// Build an invocation-rejected [`WorkflowError`]. The crate's own `invocation`
+/// constructor is `pub(crate)`, so we construct the public variant directly —
+/// these app-layer rejections map to `AppError::Workflow` like the crate's own.
+fn invocation_msg(message: String) -> WorkflowError {
+    WorkflowError::Invocation { message }
+}
+
+/// One hardcoded prompt's schema-resolution outcome.
+enum PromptSchema {
+    /// Resolved to its declared arguments (possibly empty).
+    Resolved(Vec<PromptArgument>),
+    /// The id parses but isn't in the prompt cache yet — a cold/stale MCP cache,
+    /// not a hard error. The form treats this as pending and re-checks after a
+    /// sync; invoke pre-flight is authoritative.
+    Unresolved,
+    /// The literal isn't a `provider:name` id — a malformed workflow definition.
+    Malformed,
+}
+
+/// Resolve a hardcoded prompt id to its declared arguments via the prompt cache.
+/// `builtin`/`local` are authoritative once warmed; an absent MCP prompt is
+/// `Unresolved` (sync pending), never silently "no arguments".
+fn resolve_prompt_schema(prompts: &PromptService, id: &str) -> PromptSchema {
+    match PromptId::parse(id) {
+        Ok(pid) => match prompts.get(&pid.provider, &pid.name) {
+            Some(prompt) => PromptSchema::Resolved(prompt.arguments),
+            None => PromptSchema::Unresolved,
+        },
+        Err(_) => PromptSchema::Malformed,
     }
 }
 
-/// Validate a workflow invocation: capability gate + M3's invocation rules
-/// (against the project roster and a `PromptService`-backed prompt predicate).
+/// Every top-level `send` that hardcodes a prompt, as `(prompt_id,
+/// template_var_keys)`. A top-level scan is complete for an invocable workflow: a
+/// prompt send nested in a `for_each` is unreachable without that `for_each`,
+/// which gates the workflow non-invocable (mirrors `Workflow::gated_step_kind`).
+fn hardcoded_prompt_sends(workflow: &Workflow) -> Vec<(&str, Vec<&str>)> {
+    workflow
+        .steps
+        .iter()
+        .filter_map(|step| match step {
+            Step::Send(send) => send.prompt.as_deref().map(|id| {
+                let keys = send.template_vars.iter().map(|(k, _)| k.as_str()).collect();
+                (id, keys)
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A user-fillable prompt argument surfaced in the form — the `A \ T` set (a
+/// declared prompt argument with no `template_vars` binding), merged across
+/// prompts by name.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct DerivedArgInfo {
+    pub name: String,
+    pub required: bool,
+    pub description: Option<String>,
+    /// The hardcoded prompt id(s) this field feeds — a light "which prompt" label;
+    /// more than one when two prompts share a same-named argument.
+    pub prompts: Vec<String>,
+}
+
+/// A binding/collision problem that blocks invocation.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct BindingIssue {
+    /// The prompt id(s) involved; empty `argument` means the whole id is the
+    /// problem (malformed).
+    pub prompt: String,
+    pub argument: String,
+    pub reason: String,
+}
+
+/// Whether a workflow's hardcoded prompts are runnable as picked.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum FormCompatibility {
+    /// Every prompt resolved and every binding is valid.
+    Ok,
+    /// A prompt drifted: an invalid binding (`template_vars` targets a missing
+    /// argument), a malformed id, or a disallowed collision. Blocks Run.
+    Incompatible { issues: Vec<BindingIssue> },
+    /// One or more prompts aren't resolvable yet (cold MCP cache). Pending, not an
+    /// error: the form shows a "resolving" affordance and re-fetches on sync.
+    Unresolved { prompts: Vec<String> },
+}
+
+/// The complete invocation form for a picked workflow: declared inputs plus the
+/// auto-derived user-fillable prompt-argument fields, plus a compatibility
+/// verdict. Resolved per-pick (not in `list`), so a cold prompt cache costs one
+/// workflow's resolution, not every workflow's on every menu render.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct WorkflowFormDescriptor {
+    pub name: String,
+    pub is_builtin: bool,
+    pub invocable: bool,
+    pub inputs: Vec<WorkflowInputInfo>,
+    pub derived_args: Vec<DerivedArgInfo>,
+    pub compatibility: FormCompatibility,
+}
+
+/// The resolved form: the user-fillable derived fields, the compatibility
+/// verdict, and the declared `text` inputs whose shadowed prompt argument is
+/// **required**. The last is load-bearing for soundness: a `text?` input may
+/// shadow a required prompt arg, and without enforcing it non-blank the workflow
+/// would pass pre-flight and then fail at prompt render (the renderer rejects a
+/// missing required arg). Both the descriptor and invoke use these together.
+struct ResolvedForm {
+    derived_args: Vec<DerivedArgInfo>,
+    compatibility: FormCompatibility,
+    /// Names of declared text inputs that feed a required prompt argument — must
+    /// be enforced non-blank even when the input was declared optional.
+    required_shadows: Vec<String>,
+}
+
+/// Merge one user-fillable arg into the by-name namespace: required if *either*
+/// prompt requires it; first non-empty description wins; record every prompt it
+/// feeds.
+fn merge_derived(
+    derived: &mut BTreeMap<String, DerivedArgInfo>,
+    prompt_id: &str,
+    arg: &PromptArgument,
+) {
+    derived
+        .entry(arg.name.clone())
+        .and_modify(|existing| {
+            existing.required |= arg.required;
+            if existing.description.is_none() {
+                existing.description.clone_from(&arg.description);
+            }
+            if !existing.prompts.iter().any(|p| p == prompt_id) {
+                existing.prompts.push(prompt_id.to_owned());
+                // Symmetric to the text-shadow log in `classify_form`: a share is
+                // surfaced (here a dev-log, plus `DerivedArgInfo.prompts` in the
+                // descriptor) so it's diagnosable rather than silent.
+                tracing::debug!(
+                    arg = %arg.name,
+                    prompt = prompt_id,
+                    "workflow form: prompt argument shared across multiple prompts"
+                );
+            }
+        })
+        .or_insert_with(|| DerivedArgInfo {
+            name: arg.name.clone(),
+            required: arg.required,
+            description: arg.description.clone(),
+            prompts: vec![prompt_id.to_owned()],
+        });
+}
+
+/// Classify every hardcoded prompt's bindings into the form's derived fields plus
+/// a compatibility verdict, applying the merge-by-name + type-aware-collision
+/// rules. Shared by the descriptor command and invoke pre-flight so they never
+/// disagree. Binding classification per `send` (prompt args `A`, `template_vars`
+/// keys `T`): computed `A ∩ T` is hidden; invalid `T \ A` blocks; user-fillable
+/// `A \ T` becomes a field. Collisions with a declared input: a `text` input
+/// shadows-and-satisfies (one field, its value also feeds the prompt); a non-text
+/// input is the *only* collision that is an error.
+fn classify_form(workflow: &Workflow, prompts: &PromptService) -> ResolvedForm {
+    let declared: BTreeMap<&str, InputType> = workflow
+        .inputs
+        .iter()
+        .map(|i| (i.name.as_str(), i.ty))
+        .collect();
+
+    let mut derived: BTreeMap<String, DerivedArgInfo> = BTreeMap::new();
+    let mut issues: Vec<BindingIssue> = Vec::new();
+    let mut unresolved: Vec<String> = Vec::new();
+
+    for (id, tvar_keys) in hardcoded_prompt_sends(workflow) {
+        match resolve_prompt_schema(prompts, id) {
+            PromptSchema::Malformed => issues.push(BindingIssue {
+                prompt: id.to_owned(),
+                argument: String::new(),
+                reason: format!("`{id}` is not a valid prompt id"),
+            }),
+            PromptSchema::Unresolved => unresolved.push(id.to_owned()),
+            PromptSchema::Resolved(args) => {
+                let arg_names: HashSet<&str> = args.iter().map(|a| a.name.as_str()).collect();
+                // Invalid bindings: T \ A — a template_vars key the prompt has no
+                // argument for. Any one is a blocking incompatibility (drift).
+                for key in &tvar_keys {
+                    if !arg_names.contains(key) {
+                        issues.push(BindingIssue {
+                            prompt: id.to_owned(),
+                            argument: (*key).to_owned(),
+                            reason: format!(
+                                "prompt `{id}` has no argument `{key}` (the workflow binds it via template_vars)"
+                            ),
+                        });
+                    }
+                }
+                // User-fillable: A \ T (skip computed A ∩ T), merged by name.
+                for arg in &args {
+                    if tvar_keys.contains(&arg.name.as_str()) {
+                        continue;
+                    }
+                    merge_derived(&mut derived, id, arg);
+                }
+            }
+        }
+    }
+
+    // Type-aware collisions with declared inputs.
+    let mut surviving = Vec::new();
+    let mut required_shadows = Vec::new();
+    for (name, info) in derived {
+        match declared.get(name.as_str()) {
+            // text/text? input shadows-and-satisfies: the declared input is the
+            // one field and its value also feeds the prompt; drop the duplicate.
+            // If the shadowed prompt arg is required, the declared input must be
+            // enforced non-blank (even if declared `text?`) so pre-flight stays
+            // sound — otherwise the run would start and fail at prompt render.
+            Some(InputType::Text) => {
+                if info.required {
+                    required_shadows.push(name.clone());
+                }
+                tracing::debug!(
+                    arg = %name,
+                    required = info.required,
+                    "workflow form: text input feeds the prompt argument of the same name"
+                );
+            }
+            // A non-text input feeding a string prompt arg is the only error case.
+            Some(InputType::Agent | InputType::AgentList | InputType::TextList) => {
+                issues.push(BindingIssue {
+                    prompt: info.prompts.join(", "),
+                    argument: name.clone(),
+                    reason: format!(
+                        "declared input `{name}` collides with a string prompt argument of the same name"
+                    ),
+                });
+            }
+            None => surviving.push(info),
+        }
+    }
+
+    let compatibility = if !issues.is_empty() {
+        FormCompatibility::Incompatible { issues }
+    } else if unresolved.is_empty() {
+        FormCompatibility::Ok
+    } else {
+        unresolved.sort();
+        unresolved.dedup();
+        FormCompatibility::Unresolved {
+            prompts: unresolved,
+        }
+    };
+    ResolvedForm {
+        derived_args: surviving,
+        compatibility,
+        required_shadows,
+    }
+}
+
+/// Enforce that every declared input shadowing a required prompt argument has a
+/// non-blank bound value (defaults applied). Without this a `text?` shadowing a
+/// required arg would pass pre-flight and fail at render. Run after
+/// `bind_invocation` so an input's explicit non-blank `default` satisfies it.
+fn enforce_required_shadows(
+    required_shadows: &[String],
+    bound: &BTreeMap<String, ScopeValue>,
+) -> Result<(), AppError> {
+    for name in required_shadows {
+        let filled = matches!(bound.get(name), Some(ScopeValue::Text(s)) if !s.trim().is_empty());
+        if !filled {
+            return Err(invocation_msg(format!(
+                "input {name:?} feeds a required prompt argument and must not be left blank"
+            ))
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// Split a flat invocation payload into declared-input values and derived
+/// prompt-arg values. The two are validated by different paths and conflating
+/// them is a correctness regression: `validate_invocation` rejects any key it
+/// doesn't declare (so a derived `context` routed through it would be refused),
+/// and the derived path must not bypass the required/roster/`[agent]` checks the
+/// declared path owns.
+fn partition_payload(
+    workflow: &Workflow,
+    supplied: &BTreeMap<String, InputValue>,
+) -> (BTreeMap<String, InputValue>, BTreeMap<String, InputValue>) {
+    let declared: HashSet<&str> = workflow.inputs.iter().map(|i| i.name.as_str()).collect();
+    let mut declared_vals = BTreeMap::new();
+    let mut derived_vals = BTreeMap::new();
+    for (k, v) in supplied {
+        if declared.contains(k.as_str()) {
+            declared_vals.insert(k.clone(), v.clone());
+        } else {
+            derived_vals.insert(k.clone(), v.clone());
+        }
+    }
+    (declared_vals, derived_vals)
+}
+
+/// Validate the derived prompt-arg side of an invocation against the resolved
+/// form, returning the derived values as plain strings (the runtime arg map).
+/// Blocks an incompatible or not-yet-resolved workflow, rejects an unknown derived
+/// key, and enforces required derived args.
+fn validate_derived_args(
+    derived_args: &[DerivedArgInfo],
+    compatibility: &FormCompatibility,
+    supplied: &BTreeMap<String, InputValue>,
+) -> Result<BTreeMap<String, String>, AppError> {
+    match compatibility {
+        FormCompatibility::Incompatible { issues } => {
+            let detail = issues
+                .iter()
+                .map(|i| i.reason.clone())
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(invocation_msg(format!("workflow cannot run: {detail}")).into());
+        }
+        FormCompatibility::Unresolved { prompts } => {
+            return Err(invocation_msg(format!(
+                "workflow prompt(s) not yet available: {} — try again after prompts sync",
+                prompts.join(", ")
+            ))
+            .into());
+        }
+        FormCompatibility::Ok => {}
+    }
+
+    let known: HashSet<&str> = derived_args.iter().map(|d| d.name.as_str()).collect();
+    let mut values = BTreeMap::new();
+    for (k, v) in supplied {
+        if !known.contains(k.as_str()) {
+            return Err(invocation_msg(format!(
+                "supplied prompt argument {k:?} is not a fillable argument of this workflow's prompts"
+            ))
+            .into());
+        }
+        match v {
+            InputValue::Text(s) => values.insert(k.clone(), s.clone()),
+            InputValue::List(_) => {
+                return Err(invocation_msg(format!(
+                    "prompt argument {k:?} must be a single value, not a list"
+                ))
+                .into());
+            }
+        };
+    }
+    for arg in derived_args {
+        if arg.required && values.get(&arg.name).is_none_or(|s| s.trim().is_empty()) {
+            return Err(invocation_msg(format!(
+                "required prompt argument {:?} was not provided",
+                arg.name
+            ))
+            .into());
+        }
+    }
+    Ok(values)
+}
+
+/// Resolve a workflow's invocation form: declared inputs + auto-derived
+/// user-fillable prompt-argument fields + a compatibility verdict. Resolves the
+/// hardcoded prompts on demand (not in `list`); needs no `project_id` because
+/// prompts are user-global. The frontend re-fetches on `prompts:synced` so a cold
+/// MCP cache resolves once sync lands.
+pub fn describe_workflow_form_impl(
+    state: &AppState,
+    name: &str,
+    is_builtin: bool,
+) -> Result<WorkflowFormDescriptor, AppError> {
+    let workflow = snapshot_workflow(state, name, is_builtin)?;
+    let invocable = workflow.gated_step_kind().is_none();
+    let form = classify_form(&workflow, &state.prompts);
+    // A declared input that feeds a *required* prompt arg is effectively required,
+    // even if declared `text?` — report it as required so the form demands it.
+    let mut inputs = input_infos(&workflow);
+    for info in &mut inputs {
+        if form.required_shadows.contains(&info.name) {
+            info.optional = false;
+        }
+    }
+    Ok(WorkflowFormDescriptor {
+        name: workflow.name.clone(),
+        is_builtin,
+        invocable,
+        inputs,
+        derived_args: form.derived_args,
+        compatibility: form.compatibility,
+    })
+}
+
+/// Validate a workflow invocation: capability gate + partitioned invocation rules
+/// (declared inputs via `validate_invocation`; derived prompt args via the
+/// classification + required-fill check, re-resolved here so invoke is authoritative).
 pub fn validate_workflow_invocation_impl(
     state: &AppState,
     project_id: ProjectId,
@@ -467,7 +825,14 @@ pub fn validate_workflow_invocation_impl(
     }
     let roster = roster_for_project(state, project_id);
     let names: Vec<String> = roster.iter().map(|r| r.name.clone()).collect();
-    validate_invocation(&workflow, inputs, &names, |id| prompt_resolves(state, id))?;
+
+    let (declared, derived) = partition_payload(&workflow, inputs);
+    // Bind (not just validate) the declared inputs so defaults are applied before
+    // the required-shadow check sees them.
+    let bound = bind_invocation(&workflow, &declared, &names)?;
+    let form = classify_form(&workflow, &state.prompts);
+    validate_derived_args(&form.derived_args, &form.compatibility, &derived)?;
+    enforce_required_shadows(&form.required_shadows, &bound)?;
     Ok(())
 }
 
@@ -495,8 +860,29 @@ pub fn invoke_workflow_impl(
     let roster = roster_for_project(state, project_id);
     let names: Vec<String> = roster.iter().map(|r| r.name.clone()).collect();
 
-    // Validate + bind against the roster and prompt resolver.
-    let bound = bind_invocation(&workflow, inputs, &names, |id| prompt_resolves(state, id))?;
+    // Partition the flat payload: declared inputs go through `validate_invocation`
+    // + `bind_invocation`; derived prompt args through the classification +
+    // required-fill check. Invoke is authoritative — it re-resolves the prompt
+    // schemas here (a prompt can change between form-open and invoke).
+    let (declared, derived) = partition_payload(&workflow, inputs);
+    let bound = bind_invocation(&workflow, &declared, &names)?;
+    let form = classify_form(&workflow, &state.prompts);
+    let derived_values = validate_derived_args(&form.derived_args, &form.compatibility, &derived)?;
+    enforce_required_shadows(&form.required_shadows, &bound)?;
+
+    // The run's user-fillable prompt-arg values: the derived args, plus every
+    // declared `text` input (the shadow-and-satisfy escape hatch — a text input
+    // may feed a prompt argument of the same name). Kept separate from the
+    // workflow template scope so a prompt arg can't shadow a `text:` template var.
+    let mut user_args: BTreeMap<String, String> = bound
+        .iter()
+        .filter_map(|(k, v)| match v {
+            ScopeValue::Text(s) => Some((k.clone(), s.clone())),
+            ScopeValue::List(_) => None,
+        })
+        .collect();
+    user_args.extend(derived_values);
+
     let agents: BTreeMap<String, AgentId> = roster
         .iter()
         .map(|r| (canonicalize_for_uniqueness(&r.name), r.id))
@@ -540,6 +926,7 @@ pub fn invoke_workflow_impl(
     let run = WorkflowRun {
         workflow,
         inputs: bound,
+        user_args,
         agents,
         dispatcher: Arc::clone(&state.dispatcher),
         prompts: state.prompts.clone(),

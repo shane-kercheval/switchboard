@@ -157,6 +157,34 @@ impl PromptService {
             .clone()
     }
 
+    /// One prompt by `provider:name`, or `None` if absent. Synchronous and
+    /// offline. The **freshness contract**: `builtin` and `local` prompts are
+    /// always resolvable without a sync (compiled-in / a filesystem scan), so they
+    /// are resolved **directly** here — a cold cache never reports them missing.
+    /// MCP prompts live only in the cache, so a not-yet-synced one returns `None`;
+    /// callers treat that as "unresolved" (distinct from a hard error) and
+    /// re-check after a sync.
+    #[must_use]
+    pub fn get(&self, provider: &str, name: &str) -> Option<Prompt> {
+        let direct = match provider {
+            BUILTIN_PROVIDER if self.include_builtins => BuiltinProvider::list_sync(),
+            LOCAL_PROVIDER => self
+                .local_provider()
+                .map(|local| local.list_sync())
+                .unwrap_or_default(),
+            _ => {
+                return self
+                    .cache
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .iter()
+                    .find(|p| p.provider == provider && p.name == name)
+                    .cloned();
+            }
+        };
+        direct.into_iter().find(|p| p.name == name)
+    }
+
     /// Rebuild the cache from all configured providers.
     ///
     /// - **Serialized** (the `sync_lock`): concurrent rebuilds can't interleave

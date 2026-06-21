@@ -54,13 +54,17 @@ pub struct InputDecl {
 
 /// The input type grammar. The optional `text?` variant is *not* a distinct type
 /// — it parses to [`InputType::Text`] with [`InputDecl::optional`] set, because
-/// the `?` suffix is only valid on `text` in v1 (`agent?` / `prompt_id?` are
-/// deferred to v2 and rejected at parse time).
+/// the `?` suffix is only valid on `text` in v1 (`agent?` is deferred to v2 and
+/// rejected at parse time).
+///
+/// There is no prompt-input type: a step names its prompt as a hardcoded literal
+/// (`send.prompt`), never a user-supplied value. A prompt's user-fillable
+/// arguments are auto-derived from the resolved prompt at invocation, not declared
+/// here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputType {
     Agent,
     AgentList,
-    PromptId,
     Text,
     TextList,
 }

@@ -57,9 +57,10 @@ use crate::commands::{
 use crate::preferences::Preferences;
 use crate::state::AppState;
 use crate::workflow_commands::{
-    WorkflowListing, WorkflowRunInfo, abandon_workflow_run_impl, cancel_workflow_run_impl,
-    copy_builtin_workflow_impl, invoke_workflow_impl, list_workflow_runs_impl, list_workflows_impl,
-    user_workflows_dir, validate_workflow_invocation_impl,
+    WorkflowFormDescriptor, WorkflowListing, WorkflowRunInfo, abandon_workflow_run_impl,
+    cancel_workflow_run_impl, copy_builtin_workflow_impl, describe_workflow_form_impl,
+    invoke_workflow_impl, list_workflow_runs_impl, list_workflows_impl, user_workflows_dir,
+    validate_workflow_invocation_impl,
 };
 
 use switchboard_core::{AgentRecord, Attachment, HarnessKind, ProjectId, ProjectSummary};
@@ -842,6 +843,18 @@ async fn list_workflows(state: State<'_, AppState>) -> Result<Vec<WorkflowListin
     Ok(list_workflows_impl(state.inner()))
 }
 
+/// Resolve a picked workflow's invocation form: declared inputs + auto-derived
+/// user-fillable prompt-argument fields + a compatibility verdict. No `project_id`
+/// — prompts are user-global. Resolved per-pick (not in `list_workflows`).
+#[tauri::command]
+async fn describe_workflow_form(
+    state: State<'_, AppState>,
+    name: String,
+    is_builtin: bool,
+) -> Result<WorkflowFormDescriptor, String> {
+    describe_workflow_form_impl(state.inner(), &name, is_builtin).map_err(|e| e.to_string())
+}
+
 /// Validate a workflow invocation (capability gate + input/roster/prompt rules)
 /// without launching it — drives the form's enable/disable + error display.
 #[tauri::command]
@@ -1330,6 +1343,7 @@ pub fn run() {
             open_local_prompts_dir,
             copy_builtin_prompt,
             list_workflows,
+            describe_workflow_form,
             validate_workflow_invocation,
             invoke_workflow,
             cancel_workflow_run,

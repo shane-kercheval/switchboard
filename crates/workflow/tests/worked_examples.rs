@@ -46,18 +46,9 @@ fn fan_in_review_parses_and_invocation_validates() {
         "reviewer_agents".to_owned(),
         InputValue::List(vec!["reviewer-1".to_owned(), "reviewer-2".to_owned()]),
     );
-    supplied.insert(
-        "review_prompt".to_owned(),
-        InputValue::Text("local:review".to_owned()),
-    );
-    supplied.insert(
-        "aggregation_prompt".to_owned(),
-        InputValue::Text("local:aggregate".to_owned()),
-    );
     // user_context is text? — omitted; optional, so invocation still validates.
 
-    validate_invocation(&wf, &supplied, &agents, |id| id.starts_with("local:"))
-        .expect("invocation should validate");
+    validate_invocation(&wf, &supplied, &agents).expect("invocation should validate");
 }
 
 #[test]
@@ -104,17 +95,9 @@ fn review_and_aggregate_renders_end_to_end_with_omitted_optional() {
         "reviewer_agents".to_owned(),
         InputValue::List(vec!["reviewer-1".to_owned(), "reviewer-2".to_owned()]),
     );
-    supplied.insert(
-        "review_prompt".to_owned(),
-        InputValue::Text("local:review".to_owned()),
-    );
-    supplied.insert(
-        "aggregation_prompt".to_owned(),
-        InputValue::Text("local:aggregate".to_owned()),
-    );
     // user_context (text?) deliberately omitted.
 
-    let inputs = bind_invocation(&wf, &supplied, &agents, |id| id.starts_with("local:")).unwrap();
+    let inputs = bind_invocation(&wf, &supplied, &agents).unwrap();
 
     // Step 1's `context` template_var references the omitted optional → "".
     let context_tmpl = &send_step(&wf, 0)

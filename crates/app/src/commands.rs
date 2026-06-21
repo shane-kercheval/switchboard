@@ -14259,11 +14259,29 @@ mod tests {
     // --- Workflow commands ----------------------------------------------------
 
     use crate::workflow_commands::{
-        abandon_workflow_run_impl, cancel_workflow_run_impl, copy_builtin_workflow_impl,
-        invoke_workflow_impl, list_workflow_runs_impl, list_workflows_impl, user_workflows_dir,
+        FormCompatibility, abandon_workflow_run_impl, cancel_workflow_run_impl,
+        copy_builtin_workflow_impl, describe_workflow_form_impl, invoke_workflow_impl,
+        list_workflow_runs_impl, list_workflows_impl, user_workflows_dir,
         validate_workflow_invocation_impl,
     };
     use switchboard_workflow::{InputValue, RunRecord, TerminalStatus};
+
+    /// Write a user workflow file into the workspace's user-global workflows dir.
+    fn seed_workflow(state: &AppState, stem: &str, yaml: &str) {
+        let dir = user_workflows_dir(state).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{stem}.yaml")), yaml).unwrap();
+    }
+
+    /// Write a local prompt `.md` into the state's prompt dir (`<tmp>/prompts`).
+    fn seed_prompt(tmp: &TempDir, name: &str, frontmatter_args: &str, body: &str) {
+        let header = format!("---\nname: {name}\ndescription: d\n{frontmatter_args}---\n");
+        std::fs::write(
+            tmp.path().join("prompts").join(format!("{name}.md")),
+            format!("{header}{body}\n"),
+        )
+        .unwrap();
+    }
 
     /// A prompts-enabled state (real `PromptService`, so built-ins resolve) with a
     /// project + the named agents, the prompt cache warmed, and a temp user-global
@@ -14307,17 +14325,14 @@ mod tests {
         assert!(builtins.contains(&"review-analyze-discuss"), "{builtins:?}");
         // Both shipped built-ins use only runnable steps.
         assert!(listed.iter().filter(|w| w.is_builtin).all(|w| w.invocable));
-        // review-and-aggregate pre-selects code-review for its review_prompt.
+        // review-and-aggregate declares only its agent inputs; its prompt is
+        // hardcoded and its `context` arg is auto-derived (not a declared input).
         let raa = listed
             .iter()
             .find(|w| w.name == "review-and-aggregate")
             .unwrap();
-        assert_eq!(
-            raa.recommended_prompts
-                .get("review_prompt")
-                .map(String::as_str),
-            Some("builtin:code-review")
-        );
+        let input_names: Vec<&str> = raa.inputs.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(input_names, vec!["reviewers", "worker"]);
 
         set_preferences_impl(
             &state,
@@ -14366,10 +14381,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validate_invocation_enforces_inputs_roster_prompt_and_gate() {
+    async fn validate_workflow_invocation_enforces_inputs_roster_and_derived_args() {
         let (_tmp, state, pid) = workflow_state(&["primary", "reviewer-1"]).await;
 
-        // Missing required input (no reviewers).
+        // Missing required declared input (no reviewers).
         let err = validate_workflow_invocation_impl(
             &state,
             pid,
@@ -14380,7 +14395,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, AppError::Workflow(_)));
 
-        // Non-existent agent.
+        // Non-existent agent (roster check on the declared path).
         let err = validate_workflow_invocation_impl(
             &state,
             pid,
@@ -14389,13 +14404,12 @@ mod tests {
             &inputs(vec![
                 ("worker", text("ghost")),
                 ("reviewers", list(&["reviewer-1"])),
-                ("review_prompt", text("builtin:code-review")),
             ]),
         )
         .unwrap_err();
         assert!(matches!(err, AppError::Workflow(_)));
 
-        // Unresolvable prompt id.
+        // A key that is neither a declared input nor a fillable prompt arg.
         let err = validate_workflow_invocation_impl(
             &state,
             pid,
@@ -14404,13 +14418,14 @@ mod tests {
             &inputs(vec![
                 ("worker", text("primary")),
                 ("reviewers", list(&["reviewer-1"])),
-                ("review_prompt", text("local:does-not-exist")),
+                ("nonsense", text("x")),
             ]),
         )
         .unwrap_err();
         assert!(matches!(err, AppError::Workflow(_)));
 
-        // A well-formed invocation validates.
+        // Well-formed: the agent inputs alone validate (code-review's `context` is
+        // an optional derived arg, so omitting it is fine).
         validate_workflow_invocation_impl(
             &state,
             pid,
@@ -14419,10 +14434,320 @@ mod tests {
             &inputs(vec![
                 ("worker", text("primary")),
                 ("reviewers", list(&["reviewer-1"])),
-                ("review_prompt", text("builtin:code-review")),
             ]),
         )
         .unwrap();
+
+        // The auto-derived `context` arg is accepted when supplied.
+        validate_workflow_invocation_impl(
+            &state,
+            pid,
+            "review-and-aggregate",
+            true,
+            &inputs(vec![
+                ("worker", text("primary")),
+                ("reviewers", list(&["reviewer-1"])),
+                ("context", text("focus on error handling")),
+            ]),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn describe_form_surfaces_declared_inputs_and_auto_derived_args() {
+        let (_tmp, state, _pid) = workflow_state(&["primary", "reviewer-1"]).await;
+
+        let raa = describe_workflow_form_impl(&state, "review-and-aggregate", true).unwrap();
+        assert_eq!(raa.compatibility, FormCompatibility::Ok);
+        let inputs: Vec<&str> = raa.inputs.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(inputs, vec!["reviewers", "worker"]);
+        // code-review's optional `context` is auto-derived (not declared).
+        let derived: Vec<(&str, bool)> = raa
+            .derived_args
+            .iter()
+            .map(|d| (d.name.as_str(), d.required))
+            .collect();
+        assert_eq!(derived, vec![("context", false)]);
+
+        // review-analyze-discuss surfaces `context` but NOT `review` — `review` is
+        // a computed binding (ai-review-feedback's required arg), hidden from the user.
+        let rad = describe_workflow_form_impl(&state, "review-analyze-discuss", true).unwrap();
+        assert_eq!(rad.compatibility, FormCompatibility::Ok);
+        let names: Vec<&str> = rad.derived_args.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["context"]);
+    }
+
+    #[tokio::test]
+    async fn describe_form_blocks_a_template_var_targeting_a_missing_argument() {
+        let (tmp, state, pid) = workflow_state(&["a"]).await;
+        // A prompt that has NO `context` argument.
+        seed_prompt(&tmp, "bare", "", "Just a body.");
+        // A workflow that binds `context` anyway → invalid binding (drift).
+        seed_workflow(
+            &state,
+            "drifted",
+            "name: drifted\ndescription: d\ninputs:\n  a: agent\nsteps:\n  - send:\n      to: \"{{ a }}\"\n      prompt: \"local:bare\"\n      template_vars:\n        context: \"hello\"\n",
+        );
+
+        let form = describe_workflow_form_impl(&state, "drifted", false).unwrap();
+        match &form.compatibility {
+            FormCompatibility::Incompatible { issues } => {
+                assert_eq!(issues.len(), 1);
+                assert_eq!(issues[0].prompt, "local:bare");
+                assert_eq!(issues[0].argument, "context");
+            }
+            other => panic!("expected incompatible, got {other:?}"),
+        }
+        // Invoke is blocked too (invoke is authoritative).
+        let err = invoke_workflow_impl(
+            &state,
+            pid,
+            "drifted",
+            false,
+            &inputs(vec![("a", text("a"))]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AppError::Workflow(_)));
+    }
+
+    #[tokio::test]
+    async fn text_input_shadows_and_satisfies_a_same_named_prompt_arg() {
+        let (_tmp, state, _pid) = workflow_state(&["rev"]).await;
+        seed_workflow(
+            &state,
+            "shadow",
+            "name: shadow\ndescription: d\ninputs:\n  reviewers: [agent]\n  context:\n    type: text?\n    description: My own label\nsteps:\n  - send:\n      to: \"{{ reviewers }}\"\n      prompt: \"builtin:code-review\"\n",
+        );
+        let form = describe_workflow_form_impl(&state, "shadow", false).unwrap();
+        assert_eq!(form.compatibility, FormCompatibility::Ok);
+        // `context` appears once — as the declared input, not a duplicate derived arg.
+        assert!(form.inputs.iter().any(|i| i.name == "context"));
+        assert!(form.derived_args.iter().all(|d| d.name != "context"));
+    }
+
+    #[tokio::test]
+    async fn optional_text_input_shadowing_a_required_prompt_arg_is_enforced() {
+        let (tmp, state, pid) = workflow_state(&["a"]).await;
+        // A prompt with a REQUIRED `x` argument.
+        seed_prompt(
+            &tmp,
+            "reqx",
+            "arguments:\n  - name: x\n    required: true\n",
+            "{{ x }}",
+        );
+        // A workflow shadowing it with an OPTIONAL text input.
+        seed_workflow(
+            &state,
+            "shadowreq",
+            "name: shadowreq\ndescription: d\ninputs:\n  a: agent\n  x: text?\nsteps:\n  - send:\n      to: \"{{ a }}\"\n      prompt: \"local:reqx\"\n",
+        );
+
+        // The descriptor reports `x` as required even though it's declared `text?`
+        // (it feeds a required prompt arg), and does not duplicate it as a derived field.
+        let form = describe_workflow_form_impl(&state, "shadowreq", false).unwrap();
+        assert_eq!(form.compatibility, FormCompatibility::Ok);
+        let x = form.inputs.iter().find(|i| i.name == "x").unwrap();
+        assert!(
+            !x.optional,
+            "shadowing a required prompt arg makes the input required"
+        );
+        assert!(form.derived_args.iter().all(|d| d.name != "x"));
+
+        // Invoking without `x` is blocked BEFORE the run starts (pre-flight soundness:
+        // otherwise the run would start and fail at prompt render).
+        let err = invoke_workflow_impl(
+            &state,
+            pid,
+            "shadowreq",
+            false,
+            &inputs(vec![("a", text("a"))]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AppError::Workflow(_)));
+        // Supplying `x` validates.
+        validate_workflow_invocation_impl(
+            &state,
+            pid,
+            "shadowreq",
+            false,
+            &inputs(vec![("a", text("a")), ("x", text("here"))]),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn non_blank_default_satisfies_a_shadowed_required_prompt_arg() {
+        let (tmp, state, pid) = workflow_state(&["a"]).await;
+        seed_prompt(
+            &tmp,
+            "reqy",
+            "arguments:\n  - name: y\n    required: true\n",
+            "{{ y }}",
+        );
+        // Declared optional via a non-blank default → the default fills the required arg,
+        // so omitting it is fine (the check runs against the bound value, defaults applied).
+        seed_workflow(
+            &state,
+            "defshadow",
+            "name: defshadow\ndescription: d\ninputs:\n  a: agent\n  y:\n    type: text\n    default: fallback\nsteps:\n  - send:\n      to: \"{{ a }}\"\n      prompt: \"local:reqy\"\n",
+        );
+        validate_workflow_invocation_impl(
+            &state,
+            pid,
+            "defshadow",
+            false,
+            &inputs(vec![("a", text("a"))]),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn non_text_input_colliding_with_a_prompt_arg_is_an_error() {
+        let (_tmp, state, _pid) = workflow_state(&["a"]).await;
+        // An `[agent]` input named `context` collides with code-review's string arg.
+        seed_workflow(
+            &state,
+            "clash",
+            "name: clash\ndescription: d\ninputs:\n  context: [agent]\nsteps:\n  - send:\n      to: \"{{ context }}\"\n      prompt: \"builtin:code-review\"\n",
+        );
+        let form = describe_workflow_form_impl(&state, "clash", false).unwrap();
+        assert!(matches!(
+            form.compatibility,
+            FormCompatibility::Incompatible { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn two_prompts_sharing_a_string_arg_merge_into_one_required_field() {
+        let (tmp, state, _pid) = workflow_state(&["a", "b"]).await;
+        seed_prompt(
+            &tmp,
+            "p-opt",
+            "arguments:\n  - name: shared\n    required: false\n",
+            "{{ shared }}",
+        );
+        seed_prompt(
+            &tmp,
+            "p-req",
+            "arguments:\n  - name: shared\n    required: true\n",
+            "{{ shared }}",
+        );
+        seed_workflow(
+            &state,
+            "twoprompt",
+            "name: twoprompt\ndescription: d\ninputs:\n  a: agent\n  b: agent\nsteps:\n  - send:\n      to: \"{{ a }}\"\n      prompt: \"local:p-opt\"\n  - send:\n      to: \"{{ b }}\"\n      prompt: \"local:p-req\"\n",
+        );
+        let form = describe_workflow_form_impl(&state, "twoprompt", false).unwrap();
+        assert_eq!(form.compatibility, FormCompatibility::Ok);
+        let shared: Vec<_> = form
+            .derived_args
+            .iter()
+            .filter(|d| d.name == "shared")
+            .collect();
+        assert_eq!(shared.len(), 1, "shared arg merged into a single field");
+        assert!(
+            shared[0].required,
+            "required because one prompt requires it"
+        );
+        assert_eq!(shared[0].prompts.len(), 2, "the field feeds both prompts");
+    }
+
+    #[tokio::test]
+    async fn required_derived_arg_blocks_invocation_until_filled() {
+        let (tmp, state, pid) = workflow_state(&["a"]).await;
+        seed_prompt(
+            &tmp,
+            "needsx",
+            "arguments:\n  - name: x\n    required: true\n",
+            "{{ x }}",
+        );
+        seed_workflow(
+            &state,
+            "needs",
+            "name: needs\ndescription: d\ninputs:\n  a: agent\nsteps:\n  - send:\n      to: \"{{ a }}\"\n      prompt: \"local:needsx\"\n",
+        );
+        // Required derived arg unfilled → blocked.
+        let err = validate_workflow_invocation_impl(
+            &state,
+            pid,
+            "needs",
+            false,
+            &inputs(vec![("a", text("a"))]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AppError::Workflow(_)));
+        // Supplied → validates.
+        validate_workflow_invocation_impl(
+            &state,
+            pid,
+            "needs",
+            false,
+            &inputs(vec![("a", text("a")), ("x", text("here"))]),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn invoke_re_resolves_and_blocks_when_a_prompt_changed_after_describe() {
+        let (tmp, state, pid) = workflow_state(&["a"]).await;
+        seed_prompt(
+            &tmp,
+            "mut",
+            "arguments:\n  - name: ctx\n    required: false\n",
+            "{{ ctx }}",
+        );
+        seed_workflow(
+            &state,
+            "usesmut",
+            "name: usesmut\ndescription: d\ninputs:\n  a: agent\nsteps:\n  - send:\n      to: \"{{ a }}\"\n      prompt: \"local:mut\"\n",
+        );
+        // The form validates cleanly now (only an optional arg).
+        let form = describe_workflow_form_impl(&state, "usesmut", false).unwrap();
+        assert_eq!(form.compatibility, FormCompatibility::Ok);
+
+        // The prompt then gains a REQUIRED arg the workflow can't fill.
+        seed_prompt(
+            &tmp,
+            "mut",
+            "arguments:\n  - name: ctx\n    required: false\n  - name: must\n    required: true\n",
+            "{{ ctx }}{{ must }}",
+        );
+        // Invoke re-resolves the schema (local resolves directly) and blocks.
+        let err = invoke_workflow_impl(
+            &state,
+            pid,
+            "usesmut",
+            false,
+            &inputs(vec![("a", text("a"))]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AppError::Workflow(_)));
+    }
+
+    #[tokio::test]
+    async fn builtin_prompt_resolves_under_a_cold_cache_and_missing_id_is_unresolved() {
+        // No sync: the prompt cache is cold. A built-in must still resolve (the
+        // freshness contract); a missing id is reported as Unresolved, not Ok.
+        let (tmp, state) = state_with_prompts();
+        let state = state.with_workflows_dir(tmp.path().join("workflows"));
+
+        let form = describe_workflow_form_impl(&state, "review-and-aggregate", true).unwrap();
+        assert_eq!(
+            form.compatibility,
+            FormCompatibility::Ok,
+            "a built-in resolves without a sync"
+        );
+
+        seed_workflow(
+            &state,
+            "ghostly",
+            "name: ghostly\ndescription: d\ninputs:\n  a: agent\nsteps:\n  - send:\n      to: \"{{ a }}\"\n      prompt: \"local:ghost\"\n",
+        );
+        let form = describe_workflow_form_impl(&state, "ghostly", false).unwrap();
+        assert!(matches!(
+            form.compatibility,
+            FormCompatibility::Unresolved { .. }
+        ));
     }
 
     #[tokio::test]
@@ -14484,7 +14809,6 @@ mod tests {
             &inputs(vec![
                 ("worker", text("primary")),
                 ("reviewers", list(&["reviewer-1"])),
-                ("review_prompt", text("builtin:code-review")),
             ]),
         )
         .unwrap();
@@ -14517,7 +14841,6 @@ mod tests {
             &inputs(vec![
                 ("worker", text("primary")),
                 ("reviewers", list(&["reviewer-1", "reviewer-2"])),
-                ("review_prompt", text("builtin:code-review")),
             ]),
         )
         .unwrap();
@@ -14580,7 +14903,6 @@ mod tests {
             &inputs(vec![
                 ("worker", text("primary")),
                 ("reviewers", list(&["reviewer-1"])),
-                ("review_prompt", text("builtin:code-review")),
             ]),
         )
         .unwrap();

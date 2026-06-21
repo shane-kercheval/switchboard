@@ -45,8 +45,11 @@ impl BuiltinProvider {
     }
 }
 
-impl PromptProvider for BuiltinProvider {
-    async fn list(&self) -> Vec<Prompt> {
+impl BuiltinProvider {
+    /// The built-ins, resolved synchronously. The content is compiled in, so this
+    /// is pure CPU work — no I/O, no await. Used directly by `PromptService::get`
+    /// so a built-in resolves even under a cold cache (the freshness contract).
+    pub(crate) fn list_sync() -> Vec<Prompt> {
         BUILTIN_PROMPTS
             .iter()
             .filter_map(|content| match parse_prompt_file(label(), content) {
@@ -62,6 +65,12 @@ impl PromptProvider for BuiltinProvider {
                 }
             })
             .collect()
+    }
+}
+
+impl PromptProvider for BuiltinProvider {
+    async fn list(&self) -> Vec<Prompt> {
+        Self::list_sync()
     }
 
     async fn render(

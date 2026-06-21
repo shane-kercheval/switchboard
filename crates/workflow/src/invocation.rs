@@ -1,13 +1,15 @@
 //! Invocation-time validation (`docs/workflow-spec.md` §Validation
 //! "Invocation-time"): given the parsed workflow, the user's supplied input
-//! values, the project's agent roster, and a prompt-resolution predicate, reject
-//! missing required inputs, type mismatches, non-existent agents, unresolvable
-//! prompt ids, and empty/duplicate `[agent]` lists — before any dispatch.
+//! values, and the project's agent roster, reject missing required inputs, type
+//! mismatches, non-existent agents, and empty/duplicate `[agent]` lists — before
+//! any dispatch.
 //!
-//! The pure crate cannot call `PromptService`, so prompt resolution is injected
-//! as a predicate; agent existence is checked against an injected roster. Both
-//! comparisons normalize names (hyphen→underscore, lowercased) per the project's
-//! uniqueness rule.
+//! Scope: this validates **declared inputs** only (agents / text). A step's
+//! prompt is a hardcoded literal, not an input, and a prompt's auto-derived
+//! user-fillable arguments are validated in the app layer (where `PromptService`
+//! lives), not here — the pure crate has no notion of a prompt schema. Agent
+//! existence is checked against an injected roster; comparisons normalize names
+//! (hyphen→underscore, lowercased) per the project's uniqueness rule.
 //!
 //! **Not checked here (render-time concern):** that every template *variable*
 //! reference resolves in scope. That depends on the runtime scope as it evolves
@@ -24,8 +26,8 @@ use crate::model::{InputType, Workflow};
 use crate::template::ScopeValue;
 
 /// A value the user supplied for a declared input at invocation. A scalar input
-/// (`agent` / `prompt_id` / `text`) takes [`InputValue::Text`]; a list input
-/// (`[agent]` / `[text]`) takes [`InputValue::List`].
+/// (`agent` / `text`) takes [`InputValue::Text`]; a list input (`[agent]` /
+/// `[text]`) takes [`InputValue::List`].
 ///
 /// **Wire shape (untagged):** a scalar serializes as a JSON string, a list as a
 /// JSON array of strings — so the invocation form sends a bare string for scalar
@@ -38,14 +40,11 @@ pub enum InputValue {
 }
 
 /// Validate the user's supplied inputs against the workflow's declarations and
-/// the project context. `agents` is the project roster (agent names);
-/// `prompt_resolves` answers whether a `prompt_id` resolves through the
-/// configured providers.
+/// the project context. `agents` is the project roster (agent names).
 pub fn validate_invocation(
     workflow: &Workflow,
     supplied: &BTreeMap<String, InputValue>,
     agents: &[String],
-    prompt_resolves: impl Fn(&str) -> bool,
 ) -> Result<()> {
     let declared: HashSet<&str> = workflow.inputs.iter().map(|i| i.name.as_str()).collect();
     for name in supplied.keys() {
@@ -71,14 +70,7 @@ pub fn validate_invocation(
             }
             continue;
         };
-        validate_value(
-            &input.name,
-            input.ty,
-            input.optional,
-            value,
-            &roster,
-            &prompt_resolves,
-        )?;
+        validate_value(&input.name, input.ty, input.optional, value, &roster)?;
     }
     Ok(())
 }
@@ -97,9 +89,8 @@ pub fn bind_invocation(
     workflow: &Workflow,
     supplied: &BTreeMap<String, InputValue>,
     agents: &[String],
-    prompt_resolves: impl Fn(&str) -> bool,
 ) -> Result<BTreeMap<String, ScopeValue>> {
-    validate_invocation(workflow, supplied, agents, &prompt_resolves)?;
+    validate_invocation(workflow, supplied, agents)?;
 
     let mut bound = BTreeMap::new();
     for input in &workflow.inputs {
@@ -122,7 +113,6 @@ fn validate_value(
     optional: bool,
     value: &InputValue,
     roster: &HashSet<String>,
-    prompt_resolves: &impl Fn(&str) -> bool,
 ) -> Result<()> {
     // Shape: list types need a list value; scalar types need a scalar.
     match (ty.is_list(), value) {
@@ -153,14 +143,6 @@ fn validate_value(
                 }
                 other => other,
             })?;
-        }
-        (InputType::PromptId, InputValue::Text(v)) => {
-            require_non_empty(name, optional, v)?;
-            if !prompt_resolves(v) {
-                return Err(WorkflowError::invocation(format!(
-                    "input {name:?}: prompt id {v:?} does not resolve through configured providers"
-                )));
-            }
         }
         (InputType::Text, InputValue::Text(v)) => require_non_empty(name, optional, v)?,
         // `[text]` lists may be empty (used by `for_each`); no per-item checks.
@@ -254,28 +236,24 @@ mod tests {
         InputValue::List(items.iter().map(|s| (*s).to_owned()).collect())
     }
 
-    fn always(_: &str) -> bool {
-        true
-    }
-
     #[test]
     fn missing_required_input_is_rejected() {
         let wf = workflow("  goal: text\n");
-        let err = validate_invocation(&wf, &BTreeMap::new(), &agents(), always).unwrap_err();
+        let err = validate_invocation(&wf, &BTreeMap::new(), &agents()).unwrap_err();
         assert!(err.to_string().contains("required input"), "got: {err}");
     }
 
     #[test]
     fn optional_text_input_may_be_omitted() {
         let wf = workflow("  ctx: text?\n");
-        validate_invocation(&wf, &BTreeMap::new(), &agents(), always).unwrap();
+        validate_invocation(&wf, &BTreeMap::new(), &agents()).unwrap();
     }
 
     #[test]
     fn required_text_must_not_be_blank() {
         let wf = workflow("  goal: text\n");
-        let err = validate_invocation(&wf, &supply(vec![("goal", text("   "))]), &agents(), always)
-            .unwrap_err();
+        let err =
+            validate_invocation(&wf, &supply(vec![("goal", text("   "))]), &agents()).unwrap_err();
         assert!(err.to_string().contains("blank"), "got: {err}");
     }
 
@@ -283,72 +261,37 @@ mod tests {
     fn agent_input_existence_is_checked_with_normalization() {
         let wf = workflow("  a: agent\n");
         // "Reviewer-1" normalizes to the same key as roster "reviewer-1".
-        validate_invocation(
-            &wf,
-            &supply(vec![("a", text("Reviewer-1"))]),
-            &agents(),
-            always,
-        )
-        .unwrap();
-        let err = validate_invocation(&wf, &supply(vec![("a", text("ghost"))]), &agents(), always)
-            .unwrap_err();
+        validate_invocation(&wf, &supply(vec![("a", text("Reviewer-1"))]), &agents()).unwrap();
+        let err =
+            validate_invocation(&wf, &supply(vec![("a", text("ghost"))]), &agents()).unwrap_err();
         assert!(err.to_string().contains("does not exist"), "got: {err}");
     }
 
     #[test]
     fn agent_list_empty_duplicate_and_missing_are_rejected() {
         let wf = workflow("  rs: [agent]\n");
-        assert!(
-            validate_invocation(&wf, &supply(vec![("rs", list(&[]))]), &agents(), always).is_err()
-        );
+        assert!(validate_invocation(&wf, &supply(vec![("rs", list(&[]))]), &agents()).is_err());
         // reviewer-1 and reviewer_1 normalize equal → duplicate.
         assert!(
             validate_invocation(
                 &wf,
                 &supply(vec![("rs", list(&["reviewer-1", "reviewer_1"]))]),
                 &agents(),
-                always
             )
             .unwrap_err()
             .to_string()
             .contains("duplicate")
         );
         assert!(
-            validate_invocation(
-                &wf,
-                &supply(vec![("rs", list(&["ghost"]))]),
-                &agents(),
-                always
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("does not exist")
+            validate_invocation(&wf, &supply(vec![("rs", list(&["ghost"]))]), &agents(),)
+                .unwrap_err()
+                .to_string()
+                .contains("does not exist")
         );
         validate_invocation(
             &wf,
             &supply(vec![("rs", list(&["reviewer-1", "reviewer-2"]))]),
             &agents(),
-            always,
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn prompt_id_must_resolve() {
-        let wf = workflow("  p: prompt_id\n");
-        let err = validate_invocation(
-            &wf,
-            &supply(vec![("p", text("local:nope"))]),
-            &agents(),
-            |_| false,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("does not resolve"), "got: {err}");
-        validate_invocation(
-            &wf,
-            &supply(vec![("p", text("local:ok"))]),
-            &agents(),
-            |id| id == "local:ok",
         )
         .unwrap();
     }
@@ -357,19 +300,14 @@ mod tests {
     fn shape_mismatch_is_rejected() {
         let scalar = workflow("  a: agent\n");
         assert!(
-            validate_invocation(
-                &scalar,
-                &supply(vec![("a", list(&["x"]))]),
-                &agents(),
-                always
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("not a list")
+            validate_invocation(&scalar, &supply(vec![("a", list(&["x"]))]), &agents(),)
+                .unwrap_err()
+                .to_string()
+                .contains("not a list")
         );
         let listed = workflow("  rs: [agent]\n");
         assert!(
-            validate_invocation(&listed, &supply(vec![("rs", text("x"))]), &agents(), always)
+            validate_invocation(&listed, &supply(vec![("rs", text("x"))]), &agents())
                 .unwrap_err()
                 .to_string()
                 .contains("expects a list")
@@ -383,7 +321,6 @@ mod tests {
             &wf,
             &supply(vec![("goal", text("g")), ("bogus", text("x"))]),
             &agents(),
-            always,
         )
         .unwrap_err();
         assert!(err.to_string().contains("not declared"), "got: {err}");
@@ -393,7 +330,7 @@ mod tests {
     fn empty_text_list_is_allowed() {
         // [text] (unlike [agent]) may be empty — it feeds `for_each`.
         let wf = workflow("  ms: [text]\n");
-        validate_invocation(&wf, &supply(vec![("ms", list(&[]))]), &agents(), always).unwrap();
+        validate_invocation(&wf, &supply(vec![("ms", list(&[]))]), &agents()).unwrap();
     }
 
     #[test]
@@ -401,8 +338,7 @@ mod tests {
         // The footgun this guards: omit `ctx` (text?), and without binding its
         // default a later `{{ ctx }}` render would fail strict-undefined.
         let wf = workflow("  goal: text\n  ctx: text?\n");
-        let bound =
-            bind_invocation(&wf, &supply(vec![("goal", text("g"))]), &agents(), always).unwrap();
+        let bound = bind_invocation(&wf, &supply(vec![("goal", text("g"))]), &agents()).unwrap();
         assert_eq!(bound.get("goal"), Some(&ScopeValue::Text("g".to_owned())));
         assert_eq!(bound.get("ctx"), Some(&ScopeValue::Text(String::new())));
     }
@@ -411,7 +347,7 @@ mod tests {
     fn bind_uses_explicit_long_form_default() {
         let yaml = "name: wf\ndescription: d\ninputs:\n  ctx:\n    type: text\n    default: fallback\nsteps:\n  - send: {to: a, text: t}\n";
         let wf = parse_workflow("wf", yaml).unwrap();
-        let bound = bind_invocation(&wf, &BTreeMap::new(), &agents(), always).unwrap();
+        let bound = bind_invocation(&wf, &BTreeMap::new(), &agents()).unwrap();
         assert_eq!(
             bound.get("ctx"),
             Some(&ScopeValue::Text("fallback".to_owned()))
@@ -425,7 +361,6 @@ mod tests {
             &wf,
             &supply(vec![("a", text("primary")), ("rs", list(&["reviewer-1"]))]),
             &agents(),
-            always,
         )
         .unwrap();
         assert_eq!(
@@ -442,7 +377,6 @@ mod tests {
                 &wf,
                 &supply(vec![("a", text("ghost")), ("rs", list(&["reviewer-1"]))]),
                 &agents(),
-                always
             )
             .is_err()
         );

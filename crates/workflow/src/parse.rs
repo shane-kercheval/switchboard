@@ -175,8 +175,8 @@ fn parse_input_decl(name: &str, decl: &Value) -> Result<InputDecl> {
 
     let (ty, optional_suffix) = parse_type_value(name, &type_value)?;
     // Optionality (via `?` or a `default`) is a `text`-only concept in v1: `?` is
-    // already rejected on non-text, and a `default` on `agent` / `prompt_id` / a
-    // list type would make an optional non-text input (deferred to v2) — and an
+    // already rejected on non-text, and a `default` on `agent` / a list type would
+    // make an optional non-text input (deferred to v2) — and an
     // optional `[agent]` would contradict the "every agent list is non-empty"
     // rule. Rejecting it here keeps default-binding unambiguous (only text
     // defaults exist) rather than inventing list-default semantics.
@@ -234,9 +234,10 @@ fn parse_type_value(name: &str, value: &Value) -> Result<(InputType, bool)> {
 }
 
 /// Map a scalar type shorthand to [`InputType`] + whether it carried the optional
-/// `?`. `?` is valid only on `text` in v1 (`agent?` / `prompt_id?` are deferred).
-/// The bracketed string forms `"[agent]"` / `"[text]"` are accepted here too, for
-/// when a long-form `type` is written as a quoted string.
+/// `?`. `?` is valid only on `text` in v1 (`agent?` is deferred). The bracketed
+/// string forms `"[agent]"` / `"[text]"` are accepted here too, for when a
+/// long-form `type` is written as a quoted string. `prompt_id` is not a type — a
+/// step hardcodes its prompt — so it falls through to the unknown-type error.
 fn parse_input_type(name: &str, raw: &str) -> Result<(InputType, bool)> {
     let (base, optional) = raw
         .strip_suffix('?')
@@ -244,12 +245,11 @@ fn parse_input_type(name: &str, raw: &str) -> Result<(InputType, bool)> {
     let ty = match base {
         "agent" => InputType::Agent,
         "[agent]" => InputType::AgentList,
-        "prompt_id" => InputType::PromptId,
         "text" => InputType::Text,
         "[text]" => InputType::TextList,
         other => {
             return Err(WorkflowError::validation(format!(
-                "input {name:?} has unknown type {other:?} (expected agent, [agent], prompt_id, text, text?, or [text])"
+                "input {name:?} has unknown type {other:?} (expected agent, [agent], text, text?, or [text])"
             )));
         }
     };
@@ -337,7 +337,7 @@ fn parse_send(body: &serde_norway::Mapping, ctx: &str) -> Result<Step> {
         .ok_or_else(|| WorkflowError::validation(format!("{ctx}: `send` requires `to`")))?;
     check_agent_literal(&to, &format!("{ctx} send.to"))?;
 
-    let prompt = opt_templated_string(body, "prompt", &format!("{ctx} send.prompt"))?;
+    let prompt = opt_literal_string(body, "prompt", &format!("{ctx} send.prompt"))?;
     let text = opt_templated_string(body, "text", &format!("{ctx} send.text"))?;
     if prompt.is_some() && text.is_some() {
         return Err(WorkflowError::validation(format!(
@@ -599,6 +599,33 @@ fn req_templated_string(map: &serde_norway::Mapping, key: &str, field: &str) -> 
         .ok_or_else(|| WorkflowError::validation(format!("{field} is required")))
 }
 
+/// Parse a field that must be a **literal** string — no template delimiters. Used
+/// for `send.prompt`: a step names a specific prompt id, never a templated value.
+/// A templated prompt id would make the prompt's argument schema depend on a form
+/// value, so the app couldn't statically derive the invocation form from it. The
+/// pure crate validates the string-level invariant (reject `{{` / `{%`); parsing
+/// the literal into a `PromptId` stays in the app layer (crate-purity boundary).
+fn opt_literal_string(
+    map: &serde_norway::Mapping,
+    key: &str,
+    field: &str,
+) -> Result<Option<String>> {
+    match map.get(key) {
+        None => Ok(None),
+        Some(Value::String(s)) => {
+            if s.contains("{{") || s.contains("{%") {
+                return Err(WorkflowError::validation(format!(
+                    "{field} must be a literal prompt id (e.g. `builtin:code-review`), not a template"
+                )));
+            }
+            Ok(Some(s.clone()))
+        }
+        Some(_) => Err(WorkflowError::validation(format!(
+            "{field} must be a string"
+        ))),
+    }
+}
+
 /// `[a-z][a-z0-9-]*` — the workflow `name` slug (hyphens).
 fn is_workflow_slug(s: &str) -> bool {
     let mut chars = s.chars();
@@ -699,7 +726,7 @@ mod tests {
 
     #[test]
     fn input_type_grammar() {
-        let yaml = "name: wf\ndescription: d\ninputs:\n  a: agent\n  b: [agent]\n  p: prompt_id\n  t: text\n  o: text?\n  l: [text]\nsteps:\n  - send: {to: \"{{ a }}\", text: x}\n";
+        let yaml = "name: wf\ndescription: d\ninputs:\n  a: agent\n  b: [agent]\n  t: text\n  o: text?\n  l: [text]\nsteps:\n  - send: {to: \"{{ a }}\", text: x}\n";
         let wf = parse(yaml).unwrap();
         let types: Vec<_> = wf
             .inputs
@@ -708,15 +735,47 @@ mod tests {
             .collect();
         assert_eq!(types[0], ("a", InputType::Agent, false));
         assert_eq!(types[1], ("b", InputType::AgentList, false));
-        assert_eq!(types[2], ("p", InputType::PromptId, false));
-        assert_eq!(types[3], ("t", InputType::Text, false));
-        assert_eq!(types[4], ("o", InputType::Text, true)); // text? → optional
-        assert_eq!(types[5], ("l", InputType::TextList, false));
+        assert_eq!(types[2], ("t", InputType::Text, false));
+        assert_eq!(types[3], ("o", InputType::Text, true)); // text? → optional
+        assert_eq!(types[4], ("l", InputType::TextList, false));
     }
 
     #[test]
     fn unknown_input_type_is_rejected() {
         assert!(err_msg("name: wf\ndescription: d\ninputs:\n  x: widget\nsteps:\n  - send: {to: a, text: b}\n").contains("unknown type"));
+    }
+
+    #[test]
+    fn prompt_id_input_type_is_rejected() {
+        // `prompt_id` is no longer a type — a step hardcodes its prompt instead.
+        let err = err_msg(
+            "name: wf\ndescription: d\ninputs:\n  p: prompt_id\nsteps:\n  - send: {to: a, text: b}\n",
+        );
+        assert!(err.contains("unknown type"), "got: {err}");
+        assert!(
+            err.contains("prompt_id"),
+            "error should name the bad type: {err}"
+        );
+    }
+
+    #[test]
+    fn send_prompt_must_be_a_literal_not_a_template() {
+        let err = err_msg(
+            "name: wf\ndescription: d\ninputs:\n  p: text\nsteps:\n  - send: {to: a, prompt: \"{{ p }}\"}\n",
+        );
+        assert!(err.contains("literal prompt id"), "got: {err}");
+    }
+
+    #[test]
+    fn send_prompt_literal_id_parses_and_round_trips() {
+        let wf = parse(
+            "name: wf\ndescription: d\nsteps:\n  - send: {to: a, prompt: \"builtin:code-review\"}\n",
+        )
+        .unwrap();
+        let Step::Send(send) = &wf.steps[0] else {
+            panic!()
+        };
+        assert_eq!(send.prompt.as_deref(), Some("builtin:code-review"));
     }
 
     #[test]
@@ -738,9 +797,9 @@ mod tests {
 
     #[test]
     fn default_on_non_text_type_is_rejected() {
-        // Optionality is text-only in v1; a default on a list/agent/prompt_id type
-        // would create an unsupported optional non-text input.
-        for ty in ["agent", "[agent]", "prompt_id", "[text]"] {
+        // Optionality is text-only in v1; a default on a list/agent type would
+        // create an unsupported optional non-text input.
+        for ty in ["agent", "[agent]", "[text]"] {
             let yaml = format!(
                 "name: wf\ndescription: d\ninputs:\n  x:\n    type: {ty}\n    default: v\nsteps:\n  - send: {{to: a, text: t}}\n"
             );

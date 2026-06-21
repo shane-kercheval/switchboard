@@ -1,5 +1,10 @@
 name: review-analyze-discuss
 description: Reviewers review in parallel, a worker distills their feedback into a decision-ready verdict, the reviewers respond to it, and the worker gives a final recommendation.
+# Both prompts are hardcoded: `builtin:code-review` for the reviewers and
+# `builtin:ai-review-feedback` for the worker's analysis. code-review's `context`
+# argument is auto-derived from the prompt and offered as a user-fillable field;
+# ai-review-feedback's required `review` argument is a computed binding (filled
+# from the reviewers' aggregated responses) and never shown to the user.
 inputs:
   reviewers:
     type: [agent]
@@ -7,26 +12,15 @@ inputs:
   worker:
     type: agent
     description: The agent that distills the reviewers' feedback into a verdict, weighs their pushback, and gives the final recommendation.
-  review_prompt:
-    type: prompt_id
-    description: The prompt sent to each reviewer at the start.
-  analysis_prompt:
-    type: prompt_id
-    description: The prompt sent to the worker to distill the reviewers' feedback (their combined responses fill its `review` variable).
-  context:
-    type: text?
-    description: Optional background handed to each reviewer alongside the review prompt (fills the prompt's `context` variable).
 steps:
   - send:
       to: "{{ reviewers }}"
-      prompt: "{{ review_prompt }}"
-      template_vars:
-        context: "{{ context }}"
+      prompt: "builtin:code-review"
   - wait_for_all:
       agents: "{{ reviewers }}"
   - send:
       to: "{{ worker }}"
-      prompt: "{{ analysis_prompt }}"
+      prompt: "builtin:ai-review-feedback"
       template_vars:
         review: "{{ aggregated_responses(reviewers) }}"
   - wait_for:

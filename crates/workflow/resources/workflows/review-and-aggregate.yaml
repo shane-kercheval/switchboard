@@ -1,5 +1,8 @@
 name: review-and-aggregate
-description: Fan a review prompt out to several reviewers in parallel, then hand the combined feedback to a worker agent for recommendations.
+description: Fan a code review out to several reviewers in parallel, then hand the combined feedback to a worker agent for recommendations.
+# The review prompt is hardcoded (`builtin:code-review`). Its `context` argument
+# is not declared as an input — it is auto-derived from the prompt and offered as
+# a user-fillable field at invocation.
 inputs:
   reviewers:
     type: [agent]
@@ -7,18 +10,10 @@ inputs:
   worker:
     type: agent
     description: The agent that receives every reviewer's combined feedback and produces the recommendations.
-  review_prompt:
-    type: prompt_id
-    description: The prompt sent to each reviewer at the start.
-  context:
-    type: text?
-    description: Optional background handed to each reviewer alongside the review prompt (fills the prompt's `context` variable). The worker never sees this directly — only the reviewers' responses.
 steps:
   - send:
       to: "{{ reviewers }}"
-      prompt: "{{ review_prompt }}"
-      template_vars:
-        context: "{{ context }}"
+      prompt: "builtin:code-review"
   - wait_for_all:
       agents: "{{ reviewers }}"
   - send:

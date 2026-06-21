@@ -3719,6 +3719,12 @@ fn merge_project_conversation(
     // badge comes from its Outcome marker, which renders alongside the turn
     // (`ProjectConversation` render-both contract).
     let mut agent_sends: HashMap<AgentId, Vec<SendId>> = HashMap::new();
+    // Each agent's earliest journaled-send instant — the boundary between its
+    // pre-journaling history (attached/imported turns, older than this) and its
+    // Switchboard-dispatched turns. Used to count an agent's leading imported
+    // turns by timestamp rather than by `min(turns, sends)`, which can't tell a
+    // leading imported turn from a trailing in-flight send when both are present.
+    let mut journal_start: HashMap<AgentId, chrono::DateTime<chrono::Utc>> = HashMap::new();
     for record in journal {
         match record {
             switchboard_core::JournalRecord::Send {
@@ -3730,6 +3736,14 @@ fn merge_project_conversation(
                 at,
             } => {
                 agent_sends.entry(agent_id).or_default().push(send_id);
+                journal_start
+                    .entry(agent_id)
+                    .and_modify(|earliest| {
+                        if at < *earliest {
+                            *earliest = at;
+                        }
+                    })
+                    .or_insert(at);
                 if let Some(&i) = index_of.get(&send_id) {
                     let entry = &mut user_messages[i];
                     if !entry.1.contains(&agent_id) {
@@ -3814,6 +3828,19 @@ fn merge_project_conversation(
         // duplicated or missing prompt. Pinned by characterization tests below;
         // the deferred durable key-join (plan doc) dissolves it.
         //
+        // `turn_offset` is the count of the agent's leading **imported** turns
+        // (pre-journaling history). Counting it as `agent_turns - min(turns, sends)`
+        // is wrong when the file has BOTH leading imported turns AND a trailing
+        // in-flight send: the `min` cancels them against each other, so the offset
+        // collapses to zero, the in-flight send is treated as already answered, and
+        // its dangling harness user turn is mis-rendered as an imported prompt — a
+        // duplicate of the journal's copy (the reported "prompt twice while
+        // Working…" bug). Instead, split at the agent's first journaled send: a turn
+        // older than that instant is pre-journaling (no send), a turn at/after it is
+        // Switchboard-dispatched. Imported turns are always the *leading* ones (the
+        // session file is chronological and history predates the first dispatch), so
+        // a count of them is exactly `turn_offset`.
+        //
         // User turns are classified by their REPLY, not by a suffix count — so a
         // non-journaled prompt that lands *after* journaled history (e.g. the user
         // ran the CLI directly in the same dir between Switchboard sessions) is
@@ -3824,35 +3851,48 @@ fn merge_project_conversation(
         //     journaled (`agent_seen >= turn_offset`).
         //   - A *dangling* user turn (no reply — a cancelled-before-output send or
         //     an in-flight one, or an imported prompt with no reply yet) is
-        //     journaled while sends that produced no harness turn remain to account
-        //     for it (`dangling_journaled` of them = trailing send-excess); beyond
-        //     that it's imported and rendered.
+        //     journaled while sends that produced no journaled reply remain to
+        //     account for it (`dangling_journaled` = sends minus journaled replies);
+        //     beyond that it's imported and rendered.
         // This needs 1:1 prompt/reply alternation in the file (true for Claude and
         // Codex — tool results fold into the agent turn). Two edges remain, BOTH
         // confined to the already-discouraged pattern of running the bare CLI on a
         // session Switchboard is also driving (the resume-in-terminal panel warns
-        // this corrupts the session file), and both pinned by characterization
-        // tests so the behavior stays a conscious decision:
+        // this corrupts the session file), and both pinned by characterization tests
+        // so the behavior stays a conscious decision:
         //   - A send cancelled *before* the harness recorded its prompt has no
         //     harness user turn, so `dangling_journaled` overcounts by one and can
         //     drop a co-occurring imported dangling prompt.
-        //   - Dangling turns are classified front-to-back (the first
-        //     `dangling_journaled` are treated as journaled). If an *imported*
-        //     dangling prompt precedes a *journaled* one (e.g. a bare-CLI prompt,
-        //     then an in-flight Switchboard send), the imported prompt is dropped
-        //     and the journaled one duplicated. Order alone can't disambiguate
-        //     interleaved dangling sources — a timestamp join could, but would be
-        //     inconsistent with the order-based agent-side correlation above.
-        // Both mirror the order assumptions the agent-side front-alignment already
-        // makes.
+        //   - Among reply-less *dangling* turns, classification is still front-to-
+        //     back (the first `dangling_journaled` are treated as journaled). If an
+        //     *imported* dangling prompt precedes a *journaled* one (a bare-CLI
+        //     prompt, then an in-flight Switchboard send, with no reply to either),
+        //     the imported prompt is dropped and the journaled one duplicated. Order
+        //     alone can't disambiguate two reply-less dangling sources. (An imported
+        //     turn that DOES have a reply is handled — the reply has no send slot, so
+        //     the `reply_is_journaled` check below renders its prompt.)
         let agent_turn_count = turns
             .iter()
             .filter(|t| matches!(t, switchboard_harness::Turn::Agent { .. }))
             .count();
         let all_sends = agent_sends.get(&agent_id).map_or(&[][..], Vec::as_slice);
-        let pairs = agent_turn_count.min(all_sends.len());
-        let turn_offset = agent_turn_count - pairs;
-        let dangling_journaled = all_sends.len() - pairs;
+        // Leading imported (pre-journaling) agent turns: those older than the first
+        // journaled send. With no sends, every turn is imported.
+        let turn_offset = match journal_start.get(&agent_id) {
+            Some(&start) => turns
+                .iter()
+                .filter(|t| {
+                    matches!(t, switchboard_harness::Turn::Agent { started_at, .. } if *started_at < start)
+                })
+                .count(),
+            None => agent_turn_count,
+        };
+        // Sends with no journaled reply yet (in-flight, or cancelled/failed before
+        // output) — the trailing send-excess that a dangling harness user turn can
+        // be attributed to. `saturating_sub` guards the bare-CLI-after-journaling
+        // case, where timestamp-journaled replies can outnumber sends.
+        let journaled_replies = agent_turn_count - turn_offset;
+        let dangling_journaled = all_sends.len().saturating_sub(journaled_replies);
         let mut agent_seen = 0usize;
         let mut dangling_seen = 0usize;
         for turn in turns {
@@ -3900,8 +3940,17 @@ fn merge_project_conversation(
                 } => {
                     let imported = if agent_seen < agent_turn_count {
                         // A reply follows (the agent turn at index `agent_seen`):
-                        // imported iff that reply is pre-journaling.
-                        agent_seen < turn_offset
+                        // imported iff that reply is NOT journaled — mirror the
+                        // agent-side `send_id` assignment exactly. A reply is
+                        // journaled only when it sits after the leading imported
+                        // turns AND there is a send slot for it; a reply past the
+                        // last send (e.g. a bare-CLI turn run after journaled
+                        // history) has no send to claim it, so its prompt is
+                        // imported and must render. The `>= turn_offset` guard keeps
+                        // the subtraction from underflowing.
+                        let reply_is_journaled = agent_seen >= turn_offset
+                            && (agent_seen - turn_offset) < all_sends.len();
+                        !reply_is_journaled
                     } else {
                         // Dangling (no reply): journaled while non-completed /
                         // in-flight sends remain to account for it; otherwise it's
@@ -11469,6 +11518,116 @@ mod tests {
             user_msgs,
             vec![("answered", Some(s1)), ("external", None)],
             "journaled prompt once (grouped); external prompt kept (un-grouped)"
+        );
+    }
+
+    #[test]
+    fn merge_external_prompt_with_reply_after_journaled_history_kept() {
+        // Same as the dangling case above, but the external (bare-CLI) prompt got a
+        // reply. The external prompt has no journal `Send`, and neither does its
+        // reply — so the prompt must render (imported, un-grouped) and its reply
+        // must be un-grouped, NOT mis-paired with the journaled send. Classifying
+        // the prompt by `agent_seen < turn_offset` alone drops it (its reply is
+        // after the journaling boundary, so it isn't a *leading* imported turn);
+        // mirroring the reply's actual send attribution keeps it.
+        let agent = Uuid::now_v7();
+        let s1 = Uuid::now_v7();
+        let journal = vec![send_record(s1, Uuid::now_v7(), agent, "answered", 0)];
+        let transcript = transcript_of(vec![
+            user_turn(Uuid::now_v7(), agent, "answered", 0),
+            agent_turn(Uuid::now_v7(), agent, "reply", 1),
+            user_turn(Uuid::now_v7(), agent, "external", 2),
+            agent_turn(Uuid::now_v7(), agent, "external reply", 3),
+        ]);
+
+        let merged = merge_project_conversation(journal, vec![(agent, transcript, None)]);
+
+        let user_msgs: Vec<(&str, Option<SendId>)> = merged
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                ConversationItem::UserMessage { text, send_id, .. } => {
+                    Some((text.as_str(), *send_id))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            user_msgs,
+            vec![("answered", Some(s1)), ("external", None)],
+            "journaled prompt once (grouped); external prompt with a reply kept (un-grouped)"
+        );
+
+        // The external reply must not steal the journaled send: it is un-grouped.
+        let send_at = |t: i64| {
+            merged.items.iter().find_map(|i| match i {
+                ConversationItem::AgentTurn {
+                    started_at,
+                    send_id,
+                    ..
+                } if *started_at == at(t) => Some(*send_id),
+                _ => None,
+            })
+        };
+        assert_eq!(send_at(1), Some(Some(s1)), "journaled reply keeps its send");
+        assert_eq!(send_at(3), Some(None), "external reply un-grouped");
+    }
+
+    #[test]
+    fn merge_in_flight_send_after_imported_history_not_duplicated() {
+        // The reported "prompt rendered twice while Working…" bug. An attached
+        // session carries pre-journaling history (a prompt + reply with no `Send`),
+        // then a prompt dispatched through Switchboard that is still in-flight
+        // (`Send`, no `Outcome`, no agent reply yet). A mid-flight re-parse (the
+        // user navigates away and back while the agent works) must render the
+        // in-flight prompt EXACTLY ONCE — from the journal `Send` — and keep the
+        // imported prompt.
+        //
+        // A count-only correlation (`pairs = min(agent_turns, sends)`) conflates the
+        // single leading imported agent turn with the single trailing in-flight
+        // send, computes `dangling_journaled = 0`, and so classifies the in-flight
+        // harness user turn as *imported* — emitting a second `UserMessage`
+        // (`send_id: None`) that the frontend's live-send suppression can't catch
+        // (it only drops rows that carry a `send_id`). Splitting imported from
+        // journaled agent turns at the first send's timestamp fixes the count.
+        let agent = Uuid::now_v7();
+        let send_id = Uuid::now_v7();
+        let journal = vec![send_record(send_id, Uuid::now_v7(), agent, "in flight", 2)];
+        let transcript = transcript_of(vec![
+            user_turn(Uuid::now_v7(), agent, "old prompt", 0),
+            agent_turn(Uuid::now_v7(), agent, "old reply", 1),
+            user_turn(Uuid::now_v7(), agent, "in flight", 2),
+        ]);
+
+        let merged = merge_project_conversation(journal, vec![(agent, transcript, None)]);
+
+        let user_msgs: Vec<(&str, Option<SendId>)> = merged
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                ConversationItem::UserMessage { text, send_id, .. } => {
+                    Some((text.as_str(), *send_id))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            user_msgs,
+            vec![("old prompt", None), ("in flight", Some(send_id))],
+            "imported prompt kept (un-grouped); in-flight prompt rendered once from \
+             the journal Send, not duplicated as an imported harness user turn"
+        );
+
+        // The pre-journaling reply stays un-grouped (no send); it must NOT be
+        // mis-paired with the in-flight send.
+        let old_reply_send = merged.items.iter().find_map(|i| match i {
+            ConversationItem::AgentTurn { send_id, .. } => Some(*send_id),
+            _ => None,
+        });
+        assert_eq!(
+            old_reply_send,
+            Some(None),
+            "the pre-journaling reply is un-grouped, not stamped with the in-flight send"
         );
     }
 

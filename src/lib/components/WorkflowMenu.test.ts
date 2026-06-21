@@ -20,9 +20,10 @@ function listing(over: Partial<WorkflowListing> = {}): WorkflowListing {
 function setup(workflows: WorkflowListing[]) {
   const onpick = vi.fn();
   const oncopy = vi.fn();
+  const onopenfolder = vi.fn();
   const onclose = vi.fn();
-  render(WorkflowMenu, { props: { workflows, onpick, oncopy, onclose } });
-  return { onpick, oncopy, onclose };
+  render(WorkflowMenu, { props: { workflows, onpick, oncopy, onopenfolder, onclose } });
+  return { onpick, oncopy, onopenfolder, onclose };
 }
 
 describe("WorkflowMenu", () => {
@@ -75,5 +76,11 @@ describe("WorkflowMenu", () => {
       target: { value: "zzz" },
     });
     expect(screen.getByTestId("workflow-menu-empty")).toHaveTextContent("No matching workflows");
+  });
+
+  it("offers an open-folder action", async () => {
+    const { onopenfolder } = setup([listing()]);
+    await fireEvent.click(screen.getByTestId("workflow-menu-open-folder"));
+    expect(onopenfolder).toHaveBeenCalledTimes(1);
   });
 });

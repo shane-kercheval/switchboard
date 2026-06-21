@@ -260,7 +260,6 @@
   let promptAppendedSources = $state<ForwardSource[]>([]);
   let appendedText = $state<string>("");
   let promptMenuOpen = $state(false);
-  let promptMenuWrapEl = $state<HTMLDivElement | undefined>(undefined);
   let prompts = $state<Prompt[]>([]);
   let focusPromptFieldOnMount = $state(false);
   // Whether the cache has been read at least once, so the picker can show a
@@ -930,12 +929,39 @@
     return () => document.removeEventListener("pointerdown", onPointerDown);
   });
 
-  // Click-outside closes the prompt picker (its own Escape/pick also close it).
+  // Click-outside closes the prompt / workflow pickers (their own Escape/pick
+  // also close them). "Outside" is anything that isn't the menu itself or its
+  // trigger button: scoping to the menu — rather than the whole compose box —
+  // is what lets a click on the textarea dismiss it, and excluding the trigger
+  // keeps a click there from closing-then-reopening (the trigger owns its own
+  // toggle).
+  function closeMenuOnOutsidePointer(
+    e: PointerEvent,
+    menuTestid: string,
+    triggerTestid: string,
+    close: () => void,
+  ): void {
+    const el = e.target instanceof Element ? e.target : null;
+    if (el?.closest(`[data-testid="${menuTestid}"]`)) return;
+    if (el?.closest(`[data-testid="${triggerTestid}"]`)) return;
+    close();
+  }
   $effect(() => {
     if (!promptMenuOpen) return;
     function onPointerDown(e: PointerEvent): void {
-      if (promptMenuWrapEl?.contains(e.target as Node)) return;
-      promptMenuOpen = false;
+      closeMenuOnOutsidePointer(e, "prompt-menu", "compose-prompt-button", () => {
+        promptMenuOpen = false;
+      });
+    }
+    document.addEventListener("pointerdown", onPointerDown);
+    return () => document.removeEventListener("pointerdown", onPointerDown);
+  });
+  $effect(() => {
+    if (!workflowMenuOpen) return;
+    function onPointerDown(e: PointerEvent): void {
+      closeMenuOnOutsidePointer(e, "workflow-menu", "compose-workflow-button", () => {
+        workflowMenuOpen = false;
+      });
     }
     document.addEventListener("pointerdown", onPointerDown);
     return () => document.removeEventListener("pointerdown", onPointerDown);
@@ -1017,6 +1043,7 @@
 
   function openPromptMenu(): void {
     closeMentionMenu();
+    workflowMenuOpen = false;
     void loadPrompts();
     promptMenuOpen = true;
   }
@@ -1067,7 +1094,7 @@
 
   async function loadWorkflows(): Promise<void> {
     try {
-      const list = await api.listWorkflows(projectId);
+      const list = await api.listWorkflows();
       workflows = Array.isArray(list) ? list : [];
     } catch {
       workflows = [];
@@ -1112,12 +1139,18 @@
 
   async function copyWorkflow(workflow: WorkflowListing): Promise<void> {
     try {
-      await api.copyBuiltinWorkflow(projectId, workflow.name);
+      await api.copyBuiltinWorkflow(workflow.name);
       await loadWorkflows();
       sendError = null;
     } catch (err) {
       sendError = `Couldn't copy workflow: ${err instanceof Error ? err.message : String(err)}`;
     }
+  }
+
+  function openWorkflowsFolder(): void {
+    void api.openWorkflowsDir().catch((err: unknown) => {
+      console.error("[switchboard] open workflows folder failed", err);
+    });
   }
 
   /// Required workflow inputs left unfilled (mirrors WorkflowComposer's gate), so
@@ -1585,7 +1618,6 @@
     )}
     data-testid="compose-box"
     data-drag-over={dragOver}
-    bind:this={promptMenuWrapEl}
   >
     {#if promptMenuOpen}
       <!-- Full compose-box width, floating just above the box (anchored to its
@@ -1604,6 +1636,7 @@
         loading={!workflowsLoaded}
         onpick={pickWorkflow}
         oncopy={copyWorkflow}
+        onopenfolder={openWorkflowsFolder}
         onclose={() => (workflowMenuOpen = false)}
       />
     {/if}
@@ -1890,8 +1923,8 @@
         {/each}
       </div>
     {/if}
-    <div class="mb-1.5 flex items-start justify-between gap-2">
-      {#if agents.length > 1 && mode !== "workflow"}
+    {#snippet recipientChips()}
+      {#if agents.length > 1}
         <div class="flex flex-wrap items-center gap-1.5 text-xs" data-testid="recipient-field">
           <span class="text-muted">To</span>
           {#each agents as agent, i (agent.id)}
@@ -1996,14 +2029,17 @@
             </Tooltip>
           {/if}
         </div>
-      {:else}
-        <div></div>
       {/if}
-      <div class="flex shrink-0 items-center gap-1">
-        {#if mode === "plain"}
-          <!-- Plain-mode only: prompt mode forwards per-field, and workflow mode
-               routes via its agent inputs, so the message-level ↪ Forward button
-               is hidden in both. -->
+    {/snippet}
+
+    {#if mode === "plain"}
+      <!-- Plain mode owns the To row + the message-level entry points. In prompt
+           mode the To row is handed to the composer (so the prompt name titles
+           the whole thing, above the recipients); workflow mode routes via its
+           own agent inputs, so neither shows. -->
+      <div class="mb-1.5 flex items-start justify-between gap-2">
+        <div class="min-w-0">{@render recipientChips()}</div>
+        <div class="flex shrink-0 items-center gap-1">
           <ForwardSourcePicker
             {agents}
             panes={paneLayout.panes}
@@ -2021,8 +2057,6 @@
               sending ? "cursor-not-allowed opacity-60" : "",
             )}
           />
-        {/if}
-        {#if mode !== "workflow"}
           <Tooltip label="Insert a prompt" shortcut={shortcut("/")}>
             {#snippet trigger(props)}
               <button
@@ -2059,8 +2093,6 @@
               </button>
             {/snippet}
           </Tooltip>
-        {/if}
-        {#if mode !== "prompt"}
           <Tooltip label="Run a workflow">
             {#snippet trigger(props)}
               <button
@@ -2097,9 +2129,9 @@
               </button>
             {/snippet}
           </Tooltip>
-        {/if}
+        </div>
       </div>
-    </div>
+    {/if}
 
     {#if attachmentChips.length > 0}
       <div class="mb-1.5 flex flex-wrap gap-1.5" data-testid="attachment-chips">
@@ -2154,47 +2186,45 @@
       <!-- Workflow mode: the invocation form spans the compose area. The compose
            bar's To field + message forwards are hidden (the workflow routes via
            its agent inputs); the run launches in the background. -->
-      <div class="mt-2">
-        <WorkflowComposer
-          workflow={selectedWorkflow}
-          {agents}
-          {prompts}
-          bind:inputs={workflowInputs}
-          onremove={removeWorkflow}
-        >
-          {#snippet invoke()}
-            <Button
-              variant="primary"
-              size="sm"
-              data-testid="workflow-invoke-button"
-              disabled={workflowMissing.length > 0 || invokingWorkflow}
-              onclick={() => void invokeWorkflowAction()}
-            >
-              {invokingWorkflow ? "Starting…" : "Run workflow"}
-            </Button>
-          {/snippet}
-        </WorkflowComposer>
-      </div>
+      <WorkflowComposer
+        workflow={selectedWorkflow}
+        {agents}
+        {prompts}
+        panes={paneLayout.panes}
+        bind:inputs={workflowInputs}
+        onremove={removeWorkflow}
+      >
+        {#snippet invoke()}
+          <Button
+            variant="primary"
+            size="sm"
+            data-testid="workflow-invoke-button"
+            disabled={workflowMissing.length > 0 || invokingWorkflow}
+            onclick={() => void invokeWorkflowAction()}
+          >
+            {invokingWorkflow ? "Starting…" : "Run workflow"}
+          </Button>
+        {/snippet}
+      </WorkflowComposer>
     {:else if mode === "prompt" && selectedPrompt !== null}
-      <!-- Prompt mode stacks full-width: the argument/appended boxes span the
-           whole compose area; the send button sits in the composer's footer row
-           beside Preview (passed down as a snippet). -->
-      <div class="mt-2">
-        <PromptComposer
-          prompt={selectedPrompt}
-          bind:args={promptArgs}
-          bind:appendedText
-          bind:argSources={promptArgSources}
-          bind:appendedSources={promptAppendedSources}
-          {agents}
-          panes={paneLayout.panes}
-          agentHasOutput={agentHasCompletedOutput}
-          focusFirstField={focusPromptFieldOnMount}
-          onremove={removePrompt}
-          busy={sending}
-          send={sendButton}
-        />
-      </div>
+      <!-- Prompt mode stacks full-width: the prompt name titles the area, the To
+           row sits just under it (handed in as a snippet), then the argument /
+           appended boxes; the send button rides the composer's footer row. -->
+      <PromptComposer
+        prompt={selectedPrompt}
+        bind:args={promptArgs}
+        bind:appendedText
+        bind:argSources={promptArgSources}
+        bind:appendedSources={promptAppendedSources}
+        {agents}
+        panes={paneLayout.panes}
+        agentHasOutput={agentHasCompletedOutput}
+        focusFirstField={focusPromptFieldOnMount}
+        onremove={removePrompt}
+        recipients={recipientChips}
+        busy={sending}
+        send={sendButton}
+      />
     {:else}
       <div class="relative flex items-end gap-2">
         <Textarea

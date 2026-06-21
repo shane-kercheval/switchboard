@@ -16,6 +16,8 @@ const defaultInvoke = async (cmd: string, _args?: Record<string, unknown>): Prom
   if (cmd === "list_mcp_providers") return []; // embedded McpServersSettings loads on mount
   if (cmd === "local_prompts_dir")
     return "/Users/test/Library/Application Support/switchboard/prompts";
+  if (cmd === "workflows_dir")
+    return "/Users/test/Library/Application Support/switchboard/workflows";
   return null; // auth probes resolve = authenticated
 };
 const invokeMock = vi.fn(defaultInvoke);
@@ -245,5 +247,19 @@ describe("SettingsView", () => {
     await fireEvent.click(screen.getByTestId("local-prompts-open"));
 
     expect(invokeMock).toHaveBeenCalledWith("open_local_prompts_dir", undefined);
+  });
+
+  it("shows the user-global workflows folder and opens it in Finder", async () => {
+    render(SettingsView, { props: { onClose: vi.fn() } });
+
+    await waitFor(() =>
+      expect(screen.getByTestId("workflows-dir")).toHaveTextContent(
+        "/Users/test/Library/Application Support/switchboard/workflows",
+      ),
+    );
+
+    await fireEvent.click(screen.getByTestId("workflows-open"));
+
+    expect(invokeMock).toHaveBeenCalledWith("open_workflows_dir", undefined);
   });
 });

@@ -25,7 +25,7 @@ use switchboard_workflow::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::commands::{adapter_for, resolve_owning_directory};
+use crate::commands::adapter_for;
 use crate::dispatch_context::ProjectDispatchContextFactory;
 use crate::error::AppError;
 use crate::state::{ActiveRun, AppState, RunSnapshot, lock};
@@ -315,27 +315,25 @@ fn builtin_listing(workflow: &Workflow) -> WorkflowListing {
 
 // --- list --------------------------------------------------------------------
 
-/// All workflows available to `project_id`: the read-only built-in library
-/// (governed by the `show_builtins` preference) merged with the project
-/// directory's own `*.{yaml,yml}` files. A malformed directory file surfaces its
-/// parse error in place rather than failing the whole list; built-ins, being
-/// baked-in, never produce a parse error.
-pub fn list_workflows_impl(
-    state: &AppState,
-    project_id: ProjectId,
-) -> Result<Vec<WorkflowListing>, AppError> {
+/// All workflows: the read-only built-in library (governed by the `show_builtins`
+/// preference) merged with the user-global workflows folder's own `*.{yaml,yml}`
+/// files. User-global — the same set is available from every project. A malformed
+/// file surfaces its parse error in place rather than failing the whole list;
+/// built-ins, being baked-in, never produce a parse error.
+pub fn list_workflows_impl(state: &AppState) -> Vec<WorkflowListing> {
     let mut out = Vec::new();
     if lock(&state.preferences).show_builtins {
         out.extend(builtin_workflows().iter().map(builtin_listing));
     }
-    let directory = resolve_owning_directory(state, project_id)?;
-    out.extend(directory_workflow_listings(&directory.workflows_dir()));
-    Ok(out)
+    if let Some(dir) = state.workflows_dir.as_deref() {
+        out.extend(user_workflow_listings(dir));
+    }
+    out
 }
 
-/// Scan a directory's `*.{yaml,yml}` files into listings (parsed metadata or the
-/// parse error). Directory-scoped (workflows live under the working directory).
-fn directory_workflow_listings(workflows_dir: &Path) -> Vec<WorkflowListing> {
+/// Scan the user-global workflows folder's `*.{yaml,yml}` files into listings
+/// (parsed metadata or the parse error), one entry per file.
+fn user_workflow_listings(workflows_dir: &Path) -> Vec<WorkflowListing> {
     let mut listings = Vec::new();
     for (stem, content) in read_workflow_files(workflows_dir) {
         match parse_workflow(&stem, &content) {
@@ -407,21 +405,24 @@ fn roster_for_project(state: &AppState, project_id: ProjectId) -> Vec<AgentRecor
         .collect()
 }
 
+/// The user-global workflows directory, or a clear error if no config dir was
+/// resolved (an exotic host with no home).
+fn workflows_dir(state: &AppState) -> Result<&Path, AppError> {
+    state
+        .workflows_dir
+        .as_deref()
+        .ok_or(AppError::WorkflowsDirUnavailable)
+}
+
 /// Re-read and parse the named workflow snapshot: a built-in from the library, or
-/// a directory file (re-read once at invoke, never per step).
-fn snapshot_workflow(
-    state: &AppState,
-    project_id: ProjectId,
-    name: &str,
-    is_builtin: bool,
-) -> Result<Workflow, AppError> {
+/// a user-global directory file (re-read once at invoke, never per step).
+fn snapshot_workflow(state: &AppState, name: &str, is_builtin: bool) -> Result<Workflow, AppError> {
     if is_builtin {
         return builtin_workflow(name).ok_or_else(|| AppError::WorkflowNotFound {
             name: name.to_owned(),
         });
     }
-    let directory = resolve_owning_directory(state, project_id)?;
-    let dir = directory.workflows_dir();
+    let dir = workflows_dir(state)?;
     for ext in ["yaml", "yml"] {
         let path = dir.join(format!("{name}.{ext}"));
         if path.exists() {
@@ -460,7 +461,7 @@ pub fn validate_workflow_invocation_impl(
     is_builtin: bool,
     inputs: &BTreeMap<String, InputValue>,
 ) -> Result<(), AppError> {
-    let workflow = snapshot_workflow(state, project_id, name, is_builtin)?;
+    let workflow = snapshot_workflow(state, name, is_builtin)?;
     if workflow.gated_step_kind().is_some() {
         return Err(AppError::WorkflowStepUnsupported);
     }
@@ -482,7 +483,7 @@ pub fn invoke_workflow_impl(
     is_builtin: bool,
     inputs: &BTreeMap<String, InputValue>,
 ) -> Result<Uuid, AppError> {
-    let workflow = snapshot_workflow(state, project_id, name, is_builtin)?;
+    let workflow = snapshot_workflow(state, name, is_builtin)?;
     if workflow.gated_step_kind().is_some() {
         return Err(AppError::WorkflowStepUnsupported);
     }
@@ -773,13 +774,10 @@ pub fn copy_builtin_workflow_impl(name: &str, workflows_dir: &Path) -> Result<Pa
     Ok(dest)
 }
 
-/// The directory-scoped `workflows/` folder for a project's owning directory —
-/// where "Copy to my workflows" writes and "Open workflows folder" opens.
-pub fn workflows_dir_for_project(
-    state: &AppState,
-    project_id: ProjectId,
-) -> Result<PathBuf, AppError> {
-    Ok(resolve_owning_directory(state, project_id)?.workflows_dir())
+/// The user-global workflows folder — where "Copy to my workflows" writes and
+/// "Open workflows folder" opens. Errors if no config dir was resolved.
+pub fn user_workflows_dir(state: &AppState) -> Result<PathBuf, AppError> {
+    workflows_dir(state).map(Path::to_path_buf)
 }
 
 // --- teardown ----------------------------------------------------------------

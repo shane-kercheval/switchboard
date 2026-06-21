@@ -14101,15 +14101,17 @@ mod tests {
 
     use crate::workflow_commands::{
         abandon_workflow_run_impl, cancel_workflow_run_impl, copy_builtin_workflow_impl,
-        invoke_workflow_impl, list_workflow_runs_impl, list_workflows_impl,
-        validate_workflow_invocation_impl, workflows_dir_for_project,
+        invoke_workflow_impl, list_workflow_runs_impl, list_workflows_impl, user_workflows_dir,
+        validate_workflow_invocation_impl,
     };
     use switchboard_workflow::{InputValue, RunRecord, TerminalStatus};
 
     /// A prompts-enabled state (real `PromptService`, so built-ins resolve) with a
-    /// project + the named agents, the prompt cache warmed.
+    /// project + the named agents, the prompt cache warmed, and a temp user-global
+    /// workflows dir.
     async fn workflow_state(agent_names: &[&str]) -> (TempDir, AppState, ProjectId) {
         let (tmp, state) = state_with_prompts();
+        let state = state.with_workflows_dir(tmp.path().join("workflows"));
         init_directory_impl(&state, tmp.path().to_str().unwrap())
             .await
             .unwrap();
@@ -14134,9 +14136,9 @@ mod tests {
 
     #[tokio::test]
     async fn list_workflows_includes_builtins_and_toggle_hides_them() {
-        let (_tmp, state, pid) = workflow_state(&[]).await;
+        let (_tmp, state, _pid) = workflow_state(&[]).await;
 
-        let listed = list_workflows_impl(&state, pid).unwrap();
+        let listed = list_workflows_impl(&state);
         let builtins: Vec<&str> = listed
             .iter()
             .filter(|w| w.is_builtin)
@@ -14166,7 +14168,7 @@ mod tests {
             },
         )
         .unwrap();
-        let listed = list_workflows_impl(&state, pid).unwrap();
+        let listed = list_workflows_impl(&state);
         assert!(
             listed.iter().all(|w| !w.is_builtin),
             "built-ins hidden when the toggle is off"
@@ -14175,12 +14177,12 @@ mod tests {
 
     #[tokio::test]
     async fn list_workflows_surfaces_a_directory_parse_error_in_place() {
-        let (_tmp, state, pid) = workflow_state(&[]).await;
-        let dir = workflows_dir_for_project(&state, pid).unwrap();
+        let (_tmp, state, _pid) = workflow_state(&[]).await;
+        let dir = user_workflows_dir(&state).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("broken.yaml"), "this: is: not a workflow\n").unwrap();
 
-        let listed = list_workflows_impl(&state, pid).unwrap();
+        let listed = list_workflows_impl(&state);
         let broken = listed.iter().find(|w| w.name == "broken").unwrap();
         assert!(broken.parse_error.is_some(), "parse error surfaced");
         assert!(!broken.invocable);
@@ -14190,15 +14192,15 @@ mod tests {
 
     #[tokio::test]
     async fn list_flags_a_gated_workflow_non_invocable() {
-        let (_tmp, state, pid) = workflow_state(&["w"]).await;
-        let dir = workflows_dir_for_project(&state, pid).unwrap();
+        let (_tmp, state, _pid) = workflow_state(&["w"]).await;
+        let dir = user_workflows_dir(&state).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("iterate.yaml"),
             "name: iterate\ndescription: d\ninputs:\n  ms: [text]\n  w: agent\nsteps:\n  - for_each:\n      item: m\n      in: \"{{ ms }}\"\n      steps:\n        - send:\n            to: \"{{ w }}\"\n            text: \"{{ m }}\"\n",
         )
         .unwrap();
-        let listed = list_workflows_impl(&state, pid).unwrap();
+        let listed = list_workflows_impl(&state);
         let iterate = listed.iter().find(|w| w.name == "iterate").unwrap();
         assert!(!iterate.invocable, "a for_each workflow is non-invocable");
         assert!(iterate.parse_error.is_none(), "it still parses");
@@ -14208,13 +14210,13 @@ mod tests {
     async fn validate_invocation_enforces_inputs_roster_prompt_and_gate() {
         let (_tmp, state, pid) = workflow_state(&["primary", "reviewer-1"]).await;
 
-        // Missing required input (no reviewer_agents).
+        // Missing required input (no reviewers).
         let err = validate_workflow_invocation_impl(
             &state,
             pid,
             "review-and-aggregate",
             true,
-            &inputs(vec![("primary_agent", text("primary"))]),
+            &inputs(vec![("worker", text("primary"))]),
         )
         .unwrap_err();
         assert!(matches!(err, AppError::Workflow(_)));
@@ -14226,8 +14228,8 @@ mod tests {
             "review-and-aggregate",
             true,
             &inputs(vec![
-                ("primary_agent", text("ghost")),
-                ("reviewer_agents", list(&["reviewer-1"])),
+                ("worker", text("ghost")),
+                ("reviewers", list(&["reviewer-1"])),
                 ("review_prompt", text("builtin:code-review")),
             ]),
         )
@@ -14241,8 +14243,8 @@ mod tests {
             "review-and-aggregate",
             true,
             &inputs(vec![
-                ("primary_agent", text("primary")),
-                ("reviewer_agents", list(&["reviewer-1"])),
+                ("worker", text("primary")),
+                ("reviewers", list(&["reviewer-1"])),
                 ("review_prompt", text("local:does-not-exist")),
             ]),
         )
@@ -14256,8 +14258,8 @@ mod tests {
             "review-and-aggregate",
             true,
             &inputs(vec![
-                ("primary_agent", text("primary")),
-                ("reviewer_agents", list(&["reviewer-1"])),
+                ("worker", text("primary")),
+                ("reviewers", list(&["reviewer-1"])),
                 ("review_prompt", text("builtin:code-review")),
             ]),
         )
@@ -14267,7 +14269,7 @@ mod tests {
     #[tokio::test]
     async fn capability_gate_refuses_invoke_with_the_fixed_message() {
         let (_tmp, state, pid) = workflow_state(&["w"]).await;
-        let dir = workflows_dir_for_project(&state, pid).unwrap();
+        let dir = user_workflows_dir(&state).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("iterate.yaml"),
@@ -14321,8 +14323,8 @@ mod tests {
             "review-and-aggregate",
             true,
             &inputs(vec![
-                ("primary_agent", text("primary")),
-                ("reviewer_agents", list(&["reviewer-1"])),
+                ("worker", text("primary")),
+                ("reviewers", list(&["reviewer-1"])),
                 ("review_prompt", text("builtin:code-review")),
             ]),
         )
@@ -14354,8 +14356,8 @@ mod tests {
             "review-and-aggregate",
             true,
             &inputs(vec![
-                ("primary_agent", text("primary")),
-                ("reviewer_agents", list(&["reviewer-1", "reviewer-2"])),
+                ("worker", text("primary")),
+                ("reviewers", list(&["reviewer-1", "reviewer-2"])),
                 ("review_prompt", text("builtin:code-review")),
             ]),
         )
@@ -14417,8 +14419,8 @@ mod tests {
             "review-and-aggregate",
             true,
             &inputs(vec![
-                ("primary_agent", text("primary")),
-                ("reviewer_agents", list(&["reviewer-1"])),
+                ("worker", text("primary")),
+                ("reviewers", list(&["reviewer-1"])),
                 ("review_prompt", text("builtin:code-review")),
             ]),
         )
@@ -14546,8 +14548,8 @@ mod tests {
 
     #[tokio::test]
     async fn copy_builtin_workflow_writes_yaml_and_refuses_to_clobber() {
-        let (_tmp, state, pid) = workflow_state(&[]).await;
-        let dir = workflows_dir_for_project(&state, pid).unwrap();
+        let (_tmp, state, _pid) = workflow_state(&[]).await;
+        let dir = user_workflows_dir(&state).unwrap();
 
         let written = copy_builtin_workflow_impl("review-and-aggregate", &dir).unwrap();
         assert_eq!(written, dir.join("review-and-aggregate.yaml"));
@@ -14555,7 +14557,7 @@ mod tests {
         assert!(content.contains("name: review-and-aggregate"));
 
         // It now lists as a normal (non-built-in) directory workflow.
-        let listed = list_workflows_impl(&state, pid).unwrap();
+        let listed = list_workflows_impl(&state);
         assert!(
             listed
                 .iter()

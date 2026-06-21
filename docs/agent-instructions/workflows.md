@@ -8,15 +8,15 @@
 
 A **workflow** is a YAML file that defines a reusable, parameterized sequence of agent operations — for example "fan out to three reviewers, aggregate their feedback, send to the implementer." Workflows are how the user automates multi-agent coordination they would otherwise do by hand.
 
-Workflows are file-based. There is no in-app editor. You are generating a file the user will save into the working directory's workflows directory (`<directory>/.switchboard/workflows/` — shared across all projects in that working directory; see `docs/system-design.md` §3).
+Workflows are file-based. There is no in-app editor. You are generating a file the user will save into their **user-global** workflows folder (the OS config dir's `workflows/` — e.g. `~/Library/Application Support/switchboard/workflows/` on macOS; see `docs/system-design.md` §3). Settings → Workflows shows the exact path with an "Open" button.
 
 ## Where workflows live
 
-Workflows are directory-scoped (shared across all projects in the same working directory):
+Workflows are **user-global** — one folder, shared across every project in every working directory:
 
-- `<directory>/.switchboard/workflows/<workflow-name>.yaml`
+- `<config-dir>/workflows/<workflow-name>.yaml`
 
-There is no user-global workflow directory. To share a workflow across working directories (different repos), the user copies or symlinks the file. Within a working directory, all projects can invoke the same workflow definitions — workflows describe *how to do work*; projects scope *the work in progress*. See `docs/system-design.md` §3 for the directory/project model.
+A workflow authored once is invocable from every project without redefinition — its `agent`/`[agent]` inputs are bound to whichever project's agents it's run against, so the definition isn't tied to any one repo. Workflows describe *how to do work* (a reusable, portable template, like a prompt); projects scope *the work in progress*. See `docs/system-design.md` §3 for the model.
 
 ## Top-level structure
 
@@ -324,51 +324,30 @@ steps:
 
 ## Shipped built-in workflows
 
-Two workflows ship with the app as a read-only built-in library (alongside the built-in prompts they consume, `code-review` and `ai-review-feedback`). They appear in the `+ Workflow` menu tagged **built-in / read-only**; "Copy to my workflows" writes an editable copy into `<dir>/.switchboard/workflows/` if you want to customize one. They are the canonical examples to model your own on.
+> **⚠️ Prompt model under revision.** Both built-ins currently take user-selectable `prompt_id` inputs (`review_prompt`, `analysis_prompt`) and hand-wire arguments via `template_vars`. This is being replaced by a hardcoded-prompt model (the workflow bakes in its prompt; user-fillable arguments are auto-derived). The YAML below is the **currently shipped** form — accurate today, but the `prompt_id` inputs will be removed by the hardcoded-prompt plan.
+
+Two workflows ship with the app as a read-only built-in library (alongside the built-in prompts they consume, `code-review` and `ai-review-feedback`). They appear in the `+ Workflow` menu tagged **built-in / read-only**; "Copy to my workflows" writes an editable copy into your user-global workflows folder if you want to customize one. They are the canonical examples to model your own on. Both standardize on `reviewers` (the fan-out list) and `worker` (the single agent that synthesizes).
 
 ### `review-and-aggregate` (generic fan-in)
 
-Review in parallel with several agents, then hand the combined feedback to a primary agent. The aggregation is an **inline `text`** step (no second prompt), so the workflow is self-contained.
+Review in parallel with several agents, then hand the combined feedback to a worker agent. The aggregation is an **inline `text`** step (no second prompt), so the workflow is self-contained.
 
 ```yaml
 name: review-and-aggregate
-description: Fan a review prompt out to several reviewers in parallel, then hand the combined feedback to a primary agent for recommendations.
+description: Fan a review prompt out to several reviewers in parallel, then hand the combined feedback to a worker agent for recommendations.
 inputs:
-  primary_agent: agent
-  reviewer_agents: [agent]
-  review_prompt: prompt_id
-  user_context: text?
-steps:
-  - send:
-      to: "{{ reviewer_agents }}"
-      prompt: "{{ review_prompt }}"
-      template_vars:
-        context: "{{ user_context }}"
-  - wait_for_all:
-      agents: "{{ reviewer_agents }}"
-  - send:
-      to: "{{ primary_agent }}"
-      text: |
-        Here's feedback from several reviewers:
-
-        {{ aggregated_responses(reviewer_agents) }}
-
-        Let me know what your recommendations are.
-```
-
-### `review-analyze-discuss` (flagship)
-
-Reviewers review in parallel; an analyst distills their feedback into a decision-ready verdict (filling the `ai-review-feedback` prompt's `review` argument via `template_vars`); the reviewers respond to the analysis; the analyst gives a final recommendation. It demonstrates filling a saved prompt's argument with forwarded output, plus round-trip discussion via the `last_output` / `aggregated_responses` helpers in inline `text`.
-
-```yaml
-name: review-analyze-discuss
-description: Reviewers review in parallel, an analyst distills their feedback into a decision-ready verdict, the reviewers respond to it, and the analyst gives a final recommendation.
-inputs:
-  reviewers: [agent]
-  analyst: agent
-  review_prompt: prompt_id
-  analysis_prompt: prompt_id
-  context: text?
+  reviewers:
+    type: [agent]
+    description: The agents that review in parallel. Each receives the review prompt and works independently.
+  worker:
+    type: agent
+    description: The agent that receives every reviewer's combined feedback and produces the recommendations.
+  review_prompt:
+    type: prompt_id
+    description: The prompt sent to each reviewer at the start.
+  context:
+    type: text?
+    description: Optional background handed to each reviewer alongside the review prompt (fills the prompt's `context` variable). The worker never sees this directly — only the reviewers' responses.
 steps:
   - send:
       to: "{{ reviewers }}"
@@ -378,24 +357,65 @@ steps:
   - wait_for_all:
       agents: "{{ reviewers }}"
   - send:
-      to: "{{ analyst }}"
+      to: "{{ worker }}"
+      text: |
+        Here's feedback from several reviewers:
+
+        {{ aggregated_responses(reviewers) }}
+
+        Let me know what your recommendations are.
+```
+
+### `review-analyze-discuss` (flagship)
+
+Reviewers review in parallel; a worker distills their feedback into a decision-ready verdict (filling the `ai-review-feedback` prompt's `review` argument via `template_vars`); the reviewers respond to the analysis; the worker gives a final recommendation. It demonstrates filling a saved prompt's argument with forwarded output, plus round-trip discussion via the `last_output` / `aggregated_responses` helpers in inline `text`.
+
+```yaml
+name: review-analyze-discuss
+description: Reviewers review in parallel, a worker distills their feedback into a decision-ready verdict, the reviewers respond to it, and the worker gives a final recommendation.
+inputs:
+  reviewers:
+    type: [agent]
+    description: The agents that review in parallel, then respond to the worker's analysis.
+  worker:
+    type: agent
+    description: The agent that distills the reviewers' feedback into a verdict, weighs their pushback, and gives the final recommendation.
+  review_prompt:
+    type: prompt_id
+    description: The prompt sent to each reviewer at the start.
+  analysis_prompt:
+    type: prompt_id
+    description: The prompt sent to the worker to distill the reviewers' feedback (their combined responses fill its `review` variable).
+  context:
+    type: text?
+    description: Optional background handed to each reviewer alongside the review prompt (fills the prompt's `context` variable).
+steps:
+  - send:
+      to: "{{ reviewers }}"
+      prompt: "{{ review_prompt }}"
+      template_vars:
+        context: "{{ context }}"
+  - wait_for_all:
+      agents: "{{ reviewers }}"
+  - send:
+      to: "{{ worker }}"
       prompt: "{{ analysis_prompt }}"
       template_vars:
         review: "{{ aggregated_responses(reviewers) }}"
   - wait_for:
-      agent: "{{ analyst }}"
+      agent: "{{ worker }}"
   - send:
       to: "{{ reviewers }}"
       text: |
         An analyst reviewed all of the feedback and responded:
 
-        {{ last_output(analyst) }}
+        {{ last_output(worker) }}
 
         Do you agree with this analysis? Push back where you think it's wrong, and confirm where it's right.
   - wait_for_all:
       agents: "{{ reviewers }}"
   - send:
-      to: "{{ analyst }}"
+      to: "{{ worker }}"
       text: |
         Here's how the reviewers responded to your analysis:
 
@@ -403,7 +423,7 @@ steps:
 
         Weigh their responses and give your final recommendation.
   - wait_for:
-      agent: "{{ analyst }}"
+      agent: "{{ worker }}"
 ```
 
 ## Conventions
@@ -426,7 +446,7 @@ You don't need to write failure-handling logic in the workflow file; the runtime
 
 ## After authoring
 
-1. Save the file as `<directory>/.switchboard/workflows/<name>.yaml` (filename matches `name`). Workflows are directory-scoped — shared across all projects in that working directory.
+1. Save the file as `<config-dir>/workflows/<name>.yaml` (filename matches `name`). Workflows are user-global — available in every project. (Settings → Workflows → "Open" jumps to the folder.)
 2. The user invokes it from Switchboard's workflow picker. The invocation form auto-generates from the `inputs` declaration.
 3. The workflow runs autonomously; the user watches via the workflow-progress surface and per-agent panes.
 

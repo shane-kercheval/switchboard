@@ -247,9 +247,14 @@ pub enum AppError {
     #[error(transparent)]
     Workflow(#[from] switchboard_workflow::WorkflowError),
 
-    /// No workflow with this name was found (built-in or in the directory).
+    /// No workflow with this name was found (built-in or in the user folder).
     #[error("workflow {name:?} not found")]
     WorkflowNotFound { name: String },
+
+    /// No user-global workflows directory is resolvable (no config dir — an
+    /// exotic host with no home).
+    #[error("workflows are not available (no config directory)")]
+    WorkflowsDirUnavailable,
 
     /// The workflow uses a step type that is not runnable in this version
     /// (`pause_for_user` / `for_each`) — gated at invoke, not a parse failure.

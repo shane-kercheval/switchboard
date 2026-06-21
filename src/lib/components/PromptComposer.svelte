@@ -42,6 +42,7 @@
     agentHasOutput,
     onremove,
     send,
+    recipients,
     focusFirstField = false,
     busy = false,
   }: {
@@ -65,6 +66,10 @@
     /// The compose bar's send button, rendered in the footer row beside Preview
     /// so the two actions align. Optional so the component stands alone in tests.
     send?: Snippet;
+    /// The recipient ("To") chips, handed down by the compose bar so they render
+    /// directly under the prompt name (the prompt titles the whole send, above
+    /// the recipients). Optional so the component stands alone in tests.
+    recipients?: Snippet;
     /// Focuses the first editable prompt field when a user explicitly selects a
     /// prompt from the picker. Saved/restored prompt drafts leave focus alone.
     focusFirstField?: boolean;
@@ -164,6 +169,39 @@
     });
   });
 
+  /// The add-source closure for whichever of this composer's fields currently
+  /// holds focus (an argument textarea or the appended-text box), or `null` when
+  /// focus is elsewhere. Lets the ⌘⌃N pane chord target the field being typed in.
+  function focusedFieldAdd(): ((source: ForwardSource) => void) | null {
+    const active = document.activeElement;
+    if (active === null) return null;
+    for (const arg of prompt.arguments) {
+      if (argRefs[arg.name] === active) return (source) => addArgSource(arg.name, source);
+    }
+    if (appendedRef === active) return addAppendedSource;
+    return null;
+  }
+
+  // ⌘⌃1..9 → forward pane N into the focused field, mirroring the compose bar's
+  // whole-message chord but routed per-field (the compose bar's own handler
+  // no-ops in prompt mode, so there's no double-fire). Index matches the pane's
+  // position in `panes`, the same order the picker shows the chord for.
+  $effect(() => {
+    function onKeydown(e: KeyboardEvent): void {
+      if (busy) return;
+      if (!e.metaKey || !e.ctrlKey || e.altKey || e.shiftKey) return;
+      if (e.key < "1" || e.key > "9") return;
+      const pane = panes[Number(e.key) - 1];
+      if (pane === undefined || pane.members.length === 0) return;
+      const add = focusedFieldAdd();
+      if (add === null) return;
+      e.preventDefault();
+      add(forwardSourceForPane(pane, agents));
+    }
+    window.addEventListener("keydown", onKeydown);
+    return () => window.removeEventListener("keydown", onKeydown);
+  });
+
   function openPreview(): void {
     if (busy) return;
     previewOpen = true;
@@ -194,45 +232,46 @@
     )}
     data-testid="prompt-composer-content"
   >
-    <div class="flex items-center gap-1.5">
-      <div
-        class="border-border bg-panel inline-flex h-7 min-w-0 items-center gap-1.5 rounded-full border px-3"
-        data-testid="prompt-selector"
-      >
-        <span class="text-fg truncate text-sm font-medium">{promptDisplayName(prompt)}</span>
-        <span class="text-muted shrink-0 font-mono text-[11px]">{prompt.provider}</span>
-      </div>
-      <button
-        type="button"
-        class="text-muted hover:bg-panel hover:text-status-failed inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full transition-colors"
-        data-testid="prompt-remove"
-        aria-label="Remove prompt"
-        disabled={busy}
-        onclick={() => {
-          if (!busy) onremove();
-        }}
-        class:cursor-not-allowed={busy}
-        class:opacity-50={busy}
-      >
-        <svg
-          width="16"
-          height="16"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="2"
-          stroke-linecap="round"
-          stroke-linejoin="round"
-          aria-hidden="true"
+    <div class="flex flex-col gap-1">
+      <div class="flex items-center justify-between gap-2">
+        <div class="flex min-w-0 items-baseline gap-1.5" data-testid="prompt-selector">
+          <span class="text-fg truncate text-sm font-semibold">{promptDisplayName(prompt)}</span>
+          <span class="text-muted shrink-0 font-mono text-[11px]">{prompt.provider}</span>
+        </div>
+        <button
+          type="button"
+          class="text-muted hover:bg-panel hover:text-status-failed inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full transition-colors"
+          data-testid="prompt-remove"
+          aria-label="Remove prompt"
+          disabled={busy}
+          onclick={() => {
+            if (!busy) onremove();
+          }}
+          class:cursor-not-allowed={busy}
+          class:opacity-50={busy}
         >
-          <path d="M18 6 6 18M6 6l12 12" />
-        </svg>
-      </button>
+          <svg
+            width="16"
+            height="16"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M18 6 6 18M6 6l12 12" />
+          </svg>
+        </button>
+      </div>
+
+      {#if prompt.description}
+        <p class="text-muted text-xs">{prompt.description}</p>
+      {/if}
     </div>
 
-    {#if prompt.description}
-      <p class="text-muted text-xs">{prompt.description}</p>
-    {/if}
+    {@render recipients?.()}
 
     <div
       class="min-h-0 [scrollbar-gutter:stable] space-y-3 overflow-y-auto py-1 pr-3 pl-1"
@@ -249,6 +288,7 @@
           onPickPane={(pane) => onAdd(forwardSourceForPane(pane, agents))}
           {agentHasOutput}
           disabled={busy}
+          showPaneShortcuts
           triggerTestid={testid}
           triggerLabel={label}
           tooltipLabel="Forward an agent's output"

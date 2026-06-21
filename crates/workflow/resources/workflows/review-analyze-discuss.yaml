@@ -1,11 +1,21 @@
 name: review-analyze-discuss
-description: Reviewers review in parallel, an analyst distills their feedback into a decision-ready verdict, the reviewers respond to it, and the analyst gives a final recommendation.
+description: Reviewers review in parallel, a worker distills their feedback into a decision-ready verdict, the reviewers respond to it, and the worker gives a final recommendation.
 inputs:
-  reviewers: [agent]
-  analyst: agent
-  review_prompt: prompt_id
-  analysis_prompt: prompt_id
-  context: text?
+  reviewers:
+    type: [agent]
+    description: The agents that review in parallel, then respond to the worker's analysis.
+  worker:
+    type: agent
+    description: The agent that distills the reviewers' feedback into a verdict, weighs their pushback, and gives the final recommendation.
+  review_prompt:
+    type: prompt_id
+    description: The prompt sent to each reviewer at the start.
+  analysis_prompt:
+    type: prompt_id
+    description: The prompt sent to the worker to distill the reviewers' feedback (their combined responses fill its `review` variable).
+  context:
+    type: text?
+    description: Optional background handed to each reviewer alongside the review prompt (fills the prompt's `context` variable).
 steps:
   - send:
       to: "{{ reviewers }}"
@@ -15,24 +25,24 @@ steps:
   - wait_for_all:
       agents: "{{ reviewers }}"
   - send:
-      to: "{{ analyst }}"
+      to: "{{ worker }}"
       prompt: "{{ analysis_prompt }}"
       template_vars:
         review: "{{ aggregated_responses(reviewers) }}"
   - wait_for:
-      agent: "{{ analyst }}"
+      agent: "{{ worker }}"
   - send:
       to: "{{ reviewers }}"
       text: |
         An analyst reviewed all of the feedback and responded:
 
-        {{ last_output(analyst) }}
+        {{ last_output(worker) }}
 
         Do you agree with this analysis? Push back where you think it's wrong, and confirm where it's right.
   - wait_for_all:
       agents: "{{ reviewers }}"
   - send:
-      to: "{{ analyst }}"
+      to: "{{ worker }}"
       text: |
         Here's how the reviewers responded to your analysis:
 
@@ -40,4 +50,4 @@ steps:
 
         Weigh their responses and give your final recommendation.
   - wait_for:
-      agent: "{{ analyst }}"
+      agent: "{{ worker }}"

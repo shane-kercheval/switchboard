@@ -284,6 +284,12 @@ pub struct AppState {
     /// when the window is focused). Defaults to a no-op; production injects the
     /// plugin-backed notifier via [`AppState::with_notifier`].
     pub notifier: Arc<dyn Notifier>,
+
+    /// The **user-global** workflows directory (`<config-dir>/workflows`) — the
+    /// single store of workflow definitions, shared across every project (unlike
+    /// runs, which stay per-project). `None` on a host with no resolvable config
+    /// dir; production injects it via [`AppState::with_workflows_dir`].
+    pub workflows_dir: Option<PathBuf>,
 }
 
 impl AppState {
@@ -318,6 +324,7 @@ impl AppState {
             forwards: Mutex::new(HashMap::new()),
             workflow_runs: Arc::new(Mutex::new(HashMap::new())),
             notifier: Arc::new(NullNotifier),
+            workflows_dir: None,
         }
     }
 
@@ -326,6 +333,14 @@ impl AppState {
     #[must_use]
     pub fn with_notifier(mut self, notifier: Arc<dyn Notifier>) -> Self {
         self.notifier = notifier;
+        self
+    }
+
+    /// Builder step that injects the user-global workflows directory. Production
+    /// calls this after `new`; tests that exercise workflows pass a temp dir.
+    #[must_use]
+    pub fn with_workflows_dir(mut self, dir: PathBuf) -> Self {
+        self.workflows_dir = Some(dir);
         self
     }
 

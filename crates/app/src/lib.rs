@@ -59,7 +59,7 @@ use crate::state::AppState;
 use crate::workflow_commands::{
     WorkflowListing, WorkflowRunInfo, abandon_workflow_run_impl, cancel_workflow_run_impl,
     copy_builtin_workflow_impl, invoke_workflow_impl, list_workflow_runs_impl, list_workflows_impl,
-    validate_workflow_invocation_impl, workflows_dir_for_project,
+    user_workflows_dir, validate_workflow_invocation_impl,
 };
 
 use switchboard_core::{AgentRecord, Attachment, HarnessKind, ProjectId, ProjectSummary};
@@ -834,14 +834,12 @@ async fn copy_builtin_prompt(state: State<'_, AppState>, name: String) -> Result
     Ok(written.to_string_lossy().into_owned())
 }
 
-/// All workflows available to a project: the read-only built-in library (when
-/// `show_builtins` is on) merged with the project directory's own files.
+/// All workflows: the read-only built-in library (when `show_builtins` is on)
+/// merged with the user-global workflows folder. User-global — the same set is
+/// available from every project.
 #[tauri::command]
-async fn list_workflows(
-    state: State<'_, AppState>,
-    project_id: ProjectId,
-) -> Result<Vec<WorkflowListing>, String> {
-    list_workflows_impl(state.inner(), project_id).map_err(|e| e.to_string())
+async fn list_workflows(state: State<'_, AppState>) -> Result<Vec<WorkflowListing>, String> {
+    Ok(list_workflows_impl(state.inner()))
 }
 
 /// Validate a workflow invocation (capability gate + input/roster/prompt rules)
@@ -898,29 +896,30 @@ async fn abandon_workflow_run(
     abandon_workflow_run_impl(state.inner(), project_id, run_id).map_err(|e| e.to_string())
 }
 
-/// Copy a built-in workflow into the project directory's `workflows/` folder as
-/// an owned, editable file. Returns the written path; refuses to overwrite.
+/// Copy a built-in workflow into the user-global `workflows/` folder as an owned,
+/// editable file. Returns the written path; refuses to overwrite.
 #[tauri::command]
-async fn copy_builtin_workflow(
-    state: State<'_, AppState>,
-    project_id: ProjectId,
-    name: String,
-) -> Result<String, String> {
-    let dir = workflows_dir_for_project(state.inner(), project_id).map_err(|e| e.to_string())?;
+async fn copy_builtin_workflow(state: State<'_, AppState>, name: String) -> Result<String, String> {
+    let dir = user_workflows_dir(state.inner()).map_err(|e| e.to_string())?;
     let written = copy_builtin_workflow_impl(&name, &dir).map_err(|e| e.to_string())?;
     Ok(written.to_string_lossy().into_owned())
 }
 
-/// Open the project directory's `workflows/` folder in Finder (mirrors the
-/// prompts-folder action), creating it if needed.
+/// Open the user-global `workflows/` folder in Finder (mirrors the prompts-folder
+/// action), creating it if needed.
 #[tauri::command]
-async fn open_workflows_dir(
-    state: State<'_, AppState>,
-    project_id: ProjectId,
-) -> Result<(), String> {
-    let dir = workflows_dir_for_project(state.inner(), project_id).map_err(|e| e.to_string())?;
+async fn open_workflows_dir(state: State<'_, AppState>) -> Result<(), String> {
+    let dir = user_workflows_dir(state.inner()).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     run_open_argv(vec!["open".to_owned(), dir.to_string_lossy().into_owned()]).await
+}
+
+/// The user-global workflows folder path, for the Settings display.
+#[tauri::command]
+fn workflows_dir() -> Result<String, String> {
+    workflows_dir_path()
+        .map(|p| p.to_string_lossy().into_owned())
+        .ok_or_else(|| "workflows are not available (no config directory)".to_owned())
 }
 
 #[tauri::command]
@@ -1096,6 +1095,13 @@ fn local_prompts_dir_path() -> Result<std::path::PathBuf, String> {
         .ok_or_else(|| "prompt providers are not configured (no config path)".to_owned())
 }
 
+/// The user-global workflows directory (`<config-dir>/workflows`). Workflows are
+/// user-global — shared across every project — like local prompts, not scoped to
+/// a working directory. `None` on an exotic host with no resolvable config dir.
+fn workflows_dir_path() -> Option<std::path::PathBuf> {
+    config_dir().map(|dir| dir.join("workflows"))
+}
+
 /// Build the prompt service from the user-global config dir. The pure
 /// `crates/prompts` never touches `directories`; the app resolves and injects the
 /// config path, default prompts dir, home, and the secret store. Built-in example
@@ -1162,9 +1168,16 @@ fn with_persistence_paths(state: AppState) -> AppState {
         state
     };
     // `config.yaml` — personal preferences.
-    if let Some(path) = preferences_config_path() {
+    let state = if let Some(path) = preferences_config_path() {
         state.with_preferences(path)
     } else {
+        state
+    };
+    // User-global workflows directory (`<config-dir>/workflows`).
+    if let Some(dir) = workflows_dir_path() {
+        state.with_workflows_dir(dir)
+    } else {
+        tracing::warn!("no config directory resolved — workflows disabled");
         state
     }
 }
@@ -1324,6 +1337,7 @@ pub fn run() {
             abandon_workflow_run,
             copy_builtin_workflow,
             open_workflows_dir,
+            workflows_dir,
             create_project,
             rename_project,
             delete_project,

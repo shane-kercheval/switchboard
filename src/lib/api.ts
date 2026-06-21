@@ -535,10 +535,11 @@ export async function renderPrompt(
 
 // ── Workflows ─────────────────────────────────────────────────────────────────
 
-/// All workflows available to a project: the read-only built-in library (when
-/// `show_builtins` is on) merged with the project directory's own files.
-export async function listWorkflows(projectId: ProjectId): Promise<WorkflowListing[]> {
-  return await invoke<WorkflowListing[]>("list_workflows", { projectId });
+/// All workflows: the read-only built-in library (when `show_builtins` is on)
+/// merged with the user-global workflows folder. User-global — the same set is
+/// available from every project.
+export async function listWorkflows(): Promise<WorkflowListing[]> {
+  return await invoke<WorkflowListing[]>("list_workflows");
 }
 
 /// Validate a workflow invocation (capability gate + input/roster/prompt rules)
@@ -577,13 +578,18 @@ export async function abandonWorkflowRun(projectId: ProjectId, runId: string): P
   await invoke("abandon_workflow_run", { projectId, runId });
 }
 
-/// Copy a built-in workflow into the project directory's `workflows/` folder as
-/// an owned, editable file. Returns the written path; rejects if it would clobber.
-export async function copyBuiltinWorkflow(projectId: ProjectId, name: string): Promise<string> {
-  return await invoke<string>("copy_builtin_workflow", { projectId, name });
+/// Copy a built-in workflow into the user-global `workflows/` folder as an owned,
+/// editable file. Returns the written path; rejects if it would clobber.
+export async function copyBuiltinWorkflow(name: string): Promise<string> {
+  return await invoke<string>("copy_builtin_workflow", { name });
 }
 
-/// Open the project directory's `workflows/` folder in Finder.
-export async function openWorkflowsDir(projectId: ProjectId): Promise<void> {
-  await invoke("open_workflows_dir", { projectId });
+/// Open the user-global `workflows/` folder in Finder.
+export async function openWorkflowsDir(): Promise<void> {
+  await invoke("open_workflows_dir");
+}
+
+/// The user-global workflows folder path, for the Settings display.
+export async function workflowsDir(): Promise<string> {
+  return await invoke<string>("workflows_dir");
 }

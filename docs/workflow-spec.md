@@ -24,9 +24,11 @@ What is **out of scope** for this doc:
 - Persistence-layer encoding of workflow runs (`<directory>/.switchboard/projects/<project-id>/runs/<run-id>.jsonl` schema — M6 expansion)
 - UI rendering of workflow progress (system-design §7)
 
+> **⚠️ Prompt-argument model under revision.** The `prompt_id`-input + `template_vars` examples below describe the current model, in which a workflow takes a user-selectable prompt and the author hand-wires its arguments. This is being replaced by a hardcoded-prompt model (the workflow bakes in its prompt and auto-derives the user-fillable arguments, validating computed bindings against the resolved prompt at invocation). Treat the `prompt_id`/`template_vars`/`aggregation_prompt` examples here as pre-revision until the hardcoded-prompt plan lands.
+
 ## File location and naming
 
-- Workflow files live under `<directory>/.switchboard/workflows/` (directory-scoped — shared across all projects in that working directory; see system-design §3)
+- Workflow files are **user-global**: they live in one folder under the OS config dir (e.g. `~/Library/Application Support/switchboard/workflows/` on macOS), shared across every project in every working directory; see system-design §3. A workflow's `agent`/`[agent]` inputs bind to whichever project's agents it's run against, so the definition isn't tied to any one directory.
 - One workflow per file; filename matches the workflow's declared `name` (e.g., `review-and-aggregate.yaml`)
 - File extension: `.yaml` (preferred) or `.yml`
 

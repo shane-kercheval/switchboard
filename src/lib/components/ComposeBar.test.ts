@@ -417,6 +417,45 @@ describe("ComposeBar", () => {
     expect(screen.queryByTestId("prompt-menu")).toBeNull();
   });
 
+  it("opening the prompt menu (via /) closes an open workflow menu", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    expect(await screen.findByTestId("workflow-menu")).toBeInTheDocument();
+
+    // The `/` keyboard path opens the prompt menu; it must close the workflow
+    // menu (mirroring the workflow button, which closes the prompt menu) so the
+    // two popovers can't render stacked.
+    await fireEvent.keyDown(screen.getByTestId("compose-textarea"), { key: "/" });
+    expect(await screen.findByTestId("prompt-menu")).toBeInTheDocument();
+    expect(screen.queryByTestId("workflow-menu")).toBeNull();
+  });
+
+  it("dismisses the prompt menu on a click outside it, but not inside", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+    await fireEvent.click(screen.getByTestId("compose-prompt-button"));
+    expect(await screen.findByTestId("prompt-menu")).toBeInTheDocument();
+
+    // A pointer down inside the menu leaves it open (picking happens there).
+    await fireEvent.pointerDown(screen.getByTestId("prompt-menu-search"));
+    expect(screen.queryByTestId("prompt-menu")).toBeInTheDocument();
+
+    // A pointer down on the textarea — inside the compose box but outside the
+    // menu — dismisses it. The old hit region was the whole box, so an in-box
+    // click like this left the menu stuck open.
+    await fireEvent.pointerDown(screen.getByTestId("compose-textarea"));
+    expect(screen.queryByTestId("prompt-menu")).toBeNull();
+  });
+
   it("@ menu inserts a selected README file mention without changing recipients", async () => {
     invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
       if (cmd === "search_project_files") return ["README.md"];
@@ -1435,7 +1474,6 @@ describe("ComposeBar prompt mode", () => {
     expect((screen.getByTestId("prompt-appended") as HTMLTextAreaElement).disabled).toBe(true);
     expect((screen.getByTestId("prompt-preview-button") as HTMLButtonElement).disabled).toBe(true);
     expect((screen.getByTestId("prompt-remove") as HTMLButtonElement).disabled).toBe(true);
-    expect((screen.getByTestId("compose-prompt-button") as HTMLButtonElement).disabled).toBe(true);
     expect((chip(AGENT_A.id) as HTMLButtonElement).disabled).toBe(true);
     expect((chip(AGENT_B.id) as HTMLButtonElement).disabled).toBe(true);
     expect((screen.getByTestId("recipient-clear") as HTMLButtonElement).disabled).toBe(true);
@@ -2451,7 +2489,7 @@ describe("ComposeBar — cross-agent forward", () => {
     expect(screen.queryByTestId("forward-source-chips")).toBeNull();
   });
 
-  it("⌘⌃N does nothing in prompt mode (no hidden forward source added)", async () => {
+  it("⌘⌃N forwards a pane into the focused prompt field (not the hidden message set)", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
@@ -2459,13 +2497,21 @@ describe("ComposeBar — cross-agent forward", () => {
 
     render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
     await enterPromptMode("prompt-option-local:review");
+
+    // The chord targets whichever field is focused (it's inert otherwise), so
+    // focus an argument field, then fire it.
+    (screen.getByTestId("prompt-arg-focus") as HTMLTextAreaElement).focus();
     await fireEvent.keyDown(window, { key: "1", metaKey: true, ctrlKey: true });
 
-    // No chip while in prompt mode (the forward set is hidden there), and nothing
-    // resurfaces after the prompt is removed — the shortcut never mutated it.
-    expect(screen.queryByTestId("forward-source-chip-Pane 1")).toBeNull();
-    await fireEvent.click(screen.getByTestId("prompt-remove"));
-    await waitFor(() => expect(screen.getByTestId("compose-textarea")).toBeInTheDocument());
+    // The pane lands as a forward source on that field — not on the whole-message
+    // forward set, which stays hidden in prompt mode.
+    await waitFor(() =>
+      expect(
+        screen
+          .getByTestId("prompt-arg-sources-focus")
+          .querySelector('[data-testid="forward-source-chip-Pane 1"]'),
+      ).not.toBeNull(),
+    );
     expect(screen.queryByTestId("forward-source-chips")).toBeNull();
   });
 

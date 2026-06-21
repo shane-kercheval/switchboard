@@ -13,12 +13,15 @@
     loading = false,
     onpick,
     oncopy,
+    onopenfolder,
     onclose,
   }: {
     workflows: WorkflowListing[];
     loading?: boolean;
     onpick: (workflow: WorkflowListing) => void;
     oncopy?: (workflow: WorkflowListing) => void;
+    /// Open the user-global workflows folder (where the user adds their own).
+    onopenfolder?: () => void;
     onclose: () => void;
   } = $props();
 
@@ -160,4 +163,14 @@
     data-testid="workflow-menu-search"
     class="border-border bg-panel text-fg placeholder:text-muted focus-visible:ring-accent mt-1 w-full rounded-md border px-2.5 py-1.5 text-sm focus-visible:ring-2 focus-visible:outline-none"
   />
+  {#if onopenfolder}
+    <button
+      type="button"
+      class="text-muted hover:text-fg mt-1 w-full rounded-md px-2.5 py-1 text-left text-xs"
+      data-testid="workflow-menu-open-folder"
+      onclick={() => onopenfolder()}
+    >
+      Open workflows folder…
+    </button>
+  {/if}
 </div>

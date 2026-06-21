@@ -539,13 +539,17 @@ export type GitCommitSummary = {
   author_email: string | null;
   authored_at: string | null;
   branch_work: boolean;
+  // True when this local commit isn't on its upstream yet ("not pushed").
+  unpushed: boolean;
 };
 
 // Mirror of Rust `CommitRangeKind` (a bare snake_case string on the wire).
-export type CommitRangeKind = "recent" | "unpushed" | "incoming";
+// Unpushed commits are flagged per-commit within the `recent` range rather than
+// being their own kind.
+export type CommitRangeKind = "recent" | "incoming";
 
 // Mirror of Rust `GitCommitRange` — a capped, labelled slice of a branch's
-// history (recent, or unpushed/incoming when diverged from upstream).
+// history (the local `recent` list, plus `incoming` when the upstream is ahead).
 export type GitCommitRange = {
   kind: CommitRangeKind;
   label: string;

@@ -2300,6 +2300,60 @@ describe("ComposeBar — cross-agent forward", () => {
     expect(invokeMock.mock.calls.filter(([c]) => c === "send_message")).toHaveLength(0);
   });
 
+  it("removes the held forward when it resolves after the user switches projects", async () => {
+    // Regression: the held "waiting for…" row used to stick forever if the user
+    // navigated to another project while a forward was holding (and stack across
+    // repeats). The forward's resolve closure outlives the submitting context and
+    // must key the global held-forward store by *this* forward's project (a
+    // captured id), not the reactive `projectId` prop — which, once the user has
+    // navigated, no longer points at the project the forward was submitted from.
+    // Re-rendering with a different `projectId` reproduces that prop change under
+    // the in-flight closure.
+    const OTHER_PROJECT = "00000000-0000-7000-8000-0000000000ee";
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    await seedCompletedTurn(AGENT_B.id);
+
+    // Spy on the local activity bump: the dispatched send must be attributed to
+    // the project the forward was submitted from, not the navigated-to one.
+    const workspace = await loadWorkspace();
+    const activitySpy = vi.spyOn(workspace, "recordProjectsActivityLocally");
+
+    let resolveForward!: (value: unknown) => void;
+    const forwardHold = new Promise<unknown>((resolve) => {
+      resolveForward = resolve;
+    });
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "forward_message") return forwardHold;
+      if (cmd === "send_message") return "msg-1";
+      return null;
+    });
+
+    const { rerender } = render(ComposeBar, {
+      props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] },
+    });
+    await pickForwardSource(AGENT_B.id);
+    await fireEvent.click(screen.getByTestId("compose-send"));
+
+    const held = await import("$lib/state/heldForwards.svelte");
+    await waitFor(() => expect(held.heldForwardsFor(PROJECT_ID)).toHaveLength(1));
+
+    // Navigate to another project while the forward is still holding.
+    await rerender({ projectId: OTHER_PROJECT, agents: [AGENT_A] });
+    // The hold settles only after the switch.
+    resolveForward({ status: "resolved", body: "composed", skipped: [] });
+
+    // The entry must be gone from the project it was submitted under — not leaked.
+    await waitFor(() => expect(held.heldForwardsFor(PROJECT_ID)).toHaveLength(0));
+    // …and the activity bump on dispatch must hit the submitting project, never
+    // the project navigated to (same stale-prop bug class, one call deeper).
+    await waitFor(() => {
+      expect(activitySpy).toHaveBeenCalledWith([PROJECT_ID], expect.any(String));
+    });
+    expect(activitySpy).not.toHaveBeenCalledWith([OTHER_PROJECT], expect.any(String));
+  });
+
   // Manual forwarding into a prompt's arguments — the prompt-composer analogue of
   // the compose-bar forward above. The backend resolves the per-argument sources,
   // composes + fills + renders the prompt, and returns the rendered body; the

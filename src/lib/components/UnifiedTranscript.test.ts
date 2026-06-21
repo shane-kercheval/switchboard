@@ -3287,6 +3287,34 @@ describe("UnifiedTranscript — cross-agent forward", () => {
     );
   });
 
+  it("clears the held-forward indicator when the forward resolves (removed from store)", async () => {
+    const state = await loadState();
+    const held = await loadHeld();
+    await state.registerAgent(CLAUDE_AGENT);
+    await state.registerAgent(CODEX_AGENT);
+    held.addHeldForward(PROJECT_ID, {
+      forwardId: "fwd-1",
+      sendId: "s-1",
+      body: "please aggregate",
+      sources: [{ kind: "agent", id: CODEX_AGENT.id, name: "bob" }],
+      recipients: [CLAUDE_AGENT.id],
+    });
+
+    render(UnifiedTranscript, {
+      props: { projectId: PROJECT_ID, agents: [CLAUDE_AGENT, CODEX_AGENT] },
+    });
+
+    expect(await screen.findByTestId("held-forward")).toBeInTheDocument();
+
+    // Simulate `forward_message` resolving: the compose-bar closure removes the
+    // held entry. The indicator must disappear.
+    held.removeHeldForward(PROJECT_ID, "fwd-1");
+    await tick();
+    await waitFor(() => {
+      expect(screen.queryByTestId("held-forward")).toBeNull();
+    });
+  });
+
   it("shows a held forward only in the pane(s) that contain its recipient", async () => {
     // Each pane renders its own UnifiedTranscript scoped to its agents. A held
     // forward must show in the recipient's pane only — not leak into a pane that

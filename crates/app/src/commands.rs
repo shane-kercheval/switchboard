@@ -4544,6 +4544,8 @@ const INSTANCE_LOCK_FILE: &str = "instance.lock";
 /// unlock. Contention (another process holds it) maps to `ProjectLocked`; any
 /// other I/O failure to `ProjectLockIo`.
 fn acquire_project_lock(project_id: ProjectId, root: &Path) -> Result<File, AppError> {
+    // Backoff schedule for retrying a transient `WouldBlock` (see the loop below).
+    const RETRY_BACKOFF_MS: [u64; 5] = [5, 10, 20, 40, 80];
     let lock_path = root.join(INSTANCE_LOCK_FILE);
     let file = OpenOptions::new()
         .create(true)
@@ -4553,11 +4555,29 @@ fn acquire_project_lock(project_id: ProjectId, root: &Path) -> Result<File, AppE
         .truncate(false)
         .open(&lock_path)
         .map_err(|source| AppError::ProjectLockIo { project_id, source })?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(std::fs::TryLockError::WouldBlock) => Err(AppError::ProjectLocked(project_id)),
-        Err(std::fs::TryLockError::Error(source)) => {
-            Err(AppError::ProjectLockIo { project_id, source })
+    // Retry a transient `WouldBlock` briefly before concluding another live
+    // process holds the lock. `flock` is released on the holder's last `close`,
+    // but the kernel can finalize that release *asynchronously* — so a lock that
+    // was just dropped (a prior handle in this process, or another instance that
+    // exited / restarted moments ago) can spuriously report `WouldBlock` for a
+    // few milliseconds on a loaded host. A genuinely live holder keeps the lock
+    // through the whole window, so real contention still surfaces as
+    // `ProjectLocked` (just ~150 ms later); only the false positive is absorbed.
+    // The uncontended path locks on the first try with no delay.
+    let mut attempt = 0usize;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                let Some(&backoff) = RETRY_BACKOFF_MS.get(attempt) else {
+                    return Err(AppError::ProjectLocked(project_id));
+                };
+                std::thread::sleep(std::time::Duration::from_millis(backoff));
+                attempt += 1;
+            }
+            Err(std::fs::TryLockError::Error(source)) => {
+                return Err(AppError::ProjectLockIo { project_id, source });
+            }
         }
     }
 }
@@ -8764,6 +8784,35 @@ mod tests {
             "exactly one lock handle for the project"
         );
         assert_eq!(lock(&state.projects).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn acquire_project_lock_retries_a_transiently_released_lock() {
+        // Regression for a CI flake: a lock that is released *just* after acquire
+        // begins must be obtained via the retry, not reported as ProjectLocked.
+        // This is the same shape as `concurrent_first_open` simulating "not
+        // loaded" by dropping the creation flock — the kernel can finalize a
+        // flock release asynchronously, so a fresh-fd lock attempt microseconds
+        // later can spuriously see WouldBlock under load.
+        let (_tmp, _home, state, proj) = fresh_state_with_active_project("alpha").await;
+        let root = lock(&state.projects).get(&proj.id).unwrap().root.clone();
+        // Take ownership of the creation lock handle so we control its release.
+        let held = lock(&state.project_locks).remove(&proj.id).unwrap();
+
+        // Release the held lock after a delay that lands inside the retry budget
+        // but after the first (immediate) attempt is guaranteed to fail.
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            drop(held);
+        });
+
+        // Without the retry this returns ProjectLocked on the first attempt
+        // (the held handle still conflicts); with it, acquire waits out the
+        // transient contention and succeeds.
+        let acquired =
+            acquire_project_lock(proj.id, &root).expect("retry should obtain the released lock");
+        releaser.join().unwrap();
+        drop(acquired);
     }
 
     #[tokio::test]

@@ -17,7 +17,9 @@
     buildUnifiedRows,
     copyTextOf,
     groupRenderBlocks,
+    INITIAL_WINDOW,
     lastAnswerTextOf,
+    REVEAL_BATCH,
     type RenderBlock,
     type UnifiedRow,
   } from "$lib/state/unified";
@@ -122,7 +124,7 @@
 
   /// Group the flat rows into render blocks: standalone rows, plus one block per
   /// fan-out whose responses lay out as per-recipient columns.
-  const blocks = $derived(
+  const blocks = $derived.by(() =>
     groupRenderBlocks(
       rows,
       agents.map((a) => a.id),
@@ -147,60 +149,61 @@
   ///
   /// Known limitation: select-all (and any future find-in-page) reaches only
   /// mounted blocks — unmounted history isn't in the DOM until scrolled to. A
-  /// deliberate tradeoff for the load-time win.
-  const INITIAL_WINDOW = 20;
-  /// How many older blocks each upward-reveal mounts. Same tunable-knob status as
-  /// `INITIAL_WINDOW` (block count is a loose proxy for the per-item render cost).
-  const REVEAL_BATCH = 20;
-  let firstVisibleIndex = $state(0);
-  const visibleBlocks = $derived(blocks.slice(firstVisibleIndex));
-
+  /// deliberate tradeoff for the load-time win. `INITIAL_WINDOW` / `REVEAL_BATCH`
+  /// live in `$lib/state/unified` so the component and the browser-test bound
+  /// share one definition.
   function blockKey(block: RenderBlock): string {
     return block.kind === "fanout" ? block.key : block.row.key;
   }
 
-  /// Re-pin the window to the tail whenever the conversation identity changes,
-  /// where identity is `projectId` + the visible agent list (in order) + the
-  /// *oldest* block's key. Each term covers a distinct way the block list can be
-  /// restructured under the cursor (vs. a pure tail append, which must NOT
-  /// reseed):
+  /// Conversation identity: a change means the block list was restructured *under*
+  /// the cursor and the window must re-pin to the tail. Three axes, each a
+  /// distinct restructuring (a pure tail append changes none of them, so it must
+  /// NOT reseed):
   /// - **project switch** — a wholly different conversation;
   /// - **visible-agent change** — a pane hides/shows an agent on the *same*
-  ///   persistent component (it's keyed by pane id, not roster), shrinking or
-  ///   reshaping `blocks`; without this term a stale high index can slice the
-  ///   shorter array to empty. Order matters: roster order drives row grouping
-  ///   and fan-out column order.
-  /// - **oldest-block change** — a late retry-hydration inserting historical
-  ///   turns at the front (incl. the single-failed-agent case, where `blocks` is
-  ///   empty at the first `complete` and only fills on retry).
-  /// The oldest key is stable across live appends and streaming updates (both
-  /// touch the tail / block contents, never the front), so an ordinary new turn
-  /// holds the cursor — the whole point of an absolute index over a sliding tail.
-  ///
-  /// The seed is only *authoritative* (marked, so live appends thereafter hold
-  /// the cursor) once content has **settled** (`loadStatus === "complete"`).
-  /// While loading we still bound the window — load-start resets the journal
-  /// overlay but not the per-agent `transcripts` store, so a re-open can show
-  /// *stale* content mid-load, and it must not mount unbounded — but we leave the
-  /// seed unmarked so the real seed lands on `complete` (the per-agent turns and
-  /// the status flip arrive in one synchronous flush, so `blocks` is full there).
-  /// This avoids locking the window to a stale first-non-empty snapshot. The
-  /// `seeded*` guards are non-reactive; the effect tracks `projectId`/`agents`/
-  /// `loadStatus`/`blocks`.
-  let seededProjectId: ProjectId | null = null;
-  let seededAgentsKey: string | null = null;
-  let seededFirstKey: string | null = null;
+  ///   persistent component (keyed by pane id, not roster); without it a stale
+  ///   high cursor slices the shorter array to empty. Order matters (it drives
+  ///   row grouping / fan-out column order);
+  /// - **oldest-block change** — a front insertion such as a late retry-hydration
+  ///   (incl. the single-failed-agent case: empty at first `complete`, fills on
+  ///   retry). The oldest key is stable across appends/streaming (both touch the
+  ///   tail), so an ordinary new turn holds the cursor.
+  /// NUL (`\u0000`) joins the identity axes: it can't occur in a UUID or a
+  /// block key, so distinct axis values can't collide into one string. Spelled
+  /// as an escape, not a raw byte, so the delimiter stays visible in source.
+  const windowIdentity = $derived(
+    [
+      projectId,
+      agents.map((a) => a.id).join(","),
+      blocks.length > 0 ? blockKey(blocks[0]!) : "",
+    ].join("\u0000"),
+  );
+
+  /// The window must be applied **in the derived**, not set from an `$effect`:
+  /// an effect runs *after* the render it would correct, so the first paint with
+  /// a freshly-loaded transcript would transiently mount — and markdown-parse —
+  /// every block before the effect bounded it. So `firstVisibleIndex` derives a
+  /// tail-bounded fallback for any not-yet-frozen identity, and the effect below
+  /// only *freezes* that fallback into an absolute `cursor` (so later appends grow
+  /// the window instead of sliding it, which would churn the oldest visible
+  /// block). Until frozen — or while a stale cursor belongs to a since-changed
+  /// identity — the fallback bounds the window, so the first render is never the
+  /// whole transcript. The fallback also covers the loading phase (stale content
+  /// from a re-open can't mount unbounded).
+  let cursor = $state<number | null>(null);
+  let frozenIdentity = $state<string | null>(null);
+  const firstVisibleIndex = $derived(
+    cursor !== null && windowIdentity === frozenIdentity
+      ? cursor
+      : Math.max(0, blocks.length - INITIAL_WINDOW),
+  );
+  const visibleBlocks = $derived(blocks.slice(firstVisibleIndex));
+
   $effect(() => {
-    const firstKey = blocks.length > 0 ? blockKey(blocks[0]!) : null;
-    const agentsKey = agents.map((a) => a.id).join(",");
-    const identityStable =
-      projectId === seededProjectId && agentsKey === seededAgentsKey && firstKey === seededFirstKey;
-    if (identityStable) return;
-    firstVisibleIndex = Math.max(0, blocks.length - INITIAL_WINDOW);
-    if (loadStatus === "complete") {
-      seededProjectId = projectId;
-      seededAgentsKey = agentsKey;
-      seededFirstKey = firstKey;
+    if (loadStatus === "complete" && windowIdentity !== frozenIdentity) {
+      cursor = Math.max(0, blocks.length - INITIAL_WINDOW);
+      frozenIdentity = windowIdentity;
     }
   });
 
@@ -751,7 +754,11 @@
       return;
     }
     revealing = true;
-    firstVisibleIndex = Math.max(0, firstVisibleIndex - REVEAL_BATCH);
+    // Decrement the absolute cursor (and pin the current identity, so the derived
+    // uses the cursor rather than the tail fallback). `firstVisibleIndex` reflects
+    // it on the next read.
+    cursor = Math.max(0, firstVisibleIndex - REVEAL_BATCH);
+    frozenIdentity = windowIdentity;
     // The reveal is synchronous (blocks are in memory). Growing `content` fires
     // the ResizeObserver → `reanchor`, which restores the reading position
     // (anchor-restore: the read block's own height is unchanged, only blocks

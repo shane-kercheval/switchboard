@@ -136,6 +136,12 @@ export type RenderBlock =
       columns: { agent_id: AgentId; rows: Exclude<UnifiedRow, { kind: "user" }>[] }[];
     };
 
+/// Render-windowing tunables (block counts are a loose proxy for per-item render
+/// cost). Shared with the component that consumes them and the browser tests that
+/// assert the bound, so the window size has one source of truth.
+export const INITIAL_WINDOW = 20;
+export const REVEAL_BATCH = 20;
+
 const KIND_RANK = { user: 0, agent: 1, outcome: 2 } as const;
 
 /// Merge the active project's per-agent turns (live + hydrated agent content

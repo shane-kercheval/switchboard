@@ -18,6 +18,7 @@ import {
 } from "./harness";
 import { ALICE, PROJECT_ID } from "./fixtures";
 import { buildLargeTranscript } from "$lib/dev/largeTranscript";
+import { INITIAL_WINDOW } from "$lib/state/unified";
 
 // M2 upward reveal in real WebKit — the authoritative coverage, since
 // scroll-position preservation is layout-coupled and jsdom can't measure it. The
@@ -43,11 +44,11 @@ beforeEach(() => {
 
 test("reaching the top reveals older blocks and holds the reading position", async () => {
   await registerAgent(ALICE);
-  // 120 exchanges → 240 blocks, windowed to the last 50.
+  // 120 exchanges → 240 blocks, windowed to the last INITIAL_WINDOW.
   seedTurns(ALICE.id, buildLargeTranscript({ agentIds: [ALICE.id], exchanges: 120 })[ALICE.id]!);
 
   mountTranscript({ projectId: PROJECT_ID, agents: [ALICE] });
-  await expect.poll(() => blockCount()).toBeLessThanOrEqual(50);
+  await expect.poll(() => blockCount()).toBeLessThanOrEqual(INITIAL_WINDOW);
   await expect.poll(() => distanceFromBottom()).toBeLessThan(32);
   const initialCount = blockCount();
 

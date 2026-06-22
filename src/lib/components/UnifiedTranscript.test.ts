@@ -15,6 +15,7 @@ import {
   _testing as previewState,
 } from "$lib/state/transcriptPreview.svelte";
 import type { Turn } from "$lib/state/index.svelte";
+import { INITIAL_WINDOW, REVEAL_BATCH } from "$lib/state/unified";
 
 const listeners = new Map<string, (e: { payload: NormalizedEvent }) => void>();
 vi.mock("@tauri-apps/api/event", () => ({
@@ -3479,11 +3480,11 @@ describe("UnifiedTranscript — cross-agent forward", () => {
 });
 
 describe("UnifiedTranscript render windowing", () => {
-  // Keep in sync with INITIAL_WINDOW / REVEAL_BATCH in UnifiedTranscript.svelte.
-  // Seed sizes and expectations below are expressed relative to these, so a tuning
-  // change there is a two-line change here, not a per-assertion rewrite.
-  const WINDOW = 20;
-  const BATCH = 20;
+  // Sourced from the same module the component uses, so a tuning change there
+  // flows here automatically — seed sizes and expectations below are expressed
+  // relative to these.
+  const WINDOW = INITIAL_WINDOW;
+  const BATCH = REVEAL_BATCH;
   // Comfortably more blocks than the window, so the tail is bounded with history
   // above it.
   const OVER = WINDOW * 3;

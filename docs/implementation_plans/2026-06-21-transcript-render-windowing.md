@@ -8,7 +8,9 @@
 
 The forward-looking milestone text below is preserved as written; this section records what actually shipped, including one material deviation. Where the two disagree, this section is authoritative.
 
-- **M1 — windowed render.** Renders `blocks.slice(firstVisibleIndex)`; a top-cursor index, never a sliding tail. The cursor is **seeded on `loadStatus === "complete"`** (the content-settle signal — the component mounts before history loads), and reseeds whenever the **conversation identity** changes, where identity = `projectId` + the **visible-agent list (in order)** + the **oldest block's key**. The visible-agent term is load-bearing: a pane hides/shows an agent on the *same* persistent component, and without it a stale cursor sliced a shorter `blocks` to empty (blank pane). The oldest-key term catches a late retry-hydration inserting history at the front. The window is also bounded **while loading** (so stale mid-load content can't mount unbounded), but the seed is only recorded on `complete`.
+- **M1 — windowed render.** Renders `blocks.slice(firstVisibleIndex)`; a top-cursor index, never a sliding tail. `firstVisibleIndex` is a **synchronous `$derived`**: a tail-bounded fallback (`max(0, blocks.length - INITIAL_WINDOW)`) for any not-yet-frozen conversation identity, which an `$effect` then **freezes** into an absolute `cursor` on `loadStatus === "complete"`. Freezing (rather than continuously deriving the tail) is what lets later appends grow the window instead of sliding it. Identity = `projectId` + the **visible-agent list (in order)** + the **oldest block's key**, NUL-joined; a change reseeds the window to the new tail. The visible-agent term is load-bearing: a pane hides/shows an agent on the *same* persistent component, and without it a stale cursor sliced a shorter `blocks` to empty (blank pane). The oldest-key term catches a late retry-hydration inserting history at the front.
+
+  - **Bug that shipped first, then was fixed — effect-ordering parse storm.** The original implementation seeded the cursor from an `$effect` (`firstVisibleIndex` was `$state`, set after mount). An `$effect` runs *after* the render it would correct, so the very first paint of a freshly-loaded transcript used the default index `0` → `blocks.slice(0)` mounted **every** block and `renderMarkdown`-parsed the whole history (~1.45 s on the `coder` file: 2,432 markdown calls), and only *then* did the effect bound the DOM to the window. The settled DOM was correctly 20 blocks, so every settled-state test and the M1 DoD passed — the entire cold-open cost the feature targets was silently never saved. The fix is the synchronous derived above (the fallback bounds the *first* render, before any effect runs); confirmed in-app (markdown calls 2,432 → ~90, cold-open down ~1.4 s) and guarded by a first-paint parse-count test. Lesson folded into the DoD: assert the render *cost*, never a settled-DOM proxy the bug leaves looking healthy.
 
 - **M2 — upward reveal.** A sentinel above the block list (kept OUTSIDE the `captureAnchor`-scanned `content`) is watched by an IntersectionObserver; reaching it mounts the next older batch. Reading-position stability is **not** hand-rolled — the prepend grows `content`, the existing `ResizeObserver → reanchor` holds the anchor. A one-batch latch gates re-entry and **coalesces** (does not drop) a trigger that arrives mid-reveal.
 
@@ -240,9 +242,21 @@ window applied.
     settle keeps every previously-visible block mounted and renders the new one
     (cursor does not advance); switching project/conversation reseeds to the new
     tail; the bottom (`last` block) is always present.
+- **The success criterion is first-paint render work, not settled DOM size.** The
+  feature exists to cut the cold-open markdown cost, so the DoD test must assert
+  *that* — the number of `renderMarkdown` calls on first paint is bounded to the
+  window (see `UnifiedTranscript.markdown-window.test.ts`, verified to fail when
+  the bug is simulated). A settled-DOM-count check is **not** sufficient and must
+  not stand in for this: the window can settle to N blocks while the *first* render
+  transiently mounted and markdown-parsed the whole transcript (the effect-ordering
+  bug that shipped and survived multiple reviews — the settled DOM looked healthy
+  the entire time). Measure the cost the feature targets, not a proxy the bug
+  leaves looking fine.
 - **Browser test** (`tests/browser/`): on a long seeded transcript the initial
-  DOM node count under the transcript is bounded (proves the window is real in
-  WebKit, not just a jsdom artifact), and the view is pinned at the true bottom.
+  DOM node count under the transcript is bounded **to the real window** (assert
+  against the shared `INITIAL_WINDOW`, not a loose multiple of it — a generous
+  bound is the same too-weak proxy in WebKit form), and the view is pinned at the
+  true bottom.
 - Known limitation recorded in-code and in this plan: **select-all (⌘A) and any
   future find-in-page only cover mounted blocks** — windowing reintroduces the
   exact tradeoff the containment comment chose to avoid. Note it where the

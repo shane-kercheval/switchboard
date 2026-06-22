@@ -97,7 +97,12 @@ test("a never-visited block sits at its declared placeholder; once visited it ke
     text: longText(8),
     at: "2025-12-31T00:00:00Z",
   });
-  const history = buildLargeTranscript({ agentIds: [ALICE.id], exchanges: 60 })[ALICE.id]!;
+  // Kept under the render window (INITIAL_WINDOW = 50 blocks; 2 blocks/exchange)
+  // so the probe — the OLDEST block — stays mounted-but-skipped rather than
+  // windowed out of the DOM. This test is about content-visibility's
+  // placeholder/remembered-size behavior, which is orthogonal to windowing;
+  // beyond-window reachability is the upward-reveal milestone's concern.
+  const history = buildLargeTranscript({ agentIds: [ALICE.id], exchanges: 20 })[ALICE.id]!;
   seedTurns(ALICE.id, [probe, ...history]);
 
   mountTranscript({ projectId: PROJECT_ID, agents: [ALICE] });
@@ -133,7 +138,10 @@ test("a clipped unit scrolled into view materializes and grows its collapse togg
   // must hold: scrolling the unit into view materializes it, the observer
   // fires, and the toggle appears.
   await registerAgent(ALICE);
-  const seeded = buildLargeTranscript({ agentIds: [ALICE.id], exchanges: 120 });
+  // Kept under the render window (INITIAL_WINDOW = 50 blocks; 2 blocks/exchange)
+  // so the top-of-history block is mounted-but-skipped — this exercises
+  // materialize-on-scroll of a contained block, not beyond-window reveal.
+  const seeded = buildLargeTranscript({ agentIds: [ALICE.id], exchanges: 24 });
   seedTurns(ALICE.id, seeded[ALICE.id]!);
 
   mountTranscript({ projectId: PROJECT_ID, agents: [ALICE] });

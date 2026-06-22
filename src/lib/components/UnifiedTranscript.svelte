@@ -129,6 +129,80 @@
     ),
   );
 
+  /// Render-windowing: mount only a tail window of `blocks`, so opening a long
+  /// transcript doesn't pay the full markdown-render cost up front. That cost is
+  /// the bottleneck — building the rows/blocks is single-digit ms, but mounting
+  /// every block and running its `renderMarkdown` (marked + Prism + DOMPurify per
+  /// segment) is ~1s on a long history. Off-window blocks stay in memory but
+  /// unmounted, so their Markdown never parses until they're revealed.
+  ///
+  /// The window is a top-cursor index, deliberately NOT a fixed-size tail: a tail
+  /// count would unmount the oldest visible block on every append, churning the
+  /// `content-visibility` remembered sizes (see the containment note below) and
+  /// nudging the viewport. The cursor only decreases (upward reveal, a later
+  /// milestone) or holds, so appended turns always render and nothing already
+  /// visible is unmounted. `INITIAL_WINDOW` is a tuning knob, not a contract;
+  /// block count is a loose proxy for the real cost driver (render *items* — one
+  /// agent block can hold dozens, a compact user row one), so it's sized
+  /// generously to cover a viewport plus scroll buffer.
+  ///
+  /// Known limitation: select-all (and any future find-in-page) reaches only
+  /// mounted blocks — unmounted history isn't in the DOM until scrolled to. This
+  /// is exactly the tradeoff the containment-only approach was chosen to avoid;
+  /// windowing reintroduces it deliberately, for the load-time win.
+  const INITIAL_WINDOW = 50;
+  let firstVisibleIndex = $state(0);
+  const visibleBlocks = $derived(blocks.slice(firstVisibleIndex));
+
+  function blockKey(block: RenderBlock): string {
+    return block.kind === "fanout" ? block.key : block.row.key;
+  }
+
+  /// Re-pin the window to the tail whenever the conversation identity changes,
+  /// where identity is `projectId` + the visible agent list (in order) + the
+  /// *oldest* block's key. Each term covers a distinct way the block list can be
+  /// restructured under the cursor (vs. a pure tail append, which must NOT
+  /// reseed):
+  /// - **project switch** — a wholly different conversation;
+  /// - **visible-agent change** — a pane hides/shows an agent on the *same*
+  ///   persistent component (it's keyed by pane id, not roster), shrinking or
+  ///   reshaping `blocks`; without this term a stale high index can slice the
+  ///   shorter array to empty. Order matters: roster order drives row grouping
+  ///   and fan-out column order.
+  /// - **oldest-block change** — a late retry-hydration inserting historical
+  ///   turns at the front (incl. the single-failed-agent case, where `blocks` is
+  ///   empty at the first `complete` and only fills on retry).
+  /// The oldest key is stable across live appends and streaming updates (both
+  /// touch the tail / block contents, never the front), so an ordinary new turn
+  /// holds the cursor — the whole point of an absolute index over a sliding tail.
+  ///
+  /// The seed is only *authoritative* (marked, so live appends thereafter hold
+  /// the cursor) once content has **settled** (`loadStatus === "complete"`).
+  /// While loading we still bound the window — load-start resets the journal
+  /// overlay but not the per-agent `transcripts` store, so a re-open can show
+  /// *stale* content mid-load, and it must not mount unbounded — but we leave the
+  /// seed unmarked so the real seed lands on `complete` (the per-agent turns and
+  /// the status flip arrive in one synchronous flush, so `blocks` is full there).
+  /// This avoids locking the window to a stale first-non-empty snapshot. The
+  /// `seeded*` guards are non-reactive; the effect tracks `projectId`/`agents`/
+  /// `loadStatus`/`blocks`.
+  let seededProjectId: ProjectId | null = null;
+  let seededAgentsKey: string | null = null;
+  let seededFirstKey: string | null = null;
+  $effect(() => {
+    const firstKey = blocks.length > 0 ? blockKey(blocks[0]!) : null;
+    const agentsKey = agents.map((a) => a.id).join(",");
+    const identityStable =
+      projectId === seededProjectId && agentsKey === seededAgentsKey && firstKey === seededFirstKey;
+    if (identityStable) return;
+    firstVisibleIndex = Math.max(0, blocks.length - INITIAL_WINDOW);
+    if (loadStatus === "complete") {
+      seededProjectId = projectId;
+      seededAgentsKey = agentsKey;
+      seededFirstKey = firstKey;
+    }
+  });
+
   /// Held forwards whose recipients fall in *this* transcript's agents, paired
   /// with that pane-local recipient subset. A held "waiting…" row belongs to the
   /// pane(s) that will receive the forward — exactly like a queued send shows in
@@ -241,12 +315,13 @@
     return keys;
   });
 
-  /// Containment chosen over virtualization, deliberately: it is ~CSS-only,
-  /// preserves the full DOM (copy, selection, accessibility, any future
-  /// find-in-page), keeps the hand-built scroll-anchoring machinery and its
-  /// browser tests intact, and is removable in one line if windowed
-  /// virtualization ever supersedes it. Off-screen blocks skip layout and
-  /// paint and contribute `contain-intrinsic-size` placeholder geometry —
+  /// Containment of the *mounted* blocks, complementary to render-windowing
+  /// above: windowing bounds how many blocks mount (so the initial markdown
+  /// cost is paid only for the tail), while containment keeps the mounted
+  /// window — which can still exceed a viewport — cheap to lay out. It is
+  /// ~CSS-only, keeps the hand-built scroll-anchoring machinery and its browser
+  /// tests intact, and is removable in one line. Off-screen blocks skip layout
+  /// and paint and contribute `contain-intrinsic-size` placeholder geometry —
   /// which is exactly the work the compose textarea's per-keystroke forced
   /// reflow pays for on a long transcript. `auto` makes the engine remember
   /// each block's real height once rendered; the per-kind length is only the
@@ -1381,7 +1456,7 @@
   {/if}
 
   <div bind:this={content} class="space-y-5">
-    {#each blocks as block (block.kind === "fanout" ? block.key : block.row.key)}
+    {#each visibleBlocks as block (block.kind === "fanout" ? block.key : block.row.key)}
       <div class={blockContainment(block)} data-testid="transcript-block">
         {#if block.kind === "row"}
           {#if block.row.kind === "user"}

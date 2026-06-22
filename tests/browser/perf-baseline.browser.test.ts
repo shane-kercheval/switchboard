@@ -27,6 +27,12 @@ import type { Turn } from "$lib/state/types";
 // console output doesn't reach the terminal reliably). Without VITE_PERF the
 // tests skip, so `make check` is unaffected.
 //
+// NOTE: render-windowing caps the mounted transcript at INITIAL_WINDOW blocks,
+// so the "windowed-tail" scenarios below seed a deep history but mount only the
+// tail window — the relayout numbers reflect the windowed DOM (now the realistic
+// production case), not all 300 exchanges. To measure the old unwindowed upper
+// bound a run would have to defeat the window.
+//
 // What it measures and which decisions it feeds (see the perf plan's M3/M5
 // sections, docs/implementation_plans/2026-06-09-performance-improvements.md):
 // - The compose autosize's exact per-keystroke layout operation (height-reset
@@ -124,19 +130,19 @@ test.runIf(PERF)("forced-layout cost per keystroke-equivalent", async () => {
     containment: true,
     compact: true,
   });
-  await measureScenario("large (300x) containment+compact", 300, {
+  await measureScenario("windowed-tail (300x seed) containment+compact", 300, {
     containment: true,
     compact: true,
   });
-  await measureScenario("large (300x) NO-containment compact", 300, {
+  await measureScenario("windowed-tail (300x seed) NO-containment compact", 300, {
     containment: false,
     compact: true,
   });
-  await measureScenario("large (300x) containment compact-OFF", 300, {
+  await measureScenario("windowed-tail (300x seed) containment compact-OFF", 300, {
     containment: true,
     compact: false,
   });
-  await measureScenario("large (300x) NO-containment compact-OFF", 300, {
+  await measureScenario("windowed-tail (300x seed) NO-containment compact-OFF", 300, {
     containment: false,
     compact: false,
   });

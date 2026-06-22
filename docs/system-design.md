@@ -234,7 +234,7 @@ A **workflow** is a named, parameterized composition of the primitives in §4, d
 
 Workflow definition format (illustrative; the authoritative schema is `docs/workflow-spec.md`):
 
-> **⚠️ Prompt-argument model under revision.** The `prompt_id` inputs + `template_vars` wiring shown here describe the current model. It is being replaced by a hardcoded-prompt model (the workflow bakes in its prompt and auto-derives user-fillable arguments). Treat the `aggregation_prompt`/`prompt_id`/`template_vars` shape below as pre-revision until the hardcoded-prompt plan lands.
+A workflow **hardcodes the prompts its steps run** as literal ids (`prompt: "builtin:code-review"`); a prompt is never a user-selected input. A prompt's user-fillable arguments are **auto-derived** from the resolved prompt and offered as form fields at invocation, while author-wired `template_vars` hold only **computed bindings** (workflow expressions the user can't type, e.g. `aggregated_responses(...)`). The example below fans `builtin:code-review` out to the reviewers, then hands the aggregated feedback to a primary agent via an inline `text` step.
 
 ```yaml
 name: review-and-aggregate
@@ -242,25 +242,23 @@ description: Send a message to multiple reviewers, aggregate, send to primary.
 inputs:
   primary_agent: agent
   reviewer_agents: [agent]
-  review_prompt: prompt_id           # invocation supplies e.g. local:code-review
-  aggregation_prompt: prompt_id      # invocation supplies e.g. tiddly:ai-review-feedback
-  user_context: text?
 steps:
   - send:
       to: "{{ reviewer_agents }}"
-      prompt: "{{ review_prompt }}"
-      template_vars:
-        context: "{{ user_context }}"
+      prompt: "builtin:code-review"   # code-review's optional `context` arg is auto-derived
   - wait_for_all:
       agents: "{{ reviewer_agents }}"
   - send:
       to: "{{ primary_agent }}"
-      prompt: "{{ aggregation_prompt }}"
-      template_vars:
-        feedback: "{{ aggregated_responses(reviewer_agents) }}"
+      text: |
+        Here's feedback from several reviewers:
+
+        {{ aggregated_responses(reviewer_agents) }}
+
+        Let me know what your recommendations are.
 ```
 
-When invoked, Switchboard prompts the user for each input and then executes the steps.
+When invoked, Switchboard prompts the user for each declared input plus any auto-derived prompt arguments (here, `code-review`'s optional `context`), then executes the steps.
 
 The example above uses `aggregated_responses(...)` — the helper that returns the reviewers' outputs pre-formatted in a canonical text shape — because typical aggregation prompts (especially cross-platform ones like `tiddly:ai-review-feedback`) take a single text-blob argument. A sibling helper `responses_from(...)` returns the same data as a name → text mapping for Switchboard-aware prompts that want to iterate with custom formatting. See `docs/workflow-spec.md` for both.
 
@@ -617,17 +615,17 @@ The user has a project `feature-event-logs` open in Switchboard. They have three
 
 All three are listed in the overview sidebar. The unified project transcript shows their conversation history so far in chronological order.
 
-The user has authored a workflow in their user-global workflows folder (the OS config dir's `workflows/`, e.g. `~/Library/Application Support/switchboard/workflows/review-and-aggregate.yaml`) — a variant of the built-in that takes a saved `aggregation_prompt` input (the shipped built-in wraps its aggregation step inline; this user wanted a swappable, cross-platform wrapper). The review prompt is the built-in `code-review`; the aggregation wrapper is one the user keeps in Tiddly (`tiddly:ai-review-feedback`). Both resolve because Switchboard routes each ID to its named provider — which is the point of the example. *(Prompt-model note: the user-selectable `aggregation_prompt`/`review_prompt` inputs in this walkthrough describe the current model, which the hardcoded-prompt redesign revises — see §5's marker.)*
+The user has authored a workflow in their user-global workflows folder (the OS config dir's `workflows/`, e.g. `~/Library/Application Support/switchboard/workflows/review-analyze.yaml`) — a variant of the built-in that hands the aggregated reviews to a saved cross-platform analysis prompt instead of an inline `text` step. Both prompts are **hardcoded** in the workflow file: the reviewers run `builtin:code-review`, and the analysis step runs the prompt the user keeps in Tiddly (`tiddly:ai-review-feedback`), with the aggregated reviews wired into its `review` argument via a computed `template_vars` binding. Both resolve because Switchboard routes each ID to its named provider — which is the point of the example.
 
 **Invocation:**
 
 1. The user invokes the workflow: "Run review-and-aggregate."
-2. Switchboard pops up an invocation form with one field per input the workflow declared in its YAML (`primary_agent`, `reviewer_agents`, `review_prompt`, etc. — see §4 for the schema). The user fills in:
+2. Switchboard pops up an invocation form with one field per declared input plus the auto-derived user-fillable arguments of the workflow's hardcoded prompts (`primary_agent`, `reviewer_agents`, and `code-review`'s optional `context` — see §4 for the schema). The user fills in:
    - **`primary_agent`** → `implementer`
    - **`reviewer_agents`** → `reviewer-claude` and `reviewer-codex` (multi-select)
-   - **`review_prompt`** → `local:code-review` (bundled with Switchboard)
-   - **`aggregation_prompt`** → `tiddly:ai-review-feedback` (the user's own, stored in Tiddly)
-   - **`user_context`** → "Review milestone 1, focus on the event-emission API."
+   - **`context`** (auto-derived from `builtin:code-review`) → "Review milestone 1, focus on the event-emission API."
+
+   The prompts themselves (`builtin:code-review` for the reviewers, `tiddly:ai-review-feedback` for the analysis) are hardcoded in the workflow, so there is no prompt-picker field; and `ai-review-feedback`'s `review` argument is a computed binding (the aggregated reviews), so it is not shown to the user.
 3. The user confirms. The workflow launches.
 
 **Execution:**
@@ -635,7 +633,7 @@ The user has authored a workflow in their user-global workflows folder (the OS c
 1. Switchboard sends the review-prompt message (with user context appended) to both reviewers in parallel. Each reviewer runs.
 2. Switchboard waits for both reviewers to complete their turns.
 3. Switchboard collects both reviewers' final responses.
-4. Switchboard composes the two reviews into a single aggregated text blob (canonical shape per `docs/workflow-spec.md`), then renders the aggregation-prompt template with that blob bound to the prompt's text argument. Because the aggregation prompt is a generic Tiddly prompt that takes a single `{{ feedback }}` argument, no Switchboard-specific authoring is needed — the helper does the formatting.
+4. Switchboard composes the two reviews into a single aggregated text blob (canonical shape per `docs/workflow-spec.md`), then renders the hardcoded analysis prompt (`tiddly:ai-review-feedback`) with that blob bound to the prompt's `review` argument via the workflow's computed `template_vars`. Because the analysis prompt is a generic Tiddly prompt that takes a single text argument, no Switchboard-specific authoring is needed — the helper does the formatting.
 5. Switchboard sends the rendered message to `implementer` (the agent supplied as the workflow's `primary_agent` input).
 6. The implementer runs and produces its response.
 7. Workflow complete. The user is notified.

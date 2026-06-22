@@ -432,21 +432,32 @@ fn invocation_msg(message: String) -> WorkflowError {
 enum PromptSchema {
     /// Resolved to its declared arguments (possibly empty).
     Resolved(Vec<PromptArgument>),
-    /// The id parses but isn't in the prompt cache yet — a cold/stale MCP cache,
-    /// not a hard error. The form treats this as pending and re-checks after a
-    /// sync; invoke pre-flight is authoritative.
+    /// A `builtin`/`local` id that doesn't resolve — **definitively missing**. These
+    /// providers resolve directly (compiled-in / filesystem scan), so a miss can
+    /// never become present via a sync (e.g. a `local:ghost` typo). A blocking
+    /// error, surfaced immediately — *not* `Unresolved`, which would spin forever.
+    Missing,
+    /// An **MCP** id absent from the cache — possibly just a cold/stale cache
+    /// pending a sync, so not a hard error. The form treats this as pending and
+    /// re-checks after a sync; only still-missing-after-a-settled-sync is an error.
     Unresolved,
     /// The literal isn't a `provider:name` id — a malformed workflow definition.
     Malformed,
 }
 
 /// Resolve a hardcoded prompt id to its declared arguments via the prompt cache.
-/// `builtin`/`local` are authoritative once warmed; an absent MCP prompt is
-/// `Unresolved` (sync pending), never silently "no arguments".
+/// Provider-aware on a miss: `builtin`/`local` resolve directly (so a miss is
+/// definitively `Missing`), while an MCP miss is `Unresolved` (a sync may still
+/// make it appear).
 fn resolve_prompt_schema(prompts: &PromptService, id: &str) -> PromptSchema {
     match PromptId::parse(id) {
         Ok(pid) => match prompts.get(&pid.provider, &pid.name) {
             Some(prompt) => PromptSchema::Resolved(prompt.arguments),
+            None if pid.provider == switchboard_prompts::LOCAL_PROVIDER
+                || pid.provider == switchboard_prompts::BUILTIN_PROVIDER =>
+            {
+                PromptSchema::Missing
+            }
             None => PromptSchema::Unresolved,
         },
         Err(_) => PromptSchema::Malformed,
@@ -515,6 +526,7 @@ pub enum FormCompatibility {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct WorkflowFormDescriptor {
     pub name: String,
+    pub description: Option<String>,
     pub is_builtin: bool,
     pub invocable: bool,
     pub inputs: Vec<WorkflowInputInfo>,
@@ -596,6 +608,13 @@ fn classify_form(workflow: &Workflow, prompts: &PromptService) -> ResolvedForm {
                 prompt: id.to_owned(),
                 argument: String::new(),
                 reason: format!("`{id}` is not a valid prompt id"),
+            }),
+            // Definitively missing (local/builtin): a blocking error shown at once,
+            // not a pending "resolving" state — no sync will make it appear.
+            PromptSchema::Missing => issues.push(BindingIssue {
+                prompt: id.to_owned(),
+                argument: String::new(),
+                reason: format!("prompt `{id}` not found"),
             }),
             PromptSchema::Unresolved => unresolved.push(id.to_owned()),
             PromptSchema::Resolved(args) => {
@@ -801,6 +820,7 @@ pub fn describe_workflow_form_impl(
     }
     Ok(WorkflowFormDescriptor {
         name: workflow.name.clone(),
+        description: Some(workflow.description.clone()),
         is_builtin,
         invocable,
         inputs,

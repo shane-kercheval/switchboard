@@ -2,6 +2,8 @@
 
 **Status:** plan (not started)
 **Supersedes outline in:** `docs/implementation_plans/2026-05-12-v1.md` §M6 / §M7 (this is their implementation-grade expansion).
+
+> **Superseded in part (2026-06-21).** The prompt model in this plan's command + interpreter milestones (a workflow takes a user-selectable `prompt_id` input and the author hand-wires its arguments via `template_vars`) has been replaced by the hardcoded-prompt redesign in `docs/implementation_plans/2026-06-21-workflows-refactor.md`: a step names its prompt as a literal (`prompt: "builtin:code-review"`), `prompt_id` is no longer an input type, and a prompt's user-fillable arguments are auto-derived at invocation. Read that refactor (and the current `docs/workflow-spec.md`) for the shipped behavior; this plan is left intact as historical context.
 **Authoritative DSL spec:** `docs/workflow-spec.md` — the workflow file format. This plan implements it; where this plan and the spec disagree, the spec wins and this plan is wrong and should be fixed.
 
 ## What this delivers

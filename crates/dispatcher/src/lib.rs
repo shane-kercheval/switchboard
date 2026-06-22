@@ -329,6 +329,11 @@ enum Command {
     WaitForCurrentTurn {
         reply: oneshot::Sender<CurrentTurnWait>,
     },
+    /// **Non-blocking** peek: reply `true` iff a turn is *actively running* right
+    /// now (not idle, not already past its terminal). Unlike `WaitForCurrentTurn`
+    /// it never holds the reply — used by completed-only forwarding to reject a
+    /// still-streaming source without waiting on it.
+    PeekCurrentTurn { reply: oneshot::Sender<bool> },
     /// Cancel the running turn (out-of-band; no-op if none is live).
     Cancel(CancelSource),
     /// Cancel a whole *send* on this agent: fire the running turn's cancel
@@ -948,6 +953,28 @@ impl Dispatcher {
         rx.await.unwrap_or(CurrentTurnWait::Idle)
     }
 
+    /// Whether `agent_id` has a turn **actively running** right now. Non-blocking:
+    /// the actor answers immediately (never holds the reply for a running turn),
+    /// so completed-only forwarding can reject a still-streaming source without
+    /// waiting on it. `false` for an idle/never-dispatched/shutting-down agent.
+    pub async fn is_turn_running(&self, agent_id: AgentId) -> bool {
+        let commands = {
+            let agents = lock(&self.agents);
+            match agents.get(&agent_id) {
+                Some(AgentSlot::Active(tx)) => tx.clone(),
+                _ => return false,
+            }
+        };
+        let (tx, rx) = oneshot::channel();
+        if commands
+            .send(Command::PeekCurrentTurn { reply: tx })
+            .is_err()
+        {
+            return false;
+        }
+        rx.await.unwrap_or(false)
+    }
+
     /// Close `agent_id`'s actor atomically: mark the slot `Closing` (so a racing
     /// send is rejected, not resurrected with a fresh actor), tell the actor to
     /// abandon its backlog + cancel any running turn + drain, await its reply,
@@ -1162,6 +1189,11 @@ fn apply_idle_command(
         // source's latest completed output, if any, is already on disk.
         Command::WaitForCurrentTurn { reply } => {
             let _ = reply.send(CurrentTurnWait::Idle);
+            IdleAfter::Continue
+        }
+        // No turn live ⇒ not running.
+        Command::PeekCurrentTurn { reply } => {
+            let _ = reply.send(false);
             IdleAfter::Continue
         }
         // No turn live ⇒ cancel is a no-op.
@@ -1592,6 +1624,10 @@ async fn drain_turn(
                             }
                             None => awaiters.current_turn.push(reply),
                         }
+                    }
+                    // Mid-turn peek: running iff the terminal hasn't passed yet.
+                    Some(Command::PeekCurrentTurn { reply }) => {
+                        let _ = reply.send(terminal.is_none());
                     }
                     Some(Command::CancelSend { send_id, source }) => {
                         // Fire the running turn's cancel token only if this turn

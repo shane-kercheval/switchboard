@@ -47,6 +47,7 @@
     AttachmentKind,
     ProjectId,
     Prompt,
+    WorkflowFormDescriptor,
     WorkflowInputValue,
     WorkflowListing,
   } from "$lib/types";
@@ -274,7 +275,24 @@
   let workflows = $state<WorkflowListing[]>([]);
   let workflowsLoaded = $state(false);
   let selectedWorkflow = $state<WorkflowListing | null>(null);
+  // The resolved invocation form for the picked workflow (declared inputs +
+  // auto-derived prompt-argument fields + compatibility). Fetched per-pick via
+  // `describe_workflow_form`; re-fetched on `prompts:synced` so a cold MCP cache
+  // resolves. Null until the first fetch settles.
+  let workflowForm = $state<WorkflowFormDescriptor | null>(null);
+  let workflowFormLoading = $state(false);
+  // Monotonic token: each pick/re-fetch bumps it; a fetch ignores its reply if a
+  // newer one superseded it (name alone isn't a workflow's identity — a built-in
+  // and a same-named copied user workflow share a name).
+  let workflowFormGen = 0;
+  // Whether a prompt sync has settled since this workflow was picked. Before that,
+  // an `unresolved` prompt is genuinely pending (cold MCP cache); after a settled
+  // sync, a still-`unresolved` prompt is a real "not found" error, not a spinner.
+  let workflowSyncSettled = $state(false);
   let workflowInputs = $state<Record<string, WorkflowInputValue>>({});
+  // Per-field forward sources for the workflow's fillable single-text fields,
+  // keyed by field name. Live-UI-only, reset whenever the workflow changes.
+  let workflowForwardSources = $state<Record<string, ForwardSource[]>>({});
   let invokingWorkflow = $state(false);
   // A saved prompt-mode draft to restore once the cache loads; consumed when
   // restoration settles. Null when the saved draft was plain.
@@ -303,11 +321,25 @@
   // be cold (MCP prompts land only after the launch-time sync), so also re-try
   // when the backend signals a completed sync — and only then is "still absent"
   // proof the prompt is gone.
+  // A single `prompts:synced` subscription drives two cache-warm re-tries: (1)
+  // restoring a saved prompt-mode draft whose prompt was cold at mount, and (2)
+  // re-resolving the workflow form so a workflow hardcoding an MCP prompt leaves
+  // its "Resolving…" pending state once the cache warms — without a re-pick.
   onMount(() => {
-    if (pendingRestore === null) return;
-    void loadPrompts().then(() => tryRestorePrompt(false));
+    const hadDraft = pendingRestore !== null;
+    if (hadDraft) {
+      void loadPrompts().then(() => tryRestorePrompt(false));
+    }
     const unlisten = listen("prompts:synced", () => {
-      void loadPrompts().then(() => tryRestorePrompt(true));
+      if (hadDraft) {
+        void loadPrompts().then(() => tryRestorePrompt(true));
+      }
+      if (mode === "workflow" && selectedWorkflow !== null) {
+        // A sync has now settled for this pick: a still-unresolved prompt after the
+        // re-fetch is a real "not found" error, not a perpetual pending state.
+        workflowSyncSettled = true;
+        void loadWorkflowForm(selectedWorkflow);
+      }
     });
     return () => void unlisten.then((u) => u());
   });
@@ -1111,30 +1143,61 @@
     workflowMenuOpen = true;
   }
 
-  /// Enter workflow mode with the picked workflow, seeding each `prompt_id`
-  /// input with its recommended built-in prompt (built-ins only) so the default
-  /// path is render-consistent.
+  /// Enter workflow mode with the picked workflow and resolve its form (declared
+  /// inputs + auto-derived prompt-argument fields) via `describe_workflow_form`.
+  /// The prompt is hardcoded — nothing to pre-seed/pick — so fields seed empty.
   function pickWorkflow(workflow: WorkflowListing): void {
     selectedWorkflow = workflow;
-    const seeded: Record<string, WorkflowInputValue> = {};
-    for (const input of workflow.inputs) {
-      if (input.ty === "agent_list" || input.ty === "text_list") {
-        seeded[input.name] = [];
-      } else if (input.ty === "prompt_id") {
-        seeded[input.name] = workflow.recommended_prompts[input.name] ?? "";
-      } else {
-        seeded[input.name] = "";
-      }
-    }
-    workflowInputs = seeded;
+    workflowForm = null;
+    workflowInputs = {};
+    workflowForwardSources = {};
+    workflowSyncSettled = false;
     mode = "workflow";
     workflowMenuOpen = false;
+    void loadWorkflowForm(workflow);
+  }
+
+  /// Fetch (or re-fetch) the descriptor for the picked workflow and seed any
+  /// not-yet-present fields. Seeding is additive so a re-fetch (e.g. after
+  /// `prompts:synced` resolves a previously-unresolved prompt) preserves what the
+  /// user already typed. A monotonic generation token guards stale replies — name
+  /// alone is not a workflow's identity (a built-in and a same-named copied user
+  /// workflow share a name), and the token is also future-proof against further
+  /// identity fields.
+  async function loadWorkflowForm(workflow: WorkflowListing): Promise<void> {
+    const gen = ++workflowFormGen;
+    workflowFormLoading = true;
+    try {
+      const form = await api.describeWorkflowForm(workflow.name, workflow.is_builtin);
+      if (gen !== workflowFormGen) return; // superseded by a newer pick/re-fetch
+      workflowForm = form;
+      const seeded: Record<string, WorkflowInputValue> = { ...workflowInputs };
+      for (const input of form.inputs) {
+        if (input.name in seeded) continue;
+        seeded[input.name] = input.ty === "agent_list" || input.ty === "text_list" ? [] : "";
+      }
+      for (const arg of form.derived_args) {
+        if (!(arg.name in seeded)) seeded[arg.name] = "";
+      }
+      workflowInputs = seeded;
+    } catch (err) {
+      if (gen === workflowFormGen) {
+        sendError = `Couldn't load workflow: ${err instanceof Error ? err.message : String(err)}`;
+      }
+    } finally {
+      if (gen === workflowFormGen) workflowFormLoading = false;
+    }
   }
 
   function removeWorkflow(): void {
     mode = "plain";
     selectedWorkflow = null;
+    workflowForm = null;
+    workflowFormLoading = false;
     workflowInputs = {};
+    workflowForwardSources = {};
+    workflowSyncSettled = false;
+    workflowFormGen++; // invalidate any in-flight fetch for the removed workflow
   }
 
   async function copyWorkflow(workflow: WorkflowListing): Promise<void> {
@@ -1153,21 +1216,31 @@
     });
   }
 
-  /// Required workflow inputs left unfilled (mirrors WorkflowComposer's gate), so
-  /// the invoke button can be disabled. A non-invocable workflow blocks invoke.
-  const workflowMissing = $derived.by(() => {
-    if (selectedWorkflow === null) return [];
-    if (!selectedWorkflow.invocable) return selectedWorkflow.inputs.map((i) => i.name);
-    return selectedWorkflow.inputs
-      .filter((i) => {
-        if (i.optional) return false;
-        const v = workflowInputs[i.name];
-        if (i.ty === "agent_list" || i.ty === "text_list") {
-          return !Array.isArray(v) || v.length === 0;
-        }
-        return typeof v !== "string" || v.trim() === "";
-      })
-      .map((i) => i.name);
+  /// Whether the picked workflow is runnable: the form is resolved, invocable,
+  /// compatible (prompts resolved, no drift), and every required field (declared
+  /// input or derived prompt arg) is filled. Drives the invoke button's disabled
+  /// state. A pending (`unresolved`) or `incompatible` form blocks Run.
+  const workflowRunnable = $derived.by(() => {
+    const form = workflowForm;
+    if (form === null || workflowFormLoading) return false;
+    if (!form.invocable || form.compatibility.state !== "ok") return false;
+    // A single `text` input / derived arg also counts as filled when it carries
+    // ≥1 forward source (only text/derived fields can — agent/list fields keep
+    // their existing emptiness check).
+    const hasForward = (name: string): boolean =>
+      (workflowForwardSources[name]?.length ?? 0) > 0;
+    const inputMissing = form.inputs.some((i) => {
+      if (i.optional) return false;
+      const v = workflowInputs[i.name];
+      if (i.ty === "agent_list" || i.ty === "text_list") return !Array.isArray(v) || v.length === 0;
+      return (typeof v !== "string" || v.trim() === "") && !hasForward(i.name);
+    });
+    const argMissing = form.derived_args.some((a) => {
+      if (!a.required) return false;
+      const v = workflowInputs[a.name];
+      return (typeof v !== "string" || v.trim() === "") && !hasForward(a.name);
+    });
+    return !inputMissing && !argMissing;
   });
 
   /// Request OS-notification permission once, contextually at first invoke.
@@ -1182,14 +1255,26 @@
   }
 
   async function invokeWorkflowAction(): Promise<void> {
-    if (selectedWorkflow === null || invokingWorkflow || workflowMissing.length > 0) return;
+    if (selectedWorkflow === null || invokingWorkflow || !workflowRunnable) return;
     const workflow = selectedWorkflow;
     invokingWorkflow = true;
     sendError = null;
     try {
       // Contextual permission request at first invoke (not at cold startup).
       void ensureNotificationPermission();
-      await api.invokeWorkflow(projectId, workflow.name, workflow.is_builtin, workflowInputs);
+      // Pane-expand each field's sources to agent ids; omit empty fields so the
+      // map carries only fields the user actually attached a forward to.
+      const forwardSources: Record<string, AgentId[]> = {};
+      for (const [name, sources] of Object.entries(workflowForwardSources)) {
+        if (sources.length > 0) forwardSources[name] = expandForwardSources(sources);
+      }
+      await api.invokeWorkflow(
+        projectId,
+        workflow.name,
+        workflow.is_builtin,
+        workflowInputs,
+        forwardSources,
+      );
       removeWorkflow();
     } catch (err) {
       sendError = `Couldn't run workflow: ${err instanceof Error ? err.message : String(err)}`;
@@ -2182,16 +2267,19 @@
         <Spinner class="h-4 w-4" />
         Restoring prompt…
       </div>
-    {:else if mode === "workflow" && selectedWorkflow !== null}
+    {:else if mode === "workflow" && workflowForm !== null}
       <!-- Workflow mode: the invocation form spans the compose area. The compose
            bar's To field + message forwards are hidden (the workflow routes via
            its agent inputs); the run launches in the background. -->
       <WorkflowComposer
-        workflow={selectedWorkflow}
+        descriptor={workflowForm}
         {agents}
-        {prompts}
+        loading={workflowFormLoading}
+        syncSettled={workflowSyncSettled}
+        agentHasOutput={agentHasCompletedOutput}
         panes={paneLayout.panes}
         bind:inputs={workflowInputs}
+        bind:forwardSources={workflowForwardSources}
         onremove={removeWorkflow}
       >
         {#snippet invoke()}
@@ -2199,7 +2287,7 @@
             variant="primary"
             size="sm"
             data-testid="workflow-invoke-button"
-            disabled={workflowMissing.length > 0 || invokingWorkflow}
+            disabled={!workflowRunnable || invokingWorkflow}
             onclick={() => void invokeWorkflowAction()}
           >
             {invokingWorkflow ? "Starting…" : "Run workflow"}

@@ -2752,7 +2752,7 @@ describe("ComposeBar — cross-agent forward", () => {
     await waitFor(() => expect(screen.queryByTestId("attachment-chip-image-1")).toBeNull());
   });
 
-  it("enters workflow mode (hiding To/forward) and invokes the workflow", async () => {
+  it("enters workflow mode, resolves the form, and invokes with declared + derived values", async () => {
     const state = await loadState();
     await state.registerAgent(AGENT_A);
     await state.registerAgent(AGENT_B);
@@ -2761,16 +2761,28 @@ describe("ComposeBar — cross-agent forward", () => {
       is_builtin: true,
       description: "d",
       inputs: [
-        { name: "primary_agent", ty: "agent", optional: false, description: null },
-        { name: "reviewer_agents", ty: "agent_list", optional: false, description: null },
-        { name: "review_prompt", ty: "prompt_id", optional: false, description: null },
+        { name: "reviewers", ty: "agent_list", optional: false, description: null },
+        { name: "worker", ty: "agent", optional: false, description: null },
       ],
       invocable: true,
       parse_error: null,
-      recommended_prompts: { review_prompt: "builtin:code-review" },
+    };
+    // The descriptor adds the auto-derived `context` arg (optional) from the
+    // hardcoded code-review prompt.
+    const DESCRIPTOR = {
+      name: "review-and-aggregate",
+      description: "d",
+      is_builtin: true,
+      invocable: true,
+      inputs: WORKFLOW.inputs,
+      derived_args: [
+        { name: "context", required: false, description: "Optional background", prompts: ["builtin:code-review"] },
+      ],
+      compatibility: { state: "ok" },
     };
     invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
       if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "describe_workflow_form") return DESCRIPTOR;
       if (cmd === "list_prompts") return [];
       if (cmd === "invoke_workflow") return "run-1";
       return null;
@@ -2788,10 +2800,16 @@ describe("ComposeBar — cross-agent forward", () => {
     expect(screen.queryByTestId("recipient-field")).toBeNull();
     expect(screen.queryByTestId("compose-forward-button")).toBeNull();
 
-    // Fill the required agent inputs (review_prompt is pre-seeded from the
-    // recommended built-in prompt).
-    await fireEvent.click(screen.getByTestId("workflow-agent-primary_agent-alice"));
-    await fireEvent.click(screen.getByTestId("workflow-agent-reviewer_agents-bob"));
+    // The auto-derived `context` field renders; no prompt-picker control exists.
+    await waitFor(() => screen.getByTestId("workflow-arg-input-context"));
+    expect(screen.queryByTestId("workflow-prompt-review_prompt")).toBeNull();
+
+    // Fill the required agent inputs and the optional derived arg.
+    await fireEvent.click(screen.getByTestId("workflow-agent-reviewers-bob"));
+    await fireEvent.click(screen.getByTestId("workflow-agent-worker-alice"));
+    await fireEvent.input(screen.getByTestId("workflow-arg-input-context"), {
+      target: { value: "focus on error handling" },
+    });
 
     await fireEvent.click(screen.getByTestId("workflow-invoke-button"));
     await waitFor(() => {
@@ -2803,10 +2821,215 @@ describe("ComposeBar — cross-agent forward", () => {
       name: "review-and-aggregate",
       isBuiltin: true,
       inputs: {
-        primary_agent: "alice",
-        reviewer_agents: ["bob"],
-        review_prompt: "builtin:code-review",
+        reviewers: ["bob"],
+        worker: "alice",
+        context: "focus on error handling",
       },
+      // No field had a forward attached, so the map is present but empty.
+      forwardSources: {},
     });
+  });
+
+  it("invokes a workflow with a forward source attached to a derived field", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    await state.registerAgent(AGENT_B);
+    const WORKFLOW = {
+      name: "review-and-aggregate",
+      is_builtin: true,
+      description: "d",
+      inputs: [{ name: "worker", ty: "agent", optional: false, description: null }],
+      invocable: true,
+      parse_error: null,
+    };
+    const DESCRIPTOR = {
+      name: "review-and-aggregate",
+      description: "d",
+      is_builtin: true,
+      invocable: true,
+      inputs: WORKFLOW.inputs,
+      derived_args: [
+        { name: "context", required: false, description: "Optional background", prompts: ["builtin:code-review"] },
+      ],
+      compatibility: { state: "ok" },
+    };
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "describe_workflow_form") return DESCRIPTOR;
+      if (cmd === "list_prompts") return [];
+      if (cmd === "invoke_workflow") return "run-1";
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A, AGENT_B] } });
+
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    await waitFor(() => screen.getByTestId("workflow-option-builtin:review-and-aggregate"));
+    await fireEvent.click(screen.getByTestId("workflow-option-builtin:review-and-aggregate"));
+
+    await waitFor(() => screen.getByTestId("workflow-arg-input-context"));
+    await fireEvent.click(screen.getByTestId("workflow-agent-worker-alice"));
+
+    // Forward alice's output into the derived `context` field (in place of typing).
+    await fireEvent.click(screen.getByTestId("workflow-forward-picker-context"));
+    await fireEvent.click(await screen.findByTestId(`forward-picker-agent-${AGENT_A.id}`));
+    await waitFor(() => screen.getByTestId("forward-source-chip-alice"));
+
+    await fireEvent.click(screen.getByTestId("workflow-invoke-button"));
+    await waitFor(() => {
+      expect(invokeMock.mock.calls.some(([c]) => c === "invoke_workflow")).toBe(true);
+    });
+    const call = invokeMock.mock.calls.find(([c]) => c === "invoke_workflow");
+    // The pane-expanded agent ids land under the field name.
+    expect(call?.[1]).toMatchObject({
+      name: "review-and-aggregate",
+      forwardSources: { context: [AGENT_A.id] },
+    });
+  });
+
+  it("resolves an unresolved workflow form on prompts:synced without a re-pick", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const WORKFLOW = {
+      name: "mcp-flow",
+      is_builtin: false,
+      description: "d",
+      inputs: [{ name: "worker", ty: "agent", optional: false, description: null }],
+      invocable: true,
+      parse_error: null,
+    };
+    const BASE = {
+      name: "mcp-flow",
+      description: "d",
+      is_builtin: false,
+      invocable: true,
+      inputs: WORKFLOW.inputs,
+      derived_args: [] as unknown[],
+    };
+    // The first describe lands while the MCP prompt is still cold (unresolved);
+    // after a sync the same call resolves to ok.
+    let synced = false;
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "list_prompts") return [];
+      if (cmd === "describe_workflow_form") {
+        return synced
+          ? { ...BASE, compatibility: { state: "ok" } }
+          : { ...BASE, compatibility: { state: "unresolved", prompts: ["tiddly:x"] } };
+      }
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    await waitFor(() => screen.getByTestId("workflow-option-dir:mcp-flow"));
+    await fireEvent.click(screen.getByTestId("workflow-option-dir:mcp-flow"));
+
+    // Pending affordance shown; the agent field is withheld until resolution.
+    await waitFor(() => screen.getByTestId("workflow-resolving"));
+    expect(screen.queryByTestId("workflow-agent-worker-alice")).toBeNull();
+
+    // A completed sync re-fetches the descriptor, which now resolves → fields render.
+    synced = true;
+    listeners.get("prompts:synced")?.({ payload: null as unknown as NormalizedEvent });
+    await waitFor(() => screen.getByTestId("workflow-agent-worker-alice"));
+    expect(screen.queryByTestId("workflow-resolving")).toBeNull();
+  });
+
+  it("escalates a still-unresolved workflow to a not-found error after a sync settles", async () => {
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const WORKFLOW = {
+      name: "mcp-gone",
+      is_builtin: false,
+      description: "d",
+      inputs: [{ name: "worker", ty: "agent", optional: false, description: null }],
+      invocable: true,
+      parse_error: null,
+    };
+    // The MCP prompt is missing and a sync does not produce it — the descriptor is
+    // unresolved before and after the sync.
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "list_prompts") return [];
+      if (cmd === "describe_workflow_form") {
+        return {
+          name: "mcp-gone",
+          description: "d",
+          is_builtin: false,
+          invocable: true,
+          inputs: WORKFLOW.inputs,
+          derived_args: [],
+          compatibility: { state: "unresolved", prompts: ["tiddly:gone"] },
+        };
+      }
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    await waitFor(() => screen.getByTestId("workflow-option-dir:mcp-gone"));
+    await fireEvent.click(screen.getByTestId("workflow-option-dir:mcp-gone"));
+
+    // Before a sync settles → pending spinner, not an error.
+    await waitFor(() => screen.getByTestId("workflow-resolving"));
+    expect(screen.queryByTestId("workflow-prompt-missing")).toBeNull();
+
+    // After a sync settles and it's still unresolved → blocking not-found error.
+    listeners.get("prompts:synced")?.({ payload: null as unknown as NormalizedEvent });
+    await waitFor(() => screen.getByTestId("workflow-prompt-missing"));
+    expect(screen.queryByTestId("workflow-resolving")).toBeNull();
+  });
+
+  it("drops a stale workflow-form reply that resolves out of order", async () => {
+    // The generation-token guard: an older describe reply that lands after a newer
+    // one must not overwrite the form. Drive two re-fetches whose replies resolve
+    // in reverse order and assert the newer (ok) wins, not the older (unresolved).
+    const state = await loadState();
+    await state.registerAgent(AGENT_A);
+    const WORKFLOW = {
+      name: "race",
+      is_builtin: false,
+      description: "d",
+      inputs: [{ name: "worker", ty: "agent", optional: false, description: null }],
+      invocable: true,
+      parse_error: null,
+    };
+    const base = {
+      name: "race",
+      description: "d",
+      is_builtin: false,
+      invocable: true,
+      inputs: WORKFLOW.inputs,
+      derived_args: [] as unknown[],
+    };
+    const pending: Array<(d: unknown) => void> = [];
+    invokeMock.mockImplementation(async (cmd: string): Promise<unknown> => {
+      if (cmd === "list_workflows") return [WORKFLOW];
+      if (cmd === "list_prompts") return [];
+      if (cmd === "describe_workflow_form") {
+        return new Promise((resolve) => pending.push(resolve));
+      }
+      return null;
+    });
+
+    render(ComposeBar, { props: { projectId: PROJECT_ID, agents: [AGENT_A] } });
+    await fireEvent.click(screen.getByTestId("compose-workflow-button"));
+    await waitFor(() => screen.getByTestId("workflow-option-dir:race"));
+    await fireEvent.click(screen.getByTestId("workflow-option-dir:race")); // fetch #1 (gen 1)
+    // Two prompt syncs trigger two more re-fetches (gen 2, then gen 3).
+    listeners.get("prompts:synced")?.({ payload: null as unknown as NormalizedEvent });
+    listeners.get("prompts:synced")?.({ payload: null as unknown as NormalizedEvent });
+    await waitFor(() => expect(pending.length).toBe(3));
+
+    // Resolve the NEWEST (gen 3) as ok, then an older (gen 1) as unresolved.
+    pending[2]?.({ ...base, compatibility: { state: "ok" } });
+    await waitFor(() => screen.getByTestId("workflow-agent-worker-alice"));
+    pending[0]?.({ ...base, compatibility: { state: "unresolved", prompts: ["tiddly:x"] } });
+    await tick();
+
+    // The stale unresolved reply is ignored — the form stays resolved.
+    expect(screen.getByTestId("workflow-agent-worker-alice")).toBeInTheDocument();
+    expect(screen.queryByTestId("workflow-resolving")).toBeNull();
   });
 });

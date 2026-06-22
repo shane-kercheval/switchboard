@@ -748,8 +748,9 @@ export type RenderedPrompt = {
 
 // One declared workflow input as the invocation form renders it. `ty` is the
 // base type; `text?` is `ty: "text"` with `optional: true`. List inputs
-// (`[agent]`/`[text]`) are `agent_list`/`text_list`.
-export type WorkflowInputType = "agent" | "agent_list" | "prompt_id" | "text" | "text_list";
+// (`[agent]`/`[text]`) are `agent_list`/`text_list`. There is no prompt type — a
+// step's prompt is hardcoded; its arguments are auto-derived (see DerivedArgInfo).
+export type WorkflowInputType = "agent" | "agent_list" | "text" | "text_list";
 
 export type WorkflowInputInfo = {
   name: string;
@@ -760,8 +761,7 @@ export type WorkflowInputInfo = {
 
 // A workflow as the menu/list shows it: parsed metadata OR a parse error, plus
 // the read-only/built-in flag and the up-front `invocable` flag (false when it
-// uses a not-yet-runnable step — `pause_for_user`/`for_each`). `recommended_prompts`
-// maps a `prompt_id` input name → a recommended built-in prompt id (built-ins only).
+// uses a not-yet-runnable step — `pause_for_user`/`for_each`).
 export type WorkflowListing = {
   name: string;
   is_builtin: boolean;
@@ -769,7 +769,50 @@ export type WorkflowListing = {
   inputs: WorkflowInputInfo[];
   invocable: boolean;
   parse_error: string | null;
-  recommended_prompts: Record<string, string>;
+};
+
+// A user-fillable prompt argument auto-derived from a workflow's hardcoded
+// prompt(s) — surfaced as a form field alongside the declared inputs. `prompts`
+// lists the hardcoded prompt id(s) it feeds (more than one when two prompts share
+// a same-named argument).
+export type DerivedArgInfo = {
+  name: string;
+  required: boolean;
+  description: string | null;
+  prompts: string[];
+};
+
+// A binding/collision problem that blocks invocation (drift between a workflow
+// and its hardcoded prompt). `argument` is empty when the whole prompt id is the
+// problem (malformed).
+export type BindingIssue = {
+  prompt: string;
+  argument: string;
+  reason: string;
+};
+
+// Whether a picked workflow's hardcoded prompts are runnable as-is.
+//  - `ok`: every prompt resolved, every binding valid.
+//  - `incompatible`: a prompt drifted (invalid binding / malformed id / disallowed
+//    collision) — blocks Run with the listed issues.
+//  - `unresolved`: a prompt isn't resolvable yet (cold MCP cache) — pending, not an
+//    error; the form shows a "resolving" affordance and re-fetches on `prompts:synced`.
+export type FormCompatibility =
+  | { state: "ok" }
+  | { state: "incompatible"; issues: BindingIssue[] }
+  | { state: "unresolved"; prompts: string[] };
+
+// The complete invocation form for a picked workflow: declared inputs plus the
+// auto-derived user-fillable prompt-argument fields, plus a compatibility verdict.
+// Resolved per-pick via `describe_workflow_form` (not in `list_workflows`).
+export type WorkflowFormDescriptor = {
+  name: string;
+  description: string | null;
+  is_builtin: boolean;
+  invocable: boolean;
+  inputs: WorkflowInputInfo[];
+  derived_args: DerivedArgInfo[];
+  compatibility: FormCompatibility;
 };
 
 // A run as the indicator shows it (from `list_workflow_runs`). `status` is

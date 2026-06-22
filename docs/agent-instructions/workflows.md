@@ -29,8 +29,6 @@ description: Send to multiple reviewers, aggregate, send to primary.
 inputs:
   primary_agent: agent
   reviewer_agents: [agent]
-  review_prompt: prompt_id
-  aggregation_prompt: prompt_id
 
 steps:
   - send: { ... }
@@ -57,9 +55,10 @@ Inputs are **parameter slots**, not hardcoded values. The workflow file declares
 |---|---|---|---|
 | Single agent | `agent` | Dropdown of agents in the project | The user picks one of their existing agents. |
 | List of agents | `[agent]` | Multi-select of agents | For fan-out / fan-in steps. |
-| Prompt ID | `prompt_id` | Autocomplete from configured prompt providers | E.g., `local:code-review` or `tiddly:foo`. |
 | Free-form text | `text` / `text?` | Plain text field | `text?` is optional (user can leave blank). |
 | List of text | `[text]` | Repeatable text field | Used by `for_each` for iteration lists (e.g., a milestone list). |
+
+There is **no `prompt_id` input type**. A step's prompt is a hardcoded literal, not something the user picks — see "How a `send` step produces its message" below. A prompt's own user-fillable arguments appear as form fields automatically, without being declared here.
 
 ### Shorthand vs long form
 
@@ -69,7 +68,6 @@ Most inputs use the shorthand:
 inputs:
   primary_agent: agent
   reviewer_agents: [agent]
-  review_prompt: prompt_id
   user_context: text?
 ```
 
@@ -115,12 +113,39 @@ Long-form keys: `type` (required), `description` (optional), `default` (optional
 | Field | Required | Notes |
 |---|---|---|
 | `to` | yes | One agent or a list of agents. Templated. |
-| `prompt` | yes (or `text` or `forward_from`) | A prompt ID like `"{{ review_prompt }}"`. The prompt is resolved and rendered with workflow scope + `template_vars`. |
-| `text` | yes (or `prompt` or `forward_from`) | Literal text to send. Templated. Mutually exclusive with `prompt`. |
-| `template_vars` | optional | Variables passed to the prompt template at render time. |
+| `prompt` | yes (or `text` or `forward_from`) | A **hardcoded prompt id literal** like `"builtin:code-review"`. Not templated. The prompt is resolved; its user-fillable arguments are auto-derived and its `template_vars` (computed bindings) are wired in. See "How a `send` step produces its message" below. |
+| `text` | yes (or `prompt` or `forward_from`) | Literal text to send. Templated (`{{ }}` resolved from workflow scope). Mutually exclusive with `prompt`. |
+| `template_vars` | optional | **Computed bindings only** — a workflow expression wired to a prompt argument (e.g., `review: "{{ aggregated_responses(reviewers) }}"`). Each key must be a real argument of the hardcoded prompt. User-fillable arguments do **not** go here; they are auto-derived. |
 | `forward_from` | optional | One agent or a list. The latest output(s) of those agents are appended to the message body in a canonical shape (see "Forwarding" below). |
 
 `send` is **fire-and-forget**: it dispatches and returns immediately. To wait for the recipient(s) to finish, follow with `wait_for` or `wait_for_all`. (The exception is `pause_for_user` with `recipient` set, which bundles dispatch and wait — see below.)
+
+#### How a `send` step produces its message
+
+A `send` step builds its message body one of **two ways** — pick one per step:
+
+**(a) Named prompt — `prompt: "builtin:…"`.** The step runs a **fixed, hardcoded prompt** named by literal id (`provider:name`, e.g. `builtin:code-review`, `tiddly:ai-review-feedback`). The id is *not* templated — you cannot write `prompt: "{{ x }}"` (that's a parse error), and there is no `prompt_id` input. The prompt's arguments are filled from two sources:
+
+- **Auto-derived user-fillable arguments.** Every argument the prompt declares that you do *not* wire in `template_vars` becomes a **form field automatically**, with the prompt's own label/description, required iff the prompt marks it required. You write nothing for these — `builtin:code-review`'s optional `context`, for example, just appears as a fillable field at invocation. Do **not** declare them in `inputs`.
+- **Computed bindings — `template_vars`.** For an argument you want filled by a workflow expression the user can't type (a fan-in handoff like `aggregated_responses(reviewers)`), wire it in `template_vars`. These are hidden from the user. Every `template_vars` key must be a real argument of the prompt; if it isn't (e.g. the prompt renamed the argument), invocation is **blocked** with an error naming the prompt and argument.
+
+**(b) Inline text — `text: "…"`.** The step sends a **literal body** you write directly. Its `{{ }}` variables resolve from workflow scope (inputs, the iteration variable, `user_input`, and the built-in helper functions). To let the user fill a value used inside the text, **declare it in `inputs`** — that's what surfaces it as a form field. `template_vars` does **not** apply to `text` (it only feeds a `prompt`).
+
+Worked **inline-text-with-arguments** example — a declared input feeds a `{{ }}` slot in the body:
+
+```yaml
+inputs:
+  implementer: agent
+  focus: text?          # declaring it here is what makes it a fillable form field
+steps:
+  - send:
+      to: "{{ implementer }}"
+      text: |
+        Implement the next milestone.
+        {% if focus %}Focus especially on: {{ focus }}{% endif %}
+```
+
+The contrast: in the **named-prompt** path the user-fillable fields come from the *prompt's* schema (you declare nothing); in the **inline-text** path you make a value fillable by **declaring it in `inputs`** and referencing it with `{{ }}`.
 
 **When `to` is a list of agents**: dispatches are issued in declared order; agents run in parallel; the step returns once all dispatches have been issued (not when any has completed). Always follow with `wait_for_all` to synchronize before consuming their outputs. If any dispatch in the list fails (e.g., one agent is busy), the remaining dispatches are not attempted and the step is marked `failed`, but dispatches already issued in the same step are **not** cancelled — they run to their natural terminal state and their output stays visible. Retry re-runs the whole step, re-issuing every dispatch.
 
@@ -223,6 +248,12 @@ Variables are resolved innermost first:
 
 If only `forward_from` is set (no `text`, no `prompt`), the body is the forwarded composition alone with no leading content.
 
+### Forward-from on a workflow form field (completed-only)
+
+A workflow's user-fillable **text fields** — both genuine `text` inputs and the auto-derived prompt arguments — can be filled by **forwarding an agent's or pane's latest output** at invocation, the same way a prompt's arguments are forwarded in the compose bar: instead of typing a value, the user attaches a source agent/pane and the field's value becomes that source's forwarded output (composed after any text typed into the field).
+
+**This is completed-only.** The source's latest **completed** turn is captured at invoke. If a chosen source still has an **in-flight (streaming) turn**, invocation is **rejected** with a clear message ("agent X is still responding — wait for it to finish, then run the workflow") — the workflow launch is never held open waiting on a streaming agent. So a forward-from source must already be done responding when you invoke. This differs from manual compose-bar forwarding, which *holds* the send until a streaming source finishes; workflow invocation does not hold.
+
 ## Worked examples
 
 ### 1. Sequential handoff (planner → implementer)
@@ -261,24 +292,23 @@ description: Send to multiple reviewers in parallel, aggregate, send to primary.
 inputs:
   primary_agent: agent
   reviewer_agents: [agent]
-  review_prompt: prompt_id
-  aggregation_prompt: prompt_id
-  user_context: text?
 
 steps:
   - send:
       to: "{{ reviewer_agents }}"
-      prompt: "{{ review_prompt }}"
-      template_vars:
-        context: "{{ user_context }}"
+      prompt: "builtin:code-review"
+      # code-review's optional `context` argument is auto-derived as a form field —
+      # not declared here, not wired in template_vars.
   - wait_for_all:
       agents: "{{ reviewer_agents }}"
   - send:
       to: "{{ primary_agent }}"
-      prompt: "{{ aggregation_prompt }}"
+      prompt: "builtin:ai-review-feedback"
       template_vars:
-        feedback: "{{ aggregated_responses(reviewer_agents) }}"
+        review: "{{ aggregated_responses(reviewer_agents) }}"   # computed binding, hidden from user
 ```
+
+The invocation form here shows three fields: `primary_agent`, `reviewer_agents`, and the auto-derived `context` (from `builtin:code-review`). `ai-review-feedback`'s `review` argument is a computed binding, so it never appears.
 
 ### 3. Per-milestone iteration with user approval
 
@@ -324,17 +354,15 @@ steps:
 
 ## Shipped built-in workflows
 
-> **⚠️ Prompt model under revision.** Both built-ins currently take user-selectable `prompt_id` inputs (`review_prompt`, `analysis_prompt`) and hand-wire arguments via `template_vars`. This is being replaced by a hardcoded-prompt model (the workflow bakes in its prompt; user-fillable arguments are auto-derived). The YAML below is the **currently shipped** form — accurate today, but the `prompt_id` inputs will be removed by the hardcoded-prompt plan.
-
 Two workflows ship with the app as a read-only built-in library (alongside the built-in prompts they consume, `code-review` and `ai-review-feedback`). They appear in the `+ Workflow` menu tagged **built-in / read-only**; "Copy to my workflows" writes an editable copy into your user-global workflows folder if you want to customize one. They are the canonical examples to model your own on. Both standardize on `reviewers` (the fan-out list) and `worker` (the single agent that synthesizes).
 
 ### `review-and-aggregate` (generic fan-in)
 
-Review in parallel with several agents, then hand the combined feedback to a worker agent. The aggregation is an **inline `text`** step (no second prompt), so the workflow is self-contained.
+Review in parallel with several agents, then hand the combined feedback to a worker agent. The reviewers run the hardcoded `builtin:code-review` prompt; the aggregation is an **inline `text`** step (no second prompt), so the workflow is self-contained. `code-review`'s optional `context` argument is auto-derived as a user-fillable field — it is not declared as an input.
 
 ```yaml
 name: review-and-aggregate
-description: Fan a review prompt out to several reviewers in parallel, then hand the combined feedback to a worker agent for recommendations.
+description: Fan a code review out to several reviewers in parallel, then hand the combined feedback to a worker agent for recommendations.
 inputs:
   reviewers:
     type: [agent]
@@ -342,18 +370,10 @@ inputs:
   worker:
     type: agent
     description: The agent that receives every reviewer's combined feedback and produces the recommendations.
-  review_prompt:
-    type: prompt_id
-    description: The prompt sent to each reviewer at the start.
-  context:
-    type: text?
-    description: Optional background handed to each reviewer alongside the review prompt (fills the prompt's `context` variable). The worker never sees this directly — only the reviewers' responses.
 steps:
   - send:
       to: "{{ reviewers }}"
-      prompt: "{{ review_prompt }}"
-      template_vars:
-        context: "{{ context }}"
+      prompt: "builtin:code-review"
   - wait_for_all:
       agents: "{{ reviewers }}"
   - send:
@@ -366,9 +386,11 @@ steps:
         Let me know what your recommendations are.
 ```
 
+The invocation form shows `reviewers`, `worker`, and the auto-derived optional `context` (from `builtin:code-review`). `context` is the background handed to each reviewer; the worker never sees it directly — only the reviewers' responses.
+
 ### `review-analyze-discuss` (flagship)
 
-Reviewers review in parallel; a worker distills their feedback into a decision-ready verdict (filling the `ai-review-feedback` prompt's `review` argument via `template_vars`); the reviewers respond to the analysis; the worker gives a final recommendation. It demonstrates filling a saved prompt's argument with forwarded output, plus round-trip discussion via the `last_output` / `aggregated_responses` helpers in inline `text`.
+Reviewers review in parallel with `builtin:code-review`; a worker distills their feedback into a decision-ready verdict using `builtin:ai-review-feedback` (its required `review` argument filled with the reviewers' aggregated responses via `template_vars`); the reviewers respond to the analysis; the worker gives a final recommendation. It demonstrates a computed binding into a hardcoded prompt's argument, plus round-trip discussion via the `last_output` / `aggregated_responses` helpers in inline `text`.
 
 ```yaml
 name: review-analyze-discuss
@@ -380,26 +402,15 @@ inputs:
   worker:
     type: agent
     description: The agent that distills the reviewers' feedback into a verdict, weighs their pushback, and gives the final recommendation.
-  review_prompt:
-    type: prompt_id
-    description: The prompt sent to each reviewer at the start.
-  analysis_prompt:
-    type: prompt_id
-    description: The prompt sent to the worker to distill the reviewers' feedback (their combined responses fill its `review` variable).
-  context:
-    type: text?
-    description: Optional background handed to each reviewer alongside the review prompt (fills the prompt's `context` variable).
 steps:
   - send:
       to: "{{ reviewers }}"
-      prompt: "{{ review_prompt }}"
-      template_vars:
-        context: "{{ context }}"
+      prompt: "builtin:code-review"
   - wait_for_all:
       agents: "{{ reviewers }}"
   - send:
       to: "{{ worker }}"
-      prompt: "{{ analysis_prompt }}"
+      prompt: "builtin:ai-review-feedback"
       template_vars:
         review: "{{ aggregated_responses(reviewers) }}"
   - wait_for:
@@ -426,6 +437,8 @@ steps:
       agent: "{{ worker }}"
 ```
 
+Both prompts are hardcoded. The invocation form shows `reviewers`, `worker`, and `code-review`'s auto-derived optional `context`. `ai-review-feedback`'s `review` argument is a computed binding, so it is hidden; if that prompt ever renamed `review`, invocation would be blocked with an error naming the prompt and argument rather than failing mid-run.
+
 ## Conventions
 
 - **Filename = name field**. `review-and-aggregate.yaml` has `name: review-and-aggregate`.
@@ -436,18 +449,18 @@ steps:
 
 ## Failure handling
 
-- A step failure (harness error, template render error, contention refusal, missing prompt) halts the workflow with status `failed`.
+- A step failure (harness error, template render error, contention refusal, missing/incompatible prompt) halts the workflow with status `failed`.
 - The user cancelling the workflow (or any participating agent's turn during a workflow) marks the workflow `cancelled`.
-- A crash, OS reboot, or force-kill mid-workflow marks it `interrupted` — the user can retry from the failed step or abandon.
+- A crash, OS reboot, or force-kill mid-workflow marks it `interrupted`.
 
-**Retry semantics inside `for_each`**: when a workflow is retried after a failure inside an iteration, the runtime restores the iteration variable and the per-run output state from the checkpoint and resumes at the *failed step within that iteration*. Earlier steps in the same iteration are **not** re-executed. If you write iteration bodies with side-effecting steps (commits, file writes), keep this in mind: on retry of step N within iteration K, steps 1..N-1 of iteration K do not run again — design so the failing step is the side-effecting one (so its effects are not double-applied) or so earlier-step effects are idempotent.
+**v1 does not resume or retry a run.** A `failed`, `interrupted`, or `cancelled` run is terminal. The user **abandons** it (which clears its run record) and, if the work still needs doing, **re-invokes the workflow from the start** — there is no resume-from-step and no per-iteration checkpoint. This applies to `for_each` too: a failure inside iteration K does not leave a resumable checkpoint; re-invoking re-runs the whole workflow from the first step. Because of that, if you write iteration bodies with side-effecting steps (commits, file writes), keep them idempotent or guard them, since a re-invoke after a partial run will replay earlier iterations.
 
-You don't need to write failure-handling logic in the workflow file; the runtime handles it. Just write the happy path.
+You don't need to write failure-handling logic in the workflow file; the runtime handles the status transitions. Just write the happy path.
 
 ## After authoring
 
 1. Save the file as `<config-dir>/workflows/<name>.yaml` (filename matches `name`). Workflows are user-global — available in every project. (Settings → Workflows → "Open" jumps to the folder.)
-2. The user invokes it from Switchboard's workflow picker. The invocation form auto-generates from the `inputs` declaration.
+2. The user invokes it from Switchboard's workflow picker. The invocation form auto-generates from the `inputs` declaration **plus the user-fillable arguments auto-derived from each hardcoded prompt** (see "How a `send` step produces its message").
 3. The workflow runs autonomously; the user watches via the workflow-progress surface and per-agent panes.
 
 ## When to point at the formal spec

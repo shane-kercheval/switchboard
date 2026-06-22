@@ -855,6 +855,32 @@ async fn describe_workflow_form(
     describe_workflow_form_impl(state.inner(), &name, is_builtin).map_err(|e| e.to_string())
 }
 
+/// Resolve any forward-fields (completed-only) and merge the composed text into
+/// the invocation inputs, so validation/launch see a forwarded field as a filled
+/// value. A still-streaming source rejects the whole invocation. The HOME read
+/// mirrors the manual-forward shims.
+async fn merge_workflow_forwards(
+    state: &AppState,
+    inputs: &std::collections::BTreeMap<String, InputValue>,
+    forward_sources: &std::collections::BTreeMap<String, Vec<switchboard_core::AgentId>>,
+) -> Result<std::collections::BTreeMap<String, InputValue>, String> {
+    if forward_sources.values().all(Vec::is_empty) {
+        return Ok(inputs.clone());
+    }
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    let resolved =
+        crate::commands::resolve_workflow_forwards(state, forward_sources, inputs, &home)
+            .await
+            .map_err(|e| e.to_string())?;
+    let mut effective = inputs.clone();
+    for (field, text) in resolved {
+        effective.insert(field, InputValue::Text(text));
+    }
+    Ok(effective)
+}
+
 /// Validate a workflow invocation (capability gate + input/roster/prompt rules)
 /// without launching it — drives the form's enable/disable + error display.
 #[tauri::command]
@@ -864,8 +890,10 @@ async fn validate_workflow_invocation(
     name: String,
     is_builtin: bool,
     inputs: std::collections::BTreeMap<String, InputValue>,
+    forward_sources: std::collections::BTreeMap<String, Vec<switchboard_core::AgentId>>,
 ) -> Result<(), String> {
-    validate_workflow_invocation_impl(state.inner(), project_id, &name, is_builtin, &inputs)
+    let effective = merge_workflow_forwards(state.inner(), &inputs, &forward_sources).await?;
+    validate_workflow_invocation_impl(state.inner(), project_id, &name, is_builtin, &effective)
         .map_err(|e| e.to_string())
 }
 
@@ -877,8 +905,10 @@ async fn invoke_workflow(
     name: String,
     is_builtin: bool,
     inputs: std::collections::BTreeMap<String, InputValue>,
+    forward_sources: std::collections::BTreeMap<String, Vec<switchboard_core::AgentId>>,
 ) -> Result<String, String> {
-    invoke_workflow_impl(state.inner(), project_id, &name, is_builtin, &inputs)
+    let effective = merge_workflow_forwards(state.inner(), &inputs, &forward_sources).await?;
+    invoke_workflow_impl(state.inner(), project_id, &name, is_builtin, &effective)
         .map(|id| id.to_string())
         .map_err(|e| e.to_string())
 }

@@ -2720,6 +2720,100 @@ async fn forward_resolve(
     })
 }
 
+/// Resolve a workflow's forward-fields in **completed-only** mode: each field's
+/// chosen sources contribute their *latest completed* output, composed with the
+/// field's typed lead. If any source has a turn **actively running**, the whole
+/// invocation is rejected (the workflow launch is never held open waiting on a
+/// streaming agent — see the M5 "completed-only" decision). Returns field name →
+/// composed text for the caller to merge into the invocation inputs.
+///
+/// `inputs` supplies each field's typed lead (its current string value); the
+/// composed result replaces it. Reuses the manual-forward composition helpers so
+/// a forwarded workflow field reads identically to a forwarded prompt argument.
+pub(crate) async fn resolve_workflow_forwards(
+    state: &AppState,
+    forward_sources: &std::collections::BTreeMap<String, Vec<AgentId>>,
+    inputs: &std::collections::BTreeMap<String, switchboard_workflow::InputValue>,
+    home_dir: &Path,
+) -> Result<std::collections::BTreeMap<String, String>, AppError> {
+    // Read the project journal once (the same file for every source of this
+    // invocation), mirroring `resolve_all_sources`. It supplies a failed/cancelled
+    // latest-turn note when the harness file didn't record it.
+    let journal = match forward_sources.values().flatten().next() {
+        Some(&first) => {
+            let (project, _) = lookup_agent(state, first)?;
+            switchboard_core::journal::read_records(&project.journal_path())?
+        }
+        None => Vec::new(),
+    };
+    let journal = journal.as_slice();
+
+    let mut resolved = std::collections::BTreeMap::new();
+    for (field, sources) in forward_sources {
+        if sources.is_empty() {
+            continue;
+        }
+        let mut resolutions = Vec::with_capacity(sources.len());
+        for &source in sources {
+            resolutions
+                .push(resolve_source_completed_only(state, source, home_dir, journal).await?);
+        }
+        let typed_lead = match inputs.get(field) {
+            Some(switchboard_workflow::InputValue::Text(s)) => s.as_str(),
+            _ => "",
+        };
+        let mut skipped = Vec::new();
+        resolved.insert(
+            field.clone(),
+            compose_resolutions(&resolutions, typed_lead, &mut skipped),
+        );
+    }
+    Ok(resolved)
+}
+
+/// Completed-only resolution of one forward source: reject it if a turn is
+/// **actively running** (the workflow launch never blocks on a streaming agent),
+/// else read its latest *completed* output from settled state.
+///
+/// This is still technically check-then-act (peek, then read), but **benign**: the
+/// "act" is a *non-blocking* read of the latest completed turn — a turn that starts
+/// in the gap between the peek and the read is simply read past, never awaited.
+/// That non-blocking read is the property that upholds the completed-only contract
+/// ("never block on a live turn"). Do **not** "tighten" this into
+/// `wait_for_current_turn`: that awaits a live turn and would reintroduce exactly
+/// the hang this design forbids.
+async fn resolve_source_completed_only(
+    state: &AppState,
+    agent_id: AgentId,
+    home_dir: &Path,
+    journal: &[switchboard_core::JournalRecord],
+) -> Result<SourceResolution, AppError> {
+    let (project, agent) = lookup_agent(state, agent_id)?;
+    if state.dispatcher.is_turn_running(agent_id).await {
+        return Err(AppError::Workflow(
+            switchboard_workflow::WorkflowError::Invocation {
+                message: format!(
+                    "agent {:?} is still responding — wait for it to finish, then run the workflow",
+                    agent.name
+                ),
+            },
+        ));
+    }
+    // Settled: forward a failed/cancelled latest turn over a stale older one;
+    // otherwise the latest completed output from disk.
+    if let Some(note) = latest_turn_failure_note(journal, agent_id, &agent.name) {
+        return Ok(SourceResolution::Resolved {
+            name: agent.name,
+            text: note,
+        });
+    }
+    let transcript = load_agent_transcript(&project, &agent, home_dir)?;
+    Ok(SourceResolution::Resolved {
+        name: agent.name,
+        text: latest_completed_agent_text(&transcript.turns).unwrap_or_default(),
+    })
+}
+
 /// Resolve every source concurrently and in declared order. Concurrency is
 /// load-bearing, not just latency: `join_all` polls every source on the first
 /// poll, so each source's `wait_for_current_turn` registers against its current
@@ -5078,6 +5172,70 @@ mod tests {
             !body.contains("old boom"),
             "an earlier failure does not poison a later success: {body:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn workflow_forward_resolves_a_completed_source_into_the_field() {
+        // A workflow forward-field captures its source's latest *completed* output,
+        // composed after the field's typed lead (completed-only M5 semantics).
+        let (tmp, state, _emitter) = fresh_state_with_mock();
+        let home = TempDir::new().unwrap();
+        let (_recipient, project_id) = project_with_agent(&state, &tmp).await;
+        let source = seed_source(&state, home.path(), project_id, "gemini", "FRESH ANSWER");
+
+        let mut forward_sources = std::collections::BTreeMap::new();
+        forward_sources.insert("context".to_owned(), vec![source]);
+        let mut inputs = std::collections::BTreeMap::new();
+        inputs.insert(
+            "context".to_owned(),
+            switchboard_workflow::InputValue::Text("my lead".to_owned()),
+        );
+
+        let resolved = resolve_workflow_forwards(&state, &forward_sources, &inputs, home.path())
+            .await
+            .unwrap();
+        let body = resolved.get("context").expect("context resolved");
+        assert!(body.contains("my lead"), "typed lead leads: {body}");
+        assert!(
+            body.contains("FRESH ANSWER"),
+            "forwarded completed output: {body}"
+        );
+        assert!(
+            body.contains("gemini"),
+            "block attributes the source: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_forward_rejects_a_still_streaming_source() {
+        use switchboard_harness::MockScenario;
+        // A source mid-turn is rejected (the workflow launch never holds on a
+        // streaming agent), with an actionable message — not awaited.
+        let (tmp, state, emitter) = fresh_state_with_scenario(MockScenario::AwaitCancellation);
+        let home = TempDir::new().unwrap();
+        let _ = project_with_agent(&state, &tmp).await;
+        let source =
+            create_agent_impl(&state, "reviewer-1", HarnessKind::ClaudeCode, None, None).unwrap();
+        send_msg(&state, source.id, "work").await.unwrap();
+        within(
+            &emitter,
+            "source in flight",
+            emitter.wait_for_type("turn_start", 1),
+        )
+        .await;
+
+        let mut forward_sources = std::collections::BTreeMap::new();
+        forward_sources.insert("context".to_owned(), vec![source.id]);
+        let err = resolve_workflow_forwards(
+            &state,
+            &forward_sources,
+            &std::collections::BTreeMap::new(),
+            home.path(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AppError::Workflow(_)));
+        assert!(err.to_string().contains("still responding"), "got: {err}");
     }
 
     #[tokio::test]
@@ -14725,9 +14883,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn builtin_prompt_resolves_under_a_cold_cache_and_missing_id_is_unresolved() {
+    async fn builtin_resolves_cold_while_missing_local_errors_and_missing_mcp_is_unresolved() {
         // No sync: the prompt cache is cold. A built-in must still resolve (the
-        // freshness contract); a missing id is reported as Unresolved, not Ok.
+        // freshness contract).
         let (tmp, state) = state_with_prompts();
         let state = state.with_workflows_dir(tmp.path().join("workflows"));
 
@@ -14738,12 +14896,31 @@ mod tests {
             "a built-in resolves without a sync"
         );
 
+        // A missing *local* prompt resolves directly (no sync can ever produce it),
+        // so it's a definitive blocking incompatibility — not a perpetual "pending".
         seed_workflow(
             &state,
             "ghostly",
             "name: ghostly\ndescription: d\ninputs:\n  a: agent\nsteps:\n  - send:\n      to: \"{{ a }}\"\n      prompt: \"local:ghost\"\n",
         );
         let form = describe_workflow_form_impl(&state, "ghostly", false).unwrap();
+        match &form.compatibility {
+            FormCompatibility::Incompatible { issues } => {
+                assert!(
+                    issues.iter().any(|i| i.reason.contains("not found")),
+                    "{issues:?}"
+                );
+            }
+            other => panic!("expected a missing-prompt error, got {other:?}"),
+        }
+
+        // A missing *MCP*-provider prompt stays Unresolved (a sync might produce it).
+        seed_workflow(
+            &state,
+            "mcpish",
+            "name: mcpish\ndescription: d\ninputs:\n  a: agent\nsteps:\n  - send:\n      to: \"{{ a }}\"\n      prompt: \"tiddly:ghost\"\n",
+        );
+        let form = describe_workflow_form_impl(&state, "mcpish", false).unwrap();
         assert!(matches!(
             form.compatibility,
             FormCompatibility::Unresolved { .. }

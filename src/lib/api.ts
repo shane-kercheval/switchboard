@@ -30,6 +30,7 @@ import type {
   RepoListing,
   SendId,
   StagedAttachment,
+  WorkflowFormDescriptor,
   WorkflowInputValue,
   WorkflowListing,
   WorkflowRunInfo,
@@ -542,25 +543,54 @@ export async function listWorkflows(): Promise<WorkflowListing[]> {
   return await invoke<WorkflowListing[]>("list_workflows");
 }
 
+/// Resolve a picked workflow's invocation form: declared inputs + auto-derived
+/// user-fillable prompt-argument fields + a compatibility verdict. No `projectId`
+/// — prompts are user-global. Resolved per-pick (not in `listWorkflows`); re-fetch
+/// on `prompts:synced` so a cold MCP cache resolves once sync lands.
+export async function describeWorkflowForm(
+  name: string,
+  isBuiltin: boolean,
+): Promise<WorkflowFormDescriptor> {
+  return await invoke<WorkflowFormDescriptor>("describe_workflow_form", { name, isBuiltin });
+}
+
 /// Validate a workflow invocation (capability gate + input/roster/prompt rules)
-/// without launching it. Rejects with an actionable error string.
+/// without launching it. Rejects with an actionable error string. `forwardSources`
+/// maps a fillable field name → the (pane-expanded) agent ids whose completed
+/// output the backend composes into that field's typed text. Empty map = none.
 export async function validateWorkflowInvocation(
   projectId: ProjectId,
   name: string,
   isBuiltin: boolean,
   inputs: Record<string, WorkflowInputValue>,
+  forwardSources: Record<string, AgentId[]>,
 ): Promise<void> {
-  await invoke("validate_workflow_invocation", { projectId, name, isBuiltin, inputs });
+  await invoke("validate_workflow_invocation", {
+    projectId,
+    name,
+    isBuiltin,
+    inputs,
+    forwardSources,
+  });
 }
 
 /// Validate + launch a workflow run on a background task; returns its run id.
+/// `forwardSources` maps a fillable field name → the (pane-expanded) agent ids
+/// whose completed output the backend composes into that field. Empty map = none.
 export async function invokeWorkflow(
   projectId: ProjectId,
   name: string,
   isBuiltin: boolean,
   inputs: Record<string, WorkflowInputValue>,
+  forwardSources: Record<string, AgentId[]>,
 ): Promise<string> {
-  return await invoke<string>("invoke_workflow", { projectId, name, isBuiltin, inputs });
+  return await invoke<string>("invoke_workflow", {
+    projectId,
+    name,
+    isBuiltin,
+    inputs,
+    forwardSources,
+  });
 }
 
 /// Fire a running workflow's cancel token (no-op if it already finished).

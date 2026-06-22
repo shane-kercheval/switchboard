@@ -24,8 +24,6 @@ What is **out of scope** for this doc:
 - Persistence-layer encoding of workflow runs (`<directory>/.switchboard/projects/<project-id>/runs/<run-id>.jsonl` schema — M6 expansion)
 - UI rendering of workflow progress (system-design §7)
 
-> **⚠️ Prompt-argument model under revision.** The `prompt_id`-input + `template_vars` examples below describe the current model, in which a workflow takes a user-selectable prompt and the author hand-wires its arguments. This is being replaced by a hardcoded-prompt model (the workflow bakes in its prompt and auto-derives the user-fillable arguments, validating computed bindings against the resolved prompt at invocation). Treat the `prompt_id`/`template_vars`/`aggregation_prompt` examples here as pre-revision until the hardcoded-prompt plan lands.
-
 ## File location and naming
 
 - Workflow files are **user-global**: they live in one folder under the OS config dir (e.g. `~/Library/Application Support/switchboard/workflows/` on macOS), shared across every project in every working directory; see system-design §3. A workflow's `agent`/`[agent]` inputs bind to whichever project's agents it's run against, so the definition isn't tied to any one directory.
@@ -55,12 +53,13 @@ Top-level keys not in this table are an error in v1. (Reserved keys for v2 liste
 |---|---|---|
 | Agent | `agent` | A single agent name (must exist in the project at invocation time) |
 | Agent list | `[agent]` | A list of agent names |
-| Prompt ID | `prompt_id` | A fully-qualified prompt reference (e.g., `local:code-review`, `tiddly:foo`) |
 | Text | `text` | Free-form string |
 | Text (optional) | `text?` | Free-form string; user may leave blank |
 | List of text | `[text]` | List of strings (used by Primitive 6 iteration) |
 
-In v1 the only optional type variant is `text?`. `agent?` and `prompt_id?` are deferred to v2+.
+There is no `prompt_id` input type. A step names its prompt as a **hardcoded literal** (see §`send` and §"Hardcoded prompts and auto-derived arguments"); declaring a `prompt_id` input is a parse error (unknown type). A prompt's user-fillable arguments are auto-derived from the resolved prompt and surfaced as form fields at invocation — they are **not** declared in `inputs`.
+
+In v1 the only optional type variant is `text?`. `agent?` is deferred to v2+.
 
 ### Shorthand form
 
@@ -68,7 +67,6 @@ In v1 the only optional type variant is `text?`. `agent?` and `prompt_id?` are d
 inputs:
   primary_agent: agent
   reviewer_agents: [agent]
-  review_prompt: prompt_id
   user_context: text?
 ```
 
@@ -88,7 +86,7 @@ Long-form keys:
 |---|---|---|
 | `type` | yes | One of the type shorthands above. |
 | `description` | optional | Human description shown in the invocation form. |
-| `default` | optional | Default value if the user leaves the field blank. Providing `default` implicitly makes the input optional; the `?` suffix on a type is shorthand for an optional input with a default of `""`. **`default` is only valid on a `text` input in v1** — it is the optional-input mechanism, and optional non-`text` inputs (`agent?` / `prompt_id?`, and optional `[agent]`, which would contradict the non-empty-fan-in rule) are deferred to v2. A `default` on any non-`text` type is a parse error. |
+| `default` | optional | Default value if the user leaves the field blank. Providing `default` implicitly makes the input optional; the `?` suffix on a type is shorthand for an optional input with a default of `""`. **`default` is only valid on a `text` input in v1** — it is the optional-input mechanism, and optional non-`text` inputs (`agent?`, and optional `[agent]`, which would contradict the non-empty-fan-in rule) are deferred to v2. A `default` on any non-`text` type is a parse error. |
 
 Long-form `type` is required when long form is used; mixing shorthand and long form across different inputs is allowed.
 
@@ -98,7 +96,6 @@ Long-form `type` is required when long form is used; mixing shorthand and long f
 - An input named with a reserved built-in name (`user_input`) is an error
 - Required inputs (no `?` suffix, no `default`) must be supplied at invocation; missing values fail invocation pre-flight
 - Agent-typed inputs are validated at invocation time — referenced agents must exist in the project
-- `prompt_id`-typed inputs are validated at invocation time — the prompt must resolve through configured providers
 
 ## Steps
 
@@ -108,14 +105,14 @@ Long-form `type` is required when long form is used; mixing shorthand and long f
 steps:
   - send:
       to: "{{ reviewer_agents }}"
-      prompt: "{{ review_prompt }}"
+      prompt: "builtin:code-review"
   - wait_for_all:
       agents: "{{ reviewer_agents }}"
   - send:
       to: "{{ primary_agent }}"
-      prompt: "{{ aggregation_prompt }}"
+      prompt: "builtin:ai-review-feedback"
       template_vars:
-        responses: "{{ responses_from(reviewer_agents) }}"
+        review: "{{ aggregated_responses(reviewer_agents) }}"
 ```
 
 Each step type is documented below. Unknown step types are a validation error.
@@ -127,12 +124,43 @@ Dispatch a message to one or more agents. Returns immediately; does not wait for
 | Field | Required | Type | Notes |
 |---|---|---|---|
 | `to` | yes | agent or [agent] | Recipient(s). Single agent or a list. Templated. |
-| `prompt` | yes (or `text` or `forward_from`) | prompt_id | Prompt to resolve and render. Templated. |
+| `prompt` | yes (or `text` or `forward_from`) | literal string | A hardcoded prompt id (e.g., `"builtin:code-review"`). **Not templated** — a `{{ }}`/`{% %}` delimiter in `prompt` is a parse error (see §"Hardcoded prompts and auto-derived arguments"). |
 | `text` | yes (or `prompt` or `forward_from`) | text | Literal text to send (no prompt resolution). Templated. Mutually exclusive with `prompt`. |
-| `template_vars` | optional | mapping | Variables passed to the prompt template at render time. Mapping of name → templated value. |
+| `template_vars` | optional | mapping | **Computed bindings only** — workflow expressions wired to a prompt argument (e.g., `review: "{{ aggregated_responses(reviewers) }}"`). Mapping of name → templated value. Each key must be a real argument of the hardcoded prompt (see §"Binding classification"). User-fillable arguments are **not** put here — they are auto-derived. |
 | `forward_from` | optional | agent or [agent] | Auto-forward source(s). When set, the latest output(s) of the named agent(s) are composed into the message body per the canonical shape below. Equivalent to Primitive 3 (auto-forward). If any referenced agent has no completed output from the current workflow run (per §"Output scope"), the step fails with a clear error ("no in-workflow completed output for agent X"). |
 
-If `prompt` is set, the prompt's template is rendered with workflow-scope variables plus any `template_vars` and dispatched. If `text` is set, the literal text is dispatched (after templating). At least one of `prompt`, `text`, or `forward_from` is required.
+If `prompt` is set, the hardcoded prompt is resolved and its template rendered with the step's `template_vars` (computed bindings) plus the user's values for the prompt's auto-derived user-fillable arguments, then dispatched. If `text` is set, the literal text is dispatched (after templating). At least one of `prompt`, `text`, or `forward_from` is required.
+
+#### Hardcoded prompts and auto-derived arguments
+
+A `send` step names its prompt as a **hardcoded literal id**, never a user-supplied input. The id cannot be templated: the app must statically resolve the prompt's argument schema to build the invocation form, so allowing the id to depend on an input value would make form-derivation circular. A `prompt` field containing `{{` or `{%` is a parse error.
+
+Because the prompt is fixed, the app resolves it at invocation and fills its declared arguments from **two sources**:
+
+- **Computed bindings** — the step's `template_vars`, whose values are workflow expressions the user can't type (`{{ aggregated_responses(reviewers) }}`, etc.). These stay in `template_vars` and are hidden from the user.
+- **User-fillable arguments** — every *other* argument of the prompt. These are **auto-derived** from the resolved prompt and surfaced as invocation-form fields (required iff the prompt marks the argument required). They are **not** declared in `inputs`.
+
+At render, each hardcoded-prompt `send` receives exactly its prompt's declared arguments: its `template_vars` plus the user's value for each user-fillable argument the prompt declares — and nothing else (the prompt renderer rejects unknown arguments). An unfilled optional argument is omitted, so the prompt's lenient-undefined `{% if arg %}` branch renders empty.
+
+#### Binding classification
+
+For one hardcoded-prompt `send`, let `A` = the resolved prompt's declared argument names and `T` = the step's `template_vars` keys:
+
+| Set | Meaning | Surfaced to user? |
+|---|---|---|
+| `A ∩ T` | **Computed args** — filled by the workflow expression in `template_vars`. | No (hidden). |
+| `T \ A` | **Invalid bindings** — a `template_vars` key the prompt has no argument for. | Blocks invocation (see below). |
+| `A \ T` | **User-fillable args** — auto-derived form fields, required iff the prompt requires them. | Yes (fillable field). |
+
+**Invocation-time incompatibility check.** Any non-empty `T \ A` — or a `prompt` id that doesn't resolve — is an **invocation-blocking incompatibility**: the form reports it (naming the offending prompt and argument) and disables Run. This catches the drift case where a workflow's computed binding targets an argument the prompt has since renamed or removed. The check runs both when the form is built and again at invoke (invoke is authoritative — a prompt definition can change between form-open and invoke).
+
+#### Flat, merge-by-name argument namespace
+
+Auto-derived user-fillable arguments share **one flat namespace** with the declared `inputs`, keyed by name. A given name appears in the form **once**; at render it is passed to *every* hardcoded prompt that declares it as a user-fillable arg. Because prompt arguments are strings, name collisions resolve by type:
+
+1. A scalar **`text`/`text?` declared input** may shadow-and-satisfy a same-named prompt argument: one field, the declared input's label/description wins, and its value also feeds the prompt (if the prompt marks the argument required, the input is enforced required). This is the escape hatch for custom-labeling a field that feeds a prompt.
+2. **Two hardcoded prompts** that declare a same-named (string) user-fillable argument **share** one field: its value feeds both, required if *either* prompt marks it required.
+3. A **non-text declared input** (`agent`/`[agent]`/`[text]`) colliding with a (string) prompt-argument name is a **validation error** at form-build time — it would feed a non-string into a string slot. This is the only collision that errors rather than shares.
 
 When `to` is a list of agents, dispatches are issued in declared order; agents run in parallel. The step returns once all dispatches have been issued (not when any has completed) — to synchronize, use `wait_for_all` in the next step.
 
@@ -310,7 +338,7 @@ Rationale: deterministic, predictable behavior. The author writes the workflow a
 === END response from <agent_b_name> ===
 ```
 
-A receiving prompt that simply wraps the aggregation as `{{ feedback }}` (e.g., `tiddly:ai-review-feedback`) gets this canonical shape with no Switchboard-specific authoring required.
+A receiving prompt that simply wraps the aggregation in a single text argument (e.g., `builtin:ai-review-feedback`'s `{{ review }}`) gets this canonical shape with no Switchboard-specific authoring required.
 
 **Sentinel collision policy:** there is no escaping of `=== START` / `=== END` in agent output. If an agent's output literally contains a sentinel-shaped line, the receiving agent sees it as part of the forwarded content. This is judged acceptable: collisions are rare in practice (the sentinel pattern is distinctive), agents are good at recovering from minor delimitation noise, and escaping would obscure the structure for the common case. Authors who need strict delimitation can use `responses_from` and a custom template that wraps content explicitly (e.g., XML-style tags).
 
@@ -408,14 +436,16 @@ A workflow file is validated at two times:
 - No reserved built-in names used as input names
 - No `for_each` `item:` name that collides with a workflow input name *or* with the reserved built-in name `user_input` (per §`for_each` — silent shadowing is rejected at the boundary)
 - Hardcoded `[agent]` literals in step bodies (YAML literals, not template substitution) are checked at parse time: empty literals (e.g., `to: []`) and literals containing duplicate references (after hyphen→underscore normalization) are rejected.
+- A `send.prompt` value containing a template delimiter (`{{` or `{%`) is a parse error: the prompt id must be a literal so its argument schema can be statically resolved (see §"Hardcoded prompts and auto-derived arguments").
 
-Hardcoded `prompt_id` literals (e.g., `prompt: "local:code-review"` with no template substitution) are **not** resolved against providers at parse time; provider resolution happens at invocation time. This is intentional — configured prompt providers may change between save and run.
+The literal `prompt` id (e.g., `prompt: "builtin:code-review"`) is **not** resolved against providers at parse time; provider resolution — and the binding/compatibility checks that depend on it — happen at invocation time. This is intentional: configured prompt providers (and a referenced prompt's argument schema) may change between save and run.
 
 ### Invocation-time (when the user invokes the workflow)
 
 - All required inputs are supplied
 - All `agent`-typed input values reference agents that exist in the project
-- All `prompt_id`-typed input values resolve through configured providers
+- Each hardcoded `send.prompt` id resolves through configured providers, and each of its computed `template_vars` keys is a real argument of the resolved prompt — a non-empty `template_vars \ prompt-args` set (or an unresolvable id) is an invocation-blocking incompatibility naming the offending prompt and argument (see §"Binding classification")
+- Every required user-fillable prompt argument (auto-derived, `prompt-args \ template_vars`) is supplied
 - All template variable references resolve in the available scope (per "Available template variables") at the time the template is about to render
 - Built-in functions (`responses_from`, etc.) get arguments of the right shape
 - Any `[agent]` list resolved for use as a step target (`to`), synchronization argument (`agents`), forwarding source (`forward_from`), or helper-function argument (`responses_from`, `aggregated_responses`, `agent_names`) contains unique agents — after hyphen→underscore normalization (per system-design §3 Primitive 1). Duplicate references fail invocation pre-flight; rationale: double-dispatch to a busy agent, ambiguous waits, and mapping-key collisions in fan-in helpers all silently produce wrong results.
@@ -461,32 +491,31 @@ description: Send to multiple reviewers in parallel, aggregate, send to primary.
 inputs:
   primary_agent: agent
   reviewer_agents: [agent]
-  review_prompt: prompt_id
-  aggregation_prompt: prompt_id
-  user_context: text?
 
 steps:
   - send:
       to: "{{ reviewer_agents }}"
-      prompt: "{{ review_prompt }}"
-      template_vars:
-        context: "{{ user_context }}"
+      prompt: "builtin:code-review"
+      # No template_vars: code-review's only argument, `context`, is optional and
+      # user-fillable — it is auto-derived and shown as a form field at invocation.
   - wait_for_all:
       agents: "{{ reviewer_agents }}"
   - send:
       to: "{{ primary_agent }}"
-      prompt: "{{ aggregation_prompt }}"
+      prompt: "builtin:ai-review-feedback"
       template_vars:
-        feedback: "{{ aggregated_responses(reviewer_agents) }}"
+        review: "{{ aggregated_responses(reviewer_agents) }}"
 ```
 
-This passes the aggregated reviews as a single text blob to whatever variable the aggregation prompt declares (commonly `feedback`). A typical cross-platform aggregation prompt — including ones authored outside Switchboard, such as `tiddly:ai-review-feedback` — wraps the blob directly:
+Both prompts are hardcoded literals, not inputs. The invocation form shows `primary_agent`, `reviewer_agents`, and one auto-derived field — `code-review`'s optional `context` — and nothing else. `ai-review-feedback`'s required `review` argument is a **computed binding** (filled by `aggregated_responses`), so it is hidden from the user; if `ai-review-feedback` ever renamed `review`, the `template_vars: { review: … }` binding would become a `T \ A` invalid binding and invocation would be blocked with an error naming the prompt and argument.
+
+This passes the aggregated reviews as a single text blob to whatever argument the analysis prompt declares — here `review`. A cross-platform prompt that takes a single text argument wraps the blob directly:
 
 ```jinja
 Here is feedback from AI coding agents:
 
 """
-{{ feedback }}
+{{ review }}
 """
 
 Summarize agreement and disagreement.

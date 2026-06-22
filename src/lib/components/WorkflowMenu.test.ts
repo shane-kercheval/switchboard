@@ -12,7 +12,6 @@ function listing(over: Partial<WorkflowListing> = {}): WorkflowListing {
     inputs: [],
     invocable: true,
     parse_error: null,
-    recommended_prompts: {},
     ...over,
   };
 }

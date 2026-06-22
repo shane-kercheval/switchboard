@@ -29,6 +29,7 @@ globalThis.IntersectionObserver = StubIO as unknown as typeof IntersectionObserv
 
 import { renderMarkdown } from "$lib/markdown";
 import UnifiedTranscript from "./UnifiedTranscript.svelte";
+import { INITIAL_WINDOW } from "$lib/state/unified";
 import type { Turn } from "$lib/state/index.svelte";
 
 const PROJECT_ID = "00000000-0000-7000-8000-0000000000ff";
@@ -89,9 +90,10 @@ it("parses markdown only for the windowed tail on first paint, not the whole tra
   await tick();
 
   const calls = (renderMarkdown as Mock).mock.calls.length;
-  // Bounded by the ~20-block window — far below the 200 total. The pre-fix bug
-  // parsed all 200 here.
-  expect(calls).toBeLessThan(50);
+  // One markdown segment per block and the reveal observer stubbed (never
+  // fires), so first paint parses exactly the window — assert the real bound,
+  // not a loose proxy. The pre-fix bug parsed all 200 here.
+  expect(calls).toBeLessThanOrEqual(INITIAL_WINDOW);
 });
 
 export type { NormalizedEvent };

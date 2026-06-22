@@ -327,10 +327,11 @@
   // heights the existing `reanchor` holds a top-prepend exactly, so windowing
   // owns mounted-set size and scroll-anchoring owns position stability, with no
   // estimate machinery between them. Residual: a user who reveals deep history
-  // grows the mounted set, so a forced full relayout scales with it (~3 ms at the
-  // default ~50 blocks, ~18 ms once ~300 are revealed — measured in WebKit). Past
-  // there, the answer is a true sliding-window/virtualization follow-up, not CSS
-  // containment estimates.
+  // grows the mounted set, so a forced full relayout scales with it (~3 ms at ~50
+  // mounted blocks, ~18 ms once ~300 are revealed — measured in WebKit when 50
+  // was the default window; the initial window is now 20, so cold open sits well
+  // below the ~50 point). Past there, the answer is a true
+  // sliding-window/virtualization follow-up, not CSS containment estimates.
 
   /// Clip + bottom-fade for a height-clipped preview. Absolute stops (not
   /// percentages) so a short message never fades; the fade starts around the
